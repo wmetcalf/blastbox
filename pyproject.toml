@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blastbox"
+version = "0.1.0"
+description = "Reusable detonation framework: run untrusted documents through disposable, hardened workers"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Will Metcalf" }]
+keywords = ["sandbox", "malware", "detonation", "untrusted", "document", "isolation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+
+# Core depends on pydantic ONLY. This is everything an *engine* needs — the
+# typed contract + the worker SDK (engine seam, harness, sandbox, warm
+# protocol). An engine adapter installs `blastbox` and stays lean.
+dependencies = [
+    "pydantic>=2.6.0",
+]
+
+[project.optional-dependencies]
+# The host orchestrator (ingress API + CLI, dispatcher, pool, runtime,
+# jobstores, observability). A host deployment installs `blastbox[host]`.
+host = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "python-multipart>=0.0.9",
+    "structlog>=24.1",
+    "prometheus-client>=0.20",
+    "psycopg[binary]>=3.2",
+    "redis>=5.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "mypy>=1.9.0",
+    "ruff>=0.3.0",
+    "fakeredis>=2.21",
+    "httpx>=0.27",
+]
+
+[project.urls]
+Homepage = "https://github.com/wmetcalf/blastbox"
+Repository = "https://github.com/wmetcalf/blastbox"
+Issues = "https://github.com/wmetcalf/blastbox/issues"
+
+[project.scripts]
+blastbox = "blastbox.host.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra -q"

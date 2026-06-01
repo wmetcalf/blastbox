@@ -1,0 +1,601 @@
+"""TDD tests for blastbox.host.dispatch.Dispatcher.
+
+11 test cases per the plan at docs/plans/2026-05-31-host-dispatch.md.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import time
+from pathlib import Path
+
+from blastbox.host.dispatch import Dispatcher, EngineSpec
+from blastbox.host.jobs.base import Job, JobStatus
+from blastbox.host.jobs.memory import InMemoryJobStore
+from blastbox.host.runtime.docker import InsecureRuntimeRefused, RuntimeSelection
+from blastbox.limits import Limits
+
+
+# ---------------------------------------------------------------------------
+# Helpers / fixtures
+# ---------------------------------------------------------------------------
+
+_ENGINE_NAME = "test-engine"
+_ENGINE_IMAGE = "registry.example.com/test-worker:latest"
+_INPUT_SHA = "a" * 64
+
+
+def _limits() -> Limits:
+    return Limits()
+
+
+def _engine_spec(name: str = _ENGINE_NAME, image: str = _ENGINE_IMAGE) -> EngineSpec:
+    return EngineSpec(
+        name=name,
+        image=image,
+        worker_argv=["worker", "run"],
+    )
+
+
+def _fake_runtime() -> RuntimeSelection:
+    return RuntimeSelection(runtime="runc", secure=False, warnings=["no runsc"])
+
+
+def _make_job(
+    *,
+    engine: str = _ENGINE_NAME,
+    filename: str = "malware.docx",
+    params: dict | None = None,
+) -> Job:
+    job = Job.new(engine=engine, filename=filename)
+    if params:
+        job.params = params
+    return job
+
+
+def _make_valid_output_dir(
+    output_dir: Path,
+    *,
+    engine: str = _ENGINE_NAME,
+    input_sha256: str = _INPUT_SHA,
+    artifact_content: bytes = b"PNG_DATA",
+) -> None:
+    """Write a valid output directory with one artifact + valid metadata.json."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Write artifact file
+    artifact_path = output_dir / "page-001.png"
+    artifact_path.write_bytes(artifact_content)
+    real_sha = hashlib.sha256(artifact_content).hexdigest()
+
+    # Build a valid envelope using the contract
+    envelope = {
+        "engine": engine,
+        "status": "ok",
+        "input_sha256": input_sha256,
+        "detected": {
+            "label": "docx",
+            "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "confidence": 0.99,
+            "source": "magika",
+        },
+        "artifacts": [
+            {
+                "id": "page-001",
+                "path": "page-001.png",
+                "kind": "image",
+                "sha256": real_sha,
+                "bytes": len(artifact_content),
+            }
+        ],
+        "warnings": [],
+        "payload": {
+            "_type": "extracted_text",
+            "text": "hello world",
+            "char_count": 11,
+        },
+    }
+    (output_dir / "metadata.json").write_bytes(json.dumps(envelope).encode())
+
+
+def _make_dispatcher(
+    store: InMemoryJobStore,
+    *,
+    job_root: Path,
+    engines: dict | None = None,
+    runtime_selector=None,
+    subprocess_runner=None,
+    worker_timeout_s: int = 30,
+    job_retention_seconds: int = 0,
+) -> Dispatcher:
+    if engines is None:
+        engines = {_ENGINE_NAME: _engine_spec()}
+    if runtime_selector is None:
+        runtime_selector = _fake_runtime
+    return Dispatcher(
+        job_store=store,
+        engines=engines,
+        limits=_limits(),
+        job_root=job_root,
+        runtime_selector=runtime_selector,
+        subprocess_runner=subprocess_runner or (lambda *a, **kw: subprocess.CompletedProcess(a[0], 0, "", "")),
+        worker_timeout_s=worker_timeout_s,
+        job_retention_seconds=job_retention_seconds,
+    )
+
+
+def _setup_job_dirs(job_root: Path, job: Job, *, input_content: bytes = b"malware") -> Path:
+    """Create the job directory structure ingress would create; return input_path.
+
+    Uses only the basename of job.filename (same logic the dispatcher uses)
+    so malicious filenames containing slashes don't cause mkdir failures.
+    """
+    job_dir = job_root / job.job_id
+    input_dir = job_dir / "input"
+    output_dir = job_dir / "output"
+    input_dir.mkdir(parents=True)
+    output_dir.mkdir(parents=True)
+    # Dispatcher uses Path(job.filename).name — use the same here.
+    input_path = input_dir / Path(job.filename).name
+    input_path.write_bytes(input_content)
+    return input_path
+
+
+# ---------------------------------------------------------------------------
+# Test 1: dispatch_once with empty store → returns False
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_once_empty_store(tmp_path):
+    """dispatch_once returns False when no jobs are queued."""
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    assert dispatcher.dispatch_once() is False
+
+
+# ---------------------------------------------------------------------------
+# Test 2: Happy path — valid output dir + exit 0 → DONE, result_summary, input gone
+# ---------------------------------------------------------------------------
+
+
+def test_happy_path_done_result_summary_input_gone(tmp_path):
+    """Happy path: queued job + valid output + exit 0 → DONE, result_summary, input deleted."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    input_path = _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    invocations: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        invocations.append(argv)
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    result = dispatcher.dispatch_once()
+
+    assert result is True
+    final_job = store.get(job.job_id)
+    assert final_job is not None
+    assert final_job.status == JobStatus.DONE
+    assert final_job.result_summary is not None
+    assert final_job.result_summary["artifact_count"] == 1
+    assert "warning_count" in final_job.result_summary
+    assert final_job.finished_at is not None
+    # Input file and directory must be gone
+    assert not input_path.exists()
+    assert not input_path.parent.exists()
+
+
+# ---------------------------------------------------------------------------
+# Test 3: Worker non-zero exit (no valid output) → FAILED, input gone
+# ---------------------------------------------------------------------------
+
+
+def test_nonzero_exit_fails_job_input_gone(tmp_path):
+    """Worker exits with non-zero and writes no valid output → job FAILED, input gone."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    input_path = _setup_job_dirs(tmp_path, job)
+
+    def fake_runner(argv, **kw):
+        # No output written, non-zero exit
+        return subprocess.CompletedProcess(argv, 1, "", "worker crashed")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher.dispatch_once()
+
+    final_job = store.get(job.job_id)
+    assert final_job is not None
+    assert final_job.status == JobStatus.FAILED
+    assert final_job.error is not None
+    assert not input_path.exists()
+    assert not input_path.parent.exists()
+
+
+# ---------------------------------------------------------------------------
+# Test 4: TimeoutExpired → docker kill invoked, FAILED("timed out"), input gone
+# ---------------------------------------------------------------------------
+
+
+def test_timeout_kills_container_fails_job_input_gone(tmp_path):
+    """TimeoutExpired → docker kill is called, job FAILED with timed-out message, input gone."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    input_path = _setup_job_dirs(tmp_path, job)
+    kill_calls: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        if argv[0] == "docker" and len(argv) > 1 and argv[1] == "run":
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout", 30))
+        # docker kill call
+        kill_calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher.dispatch_once()
+
+    final_job = store.get(job.job_id)
+    assert final_job is not None
+    assert final_job.status == JobStatus.FAILED
+    assert final_job.error is not None
+    assert "timed out" in final_job.error.lower() or "timeout" in final_job.error.lower()
+    # docker kill should have been called
+    assert any(
+        "kill" in argv for argv in kill_calls
+    ), f"docker kill not invoked; calls: {kill_calls}"
+    assert not input_path.exists()
+    assert not input_path.parent.exists()
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Trust fails (traversal artifact) → FAILED, input gone
+# ---------------------------------------------------------------------------
+
+
+def test_trust_failure_fails_job_input_gone(tmp_path):
+    """Output with traversal artifact path fails trust validation → FAILED, input gone."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    input_path = _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        # Write a metadata.json with a traversal path — trust gate should reject
+        output_dir.mkdir(parents=True, exist_ok=True)
+        # Write an escape target outside the output dir
+        escape = tmp_path / "escape.bin"
+        escape.write_bytes(b"secret")
+        envelope = {
+            "engine": _ENGINE_NAME,
+            "status": "ok",
+            "input_sha256": _INPUT_SHA,
+            "detected": {
+                "label": "docx",
+                "mime": "text/plain",
+                "confidence": 1.0,
+                "source": "magika",
+            },
+            "artifacts": [
+                {
+                    "id": "evil",
+                    "path": "../escape.bin",  # TRAVERSAL
+                    "kind": "image",
+                    "sha256": "a" * 64,
+                    "bytes": 6,
+                }
+            ],
+            "warnings": [],
+            "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
+        }
+        (output_dir / "metadata.json").write_bytes(json.dumps(envelope).encode())
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher.dispatch_once()
+
+    final_job = store.get(job.job_id)
+    assert final_job is not None
+    assert final_job.status == JobStatus.FAILED
+    assert not input_path.exists()
+    assert not input_path.parent.exists()
+
+
+# ---------------------------------------------------------------------------
+# Test 6: Unknown engine → FAILED, input gone, no subprocess launched
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_engine_fails_job_no_subprocess_input_gone(tmp_path):
+    """Job with unknown engine → FAILED immediately, no subprocess, input gone."""
+    store = InMemoryJobStore()
+    job = _make_job(engine="no-such-engine")
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    input_path = _setup_job_dirs(tmp_path, job)
+    subprocess_calls: list = []
+
+    def fake_runner(argv, **kw):
+        subprocess_calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher.dispatch_once()
+
+    final_job = store.get(job.job_id)
+    assert final_job is not None
+    assert final_job.status == JobStatus.FAILED
+    assert "engine" in (final_job.error or "").lower()
+    assert subprocess_calls == [], "subprocess must NOT be launched for unknown engine"
+    assert not input_path.exists()
+    assert not input_path.parent.exists()
+
+
+# ---------------------------------------------------------------------------
+# Test 7: runtime_selector raises InsecureRuntimeRefused → FAILED, input gone
+# ---------------------------------------------------------------------------
+
+
+def test_insecure_runtime_refused_fails_job_input_gone(tmp_path):
+    """InsecureRuntimeRefused from runtime_selector → job FAILED, input gone."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    input_path = _setup_job_dirs(tmp_path, job)
+
+    def bad_runtime_selector():
+        raise InsecureRuntimeRefused("no secure runtime available")
+
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, runtime_selector=bad_runtime_selector
+    )
+    dispatcher.dispatch_once()
+
+    final_job = store.get(job.job_id)
+    assert final_job is not None
+    assert final_job.status == JobStatus.FAILED
+    assert not input_path.exists()
+    assert not input_path.parent.exists()
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Image used in argv == engine.image, NEVER any job field
+# ---------------------------------------------------------------------------
+
+
+def test_image_in_argv_is_engine_image_not_job_field(tmp_path):
+    """The image in the docker run argv must be engine.image, never derived from job data."""
+    store = InMemoryJobStore()
+    # Set filename to something that looks like a Docker image name
+    malicious_filename = "evil.io/pwned:latest"
+    job = _make_job(filename=malicious_filename)
+    job.input_sha256 = _INPUT_SHA
+    # Also set params to something that looks like an image override
+    job.params = {"IMAGE": "evil.io/injected:latest"}
+    store.create(job)
+
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    launched_argv: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched_argv.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher.dispatch_once()
+
+    # Find the docker run invocation
+    docker_run_argv = next(
+        (a for a in launched_argv if len(a) >= 2 and a[:2] == ["docker", "run"]), None
+    )
+    assert docker_run_argv is not None, "docker run not called"
+
+    # The image must be _ENGINE_IMAGE (the last non-worker-argv positional)
+    # The image appears just before the worker_argv elements.
+    # It must be exactly engine.image — no job field.
+    assert _ENGINE_IMAGE in docker_run_argv, f"engine image not in argv: {docker_run_argv}"
+    assert malicious_filename not in docker_run_argv, (
+        f"job filename appeared as image in argv: {docker_run_argv}"
+    )
+    assert "evil.io/injected:latest" not in docker_run_argv, (
+        f"job params IMAGE appeared in argv position: {docker_run_argv}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 9: requeue_orphaned_jobs
+# ---------------------------------------------------------------------------
+
+
+def test_requeue_orphaned_jobs(tmp_path):
+    """RUNNING job not in active set → back to QUEUED + warning; active job untouched;
+    docker ps failure → no requeue."""
+    store = InMemoryJobStore()
+
+    # Create two RUNNING jobs
+    orphan_job = Job.new(engine=_ENGINE_NAME, filename="a.docx")
+    orphan_job.status = JobStatus.RUNNING
+    orphan_job.started_at = time.time()
+    store.create(orphan_job)
+
+    active_job = Job.new(engine=_ENGINE_NAME, filename="b.docx")
+    active_job.status = JobStatus.RUNNING
+    active_job.started_at = time.time()
+    store.create(active_job)
+
+    ps_calls: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        ps_calls.append(list(argv))
+        # docker ps returns only the active_job's container
+        if "ps" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, f"blastbox.job_id={active_job.job_id}\n", ""
+            )
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+
+    count = dispatcher.requeue_orphaned_jobs()
+    assert count == 1
+
+    orphan_after = store.get(orphan_job.job_id)
+    assert orphan_after is not None
+    assert orphan_after.status == JobStatus.QUEUED
+
+    active_after = store.get(active_job.job_id)
+    assert active_after is not None
+    assert active_after.status == JobStatus.RUNNING  # untouched
+
+    # Now test docker ps failure → no requeue
+    store2 = InMemoryJobStore()
+    stranded = Job.new(engine=_ENGINE_NAME, filename="c.docx")
+    stranded.status = JobStatus.RUNNING
+    store2.create(stranded)
+
+    def failing_runner(argv, **kw):
+        if "ps" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "error")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher2 = _make_dispatcher(store2, job_root=tmp_path, subprocess_runner=failing_runner)
+    count2 = dispatcher2.requeue_orphaned_jobs()
+    assert count2 == 0
+
+    stranded_after = store2.get(stranded.job_id)
+    assert stranded_after is not None
+    assert stranded_after.status == JobStatus.RUNNING  # NOT requeued
+
+
+# ---------------------------------------------------------------------------
+# Test 10: job.params key filtering — bad key dropped, good key passes
+# ---------------------------------------------------------------------------
+
+
+def test_params_key_filtering_bad_dropped_good_passes(tmp_path):
+    """Bad params keys are dropped from extra_env; valid keys pass through."""
+    store = InMemoryJobStore()
+    job = _make_job(
+        params={
+            "VALID_KEY": "good_value",
+            "x; --privileged": "evil",   # bad key: spaces/semicolons
+            "also-bad": "val",            # bad key: hyphens
+            "123STARTS_WITH_DIGIT": "val",  # bad key: starts with digit
+            "ANOTHER_VALID": "value2",
+        }
+    )
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    captured_argv: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        captured_argv.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher.dispatch_once()
+
+    docker_run_argv = next(
+        (a for a in captured_argv if len(a) >= 2 and a[:2] == ["docker", "run"]), None
+    )
+    assert docker_run_argv is not None
+
+    # Flatten to find -e KEY=VAL tokens
+    env_tokens = []
+    for i, tok in enumerate(docker_run_argv):
+        if tok == "-e" and i + 1 < len(docker_run_argv):
+            env_tokens.append(docker_run_argv[i + 1])
+
+    env_keys = [t.split("=", 1)[0] for t in env_tokens]
+
+    # Valid keys must be present
+    assert "VALID_KEY" in env_keys
+    assert "ANOTHER_VALID" in env_keys
+
+    # Bad keys must NOT appear anywhere in argv — not as separate tokens
+    full_argv_str = " ".join(docker_run_argv)
+    assert "x; --privileged" not in full_argv_str
+    assert "--privileged" not in docker_run_argv, (
+        "bad key injection: --privileged appeared as standalone argv element"
+    )
+    # The bad key itself should not have produced an -e entry
+    assert not any("x;" in k for k in env_keys)
+    assert not any("also-bad" in k for k in env_keys)
+    assert not any("123STARTS" in k for k in env_keys)
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Error strings on FAILED jobs are scrubbed of filesystem paths
+# ---------------------------------------------------------------------------
+
+
+def test_error_strings_scrubbed_of_filesystem_paths(tmp_path):
+    """Error messages stored on FAILED jobs must not contain internal filesystem paths."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    _setup_job_dirs(tmp_path, job)
+
+    def fake_runner(argv, **kw):
+        # Inject an error that contains an internal path
+        return subprocess.CompletedProcess(
+            argv, 1, "", f"fatal error at /var/lib/blastbox/jobs/{job.job_id}/input/malware.docx"
+        )
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher.dispatch_once()
+
+    final_job = store.get(job.job_id)
+    assert final_job is not None
+    assert final_job.status == JobStatus.FAILED
+    error = final_job.error or ""
+    # The raw path must not appear in the stored error
+    assert "/var/lib/blastbox" not in error, f"Internal path leaked in error: {error!r}"
+    assert job.job_id not in error or "/jobs/" not in error, (
+        f"Internal path with job_id leaked in error: {error!r}"
+    )
+
+
+def test_run_forever_survives_dispatch_error(tmp_path):
+    """A transient error from dispatch_once must not crash the run_forever loop."""
+    store = InMemoryJobStore()
+    d = _make_dispatcher(store, job_root=tmp_path)
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient store error")
+        return False  # no work available
+
+    d.dispatch_once = flaky  # type: ignore[method-assign]
+    # stop() is checked at the top of each iteration; break once we've gotten
+    # past the raising call (proving the loop continued instead of crashing).
+    d.run_forever(poll_interval_s=0, stop=lambda: calls["n"] >= 2)
+    assert calls["n"] >= 2

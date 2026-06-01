@@ -1,0 +1,35 @@
+# blastbox FC worker rootfs built ON TOP OF ClippyShot's image, so ClippyShot's
+# real Converter (LibreOffice 25.8 + poppler + tesseract + magika) runs inside a
+# warm, hardened, disposable Firecracker microVM.
+#
+# The base image already provides LibreOffice + clippyshot + a /opt/clippyshot
+# venv + the non-root `clippy` user. This overlay adds: blastbox (the engine
+# seam), the self-contained ClippyShot engine adapter, and the blastbox FC guest
+# agent + init. Build context = blastbox repo root; clippyshot_engine.py is
+# staged in (it lives in the ClippyShot repo, copied in at build time).
+ARG BASE_IMAGE=clippyshot:dev
+FROM ${BASE_IMAGE}
+ARG ENGINE=clippyshot   # unused (engine is baked via /opt/blastbox/engine); silences the warning
+USER root
+
+# Install blastbox (engine seam) into the clippyshot venv; drop the build inputs.
+COPY pyproject.toml README.md /src/blastbox/
+COPY src /src/blastbox/src
+RUN /opt/clippyshot/bin/pip install --no-cache-dir /src/blastbox && rm -rf /src
+
+# Add the self-contained ClippyShot engine adapter into the installed package.
+COPY deploy/firecracker/clippyshot_engine.py /tmp/engine.py
+RUN cp /tmp/engine.py \
+        "$(/opt/clippyshot/bin/python -c 'import clippyshot,os;print(os.path.dirname(clippyshot.__file__))')/engine.py" \
+    && rm /tmp/engine.py \
+    && /opt/clippyshot/bin/python -c 'import clippyshot.engine'   # fail build if it cannot import
+
+# blastbox FC guest agent + init + per-rootfs config.
+COPY deploy/firecracker/run_guest.py /opt/blastbox/run_guest.py
+COPY deploy/firecracker/engines.py /opt/blastbox/engines.py
+COPY deploy/firecracker/init /init
+COPY deploy/firecracker/guest.clippyshot.env /opt/blastbox/guest.env
+RUN chmod +x /init && mkdir -p /mnt/outdisk \
+    && printf '%s' 'clippyshot.engine:ClippyShotEngine' > /opt/blastbox/engine \
+    # Strip setuid/setgid (the in-VM Converter runs soffice directly, no setuid).
+    && find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true

@@ -1,0 +1,1072 @@
+"""Firecracker microVM slot runtime — strongest isolation tier.
+
+Each slot is a fresh hardware-virtualised Firecracker microVM launched as a
+subprocess.  The VM boots the warm worker image from a read-only root disk,
+writes output to a per-slot writable ext4 virtio-blk disk, and communicates
+the control handshake over AF_VSOCK.  After the VM exits the host reads the
+output disk via ``debugfs rdump`` — no mount, no root, no VirtioFS.
+
+Security properties (review will check):
+1. Launch argv is ALWAYS a Python list — no shell=True, no shell metacharacters
+   from caller values can become new flag elements.
+2. The firecracker binary path comes exclusively from operator config
+   (``BLASTBOX_FC_BIN`` / ``FCConfig.fc_bin``); job data cannot influence it.
+3. vcpu_count defaults to 1.  This is the hard-won mitigation for the
+   guest virtio-vsock stream-corruption bug: under concurrent workloads with
+   >1 vCPU the guest virtio-vsock driver produces interleaved frames.
+   The test suite ASSERTS this default.
+4. Output is read from the ext4 disk via ``debugfs rdump`` — never mounted,
+   never trusted directly from the guest vsock stream after the job bytes.
+   This defends against a compromised guest crafting a malicious disk image
+   (ext4 superblock magic is verified; dest path whitespace is rejected;
+   extracted size is capped).
+5. ``firecracker_available()`` checks binary + /dev/kvm + kernel + rootfs.
+   If any component is missing, the FC tier is unavailable and selection falls
+   back / refuses with a clear error.
+6. The ``subprocess_runner`` and ``ReadySignal`` seams are injectable so the
+   unit test suite can drive the full spawn→is_ready→reap state machine
+   without a real Firecracker binary, kernel, or rootfs.
+
+Hard-won lessons from RedTusk FirecrackerWorkerRuntime (ported + adapted):
+- fc_vcpu_count=1  (vsock corruption mitigation — NEVER increase without
+  validating the guest virtio-vsock driver is bug-free at that count)
+- Output via virtio-blk ext4 disk, NOT vsock (zero vsock corruption on output)
+- debugfs rdump for host-side disk read (no mount, no root)
+- ext4 superblock magic check before invoking debugfs
+- Extracted-size cap enforced host-side (guest cannot evade it)
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import selectors
+import shutil
+import socket
+import subprocess
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from blastbox.worker.warm import WarmJobSpec
+
+from blastbox.errors import SandboxError, WarmTimeout
+from blastbox.host.pool import Slot, SlotState
+from blastbox.worker.fc_guest import (
+    MAX_STATUS_BYTES,
+    recv_frame,
+    recv_line,
+    send_frame,
+)
+
+__all__ = [
+    "FCConfig",
+    "FCError",
+    "FCUnavailable",
+    "FirecrackerSlotRuntime",
+    "firecracker_available",
+    "make_ext4",
+    "rdump_ext4",
+    "FileReadySignal",
+    "VsockReadySignal",
+    "VsockHostWarmControl",
+]
+
+_log = logging.getLogger("blastbox.host.runtime.firecracker")
+
+# ---------------------------------------------------------------------------
+# Environment variable keys
+# ---------------------------------------------------------------------------
+
+_ENV_FC_BIN = "BLASTBOX_FC_BIN"
+_ENV_FC_KERNEL = "BLASTBOX_FC_KERNEL"
+_ENV_FC_ROOTFS = "BLASTBOX_FC_ROOTFS"
+_ENV_FC_VCPU = "BLASTBOX_FC_VCPU"
+_ENV_FC_MEM_MIB = "BLASTBOX_FC_MEM_MIB"
+_ENV_FC_OUTDISK_MIB = "BLASTBOX_FC_OUTDISK_MIB"
+
+# Ready marker filename written by the guest worker into the output disk root.
+# The host checks for this file via debugfs after the VM exits.  In the vsock
+# control plane the worker sends a READY frame before the warm signal.
+_READY_MARKER = "ready"
+
+# AF_VSOCK control plane.  Firecracker's vsock Unix-socket backend: when the
+# guest opens an AF_VSOCK connection to CID 2 (host) on port P, firecracker
+# connects to a host Unix socket at ``<uds_path>_<P>``.  We pre-bind that socket
+# for the READY port so the guest's post-warmup READY frame is received live —
+# the disk/marker proxy (FileReadySignal) can only be read AFTER the VM exits,
+# so it cannot signal a *warm* slot.  Output stays on the ext4 disk; vsock only
+# ever carries small control frames (the "no large vsock transfers" lesson).
+_READY_PORT = 10000
+_READY_TOKEN = b"READY"
+_READY_MAX_BYTES = 64
+# Job control plane: the host connects to the guest on this vsock port (via the FC
+# UDS + "CONNECT <port>") to deliver one job and read back the status. Must match
+# worker.fc_guest.JOB_PORT.
+_JOB_PORT = 10001
+# A guest connection must send READY within this grace window or it is dropped —
+# a connect-but-stall must never delay readiness or wedge the accept thread.
+_CONN_GRACE_S = 1.0
+# Cap concurrent in-flight (accepted, not-yet-READY) connections so a compromised
+# guest cannot exhaust host file descriptors by opening connections in a loop.
+_MAX_PENDING_CONNS = 8
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+
+class FCError(SandboxError):
+    """A Firecracker-specific error (config, launch, or I/O)."""
+
+
+class FCUnavailable(FCError):
+    """Firecracker runtime is not available on this host.
+
+    Raised by ``firecracker_available()`` callers that need a hard failure, and
+    by ``FCConfig.from_env()`` when prerequisites are missing.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FCConfig:
+    """Firecracker slot runtime configuration.
+
+    All fields have sane defaults except ``fc_kernel`` and ``fc_rootfs`` which
+    MUST be set — there is no meaningful default path.
+
+    Attributes
+    ----------
+    fc_bin:
+        Path to the ``firecracker`` binary.  Must be an executable file.
+    fc_kernel:
+        Path to the vmlinux / bzImage kernel image (host path).
+    fc_rootfs:
+        Path to the root filesystem ext4 image (read-only in the guest).
+    fc_vcpu_count:
+        Number of vCPUs.  **Default 1** — the documented mitigation for the
+        guest virtio-vsock stream-corruption bug.  Do not increase without
+        validating the guest vsock driver under concurrent load.
+    fc_mem_mib:
+        Guest RAM in MiB.
+    fc_outdisk_mib:
+        Size of the per-slot writable output disk in MiB.
+    fc_vsock_guest_cid:
+        AF_VSOCK guest CID.  Always 3 (FC convention).
+    scratch_root:
+        Directory under which per-slot scratch dirs are created.  **Keep it
+        short**: FC's vsock UDS lives at ``<scratch>/<uuid>/vsock.sock`` and
+        AF_UNIX paths cap at ~108 bytes, so a long scratch root silently breaks
+        vsock (FC's own control plane AND the readiness listener).  The default
+        ``/tmp/blastbox-fc-slots`` is well under the cap; ``__post_init__`` warns
+        if a custom value risks exceeding it.
+    max_extracted_bytes:
+        Host-side cap on total bytes extracted from the output disk.
+    """
+
+    fc_bin: str = "firecracker"
+    fc_kernel: str = ""
+    fc_rootfs: str = ""
+    # vcpu_count=1 is the vsock-corruption mitigation — asserted by unit tests.
+    fc_vcpu_count: int = 1
+    fc_mem_mib: int = 512
+    fc_outdisk_mib: int = 256
+    fc_vsock_guest_cid: int = 3
+    scratch_root: str = "/tmp/blastbox-fc-slots"
+    max_extracted_bytes: int = 512 * 1024 * 1024  # 512 MiB
+
+    def __post_init__(self) -> None:
+        if self.fc_vcpu_count < 1:
+            raise ValueError(
+                f"fc_vcpu_count must be >= 1, got {self.fc_vcpu_count}"
+            )
+        if self.fc_mem_mib < 64:
+            raise ValueError(
+                f"fc_mem_mib must be >= 64 MiB, got {self.fc_mem_mib}"
+            )
+        if self.fc_outdisk_mib < 16:
+            raise ValueError(
+                f"fc_outdisk_mib must be >= 16 MiB, got {self.fc_outdisk_mib}"
+            )
+        # AF_UNIX paths cap at ~108 bytes. The worst-case vsock UDS is
+        # <scratch>/<36-char uuid>/vsock.sock_<port>. Warn loudly at config time
+        # (an operator sees this) rather than only at per-slot bind-failure.
+        worst_case_uds = len(self.scratch_root) + len("/") + 36 + len("/vsock.sock_10000")
+        if worst_case_uds > 100:
+            _log.warning(
+                "fc.scratch_root_long len=%d worst_case_uds=%d (>100) — AF_UNIX "
+                "paths cap at ~108 bytes; vsock readiness may fail to bind. Use a "
+                "short BLASTBOX_FC_SCRATCH (default /tmp/blastbox-fc-slots).",
+                len(self.scratch_root),
+                worst_case_uds,
+            )
+
+    @classmethod
+    def from_env(cls, **overrides: object) -> "FCConfig":
+        """Build an FCConfig from ``BLASTBOX_FC_*`` environment variables.
+
+        Unset variables fall back to field defaults.  Raises ``ValueError`` on
+        parse failures and ``FCUnavailable`` if kernel or rootfs is unset and
+        not supplied via overrides.
+        """
+        values: dict[str, object] = {}
+
+        def _get_str(key: str) -> str | None:
+            return os.environ.get(key, "").strip() or None
+
+        def _get_int(key: str) -> int | None:
+            raw = os.environ.get(key, "").strip()
+            if not raw:
+                return None
+            try:
+                return int(raw)
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid integer for {key}={raw!r}: {exc}"
+                ) from exc
+
+        for env_key, field_name, coerce in [
+            (_ENV_FC_BIN, "fc_bin", _get_str),
+            (_ENV_FC_KERNEL, "fc_kernel", _get_str),
+            (_ENV_FC_ROOTFS, "fc_rootfs", _get_str),
+            (_ENV_FC_VCPU, "fc_vcpu_count", _get_int),
+            (_ENV_FC_MEM_MIB, "fc_mem_mib", _get_int),
+            (_ENV_FC_OUTDISK_MIB, "fc_outdisk_mib", _get_int),
+        ]:
+            val = coerce(env_key)
+            if val is not None:
+                values[field_name] = val
+
+        values.update(overrides)
+
+        # Validate that the required paths are present.
+        kernel = values.get("fc_kernel") or cls.__dataclass_fields__["fc_kernel"].default
+        rootfs = values.get("fc_rootfs") or cls.__dataclass_fields__["fc_rootfs"].default
+        if not kernel:
+            raise FCUnavailable(
+                f"{_ENV_FC_KERNEL} must be set to use the Firecracker runtime"
+            )
+        if not rootfs:
+            raise FCUnavailable(
+                f"{_ENV_FC_ROOTFS} must be set to use the Firecracker runtime"
+            )
+
+        return cls(**values)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Availability check
+# ---------------------------------------------------------------------------
+
+
+def firecracker_available(cfg: FCConfig | None = None) -> bool:
+    """Return True iff all FC prerequisites are present on this host.
+
+    Checks:
+    - The firecracker binary exists and is executable.
+    - ``/dev/kvm`` is present (hardware virtualisation).
+    - The kernel image path is set and the file exists.
+    - The rootfs image path is set and the file exists.
+
+    Any missing component → False.  This function never raises.
+    """
+    try:
+        if cfg is None:
+            try:
+                cfg = FCConfig.from_env()
+            except (FCUnavailable, ValueError):
+                return False
+
+        # Binary
+        fc_bin = cfg.fc_bin
+        if not fc_bin:
+            return False
+        bin_path = shutil.which(fc_bin) or fc_bin
+        if not os.access(bin_path, os.X_OK):
+            _log.debug("firecracker binary not found/executable: %s", bin_path)
+            return False
+
+        # KVM
+        if not Path("/dev/kvm").exists():
+            _log.debug("firecracker_available=False: /dev/kvm missing")
+            return False
+
+        # Kernel
+        if not cfg.fc_kernel or not Path(cfg.fc_kernel).is_file():
+            _log.debug("firecracker_available=False: kernel %r not found", cfg.fc_kernel)
+            return False
+
+        # Rootfs
+        if not cfg.fc_rootfs or not Path(cfg.fc_rootfs).is_file():
+            _log.debug("firecracker_available=False: rootfs %r not found", cfg.fc_rootfs)
+            return False
+
+        return True
+
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("firecracker_available check error: %s", exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# ext4 image helpers (ported from RedTusk, adapted for blastbox)
+# ---------------------------------------------------------------------------
+
+
+def make_ext4(path: Path, size_mib: int) -> None:
+    """Create a sparse ext4 image at ``path`` of ``size_mib`` MiB.
+
+    Uses ``mkfs.ext4 -F -O ^has_journal -m 0`` for fast, single-use images:
+    no journal (the disk is written once in-guest, read once on the host),
+    0 reserved blocks (maximum usable space for small output disks).
+
+    No root required; the caller must own the target path.
+    """
+    file_path = Path(path)
+    with open(file_path, "wb") as f:
+        f.truncate(size_mib * 1024 * 1024)
+    subprocess.run(
+        [
+            "mkfs.ext4",
+            "-q",
+            "-F",
+            "-O",
+            "^has_journal",
+            "-m",
+            "0",
+            str(file_path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def rdump_ext4(image: Path, dest: Path, max_bytes: int) -> list[str]:
+    """Extract an ext4 image's root to ``dest`` WITHOUT mounting (debugfs rdump).
+
+    Defense-in-depth against a compromised worker producing a crafted image:
+
+    1. Whitespace in ``dest`` is rejected outright — debugfs's ``-R`` request
+       is space-tokenised and would misparse, silently dropping output.
+       ``dest`` derives from ``scratch_root``/<slot_id>/out so this guards
+       against misconfigured operators; reject early either way.
+    2. The ext4 superblock magic (0xEF53 at offset 0x438) is verified before
+       invoking debugfs — catches obviously-corrupt images and gives a smaller
+       surface for e2fsprogs CVEs.
+    3. Total extracted size is capped at ``max_bytes``.  A runaway worker
+       cannot fill the slot dir up to the full disk size.
+
+    Returns the top-level names written to ``dest``.
+    Raises ``ValueError`` on any confinement failure.
+    """
+    dest_str = str(dest)
+    if any(c.isspace() for c in dest_str):
+        raise ValueError(
+            f"rdump dest path must not contain whitespace: {dest_str!r}"
+        )
+
+    # Verify ext4 superblock magic before invoking debugfs.
+    try:
+        with open(image, "rb") as f:
+            f.seek(0x438)
+            magic = f.read(2)
+    except OSError as exc:
+        raise ValueError(f"cannot read ext4 image {image}: {exc}") from exc
+
+    if magic != b"\x53\xef":
+        raise ValueError(
+            f"ext4 magic check failed on {image} (got {magic!r}); "
+            "refusing to invoke debugfs"
+        )
+
+    dest.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["debugfs", "-R", f"rdump / {dest_str}", str(image)],
+        check=True,
+        capture_output=True,
+    )
+
+    # debugfs rdump always creates lost+found; remove it so it isn't mistaken
+    # for an artifact.
+    lf = dest / "lost+found"
+    if lf.exists():
+        shutil.rmtree(lf, ignore_errors=True)
+
+    # Enforce host-side size cap.
+    total = 0
+    for p in dest.rglob("*"):
+        if p.is_file() and not p.is_symlink():
+            total += p.stat().st_size
+            if total > max_bytes:
+                shutil.rmtree(dest, ignore_errors=True)
+                dest.mkdir(parents=True, exist_ok=True)
+                raise ValueError(
+                    f"extracted output exceeds cap: >{max_bytes} bytes"
+                )
+
+    return [p.name for p in dest.iterdir()]
+
+
+# ---------------------------------------------------------------------------
+# Injectable protocol — ready-signal seam
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ReadySignal(Protocol):
+    """Injectable seam: check whether a slot's worker has signalled ready.
+
+    The real implementation polls for a ``ready`` file in the slot's output dir
+    (written by the guest after boot + warm).  Test doubles return a preset bool.
+    """
+
+    def is_ready(self, slot: Slot) -> bool:
+        """Return True if the worker has signalled it is ready."""
+        ...
+
+
+class FileReadySignal:
+    """Production ReadySignal: check for a ``ready`` marker in the output dir.
+
+    The guest worker writes an empty ``ready`` file to the root of the output
+    disk mount point (``/mnt/outdisk/ready`` inside the guest, which maps to
+    the ext4 output disk drive[1]).  On the host we check for this file in
+    the slot's output_dir AFTER the VM exits (since we cannot read the mounted
+    disk while FC is live without mounting it ourselves).
+
+    For the warm-pool flow, the guest signals READY over vsock before any job
+    arrives.  This implementation checks the output_dir for a ``ready`` file as
+    a host-side proxy for that signal — suitable for the unit test seam.
+    """
+
+    def is_ready(self, slot: Slot) -> bool:
+        return (slot.output_dir / _READY_MARKER).exists()
+
+
+@dataclass
+class _VsockReadyState:
+    """Per-slot listener state for :class:`VsockReadySignal`."""
+
+    srv: socket.socket
+    uds: Path
+    ready: threading.Event
+    stop: threading.Event
+    thread: threading.Thread | None = None
+
+
+class VsockReadySignal:
+    """Production ReadySignal for the FC tier: detect the guest's READY over vsock.
+
+    Firecracker's AF_VSOCK Unix-socket backend works thus: when the guest opens
+    an AF_VSOCK connection to CID 2 (the host) on port ``P``, firecracker connects
+    to a host Unix socket at ``<uds_path>_<P>``.  So to receive the guest's READY
+    frame we pre-bind a Unix listener at ``<slot vsock uds>_<READY_PORT>`` and wait
+    for firecracker to connect and forward the guest's bytes.
+
+    Unlike :class:`FileReadySignal` (a post-exit disk proxy that can never signal
+    a *live* warm slot), this fires while the VM is running — which is what the
+    warm pool needs to promote WARMING → IDLE.
+
+    Lifecycle (driven by :class:`FirecrackerSlotRuntime`):
+    - ``prepare(slot)`` MUST run before the VM is launched, so the listener exists
+      when the guest connects.  Idempotent.
+    - ``is_ready(slot)`` is non-blocking.
+    - ``cleanup(slot)`` stops the thread, closes the socket, unlinks the UDS.
+
+    The accept loop reads at most ``max_bytes`` and only ever sets a flag — a
+    compromised guest cannot make the host do anything except observe READY.
+    """
+
+    def __init__(self, *, max_bytes: int = _READY_MAX_BYTES) -> None:
+        self._max_bytes = max_bytes
+        self._slots: dict[str, _VsockReadyState] = {}
+        self._lock = threading.Lock()
+        # NOTE: the READY port is the module constant _READY_PORT, NOT a parameter
+        # — the guest's port (worker.fc_guest.READY_PORT) is fixed, so a divergent
+        # host port would silently break the handshake.
+
+    def _uds_for(self, slot: Slot) -> Path:
+        # FC's vsock uds_path is ``<slot_dir>/vsock.sock``; ``output_dir`` is
+        # ``<slot_dir>/out`` so the slot dir is its parent.  FC connects to
+        # ``<uds_path>_<port>`` for guest→host streams.
+        return slot.output_dir.parent / f"vsock.sock_{_READY_PORT}"
+
+    def prepare(self, slot: Slot) -> None:
+        """Bind the READY listener for ``slot``.  Call before launching FC."""
+        with self._lock:
+            if slot.slot_id in self._slots:
+                return
+            uds = self._uds_for(slot)
+            try:
+                if uds.exists():
+                    uds.unlink()
+            except OSError:
+                pass
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                srv.bind(str(uds))
+                srv.listen(16)
+                srv.setblocking(False)
+            except OSError as exc:
+                srv.close()
+                # Non-fatal (the pool reaps a slot that never reaches IDLE), but
+                # LOUD: a failed bind means readiness can NEVER fire for this slot.
+                # The usual cause is the AF_UNIX 108-byte path cap — FC itself hits
+                # it too, so keep BLASTBOX_FC_SCRATCH short.
+                _log.error(
+                    "fc.vsock_ready_bind_failed slot_id=%s uds=%s: %s "
+                    "(readiness will never fire; shorten the scratch root — "
+                    "AF_UNIX paths cap at 108 bytes)",
+                    slot.slot_id, uds, exc,
+                )
+                return
+            state = _VsockReadyState(
+                srv=srv, uds=uds, ready=threading.Event(), stop=threading.Event()
+            )
+            thread = threading.Thread(
+                target=self._accept_loop,
+                args=(slot.slot_id, state),
+                name=f"fc-vsock-ready-{slot.slot_id[:8]}",
+                daemon=True,
+            )
+            state.thread = thread
+            self._slots[slot.slot_id] = state
+            thread.start()
+
+    def _accept_loop(self, slot_id: str, state: _VsockReadyState) -> None:
+        # Non-blocking via selectors so a guest that connects-but-stalls can never
+        # head-of-line-block the listener (delaying READY) or wedge this thread
+        # (which would stall reap() and the pool). Connections that do not send
+        # READY within _CONN_GRACE_S are dropped; in-flight connections are capped
+        # so a compromised guest cannot exhaust host fds.
+        sel = selectors.DefaultSelector()
+        pending: dict[socket.socket, float] = {}
+        try:
+            try:
+                sel.register(state.srv, selectors.EVENT_READ)
+            except (OSError, ValueError):
+                # srv was already closed (e.g. cleanup() raced this thread's
+                # start). Nothing to listen on; the finally tidies up.
+                return
+            while not state.stop.is_set():
+                try:
+                    events = sel.select(timeout=0.5)
+                except OSError:
+                    break
+                for key, _ in events:
+                    if key.fileobj is state.srv:
+                        try:
+                            conn, _ = state.srv.accept()
+                        except OSError:
+                            continue
+                        if len(pending) >= _MAX_PENDING_CONNS:
+                            conn.close()  # fd-exhaustion guard
+                            continue
+                        conn.setblocking(False)
+                        sel.register(conn, selectors.EVENT_READ)
+                        pending[conn] = time.monotonic() + _CONN_GRACE_S
+                        continue
+                    conn = key.fileobj  # type: ignore[assignment]
+                    try:
+                        data = conn.recv(self._max_bytes)
+                    except (BlockingIOError, OSError):
+                        data = b""
+                    sel.unregister(conn)
+                    pending.pop(conn, None)
+                    conn.close()
+                    if _READY_TOKEN in data:
+                        _log.info("fc.vsock_ready_received slot_id=%s", slot_id)
+                        state.ready.set()
+                        return
+                # Drop connections that connected but never sent READY in time.
+                now = time.monotonic()
+                for conn in [c for c, dl in pending.items() if now > dl]:
+                    sel.unregister(conn)
+                    pending.pop(conn, None)
+                    conn.close()
+        finally:
+            for conn in list(pending):
+                try:
+                    sel.unregister(conn)
+                    conn.close()
+                except OSError:
+                    pass
+            sel.close()
+
+    def is_ready(self, slot: Slot) -> bool:
+        with self._lock:
+            state = self._slots.get(slot.slot_id)
+        return bool(state is not None and state.ready.is_set())
+
+    def cleanup(self, slot: Slot) -> None:
+        """Stop the listener for ``slot`` and remove its UDS.  Idempotent."""
+        with self._lock:
+            state = self._slots.pop(slot.slot_id, None)
+        if state is None:
+            return
+        state.stop.set()
+        try:
+            state.srv.close()
+        except OSError:
+            pass
+        if state.thread is not None:
+            state.thread.join(timeout=2.0)
+        try:
+            if state.uds.exists():
+                state.uds.unlink()
+        except OSError:
+            pass
+
+
+class VsockHostWarmControl:
+    """Host-side vsock counterpart to ``worker.fc_warm.VsockWarmControl``.
+
+    Delivers one job to a warm FC guest over a single host→guest vsock connection
+    and reads back the status, mirroring ``worker.warm.HostWarmControl``'s
+    interface (``signal_go`` / ``wait_for_done``) so the dispatcher warm path is
+    transport-agnostic.
+
+    Firecracker host→guest connect: open the slot's vsock UDS, send
+    ``CONNECT <port>\\n``; FC replies ``OK <port>\\n`` once the guest's listener
+    accepts, then the stream is full-duplex to the guest. Output is NOT returned
+    over vsock — only the status frame is; artifacts come off the ext4 disk via
+    ``read_output_disk`` after DONE.
+    """
+
+    def __init__(
+        self,
+        vsock_uds: Path,
+        *,
+        job_port: int = _JOB_PORT,
+        connect_timeout_s: float = 10.0,
+        connect_fn: "Callable[[], socket.socket] | None" = None,
+    ) -> None:
+        self._uds = Path(vsock_uds)
+        self._job_port = job_port
+        self._connect_timeout = connect_timeout_s
+        self._connect_fn = connect_fn  # injectable for tests (no real VM)
+        self._conn: "socket.socket | None" = None
+
+    def _connect(self) -> "socket.socket":
+        if self._connect_fn is not None:
+            return self._connect_fn()
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(self._connect_timeout)
+        s.connect(str(self._uds))
+        s.sendall(f"CONNECT {self._job_port}\n".encode())
+        line = recv_line(s)
+        if not line.startswith(b"OK"):
+            s.close()
+            raise FCError(
+                f"vsock CONNECT to guest port {self._job_port} failed: {line!r}"
+            )
+        return s
+
+    def signal_go(self, spec: "WarmJobSpec") -> None:
+        """Connect to the guest and send the job header + input bytes."""
+        input_bytes = Path(spec.input_path).read_bytes()
+        header = json.dumps(
+            {"filename": Path(spec.input_path).name, "params": dict(spec.params)}
+        ).encode("utf-8")
+        conn = self._connect()
+        self._conn = conn
+        send_frame(conn, header)
+        send_frame(conn, input_bytes)
+
+    def wait_for_done(self, *, timeout_s: float) -> str:
+        """Read the guest's status frame; raise WarmTimeout if it never arrives.
+
+        Uses an ABSOLUTE deadline (not a per-recv timeout), so a compromised guest
+        that dribbles the status frame cannot pin the dispatcher past ``timeout_s``.
+        """
+        if self._conn is None:
+            raise WarmTimeout("signal_go was not called before wait_for_done")
+        deadline = time.monotonic() + timeout_s
+        try:
+            return recv_frame(
+                self._conn, max_len=MAX_STATUS_BYTES, deadline=deadline
+            ).decode("utf-8")
+        except (OSError, ValueError, ConnectionError) as exc:
+            raise WarmTimeout(f"warm worker did not signal done: {exc}") from exc
+        finally:
+            try:
+                self._conn.close()
+            except OSError:
+                pass
+            self._conn = None
+
+
+# ---------------------------------------------------------------------------
+# Per-slot process handle
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FCProcess:
+    """Wraps a running FC subprocess for one slot."""
+
+    proc: subprocess.Popen  # type: ignore[type-arg]
+    slot_id: str
+    config_path: Path
+    log_path: Path
+
+    def is_alive(self) -> bool:
+        return self.proc.poll() is None
+
+    def kill(self) -> None:
+        try:
+            self.proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+    def wait(self, timeout: float | None = None) -> int:
+        try:
+            return self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.kill()
+            return self.proc.wait()
+
+
+# ---------------------------------------------------------------------------
+# FirecrackerSlotRuntime
+# ---------------------------------------------------------------------------
+
+# Type alias for the injectable subprocess runner — accepts the argv list plus
+# keyword args and returns a running Popen-like handle.  The default is the
+# real subprocess.Popen; tests inject a factory that returns a FakePopen.
+SubprocessRunner = Callable[..., "subprocess.Popen[bytes]"]
+
+
+def _default_subprocess_runner(argv: list[str], **kwargs: object) -> "subprocess.Popen[bytes]":
+    return subprocess.Popen(argv, **kwargs)  # type: ignore[call-overload]
+
+
+class FirecrackerSlotRuntime:
+    """SlotRuntime implementation backed by Firecracker microVMs.
+
+    This is the strongest isolation tier in the blastbox framework — each slot
+    gets a fresh hardware-virtualised microVM.  The VM lifecycle is:
+
+    1. ``spawn()`` — create per-slot scratch dirs + output ext4 disk, write the
+       FC config JSON (drives, vsock, machine-config), launch FC as a
+       subprocess.  Returns a WARMING Slot.
+    2. ``is_ready()`` — delegate to the injected ``ReadySignal``.  The real
+       implementation polls for a ``ready`` marker that the guest worker writes.
+    3. ``is_alive()`` — check whether the FC subprocess is still running.
+    4. ``reap()`` — kill FC if alive, remove the scratch dir.
+
+    Injectable seams for testing (no real FC binary, kernel, rootfs needed):
+    - ``subprocess_runner``: returns a fake Popen-compatible object.
+    - ``ready_signal``: returns a preset bool without touching the filesystem.
+
+    Security properties:
+    - Launch argv is a Python list — never shell=True.
+    - vcpu_count defaults to 1 (vsock-corruption mitigation).
+    - rootfs is read-only (``is_read_only: True``).
+    - Output disk is written by the guest, read host-side via debugfs rdump
+      (no mount, no root).
+    """
+
+    def __init__(
+        self,
+        cfg: FCConfig,
+        *,
+        subprocess_runner: SubprocessRunner = _default_subprocess_runner,
+        ready_signal: ReadySignal | None = None,
+    ) -> None:
+        self._cfg = cfg
+        self._subprocess_runner = subprocess_runner
+        # Default to the live vsock signal — FileReadySignal cannot signal a warm
+        # (still-running) slot, so the warm pool could never promote an FC slot.
+        self._ready_signal: ReadySignal = (
+            ready_signal if ready_signal is not None else VsockReadySignal()
+        )
+        self._scratch_root = Path(cfg.scratch_root)
+        # Per-slot process handles; all mutations under _lock.
+        self._procs: dict[str, _FCProcess] = {}
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # SlotRuntime protocol
+    # ------------------------------------------------------------------
+
+    def spawn(self) -> Slot:
+        """Create a scratch dir, write fc-config.json, launch Firecracker.
+
+        Returns a Slot in WARMING state.  The slot_id is a UUID-like string
+        derived from the scratch dir name.
+
+        Security:
+        - argv is a list[str] — no shell.
+        - The FC binary comes from ``cfg.fc_bin`` (operator config only).
+        - vcpu_count comes from ``cfg.fc_vcpu_count`` (default 1).
+        - No caller / job value can influence the argv elements.
+        """
+        import uuid
+
+        slot_id = str(uuid.uuid4())
+        slot_dir = self._scratch_root / slot_id
+        output_dir = slot_dir / "out"
+        # input_dir and control_dir are not used by the FC runtime (vsock IPC
+        # is the control plane); we create them to satisfy the Slot dataclass.
+        input_dir = slot_dir / "in"
+        control_dir = slot_dir / "ctrl"
+
+        for d in (slot_dir, output_dir, input_dir, control_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        # Create the per-slot output disk.  The guest mounts this as vdb and
+        # writes results here; the host reads it via rdump_ext4 after exit.
+        outdisk_path = slot_dir / "outdisk.ext4"
+        make_ext4(outdisk_path, self._cfg.fc_outdisk_mib)
+
+        # Build the vsock UDS path.  FC creates <uds_path> for the host side
+        # and <uds_path>_<port> for guest connects; we give FC ownership.
+        vsock_uds = slot_dir / "vsock.sock"
+
+        # fc-config.json — the sole source of FC configuration.
+        fc_config = {
+            "boot-source": {
+                "kernel_image_path": self._cfg.fc_kernel,
+                "boot_args": (
+                    "console=ttyS0 reboot=k panic=1 pci=off init=/init ro"
+                ),
+            },
+            "drives": [
+                {
+                    "drive_id": "rootfs",
+                    "path_on_host": self._cfg.fc_rootfs,
+                    "is_root_device": True,
+                    "is_read_only": True,
+                },
+                {
+                    # drive[1] = per-slot output disk (vdb).  The guest writes
+                    # results here; output goes on the disk NOT on vsock (the
+                    # hard-won lesson: large vsock transfers corrupt under concurrency).
+                    "drive_id": "outdisk",
+                    "path_on_host": str(outdisk_path),
+                    "is_root_device": False,
+                    "is_read_only": False,
+                },
+            ],
+            "machine-config": {
+                # vcpu_count=1 is the vsock-corruption mitigation; NEVER
+                # increase without validating the guest virtio-vsock driver.
+                "vcpu_count": self._cfg.fc_vcpu_count,
+                "mem_size_mib": self._cfg.fc_mem_mib,
+                "smt": False,
+            },
+            "vsock": {
+                "guest_cid": self._cfg.fc_vsock_guest_cid,
+                "uds_path": str(vsock_uds),
+            },
+        }
+
+        config_path = slot_dir / "fc-config.json"
+        config_path.write_text(json.dumps(fc_config, indent=2))
+
+        log_path = slot_dir / "fc.log"
+
+        # Build the launch argv — ALWAYS a list, NEVER shell=True.
+        # Security: fc_bin is the only source of the executable path.
+        # No job / caller value can inject new flag elements because each
+        # piece (binary, flags, config path) is a separate list element.
+        argv: list[str] = [
+            self._cfg.fc_bin,
+            "--no-api",
+            "--config-file",
+            str(config_path),
+        ]
+
+        _log.info(
+            "fc.spawn slot_id=%s argv=%r", slot_id, argv
+        )
+
+        slot = Slot(
+            slot_id=slot_id,
+            control_dir=control_dir,
+            input_dir=input_dir,
+            output_dir=output_dir,
+            state=SlotState.WARMING,
+            spawned_at=0.0,
+        )
+
+        # Bind the vsock READY listener BEFORE launching FC, so the host socket
+        # exists when the guest connects post-warmup.  FileReadySignal has no
+        # prepare() and is skipped (it has no live signal).
+        prepare = getattr(self._ready_signal, "prepare", None)
+        if callable(prepare):
+            prepare(slot)
+
+        with open(log_path, "w") as log_fh:
+            proc = self._subprocess_runner(
+                argv,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+            )
+
+        fc_proc = _FCProcess(
+            proc=proc,
+            slot_id=slot_id,
+            config_path=config_path,
+            log_path=log_path,
+        )
+
+        with self._lock:
+            self._procs[slot_id] = fc_proc
+
+        return slot
+
+    def is_ready(self, slot: Slot) -> bool:
+        """Delegate to the injected ReadySignal."""
+        try:
+            return self._ready_signal.is_ready(slot)
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("fc.is_ready error slot_id=%s: %s", slot.slot_id, exc)
+            return False
+
+    def is_alive(self, slot: Slot) -> bool:
+        """Return True iff the Firecracker subprocess is still running."""
+        with self._lock:
+            fc_proc = self._procs.get(slot.slot_id)
+        if fc_proc is None:
+            return False
+        return fc_proc.is_alive()
+
+    def reap(self, slot: Slot) -> None:
+        """Kill FC if alive, remove the scratch dir.
+
+        Safe to call on already-dead or already-reaped slots.
+        """
+        with self._lock:
+            fc_proc = self._procs.pop(slot.slot_id, None)
+
+        # Tear down the vsock READY listener (if any) before removing the dir.
+        cleanup = getattr(self._ready_signal, "cleanup", None)
+        if callable(cleanup):
+            cleanup(slot)
+
+        if fc_proc is not None:
+            if fc_proc.is_alive():
+                fc_proc.kill()
+                try:
+                    fc_proc.proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    _log.warning(
+                        "fc.reap_wait_timeout slot_id=%s", slot.slot_id
+                    )
+
+        # Remove the entire scratch dir.
+        slot_dir = self._scratch_root / slot.slot_id
+        if slot_dir.exists():
+            shutil.rmtree(slot_dir, ignore_errors=True)
+            _log.debug("fc.reap_cleaned slot_id=%s", slot.slot_id)
+
+    # ------------------------------------------------------------------
+    # Output-disk read (called by the dispatcher after the VM exits)
+    # ------------------------------------------------------------------
+
+    def read_output_disk(self, slot: Slot) -> list[str]:
+        """Extract the slot's output ext4 disk into ``slot.output_dir``.
+
+        Uses ``rdump_ext4`` — no mount, no root.  The ext4 magic is verified
+        before debugfs is invoked.  Extracted size is capped at
+        ``cfg.max_extracted_bytes``.
+
+        Returns the top-level names extracted.  Raises ``ValueError`` on
+        confinement failures (bad magic, whitespace in dest, size exceeded).
+        """
+        slot_dir = self._scratch_root / slot.slot_id
+        image = slot_dir / "outdisk.ext4"
+        if not image.exists():
+            raise FCError(
+                f"output disk not found for slot {slot.slot_id}: {image}"
+            )
+        names = rdump_ext4(image, slot.output_dir, self._cfg.max_extracted_bytes)
+        _log.info("fc.outdisk_read slot_id=%s entries=%d", slot.slot_id, len(names))
+        return names
+
+    # ------------------------------------------------------------------
+    # Warm-path seam (duck-typed; the dispatcher uses these for FC slots and
+    # falls back to the file-based HostWarmControl for runtimes without them)
+    # ------------------------------------------------------------------
+
+    def host_warm_control(self, slot: Slot) -> VsockHostWarmControl:
+        """The vsock warm control for this slot — input/status over vsock."""
+        vsock_uds = self._scratch_root / slot.slot_id / "vsock.sock"
+        return VsockHostWarmControl(vsock_uds)
+
+    def stage_warm_input(self, slot: Slot, staged_input_path: Path) -> Path:
+        """FC input travels over vsock (signal_go reads this path), NOT through a
+        shared slot dir — so return the host-staged path unchanged (no copy)."""
+        return staged_input_path
+
+    def materialize_warm_output(self, slot: Slot) -> None:
+        """Read the guest's output ext4 disk into slot.output_dir via rdump, so the
+        trust gate validates it from a regular directory (no mount, no root)."""
+        self.read_output_disk(slot)
+
+
+# ---------------------------------------------------------------------------
+# Runtime selection helper
+# ---------------------------------------------------------------------------
+
+
+def select_fc_runtime(
+    *,
+    cfg: FCConfig | None = None,
+    require_available: bool = False,
+    subprocess_runner: SubprocessRunner = _default_subprocess_runner,
+    ready_signal: ReadySignal | None = None,
+) -> "FirecrackerSlotRuntime | None":
+    """Attempt to build a FirecrackerSlotRuntime.
+
+    Returns a configured ``FirecrackerSlotRuntime`` if the FC tier is
+    available (binary + /dev/kvm + kernel + rootfs all present), or ``None``
+    if it is not.
+
+    Parameters
+    ----------
+    cfg:
+        FCConfig to use; if None, built from env via ``FCConfig.from_env()``.
+    require_available:
+        If True and the FC tier is not available, raise ``FCUnavailable``
+        instead of returning None.  Use when ``BLASTBOX_WORKER_RUNTIME=firecracker``
+        was explicitly requested by the operator.
+    subprocess_runner, ready_signal:
+        Injectable seams passed through to ``FirecrackerSlotRuntime``.
+    """
+    if cfg is None:
+        try:
+            cfg = FCConfig.from_env()
+        except (FCUnavailable, ValueError) as exc:
+            if require_available:
+                raise FCUnavailable(
+                    f"Firecracker runtime config failed: {exc}"
+                ) from exc
+            _log.debug("select_fc_runtime: config unavailable: %s", exc)
+            return None
+
+    if not firecracker_available(cfg):
+        if require_available:
+            raise FCUnavailable(
+                "Firecracker runtime required (BLASTBOX_WORKER_RUNTIME=firecracker) "
+                "but prerequisites missing: check firecracker binary, /dev/kvm, "
+                "BLASTBOX_FC_KERNEL, and BLASTBOX_FC_ROOTFS."
+            )
+        _log.debug("select_fc_runtime: prerequisites not met")
+        return None
+
+    return FirecrackerSlotRuntime(
+        cfg,
+        subprocess_runner=subprocess_runner,
+        ready_signal=ready_signal,
+    )

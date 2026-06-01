@@ -1,0 +1,104 @@
+// Blastbox seccomp policy (nsjail KAFEL DSL).
+//
+// DENYLIST style: DEFAULT ALLOW + explicit ERRNO(1) on dangerous syscalls.
+// Same philosophy Docker and Kubernetes use for their default seccomp
+// profile. The security is defense-in-depth behind:
+//   1. the outer container's namespace+cgroup isolation
+//   2. the bwrap/nsjail user-namespace + network-namespace + cap-drop
+//   3. AppArmor profiles (if loaded on the host)
+//   4. engine-specific hardening (e.g. hardened LibreOffice profile)
+//
+// Flipping from allowlist to denylist avoids the whack-a-mole where a new
+// engine version (or any new glibc) introduces a syscall we didn't
+// explicitly permit, causing silent SIGSYS at startup.
+//
+// Loaded by src/blastbox/worker/sandbox/nsjail.py via --seccomp_policy.
+// Deployed into the runtime image at /etc/blastbox/seccomp.policy.
+//
+// KAFEL caveats: not every Linux syscall name is a valid KAFEL identifier
+// (e.g. umount2, stime, _sysctl, pidfd_*, landlock_*). Only names the
+// KAFEL lexer accepts appear below. Others live in the Docker-format JSON
+// profile (deploy/seccomp/blastbox.seccomp.json).
+//
+// Syntax reference: https://github.com/google/kafel
+
+POLICY blastbox_deny {
+  ERRNO(1) {
+    // Kernel module loading
+    init_module,
+    finit_module,
+    delete_module,
+
+    // Key management
+    add_key,
+    keyctl,
+    request_key,
+
+    // Mount / filesystem manipulation
+    mount,
+    umount,
+    pivot_root,
+
+    // Kernel exec / reboot
+    kexec_load,
+    kexec_file_load,
+    reboot,
+
+    // Process inspection/control of others
+    ptrace,
+    process_vm_readv,
+    process_vm_writev,
+
+    // BPF / perf / tracing
+    bpf,
+    perf_event_open,
+
+    // io_uring — prolific attack surface
+    io_uring_setup,
+    io_uring_enter,
+    io_uring_register,
+
+    // Userfaultfd (fault-injection primitives)
+    userfaultfd,
+
+    // Clock manipulation
+    clock_settime,
+    clock_adjtime,
+    settimeofday,
+    adjtimex,
+
+    // Host identity
+    sethostname,
+    setdomainname,
+
+    // Namespace creation (we're already namespaced)
+    unshare,
+
+    // Dangerous system controls
+    quotactl,
+    vhangup,
+    nfsservctl,
+    name_to_handle_at,
+    open_by_handle_at,
+    swapon,
+    swapoff,
+
+    // Obscure cross-task primitives
+    kcmp,
+
+    // Legacy / deprecated
+    uselib,
+    sysfs,
+
+    // x86 port-IO and local descriptor table
+    iopl,
+    ioperm,
+    modify_ldt,
+
+    // fanotify — privileged filesystem notification
+    fanotify_init,
+    fanotify_mark
+  }
+}
+
+USE blastbox_deny DEFAULT ALLOW

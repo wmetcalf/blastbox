@@ -1,0 +1,48 @@
+# Minimal, hardened blastbox FC worker rootfs image.
+#
+# Exported to an ext4 disk (see build-rootfs.sh) and booted by firecracker with
+# `init=/init`. Only the worker SDK is needed inside the guest, so this installs
+# blastbox's lean core (pydantic only) — no host extras.
+#
+# Hardening (defence in depth UNDER the microVM boundary):
+#  - the untrusted detonation runs as the non-root `blastbox` user (init drops
+#    privileges via setpriv);
+#  - setuid/setgid bits are stripped so a compromised non-root guest process
+#    cannot re-escalate via su/mount/etc.;
+#  - build inputs (/src) and apt/pip caches are removed to shrink the surface;
+#  - the base image is pinnable via --build-arg BASE_IMAGE=python:3.12-slim@sha256:...
+#
+# Build context is the REPO ROOT (build-rootfs.sh sets that).
+ARG BASE_IMAGE=python:3.12-slim
+FROM ${BASE_IMAGE}
+
+# Engine selection baked in at build time (probe | pdf | pdfrasterize). NOTE:
+# Docker ENV is stored in image config, which `docker export` drops — so the
+# choice is written to a FILE (/opt/blastbox/engine) below, which survives the
+# filesystem export into the ext4 rootfs.
+ARG ENGINE=probe
+
+# util-linux: `mount` for the init + `setpriv` to drop privileges.
+# poppler-utils: `pdftoppm` for the PDF rasterize engine.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends util-linux poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root user that runs the untrusted detonation.
+RUN useradd --uid 65532 --user-group --system --no-create-home \
+        --shell /usr/sbin/nologin blastbox
+
+# Install blastbox core (pydantic only — the worker SDK); drop the build inputs.
+COPY pyproject.toml README.md /src/blastbox/
+COPY src /src/blastbox/src
+RUN pip install --no-cache-dir /src/blastbox && rm -rf /src
+
+# Guest agent + engines + PID-1 init. The output-disk mountpoint MUST exist at
+# build time: the root fs boots read-only, so the init cannot mkdir it at runtime.
+COPY deploy/firecracker/run_guest.py /opt/blastbox/run_guest.py
+COPY deploy/firecracker/engines.py /opt/blastbox/engines.py
+COPY deploy/firecracker/init /init
+RUN chmod +x /init && mkdir -p /mnt/outdisk \
+    && printf '%s' "${ENGINE}" > /opt/blastbox/engine \
+    # Strip setuid/setgid bits across the rootfs (the guest never needs them).
+    && find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true

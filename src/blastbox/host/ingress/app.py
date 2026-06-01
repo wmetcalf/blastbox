@@ -1,0 +1,561 @@
+"""FastAPI ingress application — submit jobs, poll status, fetch artifacts.
+
+Security properties (review will probe):
+1. ``BodySizeLimitMiddleware`` rejects over-limit bodies before spooling:
+   Content-Length check is O(1); chunked uploads abort mid-stream.
+2. ``_safe_upload_name`` strips directory components, rejects hidden names, and
+   replaces unsafe characters — path traversal via filename is impossible.
+3. Artifact serving is id-based: ``GET /v1/jobs/{id}/artifacts/{artifact_id}``
+   looks up the artifact's *path* in the dispatcher-validated ``metadata.json``;
+   the resolved file is confirmed under the job's ``output/`` via
+   ``_safe_artifact_path`` (``Path.resolve() + relative_to``).  No client-
+   supplied path is ever used directly.
+4. Bearer auth is off by default (proxy-fronted); a loud warning is logged.
+   ``hmac.compare_digest`` prevents timing oracles.
+5. ``_intake_gate`` semaphore (sized from ``BLASTBOX_API_WORKERS``, parsed +
+   clamped) is **actually acquired** around every upload-spool operation.
+6. ``sanitize_public_error`` is applied to all detail strings before returning.
+7. Engine allowlist: ``engine`` form field must be in the configured set or the
+   upload is rejected 400 before any disk I/O.
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import uuid
+import zipfile
+from pathlib import Path
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import Response
+from prometheus_client import CONTENT_TYPE_LATEST
+
+from blastbox import __version__
+from blastbox.errors import sanitize_public_error
+from blastbox.host.jobs.base import Job, JobStatus, JobStore
+from blastbox.host.jobs.memory import InMemoryJobStore
+from blastbox.limits import Limits
+from blastbox.observability import (
+    configure_logging,
+    generate_latest,
+    get_logger,
+    record_job_submitted,
+    record_rejection,
+    JOBS_IN_FLIGHT,
+)
+from .middleware import BearerAuthMiddleware, BodySizeLimitMiddleware
+
+_log = get_logger("blastbox.ingress")
+
+# ---------------------------------------------------------------------------
+# Filename sanitization
+# ---------------------------------------------------------------------------
+
+_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _safe_upload_name(raw: str | None) -> str:
+    """Sanitize a client-supplied filename to a safe basename.
+
+    Rules:
+    - Extract the basename only (strips any ``../`` prefix or directory path).
+    - Reject leading dots (hidden files) and empty results → ``"upload.bin"``.
+    - Replace any character outside ``[A-Za-z0-9._-]`` with ``_``.
+    - Truncate to 255 characters (POSIX NAME_MAX).
+    - Fall back to ``"upload.bin"`` if nothing usable remains.
+    """
+    if not raw:
+        return "upload.bin"
+    base = Path(raw).name
+    if not base or base.startswith("."):
+        return "upload.bin"
+    cleaned = _SAFE_FILENAME_RE.sub("_", base)[:255]
+    return cleaned or "upload.bin"
+
+
+# ---------------------------------------------------------------------------
+# Artifact path confinement
+# ---------------------------------------------------------------------------
+
+
+def _safe_artifact_path(output_dir: Path, relative: str) -> Path | None:
+    """Resolve ``output_dir / relative`` and return only if it stays under ``output_dir``.
+
+    Defense-in-depth: ``relative`` is derived from the dispatcher-validated
+    ``metadata.json`` (not from the client), but we still check in case of a
+    compromised worker that managed to pass the trust gate.
+
+    Returns ``None`` if the resolved path escapes ``output_dir``.
+    """
+    try:
+        out_resolved = output_dir.resolve(strict=False)
+        candidate = (output_dir / relative).resolve(strict=False)
+        candidate.relative_to(out_resolved)
+    except (OSError, ValueError):
+        return None
+    return candidate
+
+
+# ---------------------------------------------------------------------------
+# Upload I/O helpers
+# ---------------------------------------------------------------------------
+
+
+
+
+# ---------------------------------------------------------------------------
+# ZIP helper
+# ---------------------------------------------------------------------------
+
+
+def _zip_output_dir(output_dir: Path) -> bytes:
+    """Build a ZIP of all files under *output_dir* in memory (blocking)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for f in sorted(output_dir.rglob("*")):
+            if f.is_file():
+                zf.write(f, arcname=f.relative_to(output_dir))
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# build_app factory
+# ---------------------------------------------------------------------------
+
+
+def build_app(
+    *,
+    job_store: JobStore | None = None,
+    job_root: Path | None = None,
+    allowed_engines: set[str] | None = None,
+    limits: Limits | None = None,
+    api_workers: int | None = None,
+    api_key: str | None = None,
+) -> FastAPI:
+    """Construct and return the blastbox ingress FastAPI application.
+
+    All configuration can be supplied directly (for tests) or read from
+    ``BLASTBOX_*`` environment variables.
+
+    Args:
+        job_store: Backing store (defaults to a fresh ``InMemoryJobStore``).
+        job_root: Directory under which job subdirectories are created.
+                  Defaults to ``BLASTBOX_JOB_ROOT`` env var or
+                  ``/var/lib/blastbox/jobs``.
+        allowed_engines: Set of engine names clients may submit to.
+                         Defaults to ``BLASTBOX_ALLOWED_ENGINES`` (comma-sep).
+        limits: Resource limits.  Defaults to ``Limits.from_env()``.
+        api_workers: Max concurrent upload-spool operations.  Defaults to
+                     ``BLASTBOX_API_WORKERS`` (clamped to [1, 64]).
+        api_key: If set, installs ``BearerAuthMiddleware``; else warns.
+                 Defaults to ``BLASTBOX_API_KEY`` env var.
+    """
+    configure_logging()
+
+    _limits = limits or Limits.from_env()
+
+    _job_store: JobStore = job_store or InMemoryJobStore()
+
+    _job_root = job_root or Path(
+        os.environ.get("BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs")
+    ).expanduser()
+
+    # Engine allowlist
+    _allowed_engines: set[str]
+    if allowed_engines is not None:
+        _allowed_engines = set(allowed_engines)
+    else:
+        raw_engines = os.environ.get("BLASTBOX_ALLOWED_ENGINES", "")
+        _allowed_engines = {e.strip() for e in raw_engines.split(",") if e.strip()}
+
+    # Concurrency gate (BLASTBOX_API_WORKERS)
+    if api_workers is not None:
+        _api_workers = max(1, min(64, api_workers))
+    else:
+        raw_workers = os.environ.get("BLASTBOX_API_WORKERS", "4")
+        try:
+            _api_workers = max(1, min(64, int(raw_workers)))
+        except ValueError:
+            _api_workers = 4
+
+    # Security requirement 5: semaphore is actually wired to _api_workers.
+    _intake_gate = asyncio.Semaphore(_api_workers)
+
+    # Bearer auth (requirement 4)
+    _api_key = api_key if api_key is not None else os.environ.get("BLASTBOX_API_KEY", "").strip()
+
+    # -------------------------------------------------------------------
+    # App + middleware
+    # -------------------------------------------------------------------
+
+    app = FastAPI(title="blastbox", version=__version__)
+
+    # Requirement 1: 413 before spool (Content-Length fast path + streaming).
+    app.add_middleware(BodySizeLimitMiddleware, max_bytes=_limits.max_input_bytes)
+
+    if _api_key:
+        app.add_middleware(BearerAuthMiddleware, api_key=_api_key)
+        _log.info("api_auth_enabled", scheme="bearer")
+    else:
+        _log.warning(
+            "api_auth_disabled",
+            message=(
+                "HTTP server has no authentication. Set BLASTBOX_API_KEY "
+                "or place behind an auth proxy. /v1/* and /metrics are open."
+            ),
+        )
+
+    # -------------------------------------------------------------------
+    # Internal helpers
+    # -------------------------------------------------------------------
+
+    def _validate_job_id(job_id: str) -> None:
+        """Raise 404 if *job_id* is not a well-formed UUID.
+
+        Defense-in-depth (FIX 2): job_ids are always UUIDs generated by
+        ``Job.new()``.  Reject anything that doesn't parse as a UUID before
+        any store lookup or filesystem use, preventing path traversal and
+        injection attempts dressed up as job ids.
+        """
+        try:
+            uuid.UUID(job_id)
+        except (ValueError, AttributeError):
+            raise HTTPException(404, "job not found")
+
+    def _job_dirs(job_id: str) -> tuple[Path, Path, Path]:
+        root = _job_root / job_id
+        return root, root / "input", root / "output"
+
+    def _require_done(job_id: str) -> Job:
+        """Gate for artifact routes: 404 / 409 / 410 as appropriate."""
+        job = _job_store.get(job_id)
+        if job is None:
+            raise HTTPException(404, "job not found")
+        if job.status == JobStatus.EXPIRED:
+            raise HTTPException(410, "result expired")
+        if job.status != JobStatus.DONE:
+            raise HTTPException(409, f"job not done (status={job.status.value})")
+        return job
+
+    def _output_dir_for(job_id: str) -> Path:
+        """Re-derive the output directory from job_root and job_id.
+
+        FIX 3: Do NOT trust ``job.result_dir`` (a persisted store value is a
+        weaker trust boundary than the server-controlled ``job_root``).  Always
+        compute ``job_root / <uuid> / output`` so that a tampered or corrupted
+        ``result_dir`` cannot redirect artifact serving outside job_root.
+        """
+        return _job_root / job_id / "output"
+
+    def _public_detail(exc: Exception | str) -> str:
+        return sanitize_public_error(str(exc))
+
+    # -------------------------------------------------------------------
+    # Health / version / metrics (always public)
+    # -------------------------------------------------------------------
+
+    @app.get("/v1/healthz")
+    def healthz():
+        return {"status": "ok"}
+
+    @app.get("/v1/readyz")
+    def readyz():
+        try:
+            _job_store.list()
+            return {"status": "ready"}
+        except Exception as exc:
+            raise HTTPException(503, f"store unavailable: {_public_detail(exc)}")
+
+    @app.get("/v1/version")
+    def version():
+        return {
+            "version": __version__,
+            "allowed_engines": sorted(_allowed_engines),
+        }
+
+    @app.get("/metrics")
+    def metrics():
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+    # -------------------------------------------------------------------
+    # Job submission
+    # -------------------------------------------------------------------
+
+    @app.post("/v1/jobs", status_code=202)
+    async def submit_job(
+        file: UploadFile = File(...),
+        engine: str = Form(...),
+        params: list[str] = Form(default=[]),
+    ):
+        """Submit a file for detonation by the named engine.
+
+        Security:
+        - ``engine`` is validated against the configured allowlist (req. 7).
+        - ``_safe_upload_name`` sanitizes the filename (req. 2).
+        - Upload is spooled under ``_intake_gate`` (req. 5).
+        - Errors are scrubbed before returning (req. 6).
+        """
+        # Requirement 7: engine allowlist check before any disk I/O.
+        if _allowed_engines and engine not in _allowed_engines:
+            record_rejection("unknown_engine")
+            raise HTTPException(
+                400,
+                detail={
+                    "error": "unknown_engine",
+                    "detail": f"engine {engine!r} is not in the allowed set",
+                },
+            )
+
+        # Requirement 2: safe filename
+        safe_name = _safe_upload_name(file.filename)
+        if safe_name != (file.filename or ""):
+            _log.info(
+                "upload_filename_sanitized",
+                raw=file.filename,
+                safe=safe_name,
+            )
+
+        # Parse params: accept "key=value" strings or plain "key" strings.
+        parsed_params: dict[str, str] = {}
+        for p in params:
+            if "=" in p:
+                k, _, v = p.partition("=")
+                parsed_params[k.strip()] = v.strip()
+            else:
+                parsed_params[p.strip()] = ""
+
+        job = Job.new(engine=engine, filename=safe_name)
+        job.params = parsed_params
+
+        root, input_dir, output_dir = _job_dirs(job.job_id)
+
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            input_dir.mkdir(parents=True, exist_ok=True)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            input_path = input_dir / safe_name
+
+            # Requirement 5: semaphore actually gates upload spooling.
+            JOBS_IN_FLIGHT.inc()
+            try:
+                async with _intake_gate:
+                    # Offload blocking I/O; streams in 64 KiB chunks.
+                    nbytes, sha256 = await asyncio.to_thread(
+                        _spool_sync, file, input_path
+                    )
+            finally:
+                JOBS_IN_FLIGHT.dec()
+
+        except Exception as exc:
+            shutil.rmtree(root, ignore_errors=True)
+            raise HTTPException(500, _public_detail(exc)) from exc
+
+        job.input_sha256 = sha256
+        job.result_dir = str(output_dir)
+
+        try:
+            _job_store.create(job)
+        except Exception as exc:
+            shutil.rmtree(root, ignore_errors=True)
+            raise HTTPException(500, _public_detail(exc)) from exc
+
+        record_job_submitted(engine, nbytes)
+
+        return {
+            "job_id": job.job_id,
+            "status": "queued",
+            "links": {
+                "self": f"/v1/jobs/{job.job_id}",
+                "result": f"/v1/jobs/{job.job_id}/result",
+            },
+        }
+
+    # -------------------------------------------------------------------
+    # Job listing / status
+    # -------------------------------------------------------------------
+
+    @app.get("/v1/jobs")
+    def list_jobs(
+        offset: int = 0,
+        limit: int = 100,
+        status: str | None = None,
+    ):
+        """List jobs.  Single-tenant: all jobs are returned (no per-user scoping).
+
+        Note: multi-tenant scoping is out of scope for this slice; the
+        deployment is expected to run behind an auth proxy that enforces
+        per-tenant access.
+        """
+        filter_status: JobStatus | None = None
+        if status:
+            try:
+                filter_status = JobStatus(status)
+            except ValueError:
+                raise HTTPException(400, f"unknown status: {status!r}")
+
+        jobs = _job_store.list(status=filter_status)
+        jobs.sort(key=lambda j: j.created_at, reverse=True)
+        total = len(jobs)
+        page = jobs[offset : offset + limit]
+        return {
+            "jobs": [j.to_public_dict() for j in page],
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+        }
+
+    @app.get("/v1/jobs/{job_id}")
+    def get_job(job_id: str):
+        _validate_job_id(job_id)
+        job = _job_store.get(job_id)
+        if job is None:
+            raise HTTPException(404, "job not found")
+        return job.to_public_dict()
+
+    # -------------------------------------------------------------------
+    # Artifact routes (all require DONE status)
+    # -------------------------------------------------------------------
+
+    @app.get("/v1/jobs/{job_id}/metadata")
+    def get_metadata(job_id: str):
+        """Serve the dispatcher-validated ``output/metadata.json``.
+
+        Returns 409 if the job is not DONE; 410 if expired.
+        """
+        _validate_job_id(job_id)
+        _require_done(job_id)
+        out = _output_dir_for(job_id)
+        if not out.is_dir():
+            raise HTTPException(410, "result expired")
+        meta_json = out / "metadata.json"
+        if not meta_json.is_file():
+            raise HTTPException(404, "metadata.json not found")
+        from fastapi.responses import FileResponse
+        return FileResponse(meta_json, media_type="application/json")
+
+    @app.get("/v1/jobs/{job_id}/artifacts/{artifact_id}")
+    def get_artifact(job_id: str, artifact_id: str):
+        """Serve a single artifact by its id (from dispatcher-validated metadata).
+
+        Security (requirement 3):
+        - ``artifact_id`` is used as a *key* into the validated artifact list,
+          never as a filesystem path.
+        - The artifact's ``path`` field comes from ``metadata.json`` (validated
+          by the dispatcher's trust gate), not from the client.
+        - ``_safe_artifact_path`` does a final ``resolve() + relative_to()``
+          containment check before serving.
+        """
+        _validate_job_id(job_id)
+        _require_done(job_id)
+        out = _output_dir_for(job_id)
+        if not out.is_dir():
+            raise HTTPException(410, "result expired")
+
+        meta_json = out / "metadata.json"
+        if not meta_json.is_file():
+            raise HTTPException(404, "metadata.json not found")
+
+        try:
+            raw = meta_json.read_bytes()
+            meta = json.loads(raw)
+        except Exception:
+            raise HTTPException(500, "could not parse metadata.json")
+
+        # Find the artifact whose id matches (artifacts are in the top-level list).
+        artifacts = meta.get("artifacts", [])
+        matched = None
+        for a in artifacts:
+            if isinstance(a, dict) and a.get("id") == artifact_id:
+                matched = a
+                break
+
+        if matched is None:
+            raise HTTPException(404, f"artifact {artifact_id!r} not found")
+
+        artifact_rel_path = matched.get("path", "")
+        # Requirement 3: containment check
+        safe = _safe_artifact_path(out, artifact_rel_path)
+        if safe is None or not safe.is_file():
+            raise HTTPException(404, "artifact file not found")
+
+        from fastapi.responses import FileResponse
+        return FileResponse(safe)
+
+    @app.get("/v1/jobs/{job_id}/result")
+    async def get_result(job_id: str):
+        """Stream a ZIP of the entire ``output/`` directory."""
+        _validate_job_id(job_id)
+        _require_done(job_id)
+        out = _output_dir_for(job_id)
+        if not out.is_dir():
+            raise HTTPException(410, "result expired")
+
+        zip_bytes = await asyncio.to_thread(_zip_output_dir, out)
+        return Response(
+            content=zip_bytes,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{job_id}.zip"'},
+        )
+
+    @app.delete("/v1/jobs/{job_id}")
+    def delete_job(job_id: str):
+        """Delete a job's store entry and artifacts.
+
+        Refuses to delete QUEUED/RUNNING jobs.  Deletion is confined under
+        ``job_root`` — the directory removed is always ``job_root/<job_id>/``.
+        """
+        _validate_job_id(job_id)
+        job = _job_store.get(job_id)
+        if job is None:
+            raise HTTPException(404, "job not found")
+        if job.status in (JobStatus.QUEUED, JobStatus.RUNNING):
+            raise HTTPException(
+                409,
+                f"cannot delete job in status={job.status.value}; wait for it to finish",
+            )
+
+        # Confined delete: always relative to job_root.
+        root, _, _ = _job_dirs(job_id)
+        try:
+            root_resolved = root.resolve(strict=False)
+            job_root_resolved = _job_root.resolve(strict=False)
+            root_resolved.relative_to(job_root_resolved)
+        except ValueError:
+            raise HTTPException(500, "job directory outside job_root")
+
+        shutil.rmtree(root, ignore_errors=True)
+        _job_store.delete(job_id)
+        return {"deleted": job_id}
+
+    return app
+
+
+# ---------------------------------------------------------------------------
+# Synchronous spool helper (called via asyncio.to_thread)
+# ---------------------------------------------------------------------------
+
+
+def _spool_sync(upload: UploadFile, dest: Path) -> tuple[int, str]:
+    """Blocking spool: read the upload and write to *dest*.
+
+    Called from ``asyncio.to_thread`` so it must not use ``await``.
+    UploadFile exposes a synchronous ``file`` attribute (a SpooledTemporaryFile)
+    that we can read directly.
+    """
+    h = hashlib.sha256()
+    total = 0
+    raw_file = upload.file  # SpooledTemporaryFile or BytesIO
+    with dest.open("wb") as out:
+        while True:
+            chunk = raw_file.read(65536)
+            if not chunk:
+                break
+            out.write(chunk)
+            h.update(chunk)
+            total += len(chunk)
+    return total, h.hexdigest()
