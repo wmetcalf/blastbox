@@ -73,3 +73,23 @@ class OutputTrustError(BlastboxError):
 
 class WarmTimeout(BlastboxError):
     """No job arrived within the idle-timeout window for a warm worker slot."""
+
+
+class FcCpuFeatureMismatch(SandboxError):
+    """A CRaC warp restore aborted because the checkpoint requires CPU features
+    the Firecracker guest does not expose.
+
+    This is the actionable form of an otherwise-opaque warmup timeout: the warp
+    engine reports the compatible value itself (see
+    :func:`blastbox.host.runtime.cpu_features.parse_cpu_mismatch`).  Rebuild the
+    rootfs/checkpoint with ``-XX:CPUFeatures=<needed>`` on both the AOT-create
+    and the checkpoint command.
+    """
+
+    def __init__(self, needed: str, detail: str = "") -> None:
+        msg = (
+            "Firecracker guest is missing CPU features the CRaC checkpoint "
+            f"requires; rebuild the rootfs/checkpoint with -XX:CPUFeatures={needed}"
+        )
+        super().__init__(f"{msg} ({detail})" if detail else msg)
+        self.needed = needed
