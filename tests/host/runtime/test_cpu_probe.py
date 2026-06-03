@@ -78,6 +78,11 @@ def test_mismatch_wins_over_success_marker():
 # --------------------------------------------------------------------------- #
 
 
+def test_invalid_restore_ok_marker_rejected():
+    with pytest.raises(ValueError):
+        CpuProbeConfig(fc_bin="firecracker", kernel="/k", rootfs="/r", restore_ok_marker="(unclosed")
+
+
 def test_config_json_single_ro_root_disk_no_extras():
     cfg = CpuProbeConfig(fc_bin="firecracker", kernel="/k", rootfs="/r", mem_mib=1024)
     j = build_probe_config_json(cfg)

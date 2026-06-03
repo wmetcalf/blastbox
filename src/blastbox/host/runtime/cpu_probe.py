@@ -90,6 +90,14 @@ class CpuProbeConfig:
     timeout_s: float = 25.0
     restore_ok_marker: str = _DEFAULT_RESTORE_OK_MARKER  # regex proving a clean restore
 
+    def __post_init__(self) -> None:
+        # Fail fast + clearly if a caller overrides restore_ok_marker with an
+        # invalid pattern, rather than raising a cryptic re.error deep in the poll.
+        try:
+            re.compile(self.restore_ok_marker)
+        except re.error as exc:
+            raise ValueError(f"restore_ok_marker is not a valid regex: {exc}") from exc
+
 
 SubprocessRunner = Callable[..., "subprocess.Popen[bytes]"]
 
@@ -155,7 +163,7 @@ def _console_is_terminal(console: str, cfg: CpuProbeConfig) -> bool:
 
 def _read_text(path: Path) -> str:
     try:
-        return path.read_text(errors="replace")
+        return path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
 
@@ -190,7 +198,7 @@ def probe_guest_cpu_features(
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
     config_path = work / "probe-fc-config.json"
-    config_path.write_text(json.dumps(build_probe_config_json(cfg), indent=2))
+    config_path.write_text(json.dumps(build_probe_config_json(cfg), indent=2), encoding="utf-8")
     log_path = work / "probe-fc.log"
 
     # ALWAYS a list, NEVER shell=True; fc_bin is the only source of the binary.

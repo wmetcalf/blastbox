@@ -1,6 +1,6 @@
 # FC CRaC CPU-Feature Mismatch — Detection & Auto-Handling
 
-Status: **Phase 1 shipped** · Phase 2 designed/pending · Owner: Will · 2026-06-02
+Status: **Phase 1 + Phase 2 shipped** (live-validated) · Owner: Will · 2026-06-03
 
 **Phase 1 (runtime auto-detect) is implemented + unit-tested:**
 - blastbox canonical: `src/blastbox/host/runtime/cpu_features.py`
@@ -15,7 +15,7 @@ Status: **Phase 1 shipped** · Phase 2 designed/pending · Owner: Will · 2026-0
 - `src/blastbox/host/runtime/cpu_probe.py` — `probe_guest_cpu_features()` boots a
   one-shot probe microVM and classifies the restore (`MISMATCH`→value /
   `COMPATIBLE` / `INCONCLUSIVE`); `CpuProbeConfig`, `CpuProbeResult`, `CpuProbeError`.
-  11 unit tests via an injectable `subprocess_runner` (no real microVM needed).
+  12 unit tests via an injectable `subprocess_runner` (no real microVM needed).
 - **Rationale for blastbox-first:** Will plans to port other JVM projects into
   blastbox; CRaC warm-start + this CPU-feature auto-bake become reusable framework
   capabilities each future JVM worker inherits — not a RedTusk-only hack.

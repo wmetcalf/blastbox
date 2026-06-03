@@ -55,7 +55,7 @@ class CpuFeatureMismatch:
     raw_line: str
 
 
-def parse_cpu_mismatch(console_text: str) -> CpuFeatureMismatch | None:
+def parse_cpu_mismatch(console_text: str | None) -> CpuFeatureMismatch | None:
     """Scan a guest serial console for the warp CRaC CPU-feature-mismatch
     signature.
 
