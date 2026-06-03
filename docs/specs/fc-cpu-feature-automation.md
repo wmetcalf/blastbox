@@ -11,8 +11,48 @@ Status: **Phase 1 shipped** · Phase 2 designed/pending · Owner: Will · 2026-0
   wired into `FirecrackerWorkerRuntime.poll_fifo` →
   `_raise_if_cpu_feature_mismatch`, tests in `tests/unit/test_fc_cpu_features.py` (9).
 
-Phase 2 (build-time auto-bake / probe microVM) below is **not yet built** — it
-needs FC-host integration + a rootfs rebuild to validate, deliberately deferred.
+**Phase 2 (build-time auto-bake) — reusable core BUILT, blastbox-first:**
+- `src/blastbox/host/runtime/cpu_probe.py` — `probe_guest_cpu_features()` boots a
+  one-shot probe microVM and classifies the restore (`MISMATCH`→value /
+  `COMPATIBLE` / `INCONCLUSIVE`); `CpuProbeConfig`, `CpuProbeResult`, `CpuProbeError`.
+  11 unit tests via an injectable `subprocess_runner` (no real microVM needed).
+- **Rationale for blastbox-first:** Will plans to port other JVM projects into
+  blastbox; CRaC warm-start + this CPU-feature auto-bake become reusable framework
+  capabilities each future JVM worker inherits — not a RedTusk-only hack.
+- **Confirmed approach (assumption tested on toolz2):** `-XX:CPUFeatures` accepts
+  only a literal `0xNUM,0xNUM` (`=help`/`=generate` rejected), so there is no cheap
+  in-guest "print my features" flag. The probe uses the proven **deliberate-mismatch**
+  path: boot an unpinned/over-broad checkpoint, parse the value the warp engine
+  reports. The rootfs-only boot reaching the restore is already proven (it's how the
+  2026-06-02 bug was diagnosed).
+
+**Phase 2 wiring — DONE (RedTusk), live-validated:**
+- `Dockerfile.crac` + `build-vsock-checkpoint.sh`: `FC_CPU_FEATURES` build-arg
+  (defaults to today's value → unparameterized builds unchanged), pinned on both
+  AOT-create and checkpoint.
+- `scripts/fc_cpu_probe.py`: self-contained host-side probe CLI (stdlib-only, runs
+  on a bare FC host). `scripts/setup_firecracker_host.sh`: build → probe → on
+  `MISMATCH` rebuild pinned to the reported value + re-probe; on `INCONCLUSIVE`
+  fail loud.
+- **Live finding (toolz2):** a *successful* warp restore prints
+  `warp: Restore successful!` — NOT `[crac]` (which only tags the *failure* path).
+  The probe keys `COMPATIBLE` off that success marker; the initial `[crac]`-based
+  heuristic wrongly read a healthy restore as `INCONCLUSIVE`. Caught and fixed by
+  probing the known-good rootfs live, which now returns `COMPATIBLE` (exit 0). The
+  rootfs-only probe boot reaching the restore is confirmed live (init FATALs on the
+  absent `/dev/vdb` output disk but falls through, and the restore runs).
+
+**MISMATCH path — PROVEN live (toolz2, 2026-06-03):** built a deliberately
+over-broad (unpinned → native host features) checkpoint, exported it, and probed
+it. The restore failed exactly as the original bug did —
+`[error][crac] Restore failed due to incompatible or missing CPU features, try
+using -XX:CPUFeatures=0x102100055bbd7,0x1c8` — and the probe returned
+`MISMATCH 0x102100055bbd7,0x1c8` (the exact value the production rootfs is pinned
+to, already proven `COMPATIBLE`). So the full chain — detect a wrong build →
+extract the exact fix value → that value yields a working rootfs — is validated on
+real builds + real microVM boots. Both probe verdicts (`COMPATIBLE`, `MISMATCH`)
+are now live-proven; `INCONCLUSIVE` is unit-tested. (Throwaway image/rootfs removed,
+repo restored.)
 
 ## Problem
 
