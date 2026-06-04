@@ -274,7 +274,16 @@ any untrusted data exists.
     `CONNECT 10001` (the agent's JOB port) returned `OK …` — i.e. the restored VM
     resumed *with the running `unoserver` and the job listener intact*. This proves the
     whole tier's premise: snapshot a live `unoserver`, restore it from RAM near-instantly,
-    and the restore is immediately ready to serve a job. (Still TODO: push an actual doc
-    through the restored guest's vsock JOB channel and assert pixel-identity end-to-end —
-    the conversion itself is already proven pixel-identical through the engine; this gates
-    only the in-restore transport.)
+    and the restore is immediately ready to serve a job.
+  - **Measured perf (toolz2, 2026-06-04, `bench.py`, 2 GB guest):**
+    - **Restore vs cold boot:** cold boot → warm-ready (boot + soffice/`unoserver`
+      warmup) = **7.75 s**; warm restore (FC spawn + 256 MB outdisk copy + load+resume)
+      = **~0.56 s**, of which the FC `load snapshot` primitive is **~4 ms**. So a restore
+      replaces a 7.75 s boot+warmup with a sub-second resume of an already-live soffice
+      (~14×). The 0.56 s is dominated by the outdisk copy + process spawn (reflink-able).
+    - **`/dev/shm` (RAM) vs disk — the COW-in-RAM win:** one-time snapshot **create**
+      (write 2 GB mem) = **1.46 s tmpfs vs 29.0 s disk (~20×)**; restore → **first
+      conversion under a cold page cache** = **4.4 s tmpfs vs 31.6 s disk (~7.2×)**
+      (the disk-backed guest page-faults its 2 GB working set off disk mid-convert;
+      tmpfs faults hit RAM). When the cache is warm, disk ≈ RAM — tmpfs just *guarantees*
+      residency (no first-touch read, no eviction), which is why it's a per-host toggle.
