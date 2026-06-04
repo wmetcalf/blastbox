@@ -89,7 +89,7 @@ class SnapshotSlotRuntime:
         cfg: object,
         manager: SnapshotManager,
         *,
-        settle_s: float = 3.0,
+        settle_s: float = 1.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._cfg = cfg
@@ -104,6 +104,10 @@ class SnapshotSlotRuntime:
         # recv fails with ENOTCONN (observed on toolz2). Hold the slot WARMING for a
         # short settle window after restore before is_ready() promotes it, so the host
         # only pushes a job once the vsock can carry it. Host-side clock (injectable).
+        # Default 1.0 s: a settle-sweep (settle_sweep.py, toolz2) found the race resolves
+        # sub-second (0.0–2.0 s all passed 6/6); 1.0 s is a conservative margin over the
+        # rare intermittent case, and in a steady-state pool it overlaps pre-warming so it
+        # adds no per-job latency. Tunable via BLASTBOX_SNAPSHOT_SETTLE_S.
         self._settle_s = settle_s
         self._clock = clock
         self._handles: dict[str, object] = {}
@@ -274,7 +278,7 @@ def select_snapshot_runtime(
     )
 
     # Post-restore vsock settle window (see SnapshotSlotRuntime); tunable per host.
-    settle_s = float(os.environ.get("BLASTBOX_SNAPSHOT_SETTLE_S", "3.0"))
+    settle_s = float(os.environ.get("BLASTBOX_SNAPSHOT_SETTLE_S", "1.0"))
 
     # An injected manager (tests / custom wiring) bypasses environment probing — the
     # caller owns the launcher + snapshot lifecycle. cfg must then be supplied too.

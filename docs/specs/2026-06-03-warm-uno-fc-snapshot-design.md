@@ -291,8 +291,15 @@ any untrusted data exists.
       cold-boot→warm-ready **p50 7.76 s / p90 8.0 s / p99 10 s**; warm-restore (RAM)
       **p50 575 ms / p90 596 ms / p99 799 ms** (tight tail). **≈13.5× faster at p50.**
       The restore distribution is nearly flat (p50→p90 +4 %); the conversion itself is
-      the same on both paths, so the per-job win is the acquire. The 3 s settle is a
-      conservative safety margin (`BLASTBOX_SNAPSHOT_SETTLE_S`), tunable downward.
+      the same on both paths, so the per-job win is the acquire.
+    - **Settle sweep (`settle_sweep.py`, 6 trials × {0–2 s}):** every value 0.0–2.0 s
+      passed 6/6 — the post-restore vsock race resolves **sub-second**. Default lowered
+      3.0 s → **1.0 s** (a conservative margin over the rare intermittent ENOTCONN;
+      `BLASTBOX_SNAPSHOT_SETTLE_S`). In a steady-state pool the settle overlaps
+      background pre-warming, so it adds no per-job latency regardless.
+    - **Outdisk copy:** `restore_in` copies the 256 MB base outdisk via
+      `cp --reflink=auto` — a near-instant CoW clone on xfs/btrfs, falling back to a
+      full copy on ext4/tmpfs (safe everywhere; only the FS that supports it speeds up).
   - **Impress/draw parity gate — PASS (`parity.sh`, clippyshot-fc-warm image, LO 26.x).**
     Warm `unoconvert` (`--filter impress_pdf_Export` / `draw_pdf_Export`) vs cold
     `soffice --convert-to pdf:<filter>`, rasterized at 150 DPI, per-page md5: **pptx,

@@ -122,9 +122,18 @@ def _default_make_outdisk(path: Path) -> None:
 
 def _default_copy_outdisk(src: Path, dst: Path) -> None:
     # Copy the base outdisk image byte-for-byte (preserves the exact ext4 the guest
-    # snapshotted with). copyfile, not copy2 — metadata (mtime/mode) is irrelevant and
-    # copyfile is marginally cheaper. Injected in tests.
-    shutil.copyfile(src, dst)
+    # snapshotted with). Prefer a reflink (CoW clone — near-instant on xfs/btrfs);
+    # ``--reflink=auto`` falls back to a full copy on filesystems without CoW (ext4,
+    # tmpfs), so this is safe everywhere and only speeds up reflink-capable hosts. On
+    # any failure (no ``cp``, odd platform) fall back to a plain Python copy.
+    try:
+        subprocess.run(
+            ["cp", "--reflink=auto", str(src), str(dst)],
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        shutil.copyfile(src, dst)
 
 
 class FcSnapshotLauncher:
