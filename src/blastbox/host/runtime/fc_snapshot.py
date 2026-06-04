@@ -14,9 +14,45 @@ spec's Phase 0 finding).
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+
+# RAM-preload toggle (see resolve_mem_dir). Default tmpfs mount on Linux.
+_DEFAULT_TMPFS_MEM_DIR = Path("/dev/shm")
+_ENV_MEM_TMPFS = "BLASTBOX_SNAPSHOT_MEM_TMPFS"
+_ENV_MEM_DIR = "BLASTBOX_SNAPSHOT_MEM_DIR"
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no")
+
+
+def resolve_mem_dir() -> Path | None:
+    """Resolve the snapshot mem-file directory from the RAM-preload toggle.
+
+    The snapshot's mem file ≈ guest RAM (~2 GB with soffice live) and dominates
+    the snapshot cost. Holding it on **tmpfs** (``/dev/shm``) pins it in RAM, so
+    every restore reads the COW-shared base from memory (zero disk I/O) — fast,
+    but it permanently occupies ~one guest-RAM of RAM for the warm baseline. Hosts
+    differ in RAM, so this is **opt-in, default OFF**: unset → the mem file lives
+    on disk (page-cache-backed) in the manager's base dir, which is safe on a small
+    box (the kernel still caches it, just evictable under pressure).
+
+    Precedence:
+
+    - ``BLASTBOX_SNAPSHOT_MEM_DIR=<path>`` — preload into this explicit directory
+      (wins; for hosts whose tmpfs is mounted somewhere other than ``/dev/shm``).
+    - ``BLASTBOX_SNAPSHOT_MEM_TMPFS=1`` — preload into the default tmpfs ``/dev/shm``.
+    - neither set — return ``None`` (caller keeps the mem file on disk).
+    """
+    explicit = os.environ.get(_ENV_MEM_DIR, "").strip()
+    if explicit:
+        return Path(explicit)
+    if _env_truthy(_ENV_MEM_TMPFS):
+        return _DEFAULT_TMPFS_MEM_DIR
+    return None
 
 
 class SnapshotError(RuntimeError):
@@ -145,6 +181,27 @@ class SnapshotManager:
         self._launcher = launcher
         self._ready_timeout_s = ready_timeout_s
         self._artifact: SnapshotArtifact | None = None
+
+    @classmethod
+    def from_env(
+        cls,
+        base_dir: Path,
+        launcher: SnapshotLauncher,
+        *,
+        ready_timeout_s: float = 120.0,
+        mem_dir: Path | None = None,
+    ) -> "SnapshotManager":
+        """Construct a manager, honoring the RAM-preload toggle from the environment.
+
+        When ``mem_dir`` is not passed explicitly, it is resolved via
+        :func:`resolve_mem_dir` (``BLASTBOX_SNAPSHOT_MEM_TMPFS`` /
+        ``BLASTBOX_SNAPSHOT_MEM_DIR``, default OFF → disk-backed). This is the entry
+        point the pool wiring should use so the toggle is respected per host."""
+        if mem_dir is None:
+            mem_dir = resolve_mem_dir()
+        return cls(
+            base_dir, launcher, ready_timeout_s=ready_timeout_s, mem_dir=mem_dir
+        )
 
     @property
     def artifact(self) -> SnapshotArtifact | None:

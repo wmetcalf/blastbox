@@ -192,12 +192,21 @@ any untrusted data exists.
   cost. FC's `File` mem backend already `mmap`s it **`MAP_PRIVATE`** on load, so N
   restores **share the read-only base pages** + copy-on-write only what each VM
   dirties → cost is *base once + Σ(dirtied working set)*, NOT N × full. Two levels:
-  1. **Default: put the mem file on `tmpfs` (`/dev/shm`).** Pins the base in RAM —
-     zero disk I/O on any restore (incl. the first), still COW-shared. `SnapshotManager`
-     should write `warm.mem` to a tmpfs path; `restore_from_snapshot`'s `mem_backend`
-     points there. Cost: ~one guest-RAM of RAM held for the warm baseline (cheap for
-     a pool). Without this, the base lives only in the page cache and can be evicted
-     under pressure → re-read from disk.
+  1. **Opt-in: put the mem file on `tmpfs` (`/dev/shm`).** Pins the base in RAM —
+     zero disk I/O on any restore (incl. the first), still COW-shared. Cost: ~one
+     guest-RAM of RAM held for the warm baseline. Because that RAM cost is real and
+     **hosts differ in how much RAM they have, this is a per-host toggle, default
+     OFF** (the safe choice on a small box — the mem file lives on disk in the base
+     dir, still page-cache-backed, just evictable under pressure):
+     - `BLASTBOX_SNAPSHOT_MEM_TMPFS=1` → preload into the default tmpfs `/dev/shm`.
+     - `BLASTBOX_SNAPSHOT_MEM_DIR=<path>` → preload into an explicit dir (for hosts
+       whose tmpfs is mounted elsewhere); wins over the boolean toggle.
+     - neither → mem on disk (default).
+
+     Wired in `fc_snapshot.py`: `resolve_mem_dir()` reads the env, and
+     `SnapshotManager.from_env(base, launcher)` constructs the manager with the
+     resolved `mem_dir` (the pool wiring should use `from_env`). An explicit
+     `mem_dir=` arg still short-circuits env resolution (tests, direct callers).
   2. **Scale: FC's `Uffd` (userfaultfd) backend** — a handler process holds one base
      copy and serves guest pages lazily/shared across all restores; most RAM-efficient
      for large pools, at the cost of a page-fault handler. Future optimization.

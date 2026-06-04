@@ -1,6 +1,8 @@
 """Unit tests for FC snapshot/restore orchestration + SnapshotManager."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from blastbox.host.runtime.fc_api import FcApiError
@@ -9,6 +11,7 @@ from blastbox.host.runtime.fc_snapshot import (
     SnapshotManager,
     SnapshotRestoreError,
     create_snapshot,
+    resolve_mem_dir,
     restore_from_snapshot,
 )
 
@@ -204,3 +207,60 @@ def test_build_puts_mem_on_separate_mem_dir(tmp_path):
     assert art.snapshot_path == base / "warm.snapshot"
     assert art.mem_path == memdir / "warm.mem"  # mem on the RAM-backed dir
     assert memdir.is_dir()
+
+
+# --- RAM-preload toggle (resolve_mem_dir / from_env) ----------------------
+
+
+def test_resolve_mem_dir_default_off(monkeypatch):
+    """Unset toggle → None (mem stays on disk; safe on a low-RAM host)."""
+    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", raising=False)
+    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_DIR", raising=False)
+    assert resolve_mem_dir() is None
+
+
+def test_resolve_mem_dir_tmpfs_toggle(monkeypatch):
+    """BLASTBOX_SNAPSHOT_MEM_TMPFS truthy → the default tmpfs /dev/shm."""
+    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_DIR", raising=False)
+    monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", "1")
+    assert resolve_mem_dir() == Path("/dev/shm")
+
+
+def test_resolve_mem_dir_tmpfs_falsey_is_off(monkeypatch):
+    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_DIR", raising=False)
+    for val in ("0", "false", "no", ""):
+        monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", val)
+        assert resolve_mem_dir() is None
+
+
+def test_resolve_mem_dir_explicit_dir_wins(monkeypatch):
+    """Explicit dir beats the tmpfs toggle (for non-/dev/shm tmpfs mounts)."""
+    monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", "1")
+    monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_DIR", "/mnt/hugeram")
+    assert resolve_mem_dir() == Path("/mnt/hugeram")
+
+
+def test_from_env_default_off_keeps_mem_on_base(tmp_path, monkeypatch):
+    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", raising=False)
+    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_DIR", raising=False)
+    art = SnapshotManager.from_env(tmp_path, FakeLauncher()).build()
+    assert art.mem_path == tmp_path / "warm.mem"  # disk-backed, in base
+
+
+def test_from_env_explicit_dir_puts_mem_there(tmp_path, monkeypatch):
+    base = tmp_path / "base"
+    ram = tmp_path / "ram"  # stand-in for the tmpfs mount
+    monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_DIR", str(ram))
+    art = SnapshotManager.from_env(base, FakeLauncher()).build()
+    assert art.mem_path == ram / "warm.mem"
+    assert ram.is_dir()
+
+
+def test_from_env_explicit_mem_dir_arg_overrides_env(tmp_path, monkeypatch):
+    """An explicit mem_dir= arg short-circuits env resolution."""
+    monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", "1")  # would pick /dev/shm
+    arg_dir = tmp_path / "explicit"
+    art = SnapshotManager.from_env(
+        tmp_path / "base", FakeLauncher(), mem_dir=arg_dir
+    ).build()
+    assert art.mem_path == arg_dir / "warm.mem"
