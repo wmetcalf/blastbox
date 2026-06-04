@@ -140,10 +140,18 @@ any untrusted data exists.
     `network_overrides`, `resume_vm` — **there is NO vsock-uds override**. So the host
     vsock UDS path is baked into the snapshot and cannot be remapped in the load body.
     Implication: per-restore vsock uniqueness must come from the *environment*, not the
-    load config — run each restore in a **per-slot working dir / chroot** (jailer-style)
-    so the same baked-in `uds_path` resolves to a distinct per-slot socket. The Phase 0
-    spike must confirm (a) FC re-creates the baked uds relative to cwd/chroot on resume,
-    and (b) a fresh host connect to that per-slot path round-trips after restore.
+    load config — run each restore in a **per-slot working dir** (relative `uds_path`)
+    so the same baked-in path resolves to a distinct per-slot socket.
+  - **Phase 0 CONFIRMED on toolz2 (2026-06-04, `fc_snapshot_spike.py`, FC v1.12.1):**
+    booted a base microVM over the API with a **relative** `vsock` uds_path
+    (`vsock.sock`) + relative outdisk, cwd=base → FC created `base/vsock.sock`;
+    `PATCH /vm Paused` + `PUT /snapshot/create` succeeded; then loaded the snapshot
+    into **two** fresh firecrackers each in its own cwd (`slots/slot-A`, `slots/slot-B`)
+    via `PUT /snapshot/load` + `resume_vm:true` — **each restore re-created its own
+    `vsock.sock` in its own cwd** (verdict `{slot-A: True, slot-B: True}`). So the
+    per-slot-cwd vsock mechanism + snapshot/restore both work on real FC. Still TODO:
+    the host↔guest **round-trip** through a restored vsock (guest responds post-restore)
+    — needs the warm rootfs + job protocol, not just the probe.
 - **Output-disk remap on restore.** Confirm FC lets a restored VM attach a fresh
   per-slot output drive (the snapshot was taken with a base drive); decide whether
   the output disk is excluded from the snapshot and attached at restore, or remapped.
