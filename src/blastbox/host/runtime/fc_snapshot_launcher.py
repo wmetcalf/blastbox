@@ -10,9 +10,9 @@ Per-slot vsock uniqueness (the Phase 0 finding: ``/snapshot/load`` has no vsock
 override): the writable per-slot resources — the vsock UDS and the output disk —
 are configured with **relative** paths and each firecracker runs with its own
 **cwd**, so the same baked-in relative path resolves to a distinct per-slot socket
-+ disk after restore. rootfs/kernel stay absolute (shared, read-only). The runtime
-spike must confirm FC re-creates the relative vsock UDS relative to the restore's
-cwd before this is enabled.
++ disk after restore. rootfs/kernel stay absolute (shared, read-only). **Confirmed on
+toolz2 (FC v1.12.1):** FC re-creates the relative vsock UDS in each restore's cwd, and
+the full snapshot→restore→convert round-trip works pixel-identically (see the spec).
 """
 from __future__ import annotations
 
@@ -183,12 +183,15 @@ class FcSnapshotLauncher:
     def _spawn(self, workdir: Path):
         workdir.mkdir(parents=True, exist_ok=True)
         api_sock = workdir / "fc-api.sock"
-        # Drop any stale socket so _wait_socket can't return on an old file (and
-        # firecracker won't fail to bind an existing path).
-        try:
-            api_sock.unlink(missing_ok=True)
-        except OSError:
-            pass
+        # Drop stale sockets from a previous crashed run in this workdir so (a)
+        # _wait_socket can't return on a stale fc-api.sock, and (b) firecracker can
+        # bind the vsock UDS instead of failing on an existing path. The per-port
+        # guest→host sockets (vsock.sock_<port>) are re-created by VsockReadySignal.
+        for stale in (api_sock, workdir / REL_VSOCK, *workdir.glob(f"{REL_VSOCK}_*")):
+            try:
+                stale.unlink(missing_ok=True)
+            except OSError:
+                pass
         # cwd=workdir so the relative vsock/outdisk paths resolve per-slot.
         proc = self._popen(
             [self._cfg.fc_bin, "--api-sock", str(api_sock)], cwd=str(workdir)

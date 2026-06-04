@@ -9,8 +9,9 @@ Key constraint (FC v1.12.1, from the embedded API schema): ``PUT /snapshot/load`
 has **no vsock-uds override** — the host vsock path is baked into the snapshot. So
 per-restore uniqueness comes from running each restored firecracker in its **own
 working dir** (the same baked relative ``uds_path`` then resolves to a per-slot
-socket), NOT from the load body. Runtime-confirm this before enabling (see the
-spec's Phase 0 finding).
+socket), NOT from the load body. **Runtime-confirmed on toolz2 (FC v1.12.1):** each
+restore re-creates its own ``vsock.sock`` in its own cwd, and a full
+snapshot→restore→convert round-trip is pixel-identical to cold (see the spec).
 """
 from __future__ import annotations
 
@@ -217,13 +218,22 @@ class SnapshotManager:
         mem = self._mem_dir / "warm.mem"
         self._base_dir.mkdir(parents=True, exist_ok=True)
         self._mem_dir.mkdir(parents=True, exist_ok=True)
-        boot = self._launcher.boot_base()
+        # boot_base() is its own try so a base-boot failure is wrapped as
+        # SnapshotBuildError (as documented), not propagated raw. boot_base already
+        # kills its own firecracker on partial failure, so no handle/finally is needed
+        # here — there is nothing to kill until it returns a BootHandle.
+        try:
+            boot = self._launcher.boot_base()
+        except SnapshotError:
+            raise
+        except Exception as exc:
+            raise SnapshotBuildError(f"warm snapshot base boot failed: {exc}") from exc
         try:
             boot.wait_ready(self._ready_timeout_s)
             create_snapshot(boot.api, str(snap), str(mem))
         except SnapshotError:
             raise
-        except Exception as exc:  # launcher / readiness failure
+        except Exception as exc:  # readiness / snapshot failure
             raise SnapshotBuildError(f"warm snapshot build failed: {exc}") from exc
         finally:
             boot.kill()

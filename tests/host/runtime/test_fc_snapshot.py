@@ -106,6 +106,10 @@ class FakeRestore:
     def __init__(self, api, vsock_uds):
         self.api = api
         self.vsock_uds = vsock_uds
+        self.killed = False
+
+    def kill(self):  # satisfies the RestoreHandle protocol (kill on load failure)
+        self.killed = True
 
 
 class FakeLauncher:
