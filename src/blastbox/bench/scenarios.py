@@ -192,3 +192,21 @@ def _snapshot_restore_latency(cfg: BenchConfig) -> ScenarioResult:
             note="snapshot runtime unavailable",
         )
     return _snapshot_restore_latency_impl(cfg, runtime=rt)
+
+
+@scenario("convert.latency", requires=("soffice",))
+def _convert_latency(cfg: BenchConfig) -> ScenarioResult:
+    """Conversion wall-time, unsandboxed baseline only (first cut)."""
+    from blastbox.bench._workloads import soffice_runner
+
+    run = soffice_runner(cfg)
+    report = Report(scenario="convert.latency")
+    samples = measure(lambda: run("none"), runs=cfg.runs, warmup=cfg.warmup)
+    if len(samples) < 3:
+        return ScenarioResult(
+            report=report,
+            status="insufficient",
+            note=f"only {len(samples)} samples",
+        )
+    report.add("convert", samples)
+    return ScenarioResult(report=report, status="ok")
