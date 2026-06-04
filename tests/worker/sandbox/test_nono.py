@@ -111,6 +111,16 @@ class TestSecurity:
         assert "binary_missing" in sb.insecurity_reasons
         assert sb.secure is False
 
+    def test_bare_command_name_resolves_via_path(self):
+        from blastbox.worker.sandbox.nono import _resolve_bin
+
+        # A bare name on PATH resolves (matches the BLASTBOX_NONO_BIN=nono ergonomics).
+        assert _resolve_bin("true") is not None
+        # A directory path is NOT a valid binary.
+        assert _resolve_bin("/usr") is None
+        # An absolute path to a real file is returned as-is.
+        assert _resolve_bin("/usr/bin/true") == "/usr/bin/true"
+
     def test_run_without_binary_raises_unavailable(self):
         sb = NonoSandbox(nono_bin="/nonexistent/nono")
         with pytest.raises(SandboxUnavailable):

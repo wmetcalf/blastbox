@@ -127,15 +127,17 @@ def select_sandbox(
     1. If ``backend`` is given (or ``BLASTBOX_SANDBOX`` env var is set),
        force that backend — no silent fallback.
     2. If inside a container (heuristic), try only ``container``.
-    3. Otherwise try ``nsjail``, ``bwrap``, ``container`` in order; accept
-       the first that constructs, passes ``/usr/bin/true`` smoketest, and
-       is not insecure (unless ``BLASTBOX_WARN_ON_INSECURE=1``).
+    3. Otherwise try ``nsjail``, ``bwrap``, ``nono``, ``container`` in order;
+       accept the first that constructs, passes ``/usr/bin/true`` smoketest, and
+       is not insecure (unless ``BLASTBOX_WARN_ON_INSECURE=1``). ``nono`` is
+       ``secure=False`` (no seccomp/namespaces), so auto-mode only reaches it under
+       that env var; it is otherwise an explicit ``BLASTBOX_SANDBOX=nono`` choice.
 
     Parameters
     ----------
     backend:
-        Explicit backend name (``"nsjail"``, ``"bwrap"``, ``"container"``).
-        Overrides ``BLASTBOX_SANDBOX`` env var.
+        Explicit backend name (``"nsjail"``, ``"bwrap"``, ``"nono"``,
+        ``"container"``). Overrides ``BLASTBOX_SANDBOX`` env var.
     _status_path:
         Injected ``/proc/self/status`` stand-in for unit tests.
     """

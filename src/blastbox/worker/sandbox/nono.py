@@ -63,12 +63,17 @@ _NONO_QUIET_ENV: dict[str, str] = {
 _DEFAULT_STATE_DIR = "/var/lib/blastbox/nono-state"
 
 
-def _resolve_nono_bin() -> str | None:
-    explicit = os.environ.get("BLASTBOX_NONO_BIN", "").strip()
-    if explicit:
-        return explicit if Path(explicit).exists() else None
-    found = shutil.which("nono")
-    return found
+def _resolve_bin(raw: str | None) -> str | None:
+    """Resolve a nono binary spec to an absolute existing path, or None.
+
+    Accepts either a path (``/opt/nono`` — must be an existing **file**) or a bare
+    command name (``nono`` — resolved via ``PATH``, matching the other backends'
+    ``BLASTBOX_*_BIN`` ergonomics). Returns None when it can't resolve to a file."""
+    candidate = (raw or "").strip() or "nono"
+    if os.sep in candidate:
+        p = Path(candidate)
+        return str(p) if p.is_file() else None
+    return shutil.which(candidate)
 
 
 def _make_apply_rlimits(limits: Limits) -> Callable[[], None]:
@@ -105,14 +110,18 @@ class NonoSandbox:
         state_dir: str | os.PathLike[str] | None = None,
         popen: Callable[..., "subprocess.Popen[bytes]"] = subprocess.Popen,
     ) -> None:
-        self._nono = nono_bin if nono_bin is not None else _resolve_nono_bin()
+        # Resolve a path OR a bare command name (BLASTBOX_NONO_BIN=nono), and validate
+        # it is an existing file — so `secure`/binary_missing is accurate and a bare
+        # name on PATH doesn't read as missing.
+        raw = nono_bin if nono_bin is not None else os.environ.get("BLASTBOX_NONO_BIN")
+        self._nono = _resolve_bin(raw)
         self._state_dir = Path(
             state_dir
             if state_dir is not None
             else os.environ.get("BLASTBOX_NONO_STATE_DIR", _DEFAULT_STATE_DIR)
         )
         self._popen = popen
-        self._binary_present = self._nono is not None and Path(self._nono).exists()
+        self._binary_present = self._nono is not None
 
         reasons: list[str] = []
         if not self._binary_present:
@@ -209,6 +218,10 @@ class NonoSandbox:
         for d in _RW_BASE_DIRS:
             if Path(d).exists():
                 grants += ["-a", d]
+        # Grants are on the REAL host path (Mount.source). Mount.target is ignored:
+        # Landlock has no mount namespace, so nono cannot remap a source to a different
+        # in-sandbox path — engines targeting nono must use identity mounts
+        # (source == target), which is how the FC/container tiers already build them.
         # nono's -r/-a grant DIRECTORIES; single files need --read-file/--allow-file.
         for m in req.ro_mounts:
             src = Path(m.source)
