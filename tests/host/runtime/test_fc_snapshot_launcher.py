@@ -119,6 +119,9 @@ def test_restore_in_spawns_in_slot_cwd_and_copies_base_outdisk(tmp_path):
         make_outdisk=lambda p: made.append(Path(p)),
         copy_outdisk=lambda src, dst: copied.append((Path(src), Path(dst))),
     )
+    # The base outdisk (copy source) must exist for restore_in to proceed.
+    (tmp_path / "snap" / "base").mkdir(parents=True)
+    (tmp_path / "snap" / "base" / REL_OUTDISK).write_bytes(b"")
     slot = tmp_path / "snap" / "slots" / "slot-7"
     handle = launcher.restore_in(slot)
 
@@ -161,3 +164,82 @@ def test_spawn_kills_proc_when_api_socket_never_appears(tmp_path):
     with pytest.raises(TimeoutError):
         launcher.boot_base()
     assert proc.terminated is True
+
+
+class _TrackProc:
+    def __init__(self):
+        self.terminated = False
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def test_boot_base_kills_proc_when_post_spawn_step_fails(tmp_path):
+    """If make_outdisk / the boot PUTs raise AFTER _spawn, the FC proc must be killed
+    (the caller never gets a _Handle to kill, so boot_base must do it)."""
+    import pytest
+
+    proc = _TrackProc()
+
+    def boom(p):
+        raise OSError("ENOSPC making outdisk")
+
+    launcher = FcSnapshotLauncher(
+        FakeCfg(), tmp_path / "snap",
+        popen=lambda argv, cwd=None: proc,
+        api_factory=FakeApi,
+        wait_socket=lambda p: None,
+        make_outdisk=boom,
+    )
+    with pytest.raises(OSError):
+        launcher.boot_base()
+    assert proc.terminated is True
+
+
+def test_restore_in_kills_proc_when_copy_fails(tmp_path):
+    """If the outdisk copy raises after _spawn, the restored FC proc must be killed."""
+    import pytest
+
+    proc = _TrackProc()
+    base = tmp_path / "snap"
+    (base / "base").mkdir(parents=True)
+    (base / "base" / REL_OUTDISK).write_bytes(b"")  # base outdisk exists
+
+    def boom(src, dst):
+        raise OSError("disk full copying outdisk")
+
+    launcher = FcSnapshotLauncher(
+        FakeCfg(), base,
+        popen=lambda argv, cwd=None: proc,
+        api_factory=FakeApi,
+        wait_socket=lambda p: None,
+        make_outdisk=lambda p: None,
+        copy_outdisk=boom,
+    )
+    with pytest.raises(OSError):
+        launcher.restore_in(base / "slots" / "s1")
+    assert proc.terminated is True
+
+
+def test_restore_in_raises_and_does_not_spawn_when_base_outdisk_missing(tmp_path):
+    """No base outdisk → fail fast with FileNotFoundError and never spawn FC."""
+    import pytest
+
+    spawned = []
+    launcher = FcSnapshotLauncher(
+        FakeCfg(), tmp_path / "snap",
+        popen=lambda argv, cwd=None: spawned.append(1) or _TrackProc(),
+        api_factory=FakeApi,
+        wait_socket=lambda p: None,
+        make_outdisk=lambda p: None,
+        copy_outdisk=lambda s, d: None,
+    )
+    with pytest.raises(FileNotFoundError):
+        launcher.restore_in(tmp_path / "snap" / "slots" / "s1")
+    assert spawned == []  # never spawned FC since the source is missing

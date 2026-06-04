@@ -177,6 +177,15 @@ def test_restore_before_build_raises(tmp_path):
         SnapshotManager(tmp_path, FakeLauncher()).restore("slot-1")
 
 
+def test_restore_rejects_unsafe_slot_id(tmp_path):
+    """slot_id becomes a path segment under slots/ — traversal/odd values are rejected."""
+    mgr = SnapshotManager(tmp_path, FakeLauncher())
+    mgr.build()
+    for bad in ("../escape", "a/b", "..", ".", "", "x\x00y"):
+        with pytest.raises(SnapshotRestoreError, match="unsafe slot_id"):
+            mgr.restore(bad)
+
+
 def test_restore_kills_handle_on_load_failure(tmp_path):
     """If snapshot/load fails, the spawned firecracker must be killed (no leak)."""
     handle = type("H", (), {})()

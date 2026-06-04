@@ -104,6 +104,22 @@ class _Handle:
             self.proc.wait()
 
 
+def _terminate_proc(proc: "subprocess.Popen | None") -> None:
+    """Best-effort kill of a spawned firecracker so partial-failure paths don't leak
+    an orphaned microVM. Safe on None / already-exited procs."""
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+
 def _default_wait_socket(path: Path, timeout_s: float = 10.0) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -181,12 +197,7 @@ class FcSnapshotLauncher:
             self._wait_socket(api_sock)
         except Exception:
             # Don't leak the spawned firecracker if the API socket never appears.
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+            _terminate_proc(proc)
             raise
         return proc, self._api_factory(str(api_sock))
 
@@ -194,14 +205,21 @@ class FcSnapshotLauncher:
         """Boot the base microVM (fresh) for snapshotting."""
         workdir = self._base_dir / "base"
         proc, api = self._spawn(workdir)
-        self._make_outdisk(workdir / REL_OUTDISK)
-        for path, body in api_boot_sequence(self._cfg):
-            api.put(path, body)
-        ready = (
-            self._ready_check_factory(workdir / REL_VSOCK)
-            if self._ready_check_factory
-            else None
-        )
+        # Everything after _spawn must kill the FC process on failure — the caller only
+        # gets a _Handle (and its kill()) if boot_base RETURNS, so a raise here would
+        # otherwise orphan the microVM (e.g. make_outdisk hits ENOSPC, a PUT errors).
+        try:
+            self._make_outdisk(workdir / REL_OUTDISK)
+            for path, body in api_boot_sequence(self._cfg):
+                api.put(path, body)
+            ready = (
+                self._ready_check_factory(workdir / REL_VSOCK)
+                if self._ready_check_factory
+                else None
+            )
+        except Exception:
+            _terminate_proc(proc)
+            raise
         return _Handle(proc, api, str(workdir / REL_VSOCK), ready_check=ready)
 
     def restore_in(self, slot_workdir: Path):
@@ -216,7 +234,21 @@ class FcSnapshotLauncher:
         → ``EXT4-fs error: Directory block failed checksum`` corruption. Copying the
         snapshot-time base image (empty at READY) keeps the (disk, guest-RAM) pair
         consistent; writes still land on the isolated per-slot copy (one job per slot)."""
-        proc, api = self._spawn(Path(slot_workdir))
         base_outdisk = self._base_dir / "base" / REL_OUTDISK
-        self._copy_outdisk(base_outdisk, Path(slot_workdir) / REL_OUTDISK)
+        if not base_outdisk.exists():
+            # The base outdisk (the snapshot-time ext4 image) MUST survive for the life
+            # of the manager — it is the per-slot copy source. Fail clearly rather than
+            # deep inside the copy if the base workdir was cleaned.
+            raise FileNotFoundError(
+                f"base outdisk missing for restore: {base_outdisk} "
+                "(the base workdir must be preserved after build())"
+            )
+        proc, api = self._spawn(Path(slot_workdir))
+        # Post-spawn work must kill the FC process on failure (same reason as boot_base):
+        # the caller only gets a killable _Handle once restore_in RETURNS.
+        try:
+            self._copy_outdisk(base_outdisk, Path(slot_workdir) / REL_OUTDISK)
+        except Exception:
+            _terminate_proc(proc)
+            raise
         return _Handle(proc, api, str(Path(slot_workdir) / REL_VSOCK))

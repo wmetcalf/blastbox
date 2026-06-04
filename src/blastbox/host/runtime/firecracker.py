@@ -196,10 +196,13 @@ class FCConfig:
             raise ValueError(
                 f"fc_outdisk_mib must be >= 16 MiB, got {self.fc_outdisk_mib}"
             )
-        # AF_UNIX paths cap at ~108 bytes. The worst-case vsock UDS is
-        # <scratch>/<36-char uuid>/vsock.sock_<port>. Warn loudly at config time
+        # AF_UNIX paths cap at ~108 bytes. The worst-case vsock UDS is the
+        # snapshot tier's <scratch>/slots/<36-char uuid>/vsock.sock_<port> (longer
+        # than the cold tier by the "/slots" segment). Warn loudly at config time
         # (an operator sees this) rather than only at per-slot bind-failure.
-        worst_case_uds = len(self.scratch_root) + len("/") + 36 + len("/vsock.sock_10000")
+        worst_case_uds = (
+            len(self.scratch_root) + len("/slots/") + 36 + len("/vsock.sock_10000")
+        )
         if worst_case_uds > 100:
             _log.warning(
                 "fc.scratch_root_long len=%d worst_case_uds=%d (>100) — AF_UNIX "

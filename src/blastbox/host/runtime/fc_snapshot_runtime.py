@@ -278,7 +278,16 @@ def select_snapshot_runtime(
     )
 
     # Post-restore vsock settle window (see SnapshotSlotRuntime); tunable per host.
-    settle_s = float(os.environ.get("BLASTBOX_SNAPSHOT_SETTLE_S", "1.0"))
+    # Guarded parse: a garbage value falls back to the default + a warning rather than
+    # aborting pool construction (mirrors PoolConfig._float).
+    _raw_settle = os.environ.get("BLASTBOX_SNAPSHOT_SETTLE_S", "").strip()
+    try:
+        settle_s = float(_raw_settle) if _raw_settle else 1.0
+    except ValueError:
+        _log.warning(
+            "invalid BLASTBOX_SNAPSHOT_SETTLE_S=%r; using 1.0", _raw_settle
+        )
+        settle_s = 1.0
 
     # An injected manager (tests / custom wiring) bypasses environment probing — the
     # caller owns the launcher + snapshot lifecycle. cfg must then be supplied too.

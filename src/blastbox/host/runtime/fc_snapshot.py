@@ -236,7 +236,14 @@ class SnapshotManager:
         yet or the restore fails (caller reaps the slot + cold-boots that job)."""
         if self._artifact is None:
             raise SnapshotRestoreError("snapshot not built; call build() first")
-        slot_workdir = self._base_dir / "slots" / str(slot_id)
+        # slot_id becomes a path component under base_dir/slots/ — keep the trust
+        # boundary explicit (today's only caller passes a uuid4, but the signature is
+        # `object`): reject anything that isn't a single safe path segment so a future
+        # caller can't traverse out of slots/ with a stray "/" or "..".
+        sid = str(slot_id)
+        if not sid or "/" in sid or "\x00" in sid or sid in (".", ".."):
+            raise SnapshotRestoreError(f"unsafe slot_id: {sid!r}")
+        slot_workdir = self._base_dir / "slots" / sid
         slot_workdir.mkdir(parents=True, exist_ok=True)
         handle = self._launcher.restore_in(slot_workdir)
         try:

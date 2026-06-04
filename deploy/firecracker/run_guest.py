@@ -59,13 +59,26 @@ def main() -> None:
     # idle slots): a snapshot-restored guest must NOT self-retire while it sits warm
     # in the pool. The cold tier keeps the modest default. (The guest clock can also
     # skew across snapshot/restore, which makes a short self-timeout fire early.)
-    idle_timeout_s = float(os.environ.get("BLASTBOX_WARM_IDLE_TIMEOUT_S", "120.0"))
+    # Guarded parse: a garbage env value falls back to the default rather than killing
+    # the guest agent before serve_warm even starts.
+    _raw_idle = os.environ.get("BLASTBOX_WARM_IDLE_TIMEOUT_S", "").strip()
+    try:
+        idle_timeout_s = float(_raw_idle) if _raw_idle else 120.0
+    except ValueError:
+        _log.warning("invalid BLASTBOX_WARM_IDLE_TIMEOUT_S=%r; using 120.0", _raw_idle)
+        idle_timeout_s = 120.0
     rc = serve_warm(
         engine,
         control=control,
         limits=Limits.from_env(),
         idle_timeout_s=idle_timeout_s,
     )
+    # NOTE: after serve_warm returns (job done OR its own idle_timeout), the guest does
+    # NOT exit — it blocks until the host SIGKILLs the slot. So slot lifetime is entirely
+    # host-reaper-controlled (pool warm_size/ceiling + release/health/stop); the idle
+    # env above does not bound a warm slot's life. A warm IDLE slot holds its firecracker
+    # process + a COW share of the (single) /dev/shm base mem until the host reaps it —
+    # bounded by warm_size, but there is no idle-TTL reaper. Budget RAM via warm_size.
     _log.info("serve_warm returned rc=%s; idle until reap", rc)
     # One job per disposable VM — block until the host reaps the slot.
     while True:
