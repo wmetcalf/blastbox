@@ -6,10 +6,14 @@ Selection order (auto mode):
    policy + namespace isolation + strict rlimits.
 2. ``bwrap`` — bubblewrap user-namespace sandbox; good isolation without
    nsjail.
-3. ``container`` — runs subprocesses directly, trusting the enclosing OCI
+3. ``nono`` — Landlock capability sandbox; filesystem + network containment
+   WITHOUT user namespaces (runs where bwrap/nsjail can't). ``secure == False``
+   (no seccomp / namespaces), so auto-mode only reaches it under
+   ``BLASTBOX_WARN_ON_INSECURE``; otherwise an explicit ``BLASTBOX_SANDBOX=nono``.
+4. ``container`` — runs subprocesses directly, trusting the enclosing OCI
    container for isolation.  Always selected inside a Docker/OCI container.
 
-Override with ``BLASTBOX_SANDBOX={nsjail,bwrap,container}``.
+Override with ``BLASTBOX_SANDBOX={nsjail,bwrap,nono,container}``.
 
 In auto mode an insecure backend (``secure == False``) is refused unless
 ``BLASTBOX_WARN_ON_INSECURE=1``.  In forced mode the same rule applies
@@ -32,7 +36,11 @@ from blastbox.worker.sandbox.container import ContainerSandbox
 _log = logging.getLogger("blastbox.worker.sandbox")
 
 # All known backend names in preferred order for auto selection on a bare-metal host.
-_ALL_BACKENDS = ("nsjail", "bwrap", "container")
+# `nono` (Landlock, no user namespaces) sits after bwrap/nsjail as the fallback for
+# hosts where namespace sandboxes can't run; it is `secure=False` (no seccomp/ns) so
+# auto-mode only reaches it under BLASTBOX_WARN_ON_INSECURE — otherwise an explicit
+# opt-in via BLASTBOX_SANDBOX=nono.
+_ALL_BACKENDS = ("nsjail", "bwrap", "nono", "container")
 
 # Backends preferred inside a container (skip namespace-based backends).
 _CONTAINER_BACKENDS = ("container",)
@@ -80,6 +88,9 @@ def _make_backend(
     if name == "nsjail":
         from blastbox.worker.sandbox.nsjail import NsjailSandbox
         return NsjailSandbox()
+    if name == "nono":
+        from blastbox.worker.sandbox.nono import NonoSandbox
+        return NonoSandbox()
     raise SandboxUnavailable(f"unknown backend: {name!r}")
 
 

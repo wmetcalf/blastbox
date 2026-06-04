@@ -86,6 +86,41 @@ def test_select_sandbox_env_override_bwrap(monkeypatch, tmp_path: Path) -> None:
     assert sb.name == "bwrap"
 
 
+def test_select_sandbox_env_override_nono(monkeypatch, tmp_path: Path) -> None:
+    """BLASTBOX_SANDBOX=nono forces the nono backend (wiring test, no real nono).
+
+    nono is secure=False (no seccomp/namespaces), so forcing it also needs
+    BLASTBOX_WARN_ON_INSECURE. The smoketest runs /usr/bin/true through nono — we
+    inject a NonoSandbox with a fake Popen so the test needs neither nono nor Landlock.
+    """
+    from blastbox.worker.sandbox.nono import NonoSandbox
+
+    monkeypatch.setenv("BLASTBOX_SANDBOX", "nono")
+    monkeypatch.setenv("BLASTBOX_WARN_ON_INSECURE", "1")
+
+    class _OkProc:
+        returncode = 0
+        pid = 1
+
+        def communicate(self, timeout=None):
+            return b"", b""
+
+    import blastbox.worker.sandbox.detect as detect_mod
+
+    def _patched(name, *, warn_on_insecure, status_path):
+        assert name == "nono"
+        return NonoSandbox(
+            nono_bin="/usr/bin/true",
+            state_dir=tmp_path / "nono-state",
+            popen=lambda *a, **k: _OkProc(),
+        )
+
+    monkeypatch.setattr(detect_mod, "_make_backend", _patched)
+    sb = select_sandbox(_status_path=tmp_path / "unused")
+    assert isinstance(sb, NonoSandbox)
+    assert sb.name == "nono"
+
+
 def test_select_sandbox_env_override_nsjail(monkeypatch, tmp_path: Path) -> None:
     """BLASTBOX_SANDBOX=nsjail forces nsjail backend."""
     import shutil
