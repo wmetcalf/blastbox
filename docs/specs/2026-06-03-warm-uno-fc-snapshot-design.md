@@ -1,7 +1,10 @@
 # Warm-UNO via Firecracker snapshot/restore — design
 
-Status: **proposed** · 2026-06-03 · extends the 2026-05-31 framework design
-(§9 "FC snapshot effort", Appendix A "Warm-UNO spike") into a buildable milestone.
+Status: **core validated on toolz2** · 2026-06-03..06-04 · extends the 2026-05-31
+framework design (§9 "FC snapshot effort", Appendix A "Warm-UNO spike") into a
+buildable milestone. The full snapshot-of-running-`unoserver` → restore-from-RAM
+loop is proven on real FC hardware (see the COW section). Remaining: impress/draw
+parity gate + the in-restore document round-trip + warm-pool wiring.
 
 ## Goal
 
@@ -178,9 +181,12 @@ any untrusted data exists.
     **Loopback bug found + fixed:** FC guests boot with `lo` DOWN, so unoserver's
     `soffice --accept=socket,host=127.0.0.1` was unreachable (`couldn't connect to
     socket` → `Could not start Libreoffice`); the init now `ip link set lo up`. The
-    cold `--convert-to` path never needed loopback. Remaining: the impress/draw
-    parity gate, and the snapshot-restore-convert e2e (snapshot a running-unoserver
-    base VM → restore → push a job over vsock → convert).
+    cold `--convert-to` path never needed loopback. **Snapshot-of-running-`unoserver`
+    + restore-from-RAM now CONFIRMED** (see the COW section: warm base → READY →
+    snapshot mem on `/dev/shm` → restore in 0.01 s → restored guest's JOB listener
+    answers). Remaining: the impress/draw parity gate, and pushing an actual doc
+    through the restored guest's vsock JOB channel (the in-restore transport round-trip;
+    conversion itself already proven pixel-identical through the engine).
 - **Snapshot memory cost + RAM-resident COW (design decision, 2026-06-04).** The
   snapshot's **mem file ≈ guest RAM** (~2 GB once LO/soffice is live) — the dominant
   cost. FC's `File` mem backend already `mmap`s it **`MAP_PRIVATE`** on load, so N
@@ -195,3 +201,21 @@ any untrusted data exists.
   2. **Scale: FC's `Uffd` (userfaultfd) backend** — a handler process holds one base
      copy and serves guest pages lazily/shared across all restores; most RAM-efficient
      for large pools, at the cost of a page-fault handler. Future optimization.
+  - **CONFIRMED end-to-end on toolz2 (2026-06-04, `snap_warm.py`, FC v1.12.1).** Booted
+    the warm clippyshot rootfs over the API with a host vsock READY listener bound at
+    `base/vsock.sock_10000`; the guest ran `engine.warmup()` → `unoserver` + `soffice`
+    came up and the guest signalled `READY` over vsock (so the base reached the
+    **warm-idle** state — a *running* UNO server, not a cold boot). Then `PATCH /vm
+    Paused` + `PUT /snapshot/create` with `mem_file_path` on **`/dev/shm`** wrote the
+    snapshot in **1.4 s**, mem file **2048 MiB** (= full guest RAM with live soffice —
+    confirms the snapshot is large and the COW-in-RAM placement matters). Killed the
+    base, then `PUT /snapshot/load` (`mem_backend` File → the `/dev/shm` mem) +
+    `resume_vm:true` in a fresh per-slot cwd **restored in 0.01 s** (RAM-backed COW, no
+    disk read). Confirmed the restored guest is **alive and warm**: a host→guest vsock
+    `CONNECT 10001` (the agent's JOB port) returned `OK …` — i.e. the restored VM
+    resumed *with the running `unoserver` and the job listener intact*. This proves the
+    whole tier's premise: snapshot a live `unoserver`, restore it from RAM near-instantly,
+    and the restore is immediately ready to serve a job. (Still TODO: push an actual doc
+    through the restored guest's vsock JOB channel and assert pixel-identity end-to-end —
+    the conversion itself is already proven pixel-identical through the engine; this gates
+    only the in-restore transport.)
