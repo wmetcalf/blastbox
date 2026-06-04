@@ -24,6 +24,14 @@ RUN cp /tmp/engine.py \
     && rm /tmp/engine.py \
     && /opt/clippyshot/bin/python -c 'import clippyshot.engine'   # fail build if it cannot import
 
+# Warm-UNO: bundle unoserver so the engine's warmup() can run a persistent soffice
+# UNO server (the warm conversion path; see guest.clippyshot.env CLIPPYSHOT_WARM_UNO).
+# unoserver drives the base image's LibreOffice 25.8 over UNO. NOTE: unoserver needs
+# LibreOffice's python-uno bridge importable from this venv — validate at image
+# build (it may require --python pointing at LO's interpreter, or exposing LO's
+# site-packages); the warm path fails closed to cold if unoserver can't start.
+RUN /opt/clippyshot/bin/pip install --no-cache-dir 'unoserver>=3.6,<4'
+
 # blastbox FC guest agent + init + per-rootfs config.
 COPY deploy/firecracker/run_guest.py /opt/blastbox/run_guest.py
 COPY deploy/firecracker/engines.py /opt/blastbox/engines.py
