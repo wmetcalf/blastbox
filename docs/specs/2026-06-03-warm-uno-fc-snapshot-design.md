@@ -181,5 +181,17 @@ any untrusted data exists.
     cold `--convert-to` path never needed loopback. Remaining: the impress/draw
     parity gate, and the snapshot-restore-convert e2e (snapshot a running-unoserver
     base VM → restore → push a job over vsock → convert).
-- **Snapshot memory cost** — each restored VM holds a full copy-on-write of the
-  snapshot memory; size the pool against host RAM.
+- **Snapshot memory cost + RAM-resident COW (design decision, 2026-06-04).** The
+  snapshot's **mem file ≈ guest RAM** (~2 GB once LO/soffice is live) — the dominant
+  cost. FC's `File` mem backend already `mmap`s it **`MAP_PRIVATE`** on load, so N
+  restores **share the read-only base pages** + copy-on-write only what each VM
+  dirties → cost is *base once + Σ(dirtied working set)*, NOT N × full. Two levels:
+  1. **Default: put the mem file on `tmpfs` (`/dev/shm`).** Pins the base in RAM —
+     zero disk I/O on any restore (incl. the first), still COW-shared. `SnapshotManager`
+     should write `warm.mem` to a tmpfs path; `restore_from_snapshot`'s `mem_backend`
+     points there. Cost: ~one guest-RAM of RAM held for the warm baseline (cheap for
+     a pool). Without this, the base lives only in the page cache and can be evicted
+     under pressure → re-read from disk.
+  2. **Scale: FC's `Uffd` (userfaultfd) backend** — a handler process holds one base
+     copy and serves guest pages lazily/shared across all restores; most RAM-efficient
+     for large pools, at the cost of a page-fault handler. Future optimization.

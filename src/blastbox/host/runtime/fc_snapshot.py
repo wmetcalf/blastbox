@@ -134,8 +134,14 @@ class SnapshotManager:
         launcher: SnapshotLauncher,
         *,
         ready_timeout_s: float = 120.0,
+        mem_dir: Path | None = None,
     ) -> None:
         self._base_dir = Path(base_dir)
+        # The mem file dominates the snapshot (~guest RAM). Point mem_dir at tmpfs
+        # (/dev/shm) so every restore reads the COW-shared base from RAM, not disk
+        # (FC mmaps it MAP_PRIVATE → base shared, per-VM copy-on-write). Defaults to
+        # base_dir (page-cache-backed) when not set.
+        self._mem_dir = Path(mem_dir) if mem_dir is not None else self._base_dir
         self._launcher = launcher
         self._ready_timeout_s = ready_timeout_s
         self._artifact: SnapshotArtifact | None = None
@@ -151,8 +157,9 @@ class SnapshotManager:
         if self._artifact is not None:
             return self._artifact
         snap = self._base_dir / "warm.snapshot"
-        mem = self._base_dir / "warm.mem"
+        mem = self._mem_dir / "warm.mem"
         self._base_dir.mkdir(parents=True, exist_ok=True)
+        self._mem_dir.mkdir(parents=True, exist_ok=True)
         boot = self._launcher.boot_base()
         try:
             boot.wait_ready(self._ready_timeout_s)

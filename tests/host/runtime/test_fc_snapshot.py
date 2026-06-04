@@ -194,3 +194,13 @@ def test_restore_kills_handle_on_load_failure(tmp_path):
     with pytest.raises(SnapshotRestoreError):
         mgr.restore("slot-x")
     assert handle.killed is True
+
+
+def test_build_puts_mem_on_separate_mem_dir(tmp_path):
+    """mem_dir (e.g. tmpfs /dev/shm) holds the big mem file; snapshot stays in base."""
+    base = tmp_path / "base"
+    memdir = tmp_path / "ram"  # stand-in for /dev/shm
+    art = SnapshotManager(base, FakeLauncher(), mem_dir=memdir).build()
+    assert art.snapshot_path == base / "warm.snapshot"
+    assert art.mem_path == memdir / "warm.mem"  # mem on the RAM-backed dir
+    assert memdir.is_dir()
