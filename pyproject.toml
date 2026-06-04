@@ -68,3 +68,8 @@ blastbox = ["py.typed"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-ra -q"
+markers = [
+    "integration: needs sandbox + soffice (run in the image)",
+    "docker: exercises the built Docker image",
+    "perf: performance benchmark gate; needs a benchmarkable host (skipped otherwise)",
+]
