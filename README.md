@@ -30,15 +30,20 @@ blastbox/
 │   ├── ingress     FastAPI API + CLI: upload, status, artifact serving, /metrics
 │   ├── jobs/       JobStore protocol + memory / sql / redis backends + retention
 │   ├── dispatch    claim → launch disposable worker → validate output → serve   (+ warm path)
-│   ├── runtime/    runc/runsc selection (fail-closed) + hardened worker `docker run` argv
-│   ├── pool        warm slot pool (one-doc-per-slot, never-reuse)
+│   ├── runtime/    backend select (fail-closed): hardened `docker run` (runc/runsc)
+│   │               OR a Firecracker microVM per slot (AF_VSOCK warm protocol; the
+│   │               engine defines warmup — a JVM engine via CRaC, with guest-console
+│   │               CPU-feature-mismatch detect + a probe; a non-JVM engine without)
+│   ├── pool        warm slot pool (one-doc-per-slot, never-reuse; burst + health loops)
 │   ├── trust       output-trust validator — re-seals worker output from disk
 │   └── observability
 └── worker/     LAYER 2 — worker SDK (runs inside the disposable worker) — lean core
     ├── engine      the seam: detect / warmup / detonate
     ├── harness     read input → detonate → seal → write metadata.json
-    ├── sandbox/    in-process hardening self-check + env-stripped subprocess execution
-    └── warm        service lifecycle: boot → warmup → one job → exit
+    ├── sandbox/    auto-selected in-process hardening: nsjail / bwrap / container
+    │               (BLASTBOX_SANDBOX override; container backend inside an OCI host)
+    ├── warm        service lifecycle: boot → warmup → one job → exit
+    └── fc_warm / fc_guest   Firecracker guest: AF_VSOCK control plane + warm protocol
 ```
 
 The host never imports an engine; it depends only on the **contract**. An engine never handles
@@ -109,11 +114,35 @@ disposable worker for it; `GET /v1/jobs/{id}/artifacts/{artifact_id}` serves val
 ## Status
 
 Core framework complete and adversarially tested: contract + full host orchestrator + worker SDK
-(harness, container sandbox, warm protocol) + warm pool + warm dispatch. Proven end-to-end on two real
-engines.
+(harness, sandbox self-check, warm protocol) + warm pool (burst + health loops) + warm dispatch.
 
-Roadmap: host-native `bwrap`/`nsjail` sandbox backends; Firecracker microVM + snapshot runtime; the
-warm-pool burst/health loops.
+**Two runtime backends**, selected fail-closed: hardened `docker run` (runc/runsc) and a **Firecracker
+microVM per slot** (AF_VSOCK warm protocol — *the engine* defines what "warmup" means, so the tier is
+engine-agnostic). **Three in-process sandbox backends**, auto-selected (`nsjail` → `bwrap` → `container`;
+`container` inside an OCI host) with a `BLASTBOX_SANDBOX` override.
+
+Warmup is per-engine: the **JVM/Tika** engine warms via **CRaC** (checkpoint/restore), and for that path
+the Firecracker runtime adds guest-console **CPU-feature-mismatch detection** + a one-shot compatibility
+**probe**. The **LibreOffice**
+engine has **no CRaC** (it isn't a JVM): its FC slot is a pre-spawned microVM that still cold-starts
+`soffice --convert-to` per job — hiding that ~750 ms boot is the warm-UNO roadmap below.
+
+Proven end-to-end — live on a Firecracker host — with two real, language-diverse engines, both in the
+**FC warm-pool tier**: a **JVM + Tika** recursive extractor (CRaC warm-restore) and a **Python +
+LibreOffice** rasterizer (cold-boot, no CRaC; `deploy/firecracker/Dockerfile.clippyshot`). The
+LibreOffice engine also runs standalone on the **docker + sandbox** tier (runc/runsc).
+
+**Roadmap — warm-UNO via FC snapshot/restore** (designed + planned; build not started). Capture a warm
+in-guest `unoserver` (soffice `--accept` on a local UDS) in a Firecracker memory snapshot built
+*first-boot on the host*, then restore→convert→destroy per job — the "FC but not CRaC" warm route,
+hiding the ~750 ms soffice boot. A 2026-05-31 spike proved warm-UNO output pixel/byte-identical to cold
+`--convert-to` across docx/odt/csv/xlsx (~4–7× soffice-stage win once the boot is hidden). Everything UNO
+stays in-guest; only the existing vsock + output-disk channels cross the boundary. Net-new work lands in
+the FC runtime (API-socket restore path, `create_snapshot`/`restore_from_snapshot`, per-restore unique
+vsock + fresh output disk); bare-metal `bwrap`/`nsjail` stays cold. Design:
+`docs/specs/2026-06-03-warm-uno-fc-snapshot-design.md` · plan:
+`docs/plans/2026-06-03-warm-uno-fc-snapshot.md` · original spike:
+`docs/specs/2026-05-31-detonation-framework-design.md` Appendix A.
 
 ## License
 
