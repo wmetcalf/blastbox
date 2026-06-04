@@ -205,8 +205,18 @@ any untrusted data exists.
 
      Wired in `fc_snapshot.py`: `resolve_mem_dir()` reads the env, and
      `SnapshotManager.from_env(base, launcher)` constructs the manager with the
-     resolved `mem_dir` (the pool wiring should use `from_env`). An explicit
-     `mem_dir=` arg still short-circuits env resolution (tests, direct callers).
+     resolved `mem_dir`. An explicit `mem_dir=` arg still short-circuits env
+     resolution (tests, direct callers).
+
+     **Pool wiring DONE (`fc_snapshot_runtime.py`).** `SnapshotSlotRuntime` is a
+     `SlotRuntime` whose `spawn()` builds the warm snapshot once (via
+     `SnapshotManager.from_env`, so the toggle is honored) then restores per slot;
+     `is_ready`/`is_alive`/`reap` + the warm-path seam (`host_warm_control`,
+     `materialize_warm_output`) mirror the cold `FirecrackerSlotRuntime` so the
+     dispatcher's per-slot job flow is unchanged. `select_snapshot_runtime()` builds
+     it (waiting for the base VM's READY via `VsockReadySignal` before snapshotting).
+     Gated opt-in: `BLASTBOX_POOL_RUNTIME=firecracker` + `BLASTBOX_POOL_WARM_SNAPSHOT=1`
+     → `build_warm_pool` routes the FC tier's spawn op through the snapshot runtime.
   2. **Scale: FC's `Uffd` (userfaultfd) backend** — a handler process holds one base
      copy and serves guest pages lazily/shared across all restores; most RAM-efficient
      for large pools, at the cost of a page-fault handler. Future optimization.
