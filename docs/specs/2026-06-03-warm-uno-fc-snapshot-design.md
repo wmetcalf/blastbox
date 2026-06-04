@@ -134,6 +134,16 @@ any untrusted data exists.
   snapshotted while *idle* (no in-flight connection) restores cleanly and accepts a
   fresh host connection per restore. This is the highest-risk unknown; validate
   early with a throwaway snapshot before building the full tier.
+  - **Phase 0 finding (2026-06-04, from the FC v1.12.1 embedded API schema, not yet
+    runtime-confirmed):** `PUT /snapshot/load` (`LoadSnapshotConfig`) exposes
+    `snapshot_path`, `mem_backend{backend_type,backend_path}`, `enable_diff_snapshots`,
+    `network_overrides`, `resume_vm` — **there is NO vsock-uds override**. So the host
+    vsock UDS path is baked into the snapshot and cannot be remapped in the load body.
+    Implication: per-restore vsock uniqueness must come from the *environment*, not the
+    load config — run each restore in a **per-slot working dir / chroot** (jailer-style)
+    so the same baked-in `uds_path` resolves to a distinct per-slot socket. The Phase 0
+    spike must confirm (a) FC re-creates the baked uds relative to cwd/chroot on resume,
+    and (b) a fresh host connect to that per-slot path round-trips after restore.
 - **Output-disk remap on restore.** Confirm FC lets a restored VM attach a fresh
   per-slot output drive (the snapshot was taken with a base drive); decide whether
   the output disk is excluded from the snapshot and attached at restore, or remapped.
