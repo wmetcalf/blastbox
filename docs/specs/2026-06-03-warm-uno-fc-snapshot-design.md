@@ -217,6 +217,28 @@ any untrusted data exists.
      it (waiting for the base VM's READY via `VsockReadySignal` before snapshotting).
      Gated opt-in: `BLASTBOX_POOL_RUNTIME=firecracker` + `BLASTBOX_POOL_WARM_SNAPSHOT=1`
      → `build_warm_pool` routes the FC tier's spawn op through the snapshot runtime.
+
+     **In-restore doc round-trip GATE — run on toolz2 (2026-06-04, `rt_roundtrip.py`,
+     drives the real `SnapshotSlotRuntime`).** `spawn()` (boot base → warm `unoserver`
+     → READY → snapshot mem on `/dev/shm` → restore) completed in **9.4 s**;
+     `is_ready`/`is_alive` True; `host_warm_control().signal_go(csv)` → guest received
+     the doc (`job_received bytes=43`) → **GO→DONE in 0.7 s, status `ok`**. So the vsock
+     job round-trip into a restored warm VM works. The gate surfaced two real bugs the
+     CONNECT-liveness probe could not:
+     - **Output-disk ext4 corruption on restore (FIXED, host-side).** The base VM
+       snapshots with its outdisk **mounted** → the guest's ext4 metadata is in guest
+       RAM. Attaching a freshly-`mkfs`'d per-slot disk on restore → different
+       UUID/checksums → `EXT4-fs error: Directory block failed checksum`. Fix:
+       `FcSnapshotLauncher.restore_in` now **copies the base outdisk image** (empty at
+       READY, snapshot-time-consistent) instead of fresh-`mkfs` — writes still land on
+       the isolated per-slot copy. (`copy_outdisk` dep; one 256 MiB copy per restore.)
+     - **Stale `clippyshot:dev` base (rootfs rebuild, NOT a code bug).** The engine
+       adapter does `from clippyshot.rasterizer import build_rasterizer`; the warm
+       rootfs's `clippyshot:dev` predates that symbol (it landed with the PDFium
+       default on `feat/warm-uno-worker`) → `ImportError` in `detonate()`. Fix: rebuild
+       `clippyshot:dev` from the current branch, then rebuild the warm FC rootfs.
+     Re-running the gate after both fixes is the remaining step to a green
+     pixel-identity round-trip.
   2. **Scale: FC's `Uffd` (userfaultfd) backend** — a handler process holds one base
      copy and serves guest pages lazily/shared across all restores; most RAM-efficient
      for large pools, at the cost of a page-fault handler. Future optimization.

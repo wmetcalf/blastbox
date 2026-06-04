@@ -16,6 +16,7 @@ cwd before this is enabled.
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -119,6 +120,13 @@ def _default_make_outdisk(path: Path) -> None:
     make_ext4(path, _DEFAULT_OUTDISK_MIB)
 
 
+def _default_copy_outdisk(src: Path, dst: Path) -> None:
+    # Copy the base outdisk image byte-for-byte (preserves the exact ext4 the guest
+    # snapshotted with). copyfile, not copy2 — metadata (mtime/mode) is irrelevant and
+    # copyfile is marginally cheaper. Injected in tests.
+    shutil.copyfile(src, dst)
+
+
 class FcSnapshotLauncher:
     """Spawns ``firecracker --api-sock`` processes for snapshot build + restore.
 
@@ -135,6 +143,7 @@ class FcSnapshotLauncher:
         api_factory: Callable[[str], Any] = FcApiClient,
         wait_socket: Callable[[Path], None] | None = None,
         make_outdisk: Callable[[Path], None] = _default_make_outdisk,
+        copy_outdisk: Callable[[Path, Path], None] = _default_copy_outdisk,
         ready_check_factory: Callable[[Path], Callable[[float], None]] | None = None,
     ) -> None:
         self._cfg = cfg
@@ -143,6 +152,7 @@ class FcSnapshotLauncher:
         self._api_factory = api_factory
         self._wait_socket = wait_socket or (lambda p: _default_wait_socket(p))
         self._make_outdisk = make_outdisk
+        self._copy_outdisk = copy_outdisk
         self._ready_check_factory = ready_check_factory
 
     def _spawn(self, workdir: Path):
@@ -188,7 +198,16 @@ class FcSnapshotLauncher:
     def restore_in(self, slot_workdir: Path):
         """Spawn a fresh firecracker in ``slot_workdir`` for a snapshot restore. The
         caller (SnapshotManager) issues load+resume; the relative vsock/outdisk
-        resolve under this cwd → per-slot uniqueness."""
+        resolve under this cwd → per-slot uniqueness.
+
+        The per-slot output disk is a **copy of the base outdisk**, NOT a fresh mkfs.
+        The base VM snapshotted with its outdisk mounted, so the guest's ext4 metadata
+        (superblock, journal, dir checksums) is captured in guest RAM. A fresh mkfs has
+        different metadata/UUID → the restored guest's cached state mismatches the disk
+        → ``EXT4-fs error: Directory block failed checksum`` corruption. Copying the
+        snapshot-time base image (empty at READY) keeps the (disk, guest-RAM) pair
+        consistent; writes still land on the isolated per-slot copy (one job per slot)."""
         proc, api = self._spawn(Path(slot_workdir))
-        self._make_outdisk(Path(slot_workdir) / REL_OUTDISK)  # fresh per-slot disk
+        base_outdisk = self._base_dir / "base" / REL_OUTDISK
+        self._copy_outdisk(base_outdisk, Path(slot_workdir) / REL_OUTDISK)
         return _Handle(proc, api, str(Path(slot_workdir) / REL_VSOCK))

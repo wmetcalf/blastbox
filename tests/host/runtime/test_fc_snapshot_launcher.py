@@ -106,9 +106,10 @@ def test_boot_base_uses_api_socket_and_runs_full_config(tmp_path):
     assert handle.vsock_uds == str(tmp_path / "snap" / "base" / REL_VSOCK)
 
 
-def test_restore_in_spawns_in_slot_cwd_with_fresh_outdisk(tmp_path):
+def test_restore_in_spawns_in_slot_cwd_and_copies_base_outdisk(tmp_path):
     spawned = []
     made = []
+    copied = []
     launcher = FcSnapshotLauncher(
         FakeCfg(),
         tmp_path / "snap",
@@ -116,6 +117,7 @@ def test_restore_in_spawns_in_slot_cwd_with_fresh_outdisk(tmp_path):
         api_factory=FakeApi,
         wait_socket=lambda p: None,
         make_outdisk=lambda p: made.append(Path(p)),
+        copy_outdisk=lambda src, dst: copied.append((Path(src), Path(dst))),
     )
     slot = tmp_path / "snap" / "slots" / "slot-7"
     handle = launcher.restore_in(slot)
@@ -123,7 +125,12 @@ def test_restore_in_spawns_in_slot_cwd_with_fresh_outdisk(tmp_path):
     _, cwd = spawned[0]
     assert cwd == str(slot)  # firecracker runs in the per-slot cwd
     assert handle.vsock_uds == str(slot / REL_VSOCK)
-    assert made == [slot / REL_OUTDISK]  # fresh per-slot output disk
+    # The per-slot disk is a COPY of the base outdisk (snapshot-time-consistent ext4),
+    # NOT a fresh mkfs — a fresh mkfs corrupts the restored guest's cached ext4 state.
+    assert made == []  # no fresh mkfs on restore
+    assert copied == [
+        (tmp_path / "snap" / "base" / REL_OUTDISK, slot / REL_OUTDISK)
+    ]
 
 
 def test_spawn_kills_proc_when_api_socket_never_appears(tmp_path):
