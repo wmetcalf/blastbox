@@ -287,3 +287,14 @@ any untrusted data exists.
       (the disk-backed guest page-faults its 2 GB working set off disk mid-convert;
       tmpfs faults hit RAM). When the cache is warm, disk ≈ RAM — tmpfs just *guarantees*
       residency (no first-touch read, no eviction), which is why it's a per-host toggle.
+    - **Percentiles (`pctbench.py`, n=12 cold / n=20 restore):** per-slot acquire —
+      cold-boot→warm-ready **p50 7.76 s / p90 8.0 s / p99 10 s**; warm-restore (RAM)
+      **p50 575 ms / p90 596 ms / p99 799 ms** (tight tail). **≈13.5× faster at p50.**
+      The restore distribution is nearly flat (p50→p90 +4 %); the conversion itself is
+      the same on both paths, so the per-job win is the acquire. The 3 s settle is a
+      conservative safety margin (`BLASTBOX_SNAPSHOT_SETTLE_S`), tunable downward.
+  - **Impress/draw parity gate — PASS (`parity.sh`, clippyshot-fc-warm image, LO 26.x).**
+    Warm `unoconvert` (`--filter impress_pdf_Export` / `draw_pdf_Export`) vs cold
+    `soffice --convert-to pdf:<filter>`, rasterized at 150 DPI, per-page md5: **pptx,
+    odp, ppt (impress) and odg (draw) are all pixel-identical warm==cold.** With the
+    earlier calc/csv proof, the warm path is validated across calc, impress, and draw.
