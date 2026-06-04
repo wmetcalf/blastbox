@@ -170,7 +170,16 @@ any untrusted data exists.
     started `unoserver` → ready; the runner's warm fast-path converted a csv via
     `unoconvert` with `calc_pdf_Export` (my `pdf_filter_for_label` drove the filter).
     **Warm vs cold output is PIXEL-IDENTICAL** (page-1 render md5 equal,
-    `14797`-byte PDFs both). Remaining: the impress/draw (pptx/odp) parity gate, and
-    the full FC warm-pool + snapshot e2e (engine-adapter staging picking up `uno.py`).
+    `14797`-byte PDFs both).
+  - **Warm worker boots + warms in a REAL FC microVM (2026-06-04):** built the FC
+    clippyshot rootfs (the 3 warm files staged + python3-uno + system unoserver +
+    iproute2) and booted it; the guest agent ran `engine.warmup()` →
+    `INFO:unoserver: Starting unoserver 3.6 … Started. Server PID: 109` as uid 10001.
+    **Loopback bug found + fixed:** FC guests boot with `lo` DOWN, so unoserver's
+    `soffice --accept=socket,host=127.0.0.1` was unreachable (`couldn't connect to
+    socket` → `Could not start Libreoffice`); the init now `ip link set lo up`. The
+    cold `--convert-to` path never needed loopback. Remaining: the impress/draw
+    parity gate, and the snapshot-restore-convert e2e (snapshot a running-unoserver
+    base VM → restore → push a job over vsock → convert).
 - **Snapshot memory cost** — each restored VM holds a full copy-on-write of the
   snapshot memory; size the pool against host RAM.
