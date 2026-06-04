@@ -6,7 +6,8 @@ from __future__ import annotations
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from blastbox.bench.scenarios import BenchConfig
@@ -44,31 +45,40 @@ def cfg_timeout(cfg: BenchConfig) -> int:
     return int(raw)
 
 
-def soffice_runner(cfg: BenchConfig) -> Callable[[str], None]:
-    """Return ``run_one(backend)`` that converts a fixture under that backend.
+@contextmanager
+def soffice_runner(cfg: BenchConfig) -> Iterator[Callable[[str], None]]:
+    """Context manager yielding ``run_one(backend)``; cleans up its scratch on exit.
 
-    Uses the blastbox sandbox protocol for real backends; ``none`` runs soffice
-    directly. Each call uses a fresh per-run output dir."""
+    ``run_one`` converts a fixture under the named backend (the blastbox sandbox
+    protocol for real backends; ``none`` runs soffice directly). It reuses a single
+    output dir, recreated each call, so repeated runs don't accumulate temp dirs; the
+    whole scratch tree is removed when the ``with`` block exits."""
     tmp = Path(tempfile.mkdtemp(prefix="blastbox-bench-"))
-    inp = tmp / "in.txt"
-    inp.write_text("blastbox bench fixture\nsecond line\n")
+    try:
+        inp = tmp / "in.txt"
+        inp.write_text("blastbox bench fixture\nsecond line\n")
+        out = tmp / "out"
 
-    def run_one(backend: str) -> None:
-        out = Path(tempfile.mkdtemp(prefix="bench-out-", dir=tmp))
-        argv = soffice_argv(str(inp), str(out))
-        if backend == "none":
-            subprocess.run(argv, capture_output=True, timeout=cfg_timeout(cfg))
-            return
-        from blastbox.worker.sandbox.base import Mount, SandboxRequest
-        from blastbox.worker.sandbox.detect import select_sandbox
+        def run_one(backend: str) -> None:
+            if out.exists():
+                shutil.rmtree(out)
+            out.mkdir()
+            argv = soffice_argv(str(inp), str(out))
+            if backend == "none":
+                subprocess.run(argv, capture_output=True, timeout=cfg_timeout(cfg))
+                return
+            from blastbox.worker.sandbox.base import Mount, SandboxRequest
+            from blastbox.worker.sandbox.detect import select_sandbox
 
-        sb = select_sandbox(backend=backend)
-        sb.run(
-            SandboxRequest(
-                argv=argv,
-                ro_mounts=[Mount(source=inp, target=inp)],
-                rw_mounts=[Mount(source=out, target=out, read_only=False)],
+            sb = select_sandbox(backend=backend)
+            sb.run(
+                SandboxRequest(
+                    argv=argv,
+                    ro_mounts=[Mount(source=inp, target=inp)],
+                    rw_mounts=[Mount(source=out, target=out, read_only=False)],
+                )
             )
-        )
 
-    return run_one
+        yield run_one
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

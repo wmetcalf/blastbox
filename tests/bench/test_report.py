@@ -24,3 +24,14 @@ def test_to_table_renders_rows_and_overhead():
     assert "none" in txt and "nono" in txt
     assert "p50" in txt
     assert "+4.0%" in txt  # nono overhead vs the none baseline
+
+
+def test_empty_sample_label_does_not_crash_render():
+    r = Report(scenario="sandbox.overhead")
+    r.add("none", [100.0] * 5)
+    r.add("nono", [])  # a failed/insufficient measurement (no samples)
+    j = to_json(r)
+    nono_row = next(row for row in j["results"] if row["label"] == "nono")
+    assert nono_row["stats"] is None
+    txt = to_table(r, baseline="none")
+    assert "(no samples)" in txt and "none" in txt

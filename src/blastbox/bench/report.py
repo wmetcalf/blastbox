@@ -9,24 +9,36 @@ if TYPE_CHECKING:
 
 
 def to_json(report: Report) -> dict[str, Any]:
-    """Stable JSON schema for CLI --json output + CI baselines."""
-    results = [
-        {"label": label, "stats": asdict(report.summary(label))}
-        for label in report.labels()
-    ]
+    """Stable JSON schema for CLI --json output + CI baselines.
+
+    A label with no samples (a failed/insufficient measurement) renders with
+    ``stats: null`` rather than crashing on ``summarize`` of an empty list."""
+    results = []
+    for label in report.labels():
+        stats = asdict(report.summary(label)) if report.samples(label) else None
+        results.append({"label": label, "stats": stats})
     return {"scenario": report.scenario, "results": results}
 
 
 def to_table(report: Report, *, baseline: str | None = None) -> str:
-    """Human-readable table; if ``baseline`` is given, append overhead-vs-baseline."""
+    """Human-readable table; if ``baseline`` is given, append overhead-vs-baseline.
+
+    Empty-sample labels render as ``(no samples)`` instead of crashing."""
     labels = report.labels()
-    base_p50 = report.summary(baseline).p50 if baseline in labels else None
+    base_p50 = (
+        report.summary(baseline).p50
+        if baseline in labels and report.samples(baseline)
+        else None
+    )
     lines = [f"=== {report.scenario} ==="]
     header = f"  {'label':<14} {'p50':>9} {'p90':>9} {'p99':>9} {'n':>4}"
     if base_p50 is not None:
         header += f" {'overhead':>9}"
     lines.append(header)
     for label in labels:
+        if not report.samples(label):
+            lines.append(f"  {label:<14} {'(no samples)':>34}")
+            continue
         s = report.summary(label)
         row = (
             f"  {label:<14} {s.p50 * 1000:>8.1f}m {s.p90 * 1000:>8.1f}m "

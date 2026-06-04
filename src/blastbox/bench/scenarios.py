@@ -153,9 +153,8 @@ def _sandbox_overhead(cfg: BenchConfig) -> ScenarioResult:
     )
 
     backends = available_sandbox_backends()
-    return _sandbox_overhead_impl(
-        cfg, backends=backends, run_one=soffice_runner(cfg)
-    )
+    with soffice_runner(cfg) as run:
+        return _sandbox_overhead_impl(cfg, backends=backends, run_one=run)
 
 
 def _snapshot_restore_latency_impl(
@@ -199,9 +198,9 @@ def _convert_latency(cfg: BenchConfig) -> ScenarioResult:
     """Conversion wall-time, unsandboxed baseline only (first cut)."""
     from blastbox.bench._workloads import soffice_runner
 
-    run = soffice_runner(cfg)
     report = Report(scenario="convert.latency")
-    samples = measure(lambda: run("none"), runs=cfg.runs, warmup=cfg.warmup)
+    with soffice_runner(cfg) as run:
+        samples = measure(lambda: run("none"), runs=cfg.runs, warmup=cfg.warmup)
     if len(samples) < 3:
         return ScenarioResult(
             report=report,
