@@ -65,11 +65,11 @@ class Report:
         )
 
     def to_table(self, baseline: str | None = None) -> str:
-        from blastbox.bench.report import to_table  # type: ignore[import-not-found]
+        from blastbox.bench.report import to_table
 
         return to_table(self, baseline=baseline)
 
     def to_json(self) -> dict[str, Any]:
-        from blastbox.bench.report import to_json  # type: ignore[import-not-found]
+        from blastbox.bench.report import to_json
 
         return to_json(self)
