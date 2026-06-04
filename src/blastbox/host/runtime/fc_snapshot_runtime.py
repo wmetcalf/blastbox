@@ -19,6 +19,7 @@ host-side via ``rdump_ext4`` (no mount, no root).
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import threading
 import time
@@ -83,7 +84,14 @@ class SnapshotSlotRuntime:
         so the RAM-preload toggle is respected. Injected for testability.
     """
 
-    def __init__(self, cfg: object, manager: SnapshotManager) -> None:
+    def __init__(
+        self,
+        cfg: object,
+        manager: SnapshotManager,
+        *,
+        settle_s: float = 3.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._cfg = cfg
         self._manager = manager
         # cfg.max_extracted_bytes bounds rdump output; fall back to a 512 MiB default
@@ -91,7 +99,15 @@ class SnapshotSlotRuntime:
         self._max_extracted_bytes = int(
             getattr(cfg, "max_extracted_bytes", 512 * 1024 * 1024)
         )
+        # A freshly-restored guest's vsock DATA path isn't ready the instant resume
+        # returns: pushing the job immediately races the device resume and the guest's
+        # recv fails with ENOTCONN (observed on toolz2). Hold the slot WARMING for a
+        # short settle window after restore before is_ready() promotes it, so the host
+        # only pushes a job once the vsock can carry it. Host-side clock (injectable).
+        self._settle_s = settle_s
+        self._clock = clock
         self._handles: dict[str, object] = {}
+        self._restored_at: dict[str, float] = {}
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -116,6 +132,7 @@ class SnapshotSlotRuntime:
 
         with self._lock:
             self._handles[slot_id] = handle
+            self._restored_at[slot_id] = self._clock()
 
         _log.info("snapshot.spawn slot_id=%s workdir=%s", slot_id, slot_workdir)
         return Slot(
@@ -132,10 +149,15 @@ class SnapshotSlotRuntime:
         never re-signals READY. Readiness = the restore process is alive AND FC
         re-created the per-slot vsock socket (the vsock device restored). A dead guest
         agent is surfaced later by the job protocol's GO failing → the pool reaps it."""
-        handle = self._get(slot.slot_id)
+        with self._lock:
+            handle = self._handles.get(slot.slot_id)
+            restored_at = self._restored_at.get(slot.slot_id)
         if handle is None:
             return False
         if not self._proc_alive(handle):
+            return False
+        # Hold WARMING until the post-restore vsock settle window elapses.
+        if restored_at is not None and self._clock() - restored_at < self._settle_s:
             return False
         try:
             return Path(handle.vsock_uds).exists()  # type: ignore[attr-defined]
@@ -154,6 +176,7 @@ class SnapshotSlotRuntime:
         (``warm.snapshot`` + ``warm.mem``) lives OUTSIDE ``slots/`` and is preserved."""
         with self._lock:
             handle = self._handles.pop(slot.slot_id, None)
+            self._restored_at.pop(slot.slot_id, None)
         if handle is not None:
             try:
                 handle.kill()  # type: ignore[attr-defined]
@@ -250,12 +273,15 @@ def select_snapshot_runtime(
         firecracker_available,
     )
 
+    # Post-restore vsock settle window (see SnapshotSlotRuntime); tunable per host.
+    settle_s = float(os.environ.get("BLASTBOX_SNAPSHOT_SETTLE_S", "3.0"))
+
     # An injected manager (tests / custom wiring) bypasses environment probing — the
     # caller owns the launcher + snapshot lifecycle. cfg must then be supplied too.
     if manager is not None:
         if cfg is None:
             cfg = FCConfig.from_env()
-        return SnapshotSlotRuntime(cfg, manager)
+        return SnapshotSlotRuntime(cfg, manager, settle_s=settle_s)
 
     if cfg is None:
         try:
@@ -284,4 +310,4 @@ def select_snapshot_runtime(
         ready_check_factory=_vsock_ready_check_factory,
     )
     manager = SnapshotManager.from_env(base_dir, launcher)
-    return SnapshotSlotRuntime(cfg, manager)
+    return SnapshotSlotRuntime(cfg, manager, settle_s=settle_s)

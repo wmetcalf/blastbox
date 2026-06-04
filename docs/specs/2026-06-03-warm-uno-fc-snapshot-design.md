@@ -223,8 +223,15 @@ any untrusted data exists.
      → READY → snapshot mem on `/dev/shm` → restore) completed in **9.4 s**;
      `is_ready`/`is_alive` True; `host_warm_control().signal_go(csv)` → guest received
      the doc (`job_received bytes=43`) → **GO→DONE in 0.7 s, status `ok`**. So the vsock
-     job round-trip into a restored warm VM works. The gate surfaced two real bugs the
-     CONNECT-liveness probe could not:
+     job round-trip into a restored warm VM works.
+
+     **GREEN end-to-end after the fixes below (2026-06-04 re-run).** A restored warm
+     VM converted the CSV all the way through: `job_received bytes=43` → `GO→DONE in
+     4.2 s status ok` → the output ext4 disk held **`document.pdf` + `page-001.png` +
+     `metadata.json`**, read back host-side via rdump. So the whole tier is proven:
+     snapshot a running `unoserver` → restore from RAM → push a doc over vsock →
+     warm-convert via the live UNO server → materialize output. The gate surfaced
+     three real bugs the CONNECT-liveness probe could not:
      - **Output-disk ext4 corruption on restore (FIXED, host-side).** The base VM
        snapshots with its outdisk **mounted** → the guest's ext4 metadata is in guest
        RAM. Attaching a freshly-`mkfs`'d per-slot disk on restore → different
@@ -237,8 +244,19 @@ any untrusted data exists.
        rootfs's `clippyshot:dev` predates that symbol (it landed with the PDFium
        default on `feat/warm-uno-worker`) → `ImportError` in `detonate()`. Fix: rebuild
        `clippyshot:dev` from the current branch, then rebuild the warm FC rootfs.
-     Re-running the gate after both fixes is the remaining step to a green
-     pixel-identity round-trip.
+     - **Guest self-retire + post-restore vsock race (FIXED).** Two coupled issues:
+       (a) `serve_warm` self-retired on a 120 s idle timeout — wrong for the warm tier,
+       where the **host** reaps idle slots; and the guest clock can skew across
+       snapshot/restore so a short self-timeout fires early. Fix: idle timeout is now
+       `BLASTBOX_WARM_IDLE_TIMEOUT_S` (run_guest), set to 86400 s in the warm guest env
+       (the guest waits for a job ~indefinitely; the host owns the lifecycle).
+       (b) Pushing the job the instant `resume` returns raced the vsock device resume →
+       the guest's job read failed with `ENOTCONN` (`Transport endpoint is not
+       connected`). Fix: `SnapshotSlotRuntime` holds the slot WARMING for a short
+       **settle window** after restore (`is_ready` gates on `settle_s`, default 3 s,
+       `BLASTBOX_SNAPSHOT_SETTLE_S`) so the host only pushes a job once the restored
+       vsock can carry it. With the settle, the job transferred cleanly and converted.
+     All three fixed → the round-trip is **green** (output produced, see above).
   2. **Scale: FC's `Uffd` (userfaultfd) backend** — a handler process holds one base
      copy and serves guest pages lazily/shared across all restores; most RAM-efficient
      for large pools, at the cost of a page-fault handler. Future optimization.

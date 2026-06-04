@@ -68,8 +68,9 @@ class FakeCfg:
 
 
 def _runtime(tmp_path):
+    # settle_s=0 → is_ready is immediate (the post-restore settle is tested separately).
     mgr = FakeManager(tmp_path)
-    return SnapshotSlotRuntime(FakeCfg(), mgr), mgr
+    return SnapshotSlotRuntime(FakeCfg(), mgr, settle_s=0.0), mgr
 
 
 # --- spawn -----------------------------------------------------------------
@@ -109,6 +110,21 @@ def test_is_ready_false_when_vsock_missing(tmp_path):
     slot = rt.spawn()
     Path(mgr.handles[slot.slot_id].vsock_uds).unlink()
     assert rt.is_ready(slot) is False
+
+
+def test_is_ready_holds_during_settle_window(tmp_path):
+    """is_ready stays False until the post-restore vsock settle window elapses
+    (prevents pushing a job into a not-yet-ready restored vsock → ENOTCONN)."""
+    now = [100.0]
+    mgr = FakeManager(tmp_path)
+    rt = SnapshotSlotRuntime(FakeCfg(), mgr, settle_s=3.0, clock=lambda: now[0])
+    slot = rt.spawn()  # restored_at = 100.0
+    assert rt.is_ready(slot) is False  # 0s elapsed
+    now[0] = 102.9
+    assert rt.is_ready(slot) is False  # still inside the 3s window
+    now[0] = 103.1
+    assert rt.is_ready(slot) is True   # settle elapsed → promotable
+    assert rt.is_alive(slot) is True   # is_alive is NOT gated by settle
 
 
 def test_is_ready_false_when_proc_dead(tmp_path):
