@@ -3,11 +3,13 @@
 Subcommands:
 - ``serve``    — start the FastAPI ingress server via uvicorn.
 - ``dispatch`` — run the Dispatcher loop (claim + launch worker containers).
+- ``bench``    — run a performance benchmark scenario (or ``--list`` them).
 - ``version``  — print version and exit.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -89,6 +91,36 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bench_cmd(args: argparse.Namespace) -> int:
+    # Import here so `blastbox` startup doesn't pull bench/runtime deps unless used.
+    # Importing scenarios also triggers @scenario registration of the built-ins.
+    from blastbox.bench.scenarios import BenchConfig, list_scenarios, run_scenario
+
+    if args.list:
+        for info in list_scenarios():
+            req = ",".join(info.requires) or "-"
+            print(f"{info.name:28} requires={req}")
+        return 0
+
+    if args.scenario is None:
+        print("error: a scenario name is required (or use --list)")
+        return 2
+    try:
+        res = run_scenario(args.scenario, BenchConfig(runs=args.runs, warmup=args.warmup))
+    except KeyError:
+        print(f"error: unknown scenario {args.scenario!r} (try `blastbox bench --list`)")
+        return 2
+
+    base = res.report.labels()[0] if res.report.labels() else None
+    print(res.report.to_table(baseline=base))
+    if res.status != "ok":
+        print(f"[{res.status}] {res.note}")
+    if args.json:
+        with open(args.json, "w") as fh:
+            json.dump(res.report.to_json(), fh, indent=2)
+    return 0
+
+
 def _version_cmd(_: argparse.Namespace) -> int:
     print(f"blastbox {__version__}")
     return 0
@@ -123,6 +155,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma-separated NAME=image:tag engine specs",
     )
     pd.set_defaults(func=_dispatch_cmd)
+
+    # bench
+    pb = sub.add_parser("bench", help="run a performance benchmark scenario")
+    pb.add_argument("scenario", nargs="?", default=None, help="scenario name")
+    pb.add_argument("--list", action="store_true", help="list scenarios + requirements")
+    pb.add_argument("--runs", type=int, default=12)
+    pb.add_argument("--warmup", type=int, default=3)
+    pb.add_argument("--json", default=None, help="write the JSON report to this path")
+    pb.add_argument("--compare", default=None, help="(reserved) baseline JSON to diff")
+    pb.set_defaults(func=_bench_cmd)
 
     # version
     pv = sub.add_parser("version", help="print version and exit")
