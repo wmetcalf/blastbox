@@ -116,7 +116,7 @@ def _bench_cmd(args: argparse.Namespace) -> int:
     if res.status != "ok":
         print(f"[{res.status}] {res.note}")
     if args.json:
-        with open(args.json, "w") as fh:
+        with open(args.json, "w", encoding="utf-8") as fh:
             json.dump(res.report.to_json(), fh, indent=2)
     return 0
 

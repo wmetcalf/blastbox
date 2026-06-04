@@ -104,6 +104,13 @@ Fully unit-testable with fixed arrays and known percentiles.
 These reuse the existing runtime primitives (`SnapshotSlotRuntime`,
 `select_sandbox`, the launcher) — the bench wraps them, it does not reimplement them.
 
+> **Implemented in the first cut:** `sandbox.overhead`, `convert.latency`, and
+> `snapshot.restore-latency`. The other four `snapshot.*` scenarios
+> (`cold-boot-ready`, `restore-convert`, `ram-vs-disk`, `settle-sweep`) are deferred
+> additive follow-ons — same `_impl(cfg, *, primitive)` + `requires=("fc-host",)`
+> shape, registered when needed (they're FC-host-gated and not exercised by the
+> ratio gate, which uses synthetic samples).
+
 ### `bench/report.py` — formatting
 
 - Human table: one row per labelled sample-set, columns `p50 p90 p99 mean n
