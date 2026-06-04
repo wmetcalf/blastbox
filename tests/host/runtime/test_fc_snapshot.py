@@ -172,3 +172,25 @@ def test_restore_uses_unique_per_slot_workdir(tmp_path):
 def test_restore_before_build_raises(tmp_path):
     with pytest.raises(SnapshotRestoreError):
         SnapshotManager(tmp_path, FakeLauncher()).restore("slot-1")
+
+
+def test_restore_kills_handle_on_load_failure(tmp_path):
+    """If snapshot/load fails, the spawned firecracker must be killed (no leak)."""
+    handle = type("H", (), {})()
+    handle.api = FakeApi(fail_on=("PUT", "/snapshot/load"))
+    handle.vsock_uds = "v"
+    handle.killed = False
+    handle.kill = lambda: setattr(handle, "killed", True)
+
+    class Launcher:
+        def boot_base(self):
+            return FakeBoot(FakeApi())
+
+        def restore_in(self, wd):
+            return handle
+
+    mgr = SnapshotManager(tmp_path, Launcher())
+    mgr.build()
+    with pytest.raises(SnapshotRestoreError):
+        mgr.restore("slot-x")
+    assert handle.killed is True

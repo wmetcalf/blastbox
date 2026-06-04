@@ -107,6 +107,8 @@ class RestoreHandle(Protocol):
     api: FcApi
     vsock_uds: str
 
+    def kill(self) -> None: ...
+
 
 @runtime_checkable
 class SnapshotLauncher(Protocol):
@@ -173,9 +175,14 @@ class SnapshotManager:
         slot_workdir = self._base_dir / "slots" / str(slot_id)
         slot_workdir.mkdir(parents=True, exist_ok=True)
         handle = self._launcher.restore_in(slot_workdir)
-        restore_from_snapshot(
-            handle.api,
-            str(self._artifact.snapshot_path),
-            str(self._artifact.mem_path),
-        )
+        try:
+            restore_from_snapshot(
+                handle.api,
+                str(self._artifact.snapshot_path),
+                str(self._artifact.mem_path),
+            )
+        except Exception:
+            # Don't leak the spawned firecracker if load/resume fails.
+            handle.kill()
+            raise
         return handle

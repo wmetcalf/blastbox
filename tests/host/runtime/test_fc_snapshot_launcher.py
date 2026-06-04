@@ -124,3 +124,33 @@ def test_restore_in_spawns_in_slot_cwd_with_fresh_outdisk(tmp_path):
     assert cwd == str(slot)  # firecracker runs in the per-slot cwd
     assert handle.vsock_uds == str(slot / REL_VSOCK)
     assert made == [slot / REL_OUTDISK]  # fresh per-slot output disk
+
+
+def test_spawn_kills_proc_when_api_socket_never_appears(tmp_path):
+    """_spawn must terminate the spawned firecracker if the API socket times out."""
+    class TrackProc:
+        def __init__(self):
+            self.terminated = False
+        def poll(self):
+            return None
+        def terminate(self):
+            self.terminated = True
+        def wait(self, timeout=None):
+            return 0
+
+    proc = TrackProc()
+
+    def never_ready(p):
+        raise TimeoutError("api socket never appeared")
+
+    launcher = FcSnapshotLauncher(
+        FakeCfg(), tmp_path,
+        popen=lambda argv, cwd=None: proc,
+        api_factory=FakeApi,
+        wait_socket=never_ready,
+        make_outdisk=lambda p: None,
+    )
+    import pytest
+    with pytest.raises(TimeoutError):
+        launcher.boot_base()
+    assert proc.terminated is True

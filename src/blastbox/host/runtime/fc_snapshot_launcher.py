@@ -148,11 +148,27 @@ class FcSnapshotLauncher:
     def _spawn(self, workdir: Path):
         workdir.mkdir(parents=True, exist_ok=True)
         api_sock = workdir / "fc-api.sock"
+        # Drop any stale socket so _wait_socket can't return on an old file (and
+        # firecracker won't fail to bind an existing path).
+        try:
+            api_sock.unlink(missing_ok=True)
+        except OSError:
+            pass
         # cwd=workdir so the relative vsock/outdisk paths resolve per-slot.
         proc = self._popen(
             [self._cfg.fc_bin, "--api-sock", str(api_sock)], cwd=str(workdir)
         )
-        self._wait_socket(api_sock)
+        try:
+            self._wait_socket(api_sock)
+        except Exception:
+            # Don't leak the spawned firecracker if the API socket never appears.
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            raise
         return proc, self._api_factory(str(api_sock))
 
     def boot_base(self):
