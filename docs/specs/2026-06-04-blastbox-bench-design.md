@@ -1,6 +1,6 @@
 # blastbox.bench — performance benchmarking, stats & comparisons
 
-Status: **proposed** · 2026-06-04
+Status: **implemented** · 2026-06-04
 
 ## Goal
 
