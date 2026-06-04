@@ -29,6 +29,9 @@ class PoolConfig:
     concurrent_ceiling: int = 16
     spawn_rate_limit: float = 4.0
     burst_size: int = 4
+    # Warm-snapshot tier (firecracker only): spawn = restore-from-warm-snapshot
+    # instead of cold-boot. Opt-in; default OFF (cold FC boot per slot).
+    warm_snapshot: bool = False
 
     @classmethod
     def from_env(cls, **overrides: object) -> "PoolConfig":
@@ -50,12 +53,19 @@ class PoolConfig:
             except ValueError as exc:
                 raise ValueError(f"invalid float for {key}={raw!r}: {exc}") from exc
 
+        def _bool(key: str, default: bool) -> bool:
+            raw = os.environ.get(key, "").strip().lower()
+            if not raw:
+                return default
+            return raw not in ("0", "false", "no")
+
         values: dict[str, object] = {
             "runtime": os.environ.get("BLASTBOX_POOL_RUNTIME", cls.runtime).strip().lower(),
             "warm_size": _int("BLASTBOX_POOL_WARM_SIZE", cls.warm_size),
             "concurrent_ceiling": _int("BLASTBOX_POOL_CEILING", cls.concurrent_ceiling),
             "spawn_rate_limit": _float("BLASTBOX_POOL_SPAWN_RATE", cls.spawn_rate_limit),
             "burst_size": _int("BLASTBOX_POOL_BURST_SIZE", cls.burst_size),
+            "warm_snapshot": _bool("BLASTBOX_POOL_WARM_SNAPSHOT", cls.warm_snapshot),
         }
         values.update(overrides)
         cfg = cls(**values)  # type: ignore[arg-type]
@@ -73,8 +83,11 @@ def build_warm_pool(
 
     ``runtime`` may be injected (tests / custom runtimes); otherwise it is
     resolved from ``cfg.runtime``. For ``firecracker`` the FC tier MUST be
-    available (binary + /dev/kvm + kernel + rootfs) or ``select_fc_runtime``
-    raises ``FCUnavailable`` — fail loudly rather than silently fall back to cold.
+    available (binary + /dev/kvm + kernel + rootfs) or the selector raises
+    ``FCUnavailable`` — fail loudly rather than silently fall back to cold. When
+    ``cfg.warm_snapshot`` is set, the firecracker tier's spawn op becomes
+    restore-from-warm-snapshot (``select_snapshot_runtime``, which builds the
+    ``SnapshotManager`` via ``from_env`` so the RAM-preload toggle is honored).
     """
     cfg = cfg or PoolConfig.from_env()
 
@@ -82,9 +95,16 @@ def build_warm_pool(
         if cfg.runtime == RUNTIME_NONE:
             return None
         if cfg.runtime == RUNTIME_FIRECRACKER:
-            from blastbox.host.runtime.firecracker import select_fc_runtime
+            if cfg.warm_snapshot:
+                from blastbox.host.runtime.fc_snapshot_runtime import (
+                    select_snapshot_runtime,
+                )
 
-            runtime = select_fc_runtime(require_available=True)
+                runtime = select_snapshot_runtime(require_available=True)
+            else:
+                from blastbox.host.runtime.firecracker import select_fc_runtime
+
+                runtime = select_fc_runtime(require_available=True)
         else:
             raise ValueError(f"unknown pool runtime: {cfg.runtime!r}")
 
@@ -97,9 +117,10 @@ def build_warm_pool(
         burst_size=cfg.burst_size,
     )
     _log.info(
-        "warm_pool_built runtime=%s warm_size=%d ceiling=%d",
+        "warm_pool_built runtime=%s warm_size=%d ceiling=%d warm_snapshot=%s",
         cfg.runtime,
         cfg.warm_size,
         cfg.concurrent_ceiling,
+        cfg.warm_snapshot,
     )
     return pool

@@ -17,12 +17,35 @@ COPY pyproject.toml README.md /src/blastbox/
 COPY src /src/blastbox/src
 RUN /opt/clippyshot/bin/pip install --no-cache-dir /src/blastbox && rm -rf /src
 
-# Add the self-contained ClippyShot engine adapter into the installed package.
-COPY deploy/firecracker/clippyshot_engine.py /tmp/engine.py
-RUN cp /tmp/engine.py \
-        "$(/opt/clippyshot/bin/python -c 'import clippyshot,os;print(os.path.dirname(clippyshot.__file__))')/engine.py" \
-    && rm /tmp/engine.py \
-    && /opt/clippyshot/bin/python -c 'import clippyshot.engine'   # fail build if it cannot import
+# Stage the warm-UNO ClippyShot code into the installed package: the engine adapter
+# + the UNO server module + the runner's warm fast-path. The base clippyshot:dev is
+# built from ClippyShot master, which lacks uno.py + the warm runner, so all three
+# are staged. (When ClippyShot's warm-uno branch merges and clippyshot:dev is rebuilt
+# with them, only the engine-adapter staging remains needed.)
+COPY deploy/firecracker/clippyshot_engine.py /tmp/cs/engine.py
+COPY deploy/firecracker/clippyshot_uno.py /tmp/cs/uno.py
+COPY deploy/firecracker/clippyshot_runner.py /tmp/cs/runner.py
+RUN PKG="$(/opt/clippyshot/bin/python -c 'import clippyshot,os;print(os.path.dirname(clippyshot.__file__))')" \
+    && cp /tmp/cs/engine.py "$PKG/engine.py" \
+    && cp /tmp/cs/uno.py "$PKG/libreoffice/uno.py" \
+    && cp /tmp/cs/runner.py "$PKG/libreoffice/runner.py" \
+    && rm -rf /tmp/cs \
+    && /opt/clippyshot/bin/python -c 'import clippyshot.engine, clippyshot.libreoffice.uno, clippyshot.libreoffice.runner'  # fail build if any cannot import
+
+# Warm-UNO: the engine's warmup() runs a persistent soffice UNO server (the warm
+# conversion path; see guest.clippyshot.env CLIPPYSHOT_WARM_UNO). VALIDATED on
+# toolz2 (2026-06-04): the base image ships LibreOffice + the C++ UNO libs but NOT
+# the Python bridge, and the /opt/clippyshot venv cannot see the system `uno`
+# module — so install python3-uno (provides /usr/lib/python3/dist-packages/uno.py
+# for the SYSTEM python3) and unoserver into the SYSTEM python3 (NOT the venv). The
+# engine Popens `unoserver`/`unoconvert`; since the venv has neither, PATH resolves
+# to /usr/local/bin (shebang #!/usr/bin/python3, which has uno). Warm fails closed
+# to cold soffice if unoserver can't start.
+# iproute2 gives the guest init `ip` to bring up loopback (unoserver binds 127.0.0.1).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3-uno iproute2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && /usr/bin/python3 -m pip install --break-system-packages --no-cache-dir 'unoserver>=3.6,<4'
 
 # blastbox FC guest agent + init + per-rootfs config.
 COPY deploy/firecracker/run_guest.py /opt/blastbox/run_guest.py

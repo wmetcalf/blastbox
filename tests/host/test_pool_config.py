@@ -93,6 +93,55 @@ def test_build_pool_unknown_runtime_raises():
         build_warm_pool(cfg)
 
 
+# --- warm-snapshot gate ----------------------------------------------------
+
+
+def test_from_env_warm_snapshot_default_off(monkeypatch):
+    monkeypatch.delenv("BLASTBOX_POOL_WARM_SNAPSHOT", raising=False)
+    assert PoolConfig.from_env().warm_snapshot is False
+
+
+def test_from_env_warm_snapshot_reads_truthy(monkeypatch):
+    monkeypatch.setenv("BLASTBOX_POOL_WARM_SNAPSHOT", "1")
+    assert PoolConfig.from_env().warm_snapshot is True
+    for falsey in ("0", "false", "no"):
+        monkeypatch.setenv("BLASTBOX_POOL_WARM_SNAPSHOT", falsey)
+        assert PoolConfig.from_env().warm_snapshot is False
+
+
+def test_build_pool_warm_snapshot_routes_to_snapshot_selector(monkeypatch):
+    """When warm_snapshot is set, the firecracker tier resolves via
+    select_snapshot_runtime (NOT the cold select_fc_runtime)."""
+    import blastbox.host.runtime.fc_snapshot_runtime as snap_mod
+
+    sentinel = _FakeRuntime()
+    called = {}
+
+    def fake_select(*, require_available=False):
+        called["require_available"] = require_available
+        return sentinel
+
+    monkeypatch.setattr(snap_mod, "select_snapshot_runtime", fake_select)
+    cfg = PoolConfig(runtime=RUNTIME_FIRECRACKER, warm_snapshot=True)
+    pool = build_warm_pool(cfg)
+    assert pool is not None
+    assert pool.runtime is sentinel
+    assert called["require_available"] is True  # operator opted in → fail loud
+
+
+def test_build_pool_cold_path_unaffected_when_snapshot_off(monkeypatch):
+    """warm_snapshot=False must NOT touch the snapshot selector."""
+    import blastbox.host.runtime.firecracker as fc_mod
+
+    sentinel = _FakeRuntime()
+    monkeypatch.setattr(
+        fc_mod, "select_fc_runtime", lambda *, require_available=False: sentinel
+    )
+    cfg = PoolConfig(runtime=RUNTIME_FIRECRACKER, warm_snapshot=False)
+    pool = build_warm_pool(cfg)
+    assert pool is not None and pool.runtime is sentinel
+
+
 @pytest.mark.skipif(
     _HAS_FC,
     reason="this host HAS the FC tier; the unavailable-path only holds without it",

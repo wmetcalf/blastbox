@@ -32,6 +32,12 @@ mount -t ext4 /dev/vdb /mnt/outdisk 2>/dev/null
 # The fresh ext4 root dir is owned by root; hand it to the non-root agent.
 chown "$DROP_USER:$DROP_USER" /mnt/outdisk 2>/dev/null
 
+# Bring up loopback. FC guests boot with lo DOWN; warm-UNO's unoserver binds
+# soffice on 127.0.0.1 (and unoconvert connects there), so without this the UNO
+# socket is unreachable ("couldn't connect to socket") and LibreOffice never
+# starts. The cold --convert-to path uses no socket, hence this was never needed.
+ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || true
+
 echo "blastbox-fc-guest: init up, dropping to $DROP_USER" > /dev/console 2>/dev/null
 
 # Drop privileges and exec the agent. stdout/stderr (opened here as root) are

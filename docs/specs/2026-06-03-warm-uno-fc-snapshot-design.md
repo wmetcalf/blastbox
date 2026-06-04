@@ -1,7 +1,10 @@
 # Warm-UNO via Firecracker snapshot/restore — design
 
-Status: **proposed** · 2026-06-03 · extends the 2026-05-31 framework design
-(§9 "FC snapshot effort", Appendix A "Warm-UNO spike") into a buildable milestone.
+Status: **core validated on toolz2** · 2026-06-03..06-04 · extends the 2026-05-31
+framework design (§9 "FC snapshot effort", Appendix A "Warm-UNO spike") into a
+buildable milestone. The full snapshot-of-running-`unoserver` → restore-from-RAM
+loop is proven on real FC hardware (see the COW section). Remaining: impress/draw
+parity gate + the in-restore document round-trip + warm-pool wiring.
 
 ## Goal
 
@@ -140,14 +143,165 @@ any untrusted data exists.
     `network_overrides`, `resume_vm` — **there is NO vsock-uds override**. So the host
     vsock UDS path is baked into the snapshot and cannot be remapped in the load body.
     Implication: per-restore vsock uniqueness must come from the *environment*, not the
-    load config — run each restore in a **per-slot working dir / chroot** (jailer-style)
-    so the same baked-in `uds_path` resolves to a distinct per-slot socket. The Phase 0
-    spike must confirm (a) FC re-creates the baked uds relative to cwd/chroot on resume,
-    and (b) a fresh host connect to that per-slot path round-trips after restore.
+    load config — run each restore in a **per-slot working dir** (relative `uds_path`)
+    so the same baked-in path resolves to a distinct per-slot socket.
+  - **Phase 0 CONFIRMED on toolz2 (2026-06-04, `fc_snapshot_spike.py`, FC v1.12.1):**
+    booted a base microVM over the API with a **relative** `vsock` uds_path
+    (`vsock.sock`) + relative outdisk, cwd=base → FC created `base/vsock.sock`;
+    `PATCH /vm Paused` + `PUT /snapshot/create` succeeded; then loaded the snapshot
+    into **two** fresh firecrackers each in its own cwd (`slots/slot-A`, `slots/slot-B`)
+    via `PUT /snapshot/load` + `resume_vm:true` — **each restore re-created its own
+    `vsock.sock` in its own cwd** (verdict `{slot-A: True, slot-B: True}`). So the
+    per-slot-cwd vsock mechanism + snapshot/restore both work on real FC. Still TODO:
+    the host↔guest **round-trip** through a restored vsock (guest responds post-restore)
+    — needs the warm rootfs + job protocol, not just the probe.
 - **Output-disk remap on restore.** Confirm FC lets a restored VM attach a fresh
   per-slot output drive (the snapshot was taken with a base drive); decide whether
   the output disk is excluded from the snapshot and attached at restore, or remapped.
-- **`unoserver` packaging in the rootfs** — pin v3.6 + python-uno; confirm it warms
-  to a listening socket deterministically for the READY signal.
-- **Snapshot memory cost** — each restored VM holds a full copy-on-write of the
-  snapshot memory; size the pool against host RAM.
+- **`unoserver` packaging — RESOLVED + warm conversion CONFIRMED on toolz2
+  (2026-06-04, in the `clippyshot:dev` LO image):** the image ships LibreOffice +
+  the C++ UNO libs but **not** the Python bridge, and the `/opt/clippyshot` venv
+  can't see the system `uno` module. Fix (now in `Dockerfile.clippyshot`): install
+  **`python3-uno`** (→ `/usr/lib/python3/dist-packages/uno.py` for the **system**
+  python3) + `unoserver` into **system** python3 (not the venv). Then `unoserver`
+  starts ("UNO PORT LISTENING") and **`unoconvert` produced a valid PDF** (the
+  engine resolves `unoserver`/`unoconvert` to `/usr/local/bin`, shebang
+  `#!/usr/bin/python3`, which has `uno`, since the venv has neither).
+  - **Warm path E2E CONFIRMED through the ClippyShot engine (2026-06-04):** a thin
+    overlay on `clippyshot:dev` (the warm `uno.py`/`engine.py`/`runner.py` + the deps
+    fix + `blastbox`) ran, **as the non-root `clippy` user**, `engine.warmup()` →
+    started `unoserver` → ready; the runner's warm fast-path converted a csv via
+    `unoconvert` with `calc_pdf_Export` (my `pdf_filter_for_label` drove the filter).
+    **Warm vs cold output is PIXEL-IDENTICAL** (page-1 render md5 equal,
+    `14797`-byte PDFs both).
+  - **Warm worker boots + warms in a REAL FC microVM (2026-06-04):** built the FC
+    clippyshot rootfs (the 3 warm files staged + python3-uno + system unoserver +
+    iproute2) and booted it; the guest agent ran `engine.warmup()` →
+    `INFO:unoserver: Starting unoserver 3.6 … Started. Server PID: 109` as uid 10001.
+    **Loopback bug found + fixed:** FC guests boot with `lo` DOWN, so unoserver's
+    `soffice --accept=socket,host=127.0.0.1` was unreachable (`couldn't connect to
+    socket` → `Could not start Libreoffice`); the init now `ip link set lo up`. The
+    cold `--convert-to` path never needed loopback. **Snapshot-of-running-`unoserver`
+    + restore-from-RAM now CONFIRMED** (see the COW section: warm base → READY →
+    snapshot mem on `/dev/shm` → restore in 0.01 s → restored guest's JOB listener
+    answers). Remaining: the impress/draw parity gate, and pushing an actual doc
+    through the restored guest's vsock JOB channel (the in-restore transport round-trip;
+    conversion itself already proven pixel-identical through the engine).
+- **Snapshot memory cost + RAM-resident COW (design decision, 2026-06-04).** The
+  snapshot's **mem file ≈ guest RAM** (~2 GB once LO/soffice is live) — the dominant
+  cost. FC's `File` mem backend already `mmap`s it **`MAP_PRIVATE`** on load, so N
+  restores **share the read-only base pages** + copy-on-write only what each VM
+  dirties → cost is *base once + Σ(dirtied working set)*, NOT N × full. Two levels:
+  1. **Opt-in: put the mem file on `tmpfs` (`/dev/shm`).** Pins the base in RAM —
+     zero disk I/O on any restore (incl. the first), still COW-shared. Cost: ~one
+     guest-RAM of RAM held for the warm baseline. Because that RAM cost is real and
+     **hosts differ in how much RAM they have, this is a per-host toggle, default
+     OFF** (the safe choice on a small box — the mem file lives on disk in the base
+     dir, still page-cache-backed, just evictable under pressure):
+     - `BLASTBOX_SNAPSHOT_MEM_TMPFS=1` → preload into the default tmpfs `/dev/shm`.
+     - `BLASTBOX_SNAPSHOT_MEM_DIR=<path>` → preload into an explicit dir (for hosts
+       whose tmpfs is mounted elsewhere); wins over the boolean toggle.
+     - neither → mem on disk (default).
+
+     Wired in `fc_snapshot.py`: `resolve_mem_dir()` reads the env, and
+     `SnapshotManager.from_env(base, launcher)` constructs the manager with the
+     resolved `mem_dir`. An explicit `mem_dir=` arg still short-circuits env
+     resolution (tests, direct callers).
+
+     **Pool wiring DONE (`fc_snapshot_runtime.py`).** `SnapshotSlotRuntime` is a
+     `SlotRuntime` whose `spawn()` builds the warm snapshot once (via
+     `SnapshotManager.from_env`, so the toggle is honored) then restores per slot;
+     `is_ready`/`is_alive`/`reap` + the warm-path seam (`host_warm_control`,
+     `materialize_warm_output`) mirror the cold `FirecrackerSlotRuntime` so the
+     dispatcher's per-slot job flow is unchanged. `select_snapshot_runtime()` builds
+     it (waiting for the base VM's READY via `VsockReadySignal` before snapshotting).
+     Gated opt-in: `BLASTBOX_POOL_RUNTIME=firecracker` + `BLASTBOX_POOL_WARM_SNAPSHOT=1`
+     → `build_warm_pool` routes the FC tier's spawn op through the snapshot runtime.
+
+     **In-restore doc round-trip GATE — run on toolz2 (2026-06-04, `rt_roundtrip.py`,
+     drives the real `SnapshotSlotRuntime`).** `spawn()` (boot base → warm `unoserver`
+     → READY → snapshot mem on `/dev/shm` → restore) completed in **9.4 s**;
+     `is_ready`/`is_alive` True; `host_warm_control().signal_go(csv)` → guest received
+     the doc (`job_received bytes=43`) → **GO→DONE in 0.7 s, status `ok`**. So the vsock
+     job round-trip into a restored warm VM works.
+
+     **GREEN end-to-end after the fixes below (2026-06-04 re-run).** A restored warm
+     VM converted the CSV all the way through: `job_received bytes=43` → `GO→DONE in
+     4.2 s status ok` → the output ext4 disk held **`document.pdf` + `page-001.png` +
+     `metadata.json`**, read back host-side via rdump. So the whole tier is proven:
+     snapshot a running `unoserver` → restore from RAM → push a doc over vsock →
+     warm-convert via the live UNO server → materialize output. The gate surfaced
+     three real bugs the CONNECT-liveness probe could not:
+     - **Output-disk ext4 corruption on restore (FIXED, host-side).** The base VM
+       snapshots with its outdisk **mounted** → the guest's ext4 metadata is in guest
+       RAM. Attaching a freshly-`mkfs`'d per-slot disk on restore → different
+       UUID/checksums → `EXT4-fs error: Directory block failed checksum`. Fix:
+       `FcSnapshotLauncher.restore_in` now **copies the base outdisk image** (empty at
+       READY, snapshot-time-consistent) instead of fresh-`mkfs` — writes still land on
+       the isolated per-slot copy. (`copy_outdisk` dep; one 256 MiB copy per restore.)
+     - **Stale `clippyshot:dev` base (rootfs rebuild, NOT a code bug).** The engine
+       adapter does `from clippyshot.rasterizer import build_rasterizer`; the warm
+       rootfs's `clippyshot:dev` predates that symbol (it landed with the PDFium
+       default on `feat/warm-uno-worker`) → `ImportError` in `detonate()`. Fix: rebuild
+       `clippyshot:dev` from the current branch, then rebuild the warm FC rootfs.
+     - **Guest self-retire + post-restore vsock race (FIXED).** Two coupled issues:
+       (a) `serve_warm` self-retired on a 120 s idle timeout — wrong for the warm tier,
+       where the **host** reaps idle slots; and the guest clock can skew across
+       snapshot/restore so a short self-timeout fires early. Fix: idle timeout is now
+       `BLASTBOX_WARM_IDLE_TIMEOUT_S` (run_guest), set to 86400 s in the warm guest env
+       (the guest waits for a job ~indefinitely; the host owns the lifecycle).
+       (b) Pushing the job the instant `resume` returns raced the vsock device resume →
+       the guest's job read failed with `ENOTCONN` (`Transport endpoint is not
+       connected`). Fix: `SnapshotSlotRuntime` holds the slot WARMING for a short
+       **settle window** after restore (`is_ready` gates on `settle_s`, default 3 s,
+       `BLASTBOX_SNAPSHOT_SETTLE_S`) so the host only pushes a job once the restored
+       vsock can carry it. With the settle, the job transferred cleanly and converted.
+     All three fixed → the round-trip is **green** (output produced, see above).
+  2. **Scale: FC's `Uffd` (userfaultfd) backend** — a handler process holds one base
+     copy and serves guest pages lazily/shared across all restores; most RAM-efficient
+     for large pools, at the cost of a page-fault handler. Future optimization.
+  - **CONFIRMED end-to-end on toolz2 (2026-06-04, `snap_warm.py`, FC v1.12.1).** Booted
+    the warm clippyshot rootfs over the API with a host vsock READY listener bound at
+    `base/vsock.sock_10000`; the guest ran `engine.warmup()` → `unoserver` + `soffice`
+    came up and the guest signalled `READY` over vsock (so the base reached the
+    **warm-idle** state — a *running* UNO server, not a cold boot). Then `PATCH /vm
+    Paused` + `PUT /snapshot/create` with `mem_file_path` on **`/dev/shm`** wrote the
+    snapshot in **1.4 s**, mem file **2048 MiB** (= full guest RAM with live soffice —
+    confirms the snapshot is large and the COW-in-RAM placement matters). Killed the
+    base, then `PUT /snapshot/load` (`mem_backend` File → the `/dev/shm` mem) +
+    `resume_vm:true` in a fresh per-slot cwd **restored in 0.01 s** (RAM-backed COW, no
+    disk read). Confirmed the restored guest is **alive and warm**: a host→guest vsock
+    `CONNECT 10001` (the agent's JOB port) returned `OK …` — i.e. the restored VM
+    resumed *with the running `unoserver` and the job listener intact*. This proves the
+    whole tier's premise: snapshot a live `unoserver`, restore it from RAM near-instantly,
+    and the restore is immediately ready to serve a job.
+  - **Measured perf (toolz2, 2026-06-04, `bench.py`, 2 GB guest):**
+    - **Restore vs cold boot:** cold boot → warm-ready (boot + soffice/`unoserver`
+      warmup) = **7.75 s**; warm restore (FC spawn + 256 MB outdisk copy + load+resume)
+      = **~0.56 s**, of which the FC `load snapshot` primitive is **~4 ms**. So a restore
+      replaces a 7.75 s boot+warmup with a sub-second resume of an already-live soffice
+      (~14×). The 0.56 s is dominated by the outdisk copy + process spawn (reflink-able).
+    - **`/dev/shm` (RAM) vs disk — the COW-in-RAM win:** one-time snapshot **create**
+      (write 2 GB mem) = **1.46 s tmpfs vs 29.0 s disk (~20×)**; restore → **first
+      conversion under a cold page cache** = **4.4 s tmpfs vs 31.6 s disk (~7.2×)**
+      (the disk-backed guest page-faults its 2 GB working set off disk mid-convert;
+      tmpfs faults hit RAM). When the cache is warm, disk ≈ RAM — tmpfs just *guarantees*
+      residency (no first-touch read, no eviction), which is why it's a per-host toggle.
+    - **Percentiles (`pctbench.py`, n=12 cold / n=20 restore):** per-slot acquire —
+      cold-boot→warm-ready **p50 7.76 s / p90 8.0 s / p99 10 s**; warm-restore (RAM)
+      **p50 575 ms / p90 596 ms / p99 799 ms** (tight tail). **≈13.5× faster at p50.**
+      The restore distribution is nearly flat (p50→p90 +4 %); the conversion itself is
+      the same on both paths, so the per-job win is the acquire.
+    - **Settle sweep (`settle_sweep.py`, 6 trials × {0–2 s}):** every value 0.0–2.0 s
+      passed 6/6 — the post-restore vsock race resolves **sub-second**. Default lowered
+      3.0 s → **1.0 s** (a conservative margin over the rare intermittent ENOTCONN;
+      `BLASTBOX_SNAPSHOT_SETTLE_S`). In a steady-state pool the settle overlaps
+      background pre-warming, so it adds no per-job latency regardless.
+    - **Outdisk copy:** `restore_in` copies the 256 MB base outdisk via
+      `cp --reflink=auto` — a near-instant CoW clone on xfs/btrfs, falling back to a
+      full copy on ext4/tmpfs (safe everywhere; only the FS that supports it speeds up).
+  - **Impress/draw parity gate — PASS (`parity.sh`, clippyshot-fc-warm image, LO 26.x).**
+    Warm `unoconvert` (`--filter impress_pdf_Export` / `draw_pdf_Export`) vs cold
+    `soffice --convert-to pdf:<filter>`, rasterized at 150 DPI, per-page md5: **pptx,
+    odp, ppt (impress) and odg (draw) are all pixel-identical warm==cold.** With the
+    earlier calc/csv proof, the warm path is validated across calc, impress, and draw.
