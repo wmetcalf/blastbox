@@ -41,8 +41,9 @@ RUN PKG="$(/opt/clippyshot/bin/python -c 'import clippyshot,os;print(os.path.dir
 # engine Popens `unoserver`/`unoconvert`; since the venv has neither, PATH resolves
 # to /usr/local/bin (shebang #!/usr/bin/python3, which has uno). Warm fails closed
 # to cold soffice if unoserver can't start.
+# iproute2 gives the guest init `ip` to bring up loopback (unoserver binds 127.0.0.1).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3-uno \
+    && apt-get install -y --no-install-recommends python3-uno iproute2 \
     && rm -rf /var/lib/apt/lists/* \
     && /usr/bin/python3 -m pip install --break-system-packages --no-cache-dir 'unoserver>=3.6,<4'
 
