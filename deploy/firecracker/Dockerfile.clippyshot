@@ -17,12 +17,20 @@ COPY pyproject.toml README.md /src/blastbox/
 COPY src /src/blastbox/src
 RUN /opt/clippyshot/bin/pip install --no-cache-dir /src/blastbox && rm -rf /src
 
-# Add the self-contained ClippyShot engine adapter into the installed package.
-COPY deploy/firecracker/clippyshot_engine.py /tmp/engine.py
-RUN cp /tmp/engine.py \
-        "$(/opt/clippyshot/bin/python -c 'import clippyshot,os;print(os.path.dirname(clippyshot.__file__))')/engine.py" \
-    && rm /tmp/engine.py \
-    && /opt/clippyshot/bin/python -c 'import clippyshot.engine'   # fail build if it cannot import
+# Stage the warm-UNO ClippyShot code into the installed package: the engine adapter
+# + the UNO server module + the runner's warm fast-path. The base clippyshot:dev is
+# built from ClippyShot master, which lacks uno.py + the warm runner, so all three
+# are staged. (When ClippyShot's warm-uno branch merges and clippyshot:dev is rebuilt
+# with them, only the engine-adapter staging remains needed.)
+COPY deploy/firecracker/clippyshot_engine.py /tmp/cs/engine.py
+COPY deploy/firecracker/clippyshot_uno.py /tmp/cs/uno.py
+COPY deploy/firecracker/clippyshot_runner.py /tmp/cs/runner.py
+RUN PKG="$(/opt/clippyshot/bin/python -c 'import clippyshot,os;print(os.path.dirname(clippyshot.__file__))')" \
+    && cp /tmp/cs/engine.py "$PKG/engine.py" \
+    && cp /tmp/cs/uno.py "$PKG/libreoffice/uno.py" \
+    && cp /tmp/cs/runner.py "$PKG/libreoffice/runner.py" \
+    && rm -rf /tmp/cs \
+    && /opt/clippyshot/bin/python -c 'import clippyshot.engine, clippyshot.libreoffice.uno, clippyshot.libreoffice.runner'  # fail build if any cannot import
 
 # Warm-UNO: the engine's warmup() runs a persistent soffice UNO server (the warm
 # conversion path; see guest.clippyshot.env CLIPPYSHOT_WARM_UNO). VALIDATED on
