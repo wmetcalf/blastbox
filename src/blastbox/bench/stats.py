@@ -46,3 +46,33 @@ def summarize(samples: list[float]) -> Stats:
         max=xs[-1],
         stdev=statistics.pstdev(xs) if len(xs) > 1 else 0.0,
     )
+
+
+@dataclass(frozen=True)
+class Comparison:
+    """A vs B on p50. ``speedup`` > 1 means the candidate is faster than the baseline."""
+
+    baseline: str
+    candidate: str
+    speedup: float
+    overhead_pct: float
+
+
+def compare(
+    baseline: Stats,
+    candidate: Stats,
+    *,
+    baseline_label: str = "baseline",
+    candidate_label: str = "candidate",
+) -> Comparison:
+    """Compare two Stats on p50."""
+    speedup = baseline.p50 / candidate.p50 if candidate.p50 else float("inf")
+    overhead_pct = (
+        (candidate.p50 / baseline.p50 - 1.0) * 100.0 if baseline.p50 else 0.0
+    )
+    return Comparison(
+        baseline=baseline_label,
+        candidate=candidate_label,
+        speedup=speedup,
+        overhead_pct=overhead_pct,
+    )
