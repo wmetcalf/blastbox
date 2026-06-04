@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from blastbox.bench.harness import Report
+from blastbox.bench.harness import Report, measure
 
 _log = logging.getLogger("blastbox.bench")
 
@@ -156,3 +156,39 @@ def _sandbox_overhead(cfg: BenchConfig) -> ScenarioResult:
     return _sandbox_overhead_impl(
         cfg, backends=backends, run_one=soffice_runner(cfg)
     )
+
+
+def _snapshot_restore_latency_impl(
+    cfg: BenchConfig, *, runtime: object
+) -> ScenarioResult:
+    """Time runtime.spawn()→reap() (one restore) repeatedly."""
+    report = Report(scenario="snapshot.restore-latency")
+
+    def one() -> None:
+        slot = runtime.spawn()      # type: ignore[attr-defined]
+        runtime.reap(slot)          # type: ignore[attr-defined]
+
+    samples = measure(one, runs=cfg.runs, warmup=cfg.warmup)
+    if len(samples) < 3:
+        return ScenarioResult(
+            report=report,
+            status="insufficient",
+            note=f"only {len(samples)} samples",
+        )
+    report.add("restore", samples)
+    return ScenarioResult(report=report, status="ok")
+
+
+@scenario("snapshot.restore-latency", requires=("fc-host",))
+def _snapshot_restore_latency(cfg: BenchConfig) -> ScenarioResult:
+    """Real scenario: build the warm snapshot once, then time per-slot restores."""
+    from blastbox.host.runtime.fc_snapshot_runtime import select_snapshot_runtime
+
+    rt = select_snapshot_runtime(require_available=True)
+    if rt is None:
+        return ScenarioResult(
+            report=Report(scenario="snapshot.restore-latency"),
+            status="skipped",
+            note="snapshot runtime unavailable",
+        )
+    return _snapshot_restore_latency_impl(cfg, runtime=rt)
