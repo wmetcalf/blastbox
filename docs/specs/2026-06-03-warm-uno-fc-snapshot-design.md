@@ -155,7 +155,16 @@ any untrusted data exists.
 - **Output-disk remap on restore.** Confirm FC lets a restored VM attach a fresh
   per-slot output drive (the snapshot was taken with a base drive); decide whether
   the output disk is excluded from the snapshot and attached at restore, or remapped.
-- **`unoserver` packaging in the rootfs** — pin v3.6 + python-uno; confirm it warms
-  to a listening socket deterministically for the READY signal.
+- **`unoserver` packaging — RESOLVED + warm conversion CONFIRMED on toolz2
+  (2026-06-04, in the `clippyshot:dev` LO image):** the image ships LibreOffice +
+  the C++ UNO libs but **not** the Python bridge, and the `/opt/clippyshot` venv
+  can't see the system `uno` module. Fix (now in `Dockerfile.clippyshot`): install
+  **`python3-uno`** (→ `/usr/lib/python3/dist-packages/uno.py` for the **system**
+  python3) + `unoserver` into **system** python3 (not the venv). Then `unoserver`
+  starts ("UNO PORT LISTENING") and **`unoconvert` produced a valid PDF** (the
+  engine resolves `unoserver`/`unoconvert` to `/usr/local/bin`, shebang
+  `#!/usr/bin/python3`, which has `uno`, since the venv has neither). Still TODO:
+  byte/pixel parity of the *matched-filter* warm output vs cold on the corpus, and
+  unoserver-as-the-non-root-`clippy`-user.
 - **Snapshot memory cost** — each restored VM holds a full copy-on-write of the
   snapshot memory; size the pool against host RAM.
