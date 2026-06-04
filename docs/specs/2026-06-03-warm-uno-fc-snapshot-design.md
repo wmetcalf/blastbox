@@ -163,8 +163,14 @@ any untrusted data exists.
   python3) + `unoserver` into **system** python3 (not the venv). Then `unoserver`
   starts ("UNO PORT LISTENING") and **`unoconvert` produced a valid PDF** (the
   engine resolves `unoserver`/`unoconvert` to `/usr/local/bin`, shebang
-  `#!/usr/bin/python3`, which has `uno`, since the venv has neither). Still TODO:
-  byte/pixel parity of the *matched-filter* warm output vs cold on the corpus, and
-  unoserver-as-the-non-root-`clippy`-user.
+  `#!/usr/bin/python3`, which has `uno`, since the venv has neither).
+  - **Warm path E2E CONFIRMED through the ClippyShot engine (2026-06-04):** a thin
+    overlay on `clippyshot:dev` (the warm `uno.py`/`engine.py`/`runner.py` + the deps
+    fix + `blastbox`) ran, **as the non-root `clippy` user**, `engine.warmup()` →
+    started `unoserver` → ready; the runner's warm fast-path converted a csv via
+    `unoconvert` with `calc_pdf_Export` (my `pdf_filter_for_label` drove the filter).
+    **Warm vs cold output is PIXEL-IDENTICAL** (page-1 render md5 equal,
+    `14797`-byte PDFs both). Remaining: the impress/draw (pptx/odp) parity gate, and
+    the full FC warm-pool + snapshot e2e (engine-adapter staging picking up `uno.py`).
 - **Snapshot memory cost** — each restored VM holds a full copy-on-write of the
   snapshot memory; size the pool against host RAM.
