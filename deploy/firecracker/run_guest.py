@@ -55,11 +55,16 @@ def main() -> None:
     )
 
     control = VsockWarmControl(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR)
+    # The warm/snapshot tier sets BLASTBOX_WARM_IDLE_TIMEOUT_S high (the HOST reaps
+    # idle slots): a snapshot-restored guest must NOT self-retire while it sits warm
+    # in the pool. The cold tier keeps the modest default. (The guest clock can also
+    # skew across snapshot/restore, which makes a short self-timeout fire early.)
+    idle_timeout_s = float(os.environ.get("BLASTBOX_WARM_IDLE_TIMEOUT_S", "120.0"))
     rc = serve_warm(
         engine,
         control=control,
         limits=Limits.from_env(),
-        idle_timeout_s=120.0,
+        idle_timeout_s=idle_timeout_s,
     )
     _log.info("serve_warm returned rc=%s; idle until reap", rc)
     # One job per disposable VM — block until the host reaps the slot.

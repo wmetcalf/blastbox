@@ -336,8 +336,12 @@ def serve_warm(
     # ------------------------------------------------------------------
     try:
         spec = control.wait_for_go(timeout_s=idle_timeout_s)
-    except WarmTimeout:
-        logger.info("warm slot idle timeout after %.1fs; retiring", idle_timeout_s)
+    except WarmTimeout as to_exc:
+        # Log the underlying cause too — distinguishes a genuine timeout ("timed out")
+        # from an immediate accept() error (e.g. a vsock device issue post-restore).
+        logger.info(
+            "warm slot idle timeout after %.1fs; retiring (%s)", idle_timeout_s, to_exc
+        )
         try:
             control.signal_done(status="idle_timeout")
         except Exception as sig_exc:  # noqa: BLE001
