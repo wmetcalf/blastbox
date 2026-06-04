@@ -1,6 +1,8 @@
 """Scenario registry for blastbox benchmarks (runtime-agnostic)."""
 from __future__ import annotations
 
+import os
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -54,3 +56,38 @@ def get_info(name: str) -> ScenarioInfo:
 
 def list_scenarios() -> list[ScenarioInfo]:
     return sorted(_REGISTRY.values(), key=lambda s: s.name)
+
+
+def check_requirement(token: str) -> bool:
+    """Probe a prerequisite token. Unknown tokens are False (fail-safe skip)."""
+    if token == "soffice":
+        return shutil.which("soffice") is not None
+    if token == "nono":
+        return shutil.which("nono") is not None or bool(
+            os.environ.get("BLASTBOX_NONO_BIN")
+        )
+    if token == "bwrap":
+        return shutil.which("bwrap") is not None
+    if token == "fc-host":
+        try:
+            from blastbox.host.runtime.firecracker import (
+                FCConfig,
+                firecracker_available,
+            )
+            return firecracker_available(FCConfig.from_env())
+        except Exception:  # noqa: BLE001 — any failure means "not available"
+            return False
+    return False
+
+
+def run_scenario(name: str, cfg: BenchConfig) -> ScenarioResult:
+    """Run a registered scenario, skipping cleanly if any requirement is unmet."""
+    info = _REGISTRY[name]
+    missing = [t for t in info.requires if not check_requirement(t)]
+    if missing:
+        return ScenarioResult(
+            report=Report(scenario=name),
+            status="skipped",
+            note=f"missing prerequisites: {', '.join(missing)}",
+        )
+    return info.fn(cfg)

@@ -1,7 +1,8 @@
 # tests/bench/test_scenarios.py
 import pytest
 from blastbox.bench.scenarios import (
-    BenchConfig, ScenarioResult, scenario, get_scenario, list_scenarios,
+    BenchConfig, ScenarioResult, check_requirement, get_scenario, list_scenarios,
+    run_scenario, scenario,
 )
 from blastbox.bench.harness import Report
 
@@ -23,3 +24,17 @@ def test_scenario_registers_and_is_listable():
 def test_get_unknown_scenario_raises():
     with pytest.raises(KeyError):
         get_scenario("does.not.exist")
+
+
+# --- Task 8 ---
+def test_check_requirement_unknown_token_is_false():
+    assert check_requirement("totally-bogus-token") is False
+
+
+def test_run_scenario_skips_when_requirement_unmet():
+    @scenario("demo.needsfc", requires=("totally-bogus-token",))
+    def _s(cfg):  # pragma: no cover - never runs (skipped)
+        raise AssertionError("must not execute when requirement unmet")
+
+    res = run_scenario("demo.needsfc", BenchConfig())
+    assert res.status == "skipped" and "totally-bogus-token" in res.note
