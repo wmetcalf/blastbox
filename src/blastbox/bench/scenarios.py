@@ -1,12 +1,16 @@
 """Scenario registry for blastbox benchmarks (runtime-agnostic)."""
 from __future__ import annotations
 
+import logging
 import os
 import shutil
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from blastbox.bench.harness import Report
+
+_log = logging.getLogger("blastbox.bench")
 
 
 @dataclass(frozen=True)
@@ -91,3 +95,64 @@ def run_scenario(name: str, cfg: BenchConfig) -> ScenarioResult:
             note=f"missing prerequisites: {', '.join(missing)}",
         )
     return info.fn(cfg)
+
+
+def _measure_runner(
+    run_one: Callable[[str], object], backend: str, cfg: BenchConfig
+) -> list[float]:
+    """Sample one backend: if ``run_one`` returns a number, treat it as the
+    duration (deterministic for injected fakes); otherwise time wall-clock."""
+    samples: list[float] = []
+    for i in range(cfg.warmup + cfg.runs):
+        start = time.monotonic()
+        try:
+            result = run_one(backend)
+        except Exception as exc:  # noqa: BLE001 — one bad sample must not abort the run
+            _log.debug("sandbox.overhead %s raised on iter %d: %s", backend, i, exc)
+            continue
+        elapsed = (
+            float(result)
+            if isinstance(result, (int, float)) and not isinstance(result, bool)
+            else time.monotonic() - start
+        )
+        if i >= cfg.warmup:
+            samples.append(elapsed)
+    return samples
+
+
+def _sandbox_overhead_impl(
+    cfg: BenchConfig,
+    *,
+    backends: tuple[str, ...],
+    run_one: Callable[[str], object],
+) -> ScenarioResult:
+    """Measure each backend's wall-time for one workload (injected ``run_one``)."""
+    report = Report(scenario="sandbox.overhead")
+    for backend in backends:
+        samples = _measure_runner(run_one, backend, cfg)
+        if len(samples) < 3:
+            return ScenarioResult(
+                report=report,
+                status="insufficient",
+                note=f"{backend}: only {len(samples)} samples",
+            )
+        report.add(backend, samples)
+    return ScenarioResult(report=report, status="ok")
+
+
+@scenario("sandbox.overhead", requires=("soffice",))
+def _sandbox_overhead(cfg: BenchConfig) -> ScenarioResult:
+    """Real scenario: wrap `soffice --convert-to pdf` in each available backend.
+
+    The default workload + per-backend runner live in
+    ``blastbox.bench._workloads`` (Task 11); here we resolve the installed backends
+    and delegate to ``_sandbox_overhead_impl``."""
+    from blastbox.bench._workloads import (  # type: ignore[import-not-found]
+        available_sandbox_backends,
+        soffice_runner,
+    )
+
+    backends = available_sandbox_backends()
+    return _sandbox_overhead_impl(
+        cfg, backends=backends, run_one=soffice_runner(cfg)
+    )

@@ -2,7 +2,7 @@
 import pytest
 from blastbox.bench.scenarios import (
     BenchConfig, ScenarioResult, check_requirement, get_scenario, list_scenarios,
-    run_scenario, scenario,
+    run_scenario, scenario, _sandbox_overhead_impl,
 )
 from blastbox.bench.harness import Report
 
@@ -38,3 +38,22 @@ def test_run_scenario_skips_when_requirement_unmet():
 
     res = run_scenario("demo.needsfc", BenchConfig())
     assert res.status == "skipped" and "totally-bogus-token" in res.note
+
+
+# --- Task 9 ---
+def test_sandbox_overhead_impl_compares_backends_with_fake_runner():
+    # Fake "run one workload under backend X" → returns a fixed duration per backend.
+    durations = {"none": 0.10, "bwrap": 0.104, "nono": 0.102}
+
+    def fake_run(backend: str) -> float:
+        return durations[backend]
+
+    cfg = BenchConfig(runs=4, warmup=1)
+    res = _sandbox_overhead_impl(
+        cfg, backends=("none", "bwrap", "nono"), run_one=fake_run
+    )
+    assert res.status == "ok"
+    assert set(res.report.labels()) == {"none", "bwrap", "nono"}
+    # nono overhead vs none ≈ +2%
+    c = res.report.compare("none", "nono")
+    assert 1.0 < c.overhead_pct < 3.0
