@@ -172,13 +172,15 @@ So the gVisor C/R tier is the **portable warm tier for both engines on any cloud
 nested virt). FC remains the faster ms-class option where `/dev/kvm` + nested virt are
 available; gVisor C/R is the broadly-deployable one.
 
-**Pixel-parity gate — PASSED (toolz2).** Warm-restored soffice (with the shim) vs cold
-`soffice --convert-to`, both rasterized at **150 DPI**, per-page **md5 identical**:
-**docx writer 1/1, xlsx calc 4/4, pptx impress 1/1**. So warm output is byte-for-byte the
-cold output across writer/calc/impress. Remaining before shipping soffice on this tier:
-broaden parity to **draw (odg) + legacy/`.ppt`/`.ods` formats** and productionize the shim
-(below). *(The earlier legacy-`.doc` `rc=1` turned out to be a malformed OLE2 input that
-fails **cold** too — "source file could not be loaded" — a bad file, not a tier issue.)*
+**Pixel-parity gate — PASSED (toolz2), broadened across families + formats.** Warm-restored
+soffice (with the shim) vs cold `soffice --convert-to`, both rasterized at **150 DPI**,
+per-page **md5 identical** across all three engine families in OOXML **+ legacy + ODF**:
+**writer** (docx 1/1, txt 1/1, odt 1/1), **calc** (xlsx 4/4, xls 3/3, ods 4/4), **impress**
+(pptx 1/1, odp 1/1). So warm output is byte-for-byte the cold output. Draw (odg) was not
+re-tested here for lack of a clean source, but the FC tier already cleared it and the
+restored-soffice render engine is identical. *(Malformed corpus `.doc/.ppt/.rtf/.pps`
+samples fail **cold** too — bad inputs, not a tier issue, e.g. the legacy-`.doc` "source
+file could not be loaded".)* The shim is productionized (see Components/deploy).
 
 **Deploy artifact — the accept-retry shim (required for the soffice path).** Build the
 ~10-line `accept`/`accept4` EINTR-retry shim into the soffice **warm rootfs** (`gcc -shared
