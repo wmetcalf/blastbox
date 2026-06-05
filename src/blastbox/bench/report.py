@@ -31,18 +31,21 @@ def to_table(report: Report, *, baseline: str | None = None) -> str:
         else None
     )
     lines = [f"=== {report.scenario} ==="]
-    header = f"  {'label':<14} {'p50':>9} {'p90':>9} {'p99':>9} {'n':>4}"
+    header = (
+        f"  {'label':<14} {'p50(ms)':>9} {'p90(ms)':>9} {'p99(ms)':>9} "
+        f"{'mean(ms)':>9} {'n':>4}"
+    )
     if base_p50 is not None:
         header += f" {'overhead':>9}"
     lines.append(header)
     for label in labels:
         if not report.samples(label):
-            lines.append(f"  {label:<14} {'(no samples)':>34}")
+            lines.append(f"  {label:<14} {'(no samples)':>44}")
             continue
         s = report.summary(label)
         row = (
-            f"  {label:<14} {s.p50 * 1000:>8.1f}m {s.p90 * 1000:>8.1f}m "
-            f"{s.p99 * 1000:>8.1f}m {s.n:>4}"
+            f"  {label:<14} {s.p50 * 1000:>9.1f} {s.p90 * 1000:>9.1f} "
+            f"{s.p99 * 1000:>9.1f} {s.mean * 1000:>9.1f} {s.n:>4}"
         )
         if base_p50 is not None:
             ov = (s.p50 / base_p50 - 1.0) * 100.0

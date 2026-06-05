@@ -12,7 +12,9 @@ from pathlib import Path
 
 from blastbox.bench.scenarios import BenchConfig
 
-_SOFFICE = "/usr/bin/soffice"
+# Resolve via PATH so the workload uses the SAME soffice the requirement check
+# (shutil.which) found, not a possibly-different hardcoded location.
+_SOFFICE = shutil.which("soffice") or "/usr/bin/soffice"
 
 
 def soffice_argv(input_path: str, outdir: str) -> list[str]:
@@ -60,24 +62,34 @@ def soffice_runner(cfg: BenchConfig) -> Iterator[Callable[[str], None]]:
         out = tmp / "out"
 
         def run_one(backend: str) -> None:
+            # A failed/timed-out conversion MUST raise so measure() drops the sample
+            # rather than recording a meaningless timing (which would hide regressions).
             if out.exists():
                 shutil.rmtree(out)
             out.mkdir()
             argv = soffice_argv(str(inp), str(out))
             if backend == "none":
-                subprocess.run(argv, capture_output=True, timeout=cfg_timeout(cfg))
+                subprocess.run(
+                    argv, capture_output=True, timeout=cfg_timeout(cfg), check=True
+                )
                 return
+            from blastbox.limits import Limits
             from blastbox.worker.sandbox.base import Mount, SandboxRequest
             from blastbox.worker.sandbox.detect import select_sandbox
 
             sb = select_sandbox(backend=backend)
-            sb.run(
+            res = sb.run(
                 SandboxRequest(
                     argv=argv,
                     ro_mounts=[Mount(source=inp, target=inp)],
                     rw_mounts=[Mount(source=out, target=out, read_only=False)],
+                    limits=Limits(timeout_s=cfg_timeout(cfg)),
                 )
             )
+            if res.killed or res.exit_code != 0:
+                raise RuntimeError(
+                    f"sandbox conversion failed: exit={res.exit_code} killed={res.killed}"
+                )
 
         yield run_one
     finally:

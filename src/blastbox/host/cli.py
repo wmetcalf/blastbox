@@ -103,18 +103,22 @@ def _bench_cmd(args: argparse.Namespace) -> int:
         return 0
 
     if args.scenario is None:
-        print("error: a scenario name is required (or use --list)")
+        print("error: a scenario name is required (or use --list)", file=sys.stderr)
         return 2
     try:
         res = run_scenario(args.scenario, BenchConfig(runs=args.runs, warmup=args.warmup))
     except KeyError:
-        print(f"error: unknown scenario {args.scenario!r} (try `blastbox bench --list`)")
+        print(
+            f"error: unknown scenario {args.scenario!r} (try `blastbox bench --list`)",
+            file=sys.stderr,
+        )
         return 2
 
     base = res.report.labels()[0] if res.report.labels() else None
     print(res.report.to_table(baseline=base))
     if res.status != "ok":
-        print(f"[{res.status}] {res.note}")
+        # diagnostic → stderr so stdout stays report-only (pipe/JSON-friendly)
+        print(f"[{res.status}] {res.note}", file=sys.stderr)
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
             json.dump(res.report.to_json(), fh, indent=2)

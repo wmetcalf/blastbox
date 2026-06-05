@@ -115,8 +115,10 @@ These reuse the existing runtime primitives (`SnapshotSlotRuntime`,
 
 - Human table: one row per labelled sample-set, columns `p50 p90 p99 mean n
   overhead-vs-baseline`.
-- JSON: a stable schema (`{scenario, config, results: [{label, stats}],
-  comparisons: [...]}`) — the seam for CI baselines and any external tracking.
+- JSON: a stable schema — the first cut emits `{scenario, results: [{label, stats}]}`
+  (`stats` is `null` for an empty-sample label); this is the seam for CI baselines and
+  external tracking. Top-level `config` (the run knobs) and precomputed `comparisons`
+  are deferred additive fields, not in the first cut.
 
 ## Two front-ends
 
