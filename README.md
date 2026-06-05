@@ -40,8 +40,8 @@ blastbox/
 └── worker/     LAYER 2 — worker SDK (runs inside the disposable worker) — lean core
     ├── engine      the seam: detect / warmup / detonate
     ├── harness     read input → detonate → seal → write metadata.json
-    ├── sandbox/    auto-selected in-process hardening: nsjail / bwrap / container
-    │               (BLASTBOX_SANDBOX override; container backend inside an OCI host)
+    ├── sandbox/    auto-selected in-process hardening: nsjail / bwrap / nono / container
+    │               (BLASTBOX_SANDBOX override; container inside OCI; nono = Landlock, no userns)
     ├── warm        service lifecycle: boot → warmup → one job → exit
     └── fc_warm / fc_guest   Firecracker guest: AF_VSOCK control plane + warm protocol
 ```
@@ -118,31 +118,42 @@ Core framework complete and adversarially tested: contract + full host orchestra
 
 **Two runtime backends**, selected fail-closed: hardened `docker run` (runc/runsc) and a **Firecracker
 microVM per slot** (AF_VSOCK warm protocol — *the engine* defines what "warmup" means, so the tier is
-engine-agnostic). **Three in-process sandbox backends**, auto-selected (`nsjail` → `bwrap` → `container`;
-`container` inside an OCI host) with a `BLASTBOX_SANDBOX` override.
+engine-agnostic). **Four in-process sandbox backends**, auto-selected (`nsjail` → `bwrap` → `nono` →
+`container`; `container` inside an OCI host) with a `BLASTBOX_SANDBOX` override. `nono` is a **Landlock**
+capability sandbox — filesystem + network containment **without user namespaces**, for hosts where
+`bwrap`/`nsjail` can't run (restricted-userns / no `CAP_SYS_ADMIN`); it's `secure=False` (no
+seccomp/namespaces) and so an explicit opt-in, at ~1–4 % per-job overhead.
 
 Warmup is per-engine: the **JVM/Tika** engine warms via **CRaC** (checkpoint/restore), and for that path
 the Firecracker runtime adds guest-console **CPU-feature-mismatch detection** + a one-shot compatibility
 **probe**. The **LibreOffice**
-engine has **no CRaC** (it isn't a JVM): its FC slot is a pre-spawned microVM that still cold-starts
-`soffice --convert-to` per job — hiding that ~750 ms boot is the warm-UNO roadmap below.
+engine has **no CRaC** (it isn't a JVM): instead its ~750 ms `soffice` boot is hidden by the **warm-UNO
+FC snapshot/restore** tier (below), or it falls back to cold-starting `soffice --convert-to` per job.
 
 Proven end-to-end — live on a Firecracker host — with two real, language-diverse engines, both in the
 **FC warm-pool tier**: a **JVM + Tika** recursive extractor (CRaC warm-restore) and a **Python +
-LibreOffice** rasterizer (cold-boot, no CRaC; `deploy/firecracker/Dockerfile.clippyshot`). The
-LibreOffice engine also runs standalone on the **docker + sandbox** tier (runc/runsc).
+LibreOffice** rasterizer (warm-UNO snapshot/restore, or cold-boot; `deploy/firecracker/Dockerfile.clippyshot`).
+The LibreOffice engine also runs standalone on the **docker + sandbox** tier (runc/runsc).
 
-**Roadmap — warm-UNO via FC snapshot/restore** (designed + planned; build not started). Capture a warm
-in-guest `unoserver` (soffice `--accept` on a local UDS) in a Firecracker memory snapshot built
-*first-boot on the host*, then restore→convert→destroy per job — the "FC but not CRaC" warm route,
-hiding the ~750 ms soffice boot. A 2026-05-31 spike proved warm-UNO output pixel/byte-identical to cold
-`--convert-to` across docx/odt/csv/xlsx (~4–7× soffice-stage win once the boot is hidden). Everything UNO
-stays in-guest; only the existing vsock + output-disk channels cross the boundary. Net-new work lands in
-the FC runtime (API-socket restore path, `create_snapshot`/`restore_from_snapshot`, per-restore unique
-vsock + fresh output disk); bare-metal `bwrap`/`nsjail` stays cold. Design:
-`docs/specs/2026-06-03-warm-uno-fc-snapshot-design.md` · plan:
-`docs/plans/2026-06-03-warm-uno-fc-snapshot.md` · original spike:
-`docs/specs/2026-05-31-detonation-framework-design.md` Appendix A.
+**Warm-UNO via FC snapshot/restore — shipped.** A microVM with a running, idle in-guest `unoserver`
+(soffice `--accept` on a local UDS) is captured in a Firecracker memory snapshot built *first-boot on the
+host*, then restored→converted→destroyed per job — the "FC but not CRaC" warm route that hides the
+~750 ms soffice boot. Validated end-to-end on a Firecracker host: snapshot a live `unoserver` → restore
+from `/dev/shm` → convert → output is **pixel-identical to cold** `--convert-to` across calc/csv **and
+impress/draw** (pptx / odp / ppt / odg). Measured: a warm restore (~0.5 s; the FC `load-snapshot`
+primitive itself is ~4 ms) replaces a ~7.8 s cold boot+warmup — **~13.5× to a ready slot** — with the
+copy-on-write mem base optionally **pinned in RAM** (`BLASTBOX_SNAPSHOT_MEM_TMPFS`, a per-host toggle).
+Everything UNO stays in-guest; only the existing vsock + output-disk channels cross the boundary. Gated
+opt-in: `BLASTBOX_POOL_RUNTIME=firecracker` + `BLASTBOX_POOL_WARM_SNAPSHOT=1`; bare-metal
+`bwrap`/`nsjail`/`nono` stays cold. Implemented in `host/runtime/fc_snapshot*.py`
+(`SnapshotManager` + `SnapshotSlotRuntime`); design:
+`docs/specs/2026-06-03-warm-uno-fc-snapshot-design.md`.
+
+**Benchmarking — `blastbox bench`.** A runtime-agnostic perf harness (stats + percentiles + A/B
+comparisons) with a scenario registry that skips cleanly when prerequisites are absent, plus a
+`perf`-marked CI ratio gate. `blastbox bench --list`; scenarios include `sandbox.overhead` (nono vs
+bwrap vs none), `snapshot.restore-latency`, and `convert.latency`. Design:
+`docs/specs/2026-06-04-blastbox-bench-design.md`.
 
 ## License
 
