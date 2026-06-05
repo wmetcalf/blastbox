@@ -30,6 +30,12 @@ class GvisorConfig:
     ld_preload: str | None = None                 # soffice tier: /opt/clippyshot/accept-retry.so
     cpu_features_annotation: str | None = None     # dev.gvisor.internal.cpufeatures (pinning)
     extra_env: list[str] = field(default_factory=list)
+    # Run the untrusted-document worker as NON-ROOT with NO capabilities (parity with the
+    # docker `--user`/`--cap-drop=ALL` and FC `setpriv 65532` tiers). The per-slot out/ + ctrl/
+    # bind mounts are chmod'd writable for this uid by the backend; HOME=/tmp (tmpfs) and the
+    # UserInstallation under /tmp keep soffice happy unprivileged.
+    uid: int = 65532
+    gid: int = 65532
 
 
 def _runsc(cfg: GvisorConfig) -> list[str]:
@@ -52,14 +58,16 @@ def _oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> dict:
         "ociVersion": "1.0.0",
         "process": {
             "terminal": False,
-            "user": {"uid": 0, "gid": 0},
+            "user": {"uid": cfg.uid, "gid": cfg.gid},
             "args": list(cfg.warm_argv),
             "env": env,
             "cwd": "/",
+            # Non-root + no capabilities + no-new-privs: a malicious doc / soffice parser bug
+            # runs unprivileged, matching the docker + FC tiers and the design's stated invariant.
+            "noNewPrivileges": True,
             "capabilities": {
-                k: ["CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER", "CAP_KILL",
-                    "CAP_SETGID", "CAP_SETUID", "CAP_NET_BIND_SERVICE"]
-                for k in ("bounding", "effective", "permitted")
+                k: []
+                for k in ("bounding", "effective", "permitted", "inheritable", "ambient")
             },
         },
         "root": {"path": str(cfg.image_rootfs), "readonly": True},
@@ -69,7 +77,9 @@ def _oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> dict:
             {"destination": "/dev", "type": "tmpfs", "source": "tmpfs",
              "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]},
             {"destination": "/tmp", "type": "tmpfs", "source": "tmpfs",
-             "options": ["rw", "nosuid", "nodev", "size=512m"]},
+             # mode=1777 (sticky world-writable like a real /tmp) so the NON-ROOT worker can
+             # write soffice's profile + the OSL UNO pipe under /tmp.
+             "options": ["rw", "nosuid", "nodev", "mode=1777", "size=512m"]},
             {"destination": "/in", "type": "bind", "source": str(workdir / "in"),
              "options": ["rbind", "ro" if in_ro else "rw"]},
             {"destination": "/out", "type": "bind", "source": str(workdir / "out"),
@@ -89,6 +99,23 @@ def _write_oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> None:
     (workdir / "config.json").write_text(
         json.dumps(_oci_config(cfg, workdir, in_ro=in_ro), indent=2), encoding="utf-8"
     )
+
+
+def _prepare_slot_dirs(cfg: GvisorConfig, workdir: Path) -> None:
+    """Create the per-slot bind-mount dirs. ``out/`` and ``ctrl/`` are shared scratch between
+    the NON-ROOT container uid (writes output + ready/done) and the host services (the
+    dispatcher writes go.json / reads done; the trust gate reads output) — which run under
+    different uids — so they are mode 0o777. This is safe because the parent
+    (``/var/lib/blastbox/...``, deploy concern) MUST be root-owned 0700, making the 0o777 leaf
+    reachable only by root + the mapped container uid (via the bind mount), not other local
+    users. ``in/`` is read-only and only needs world-traversable (0o755)."""
+    in_dir = workdir / "in"
+    in_dir.mkdir(parents=True, exist_ok=True)
+    in_dir.chmod(0o755)
+    for sub in ("out", "ctrl"):
+        d = workdir / sub
+        d.mkdir(parents=True, exist_ok=True)
+        d.chmod(0o777)
 
 
 def _default_run(argv: list[str], **kw: Any) -> int:
@@ -139,6 +166,7 @@ class GvisorBootHandle:
             self._run([*_runsc(self._cfg), "delete", "-force", self._cid])
         except Exception:
             pass
+        shutil.rmtree(self._base, ignore_errors=True)  # don't leave the base bundle dir behind
 
 
 class GvisorRestoreHandle:
@@ -200,9 +228,8 @@ class GvisorSnapshotBackend:
 
     def boot_base(self) -> GvisorBootHandle:
         base = self._cfg.root.parent / "gvisor-base"
+        _prepare_slot_dirs(self._cfg, base)
         ctrl = base / "ctrl"
-        for d in (base / "in", base / "out", ctrl):
-            d.mkdir(parents=True, exist_ok=True)
         cid = "warm-base"
         _write_oci_config(self._cfg, base, in_ro=True)
         self._run(
@@ -215,8 +242,7 @@ class GvisorSnapshotBackend:
 
     def restore_in(self, slot_workdir: Path, artifact: object) -> GvisorRestoreHandle:
         wd = Path(slot_workdir)
-        for sub in ("in", "out", "ctrl"):
-            (wd / sub).mkdir(parents=True, exist_ok=True)
+        _prepare_slot_dirs(self._cfg, wd)
         cid = f"slot-{uuid.uuid4().hex[:12]}"
         _write_oci_config(self._cfg, wd, in_ro=True)
         self._run(

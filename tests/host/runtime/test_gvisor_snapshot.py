@@ -81,6 +81,22 @@ def test_oci_config_no_ld_preload_when_unset(tmp_path: Path) -> None:
     assert not any(e.startswith("LD_PRELOAD") for e in spec["process"]["env"])
 
 
+def test_oci_config_security_posture_non_root_no_caps_no_new_privs(tmp_path: Path) -> None:
+    # The untrusted-document worker must run NON-ROOT with NO capabilities and no-new-privs,
+    # matching the docker (--user/--cap-drop=ALL) and FC (setpriv 65532) tiers.
+    spec = _oci_config(_cfg(tmp_path), tmp_path / "wd", in_ro=True)
+    proc = spec["process"]
+    assert proc["user"]["uid"] != 0 and proc["user"]["uid"] == 65532
+    assert proc["noNewPrivileges"] is True
+    assert all(caps == [] for caps in proc["capabilities"].values())
+    assert spec["root"]["readonly"] is True
+
+
+def test_oci_config_honors_custom_uid(tmp_path: Path) -> None:
+    spec = _oci_config(_cfg(tmp_path, uid=10001, gid=10001), tmp_path / "wd", in_ro=True)
+    assert spec["process"]["user"] == {"uid": 10001, "gid": 10001}
+
+
 def test_restore_handle_alive_running(tmp_path: Path) -> None:
     from blastbox.host.runtime.gvisor_snapshot import GvisorRestoreHandle
     cfg = _cfg(tmp_path)

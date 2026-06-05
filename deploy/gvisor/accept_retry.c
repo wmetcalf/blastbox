@@ -16,15 +16,20 @@
 #include <errno.h>
 #include <sys/socket.h>
 
-static int (*real_accept)(int, struct sockaddr *, socklen_t *) = 0;
-static int (*real_accept4)(int, struct sockaddr *, socklen_t *, int) = 0;
+static int (*real_accept)(int, struct sockaddr *, socklen_t *);
+static int (*real_accept4)(int, struct sockaddr *, socklen_t *, int);
+
+/* Resolve the real symbols once at load time (before any accept call) — avoids a
+ * lazy-init data race between concurrent first calls. */
+__attribute__((constructor)) static void init_real_accept(void) {
+    real_accept = dlsym(RTLD_NEXT, "accept");
+    real_accept4 = dlsym(RTLD_NEXT, "accept4");
+}
 
 int accept(int fd, struct sockaddr *a, socklen_t *l) {
-    if (!real_accept) real_accept = dlsym(RTLD_NEXT, "accept");
     for (;;) { int r = real_accept(fd, a, l); if (r < 0 && errno == EINTR) continue; return r; }
 }
 
 int accept4(int fd, struct sockaddr *a, socklen_t *l, int flags) {
-    if (!real_accept4) real_accept4 = dlsym(RTLD_NEXT, "accept4");
     for (;;) { int r = real_accept4(fd, a, l, flags); if (r < 0 && errno == EINTR) continue; return r; }
 }
