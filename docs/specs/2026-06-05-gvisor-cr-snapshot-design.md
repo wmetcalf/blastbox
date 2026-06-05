@@ -324,6 +324,24 @@ into `FcSnapshotBackend`. The manager stops knowing FC exists.
   filesystem UDS, not a routable socket.
 - **The restored sandbox is still a gVisor sandbox** — full Sentry syscall interposition,
   cap-drop, no-new-privs, read-only rootfs. C/R does not relax the isolation posture.
+- **Unprivileged worker (security-reviewed + validated).** The OCI process spec runs the
+  untrusted-document worker **non-root (uid/gid 65532), with an empty capability set and
+  `noNewPrivileges: true`** — parity with the docker (`--user`/`--cap-drop=ALL`) and FC
+  (`setpriv 65532`) tiers. A malicious document / soffice-parser bug therefore runs
+  unprivileged. `root.readonly` is true; soffice's writes go to a `mode=1777` `/tmp` tmpfs
+  (profile + the OSL pipe). The per-slot `out/`+`ctrl/` bind mounts are `0o777` shared
+  host↔container scratch, contained by the **required root-owned `0700` parent**
+  (`/var/lib/blastbox/...` — a deploy precondition); `in/` is read-only `0o755`. *Validated on
+  toolz2: warm convert as uid 65532 with zero caps + no-new-privs → byte-identical to cold.*
+- **No untrusted value reaches the runtime boundary** — the container id is always internal
+  (`warm-base` / `slot-<uuid4>`); every `runsc` argv token is operator config; `job.params`
+  are allowlisted and confined to `go.json` (never the OCI env/argv); the rootfs/image is
+  operator config, never job-derived. Output is re-sealed by the host trust gate unchanged.
+- **Entropy caveat (inherent to C/R, low-risk here).** Every restore resumes from one
+  checkpoint's captured RNG state, so in-guest nonce/tmp-name generation is not unique across
+  restores (the FC tier shares this). Low-risk for a one-doc-then-destroyed rasterizer; if an
+  engine ever generates security-sensitive randomness in-guest, reseed via `getrandom` on the
+  first job.
 
 ## Error handling & fallbacks (fail-closed, mirrors the FC tier)
 
