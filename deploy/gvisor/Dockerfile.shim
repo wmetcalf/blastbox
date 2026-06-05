@@ -1,0 +1,14 @@
+# Adds the accept-retry shim to a clippyshot soffice image for the gVisor C/R warm tier.
+# Build:  docker build --build-arg BASE=clippyshot:dev -f deploy/gvisor/Dockerfile.shim -t clippyshot-warm:gvisor .
+ARG BASE=clippyshot:dev
+FROM ${BASE}
+USER root
+COPY deploy/gvisor/accept_retry.c /tmp/accept_retry.c
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends gcc libc6-dev; \
+    mkdir -p /opt/clippyshot; \
+    gcc -shared -fPIC -O2 -o /opt/clippyshot/accept-retry.so /tmp/accept_retry.c -ldl; \
+    apt-get purge -y gcc libc6-dev; apt-get autoremove -y; \
+    rm -rf /var/lib/apt/lists/* /tmp/accept_retry.c
+# The warm worker env then sets LD_PRELOAD=/opt/clippyshot/accept-retry.so (soffice only).
