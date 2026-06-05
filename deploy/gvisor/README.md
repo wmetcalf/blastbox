@@ -73,7 +73,7 @@ reads the following env vars (all optional, defaults shown):
 | Variable | Default | Purpose |
 |---|---|---|
 | `BLASTBOX_GVISOR_RUNSC` | `runsc` | Path to the `runsc` binary |
-| `BLASTBOX_GVISOR_ROOT` | _(runsc default)_ | `--root` state directory for runsc |
+| `BLASTBOX_GVISOR_ROOT` | `/var/lib/blastbox/gvisor-root` | `--root` state directory for runsc |
 | `BLASTBOX_GVISOR_ROOTFS` | _(image rootfs)_ | OCI rootfs path for the warm container |
 | `BLASTBOX_GVISOR_NETWORK` | `none` | `none` or `sandbox` (use `none` for the warm tier) |
 | `BLASTBOX_GVISOR_WARM_ARGV` | `["worker","warm"]` | JSON list; argv passed to the warm entrypoint |
@@ -82,7 +82,7 @@ reads the following env vars (all optional, defaults shown):
 | `BLASTBOX_GVISOR_CPUFEATURES` | _(unset)_ | `dev.gvisor.internal.cpufeatures` OCI annotation for cross-host CPU pinning |
 | `BLASTBOX_SNAPSHOT_SETTLE_S` | `1.0` | Seconds to wait after restore before sending the job (post-restore settle) |
 
-`_gvisor_config_from_env()` assembles a `GVisorSnapshotConfig` dataclass from these
+`_gvisor_config_from_env()` assembles a `GvisorConfig` dataclass from these
 vars; `select_gvisor_snapshot_runtime()` returns the configured runtime object.
 
 ## I/O plane

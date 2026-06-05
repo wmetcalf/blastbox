@@ -79,3 +79,47 @@ def test_oci_config_has_bind_mounts_args_and_ld_preload(tmp_path: Path) -> None:
 def test_oci_config_no_ld_preload_when_unset(tmp_path: Path) -> None:
     spec = _oci_config(_cfg(tmp_path), tmp_path / "wd", in_ro=True)
     assert not any(e.startswith("LD_PRELOAD") for e in spec["process"]["env"])
+
+
+def test_restore_handle_alive_running(tmp_path: Path) -> None:
+    from blastbox.host.runtime.gvisor_snapshot import GvisorRestoreHandle
+    cfg = _cfg(tmp_path)
+    handle = GvisorRestoreHandle(
+        cfg,
+        run=lambda a, **k: 0,
+        cid="test-cid",
+        slot_workdir=tmp_path,
+        run_text=lambda argv: '{"status": "running"}',
+    )
+    assert handle.alive() is True
+
+
+def test_restore_handle_alive_stopped(tmp_path: Path) -> None:
+    from blastbox.host.runtime.gvisor_snapshot import GvisorRestoreHandle
+    cfg = _cfg(tmp_path)
+    handle = GvisorRestoreHandle(
+        cfg,
+        run=lambda a, **k: 0,
+        cid="test-cid",
+        slot_workdir=tmp_path,
+        run_text=lambda argv: '{"status": "stopped"}',
+    )
+    assert handle.alive() is False
+
+
+def test_restore_handle_alive_runsc_error(tmp_path: Path) -> None:
+    from blastbox.host.runtime.gvisor_snapshot import GvisorRestoreHandle
+
+    def _boom(argv: list[str]) -> str:
+        raise RuntimeError("runsc gone")
+
+    cfg = _cfg(tmp_path)
+    handle = GvisorRestoreHandle(
+        cfg,
+        run=lambda a, **k: 0,
+        cid="test-cid",
+        slot_workdir=tmp_path,
+        run_text=_boom,
+    )
+    # alive() must be False (not raise) when run_text raises
+    assert handle.alive() is False

@@ -95,6 +95,10 @@ def _default_run(argv: list[str], **kw: Any) -> int:
     return subprocess.run(argv, check=True, **kw).returncode
 
 
+def _default_run_text(argv: list[str]) -> str:
+    return subprocess.run(argv, capture_output=True, text=True, check=False).stdout
+
+
 def _default_ready_wait(ctrl_dir: Path, timeout_s: float) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -144,14 +148,26 @@ class GvisorRestoreHandle:
         run: Callable[..., int],
         cid: str,
         slot_workdir: Path,
+        run_text: Callable[[list[str]], str] = _default_run_text,
     ) -> None:
         self._cfg = cfg
         self._run = run
+        self._run_text = run_text
         self._cid = cid
         self.slot_workdir = Path(slot_workdir)
         self.control_dir = self.slot_workdir / "ctrl"
         self.output_dir = self.slot_workdir / "out"
         self.input_dir = self.slot_workdir / "in"
+
+    def alive(self) -> bool:
+        """True iff the restored container is still running (via runsc state)."""
+        import json as _json
+        try:
+            out = self._run_text([*_runsc(self._cfg), "state", self._cid])
+            status = _json.loads(out).get("status", "")
+            return status in ("running", "created")
+        except Exception:  # noqa: BLE001
+            return False
 
     def kill(self) -> None:
         for argv in (["kill", self._cid, "KILL"], ["delete", "-force", self._cid]):
@@ -167,11 +183,13 @@ class GvisorSnapshotBackend:
         cfg: GvisorConfig,
         *,
         run: Callable[..., int] = _default_run,
+        run_text: Callable[[list[str]], str] = _default_run_text,
         ready_wait: Callable[[Path, float], None] = _default_ready_wait,
         probe: Callable[[], bool] | None = None,
     ) -> None:
         self._cfg = cfg
         self._run = run
+        self._run_text = run_text
         self._ready = ready_wait
         self._probe = probe
 
@@ -208,4 +226,4 @@ class GvisorSnapshotBackend:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        return GvisorRestoreHandle(self._cfg, self._run, cid, wd)
+        return GvisorRestoreHandle(self._cfg, self._run, cid, wd, self._run_text)

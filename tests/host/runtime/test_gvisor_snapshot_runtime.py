@@ -1,13 +1,15 @@
+import json
 from pathlib import Path
 
 import pytest
 
 from blastbox.host.runtime.gvisor_snapshot_runtime import (
+    GvisorHostWarmControl,
     GvisorSnapshotSlotRuntime,
     GvisorUnavailable,
     select_gvisor_snapshot_runtime,
 )
-from blastbox.worker.warm import HostWarmControl
+from blastbox.worker.warm import WarmJobSpec
 
 
 class _FakeHandle:
@@ -47,9 +49,25 @@ def test_spawn_builds_once_then_restores(tmp_path):
     assert rt.is_ready(s1) is True
 
 
-def test_host_warm_control_is_file_based(tmp_path):
+def test_host_warm_control_returns_translating_control(tmp_path):
     rt = GvisorSnapshotSlotRuntime(_FakeMgr(tmp_path), settle_s=0.0)
-    assert isinstance(rt.host_warm_control(rt.spawn()), HostWarmControl)
+    assert isinstance(rt.host_warm_control(rt.spawn()), GvisorHostWarmControl)
+
+
+def test_gvisor_control_translates_paths_to_sandbox(tmp_path):
+    ctrl_dir = tmp_path / "ctrl"
+    ctrl_dir.mkdir()
+    GvisorHostWarmControl(ctrl_dir).signal_go(
+        WarmJobSpec(
+            input_path=tmp_path / "slots" / "x" / "in" / "doc.docx",
+            output_dir=tmp_path / "slots" / "x" / "out",
+            params={"a": "b"},
+        )
+    )
+    go = json.loads((ctrl_dir / "go.json").read_text())
+    assert go["input_path"] == "/in/doc.docx"
+    assert go["output_dir"] == "/out"
+    assert go["params"] == {"a": "b"}
 
 
 def test_settle_gates_readiness(tmp_path):
@@ -75,6 +93,54 @@ def test_reap_kills_and_cleans(tmp_path):
     rt.reap(s)
     assert not Path(s.output_dir).parent.exists()
     assert rt.is_alive(s) is False
+
+
+def test_is_alive_dead_handle_returns_false(tmp_path):
+    """A handle whose alive() returns False makes is_alive() return False."""
+
+    class _DeadHandle(_FakeHandle):
+        def alive(self) -> bool:
+            return False
+
+    class _DeadMgr(_FakeMgr):
+        def restore(self, slot_id):
+            self.restores += 1
+            wd = self.base / "slots" / str(slot_id)
+            for s in ("in", "out", "ctrl"):
+                (wd / s).mkdir(parents=True, exist_ok=True)
+            return _DeadHandle(wd)
+
+    rt = GvisorSnapshotSlotRuntime(_DeadMgr(tmp_path), settle_s=0.0)
+    slot = rt.spawn()
+    assert rt.is_alive(slot) is False
+
+
+def test_is_alive_alive_handle_returns_true(tmp_path):
+    """A handle whose alive() returns True makes is_alive() return True."""
+
+    class _AliveHandle(_FakeHandle):
+        def alive(self) -> bool:
+            return True
+
+    class _AliveMgr(_FakeMgr):
+        def restore(self, slot_id):
+            self.restores += 1
+            wd = self.base / "slots" / str(slot_id)
+            for s in ("in", "out", "ctrl"):
+                (wd / s).mkdir(parents=True, exist_ok=True)
+            return _AliveHandle(wd)
+
+    rt = GvisorSnapshotSlotRuntime(_AliveMgr(tmp_path), settle_s=0.0)
+    slot = rt.spawn()
+    assert rt.is_alive(slot) is True
+
+
+def test_is_alive_handle_without_alive_method_returns_true(tmp_path):
+    """A handle without alive() (e.g. legacy fake) is assumed alive."""
+    rt = GvisorSnapshotSlotRuntime(_FakeMgr(tmp_path), settle_s=0.0)
+    slot = rt.spawn()
+    # _FakeHandle has no alive() method — should default to True
+    assert rt.is_alive(slot) is True
 
 
 def test_stage_warm_input_copies(tmp_path):

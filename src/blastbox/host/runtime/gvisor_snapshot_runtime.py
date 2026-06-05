@@ -65,7 +65,11 @@ class GvisorSnapshotSlotRuntime:
 
     def is_alive(self, slot: Slot) -> bool:
         with self._lock:
-            return slot.slot_id in self._handles
+            handle = self._handles.get(slot.slot_id)
+        if handle is None:
+            return False
+        alive = getattr(handle, "alive", None)
+        return alive() if callable(alive) else True
 
     def reap(self, slot: Slot) -> None:
         with self._lock:
@@ -81,9 +85,8 @@ class GvisorSnapshotSlotRuntime:
             shutil.rmtree(slot_workdir, ignore_errors=True)
 
     # --- warm-path seam (file-trigger control; output already on the bind mount) ---
-    def host_warm_control(self, slot: Slot) -> object:
-        from blastbox.worker.warm import HostWarmControl
-        return HostWarmControl(slot.control_dir)
+    def host_warm_control(self, slot: Slot) -> GvisorHostWarmControl:
+        return GvisorHostWarmControl(slot.control_dir)
 
     def stage_warm_input(self, slot: Slot, staged_input_path: Path) -> Path:
         dst = Path(slot.input_dir) / Path(staged_input_path).name
@@ -94,6 +97,32 @@ class GvisorSnapshotSlotRuntime:
     def materialize_warm_output(self, slot: Slot) -> None:
         # Output is written directly into the bind-mounted out/ dir; nothing to read back.
         return None
+
+
+class GvisorHostWarmControl:
+    """Wraps HostWarmControl, rewriting the job spec's host paths to the fixed
+    in-sandbox bind-mount destinations (/in, /out) before writing go.json — the
+    worker validates + reads those in its own (sandbox) namespace.  The host still
+    reads results from the host-side slot.output_dir (same bind mount)."""
+
+    SANDBOX_IN = Path("/in")
+    SANDBOX_OUT = Path("/out")
+
+    def __init__(self, control_dir: Path) -> None:
+        from blastbox.worker.warm import HostWarmControl
+        self._inner = HostWarmControl(control_dir)
+
+    def signal_go(self, spec: object) -> None:
+        from blastbox.worker.warm import WarmJobSpec
+        translated = WarmJobSpec(
+            input_path=self.SANDBOX_IN / Path(spec.input_path).name,  # type: ignore[attr-defined]
+            output_dir=self.SANDBOX_OUT,
+            params=dict(spec.params),  # type: ignore[attr-defined]
+        )
+        self._inner.signal_go(translated)
+
+    def wait_for_done(self, *, timeout_s: float) -> str:
+        return self._inner.wait_for_done(timeout_s=timeout_s)
 
 
 class GvisorUnavailable(RuntimeError):
