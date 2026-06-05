@@ -1,8 +1,9 @@
 """SlotRuntime backed by warm-snapshot restore — the warm-UNO Firecracker tier.
 
 ``spawn()`` builds **one** warm snapshot on its first call (``SnapshotManager.build``,
-constructed via ``SnapshotManager.from_env`` so the RAM-preload toggle —
-``BLASTBOX_SNAPSHOT_MEM_TMPFS`` / ``BLASTBOX_SNAPSHOT_MEM_DIR`` — is honored), then
+driving an ``FcSnapshotBackend`` constructed via ``FcSnapshotBackend.from_env`` so the
+RAM-preload toggle — ``BLASTBOX_SNAPSHOT_MEM_TMPFS`` / ``BLASTBOX_SNAPSHOT_MEM_DIR`` —
+is honored), then
 restores it into a fresh per-slot microVM on every subsequent ``spawn()``. The
 restored guest resumes **already warm** (the snapshot captured the READY/idle state,
 e.g. a live ``unoserver``), so promotion is near-instant — no soffice cold boot per
@@ -80,8 +81,9 @@ class SnapshotSlotRuntime:
     cfg:
         The FC config (``FCConfig``); used for ``max_extracted_bytes`` on output read.
     manager:
-        A :class:`SnapshotManager`, normally built via ``SnapshotManager.from_env``
-        so the RAM-preload toggle is respected. Injected for testability.
+        A :class:`SnapshotManager` driving an ``FcSnapshotBackend`` (normally built
+        via ``FcSnapshotBackend.from_env`` so the RAM-preload toggle is respected).
+        Injected for testability.
     """
 
     def __init__(
@@ -127,7 +129,9 @@ class SnapshotSlotRuntime:
         handle = self._manager.restore(slot_id)
         # The launcher restores in base_dir/slots/<id>; the vsock UDS lives there, so
         # its parent IS the per-slot workdir (vsock.sock + outdisk.ext4 + fc-api.sock).
-        slot_workdir = Path(handle.vsock_uds).parent
+        # vsock_uds is a concrete-FC-handle accessor not on the generic RestoreHandle
+        # seam (kill-only) — the FC backend's handle always provides it.
+        slot_workdir = Path(handle.vsock_uds).parent  # type: ignore[attr-defined]
         output_dir = slot_workdir / "out"
         input_dir = slot_workdir / "in"
         control_dir = slot_workdir / "ctrl"
@@ -260,16 +264,20 @@ def select_snapshot_runtime(
 ) -> "SnapshotSlotRuntime | None":
     """Build a :class:`SnapshotSlotRuntime`, or ``None`` if the FC tier is unavailable.
 
-    When ``manager`` is not injected, it is built via ``SnapshotManager.from_env`` —
-    so the **RAM-preload toggle** (``BLASTBOX_SNAPSHOT_MEM_TMPFS`` /
-    ``BLASTBOX_SNAPSHOT_MEM_DIR``, default OFF) is honored — over a
-    :class:`FcSnapshotLauncher` that waits for the base VM's READY (warm-idle) before
-    the snapshot is taken. ``cfg`` defaults to ``FCConfig.from_env()``.
+    When ``manager`` is not injected, it drives an ``FcSnapshotBackend`` built via
+    ``FcSnapshotBackend.from_env`` — so the **RAM-preload toggle**
+    (``BLASTBOX_SNAPSHOT_MEM_TMPFS`` / ``BLASTBOX_SNAPSHOT_MEM_DIR``, default OFF) is
+    honored — over a :class:`FcSnapshotLauncher` that waits for the base VM's READY
+    (warm-idle) before the snapshot is taken. ``cfg`` defaults to ``FCConfig.from_env()``.
 
     ``require_available=True`` raises ``FCUnavailable`` when the FC prerequisites
     (binary + /dev/kvm + kernel + rootfs) are missing — use when the operator
     explicitly requested the snapshot tier.
     """
+    from blastbox.host.runtime.fc_snapshot_backend import (
+        FcSnapshotBackend,
+        resolve_mem_dir,
+    )
     from blastbox.host.runtime.fc_snapshot_launcher import FcSnapshotLauncher
     from blastbox.host.runtime.firecracker import (
         FCConfig,
@@ -317,10 +325,16 @@ def select_snapshot_runtime(
         return None
 
     base_dir = Path(cfg.scratch_root)  # type: ignore[attr-defined]
+    # Resolve the RAM-preload mem dir once, hand it to BOTH the launcher (whose base
+    # handle writes warm.mem there at checkpoint) and the backend (whose restore loads
+    # mem from there) so build/restore agree on the mem-file location.
+    mem_dir = resolve_mem_dir() or base_dir
     launcher = FcSnapshotLauncher(
         cfg,
         base_dir,
+        mem_dir=mem_dir,
         ready_check_factory=_vsock_ready_check_factory,
     )
-    manager = SnapshotManager.from_env(base_dir, launcher)
+    backend = FcSnapshotBackend.from_env(base_dir, launcher, mem_dir=mem_dir)
+    manager = SnapshotManager(base_dir, backend)
     return SnapshotSlotRuntime(cfg, manager, settle_s=settle_s)
