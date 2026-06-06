@@ -194,6 +194,22 @@ def _default_run_text(argv: list[str]) -> str:
         return ""
 
 
+def _default_cr_capable(runsc_bin: str) -> bool:
+    """Fail-closed capability probe: the runsc binary must advertise BOTH the ``checkpoint``
+    and ``restore`` subcommands. An older/stripped/CRI-only build that lacks C/R must not be
+    selected and then fail at restore time. ``runsc help`` lists subcommands; capture stdout+
+    stderr (which stream it lands on is build-dependent) and cap the stall. Any error/timeout →
+    not capable (don't select a runsc that can't C/R)."""
+    try:
+        r = subprocess.run(
+            [runsc_bin, "help"], capture_output=True, text=True, check=False, timeout=5
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    out = r.stdout + r.stderr
+    return "checkpoint" in out and "restore" in out
+
+
 def _default_ready_wait(ctrl_dir: Path, timeout_s: float) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -293,17 +309,25 @@ class GvisorSnapshotBackend:
         run_text: Callable[[list[str]], str] = _default_run_text,
         ready_wait: Callable[[Path, float], None] = _default_ready_wait,
         probe: Callable[[], bool] | None = None,
+        cr_capable: Callable[[str], bool] = _default_cr_capable,
     ) -> None:
         self._cfg = cfg
         self._run = run
         self._run_text = run_text
         self._ready = ready_wait
         self._probe = probe
+        self._cr_capable = cr_capable
 
     def available(self) -> bool:
+        # `probe` is a full override (tests/embedders); honor it verbatim.
         if self._probe is not None:
             return self._probe()
-        return shutil.which(self._cfg.runsc_bin) is not None
+        # Fail-closed seam contract: the binary must EXIST and advertise checkpoint+restore.
+        # Checking mere existence would fail-open — selecting gVisor on a runsc that can't C/R,
+        # then erroring at restore time instead of falling back at selection.
+        if shutil.which(self._cfg.runsc_bin) is None:
+            return False
+        return self._cr_capable(self._cfg.runsc_bin)
 
     def boot_base(self) -> GvisorBootHandle:
         # Unique per build so two pool processes sharing this -root parent (e.g. a

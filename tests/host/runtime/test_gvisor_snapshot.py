@@ -87,6 +87,63 @@ def test_available_uses_probe(tmp_path: Path) -> None:
     assert GvisorSnapshotBackend(_cfg(tmp_path), run=lambda a, **k: 0, probe=lambda: False).available() is False
 
 
+def test_available_missing_binary_is_false(tmp_path: Path) -> None:
+    # No probe override + a binary that doesn't resolve -> fail-closed before the C/R probe.
+    be = GvisorSnapshotBackend(
+        _cfg(tmp_path, runsc_bin="definitely-not-a-real-binary-xyz"),
+        cr_capable=lambda b: pytest.fail("cr_capable must not run when the binary is missing"),
+    )
+    assert be.available() is False
+
+
+def test_available_requires_checkpoint_restore_capability(tmp_path: Path) -> None:
+    # Binary EXISTS (sys.executable resolves) but the runsc build lacks C/R -> fail-closed,
+    # so the pool never selects gVisor and then errors at restore time.
+    import sys
+
+    seen: list[str] = []
+
+    def _incapable(binary: str) -> bool:
+        seen.append(binary)
+        return False
+
+    be = GvisorSnapshotBackend(_cfg(tmp_path, runsc_bin=sys.executable), cr_capable=_incapable)
+    assert be.available() is False
+    assert seen == [sys.executable]  # the capability probe actually ran on the resolved binary
+
+    ok = GvisorSnapshotBackend(_cfg(tmp_path, runsc_bin=sys.executable), cr_capable=lambda b: True)
+    assert ok.available() is True
+
+
+def test_default_cr_capable_parses_help_output(monkeypatch, tmp_path: Path) -> None:
+    # _default_cr_capable runs `runsc help` and requires BOTH subcommands in the output.
+    import subprocess as _sp
+
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    class _Completed:
+        def __init__(self, out: str) -> None:
+            self.stdout, self.stderr = out, ""
+
+    def _fake_run_both(argv, **kw):
+        return _Completed("Subcommands:\n\tcheckpoint\n\trestore\n\trun\n")
+
+    def _fake_run_missing(argv, **kw):
+        return _Completed("Subcommands:\n\trun\n\tdelete\n")  # no checkpoint/restore
+
+    monkeypatch.setattr(gs.subprocess, "run", _fake_run_both)
+    assert gs._default_cr_capable("runsc") is True
+
+    monkeypatch.setattr(gs.subprocess, "run", _fake_run_missing)
+    assert gs._default_cr_capable("runsc") is False
+
+    def _boom(argv, **kw):
+        raise _sp.TimeoutExpired(argv, 5)
+
+    monkeypatch.setattr(gs.subprocess, "run", _boom)
+    assert gs._default_cr_capable("runsc") is False  # timeout -> not capable (fail-closed)
+
+
 def test_restore_in_propagates_run_error(tmp_path: Path) -> None:
     def boom(argv: list[str], **kw: object) -> int:
         raise RuntimeError("runsc gone")
