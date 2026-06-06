@@ -591,3 +591,31 @@ def test_16_is_healthy_true_if_idle_recently() -> None:
     # Beyond 30 s without idle and past warmup grace → not healthy
     clock.advance(30.0)
     assert pool.is_healthy() is False
+
+
+def test_stuck_warming_slot_evicted_after_timeout() -> None:
+    """A WARMING slot that never becomes ready (dead restore) must be evicted after
+    warming_timeout_s and replaced — otherwise it counts toward capacity forever."""
+    clock = _FakeClock()
+    rt = _FakeRuntime()
+    rt.set_default_ready_after(10**9)  # never becomes ready
+    pool = WarmPool(
+        runtime=rt, warm_size=1, clock=clock, spawn_rate_limit=100.0, warming_timeout_s=60.0
+    )
+    pool.tick()  # spawn one WARMING slot (spawned_at = clock = 0)
+    warming = [s for s in pool._slots.values() if s.state == SlotState.WARMING]
+    assert len(warming) == 1
+    stuck_id = warming[0].slot_id
+
+    # Before the timeout: still WARMING, not evicted, no replacement.
+    clock.advance(30.0)
+    pool.tick()
+    assert stuck_id in pool._slots
+
+    # After the timeout: the stuck slot is reaped + removed and a fresh slot spawned.
+    clock.advance(40.0)  # now 70s > 60s
+    pool.tick()
+    assert stuck_id in rt.reaped
+    assert stuck_id not in pool._slots
+    new_warming = [s for s in pool._slots.values() if s.state == SlotState.WARMING]
+    assert len(new_warming) == 1 and new_warming[0].slot_id != stuck_id

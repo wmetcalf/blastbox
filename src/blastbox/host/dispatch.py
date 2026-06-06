@@ -59,6 +59,10 @@ _MAX_ENV_VALUE_LEN = 4096
 # and underscores.  This prevents any lowercase/symbol injection.
 _VALID_ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
+# Max number of entries (files + dirs) allowed in a worker output dir — bounds inode + walk-time
+# exhaustion from undeclared files even under the byte cap.
+_MAX_OUTPUT_ENTRIES = 65536
+
 
 @dataclass(frozen=True)
 class EngineSpec:
@@ -610,7 +614,15 @@ class Dispatcher:
         The cold worker is already exited (--rm) so the dir is static (no TOCTOU)."""
         cap = self._limits.max_total_artifact_bytes
         total = 0
+        count = 0
         for p in output_dir.rglob("*"):
+            count += 1
+            # Bound entry count too: many tiny/empty files exhaust inodes + traversal time even
+            # under the byte cap. Checked first so the walk itself can't run unbounded.
+            if count > _MAX_OUTPUT_ENTRIES:
+                raise OutputTrustError(
+                    f"output entry count exceeds {_MAX_OUTPUT_ENTRIES} (inode/traversal DoS)"
+                )
             try:
                 if p.is_symlink() or not p.is_file():
                     continue

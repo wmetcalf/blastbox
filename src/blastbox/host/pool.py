@@ -147,6 +147,7 @@ class WarmPool:
         burst_trigger_s: float = 3.0,
         burst_drain_s: float = 60.0,
         warmup_grace_s: float = 30.0,
+        warming_timeout_s: float = 120.0,
     ) -> None:
         self._runtime = runtime
         self._warm_size = warm_size
@@ -157,6 +158,7 @@ class WarmPool:
         self._burst_trigger_s = burst_trigger_s
         self._burst_drain_s = burst_drain_s
         self._warmup_grace_s = warmup_grace_s
+        self._warming_timeout_s = warming_timeout_s
 
         # slot_id → Slot; all mutations under _lock
         self._slots: dict[str, Slot] = {}
@@ -506,17 +508,29 @@ class WarmPool:
                     logger.info("pool.burst_drained")
 
     def _health_check(self) -> None:
-        """Evict dead IDLE slots so the spawn loop replaces them next tick.
+        """Evict dead IDLE slots AND stuck WARMING slots so the spawn loop replaces them.
 
-        For each IDLE slot, calls runtime.is_alive(); on False → DRAINING →
-        reap → remove.  All slot-dict mutations happen under _lock.  The
-        is_alive() call itself is made outside the lock (may be slow) using
-        the same pattern as _try_claim_one().
+        For each IDLE slot, calls runtime.is_alive(); on False → DRAINING → reap → remove.
+        Additionally, a WARMING slot that never reached IDLE within ``warming_timeout_s`` (a
+        dead/never-ready restore) is evicted too — otherwise it counts toward capacity in
+        _spawn_to_deficit and permanently blocks its replacement. All slot-dict mutations happen
+        under _lock; the (possibly slow) is_alive() call is made outside the lock.
         """
+        now = self._clock()
         with self._lock:
             idle_slots = [s for s in self._slots.values() if s.state == SlotState.IDLE]
+            stuck_warming = [
+                s for s in self._slots.values()
+                if s.state == SlotState.WARMING
+                and self._warming_timeout_s > 0
+                and now - s.spawned_at > self._warming_timeout_s
+            ]
 
-        dead: list[Slot] = []
+        dead: list[Slot] = list(stuck_warming)
+        for slot in stuck_warming:
+            logger.warning(
+                "pool.warming_timeout_evict slot_id=%s age=%.1fs", slot.slot_id, now - slot.spawned_at
+            )
         for slot in idle_slots:
             try:
                 alive = self._runtime.is_alive(slot)
@@ -532,8 +546,9 @@ class WarmPool:
         # Demote dead slots under the lock, then reap+remove outside
         with self._lock:
             for slot in dead:
-                if slot.slot_id in self._slots and self._slots[slot.slot_id].state == SlotState.IDLE:
-                    slot.state = SlotState.DRAINING
+                cur = self._slots.get(slot.slot_id)
+                if cur is not None and cur.state in (SlotState.IDLE, SlotState.WARMING):
+                    cur.state = SlotState.DRAINING
 
         for slot in dead:
             logger.warning("pool.health_evicted_dead_slot slot_id=%s", slot.slot_id)

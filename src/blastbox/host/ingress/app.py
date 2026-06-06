@@ -423,6 +423,12 @@ def build_app(
         deployment is expected to run behind an auth proxy that enforces
         per-tenant access.
         """
+        # Clamp pagination defensively — a negative offset slices from the end and a huge/negative
+        # limit is nonsensical. (The in-memory store still loads+sorts all jobs; SQL/redis backends
+        # should push LIMIT/OFFSET down for large stores.)
+        offset = max(0, offset)
+        limit = max(1, min(limit, 1000))
+
         filter_status: JobStatus | None = None
         if status:
             try:
@@ -491,7 +497,7 @@ def build_app(
             raise HTTPException(410, "result expired")
 
         meta_json = out / "metadata.json"
-        if not meta_json.is_file():
+        if meta_json.is_symlink() or not meta_json.is_file():
             raise HTTPException(404, "metadata.json not found")
 
         try:
