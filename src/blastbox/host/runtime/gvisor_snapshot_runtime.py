@@ -173,6 +173,15 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
     return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle())
 
 
+def _int_env(env, key: str, default: int) -> int:
+    raw = str(env.get(key, "")).strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        _log.warning("invalid %s=%r; using %d", key, raw, default)
+        return default
+
+
 def _gvisor_config_from_env(env):
     import json
     from blastbox.host.runtime.gvisor_snapshot import GvisorConfig
@@ -209,4 +218,7 @@ def _gvisor_config_from_env(env):
         ld_preload=env.get("BLASTBOX_GVISOR_LD_PRELOAD") or None,
         platform=env.get("BLASTBOX_GVISOR_PLATFORM") or None,
         cpu_features_annotation=env.get("BLASTBOX_GVISOR_CPUFEATURES") or None,
+        # Generous defense-in-depth bounds for the whole warm worker tree (see GvisorConfig).
+        rlimit_nproc=_int_env(env, "BLASTBOX_GVISOR_NPROC", 4096),
+        rlimit_nofile=_int_env(env, "BLASTBOX_GVISOR_NOFILE", 65536),
     )

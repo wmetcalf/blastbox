@@ -94,6 +94,8 @@ reads the following env vars (all optional, defaults shown):
 | `BLASTBOX_GVISOR_PLATFORM` | _(runsc default)_ | `ptrace` or `kvm`; leave unset to let runsc choose |
 | `BLASTBOX_GVISOR_CPUFEATURES` | _(unset)_ | `dev.gvisor.internal.cpufeatures` OCI annotation for cross-host CPU pinning |
 | `BLASTBOX_SNAPSHOT_SETTLE_S` | `1.0` | Seconds to wait after restore before sending the job (post-restore settle) |
+| `BLASTBOX_GVISOR_NPROC` | `4096` | `RLIMIT_NPROC` for the warm worker tree (fork-bomb bound) |
+| `BLASTBOX_GVISOR_NOFILE` | `65536` | `RLIMIT_NOFILE` for the warm worker tree (fd-exhaustion bound) |
 
 `_gvisor_config_from_env()` assembles a `GvisorConfig` dataclass from these
 vars; `select_gvisor_snapshot_runtime()` returns the configured runtime object.
@@ -111,6 +113,23 @@ tier — no vsock, no ext4 image:
 
 Output is read directly from `out/` on the host after the job completes.  Each restore
 is **disposable**: one untrusted document per restore, then the container is destroyed.
+
+## Resource & filesystem isolation
+
+The warm worker runs **non-root (uid 65532), no capabilities, no-new-privs, read-only rootfs,
+network=none**. The OCI spec applies `RLIMIT_NPROC` (4096) + `RLIMIT_NOFILE` (65536) — the gVisor
+sentry enforces these even though `-ignore-cgroups` disables cgroup pids/memory — so a
+malicious-doc fork-bomb or fd-exhaustion can't degrade the pool. These are generous
+defense-in-depth bounds (the whole python + soffice + pdfium worker tree shares one limit), not
+tight quotas. Worker **memory** is bounded
+per-soffice by the inner sandbox's `RLIMIT_AS`; for a worker-tree RSS bound, place the `runsc`
+process under a host memory cgroup (the spec's cgroup is intentionally ignored).
+
+Per-slot `out/` + `ctrl/` are mode `0o777` (shared cross-uid scratch between the non-root worker
+and the host services) but live inside a **`0o700`** slot dir created atomically — another local
+user can't traverse into it to reach them, independent of the deploy parent. blastbox additionally
+**warns** if the deploy state parent (`/var/lib/blastbox/...`) is group/other-writable; lock it to
+root-owned `0o700`.
 
 ## Snapshot sensitivity
 

@@ -128,6 +128,37 @@ def test_oci_config_honors_custom_uid(tmp_path: Path) -> None:
     assert spec["process"]["user"] == {"uid": 10001, "gid": 10001}
 
 
+def test_oci_config_sets_resource_rlimits(tmp_path: Path) -> None:
+    # Bound the untrusted worker so a malicious-doc fork-bomb / fd-exhaustion can't degrade the
+    # pool (the FC tier bounds via the microVM; -ignore-cgroups disables cgroup pids here).
+    spec = _oci_config(_cfg(tmp_path), tmp_path / "wd", in_ro=True)
+    rlimits = {r["type"]: r for r in spec["process"].get("rlimits", [])}
+    assert rlimits["RLIMIT_NPROC"]["hard"] == 4096  # generous fork-bomb bound
+    assert rlimits["RLIMIT_NOFILE"]["hard"] == 65536  # generous fd-exhaustion bound
+    assert all(r["soft"] == r["hard"] for r in rlimits.values())
+
+
+def test_oci_config_omits_rlimits_when_disabled(tmp_path: Path) -> None:
+    spec = _oci_config(
+        _cfg(tmp_path, rlimit_nproc=0, rlimit_nofile=0), tmp_path / "wd", in_ro=True
+    )
+    assert "rlimits" not in spec["process"]
+
+
+def test_prepare_slot_dirs_perms_are_locked_down(tmp_path: Path) -> None:
+    import stat
+
+    rec = _Rec()
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=rec, ready_wait=lambda d, t: None)
+    wd = tmp_path / "slots" / "s1"
+    be.restore_in(wd, "img")
+    # The 0o700 leaf is what blocks other local users from reaching the 0o777 out/ctrl scratch.
+    assert stat.S_IMODE(wd.stat().st_mode) == 0o700
+    assert stat.S_IMODE((wd / "in").stat().st_mode) == 0o755
+    assert stat.S_IMODE((wd / "out").stat().st_mode) == 0o777
+    assert stat.S_IMODE((wd / "ctrl").stat().st_mode) == 0o777
+
+
 def test_restore_handle_alive_running(tmp_path: Path) -> None:
     from blastbox.host.runtime.gvisor_snapshot import GvisorRestoreHandle
     cfg = _cfg(tmp_path)

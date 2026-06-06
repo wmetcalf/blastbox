@@ -70,6 +70,22 @@ def test_gvisor_control_translates_paths_to_sandbox(tmp_path):
     assert go["params"] == {"a": "b"}
 
 
+def test_config_from_env_sources_worker_rlimits():
+    from blastbox.host.runtime.gvisor_snapshot_runtime import _gvisor_config_from_env
+
+    # Generous defense-in-depth defaults for the whole warm worker tree.
+    cfg = _gvisor_config_from_env({})
+    assert cfg.rlimit_nproc == 4096
+    assert cfg.rlimit_nofile == 65536
+    cfg2 = _gvisor_config_from_env(
+        {"BLASTBOX_GVISOR_NPROC": "8192", "BLASTBOX_GVISOR_NOFILE": "131072"}
+    )
+    assert cfg2.rlimit_nproc == 8192
+    assert cfg2.rlimit_nofile == 131072
+    # A garbage value falls back to the default rather than crashing host startup.
+    assert _gvisor_config_from_env({"BLASTBOX_GVISOR_NPROC": "garbage"}).rlimit_nproc == 4096
+
+
 def test_warm_argv_rejects_non_list_json():
     """A bare JSON string / object / non-string array is valid JSON but not an argv —
     it must fall back to the default, not char-split or take dict keys into argv."""

@@ -9,6 +9,7 @@ rw, ctrl/ rw) — no vsock, no ext4. All runsc calls go through an injected `run
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 import time
@@ -16,6 +17,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,19 @@ class GvisorConfig:
     # UserInstallation under /tmp keep soffice happy unprivileged.
     uid: int = 65532
     gid: int = 65532
+    # Bound the untrusted worker's process + fd count at the OCI layer. The sentry enforces
+    # process.rlimits even though `-ignore-cgroups` disables cgroup pids/memory, so without
+    # these a malicious doc could fork-bomb / exhaust fds and degrade the whole pool (the FC
+    # tier bounds via the microVM; this tier had no equivalent). These are GENEROUS
+    # defense-in-depth bounds, not tight quotas: the docker tier proved 256 procs / 4096 fds
+    # sufficient for the whole corpus, but that limit covers a single conversion — here the warm
+    # worker tree (python + soffice + pdfium multiprocessing sharding across cores) shares ONE
+    # limit, so we leave ample headroom while still capping a fork-bomb / fd-exhaustion well below
+    # host exhaustion. 0/None omits a limit. Worker-level MEMORY is intentionally NOT bounded here
+    # (RLIMIT_AS on the whole python/pdfium tree risks false VADDR kills); it stays bounded
+    # per-soffice by the inner sandbox's RLIMIT_AS and, recommended, a host memory cgroup.
+    rlimit_nproc: int | None = 4096
+    rlimit_nofile: int | None = 65536
 
 
 def _runsc(cfg: GvisorConfig) -> list[str]:
@@ -89,6 +105,15 @@ def _oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> dict:
         ],
         "linux": {"namespaces": [{"type": t} for t in ("pid", "network", "ipc", "uts", "mount")]},
     }
+    # Resource bounds for the untrusted worker (gVisor sentry honors these even under
+    # -ignore-cgroups). NPROC caps a fork-bomb; NOFILE caps fd-exhaustion. See GvisorConfig.
+    rlimits = []
+    if cfg.rlimit_nproc:
+        rlimits.append({"type": "RLIMIT_NPROC", "hard": cfg.rlimit_nproc, "soft": cfg.rlimit_nproc})
+    if cfg.rlimit_nofile:
+        rlimits.append({"type": "RLIMIT_NOFILE", "hard": cfg.rlimit_nofile, "soft": cfg.rlimit_nofile})
+    if rlimits:
+        spec["process"]["rlimits"] = rlimits
     if cfg.cpu_features_annotation:
         spec["annotations"] = {"dev.gvisor.internal.cpufeatures": cfg.cpu_features_annotation}
     return spec
@@ -101,26 +126,55 @@ def _write_oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> None:
     )
 
 
+_warned_lax_parents: set[str] = set()
+
+
+def _warn_if_lax_parent(workdir: Path) -> None:
+    """One-time warning if the slot dir's parent is group/other-writable. The 0o700 slot leaf
+    already blocks other local users from reaching the 0o777 out/ctrl scratch (you can't traverse
+    INTO a 0o700 dir you don't own), so this is defense-in-depth/observability — it surfaces a lax
+    deploy (the parent should be root-owned 0700) instead of letting the old comment-only
+    assumption pass silently."""
+    parent = workdir.parent
+    key = str(parent)
+    if key in _warned_lax_parents:
+        return
+    try:
+        mode = parent.stat().st_mode & 0o777
+    except OSError:
+        return
+    if mode & 0o022:  # group- or other-writable
+        _warned_lax_parents.add(key)
+        _log.warning(
+            "gVisor warm state parent %s is group/other-writable (mode %o); slot dirs are 0o700 "
+            "so this is not an exposure, but lock the deploy parent to root-owned 0700.",
+            parent, mode,
+        )
+
+
 def _prepare_slot_dirs(cfg: GvisorConfig, workdir: Path) -> None:
     """Create the per-slot bind-mount dirs. ``out/`` and ``ctrl/`` are shared scratch between
-    the NON-ROOT container uid (writes output + ready/done) and the host services (the
-    dispatcher writes go.json / reads done; the trust gate reads output) — which run under
-    different uids — so they are mode 0o777. This is safe because the parent
-    (``/var/lib/blastbox/...``, deploy concern) MUST be root-owned 0700, making the 0o777 leaf
-    reachable only by root + the mapped container uid (via the bind mount), not other local
-    users. ``in/`` is read-only and only needs world-traversable (0o755).
+    the NON-ROOT container uid (writes output + ready/done) and the host services (the dispatcher
+    writes go.json / reads done; the trust gate reads output) — which run under different uids —
+    so they are mode 0o777. ``in/`` is read-only (0o755).
 
-    We also clamp ``workdir`` itself to 0o700 (belt-and-suspenders): even if the deploy parent
-    is lax, an unprivileged local user can't traverse INTO this slot dir to reach the 0o777
-    leaves. The container's gofer (and the host pool service) own/traverse it regardless."""
-    workdir.mkdir(parents=True, exist_ok=True)
-    workdir.chmod(0o700)
+    The 0o777 leaves are protected by the slot ``workdir`` being **0o700**: another local user
+    can't traverse into a 0o700 dir it doesn't own, so it can't reach out/ctrl — independent of
+    the deploy parent's perms. The leaf is created **mode 0o700 atomically** (0o700 has no
+    group/other bits, so the umask can only further restrict it — there is NO mkdir-then-chmod
+    window where it is briefly group/other-traversable). ``_warn_if_lax_parent`` additionally
+    surfaces a lax deploy parent as observability."""
+    workdir = Path(workdir)
+    workdir.parent.mkdir(parents=True, exist_ok=True)
+    _warn_if_lax_parent(workdir)
+    workdir.mkdir(mode=0o700, exist_ok=True)
+    workdir.chmod(0o700)  # exact 0o700 even if it pre-existed (mkdir mode is a no-op on exist)
     in_dir = workdir / "in"
-    in_dir.mkdir(parents=True, exist_ok=True)
+    in_dir.mkdir(mode=0o755, exist_ok=True)
     in_dir.chmod(0o755)
     for sub in ("out", "ctrl"):
         d = workdir / sub
-        d.mkdir(parents=True, exist_ok=True)
+        d.mkdir(exist_ok=True)
         d.chmod(0o777)
 
 
