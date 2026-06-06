@@ -226,15 +226,47 @@ class SqlJobStore:
             raise KeyError(job_id)
         return job
 
-    def list(self, status: JobStatus | None = None) -> list[Job]:
+    def list(
+        self,
+        status: JobStatus | None = None,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        newest_first: bool = False,
+    ) -> list[Job]:
         sql = f"SELECT {', '.join(_COLUMNS)} FROM jobs"
+        params: list = []
+        if status is not None:
+            sql += f" WHERE status = {self._param}"
+            params.append(status.value)
+        if newest_first:
+            sql += " ORDER BY created_at DESC, job_id DESC"
+        # Push the page window into the query so large tables never fully
+        # materialize.  SQLite requires a LIMIT clause syntactically before
+        # OFFSET, so a bare offset gets the unbounded sentinel ``LIMIT -1``;
+        # Postgres accepts OFFSET alone.
+        eff_limit = limit
+        if offset and eff_limit is None and self._driver == "sqlite":
+            eff_limit = -1
+        if eff_limit is not None:
+            sql += f" LIMIT {self._param}"
+            params.append(int(eff_limit))
+        if offset:
+            sql += f" OFFSET {self._param}"
+            params.append(int(offset))
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [job for row in rows if (job := self._row_to_job(row)) is not None]
+
+    def count(self, status: JobStatus | None = None) -> int:
+        sql = "SELECT COUNT(*) FROM jobs"
         params: tuple = ()
         if status is not None:
             sql += f" WHERE status = {self._param}"
             params = (status.value,)
         with self._lock, self._connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
-        return [job for row in rows if (job := self._row_to_job(row)) is not None]
+            row = conn.execute(sql, params).fetchone()
+        return int(row[0]) if row else 0
 
     def claim_next(self) -> Job | None:
         if self._driver == "sqlite":

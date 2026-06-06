@@ -36,12 +36,31 @@ class InMemoryJobStore:
                 setattr(job, k, v)
             return job
 
-    def list(self, status: JobStatus | None = None) -> list[Job]:
+    def list(
+        self,
+        status: JobStatus | None = None,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        newest_first: bool = False,
+    ) -> list[Job]:
         with self._lock:
             jobs = list(self._jobs.values())
         if status is not None:
             jobs = [j for j in jobs if j.status == status]
+        if newest_first:
+            jobs.sort(key=lambda j: (j.created_at, j.job_id), reverse=True)
+        if offset:
+            jobs = jobs[offset:]
+        if limit is not None:
+            jobs = jobs[:limit]
         return jobs
+
+    def count(self, status: JobStatus | None = None) -> int:
+        with self._lock:
+            if status is None:
+                return len(self._jobs)
+            return sum(1 for j in self._jobs.values() if j.status == status)
 
     def claim_next(self) -> Job | None:
         """Atomically claim the oldest QUEUED job and flip it to RUNNING."""

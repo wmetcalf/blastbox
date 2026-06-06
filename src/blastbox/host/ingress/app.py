@@ -296,7 +296,9 @@ def build_app(
     @app.get("/v1/readyz")
     def readyz():
         try:
-            _job_store.list()
+            # Cheapest store round-trip that proves connectivity — a bare COUNT on SQL,
+            # never a full materialization of the jobs table.
+            _job_store.count()
             return {"status": "ready"}
         except Exception as exc:
             # Never echo the store exception to an unauthenticated caller — it can carry the DB
@@ -435,8 +437,8 @@ def build_app(
         per-tenant access.
         """
         # Clamp pagination defensively — a negative offset slices from the end and a huge/negative
-        # limit is nonsensical. (The in-memory store still loads+sorts all jobs; SQL/redis backends
-        # should push LIMIT/OFFSET down for large stores.)
+        # limit is nonsensical.  The store pushes this window down (SQL: ORDER BY ... LIMIT ...
+        # OFFSET + a COUNT(*) for total), so a large jobs table never fully materializes here.
         offset = max(0, offset)
         limit = max(1, min(limit, 1000))
 
@@ -447,10 +449,10 @@ def build_app(
             except ValueError:
                 raise HTTPException(400, f"unknown status: {status!r}")
 
-        jobs = _job_store.list(status=filter_status)
-        jobs.sort(key=lambda j: j.created_at, reverse=True)
-        total = len(jobs)
-        page = jobs[offset : offset + limit]
+        total = _job_store.count(status=filter_status)
+        page = _job_store.list(
+            status=filter_status, limit=limit, offset=offset, newest_first=True
+        )
         return {
             "jobs": [j.to_public_dict() for j in page],
             "total": total,

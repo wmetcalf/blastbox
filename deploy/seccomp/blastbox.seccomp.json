@@ -262,7 +262,6 @@
         "sigaltstack",
         "signalfd",
         "signalfd4",
-        "socketcall",
         "socketpair",
         "splice",
         "stat",
@@ -315,7 +314,7 @@
       "action": "SCMP_ACT_ALLOW"
     },
     {
-      "_comment": "socket() restricted to AF_UNIX(1), AF_LOCAL(1) only. All networking-capable address families blocked. Namespace --network=none already prevents egress, this is defense-in-depth.",
+      "_comment": "socket() arg-filtered to AF_UNIX/AF_LOCAL (family==1) only; networking-capable families (AF_INET, AF_INET6, ...) fall through to defaultAction ERRNO. The i386 socketcall() multiplexer — which on 32-bit would tunnel socket(AF_INET)/connect/bind past this arg-filter — is unreachable here: it has no x86_64/aarch64 syscall number (the only configured architectures), and the 32-bit compat ABI (SCMP_ARCH_X86) is intentionally absent from this profile, so an int-0x80 socketcall hits the default-deny rather than this allow. --network=none already prevents egress; this is defense-in-depth.",
       "names": ["socket"],
       "action": "SCMP_ACT_ALLOW",
       "args": [

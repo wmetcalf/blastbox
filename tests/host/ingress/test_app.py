@@ -100,7 +100,7 @@ def test_readyz_does_not_leak_store_error(tmp_path):
     def boom():
         raise RuntimeError("could not connect: host=db.internal port=5432 password=hunter2")
 
-    store.list = boom  # type: ignore[method-assign]
+    store.count = boom  # type: ignore[method-assign]  # readyz probes via count()
     resp = client.get("/v1/readyz")
     assert resp.status_code == 503
     body = resp.text
@@ -380,6 +380,33 @@ class TestJobListing:
         client, _ = _make_client(tmp_path)
         resp = client.get("/v1/jobs?status=flying")
         assert resp.status_code == 400
+
+    def test_list_pagination_window_and_total(self, tmp_path):
+        """offset/limit page the result via the store pushdown; total reflects the full count,
+        and jobs come back newest-first."""
+        client, store = _make_client(tmp_path)
+        created = []
+        for i in range(5):
+            j = Job.new(engine="clippyshot", filename=f"f{i}.docx")
+            j.created_at = 1000.0 + i  # deterministic newest-first ordering
+            store.create(j)
+            created.append(j)
+
+        resp = client.get("/v1/jobs?offset=1&limit=2")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 5  # full count, not the page size
+        assert body["offset"] == 1 and body["limit"] == 2
+        ids = [j["job_id"] for j in body["jobs"]]
+        # newest-first is f4,f3,f2,f1,f0 -> skip f4, take f3,f2
+        assert ids == [created[3].job_id, created[2].job_id]
+
+    def test_list_limit_clamped_to_1000(self, tmp_path):
+        client, _ = _make_client(tmp_path)
+        resp = client.get("/v1/jobs?limit=999999&offset=-5")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["limit"] == 1000 and body["offset"] == 0
 
     def test_public_dict_strips_result_dir(self, tmp_path):
         """result_dir must not appear in any public-facing response."""

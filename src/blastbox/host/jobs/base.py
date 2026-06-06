@@ -105,6 +105,33 @@ class JobStore(Protocol):
     def create(self, job: Job) -> None: ...
     def get(self, job_id: str) -> Job | None: ...
     def update(self, job_id: str, **fields) -> Job: ...
-    def list(self, status: JobStatus | None = None) -> list[Job]: ...
+    def list(
+        self,
+        status: JobStatus | None = None,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        newest_first: bool = False,
+    ) -> list[Job]:
+        """Return jobs, optionally filtered by ``status``.
+
+        ``limit``/``offset`` page the result and ``newest_first`` orders by
+        ``created_at`` descending.  SQL backends push these down into the query
+        (``ORDER BY ... LIMIT ... OFFSET``) so a listing endpoint never loads
+        the whole table; the in-memory/Redis backends apply the same window
+        after collecting (the data already lives in memory there).  Callers
+        that iterate every job (dispatcher, retention) omit all three and get
+        the full set, unordered.
+        """
+        ...
+
+    def count(self, status: JobStatus | None = None) -> int:
+        """Total number of jobs (optionally filtered by ``status``).
+
+        Paired with ``list(..., limit=, offset=)`` so the listing endpoint can
+        report ``total`` without materializing every row.
+        """
+        ...
+
     def claim_next(self) -> Job | None: ...
     def delete(self, job_id: str) -> None: ...

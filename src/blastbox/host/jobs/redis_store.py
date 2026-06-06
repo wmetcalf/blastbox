@@ -98,7 +98,17 @@ class RedisJobStore:
                 except WatchError:
                     continue  # retry on concurrent modification
 
-    def list(self, status: JobStatus | None = None) -> list[Job]:
+    def list(
+        self,
+        status: JobStatus | None = None,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        newest_first: bool = False,
+    ) -> list[Job]:
+        # Redis has no server-side ORDER BY/LIMIT over a scanned key space, so we
+        # still collect matching jobs, then apply the same window the SQL backend
+        # pushes down — keeping the protocol uniform for the listing endpoint.
         jobs: list[Job] = []
         for k in self._r.scan_iter(match=_PREFIX + "*", count=200):
             raw = self._r.get(k)
@@ -109,7 +119,26 @@ class RedisJobStore:
                 continue
             if status is None or job.status == status:
                 jobs.append(job)
+        if newest_first:
+            jobs.sort(key=lambda j: (j.created_at, j.job_id), reverse=True)
+        if offset:
+            jobs = jobs[offset:]
+        if limit is not None:
+            jobs = jobs[:limit]
         return jobs
+
+    def count(self, status: JobStatus | None = None) -> int:
+        n = 0
+        for k in self._r.scan_iter(match=_PREFIX + "*", count=200):
+            raw = self._r.get(k)
+            if raw is None:
+                continue
+            job = _decode_job(raw)
+            if job is None:
+                continue
+            if status is None or job.status == status:
+                n += 1
+        return n
 
     def claim_next(self) -> Job | None:
         """Atomically claim the oldest QUEUED job.
