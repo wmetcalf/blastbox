@@ -237,12 +237,16 @@ class TestBwrapArgvBuilding:
 class TestBwrapInsecurityReasons:
     """Test insecurity_reasons without running bwrap."""
 
-    def test_seccomp_missing_when_lib_unavailable(self, monkeypatch) -> None:
-        """When the seccomp lib is absent, 'seccomp_missing' is in reasons."""
+    def test_seccomp_not_implemented_is_always_a_reason(self, monkeypatch) -> None:
+        """bwrap attaches NO BPF filter, so 'seccomp_not_implemented' is ALWAYS recorded and
+        secure is False — even when python3-libseccomp is importable (the import is unused).
+        Prevents the backend from falsely self-certifying as secure on a mere library import."""
         import blastbox.worker.sandbox.bwrap as bwrap_mod
-        monkeypatch.setattr(bwrap_mod, "_LIBSECCOMP_AVAILABLE", False)
+        monkeypatch.setattr(bwrap_mod, "_LIBSECCOMP_AVAILABLE", True)  # even WITH the lib present
         sb = _make_sandbox()
-        assert "seccomp_missing" in sb.insecurity_reasons
+        assert "seccomp_not_implemented" in sb.insecurity_reasons
+        assert sb.secure is False
+        assert sb.seccomp_active is False
 
     def test_secure_false_when_seccomp_missing(self, monkeypatch) -> None:
         """secure is False when seccomp lib is absent."""
@@ -274,20 +278,11 @@ class TestBwrapInsecurityReasons:
         r2 = sb.insecurity_reasons
         assert "injected" not in r2
 
-    def test_venv_has_no_seccomp_lib(self) -> None:
-        """The test venv does NOT have the seccomp library installed.
-
-        This is the specific case described in the task brief.  We verify
-        that the module correctly detects the absence and records the reason
-        rather than crashing.
-        """
-        import blastbox.worker.sandbox.bwrap as bwrap_mod
-        # The venv should have _LIBSECCOMP_AVAILABLE == False per the brief.
-        # If it's True (user installed it), we just skip this assertion.
-        if bwrap_mod._LIBSECCOMP_AVAILABLE:
-            pytest.skip("seccomp lib IS available in this venv; skipping absence test")
+    def test_seccomp_axis_insecure_regardless_of_venv_lib(self) -> None:
+        """bwrap reports the seccomp axis insecure whether or not the venv has
+        python3-libseccomp, because it never attaches a filter (no --seccomp wiring)."""
         sb = _make_sandbox()
-        assert "seccomp_missing" in sb.insecurity_reasons
+        assert "seccomp_not_implemented" in sb.insecurity_reasons
         assert sb.secure is False
 
 

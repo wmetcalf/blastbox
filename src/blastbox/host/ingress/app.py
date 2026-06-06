@@ -190,6 +190,13 @@ def build_app(
     else:
         raw_engines = os.environ.get("BLASTBOX_ALLOWED_ENGINES", "")
         _allowed_engines = {e.strip() for e in raw_engines.split(",") if e.strip()}
+    if not _allowed_engines:
+        # Don't let the ingress allowlist silently become a no-op: an empty set means ANY engine
+        # name is accepted (and spooled) before the dispatcher rejects unknown engines. Surface it.
+        _log.warning(
+            "engine_allowlist_unconfigured accepts_any_engine=true "
+            "fix=set_BLASTBOX_ALLOWED_ENGINES_or_pass_allowed_engines"
+        )
 
     # Concurrency gate (BLASTBOX_API_WORKERS)
     if api_workers is not None:
@@ -203,6 +210,10 @@ def build_app(
 
     # Security requirement 5: semaphore is actually wired to _api_workers.
     _intake_gate = asyncio.Semaphore(_api_workers)
+
+    # Bound concurrent in-memory result-ZIP builds (each up to max_total_artifact_bytes) so a
+    # burst of /result requests can't amplify into host memory pressure.
+    _result_gate = asyncio.Semaphore(max(1, min(_api_workers, 4)))
 
     # Bearer auth (requirement 4)
     _api_key = api_key if api_key is not None else os.environ.get("BLASTBOX_API_KEY", "").strip()
@@ -287,7 +298,10 @@ def build_app(
             _job_store.list()
             return {"status": "ready"}
         except Exception as exc:
-            raise HTTPException(503, f"store unavailable: {_public_detail(exc)}")
+            # Never echo the store exception to an unauthenticated caller — it can carry the DB
+            # host:port / DSN. Log the real cause server-side; return a generic 503.
+            _log.warning("readyz_store_unavailable", error=str(exc))
+            raise HTTPException(503, "store unavailable") from exc
 
     @app.get("/v1/version")
     def version():
@@ -451,7 +465,9 @@ def build_app(
         if not out.is_dir():
             raise HTTPException(410, "result expired")
         meta_json = out / "metadata.json"
-        if not meta_json.is_file():
+        # Reject a symlinked metadata.json (don't follow it to an outside target) — mirrors
+        # _zip_validated_artifacts; defense-in-depth even though output/ is not live at serve time.
+        if meta_json.is_symlink() or not meta_json.is_file():
             raise HTTPException(404, "metadata.json not found")
         from fastapi.responses import FileResponse
         return FileResponse(meta_json, media_type="application/json")
@@ -496,9 +512,12 @@ def build_app(
             raise HTTPException(404, f"artifact {artifact_id!r} not found")
 
         artifact_rel_path = matched.get("path", "")
-        # Requirement 3: containment check
+        # Requirement 3: containment check + reject a symlinked artifact (don't follow it to an
+        # outside target), mirroring _zip_validated_artifacts.
+        if (out / artifact_rel_path).is_symlink():
+            raise HTTPException(404, "artifact file not found")
         safe = _safe_artifact_path(out, artifact_rel_path)
-        if safe is None or not safe.is_file():
+        if safe is None or safe.is_symlink() or not safe.is_file():
             raise HTTPException(404, "artifact file not found")
 
         from fastapi.responses import FileResponse
@@ -519,7 +538,7 @@ def build_app(
             raise HTTPException(410, "result expired")
 
         meta_json = out / "metadata.json"
-        if not meta_json.is_file():
+        if meta_json.is_symlink() or not meta_json.is_file():
             raise HTTPException(404, "metadata.json not found")
         try:
             meta = json.loads(meta_json.read_bytes())
@@ -531,7 +550,8 @@ def build_app(
             if isinstance(a, dict) and isinstance(a.get("path"), str)
         ]
 
-        zip_bytes = await asyncio.to_thread(_zip_validated_artifacts, out, rels)
+        async with _result_gate:  # bound concurrent in-memory ZIP builds
+            zip_bytes = await asyncio.to_thread(_zip_validated_artifacts, out, rels)
         return Response(
             content=zip_bytes,
             media_type="application/zip",

@@ -93,6 +93,43 @@ def test_result_zip_serves_only_validated_artifacts(tmp_path):
     assert b"OUTSIDE-SECRET" not in resp.content  # symlink target bytes never disclosed
 
 
+def test_readyz_does_not_leak_store_error(tmp_path):
+    """A store failure on /v1/readyz must NOT echo the DSN/host:port to the caller."""
+    client, store = _make_client(tmp_path)
+
+    def boom():
+        raise RuntimeError("could not connect: host=db.internal port=5432 password=hunter2")
+
+    store.list = boom  # type: ignore[method-assign]
+    resp = client.get("/v1/readyz")
+    assert resp.status_code == 503
+    body = resp.text
+    assert "db.internal" not in body and "hunter2" not in body and "5432" not in body
+
+
+def test_serve_endpoints_reject_symlinked_output(tmp_path):
+    """A compromised worker's symlinked artifact / metadata.json must not be served."""
+    client, store = _make_client(tmp_path)
+    job, output_dir = _make_done_job(tmp_path, store)
+    outside = tmp_path / "outside_secret"
+    outside.write_bytes(b"OUTSIDE-SECRET")
+
+    # declared artifact replaced by a symlink to an outside file -> 404, not the target bytes
+    (output_dir / "page-001.png").unlink()
+    (output_dir / "page-001.png").symlink_to(outside)
+    r = client.get(f"/v1/jobs/{job.job_id}/artifacts/page-001")
+    assert r.status_code == 404
+    assert b"OUTSIDE-SECRET" not in r.content
+
+    # metadata.json replaced by a symlink -> 404
+    meta = output_dir / "metadata.json"
+    data = meta.read_bytes()
+    meta.unlink()
+    (tmp_path / "ext_meta.json").write_bytes(data)
+    meta.symlink_to(tmp_path / "ext_meta.json")
+    assert client.get(f"/v1/jobs/{job.job_id}/metadata").status_code == 404
+
+
 def _make_done_job(
     tmp_path: Path,
     job_store: InMemoryJobStore,
