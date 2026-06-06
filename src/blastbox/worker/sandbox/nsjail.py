@@ -72,10 +72,21 @@ _USR_SYMLINKS = {
 
 
 def _find_seccomp_policy() -> Path | None:
-    """Return the first seccomp policy file found in the candidate list."""
+    """Return the first seccomp policy file found in the candidate list.
+
+    NOTE: the repo-relative candidate (parents[4]/deploy/...) only resolves in a dev checkout;
+    under ``pip install`` the bundled deploy/ tree is absent, so nsjail finds no policy, records
+    ``seccomp_policy_missing``, and is correctly skipped as insecure (fail-closed) — but silently.
+    Warn loudly so an operator knows to install the policy at /etc/blastbox/seccomp.policy."""
     for candidate in _SECCOMP_POLICY_CANDIDATES:
         if candidate.is_file():
             return candidate
+    _log.warning(
+        "nsjail_seccomp_policy_not_found searched=%s "
+        "impact=backend_reports_insecure_and_is_skipped_unless_BLASTBOX_WARN_ON_INSECURE "
+        "fix=install_the_policy_at_/etc/blastbox/seccomp.policy",
+        [str(c) for c in _SECCOMP_POLICY_CANDIDATES],
+    )
     return None
 
 

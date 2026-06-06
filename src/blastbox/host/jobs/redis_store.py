@@ -7,12 +7,17 @@ works on large key spaces without blocking.  Every ``set`` includes a TTL.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import time
 
 from redis.exceptions import WatchError
 
 from blastbox.host.jobs.base import Job, JobStatus
+
+# Allowlist of Job fields that update() may set — mirrors SqlJobStore's _COLUMNS guard so a
+# future caller forwarding client-controlled field names can't setattr an arbitrary attribute.
+_JOB_FIELDS = frozenset(f.name for f in dataclasses.fields(Job))
 
 
 _PREFIX = "blastbox:job:"
@@ -67,6 +72,8 @@ class RedisJobStore:
                         raise KeyError(job_id)
                     job = Job.from_dict(json.loads(raw))
                     for k, v in fields.items():
+                        if k not in _JOB_FIELDS:
+                            raise ValueError(f"unknown Job field in update(): {k!r}")
                         setattr(job, k, v)
                     pipe.multi()
                     pipe.set(key, json.dumps(job.to_dict()), ex=self._expiry_arg())

@@ -251,6 +251,30 @@ def validate_envelope(env: Envelope, *, outdir: Path, max_artifact_bytes: int,
     return env
 
 
+# Backstop nesting bound enforced at PARSE time (matches contract/walk._MAX_DEPTH=128, which
+# only guards consumers that iter_nodes). Counts EVERY nested dict/list — including Record.fields
+# (a second recursion vector iter_nodes never walks) — so a deep payload is rejected with a clean
+# ValueError rather than relying on a catchable RecursionError whose threshold depends on
+# sys.getrecursionlimit.
+_MAX_PAYLOAD_DEPTH = 128
+
+
+def _check_json_depth(obj: object, max_depth: int) -> None:
+    """Reject if the nested dict/list structure of ``obj`` exceeds ``max_depth`` (iterative —
+    no recursion, so the check itself can't blow the stack)."""
+    stack: list[tuple[object, int]] = [(obj, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > max_depth:
+            raise ValueError(f"payload nesting exceeds maximum depth of {max_depth}")
+        if isinstance(node, dict):
+            for v in node.values():
+                stack.append((v, depth + 1))
+        elif isinstance(node, list):
+            for v in node:
+                stack.append((v, depth + 1))
+
+
 def envelope_from_json(raw: bytes, *, max_bytes: int = 4 * 1024 * 1024) -> Envelope:
     """Parse a worker-emitted metadata.json into an Envelope (size-bounded)."""
     if len(raw) > max_bytes:
@@ -262,5 +286,7 @@ def envelope_from_json(raw: bytes, *, max_bytes: int = 4 * 1024 * 1024) -> Envel
     payload_data = obj.get("payload")
     if payload_data is None:
         raise ValueError("envelope JSON missing required 'payload' field")
+    # Enforce the depth bound BEFORE pydantic recurses into it.
+    _check_json_depth(payload_data, _MAX_PAYLOAD_DEPTH)
     obj["payload"] = parse_node(payload_data)
     return Envelope.model_validate(obj)

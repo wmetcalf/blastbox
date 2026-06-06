@@ -49,6 +49,24 @@ def test_seal_within_cap_uses_stat_size(tmp_path):
     assert env.artifacts[0].bytes == 5  # under cap -> sealed; size from stat, chunk-hashed
 
 
+def test_envelope_from_json_rejects_deep_payload():
+    """A payload nested past the depth bound is rejected cleanly at parse time (not via a
+    catchable RecursionError) — covers the Record.fields recursion vector too."""
+    import json as _json
+
+    from blastbox.contract.envelope import envelope_from_json
+    deep: dict = {"_type": "extracted_text", "text": "x", "char_count": 1}
+    for _ in range(200):
+        deep = {"_type": "record", "fields": {"nested": deep}}
+    env = {
+        "engine": "e", "status": "ok", "input_sha256": "a" * 64,
+        "detected": {"label": "d", "mime": "m", "confidence": 1.0, "source": "magika"},
+        "artifacts": [], "warnings": [], "payload": deep,
+    }
+    with pytest.raises(ValueError, match="depth"):
+        envelope_from_json(_json.dumps(env).encode())
+
+
 def test_seal_rejects_symlinked_artifact(tmp_path):
     """A declared artifact that is a symlink (e.g. to a host file) is rejected — the fd open
     is O_NOFOLLOW, so it can't be followed to read outside outdir on a live worker dir."""
