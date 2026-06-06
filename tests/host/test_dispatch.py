@@ -191,6 +191,112 @@ def test_happy_path_done_result_summary_input_gone(tmp_path):
     assert not input_path.parent.exists()
 
 
+def test_cold_dispatch_serves_host_sealed_metadata(tmp_path):
+    """#5: a worker that fabricates artifact sha256/bytes in metadata.json must NOT have those
+    served — after DONE the on-disk metadata.json carries the host-recomputed (real) values."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    content = b"REAL-ARTIFACT-BYTES"
+    real_sha = hashlib.sha256(content).hexdigest()
+
+    def fake_runner(argv, **kw):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "page-001.png").write_bytes(content)
+        env = {
+            "engine": _ENGINE_NAME, "status": "ok", "input_sha256": _INPUT_SHA,
+            "detected": {"label": "docx", "mime": "x", "confidence": 1.0, "source": "magika"},
+            "artifacts": [{"id": "page-001", "path": "page-001.png", "kind": "image",
+                           "sha256": "f" * 64, "bytes": 999999}],  # FABRICATED by the worker
+            "warnings": [], "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
+        }
+        (output_dir / "metadata.json").write_bytes(json.dumps(env).encode())
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    d = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    assert d.dispatch_once() is True
+    assert store.get(job.job_id).status == JobStatus.DONE
+    served = json.loads((output_dir / "metadata.json").read_text())
+    assert served["artifacts"][0]["sha256"] == real_sha
+    assert served["artifacts"][0]["bytes"] == len(content)
+
+
+def test_cold_dispatch_injects_mount_dir_env(tmp_path):
+    """#8: the worker argv carries BLASTBOX_INPUT_DIR=/input + BLASTBOX_OUTPUT_DIR=/output so the
+    harness (defaults /in,/out) reads the dirs the dispatcher actually mounted."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    seen: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        seen.append(argv)
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner).dispatch_once()
+    flat = seen[0]
+    assert "BLASTBOX_INPUT_DIR=/input" in flat
+    assert "BLASTBOX_OUTPUT_DIR=/output" in flat
+
+
+def test_cold_output_size_cap_fails_undeclared_bloat(tmp_path):
+    """#3: a huge UNDECLARED file (the trust gate never sizes it) must fail the job, not DONE."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)  # one tiny declared artifact
+        (output_dir / "pad.bin").write_bytes(b"x" * 200_000)  # huge undeclared file
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    d = Dispatcher(
+        job_store=store, engines={_ENGINE_NAME: _engine_spec()},
+        limits=Limits(max_total_artifact_bytes=50_000), job_root=tmp_path,
+        runtime_selector=_fake_runtime, subprocess_runner=fake_runner, worker_timeout_s=30,
+    )
+    assert d.dispatch_once() is True
+    final = store.get(job.job_id)
+    assert final.status == JobStatus.FAILED
+    assert "too large" in (final.error or "")
+
+
+def test_run_maintenance_expires_and_requeues(tmp_path):
+    """#4: _run_maintenance expires retention-due artifacts AND requeues orphaned RUNNING jobs."""
+    store = InMemoryJobStore()
+    # an expired DONE job with on-disk artifacts
+    done = Job.new(engine=_ENGINE_NAME, filename="d.docx")
+    done.status = JobStatus.DONE
+    done.finished_at = time.time() - 100
+    done.expires_at = time.time() - 50
+    out = tmp_path / done.job_id / "output"
+    out.mkdir(parents=True)
+    (out / "art.png").write_bytes(b"data")
+    done.result_dir = str(out)
+    store.create(done)
+    # a RUNNING job whose worker container is gone (mock docker ps returns no active ids)
+    running = Job.new(engine=_ENGINE_NAME, filename="r.docx")
+    running.status = JobStatus.RUNNING
+    store.create(running)
+
+    d = _make_dispatcher(store, job_root=tmp_path, job_retention_seconds=60)
+    d._run_maintenance()
+
+    assert store.get(done.job_id).status == JobStatus.EXPIRED
+    assert not out.exists()  # artifacts swept
+    assert store.get(running.job_id).status == JobStatus.QUEUED  # orphan requeued
+
+
 # ---------------------------------------------------------------------------
 # Test 3: Worker non-zero exit (no valid output) → FAILED, input gone
 # ---------------------------------------------------------------------------

@@ -81,6 +81,9 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         limits=limits,
         job_root=job_root,
         worker_timeout_s=int(os.environ.get("BLASTBOX_WORKER_TIMEOUT_S", "300")),
+        # Retention: 0 (default) keeps artifacts forever; set a TTL (seconds) so run_forever's
+        # periodic sweep deletes expired terminal jobs' output (of untrusted documents).
+        job_retention_seconds=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS", "0")),
         pool=pool,
     )
     try:

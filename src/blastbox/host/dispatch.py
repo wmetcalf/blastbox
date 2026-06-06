@@ -17,7 +17,9 @@ Security properties (review will check):
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -26,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Mapping
 
+from blastbox.contract.envelope import open_confined_regular_fd
 from blastbox.errors import OutputTrustError, WarmTimeout, sanitize_public_error
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.runtime.docker import (
@@ -125,8 +128,15 @@ class Dispatcher:
         *,
         poll_interval_s: float = 1.0,
         stop: Callable[[], bool] | None = None,
+        maintenance_interval_s: float = 60.0,
     ) -> None:
-        """Continuously claim and dispatch jobs until ``stop()`` returns True."""
+        """Continuously claim and dispatch jobs until ``stop()`` returns True.
+
+        Every ``maintenance_interval_s`` it also runs _run_maintenance: requeue orphaned RUNNING
+        jobs (crash recovery) and expire retention-due artifacts (so untrusted output doesn't
+        accumulate forever). Set ``maintenance_interval_s<=0`` to disable.
+        """
+        last_maint = time.monotonic()
         while True:
             if stop is not None and stop():
                 break
@@ -139,6 +149,9 @@ class Dispatcher:
                 # returns it to the queue. Log and keep serving.
                 _log.exception("dispatch_once failed; continuing")
                 progressed = False
+            if maintenance_interval_s > 0 and time.monotonic() - last_maint >= maintenance_interval_s:
+                last_maint = time.monotonic()
+                self._run_maintenance()
             if not progressed:
                 time.sleep(poll_interval_s)
 
@@ -205,7 +218,9 @@ class Dispatcher:
                 # Staged input is still deleted in the finally block.
                 t0 = time.monotonic()
                 try:
-                    self._dispatch_warm(job, staged_input_path=input_path, slot=slot)
+                    self._dispatch_warm(
+                        job, staged_input_path=input_path, slot=slot, output_dir=output_dir
+                    )
                 finally:
                     # Security: delete staged input on EVERY terminal path.
                     self._delete_input(input_path)
@@ -239,6 +254,7 @@ class Dispatcher:
         *,
         staged_input_path: Path,
         slot: "Slot",
+        output_dir: Path,
     ) -> None:
         """Execute one claimed job via a pre-warmed slot.
 
@@ -354,6 +370,19 @@ class Dispatcher:
                 return
 
             # ------------------------------------------------------------------
+            # Step 6b: Materialize the SEALED, validated output from the (possibly still-live)
+            # slot dir into the host-only job_root output dir, re-verifying each artifact's sha.
+            # This makes warm results fetchable from the API (they were validated in the slot dir,
+            # which is reaped) AND makes the served bytes == the sealed shas (#5/#6 + the live-dir
+            # validation residual).
+            # ------------------------------------------------------------------
+            try:
+                self._materialize_sealed_warm_output(envelope, slot.output_dir, output_dir)
+            except OutputTrustError as exc:
+                self._fail_job(job, f"failed to materialize warm output: {exc}")
+                return
+
+            # ------------------------------------------------------------------
             # Step 7: Mark DONE
             # ------------------------------------------------------------------
             finished_at = time.time()
@@ -438,7 +467,15 @@ class Dispatcher:
                 "blastbox.role": "worker",
                 "blastbox.job_id": job.job_id,
             },
-            extra_env=self._sanitize_params(job.params),
+            extra_env={
+                **self._sanitize_params(job.params),
+                # Tell the harness where the dispatcher mounted I/O (it mounts the input file at
+                # /input/<name> and output at /output; the harness defaults are /in,/out, so
+                # without this the cold path is broken-as-wired). Dispatcher-set keys are merged
+                # LAST so a hostile job.param can't override them.
+                "BLASTBOX_INPUT_DIR": "/input",
+                "BLASTBOX_OUTPUT_DIR": "/output",
+            },
         )
 
         try:
@@ -459,6 +496,14 @@ class Dispatcher:
             return
         except Exception as exc:  # noqa: BLE001
             self._fail_job(job, f"docker launch failed: {exc}")
+            return
+
+        # Bound TOTAL on-disk output (declared + UNDECLARED) before trusting it, so a worker
+        # that wrote a huge undeclared file can't exhaust job_root (#3 disk-exhaustion DoS).
+        try:
+            self._enforce_output_size_cap(output_dir)
+        except OutputTrustError as exc:
+            self._fail_job(job, f"output too large: {exc}")
             return
 
         # ------------------------------------------------------------------
@@ -484,6 +529,10 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             self._fail_job(job, f"unexpected trust validation error: {exc}")
             return
+
+        # Persist the host-SEALED metadata over the worker's raw file so the API serves trusted
+        # hashes/sizes/payload, not worker-fabricated ones (#5).
+        self._write_sealed_metadata(envelope, output_dir)
 
         # Note: a non-zero worker exit with *no* valid output is already FAILED
         # via the OutputTrustError branch above (missing/invalid metadata.json
@@ -551,6 +600,85 @@ class Dispatcher:
             input_path.parent.rmdir()
         except OSError:
             pass
+
+    def _enforce_output_size_cap(self, output_dir: Path) -> None:
+        """Reject if the TOTAL on-disk output exceeds the total-artifact cap.
+
+        The trust gate only sums DECLARED artifacts, so a worker can write a huge UNDECLARED
+        file (e.g. /output/pad.bin) that passes validation yet fills job_root. This counts every
+        regular file (declared or not) and fails the job before DONE if the sum exceeds the cap.
+        The cold worker is already exited (--rm) so the dir is static (no TOCTOU)."""
+        cap = self._limits.max_total_artifact_bytes
+        total = 0
+        for p in output_dir.rglob("*"):
+            try:
+                if p.is_symlink() or not p.is_file():
+                    continue
+                total += p.stat().st_size
+            except OSError:
+                continue
+            if total > cap:
+                raise OutputTrustError(
+                    f"total output {total} bytes exceeds cap {cap} (undeclared files counted)"
+                )
+
+    def _write_sealed_metadata(self, envelope, output_dir: Path) -> None:
+        """Overwrite metadata.json with the host-SEALED envelope (recomputed sha256/bytes/payload)
+        atomically, so the API serves host-trusted metadata — not the raw worker-written file
+        whose hashes/sizes the worker could fabricate."""
+        data = envelope.model_dump_json(by_alias=True).encode("utf-8")
+        tmp = output_dir / ".metadata.json.tmp"
+        tmp.write_bytes(data)
+        os.replace(tmp, output_dir / "metadata.json")
+
+    def _materialize_sealed_warm_output(self, envelope, src_dir: Path, dst_dir: Path) -> None:
+        """Copy the validated declared artifacts from the warm slot dir (``src_dir``, possibly a
+        still-live bind mount) into the host-only job_root output dir (``dst_dir``) using
+        TOCTOU-safe reads, RE-VERIFYING each artifact's sha against the sealed envelope (so a
+        mid-flight content swap is detected and fails the job), then writing the sealed
+        metadata.json. After this the API serves a stable, host-trusted copy — closing both the
+        'warm results unreachable' gap and the live-dir validation residual."""
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for a in envelope.artifacts:
+            fd = open_confined_regular_fd(src_dir, a.path)
+            digest = hashlib.sha256()
+            n = 0
+            dst_path = dst_dir / a.path
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(dst_path, "wb") as out:
+                    while True:
+                        chunk = os.read(fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        n += len(chunk)
+                        out.write(chunk)
+            finally:
+                os.close(fd)
+            if digest.hexdigest() != a.sha256 or n != a.bytes:
+                raise OutputTrustError(
+                    f"artifact {a.id} changed during materialization (live-dir swap)"
+                )
+        self._write_sealed_metadata(envelope, dst_dir)
+
+    def _run_maintenance(self) -> None:
+        """Periodic upkeep from run_forever: requeue jobs whose worker vanished (so a crash
+        mid-dispatch doesn't strand a RUNNING zombie forever) and expire retention-due artifacts
+        (so output of untrusted documents doesn't accumulate on disk forever)."""
+        try:
+            self.requeue_orphaned_jobs()
+        except Exception:  # noqa: BLE001
+            _log.exception("requeue_orphaned_jobs failed")
+        if self._job_retention_seconds > 0:
+            try:
+                from blastbox.host.jobs.retention import JobRetentionSweeper
+
+                expired = JobRetentionSweeper(self._job_root).expire_due(self._job_store)
+                if expired:
+                    _log.info("retention_sweep_expired count=%d", len(expired))
+            except Exception:  # noqa: BLE001
+                _log.exception("retention sweep failed")
 
     def _kill_container(self, container_name: str) -> None:
         """Best-effort ``docker kill`` on a timed-out worker."""
