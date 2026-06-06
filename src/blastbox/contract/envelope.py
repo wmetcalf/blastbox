@@ -233,6 +233,13 @@ def seal_envelope(*, engine: str, outdir: Path, input_sha256: str,
         if d.id in declared_ids:
             raise ValueError(f"duplicate artifact id: {d.id}")
         declared_ids.add(d.id)
+        # Reserve metadata.json (+ the atomic-write temp prefix): the host OVERWRITES
+        # metadata.json with the SEALED envelope after sealing, so a worker declaring it as an
+        # artifact would record a sha256/bytes for the OLD raw file while the host serves the new
+        # sealed one — desyncing served-bytes from the sealed hash. Reject it.
+        _name = Path(d.path).name
+        if _name == "metadata.json" or _name.startswith(".metadata.json."):
+            raise ValueError(f"reserved output path may not be a declared artifact: {d.path}")
         # TOCTOU-safe open: confines under outdir AND rejects symlink/.. components + special
         # files in one walk (no separate resolve()/is_file()/open() the worker could race on a
         # still-live bind mount). ENOENT -> "missing"; everything else (escape, symlink, FIFO,
@@ -320,10 +327,42 @@ def _check_json_depth(obj: object, max_depth: int) -> None:
                 stack.append((v, depth + 1))
 
 
+def _raw_json_max_depth(raw: bytes) -> int:
+    """Max nesting depth of unescaped ``{``/``[`` in raw JSON bytes — string-aware (brackets
+    inside string literals don't count). Used to reject deep input BEFORE ``json.loads``, which
+    itself raises RecursionError on deeply nested input (the C scanner recurses)."""
+    depth = 0
+    maxd = 0
+    in_str = False
+    esc = False
+    for b in raw:
+        if in_str:
+            if esc:
+                esc = False
+            elif b == 0x5C:  # backslash
+                esc = True
+            elif b == 0x22:  # closing quote
+                in_str = False
+            continue
+        if b == 0x22:  # opening quote
+            in_str = True
+        elif b == 0x7B or b == 0x5B:  # { or [
+            depth += 1
+            if depth > maxd:
+                maxd = depth
+        elif b == 0x7D or b == 0x5D:  # } or ]
+            depth -= 1
+    return maxd
+
+
 def envelope_from_json(raw: bytes, *, max_bytes: int = 4 * 1024 * 1024) -> Envelope:
-    """Parse a worker-emitted metadata.json into an Envelope (size-bounded)."""
+    """Parse a worker-emitted metadata.json into an Envelope (size + depth bounded)."""
     if len(raw) > max_bytes:
         raise ValueError(f"metadata json {len(raw)} bytes exceeds {max_bytes}")
+    # Bound nesting depth on the RAW bytes BEFORE json.loads — json.loads itself RecursionErrors
+    # on deep input, so the post-parse structural check alone was too late.
+    if _raw_json_max_depth(raw) > _MAX_PAYLOAD_DEPTH:
+        raise ValueError(f"JSON nesting exceeds maximum depth of {_MAX_PAYLOAD_DEPTH}")
     import json
     obj = json.loads(raw)
     if not isinstance(obj, dict):
@@ -331,7 +370,7 @@ def envelope_from_json(raw: bytes, *, max_bytes: int = 4 * 1024 * 1024) -> Envel
     payload_data = obj.get("payload")
     if payload_data is None:
         raise ValueError("envelope JSON missing required 'payload' field")
-    # Enforce the depth bound BEFORE pydantic recurses into it.
+    # Belt-and-suspenders structural depth check on the parsed payload subtree.
     _check_json_depth(payload_data, _MAX_PAYLOAD_DEPTH)
     obj["payload"] = parse_node(payload_data)
     return Envelope.model_validate(obj)

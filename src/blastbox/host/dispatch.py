@@ -98,6 +98,7 @@ class Dispatcher:
         job_retention_seconds: int = 0,
         pool: "WarmPool | None" = None,
         warm_claim_timeout_s: float = 2.0,
+        requeue_grace_s: float = 60.0,
     ) -> None:
         self._job_store = job_store
         # engines is kept as an immutable mapping snapshot so callers cannot
@@ -111,6 +112,7 @@ class Dispatcher:
         self._job_retention_seconds = max(0, int(job_retention_seconds))
         self._pool = pool
         self._warm_claim_timeout_s = float(warm_claim_timeout_s)
+        self._requeue_grace_s = max(0.0, float(requeue_grace_s))
 
     # ------------------------------------------------------------------
     # Public API
@@ -176,9 +178,15 @@ class Dispatcher:
             return 0
 
         excluded = exclude or frozenset()
+        grace_cutoff = time.time() - self._requeue_grace_s
         recovered = 0
         for job in self._job_store.list(status=JobStatus.RUNNING):
             if job.job_id in excluded or job.job_id in active_job_ids:
+                continue
+            # Grace window: a just-claimed job's worker container may not appear in `docker ps`
+            # yet, so requeuing it now would double-detonate the same (malicious) input in two
+            # workers. Only requeue jobs whose started_at is older than the grace window.
+            if job.started_at is not None and job.started_at > grace_cutoff:
                 continue
             self._job_store.update(
                 job.job_id,
@@ -354,6 +362,17 @@ class Dispatcher:
                 except Exception as exc:  # noqa: BLE001
                     self._fail_job(job, f"failed to read warm worker output: {exc}")
                     return
+
+            # Bound TOTAL on-disk output (declared + UNDECLARED) before trusting it. The gVisor
+            # warm /out is a live 0o777 host bind mount with NO kernel size/inode quota, so a
+            # compromised worker can fill job_root with undeclared files just like the cold path
+            # — this closes the cold/warm asymmetry. (FC's output is already bounded by its
+            # fixed-size ext4 disk, so this is a cheap no-op there.)
+            try:
+                self._enforce_output_size_cap(slot.output_dir)
+            except OutputTrustError as exc:
+                self._fail_job(job, f"warm output too large: {exc}")
+                return
 
             # ------------------------------------------------------------------
             # Step 6: Validate output through trust gate

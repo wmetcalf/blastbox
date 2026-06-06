@@ -537,10 +537,11 @@ def test_requeue_orphaned_jobs(tmp_path):
     docker ps failure → no requeue."""
     store = InMemoryJobStore()
 
-    # Create two RUNNING jobs
+    # Create two RUNNING jobs. The orphan's started_at is past the requeue grace window so it
+    # is eligible (a fresh start_at would be skipped — see test_requeue_grace_window).
     orphan_job = Job.new(engine=_ENGINE_NAME, filename="a.docx")
     orphan_job.status = JobStatus.RUNNING
-    orphan_job.started_at = time.time()
+    orphan_job.started_at = time.time() - 120
     store.create(orphan_job)
 
     active_job = Job.new(engine=_ENGINE_NAME, filename="b.docx")
@@ -705,3 +706,19 @@ def test_run_forever_survives_dispatch_error(tmp_path):
     # past the raising call (proving the loop continued instead of crashing).
     d.run_forever(poll_interval_s=0, stop=lambda: calls["n"] >= 2)
     assert calls["n"] >= 2
+
+
+def test_requeue_grace_window(tmp_path):
+    """A just-claimed RUNNING job (fresh started_at) is NOT requeued — its container may not be
+    in docker ps yet; requeuing would double-detonate the same input."""
+    store = InMemoryJobStore()
+    fresh = Job.new(engine=_ENGINE_NAME, filename="x.docx")
+    fresh.status = JobStatus.RUNNING
+    fresh.started_at = time.time()  # within the grace window
+    store.create(fresh)
+    d = _make_dispatcher(
+        store, job_root=tmp_path,
+        subprocess_runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+    assert d.requeue_orphaned_jobs() == 0
+    assert store.get(fresh.job_id).status == JobStatus.RUNNING

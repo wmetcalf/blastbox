@@ -72,7 +72,7 @@ class RedisJobStore:
         raw = self._r.get(self._key(job_id))
         if raw is None:
             return None
-        return Job.from_dict(json.loads(raw))
+        return _decode_job(raw)  # None on malformed payload -> treated as not found
 
     def update(self, job_id: str, **fields) -> Job:
         """Atomic read-modify-write via WATCH/MULTI/EXEC."""
@@ -84,7 +84,9 @@ class RedisJobStore:
                     raw = pipe.get(key)
                     if raw is None:
                         raise KeyError(job_id)
-                    job = Job.from_dict(json.loads(raw))
+                    job = _decode_job(raw)
+                    if job is None:
+                        raise KeyError(job_id)  # malformed payload -> fail closed, don't crash
                     for k, v in fields.items():
                         if k not in _JOB_FIELDS:
                             raise ValueError(f"unknown Job field in update(): {k!r}")

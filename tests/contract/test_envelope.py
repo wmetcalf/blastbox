@@ -272,3 +272,13 @@ def test_envelope_from_json_raises_value_error_on_non_object():
     from blastbox.contract.envelope import envelope_from_json
     with pytest.raises(ValueError):
         envelope_from_json(b'[]')
+
+
+def test_seal_rejects_metadata_json_as_declared_artifact(tmp_path):
+    """A worker declaring metadata.json as an artifact is rejected — the host overwrites
+    metadata.json with the sealed envelope, so the declared sha would desync from served bytes."""
+    (tmp_path / "metadata.json").write_bytes(b"{}")
+    with pytest.raises(ValueError, match="reserved"):
+        seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+                      declared=[DeclaredArtifact(id="a0", path="metadata.json", kind="json")],
+                      warnings=[], payload=ExtractedText(text="x", char_count=1))

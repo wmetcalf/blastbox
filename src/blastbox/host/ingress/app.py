@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
 import json
 import os
 import re
@@ -113,18 +112,17 @@ def _safe_artifact_path(output_dir: Path, relative: str) -> Path | None:
 # ---------------------------------------------------------------------------
 
 
-def _zip_validated_artifacts(output_dir: Path, artifact_rels: list[str]) -> bytes:
-    """Build a ZIP of ONLY the dispatcher-validated artifacts (+ ``metadata.json``).
+def _zip_validated_artifacts(output_dir: Path, artifact_rels: list[str], dest) -> None:
+    """Write a ZIP of ONLY the dispatcher-validated artifacts (+ ``metadata.json``) to ``dest``
+    (a writable binary file object). The caller streams from a TEMP FILE, so the ZIP — up to
+    max_total_artifact_bytes — is never held in host memory.
 
     A compromised worker can drop EXTRA undeclared files or a symlink (``output/leak ->
-    /etc/passwd``) into output/; the old helper ``rglob``'d everything and ``zipfile.write``
-    follows symlinks, so it disclosed undeclared files + symlink targets. We now serve only
-    the relative paths the trust gate declared in ``metadata.json``, each run through
-    ``_safe_artifact_path`` (resolve + containment under output_dir) and skipped if it is a
-    symlink or not a regular file — the same guard the per-artifact endpoint uses."""
-    buf = io.BytesIO()
+    /etc/passwd``) into output/; we serve only the relative paths the trust gate declared in
+    ``metadata.json``, each run through ``_safe_artifact_path`` (resolve + containment) and
+    skipped if it is a symlink or not a regular file."""
     seen: set[str] = set()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for rel in ["metadata.json", *artifact_rels]:
             if not rel or rel in seen:
                 continue
@@ -137,7 +135,6 @@ def _zip_validated_artifacts(output_dir: Path, artifact_rels: list[str]) -> byte
             if safe is None or safe.is_symlink() or not safe.is_file():
                 continue
             zf.write(safe, arcname=rel)
-    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -556,12 +553,29 @@ def build_app(
             if isinstance(a, dict) and isinstance(a.get("path"), str)
         ]
 
-        async with _result_gate:  # bound concurrent in-memory ZIP builds
-            zip_bytes = await asyncio.to_thread(_zip_validated_artifacts, out, rels)
-        return Response(
-            content=zip_bytes,
+        import tempfile
+
+        from fastapi.responses import FileResponse
+        from starlette.background import BackgroundTask
+
+        def _build_zip() -> str:
+            fd, tmp_path = tempfile.mkstemp(prefix="bbresult-", suffix=".zip")
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    _zip_validated_artifacts(out, rels, fh)
+                return tmp_path
+            except BaseException:
+                os.unlink(tmp_path)
+                raise
+
+        async with _result_gate:  # bound concurrent ZIP builds (now disk-backed, not in-memory)
+            tmp_path = await asyncio.to_thread(_build_zip)
+        # Stream from the temp file (constant memory) + delete it after the response is sent.
+        return FileResponse(
+            tmp_path,
             media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{job_id}.zip"'},
+            filename=f"{job_id}.zip",
+            background=BackgroundTask(os.unlink, tmp_path),
         )
 
     @app.delete("/v1/jobs/{job_id}")
