@@ -141,6 +141,21 @@ def test_restore_handle_alive_running(tmp_path: Path) -> None:
     assert handle.alive() is True
 
 
+def test_restore_handle_alive_created_is_not_live(tmp_path: Path) -> None:
+    from blastbox.host.runtime.gvisor_snapshot import GvisorRestoreHandle
+    cfg = _cfg(tmp_path)
+    handle = GvisorRestoreHandle(
+        cfg,
+        run=lambda a, **k: 0,
+        cid="test-cid",
+        slot_workdir=tmp_path,
+        run_text=lambda argv: '{"status": "created"}',
+    )
+    # 'created' = restored but init never started → must NOT be promoted to live, else a
+    # wedged slot gets a job and hangs until the worker timeout.
+    assert handle.alive() is False
+
+
 def test_restore_handle_alive_stopped(tmp_path: Path) -> None:
     from blastbox.host.runtime.gvisor_snapshot import GvisorRestoreHandle
     cfg = _cfg(tmp_path)

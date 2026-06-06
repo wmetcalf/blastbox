@@ -1,8 +1,16 @@
-# Adds the accept-retry shim to a clippyshot soffice image for the gVisor C/R warm tier.
+# Builds the COMPLETE gVisor C/R warm image from a clippyshot soffice base:
+#   1) the accept-retry LD_PRELOAD shim (the restore-EINTR fix), and
+#   2) the file-trigger warm entrypoint — run_warm.py + engines.py + a baked engine name —
+#      which is what BLASTBOX_GVISOR_WARM_ARGV=["python3","/opt/blastbox/run_warm.py"] invokes.
+# There is intentionally NO `worker warm` CLI: run_warm.py is the gVisor analog of FC's
+# run_guest.py, so without (2) the documented default entrypoint would not exist in the image.
+#
 # Build:  docker build --build-arg BASE=clippyshot:dev -f deploy/gvisor/Dockerfile.shim -t clippyshot-warm:gvisor .
 ARG BASE=clippyshot:dev
 FROM ${BASE}
 USER root
+
+# (1) accept-retry shim -> /opt/clippyshot/accept-retry.so (set LD_PRELOAD to it for soffice).
 COPY deploy/gvisor/accept_retry.c /tmp/accept_retry.c
 RUN set -eux; \
     apt-get update; \
@@ -11,4 +19,14 @@ RUN set -eux; \
     gcc -shared -fPIC -O2 -o /opt/clippyshot/accept-retry.so /tmp/accept_retry.c -ldl; \
     apt-get purge -y gcc libc6-dev; apt-get autoremove -y; \
     rm -rf /var/lib/apt/lists/* /tmp/accept_retry.c
+
+# (2) warm entrypoint. run_warm.py imports `engines` from its own dir (sys.path[0]); the engine
+#     name is baked into a FILE (Docker ENV is dropped by `docker export` when exporting a rootfs).
+#     Mirrors deploy/firecracker/Dockerfile.clippyshot. Override --build-arg ENGINE=... for a
+#     different engine (e.g. ENGINE=probe for a soffice-free smoke image).
+ARG ENGINE=clippyshot.engine:ClippyShotEngine
+COPY deploy/gvisor/run_warm.py /opt/blastbox/run_warm.py
+COPY deploy/firecracker/engines.py /opt/blastbox/engines.py
+RUN printf '%s' "${ENGINE}" > /opt/blastbox/engine
+
 # The warm worker env then sets LD_PRELOAD=/opt/clippyshot/accept-retry.so (soffice only).

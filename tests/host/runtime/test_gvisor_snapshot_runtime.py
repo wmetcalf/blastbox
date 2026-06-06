@@ -73,24 +73,25 @@ def test_gvisor_control_translates_paths_to_sandbox(tmp_path):
 def test_warm_argv_rejects_non_list_json():
     """A bare JSON string / object / non-string array is valid JSON but not an argv —
     it must fall back to the default, not char-split or take dict keys into argv."""
-    from blastbox.host.runtime.gvisor_snapshot_runtime import _gvisor_config_from_env
+    from blastbox.host.runtime.gvisor_snapshot_runtime import (
+        _DEFAULT_WARM_ARGV,
+        _gvisor_config_from_env,
+    )
 
-    assert _gvisor_config_from_env(
-        {"BLASTBOX_GVISOR_WARM_ARGV": '"soffice"'}
-    ).warm_argv == ["worker", "warm"]
-    assert _gvisor_config_from_env(
-        {"BLASTBOX_GVISOR_WARM_ARGV": "[1, 2]"}
-    ).warm_argv == ["worker", "warm"]
-    assert _gvisor_config_from_env(
-        {"BLASTBOX_GVISOR_WARM_ARGV": "[]"}
-    ).warm_argv == ["worker", "warm"]
-    assert _gvisor_config_from_env(
-        {"BLASTBOX_GVISOR_WARM_ARGV": "{}"}
-    ).warm_argv == ["worker", "warm"]
+    # The default itself must be the real run_warm.py entrypoint, NOT a nonexistent
+    # `worker warm` command (which would exec a missing `worker` binary).
+    assert _DEFAULT_WARM_ARGV == ["python3", "/opt/blastbox/run_warm.py"]
+    for bad in ('"soffice"', "[1, 2]", "[]", "{}"):
+        assert (
+            _gvisor_config_from_env({"BLASTBOX_GVISOR_WARM_ARGV": bad}).warm_argv
+            == _DEFAULT_WARM_ARGV
+        ), bad
+    # an absent override also yields the default
+    assert _gvisor_config_from_env({}).warm_argv == _DEFAULT_WARM_ARGV
     # a well-formed argv passes through untouched
     assert _gvisor_config_from_env(
-        {"BLASTBOX_GVISOR_WARM_ARGV": '["python3", "/opt/blastbox/run_warm.py"]'}
-    ).warm_argv == ["python3", "/opt/blastbox/run_warm.py"]
+        {"BLASTBOX_GVISOR_WARM_ARGV": '["python3", "/custom/entry.py"]'}
+    ).warm_argv == ["python3", "/custom/entry.py"]
 
 
 def test_settle_gates_readiness(tmp_path):

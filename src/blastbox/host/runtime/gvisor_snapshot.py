@@ -129,11 +129,12 @@ def _default_run(argv: list[str], **kw: Any) -> int:
 
 
 def _default_run_text(argv: list[str]) -> str:
-    # Bounded: alive() runs this from the pool's liveness path, so a hung `runsc state`
-    # must not block claim/promote indefinitely. Timeout/error → "" (treated as not-alive).
+    # Bounded: alive() runs this from the pool's liveness path (serially over IDLE slots),
+    # so a hung `runsc state` must not block claim/promote. `runsc state` is a fast query;
+    # 3s caps the per-call stall (and thus the N-slot aggregate). Timeout/error → "" (not-alive).
     try:
         return subprocess.run(
-            argv, capture_output=True, text=True, check=False, timeout=10
+            argv, capture_output=True, text=True, check=False, timeout=3
         ).stdout
     except (subprocess.TimeoutExpired, OSError):
         return ""
@@ -211,12 +212,17 @@ class GvisorRestoreHandle:
         self.input_dir = self.slot_workdir / "in"
 
     def alive(self) -> bool:
-        """True iff the restored container is still running (via runsc state)."""
+        """True iff the restored container is actually RUNNING (via runsc state).
+
+        Deliberately excludes ``"created"``: after ``runsc restore -detach`` a healthy warm
+        worker resumes to ``"running"``; a container still in ``"created"`` never started its
+        init, so promoting it to IDLE (is_ready) or claiming it would hand a job to a wedged
+        slot that then hangs until the worker timeout. Only ``"running"`` counts as live."""
         import json as _json
         try:
             out = self._run_text([*_runsc(self._cfg), "state", self._cid])
             status = _json.loads(out).get("status", "")
-            return status in ("running", "created")
+            return status == "running"
         except Exception:  # noqa: BLE001
             return False
 

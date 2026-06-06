@@ -124,13 +124,16 @@ def test_gvisor_snapshot_roundtrip(tmp_path: Path) -> None:
 
     from blastbox.host.runtime.fc_snapshot import SnapshotManager
     from blastbox.host.runtime.gvisor_snapshot import GvisorConfig, GvisorSnapshotBackend
-    from blastbox.host.runtime.gvisor_snapshot_runtime import GvisorSnapshotSlotRuntime
+    from blastbox.host.runtime.gvisor_snapshot_runtime import (
+        _DEFAULT_WARM_ARGV,
+        GvisorSnapshotSlotRuntime,
+    )
     from blastbox.worker.warm import HostWarmControl, WarmJobSpec
 
     # --- env-driven config (mirrors _gvisor_config_from_env) ---
     runsc_bin = os.environ.get("BLASTBOX_GVISOR_RUNSC", "runsc")
     raw_argv = os.environ.get("BLASTBOX_GVISOR_WARM_ARGV", "").strip()
-    warm_argv: list[str] = json.loads(raw_argv) if raw_argv else ["worker", "warm"]
+    warm_argv: list[str] = json.loads(raw_argv) if raw_argv else list(_DEFAULT_WARM_ARGV)
     ld_preload: str | None = os.environ.get("BLASTBOX_GVISOR_LD_PRELOAD") or None
     settle_s = float(os.environ.get("BLASTBOX_SNAPSHOT_SETTLE_S", "1.0"))
 
@@ -172,6 +175,17 @@ def test_gvisor_snapshot_roundtrip(tmp_path: Path) -> None:
         output_files = list(slot.output_dir.iterdir())
         assert output_files, (
             f"slot.output_dir ({slot.output_dir}) is empty after a successful warm job"
+        )
+
+        # The lifecycle status above ("ok" from signal_done) only proves the worker
+        # COMPLETED — not that the conversion succeeded. Validate the envelope status in
+        # metadata.json so a failed conversion (status="engine_error") that still wrote a
+        # metadata.json can't pass this test green.
+        meta_path = slot.output_dir / "metadata.json"
+        assert meta_path.exists(), f"metadata.json missing from {slot.output_dir}"
+        envelope = json.loads(meta_path.read_text())
+        assert envelope.get("status") == "ok", (
+            f"conversion envelope status={envelope.get('status')!r} (expected 'ok')"
         )
 
     finally:

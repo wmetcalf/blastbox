@@ -21,6 +21,13 @@ from blastbox.host.pool import Slot, SlotState
 
 _log = logging.getLogger(__name__)
 
+# The warm worker entrypoint baked into the gVisor warm image (deploy/gvisor/Dockerfile.shim
+# COPYs run_warm.py + engines.py to /opt/blastbox/). There is intentionally NO `worker warm`
+# CLI — the file-trigger warm loop IS run_warm.py (the gVisor analog of FC's run_guest.py), so
+# the default must invoke it directly. A bare `["worker","warm"]` would exec a nonexistent
+# `worker` binary and the restore would never become ready.
+_DEFAULT_WARM_ARGV = ["python3", "/opt/blastbox/run_warm.py"]
+
 
 class GvisorSnapshotSlotRuntime:
     def __init__(self, manager, *, settle_s: float = 1.0, clock: Callable[[], float] = time.monotonic) -> None:
@@ -173,24 +180,26 @@ def _gvisor_config_from_env(env):
     rootfs = env.get("BLASTBOX_GVISOR_ROOTFS", "/var/lib/blastbox/gvisor-rootfs")
     raw_argv = env.get("BLASTBOX_GVISOR_WARM_ARGV", "").strip()
     try:
-        warm_argv = json.loads(raw_argv) if raw_argv else ["worker", "warm"]
+        warm_argv = json.loads(raw_argv) if raw_argv else list(_DEFAULT_WARM_ARGV)
     except json.JSONDecodeError:
         # A malformed override must not crash host startup — fall back to the default argv.
         _log.warning(
-            "invalid BLASTBOX_GVISOR_WARM_ARGV JSON %r; using default ['worker', 'warm']",
+            "invalid BLASTBOX_GVISOR_WARM_ARGV JSON %r; using default %r",
             raw_argv,
+            _DEFAULT_WARM_ARGV,
         )
-        warm_argv = ["worker", "warm"]
+        warm_argv = list(_DEFAULT_WARM_ARGV)
     # Type-validate the SHAPE, not just JSON well-formedness: a bare string ('"soffice"')
     # or object is valid JSON but `list(...)` in the OCI spec would char-split it / take dict
     # keys into a malformed argv. Require a non-empty list of strings or fall back loudly.
     if not (isinstance(warm_argv, list) and warm_argv and all(isinstance(a, str) for a in warm_argv)):
         _log.warning(
             "BLASTBOX_GVISOR_WARM_ARGV must be a non-empty JSON array of strings; got %r; "
-            "using default ['worker', 'warm']",
+            "using default %r",
             raw_argv,
+            _DEFAULT_WARM_ARGV,
         )
-        warm_argv = ["worker", "warm"]
+        warm_argv = list(_DEFAULT_WARM_ARGV)
     return GvisorConfig(
         runsc_bin=env.get("BLASTBOX_GVISOR_RUNSC", "runsc"),
         root=Path(root),

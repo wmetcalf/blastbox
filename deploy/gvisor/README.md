@@ -39,23 +39,36 @@ outside a restore** (the retry path only fires when `errno == EINTR`).
 The JVM retries `accept` automatically on EINTR.  Only the soffice warm container
 needs the shim.
 
-### Building the shim
+### Building the warm image
 
-Option A — bake it into the warm image at build time (recommended):
+`Dockerfile.shim` builds the **complete** warm image from a clippyshot soffice base: it
+compiles the shim **and** bakes the warm entrypoint (`run_warm.py` + `engines.py` + the
+engine name in `/opt/blastbox/engine`). Recommended:
 
 ```sh
 docker build \
     --build-arg BASE=clippyshot:dev \
     -f deploy/gvisor/Dockerfile.shim \
     -t clippyshot-warm:gvisor .
+# soffice-free smoke image (ProbeEngine, no LibreOffice): add --build-arg ENGINE=probe
 ```
 
-Option B — compile manually and COPY the `.so` into an existing image layer:
+Shim-only (compile + COPY the `.so` into an existing image layer manually):
 
 ```sh
 gcc -shared -fPIC -O2 -o /opt/clippyshot/accept-retry.so \
     deploy/gvisor/accept_retry.c -ldl
 ```
+
+## The warm entrypoint (`run_warm.py`)
+
+There is **no `worker warm` CLI**. The file-trigger warm loop is `deploy/gvisor/run_warm.py`
+— the gVisor analog of the Firecracker tier's vsock `run_guest.py`. It runs `serve_warm` with a
+`FileWarmControl` over the bind-mounted `/ctrl` dir (input at `/in`, output at `/out`) and picks
+its engine from `/opt/blastbox/engine` (or `BLASTBOX_GVISOR_ENGINE`). `Dockerfile.shim` installs
+it at `/opt/blastbox/run_warm.py`, which is why the default `BLASTBOX_GVISOR_WARM_ARGV` is
+`["python3","/opt/blastbox/run_warm.py"]`. If engine setup fails it logs + drops a
+`ctrl/setup_error` breadcrumb (so a misconfig is diagnosable rather than a silent ready-timeout).
 
 ### Activating the shim
 
@@ -76,7 +89,7 @@ reads the following env vars (all optional, defaults shown):
 | `BLASTBOX_GVISOR_ROOT` | `/var/lib/blastbox/gvisor-root` | `--root` state directory for runsc |
 | `BLASTBOX_GVISOR_ROOTFS` | _(image rootfs)_ | OCI rootfs path for the warm container |
 | `BLASTBOX_GVISOR_NETWORK` | `none` | `none` or `sandbox` (use `none` for the warm tier) |
-| `BLASTBOX_GVISOR_WARM_ARGV` | `["worker","warm"]` | JSON list; argv passed to the warm entrypoint |
+| `BLASTBOX_GVISOR_WARM_ARGV` | `["python3","/opt/blastbox/run_warm.py"]` | JSON list; argv of the warm entrypoint (see below). Must be a non-empty list of strings or it falls back to the default |
 | `BLASTBOX_GVISOR_LD_PRELOAD` | _(unset)_ | Set to `/opt/clippyshot/accept-retry.so` for the soffice warm container |
 | `BLASTBOX_GVISOR_PLATFORM` | _(runsc default)_ | `ptrace` or `kvm`; leave unset to let runsc choose |
 | `BLASTBOX_GVISOR_CPUFEATURES` | _(unset)_ | `dev.gvisor.internal.cpufeatures` OCI annotation for cross-host CPU pinning |
