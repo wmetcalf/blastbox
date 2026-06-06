@@ -148,6 +148,19 @@ def _default_ready_wait(ctrl_dir: Path, timeout_s: float) -> None:
     raise TimeoutError(f"warm base not READY within {timeout_s}s ({ctrl_dir})")
 
 
+def _best_effort_delete(cfg: GvisorConfig, run: Callable[..., int], cid: str) -> None:
+    """Tear down a (possibly half-created) runsc container: kill then force-delete,
+    swallowing errors. Used on failure + reap paths where the container may or may not
+    exist — a `runsc run`/`restore` that fails partway can still register container state
+    under ``-root`` (with its sandbox/gofer processes), which would otherwise leak because
+    the caller never gets a handle to reap it."""
+    for argv in (["kill", cid, "KILL"], ["delete", "-force", cid]):
+        try:
+            run([*_runsc(cfg), *argv])
+        except Exception:
+            pass
+
+
 class GvisorBootHandle:
     def __init__(
         self,
@@ -175,10 +188,7 @@ class GvisorBootHandle:
         return str(img)
 
     def kill(self) -> None:
-        try:
-            self._run([*_runsc(self._cfg), "delete", "-force", self._cid])
-        except Exception:
-            pass
+        _best_effort_delete(self._cfg, self._run, self._cid)
         shutil.rmtree(self._base, ignore_errors=True)  # don't leave the base bundle dir behind
 
 
@@ -211,11 +221,7 @@ class GvisorRestoreHandle:
             return False
 
     def kill(self) -> None:
-        for argv in (["kill", self._cid, "KILL"], ["delete", "-force", self._cid]):
-            try:
-                self._run([*_runsc(self._cfg), *argv])
-            except Exception:
-                pass
+        _best_effort_delete(self._cfg, self._run, self._cid)
 
 
 class GvisorSnapshotBackend:
@@ -240,10 +246,14 @@ class GvisorSnapshotBackend:
         return shutil.which(self._cfg.runsc_bin) is not None
 
     def boot_base(self) -> GvisorBootHandle:
-        base = self._cfg.root.parent / "gvisor-base"
+        # Unique per build so two pool processes sharing this -root parent (e.g. a
+        # restart-overlap: the old process still tearing down while the new one boots)
+        # don't collide on a fixed base bundle dir / cid and stomp each other's base.
+        token = uuid.uuid4().hex[:12]
+        base = self._cfg.root.parent / f"gvisor-base-{token}"
         _prepare_slot_dirs(self._cfg, base)
         ctrl = base / "ctrl"
-        cid = "warm-base"
+        cid = f"warm-base-{token}"
         _write_oci_config(self._cfg, base, in_ro=True)
         try:
             self._run(
@@ -253,8 +263,9 @@ class GvisorSnapshotBackend:
                 stderr=subprocess.DEVNULL,
             )
         except Exception:
-            # No boot handle is returned on failure, so nothing reaps the base bundle —
-            # remove it (and its OCI config) so the host dir doesn't leak.
+            # No boot handle is returned on failure, so nothing reaps the base — drop any
+            # registered runsc state for this cid AND remove the bundle dir so neither leaks.
+            _best_effort_delete(self._cfg, self._run, cid)
             shutil.rmtree(base, ignore_errors=True)
             raise
         return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready)
@@ -264,11 +275,19 @@ class GvisorSnapshotBackend:
         _prepare_slot_dirs(self._cfg, wd)
         cid = f"slot-{uuid.uuid4().hex[:12]}"
         _write_oci_config(self._cfg, wd, in_ro=True)
-        self._run(
-            [*_runsc(self._cfg), "restore", "-image-path", str(artifact),
-             "-detach", "-bundle", str(wd), cid],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        try:
+            self._run(
+                [*_runsc(self._cfg), "restore", "-image-path", str(artifact),
+                 "-detach", "-bundle", str(wd), cid],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            # A partially-failed `runsc restore` can leave registered container state (with
+            # its sandbox/gofer processes) under -root. No handle is returned on failure, and
+            # the manager only knows the slot dir — not this cid — so tear it down here before
+            # re-raising, or it orphans an unmanaged sandbox.
+            _best_effort_delete(self._cfg, self._run, cid)
+            raise
         return GvisorRestoreHandle(self._cfg, self._run, cid, wd, self._run_text)

@@ -181,6 +181,16 @@ def _gvisor_config_from_env(env):
             raw_argv,
         )
         warm_argv = ["worker", "warm"]
+    # Type-validate the SHAPE, not just JSON well-formedness: a bare string ('"soffice"')
+    # or object is valid JSON but `list(...)` in the OCI spec would char-split it / take dict
+    # keys into a malformed argv. Require a non-empty list of strings or fall back loudly.
+    if not (isinstance(warm_argv, list) and warm_argv and all(isinstance(a, str) for a in warm_argv)):
+        _log.warning(
+            "BLASTBOX_GVISOR_WARM_ARGV must be a non-empty JSON array of strings; got %r; "
+            "using default ['worker', 'warm']",
+            raw_argv,
+        )
+        warm_argv = ["worker", "warm"]
     return GvisorConfig(
         runsc_bin=env.get("BLASTBOX_GVISOR_RUNSC", "runsc"),
         root=Path(root),

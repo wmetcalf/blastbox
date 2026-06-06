@@ -51,6 +51,37 @@ def test_restore_in_creates_dirs_and_restores(tmp_path: Path) -> None:
     assert h.output_dir == wd / "out" and h.control_dir == wd / "ctrl"
 
 
+def test_restore_in_force_deletes_leaked_container_on_failure(tmp_path: Path) -> None:
+    # A restore that fails partway can leave registered runsc state; restore_in must
+    # tear down its cid (best-effort) before re-raising rather than orphan a sandbox.
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kw: object) -> int:
+        calls.append(argv)
+        if "restore" in argv:
+            raise RuntimeError("restore failed mid-way")
+        return 0
+
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=run, ready_wait=lambda d, t: None)
+    with pytest.raises(RuntimeError):
+        be.restore_in(tmp_path / "s", "img")
+    joined = [" ".join(c) for c in calls]
+    assert any("restore" in c for c in joined)
+    assert any("delete" in c and "-force" in c for c in joined), joined
+
+
+def test_boot_base_uses_unique_cid_per_call(tmp_path: Path) -> None:
+    # Two builds sharing this -root parent must not collide on a fixed cid / bundle path.
+    rec = _Rec()
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=rec, ready_wait=lambda d, t: None)
+    be.boot_base()
+    be.boot_base()
+    run_cids = [c[-1] for c in rec.calls if "run" in c and "-detach" in c]
+    assert len(run_cids) == 2
+    assert run_cids[0] != run_cids[1]
+    assert all(cid != "warm-base" for cid in run_cids)
+
+
 def test_available_uses_probe(tmp_path: Path) -> None:
     assert GvisorSnapshotBackend(_cfg(tmp_path), run=lambda a, **k: 0, probe=lambda: True).available() is True
     assert GvisorSnapshotBackend(_cfg(tmp_path), run=lambda a, **k: 0, probe=lambda: False).available() is False

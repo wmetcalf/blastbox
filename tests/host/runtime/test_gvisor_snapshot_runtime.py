@@ -70,6 +70,29 @@ def test_gvisor_control_translates_paths_to_sandbox(tmp_path):
     assert go["params"] == {"a": "b"}
 
 
+def test_warm_argv_rejects_non_list_json():
+    """A bare JSON string / object / non-string array is valid JSON but not an argv —
+    it must fall back to the default, not char-split or take dict keys into argv."""
+    from blastbox.host.runtime.gvisor_snapshot_runtime import _gvisor_config_from_env
+
+    assert _gvisor_config_from_env(
+        {"BLASTBOX_GVISOR_WARM_ARGV": '"soffice"'}
+    ).warm_argv == ["worker", "warm"]
+    assert _gvisor_config_from_env(
+        {"BLASTBOX_GVISOR_WARM_ARGV": "[1, 2]"}
+    ).warm_argv == ["worker", "warm"]
+    assert _gvisor_config_from_env(
+        {"BLASTBOX_GVISOR_WARM_ARGV": "[]"}
+    ).warm_argv == ["worker", "warm"]
+    assert _gvisor_config_from_env(
+        {"BLASTBOX_GVISOR_WARM_ARGV": "{}"}
+    ).warm_argv == ["worker", "warm"]
+    # a well-formed argv passes through untouched
+    assert _gvisor_config_from_env(
+        {"BLASTBOX_GVISOR_WARM_ARGV": '["python3", "/opt/blastbox/run_warm.py"]'}
+    ).warm_argv == ["python3", "/opt/blastbox/run_warm.py"]
+
+
 def test_settle_gates_readiness(tmp_path):
     clock = {"t": 0.0}
     rt = GvisorSnapshotSlotRuntime(_FakeMgr(tmp_path), settle_s=1.0, clock=lambda: clock["t"])
