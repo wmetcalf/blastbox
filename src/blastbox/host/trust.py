@@ -14,10 +14,11 @@ from pathlib import Path
 
 from blastbox.contract.envelope import (
     DeclaredArtifact,
+    Envelope,
     envelope_from_json,
+    read_confined_regular_bytes,
     seal_envelope,
     validate_envelope,
-    Envelope,
 )
 from blastbox.errors import OutputTrustError, sanitize_public_error
 from blastbox.limits import Limits
@@ -49,32 +50,29 @@ def validate_worker_output(
     # ------------------------------------------------------------------
     # Step 1: metadata path safety
     # ------------------------------------------------------------------
-    meta = output_dir / "metadata.json"
-
-    if not meta.exists():
-        raise OutputTrustError("metadata.json not found in output directory")
-
-    # Reject symlinks and non-regular files (FIFOs, devices, …)
-    if meta.is_symlink() or not meta.is_file():
-        raise OutputTrustError("metadata.json must be a regular file, not a symlink or special file")
-
+    # Read metadata.json TOCTOU-safely: one fd opened O_NOFOLLOW|O_NONBLOCK, required to be a
+    # regular file within output_dir and <= max_metadata_bytes — so a worker on a still-live
+    # shared dir cannot swap it for a symlink (read a host file) or a FIFO (block the dispatcher)
+    # between an is_symlink() check and a read_bytes(). Confinement + type + size + read are one
+    # operation on one inode.
     try:
-        meta_size = meta.stat().st_size
-    except OSError as exc:
-        raise OutputTrustError(
-            sanitize_public_error(f"cannot stat metadata.json: {exc}")
-        ) from exc
-
-    if meta_size > limits.max_metadata_bytes:
-        raise OutputTrustError(
-            f"metadata.json size {meta_size} exceeds limit {limits.max_metadata_bytes}"
+        raw = read_confined_regular_bytes(
+            output_dir, "metadata.json", max_bytes=limits.max_metadata_bytes
         )
+    except FileNotFoundError as exc:
+        raise OutputTrustError("metadata.json not found in output directory") from exc
+    except (OSError, ValueError) as exc:
+        raise OutputTrustError(
+            sanitize_public_error(
+                "metadata.json must be a regular file inside the output dir within the size "
+                f"limit ({exc})"
+            )
+        ) from exc
 
     # ------------------------------------------------------------------
     # Step 2: parse
     # ------------------------------------------------------------------
     try:
-        raw = meta.read_bytes()
         parsed = envelope_from_json(raw, max_bytes=limits.max_metadata_bytes)
     except (ValueError, Exception) as exc:
         raise OutputTrustError(

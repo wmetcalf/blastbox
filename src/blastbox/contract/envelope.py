@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import stat as _stat
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -93,6 +95,77 @@ def _collect_refs(node) -> set[str]:
     return refs
 
 
+def open_confined_regular_fd(base: Path, relpath: str) -> int:
+    """Open ``base/relpath`` as a regular file, TOCTOU-safely, confined strictly under ``base``.
+
+    Walks the path one segment at a time relative to a directory fd, opening each component with
+    ``O_NOFOLLOW`` (a symlinked component can't redirect the walk) and ``O_DIRECTORY`` on
+    intermediates; the leaf is opened ``O_RDONLY|O_NOFOLLOW|O_NONBLOCK`` and ``fstat``'d to require
+    a regular file. This defeats, on a still-live worker-writable dir, both the symlink-swap (read
+    a host file) and the FIFO-block (a special-file target stalling the reader) attacks — a symlink
+    leaf fails ``ELOOP``, a FIFO/socket/device fails the ``S_ISREG`` check, and ``O_NONBLOCK`` means
+    a FIFO can never block. ``..`` and absolute paths are rejected. Returns an fd the caller closes;
+    raises ``FileNotFoundError`` (missing), ``OSError`` (symlink/non-dir component), or ``ValueError``
+    (unsafe shape / not a regular file)."""
+    rel = Path(relpath)
+    if rel.is_absolute() or not rel.parts or any(p == ".." for p in rel.parts):
+        raise ValueError(f"unsafe path (absolute, empty, or contains '..'): {relpath!r}")
+    dir_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in rel.parts[:-1]:
+            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = nfd
+        leaf_fd = os.open(
+            rel.parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd
+        )
+    finally:
+        os.close(dir_fd)
+    try:
+        if not _stat.S_ISREG(os.fstat(leaf_fd).st_mode):
+            raise ValueError(f"not a regular file: {relpath!r}")
+        return leaf_fd
+    except BaseException:
+        os.close(leaf_fd)
+        raise
+
+
+def _hash_fd(fd: int) -> tuple[str, int]:
+    """SHA-256 + byte count of an open fd, read in chunks (constant memory)."""
+    digest = hashlib.sha256()
+    total = 0
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+        total += len(chunk)
+    return digest.hexdigest(), total
+
+
+def read_confined_regular_bytes(base: Path, relpath: str, *, max_bytes: int) -> bytes:
+    """TOCTOU-safe, size-capped read of ``base/relpath`` via :func:`open_confined_regular_fd`.
+
+    Enforces ``max_bytes`` from a running total while reading (so growth on a live dir can't
+    exceed the cap). Raises the same exceptions as :func:`open_confined_regular_fd`, plus
+    ``ValueError`` if the file exceeds ``max_bytes``."""
+    fd = open_confined_regular_fd(base, relpath)
+    try:
+        if os.fstat(fd).st_size > max_bytes:
+            raise ValueError(f"{relpath!r} exceeds {max_bytes} bytes")
+        out = bytearray()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            out += chunk
+            if len(out) > max_bytes:
+                raise ValueError(f"{relpath!r} exceeds {max_bytes} bytes")
+        return bytes(out)
+    finally:
+        os.close(fd)
+
+
 def seal_envelope(*, engine: str, outdir: Path, input_sha256: str,
                   detected: Detection, declared: list[DeclaredArtifact],
                   warnings: list[Warning], payload: ChildNode,
@@ -109,33 +182,36 @@ def seal_envelope(*, engine: str, outdir: Path, input_sha256: str,
     malicious worker declaring a giant artifact is rejected without the host ever reading
     the whole file into memory.
     """
-    outdir_resolved = outdir.resolve(strict=False)
     artifacts: list[Artifact] = []
     declared_ids: set[str] = set()
     for d in declared:
         if d.id in declared_ids:
             raise ValueError(f"duplicate artifact id: {d.id}")
         declared_ids.add(d.id)
-        target = (outdir / d.path).resolve(strict=False)
-        if outdir_resolved != target and outdir_resolved not in target.parents:
-            raise ValueError(f"artifact path not confined to outdir: {d.path}")
-        if not target.is_file():
-            raise ValueError(f"declared artifact file missing or not a regular file: {d.path}")
-        size = target.stat().st_size
-        if max_artifact_bytes is not None and size > max_artifact_bytes:
-            # Reject BEFORE reading — no unbounded read into memory from a hostile worker.
+        # TOCTOU-safe open: confines under outdir AND rejects symlink/.. components + special
+        # files in one walk (no separate resolve()/is_file()/open() the worker could race on a
+        # still-live bind mount). ENOENT -> "missing"; everything else (escape, symlink, FIFO,
+        # device, dir) -> a confinement failure.
+        try:
+            fd = open_confined_regular_fd(outdir, d.path)
+        except FileNotFoundError as exc:
+            raise ValueError(f"declared artifact file missing: {d.path}") from exc
+        except (OSError, ValueError) as exc:
             raise ValueError(
-                f"declared artifact {d.path} size {size} exceeds {max_artifact_bytes}"
-            )
-        digest = hashlib.sha256()
-        with target.open("rb") as fh:
-            while True:
-                chunk = fh.read(1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
-        artifacts.append(Artifact(id=d.id, path=d.path, kind=d.kind,
-                                  sha256=digest.hexdigest(), bytes=size))
+                f"declared artifact path not confined to outdir or not a regular file: "
+                f"{d.path} ({exc})"
+            ) from exc
+        try:
+            size = os.fstat(fd).st_size
+            if max_artifact_bytes is not None and size > max_artifact_bytes:
+                # Reject BEFORE reading — no unbounded read into memory from a hostile worker.
+                raise ValueError(
+                    f"declared artifact {d.path} size {size} exceeds {max_artifact_bytes}"
+                )
+            sha256, n = _hash_fd(fd)
+        finally:
+            os.close(fd)
+        artifacts.append(Artifact(id=d.id, path=d.path, kind=d.kind, sha256=sha256, bytes=n))
     unresolved = _collect_refs(payload) - declared_ids
     if unresolved:
         raise ValueError(f"payload has unresolved ArtifactRef(s): {sorted(unresolved)}")

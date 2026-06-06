@@ -49,6 +49,29 @@ def test_seal_within_cap_uses_stat_size(tmp_path):
     assert env.artifacts[0].bytes == 5  # under cap -> sealed; size from stat, chunk-hashed
 
 
+def test_seal_rejects_symlinked_artifact(tmp_path):
+    """A declared artifact that is a symlink (e.g. to a host file) is rejected — the fd open
+    is O_NOFOLLOW, so it can't be followed to read outside outdir on a live worker dir."""
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"SECRET")
+    (tmp_path / "a.png").symlink_to(outside)
+    with pytest.raises(ValueError, match="confined"):
+        seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+                      declared=[DeclaredArtifact(id="a0", path="a.png", kind="x")],
+                      warnings=[], payload=ExtractedText(text="x", char_count=1))
+
+
+def test_seal_rejects_fifo_artifact(tmp_path):
+    """A declared artifact that is a FIFO/special file is rejected (S_ISREG check) — and the
+    O_NONBLOCK open means it could never block the single-threaded dispatcher."""
+    import os
+    os.mkfifo(tmp_path / "f.bin")
+    with pytest.raises(ValueError, match="confined|regular"):
+        seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+                      declared=[DeclaredArtifact(id="a0", path="f.bin", kind="x")],
+                      warnings=[], payload=ExtractedText(text="x", char_count=1))
+
+
 def test_seal_rejects_missing_file(tmp_path):
     with pytest.raises(ValueError, match="missing"):
         seal_envelope(engine="e", outdir=tmp_path, input_sha256="b"*64, detected=_det(),
