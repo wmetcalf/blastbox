@@ -641,7 +641,9 @@ class Dispatcher:
         worker that pre-planted .metadata.json.tmp (or metadata.json) as a symlink can't redirect
         the host write to clobber an outside file."""
         data = envelope.model_dump_json(by_alias=True).encode("utf-8")
-        atomic_write_confined(output_dir, "metadata.json", data)
+        # 0o644: in compose mode the API serves this from a separate process/uid than the
+        # dispatcher that writes it; 0o600 would make /metadata + /result unreadable. Not secret.
+        atomic_write_confined(output_dir, "metadata.json", data, mode=0o644)
 
     def _materialize_sealed_warm_output(self, envelope, src_dir: Path, dst_dir: Path) -> None:
         """Copy the validated declared artifacts from the warm slot dir (``src_dir``, possibly a

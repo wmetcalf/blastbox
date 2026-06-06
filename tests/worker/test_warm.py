@@ -399,3 +399,23 @@ def test_file_warm_control_full_handshake(tmp_path: Path) -> None:
 
     ctrl.signal_done(status="ok")
     assert (ctrl_dir / "done").read_text(encoding="utf-8").strip() == "ok"
+
+
+def test_host_wait_for_done_reads_regular_done(tmp_path: Path) -> None:
+    from blastbox.worker.warm import HostWarmControl
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    (ctrl / "done").write_text("ok\n")
+    assert HostWarmControl(ctrl).wait_for_done(timeout_s=0.5) == "ok"
+
+
+def test_host_wait_for_done_rejects_symlinked_done(tmp_path: Path) -> None:
+    """A hostile worker symlinking ctrl/done at a host file must NOT have its contents read back
+    as a status — rejected (WarmTimeout). ctrl/ is worker-writable on the gVisor tier."""
+    from blastbox.worker.warm import HostWarmControl
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    (tmp_path / "outside").write_text("SECRET-OUTSIDE")
+    (ctrl / "done").symlink_to(tmp_path / "outside")
+    with pytest.raises(WarmTimeout):
+        HostWarmControl(ctrl).wait_for_done(timeout_s=0.5)

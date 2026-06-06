@@ -9,11 +9,25 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import time
 
 from redis.exceptions import WatchError
 
 from blastbox.host.jobs.base import Job, JobStatus
+
+_log = logging.getLogger("blastbox.host.jobs.redis_store")
+
+
+def _decode_job(raw: object) -> Job | None:
+    """Decode a stored value into a Job, or None (logged) if it isn't valid job JSON — so a
+    malformed key sharing the blastbox:job:* prefix (shared/operator-mutable Redis) can't crash
+    list()/claim_next()."""
+    try:
+        return Job.from_dict(json.loads(raw))  # type: ignore[arg-type]
+    except (ValueError, TypeError, KeyError) as exc:
+        _log.warning("redis_store: skipping malformed job key payload: %s", exc)
+        return None
 
 # Allowlist of Job fields that update() may set — mirrors SqlJobStore's _COLUMNS guard so a
 # future caller forwarding client-controlled field names can't setattr an arbitrary attribute.
@@ -88,7 +102,9 @@ class RedisJobStore:
             raw = self._r.get(k)
             if raw is None:
                 continue
-            job = Job.from_dict(json.loads(raw))
+            job = _decode_job(raw)
+            if job is None:
+                continue
             if status is None or job.status == status:
                 jobs.append(job)
         return jobs
@@ -106,7 +122,9 @@ class RedisJobStore:
                 raw = self._r.get(k)
                 if raw is None:
                     continue
-                job = Job.from_dict(json.loads(raw))
+                job = _decode_job(raw)
+                if job is None:
+                    continue
                 if job.status == JobStatus.QUEUED:
                     # Decode key to str for comparison; fakeredis may return bytes
                     k_str = k.decode() if isinstance(k, bytes) else k
@@ -121,7 +139,9 @@ class RedisJobStore:
                     raw = pipe.get(key)
                     if raw is None:
                         continue
-                    job = Job.from_dict(json.loads(raw))
+                    job = _decode_job(raw)
+                    if job is None:
+                        continue
                     if job.status != JobStatus.QUEUED:
                         # Another claimer won the race; retry from the scan.
                         continue

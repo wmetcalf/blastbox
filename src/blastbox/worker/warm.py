@@ -228,7 +228,11 @@ class HostWarmControl:
         write to clobber an outside file. ``atomic_write_confined`` uses a random
         ``O_EXCL|O_NOFOLLOW`` temp + ``renameat`` so the write can never follow a worker symlink."""
         from blastbox.contract.envelope import atomic_write_confined
-        atomic_write_confined(self._dir, name, content.encode("utf-8"))
+        # 0o644: control files are HOST-authored but READ BY THE WORKER, which runs as a DIFFERENT
+        # uid on the gVisor tier (65532) — 0o600 would make go.json unreadable and hang the warm
+        # job. Not secret (the worker already knows its own job); the per-slot 0o700 ctrl dir keeps
+        # other local users out.
+        atomic_write_confined(self._dir, name, content.encode("utf-8"), mode=0o644)
 
     def signal_go(self, spec: WarmJobSpec) -> None:
         """Atomically write ``control_dir/go.json`` with the job spec.
@@ -254,15 +258,22 @@ class HostWarmControl:
         Raises:
             WarmTimeout: if ``done`` does not appear before the deadline.
         """
-        done_path = self._dir / "done"
+        from blastbox.contract.envelope import read_confined_regular_bytes
+
         deadline = time.monotonic() + timeout_s
 
         while True:
-            if done_path.exists():
-                try:
-                    return done_path.read_text(encoding="utf-8").strip()
-                except OSError as exc:
-                    raise WarmTimeout(f"done file unreadable: {exc}") from exc
+            try:
+                # Symlink-safe, capped, confined read: ctrl/ is WORKER-WRITABLE on the gVisor tier,
+                # so a hostile worker could symlink `done` at a host file (info disclosure) or a
+                # FIFO/huge file (block/pressure the single-threaded dispatcher). O_NOFOLLOW +
+                # S_ISREG + a 4 KiB cap defeat that; a non-regular/oversized done fails closed.
+                raw = read_confined_regular_bytes(self._dir, "done", max_bytes=4096)
+                return raw.decode("utf-8", "replace").strip()
+            except FileNotFoundError:
+                pass  # not signalled yet → keep polling
+            except (OSError, ValueError) as exc:
+                raise WarmTimeout(f"invalid done file: {exc}") from exc
 
             if time.monotonic() >= deadline:
                 raise WarmTimeout(

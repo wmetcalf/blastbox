@@ -66,6 +66,19 @@ def test_atomic_write_confined_defeats_destination_symlink(tmp_path):
     assert (d / "metadata.json").read_bytes() == b"SEALED"
 
 
+def test_atomic_write_confined_applies_exact_mode(tmp_path):
+    """The mode is applied EXACTLY (fchmod, umask-independent) so a host-authored control file
+    (go.json) / metadata.json the worker or API reads cross-uid gets 0o644, not 0o600."""
+    import stat as _stat
+    from blastbox.contract.envelope import atomic_write_confined
+    d = tmp_path / "ctrl"
+    d.mkdir()
+    atomic_write_confined(d, "go.json", b"{}", mode=0o644)
+    assert _stat.S_IMODE((d / "go.json").stat().st_mode) == 0o644
+    atomic_write_confined(d, "host_only", b"x", mode=0o600)
+    assert _stat.S_IMODE((d / "host_only").stat().st_mode) == 0o600
+
+
 def test_atomic_write_confined_defeats_temp_symlink(tmp_path):
     """The old predictable temp name pre-planted as a symlink must NOT be followed (random
     O_EXCL|O_NOFOLLOW temp name avoids it entirely)."""

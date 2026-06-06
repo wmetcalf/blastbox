@@ -147,14 +147,19 @@ def _hash_fd(fd: int, *, max_bytes: int | None = None) -> tuple[str, int]:
     return digest.hexdigest(), total
 
 
-def atomic_write_confined(base: Path, name: str, data: bytes) -> None:
+def atomic_write_confined(base: Path, name: str, data: bytes, *, mode: int = 0o600) -> None:
     """Atomically write ``data`` to ``base/name``, symlink/TOCTOU-safe even when ``base`` is a
     worker-writable dir.
 
     The temp is created relative to a directory fd under a RANDOM name with
     ``O_CREAT|O_EXCL|O_NOFOLLOW`` (a worker can't pre-plant a symlink/file there to redirect the
     host write), then ``renameat`` replaces ``name`` (clobbering any worker-planted symlink at the
-    destination, since rename doesn't follow it). ``name`` must be a single path segment."""
+    destination, since rename doesn't follow it). ``name`` must be a single path segment.
+
+    ``mode`` is applied EXACTLY via fchmod (not subject to the process umask). Use 0o644 for
+    host-authored files a DIFFERENT uid must read — e.g. the host writes go.json that the
+    non-root worker (uid 65532 on the gVisor tier) reads, or metadata.json the API serves from a
+    different uid; the per-dir 0o700 confinement keeps other local users out regardless."""
     import secrets
     if not name or "/" in name or name in (".", ".."):
         raise ValueError(f"unsafe name: {name!r}")
@@ -162,9 +167,10 @@ def atomic_write_confined(base: Path, name: str, data: bytes) -> None:
     try:
         tmp_name = f".{name}.{secrets.token_hex(8)}.tmp"
         tfd = os.open(
-            tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd
+            tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=dir_fd
         )
         try:
+            os.fchmod(tfd, mode)  # exact mode regardless of the host umask (cross-uid reads)
             mv = memoryview(data)
             while mv:
                 mv = mv[os.write(tfd, mv):]
