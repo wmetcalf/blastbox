@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 import time
 
 from blastbox.host.jobs.base import Job, JobStatus
+
+# Allowlist of Job fields that update() may set — mirrors RedisJobStore._JOB_FIELDS and
+# SqlJobStore._COLUMNS so all three backends fail closed identically on an unknown field
+# name (a typo'd/invalid key that prod SQL/Redis reject must not silently succeed here).
+_JOB_FIELDS = frozenset(f.name for f in dataclasses.fields(Job))
 
 
 class InMemoryJobStore:
@@ -33,6 +39,8 @@ class InMemoryJobStore:
             if job is None:
                 raise KeyError(job_id)
             for k, v in fields.items():
+                if k not in _JOB_FIELDS:
+                    raise ValueError(f"unknown Job field in update(): {k!r}")
                 setattr(job, k, v)
             return job
 

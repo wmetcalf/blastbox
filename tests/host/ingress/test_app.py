@@ -54,6 +54,7 @@ def _make_client(
     max_input_bytes: int = 10 * 1024 * 1024,
     api_workers: int = 4,
     api_key: str | None = None,
+    metrics_public: bool | None = None,
     store: InMemoryJobStore | None = None,
 ) -> tuple[TestClient, InMemoryJobStore]:
     """Build a TestClient wired to a temp job_root + InMemoryJobStore."""
@@ -66,6 +67,7 @@ def _make_client(
         limits=limits,
         api_workers=api_workers,
         api_key=api_key,
+        metrics_public=metrics_public,
     )
     client = TestClient(app, raise_server_exceptions=False)
     return client, job_store
@@ -594,10 +596,25 @@ class TestAuth:
         assert resp.status_code == 200
 
     def test_metrics_always_public(self, tmp_path):
-        """metrics must remain 200 even when auth is enabled."""
+        """metrics must remain 200 even when auth is enabled (default metrics_public=True)."""
         client, _ = _make_client(tmp_path, api_key="secret123")
         resp = client.get("/metrics")
         assert resp.status_code == 200
+
+    def test_metrics_requires_token_when_private(self, tmp_path):
+        """With metrics_public=False (BLASTBOX_METRICS_PUBLIC=false) + auth on, /metrics needs
+        the bearer token; /v1/healthz + /v1/version stay public regardless."""
+        client, _ = _make_client(tmp_path, api_key="secret123", metrics_public=False)
+        assert client.get("/metrics").status_code == 401
+        assert client.get("/metrics", headers={"Authorization": "Bearer secret123"}).status_code == 200
+        # Health/version must NOT be gated by the metrics toggle.
+        assert client.get("/v1/healthz").status_code == 200
+        assert client.get("/v1/version").status_code == 200
+
+    def test_metrics_private_toggle_noop_without_api_key(self, tmp_path):
+        """No api_key -> no auth middleware -> /metrics open even with metrics_public=False."""
+        client, _ = _make_client(tmp_path, metrics_public=False)
+        assert client.get("/metrics").status_code == 200
 
 
 # ===========================================================================

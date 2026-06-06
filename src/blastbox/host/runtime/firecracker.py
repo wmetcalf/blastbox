@@ -60,6 +60,7 @@ from blastbox.worker.fc_guest import (
     recv_frame,
     recv_line,
     send_frame,
+    send_frame_from_file,
 )
 
 __all__ = [
@@ -674,15 +675,22 @@ class VsockHostWarmControl:
         return s
 
     def signal_go(self, spec: "WarmJobSpec") -> None:
-        """Connect to the guest and send the job header + input bytes."""
-        input_bytes = Path(spec.input_path).read_bytes()
+        """Connect to the guest and send the job header + input frame.
+
+        The input body is STREAMED from disk in fixed chunks (send_frame_from_file), not read
+        into RAM — so a warm dispatch holds at most one chunk per in-flight job instead of the
+        whole file plus send_frame's len+data copy (~2x). The on-disk input is already bounded
+        by max_input_bytes at ingress; the guest's recv_frame independently caps the frame. The
+        wire format is unchanged (8-byte length + body), so the guest decodes it identically.
+        """
+        path = Path(spec.input_path)
         header = json.dumps(
-            {"filename": Path(spec.input_path).name, "params": dict(spec.params)}
+            {"filename": path.name, "params": dict(spec.params)}
         ).encode("utf-8")
         conn = self._connect()
         self._conn = conn
         send_frame(conn, header)
-        send_frame(conn, input_bytes)
+        send_frame_from_file(conn, path)
 
     def wait_for_done(self, *, timeout_s: float) -> str:
         """Read the guest's status frame; raise WarmTimeout if it never arrives.

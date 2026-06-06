@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import socket
+import struct
 import subprocess
 import threading
 import time
@@ -1073,6 +1074,56 @@ class TestVsockReadySignal:
             rt.reap(slot)
         assert not uds.exists()  # cleanup() ran during reap
         _shutil.rmtree(scratch, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# signal_go — streams the input frame from disk (no read_bytes materialization)
+# ---------------------------------------------------------------------------
+
+
+class TestSignalGoStreaming:
+    def test_signal_go_streams_input_without_read_bytes(self, tmp_path, monkeypatch):
+        """signal_go must send header + a wire-identical body frame STREAMED from disk —
+        never Path.read_bytes() the whole input into host RAM."""
+        from blastbox.host.runtime.firecracker import VsockHostWarmControl
+        from blastbox.worker.warm import WarmJobSpec
+
+        # Fail loudly if the old read_bytes() path is ever reintroduced.
+        def _boom(self):  # noqa: ANN001
+            raise AssertionError("signal_go must stream, not read_bytes() the whole input")
+
+        monkeypatch.setattr(Path, "read_bytes", _boom)
+
+        body = b"PK\x03\x04" + b"q" * 150_000  # > one 64 KiB chunk
+        src = tmp_path / "in.docx"
+        src.write_bytes(body)
+
+        class _RecSock:
+            def __init__(self) -> None:
+                self.buf = bytearray()
+
+            def sendall(self, data: bytes) -> None:
+                self.buf += data
+
+        sock = _RecSock()
+        ctrl = VsockHostWarmControl(tmp_path / "vsock.uds", connect_fn=lambda: sock)
+        ctrl.signal_go(
+            WarmJobSpec(input_path=src, output_dir=tmp_path / "out", params={"a": "b"})
+        )
+
+        data = bytes(sock.buf)
+        # Frame 1: header JSON.
+        (hlen,) = struct.unpack(">Q", data[:8])
+        off = 8
+        header = json.loads(data[off : off + hlen])
+        off += hlen
+        assert header == {"filename": "in.docx", "params": {"a": "b"}}
+        # Frame 2: the streamed body, wire-identical to send_frame(sock, body).
+        (blen,) = struct.unpack(">Q", data[off : off + 8])
+        off += 8
+        assert blen == len(body)
+        assert data[off : off + blen] == body
+        assert off + blen == len(data)  # nothing extra on the wire
 
 
 # ---------------------------------------------------------------------------

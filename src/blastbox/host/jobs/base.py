@@ -118,10 +118,13 @@ class JobStore(Protocol):
         ``limit``/``offset`` page the result and ``newest_first`` orders by
         ``created_at`` descending.  SQL backends push these down into the query
         (``ORDER BY ... LIMIT ... OFFSET``) so a listing endpoint never loads
-        the whole table; the in-memory/Redis backends apply the same window
-        after collecting (the data already lives in memory there).  Callers
-        that iterate every job (dispatcher, retention) omit all three and get
-        the full set, unordered.
+        the whole table.  The in-memory backend windows after a cheap in-process
+        scan.  The Redis backend has NO server-side ordering/limit over a scanned
+        key space, so it still fetches+decodes every key and windows in-process —
+        i.e. **O(N) per call**, so it is unsuitable for very large job histories
+        (prefer Postgres there; see ``factory`` / README).  Callers that iterate
+        every job (dispatcher, retention) omit all three and get the full set,
+        unordered.
         """
         ...
 

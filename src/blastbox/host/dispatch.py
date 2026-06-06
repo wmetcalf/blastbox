@@ -368,6 +368,16 @@ class Dispatcher:
             # compromised worker can fill job_root with undeclared files just like the cold path
             # — this closes the cold/warm asymmetry. (FC's output is already bounded by its
             # fixed-size ext4 disk, so this is a cheap no-op there.)
+            #
+            # KNOWN RESIDUAL (post-run gate, not a runtime quota): this rejects + reclaims
+            # oversized output AFTER the worker exits, so oversized output is never trusted or
+            # served. It does NOT stop a compromised worker from TRANSIENTLY filling host disk
+            # DURING execution on the docker-cold + gVisor-warm tiers (bounded by worker_timeout_s,
+            # then SIGKILL + reclaim; partially capped by the worker's per-file RLIMIT_FSIZE). A
+            # true in-execution kernel quota isn't portable here (gVisor reads /out via this very
+            # host bind — a sentry-internal tmpfs would be unreadable; docker bind sizing needs a
+            # storage-driver quota). Mitigate operationally: put job_root on a project-quota'd /
+            # size-capped filesystem. FC is immune (fixed ext4 disk).
             try:
                 self._enforce_output_size_cap(slot.output_dir)
             except OutputTrustError as exc:

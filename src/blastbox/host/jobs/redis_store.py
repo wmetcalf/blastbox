@@ -49,6 +49,15 @@ class RedisJobStore:
       to disable (no-expiry).
     - Atomic claim via WATCH/MULTI/EXEC with WatchError retry — two concurrent
       claimers racing on the same job result in exactly one claim.
+
+    Scaling caveat: ``list()``/``count()`` and ``claim_next()`` ``scan_iter`` +
+    ``GET`` + JSON-decode EVERY key (there is no server-side ORDER BY/LIMIT over a
+    Redis key space), so listing and claim are **O(N) in the live job count**.  The
+    24h TTL bounds N, but for LARGE or high-throughput job histories use the SQL
+    (Postgres) backend, which pushes the window + ``COUNT`` down into the query.  A
+    ZSET created_at/status index could make these O(log N + page) but is deferred
+    (it must also cover ``claim_next`` to move the bottleneck, and stay byte-identical
+    to the scan path under the backend-uniform pagination tests).
     """
 
     def __init__(self, client, *, ttl_seconds: int = _TTL_SECONDS) -> None:

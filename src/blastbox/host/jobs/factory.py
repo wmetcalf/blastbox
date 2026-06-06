@@ -45,6 +45,10 @@ def build_job_store_from_env(env: dict[str, str] | None = None) -> JobStore:
 
         from blastbox.host.jobs.redis_store import RedisJobStore
 
+        # NOTE: RedisJobStore list()/count()/claim_next() are O(N) in the live job count
+        # (full scan_iter + decode; no server-side ORDER BY/LIMIT). Fine for modest histories
+        # bounded by the 24h TTL; for LARGE/high-throughput deployments prefer Postgres
+        # (postgresql://...), whose SqlJobStore pushes the window + COUNT down into the query.
         return RedisJobStore(redis.from_url(url))
 
     from blastbox.host.jobs.sql_store import SqlJobStore

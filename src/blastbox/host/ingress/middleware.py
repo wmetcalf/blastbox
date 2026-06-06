@@ -117,18 +117,23 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     via ``hmac.compare_digest`` to prevent timing-oracle attacks.
 
     ``/v1/healthz`` and ``/v1/version`` are always public (proxy health checks
-    must not require auth).  ``GET /metrics`` is also public by default so
-    a Prometheus scraper on the same host can reach it without a token.
+    must not require auth).  ``GET /metrics`` is public by *default* so a Prometheus
+    scraper on the same host can reach it without a token; set ``metrics_public=False``
+    (``BLASTBOX_METRICS_PUBLIC=false``) to require the bearer token for ``/metrics`` too,
+    for deployments whose scraper can present the token.
     """
 
-    _PUBLIC: frozenset[str] = frozenset({"/v1/healthz", "/v1/version", "/metrics"})
+    _ALWAYS_PUBLIC: frozenset[str] = frozenset({"/v1/healthz", "/v1/version"})
 
-    def __init__(self, app, api_key: str) -> None:
+    def __init__(self, app, api_key: str, *, metrics_public: bool = True) -> None:
         super().__init__(app)
         self._key = api_key
+        self._public = (
+            self._ALWAYS_PUBLIC | {"/metrics"} if metrics_public else self._ALWAYS_PUBLIC
+        )
 
     async def dispatch(self, request, call_next):
-        if request.url.path in self._PUBLIC:
+        if request.url.path in self._public:
             return await call_next(request)
         header = request.headers.get("authorization", "")
         if not header.startswith("Bearer "):

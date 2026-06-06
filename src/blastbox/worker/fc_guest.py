@@ -20,6 +20,7 @@ import logging
 import socket
 import struct
 import time
+from pathlib import Path
 from typing import Callable
 
 _log = logging.getLogger("blastbox.worker.fc_guest")
@@ -48,6 +49,39 @@ MAX_STATUS_BYTES = 64 * 1024  # status string
 def send_frame(sock: "socket.socket", data: bytes) -> None:
     """Send a length-prefixed frame."""
     sock.sendall(_LEN.pack(len(data)) + data)
+
+
+# Stream chunk for send_frame_from_file — bounds the host-side buffer per write.
+_FILE_FRAME_CHUNK = 64 * 1024
+
+
+def send_frame_from_file(
+    sock: "socket.socket", path: "Path", *, chunk: int = _FILE_FRAME_CHUNK
+) -> int:
+    """Send a length-prefixed frame whose body is streamed from ``path`` in fixed chunks.
+
+    Wire-identical to ``send_frame(sock, path.read_bytes())`` — an 8-byte length prefix then
+    the file bytes, which the peer's ``recv_frame`` reads as length + ``recv_exact(length)`` —
+    but the host never materializes the whole file (nor ``send_frame``'s ``len+data`` copy) in
+    RAM. The announced length is ``path.stat().st_size``; a staged input is written once before
+    the frame is sent, so the size is stable. As a belt-and-suspenders guard against a short
+    read (truncated file), any shortfall is zero-padded to the announced length so the peer's
+    ``recv_exact`` never blocks waiting for bytes that will not arrive (the document simply
+    fails to parse rather than hanging the connection). Returns the number of bytes announced.
+    """
+    size = path.stat().st_size
+    sock.sendall(_LEN.pack(size))
+    sent = 0
+    with path.open("rb") as f:
+        while sent < size:
+            buf = f.read(min(chunk, size - sent))
+            if not buf:
+                break
+            sock.sendall(buf)
+            sent += len(buf)
+    if sent < size:
+        sock.sendall(b"\x00" * (size - sent))
+    return size
 
 
 def recv_exact(

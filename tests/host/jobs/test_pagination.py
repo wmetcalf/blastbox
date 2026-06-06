@@ -36,6 +36,17 @@ def _seed(store, n: int) -> list[Job]:
     return jobs
 
 
+def test_update_rejects_unknown_field_all_backends(store):
+    # Cross-backend parity: memory/redis/sql must ALL fail closed (ValueError) on an unknown
+    # field name, and accept a valid one. Asserts the type only (messages differ by backend),
+    # so the three allowlists can't silently drift apart.
+    jobs = _seed(store, 1)
+    with pytest.raises(ValueError):
+        store.update(jobs[0].job_id, not_a_real_field="x")
+    updated = store.update(jobs[0].job_id, status=JobStatus.RUNNING)
+    assert updated.status == JobStatus.RUNNING
+
+
 def test_count_total_and_by_status(store):
     jobs = _seed(store, 5)
     store.update(jobs[0].job_id, status=JobStatus.DONE)

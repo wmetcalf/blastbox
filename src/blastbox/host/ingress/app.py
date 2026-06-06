@@ -154,6 +154,7 @@ def build_app(
     limits: Limits | None = None,
     api_workers: int | None = None,
     api_key: str | None = None,
+    metrics_public: bool | None = None,
 ) -> FastAPI:
     """Construct and return the blastbox ingress FastAPI application.
 
@@ -173,6 +174,9 @@ def build_app(
                      ``BLASTBOX_API_WORKERS`` (clamped to [1, 64]).
         api_key: If set, installs ``BearerAuthMiddleware``; else warns.
                  Defaults to ``BLASTBOX_API_KEY`` env var.
+        metrics_public: Whether ``GET /metrics`` bypasses bearer auth.  Defaults to
+                        ``BLASTBOX_METRICS_PUBLIC`` (true unless ``false``/``0``/``no``/``off``).
+                        Only takes effect when ``api_key`` is set (otherwise nothing is gated).
     """
     configure_logging()
 
@@ -218,6 +222,12 @@ def build_app(
 
     # Bearer auth (requirement 4)
     _api_key = api_key if api_key is not None else os.environ.get("BLASTBOX_API_KEY", "").strip()
+    _metrics_public = (
+        metrics_public
+        if metrics_public is not None
+        else os.environ.get("BLASTBOX_METRICS_PUBLIC", "true").strip().lower()
+        not in ("false", "0", "no", "off")
+    )
 
     # -------------------------------------------------------------------
     # App + middleware
@@ -229,8 +239,10 @@ def build_app(
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=_limits.max_input_bytes)
 
     if _api_key:
-        app.add_middleware(BearerAuthMiddleware, api_key=_api_key)
-        _log.info("api_auth_enabled", scheme="bearer")
+        app.add_middleware(
+            BearerAuthMiddleware, api_key=_api_key, metrics_public=_metrics_public
+        )
+        _log.info("api_auth_enabled", scheme="bearer", metrics_public=_metrics_public)
     else:
         _log.warning(
             "api_auth_disabled",
@@ -584,9 +596,18 @@ def build_app(
                 os.unlink(tmp_path)
                 raise
 
-        async with _result_gate:  # bound concurrent ZIP builds (now disk-backed, not in-memory)
+        async with _result_gate:  # bound concurrent ZIP BUILDS (now disk-backed, not in-memory)
             tmp_path = await asyncio.to_thread(_build_zip)
         # Stream from the temp file (constant memory) + delete it after the response is sent.
+        #
+        # The gate is released after the BUILD, not held across streaming — deliberately. Each
+        # temp ZIP is size-bounded (<= max_total_artifact_bytes, enforced before the job reaches
+        # DONE) and cleanup is GUARANTEED (BackgroundTask below + _build_zip's except-unlink), so
+        # the only residual is the COUNT of concurrent slow downloads each pinning one bounded
+        # temp file. Holding this small gate (<= 4) across streaming would let a few slowloris
+        # readers block ALL /result callers — strictly worse. Generic slow-read DoS is delegated
+        # to the upstream proxy / ASGI read timeouts (per the deployment model); for a hard disk
+        # bound, mount the ingress temp dir ($TMPDIR) on a size-capped tmpfs (fails closed -> 500).
         return FileResponse(
             tmp_path,
             media_type="application/zip",
