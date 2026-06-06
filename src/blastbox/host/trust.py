@@ -10,6 +10,7 @@ is scrubbed through ``sanitize_public_error`` before being surfaced.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from blastbox.contract.envelope import (
@@ -22,6 +23,8 @@ from blastbox.contract.envelope import (
 )
 from blastbox.errors import OutputTrustError, sanitize_public_error
 from blastbox.limits import Limits
+
+_log = logging.getLogger("blastbox.host.trust")
 
 
 def validate_worker_output(
@@ -74,10 +77,11 @@ def validate_worker_output(
     # ------------------------------------------------------------------
     try:
         parsed = envelope_from_json(raw, max_bytes=limits.max_metadata_bytes)
-    except (ValueError, Exception) as exc:
-        raise OutputTrustError(
-            sanitize_public_error(f"failed to parse metadata.json: {exc}")
-        ) from exc
+    except Exception as exc:
+        # Do NOT echo the exception: a pydantic ValidationError embeds the worker's input_value
+        # verbatim (worker-controlled). Log the detail server-side; surface a fixed message.
+        _log.warning("metadata.json parse/validation failed: %s", exc)
+        raise OutputTrustError("metadata.json failed schema validation") from exc
 
     # ------------------------------------------------------------------
     # Step 3: engine match

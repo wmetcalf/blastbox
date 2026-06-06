@@ -57,6 +57,10 @@ _log = get_logger("blastbox.ingress")
 
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 
+# Bounds on client-supplied job params (persisted on the Job + forwarded to the dispatcher).
+_MAX_PARAMS = 64
+_MAX_PARAM_LEN = 4096
+
 
 def _safe_upload_name(raw: str | None) -> str:
     """Sanitize a client-supplied filename to a safe basename.
@@ -349,9 +353,15 @@ def build_app(
                 safe=safe_name,
             )
 
-        # Parse params: accept "key=value" strings or plain "key" strings.
+        # Bound params at ingest: cap count + entry length so a hostile client can't bloat the
+        # persisted job (and amplify the full-list job listing). Reject (400) rather than
+        # silently truncate. (The dispatcher additionally key-allowlists + length-caps for env.)
+        if len(params) > _MAX_PARAMS:
+            raise HTTPException(400, f"too many params (max {_MAX_PARAMS})")
         parsed_params: dict[str, str] = {}
         for p in params:
+            if len(p) > _MAX_PARAM_LEN:
+                raise HTTPException(400, f"param too long (max {_MAX_PARAM_LEN} chars)")
             if "=" in p:
                 k, _, v = p.partition("=")
                 parsed_params[k.strip()] = v.strip()
@@ -382,7 +392,9 @@ def build_app(
 
         except Exception as exc:
             shutil.rmtree(root, ignore_errors=True)
-            raise HTTPException(500, _public_detail(exc)) from exc
+            # Don't reflect the spool exception (could carry internal paths/details). Log it.
+            _log.warning("upload_spool_failed", error=str(exc))
+            raise HTTPException(500, "upload failed") from exc
 
         job.input_sha256 = sha256
         job.result_dir = str(output_dir)
@@ -391,7 +403,9 @@ def build_app(
             _job_store.create(job)
         except Exception as exc:
             shutil.rmtree(root, ignore_errors=True)
-            raise HTTPException(500, _public_detail(exc)) from exc
+            # Don't reflect the store exception (DB driver errors carry host:port/DSN). Log it.
+            _log.warning("job_store_create_failed", error=str(exc))
+            raise HTTPException(503, "store unavailable") from exc
 
         record_job_submitted(engine, nbytes)
 

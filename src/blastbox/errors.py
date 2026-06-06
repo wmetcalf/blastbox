@@ -12,10 +12,23 @@ import re
 # is not a path and is left untouched because it lacks a trailing segment
 # separator.
 _INTERNAL_PATH_RE = re.compile(r"/(?:[A-Za-z0-9._+-]+/)+[A-Za-z0-9._+-]*")
+# Credentials embedded in a URI/DSN: ``scheme://user:pass@host`` -> ``scheme://<redacted>@host``.
+_URI_CRED_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://)[^/@\s]*@")
+# psycopg/driver connection-string key=value pairs that carry infra/secret data.
+_SENSITIVE_KV_RE = re.compile(
+    r"(?i)\b(password|passwd|pwd|host|hostaddr|port|user|dbname|database)=\S+"
+)
 
 
 def sanitize_public_error(msg: str) -> str:
-    """Remove internal filesystem paths from an error message."""
+    """Scrub internal filesystem paths AND DSN/connection credentials (URI ``user:pass@`` and
+    ``host=/port=/password=`` style kv pairs) from a client-facing error message.
+
+    Defense-in-depth only — infrastructure exceptions (store/driver/connection) should NOT be
+    routed through here at all: return a fixed generic message and log the detail server-side.
+    """
+    msg = _URI_CRED_RE.sub(r"\1<redacted>@", msg)
+    msg = _SENSITIVE_KV_RE.sub(r"\1=<redacted>", msg)
     return _INTERNAL_PATH_RE.sub("<path>", msg)
 
 

@@ -75,7 +75,8 @@ class SqlJobStore:
             return "sqlite", "?"
         if scheme in {"postgres", "postgresql"}:
             return "postgres", "%s"
-        raise ValueError(f"unsupported database url: {database_url!r}")
+        # Report only the scheme — never the full DSN (it carries credentials).
+        raise ValueError(f"unsupported database url scheme: {scheme!r} (use sqlite/postgresql)")
 
     @contextmanager
     def _connect(self):
