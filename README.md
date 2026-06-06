@@ -93,9 +93,15 @@ pip install blastbox[host]     # + the host orchestrator (FastAPI, jobstores, ob
 ## Run (host)
 
 ```sh
+# serve + dispatch are SEPARATE processes — point both at a SHARED job store:
+export BLASTBOX_DATABASE_URL=sqlite:////var/lib/blastbox/jobs.db   # or postgresql://… / redis://…
 blastbox serve     --host 127.0.0.1 --port 8000     # the ingress API
 blastbox dispatch                                    # the worker dispatcher loop
 ```
+
+> **`BLASTBOX_DATABASE_URL` is required for the two-process flow above.** Unset, each command
+> uses its own in-memory store, so jobs submitted to `serve` are invisible to `dispatch` (a
+> warning is logged). `sqlite:///…`, `postgresql://…`, and `redis://…` are supported.
 
 `POST /v1/jobs` (multipart `file` + `engine`) enqueues a job; the dispatcher launches a hardened
 disposable worker for it; `GET /v1/jobs/{id}/artifacts/{artifact_id}` serves validated output.

@@ -38,7 +38,7 @@ host = [
     "python-multipart>=0.0.9",
     "structlog>=24.1",
     "prometheus-client>=0.20",
-    "psycopg[binary]>=3.2",
+    "psycopg[binary,pool]>=3.2",  # [pool] -> psycopg-pool, imported by SqlJobStore for Postgres
     "redis>=5.0",
 ]
 dev = [

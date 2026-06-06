@@ -71,6 +71,28 @@ def _make_client(
     return client, job_store
 
 
+def test_result_zip_serves_only_validated_artifacts(tmp_path):
+    """GET /result must zip ONLY the declared artifacts (+ metadata.json), never undeclared
+    files or symlink targets a compromised worker drops into output/."""
+    import io
+    import zipfile
+
+    client, store = _make_client(tmp_path)
+    job, output_dir = _make_done_job(tmp_path, store)
+
+    # Hostile worker leftovers: an undeclared file + a symlink to a file outside output/.
+    (output_dir / "secret.txt").write_bytes(b"undeclared-leftover")
+    outside = tmp_path / "outside_secret"
+    outside.write_bytes(b"OUTSIDE-SECRET")
+    (output_dir / "leak").symlink_to(outside)
+
+    resp = client.get(f"/v1/jobs/{job.job_id}/result")
+    assert resp.status_code == 200
+    names = set(zipfile.ZipFile(io.BytesIO(resp.content)).namelist())
+    assert names == {"metadata.json", "page-001.png"}, names
+    assert b"OUTSIDE-SECRET" not in resp.content  # symlink target bytes never disclosed
+
+
 def _make_done_job(
     tmp_path: Path,
     job_store: InMemoryJobStore,

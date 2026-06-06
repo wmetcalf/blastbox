@@ -35,7 +35,7 @@ def _serve_cmd(args: argparse.Namespace) -> int:
 
 def _dispatch_cmd(args: argparse.Namespace) -> int:
     from blastbox.host.dispatch import Dispatcher, EngineSpec
-    from blastbox.host.jobs.memory import InMemoryJobStore
+    from blastbox.host.jobs.factory import build_job_store_from_env
 
     # Build engine specs from env or CLI.
     # Format expected: ENGINE_NAME=image:tag[,ENGINE_NAME2=image2:tag2]
@@ -66,7 +66,7 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
 
     limits = Limits.from_env()
     job_root = Path(os.environ.get("BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs"))
-    store = InMemoryJobStore()
+    store = build_job_store_from_env()
 
     # Opt-in warm pool (BLASTBOX_POOL_RUNTIME; default "none" → cold path only).
     from blastbox.host.pool_config import build_warm_pool

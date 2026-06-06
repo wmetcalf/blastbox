@@ -29,6 +29,26 @@ def test_seal_rejects_path_traversal(tmp_path):
                       declared=[DeclaredArtifact(id="a0", path="../escape", kind="x")],
                       warnings=[], payload=ExtractedText(text="x", char_count=1))
 
+def test_seal_rejects_oversize_artifact_before_reading(tmp_path):
+    # A declared artifact larger than the cap is rejected at stat() time (before the host
+    # reads/hashes it), so a hostile worker can't force an unbounded in-memory read.
+    (tmp_path / "big.bin").write_bytes(b"x" * 100)
+    with pytest.raises(ValueError, match="exceeds"):
+        seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+                      declared=[DeclaredArtifact(id="a0", path="big.bin", kind="x")],
+                      warnings=[], payload=ExtractedText(text="x", char_count=1),
+                      max_artifact_bytes=10)
+
+
+def test_seal_within_cap_uses_stat_size(tmp_path):
+    (tmp_path / "ok.bin").write_bytes(b"x" * 5)
+    env = seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+                        declared=[DeclaredArtifact(id="a0", path="ok.bin", kind="x")],
+                        warnings=[], payload=ExtractedText(text="x", char_count=1),
+                        max_artifact_bytes=10)
+    assert env.artifacts[0].bytes == 5  # under cap -> sealed; size from stat, chunk-hashed
+
+
 def test_seal_rejects_missing_file(tmp_path):
     with pytest.raises(ValueError, match="missing"):
         seal_envelope(engine="e", outdir=tmp_path, input_sha256="b"*64, detected=_det(),

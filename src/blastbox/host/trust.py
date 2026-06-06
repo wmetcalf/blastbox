@@ -108,6 +108,8 @@ def validate_worker_output(
             warnings=parsed.warnings,
             payload=parsed.payload,
             status=parsed.status,
+            # Reject an oversized declared artifact at stat() time, before re-hashing reads it.
+            max_artifact_bytes=limits.max_artifact_bytes,
         )
     except (ValueError, Exception) as exc:
         raise OutputTrustError(

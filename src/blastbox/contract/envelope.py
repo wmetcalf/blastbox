@@ -96,12 +96,18 @@ def _collect_refs(node) -> set[str]:
 def seal_envelope(*, engine: str, outdir: Path, input_sha256: str,
                   detected: Detection, declared: list[DeclaredArtifact],
                   warnings: list[Warning], payload: ChildNode,
-                  status: Literal["ok", "rejected", "engine_error"] = "ok") -> Envelope:
+                  status: Literal["ok", "rejected", "engine_error"] = "ok",
+                  max_artifact_bytes: int | None = None) -> Envelope:
     """Seal declared artifacts + payload into a validated Envelope.
 
     Computes sha256/bytes from disk, confines every path under outdir, and
     verifies every ArtifactRef in the payload resolves to a declared id.
     Raises ValueError on any violation — the worker must not emit on failure.
+
+    Size is taken from ``stat()`` and (when ``max_artifact_bytes`` is set) the cap is
+    enforced **before** any bytes are read, then the hash is computed in CHUNKS — so a
+    malicious worker declaring a giant artifact is rejected without the host ever reading
+    the whole file into memory.
     """
     outdir_resolved = outdir.resolve(strict=False)
     artifacts: list[Artifact] = []
@@ -115,10 +121,21 @@ def seal_envelope(*, engine: str, outdir: Path, input_sha256: str,
             raise ValueError(f"artifact path not confined to outdir: {d.path}")
         if not target.is_file():
             raise ValueError(f"declared artifact file missing or not a regular file: {d.path}")
-        data = target.read_bytes()
+        size = target.stat().st_size
+        if max_artifact_bytes is not None and size > max_artifact_bytes:
+            # Reject BEFORE reading — no unbounded read into memory from a hostile worker.
+            raise ValueError(
+                f"declared artifact {d.path} size {size} exceeds {max_artifact_bytes}"
+            )
+        digest = hashlib.sha256()
+        with target.open("rb") as fh:
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
         artifacts.append(Artifact(id=d.id, path=d.path, kind=d.kind,
-                                  sha256=hashlib.sha256(data).hexdigest(),
-                                  bytes=len(data)))
+                                  sha256=digest.hexdigest(), bytes=size))
     unresolved = _collect_refs(payload) - declared_ids
     if unresolved:
         raise ValueError(f"payload has unresolved ArtifactRef(s): {sorted(unresolved)}")

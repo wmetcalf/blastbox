@@ -38,7 +38,7 @@ from prometheus_client import CONTENT_TYPE_LATEST
 from blastbox import __version__
 from blastbox.errors import sanitize_public_error
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
-from blastbox.host.jobs.memory import InMemoryJobStore
+from blastbox.host.jobs.factory import build_job_store_from_env
 from blastbox.limits import Limits
 from blastbox.observability import (
     configure_logging,
@@ -113,13 +113,30 @@ def _safe_artifact_path(output_dir: Path, relative: str) -> Path | None:
 # ---------------------------------------------------------------------------
 
 
-def _zip_output_dir(output_dir: Path) -> bytes:
-    """Build a ZIP of all files under *output_dir* in memory (blocking)."""
+def _zip_validated_artifacts(output_dir: Path, artifact_rels: list[str]) -> bytes:
+    """Build a ZIP of ONLY the dispatcher-validated artifacts (+ ``metadata.json``).
+
+    A compromised worker can drop EXTRA undeclared files or a symlink (``output/leak ->
+    /etc/passwd``) into output/; the old helper ``rglob``'d everything and ``zipfile.write``
+    follows symlinks, so it disclosed undeclared files + symlink targets. We now serve only
+    the relative paths the trust gate declared in ``metadata.json``, each run through
+    ``_safe_artifact_path`` (resolve + containment under output_dir) and skipped if it is a
+    symlink or not a regular file — the same guard the per-artifact endpoint uses."""
     buf = io.BytesIO()
+    seen: set[str] = set()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for f in sorted(output_dir.rglob("*")):
-            if f.is_file():
-                zf.write(f, arcname=f.relative_to(output_dir))
+        for rel in ["metadata.json", *artifact_rels]:
+            if not rel or rel in seen:
+                continue
+            seen.add(rel)
+            # Don't follow a symlink to its (possibly outside) target...
+            if (output_dir / rel).is_symlink():
+                continue
+            # ...and resolve+confine (catches a symlink in any parent component too).
+            safe = _safe_artifact_path(output_dir, rel)
+            if safe is None or safe.is_symlink() or not safe.is_file():
+                continue
+            zf.write(safe, arcname=rel)
     return buf.getvalue()
 
 
@@ -143,7 +160,8 @@ def build_app(
     ``BLASTBOX_*`` environment variables.
 
     Args:
-        job_store: Backing store (defaults to a fresh ``InMemoryJobStore``).
+        job_store: Backing store. Defaults to ``build_job_store_from_env()`` —
+                   ``BLASTBOX_DATABASE_URL`` (sqlite/postgres/redis) or an in-memory store.
         job_root: Directory under which job subdirectories are created.
                   Defaults to ``BLASTBOX_JOB_ROOT`` env var or
                   ``/var/lib/blastbox/jobs``.
@@ -159,7 +177,7 @@ def build_app(
 
     _limits = limits or Limits.from_env()
 
-    _job_store: JobStore = job_store or InMemoryJobStore()
+    _job_store: JobStore = job_store or build_job_store_from_env()
 
     _job_root = job_root or Path(
         os.environ.get("BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs")
@@ -488,14 +506,32 @@ def build_app(
 
     @app.get("/v1/jobs/{job_id}/result")
     async def get_result(job_id: str):
-        """Stream a ZIP of the entire ``output/`` directory."""
+        """Stream a ZIP of the dispatcher-validated artifacts (+ ``metadata.json``).
+
+        Serves only the artifact paths declared in the validated ``metadata.json`` — NOT a
+        blind walk of output/ — so a compromised worker's undeclared/symlinked files are not
+        disclosed (see ``_zip_validated_artifacts``).
+        """
         _validate_job_id(job_id)
         _require_done(job_id)
         out = _output_dir_for(job_id)
         if not out.is_dir():
             raise HTTPException(410, "result expired")
 
-        zip_bytes = await asyncio.to_thread(_zip_output_dir, out)
+        meta_json = out / "metadata.json"
+        if not meta_json.is_file():
+            raise HTTPException(404, "metadata.json not found")
+        try:
+            meta = json.loads(meta_json.read_bytes())
+        except Exception:
+            raise HTTPException(500, "could not parse metadata.json")
+        rels = [
+            a["path"]
+            for a in meta.get("artifacts", [])
+            if isinstance(a, dict) and isinstance(a.get("path"), str)
+        ]
+
+        zip_bytes = await asyncio.to_thread(_zip_validated_artifacts, out, rels)
         return Response(
             content=zip_bytes,
             media_type="application/zip",
