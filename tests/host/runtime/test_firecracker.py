@@ -1149,6 +1149,9 @@ class TestWorkerRuntimeEnvSelection:
 
         monkeypatch.setenv("BLASTBOX_WORKER_RUNTIME", "firecracker")
         monkeypatch.delenv("BLASTBOX_REQUIRE_SECURE_RUNTIME", raising=False)
+        # Opt into runc so the fallback is allowed — this test is about the firecracker
+        # override being IGNORED, not the runc fail-closed policy (see test_docker.py).
+        monkeypatch.setenv("BLASTBOX_ALLOW_RUNC", "1")
         # Should NOT raise; just returns whichever Docker runtime is detected.
         # The FC path is handled by select_fc_runtime, not select_worker_runtime.
         sel = select_worker_runtime(available_runtimes=["runc"])

@@ -21,10 +21,15 @@ Security properties (review WILL check these):
    ``--memory-swap`` (swap disabled = equal), ``--pids-limit``, ``--cpus``,
    ``--ulimit nofile``, input bind ``:readonly``, output bind (rw),
    ``--tmpfs /tmp:…,nosuid,noexec``.
-3. Fail-closed: ``BLASTBOX_REQUIRE_SECURE_RUNTIME`` truthy + chosen runtime
-   not secure → raise ``InsecureRuntimeRefused``.
-4. gVisor opt-in: under runsc set ``-e BLASTBOX_WARN_ON_INSECURE=1``; under
-   runc leave it absent (strict).
+3. Fail-closed BY DEFAULT: an insecure runtime (plain ``runc`` — no gVisor) is
+   REFUSED unless the operator explicitly opts in with ``BLASTBOX_ALLOW_RUNC=1``.
+   ``BLASTBOX_REQUIRE_SECURE_RUNTIME`` is a hard lockdown that refuses ``runc``
+   even when the opt-in is present. Both raise ``InsecureRuntimeRefused`` early
+   (a clear, actionable error) rather than letting the worker fail opaquely later.
+4. ``-e BLASTBOX_WARN_ON_INSECURE=1`` is set under runsc (gVisor virtualises
+   /proc, so the worker's self-check can't see the host-applied flags) AND under
+   an opted-in ``runc`` run (so the deliberately-degraded worker runs its
+   sandbox self-check leniently instead of aborting opaquely).
 5. Optional MAC layers attached only if the operator wired host paths
    (``BLASTBOX_SECCOMP_JSON_HOST`` → ``--security-opt seccomp=<path>``;
    apparmor profile if loaded) — else record a warning, don't fail.
@@ -117,8 +122,21 @@ _DEFAULT_WORKDIR = "/tmp"
 # ---------------------------------------------------------------------------
 
 def _require_secure_runtime() -> bool:
-    """Return True when BLASTBOX_REQUIRE_SECURE_RUNTIME is set to a truthy value."""
+    """Return True when BLASTBOX_REQUIRE_SECURE_RUNTIME is set to a truthy value.
+
+    Hard lockdown: refuses an insecure runtime even if BLASTBOX_ALLOW_RUNC is also set.
+    """
     val = os.environ.get("BLASTBOX_REQUIRE_SECURE_RUNTIME", "0").strip().lower()
+    return val not in ("", "0", "false", "no")
+
+
+def _allow_runc() -> bool:
+    """Return True when BLASTBOX_ALLOW_RUNC is set to a truthy value.
+
+    The operator's EXPLICIT opt-in to run workers under plain ``runc`` (no gVisor
+    isolation). Absent, an insecure runtime is refused fail-closed.
+    """
+    val = os.environ.get("BLASTBOX_ALLOW_RUNC", "0").strip().lower()
     return val not in ("", "0", "false", "no")
 
 
@@ -197,13 +215,27 @@ def _apparmor_profile_loaded(profile_name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _finalize_runtime(selection: RuntimeSelection) -> RuntimeSelection:
-    """Enforce fail-closed policy: refuse an insecure runtime when required."""
-    if not selection.secure and _require_secure_runtime():
-        raise InsecureRuntimeRefused(
-            f"runtime {selection.runtime!r} is not secure (gVisor/runsc "
-            "unavailable) and BLASTBOX_REQUIRE_SECURE_RUNTIME is set; "
-            "refusing to process the job under plain runc"
-        )
+    """Enforce the fail-closed-by-default runtime policy.
+
+    An insecure runtime (plain ``runc`` — no gVisor isolation) is refused EARLY with an
+    actionable :class:`InsecureRuntimeRefused`, rather than letting the worker container
+    start and then fail its own sandbox self-check opaquely. It is allowed ONLY when the
+    operator explicitly opts in via ``BLASTBOX_ALLOW_RUNC=1`` — and ``BLASTBOX_REQUIRE_SECURE_RUNTIME``
+    is a hard lockdown that refuses it even then.
+    """
+    if not selection.secure:
+        if _require_secure_runtime():
+            raise InsecureRuntimeRefused(
+                f"runtime {selection.runtime!r} is insecure (gVisor/runsc unavailable) and "
+                "BLASTBOX_REQUIRE_SECURE_RUNTIME is set; refusing to process the job."
+            )
+        if not _allow_runc():
+            raise InsecureRuntimeRefused(
+                f"runtime {selection.runtime!r} is insecure: gVisor/runsc is unavailable, so the "
+                "worker would run WITHOUT gVisor isolation. Install/enable the runsc (gVisor) "
+                "Docker runtime, or set BLASTBOX_ALLOW_RUNC=1 to run in EXPLICIT degraded mode "
+                "under plain runc."
+            )
     return selection
 
 
@@ -295,8 +327,13 @@ def build_worker_docker_run_argv(
       read ``/proc/self/status``) can't observe docker's ``--security-opt``
       flags even though they ARE applied at the host level.  Under runsc we
       therefore opt the worker into ``BLASTBOX_WARN_ON_INSECURE=1`` so it
-      doesn't falsely abort on its own self-check.  Under runc the /proc reads
-      reflect reality so we leave it absent (strict).
+      doesn't falsely abort on its own self-check.
+    * Under an insecure runtime (plain ``runc``) we ALSO set
+      ``BLASTBOX_WARN_ON_INSECURE=1`` — but this path is reachable only after the
+      operator explicitly opted in via ``BLASTBOX_ALLOW_RUNC=1`` (``select_worker_runtime``
+      refuses runc otherwise), so the worker runs its self-check in DELIBERATE degraded
+      mode instead of aborting opaquely. The honest insecurity is surfaced by the
+      ``RuntimeSelection.warnings`` recorded at selection time.
     """
     bind_input = str(Path(input_path).expanduser().resolve(strict=False))
     bind_output = str(Path(output_dir).expanduser().resolve(strict=False))
@@ -307,10 +344,12 @@ def build_worker_docker_run_argv(
     cpus = os.environ.get("BLASTBOX_WORKER_CPUS", _DEFAULT_WORKER_CPUS)
     nofile = os.environ.get("BLASTBOX_WORKER_NOFILE", _DEFAULT_WORKER_NOFILE)
 
-    # gVisor opt-in: tell the worker's sandbox self-check to be lenient about
-    # /proc not reflecting host-applied flags.
+    # Tell the worker's sandbox self-check to be lenient. Under runsc that's because
+    # /proc doesn't reflect the host-applied flags (still secure); under an insecure
+    # runtime it's a DELIBERATE degraded run (reachable only after BLASTBOX_ALLOW_RUNC,
+    # which select_worker_runtime requires) so the worker doesn't abort opaquely.
     warn_on_insecure: str | None = None
-    if runtime.runtime == "runsc":
+    if runtime.runtime == "runsc" or not runtime.secure:
         warn_on_insecure = "1"
 
     # ------------------------------------------------------------------
@@ -337,7 +376,8 @@ def build_worker_docker_run_argv(
         cpus,
         "--ulimit",
         f"nofile={nofile}:{nofile}",
-        # gVisor /proc opt-in env (runsc only); omit entirely under runc.
+        # Self-check leniency env: set under runsc (/proc opt-in) AND under an
+        # opted-in insecure runtime (deliberate degraded run); absent otherwise.
         *(["-e", f"BLASTBOX_WARN_ON_INSECURE={warn_on_insecure}"]
           if warn_on_insecure is not None else []),
         "-e",
