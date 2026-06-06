@@ -1,35 +1,24 @@
-from pathlib import Path
+"""The snapshot seam is a structural contract.
 
+``@runtime_checkable`` lets ``issubclass``/``isinstance`` verify method NAMES at runtime;
+SIGNATURE conformance is enforced statically by mypy (``SnapshotManager`` calls the backend
+positionally and is type-checked against these Protocols). This test guards the NAME contract
+for the REAL backends + handles, so renaming/dropping a seam method can't silently break it —
+unlike a hand-written fake, which would tautologically "conform" to whatever it copies."""
 from blastbox.host.runtime.snapshot_backend import BootHandle, RestoreHandle, SnapshotBackend
 
 
-def test_protocols_are_runtime_checkable():
-    # A minimal fake satisfies the Protocols structurally.
-    class FakeBoot:
-        def wait_ready(self, timeout_s: float) -> None:
-            ...
+def test_real_backends_satisfy_the_seam():
+    from blastbox.host.runtime.fc_snapshot_backend import FcSnapshotBackend
+    from blastbox.host.runtime.gvisor_snapshot import (
+        GvisorBootHandle,
+        GvisorRestoreHandle,
+        GvisorSnapshotBackend,
+    )
 
-        def checkpoint(self, dest_dir: Path) -> object:
-            return {"art": str(dest_dir)}
-
-        def kill(self) -> None:
-            ...
-
-    class FakeRestore:
-        def kill(self) -> None:
-            ...
-
-    class FakeBackend:
-        def available(self) -> bool:
-            return True
-
-        def boot_base(self) -> BootHandle:
-            return FakeBoot()
-
-        def restore_in(self, slot_workdir: Path, artifact: object) -> RestoreHandle:
-            return FakeRestore()
-
-    b = FakeBackend()
-    assert isinstance(b, SnapshotBackend)
-    assert isinstance(b.boot_base(), BootHandle)
-    assert isinstance(b.restore_in(Path("/x"), {"art": "y"}), RestoreHandle)
+    # Both runtimes' backends expose available()/boot_base()/restore_in()...
+    assert issubclass(GvisorSnapshotBackend, SnapshotBackend)
+    assert issubclass(FcSnapshotBackend, SnapshotBackend)
+    # ...and the concrete handles expose the lifecycle methods the manager/runtime call.
+    assert issubclass(GvisorBootHandle, BootHandle)
+    assert issubclass(GvisorRestoreHandle, RestoreHandle)

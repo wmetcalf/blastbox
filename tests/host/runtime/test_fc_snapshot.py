@@ -181,6 +181,9 @@ def test_restore_wraps_backend_failure_as_restore_error(tmp_path):
     mgr.build()
     with pytest.raises(SnapshotRestoreError):
         mgr.restore("slot-x")
+    # A failed restore returns no handle, so nothing reaps the slot — the manager must rmtree
+    # the just-created workdir so it doesn't leak on the host.
+    assert not (tmp_path / "slots" / "slot-x").exists()
 
 
 def test_restore_preserves_snapshot_error_subclasses(tmp_path):
@@ -192,3 +195,4 @@ def test_restore_preserves_snapshot_error_subclasses(tmp_path):
     mgr.build()
     with pytest.raises(SnapshotRestoreError, match="backend already chose"):
         mgr.restore("slot-x")
+    assert not (tmp_path / "slots" / "slot-x").exists()  # cleanup on the SnapshotError path too

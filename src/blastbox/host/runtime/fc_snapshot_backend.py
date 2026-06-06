@@ -187,7 +187,13 @@ class FcSnapshotBackend:
         """Spawn a fresh firecracker in ``slot_workdir`` and load+resume the FC
         snapshot into it. ``artifact`` is the :class:`FcSnapshotArtifact` the build
         side produced; the manager passes it back here opaquely."""
-        assert isinstance(artifact, FcSnapshotArtifact)
+        if not isinstance(artifact, FcSnapshotArtifact):
+            # Explicit raise (not assert) so the validation survives `python -O`; fails closed
+            # with a typed error the manager already maps + cleans up after.
+            raise SnapshotRestoreError(
+                f"FcSnapshotBackend.restore_in expected FcSnapshotArtifact, "
+                f"got {type(artifact).__name__}"
+            )
         handle = self._launcher.restore_in(slot_workdir)
         try:
             _restore_from_snapshot(

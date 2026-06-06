@@ -87,12 +87,14 @@ def test_available_uses_probe(tmp_path: Path) -> None:
     assert GvisorSnapshotBackend(_cfg(tmp_path), run=lambda a, **k: 0, probe=lambda: False).available() is False
 
 
-def test_kill_is_best_effort(tmp_path: Path) -> None:
+def test_restore_in_propagates_run_error(tmp_path: Path) -> None:
     def boom(argv: list[str], **kw: object) -> int:
         raise RuntimeError("runsc gone")
 
     be = GvisorSnapshotBackend(_cfg(tmp_path), run=boom, ready_wait=lambda d, t: None)
-    # restore_in calls run() which raises -> should propagate; but handle.kill must swallow
+    # The `runsc restore` failure must propagate (the best-effort cleanup that runs in the
+    # except — swallowing its own errors — must not mask it). The leaked-container teardown
+    # itself is asserted by test_restore_in_force_deletes_leaked_container_on_failure.
     with pytest.raises(RuntimeError):
         be.restore_in(tmp_path / "s", "img")
 
