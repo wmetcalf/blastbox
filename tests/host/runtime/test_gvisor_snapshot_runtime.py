@@ -79,6 +79,24 @@ def test_settle_gates_readiness(tmp_path):
     assert rt.is_ready(s) is True
 
 
+def test_is_ready_false_when_handle_dead(tmp_path):
+    """control_dir exists (created on the host before restore) but the sandbox died
+    (alive()=False) → NOT ready, so dead slots aren't promoted to IDLE."""
+    class _DeadHandle(_FakeHandle):
+        def alive(self):
+            return False
+
+    class _DeadMgr(_FakeMgr):
+        def restore(self, slot_id):
+            wd = self.base / "slots" / str(slot_id)
+            for s in ("in", "out", "ctrl"):
+                (wd / s).mkdir(parents=True, exist_ok=True)
+            return _DeadHandle(wd)
+
+    rt = GvisorSnapshotSlotRuntime(_DeadMgr(tmp_path), settle_s=0.0)
+    assert rt.is_ready(rt.spawn()) is False
+
+
 def test_materialize_output_noop_keeps_output(tmp_path):
     rt = GvisorSnapshotSlotRuntime(_FakeMgr(tmp_path), settle_s=0.0)
     s = rt.spawn()

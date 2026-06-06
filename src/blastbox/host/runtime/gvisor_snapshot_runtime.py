@@ -59,9 +59,15 @@ class GvisorSnapshotSlotRuntime:
         if restored_at is not None and self._clock() - restored_at < self._settle_s:
             return False
         try:
-            return Path(slot.control_dir).exists()
+            if not Path(slot.control_dir).exists():
+                return False
         except OSError:
             return False
+        # control_dir is created on the HOST before `runsc restore`, so its mere existence
+        # doesn't prove the sandbox came up — a restore that immediately exited would still
+        # pass. Gate on liveness too (mirrors the FC tier) so dead slots aren't promoted to IDLE.
+        alive = getattr(handle, "alive", None)
+        return alive() if callable(alive) else True
 
     def is_alive(self, slot: Slot) -> bool:
         with self._lock:
@@ -117,7 +123,7 @@ class GvisorHostWarmControl:
         translated = WarmJobSpec(
             input_path=self.SANDBOX_IN / Path(spec.input_path).name,  # type: ignore[attr-defined]
             output_dir=self.SANDBOX_OUT,
-            params=dict(spec.params),  # type: ignore[attr-defined]
+            params=dict(spec.params or {}),  # type: ignore[attr-defined]
         )
         self._inner.signal_go(translated)
 
@@ -166,7 +172,15 @@ def _gvisor_config_from_env(env):
     root = env.get("BLASTBOX_GVISOR_ROOT", "/var/lib/blastbox/gvisor-root")
     rootfs = env.get("BLASTBOX_GVISOR_ROOTFS", "/var/lib/blastbox/gvisor-rootfs")
     raw_argv = env.get("BLASTBOX_GVISOR_WARM_ARGV", "").strip()
-    warm_argv = json.loads(raw_argv) if raw_argv else ["worker", "warm"]
+    try:
+        warm_argv = json.loads(raw_argv) if raw_argv else ["worker", "warm"]
+    except json.JSONDecodeError:
+        # A malformed override must not crash host startup — fall back to the default argv.
+        _log.warning(
+            "invalid BLASTBOX_GVISOR_WARM_ARGV JSON %r; using default ['worker', 'warm']",
+            raw_argv,
+        )
+        warm_argv = ["worker", "warm"]
     return GvisorConfig(
         runsc_bin=env.get("BLASTBOX_GVISOR_RUNSC", "runsc"),
         root=Path(root),

@@ -108,7 +108,13 @@ def _prepare_slot_dirs(cfg: GvisorConfig, workdir: Path) -> None:
     different uids — so they are mode 0o777. This is safe because the parent
     (``/var/lib/blastbox/...``, deploy concern) MUST be root-owned 0700, making the 0o777 leaf
     reachable only by root + the mapped container uid (via the bind mount), not other local
-    users. ``in/`` is read-only and only needs world-traversable (0o755)."""
+    users. ``in/`` is read-only and only needs world-traversable (0o755).
+
+    We also clamp ``workdir`` itself to 0o700 (belt-and-suspenders): even if the deploy parent
+    is lax, an unprivileged local user can't traverse INTO this slot dir to reach the 0o777
+    leaves. The container's gofer (and the host pool service) own/traverse it regardless."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    workdir.chmod(0o700)
     in_dir = workdir / "in"
     in_dir.mkdir(parents=True, exist_ok=True)
     in_dir.chmod(0o755)
@@ -123,7 +129,14 @@ def _default_run(argv: list[str], **kw: Any) -> int:
 
 
 def _default_run_text(argv: list[str]) -> str:
-    return subprocess.run(argv, capture_output=True, text=True, check=False).stdout
+    # Bounded: alive() runs this from the pool's liveness path, so a hung `runsc state`
+    # must not block claim/promote indefinitely. Timeout/error → "" (treated as not-alive).
+    try:
+        return subprocess.run(
+            argv, capture_output=True, text=True, check=False, timeout=10
+        ).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
 
 
 def _default_ready_wait(ctrl_dir: Path, timeout_s: float) -> None:
@@ -232,12 +245,18 @@ class GvisorSnapshotBackend:
         ctrl = base / "ctrl"
         cid = "warm-base"
         _write_oci_config(self._cfg, base, in_ro=True)
-        self._run(
-            [*_runsc(self._cfg), "run", "-detach", "-bundle", str(base), cid],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        try:
+            self._run(
+                [*_runsc(self._cfg), "run", "-detach", "-bundle", str(base), cid],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            # No boot handle is returned on failure, so nothing reaps the base bundle —
+            # remove it (and its OCI config) so the host dir doesn't leak.
+            shutil.rmtree(base, ignore_errors=True)
+            raise
         return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready)
 
     def restore_in(self, slot_workdir: Path, artifact: object) -> GvisorRestoreHandle:

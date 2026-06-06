@@ -22,14 +22,20 @@ static int (*real_accept4)(int, struct sockaddr *, socklen_t *, int);
 /* Resolve the real symbols once at load time (before any accept call) — avoids a
  * lazy-init data race between concurrent first calls. */
 __attribute__((constructor)) static void init_real_accept(void) {
-    real_accept = dlsym(RTLD_NEXT, "accept");
-    real_accept4 = dlsym(RTLD_NEXT, "accept4");
+    /* Explicit casts: dlsym returns void*, and ISO C forbids the implicit
+     * object->function-pointer conversion (some toolchains warn/error on -pedantic). */
+    real_accept = (int (*)(int, struct sockaddr *, socklen_t *)) dlsym(RTLD_NEXT, "accept");
+    real_accept4 =
+        (int (*)(int, struct sockaddr *, socklen_t *, int)) dlsym(RTLD_NEXT, "accept4");
 }
 
 int accept(int fd, struct sockaddr *a, socklen_t *l) {
+    /* If resolution failed (unusual libc/linker), fail cleanly instead of a NULL deref. */
+    if (!real_accept) { errno = ENOSYS; return -1; }
     for (;;) { int r = real_accept(fd, a, l); if (r < 0 && errno == EINTR) continue; return r; }
 }
 
 int accept4(int fd, struct sockaddr *a, socklen_t *l, int flags) {
+    if (!real_accept4) { errno = ENOSYS; return -1; }
     for (;;) { int r = real_accept4(fd, a, l, flags); if (r < 0 && errno == EINTR) continue; return r; }
 }

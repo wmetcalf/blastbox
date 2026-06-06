@@ -15,6 +15,7 @@ toggle, the FcSnapshotArtifact) live in
 """
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from blastbox.host.runtime.snapshot_backend import RestoreHandle, SnapshotBackend
@@ -106,6 +107,10 @@ class SnapshotManager:
         try:
             return self._backend.restore_in(slot_workdir, self._artifact)
         except SnapshotError:
+            # A failed restore never yields a handle, so the slot is never reaped —
+            # remove the just-created (empty) workdir so it doesn't leak on the host.
+            shutil.rmtree(slot_workdir, ignore_errors=True)
             raise
         except Exception as exc:
+            shutil.rmtree(slot_workdir, ignore_errors=True)
             raise SnapshotRestoreError(f"restore failed: {exc}") from exc

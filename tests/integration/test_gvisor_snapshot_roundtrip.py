@@ -41,12 +41,20 @@ import pytest
 
 
 def _runsc_cr_available() -> bool:
-    """Return True iff runsc is on PATH and advertises checkpoint/restore."""
-    if not shutil.which("runsc"):
+    """Return True iff the configured runsc binary advertises checkpoint/restore.
+
+    Honors ``BLASTBOX_GVISOR_RUNSC`` (the same override the test uses to build the
+    GvisorConfig): an absolute path is probed as-is, a bare name is resolved on PATH —
+    so setting an absolute path no longer spuriously skips the test."""
+    runsc = os.environ.get("BLASTBOX_GVISOR_RUNSC", "runsc").strip() or "runsc"
+    if os.sep in runsc:
+        if not Path(runsc).is_file():
+            return False
+    elif not shutil.which(runsc):
         return False
     try:
         result = subprocess.run(
-            ["runsc", "help"],
+            [runsc, "help"],
             capture_output=True,
             text=True,
             timeout=10,
