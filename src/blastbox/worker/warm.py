@@ -221,18 +221,14 @@ class HostWarmControl:
         self._dir = control_dir
 
     def _atomic_write(self, name: str, content: str) -> None:
-        """Write *content* to ``control_dir/<name>`` atomically via temp+rename."""
-        target = self._dir / name
-        tmp = self._dir / f".{name}.tmp"
-        try:
-            tmp.write_text(content, encoding="utf-8")
-            os.replace(tmp, target)
-        except Exception:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        """Write *content* to ``control_dir/<name>`` atomically AND symlink-safely.
+
+        control_dir is WORKER-WRITABLE (the gVisor tier bind-mounts ctrl/ at 0o777), so a worker
+        could pre-plant ``.<name>.tmp`` or ``<name>`` as a symlink to redirect this HOST-authored
+        write to clobber an outside file. ``atomic_write_confined`` uses a random
+        ``O_EXCL|O_NOFOLLOW`` temp + ``renameat`` so the write can never follow a worker symlink."""
+        from blastbox.contract.envelope import atomic_write_confined
+        atomic_write_confined(self._dir, name, content.encode("utf-8"))
 
     def signal_go(self, spec: WarmJobSpec) -> None:
         """Atomically write ``control_dir/go.json`` with the job spec.

@@ -49,6 +49,51 @@ def test_seal_within_cap_uses_stat_size(tmp_path):
     assert env.artifacts[0].bytes == 5  # under cap -> sealed; size from stat, chunk-hashed
 
 
+def test_atomic_write_confined_defeats_destination_symlink(tmp_path):
+    """A worker pre-planting the destination as a symlink to an outside file must NOT redirect
+    the host write; the target is untouched and the destination becomes a real file."""
+    from blastbox.contract.envelope import atomic_write_confined
+    d = tmp_path / "out"
+    d.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"ORIGINAL")
+    (d / "metadata.json").symlink_to(outside)  # worker pre-plants the dst as a symlink
+
+    atomic_write_confined(d, "metadata.json", b"SEALED")
+
+    assert outside.read_bytes() == b"ORIGINAL"  # outside file NOT clobbered
+    assert not (d / "metadata.json").is_symlink()  # dst replaced by a real file
+    assert (d / "metadata.json").read_bytes() == b"SEALED"
+
+
+def test_atomic_write_confined_defeats_temp_symlink(tmp_path):
+    """The old predictable temp name pre-planted as a symlink must NOT be followed (random
+    O_EXCL|O_NOFOLLOW temp name avoids it entirely)."""
+    from blastbox.contract.envelope import atomic_write_confined
+    d = tmp_path / "out"
+    d.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"ORIGINAL")
+    (d / ".metadata.json.tmp").symlink_to(outside)  # the previously-predictable temp path
+
+    atomic_write_confined(d, "metadata.json", b"SEALED")
+
+    assert outside.read_bytes() == b"ORIGINAL"
+    assert (d / "metadata.json").read_bytes() == b"SEALED"
+
+
+def test_seal_caps_growing_artifact_during_hash(tmp_path):
+    """#4: an artifact larger than the cap is rejected DURING the hash read, not just by the
+    initial fstat (defends a live worker that grows the file after stat)."""
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * 5000)
+    with pytest.raises(ValueError, match="exceeds|grew"):
+        seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+                      declared=[DeclaredArtifact(id="a0", path="big.bin", kind="x")],
+                      warnings=[], payload=ExtractedText(text="x", char_count=1),
+                      max_artifact_bytes=1000)
+
+
 def test_envelope_from_json_rejects_deep_payload():
     """A payload nested past the depth bound is rejected cleanly at parse time (not via a
     catchable RecursionError) — covers the Record.fields recursion vector too."""

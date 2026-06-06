@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Mapping
 
-from blastbox.contract.envelope import open_confined_regular_fd
+from blastbox.contract.envelope import atomic_write_confined, open_confined_regular_fd
 from blastbox.errors import OutputTrustError, WarmTimeout, sanitize_public_error
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.runtime.docker import (
@@ -624,12 +624,12 @@ class Dispatcher:
 
     def _write_sealed_metadata(self, envelope, output_dir: Path) -> None:
         """Overwrite metadata.json with the host-SEALED envelope (recomputed sha256/bytes/payload)
-        atomically, so the API serves host-trusted metadata — not the raw worker-written file
-        whose hashes/sizes the worker could fabricate."""
+        atomically AND symlink-safely, so the API serves host-trusted metadata — not the raw
+        worker file. atomic_write_confined uses a random O_EXCL|O_NOFOLLOW temp + renameat, so a
+        worker that pre-planted .metadata.json.tmp (or metadata.json) as a symlink can't redirect
+        the host write to clobber an outside file."""
         data = envelope.model_dump_json(by_alias=True).encode("utf-8")
-        tmp = output_dir / ".metadata.json.tmp"
-        tmp.write_bytes(data)
-        os.replace(tmp, output_dir / "metadata.json")
+        atomic_write_confined(output_dir, "metadata.json", data)
 
     def _materialize_sealed_warm_output(self, envelope, src_dir: Path, dst_dir: Path) -> None:
         """Copy the validated declared artifacts from the warm slot dir (``src_dir``, possibly a
@@ -651,8 +651,14 @@ class Dispatcher:
                         chunk = os.read(fd, 1024 * 1024)
                         if not chunk:
                             break
-                        digest.update(chunk)
                         n += len(chunk)
+                        # Cap the copy at the sealed size — a still-live worker growing the file
+                        # past its declared bytes can't force unbounded host I/O (#4).
+                        if n > a.bytes:
+                            raise OutputTrustError(
+                                f"artifact {a.id} grew past {a.bytes} bytes during materialization"
+                            )
+                        digest.update(chunk)
                         out.write(chunk)
             finally:
                 os.close(fd)

@@ -130,17 +130,56 @@ def open_confined_regular_fd(base: Path, relpath: str) -> int:
         raise
 
 
-def _hash_fd(fd: int) -> tuple[str, int]:
-    """SHA-256 + byte count of an open fd, read in chunks (constant memory)."""
+def _hash_fd(fd: int, *, max_bytes: int | None = None) -> tuple[str, int]:
+    """SHA-256 + byte count of an open fd, read in chunks (constant memory). If ``max_bytes`` is
+    set, abort as soon as the RUNNING total exceeds it — so a still-live worker that grows the
+    file after the initial stat can't force unbounded host I/O past the cap."""
     digest = hashlib.sha256()
     total = 0
     while True:
         chunk = os.read(fd, 1024 * 1024)
         if not chunk:
             break
-        digest.update(chunk)
         total += len(chunk)
+        if max_bytes is not None and total > max_bytes:
+            raise ValueError(f"file grew past {max_bytes} bytes during read")
+        digest.update(chunk)
     return digest.hexdigest(), total
+
+
+def atomic_write_confined(base: Path, name: str, data: bytes) -> None:
+    """Atomically write ``data`` to ``base/name``, symlink/TOCTOU-safe even when ``base`` is a
+    worker-writable dir.
+
+    The temp is created relative to a directory fd under a RANDOM name with
+    ``O_CREAT|O_EXCL|O_NOFOLLOW`` (a worker can't pre-plant a symlink/file there to redirect the
+    host write), then ``renameat`` replaces ``name`` (clobbering any worker-planted symlink at the
+    destination, since rename doesn't follow it). ``name`` must be a single path segment."""
+    import secrets
+    if not name or "/" in name or name in (".", ".."):
+        raise ValueError(f"unsafe name: {name!r}")
+    dir_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        tmp_name = f".{name}.{secrets.token_hex(8)}.tmp"
+        tfd = os.open(
+            tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd
+        )
+        try:
+            mv = memoryview(data)
+            while mv:
+                mv = mv[os.write(tfd, mv):]
+            os.close(tfd)
+            tfd = -1
+            os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        finally:
+            if tfd >= 0:
+                os.close(tfd)
+                try:
+                    os.unlink(tmp_name, dir_fd=dir_fd)
+                except OSError:
+                    pass
+    finally:
+        os.close(dir_fd)
 
 
 def read_confined_regular_bytes(base: Path, relpath: str, *, max_bytes: int) -> bytes:
@@ -208,7 +247,7 @@ def seal_envelope(*, engine: str, outdir: Path, input_sha256: str,
                 raise ValueError(
                     f"declared artifact {d.path} size {size} exceeds {max_artifact_bytes}"
                 )
-            sha256, n = _hash_fd(fd)
+            sha256, n = _hash_fd(fd, max_bytes=max_artifact_bytes)
         finally:
             os.close(fd)
         artifacts.append(Artifact(id=d.id, path=d.path, kind=d.kind, sha256=sha256, bytes=n))
