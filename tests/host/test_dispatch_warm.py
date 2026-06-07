@@ -886,3 +886,49 @@ def test_requeue_recovers_only_stale_warm_jobs(tmp_path, monkeypatch):
     assert failed.status == JobStatus.FAILED  # crashed-owner warm -> terminal, never re-detonated
     assert "recovered: warm worker owner gone" in failed.security_warnings
     assert store.get(cold.job_id).status == JobStatus.QUEUED
+
+
+def test_requeue_warm_recovery_runs_when_docker_probe_fails(tmp_path, monkeypatch):
+    """Warm recovery is TIME-based and must NOT be gated by the docker probe — a docker ps
+    failure (returns None) still recovers a stale warm job, while cold requeue is skipped."""
+    store = InMemoryJobStore()
+    disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs", worker_timeout_s=30)
+    monkeypatch.setattr(disp, "_list_active_worker_job_ids", lambda: None)  # docker ps FAILED
+    now = time.time()
+
+    stale_warm = Job.new(engine=_ENGINE_NAME, filename="warm.docx")
+    stale_warm.status = JobStatus.RUNNING
+    stale_warm.worker_runtime = "warm"
+    stale_warm.started_at = now - 600
+    store.create(stale_warm)
+
+    cold = Job.new(engine=_ENGINE_NAME, filename="cold.docx")
+    cold.status = JobStatus.RUNNING
+    cold.worker_runtime = "runsc"
+    cold.started_at = now - 600
+    store.create(cold)
+
+    recovered = disp.requeue_orphaned_jobs()
+    assert recovered == 1  # warm recovered despite the docker-probe failure
+    assert store.get(stale_warm.job_id).status == JobStatus.FAILED
+    assert store.get(cold.job_id).status == JobStatus.RUNNING  # cold requeue skipped (docker down)
+
+
+def test_warm_recovery_deletes_stale_input(tmp_path, monkeypatch):
+    """A recovered (owner-gone) warm job's staged input is deleted by the sweep — the gone owner
+    won't clean up, so without this the untrusted input would leak when retention is disabled."""
+    store = InMemoryJobStore()
+    disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs", worker_timeout_s=30)
+    monkeypatch.setattr(disp, "_list_active_worker_job_ids", lambda: set())
+
+    job = Job.new(engine=_ENGINE_NAME, filename="stale.docx")
+    job.status = JobStatus.RUNNING
+    job.worker_runtime = "warm"
+    job.started_at = time.time() - 600
+    store.create(job)
+    input_path = _setup_job_dirs(tmp_path / "jobs", job)
+    assert input_path.exists()
+
+    assert disp.requeue_orphaned_jobs() == 1
+    assert store.get(job.job_id).status == JobStatus.FAILED
+    assert not input_path.exists()  # recovered job's input cleaned up by the sweep

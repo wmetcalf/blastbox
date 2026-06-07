@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import threading
 import time
+import uuid
 
 from blastbox.host.jobs.base import Job, JobStatus
 
@@ -45,7 +46,12 @@ class InMemoryJobStore:
             return job
 
     def update_if_status(
-        self, job_id: str, expect_status: JobStatus, **fields
+        self,
+        job_id: str,
+        expect_status: JobStatus,
+        *,
+        expect_claim_id: str | None = None,
+        **fields,
     ) -> bool:
         # Validate field names BEFORE the status guard so an unknown field fails fast (ValueError)
         # uniformly across all backends — not silently no-op on a status mismatch here while the
@@ -56,6 +62,8 @@ class InMemoryJobStore:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None or job.status != expect_status:
+                return False
+            if expect_claim_id is not None and job.claim_id != expect_claim_id:
                 return False
             for k, v in fields.items():
                 setattr(job, k, v)
@@ -99,6 +107,7 @@ class InMemoryJobStore:
             job = min(queued, key=lambda j: (j.created_at, j.job_id))
             job.status = JobStatus.RUNNING
             job.started_at = time.time()
+            job.claim_id = uuid.uuid4().hex  # fresh ownership token per claim
             return job
 
     def delete(self, job_id: str) -> None:

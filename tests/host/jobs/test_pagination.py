@@ -73,6 +73,50 @@ def test_update_if_status_cas_all_backends(store):
     assert store.update_if_status("nope", JobStatus.RUNNING, status=JobStatus.FAILED) is False
 
 
+def test_claim_next_stamps_unique_claim_id(store):
+    _seed(store, 2)
+    j1 = store.claim_next()
+    j2 = store.claim_next()
+    assert j1 is not None and j2 is not None
+    assert j1.claim_id and j2.claim_id and j1.claim_id != j2.claim_id
+    assert store.get(j1.job_id).claim_id == j1.claim_id  # persisted on the row
+
+
+def test_update_if_status_claim_id_fences_aba(store):
+    """The claim_id guard closes the status-only ABA hole: after RUNNING->QUEUED->RUNNING (a new
+    claim), a STALE owner keyed on the OLD claim_id can no longer write — only the new owner can."""
+    _seed(store, 1)
+    claimed = store.claim_next()
+    c1 = claimed.claim_id
+    assert c1
+
+    # The owner's write keyed on (RUNNING, c1) applies now (still our claim).
+    assert store.update_if_status(
+        claimed.job_id, JobStatus.RUNNING, expect_claim_id=c1, worker_runtime="warm"
+    ) is True
+
+    # ABA: requeue (clear claim) then reclaim -> a fresh claim c2.
+    assert store.update_if_status(
+        claimed.job_id, JobStatus.RUNNING, expect_claim_id=c1,
+        status=JobStatus.QUEUED, claim_id=None,
+    ) is True
+    reclaimed = store.claim_next()
+    c2 = reclaimed.claim_id
+    assert c2 and c2 != c1
+
+    # The OLD owner (c1) must NOT be able to terminal-write the reclaimed job (ABA closed).
+    assert store.update_if_status(
+        claimed.job_id, JobStatus.RUNNING, expect_claim_id=c1, status=JobStatus.DONE
+    ) is False
+    assert store.get(claimed.job_id).status == JobStatus.RUNNING  # still the new claim's job
+
+    # The CURRENT owner (c2) can.
+    assert store.update_if_status(
+        claimed.job_id, JobStatus.RUNNING, expect_claim_id=c2, status=JobStatus.DONE
+    ) is True
+    assert store.get(claimed.job_id).status == JobStatus.DONE
+
+
 def test_update_if_status_rejects_unknown_field(store):
     jobs = _seed(store, 1)  # QUEUED
     # Fail-fast on a bad field name UNIFORMLY across backends — regardless of status match,

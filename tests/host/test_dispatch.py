@@ -722,3 +722,51 @@ def test_requeue_grace_window(tmp_path):
     )
     assert d.requeue_orphaned_jobs() == 0
     assert store.get(fresh.job_id).status == JobStatus.RUNNING
+
+
+def test_cold_enrichment_claim_fenced_aborts_on_reclaim(tmp_path):
+    """If a peer requeues+reclaims a cold job while _runtime_selector blocks (e.g. on `docker
+    info`), the claim-fenced enrichment write aborts THIS stale owner before it launches a worker,
+    does NOT overwrite the new owner's worker_runtime (which would mis-route recovery and cause a
+    double-detonation), and leaves the shared input on disk for the new owner."""
+    # SqlJobStore (not in-memory) so the dispatcher's claimed Job is a frozen SNAPSHOT — modelling
+    # a real multi-dispatcher store. (In-memory is single-process and returns live references, so
+    # it can't model a peer reclaim.)
+    from blastbox.host.jobs.sql_store import SqlJobStore
+    store = SqlJobStore(f"sqlite:///{tmp_path / 'jobs.db'}")
+    job = _make_job()
+    store.create(job)
+    input_path = _setup_job_dirs(tmp_path, job)
+
+    launched: list = []
+
+    def _runner(argv, **kw):
+        launched.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def _selector_that_reclaims() -> RuntimeSelection:
+        # Simulate a peer dispatcher mid-`docker info`: requeue (clear claim), reclaim under a
+        # fresh claim, and mark it warm — exactly the multi-dispatcher reclaim the fence detects.
+        cur = store.get(job.job_id)
+        store.update_if_status(
+            job.job_id, JobStatus.RUNNING, expect_claim_id=cur.claim_id,
+            status=JobStatus.QUEUED, claim_id=None,
+        )
+        new_owner = store.claim_next()
+        store.update_if_status(
+            job.job_id, JobStatus.RUNNING,
+            expect_claim_id=new_owner.claim_id, worker_runtime="warm",
+        )
+        return RuntimeSelection(runtime="runc", secure=False, warnings=["stale"])
+
+    disp = _make_dispatcher(
+        store, job_root=tmp_path,
+        runtime_selector=_selector_that_reclaims, subprocess_runner=_runner,
+    )
+    disp.dispatch_once()
+
+    final = store.get(job.job_id)
+    assert launched == []  # the stale owner aborted — no worker launched
+    assert final.worker_runtime == "warm"  # the new owner's label is NOT clobbered to "runc"
+    assert final.status == JobStatus.RUNNING  # still the new owner's live claim
+    assert input_path.exists()  # shared input preserved for the new owner (not deleted on abort)

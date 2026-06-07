@@ -11,6 +11,7 @@ import dataclasses
 import json
 import logging
 import time
+import uuid
 
 from redis.exceptions import WatchError
 
@@ -108,10 +109,16 @@ class RedisJobStore:
                     continue  # retry on concurrent modification
 
     def update_if_status(
-        self, job_id: str, expect_status: JobStatus, **fields
+        self,
+        job_id: str,
+        expect_status: JobStatus,
+        *,
+        expect_claim_id: str | None = None,
+        **fields,
     ) -> bool:
         """Compare-and-set via WATCH/MULTI/EXEC: apply ``fields`` only while status is still
-        ``expect_status``. Returns False (no write) on missing/malformed/mismatched status."""
+        ``expect_status`` (and claim_id matches when ``expect_claim_id`` is given — closes the
+        ABA hole). Returns False (no write) on missing/malformed/mismatched status or claim."""
         # Fail fast on an unknown field name BEFORE any Redis round-trip — uniform with the SQL
         # backend (which validates before the UPDATE) so the cross-backend contract holds.
         for k in fields:
@@ -124,7 +131,9 @@ class RedisJobStore:
                     pipe.watch(key)
                     raw = pipe.get(key)
                     job = _decode_job(raw) if raw is not None else None
-                    if job is None or job.status != expect_status:
+                    if job is None or job.status != expect_status or (
+                        expect_claim_id is not None and job.claim_id != expect_claim_id
+                    ):
                         pipe.unwatch()
                         return False
                     for k, v in fields.items():
@@ -216,6 +225,7 @@ class RedisJobStore:
                         continue
                     job.status = JobStatus.RUNNING
                     job.started_at = time.time()
+                    job.claim_id = uuid.uuid4().hex  # fresh ownership token per claim
                     pipe.multi()
                     pipe.set(key, json.dumps(job.to_dict()), ex=self._expiry_arg())
                     pipe.execute()

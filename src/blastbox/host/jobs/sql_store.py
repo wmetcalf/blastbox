@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -34,6 +35,7 @@ _COLUMNS = (
     "security_warnings",
     "params",
     "result_summary",
+    "claim_id",
 )
 
 # Fields whose values are JSON-serialised for storage.
@@ -128,7 +130,8 @@ class SqlJobStore:
             error             TEXT,
             security_warnings TEXT,
             params            TEXT,
-            result_summary    TEXT
+            result_summary    TEXT,
+            claim_id          TEXT
         )
         """
         with self._lock, self._connect() as conn:
@@ -138,7 +141,7 @@ class SqlJobStore:
     def _ensure_columns(self, conn) -> None:
         """Add any columns that don't exist yet (forward-compat migrations)."""
         existing = self._existing_columns(conn)
-        for col in ("engine", "params", "result_summary"):
+        for col in ("engine", "params", "result_summary", "claim_id"):
             if col not in existing:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
 
@@ -227,26 +230,33 @@ class SqlJobStore:
         return job
 
     def update_if_status(
-        self, job_id: str, expect_status: JobStatus, **fields
+        self,
+        job_id: str,
+        expect_status: JobStatus,
+        *,
+        expect_claim_id: str | None = None,
+        **fields,
     ) -> bool:
-        """Compare-and-set: ``UPDATE ... WHERE job_id = ? AND status = ?`` — applies only while
-        the row is still ``expect_status`` (rowcount==1), like ``claim_next``'s QUEUED guard."""
-        if not fields:
-            job = self.get(job_id)
-            return job is not None and job.status == expect_status
+        """Compare-and-set: ``UPDATE ... WHERE job_id = ? AND status = ?`` (and ``AND claim_id = ?``
+        when ``expect_claim_id`` is given) — applies only while the row still matches (rowcount==1),
+        like ``claim_next``'s QUEUED guard. The claim_id guard closes the status-only ABA hole."""
         for key in fields:
             if key not in _COLUMNS:
                 raise ValueError(f"invalid column: {key!r}")
+        guard_sql = f"WHERE job_id = {self._param} AND status = {self._param}"
+        guard_params: tuple = (job_id, expect_status.value)
+        if expect_claim_id is not None:
+            guard_sql += f" AND claim_id = {self._param}"
+            guard_params += (expect_claim_id,)
+        if not fields:
+            sql = f"SELECT 1 FROM jobs {guard_sql}"
+            with self._lock, self._connect() as conn:
+                return conn.execute(sql, guard_params).fetchone() is not None
         encoded = {key: self._encode_value(key, value) for key, value in fields.items()}
         set_clause = ", ".join(f"{key} = {self._param}" for key in encoded)
-        sql = (
-            f"UPDATE jobs SET {set_clause} "
-            f"WHERE job_id = {self._param} AND status = {self._param}"
-        )
+        sql = f"UPDATE jobs SET {set_clause} {guard_sql}"
         with self._lock, self._connect() as conn:
-            cur = conn.execute(
-                sql, tuple(encoded.values()) + (job_id, expect_status.value)
-            )
+            cur = conn.execute(sql, tuple(encoded.values()) + guard_params)
             return cur.rowcount == 1
 
     def list(
@@ -309,7 +319,8 @@ class SqlJobStore:
         # EXPIRED) flipping it between the SELECT and UPDATE — without it,
         # such a transition would be silently clobbered back to RUNNING.
         update_sql = (
-            f"UPDATE jobs SET status = {self._param}, started_at = {self._param} "
+            f"UPDATE jobs SET status = {self._param}, started_at = {self._param}, "
+            f"claim_id = {self._param} "
             f"WHERE job_id = {self._param} AND status = {self._param}"
         )
         with self._lock, self._connect() as conn:
@@ -321,11 +332,13 @@ class SqlJobStore:
             if job is None:
                 return None
             started_at = time.time()
+            claim_id = uuid.uuid4().hex  # fresh ownership token per claim
             cur = conn.execute(
                 update_sql,
                 (
                     JobStatus.RUNNING.value,
                     started_at,
+                    claim_id,
                     job.job_id,
                     JobStatus.QUEUED.value,
                 ),
@@ -335,6 +348,7 @@ class SqlJobStore:
                 return None
             job.status = JobStatus.RUNNING
             job.started_at = started_at
+            job.claim_id = claim_id
             return job
 
     def _claim_next_postgres(self) -> Job | None:
@@ -349,12 +363,17 @@ class SqlJobStore:
             LIMIT 1
         )
         UPDATE jobs
-        SET status = {self._param}, started_at = {self._param}
+        SET status = {self._param}, started_at = {self._param}, claim_id = {self._param}
         FROM next_job
         WHERE jobs.job_id = next_job.job_id
         RETURNING {cols_jobs}
         """
-        params = (JobStatus.QUEUED.value, JobStatus.RUNNING.value, time.time())
+        params = (
+            JobStatus.QUEUED.value,
+            JobStatus.RUNNING.value,
+            time.time(),
+            uuid.uuid4().hex,  # fresh ownership token per claim
+        )
         with self._lock, self._connect() as conn:
             row = conn.execute(sql, params).fetchone()
         return self._row_to_job(row)

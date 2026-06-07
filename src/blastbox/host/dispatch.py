@@ -9,8 +9,11 @@ Security properties (review will check):
 2. Output is validated through ``trust.validate_worker_output`` BEFORE the job
    is marked DONE.  A worker that writes a traversal/tampered/oversized
    metadata.json produces FAILED, not DONE.
-3. Input is deleted on EVERY terminal path (success, failure, timeout, launch
-   error, unknown engine, insecure runtime) via a ``finally`` block.
+3. Input is deleted whenever a dispatcher reaches a terminal path FOR A JOB IT STILL
+   OWNS (success, failure, timeout, launch error, unknown engine, insecure runtime) via a
+   ``finally`` block; on a lost-claim abort the input is left for the dispatcher that
+   reclaimed it, and a time-recovered (owner-gone) job's input is deleted by the recovery
+   sweep — so untrusted input never persists permanently, but never races a live new owner.
 4. ``job.params`` → ``extra_env`` only for keys matching ``^[A-Z][A-Z0-9_]*$``
    with length-capped values; never raw.
 5. All error strings stored on the job pass through ``sanitize_public_error``.
@@ -173,79 +176,94 @@ class Dispatcher:
                 time.sleep(poll_interval_s)
 
     def requeue_orphaned_jobs(self, *, exclude: frozenset[str] | None = None) -> int:
-        """Re-queue RUNNING jobs whose worker container is no longer alive.
+        """Recover RUNNING jobs whose owning dispatcher is gone, in two independent passes.
 
-        Uses ``docker ps --filter label=blastbox.role=worker`` to determine
-        which worker containers are still running.  On any ``docker ps`` failure
-        the method returns 0 without modifying any jobs (fail-safe: never
-        accidentally requeue a job that is still live).
+        WARM pass (first; needs NO docker): warm slots have no docker label, so liveness is
+        TIME-based — a warm job still RUNNING past ``worker_timeout_s + requeue_grace_s`` (from a
+        started_at that ``_dispatch_warm`` refreshes before its sealing phase) has a gone owner.
+        It is FAILED (terminal), NOT requeued — a requeue would let a second worker re-detonate
+        the same untrusted input, and orphaned sandboxes don't die with a crashed dispatcher.
+        Running this pass first means a ``docker ps`` failure can't strand warm jobs.
 
-        WARM-tier jobs (worker_runtime == "warm") have no docker label, so
-        ``docker ps`` can't attest their liveness — they are recovered on a TIME
-        basis instead, and FAILED (terminal) rather than requeued. A warm job
-        still RUNNING past ``worker_timeout_s + requeue_grace_s`` (measured from a
-        started_at that ``_dispatch_warm`` refreshes before its sealing phase) has
-        a gone owner; we CAS it RUNNING->FAILED (never clobbering a terminal status
-        the owner just wrote). Failing rather than requeuing means a second worker
-        never re-detonates the same untrusted input, while retention can now expire
-        the job and the API can delete it (RUNNING jobs are un-expirable /
-        un-deletable). A younger warm job may be live and is left alone.
+        COLD pass (needs docker): uses ``docker ps --filter label=blastbox.role=worker`` to find
+        live worker containers; a cold job absent from it (and past the grace window) is requeued.
+        On a ``docker ps`` failure the COLD pass is skipped (fail-safe — never requeue a job that
+        may still be live), but the WARM pass already ran.
 
-        ``exclude`` is an optional set of job_ids to skip (claimed in-process
-        this tick).
+        All recovery + terminal writes are CAS-fenced on (status, claim_id), so a stale owner can
+        never clobber a job that was reclaimed (RUNNING->QUEUED->RUNNING), and recovery never
+        clobbers a terminal status the owner wrote.
+
+        ``exclude`` is an optional set of job_ids to skip (claimed in-process this tick).
         """
+        excluded = exclude or frozenset()
+        now = time.time()
+        grace_cutoff = now - self._requeue_grace_s
+        warm_stale_cutoff = now - (self._worker_timeout_s + self._requeue_grace_s)
+        running = self._job_store.list(status=JobStatus.RUNNING)
+        recovered = 0
+
+        # --- WARM recovery (time-based; needs NO docker) -------------------------------------
+        # A warm slot carries no docker label, so docker ps can't attest its liveness — recovery
+        # is purely TIME-based, so it runs FIRST and is NOT blocked by a docker-ps failure. A warm
+        # job still RUNNING past worker_timeout_s + grace (started_at refreshed before the bounded
+        # sealing phase) has a GONE owner; we FAIL it (terminal), NOT requeue — a requeue would let
+        # a second worker re-detonate the same untrusted input, and orphaned sandboxes don't die
+        # with a crashed dispatcher. CAS-fenced on (RUNNING, the observed claim_id): never clobbers
+        # a terminal status the owner wrote, and never fails a job that was reclaimed (ABA-safe).
+        for job in running:
+            if job.job_id in excluded or job.worker_runtime != "warm":
+                continue
+            if job.started_at is None or job.started_at >= warm_stale_cutoff:
+                continue
+            if self._fail_if_running(
+                job,
+                "warm worker abandoned: owning dispatcher gone "
+                f"(no progress for >{self._worker_timeout_s + self._requeue_grace_s:.0f}s)",
+                warning="recovered: warm worker owner gone",
+            ):
+                recovered += 1
+                # The owner is gone and the job is now terminal (FAILED is not claim_next-able),
+                # so nothing else will clean up its staged input. Delete it here so a recovered
+                # job's untrusted input doesn't leak on disk even when retention is disabled.
+                self._delete_input(
+                    self._job_root / job.job_id / "input" / Path(job.filename).name
+                )
+
+        # --- COLD requeue (needs docker liveness) -------------------------------------------
         active_job_ids = self._list_active_worker_job_ids()
         if active_job_ids is None:
-            # docker ps failed — don't touch anything
-            return 0
-
-        excluded = exclude or frozenset()
-        grace_cutoff = time.time() - self._requeue_grace_s
-        # A warm slot carries no docker label, so docker ps can't attest its liveness at ANY age.
-        # We recover a warm job purely on TIME: _dispatch_warm refreshes started_at right before
-        # its post-wait sealing phase (Step 5b+), so the staleness clock covers BOTH the bounded
-        # wait and the bounded materialize — a warm job still RUNNING past worker_timeout_s + grace
-        # has a GONE owner. Such a job is FAILED (terminal), NOT requeued: a requeue would let a
-        # second worker re-detonate the same untrusted input (double-detonation) and orphaned
-        # sandboxes don't die with a crashed dispatcher. The transition is CAS-fenced
-        # (update_if_status RUNNING->FAILED), so it can never clobber a DONE/FAILED the owning
-        # dispatcher wrote in the meantime; if the owner is merely slow it self-corrects (the
-        # owner's later terminal write wins). This both unstrands crashed-dispatcher warm jobs
-        # (retention can now expire them; the API can delete them) and never double-detonates.
-        warm_stale_cutoff = time.time() - (self._worker_timeout_s + self._requeue_grace_s)
-        recovered = 0
-        for job in self._job_store.list(status=JobStatus.RUNNING):
-            if job.job_id in excluded or job.job_id in active_job_ids:
-                continue
-            if job.worker_runtime == "warm":
-                # Recover ONLY when definitely stale (owner gone); a younger warm job may be live.
-                if job.started_at is None or job.started_at >= warm_stale_cutoff:
-                    continue
-                if self._fail_if_running(
-                    job,
-                    "warm worker abandoned: owning dispatcher gone "
-                    f"(no progress for >{self._worker_timeout_s + self._requeue_grace_s:.0f}s)",
-                    warning="recovered: warm worker owner gone",
-                ):
-                    recovered += 1
+            # docker ps failed — skip cold requeue (warm recovery above already ran).
+            return recovered
+        for job in running:
+            if (
+                job.job_id in excluded
+                or job.job_id in active_job_ids
+                or job.worker_runtime == "warm"  # handled above
+            ):
                 continue
             # Grace window: a just-claimed cold job's worker container may not appear in
             # `docker ps` yet, so requeuing it now would double-detonate the same (malicious)
             # input in two workers. Only requeue jobs whose started_at is older than the window.
             if job.started_at is not None and job.started_at > grace_cutoff:
                 continue
-            self._job_store.update(
+            # Claim-fenced (RUNNING, observed claim_id) so we never requeue a job that was
+            # reclaimed since the list() snapshot, and clear claim_id so the next claim is fresh.
+            if self._job_store.update_if_status(
                 job.job_id,
+                JobStatus.RUNNING,
+                expect_claim_id=job.claim_id,
                 status=JobStatus.QUEUED,
                 started_at=None,
                 worker_runtime=None,
+                claim_id=None,
                 security_warnings=[
                     *job.security_warnings,
                     "requeued: worker container disappeared",
                 ],
                 error=None,
-            )
-            recovered += 1
+            ):
+                recovered += 1
         return recovered
 
     def _fail_if_running(self, job: Job, reason: str, *, warning: str | None = None) -> bool:
@@ -266,7 +284,12 @@ class Dispatcher:
         )
         if warning is not None:
             fields["security_warnings"] = [*job.security_warnings, warning]
-        return self._job_store.update_if_status(job.job_id, JobStatus.RUNNING, **fields)
+        # Fence on the claim_id observed in the list() snapshot: if the job was reclaimed
+        # (RUNNING->QUEUED->RUNNING with a new claim) since we read it, do NOT fail the fresh
+        # claim — closes the status-only ABA hole.
+        return self._job_store.update_if_status(
+            job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id, **fields
+        )
 
     # ------------------------------------------------------------------
     # Internal dispatch flow
@@ -275,8 +298,9 @@ class Dispatcher:
     def _dispatch_claimed_job(self, job: Job) -> None:
         """Execute one claimed job (status is already RUNNING on entry).
 
-        Security: input is ALWAYS deleted via a finally block — every branch
-        ultimately falls into the ``finally`` at the bottom of this method.
+        Security: input is deleted via a finally block on every branch — but only when we
+        still own the claim (``_delete_input_if_owned``); a job a peer reclaimed keeps its
+        input for the new owner (the recovery sweep deletes a time-recovered job's input).
 
         If a warm pool is configured, attempt to claim a slot.  On success, the
         WARM path runs.  If no slot is available (pool.claim returns None), the
@@ -293,15 +317,16 @@ class Dispatcher:
             record_warm_claim(hit=slot is not None)
             if slot is not None:
                 # WARM PATH — the slot, not input_path/output_dir, owns I/O dirs.
-                # Staged input is still deleted in the finally block.
+                # Staged input is deleted in the finally block (only if we still own the claim;
+                # a reclaimed job's input is left for the new owner — see _delete_input_if_owned).
                 t0 = time.monotonic()
                 try:
                     self._dispatch_warm(
                         job, staged_input_path=input_path, slot=slot, output_dir=output_dir
                     )
                 finally:
-                    # Security: delete staged input on EVERY terminal path.
-                    self._delete_input(input_path)
+                    # Delete the staged input on every terminal path WE own.
+                    self._delete_input_if_owned(job, input_path)
                     self._record_outcome(job, path="warm", started=t0)
                 return
             else:
@@ -312,11 +337,27 @@ class Dispatcher:
         try:
             self._dispatch_inner(job, input_path, output_dir)
         finally:
-            # Security guarantee: delete the malicious input on every path,
-            # regardless of success, failure, exception, or unknown engine.
-            # We never touch output/ here.
-            self._delete_input(input_path)
+            # Delete the malicious input on every terminal path WE own, regardless of success,
+            # failure, exception, or unknown engine. We never touch output/ here.
+            self._delete_input_if_owned(job, input_path)
             self._record_outcome(job, path="cold", started=t0)
+
+    def _delete_input_if_owned(self, job: Job, input_path: Path) -> None:
+        """Delete the shared staged input ONLY if we still hold the claim (or the job
+        terminalized under it). The input at job_root/<id>/input is spooled ONCE at submission
+        and shared across reclaims; if a peer dispatcher requeued+reclaimed this job (claim_id
+        changed/cleared — e.g. we ABORTED a lost claim), the NEW owner still needs it on disk, so
+        we must NOT delete it. On the normal owned terminal path claim_id still matches and the
+        untrusted input is deleted exactly as before; a leak only occurs if the reclaiming owner
+        also dies before its own cleanup, bounded by the retention sweep of job_root/<id>."""
+        final = self._job_store.get(job.job_id)
+        if final is None or final.claim_id == job.claim_id:
+            self._delete_input(input_path)
+        else:
+            _log.info(
+                "job %s reclaimed by another dispatcher (claim changed); leaving its staged "
+                "input for the new owner", job.job_id,
+            )
 
     def _record_outcome(self, job: Job, *, path: str, started: float) -> None:
         """Record the dispatched-job outcome + duration (warm|cold). Read the
@@ -364,7 +405,28 @@ class Dispatcher:
                 return
 
             # ------------------------------------------------------------------
-            # Step 2: Stage input — over the wire (vsock) or into slot.input_dir
+            # Step 2: Mark warm BEFORE staging (claim-fenced).
+            # A slow staging copy (e.g. the gVisor input copy) would otherwise leave the job
+            # looking COLD (worker_runtime=None) to a PEER dispatcher's maintenance sweep, which
+            # would docker-ps-requeue it (a warm job has no container) and double-detonate. Mark
+            # warm first so the sweep routes it to time-based warm recovery. CAS on our claim so
+            # if a peer already requeued/reclaimed it we abort BEFORE staging+detonating.
+            # ------------------------------------------------------------------
+            if not self._job_store.update_if_status(
+                job.job_id,
+                JobStatus.RUNNING,
+                expect_claim_id=job.claim_id,
+                worker_runtime="warm",
+            ):
+                _log.warning(
+                    "warm job %s lost its claim before staging (requeued/recovered by another "
+                    "dispatcher); aborting", job.job_id,
+                )
+                return
+            job.worker_runtime = "warm"
+
+            # ------------------------------------------------------------------
+            # Step 3: Stage input — over the wire (vsock) or into slot.input_dir
             # ------------------------------------------------------------------
             if callable(stage_fn):
                 input_path = stage_fn(slot, staged_input_path)
@@ -376,14 +438,6 @@ class Dispatcher:
                     self._fail_job(job, f"failed to stage input to warm slot: {exc}")
                     return
                 input_path = slot_input_copy
-
-            # ------------------------------------------------------------------
-            # Step 3: Mark RUNNING with warm worker_runtime
-            # ------------------------------------------------------------------
-            self._job_store.update(
-                job.job_id,
-                worker_runtime="warm",
-            )
 
             # ------------------------------------------------------------------
             # Step 4: Signal go to warm worker (atomic write of go.json)
@@ -434,8 +488,19 @@ class Dispatcher:
             # warm_deadline. Refresh started_at so requeue_orphaned_jobs (which fails a warm job
             # RUNNING past worker_timeout_s + grace) measures the sealing phase from a fresh clock
             # — otherwise a legitimately slow/large seal could be judged "owner gone" and FAILed
-            # out from under a live owner.
-            self._job_store.update(job.job_id, started_at=time.time())
+            # out from under a live owner. Claim-fenced (like every other owner write): if a peer
+            # already recovered/reclaimed us, abort before the pointless seal.
+            if not self._job_store.update_if_status(
+                job.job_id,
+                JobStatus.RUNNING,
+                expect_claim_id=job.claim_id,
+                started_at=time.time(),
+            ):
+                _log.warning(
+                    "warm job %s lost its claim before sealing (recovered/reclaimed by another "
+                    "dispatcher); aborting", job.job_id,
+                )
+                return
 
             # ------------------------------------------------------------------
             # Step 5b: Materialize output into slot.output_dir (FC: rdump the ext4
@@ -522,6 +587,7 @@ class Dispatcher:
             applied = self._job_store.update_if_status(
                 job.job_id,
                 JobStatus.RUNNING,
+                expect_claim_id=job.claim_id,
                 status=JobStatus.DONE,
                 finished_at=finished_at,
                 expires_at=expires_at,
@@ -530,8 +596,8 @@ class Dispatcher:
             )
             if not applied:
                 _log.warning(
-                    "warm job %s no longer RUNNING at DONE write (recovered by another "
-                    "dispatcher); leaving its terminal state untouched",
+                    "warm job %s no longer our RUNNING claim at DONE write (recovered/reclaimed "
+                    "by another dispatcher); leaving its terminal state untouched",
                     job.job_id,
                 )
 
@@ -570,13 +636,24 @@ class Dispatcher:
             self._fail_job(job, f"runtime selection failed: {exc}")
             return
 
-        # Update job to RUNNING state with runtime info.
-        # (claim_next already set status=RUNNING; we enrich with runtime data.)
-        self._job_store.update(
+        # Enrich the RUNNING job with runtime info — claim-fenced (the cold twin of the warm
+        # mark-warm fence). _runtime_selector() can block on `docker info` (no timeout); a peer's
+        # docker-ps requeue can fire during that stall and reclaim the row under a new claim. A
+        # BLIND write here would overwrite worker_runtime on the reclaimed job — mis-routing the
+        # peer's warm-vs-cold recovery (a relabeled warm job gets cold-requeued -> re-detonation).
+        # If we lost the claim, abort BEFORE launching our own (stale) worker.
+        if not self._job_store.update_if_status(
             job.job_id,
+            JobStatus.RUNNING,
+            expect_claim_id=job.claim_id,
             worker_runtime=runtime.runtime,
             security_warnings=list(job.security_warnings) + list(runtime.warnings),
-        )
+        ):
+            _log.warning(
+                "cold job %s lost its claim before launch (requeued/reclaimed by another "
+                "dispatcher); aborting before detonation", job.job_id,
+            )
+            return
 
         # ------------------------------------------------------------------
         # Step 4: Build argv and launch worker container
@@ -685,21 +762,35 @@ class Dispatcher:
             "artifact_count": len(envelope.artifacts),
             "warning_count": len(envelope.warnings),
         }
-        self._job_store.update(
+        # Claim-fenced (RUNNING, our claim_id): a peer's docker-ps sweep on another host can't
+        # see this container, so it may have requeued the job; don't resurrect a reclaimed job to
+        # DONE with this (stale) detonation's result.
+        if not self._job_store.update_if_status(
             job.job_id,
+            JobStatus.RUNNING,
+            expect_claim_id=job.claim_id,
             status=JobStatus.DONE,
             finished_at=finished_at,
             expires_at=expires_at,
             result_summary=result_summary,
             error=None,
-        )
+        ):
+            _log.warning(
+                "cold job %s no longer our RUNNING claim at DONE write (recovered/reclaimed by "
+                "another dispatcher); leaving its terminal state untouched",
+                job.job_id,
+            )
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
     def _fail_job(self, job: Job, reason: str) -> None:
-        """Mark a job FAILED, scrubbing the error string before storage."""
+        """Mark a job FAILED, scrubbing the error string before storage.
+
+        Claim-fenced on (RUNNING, our claim_id): if a peer dispatcher already requeued/recovered
+        this job, the owner's FAILED is a no-op (don't clobber the new owner's state). In the
+        normal path the job is RUNNING under our claim, so it applies as before."""
         error = sanitize_public_error(reason)
         finished_at = time.time()
         expires_at = (
@@ -707,8 +798,10 @@ class Dispatcher:
             if self._job_retention_seconds > 0
             else None
         )
-        self._job_store.update(
+        self._job_store.update_if_status(
             job.job_id,
+            JobStatus.RUNNING,
+            expect_claim_id=job.claim_id,
             status=JobStatus.FAILED,
             finished_at=finished_at,
             expires_at=expires_at,
