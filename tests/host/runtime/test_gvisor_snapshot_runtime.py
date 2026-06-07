@@ -49,6 +49,34 @@ def test_spawn_builds_once_then_restores(tmp_path):
     assert rt.is_ready(s1) is True
 
 
+def test_prepare_gates_on_async_build(tmp_path):
+    """prepare() kicks the async build (once) and reports readiness — False until is_built(),
+    True after — so the pool can spawn off the tick thread without blocking on build()."""
+    class _AsyncMgr:
+        def __init__(self):
+            self.started = 0
+            self._built = False
+
+        def ensure_build_started(self):
+            self.started += 1
+
+        def is_built(self):
+            return self._built
+
+    m = _AsyncMgr()
+    rt = GvisorSnapshotSlotRuntime(m, settle_s=0.0)
+    assert rt.prepare() is False  # not built -> kicks build, not ready to spawn
+    assert m.started == 1
+    m._built = True
+    assert rt.prepare() is True  # now ready
+
+
+def test_prepare_true_for_manager_without_async_seam(tmp_path):
+    # A bare/test manager lacking ensure_build_started is always ready (back-compat).
+    rt = GvisorSnapshotSlotRuntime(_FakeMgr(tmp_path), settle_s=0.0)
+    assert rt.prepare() is True
+
+
 def test_host_warm_control_returns_translating_control(tmp_path):
     rt = GvisorSnapshotSlotRuntime(_FakeMgr(tmp_path), settle_s=0.0)
     assert isinstance(rt.host_warm_control(rt.spawn()), GvisorHostWarmControl)

@@ -15,10 +15,15 @@ toggle, the FcSnapshotArtifact) live in
 """
 from __future__ import annotations
 
+import logging
 import shutil
+import threading
+import time
 from pathlib import Path
 
 from blastbox.host.runtime.snapshot_backend import RestoreHandle, SnapshotBackend
+
+_log = logging.getLogger("blastbox.host.runtime.fc_snapshot")
 
 
 class SnapshotError(RuntimeError):
@@ -50,15 +55,66 @@ class SnapshotManager:
         backend: SnapshotBackend,
         *,
         ready_timeout_s: float = 120.0,
+        build_retry_backoff_s: float = 30.0,
     ) -> None:
         self._base_dir = Path(base_dir)
         self._backend = backend
         self._ready_timeout_s = ready_timeout_s
+        self._build_retry_backoff_s = build_retry_backoff_s
         self._artifact: object | None = None
+        # Async-build state (used by ensure_build_started so the up-to-ready_timeout_s build
+        # never runs on the pool's single tick thread). _build_lock guards only the cheap
+        # bookkeeping below, never the slow boot/checkpoint inside build().
+        self._build_lock = threading.Lock()
+        self._build_thread: threading.Thread | None = None
+        self._build_error: Exception | None = None
+        self._retry_not_before: float = 0.0  # monotonic; backoff gate after a failed build
 
     @property
     def artifact(self) -> object | None:
         return self._artifact
+
+    def is_built(self) -> bool:
+        """True once the snapshot artifact exists (atomic reference read)."""
+        return self._artifact is not None
+
+    @property
+    def build_error(self) -> Exception | None:
+        """The most recent async-build failure (None if never failed / since recovered)."""
+        return self._build_error
+
+    def ensure_build_started(self) -> None:
+        """Non-blocking: kick the (idempotent) build in a daemon thread if it isn't built and no
+        build is already running. Returns immediately so the caller (the pool's tick loop) never
+        blocks on the boot+wait_ready. After a failure it waits ``build_retry_backoff_s`` before
+        retrying, so a persistently-failing base boot doesn't churn the host every tick."""
+        with self._build_lock:
+            if self._artifact is not None:
+                return
+            if self._build_thread is not None and self._build_thread.is_alive():
+                return
+            if time.monotonic() < self._retry_not_before:
+                return
+            self._build_thread = threading.Thread(
+                target=self._build_worker, daemon=True, name="warm-snapshot-build"
+            )
+            self._build_thread.start()
+
+    def _build_worker(self) -> None:
+        try:
+            self.build()
+        except Exception as exc:  # noqa: BLE001 — surface + back off; the pool falls back to cold
+            with self._build_lock:
+                self._build_error = exc
+                self._retry_not_before = time.monotonic() + self._build_retry_backoff_s
+            _log.warning(
+                "warm snapshot build failed; cold fallback active, retry after %.0fs: %s",
+                self._build_retry_backoff_s,
+                exc,
+            )
+        else:
+            with self._build_lock:
+                self._build_error = None
 
     def build(self) -> object:
         """Build the warm snapshot. Idempotent — a second call returns the same

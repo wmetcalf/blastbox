@@ -7,6 +7,9 @@ the FcSnapshotBackend wiring) are tested in ``test_fc_snapshot_backend.py``.
 """
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 from blastbox.host.runtime.fc_snapshot import (
@@ -14,6 +17,15 @@ from blastbox.host.runtime.fc_snapshot import (
     SnapshotManager,
     SnapshotRestoreError,
 )
+
+
+def _wait_until(pred, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.01)
+    return False
 
 
 # --- fake backend (the seam) ----------------------------------------------
@@ -91,6 +103,69 @@ def test_build_returns_opaque_artifact_unchanged(tmp_path):
     backend = FakeBackend(artifact=sentinel)
     art = SnapshotManager(tmp_path, backend).build()
     assert art is sentinel  # manager never reshapes the artifact
+
+
+# --- async build (ensure_build_started) ------------------------------------
+
+
+def test_ensure_build_started_is_async_and_nonblocking(tmp_path):
+    """ensure_build_started() must return IMMEDIATELY (not block on the up-to-120s wait_ready),
+    leaving the build in flight on a daemon thread; is_built() flips True once it completes."""
+    gate = threading.Event()
+
+    class _Boot(FakeBoot):
+        def wait_ready(self, timeout_s):
+            assert gate.wait(timeout_s), "gate not released within timeout"
+
+    class _Backend(FakeBackend):
+        def boot_base(self):
+            b = _Boot(self.artifact)
+            self.boots.append(b)
+            self.last_boot = b
+            return b
+
+    backend = _Backend()
+    mgr = SnapshotManager(tmp_path, backend)
+
+    t0 = time.monotonic()
+    mgr.ensure_build_started()
+    assert time.monotonic() - t0 < 0.5  # did NOT block on wait_ready
+    assert mgr.is_built() is False  # build still in flight
+
+    gate.set()  # let the build complete
+    assert _wait_until(mgr.is_built)
+    assert mgr.artifact is backend.artifact
+    assert mgr.build_error is None
+
+
+def test_ensure_build_started_builds_exactly_once(tmp_path):
+    """Many ensure_build_started() calls (every pool tick) must boot the base only once."""
+    backend = FakeBackend()
+    mgr = SnapshotManager(tmp_path, backend)
+    for _ in range(8):
+        mgr.ensure_build_started()
+    assert _wait_until(mgr.is_built)
+    for _ in range(8):
+        mgr.ensure_build_started()  # already built -> no-op
+    time.sleep(0.05)
+    assert len(backend.boots) == 1
+
+
+def test_failed_build_records_error_and_backs_off(tmp_path):
+    """A failing build must NOT churn: it records build_error, stays unbuilt, and a retry within
+    build_retry_backoff_s does not start another base boot (no per-tick re-boot storm)."""
+    backend = FakeBackend(ready_ok=False)  # wait_ready raises -> SnapshotBuildError
+    mgr = SnapshotManager(tmp_path, backend, build_retry_backoff_s=60.0)
+
+    mgr.ensure_build_started()
+    assert _wait_until(lambda: mgr.build_error is not None)
+    assert mgr.is_built() is False
+    assert isinstance(mgr.build_error, SnapshotBuildError)
+    assert len(backend.boots) == 1
+
+    mgr.ensure_build_started()  # within the 60s backoff -> must not re-boot
+    time.sleep(0.1)
+    assert len(backend.boots) == 1
 
 
 def test_build_is_idempotent(tmp_path):

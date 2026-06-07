@@ -275,11 +275,24 @@ class WarmPool:
         Must be called periodically (the background thread does this).
         Safe to call manually in tests.
         """
+        # Warm-snapshot runtimes build their base lazily + asynchronously; resolve readiness
+        # ONCE per tick (this also kicks the async build) and gate both burst + spawn on it, so
+        # the (up to ready_timeout_s) build never blocks this loop and demand misses during the
+        # build window don't spuriously trip burst the instant the tier becomes ready.
+        ready = self._runtime_ready()
         self._promote_warming()
         self._health_check()
-        self._update_burst()
-        self._spawn_to_deficit()
+        self._update_burst(ready)
+        self._spawn_to_deficit(ready)
         self._sample_metrics()
+
+    def _runtime_ready(self) -> bool:
+        """Kick the warm runtime's async prepare (if any) and report whether it can spawn this
+        tick. Runtimes without prepare() (cold/docker, test fakes) are always ready."""
+        prepare = getattr(self._runtime, "prepare", None)
+        if callable(prepare):
+            return bool(prepare())
+        return True
 
     def _reap_and_count(self, slot: "Slot") -> None:
         """Reap a slot via the runtime and count the disposal (metrics)."""
@@ -441,8 +454,15 @@ class WarmPool:
                 self._last_idle_at = self._clock()
             self._idle_event.set()
 
-    def _spawn_to_deficit(self) -> None:
-        """Spawn new slots to fill the deficit, respecting ceiling + rate limit."""
+    def _spawn_to_deficit(self, ready: bool = True) -> None:
+        """Spawn new slots to fill the deficit, respecting ceiling + rate limit.
+
+        ``ready`` is the warm runtime's per-tick readiness (resolved once in tick()). When False
+        the warm snapshot is still building, so we spawn nothing this tick — _promote_warming and
+        _health_check already ran, and dispatch falls back to cold until the snapshot is ready.
+        """
+        if not ready:
+            return
         with self._lock:
             # Deficit = effective_target minus everything not DRAINING
             active = sum(
@@ -480,13 +500,20 @@ class WarmPool:
             return min(self._warm_size + self._burst_size, self._concurrent_ceiling)
         return self._warm_size
 
-    def _update_burst(self) -> None:
+    def _update_burst(self, ready: bool = True) -> None:
         """Check demand history and activate/deactivate burst.
 
-        Called from tick().  Thread-safe (acquires _lock).
+        Called from tick().  Thread-safe (acquires _lock).  When ``ready`` is False the warm
+        tier can't spawn yet (snapshot still building), so misses now aren't burst-actionable:
+        drop the miss window so a long build doesn't activate burst the instant it goes ready
+        (which would over-provision to the ceiling at startup).
         """
         now = self._clock()
         with self._lock:
+            if not ready:
+                self._first_miss_at = None
+                self._last_miss_at = None
+                return
             if not self._burst_active:
                 # Activate if sustained demand for >= burst_trigger_s
                 if (

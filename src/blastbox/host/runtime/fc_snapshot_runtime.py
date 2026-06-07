@@ -120,10 +120,22 @@ class SnapshotSlotRuntime:
     # SlotRuntime protocol
     # ------------------------------------------------------------------
 
+    def prepare(self) -> bool:
+        """Non-blocking readiness gate the pool calls each tick before spawning: kicks the async
+        snapshot build (once, with backoff) and reports whether the warm tier can spawn yet. Until
+        the snapshot is built the pool spawns nothing (dispatch falls back to cold) instead of
+        blocking its single background loop for up to ready_timeout_s inside build()."""
+        ensure = getattr(self._manager, "ensure_build_started", None)
+        if callable(ensure):
+            ensure()
+            return bool(self._manager.is_built())
+        return True  # a manager without the async seam (test double) is always ready
+
     def spawn(self) -> Slot:
         """Build the warm snapshot once (idempotent), then restore it into a fresh
         per-slot microVM. Returns a WARMING Slot."""
-        # build() is idempotent — the snapshot is captured on the first spawn only.
+        # build() is idempotent — the snapshot is captured on the first spawn only (instant
+        # once built; prepare() gates the pool so the slow first build is off the tick thread).
         self._manager.build()
         slot_id = str(uuid.uuid4())
         handle = self._manager.restore(slot_id)

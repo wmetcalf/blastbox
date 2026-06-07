@@ -38,8 +38,19 @@ class GvisorSnapshotSlotRuntime:
         self._restored_at: dict[str, float] = {}
         self._lock = threading.Lock()
 
+    def prepare(self) -> bool:
+        """Non-blocking readiness gate the pool calls each tick before spawning: kicks the async
+        snapshot build (once, with backoff) and reports whether the warm tier can spawn yet. Until
+        the snapshot is built the pool spawns nothing (dispatch falls back to cold) instead of
+        blocking its single background loop for up to ready_timeout_s inside build()."""
+        ensure = getattr(self._mgr, "ensure_build_started", None)
+        if callable(ensure):
+            ensure()
+            return bool(self._mgr.is_built())
+        return True  # a manager without the async seam (test double) is always ready
+
     def spawn(self) -> Slot:
-        self._mgr.build()  # idempotent: snapshot built on first spawn only
+        self._mgr.build()  # idempotent: snapshot built on first spawn only (instant once built)
         slot_id = str(uuid.uuid4())
         handle = self._mgr.restore(slot_id)
         wd = Path(handle.slot_workdir)  # type: ignore[attr-defined]
