@@ -234,12 +234,15 @@ class HostWarmControl:
         # other local users out.
         atomic_write_confined(self._dir, name, content.encode("utf-8"), mode=0o644)
 
-    def signal_go(self, spec: WarmJobSpec) -> None:
+    def signal_go(self, spec: WarmJobSpec, *, deadline: float | None = None) -> None:
         """Atomically write ``control_dir/go.json`` with the job spec.
 
         Symmetric with ``FileWarmControl.wait_for_go``.
         The payload matches the format parsed by that method:
         ``{"input_path": str, "output_dir": str, "params": dict}``.
+
+        ``deadline`` is accepted for a uniform signal_go signature but unused: the go.json write
+        is instant (no network), so the file-trigger warm path is bounded by wait_for_done.
         """
         payload = json.dumps(
             {

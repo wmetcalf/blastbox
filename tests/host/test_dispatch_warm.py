@@ -263,8 +263,9 @@ class _RecordingVsockControl:
         self.slot = slot
         self.spec: Any = None
 
-    def signal_go(self, spec: Any) -> None:
+    def signal_go(self, spec: Any, *, deadline: float | None = None) -> None:
         self.spec = spec
+        self.deadline = deadline
 
     def wait_for_done(self, *, timeout_s: float) -> str:
         return "ok"
@@ -458,6 +459,39 @@ def test_1_warm_happy_path(tmp_path):
     # slot input dir copy must be gone too
     slot_input = slot.input_dir / Path(job.filename).name
     assert not slot_input.exists()
+
+
+def test_warm_done_cas_fenced_against_concurrent_recovery(tmp_path):
+    """If a peer dispatcher FAILs the warm job as stale WHILE this owner is processing, the
+    owner's terminal DONE write must NOT resurrect it (first-writer-wins) — otherwise a recovered/
+    retention-expired job flips back to DONE with a self-contradictory 'owner gone' record."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)
+
+    # Fake worker writes valid output AND simulates a concurrent peer recovery: CAS-fail the
+    # still-RUNNING job before signaling done, so the owner's later DONE must be fenced out.
+    def _output_then_peer_recovers(out_dir):
+        _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA)
+        assert store.update_if_status(
+            job.job_id, JobStatus.RUNNING, status=JobStatus.FAILED, error="peer recovered (stale)"
+        )
+
+    _start_fake_worker(slot, output_fn=_output_then_peer_recovers)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10
+    )
+    dispatcher.dispatch_once()
+
+    final = store.get(job.job_id)
+    assert final.status == JobStatus.FAILED  # DONE did NOT resurrect the peer-recovered job
+    assert final.error == "peer recovered (stale)"
+    assert final.result_summary is None  # the DONE write (with result_summary) never applied
 
 
 # ===========================================================================
@@ -813,27 +847,42 @@ def test_materialize_rejects_oversize_growth(tmp_path):
     assert not (dst / "page-001.png").exists()
 
 
-def test_requeue_skips_warm_jobs(tmp_path, monkeypatch):
-    """requeue_orphaned_jobs must never requeue a warm job off the docker-ps signal (warm slots
-    carry no docker label, so 'gone from docker ps' is meaningless for them) — only cold jobs."""
+def test_requeue_recovers_only_stale_warm_jobs(tmp_path, monkeypatch):
+    """Warm jobs have no docker label, so they're recovered on TIME and FAILED (terminal) — NOT
+    requeued (a second worker would re-detonate the same untrusted input). A warm job still
+    RUNNING past worker_timeout_s + grace (owner gone) is failed; a younger one (possibly live)
+    is left alone. Cold jobs requeue via the docker-ps + grace path."""
     store = InMemoryJobStore()
-    disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs")
+    disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs", worker_timeout_s=30)
     monkeypatch.setattr(disp, "_list_active_worker_job_ids", lambda: set())  # docker ps: none active
+    now = time.time()
 
-    warm = Job.new(engine=_ENGINE_NAME, filename="a.docx")
-    warm.status = JobStatus.RUNNING
-    warm.worker_runtime = "warm"
-    warm.started_at = time.time() - 600  # older than the grace window
-    store.create(warm)
+    # Young warm job (within worker_timeout_s=30 + grace): could be live -> left alone.
+    live_warm = Job.new(engine=_ENGINE_NAME, filename="live.docx")
+    live_warm.status = JobStatus.RUNNING
+    live_warm.worker_runtime = "warm"
+    live_warm.started_at = now - 5
+    store.create(live_warm)
 
-    cold = Job.new(engine=_ENGINE_NAME, filename="b.docx")
+    # Stale warm job (past worker_timeout_s + grace, ~90s): owner gone -> FAILED (not requeued).
+    stale_warm = Job.new(engine=_ENGINE_NAME, filename="stale.docx")
+    stale_warm.status = JobStatus.RUNNING
+    stale_warm.worker_runtime = "warm"
+    stale_warm.started_at = now - 600
+    store.create(stale_warm)
+
+    # Cold orphan -> requeued via the docker-ps path.
+    cold = Job.new(engine=_ENGINE_NAME, filename="cold.docx")
     cold.status = JobStatus.RUNNING
     cold.worker_runtime = "runsc"
-    cold.started_at = time.time() - 600
+    cold.started_at = now - 600
     store.create(cold)
 
     recovered = disp.requeue_orphaned_jobs()
 
-    assert recovered == 1  # only the cold job
-    assert store.get(warm.job_id).status == JobStatus.RUNNING  # warm left alone (not double-detonated)
+    assert recovered == 2  # stale warm (failed) + cold (requeued)
+    assert store.get(live_warm.job_id).status == JobStatus.RUNNING  # live warm protected
+    failed = store.get(stale_warm.job_id)
+    assert failed.status == JobStatus.FAILED  # crashed-owner warm -> terminal, never re-detonated
+    assert "recovered: warm worker owner gone" in failed.security_warnings
     assert store.get(cold.job_id).status == JobStatus.QUEUED

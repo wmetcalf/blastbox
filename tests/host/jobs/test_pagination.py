@@ -47,6 +47,44 @@ def test_update_rejects_unknown_field_all_backends(store):
     assert updated.status == JobStatus.RUNNING
 
 
+def test_update_if_status_cas_all_backends(store):
+    """update_if_status applies ONLY while status matches (a CAS, like claim_next) — across
+    memory/redis/sql. Used to fence orphan-recovery against a concurrent terminal write."""
+    jobs = _seed(store, 1)
+    jid = jobs[0].job_id
+    store.update(jid, status=JobStatus.RUNNING)
+
+    # Mismatched expectation -> no write, returns False.
+    assert store.update_if_status(jid, JobStatus.QUEUED, status=JobStatus.FAILED) is False
+    assert store.get(jid).status == JobStatus.RUNNING  # unchanged
+
+    # Matching expectation -> applies, returns True.
+    assert store.update_if_status(
+        jid, JobStatus.RUNNING, status=JobStatus.FAILED, error="boom"
+    ) is True
+    got = store.get(jid)
+    assert got.status == JobStatus.FAILED and got.error == "boom"
+
+    # Now RUNNING no longer matches -> a second CAS can't clobber the terminal state.
+    assert store.update_if_status(jid, JobStatus.RUNNING, status=JobStatus.DONE) is False
+    assert store.get(jid).status == JobStatus.FAILED
+
+    # Missing job -> False.
+    assert store.update_if_status("nope", JobStatus.RUNNING, status=JobStatus.FAILED) is False
+
+
+def test_update_if_status_rejects_unknown_field(store):
+    jobs = _seed(store, 1)  # QUEUED
+    # Fail-fast on a bad field name UNIFORMLY across backends — regardless of status match,
+    # mismatch, or a missing job (an unknown field is a programming error, caught everywhere).
+    with pytest.raises(ValueError):  # status MATCH
+        store.update_if_status(jobs[0].job_id, JobStatus.QUEUED, not_a_field="x")
+    with pytest.raises(ValueError):  # status MISMATCH
+        store.update_if_status(jobs[0].job_id, JobStatus.RUNNING, not_a_field="x")
+    with pytest.raises(ValueError):  # missing job
+        store.update_if_status("nope", JobStatus.RUNNING, not_a_field="x")
+
+
 def test_count_total_and_by_status(store):
     jobs = _seed(store, 5)
     store.update(jobs[0].job_id, status=JobStatus.DONE)

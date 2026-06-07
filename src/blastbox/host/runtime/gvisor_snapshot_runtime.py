@@ -136,14 +136,16 @@ class GvisorHostWarmControl:
         from blastbox.worker.warm import HostWarmControl
         self._inner = HostWarmControl(control_dir)
 
-    def signal_go(self, spec: object) -> None:
+    def signal_go(self, spec: object, *, deadline: float | None = None) -> None:
         from blastbox.worker.warm import WarmJobSpec
         translated = WarmJobSpec(
             input_path=self.SANDBOX_IN / Path(spec.input_path).name,  # type: ignore[attr-defined]
             output_dir=self.SANDBOX_OUT,
             params=dict(spec.params or {}),  # type: ignore[attr-defined]
         )
-        self._inner.signal_go(translated)
+        # File-trigger (go.json) — the write is instant, so the deadline is a no-op here; the
+        # warm interaction is bounded by wait_for_done. Accepted for a uniform signal_go signature.
+        self._inner.signal_go(translated, deadline=deadline)
 
     def wait_for_done(self, *, timeout_s: float) -> str:
         return self._inner.wait_for_done(timeout_s=timeout_s)

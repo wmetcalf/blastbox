@@ -56,7 +56,11 @@ _FILE_FRAME_CHUNK = 64 * 1024
 
 
 def send_frame_from_file(
-    sock: "socket.socket", path: "Path", *, chunk: int = _FILE_FRAME_CHUNK
+    sock: "socket.socket",
+    path: "Path",
+    *,
+    chunk: int = _FILE_FRAME_CHUNK,
+    deadline: float | None = None,
 ) -> int:
     """Send a length-prefixed frame whose body is streamed from ``path`` in fixed chunks.
 
@@ -65,22 +69,38 @@ def send_frame_from_file(
     but the host never materializes the whole file (nor ``send_frame``'s ``len+data`` copy) in
     RAM. The announced length is ``path.stat().st_size``; a staged input is written once before
     the frame is sent, so the size is stable. As a belt-and-suspenders guard against a short
-    read (truncated file), any shortfall is zero-padded to the announced length so the peer's
-    ``recv_exact`` never blocks waiting for bytes that will not arrive (the document simply
-    fails to parse rather than hanging the connection). Returns the number of bytes announced.
+    read (truncated file), any shortfall is zero-padded IN BOUNDED CHUNKS to the announced
+    length (so a large post-stat shrink can't allocate a huge buffer) — the peer's ``recv_exact``
+    never blocks waiting for bytes that won't arrive (the document simply fails to parse).
+
+    ``deadline`` (a ``time.monotonic()`` value) bounds the WHOLE send: each ``sendall`` is
+    capped by the remaining time, so a slow-reading guest can't pin the host past it (raises
+    ``TimeoutError``/``socket.timeout``). Returns the number of bytes announced.
     """
+    def _sendall(buf: bytes) -> None:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("send deadline exceeded")
+            sock.settimeout(remaining)
+        sock.sendall(buf)
+
     size = path.stat().st_size
-    sock.sendall(_LEN.pack(size))
+    _sendall(_LEN.pack(size))
     sent = 0
     with path.open("rb") as f:
         while sent < size:
             buf = f.read(min(chunk, size - sent))
             if not buf:
                 break
-            sock.sendall(buf)
+            _sendall(buf)
             sent += len(buf)
-    if sent < size:
-        sock.sendall(b"\x00" * (size - sent))
+    # Bounded zero-pad on a short read — never allocate more than one chunk at a time.
+    zeros = bytes(min(chunk, size - sent)) if sent < size else b""
+    while sent < size:
+        pad = min(chunk, size - sent)
+        _sendall(zeros if pad == len(zeros) else bytes(pad))
+        sent += pad
     return size
 
 
@@ -119,10 +139,21 @@ def recv_frame(
     return recv_exact(sock, n, deadline=deadline)
 
 
-def recv_line(sock: "socket.socket", *, max_len: int = 256) -> bytes:
-    """Read bytes up to and including the first newline (for FC's CONNECT reply)."""
+def recv_line(
+    sock: "socket.socket", *, max_len: int = 256, deadline: float | None = None
+) -> bytes:
+    """Read bytes up to and including the first newline (for FC's CONNECT reply).
+
+    ``deadline`` (a ``time.monotonic()`` value), when given, bounds the WHOLE read: each
+    ``recv`` is capped by the remaining time, so a guest that dribbles the reply one byte
+    just under a per-recv timeout can't pin the caller (raises ``TimeoutError``)."""
     buf = bytearray()
     while b"\n" not in buf:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("read deadline exceeded")
+            sock.settimeout(remaining)
         chunk = sock.recv(1)
         if not chunk:
             break

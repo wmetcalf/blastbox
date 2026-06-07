@@ -117,6 +117,13 @@ class Dispatcher:
         self._pool = pool
         self._warm_claim_timeout_s = float(warm_claim_timeout_s)
         self._requeue_grace_s = max(0.0, float(requeue_grace_s))
+        # Safety floor for warm recovery: the warm staleness cutoff anchors on started_at (set at
+        # CLAIM time), but a warm job's bounding deadline is only established later — after
+        # pool.claim (<= warm_claim_timeout_s) + input staging. requeue_grace_s is the slack that
+        # must cover that pre-deadline overhead, so a concurrent dispatcher never judges a live
+        # warm job stale. Floor it at the claim window when a pool is configured.
+        if self._pool is not None:
+            self._requeue_grace_s = max(self._requeue_grace_s, self._warm_claim_timeout_s)
 
     # ------------------------------------------------------------------
     # Public API
@@ -173,13 +180,16 @@ class Dispatcher:
         the method returns 0 without modifying any jobs (fail-safe: never
         accidentally requeue a job that is still live).
 
-        WARM-tier jobs (worker_runtime == "warm") are NEVER requeued here: a warm
-        slot is a runsc/Firecracker sandbox with no docker label, so ``docker ps``
-        can't attest its liveness at any age — requeuing one off this cold-only
-        signal would double-detonate a LIVE warm job under a multi-dispatcher
-        topology. They are bounded by worker_timeout_s + the owning dispatcher's
-        pool; a crashed warm dispatcher's jobs are recovered by timeout/retention,
-        not this docker-ps sweep.
+        WARM-tier jobs (worker_runtime == "warm") have no docker label, so
+        ``docker ps`` can't attest their liveness — they are recovered on a TIME
+        basis instead, and FAILED (terminal) rather than requeued. A warm job
+        still RUNNING past ``worker_timeout_s + requeue_grace_s`` (measured from a
+        started_at that ``_dispatch_warm`` refreshes before its sealing phase) has
+        a gone owner; we CAS it RUNNING->FAILED (never clobbering a terminal status
+        the owner just wrote). Failing rather than requeuing means a second worker
+        never re-detonates the same untrusted input, while retention can now expire
+        the job and the API can delete it (RUNNING jobs are un-expirable /
+        un-deletable). A younger warm job may be live and is left alone.
 
         ``exclude`` is an optional set of job_ids to skip (claimed in-process
         this tick).
@@ -191,17 +201,37 @@ class Dispatcher:
 
         excluded = exclude or frozenset()
         grace_cutoff = time.time() - self._requeue_grace_s
+        # A warm slot carries no docker label, so docker ps can't attest its liveness at ANY age.
+        # We recover a warm job purely on TIME: _dispatch_warm refreshes started_at right before
+        # its post-wait sealing phase (Step 5b+), so the staleness clock covers BOTH the bounded
+        # wait and the bounded materialize — a warm job still RUNNING past worker_timeout_s + grace
+        # has a GONE owner. Such a job is FAILED (terminal), NOT requeued: a requeue would let a
+        # second worker re-detonate the same untrusted input (double-detonation) and orphaned
+        # sandboxes don't die with a crashed dispatcher. The transition is CAS-fenced
+        # (update_if_status RUNNING->FAILED), so it can never clobber a DONE/FAILED the owning
+        # dispatcher wrote in the meantime; if the owner is merely slow it self-corrects (the
+        # owner's later terminal write wins). This both unstrands crashed-dispatcher warm jobs
+        # (retention can now expire them; the API can delete them) and never double-detonates.
+        warm_stale_cutoff = time.time() - (self._worker_timeout_s + self._requeue_grace_s)
         recovered = 0
         for job in self._job_store.list(status=JobStatus.RUNNING):
             if job.job_id in excluded or job.job_id in active_job_ids:
                 continue
-            # Warm slots carry no docker label, so docker ps can never confirm their liveness;
-            # never requeue them off this cold-only signal (would double-detonate a live one).
             if job.worker_runtime == "warm":
+                # Recover ONLY when definitely stale (owner gone); a younger warm job may be live.
+                if job.started_at is None or job.started_at >= warm_stale_cutoff:
+                    continue
+                if self._fail_if_running(
+                    job,
+                    "warm worker abandoned: owning dispatcher gone "
+                    f"(no progress for >{self._worker_timeout_s + self._requeue_grace_s:.0f}s)",
+                    warning="recovered: warm worker owner gone",
+                ):
+                    recovered += 1
                 continue
-            # Grace window: a just-claimed job's worker container may not appear in `docker ps`
-            # yet, so requeuing it now would double-detonate the same (malicious) input in two
-            # workers. Only requeue jobs whose started_at is older than the grace window.
+            # Grace window: a just-claimed cold job's worker container may not appear in
+            # `docker ps` yet, so requeuing it now would double-detonate the same (malicious)
+            # input in two workers. Only requeue jobs whose started_at is older than the window.
             if job.started_at is not None and job.started_at > grace_cutoff:
                 continue
             self._job_store.update(
@@ -217,6 +247,26 @@ class Dispatcher:
             )
             recovered += 1
         return recovered
+
+    def _fail_if_running(self, job: Job, reason: str, *, warning: str | None = None) -> bool:
+        """CAS terminal-fail: mark ``job`` FAILED only while it is STILL RUNNING (so a concurrent
+        terminal write by its owner is never clobbered). Mirrors ``_fail_job``'s fields + error
+        scrubbing + retention expiry. Returns whether the transition applied."""
+        finished_at = time.time()
+        expires_at = (
+            finished_at + self._job_retention_seconds
+            if self._job_retention_seconds > 0
+            else None
+        )
+        fields: dict = dict(
+            status=JobStatus.FAILED,
+            finished_at=finished_at,
+            expires_at=expires_at,
+            error=sanitize_public_error(reason),
+        )
+        if warning is not None:
+            fields["security_warnings"] = [*job.security_warnings, warning]
+        return self._job_store.update_if_status(job.job_id, JobStatus.RUNNING, **fields)
 
     # ------------------------------------------------------------------
     # Internal dispatch flow
@@ -350,23 +400,42 @@ class Dispatcher:
                 output_dir=slot.output_dir,
                 params=self._sanitize_params(job.params),
             )
+            # One absolute deadline bounds the input send + wait (the only steps a slow guest
+            # can stall) to worker_timeout_s, so the upload (which runs BEFORE the wait) can't
+            # pin dispatch. NOTE: the post-wait sealing phase (Step 5b+) is NOT under this
+            # deadline; its staleness is covered separately by refreshing started_at below.
+            warm_deadline = time.monotonic() + self._worker_timeout_s
             try:
-                control.signal_go(spec)
+                control.signal_go(spec, deadline=warm_deadline)
             except Exception as exc:  # noqa: BLE001
                 self._fail_job(job, f"failed to signal go to warm worker: {exc}")
                 return
 
             # ------------------------------------------------------------------
-            # Step 5: Wait for done signal
+            # Step 5: Wait for done signal (same deadline; remaining budget after the send)
             # ------------------------------------------------------------------
+            remaining = warm_deadline - time.monotonic()
+            if remaining <= 0:
+                self._fail_job(
+                    job, f"warm worker timed out after {self._worker_timeout_s}s"
+                )
+                return
             try:
-                control.wait_for_done(timeout_s=self._worker_timeout_s)
+                control.wait_for_done(timeout_s=remaining)
             except WarmTimeout:
                 self._fail_job(
                     job,
                     f"warm worker timed out after {self._worker_timeout_s}s",
                 )
                 return
+
+            # The guest is done; the sealing phase below (rdump materialize, output-cap, validate,
+            # re-seal of up to max_total_artifact_bytes) is real wall-clock work NOT bounded by
+            # warm_deadline. Refresh started_at so requeue_orphaned_jobs (which fails a warm job
+            # RUNNING past worker_timeout_s + grace) measures the sealing phase from a fresh clock
+            # — otherwise a legitimately slow/large seal could be judged "owner gone" and FAILed
+            # out from under a live owner.
+            self._job_store.update(job.job_id, started_at=time.time())
 
             # ------------------------------------------------------------------
             # Step 5b: Materialize output into slot.output_dir (FC: rdump the ext4
@@ -445,14 +514,26 @@ class Dispatcher:
                 "artifact_count": len(envelope.artifacts),
                 "warning_count": len(envelope.warnings),
             }
-            self._job_store.update(
+            # CAS-fence the terminal DONE on RUNNING (symmetric with the recovery FAIL): under a
+            # multi-dispatcher topology a peer may have already FAILED this warm job as stale (its
+            # output possibly retention-deleted). A blind DONE would resurrect that terminal state
+            # to DONE with no artifacts on disk + a self-contradictory "owner gone" warning. "First
+            # writer wins": if the job is no longer RUNNING, leave the recovery's terminal state.
+            applied = self._job_store.update_if_status(
                 job.job_id,
+                JobStatus.RUNNING,
                 status=JobStatus.DONE,
                 finished_at=finished_at,
                 expires_at=expires_at,
                 result_summary=result_summary,
                 error=None,
             )
+            if not applied:
+                _log.warning(
+                    "warm job %s no longer RUNNING at DONE write (recovered by another "
+                    "dispatcher); leaving its terminal state untouched",
+                    job.job_id,
+                )
 
         finally:
             # Security: release the slot on EVERY terminal path (success, trust-fail,
@@ -712,7 +793,9 @@ class Dispatcher:
             digest = hashlib.sha256()
             n = 0
             try:
-                with confined_atomic_writer(dst_dir, a.path, mode=0o644) as out_fd:
+                with confined_atomic_writer(
+                    dst_dir, a.path, mode=0o644, dir_mode=0o755
+                ) as out_fd:
                     while True:
                         chunk = os.read(fd, 1024 * 1024)
                         if not chunk:

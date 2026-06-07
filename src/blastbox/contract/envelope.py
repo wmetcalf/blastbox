@@ -190,7 +190,7 @@ def atomic_write_confined(base: Path, name: str, data: bytes, *, mode: int = 0o6
 
 
 @contextmanager
-def confined_atomic_writer(base: Path, relpath: str, *, mode: int = 0o644):
+def confined_atomic_writer(base: Path, relpath: str, *, mode: int = 0o644, dir_mode: int = 0o700):
     """Yield a writable fd for ``base/relpath``, symlink/TOCTOU-safe even when ``base`` is a
     worker-writable dir, placing the result atomically only on clean exit.
 
@@ -213,12 +213,17 @@ def confined_atomic_writer(base: Path, relpath: str, *, mode: int = 0o644):
     try:
         for part in rel.parts[:-1]:
             try:
-                os.mkdir(part, 0o700, dir_fd=dir_fd)
+                os.mkdir(part, dir_mode, dir_fd=dir_fd)
             except FileExistsError:
                 pass
             nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
             os.close(dir_fd)
             dir_fd = nfd
+            # Exact mode via fchmod on the (O_NOFOLLOW-opened) dir fd, umask-independent — the
+            # API may serve NESTED artifacts as a different uid, so intermediate dirs need 0o755
+            # to be traversable to the 0o644 files inside (the metadata/single-segment path has
+            # no intermediates and keeps the 0o700 default).
+            os.fchmod(dir_fd, dir_mode)
         leaf = rel.parts[-1]
         tmp_name = f".{leaf}.{secrets.token_hex(8)}.tmp"
         tfd = os.open(

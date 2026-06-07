@@ -105,6 +105,18 @@ class JobStore(Protocol):
     def create(self, job: Job) -> None: ...
     def get(self, job_id: str) -> Job | None: ...
     def update(self, job_id: str, **fields) -> Job: ...
+    def update_if_status(
+        self, job_id: str, expect_status: JobStatus, **fields
+    ) -> bool:
+        """Atomically apply ``fields`` ONLY if the job's current status is ``expect_status``;
+        return whether it applied (a compare-and-set, like ``claim_next``'s QUEUED guard).
+
+        Used to fence a transition against a concurrent writer — e.g. an orphan-recovery sweep
+        flips a stale RUNNING job to FAILED only while it is still RUNNING, so it can never
+        clobber a terminal status the owning dispatcher wrote in the meantime. Missing job or a
+        status mismatch returns ``False`` without modifying anything.
+        """
+        ...
     def list(
         self,
         status: JobStatus | None = None,

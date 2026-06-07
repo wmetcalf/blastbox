@@ -353,7 +353,13 @@ def make_ext4(path: Path, size_mib: int) -> None:
     )
 
 
-def rdump_ext4(image: Path, dest: Path, max_bytes: int) -> list[str]:
+_RDUMP_TIMEOUT_S = 300.0  # debugfs rdump over a fixed-size (<=512 MiB) image completes in seconds;
+#                           bound it so a crafted image can't hang the dispatcher indefinitely.
+
+
+def rdump_ext4(
+    image: Path, dest: Path, max_bytes: int, *, timeout_s: float = _RDUMP_TIMEOUT_S
+) -> list[str]:
     """Extract an ext4 image's root to ``dest`` WITHOUT mounting (debugfs rdump).
 
     Defense-in-depth against a compromised worker producing a crafted image:
@@ -396,6 +402,7 @@ def rdump_ext4(image: Path, dest: Path, max_bytes: int) -> list[str]:
         ["debugfs", "-R", f"rdump / {dest_str}", str(image)],
         check=True,
         capture_output=True,
+        timeout=timeout_s,
     )
 
     # debugfs rdump always creates lost+found; remove it so it isn't mistaken
@@ -659,14 +666,21 @@ class VsockHostWarmControl:
         self._connect_fn = connect_fn  # injectable for tests (no real VM)
         self._conn: "socket.socket | None" = None
 
-    def _connect(self) -> "socket.socket":
+    def _connect(self, *, deadline: float | None = None) -> "socket.socket":
         if self._connect_fn is not None:
             return self._connect_fn()
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(self._connect_timeout)
+        # Cap the handshake at the warm deadline (never looser than connect_timeout) so the
+        # CONNECT-reply read is inside the same budget as the rest of signal_go — a slowloris
+        # guest dribbling the OK\n reply can't pin dispatch.
+        s.settimeout(
+            self._connect_timeout
+            if deadline is None
+            else min(self._connect_timeout, max(0.0, deadline - time.monotonic()))
+        )
         s.connect(str(self._uds))
         s.sendall(f"CONNECT {self._job_port}\n".encode())
-        line = recv_line(s)
+        line = recv_line(s, deadline=deadline)
         if not line.startswith(b"OK"):
             s.close()
             raise FCError(
@@ -674,7 +688,7 @@ class VsockHostWarmControl:
             )
         return s
 
-    def signal_go(self, spec: "WarmJobSpec") -> None:
+    def signal_go(self, spec: "WarmJobSpec", *, deadline: float | None = None) -> None:
         """Connect to the guest and send the job header + input frame.
 
         The input body is STREAMED from disk in fixed chunks (send_frame_from_file), not read
@@ -682,15 +696,21 @@ class VsockHostWarmControl:
         whole file plus send_frame's len+data copy (~2x). The on-disk input is already bounded
         by max_input_bytes at ingress; the guest's recv_frame independently caps the frame. The
         wire format is unchanged (8-byte length + body), so the guest decodes it identically.
+
+        ``deadline`` (a ``time.monotonic()`` value) bounds the upload so a slow-reading guest
+        can't pin the dispatcher during the send (the send runs BEFORE wait_for_done's timeout
+        starts, so without this it would otherwise be unbounded).
         """
         path = Path(spec.input_path)
         header = json.dumps(
             {"filename": path.name, "params": dict(spec.params)}
         ).encode("utf-8")
-        conn = self._connect()
+        conn = self._connect(deadline=deadline)
         self._conn = conn
+        if deadline is not None:
+            conn.settimeout(max(0.0, deadline - time.monotonic()))
         send_frame(conn, header)
-        send_frame_from_file(conn, path)
+        send_frame_from_file(conn, path, deadline=deadline)
 
     def wait_for_done(self, *, timeout_s: float) -> str:
         """Read the guest's status frame; raise WarmTimeout if it never arrives.

@@ -107,6 +107,35 @@ class RedisJobStore:
                 except WatchError:
                     continue  # retry on concurrent modification
 
+    def update_if_status(
+        self, job_id: str, expect_status: JobStatus, **fields
+    ) -> bool:
+        """Compare-and-set via WATCH/MULTI/EXEC: apply ``fields`` only while status is still
+        ``expect_status``. Returns False (no write) on missing/malformed/mismatched status."""
+        # Fail fast on an unknown field name BEFORE any Redis round-trip — uniform with the SQL
+        # backend (which validates before the UPDATE) so the cross-backend contract holds.
+        for k in fields:
+            if k not in _JOB_FIELDS:
+                raise ValueError(f"unknown Job field in update_if_status(): {k!r}")
+        key = self._key(job_id)
+        with self._r.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(key)
+                    raw = pipe.get(key)
+                    job = _decode_job(raw) if raw is not None else None
+                    if job is None or job.status != expect_status:
+                        pipe.unwatch()
+                        return False
+                    for k, v in fields.items():
+                        setattr(job, k, v)
+                    pipe.multi()
+                    pipe.set(key, json.dumps(job.to_dict()), ex=self._expiry_arg())
+                    pipe.execute()
+                    return True
+                except WatchError:
+                    continue  # status changed under us -> retry, re-check the guard
+
     def list(
         self,
         status: JobStatus | None = None,

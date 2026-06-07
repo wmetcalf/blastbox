@@ -44,6 +44,23 @@ class InMemoryJobStore:
                 setattr(job, k, v)
             return job
 
+    def update_if_status(
+        self, job_id: str, expect_status: JobStatus, **fields
+    ) -> bool:
+        # Validate field names BEFORE the status guard so an unknown field fails fast (ValueError)
+        # uniformly across all backends — not silently no-op on a status mismatch here while the
+        # SQL backend raises. (An unknown field is a programming error, never client/worker input.)
+        for k in fields:
+            if k not in _JOB_FIELDS:
+                raise ValueError(f"unknown Job field in update_if_status(): {k!r}")
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status != expect_status:
+                return False
+            for k, v in fields.items():
+                setattr(job, k, v)
+            return True
+
     def list(
         self,
         status: JobStatus | None = None,

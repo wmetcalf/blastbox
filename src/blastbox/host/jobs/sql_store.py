@@ -226,6 +226,29 @@ class SqlJobStore:
             raise KeyError(job_id)
         return job
 
+    def update_if_status(
+        self, job_id: str, expect_status: JobStatus, **fields
+    ) -> bool:
+        """Compare-and-set: ``UPDATE ... WHERE job_id = ? AND status = ?`` — applies only while
+        the row is still ``expect_status`` (rowcount==1), like ``claim_next``'s QUEUED guard."""
+        if not fields:
+            job = self.get(job_id)
+            return job is not None and job.status == expect_status
+        for key in fields:
+            if key not in _COLUMNS:
+                raise ValueError(f"invalid column: {key!r}")
+        encoded = {key: self._encode_value(key, value) for key, value in fields.items()}
+        set_clause = ", ".join(f"{key} = {self._param}" for key in encoded)
+        sql = (
+            f"UPDATE jobs SET {set_clause} "
+            f"WHERE job_id = {self._param} AND status = {self._param}"
+        )
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                sql, tuple(encoded.values()) + (job_id, expect_status.value)
+            )
+            return cur.rowcount == 1
+
     def list(
         self,
         status: JobStatus | None = None,

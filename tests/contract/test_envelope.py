@@ -137,6 +137,25 @@ def test_confined_atomic_writer_rejects_traversal(tmp_path):
                 pass
 
 
+def test_confined_atomic_writer_dir_mode_for_cross_uid_traverse(tmp_path):
+    """Nested artifact dirs get dir_mode (0o755) so a DIFFERENT API uid can traverse to the
+    0o644 file inside; the default stays 0o700 (host-only control/metadata writes)."""
+    import stat as _stat
+    from blastbox.contract.envelope import confined_atomic_writer
+    d = tmp_path / "out"
+    d.mkdir()
+
+    with confined_atomic_writer(d, "nested/sub/art.txt", mode=0o644, dir_mode=0o755) as fd:
+        os.write(fd, b"png")
+    assert _stat.S_IMODE((d / "nested").stat().st_mode) == 0o755
+    assert _stat.S_IMODE((d / "nested" / "sub").stat().st_mode) == 0o755
+    assert _stat.S_IMODE((d / "nested" / "sub" / "art.txt").stat().st_mode) == 0o644
+
+    with confined_atomic_writer(d, "priv/f", mode=0o600) as fd:  # default dir_mode=0o700
+        os.write(fd, b"y")
+    assert _stat.S_IMODE((d / "priv").stat().st_mode) == 0o700
+
+
 def test_atomic_write_confined_defeats_temp_symlink(tmp_path):
     """The old predictable temp name pre-planted as a symlink must NOT be followed (random
     O_EXCL|O_NOFOLLOW temp name avoids it entirely)."""

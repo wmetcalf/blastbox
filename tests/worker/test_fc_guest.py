@@ -243,6 +243,90 @@ def test_send_frame_from_file_zero_pads_short_read(tmp_path):
         b.close()
 
 
+def test_send_frame_from_file_pads_short_read_in_bounded_chunks(tmp_path):
+    """A large post-stat shrink must pad in bounded chunks — never allocate (size - sent) at
+    once — so the chunked memory bound holds even on a truncation race."""
+    from blastbox.worker.fc_guest import send_frame_from_file
+
+    real = tmp_path / "real.bin"
+    real.write_bytes(b"abc")  # only 3 real bytes on disk
+
+    class _BigStat:
+        """stat() claims 5 MB but the stream yields 3 bytes -> ~5 MB of zero-pad."""
+
+        def stat(self):
+            import os as _os
+
+            r = real.stat()
+            return _os.stat_result((r.st_mode, 0, 0, 1, 0, 0, 5_000_000, 0, 0, 0))
+
+        def open(self, mode):
+            return real.open(mode)
+
+    class _Rec:
+        def __init__(self):
+            self.max_write = 0
+            self.total = 0
+
+        def settimeout(self, t):
+            pass
+
+        def sendall(self, b):
+            self.max_write = max(self.max_write, len(b))
+            self.total += len(b)
+
+    rec = _Rec()
+    send_frame_from_file(rec, _BigStat(), chunk=64 * 1024)
+    assert rec.max_write <= 64 * 1024  # never one giant ~5 MB buffer
+    assert rec.total == 8 + 5_000_000  # 8-byte length prefix + announced size (3 real + pad)
+
+
+def test_send_frame_from_file_honors_deadline(tmp_path):
+    """An already-passed deadline aborts the send so a slow-reading guest can't pin the host."""
+    import time
+
+    from blastbox.worker.fc_guest import send_frame_from_file
+
+    p = tmp_path / "in.bin"
+    p.write_bytes(b"x" * 200_000)
+
+    class _Sock:
+        def settimeout(self, t):
+            pass
+
+        def sendall(self, b):
+            pass
+
+    with pytest.raises(TimeoutError):
+        send_frame_from_file(_Sock(), p, deadline=time.monotonic() - 1.0)
+
+
+def test_send_frame_from_file_sets_per_send_timeout_from_deadline(tmp_path):
+    """With a future deadline, each sendall is bounded by the remaining time."""
+    import time
+
+    from blastbox.worker.fc_guest import send_frame_from_file
+
+    p = tmp_path / "in.bin"
+    p.write_bytes(b"y" * 100_000)
+
+    class _Rec:
+        def __init__(self):
+            self.timeouts = []
+            self.body = bytearray()
+
+        def settimeout(self, t):
+            self.timeouts.append(t)
+
+        def sendall(self, b):
+            self.body += b
+
+    rec = _Rec()
+    send_frame_from_file(rec, p, deadline=time.monotonic() + 30.0)
+    assert rec.timeouts and all(t > 0 for t in rec.timeouts)  # every send bounded
+    assert rec.body[8:] == b"y" * 100_000  # body intact after the length prefix
+
+
 def test_multiple_frames_preserved_in_order():
     a, b = socket.socketpair()
     try:
