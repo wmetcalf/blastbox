@@ -77,6 +77,13 @@ soffice/unoserver warm container (not the job-restore environment, not Tika).
 blastbox reads this from `BLASTBOX_GVISOR_LD_PRELOAD` and passes it to the warm
 container's env at snapshot time.
 
+> **Required for the soffice tier — fails SILENTLY if omitted.** The gVisor OCI spec
+> is built from scratch (image `ENV` is dropped), so baking the `.so` into the image is
+> **not** enough — you must also set `BLASTBOX_GVISOR_LD_PRELOAD` on the **dispatcher host**.
+> If you forget it, every soffice restore hangs on the osl_acceptPipe EINTR, the slot never
+> reaches READY, and the pool silently churns + falls back to the cold path (no warm speedup,
+> no loud error). The Tika/JVM tier is unaffected (it doesn't need the shim).
+
 ## Enabling the tier
 
 Set `BLASTBOX_POOL_RUNTIME=gvisor` before starting the pool, or pass it to the

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat as _stat
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -180,6 +181,61 @@ def atomic_write_confined(base: Path, name: str, data: bytes, *, mode: int = 0o6
         finally:
             if tfd >= 0:
                 os.close(tfd)
+                try:
+                    os.unlink(tmp_name, dir_fd=dir_fd)
+                except OSError:
+                    pass
+    finally:
+        os.close(dir_fd)
+
+
+@contextmanager
+def confined_atomic_writer(base: Path, relpath: str, *, mode: int = 0o644):
+    """Yield a writable fd for ``base/relpath``, symlink/TOCTOU-safe even when ``base`` is a
+    worker-writable dir, placing the result atomically only on clean exit.
+
+    The streaming sibling of :func:`atomic_write_confined`, for copying out artifacts whose bytes
+    are verified WHILE writing (running sha + size cap). Walks ``relpath`` one segment at a time
+    relative to a directory fd — existing intermediates opened ``O_NOFOLLOW|O_DIRECTORY``, missing
+    ones created with ``mkdir``+``O_NOFOLLOW`` reopen — so a worker-planted symlink at ANY
+    component fails the walk (``O_NOFOLLOW`` → ``ELOOP``/``ENOTDIR``) instead of redirecting the
+    write outside ``base``. The body streams into a RANDOM ``O_CREAT|O_EXCL|O_NOFOLLOW`` temp; on
+    a clean exit the temp is ``fchmod``'d to ``mode`` and ``renameat``'d over the leaf (clobbering
+    any worker-planted symlink there, since rename replaces the dir entry without following it);
+    on ANY exception the temp is unlinked and the destination is left untouched. So a caller that
+    raises after detecting a bad hash/size never publishes the artifact. ``..``/absolute paths are
+    rejected."""
+    import secrets
+    rel = Path(relpath)
+    if rel.is_absolute() or not rel.parts or any(p in ("..", ".") for p in rel.parts):
+        raise ValueError(f"unsafe path (absolute, empty, or contains '.'/'..'): {relpath!r}")
+    dir_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in rel.parts[:-1]:
+            try:
+                os.mkdir(part, 0o700, dir_fd=dir_fd)
+            except FileExistsError:
+                pass
+            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = nfd
+        leaf = rel.parts[-1]
+        tmp_name = f".{leaf}.{secrets.token_hex(8)}.tmp"
+        tfd = os.open(
+            tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=dir_fd
+        )
+        committed = False
+        try:
+            yield tfd
+            os.fchmod(tfd, mode)  # exact mode regardless of umask (cross-uid serving)
+            os.close(tfd)
+            tfd = -1
+            os.replace(tmp_name, leaf, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            committed = True
+        finally:
+            if tfd >= 0:
+                os.close(tfd)
+            if not committed:
                 try:
                     os.unlink(tmp_name, dir_fd=dir_fd)
                 except OSError:

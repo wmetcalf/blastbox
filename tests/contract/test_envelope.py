@@ -1,3 +1,5 @@
+import os
+
 import pytest
 from typing import Literal
 from pydantic import Field
@@ -77,6 +79,62 @@ def test_atomic_write_confined_applies_exact_mode(tmp_path):
     assert _stat.S_IMODE((d / "go.json").stat().st_mode) == 0o644
     atomic_write_confined(d, "host_only", b"x", mode=0o600)
     assert _stat.S_IMODE((d / "host_only").stat().st_mode) == 0o600
+
+
+def test_confined_atomic_writer_defeats_destination_symlink(tmp_path):
+    """The streaming artifact writer must NOT follow a worker-planted destination symlink — it
+    clobbers it with a real confined file and leaves the outside target untouched."""
+    from blastbox.contract.envelope import confined_atomic_writer
+    d = tmp_path / "out"
+    d.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"ORIGINAL")
+    (d / "page-001.png").symlink_to(outside)  # worker pre-plants the dst as a symlink
+
+    with confined_atomic_writer(d, "page-001.png") as fd:
+        os.write(fd, b"SEALED-PNG")
+
+    assert outside.read_bytes() == b"ORIGINAL"  # outside file NOT clobbered
+    assert not (d / "page-001.png").is_symlink()  # replaced by a real file
+    assert (d / "page-001.png").read_bytes() == b"SEALED-PNG"
+
+
+def test_confined_atomic_writer_blocks_symlinked_parent(tmp_path):
+    """A symlinked intermediate component must fail the O_NOFOLLOW walk, not redirect the write."""
+    from blastbox.contract.envelope import confined_atomic_writer
+    d = tmp_path / "out"
+    d.mkdir()
+    outside_dir = tmp_path / "evil"
+    outside_dir.mkdir()
+    (d / "sub").symlink_to(outside_dir)  # worker plants a symlinked subdir
+
+    with pytest.raises(OSError):
+        with confined_atomic_writer(d, "sub/x.png") as fd:
+            os.write(fd, b"data")
+    assert not (outside_dir / "x.png").exists()  # write never escaped into the symlink target
+
+
+def test_confined_atomic_writer_unlinks_temp_on_exception(tmp_path):
+    """If the body raises (e.g. a bad re-hash), nothing is published and no temp is leaked."""
+    from blastbox.contract.envelope import confined_atomic_writer
+    d = tmp_path / "out"
+    d.mkdir()
+    with pytest.raises(RuntimeError):
+        with confined_atomic_writer(d, "page-001.png") as fd:
+            os.write(fd, b"partial")
+            raise RuntimeError("bad hash")
+    assert not (d / "page-001.png").exists()  # not published
+    assert list(d.iterdir()) == []  # temp cleaned up
+
+
+def test_confined_atomic_writer_rejects_traversal(tmp_path):
+    from blastbox.contract.envelope import confined_atomic_writer
+    d = tmp_path / "out"
+    d.mkdir()
+    for bad in ("../escape", "/abs", "a/../../b"):
+        with pytest.raises(ValueError):
+            with confined_atomic_writer(d, bad):
+                pass
 
 
 def test_atomic_write_confined_defeats_temp_symlink(tmp_path):

@@ -28,7 +28,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Mapping
 
-from blastbox.contract.envelope import atomic_write_confined, open_confined_regular_fd
+from blastbox.contract.envelope import (
+    atomic_write_confined,
+    confined_atomic_writer,
+    open_confined_regular_fd,
+)
 from blastbox.errors import OutputTrustError, WarmTimeout, sanitize_public_error
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.runtime.docker import (
@@ -169,6 +173,14 @@ class Dispatcher:
         the method returns 0 without modifying any jobs (fail-safe: never
         accidentally requeue a job that is still live).
 
+        WARM-tier jobs (worker_runtime == "warm") are NEVER requeued here: a warm
+        slot is a runsc/Firecracker sandbox with no docker label, so ``docker ps``
+        can't attest its liveness at any age — requeuing one off this cold-only
+        signal would double-detonate a LIVE warm job under a multi-dispatcher
+        topology. They are bounded by worker_timeout_s + the owning dispatcher's
+        pool; a crashed warm dispatcher's jobs are recovered by timeout/retention,
+        not this docker-ps sweep.
+
         ``exclude`` is an optional set of job_ids to skip (claimed in-process
         this tick).
         """
@@ -182,6 +194,10 @@ class Dispatcher:
         recovered = 0
         for job in self._job_store.list(status=JobStatus.RUNNING):
             if job.job_id in excluded or job.job_id in active_job_ids:
+                continue
+            # Warm slots carry no docker label, so docker ps can never confirm their liveness;
+            # never requeue them off this cold-only signal (would double-detonate a live one).
+            if job.worker_runtime == "warm":
                 continue
             # Grace window: a just-claimed job's worker container may not appear in `docker ps`
             # yet, so requeuing it now would double-detonate the same (malicious) input in two
@@ -680,16 +696,23 @@ class Dispatcher:
         TOCTOU-safe reads, RE-VERIFYING each artifact's sha against the sealed envelope (so a
         mid-flight content swap is detected and fails the job), then writing the sealed
         metadata.json. After this the API serves a stable, host-trusted copy — closing both the
-        'warm results unreachable' gap and the live-dir validation residual."""
+        'warm results unreachable' gap and the live-dir validation residual.
+
+        ``dst_dir`` is job_root/<id>/output — the SAME dir a prior COLD attempt of this job
+        bind-mounts writable into the untrusted worker (a requeue after a cold crash reuses it),
+        so it can contain worker-planted symlinks. We therefore (1) wipe+recreate it (rmtree
+        unlinks symlinks, never follows them) and (2) write each artifact via confined_atomic_writer
+        (per-segment O_NOFOLLOW walk + O_EXCL temp + renameat) — exactly the symlink defence the
+        sibling metadata write already uses — so a planted symlink can never redirect a
+        host-trusted write to clobber a file outside dst_dir."""
+        shutil.rmtree(dst_dir, ignore_errors=True)
         dst_dir.mkdir(parents=True, exist_ok=True)
         for a in envelope.artifacts:
             fd = open_confined_regular_fd(src_dir, a.path)
             digest = hashlib.sha256()
             n = 0
-            dst_path = dst_dir / a.path
-            dst_path.parent.mkdir(parents=True, exist_ok=True)
             try:
-                with open(dst_path, "wb") as out:
+                with confined_atomic_writer(dst_dir, a.path, mode=0o644) as out_fd:
                     while True:
                         chunk = os.read(fd, 1024 * 1024)
                         if not chunk:
@@ -702,13 +725,17 @@ class Dispatcher:
                                 f"artifact {a.id} grew past {a.bytes} bytes during materialization"
                             )
                         digest.update(chunk)
-                        out.write(chunk)
+                        mv = memoryview(chunk)
+                        while mv:
+                            mv = mv[os.write(out_fd, mv):]
+                    # Re-verify INSIDE the writer ctx: a mismatch raises -> the temp is unlinked
+                    # and nothing is published (no partial/forged artifact ever lands in dst_dir).
+                    if digest.hexdigest() != a.sha256 or n != a.bytes:
+                        raise OutputTrustError(
+                            f"artifact {a.id} changed during materialization (live-dir swap)"
+                        )
             finally:
                 os.close(fd)
-            if digest.hexdigest() != a.sha256 or n != a.bytes:
-                raise OutputTrustError(
-                    f"artifact {a.id} changed during materialization (live-dir swap)"
-                )
         self._write_sealed_metadata(envelope, dst_dir)
 
     def _run_maintenance(self) -> None:

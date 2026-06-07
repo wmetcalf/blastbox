@@ -22,6 +22,10 @@ from uuid import uuid4
 
 import pytest
 
+from blastbox.contract.envelope import DeclaredArtifact, seal_envelope
+from blastbox.contract.leaf import Detection
+from blastbox.contract.nodes import ExtractedText
+from blastbox.errors import OutputTrustError
 from blastbox.host.dispatch import Dispatcher, EngineSpec
 from blastbox.host.jobs.base import Job, JobStatus
 from blastbox.host.jobs.memory import InMemoryJobStore
@@ -731,3 +735,105 @@ def test_6_image_never_job_derived_in_warm_mode(tmp_path):
     # Pool release was called (confirming warm path was used)
     assert len(pool.release_calls) == 1
     assert pool.release_calls[0] is slot
+
+
+# ===========================================================================
+# Warm-output materialize trust gate (symlink overwrite + live-dir swap/grow)
+# ===========================================================================
+
+
+def _det() -> Detection:
+    return Detection(label="docx", mime="x", confidence=1.0, source="magika")
+
+
+def _seal_over(src_dir: Path, *, content: bytes, path: str = "page-001.png"):
+    """Seal an envelope over a freshly-written src artifact (sha/bytes from its current content)."""
+    src_dir.mkdir(parents=True, exist_ok=True)
+    (src_dir / path).write_bytes(content)
+    return seal_envelope(
+        engine=_ENGINE_NAME,
+        outdir=src_dir,
+        input_sha256=_INPUT_SHA,
+        detected=_det(),
+        declared=[DeclaredArtifact(id="page-001", path=path, kind="image")],
+        warnings=[],
+        payload=ExtractedText(text="x", char_count=1),
+    )
+
+
+def test_materialize_defeats_destination_symlink(tmp_path):
+    """The trust-boundary MED: a cold attempt of this job can plant a symlink in the REUSED
+    job_root/<id>/output dir; a requeue→warm materialize must NOT follow it to overwrite a host
+    file. The sealed artifact lands as a real confined file; the outside target is untouched."""
+    store = InMemoryJobStore()
+    disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs")
+    src = tmp_path / "slot_out"
+    env = _seal_over(src, content=b"REAL-PNG-BYTES")
+
+    dst = tmp_path / "job_out"
+    dst.mkdir()
+    outside = tmp_path / "victim"
+    outside.write_bytes(b"ORIGINAL")
+    (dst / "page-001.png").symlink_to(outside)  # cold-worker-planted symlink in the reused dir
+
+    disp._materialize_sealed_warm_output(env, src, dst)
+
+    assert outside.read_bytes() == b"ORIGINAL"  # host file NOT overwritten
+    assert not (dst / "page-001.png").is_symlink()
+    assert (dst / "page-001.png").read_bytes() == b"REAL-PNG-BYTES"
+    assert (dst / "metadata.json").exists()
+
+
+def test_materialize_detects_content_swap(tmp_path):
+    """A still-live worker swapping the artifact's content (same length) after sealing must fail
+    the re-hash and publish nothing."""
+    store = InMemoryJobStore()
+    disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs")
+    src = tmp_path / "slot_out"
+    env = _seal_over(src, content=b"ORIGINAL-X")  # 10 bytes
+    (src / "page-001.png").write_bytes(b"SWAPPED-YZ")  # 10 bytes, different content -> sha mismatch
+
+    dst = tmp_path / "job_out"
+    with pytest.raises(OutputTrustError):
+        disp._materialize_sealed_warm_output(env, src, dst)
+    assert not (dst / "page-001.png").exists()  # nothing published on a swap
+
+
+def test_materialize_rejects_oversize_growth(tmp_path):
+    """A worker growing the artifact past its sealed size during the copy is capped + fails."""
+    store = InMemoryJobStore()
+    disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs")
+    src = tmp_path / "slot_out"
+    env = _seal_over(src, content=b"SMALL")  # sealed bytes = 5
+    (src / "page-001.png").write_bytes(b"SMALL" + b"X" * 4096)  # grew past
+
+    dst = tmp_path / "job_out"
+    with pytest.raises(OutputTrustError):
+        disp._materialize_sealed_warm_output(env, src, dst)
+    assert not (dst / "page-001.png").exists()
+
+
+def test_requeue_skips_warm_jobs(tmp_path, monkeypatch):
+    """requeue_orphaned_jobs must never requeue a warm job off the docker-ps signal (warm slots
+    carry no docker label, so 'gone from docker ps' is meaningless for them) — only cold jobs."""
+    store = InMemoryJobStore()
+    disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs")
+    monkeypatch.setattr(disp, "_list_active_worker_job_ids", lambda: set())  # docker ps: none active
+
+    warm = Job.new(engine=_ENGINE_NAME, filename="a.docx")
+    warm.status = JobStatus.RUNNING
+    warm.worker_runtime = "warm"
+    warm.started_at = time.time() - 600  # older than the grace window
+    store.create(warm)
+
+    cold = Job.new(engine=_ENGINE_NAME, filename="b.docx")
+    cold.status = JobStatus.RUNNING
+    cold.worker_runtime = "runsc"
+    cold.started_at = time.time() - 600
+    store.create(cold)
+
+    recovered = disp.requeue_orphaned_jobs()
+
+    assert recovered == 1  # only the cold job
+    assert store.get(warm.job_id).status == JobStatus.RUNNING  # warm left alone (not double-detonated)
+    assert store.get(cold.job_id).status == JobStatus.QUEUED
