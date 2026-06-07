@@ -106,6 +106,19 @@ blastbox dispatch                                    # the worker dispatcher loo
 `POST /v1/jobs` (multipart `file` + `engine`) enqueues a job; the dispatcher launches a hardened
 disposable worker for it; `GET /v1/jobs/{id}/artifacts/{artifact_id}` serves validated output.
 
+## Testing
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install -e .[dev]
+.venv/bin/pytest tests          # unit (mocked) — runs anywhere
+.venv/bin/ruff check src tests && .venv/bin/mypy src
+```
+
+The gated `integration` suite (gVisor C/R + Firecracker warm round-trips, real sandboxes) needs
+real runtimes + (on Ubuntu 24.04+) **root**, because the hardened kernel restricts the
+unprivileged user namespaces `runsc`/`bwrap`/`nsjail` need. See **[docs/TESTING.md](docs/TESTING.md)**
+for the full setup (incl. building a `probe`-engine rootfs and the userns workaround).
+
 ## Security model
 
 - Disposable worker per job: `--network=none --cap-drop=ALL --no-new-privileges --read-only`; the
