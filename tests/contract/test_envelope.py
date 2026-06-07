@@ -1,3 +1,5 @@
+import os
+
 import pytest
 from typing import Literal
 from pydantic import Field
@@ -28,6 +30,200 @@ def test_seal_rejects_path_traversal(tmp_path):
         seal_envelope(engine="e", outdir=tmp_path, input_sha256="b"*64, detected=_det(),
                       declared=[DeclaredArtifact(id="a0", path="../escape", kind="x")],
                       warnings=[], payload=ExtractedText(text="x", char_count=1))
+
+def test_seal_rejects_oversize_artifact_before_reading(tmp_path):
+    # A declared artifact larger than the cap is rejected at stat() time (before the host
+    # reads/hashes it), so a hostile worker can't force an unbounded in-memory read.
+    (tmp_path / "big.bin").write_bytes(b"x" * 100)
+    with pytest.raises(ValueError, match="exceeds"):
+        seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+                      declared=[DeclaredArtifact(id="a0", path="big.bin", kind="x")],
+                      warnings=[], payload=ExtractedText(text="x", char_count=1),
+                      max_artifact_bytes=10)
+
+
+def test_seal_within_cap_uses_stat_size(tmp_path):
+    (tmp_path / "ok.bin").write_bytes(b"x" * 5)
+    env = seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+                        declared=[DeclaredArtifact(id="a0", path="ok.bin", kind="x")],
+                        warnings=[], payload=ExtractedText(text="x", char_count=1),
+                        max_artifact_bytes=10)
+    assert env.artifacts[0].bytes == 5  # under cap -> sealed; size from stat, chunk-hashed
+
+
+def test_atomic_write_confined_defeats_destination_symlink(tmp_path):
+    """A worker pre-planting the destination as a symlink to an outside file must NOT redirect
+    the host write; the target is untouched and the destination becomes a real file."""
+    from blastbox.contract.envelope import atomic_write_confined
+    d = tmp_path / "out"
+    d.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"ORIGINAL")
+    (d / "metadata.json").symlink_to(outside)  # worker pre-plants the dst as a symlink
+
+    atomic_write_confined(d, "metadata.json", b"SEALED")
+
+    assert outside.read_bytes() == b"ORIGINAL"  # outside file NOT clobbered
+    assert not (d / "metadata.json").is_symlink()  # dst replaced by a real file
+    assert (d / "metadata.json").read_bytes() == b"SEALED"
+
+
+def test_atomic_write_confined_applies_exact_mode(tmp_path):
+    """The mode is applied EXACTLY (fchmod, umask-independent) so a host-authored control file
+    (go.json) / metadata.json the worker or API reads cross-uid gets 0o644, not 0o600."""
+    import stat as _stat
+    from blastbox.contract.envelope import atomic_write_confined
+    d = tmp_path / "ctrl"
+    d.mkdir()
+    atomic_write_confined(d, "go.json", b"{}", mode=0o644)
+    assert _stat.S_IMODE((d / "go.json").stat().st_mode) == 0o644
+    atomic_write_confined(d, "host_only", b"x", mode=0o600)
+    assert _stat.S_IMODE((d / "host_only").stat().st_mode) == 0o600
+
+
+def test_confined_atomic_writer_defeats_destination_symlink(tmp_path):
+    """The streaming artifact writer must NOT follow a worker-planted destination symlink — it
+    clobbers it with a real confined file and leaves the outside target untouched."""
+    from blastbox.contract.envelope import confined_atomic_writer
+    d = tmp_path / "out"
+    d.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"ORIGINAL")
+    (d / "page-001.png").symlink_to(outside)  # worker pre-plants the dst as a symlink
+
+    with confined_atomic_writer(d, "page-001.png") as fd:
+        os.write(fd, b"SEALED-PNG")
+
+    assert outside.read_bytes() == b"ORIGINAL"  # outside file NOT clobbered
+    assert not (d / "page-001.png").is_symlink()  # replaced by a real file
+    assert (d / "page-001.png").read_bytes() == b"SEALED-PNG"
+
+
+def test_confined_atomic_writer_blocks_symlinked_parent(tmp_path):
+    """A symlinked intermediate component must fail the O_NOFOLLOW walk, not redirect the write."""
+    from blastbox.contract.envelope import confined_atomic_writer
+    d = tmp_path / "out"
+    d.mkdir()
+    outside_dir = tmp_path / "evil"
+    outside_dir.mkdir()
+    (d / "sub").symlink_to(outside_dir)  # worker plants a symlinked subdir
+
+    with pytest.raises(OSError):
+        with confined_atomic_writer(d, "sub/x.png") as fd:
+            os.write(fd, b"data")
+    assert not (outside_dir / "x.png").exists()  # write never escaped into the symlink target
+
+
+def test_confined_atomic_writer_unlinks_temp_on_exception(tmp_path):
+    """If the body raises (e.g. a bad re-hash), nothing is published and no temp is leaked."""
+    from blastbox.contract.envelope import confined_atomic_writer
+    d = tmp_path / "out"
+    d.mkdir()
+    with pytest.raises(RuntimeError):
+        with confined_atomic_writer(d, "page-001.png") as fd:
+            os.write(fd, b"partial")
+            raise RuntimeError("bad hash")
+    assert not (d / "page-001.png").exists()  # not published
+    assert list(d.iterdir()) == []  # temp cleaned up
+
+
+def test_confined_atomic_writer_rejects_traversal(tmp_path):
+    from blastbox.contract.envelope import confined_atomic_writer
+    d = tmp_path / "out"
+    d.mkdir()
+    for bad in ("../escape", "/abs", "a/../../b"):
+        with pytest.raises(ValueError):
+            with confined_atomic_writer(d, bad):
+                pass
+
+
+def test_confined_atomic_writer_dir_mode_for_cross_uid_traverse(tmp_path):
+    """Nested artifact dirs get dir_mode (0o755) so a DIFFERENT API uid can traverse to the
+    0o644 file inside; the default stays 0o700 (host-only control/metadata writes)."""
+    import stat as _stat
+    from blastbox.contract.envelope import confined_atomic_writer
+    d = tmp_path / "out"
+    d.mkdir()
+
+    with confined_atomic_writer(d, "nested/sub/art.txt", mode=0o644, dir_mode=0o755) as fd:
+        os.write(fd, b"png")
+    assert _stat.S_IMODE((d / "nested").stat().st_mode) == 0o755
+    assert _stat.S_IMODE((d / "nested" / "sub").stat().st_mode) == 0o755
+    assert _stat.S_IMODE((d / "nested" / "sub" / "art.txt").stat().st_mode) == 0o644
+
+    with confined_atomic_writer(d, "priv/f", mode=0o600) as fd:  # default dir_mode=0o700
+        os.write(fd, b"y")
+    assert _stat.S_IMODE((d / "priv").stat().st_mode) == 0o700
+
+
+def test_atomic_write_confined_defeats_temp_symlink(tmp_path):
+    """The old predictable temp name pre-planted as a symlink must NOT be followed (random
+    O_EXCL|O_NOFOLLOW temp name avoids it entirely)."""
+    from blastbox.contract.envelope import atomic_write_confined
+    d = tmp_path / "out"
+    d.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"ORIGINAL")
+    (d / ".metadata.json.tmp").symlink_to(outside)  # the previously-predictable temp path
+
+    atomic_write_confined(d, "metadata.json", b"SEALED")
+
+    assert outside.read_bytes() == b"ORIGINAL"
+    assert (d / "metadata.json").read_bytes() == b"SEALED"
+
+
+def test_seal_caps_growing_artifact_during_hash(tmp_path):
+    """#4: an artifact larger than the cap is rejected DURING the hash read, not just by the
+    initial fstat (defends a live worker that grows the file after stat)."""
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * 5000)
+    with pytest.raises(ValueError, match="exceeds|grew"):
+        seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+                      declared=[DeclaredArtifact(id="a0", path="big.bin", kind="x")],
+                      warnings=[], payload=ExtractedText(text="x", char_count=1),
+                      max_artifact_bytes=1000)
+
+
+def test_envelope_from_json_rejects_deep_payload():
+    """A payload nested past the depth bound is rejected cleanly at parse time (not via a
+    catchable RecursionError) — covers the Record.fields recursion vector too."""
+    import json as _json
+
+    from blastbox.contract.envelope import envelope_from_json
+    deep: dict = {"_type": "extracted_text", "text": "x", "char_count": 1}
+    for _ in range(200):
+        deep = {"_type": "record", "fields": {"nested": deep}}
+    env = {
+        "engine": "e", "status": "ok", "input_sha256": "a" * 64,
+        "detected": {"label": "d", "mime": "m", "confidence": 1.0, "source": "magika"},
+        "artifacts": [], "warnings": [], "payload": deep,
+    }
+    with pytest.raises(ValueError, match="depth"):
+        envelope_from_json(_json.dumps(env).encode())
+
+
+def test_seal_rejects_symlinked_artifact(tmp_path):
+    """A declared artifact that is a symlink (e.g. to a host file) is rejected — the fd open
+    is O_NOFOLLOW, so it can't be followed to read outside outdir on a live worker dir."""
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"SECRET")
+    (tmp_path / "a.png").symlink_to(outside)
+    with pytest.raises(ValueError, match="confined"):
+        seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+                      declared=[DeclaredArtifact(id="a0", path="a.png", kind="x")],
+                      warnings=[], payload=ExtractedText(text="x", char_count=1))
+
+
+def test_seal_rejects_fifo_artifact(tmp_path):
+    """A declared artifact that is a FIFO/special file is rejected (S_ISREG check) — and the
+    O_NONBLOCK open means it could never block the single-threaded dispatcher."""
+    import os
+    os.mkfifo(tmp_path / "f.bin")
+    with pytest.raises(ValueError, match="confined|regular"):
+        seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+                      declared=[DeclaredArtifact(id="a0", path="f.bin", kind="x")],
+                      warnings=[], payload=ExtractedText(text="x", char_count=1))
+
 
 def test_seal_rejects_missing_file(tmp_path):
     with pytest.raises(ValueError, match="missing"):
@@ -153,3 +349,13 @@ def test_envelope_from_json_raises_value_error_on_non_object():
     from blastbox.contract.envelope import envelope_from_json
     with pytest.raises(ValueError):
         envelope_from_json(b'[]')
+
+
+def test_seal_rejects_metadata_json_as_declared_artifact(tmp_path):
+    """A worker declaring metadata.json as an artifact is rejected — the host overwrites
+    metadata.json with the sealed envelope, so the declared sha would desync from served bytes."""
+    (tmp_path / "metadata.json").write_bytes(b"{}")
+    with pytest.raises(ValueError, match="reserved"):
+        seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+                      declared=[DeclaredArtifact(id="a0", path="metadata.json", kind="json")],
+                      warnings=[], payload=ExtractedText(text="x", char_count=1))

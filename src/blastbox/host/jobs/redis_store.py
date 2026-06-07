@@ -7,12 +7,32 @@ works on large key spaces without blocking.  Every ``set`` includes a TTL.
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import logging
 import time
+import uuid
 
 from redis.exceptions import WatchError
 
 from blastbox.host.jobs.base import Job, JobStatus
+
+_log = logging.getLogger("blastbox.host.jobs.redis_store")
+
+
+def _decode_job(raw: object) -> Job | None:
+    """Decode a stored value into a Job, or None (logged) if it isn't valid job JSON — so a
+    malformed key sharing the blastbox:job:* prefix (shared/operator-mutable Redis) can't crash
+    list()/claim_next()."""
+    try:
+        return Job.from_dict(json.loads(raw))  # type: ignore[arg-type]
+    except (ValueError, TypeError, KeyError) as exc:
+        _log.warning("redis_store: skipping malformed job key payload: %s", exc)
+        return None
+
+# Allowlist of Job fields that update() may set — mirrors SqlJobStore's _COLUMNS guard so a
+# future caller forwarding client-controlled field names can't setattr an arbitrary attribute.
+_JOB_FIELDS = frozenset(f.name for f in dataclasses.fields(Job))
 
 
 _PREFIX = "blastbox:job:"
@@ -30,6 +50,15 @@ class RedisJobStore:
       to disable (no-expiry).
     - Atomic claim via WATCH/MULTI/EXEC with WatchError retry — two concurrent
       claimers racing on the same job result in exactly one claim.
+
+    Scaling caveat: ``list()``/``count()`` and ``claim_next()`` ``scan_iter`` +
+    ``GET`` + JSON-decode EVERY key (there is no server-side ORDER BY/LIMIT over a
+    Redis key space), so listing and claim are **O(N) in the live job count**.  The
+    24h TTL bounds N, but for LARGE or high-throughput job histories use the SQL
+    (Postgres) backend, which pushes the window + ``COUNT`` down into the query.  A
+    ZSET created_at/status index could make these O(log N + page) but is deferred
+    (it must also cover ``claim_next`` to move the bottleneck, and stay byte-identical
+    to the scan path under the backend-uniform pagination tests).
     """
 
     def __init__(self, client, *, ttl_seconds: int = _TTL_SECONDS) -> None:
@@ -53,7 +82,7 @@ class RedisJobStore:
         raw = self._r.get(self._key(job_id))
         if raw is None:
             return None
-        return Job.from_dict(json.loads(raw))
+        return _decode_job(raw)  # None on malformed payload -> treated as not found
 
     def update(self, job_id: str, **fields) -> Job:
         """Atomic read-modify-write via WATCH/MULTI/EXEC."""
@@ -65,8 +94,12 @@ class RedisJobStore:
                     raw = pipe.get(key)
                     if raw is None:
                         raise KeyError(job_id)
-                    job = Job.from_dict(json.loads(raw))
+                    job = _decode_job(raw)
+                    if job is None:
+                        raise KeyError(job_id)  # malformed payload -> fail closed, don't crash
                     for k, v in fields.items():
+                        if k not in _JOB_FIELDS:
+                            raise ValueError(f"unknown Job field in update(): {k!r}")
                         setattr(job, k, v)
                     pipe.multi()
                     pipe.set(key, json.dumps(job.to_dict()), ex=self._expiry_arg())
@@ -75,16 +108,84 @@ class RedisJobStore:
                 except WatchError:
                     continue  # retry on concurrent modification
 
-    def list(self, status: JobStatus | None = None) -> list[Job]:
+    def update_if_status(
+        self,
+        job_id: str,
+        expect_status: JobStatus,
+        *,
+        expect_claim_id: str | None = None,
+        **fields,
+    ) -> bool:
+        """Compare-and-set via WATCH/MULTI/EXEC: apply ``fields`` only while status is still
+        ``expect_status`` (and claim_id matches when ``expect_claim_id`` is given — closes the
+        ABA hole). Returns False (no write) on missing/malformed/mismatched status or claim."""
+        # Fail fast on an unknown field name BEFORE any Redis round-trip — uniform with the SQL
+        # backend (which validates before the UPDATE) so the cross-backend contract holds.
+        for k in fields:
+            if k not in _JOB_FIELDS:
+                raise ValueError(f"unknown Job field in update_if_status(): {k!r}")
+        key = self._key(job_id)
+        with self._r.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(key)
+                    raw = pipe.get(key)
+                    job = _decode_job(raw) if raw is not None else None
+                    if job is None or job.status != expect_status or (
+                        expect_claim_id is not None and job.claim_id != expect_claim_id
+                    ):
+                        pipe.unwatch()
+                        return False
+                    for k, v in fields.items():
+                        setattr(job, k, v)
+                    pipe.multi()
+                    pipe.set(key, json.dumps(job.to_dict()), ex=self._expiry_arg())
+                    pipe.execute()
+                    return True
+                except WatchError:
+                    continue  # status changed under us -> retry, re-check the guard
+
+    def list(
+        self,
+        status: JobStatus | None = None,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        newest_first: bool = False,
+    ) -> list[Job]:
+        # Redis has no server-side ORDER BY/LIMIT over a scanned key space, so we
+        # still collect matching jobs, then apply the same window the SQL backend
+        # pushes down — keeping the protocol uniform for the listing endpoint.
         jobs: list[Job] = []
         for k in self._r.scan_iter(match=_PREFIX + "*", count=200):
             raw = self._r.get(k)
             if raw is None:
                 continue
-            job = Job.from_dict(json.loads(raw))
+            job = _decode_job(raw)
+            if job is None:
+                continue
             if status is None or job.status == status:
                 jobs.append(job)
+        if newest_first:
+            jobs.sort(key=lambda j: (j.created_at, j.job_id), reverse=True)
+        if offset:
+            jobs = jobs[offset:]
+        if limit is not None:
+            jobs = jobs[:limit]
         return jobs
+
+    def count(self, status: JobStatus | None = None) -> int:
+        n = 0
+        for k in self._r.scan_iter(match=_PREFIX + "*", count=200):
+            raw = self._r.get(k)
+            if raw is None:
+                continue
+            job = _decode_job(raw)
+            if job is None:
+                continue
+            if status is None or job.status == status:
+                n += 1
+        return n
 
     def claim_next(self) -> Job | None:
         """Atomically claim the oldest QUEUED job.
@@ -99,7 +200,9 @@ class RedisJobStore:
                 raw = self._r.get(k)
                 if raw is None:
                     continue
-                job = Job.from_dict(json.loads(raw))
+                job = _decode_job(raw)
+                if job is None:
+                    continue
                 if job.status == JobStatus.QUEUED:
                     # Decode key to str for comparison; fakeredis may return bytes
                     k_str = k.decode() if isinstance(k, bytes) else k
@@ -114,12 +217,15 @@ class RedisJobStore:
                     raw = pipe.get(key)
                     if raw is None:
                         continue
-                    job = Job.from_dict(json.loads(raw))
+                    job = _decode_job(raw)
+                    if job is None:
+                        continue
                     if job.status != JobStatus.QUEUED:
                         # Another claimer won the race; retry from the scan.
                         continue
                     job.status = JobStatus.RUNNING
                     job.started_at = time.time()
+                    job.claim_id = uuid.uuid4().hex  # fresh ownership token per claim
                     pipe.multi()
                     pipe.set(key, json.dumps(job.to_dict()), ex=self._expiry_arg())
                     pipe.execute()

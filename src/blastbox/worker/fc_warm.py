@@ -114,7 +114,12 @@ class VsockWarmControl:
         deadline = time.monotonic() + timeout_s
         try:
             header_raw = recv_frame(conn, max_len=MAX_HEADER_BYTES, deadline=deadline)
-            header: dict[str, Any] = json.loads(header_raw.decode("utf-8"))
+            header_obj = json.loads(header_raw.decode("utf-8"))
+            if not isinstance(header_obj, dict):
+                # A header decoding to a list/scalar would make header.get(...) raise
+                # AttributeError (NOT caught below) — validate the shape so it fails cleanly.
+                raise ValueError("warm job header must be a JSON object")
+            header: dict[str, Any] = header_obj
             input_bytes = recv_frame(conn, max_len=self._max_input, deadline=deadline)
         except (OSError, ValueError, ConnectionError) as exc:
             try:
@@ -129,7 +134,9 @@ class VsockWarmControl:
         input_path.write_bytes(input_bytes)
         _log.info("fc_warm.job_received bytes=%d -> %s", len(input_bytes), input_path)
 
-        params = header.get("params") or {}
+        params = header.get("params")
+        if not isinstance(params, dict):  # never forward a non-dict params to the engine
+            params = {}
         return WarmJobSpec(
             input_path=input_path, output_dir=self._output_dir, params=params
         )

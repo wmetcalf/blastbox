@@ -83,15 +83,40 @@ def api_boot_sequence(
 
 
 class _Handle:
-    def __init__(self, proc, api, vsock_uds: str, ready_check=None) -> None:
+    def __init__(
+        self, proc, api, vsock_uds: str, ready_check=None, mem_dir: Path | None = None
+    ) -> None:
         self.proc = proc
         self.api = api
         self.vsock_uds = vsock_uds
         self._ready_check = ready_check
+        # Only the base (boot) handle carries a mem_dir — it's the one that gets
+        # checkpoint()ed. Restore handles don't snapshot, so they leave it None.
+        self._mem_dir = mem_dir
 
     def wait_ready(self, timeout_s: float) -> None:
         if self._ready_check is not None:
             self._ready_check(timeout_s)
+
+    def checkpoint(self, dest_dir: Path) -> object:
+        """Pause + Full-snapshot this base microVM. The state file lands under
+        ``dest_dir`` (the manager's base dir); the big mem file lands under the
+        launcher's ``mem_dir`` (tmpfs when the RAM-preload toggle is on). Returns the
+        opaque :class:`FcSnapshotArtifact` the manager round-trips to ``restore_in``."""
+        from blastbox.host.runtime.fc_snapshot_backend import (
+            FcSnapshotArtifact,
+            _create_snapshot,
+        )
+
+        if self._mem_dir is None:
+            raise RuntimeError("checkpoint() called on a handle without a mem_dir")
+        dest = Path(dest_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+        self._mem_dir.mkdir(parents=True, exist_ok=True)
+        snap = dest / "warm.snapshot"
+        mem = self._mem_dir / "warm.mem"
+        _create_snapshot(self.api, str(snap), str(mem))
+        return FcSnapshotArtifact(snap, mem)
 
     def kill(self) -> None:
         if self.proc is None or self.proc.poll() is not None:
@@ -164,6 +189,7 @@ class FcSnapshotLauncher:
         cfg: Any,
         base_dir: Path,
         *,
+        mem_dir: Path | None = None,
         popen: Callable[..., subprocess.Popen] = subprocess.Popen,
         api_factory: Callable[[str], Any] = FcApiClient,
         wait_socket: Callable[[Path], None] | None = None,
@@ -173,6 +199,10 @@ class FcSnapshotLauncher:
     ) -> None:
         self._cfg = cfg
         self._base_dir = Path(base_dir)
+        # Where the snapshot mem file (~guest RAM) is written at checkpoint time. The
+        # base handle carries this so its checkpoint() places mem on the right dir
+        # (tmpfs /dev/shm when the RAM-preload toggle is on). Defaults to base_dir.
+        self._mem_dir = Path(mem_dir) if mem_dir is not None else self._base_dir
         self._popen = popen
         self._api_factory = api_factory
         self._wait_socket = wait_socket or (lambda p: _default_wait_socket(p))
@@ -223,7 +253,13 @@ class FcSnapshotLauncher:
         except Exception:
             _terminate_proc(proc)
             raise
-        return _Handle(proc, api, str(workdir / REL_VSOCK), ready_check=ready)
+        return _Handle(
+            proc,
+            api,
+            str(workdir / REL_VSOCK),
+            ready_check=ready,
+            mem_dir=self._mem_dir,
+        )
 
     def restore_in(self, slot_workdir: Path):
         """Spawn a fresh firecracker in ``slot_workdir`` for a snapshot restore. The

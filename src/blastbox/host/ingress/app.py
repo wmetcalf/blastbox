@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
 import json
 import os
 import re
@@ -38,7 +37,7 @@ from prometheus_client import CONTENT_TYPE_LATEST
 from blastbox import __version__
 from blastbox.errors import sanitize_public_error
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
-from blastbox.host.jobs.memory import InMemoryJobStore
+from blastbox.host.jobs.factory import build_job_store_from_env
 from blastbox.limits import Limits
 from blastbox.observability import (
     configure_logging,
@@ -57,6 +56,10 @@ _log = get_logger("blastbox.ingress")
 # ---------------------------------------------------------------------------
 
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+# Bounds on client-supplied job params (persisted on the Job + forwarded to the dispatcher).
+_MAX_PARAMS = 64
+_MAX_PARAM_LEN = 4096
 
 
 def _safe_upload_name(raw: str | None) -> str:
@@ -113,14 +116,29 @@ def _safe_artifact_path(output_dir: Path, relative: str) -> Path | None:
 # ---------------------------------------------------------------------------
 
 
-def _zip_output_dir(output_dir: Path) -> bytes:
-    """Build a ZIP of all files under *output_dir* in memory (blocking)."""
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for f in sorted(output_dir.rglob("*")):
-            if f.is_file():
-                zf.write(f, arcname=f.relative_to(output_dir))
-    return buf.getvalue()
+def _zip_validated_artifacts(output_dir: Path, artifact_rels: list[str], dest) -> None:
+    """Write a ZIP of ONLY the dispatcher-validated artifacts (+ ``metadata.json``) to ``dest``
+    (a writable binary file object). The caller streams from a TEMP FILE, so the ZIP — up to
+    max_total_artifact_bytes — is never held in host memory.
+
+    A compromised worker can drop EXTRA undeclared files or a symlink (``output/leak ->
+    /etc/passwd``) into output/; we serve only the relative paths the trust gate declared in
+    ``metadata.json``, each run through ``_safe_artifact_path`` (resolve + containment) and
+    skipped if it is a symlink or not a regular file."""
+    seen: set[str] = set()
+    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for rel in ["metadata.json", *artifact_rels]:
+            if not rel or rel in seen:
+                continue
+            seen.add(rel)
+            # Don't follow a symlink to its (possibly outside) target...
+            if (output_dir / rel).is_symlink():
+                continue
+            # ...and resolve+confine (catches a symlink in any parent component too).
+            safe = _safe_artifact_path(output_dir, rel)
+            if safe is None or safe.is_symlink() or not safe.is_file():
+                continue
+            zf.write(safe, arcname=rel)
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +154,7 @@ def build_app(
     limits: Limits | None = None,
     api_workers: int | None = None,
     api_key: str | None = None,
+    metrics_public: bool | None = None,
 ) -> FastAPI:
     """Construct and return the blastbox ingress FastAPI application.
 
@@ -143,7 +162,8 @@ def build_app(
     ``BLASTBOX_*`` environment variables.
 
     Args:
-        job_store: Backing store (defaults to a fresh ``InMemoryJobStore``).
+        job_store: Backing store. Defaults to ``build_job_store_from_env()`` —
+                   ``BLASTBOX_DATABASE_URL`` (sqlite/postgres/redis) or an in-memory store.
         job_root: Directory under which job subdirectories are created.
                   Defaults to ``BLASTBOX_JOB_ROOT`` env var or
                   ``/var/lib/blastbox/jobs``.
@@ -154,12 +174,15 @@ def build_app(
                      ``BLASTBOX_API_WORKERS`` (clamped to [1, 64]).
         api_key: If set, installs ``BearerAuthMiddleware``; else warns.
                  Defaults to ``BLASTBOX_API_KEY`` env var.
+        metrics_public: Whether ``GET /metrics`` bypasses bearer auth.  Defaults to
+                        ``BLASTBOX_METRICS_PUBLIC`` (true unless ``false``/``0``/``no``/``off``).
+                        Only takes effect when ``api_key`` is set (otherwise nothing is gated).
     """
     configure_logging()
 
     _limits = limits or Limits.from_env()
 
-    _job_store: JobStore = job_store or InMemoryJobStore()
+    _job_store: JobStore = job_store or build_job_store_from_env()
 
     _job_root = job_root or Path(
         os.environ.get("BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs")
@@ -172,6 +195,13 @@ def build_app(
     else:
         raw_engines = os.environ.get("BLASTBOX_ALLOWED_ENGINES", "")
         _allowed_engines = {e.strip() for e in raw_engines.split(",") if e.strip()}
+    if not _allowed_engines:
+        # Don't let the ingress allowlist silently become a no-op: an empty set means ANY engine
+        # name is accepted (and spooled) before the dispatcher rejects unknown engines. Surface it.
+        _log.warning(
+            "engine_allowlist_unconfigured accepts_any_engine=true "
+            "fix=set_BLASTBOX_ALLOWED_ENGINES_or_pass_allowed_engines"
+        )
 
     # Concurrency gate (BLASTBOX_API_WORKERS)
     if api_workers is not None:
@@ -186,8 +216,18 @@ def build_app(
     # Security requirement 5: semaphore is actually wired to _api_workers.
     _intake_gate = asyncio.Semaphore(_api_workers)
 
+    # Bound concurrent in-memory result-ZIP builds (each up to max_total_artifact_bytes) so a
+    # burst of /result requests can't amplify into host memory pressure.
+    _result_gate = asyncio.Semaphore(max(1, min(_api_workers, 4)))
+
     # Bearer auth (requirement 4)
     _api_key = api_key if api_key is not None else os.environ.get("BLASTBOX_API_KEY", "").strip()
+    _metrics_public = (
+        metrics_public
+        if metrics_public is not None
+        else os.environ.get("BLASTBOX_METRICS_PUBLIC", "true").strip().lower()
+        not in ("false", "0", "no", "off")
+    )
 
     # -------------------------------------------------------------------
     # App + middleware
@@ -199,8 +239,10 @@ def build_app(
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=_limits.max_input_bytes)
 
     if _api_key:
-        app.add_middleware(BearerAuthMiddleware, api_key=_api_key)
-        _log.info("api_auth_enabled", scheme="bearer")
+        app.add_middleware(
+            BearerAuthMiddleware, api_key=_api_key, metrics_public=_metrics_public
+        )
+        _log.info("api_auth_enabled", scheme="bearer", metrics_public=_metrics_public)
     else:
         _log.warning(
             "api_auth_disabled",
@@ -266,10 +308,15 @@ def build_app(
     @app.get("/v1/readyz")
     def readyz():
         try:
-            _job_store.list()
+            # Cheapest store round-trip that proves connectivity — a bare COUNT on SQL,
+            # never a full materialization of the jobs table.
+            _job_store.count()
             return {"status": "ready"}
         except Exception as exc:
-            raise HTTPException(503, f"store unavailable: {_public_detail(exc)}")
+            # Never echo the store exception to an unauthenticated caller — it can carry the DB
+            # host:port / DSN. Log the real cause server-side; return a generic 503.
+            _log.warning("readyz_store_unavailable", error=str(exc))
+            raise HTTPException(503, "store unavailable") from exc
 
     @app.get("/v1/version")
     def version():
@@ -320,9 +367,15 @@ def build_app(
                 safe=safe_name,
             )
 
-        # Parse params: accept "key=value" strings or plain "key" strings.
+        # Bound params at ingest: cap count + entry length so a hostile client can't bloat the
+        # persisted job (and amplify the full-list job listing). Reject (400) rather than
+        # silently truncate. (The dispatcher additionally key-allowlists + length-caps for env.)
+        if len(params) > _MAX_PARAMS:
+            raise HTTPException(400, f"too many params (max {_MAX_PARAMS})")
         parsed_params: dict[str, str] = {}
         for p in params:
+            if len(p) > _MAX_PARAM_LEN:
+                raise HTTPException(400, f"param too long (max {_MAX_PARAM_LEN} chars)")
             if "=" in p:
                 k, _, v = p.partition("=")
                 parsed_params[k.strip()] = v.strip()
@@ -353,7 +406,9 @@ def build_app(
 
         except Exception as exc:
             shutil.rmtree(root, ignore_errors=True)
-            raise HTTPException(500, _public_detail(exc)) from exc
+            # Don't reflect the spool exception (could carry internal paths/details). Log it.
+            _log.warning("upload_spool_failed", error=str(exc))
+            raise HTTPException(500, "upload failed") from exc
 
         job.input_sha256 = sha256
         job.result_dir = str(output_dir)
@@ -362,7 +417,9 @@ def build_app(
             _job_store.create(job)
         except Exception as exc:
             shutil.rmtree(root, ignore_errors=True)
-            raise HTTPException(500, _public_detail(exc)) from exc
+            # Don't reflect the store exception (DB driver errors carry host:port/DSN). Log it.
+            _log.warning("job_store_create_failed", error=str(exc))
+            raise HTTPException(503, "store unavailable") from exc
 
         record_job_submitted(engine, nbytes)
 
@@ -391,6 +448,12 @@ def build_app(
         deployment is expected to run behind an auth proxy that enforces
         per-tenant access.
         """
+        # Clamp pagination defensively — a negative offset slices from the end and a huge/negative
+        # limit is nonsensical.  The store pushes this window down (SQL: ORDER BY ... LIMIT ...
+        # OFFSET + a COUNT(*) for total), so a large jobs table never fully materializes here.
+        offset = max(0, offset)
+        limit = max(1, min(limit, 1000))
+
         filter_status: JobStatus | None = None
         if status:
             try:
@@ -398,10 +461,10 @@ def build_app(
             except ValueError:
                 raise HTTPException(400, f"unknown status: {status!r}")
 
-        jobs = _job_store.list(status=filter_status)
-        jobs.sort(key=lambda j: j.created_at, reverse=True)
-        total = len(jobs)
-        page = jobs[offset : offset + limit]
+        total = _job_store.count(status=filter_status)
+        page = _job_store.list(
+            status=filter_status, limit=limit, offset=offset, newest_first=True
+        )
         return {
             "jobs": [j.to_public_dict() for j in page],
             "total": total,
@@ -433,7 +496,9 @@ def build_app(
         if not out.is_dir():
             raise HTTPException(410, "result expired")
         meta_json = out / "metadata.json"
-        if not meta_json.is_file():
+        # Reject a symlinked metadata.json (don't follow it to an outside target) — mirrors
+        # _zip_validated_artifacts; defense-in-depth even though output/ is not live at serve time.
+        if meta_json.is_symlink() or not meta_json.is_file():
             raise HTTPException(404, "metadata.json not found")
         from fastapi.responses import FileResponse
         return FileResponse(meta_json, media_type="application/json")
@@ -457,7 +522,7 @@ def build_app(
             raise HTTPException(410, "result expired")
 
         meta_json = out / "metadata.json"
-        if not meta_json.is_file():
+        if meta_json.is_symlink() or not meta_json.is_file():
             raise HTTPException(404, "metadata.json not found")
 
         try:
@@ -478,9 +543,12 @@ def build_app(
             raise HTTPException(404, f"artifact {artifact_id!r} not found")
 
         artifact_rel_path = matched.get("path", "")
-        # Requirement 3: containment check
+        # Requirement 3: containment check + reject a symlinked artifact (don't follow it to an
+        # outside target), mirroring _zip_validated_artifacts.
+        if (out / artifact_rel_path).is_symlink():
+            raise HTTPException(404, "artifact file not found")
         safe = _safe_artifact_path(out, artifact_rel_path)
-        if safe is None or not safe.is_file():
+        if safe is None or safe.is_symlink() or not safe.is_file():
             raise HTTPException(404, "artifact file not found")
 
         from fastapi.responses import FileResponse
@@ -488,18 +556,63 @@ def build_app(
 
     @app.get("/v1/jobs/{job_id}/result")
     async def get_result(job_id: str):
-        """Stream a ZIP of the entire ``output/`` directory."""
+        """Stream a ZIP of the dispatcher-validated artifacts (+ ``metadata.json``).
+
+        Serves only the artifact paths declared in the validated ``metadata.json`` — NOT a
+        blind walk of output/ — so a compromised worker's undeclared/symlinked files are not
+        disclosed (see ``_zip_validated_artifacts``).
+        """
         _validate_job_id(job_id)
         _require_done(job_id)
         out = _output_dir_for(job_id)
         if not out.is_dir():
             raise HTTPException(410, "result expired")
 
-        zip_bytes = await asyncio.to_thread(_zip_output_dir, out)
-        return Response(
-            content=zip_bytes,
+        meta_json = out / "metadata.json"
+        if meta_json.is_symlink() or not meta_json.is_file():
+            raise HTTPException(404, "metadata.json not found")
+        try:
+            meta = json.loads(meta_json.read_bytes())
+        except Exception:
+            raise HTTPException(500, "could not parse metadata.json")
+        rels = [
+            a["path"]
+            for a in meta.get("artifacts", [])
+            if isinstance(a, dict) and isinstance(a.get("path"), str)
+        ]
+
+        import tempfile
+
+        from fastapi.responses import FileResponse
+        from starlette.background import BackgroundTask
+
+        def _build_zip() -> str:
+            fd, tmp_path = tempfile.mkstemp(prefix="bbresult-", suffix=".zip")
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    _zip_validated_artifacts(out, rels, fh)
+                return tmp_path
+            except BaseException:
+                os.unlink(tmp_path)
+                raise
+
+        async with _result_gate:  # bound concurrent ZIP BUILDS (now disk-backed, not in-memory)
+            tmp_path = await asyncio.to_thread(_build_zip)
+        # Stream from the temp file (constant memory) + delete it after the response is sent.
+        #
+        # The gate is released after the BUILD, not held across streaming — deliberately. Each
+        # temp ZIP is size-bounded (<= max_total_artifact_bytes, enforced before the job reaches
+        # DONE) and cleanup is GUARANTEED (BackgroundTask below + _build_zip's except-unlink), so
+        # the only residual is the COUNT of concurrent slow downloads each pinning one bounded
+        # temp file. Holding this small gate (<= 4) across streaming would let a few slowloris
+        # readers block ALL /result callers — strictly worse. Generic slow-read DoS is delegated
+        # to the upstream proxy / ASGI read timeouts (per the deployment model); for a hard disk
+        # bound, mount the ingress temp dir ($TMPDIR) on a size-capped tmpfs (fails closed -> 500).
+        return FileResponse(
+            tmp_path,
             media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{job_id}.zip"'},
+            filename=f"{job_id}.zip",
+            background=BackgroundTask(os.unlink, tmp_path),
         )
 
     @app.delete("/v1/jobs/{job_id}")

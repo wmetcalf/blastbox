@@ -22,6 +22,10 @@ from uuid import uuid4
 
 import pytest
 
+from blastbox.contract.envelope import DeclaredArtifact, seal_envelope
+from blastbox.contract.leaf import Detection
+from blastbox.contract.nodes import ExtractedText
+from blastbox.errors import OutputTrustError
 from blastbox.host.dispatch import Dispatcher, EngineSpec
 from blastbox.host.jobs.base import Job, JobStatus
 from blastbox.host.jobs.memory import InMemoryJobStore
@@ -259,8 +263,9 @@ class _RecordingVsockControl:
         self.slot = slot
         self.spec: Any = None
 
-    def signal_go(self, spec: Any) -> None:
+    def signal_go(self, spec: Any, *, deadline: float | None = None) -> None:
         self.spec = spec
+        self.deadline = deadline
 
     def wait_for_done(self, *, timeout_s: float) -> str:
         return "ok"
@@ -454,6 +459,39 @@ def test_1_warm_happy_path(tmp_path):
     # slot input dir copy must be gone too
     slot_input = slot.input_dir / Path(job.filename).name
     assert not slot_input.exists()
+
+
+def test_warm_done_cas_fenced_against_concurrent_recovery(tmp_path):
+    """If a peer dispatcher FAILs the warm job as stale WHILE this owner is processing, the
+    owner's terminal DONE write must NOT resurrect it (first-writer-wins) — otherwise a recovered/
+    retention-expired job flips back to DONE with a self-contradictory 'owner gone' record."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)
+
+    # Fake worker writes valid output AND simulates a concurrent peer recovery: CAS-fail the
+    # still-RUNNING job before signaling done, so the owner's later DONE must be fenced out.
+    def _output_then_peer_recovers(out_dir):
+        _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA)
+        assert store.update_if_status(
+            job.job_id, JobStatus.RUNNING, status=JobStatus.FAILED, error="peer recovered (stale)"
+        )
+
+    _start_fake_worker(slot, output_fn=_output_then_peer_recovers)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10
+    )
+    dispatcher.dispatch_once()
+
+    final = store.get(job.job_id)
+    assert final.status == JobStatus.FAILED  # DONE did NOT resurrect the peer-recovered job
+    assert final.error == "peer recovered (stale)"
+    assert final.result_summary is None  # the DONE write (with result_summary) never applied
 
 
 # ===========================================================================
@@ -731,3 +769,166 @@ def test_6_image_never_job_derived_in_warm_mode(tmp_path):
     # Pool release was called (confirming warm path was used)
     assert len(pool.release_calls) == 1
     assert pool.release_calls[0] is slot
+
+
+# ===========================================================================
+# Warm-output materialize trust gate (symlink overwrite + live-dir swap/grow)
+# ===========================================================================
+
+
+def _det() -> Detection:
+    return Detection(label="docx", mime="x", confidence=1.0, source="magika")
+
+
+def _seal_over(src_dir: Path, *, content: bytes, path: str = "page-001.png"):
+    """Seal an envelope over a freshly-written src artifact (sha/bytes from its current content)."""
+    src_dir.mkdir(parents=True, exist_ok=True)
+    (src_dir / path).write_bytes(content)
+    return seal_envelope(
+        engine=_ENGINE_NAME,
+        outdir=src_dir,
+        input_sha256=_INPUT_SHA,
+        detected=_det(),
+        declared=[DeclaredArtifact(id="page-001", path=path, kind="image")],
+        warnings=[],
+        payload=ExtractedText(text="x", char_count=1),
+    )
+
+
+def test_materialize_defeats_destination_symlink(tmp_path):
+    """The trust-boundary MED: a cold attempt of this job can plant a symlink in the REUSED
+    job_root/<id>/output dir; a requeue→warm materialize must NOT follow it to overwrite a host
+    file. The sealed artifact lands as a real confined file; the outside target is untouched."""
+    store = InMemoryJobStore()
+    disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs")
+    src = tmp_path / "slot_out"
+    env = _seal_over(src, content=b"REAL-PNG-BYTES")
+
+    dst = tmp_path / "job_out"
+    dst.mkdir()
+    outside = tmp_path / "victim"
+    outside.write_bytes(b"ORIGINAL")
+    (dst / "page-001.png").symlink_to(outside)  # cold-worker-planted symlink in the reused dir
+
+    disp._materialize_sealed_warm_output(env, src, dst)
+
+    assert outside.read_bytes() == b"ORIGINAL"  # host file NOT overwritten
+    assert not (dst / "page-001.png").is_symlink()
+    assert (dst / "page-001.png").read_bytes() == b"REAL-PNG-BYTES"
+    assert (dst / "metadata.json").exists()
+
+
+def test_materialize_detects_content_swap(tmp_path):
+    """A still-live worker swapping the artifact's content (same length) after sealing must fail
+    the re-hash and publish nothing."""
+    store = InMemoryJobStore()
+    disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs")
+    src = tmp_path / "slot_out"
+    env = _seal_over(src, content=b"ORIGINAL-X")  # 10 bytes
+    (src / "page-001.png").write_bytes(b"SWAPPED-YZ")  # 10 bytes, different content -> sha mismatch
+
+    dst = tmp_path / "job_out"
+    with pytest.raises(OutputTrustError):
+        disp._materialize_sealed_warm_output(env, src, dst)
+    assert not (dst / "page-001.png").exists()  # nothing published on a swap
+
+
+def test_materialize_rejects_oversize_growth(tmp_path):
+    """A worker growing the artifact past its sealed size during the copy is capped + fails."""
+    store = InMemoryJobStore()
+    disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs")
+    src = tmp_path / "slot_out"
+    env = _seal_over(src, content=b"SMALL")  # sealed bytes = 5
+    (src / "page-001.png").write_bytes(b"SMALL" + b"X" * 4096)  # grew past
+
+    dst = tmp_path / "job_out"
+    with pytest.raises(OutputTrustError):
+        disp._materialize_sealed_warm_output(env, src, dst)
+    assert not (dst / "page-001.png").exists()
+
+
+def test_requeue_recovers_only_stale_warm_jobs(tmp_path, monkeypatch):
+    """Warm jobs have no docker label, so they're recovered on TIME and FAILED (terminal) — NOT
+    requeued (a second worker would re-detonate the same untrusted input). A warm job still
+    RUNNING past worker_timeout_s + grace (owner gone) is failed; a younger one (possibly live)
+    is left alone. Cold jobs requeue via the docker-ps + grace path."""
+    store = InMemoryJobStore()
+    disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs", worker_timeout_s=30)
+    monkeypatch.setattr(disp, "_list_active_worker_job_ids", lambda: set())  # docker ps: none active
+    now = time.time()
+
+    # Young warm job (within worker_timeout_s=30 + grace): could be live -> left alone.
+    live_warm = Job.new(engine=_ENGINE_NAME, filename="live.docx")
+    live_warm.status = JobStatus.RUNNING
+    live_warm.worker_runtime = "warm"
+    live_warm.started_at = now - 5
+    store.create(live_warm)
+
+    # Stale warm job (past worker_timeout_s + grace, ~90s): owner gone -> FAILED (not requeued).
+    stale_warm = Job.new(engine=_ENGINE_NAME, filename="stale.docx")
+    stale_warm.status = JobStatus.RUNNING
+    stale_warm.worker_runtime = "warm"
+    stale_warm.started_at = now - 600
+    store.create(stale_warm)
+
+    # Cold orphan -> requeued via the docker-ps path.
+    cold = Job.new(engine=_ENGINE_NAME, filename="cold.docx")
+    cold.status = JobStatus.RUNNING
+    cold.worker_runtime = "runsc"
+    cold.started_at = now - 600
+    store.create(cold)
+
+    recovered = disp.requeue_orphaned_jobs()
+
+    assert recovered == 2  # stale warm (failed) + cold (requeued)
+    assert store.get(live_warm.job_id).status == JobStatus.RUNNING  # live warm protected
+    failed = store.get(stale_warm.job_id)
+    assert failed.status == JobStatus.FAILED  # crashed-owner warm -> terminal, never re-detonated
+    assert "recovered: warm worker owner gone" in failed.security_warnings
+    assert store.get(cold.job_id).status == JobStatus.QUEUED
+
+
+def test_requeue_warm_recovery_runs_when_docker_probe_fails(tmp_path, monkeypatch):
+    """Warm recovery is TIME-based and must NOT be gated by the docker probe — a docker ps
+    failure (returns None) still recovers a stale warm job, while cold requeue is skipped."""
+    store = InMemoryJobStore()
+    disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs", worker_timeout_s=30)
+    monkeypatch.setattr(disp, "_list_active_worker_job_ids", lambda: None)  # docker ps FAILED
+    now = time.time()
+
+    stale_warm = Job.new(engine=_ENGINE_NAME, filename="warm.docx")
+    stale_warm.status = JobStatus.RUNNING
+    stale_warm.worker_runtime = "warm"
+    stale_warm.started_at = now - 600
+    store.create(stale_warm)
+
+    cold = Job.new(engine=_ENGINE_NAME, filename="cold.docx")
+    cold.status = JobStatus.RUNNING
+    cold.worker_runtime = "runsc"
+    cold.started_at = now - 600
+    store.create(cold)
+
+    recovered = disp.requeue_orphaned_jobs()
+    assert recovered == 1  # warm recovered despite the docker-probe failure
+    assert store.get(stale_warm.job_id).status == JobStatus.FAILED
+    assert store.get(cold.job_id).status == JobStatus.RUNNING  # cold requeue skipped (docker down)
+
+
+def test_warm_recovery_deletes_stale_input(tmp_path, monkeypatch):
+    """A recovered (owner-gone) warm job's staged input is deleted by the sweep — the gone owner
+    won't clean up, so without this the untrusted input would leak when retention is disabled."""
+    store = InMemoryJobStore()
+    disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs", worker_timeout_s=30)
+    monkeypatch.setattr(disp, "_list_active_worker_job_ids", lambda: set())
+
+    job = Job.new(engine=_ENGINE_NAME, filename="stale.docx")
+    job.status = JobStatus.RUNNING
+    job.worker_runtime = "warm"
+    job.started_at = time.time() - 600
+    store.create(job)
+    input_path = _setup_job_dirs(tmp_path / "jobs", job)
+    assert input_path.exists()
+
+    assert disp.requeue_orphaned_jobs() == 1
+    assert store.get(job.job_id).status == JobStatus.FAILED
+    assert not input_path.exists()  # recovered job's input cleaned up by the sweep

@@ -172,6 +172,161 @@ def test_send_recv_frame_roundtrip():
         b.close()
 
 
+def test_send_frame_from_file_wire_identical_to_send_frame(tmp_path):
+    # Streaming the body from disk must produce the exact same wire bytes as
+    # send_frame(sock, path.read_bytes()) so the guest's recv_frame is unaffected.
+    from blastbox.worker.fc_guest import send_frame_from_file
+
+    body = b"".join(bytes([i % 256]) for i in range(200_000))  # > one 64 KiB chunk
+    p = tmp_path / "input.bin"
+    p.write_bytes(body)
+
+    a, b = socket.socketpair()
+    try:
+        ret = send_frame_from_file(a, p, chunk=64 * 1024)
+        assert ret == len(body)
+        assert recv_frame(b, max_len=len(body) + 16) == body  # reassembles identically
+    finally:
+        a.close()
+        b.close()
+
+
+def test_send_frame_from_file_streams_in_chunks(tmp_path):
+    # Prove it never materializes the whole file: record every sendall() and assert no single
+    # write exceeds the chunk size + the 8-byte length prefix (i.e. no read_bytes()+concat copy).
+    from blastbox.worker.fc_guest import send_frame_from_file
+
+    p = tmp_path / "big.bin"
+    p.write_bytes(b"Z" * 300_000)
+
+    class _Rec:
+        def __init__(self) -> None:
+            self.writes: list[int] = []
+
+        def sendall(self, data: bytes) -> None:
+            self.writes.append(len(data))
+
+    rec = _Rec()
+    send_frame_from_file(rec, p, chunk=64 * 1024)
+    assert rec.writes[0] == 8  # length prefix sent on its own
+    assert max(rec.writes[1:]) <= 64 * 1024  # body never sent as one giant buffer
+    assert sum(rec.writes[1:]) == 300_000  # all bytes accounted for
+
+
+def test_send_frame_from_file_zero_pads_short_read(tmp_path):
+    # Belt-and-suspenders: if the file shrinks below its announced stat size, the frame is
+    # padded to length so the peer's recv_exact never blocks (the doc just fails to parse).
+    from blastbox.worker.fc_guest import send_frame_from_file
+
+    p = tmp_path / "shrinks.bin"
+    p.write_bytes(b"abcd")
+
+    class _ShrinkFile:
+        """stat() reports 8 bytes but the stream only yields 4 — simulates a truncation race."""
+
+        def stat(self):
+            import os as _os
+
+            real = p.stat()
+            return _os.stat_result((real.st_mode, 0, 0, 1, 0, 0, 8, 0, 0, 0))
+
+        def open(self, mode):
+            return p.open(mode)
+
+    a, b = socket.socketpair()
+    try:
+        send_frame_from_file(a, _ShrinkFile(), chunk=64 * 1024)
+        frame = recv_frame(b, max_len=100)
+        assert len(frame) == 8 and frame[:4] == b"abcd" and frame[4:] == b"\x00\x00\x00\x00"
+    finally:
+        a.close()
+        b.close()
+
+
+def test_send_frame_from_file_pads_short_read_in_bounded_chunks(tmp_path):
+    """A large post-stat shrink must pad in bounded chunks — never allocate (size - sent) at
+    once — so the chunked memory bound holds even on a truncation race."""
+    from blastbox.worker.fc_guest import send_frame_from_file
+
+    real = tmp_path / "real.bin"
+    real.write_bytes(b"abc")  # only 3 real bytes on disk
+
+    class _BigStat:
+        """stat() claims 5 MB but the stream yields 3 bytes -> ~5 MB of zero-pad."""
+
+        def stat(self):
+            import os as _os
+
+            r = real.stat()
+            return _os.stat_result((r.st_mode, 0, 0, 1, 0, 0, 5_000_000, 0, 0, 0))
+
+        def open(self, mode):
+            return real.open(mode)
+
+    class _Rec:
+        def __init__(self):
+            self.max_write = 0
+            self.total = 0
+
+        def settimeout(self, t):
+            pass
+
+        def sendall(self, b):
+            self.max_write = max(self.max_write, len(b))
+            self.total += len(b)
+
+    rec = _Rec()
+    send_frame_from_file(rec, _BigStat(), chunk=64 * 1024)
+    assert rec.max_write <= 64 * 1024  # never one giant ~5 MB buffer
+    assert rec.total == 8 + 5_000_000  # 8-byte length prefix + announced size (3 real + pad)
+
+
+def test_send_frame_from_file_honors_deadline(tmp_path):
+    """An already-passed deadline aborts the send so a slow-reading guest can't pin the host."""
+    import time
+
+    from blastbox.worker.fc_guest import send_frame_from_file
+
+    p = tmp_path / "in.bin"
+    p.write_bytes(b"x" * 200_000)
+
+    class _Sock:
+        def settimeout(self, t):
+            pass
+
+        def sendall(self, b):
+            pass
+
+    with pytest.raises(TimeoutError):
+        send_frame_from_file(_Sock(), p, deadline=time.monotonic() - 1.0)
+
+
+def test_send_frame_from_file_sets_per_send_timeout_from_deadline(tmp_path):
+    """With a future deadline, each sendall is bounded by the remaining time."""
+    import time
+
+    from blastbox.worker.fc_guest import send_frame_from_file
+
+    p = tmp_path / "in.bin"
+    p.write_bytes(b"y" * 100_000)
+
+    class _Rec:
+        def __init__(self):
+            self.timeouts = []
+            self.body = bytearray()
+
+        def settimeout(self, t):
+            self.timeouts.append(t)
+
+        def sendall(self, b):
+            self.body += b
+
+    rec = _Rec()
+    send_frame_from_file(rec, p, deadline=time.monotonic() + 30.0)
+    assert rec.timeouts and all(t > 0 for t in rec.timeouts)  # every send bounded
+    assert rec.body[8:] == b"y" * 100_000  # body intact after the length prefix
+
+
 def test_multiple_frames_preserved_in_order():
     a, b = socket.socketpair()
     try:

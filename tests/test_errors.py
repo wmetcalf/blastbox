@@ -129,3 +129,11 @@ def test_detonation_error_no_cause():
 def test_validation_error_hierarchy():
     e = ValidationError("bad envelope")
     assert isinstance(e, BlastboxError)
+
+
+def test_sanitize_public_error_redacts_dsn_credentials():
+    from blastbox.errors import sanitize_public_error
+    out = sanitize_public_error("conn failed: postgresql://u:secret@db.internal:5432/jobs")
+    assert "secret" not in out and "<redacted>" in out
+    out2 = sanitize_public_error("could not connect host=db.internal port=5432 password=hunter2")
+    assert "hunter2" not in out2 and "db.internal" not in out2 and "5432" not in out2

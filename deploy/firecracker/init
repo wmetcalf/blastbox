@@ -26,11 +26,14 @@ mount -t devtmpfs dev /dev 2>/dev/null
 # tmpfs /tmp, sticky world-writable (1777) so the non-root agent can create
 # /tmp/in (input scratch) and any tool profiles. Kept OFF the output disk so
 # rdump returns only artifacts + metadata.json.
-mount -t tmpfs -o mode=1777 tmpfs /tmp 2>/dev/null
+mount -t tmpfs -o mode=1777 tmpfs /tmp 2>/dev/null \
+    || echo "blastbox-fc-guest: WARNING /tmp tmpfs mount failed; scratch lands on the read-only root (conversions will fail-closed, not leak)" > /dev/console 2>&1
 mkdir -p /mnt/outdisk 2>/dev/null
-mount -t ext4 /dev/vdb /mnt/outdisk 2>/dev/null
+mount -t ext4 /dev/vdb /mnt/outdisk 2>/dev/null \
+    || echo "blastbox-fc-guest: ERROR /dev/vdb -> /mnt/outdisk mount failed; no output will be captured" > /dev/console 2>&1
 # The fresh ext4 root dir is owned by root; hand it to the non-root agent.
-chown "$DROP_USER:$DROP_USER" /mnt/outdisk 2>/dev/null
+chown "$DROP_USER:$DROP_USER" /mnt/outdisk 2>/dev/null \
+    || echo "blastbox-fc-guest: ERROR chown /mnt/outdisk to $DROP_USER failed; agent cannot write output" > /dev/console 2>&1
 
 # Bring up loopback. FC guests boot with lo DOWN; warm-UNO's unoserver binds
 # soffice on 127.0.0.1 (and unoconvert connects there), so without this the UNO
@@ -44,3 +47,7 @@ echo "blastbox-fc-guest: init up, dropping to $DROP_USER" > /dev/console 2>/dev/
 # inherited by the unprivileged process and go to the serial console (fc.log).
 exec setpriv --reuid "$DROP_USER" --regid "$DROP_USER" --clear-groups \
     python3 /opt/blastbox/run_guest.py > /dev/console 2>&1
+# exec only returns if it FAILED — surface it loudly instead of letting PID 1 die into a
+# silent kernel panic / hung VM, so the host's fc.log shows the cause.
+echo "blastbox-fc-guest: FATAL setpriv/exec of run_guest.py failed (rc=$?)" > /dev/console 2>&1
+exit 1

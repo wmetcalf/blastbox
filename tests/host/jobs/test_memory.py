@@ -73,6 +73,21 @@ def test_list_all():
     assert j2.job_id in ids
 
 
+def test_update_rejects_unknown_field():
+    # Parity with SQL (_COLUMNS) and Redis (_JOB_FIELDS): an unknown/typo'd field name must
+    # fail closed, not silently setattr a junk attribute that prod stores would reject.
+    store = InMemoryJobStore()
+    job = _make_job()
+    store.create(job)
+    with pytest.raises(ValueError):
+        store.update(job.job_id, malicious_col="bad")
+    with pytest.raises(ValueError):
+        store.update(job.job_id, **{"status; DROP TABLE jobs": "x"})
+    # A valid field still succeeds.
+    updated = store.update(job.job_id, status=JobStatus.RUNNING)
+    assert updated.status == JobStatus.RUNNING
+
+
 def test_list_by_status():
     store = InMemoryJobStore()
     j1 = _make_job(filename="a.docx")

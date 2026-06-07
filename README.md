@@ -93,17 +93,31 @@ pip install blastbox[host]     # + the host orchestrator (FastAPI, jobstores, ob
 ## Run (host)
 
 ```sh
+# serve + dispatch are SEPARATE processes — point both at a SHARED job store:
+export BLASTBOX_DATABASE_URL=sqlite:////var/lib/blastbox/jobs.db   # or postgresql://… / redis://…
 blastbox serve     --host 127.0.0.1 --port 8000     # the ingress API
 blastbox dispatch                                    # the worker dispatcher loop
 ```
+
+> **`BLASTBOX_DATABASE_URL` is required for the two-process flow above.** Unset, each command
+> uses its own in-memory store, so jobs submitted to `serve` are invisible to `dispatch` (a
+> warning is logged). `sqlite:///…`, `postgresql://…`, and `redis://…` are supported.
 
 `POST /v1/jobs` (multipart `file` + `engine`) enqueues a job; the dispatcher launches a hardened
 disposable worker for it; `GET /v1/jobs/{id}/artifacts/{artifact_id}` serves validated output.
 
 ## Security model
 
-- Disposable worker per job: `--network=none --cap-drop=ALL --no-new-privileges --read-only`, runsc
-  preferred (fail-closed when a secure runtime is required); the input is deleted after conversion.
+- Disposable worker per job: `--network=none --cap-drop=ALL --no-new-privileges --read-only`; the
+  input is deleted after conversion.
+- **runsc (gVisor) is required by default — fail-closed.** If no secure runtime is available the
+  dispatcher refuses the job *early* with an actionable `InsecureRuntimeRefused` (rather than letting
+  the worker start and fail its own sandbox self-check opaquely). To run **without** gVisor, the
+  operator must explicitly opt in with **`BLASTBOX_ALLOW_RUNC=1`** — that runs the worker under plain
+  `runc` in deliberate degraded mode (no gVisor isolation; the per-job warning is recorded, and the
+  worker is told to run its self-check leniently). `BLASTBOX_REQUIRE_SECURE_RUNTIME=1` is a hard
+  lockdown that refuses `runc` even when `BLASTBOX_ALLOW_RUNC` is set. (`BLASTBOX_WORKER_RUNTIME=runc`
+  forces the runtime but still needs the `ALLOW_RUNC` consent flag.)
 - The host re-seals worker output from disk — worker-reported hashes/sizes are never trusted; artifact
   paths are confined; the input-SHA round-trip is checked; `metadata.json` must be a regular file.
 - Ingress rejects oversized bodies before spooling, sanitizes filenames, serves artifacts by id under

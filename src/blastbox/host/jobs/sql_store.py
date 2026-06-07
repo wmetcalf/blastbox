@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -34,6 +35,7 @@ _COLUMNS = (
     "security_warnings",
     "params",
     "result_summary",
+    "claim_id",
 )
 
 # Fields whose values are JSON-serialised for storage.
@@ -75,7 +77,8 @@ class SqlJobStore:
             return "sqlite", "?"
         if scheme in {"postgres", "postgresql"}:
             return "postgres", "%s"
-        raise ValueError(f"unsupported database url: {database_url!r}")
+        # Report only the scheme — never the full DSN (it carries credentials).
+        raise ValueError(f"unsupported database url scheme: {scheme!r} (use sqlite/postgresql)")
 
     @contextmanager
     def _connect(self):
@@ -127,7 +130,8 @@ class SqlJobStore:
             error             TEXT,
             security_warnings TEXT,
             params            TEXT,
-            result_summary    TEXT
+            result_summary    TEXT,
+            claim_id          TEXT
         )
         """
         with self._lock, self._connect() as conn:
@@ -137,7 +141,7 @@ class SqlJobStore:
     def _ensure_columns(self, conn) -> None:
         """Add any columns that don't exist yet (forward-compat migrations)."""
         existing = self._existing_columns(conn)
-        for col in ("engine", "params", "result_summary"):
+        for col in ("engine", "params", "result_summary", "claim_id"):
             if col not in existing:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
 
@@ -225,15 +229,77 @@ class SqlJobStore:
             raise KeyError(job_id)
         return job
 
-    def list(self, status: JobStatus | None = None) -> list[Job]:
+    def update_if_status(
+        self,
+        job_id: str,
+        expect_status: JobStatus,
+        *,
+        expect_claim_id: str | None = None,
+        **fields,
+    ) -> bool:
+        """Compare-and-set: ``UPDATE ... WHERE job_id = ? AND status = ?`` (and ``AND claim_id = ?``
+        when ``expect_claim_id`` is given) — applies only while the row still matches (rowcount==1),
+        like ``claim_next``'s QUEUED guard. The claim_id guard closes the status-only ABA hole."""
+        for key in fields:
+            if key not in _COLUMNS:
+                raise ValueError(f"invalid column: {key!r}")
+        guard_sql = f"WHERE job_id = {self._param} AND status = {self._param}"
+        guard_params: tuple = (job_id, expect_status.value)
+        if expect_claim_id is not None:
+            guard_sql += f" AND claim_id = {self._param}"
+            guard_params += (expect_claim_id,)
+        if not fields:
+            sql = f"SELECT 1 FROM jobs {guard_sql}"
+            with self._lock, self._connect() as conn:
+                return conn.execute(sql, guard_params).fetchone() is not None
+        encoded = {key: self._encode_value(key, value) for key, value in fields.items()}
+        set_clause = ", ".join(f"{key} = {self._param}" for key in encoded)
+        sql = f"UPDATE jobs SET {set_clause} {guard_sql}"
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(sql, tuple(encoded.values()) + guard_params)
+            return cur.rowcount == 1
+
+    def list(
+        self,
+        status: JobStatus | None = None,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        newest_first: bool = False,
+    ) -> list[Job]:
         sql = f"SELECT {', '.join(_COLUMNS)} FROM jobs"
+        params: list = []
+        if status is not None:
+            sql += f" WHERE status = {self._param}"
+            params.append(status.value)
+        if newest_first:
+            sql += " ORDER BY created_at DESC, job_id DESC"
+        # Push the page window into the query so large tables never fully
+        # materialize.  SQLite requires a LIMIT clause syntactically before
+        # OFFSET, so a bare offset gets the unbounded sentinel ``LIMIT -1``;
+        # Postgres accepts OFFSET alone.
+        eff_limit = limit
+        if offset and eff_limit is None and self._driver == "sqlite":
+            eff_limit = -1
+        if eff_limit is not None:
+            sql += f" LIMIT {self._param}"
+            params.append(int(eff_limit))
+        if offset:
+            sql += f" OFFSET {self._param}"
+            params.append(int(offset))
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [job for row in rows if (job := self._row_to_job(row)) is not None]
+
+    def count(self, status: JobStatus | None = None) -> int:
+        sql = "SELECT COUNT(*) FROM jobs"
         params: tuple = ()
         if status is not None:
             sql += f" WHERE status = {self._param}"
             params = (status.value,)
         with self._lock, self._connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
-        return [job for row in rows if (job := self._row_to_job(row)) is not None]
+            row = conn.execute(sql, params).fetchone()
+        return int(row[0]) if row else 0
 
     def claim_next(self) -> Job | None:
         if self._driver == "sqlite":
@@ -253,7 +319,8 @@ class SqlJobStore:
         # EXPIRED) flipping it between the SELECT and UPDATE — without it,
         # such a transition would be silently clobbered back to RUNNING.
         update_sql = (
-            f"UPDATE jobs SET status = {self._param}, started_at = {self._param} "
+            f"UPDATE jobs SET status = {self._param}, started_at = {self._param}, "
+            f"claim_id = {self._param} "
             f"WHERE job_id = {self._param} AND status = {self._param}"
         )
         with self._lock, self._connect() as conn:
@@ -265,11 +332,13 @@ class SqlJobStore:
             if job is None:
                 return None
             started_at = time.time()
+            claim_id = uuid.uuid4().hex  # fresh ownership token per claim
             cur = conn.execute(
                 update_sql,
                 (
                     JobStatus.RUNNING.value,
                     started_at,
+                    claim_id,
                     job.job_id,
                     JobStatus.QUEUED.value,
                 ),
@@ -279,6 +348,7 @@ class SqlJobStore:
                 return None
             job.status = JobStatus.RUNNING
             job.started_at = started_at
+            job.claim_id = claim_id
             return job
 
     def _claim_next_postgres(self) -> Job | None:
@@ -293,12 +363,17 @@ class SqlJobStore:
             LIMIT 1
         )
         UPDATE jobs
-        SET status = {self._param}, started_at = {self._param}
+        SET status = {self._param}, started_at = {self._param}, claim_id = {self._param}
         FROM next_job
         WHERE jobs.job_id = next_job.job_id
         RETURNING {cols_jobs}
         """
-        params = (JobStatus.QUEUED.value, JobStatus.RUNNING.value, time.time())
+        params = (
+            JobStatus.QUEUED.value,
+            JobStatus.RUNNING.value,
+            time.time(),
+            uuid.uuid4().hex,  # fresh ownership token per claim
+        )
         with self._lock, self._connect() as conn:
             row = conn.execute(sql, params).fetchone()
         return self._row_to_job(row)

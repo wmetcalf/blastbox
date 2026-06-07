@@ -20,8 +20,9 @@ Security guarantees on every :meth:`run` call:
 
 ``insecurity_reasons`` / ``secure`` property:
 
-* ``seccomp_missing`` — the ``seccomp`` Python library is not importable;
-  bwrap cannot attach a BPF filter without it.
+* ``seccomp_not_implemented`` — this backend attaches NO seccomp BPF filter (it never
+  passes ``--seccomp`` to bwrap), so it is ALWAYS recorded as insecure on the seccomp axis
+  and never self-certifies as fully secure. Use the nsjail backend for in-process seccomp.
 * ``apparmor_missing`` — ``aa-exec`` helper is not found; no AppArmor profile
   can be attached to the child.
 * ``pid_limit_missing`` — bwrap does not support ``--cgroup-pids``; the fork-bomb
@@ -190,25 +191,26 @@ class BubblewrapSandbox:
                 "mitigation=container_runtime_pid_limits"
             )
 
-        # Seccomp: bwrap feeds a pre-built BPF program via --seccomp <fd>.
-        # Building the program requires the ``seccomp`` Python library.
-        # Without it we run without a syscall filter and log an ERROR.
-        self._seccomp_active = _LIBSECCOMP_AVAILABLE
-        if self._seccomp_active:
-            _log.info("bwrap_seccomp_enabled library=libseccomp-python")
-        else:
-            _log.error(
-                "bwrap_seccomp_unavailable reason=libseccomp_python_not_available "
-                "impact=child_runs_without_syscall_filter "
-                "fix=install_python3-libseccomp "
-                "note=nsjail_backend_has_seccomp_via_KAFEL"
-            )
+        # Seccomp: NOT IMPLEMENTED for the bwrap backend. _build_argv() never builds a BPF
+        # program nor passes ``--seccomp <fd>`` to bwrap (the imported ``seccomp`` library is
+        # unused), so the untrusted child runs with NO syscall filter — only namespaces +
+        # cap-drop. We therefore report it honestly and UNCONDITIONALLY as an insecurity reason
+        # (regardless of whether python3-libseccomp happens to be importable), so the security
+        # gate never mistakes bwrap for fully secure. Use the nsjail backend for in-process
+        # seccomp (KAFEL), or opt into bwrap explicitly with BLASTBOX_WARN_ON_INSECURE.
+        # TODO: wire a real libseccomp BPF program via bwrap --seccomp/--add-seccomp-fd, then
+        # this can become conditional on the filter actually being attached.
+        self._seccomp_active = False
+        _log.warning(
+            "bwrap_seccomp_not_implemented impact=child_runs_without_syscall_filter "
+            "fix=use_nsjail_backend_or_set_BLASTBOX_WARN_ON_INSECURE"
+        )
 
         self._insecurity_reasons: list[str] = []
         if not self._binary_present:
             self._insecurity_reasons.append("binary_missing")
-        if not self._seccomp_active:
-            self._insecurity_reasons.append("seccomp_missing")
+        # bwrap applies no seccomp filter -> always insecure on the seccomp axis.
+        self._insecurity_reasons.append("seccomp_not_implemented")
         if not self._aa_exec:
             self._insecurity_reasons.append("apparmor_missing")
         if not self._cgroup_pids_supported:

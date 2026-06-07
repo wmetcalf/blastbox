@@ -106,6 +106,66 @@ def test_boot_base_uses_api_socket_and_runs_full_config(tmp_path):
     assert handle.vsock_uds == str(tmp_path / "snap" / "base" / REL_VSOCK)
 
 
+class FakeApiPatch(FakeApi):
+    """FakeApi that also records PATCH (checkpoint needs Pause + CreateSnapshot)."""
+
+    def patch(self, path, body=None):
+        self.calls.append((path, body))
+        return 204
+
+
+def test_boot_base_handle_checkpoint_writes_artifact_under_base_and_mem_dir(tmp_path):
+    """boot_base()'s handle.checkpoint(dest) Pause+Full-snapshots: the state file lands
+    under dest (base), the mem file under the launcher's mem_dir (the RAM-preload toggle
+    flows through the launcher to the boot handle)."""
+    base = tmp_path / "snap"
+    memdir = tmp_path / "ram"  # stand-in for /dev/shm
+    launcher = FcSnapshotLauncher(
+        FakeCfg(),
+        base,
+        mem_dir=memdir,
+        popen=lambda argv, cwd=None: FakeProc(),
+        api_factory=FakeApiPatch,
+        wait_socket=lambda p: None,
+        make_outdisk=lambda p: None,
+    )
+    handle = launcher.boot_base()
+    dest = base / "base"
+    art = handle.checkpoint(dest)
+
+    from blastbox.host.runtime.fc_snapshot_backend import FcSnapshotArtifact
+
+    assert isinstance(art, FcSnapshotArtifact)
+    assert art.snapshot_path == dest / "warm.snapshot"
+    assert art.mem_path == memdir / "warm.mem"  # mem on the launcher's mem_dir
+    # The boot PUTs ran first; checkpoint appended PATCH /vm Paused + PUT create Full.
+    assert ("/vm", {"state": "Paused"}) in handle.api.calls
+    assert (
+        "/snapshot/create",
+        {
+            "snapshot_type": "Full",
+            "snapshot_path": str(dest / "warm.snapshot"),
+            "mem_file_path": str(memdir / "warm.mem"),
+        },
+    ) in handle.api.calls
+
+
+def test_boot_base_handle_checkpoint_defaults_mem_to_base_dir(tmp_path):
+    """No mem_dir given → the boot handle's checkpoint writes warm.mem under base_dir."""
+    base = tmp_path / "snap"
+    launcher = FcSnapshotLauncher(
+        FakeCfg(),
+        base,
+        popen=lambda argv, cwd=None: FakeProc(),
+        api_factory=FakeApiPatch,
+        wait_socket=lambda p: None,
+        make_outdisk=lambda p: None,
+    )
+    handle = launcher.boot_base()
+    art = handle.checkpoint(base / "base")
+    assert art.mem_path == base / "warm.mem"  # defaults to base_dir
+
+
 def test_restore_in_spawns_in_slot_cwd_and_copies_base_outdisk(tmp_path):
     spawned = []
     made = []

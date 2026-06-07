@@ -591,3 +591,113 @@ def test_16_is_healthy_true_if_idle_recently() -> None:
     # Beyond 30 s without idle and past warmup grace → not healthy
     clock.advance(30.0)
     assert pool.is_healthy() is False
+
+
+def test_stuck_warming_slot_evicted_after_timeout() -> None:
+    """A WARMING slot that never becomes ready (dead restore) must be evicted after
+    warming_timeout_s and replaced — otherwise it counts toward capacity forever."""
+    clock = _FakeClock()
+    rt = _FakeRuntime()
+    rt.set_default_ready_after(10**9)  # never becomes ready
+    pool = WarmPool(
+        runtime=rt, warm_size=1, clock=clock, spawn_rate_limit=100.0, warming_timeout_s=60.0
+    )
+    pool.tick()  # spawn one WARMING slot (spawned_at = clock = 0)
+    warming = [s for s in pool._slots.values() if s.state == SlotState.WARMING]
+    assert len(warming) == 1
+    stuck_id = warming[0].slot_id
+
+    # Before the timeout: still WARMING, not evicted, no replacement.
+    clock.advance(30.0)
+    pool.tick()
+    assert stuck_id in pool._slots
+
+    # After the timeout: the stuck slot is reaped + removed and a fresh slot spawned.
+    clock.advance(40.0)  # now 70s > 60s
+    pool.tick()
+    assert stuck_id in rt.reaped
+    assert stuck_id not in pool._slots
+    new_warming = [s for s in pool._slots.values() if s.state == SlotState.WARMING]
+    assert len(new_warming) == 1 and new_warming[0].slot_id != stuck_id
+
+
+# ---------------------------------------------------------------------------
+# Spawn gating: warm-snapshot runtimes build asynchronously; the pool must not
+# spawn (and must not block the tick) until runtime.prepare() reports ready.
+# ---------------------------------------------------------------------------
+
+
+class _GatedRuntime(_FakeRuntime):
+    """A snapshot-style runtime whose prepare() gates spawning on an async build."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ready = False
+        self.prepare_calls = 0
+
+    def prepare(self) -> bool:
+        self.prepare_calls += 1
+        return self.ready
+
+    def spawn(self) -> Slot:
+        assert self.ready, "spawn() must NOT be called before prepare() reports ready"
+        return super().spawn()
+
+
+def test_pool_does_not_spawn_until_runtime_prepared() -> None:
+    rt = _GatedRuntime()
+    pool = WarmPool(runtime=rt, warm_size=2, spawn_rate_limit=100.0)
+
+    pool.tick()  # build not ready -> spawn nothing this tick (and don't block on it)
+    assert pool.slot_count == 0
+    assert rt.prepare_calls >= 1
+
+    rt.ready = True
+    pool.tick()  # ready -> fills warm_size
+    assert pool.slot_count == 2
+
+
+def test_pool_still_promotes_while_spawn_gated() -> None:
+    """tick() runs promote/health BEFORE the gated spawn, so a transient 'not ready' (e.g. a
+    rebuild) never stalls promotion of already-WARMING slots."""
+    rt = _GatedRuntime()
+    rt.ready = True
+    pool = WarmPool(runtime=rt, warm_size=2, spawn_rate_limit=100.0)
+    pool.tick()  # spawn 2 (WARMING)
+    assert pool.slot_count == 2
+
+    rt.ready = False  # warm tier goes "rebuilding" — spawning is gated off
+    pool.tick()  # promote must still run despite the spawn gate
+    assert pool.idle_count == 2
+
+
+def test_burst_suppressed_while_warm_tier_building() -> None:
+    """Demand misses accumulated while the snapshot is still building (prepare() False) must NOT
+    arm burst the instant the tier becomes ready — otherwise the pool over-provisions to the
+    burst ceiling right after its first build."""
+    rt = _GatedRuntime()  # ready=False (build in flight)
+    clock = _FakeClock(t=0.0)
+    pool = WarmPool(
+        runtime=rt,
+        warm_size=1,
+        burst_size=4,
+        burst_trigger_s=3.0,
+        burst_drain_s=60.0,
+        concurrent_ceiling=20,
+        spawn_rate_limit=100.0,
+        clock=clock,
+    )
+
+    # Sustained misses across a long build window — far exceeding burst_trigger_s.
+    for _ in range(4):
+        pool._record_demand_miss()
+        clock.advance(2.0)  # cumulative 8s >> burst_trigger_s=3.0
+        pool.tick()
+        assert pool.burst_active is False  # can't spawn while building -> never bursts
+
+    # Build finishes; the stale build-window misses must NOT have armed burst.
+    rt.ready = True
+    pool.tick()
+    assert pool.burst_active is False
+    assert pool.effective_target == 1  # warm_size only, NOT warm_size + burst_size
+    assert pool.slot_count == 1

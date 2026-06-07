@@ -23,7 +23,18 @@
 // Syntax reference: https://github.com/google/kafel
 
 POLICY blastbox_deny {
+  // clone3() passes its flags in a struct seccomp cannot inspect -> ENOSYS(38) so glibc falls
+  // back to the arg-filtered clone() below (the docker-default approach; parity with the JSON
+  // profile).
+  ERRNO(38) {
+    clone3
+  },
   ERRNO(1) {
+    // clone() with ANY new-namespace flag (mask 0x7E020000 = CLONE_NEWNS|NEWUTS|NEWIPC|NEWUSER|
+    // NEWPID|NEWNET|NEWCGROUP) -> deny; thread/process creation (CLONE_VM/THREAD, fork) still
+    // allowed. Pairs with the unshare/setns denies to block namespace creation by the child.
+    clone { clone_flags & 0x7E020000 != 0 },
+
     // Kernel module loading
     init_module,
     finit_module,
@@ -71,8 +82,9 @@ POLICY blastbox_deny {
     sethostname,
     setdomainname,
 
-    // Namespace creation (we're already namespaced)
+    // Namespace creation / joining (we're already namespaced)
     unshare,
+    setns,
 
     // Dangerous system controls
     quotactl,

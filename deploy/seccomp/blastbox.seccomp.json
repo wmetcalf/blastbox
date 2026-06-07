@@ -32,8 +32,6 @@
         "clock_gettime64",
         "clock_nanosleep",
         "clock_nanosleep_time64",
-        "clone",
-        "clone3",
         "close",
         "close_range",
         "connect",
@@ -264,7 +262,6 @@
         "sigaltstack",
         "signalfd",
         "signalfd4",
-        "socketcall",
         "socketpair",
         "splice",
         "stat",
@@ -317,7 +314,7 @@
       "action": "SCMP_ACT_ALLOW"
     },
     {
-      "_comment": "socket() restricted to AF_UNIX(1), AF_LOCAL(1) only. All networking-capable address families blocked. Namespace --network=none already prevents egress, this is defense-in-depth.",
+      "_comment": "socket() arg-filtered to AF_UNIX/AF_LOCAL (family==1) only; networking-capable families (AF_INET, AF_INET6, ...) fall through to defaultAction ERRNO. The i386 socketcall() multiplexer — which on 32-bit would tunnel socket(AF_INET)/connect/bind past this arg-filter — is DENIED because it was deliberately removed from the allowlist: archMap maps SCMP_ARCH_X86_64 -> [SCMP_ARCH_X86, SCMP_ARCH_X32] (and AARCH64 -> ARM), so the i386 compat ABI IS covered by this profile, and a socketcall there now hits defaultAction ERRNO. DO NOT re-add socketcall to the allowlist: on the 32-bit sub-arch that reopens the socket(AF_INET)/connect bypass of this very arg-filter (on x86_64/aarch64 it simply has no syscall number). --network=none already prevents egress; this is defense-in-depth.",
       "names": ["socket"],
       "action": "SCMP_ACT_ALLOW",
       "args": [
@@ -353,6 +350,18 @@
       "names": ["personality"],
       "action": "SCMP_ACT_ALLOW",
       "args": [{ "index": 0, "value": 4294967295, "op": "SCMP_CMP_EQ" }]
+    },
+    {
+      "_comment": "clone() allowed only when NO new-namespace flag is set (mask 0x7E020000 = CLONE_NEWNS|NEWUTS|NEWIPC|NEWUSER|NEWPID|NEWNET|NEWCGROUP). Permits thread/process creation (CLONE_VM/THREAD/etc., used by soffice + pdfium multiprocessing) while blocking namespace creation. Matches the docker default. A clone() with a NEW* flag falls through to defaultAction ERRNO(EPERM) — bounding the unshare-deny bypass.",
+      "names": ["clone"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [{ "index": 0, "value": 2114060288, "valueTwo": 0, "op": "SCMP_CMP_MASKED_EQ" }]
+    },
+    {
+      "_comment": "clone3() flags live in a struct (not a register) so seccomp can't filter them; return ENOSYS(38) so glibc falls back to the arg-filtered clone() above (the docker-default approach).",
+      "names": ["clone3"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 38
     },
     {
       "_comment": "Block dangerous syscalls with EPERM rather than allowlist miss for better observability",

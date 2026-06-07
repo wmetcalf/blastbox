@@ -86,10 +86,12 @@ class JobRetentionSweeper:
         if result_dir is not None:
             self._safe_rmtree(job_id, Path(result_dir))
 
-        # Update the store regardless of whether result_dir existed.
+        # Update the store regardless of whether result_dir existed. Clear expires_at so the now-
+        # EXPIRED job (EXPIRED is in _TERMINAL) isn't re-selected + re-swept on every subsequent
+        # pass — wasteful churn, and a rmtree retry on an already-deleted tree.
         job = job_store.get(job_id)
         if job is not None:
-            job_store.update(job_id, status=JobStatus.EXPIRED, result_dir=None)
+            job_store.update(job_id, status=JobStatus.EXPIRED, result_dir=None, expires_at=None)
 
     def _safe_rmtree(self, job_id: str, result_dir: Path) -> None:
         """Delete the artifact tree, confined to ``job_root``.

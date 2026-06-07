@@ -82,38 +82,60 @@ def test_select_runsc_when_available(monkeypatch):
     assert sel.warnings == []
 
 
-def test_select_runc_fallback_when_no_runsc(monkeypatch):
-    """Only runc available → runc + insecure + warning recorded."""
+def test_select_runc_refused_by_default(monkeypatch):
+    """Only runc available + NO opt-in → fail-closed (InsecureRuntimeRefused) early."""
     monkeypatch.delenv("BLASTBOX_WORKER_RUNTIME", raising=False)
     monkeypatch.delenv("BLASTBOX_REQUIRE_SECURE_RUNTIME", raising=False)
+    monkeypatch.delenv("BLASTBOX_ALLOW_RUNC", raising=False)
+    with pytest.raises(InsecureRuntimeRefused, match="BLASTBOX_ALLOW_RUNC"):
+        select_worker_runtime(available_runtimes=["runc"])
+
+
+def test_select_runc_allowed_with_explicit_opt_in(monkeypatch):
+    """BLASTBOX_ALLOW_RUNC=1 → runc allowed in explicit degraded mode (insecure + warning)."""
+    monkeypatch.delenv("BLASTBOX_WORKER_RUNTIME", raising=False)
+    monkeypatch.delenv("BLASTBOX_REQUIRE_SECURE_RUNTIME", raising=False)
+    monkeypatch.setenv("BLASTBOX_ALLOW_RUNC", "1")
     sel = select_worker_runtime(available_runtimes=["runc"])
     assert sel.runtime == "runc"
     assert sel.secure is False
-    assert len(sel.warnings) >= 1
     assert any("runsc" in w.lower() or "insecure" in w.lower() or "runc" in w.lower()
                for w in sel.warnings)
 
 
-def test_fail_closed_require_secure_runc_only(monkeypatch):
-    """BLASTBOX_REQUIRE_SECURE_RUNTIME=1 + only runc → raises InsecureRuntimeRefused."""
-    monkeypatch.setenv("BLASTBOX_REQUIRE_SECURE_RUNTIME", "1")
+def test_require_secure_overrides_allow_runc(monkeypatch):
+    """BLASTBOX_REQUIRE_SECURE_RUNTIME=1 is a hard lockdown — refuses runc EVEN with ALLOW_RUNC."""
     monkeypatch.delenv("BLASTBOX_WORKER_RUNTIME", raising=False)
-    with pytest.raises(InsecureRuntimeRefused):
+    monkeypatch.setenv("BLASTBOX_REQUIRE_SECURE_RUNTIME", "1")
+    monkeypatch.setenv("BLASTBOX_ALLOW_RUNC", "1")
+    with pytest.raises(InsecureRuntimeRefused, match="REQUIRE_SECURE_RUNTIME"):
         select_worker_runtime(available_runtimes=["runc"])
 
 
-def test_fail_closed_require_secure_empty_set(monkeypatch):
-    """BLASTBOX_REQUIRE_SECURE_RUNTIME=1 + empty runtime set → raises InsecureRuntimeRefused."""
-    monkeypatch.setenv("BLASTBOX_REQUIRE_SECURE_RUNTIME", "1")
+def test_fail_closed_empty_runtime_set_by_default(monkeypatch):
+    """No runtimes detected + no opt-in → fail-closed (the dispatcher refuses early)."""
     monkeypatch.delenv("BLASTBOX_WORKER_RUNTIME", raising=False)
+    monkeypatch.delenv("BLASTBOX_REQUIRE_SECURE_RUNTIME", raising=False)
+    monkeypatch.delenv("BLASTBOX_ALLOW_RUNC", raising=False)
     with pytest.raises(InsecureRuntimeRefused):
         select_worker_runtime(available_runtimes=[])
 
 
-def test_force_runc_even_when_runsc_present(monkeypatch):
-    """BLASTBOX_WORKER_RUNTIME=runc overrides detection even when runsc is available."""
+def test_force_runc_still_needs_opt_in(monkeypatch):
+    """BLASTBOX_WORKER_RUNTIME=runc is an explicit runtime choice but still insecure — it
+    requires the ALLOW_RUNC consent flag too (otherwise refused)."""
     monkeypatch.setenv("BLASTBOX_WORKER_RUNTIME", "runc")
     monkeypatch.delenv("BLASTBOX_REQUIRE_SECURE_RUNTIME", raising=False)
+    monkeypatch.delenv("BLASTBOX_ALLOW_RUNC", raising=False)
+    with pytest.raises(InsecureRuntimeRefused):
+        select_worker_runtime(available_runtimes=["runsc", "runc"])
+
+
+def test_force_runc_with_opt_in(monkeypatch):
+    """BLASTBOX_WORKER_RUNTIME=runc + BLASTBOX_ALLOW_RUNC=1 → runc (insecure, deliberate)."""
+    monkeypatch.setenv("BLASTBOX_WORKER_RUNTIME", "runc")
+    monkeypatch.delenv("BLASTBOX_REQUIRE_SECURE_RUNTIME", raising=False)
+    monkeypatch.setenv("BLASTBOX_ALLOW_RUNC", "1")
     sel = select_worker_runtime(available_runtimes=["runsc", "runc"])
     assert sel.runtime == "runc"
     assert sel.secure is False
@@ -137,14 +159,14 @@ def test_require_secure_satisfied_by_runsc(monkeypatch):
     assert sel.secure is True
 
 
-def test_require_secure_falsy_values(monkeypatch):
-    """BLASTBOX_REQUIRE_SECURE_RUNTIME=0/false/no/empty → NOT fail-closed."""
+def test_allow_runc_falsy_values_still_refuse(monkeypatch):
+    """BLASTBOX_ALLOW_RUNC=0/false/no/empty → NOT opted in → still fail-closed under runc."""
+    monkeypatch.delenv("BLASTBOX_WORKER_RUNTIME", raising=False)
+    monkeypatch.delenv("BLASTBOX_REQUIRE_SECURE_RUNTIME", raising=False)
     for falsy in ("0", "false", "False", "no", ""):
-        monkeypatch.setenv("BLASTBOX_REQUIRE_SECURE_RUNTIME", falsy)
-        monkeypatch.delenv("BLASTBOX_WORKER_RUNTIME", raising=False)
-        # Should not raise even with only runc
-        sel = select_worker_runtime(available_runtimes=["runc"])
-        assert sel.runtime == "runc"
+        monkeypatch.setenv("BLASTBOX_ALLOW_RUNC", falsy)
+        with pytest.raises(InsecureRuntimeRefused):
+            select_worker_runtime(available_runtimes=["runc"])
 
 
 def test_selection_is_frozen():
@@ -204,6 +226,22 @@ def test_runtime_flag_present(tmp_path):
 def test_runtime_flag_runc(tmp_path):
     argv = _argv(tmp_path=tmp_path, runtime=RuntimeSelection(runtime="runc", secure=False, warnings=[]))
     assert "--runtime=runc" in argv
+
+
+def test_warn_on_insecure_set_under_runsc(tmp_path):
+    argv = _argv(tmp_path=tmp_path, runtime=RuntimeSelection(runtime="runsc", secure=True, warnings=[]))
+    assert "BLASTBOX_WARN_ON_INSECURE=1" in argv
+
+
+def test_warn_on_insecure_set_under_opted_in_runc(tmp_path):
+    """An insecure (runc) RuntimeSelection -> the worker is told to run its self-check in
+    DELIBERATE degraded mode (this selection is only produced after BLASTBOX_ALLOW_RUNC),
+    so it doesn't abort opaquely instead of failing cleanly at dispatch time."""
+    argv = _argv(
+        tmp_path=tmp_path,
+        runtime=RuntimeSelection(runtime="runc", secure=False, warnings=["insecure"]),
+    )
+    assert "BLASTBOX_WARN_ON_INSECURE=1" in argv
 
 
 def test_user_flag_present(tmp_path):
@@ -393,16 +431,19 @@ def test_runsc_sets_warn_on_insecure_env(tmp_path):
         pytest.fail("BLASTBOX_WARN_ON_INSECURE not set in argv for runsc")
 
 
-def test_runc_does_not_set_warn_on_insecure(tmp_path, monkeypatch):
-    """Under runc, BLASTBOX_WARN_ON_INSECURE must be absent (strict mode)."""
+def test_runc_sets_warn_on_insecure_for_deliberate_degraded_mode(tmp_path, monkeypatch):
+    """POLICY: an insecure (runc) RuntimeSelection now SETS BLASTBOX_WARN_ON_INSECURE=1.
+
+    runc is only reachable after the operator's explicit BLASTBOX_ALLOW_RUNC opt-in
+    (select_worker_runtime refuses it otherwise), so the worker runs its sandbox self-check
+    in DELIBERATE degraded mode rather than aborting opaquely. The honest insecurity is
+    surfaced by the RuntimeSelection.warnings, not by silently killing the worker."""
     monkeypatch.delenv("BLASTBOX_WARN_ON_INSECURE", raising=False)
     argv = _argv(
         runtime=RuntimeSelection(runtime="runc", secure=False, warnings=[]),
         tmp_path=tmp_path,
     )
-    for i, tok in enumerate(argv):
-        if tok == "-e" and "BLASTBOX_WARN_ON_INSECURE" in argv[i + 1]:
-            pytest.fail(f"BLASTBOX_WARN_ON_INSECURE unexpectedly set: {argv[i+1]}")
+    assert "BLASTBOX_WARN_ON_INSECURE=1" in argv
 
 
 # ---------------------------------------------------------------------------

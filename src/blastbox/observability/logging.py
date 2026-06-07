@@ -32,7 +32,12 @@ def configure_logging(format_: Literal["json", "text"] = "json", level: str = "I
         processors=processors,
         logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
         wrapper_class=structlog.make_filtering_bound_logger(getattr(logging, level)),
-        cache_logger_on_first_use=True,
+        # NOT cached: configure_logging() runs on every build_app(), and caching the
+        # bound logger on first use pins the sys.stderr captured at that instant —
+        # which defeats the per-call reconfigure and, under pytest's per-test stream
+        # capture, makes a later log write to an already-closed stream
+        # ("I/O operation on closed file"). The per-call logger cost is negligible here.
+        cache_logger_on_first_use=False,
     )
 
 

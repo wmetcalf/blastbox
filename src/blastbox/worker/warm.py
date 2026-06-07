@@ -221,25 +221,28 @@ class HostWarmControl:
         self._dir = control_dir
 
     def _atomic_write(self, name: str, content: str) -> None:
-        """Write *content* to ``control_dir/<name>`` atomically via temp+rename."""
-        target = self._dir / name
-        tmp = self._dir / f".{name}.tmp"
-        try:
-            tmp.write_text(content, encoding="utf-8")
-            os.replace(tmp, target)
-        except Exception:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        """Write *content* to ``control_dir/<name>`` atomically AND symlink-safely.
 
-    def signal_go(self, spec: WarmJobSpec) -> None:
+        control_dir is WORKER-WRITABLE (the gVisor tier bind-mounts ctrl/ at 0o777), so a worker
+        could pre-plant ``.<name>.tmp`` or ``<name>`` as a symlink to redirect this HOST-authored
+        write to clobber an outside file. ``atomic_write_confined`` uses a random
+        ``O_EXCL|O_NOFOLLOW`` temp + ``renameat`` so the write can never follow a worker symlink."""
+        from blastbox.contract.envelope import atomic_write_confined
+        # 0o644: control files are HOST-authored but READ BY THE WORKER, which runs as a DIFFERENT
+        # uid on the gVisor tier (65532) — 0o600 would make go.json unreadable and hang the warm
+        # job. Not secret (the worker already knows its own job); the per-slot 0o700 ctrl dir keeps
+        # other local users out.
+        atomic_write_confined(self._dir, name, content.encode("utf-8"), mode=0o644)
+
+    def signal_go(self, spec: WarmJobSpec, *, deadline: float | None = None) -> None:
         """Atomically write ``control_dir/go.json`` with the job spec.
 
         Symmetric with ``FileWarmControl.wait_for_go``.
         The payload matches the format parsed by that method:
         ``{"input_path": str, "output_dir": str, "params": dict}``.
+
+        ``deadline`` is accepted for a uniform signal_go signature but unused: the go.json write
+        is instant (no network), so the file-trigger warm path is bounded by wait_for_done.
         """
         payload = json.dumps(
             {
@@ -258,15 +261,22 @@ class HostWarmControl:
         Raises:
             WarmTimeout: if ``done`` does not appear before the deadline.
         """
-        done_path = self._dir / "done"
+        from blastbox.contract.envelope import read_confined_regular_bytes
+
         deadline = time.monotonic() + timeout_s
 
         while True:
-            if done_path.exists():
-                try:
-                    return done_path.read_text(encoding="utf-8").strip()
-                except OSError as exc:
-                    raise WarmTimeout(f"done file unreadable: {exc}") from exc
+            try:
+                # Symlink-safe, capped, confined read: ctrl/ is WORKER-WRITABLE on the gVisor tier,
+                # so a hostile worker could symlink `done` at a host file (info disclosure) or a
+                # FIFO/huge file (block/pressure the single-threaded dispatcher). O_NOFOLLOW +
+                # S_ISREG + a 4 KiB cap defeat that; a non-regular/oversized done fails closed.
+                raw = read_confined_regular_bytes(self._dir, "done", max_bytes=4096)
+                return raw.decode("utf-8", "replace").strip()
+            except FileNotFoundError:
+                pass  # not signalled yet → keep polling
+            except (OSError, ValueError) as exc:
+                raise WarmTimeout(f"invalid done file: {exc}") from exc
 
             if time.monotonic() >= deadline:
                 raise WarmTimeout(

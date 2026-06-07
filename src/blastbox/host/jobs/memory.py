@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 import time
+import uuid
 
 from blastbox.host.jobs.base import Job, JobStatus
+
+# Allowlist of Job fields that update() may set — mirrors RedisJobStore._JOB_FIELDS and
+# SqlJobStore._COLUMNS so all three backends fail closed identically on an unknown field
+# name (a typo'd/invalid key that prod SQL/Redis reject must not silently succeed here).
+_JOB_FIELDS = frozenset(f.name for f in dataclasses.fields(Job))
 
 
 class InMemoryJobStore:
@@ -33,15 +40,60 @@ class InMemoryJobStore:
             if job is None:
                 raise KeyError(job_id)
             for k, v in fields.items():
+                if k not in _JOB_FIELDS:
+                    raise ValueError(f"unknown Job field in update(): {k!r}")
                 setattr(job, k, v)
             return job
 
-    def list(self, status: JobStatus | None = None) -> list[Job]:
+    def update_if_status(
+        self,
+        job_id: str,
+        expect_status: JobStatus,
+        *,
+        expect_claim_id: str | None = None,
+        **fields,
+    ) -> bool:
+        # Validate field names BEFORE the status guard so an unknown field fails fast (ValueError)
+        # uniformly across all backends — not silently no-op on a status mismatch here while the
+        # SQL backend raises. (An unknown field is a programming error, never client/worker input.)
+        for k in fields:
+            if k not in _JOB_FIELDS:
+                raise ValueError(f"unknown Job field in update_if_status(): {k!r}")
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status != expect_status:
+                return False
+            if expect_claim_id is not None and job.claim_id != expect_claim_id:
+                return False
+            for k, v in fields.items():
+                setattr(job, k, v)
+            return True
+
+    def list(
+        self,
+        status: JobStatus | None = None,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        newest_first: bool = False,
+    ) -> list[Job]:
         with self._lock:
             jobs = list(self._jobs.values())
         if status is not None:
             jobs = [j for j in jobs if j.status == status]
+        if newest_first:
+            jobs.sort(key=lambda j: (j.created_at, j.job_id), reverse=True)
+        if offset:
+            jobs = jobs[offset:]
+        if limit is not None:
+            jobs = jobs[:limit]
         return jobs
+
+    def count(self, status: JobStatus | None = None) -> int:
+        with self._lock:
+            if status is None:
+                return len(self._jobs)
+            return sum(1 for j in self._jobs.values() if j.status == status)
 
     def claim_next(self) -> Job | None:
         """Atomically claim the oldest QUEUED job and flip it to RUNNING."""
@@ -55,6 +107,7 @@ class InMemoryJobStore:
             job = min(queued, key=lambda j: (j.created_at, j.job_id))
             job.status = JobStatus.RUNNING
             job.started_at = time.time()
+            job.claim_id = uuid.uuid4().hex  # fresh ownership token per claim
             return job
 
     def delete(self, job_id: str) -> None:

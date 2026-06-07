@@ -33,15 +33,17 @@ dependencies = [
 # The host orchestrator (ingress API + CLI, dispatcher, pool, runtime,
 # jobstores, observability). A host deployment installs `blastbox[host]`.
 host = [
-    "fastapi>=0.110",
+    "fastapi>=0.115.0",          # pairs with starlette>=0.40 (older fastapi pins starlette<0.37)
+    "starlette>=0.40.0",         # imported directly (middleware.py); >=0.40 fixes the multipart DoS
     "uvicorn[standard]>=0.27",
-    "python-multipart>=0.0.9",
+    "python-multipart>=0.0.18",  # CVE-2024-53981 (boundary-deformation DoS on the upload path)
     "structlog>=24.1",
     "prometheus-client>=0.20",
-    "psycopg[binary]>=3.2",
+    "psycopg[binary,pool]>=3.2",  # [pool] -> psycopg-pool, imported by SqlJobStore for Postgres
     "redis>=5.0",
 ]
 dev = [
+    "blastbox[host]",            # the http/ingress tests need the host stack (fastapi, etc.)
     "pytest>=8.0.0",
     "mypy>=1.9.0",
     "ruff>=0.3.0",

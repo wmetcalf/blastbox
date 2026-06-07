@@ -42,6 +42,11 @@ class Job:
     result_dir: str | None = None       # server-set; stripped from public dict
     worker_runtime: str | None = None
     error: str | None = None
+    # Per-claim ownership token: claim_next() stamps a fresh value on each QUEUED->RUNNING
+    # transition; requeue clears it. Terminal/recovery writes CAS on (status, claim_id) so a
+    # stale owner can't clobber a RECLAIMED job (status alone has an ABA hole across
+    # RUNNING->QUEUED->RUNNING under multiple dispatchers).
+    claim_id: str | None = None
     security_warnings: list[str] = field(default_factory=list)
     params: dict[str, str] = field(default_factory=dict)       # engine per-job options
     result_summary: dict | None = None  # small engine result summary for listing
@@ -64,13 +69,14 @@ class Job:
     def to_public_dict(self) -> dict:
         """Return a dict safe to expose publicly.
 
-        Strips ``result_dir`` (internal server path) and ``params``
-        (may contain sensitive engine options), and sanitizes the ``error``
-        field to remove internal filesystem paths.
+        Strips ``result_dir`` (internal server path), ``params`` (may contain
+        sensitive engine options), and ``claim_id`` (an internal ownership token),
+        and sanitizes the ``error`` field to remove internal filesystem paths.
         """
         d = self.to_dict()
         d.pop("result_dir", None)
         d.pop("params", None)
+        d.pop("claim_id", None)
         if isinstance(d.get("error"), str):
             d["error"] = sanitize_public_error(d["error"])
         return d
@@ -90,6 +96,7 @@ class Job:
             result_dir=d.get("result_dir"),
             worker_runtime=d.get("worker_runtime"),
             error=d.get("error"),
+            claim_id=d.get("claim_id"),
             security_warnings=(
                 list(d.get("security_warnings", []))
                 if d.get("security_warnings") is not None
@@ -105,6 +112,54 @@ class JobStore(Protocol):
     def create(self, job: Job) -> None: ...
     def get(self, job_id: str) -> Job | None: ...
     def update(self, job_id: str, **fields) -> Job: ...
-    def list(self, status: JobStatus | None = None) -> list[Job]: ...
+    def update_if_status(
+        self,
+        job_id: str,
+        expect_status: JobStatus,
+        *,
+        expect_claim_id: str | None = None,
+        **fields,
+    ) -> bool:
+        """Atomically apply ``fields`` ONLY if the job's current status is ``expect_status`` (and,
+        when ``expect_claim_id`` is given, its ``claim_id`` still matches); return whether it
+        applied (a compare-and-set, like ``claim_next``'s QUEUED guard).
+
+        Used to fence a transition against a concurrent writer. ``expect_claim_id`` closes the ABA
+        hole: a terminal/recovery write keyed on (status, claim_id) can't clobber a job that was
+        RECLAIMED (RUNNING->QUEUED->RUNNING with a new claim) — status alone can't tell. Missing
+        job, status mismatch, or claim_id mismatch returns ``False`` without modifying anything.
+        """
+        ...
+    def list(
+        self,
+        status: JobStatus | None = None,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        newest_first: bool = False,
+    ) -> list[Job]:
+        """Return jobs, optionally filtered by ``status``.
+
+        ``limit``/``offset`` page the result and ``newest_first`` orders by
+        ``created_at`` descending.  SQL backends push these down into the query
+        (``ORDER BY ... LIMIT ... OFFSET``) so a listing endpoint never loads
+        the whole table.  The in-memory backend windows after a cheap in-process
+        scan.  The Redis backend has NO server-side ordering/limit over a scanned
+        key space, so it still fetches+decodes every key and windows in-process —
+        i.e. **O(N) per call**, so it is unsuitable for very large job histories
+        (prefer Postgres there; see ``factory`` / README).  Callers that iterate
+        every job (dispatcher, retention) omit all three and get the full set,
+        unordered.
+        """
+        ...
+
+    def count(self, status: JobStatus | None = None) -> int:
+        """Total number of jobs (optionally filtered by ``status``).
+
+        Paired with ``list(..., limit=, offset=)`` so the listing endpoint can
+        report ``total`` without materializing every row.
+        """
+        ...
+
     def claim_next(self) -> Job | None: ...
     def delete(self, job_id: str) -> None: ...

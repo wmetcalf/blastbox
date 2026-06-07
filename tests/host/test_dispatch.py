@@ -191,6 +191,112 @@ def test_happy_path_done_result_summary_input_gone(tmp_path):
     assert not input_path.parent.exists()
 
 
+def test_cold_dispatch_serves_host_sealed_metadata(tmp_path):
+    """#5: a worker that fabricates artifact sha256/bytes in metadata.json must NOT have those
+    served — after DONE the on-disk metadata.json carries the host-recomputed (real) values."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    content = b"REAL-ARTIFACT-BYTES"
+    real_sha = hashlib.sha256(content).hexdigest()
+
+    def fake_runner(argv, **kw):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "page-001.png").write_bytes(content)
+        env = {
+            "engine": _ENGINE_NAME, "status": "ok", "input_sha256": _INPUT_SHA,
+            "detected": {"label": "docx", "mime": "x", "confidence": 1.0, "source": "magika"},
+            "artifacts": [{"id": "page-001", "path": "page-001.png", "kind": "image",
+                           "sha256": "f" * 64, "bytes": 999999}],  # FABRICATED by the worker
+            "warnings": [], "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
+        }
+        (output_dir / "metadata.json").write_bytes(json.dumps(env).encode())
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    d = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    assert d.dispatch_once() is True
+    assert store.get(job.job_id).status == JobStatus.DONE
+    served = json.loads((output_dir / "metadata.json").read_text())
+    assert served["artifacts"][0]["sha256"] == real_sha
+    assert served["artifacts"][0]["bytes"] == len(content)
+
+
+def test_cold_dispatch_injects_mount_dir_env(tmp_path):
+    """#8: the worker argv carries BLASTBOX_INPUT_DIR=/input + BLASTBOX_OUTPUT_DIR=/output so the
+    harness (defaults /in,/out) reads the dirs the dispatcher actually mounted."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    seen: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        seen.append(argv)
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner).dispatch_once()
+    flat = seen[0]
+    assert "BLASTBOX_INPUT_DIR=/input" in flat
+    assert "BLASTBOX_OUTPUT_DIR=/output" in flat
+
+
+def test_cold_output_size_cap_fails_undeclared_bloat(tmp_path):
+    """#3: a huge UNDECLARED file (the trust gate never sizes it) must fail the job, not DONE."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)  # one tiny declared artifact
+        (output_dir / "pad.bin").write_bytes(b"x" * 200_000)  # huge undeclared file
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    d = Dispatcher(
+        job_store=store, engines={_ENGINE_NAME: _engine_spec()},
+        limits=Limits(max_total_artifact_bytes=50_000), job_root=tmp_path,
+        runtime_selector=_fake_runtime, subprocess_runner=fake_runner, worker_timeout_s=30,
+    )
+    assert d.dispatch_once() is True
+    final = store.get(job.job_id)
+    assert final.status == JobStatus.FAILED
+    assert "too large" in (final.error or "")
+
+
+def test_run_maintenance_expires_and_requeues(tmp_path):
+    """#4: _run_maintenance expires retention-due artifacts AND requeues orphaned RUNNING jobs."""
+    store = InMemoryJobStore()
+    # an expired DONE job with on-disk artifacts
+    done = Job.new(engine=_ENGINE_NAME, filename="d.docx")
+    done.status = JobStatus.DONE
+    done.finished_at = time.time() - 100
+    done.expires_at = time.time() - 50
+    out = tmp_path / done.job_id / "output"
+    out.mkdir(parents=True)
+    (out / "art.png").write_bytes(b"data")
+    done.result_dir = str(out)
+    store.create(done)
+    # a RUNNING job whose worker container is gone (mock docker ps returns no active ids)
+    running = Job.new(engine=_ENGINE_NAME, filename="r.docx")
+    running.status = JobStatus.RUNNING
+    store.create(running)
+
+    d = _make_dispatcher(store, job_root=tmp_path, job_retention_seconds=60)
+    d._run_maintenance()
+
+    assert store.get(done.job_id).status == JobStatus.EXPIRED
+    assert not out.exists()  # artifacts swept
+    assert store.get(running.job_id).status == JobStatus.QUEUED  # orphan requeued
+
+
 # ---------------------------------------------------------------------------
 # Test 3: Worker non-zero exit (no valid output) → FAILED, input gone
 # ---------------------------------------------------------------------------
@@ -431,10 +537,11 @@ def test_requeue_orphaned_jobs(tmp_path):
     docker ps failure → no requeue."""
     store = InMemoryJobStore()
 
-    # Create two RUNNING jobs
+    # Create two RUNNING jobs. The orphan's started_at is past the requeue grace window so it
+    # is eligible (a fresh start_at would be skipped — see test_requeue_grace_window).
     orphan_job = Job.new(engine=_ENGINE_NAME, filename="a.docx")
     orphan_job.status = JobStatus.RUNNING
-    orphan_job.started_at = time.time()
+    orphan_job.started_at = time.time() - 120
     store.create(orphan_job)
 
     active_job = Job.new(engine=_ENGINE_NAME, filename="b.docx")
@@ -599,3 +706,67 @@ def test_run_forever_survives_dispatch_error(tmp_path):
     # past the raising call (proving the loop continued instead of crashing).
     d.run_forever(poll_interval_s=0, stop=lambda: calls["n"] >= 2)
     assert calls["n"] >= 2
+
+
+def test_requeue_grace_window(tmp_path):
+    """A just-claimed RUNNING job (fresh started_at) is NOT requeued — its container may not be
+    in docker ps yet; requeuing would double-detonate the same input."""
+    store = InMemoryJobStore()
+    fresh = Job.new(engine=_ENGINE_NAME, filename="x.docx")
+    fresh.status = JobStatus.RUNNING
+    fresh.started_at = time.time()  # within the grace window
+    store.create(fresh)
+    d = _make_dispatcher(
+        store, job_root=tmp_path,
+        subprocess_runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+    assert d.requeue_orphaned_jobs() == 0
+    assert store.get(fresh.job_id).status == JobStatus.RUNNING
+
+
+def test_cold_enrichment_claim_fenced_aborts_on_reclaim(tmp_path):
+    """If a peer requeues+reclaims a cold job while _runtime_selector blocks (e.g. on `docker
+    info`), the claim-fenced enrichment write aborts THIS stale owner before it launches a worker,
+    does NOT overwrite the new owner's worker_runtime (which would mis-route recovery and cause a
+    double-detonation), and leaves the shared input on disk for the new owner."""
+    # SqlJobStore (not in-memory) so the dispatcher's claimed Job is a frozen SNAPSHOT — modelling
+    # a real multi-dispatcher store. (In-memory is single-process and returns live references, so
+    # it can't model a peer reclaim.)
+    from blastbox.host.jobs.sql_store import SqlJobStore
+    store = SqlJobStore(f"sqlite:///{tmp_path / 'jobs.db'}")
+    job = _make_job()
+    store.create(job)
+    input_path = _setup_job_dirs(tmp_path, job)
+
+    launched: list = []
+
+    def _runner(argv, **kw):
+        launched.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def _selector_that_reclaims() -> RuntimeSelection:
+        # Simulate a peer dispatcher mid-`docker info`: requeue (clear claim), reclaim under a
+        # fresh claim, and mark it warm — exactly the multi-dispatcher reclaim the fence detects.
+        cur = store.get(job.job_id)
+        store.update_if_status(
+            job.job_id, JobStatus.RUNNING, expect_claim_id=cur.claim_id,
+            status=JobStatus.QUEUED, claim_id=None,
+        )
+        new_owner = store.claim_next()
+        store.update_if_status(
+            job.job_id, JobStatus.RUNNING,
+            expect_claim_id=new_owner.claim_id, worker_runtime="warm",
+        )
+        return RuntimeSelection(runtime="runc", secure=False, warnings=["stale"])
+
+    disp = _make_dispatcher(
+        store, job_root=tmp_path,
+        runtime_selector=_selector_that_reclaims, subprocess_runner=_runner,
+    )
+    disp.dispatch_once()
+
+    final = store.get(job.job_id)
+    assert launched == []  # the stale owner aborted — no worker launched
+    assert final.worker_runtime == "warm"  # the new owner's label is NOT clobbered to "runc"
+    assert final.status == JobStatus.RUNNING  # still the new owner's live claim
+    assert input_path.exists()  # shared input preserved for the new owner (not deleted on abort)

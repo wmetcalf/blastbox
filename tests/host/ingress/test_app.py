@@ -54,6 +54,7 @@ def _make_client(
     max_input_bytes: int = 10 * 1024 * 1024,
     api_workers: int = 4,
     api_key: str | None = None,
+    metrics_public: bool | None = None,
     store: InMemoryJobStore | None = None,
 ) -> tuple[TestClient, InMemoryJobStore]:
     """Build a TestClient wired to a temp job_root + InMemoryJobStore."""
@@ -66,9 +67,69 @@ def _make_client(
         limits=limits,
         api_workers=api_workers,
         api_key=api_key,
+        metrics_public=metrics_public,
     )
     client = TestClient(app, raise_server_exceptions=False)
     return client, job_store
+
+
+def test_result_zip_serves_only_validated_artifacts(tmp_path):
+    """GET /result must zip ONLY the declared artifacts (+ metadata.json), never undeclared
+    files or symlink targets a compromised worker drops into output/."""
+    import io
+    import zipfile
+
+    client, store = _make_client(tmp_path)
+    job, output_dir = _make_done_job(tmp_path, store)
+
+    # Hostile worker leftovers: an undeclared file + a symlink to a file outside output/.
+    (output_dir / "secret.txt").write_bytes(b"undeclared-leftover")
+    outside = tmp_path / "outside_secret"
+    outside.write_bytes(b"OUTSIDE-SECRET")
+    (output_dir / "leak").symlink_to(outside)
+
+    resp = client.get(f"/v1/jobs/{job.job_id}/result")
+    assert resp.status_code == 200
+    names = set(zipfile.ZipFile(io.BytesIO(resp.content)).namelist())
+    assert names == {"metadata.json", "page-001.png"}, names
+    assert b"OUTSIDE-SECRET" not in resp.content  # symlink target bytes never disclosed
+
+
+def test_readyz_does_not_leak_store_error(tmp_path):
+    """A store failure on /v1/readyz must NOT echo the DSN/host:port to the caller."""
+    client, store = _make_client(tmp_path)
+
+    def boom():
+        raise RuntimeError("could not connect: host=db.internal port=5432 password=hunter2")
+
+    store.count = boom  # type: ignore[method-assign]  # readyz probes via count()
+    resp = client.get("/v1/readyz")
+    assert resp.status_code == 503
+    body = resp.text
+    assert "db.internal" not in body and "hunter2" not in body and "5432" not in body
+
+
+def test_serve_endpoints_reject_symlinked_output(tmp_path):
+    """A compromised worker's symlinked artifact / metadata.json must not be served."""
+    client, store = _make_client(tmp_path)
+    job, output_dir = _make_done_job(tmp_path, store)
+    outside = tmp_path / "outside_secret"
+    outside.write_bytes(b"OUTSIDE-SECRET")
+
+    # declared artifact replaced by a symlink to an outside file -> 404, not the target bytes
+    (output_dir / "page-001.png").unlink()
+    (output_dir / "page-001.png").symlink_to(outside)
+    r = client.get(f"/v1/jobs/{job.job_id}/artifacts/page-001")
+    assert r.status_code == 404
+    assert b"OUTSIDE-SECRET" not in r.content
+
+    # metadata.json replaced by a symlink -> 404
+    meta = output_dir / "metadata.json"
+    data = meta.read_bytes()
+    meta.unlink()
+    (tmp_path / "ext_meta.json").write_bytes(data)
+    meta.symlink_to(tmp_path / "ext_meta.json")
+    assert client.get(f"/v1/jobs/{job.job_id}/metadata").status_code == 404
 
 
 def _make_done_job(
@@ -322,6 +383,33 @@ class TestJobListing:
         resp = client.get("/v1/jobs?status=flying")
         assert resp.status_code == 400
 
+    def test_list_pagination_window_and_total(self, tmp_path):
+        """offset/limit page the result via the store pushdown; total reflects the full count,
+        and jobs come back newest-first."""
+        client, store = _make_client(tmp_path)
+        created = []
+        for i in range(5):
+            j = Job.new(engine="clippyshot", filename=f"f{i}.docx")
+            j.created_at = 1000.0 + i  # deterministic newest-first ordering
+            store.create(j)
+            created.append(j)
+
+        resp = client.get("/v1/jobs?offset=1&limit=2")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 5  # full count, not the page size
+        assert body["offset"] == 1 and body["limit"] == 2
+        ids = [j["job_id"] for j in body["jobs"]]
+        # newest-first is f4,f3,f2,f1,f0 -> skip f4, take f3,f2
+        assert ids == [created[3].job_id, created[2].job_id]
+
+    def test_list_limit_clamped_to_1000(self, tmp_path):
+        client, _ = _make_client(tmp_path)
+        resp = client.get("/v1/jobs?limit=999999&offset=-5")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["limit"] == 1000 and body["offset"] == 0
+
     def test_public_dict_strips_result_dir(self, tmp_path):
         """result_dir must not appear in any public-facing response."""
         client, store = _make_client(tmp_path)
@@ -508,10 +596,25 @@ class TestAuth:
         assert resp.status_code == 200
 
     def test_metrics_always_public(self, tmp_path):
-        """metrics must remain 200 even when auth is enabled."""
+        """metrics must remain 200 even when auth is enabled (default metrics_public=True)."""
         client, _ = _make_client(tmp_path, api_key="secret123")
         resp = client.get("/metrics")
         assert resp.status_code == 200
+
+    def test_metrics_requires_token_when_private(self, tmp_path):
+        """With metrics_public=False (BLASTBOX_METRICS_PUBLIC=false) + auth on, /metrics needs
+        the bearer token; /v1/healthz + /v1/version stay public regardless."""
+        client, _ = _make_client(tmp_path, api_key="secret123", metrics_public=False)
+        assert client.get("/metrics").status_code == 401
+        assert client.get("/metrics", headers={"Authorization": "Bearer secret123"}).status_code == 200
+        # Health/version must NOT be gated by the metrics toggle.
+        assert client.get("/v1/healthz").status_code == 200
+        assert client.get("/v1/version").status_code == 200
+
+    def test_metrics_private_toggle_noop_without_api_key(self, tmp_path):
+        """No api_key -> no auth middleware -> /metrics open even with metrics_public=False."""
+        client, _ = _make_client(tmp_path, metrics_public=False)
+        assert client.get("/metrics").status_code == 200
 
 
 # ===========================================================================

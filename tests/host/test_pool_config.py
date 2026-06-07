@@ -142,6 +142,25 @@ def test_build_pool_cold_path_unaffected_when_snapshot_off(monkeypatch):
     assert pool is not None and pool.runtime is sentinel
 
 
+def test_gvisor_runtime_routes_to_gvisor_snapshot(monkeypatch):
+    monkeypatch.setenv("BLASTBOX_POOL_RUNTIME", "gvisor")
+    sentinel = _FakeRuntime()
+    calls = {}
+
+    def _capture(**kwargs):
+        calls.update(kwargs)
+        return sentinel
+
+    import blastbox.host.runtime.gvisor_snapshot_runtime as g
+    monkeypatch.setattr(g, "select_gvisor_snapshot_runtime", _capture)
+    from blastbox.host.pool_config import build_warm_pool, PoolConfig
+    pool = build_warm_pool(PoolConfig.from_env())
+    # The pool must wrap the runtime the gvisor selector returned...
+    assert pool is not None and pool.runtime is sentinel
+    # ...and it must be selected fail-loud (require_available=True), like the FC tier.
+    assert calls.get("require_available") is True
+
+
 @pytest.mark.skipif(
     _HAS_FC,
     reason="this host HAS the FC tier; the unavailable-path only holds without it",

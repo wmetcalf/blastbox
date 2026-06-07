@@ -1,0 +1,2878 @@
+diff --git a/deploy/gvisor/Dockerfile.shim b/deploy/gvisor/Dockerfile.shim
+new file mode 100644
+index 0000000..7b9d94c
+--- /dev/null
++++ b/deploy/gvisor/Dockerfile.shim
+@@ -0,0 +1,14 @@
++# Adds the accept-retry shim to a clippyshot soffice image for the gVisor C/R warm tier.
++# Build:  docker build --build-arg BASE=clippyshot:dev -f deploy/gvisor/Dockerfile.shim -t clippyshot-warm:gvisor .
++ARG BASE=clippyshot:dev
++FROM ${BASE}
++USER root
++COPY deploy/gvisor/accept_retry.c /tmp/accept_retry.c
++RUN set -eux; \
++    apt-get update; \
++    apt-get install -y --no-install-recommends gcc libc6-dev; \
++    mkdir -p /opt/clippyshot; \
++    gcc -shared -fPIC -O2 -o /opt/clippyshot/accept-retry.so /tmp/accept_retry.c -ldl; \
++    apt-get purge -y gcc libc6-dev; apt-get autoremove -y; \
++    rm -rf /var/lib/apt/lists/* /tmp/accept_retry.c
++# The warm worker env then sets LD_PRELOAD=/opt/clippyshot/accept-retry.so (soffice only).
+diff --git a/deploy/gvisor/README.md b/deploy/gvisor/README.md
+new file mode 100644
+index 0000000..0adef40
+--- /dev/null
++++ b/deploy/gvisor/README.md
+@@ -0,0 +1,113 @@
++# gVisor C/R warm tier — deploy guide
++
++## What it is
++
++A second warm-snapshot backend for blastbox alongside the Firecracker tier.  Instead
++of a full microVM, it uses **gVisor** (`runsc`) checkpoint/restore to snapshot a warm
++`unoserver`/soffice process and restore one disposable instance per job.
++
++**Advantages over Firecracker:** requires no nested-virt support — `runsc` runs on any
++cloud VM where KVM is unavailable or prohibited (e.g. GCP Tau T2D, ARM spots, VMs-in-VMs).
++**Validated on toolz2.**  Full design and rationale:
++`docs/specs/2026-06-05-gvisor-cr-snapshot-design.md`.
++
++## Prerequisites
++
++- A host with `runsc` (gVisor) installed and checkpoint/restore support enabled.
++  Verify: `runsc help` lists `checkpoint` and `restore` subcommands.
++- Drive `runsc` **directly** (not via containerd/CRI): the OCI checkpoint extension is
++  still unimplemented upstream, so `docker checkpoint` and `ctr checkpoint` do not work.
++  blastbox's `select_gvisor_snapshot_runtime` calls `runsc` directly.
++- The accept-retry shim `.so` baked into the soffice image (see below).
++
++## The accept-retry shim
++
++### Why it is needed
++
++gVisor's restore forces **EINTR on every blocked syscall** regardless of `SA_RESTART`
++or signal mask.  Most software retries `accept()` and recovers.  LibreOffice's
++`osl_acceptPipe` in `sal/osl/unx/pipe.cxx` does a **single non-retrying `accept()`**,
++so its UNO-pipe acceptor bails on the restore-time EINTR and the warm conversion
++hangs indefinitely.
++
++The shim (`accept_retry.c`) interposes `accept` and `accept4` via `LD_PRELOAD` and
++loops on `EINTR` — the one line of retry logic that `osl` omits.  It is **inert
++outside a restore** (the retry path only fires when `errno == EINTR`).
++
++### The Tika/JVM tier does NOT need the shim
++
++The JVM retries `accept` automatically on EINTR.  Only the soffice warm container
++needs the shim.
++
++### Building the shim
++
++Option A — bake it into the warm image at build time (recommended):
++
++```sh
++docker build \
++    --build-arg BASE=clippyshot:dev \
++    -f deploy/gvisor/Dockerfile.shim \
++    -t clippyshot-warm:gvisor .
++```
++
++Option B — compile manually and COPY the `.so` into an existing image layer:
++
++```sh
++gcc -shared -fPIC -O2 -o /opt/clippyshot/accept-retry.so \
++    deploy/gvisor/accept_retry.c -ldl
++```
++
++### Activating the shim
++
++Set `LD_PRELOAD=/opt/clippyshot/accept-retry.so` **only** in the environment of the
++soffice/unoserver warm container (not the job-restore environment, not Tika).
++blastbox reads this from `BLASTBOX_GVISOR_LD_PRELOAD` and passes it to the warm
++container's env at snapshot time.
++
++## Enabling the tier
++
++Set `BLASTBOX_POOL_RUNTIME=gvisor` before starting the pool, or pass it to the
++blastbox engine config.  blastbox calls `select_gvisor_snapshot_runtime()` which
++reads the following env vars (all optional, defaults shown):
++
++| Variable | Default | Purpose |
++|---|---|---|
++| `BLASTBOX_GVISOR_RUNSC` | `runsc` | Path to the `runsc` binary |
++| `BLASTBOX_GVISOR_ROOT` | `/var/lib/blastbox/gvisor-root` | `--root` state directory for runsc |
++| `BLASTBOX_GVISOR_ROOTFS` | _(image rootfs)_ | OCI rootfs path for the warm container |
++| `BLASTBOX_GVISOR_NETWORK` | `none` | `none` or `sandbox` (use `none` for the warm tier) |
++| `BLASTBOX_GVISOR_WARM_ARGV` | `["worker","warm"]` | JSON list; argv passed to the warm entrypoint |
++| `BLASTBOX_GVISOR_LD_PRELOAD` | _(unset)_ | Set to `/opt/clippyshot/accept-retry.so` for the soffice warm container |
++| `BLASTBOX_GVISOR_PLATFORM` | _(runsc default)_ | `ptrace` or `kvm`; leave unset to let runsc choose |
++| `BLASTBOX_GVISOR_CPUFEATURES` | _(unset)_ | `dev.gvisor.internal.cpufeatures` OCI annotation for cross-host CPU pinning |
++| `BLASTBOX_SNAPSHOT_SETTLE_S` | `1.0` | Seconds to wait after restore before sending the job (post-restore settle) |
++
++`_gvisor_config_from_env()` assembles a `GvisorConfig` dataclass from these
++vars; `select_gvisor_snapshot_runtime()` returns the configured runtime object.
++
++## I/O plane
++
++The gVisor warm tier uses the same file-trigger control protocol as the Firecracker
++tier — no vsock, no ext4 image:
++
++- **`in/`** — bind-mounted read-only into the restore container; contains the input doc.
++- **`out/`** — bind-mounted read-write; the worker writes PNGs + `metadata.json` here.
++- **`ctrl/`** — bind-mounted read-write; blastbox writes a trigger file
++  (`HostWarmControl` / `FileWarmControl`) that the in-guest worker polls; the guest
++  writes a completion sentinel when done.
++
++Output is read directly from `out/` on the host after the job completes.  Each restore
++is **disposable**: one untrusted document per restore, then the container is destroyed.
++
++## Snapshot sensitivity
++
++The checkpoint image encodes the host CPU feature set and the `runsc` version.  **Rebuild
++the snapshot** whenever:
++
++- `runsc` is upgraded on the host.
++- The soffice/clippyshot image is rebuilt.
++- The host changes (different CPU microarchitecture).
++
++Use `BLASTBOX_GVISOR_CPUFEATURES` to annotate the snapshot with a portable CPU feature
++subset, which allows restoring across minor microarchitecture differences within the
++same vendor family.  Cross-vendor (Intel ↔ AMD) restore is not supported by gVisor.
+diff --git a/deploy/gvisor/accept_retry.c b/deploy/gvisor/accept_retry.c
+new file mode 100644
+index 0000000..23ef2ca
+--- /dev/null
++++ b/deploy/gvisor/accept_retry.c
+@@ -0,0 +1,41 @@
++/* accept-retry LD_PRELOAD shim for the gVisor (runsc) C/R warm-soffice tier.
++ *
++ * gVisor's checkpoint/restore interrupts blocked syscalls with EINTR (regardless
++ * of SA_RESTART / signal mask). Most code re-calls accept() and recovers, but
++ * LibreOffice's osl_acceptPipe (sal/osl/unx/pipe.cxx) does a single non-retrying
++ * accept(), so its UNO-pipe acceptor bails on the restore EINTR and the warm
++ * conversion hangs. This shim transparently retries accept()/accept4() on EINTR,
++ * restoring the behavior osl omits. Required ONLY for the soffice warm container;
++ * inert everywhere else (the retry only fires on a restore-time EINTR).
++ *
++ * Build: gcc -shared -fPIC -O2 -o /opt/clippyshot/accept-retry.so accept_retry.c -ldl
++ * Use:   LD_PRELOAD=/opt/clippyshot/accept-retry.so  (set in the warm soffice env)
++ */
++#define _GNU_SOURCE
++#include <dlfcn.h>
++#include <errno.h>
++#include <sys/socket.h>
++
++static int (*real_accept)(int, struct sockaddr *, socklen_t *);
++static int (*real_accept4)(int, struct sockaddr *, socklen_t *, int);
++
++/* Resolve the real symbols once at load time (before any accept call) — avoids a
++ * lazy-init data race between concurrent first calls. */
++__attribute__((constructor)) static void init_real_accept(void) {
++    /* Explicit casts: dlsym returns void*, and ISO C forbids the implicit
++     * object->function-pointer conversion (some toolchains warn/error on -pedantic). */
++    real_accept = (int (*)(int, struct sockaddr *, socklen_t *)) dlsym(RTLD_NEXT, "accept");
++    real_accept4 =
++        (int (*)(int, struct sockaddr *, socklen_t *, int)) dlsym(RTLD_NEXT, "accept4");
++}
++
++int accept(int fd, struct sockaddr *a, socklen_t *l) {
++    /* If resolution failed (unusual libc/linker), fail cleanly instead of a NULL deref. */
++    if (!real_accept) { errno = ENOSYS; return -1; }
++    for (;;) { int r = real_accept(fd, a, l); if (r < 0 && errno == EINTR) continue; return r; }
++}
++
++int accept4(int fd, struct sockaddr *a, socklen_t *l, int flags) {
++    if (!real_accept4) { errno = ENOSYS; return -1; }
++    for (;;) { int r = real_accept4(fd, a, l, flags); if (r < 0 && errno == EINTR) continue; return r; }
++}
+diff --git a/deploy/gvisor/run_warm.py b/deploy/gvisor/run_warm.py
+new file mode 100644
+index 0000000..64e6b88
+--- /dev/null
++++ b/deploy/gvisor/run_warm.py
+@@ -0,0 +1,79 @@
++"""gVisor warm worker entrypoint — the file-trigger analog of the FC run_guest.py.
++
++Runs ``serve_warm`` with a ``FileWarmControl`` over the per-slot bind-mounted ``/ctrl``
++dir (host writes ``go.json`` + reads ``done``; the worker polls). The untrusted input
++arrives at ``/in`` (read-only bind mount) and output goes to ``/out`` (rw bind mount) —
++both paths are delivered by the host in ``go.json`` (already rewritten to the in-sandbox
++mount points by ``GvisorHostWarmControl``). The engine is chosen by ``BLASTBOX_GVISOR_ENGINE``
++(default ``probe``). After ``serve_warm`` returns (job done or idle), the worker blocks until
++the host reaps the slot — one untrusted document per disposable restore.
++
++This is the gVisor-tier counterpart to ``deploy/firecracker/run_guest.py`` (which uses a
++vsock control instead of the file trigger). Set the warm entrypoint to
++``["python3", "/opt/blastbox/run_warm.py"]`` via ``BLASTBOX_GVISOR_WARM_ARGV`` and bake the
++engine name into ``/opt/blastbox/engine`` (Docker ENV is dropped by ``docker export``).
++"""
++from __future__ import annotations
++
++import logging
++import os
++import time
++from pathlib import Path
++
++from blastbox.limits import Limits
++from blastbox.worker.warm import FileWarmControl, serve_warm
++from engines import get_engine  # /opt/blastbox/engines.py (sys.path[0] for this script)
++
++logging.basicConfig(
++    level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
++)
++_log = logging.getLogger("blastbox.gvisor.run_warm")
++
++CTRL_DIR = os.environ.get("BLASTBOX_GVISOR_CTRL_DIR", "/ctrl")
++
++
++def _engine_name() -> str:
++    # Baked into the rootfs filesystem at build time (Docker ENV is dropped by
++    # `docker export`); env/default is the running-the-image-directly fallback.
++    try:
++        baked = Path("/opt/blastbox/engine").read_text().strip()
++        if baked:
++            return baked
++    except OSError:
++        pass
++    return os.environ.get("BLASTBOX_GVISOR_ENGINE", "probe")
++
++
++def main() -> None:
++    engine = get_engine(_engine_name())
++    _log.info(
++        "run_warm start engine=%s uid=%d gid=%d",
++        getattr(engine, "name", _engine_name()),
++        os.getuid(),
++        os.getgid(),
++    )
++    # A snapshot-restored worker must NOT self-retire while it sits warm in the pool —
++    # the HOST reaps idle slots. Default high; guarded parse (a garbage value falls back
++    # rather than killing the worker before serve_warm starts).
++    _raw_idle = os.environ.get("BLASTBOX_WARM_IDLE_TIMEOUT_S", "").strip()
++    try:
++        idle_timeout_s = float(_raw_idle) if _raw_idle else 86400.0
++    except ValueError:
++        _log.warning("invalid BLASTBOX_WARM_IDLE_TIMEOUT_S=%r; using 86400.0", _raw_idle)
++        idle_timeout_s = 86400.0
++
++    control = FileWarmControl(Path(CTRL_DIR))
++    rc = serve_warm(
++        engine,
++        control=control,
++        limits=Limits.from_env(),
++        idle_timeout_s=idle_timeout_s,
++    )
++    _log.info("serve_warm returned rc=%s; idle until reap", rc)
++    # One job per disposable restore — block until the host SIGKILLs the slot.
++    while True:
++        time.sleep(3600)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/blastbox/host/pool_config.py b/src/blastbox/host/pool_config.py
+index fda7352..b4b357d 100644
+--- a/src/blastbox/host/pool_config.py
++++ b/src/blastbox/host/pool_config.py
+@@ -18,6 +18,7 @@ _log = logging.getLogger("blastbox.host.pool_config")
+ # Pool runtime identifiers.
+ RUNTIME_NONE = "none"
+ RUNTIME_FIRECRACKER = "firecracker"
++RUNTIME_GVISOR = "gvisor"
+ 
+ 
+ @dataclass(frozen=True)
+@@ -105,6 +106,12 @@ def build_warm_pool(
+                 from blastbox.host.runtime.firecracker import select_fc_runtime
+ 
+                 runtime = select_fc_runtime(require_available=True)
++        elif cfg.runtime == RUNTIME_GVISOR:
++            from blastbox.host.runtime.gvisor_snapshot_runtime import (
++                select_gvisor_snapshot_runtime,
++            )
++
++            runtime = select_gvisor_snapshot_runtime(require_available=True)
+         else:
+             raise ValueError(f"unknown pool runtime: {cfg.runtime!r}")
+ 
+diff --git a/src/blastbox/host/runtime/fc_snapshot.py b/src/blastbox/host/runtime/fc_snapshot.py
+index 9d1586f..aabd858 100644
+--- a/src/blastbox/host/runtime/fc_snapshot.py
++++ b/src/blastbox/host/runtime/fc_snapshot.py
+@@ -1,59 +1,24 @@
+-"""Firecracker snapshot/restore orchestration + the warm-snapshot manager.
+-
+-The warm tier builds **one** memory snapshot of a running, idle microVM (e.g. a
+-warm ``unoserver``) on host first-boot, then restores it per job. This module is
+-the host-side orchestration; the real process-spawning is injected as a *launcher*
+-so the logic is unit-tested without a real Firecracker.
+-
+-Key constraint (FC v1.12.1, from the embedded API schema): ``PUT /snapshot/load``
+-has **no vsock-uds override** — the host vsock path is baked into the snapshot. So
+-per-restore uniqueness comes from running each restored firecracker in its **own
+-working dir** (the same baked relative ``uds_path`` then resolves to a per-slot
+-socket), NOT from the load body. **Runtime-confirmed on toolz2 (FC v1.12.1):** each
+-restore re-creates its own ``vsock.sock`` in its own cwd, and a full
+-snapshot→restore→convert round-trip is pixel-identical to cold (see the spec).
++"""Runtime-agnostic warm-snapshot manager.
++
++The warm tier builds **one** snapshot of a running, idle sandbox (e.g. a warm
++``unoserver``) on host first-boot, then restores it per job. This module owns only
++the **lifecycle** — build once, serve restores — and talks exclusively to the
++:class:`~blastbox.host.runtime.snapshot_backend.SnapshotBackend` seam. The artifact
++a backend produces at checkpoint time is **opaque** to the manager: it is stored
++and handed straight back to ``restore_in`` without inspection, so the same manager
++drives Firecracker (a {snapshot, mem} file pair) or gVisor (a runsc image dir)
++unchanged.
++
++The FC-specific mechanics (create/restore API calls, the mem-dir RAM-preload
++toggle, the FcSnapshotArtifact) live in
++:mod:`blastbox.host.runtime.fc_snapshot_backend`.
+ """
+ from __future__ import annotations
+ 
+-import os
+-from dataclasses import dataclass
++import shutil
+ from pathlib import Path
+-from typing import Any, Protocol, runtime_checkable
+-
+-# RAM-preload toggle (see resolve_mem_dir). Default tmpfs mount on Linux.
+-_DEFAULT_TMPFS_MEM_DIR = Path("/dev/shm")
+-_ENV_MEM_TMPFS = "BLASTBOX_SNAPSHOT_MEM_TMPFS"
+-_ENV_MEM_DIR = "BLASTBOX_SNAPSHOT_MEM_DIR"
+-
+-
+-def _env_truthy(name: str) -> bool:
+-    return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no")
+-
+ 
+-def resolve_mem_dir() -> Path | None:
+-    """Resolve the snapshot mem-file directory from the RAM-preload toggle.
+-
+-    The snapshot's mem file ≈ guest RAM (~2 GB with soffice live) and dominates
+-    the snapshot cost. Holding it on **tmpfs** (``/dev/shm``) pins it in RAM, so
+-    every restore reads the COW-shared base from memory (zero disk I/O) — fast,
+-    but it permanently occupies ~one guest-RAM of RAM for the warm baseline. Hosts
+-    differ in RAM, so this is **opt-in, default OFF**: unset → the mem file lives
+-    on disk (page-cache-backed) in the manager's base dir, which is safe on a small
+-    box (the kernel still caches it, just evictable under pressure).
+-
+-    Precedence:
+-
+-    - ``BLASTBOX_SNAPSHOT_MEM_DIR=<path>`` — preload into this explicit directory
+-      (wins; for hosts whose tmpfs is mounted somewhere other than ``/dev/shm``).
+-    - ``BLASTBOX_SNAPSHOT_MEM_TMPFS=1`` — preload into the default tmpfs ``/dev/shm``.
+-    - neither set — return ``None`` (caller keeps the mem file on disk).
+-    """
+-    explicit = os.environ.get(_ENV_MEM_DIR, "").strip()
+-    if explicit:
+-        return Path(explicit)
+-    if _env_truthy(_ENV_MEM_TMPFS):
+-        return _DEFAULT_TMPFS_MEM_DIR
+-    return None
++from blastbox.host.runtime.snapshot_backend import RestoreHandle, SnapshotBackend
+ 
+ 
+ class SnapshotError(RuntimeError):
+@@ -68,180 +33,64 @@ class SnapshotRestoreError(SnapshotError):
+     """Restoring a slot from the snapshot failed (caller reaps + cold-boots the job)."""
+ 
+ 
+-@runtime_checkable
+-class FcApi(Protocol):
+-    """The subset of the Firecracker API client the orchestration uses."""
+-
+-    def put(self, path: str, body: Any = ...) -> int: ...
+-    def patch(self, path: str, body: Any = ...) -> int: ...
+-
+-
+-def create_snapshot(api: FcApi, snapshot_path: str, mem_path: str) -> None:
+-    """Pause the running microVM, then write a **Full** snapshot (state + memory).
+-
+-    Order is load-bearing — the VM MUST be Paused before ``/snapshot/create`` or
+-    Firecracker rejects it. Field shapes per FC v1.12.1 ``CreateSnapshotParams``."""
+-    from blastbox.host.runtime.fc_api import FcApiError
+-
+-    try:
+-        api.patch("/vm", {"state": "Paused"})
+-        api.put(
+-            "/snapshot/create",
+-            {
+-                "snapshot_type": "Full",
+-                "snapshot_path": snapshot_path,
+-                "mem_file_path": mem_path,
+-            },
+-        )
+-    except FcApiError as exc:
+-        raise SnapshotBuildError(f"create_snapshot failed: {exc}") from exc
+-
+-
+-def restore_from_snapshot(
+-    api: FcApi, snapshot_path: str, mem_path: str, *, resume: bool = True
+-) -> None:
+-    """Load a snapshot (state + memory) into a fresh firecracker and (optionally)
+-    resume. Field shapes per FC v1.12.1 ``LoadSnapshotConfig`` — ``mem_backend``
+-    (not the deprecated ``mem_file_path``), no vsock override (see module note)."""
+-    from blastbox.host.runtime.fc_api import FcApiError
+-
+-    try:
+-        api.put(
+-            "/snapshot/load",
+-            {
+-                "snapshot_path": snapshot_path,
+-                "mem_backend": {"backend_type": "File", "backend_path": mem_path},
+-                "enable_diff_snapshots": False,
+-                "resume_vm": resume,
+-            },
+-        )
+-    except FcApiError as exc:
+-        raise SnapshotRestoreError(f"restore_from_snapshot failed: {exc}") from exc
+-
+-
+-@dataclass(frozen=True)
+-class SnapshotArtifact:
+-    """The built warm snapshot: a state file + a memory file."""
+-
+-    snapshot_path: Path
+-    mem_path: Path
+-
+-
+-@runtime_checkable
+-class BootHandle(Protocol):
+-    """A launched base microVM used to build the snapshot."""
+-
+-    api: FcApi
+-
+-    def wait_ready(self, timeout_s: float) -> None: ...
+-    def kill(self) -> None: ...
+-
+-
+-@runtime_checkable
+-class RestoreHandle(Protocol):
+-    """A restored per-slot microVM."""
+-
+-    api: FcApi
+-    vsock_uds: str
+-
+-    def kill(self) -> None: ...
+-
+-
+-@runtime_checkable
+-class SnapshotLauncher(Protocol):
+-    """Spawns the real firecracker processes. Injected so SnapshotManager logic is
+-    testable without a host. The container/runtime implementation lives in Phase 2."""
+-
+-    def boot_base(self) -> BootHandle: ...
+-    def restore_in(self, slot_workdir: Path) -> RestoreHandle: ...
+-
+-
+ class SnapshotManager:
+     """Builds the warm snapshot once (first-boot), then serves restores to the pool.
+ 
+-    ``build()`` boots a base VM, waits READY, snapshots it, kills the base VM, and
+-    records the artifact (idempotent). ``restore(slot_id)`` launches a fresh
+-    firecracker in a **per-slot working dir** (vsock uniqueness — see module note)
+-    and loads+resumes the snapshot into it.
++    ``build()`` boots a base sandbox, waits READY, checkpoints it, tears the base
++    down, and records the OPAQUE artifact (idempotent). ``restore(slot_id)`` asks
++    the backend to restore that artifact into a fresh per-slot working dir.
++
++    The manager is runtime-agnostic: it never inspects the artifact and never
++    touches FC/gVisor APIs — all of that is behind the injected ``backend``.
+     """
+ 
+     def __init__(
+         self,
+         base_dir: Path,
+-        launcher: SnapshotLauncher,
++        backend: SnapshotBackend,
+         *,
+         ready_timeout_s: float = 120.0,
+-        mem_dir: Path | None = None,
+     ) -> None:
+         self._base_dir = Path(base_dir)
+-        # The mem file dominates the snapshot (~guest RAM). Point mem_dir at tmpfs
+-        # (/dev/shm) so every restore reads the COW-shared base from RAM, not disk
+-        # (FC mmaps it MAP_PRIVATE → base shared, per-VM copy-on-write). Defaults to
+-        # base_dir (page-cache-backed) when not set.
+-        self._mem_dir = Path(mem_dir) if mem_dir is not None else self._base_dir
+-        self._launcher = launcher
++        self._backend = backend
+         self._ready_timeout_s = ready_timeout_s
+-        self._artifact: SnapshotArtifact | None = None
+-
+-    @classmethod
+-    def from_env(
+-        cls,
+-        base_dir: Path,
+-        launcher: SnapshotLauncher,
+-        *,
+-        ready_timeout_s: float = 120.0,
+-        mem_dir: Path | None = None,
+-    ) -> "SnapshotManager":
+-        """Construct a manager, honoring the RAM-preload toggle from the environment.
+-
+-        When ``mem_dir`` is not passed explicitly, it is resolved via
+-        :func:`resolve_mem_dir` (``BLASTBOX_SNAPSHOT_MEM_TMPFS`` /
+-        ``BLASTBOX_SNAPSHOT_MEM_DIR``, default OFF → disk-backed). This is the entry
+-        point the pool wiring should use so the toggle is respected per host."""
+-        if mem_dir is None:
+-            mem_dir = resolve_mem_dir()
+-        return cls(
+-            base_dir, launcher, ready_timeout_s=ready_timeout_s, mem_dir=mem_dir
+-        )
++        self._artifact: object | None = None
+ 
+     @property
+-    def artifact(self) -> SnapshotArtifact | None:
++    def artifact(self) -> object | None:
+         return self._artifact
+ 
+-    def build(self) -> SnapshotArtifact:
++    def build(self) -> object:
+         """Build the warm snapshot. Idempotent — a second call returns the same
+         artifact without rebuilding. Raises :class:`SnapshotBuildError` on failure
+         (callers fall back to cold-boot)."""
+         if self._artifact is not None:
+             return self._artifact
+-        snap = self._base_dir / "warm.snapshot"
+-        mem = self._mem_dir / "warm.mem"
+         self._base_dir.mkdir(parents=True, exist_ok=True)
+-        self._mem_dir.mkdir(parents=True, exist_ok=True)
+         # boot_base() is its own try so a base-boot failure is wrapped as
+         # SnapshotBuildError (as documented), not propagated raw. boot_base already
+-        # kills its own firecracker on partial failure, so no handle/finally is needed
+-        # here — there is nothing to kill until it returns a BootHandle.
++        # tears down its own sandbox on partial failure, so no handle/finally is
++        # needed here — there is nothing to kill until it returns a BootHandle.
+         try:
+-            boot = self._launcher.boot_base()
++            boot = self._backend.boot_base()
+         except SnapshotError:
+             raise
+         except Exception as exc:
+             raise SnapshotBuildError(f"warm snapshot base boot failed: {exc}") from exc
+         try:
+             boot.wait_ready(self._ready_timeout_s)
+-            create_snapshot(boot.api, str(snap), str(mem))
++            artifact = boot.checkpoint(self._base_dir)
+         except SnapshotError:
+             raise
+-        except Exception as exc:  # readiness / snapshot failure
++        except Exception as exc:  # readiness / checkpoint failure
+             raise SnapshotBuildError(f"warm snapshot build failed: {exc}") from exc
+         finally:
+             boot.kill()
+-        self._artifact = SnapshotArtifact(snap, mem)
+-        return self._artifact
++        self._artifact = artifact
++        return artifact
+ 
+     def restore(self, slot_id: object) -> RestoreHandle:
+-        """Restore the warm snapshot into a fresh per-slot microVM and return its
++        """Restore the warm snapshot into a fresh per-slot sandbox and return its
+         handle. Raises :class:`SnapshotRestoreError` if the snapshot isn't built
+         yet or the restore fails (caller reaps the slot + cold-boots that job)."""
+         if self._artifact is None:
+@@ -255,15 +104,13 @@ class SnapshotManager:
+             raise SnapshotRestoreError(f"unsafe slot_id: {sid!r}")
+         slot_workdir = self._base_dir / "slots" / sid
+         slot_workdir.mkdir(parents=True, exist_ok=True)
+-        handle = self._launcher.restore_in(slot_workdir)
+         try:
+-            restore_from_snapshot(
+-                handle.api,
+-                str(self._artifact.snapshot_path),
+-                str(self._artifact.mem_path),
+-            )
+-        except Exception:
+-            # Don't leak the spawned firecracker if load/resume fails.
+-            handle.kill()
++            return self._backend.restore_in(slot_workdir, self._artifact)
++        except SnapshotError:
++            # A failed restore never yields a handle, so the slot is never reaped —
++            # remove the just-created (empty) workdir so it doesn't leak on the host.
++            shutil.rmtree(slot_workdir, ignore_errors=True)
+             raise
+-        return handle
++        except Exception as exc:
++            shutil.rmtree(slot_workdir, ignore_errors=True)
++            raise SnapshotRestoreError(f"restore failed: {exc}") from exc
+diff --git a/src/blastbox/host/runtime/fc_snapshot_backend.py b/src/blastbox/host/runtime/fc_snapshot_backend.py
+new file mode 100644
+index 0000000..85b01f2
+--- /dev/null
++++ b/src/blastbox/host/runtime/fc_snapshot_backend.py
+@@ -0,0 +1,200 @@
++"""Firecracker SnapshotBackend — the FC-specific mechanics behind the runtime seam.
++
++This is the Firecracker implementation of
++:class:`~blastbox.host.runtime.snapshot_backend.SnapshotBackend`. It owns everything
++FC-specific that the generic :class:`~blastbox.host.runtime.fc_snapshot.SnapshotManager`
++used to know about:
++
++- the **RAM-preload toggle** (``resolve_mem_dir`` / the ``BLASTBOX_SNAPSHOT_MEM_*``
++  env vars) that decides where the big mem file lives;
++- the FC artifact shape (:class:`FcSnapshotArtifact` — a ``{snapshot, mem}`` file
++  pair); and
++- the FC API call sequences for **CreateSnapshot Full** (``_create_snapshot``) and
++  **load+resume** (``_restore_from_snapshot``).
++
++Key constraint (FC v1.12.1, from the embedded API schema): ``PUT /snapshot/load``
++has **no vsock-uds override** — the host vsock path is baked into the snapshot. So
++per-restore uniqueness comes from running each restored firecracker in its **own
++working dir** (the same baked relative ``uds_path`` then resolves to a per-slot
++socket), NOT from the load body. **Runtime-confirmed on toolz2 (FC v1.12.1):** each
++restore re-creates its own ``vsock.sock`` in its own cwd, and a full
++snapshot→restore→convert round-trip is pixel-identical to cold (see the spec).
++"""
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Protocol, runtime_checkable
++
++from blastbox.host.runtime.fc_snapshot import SnapshotBuildError, SnapshotRestoreError
++
++# RAM-preload toggle (see resolve_mem_dir). Default tmpfs mount on Linux.
++_DEFAULT_TMPFS_MEM_DIR = Path("/dev/shm")
++_ENV_MEM_TMPFS = "BLASTBOX_SNAPSHOT_MEM_TMPFS"
++_ENV_MEM_DIR = "BLASTBOX_SNAPSHOT_MEM_DIR"
++
++
++def _env_truthy(name: str) -> bool:
++    return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no")
++
++
++def resolve_mem_dir() -> Path | None:
++    """Resolve the snapshot mem-file directory from the RAM-preload toggle.
++
++    The snapshot's mem file ≈ guest RAM (~2 GB with soffice live) and dominates
++    the snapshot cost. Holding it on **tmpfs** (``/dev/shm``) pins it in RAM, so
++    every restore reads the COW-shared base from memory (zero disk I/O) — fast,
++    but it permanently occupies ~one guest-RAM of RAM for the warm baseline. Hosts
++    differ in RAM, so this is **opt-in, default OFF**: unset → the mem file lives
++    on disk (page-cache-backed) in the manager's base dir, which is safe on a small
++    box (the kernel still caches it, just evictable under pressure).
++
++    Precedence:
++
++    - ``BLASTBOX_SNAPSHOT_MEM_DIR=<path>`` — preload into this explicit directory
++      (wins; for hosts whose tmpfs is mounted somewhere other than ``/dev/shm``).
++    - ``BLASTBOX_SNAPSHOT_MEM_TMPFS=1`` — preload into the default tmpfs ``/dev/shm``.
++    - neither set — return ``None`` (caller keeps the mem file on disk).
++    """
++    explicit = os.environ.get(_ENV_MEM_DIR, "").strip()
++    if explicit:
++        return Path(explicit)
++    if _env_truthy(_ENV_MEM_TMPFS):
++        return _DEFAULT_TMPFS_MEM_DIR
++    return None
++
++
++@runtime_checkable
++class FcApi(Protocol):
++    """The subset of the Firecracker API client the orchestration uses."""
++
++    def put(self, path: str, body: Any = ...) -> int: ...
++    def patch(self, path: str, body: Any = ...) -> int: ...
++
++
++def _create_snapshot(api: FcApi, snapshot_path: str, mem_path: str) -> None:
++    """Pause the running microVM, then write a **Full** snapshot (state + memory).
++
++    Order is load-bearing — the VM MUST be Paused before ``/snapshot/create`` or
++    Firecracker rejects it. Field shapes per FC v1.12.1 ``CreateSnapshotParams``."""
++    from blastbox.host.runtime.fc_api import FcApiError
++
++    try:
++        api.patch("/vm", {"state": "Paused"})
++        api.put(
++            "/snapshot/create",
++            {
++                "snapshot_type": "Full",
++                "snapshot_path": snapshot_path,
++                "mem_file_path": mem_path,
++            },
++        )
++    except FcApiError as exc:
++        raise SnapshotBuildError(f"create_snapshot failed: {exc}") from exc
++
++
++def _restore_from_snapshot(
++    api: FcApi, snapshot_path: str, mem_path: str, *, resume: bool = True
++) -> None:
++    """Load a snapshot (state + memory) into a fresh firecracker and (optionally)
++    resume. Field shapes per FC v1.12.1 ``LoadSnapshotConfig`` — ``mem_backend``
++    (not the deprecated ``mem_file_path``), no vsock override (see module note)."""
++    from blastbox.host.runtime.fc_api import FcApiError
++
++    try:
++        api.put(
++            "/snapshot/load",
++            {
++                "snapshot_path": snapshot_path,
++                "mem_backend": {"backend_type": "File", "backend_path": mem_path},
++                "enable_diff_snapshots": False,
++                "resume_vm": resume,
++            },
++        )
++    except FcApiError as exc:
++        raise SnapshotRestoreError(f"restore_from_snapshot failed: {exc}") from exc
++
++
++@dataclass(frozen=True)
++class FcSnapshotArtifact:
++    """The built warm snapshot: a state file + a memory file. This is the OPAQUE
++    artifact the generic :class:`SnapshotManager` round-trips between ``checkpoint``
++    and ``restore_in``; only the FC backend (and its launcher) ever inspect it."""
++
++    snapshot_path: Path
++    mem_path: Path
++
++
++class FcSnapshotBackend:
++    """Firecracker :class:`SnapshotBackend`.
++
++    ``boot_base()`` and ``restore_in()`` delegate process spawning to the injected
++    :class:`~blastbox.host.runtime.fc_snapshot_launcher.FcSnapshotLauncher`; this
++    backend layers the FC ``/snapshot/load`` + resume on top of the restored
++    firecracker the launcher spawns. ``checkpoint`` lives on the launcher's boot
++    handle (it needs the launcher's mem-dir), so this backend's role on the build
++    side is simply to hand the boot handle back to the manager.
++    """
++
++    def __init__(
++        self,
++        base_dir: Path,
++        launcher: Any,
++        *,
++        mem_dir: Path | None = None,
++    ) -> None:
++        self._base_dir = Path(base_dir)
++        self._launcher = launcher
++        # The mem file dominates the snapshot (~guest RAM). Point mem_dir at tmpfs
++        # (/dev/shm) so every restore reads the COW-shared base from RAM, not disk
++        # (FC mmaps it MAP_PRIVATE → base shared, per-VM copy-on-write). Defaults to
++        # base_dir (page-cache-backed) when not set.
++        self._mem_dir = Path(mem_dir) if mem_dir is not None else self._base_dir
++
++    @classmethod
++    def from_env(
++        cls,
++        base_dir: Path,
++        launcher: Any,
++        *,
++        mem_dir: Path | None = None,
++    ) -> "FcSnapshotBackend":
++        """Construct a backend, honoring the RAM-preload toggle from the environment.
++
++        When ``mem_dir`` is not passed explicitly, it is resolved via
++        :func:`resolve_mem_dir` (``BLASTBOX_SNAPSHOT_MEM_TMPFS`` /
++        ``BLASTBOX_SNAPSHOT_MEM_DIR``, default OFF → disk-backed). This is the entry
++        point the runtime wiring uses so the toggle is respected per host."""
++        if mem_dir is None:
++            mem_dir = resolve_mem_dir() or Path(base_dir)
++        return cls(base_dir, launcher, mem_dir=mem_dir)
++
++    @property
++    def mem_dir(self) -> Path:
++        return self._mem_dir
++
++    def available(self) -> bool:
++        # The caller (select_snapshot_runtime) already gated on firecracker_available;
++        # by the time a backend is constructed the FC prerequisites are present.
++        return True
++
++    def boot_base(self) -> Any:
++        """Boot the base microVM (whose handle ``checkpoint(dest_dir)`` snapshots)."""
++        return self._launcher.boot_base()
++
++    def restore_in(self, slot_workdir: Path, artifact: object) -> Any:
++        """Spawn a fresh firecracker in ``slot_workdir`` and load+resume the FC
++        snapshot into it. ``artifact`` is the :class:`FcSnapshotArtifact` the build
++        side produced; the manager passes it back here opaquely."""
++        assert isinstance(artifact, FcSnapshotArtifact)
++        handle = self._launcher.restore_in(slot_workdir)
++        try:
++            _restore_from_snapshot(
++                handle.api, str(artifact.snapshot_path), str(artifact.mem_path)
++            )
++        except Exception:
++            # Don't leak the spawned firecracker if load/resume fails.
++            handle.kill()
++            raise
++        return handle
+diff --git a/src/blastbox/host/runtime/fc_snapshot_launcher.py b/src/blastbox/host/runtime/fc_snapshot_launcher.py
+index fc87418..e35634a 100644
+--- a/src/blastbox/host/runtime/fc_snapshot_launcher.py
++++ b/src/blastbox/host/runtime/fc_snapshot_launcher.py
+@@ -83,16 +83,41 @@ def api_boot_sequence(
+ 
+ 
+ class _Handle:
+-    def __init__(self, proc, api, vsock_uds: str, ready_check=None) -> None:
++    def __init__(
++        self, proc, api, vsock_uds: str, ready_check=None, mem_dir: Path | None = None
++    ) -> None:
+         self.proc = proc
+         self.api = api
+         self.vsock_uds = vsock_uds
+         self._ready_check = ready_check
++        # Only the base (boot) handle carries a mem_dir — it's the one that gets
++        # checkpoint()ed. Restore handles don't snapshot, so they leave it None.
++        self._mem_dir = mem_dir
+ 
+     def wait_ready(self, timeout_s: float) -> None:
+         if self._ready_check is not None:
+             self._ready_check(timeout_s)
+ 
++    def checkpoint(self, dest_dir: Path) -> object:
++        """Pause + Full-snapshot this base microVM. The state file lands under
++        ``dest_dir`` (the manager's base dir); the big mem file lands under the
++        launcher's ``mem_dir`` (tmpfs when the RAM-preload toggle is on). Returns the
++        opaque :class:`FcSnapshotArtifact` the manager round-trips to ``restore_in``."""
++        from blastbox.host.runtime.fc_snapshot_backend import (
++            FcSnapshotArtifact,
++            _create_snapshot,
++        )
++
++        if self._mem_dir is None:
++            raise RuntimeError("checkpoint() called on a handle without a mem_dir")
++        dest = Path(dest_dir)
++        dest.mkdir(parents=True, exist_ok=True)
++        self._mem_dir.mkdir(parents=True, exist_ok=True)
++        snap = dest / "warm.snapshot"
++        mem = self._mem_dir / "warm.mem"
++        _create_snapshot(self.api, str(snap), str(mem))
++        return FcSnapshotArtifact(snap, mem)
++
+     def kill(self) -> None:
+         if self.proc is None or self.proc.poll() is not None:
+             return
+@@ -164,6 +189,7 @@ class FcSnapshotLauncher:
+         cfg: Any,
+         base_dir: Path,
+         *,
++        mem_dir: Path | None = None,
+         popen: Callable[..., subprocess.Popen] = subprocess.Popen,
+         api_factory: Callable[[str], Any] = FcApiClient,
+         wait_socket: Callable[[Path], None] | None = None,
+@@ -173,6 +199,10 @@ class FcSnapshotLauncher:
+     ) -> None:
+         self._cfg = cfg
+         self._base_dir = Path(base_dir)
++        # Where the snapshot mem file (~guest RAM) is written at checkpoint time. The
++        # base handle carries this so its checkpoint() places mem on the right dir
++        # (tmpfs /dev/shm when the RAM-preload toggle is on). Defaults to base_dir.
++        self._mem_dir = Path(mem_dir) if mem_dir is not None else self._base_dir
+         self._popen = popen
+         self._api_factory = api_factory
+         self._wait_socket = wait_socket or (lambda p: _default_wait_socket(p))
+@@ -223,7 +253,13 @@ class FcSnapshotLauncher:
+         except Exception:
+             _terminate_proc(proc)
+             raise
+-        return _Handle(proc, api, str(workdir / REL_VSOCK), ready_check=ready)
++        return _Handle(
++            proc,
++            api,
++            str(workdir / REL_VSOCK),
++            ready_check=ready,
++            mem_dir=self._mem_dir,
++        )
+ 
+     def restore_in(self, slot_workdir: Path):
+         """Spawn a fresh firecracker in ``slot_workdir`` for a snapshot restore. The
+diff --git a/src/blastbox/host/runtime/fc_snapshot_runtime.py b/src/blastbox/host/runtime/fc_snapshot_runtime.py
+index 79caee5..8f3dc08 100644
+--- a/src/blastbox/host/runtime/fc_snapshot_runtime.py
++++ b/src/blastbox/host/runtime/fc_snapshot_runtime.py
+@@ -1,8 +1,9 @@
+ """SlotRuntime backed by warm-snapshot restore — the warm-UNO Firecracker tier.
+ 
+ ``spawn()`` builds **one** warm snapshot on its first call (``SnapshotManager.build``,
+-constructed via ``SnapshotManager.from_env`` so the RAM-preload toggle —
+-``BLASTBOX_SNAPSHOT_MEM_TMPFS`` / ``BLASTBOX_SNAPSHOT_MEM_DIR`` — is honored), then
++driving an ``FcSnapshotBackend`` constructed via ``FcSnapshotBackend.from_env`` so the
++RAM-preload toggle — ``BLASTBOX_SNAPSHOT_MEM_TMPFS`` / ``BLASTBOX_SNAPSHOT_MEM_DIR`` —
++is honored), then
+ restores it into a fresh per-slot microVM on every subsequent ``spawn()``. The
+ restored guest resumes **already warm** (the snapshot captured the READY/idle state,
+ e.g. a live ``unoserver``), so promotion is near-instant — no soffice cold boot per
+@@ -80,8 +81,9 @@ class SnapshotSlotRuntime:
+     cfg:
+         The FC config (``FCConfig``); used for ``max_extracted_bytes`` on output read.
+     manager:
+-        A :class:`SnapshotManager`, normally built via ``SnapshotManager.from_env``
+-        so the RAM-preload toggle is respected. Injected for testability.
++        A :class:`SnapshotManager` driving an ``FcSnapshotBackend`` (normally built
++        via ``FcSnapshotBackend.from_env`` so the RAM-preload toggle is respected).
++        Injected for testability.
+     """
+ 
+     def __init__(
+@@ -127,7 +129,9 @@ class SnapshotSlotRuntime:
+         handle = self._manager.restore(slot_id)
+         # The launcher restores in base_dir/slots/<id>; the vsock UDS lives there, so
+         # its parent IS the per-slot workdir (vsock.sock + outdisk.ext4 + fc-api.sock).
+-        slot_workdir = Path(handle.vsock_uds).parent
++        # vsock_uds is a concrete-FC-handle accessor not on the generic RestoreHandle
++        # seam (kill-only) — the FC backend's handle always provides it.
++        slot_workdir = Path(handle.vsock_uds).parent  # type: ignore[attr-defined]
+         output_dir = slot_workdir / "out"
+         input_dir = slot_workdir / "in"
+         control_dir = slot_workdir / "ctrl"
+@@ -260,16 +264,20 @@ def select_snapshot_runtime(
+ ) -> "SnapshotSlotRuntime | None":
+     """Build a :class:`SnapshotSlotRuntime`, or ``None`` if the FC tier is unavailable.
+ 
+-    When ``manager`` is not injected, it is built via ``SnapshotManager.from_env`` —
+-    so the **RAM-preload toggle** (``BLASTBOX_SNAPSHOT_MEM_TMPFS`` /
+-    ``BLASTBOX_SNAPSHOT_MEM_DIR``, default OFF) is honored — over a
+-    :class:`FcSnapshotLauncher` that waits for the base VM's READY (warm-idle) before
+-    the snapshot is taken. ``cfg`` defaults to ``FCConfig.from_env()``.
++    When ``manager`` is not injected, it drives an ``FcSnapshotBackend`` built via
++    ``FcSnapshotBackend.from_env`` — so the **RAM-preload toggle**
++    (``BLASTBOX_SNAPSHOT_MEM_TMPFS`` / ``BLASTBOX_SNAPSHOT_MEM_DIR``, default OFF) is
++    honored — over a :class:`FcSnapshotLauncher` that waits for the base VM's READY
++    (warm-idle) before the snapshot is taken. ``cfg`` defaults to ``FCConfig.from_env()``.
+ 
+     ``require_available=True`` raises ``FCUnavailable`` when the FC prerequisites
+     (binary + /dev/kvm + kernel + rootfs) are missing — use when the operator
+     explicitly requested the snapshot tier.
+     """
++    from blastbox.host.runtime.fc_snapshot_backend import (
++        FcSnapshotBackend,
++        resolve_mem_dir,
++    )
+     from blastbox.host.runtime.fc_snapshot_launcher import FcSnapshotLauncher
+     from blastbox.host.runtime.firecracker import (
+         FCConfig,
+@@ -317,10 +325,16 @@ def select_snapshot_runtime(
+         return None
+ 
+     base_dir = Path(cfg.scratch_root)  # type: ignore[attr-defined]
++    # Resolve the RAM-preload mem dir once, hand it to BOTH the launcher (whose base
++    # handle writes warm.mem there at checkpoint) and the backend (whose restore loads
++    # mem from there) so build/restore agree on the mem-file location.
++    mem_dir = resolve_mem_dir() or base_dir
+     launcher = FcSnapshotLauncher(
+         cfg,
+         base_dir,
++        mem_dir=mem_dir,
+         ready_check_factory=_vsock_ready_check_factory,
+     )
+-    manager = SnapshotManager.from_env(base_dir, launcher)
++    backend = FcSnapshotBackend.from_env(base_dir, launcher, mem_dir=mem_dir)
++    manager = SnapshotManager(base_dir, backend)
+     return SnapshotSlotRuntime(cfg, manager, settle_s=settle_s)
+diff --git a/src/blastbox/host/runtime/gvisor_snapshot.py b/src/blastbox/host/runtime/gvisor_snapshot.py
+new file mode 100644
+index 0000000..00ac4cb
+--- /dev/null
++++ b/src/blastbox/host/runtime/gvisor_snapshot.py
+@@ -0,0 +1,274 @@
++"""GvisorSnapshotBackend — runsc checkpoint/restore as a SnapshotBackend.
++
++Drives `runsc` directly (containerd/CRI checkpoint is unimplemented upstream; the
++dispatcher already drives the runtime directly). The warm container runs the worker
++entrypoint (serve_warm + FileWarmControl); it writes `ready` into the bind-mounted
++control dir, which we poll before checkpointing. I/O is bind mounts (in/ ro, out/
++rw, ctrl/ rw) — no vsock, no ext4. All runsc calls go through an injected `run`.
++"""
++from __future__ import annotations
++
++import json
++import shutil
++import subprocess
++import time
++import uuid
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any, Callable
++
++
++@dataclass(frozen=True)
++class GvisorConfig:
++    runsc_bin: str
++    root: Path                  # runsc --root state dir
++    image_rootfs: Path          # OCI rootfs for the warm container
++    network: str                # "none" | "sandbox"
++    warm_argv: list[str]        # the warm worker entrypoint argv (inside the container)
++    ignore_cgroups: bool = True
++    platform: str | None = None
++    ld_preload: str | None = None                 # soffice tier: /opt/clippyshot/accept-retry.so
++    cpu_features_annotation: str | None = None     # dev.gvisor.internal.cpufeatures (pinning)
++    extra_env: list[str] = field(default_factory=list)
++    # Run the untrusted-document worker as NON-ROOT with NO capabilities (parity with the
++    # docker `--user`/`--cap-drop=ALL` and FC `setpriv 65532` tiers). The per-slot out/ + ctrl/
++    # bind mounts are chmod'd writable for this uid by the backend; HOME=/tmp (tmpfs) and the
++    # UserInstallation under /tmp keep soffice happy unprivileged.
++    uid: int = 65532
++    gid: int = 65532
++
++
++def _runsc(cfg: GvisorConfig) -> list[str]:
++    a = [cfg.runsc_bin, "-root", str(cfg.root), f"-network={cfg.network}"]
++    if cfg.ignore_cgroups:
++        a.append("-ignore-cgroups")
++    if cfg.platform:
++        a.append(f"-platform={cfg.platform}")
++    return a
++
++
++def _oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> dict:
++    """A self-contained OCI spec (config.json) for the warm/restore container with
++    per-slot bind mounts. Pure (no runsc spec needed) so it's unit-testable."""
++    env = ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/tmp"]
++    if cfg.ld_preload:
++        env.append(f"LD_PRELOAD={cfg.ld_preload}")
++    env.extend(cfg.extra_env)
++    spec: dict = {
++        "ociVersion": "1.0.0",
++        "process": {
++            "terminal": False,
++            "user": {"uid": cfg.uid, "gid": cfg.gid},
++            "args": list(cfg.warm_argv),
++            "env": env,
++            "cwd": "/",
++            # Non-root + no capabilities + no-new-privs: a malicious doc / soffice parser bug
++            # runs unprivileged, matching the docker + FC tiers and the design's stated invariant.
++            "noNewPrivileges": True,
++            "capabilities": {
++                k: []
++                for k in ("bounding", "effective", "permitted", "inheritable", "ambient")
++            },
++        },
++        "root": {"path": str(cfg.image_rootfs), "readonly": True},
++        "hostname": "warm",
++        "mounts": [
++            {"destination": "/proc", "type": "proc", "source": "proc"},
++            {"destination": "/dev", "type": "tmpfs", "source": "tmpfs",
++             "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]},
++            {"destination": "/tmp", "type": "tmpfs", "source": "tmpfs",
++             # mode=1777 (sticky world-writable like a real /tmp) so the NON-ROOT worker can
++             # write soffice's profile + the OSL UNO pipe under /tmp.
++             "options": ["rw", "nosuid", "nodev", "mode=1777", "size=512m"]},
++            {"destination": "/in", "type": "bind", "source": str(workdir / "in"),
++             "options": ["rbind", "ro" if in_ro else "rw"]},
++            {"destination": "/out", "type": "bind", "source": str(workdir / "out"),
++             "options": ["rbind", "rw"]},
++            {"destination": "/ctrl", "type": "bind", "source": str(workdir / "ctrl"),
++             "options": ["rbind", "rw"]},
++        ],
++        "linux": {"namespaces": [{"type": t} for t in ("pid", "network", "ipc", "uts", "mount")]},
++    }
++    if cfg.cpu_features_annotation:
++        spec["annotations"] = {"dev.gvisor.internal.cpufeatures": cfg.cpu_features_annotation}
++    return spec
++
++
++def _write_oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> None:
++    workdir.mkdir(parents=True, exist_ok=True)
++    (workdir / "config.json").write_text(
++        json.dumps(_oci_config(cfg, workdir, in_ro=in_ro), indent=2), encoding="utf-8"
++    )
++
++
++def _prepare_slot_dirs(cfg: GvisorConfig, workdir: Path) -> None:
++    """Create the per-slot bind-mount dirs. ``out/`` and ``ctrl/`` are shared scratch between
++    the NON-ROOT container uid (writes output + ready/done) and the host services (the
++    dispatcher writes go.json / reads done; the trust gate reads output) — which run under
++    different uids — so they are mode 0o777. This is safe because the parent
++    (``/var/lib/blastbox/...``, deploy concern) MUST be root-owned 0700, making the 0o777 leaf
++    reachable only by root + the mapped container uid (via the bind mount), not other local
++    users. ``in/`` is read-only and only needs world-traversable (0o755).
++
++    We also clamp ``workdir`` itself to 0o700 (belt-and-suspenders): even if the deploy parent
++    is lax, an unprivileged local user can't traverse INTO this slot dir to reach the 0o777
++    leaves. The container's gofer (and the host pool service) own/traverse it regardless."""
++    workdir.mkdir(parents=True, exist_ok=True)
++    workdir.chmod(0o700)
++    in_dir = workdir / "in"
++    in_dir.mkdir(parents=True, exist_ok=True)
++    in_dir.chmod(0o755)
++    for sub in ("out", "ctrl"):
++        d = workdir / sub
++        d.mkdir(parents=True, exist_ok=True)
++        d.chmod(0o777)
++
++
++def _default_run(argv: list[str], **kw: Any) -> int:
++    return subprocess.run(argv, check=True, **kw).returncode
++
++
++def _default_run_text(argv: list[str]) -> str:
++    # Bounded: alive() runs this from the pool's liveness path, so a hung `runsc state`
++    # must not block claim/promote indefinitely. Timeout/error → "" (treated as not-alive).
++    try:
++        return subprocess.run(
++            argv, capture_output=True, text=True, check=False, timeout=10
++        ).stdout
++    except (subprocess.TimeoutExpired, OSError):
++        return ""
++
++
++def _default_ready_wait(ctrl_dir: Path, timeout_s: float) -> None:
++    deadline = time.monotonic() + timeout_s
++    while time.monotonic() < deadline:
++        if (ctrl_dir / "ready").exists():
++            return
++        time.sleep(0.2)
++    raise TimeoutError(f"warm base not READY within {timeout_s}s ({ctrl_dir})")
++
++
++class GvisorBootHandle:
++    def __init__(
++        self,
++        cfg: GvisorConfig,
++        run: Callable[..., int],
++        cid: str,
++        base_dir: Path,
++        ctrl_dir: Path,
++        ready_wait: Callable[[Path, float], None],
++    ) -> None:
++        self._cfg = cfg
++        self._run = run
++        self._cid = cid
++        self._base = base_dir
++        self._ctrl = ctrl_dir
++        self._ready = ready_wait
++
++    def wait_ready(self, timeout_s: float) -> None:
++        self._ready(self._ctrl, timeout_s)
++
++    def checkpoint(self, dest_dir: Path) -> object:
++        img = Path(dest_dir) / "checkpoint"
++        img.mkdir(parents=True, exist_ok=True)
++        self._run([*_runsc(self._cfg), "checkpoint", "-image-path", str(img), self._cid])
++        return str(img)
++
++    def kill(self) -> None:
++        try:
++            self._run([*_runsc(self._cfg), "delete", "-force", self._cid])
++        except Exception:
++            pass
++        shutil.rmtree(self._base, ignore_errors=True)  # don't leave the base bundle dir behind
++
++
++class GvisorRestoreHandle:
++    def __init__(
++        self,
++        cfg: GvisorConfig,
++        run: Callable[..., int],
++        cid: str,
++        slot_workdir: Path,
++        run_text: Callable[[list[str]], str] = _default_run_text,
++    ) -> None:
++        self._cfg = cfg
++        self._run = run
++        self._run_text = run_text
++        self._cid = cid
++        self.slot_workdir = Path(slot_workdir)
++        self.control_dir = self.slot_workdir / "ctrl"
++        self.output_dir = self.slot_workdir / "out"
++        self.input_dir = self.slot_workdir / "in"
++
++    def alive(self) -> bool:
++        """True iff the restored container is still running (via runsc state)."""
++        import json as _json
++        try:
++            out = self._run_text([*_runsc(self._cfg), "state", self._cid])
++            status = _json.loads(out).get("status", "")
++            return status in ("running", "created")
++        except Exception:  # noqa: BLE001
++            return False
++
++    def kill(self) -> None:
++        for argv in (["kill", self._cid, "KILL"], ["delete", "-force", self._cid]):
++            try:
++                self._run([*_runsc(self._cfg), *argv])
++            except Exception:
++                pass
++
++
++class GvisorSnapshotBackend:
++    def __init__(
++        self,
++        cfg: GvisorConfig,
++        *,
++        run: Callable[..., int] = _default_run,
++        run_text: Callable[[list[str]], str] = _default_run_text,
++        ready_wait: Callable[[Path, float], None] = _default_ready_wait,
++        probe: Callable[[], bool] | None = None,
++    ) -> None:
++        self._cfg = cfg
++        self._run = run
++        self._run_text = run_text
++        self._ready = ready_wait
++        self._probe = probe
++
++    def available(self) -> bool:
++        if self._probe is not None:
++            return self._probe()
++        return shutil.which(self._cfg.runsc_bin) is not None
++
++    def boot_base(self) -> GvisorBootHandle:
++        base = self._cfg.root.parent / "gvisor-base"
++        _prepare_slot_dirs(self._cfg, base)
++        ctrl = base / "ctrl"
++        cid = "warm-base"
++        _write_oci_config(self._cfg, base, in_ro=True)
++        try:
++            self._run(
++                [*_runsc(self._cfg), "run", "-detach", "-bundle", str(base), cid],
++                stdin=subprocess.DEVNULL,
++                stdout=subprocess.DEVNULL,
++                stderr=subprocess.DEVNULL,
++            )
++        except Exception:
++            # No boot handle is returned on failure, so nothing reaps the base bundle —
++            # remove it (and its OCI config) so the host dir doesn't leak.
++            shutil.rmtree(base, ignore_errors=True)
++            raise
++        return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready)
++
++    def restore_in(self, slot_workdir: Path, artifact: object) -> GvisorRestoreHandle:
++        wd = Path(slot_workdir)
++        _prepare_slot_dirs(self._cfg, wd)
++        cid = f"slot-{uuid.uuid4().hex[:12]}"
++        _write_oci_config(self._cfg, wd, in_ro=True)
++        self._run(
++            [*_runsc(self._cfg), "restore", "-image-path", str(artifact),
++             "-detach", "-bundle", str(wd), cid],
++            stdin=subprocess.DEVNULL,
++            stdout=subprocess.DEVNULL,
++            stderr=subprocess.DEVNULL,
++        )
++        return GvisorRestoreHandle(self._cfg, self._run, cid, wd, self._run_text)
+diff --git a/src/blastbox/host/runtime/gvisor_snapshot_runtime.py b/src/blastbox/host/runtime/gvisor_snapshot_runtime.py
+new file mode 100644
+index 0000000..2219bc6
+--- /dev/null
++++ b/src/blastbox/host/runtime/gvisor_snapshot_runtime.py
+@@ -0,0 +1,193 @@
++"""SlotRuntime backed by gVisor (runsc) C/R restore — the warm tier for runsc hosts.
++
++spawn() builds ONE warm snapshot on its first call (SnapshotManager.build), then
++restores it into a fresh per-slot container on every spawn(). Control is the
++existing file-trigger (HostWarmControl over the per-slot ctrl/ bind mount); output
++is read DIRECTLY from the per-slot out/ bind mount (no vsock, no ext4 — so
++materialize_warm_output is a no-op). Mirrors the FC SnapshotSlotRuntime's
++SlotRuntime + warm-path seam so the dispatcher's per-slot job flow is identical.
++"""
++from __future__ import annotations
++
++import logging
++import shutil
++import threading
++import time
++import uuid
++from pathlib import Path
++from typing import Callable
++
++from blastbox.host.pool import Slot, SlotState
++
++_log = logging.getLogger(__name__)
++
++
++class GvisorSnapshotSlotRuntime:
++    def __init__(self, manager, *, settle_s: float = 1.0, clock: Callable[[], float] = time.monotonic) -> None:
++        self._mgr = manager
++        self._settle_s = settle_s
++        self._clock = clock
++        self._handles: dict[str, object] = {}
++        self._restored_at: dict[str, float] = {}
++        self._lock = threading.Lock()
++
++    def spawn(self) -> Slot:
++        self._mgr.build()  # idempotent: snapshot built on first spawn only
++        slot_id = str(uuid.uuid4())
++        handle = self._mgr.restore(slot_id)
++        wd = Path(handle.slot_workdir)  # type: ignore[attr-defined]
++        with self._lock:
++            self._handles[slot_id] = handle
++            self._restored_at[slot_id] = self._clock()
++        _log.info("gvisor_snapshot.spawn slot_id=%s workdir=%s", slot_id, wd)
++        return Slot(
++            slot_id=slot_id,
++            control_dir=wd / "ctrl",
++            input_dir=wd / "in",
++            output_dir=wd / "out",
++            state=SlotState.WARMING,
++        )
++
++    def is_ready(self, slot: Slot) -> bool:
++        with self._lock:
++            handle = self._handles.get(slot.slot_id)
++            restored_at = self._restored_at.get(slot.slot_id)
++        if handle is None:
++            return False
++        # Hold WARMING for a short post-restore settle window (mirrors the FC tier);
++        # in a steady-state pool it overlaps background pre-warming, adding no per-job latency.
++        if restored_at is not None and self._clock() - restored_at < self._settle_s:
++            return False
++        try:
++            if not Path(slot.control_dir).exists():
++                return False
++        except OSError:
++            return False
++        # control_dir is created on the HOST before `runsc restore`, so its mere existence
++        # doesn't prove the sandbox came up — a restore that immediately exited would still
++        # pass. Gate on liveness too (mirrors the FC tier) so dead slots aren't promoted to IDLE.
++        alive = getattr(handle, "alive", None)
++        return alive() if callable(alive) else True
++
++    def is_alive(self, slot: Slot) -> bool:
++        with self._lock:
++            handle = self._handles.get(slot.slot_id)
++        if handle is None:
++            return False
++        alive = getattr(handle, "alive", None)
++        return alive() if callable(alive) else True
++
++    def reap(self, slot: Slot) -> None:
++        with self._lock:
++            handle = self._handles.pop(slot.slot_id, None)
++            self._restored_at.pop(slot.slot_id, None)
++        if handle is not None:
++            try:
++                handle.kill()  # type: ignore[attr-defined]
++            except Exception as exc:  # noqa: BLE001 — reap must never raise
++                _log.warning("gvisor_snapshot.reap_kill_error slot_id=%s: %s", slot.slot_id, exc)
++        slot_workdir = Path(slot.output_dir).parent
++        if slot_workdir.exists():
++            shutil.rmtree(slot_workdir, ignore_errors=True)
++
++    # --- warm-path seam (file-trigger control; output already on the bind mount) ---
++    def host_warm_control(self, slot: Slot) -> GvisorHostWarmControl:
++        return GvisorHostWarmControl(slot.control_dir)
++
++    def stage_warm_input(self, slot: Slot, staged_input_path: Path) -> Path:
++        dst = Path(slot.input_dir) / Path(staged_input_path).name
++        Path(slot.input_dir).mkdir(parents=True, exist_ok=True)
++        shutil.copyfile(staged_input_path, dst)
++        return dst
++
++    def materialize_warm_output(self, slot: Slot) -> None:
++        # Output is written directly into the bind-mounted out/ dir; nothing to read back.
++        return None
++
++
++class GvisorHostWarmControl:
++    """Wraps HostWarmControl, rewriting the job spec's host paths to the fixed
++    in-sandbox bind-mount destinations (/in, /out) before writing go.json — the
++    worker validates + reads those in its own (sandbox) namespace.  The host still
++    reads results from the host-side slot.output_dir (same bind mount)."""
++
++    SANDBOX_IN = Path("/in")
++    SANDBOX_OUT = Path("/out")
++
++    def __init__(self, control_dir: Path) -> None:
++        from blastbox.worker.warm import HostWarmControl
++        self._inner = HostWarmControl(control_dir)
++
++    def signal_go(self, spec: object) -> None:
++        from blastbox.worker.warm import WarmJobSpec
++        translated = WarmJobSpec(
++            input_path=self.SANDBOX_IN / Path(spec.input_path).name,  # type: ignore[attr-defined]
++            output_dir=self.SANDBOX_OUT,
++            params=dict(spec.params or {}),  # type: ignore[attr-defined]
++        )
++        self._inner.signal_go(translated)
++
++    def wait_for_done(self, *, timeout_s: float) -> str:
++        return self._inner.wait_for_done(timeout_s=timeout_s)
++
++
++class GvisorUnavailable(RuntimeError):
++    """The gVisor C/R warm tier was required but runsc/prereqs are missing."""
++
++
++def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager=None,
++                                   settle_s=None):
++    """Build a GvisorSnapshotSlotRuntime, or None if runsc is unavailable (unless
++    require_available, which raises GvisorUnavailable)."""
++    import os
++
++    def _settle():
++        raw = (str(settle_s) if settle_s is not None else os.environ.get("BLASTBOX_SNAPSHOT_SETTLE_S", "")).strip()
++        try:
++            return float(raw) if raw else 1.0
++        except ValueError:
++            _log.warning("invalid BLASTBOX_SNAPSHOT_SETTLE_S=%r; using 1.0", raw)
++            return 1.0
++
++    if manager is not None:
++        return GvisorSnapshotSlotRuntime(manager, settle_s=_settle())
++    from blastbox.host.runtime.gvisor_snapshot import GvisorSnapshotBackend
++    from blastbox.host.runtime.fc_snapshot import SnapshotManager
++    gcfg = cfg or _gvisor_config_from_env(os.environ)
++    backend = GvisorSnapshotBackend(gcfg)
++    if not backend.available():
++        if require_available:
++            raise GvisorUnavailable("gVisor C/R warm tier required but runsc not found; "
++                                    "set BLASTBOX_GVISOR_RUNSC / install runsc")
++        _log.debug("select_gvisor_snapshot_runtime: runsc unavailable")
++        return None
++    base_dir = Path(gcfg.root).parent / "gvisor-snapshot"
++    mgr = SnapshotManager(base_dir, backend)
++    return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle())
++
++
++def _gvisor_config_from_env(env):
++    import json
++    from blastbox.host.runtime.gvisor_snapshot import GvisorConfig
++    root = env.get("BLASTBOX_GVISOR_ROOT", "/var/lib/blastbox/gvisor-root")
++    rootfs = env.get("BLASTBOX_GVISOR_ROOTFS", "/var/lib/blastbox/gvisor-rootfs")
++    raw_argv = env.get("BLASTBOX_GVISOR_WARM_ARGV", "").strip()
++    try:
++        warm_argv = json.loads(raw_argv) if raw_argv else ["worker", "warm"]
++    except json.JSONDecodeError:
++        # A malformed override must not crash host startup — fall back to the default argv.
++        _log.warning(
++            "invalid BLASTBOX_GVISOR_WARM_ARGV JSON %r; using default ['worker', 'warm']",
++            raw_argv,
++        )
++        warm_argv = ["worker", "warm"]
++    return GvisorConfig(
++        runsc_bin=env.get("BLASTBOX_GVISOR_RUNSC", "runsc"),
++        root=Path(root),
++        image_rootfs=Path(rootfs),
++        network=env.get("BLASTBOX_GVISOR_NETWORK", "none"),
++        warm_argv=warm_argv,
++        ld_preload=env.get("BLASTBOX_GVISOR_LD_PRELOAD") or None,
++        platform=env.get("BLASTBOX_GVISOR_PLATFORM") or None,
++        cpu_features_annotation=env.get("BLASTBOX_GVISOR_CPUFEATURES") or None,
++    )
+diff --git a/src/blastbox/host/runtime/snapshot_backend.py b/src/blastbox/host/runtime/snapshot_backend.py
+new file mode 100644
+index 0000000..77cfb9c
+--- /dev/null
++++ b/src/blastbox/host/runtime/snapshot_backend.py
+@@ -0,0 +1,49 @@
++"""Runtime-agnostic warm-snapshot seam.
++
++One generic SnapshotManager (fc_snapshot.py) drives any SnapshotBackend. The
++artifact a backend produces at checkpoint time is OPAQUE to the manager — the
++manager stores it and hands it back to restore_in(), never inspecting it. FC's
++artifact is a {snapshot, mem} file pair; gVisor's is a runsc image-path dir.
++"""
++from __future__ import annotations
++from pathlib import Path
++from typing import Protocol, runtime_checkable
++
++
++@runtime_checkable
++class BootHandle(Protocol):
++    """A launched base sandbox used to build the snapshot."""
++
++    def wait_ready(self, timeout_s: float) -> None:
++        """Block until the base sandbox's engine signals READY (warm-idle)."""
++        ...
++
++    def checkpoint(self, dest_dir: Path) -> object:
++        """Capture the warm snapshot, writing artifacts under/near dest_dir.
++        Returns an OPAQUE artifact the manager round-trips to restore_in()."""
++        ...
++
++    def kill(self) -> None:
++        """Tear down the base sandbox."""
++        ...
++
++
++@runtime_checkable
++class RestoreHandle(Protocol):
++    """A restored per-slot sandbox. Backend-specific I/O accessors are added by
++    the concrete handle; the seam only requires kill()."""
++
++    def kill(self) -> None: ...
++
++
++@runtime_checkable
++class SnapshotBackend(Protocol):
++    """Spawns/checkpoints/restores the real sandboxes for one runtime (FC, gVisor)."""
++
++    def available(self) -> bool:
++        """True iff this backend's prerequisites are present (fail-closed selection)."""
++        ...
++
++    def boot_base(self) -> BootHandle: ...
++
++    def restore_in(self, slot_workdir: Path, artifact: object) -> RestoreHandle: ...
+diff --git a/tests/fixtures/sample.txt b/tests/fixtures/sample.txt
+new file mode 100644
+index 0000000..eb7d4bc
+--- /dev/null
++++ b/tests/fixtures/sample.txt
+@@ -0,0 +1,2 @@
++blastbox gVisor C/R integration fixture
++second line
+diff --git a/tests/host/runtime/test_fc_snapshot.py b/tests/host/runtime/test_fc_snapshot.py
+index 1bd3153..2f4ce05 100644
+--- a/tests/host/runtime/test_fc_snapshot.py
++++ b/tests/host/runtime/test_fc_snapshot.py
+@@ -1,279 +1,194 @@
+-"""Unit tests for FC snapshot/restore orchestration + SnapshotManager."""
+-from __future__ import annotations
++"""Unit tests for the runtime-agnostic SnapshotManager.
+ 
+-from pathlib import Path
++The manager talks only to the :class:`SnapshotBackend` seam and round-trips an
++OPAQUE artifact (it never inspects it). FC-specific mechanics
++(create_snapshot/restore_from_snapshot/resolve_mem_dir, the FcSnapshotArtifact,
++the FcSnapshotBackend wiring) are tested in ``test_fc_snapshot_backend.py``.
++"""
++from __future__ import annotations
+ 
+ import pytest
+ 
+-from blastbox.host.runtime.fc_api import FcApiError
+ from blastbox.host.runtime.fc_snapshot import (
+     SnapshotBuildError,
+     SnapshotManager,
+     SnapshotRestoreError,
+-    create_snapshot,
+-    resolve_mem_dir,
+-    restore_from_snapshot,
+ )
+ 
+ 
+-class FakeApi:
+-    def __init__(self, fail_on=None):
+-        self.calls = []
+-        self._fail_on = fail_on  # (method, path) to raise FcApiError on
+-
+-    def put(self, path, body=None):
+-        self.calls.append(("PUT", path, body))
+-        if self._fail_on == ("PUT", path):
+-            raise FcApiError("PUT", path, 400, "bad request")
+-        return 204
+-
+-    def patch(self, path, body=None):
+-        self.calls.append(("PATCH", path, body))
+-        if self._fail_on == ("PATCH", path):
+-            raise FcApiError("PATCH", path, 400, "bad request")
+-        return 204
+-
+-
+-# --- create_snapshot / restore_from_snapshot ------------------------------
+-
+-
+-def test_create_snapshot_pauses_then_snapshots():
+-    api = FakeApi()
+-    create_snapshot(api, "/s/state", "/s/mem")
+-    assert api.calls == [
+-        ("PATCH", "/vm", {"state": "Paused"}),
+-        (
+-            "PUT",
+-            "/snapshot/create",
+-            {"snapshot_type": "Full", "snapshot_path": "/s/state", "mem_file_path": "/s/mem"},
+-        ),
+-    ]
+-
+-
+-def test_create_snapshot_wraps_api_error_as_build_error():
+-    api = FakeApi(fail_on=("PUT", "/snapshot/create"))
+-    with pytest.raises(SnapshotBuildError):
+-        create_snapshot(api, "/s/state", "/s/mem")
+-
+-
+-def test_restore_loads_mem_backend_and_resumes():
+-    api = FakeApi()
+-    restore_from_snapshot(api, "/s/state", "/s/mem")
+-    assert api.calls == [
+-        (
+-            "PUT",
+-            "/snapshot/load",
+-            {
+-                "snapshot_path": "/s/state",
+-                "mem_backend": {"backend_type": "File", "backend_path": "/s/mem"},
+-                "enable_diff_snapshots": False,
+-                "resume_vm": True,
+-            },
+-        ),
+-    ]
+-
+-
+-def test_restore_respects_resume_false():
+-    api = FakeApi()
+-    restore_from_snapshot(api, "/s/state", "/s/mem", resume=False)
+-    assert api.calls[0][2]["resume_vm"] is False
+-
+-
+-def test_restore_wraps_api_error_as_restore_error():
+-    api = FakeApi(fail_on=("PUT", "/snapshot/load"))
+-    with pytest.raises(SnapshotRestoreError):
+-        restore_from_snapshot(api, "/s/state", "/s/mem")
+-
+-
+-# --- SnapshotManager (fake launcher) --------------------------------------
++# --- fake backend (the seam) ----------------------------------------------
+ 
+ 
+ class FakeBoot:
+-    def __init__(self, api, ready_ok=True):
+-        self.api = api
++    def __init__(self, artifact, *, ready_ok=True):
++        self._artifact = artifact
+         self._ready_ok = ready_ok
+         self.killed = False
++        self.checkpoint_dest = None
+ 
+     def wait_ready(self, timeout_s):
+         if not self._ready_ok:
+             raise TimeoutError("never became ready")
+ 
++    def checkpoint(self, dest_dir):
++        self.checkpoint_dest = dest_dir
++        return self._artifact
++
+     def kill(self):
+         self.killed = True
+ 
+ 
+ class FakeRestore:
+-    def __init__(self, api, vsock_uds):
+-        self.api = api
+-        self.vsock_uds = vsock_uds
++    def __init__(self, slot_workdir, artifact):
++        self.slot_workdir = slot_workdir
++        self.artifact = artifact
+         self.killed = False
+ 
+-    def kill(self):  # satisfies the RestoreHandle protocol (kill on load failure)
++    def kill(self):  # satisfies the RestoreHandle protocol
+         self.killed = True
+ 
+ 
+-class FakeLauncher:
+-    def __init__(self, ready_ok=True):
++class FakeBackend:
++    """An opaque-artifact backend the manager drives. ``artifact`` is an arbitrary
++    sentinel object the manager must round-trip unchanged into ``restore_in``."""
++
++    def __init__(self, *, ready_ok=True, artifact=None):
+         self._ready_ok = ready_ok
++        self.artifact = artifact if artifact is not None else object()
+         self.boots = []
+         self.restores = []
+         self.last_boot = None
+ 
++    def available(self):
++        return True
++
+     def boot_base(self):
+-        self.last_boot = FakeBoot(FakeApi(), self._ready_ok)
++        self.last_boot = FakeBoot(self.artifact, ready_ok=self._ready_ok)
+         self.boots.append(self.last_boot)
+         return self.last_boot
+ 
+-    def restore_in(self, slot_workdir):
+-        h = FakeRestore(FakeApi(), vsock_uds=str(slot_workdir / "vsock.sock"))
++    def restore_in(self, slot_workdir, artifact):
++        h = FakeRestore(slot_workdir, artifact)
+         self.restores.append(h)
+         return h
+ 
+ 
+-def test_build_snapshots_then_kills_base(tmp_path):
+-    launcher = FakeLauncher()
+-    art = SnapshotManager(tmp_path, launcher).build()
+-    assert art.snapshot_path == tmp_path / "warm.snapshot"
+-    assert art.mem_path == tmp_path / "warm.mem"
+-    assert launcher.last_boot.killed is True
+-    assert (
+-        "PUT",
+-        "/snapshot/create",
+-        {
+-            "snapshot_type": "Full",
+-            "snapshot_path": str(tmp_path / "warm.snapshot"),
+-            "mem_file_path": str(tmp_path / "warm.mem"),
+-        },
+-    ) in launcher.last_boot.api.calls
++# --- build -----------------------------------------------------------------
++
++
++def test_build_waits_ready_checkpoints_then_kills_base(tmp_path):
++    backend = FakeBackend()
++    mgr = SnapshotManager(tmp_path, backend)
++    art = mgr.build()
++    assert art is backend.artifact  # opaque artifact returned unchanged
++    assert backend.last_boot.killed is True
++    # checkpoint is written under/near the manager's base_dir
++    assert backend.last_boot.checkpoint_dest == tmp_path
++
++
++def test_build_returns_opaque_artifact_unchanged(tmp_path):
++    sentinel = {"this": "is opaque", "n": 3}
++    backend = FakeBackend(artifact=sentinel)
++    art = SnapshotManager(tmp_path, backend).build()
++    assert art is sentinel  # manager never reshapes the artifact
+ 
+ 
+ def test_build_is_idempotent(tmp_path):
+-    launcher = FakeLauncher()
+-    mgr = SnapshotManager(tmp_path, launcher)
++    backend = FakeBackend()
++    mgr = SnapshotManager(tmp_path, backend)
+     a = mgr.build()
+     b = mgr.build()
+     assert a is b
+-    assert len(launcher.boots) == 1  # built exactly once
++    assert len(backend.boots) == 1  # built exactly once
++    assert mgr.artifact is a
+ 
+ 
+ def test_build_kills_base_even_on_failure(tmp_path):
+-    launcher = FakeLauncher(ready_ok=False)  # readiness times out
+-    mgr = SnapshotManager(tmp_path, launcher)
++    backend = FakeBackend(ready_ok=False)  # readiness times out
++    mgr = SnapshotManager(tmp_path, backend)
+     with pytest.raises(SnapshotBuildError):
+         mgr.build()
+-    assert launcher.last_boot.killed is True  # torn down in finally
++    assert backend.last_boot.killed is True  # torn down in finally
+     assert mgr.artifact is None
+ 
+ 
++def test_build_wraps_boot_base_failure_as_build_error(tmp_path):
++    class BoomBackend(FakeBackend):
++        def boot_base(self):
++            raise RuntimeError("no kvm")
++
++    with pytest.raises(SnapshotBuildError):
++        SnapshotManager(tmp_path, BoomBackend()).build()
++
++
++def test_build_preserves_snapshot_error_subclasses(tmp_path):
++    """A backend that raises a SnapshotError (e.g. SnapshotBuildError) is NOT
++    re-wrapped — it propagates as-is (the `except SnapshotError: raise` arm)."""
++    class BoomBackend(FakeBackend):
++        def boot_base(self):
++            raise SnapshotBuildError("backend already chose the error")
++
++    with pytest.raises(SnapshotBuildError, match="backend already chose"):
++        SnapshotManager(tmp_path, BoomBackend()).build()
++
++
++# --- restore ---------------------------------------------------------------
++
++
++def test_restore_passes_opaque_artifact_to_backend(tmp_path):
++    sentinel = object()
++    backend = FakeBackend(artifact=sentinel)
++    mgr = SnapshotManager(tmp_path, backend)
++    mgr.build()
++    handle = mgr.restore("slot-7")
++    # the manager handed the exact artifact back to restore_in, unmodified
++    assert handle.artifact is sentinel
++    assert handle.slot_workdir == tmp_path / "slots" / "slot-7"
++
++
+ def test_restore_uses_unique_per_slot_workdir(tmp_path):
+-    launcher = FakeLauncher()
+-    mgr = SnapshotManager(tmp_path, launcher)
++    backend = FakeBackend()
++    mgr = SnapshotManager(tmp_path, backend)
+     mgr.build()
+     h7 = mgr.restore("slot-7")
+     h8 = mgr.restore("slot-8")
+-    assert h7.vsock_uds != h8.vsock_uds  # per-slot uniqueness via workdir
++    assert h7.slot_workdir != h8.slot_workdir
+     assert (tmp_path / "slots" / "slot-7").is_dir()
+-    assert any(c[0:2] == ("PUT", "/snapshot/load") for c in launcher.restores[0].api.calls)
++    assert (tmp_path / "slots" / "slot-8").is_dir()
++    assert len(backend.restores) == 2
+ 
+ 
+ def test_restore_before_build_raises(tmp_path):
+     with pytest.raises(SnapshotRestoreError):
+-        SnapshotManager(tmp_path, FakeLauncher()).restore("slot-1")
++        SnapshotManager(tmp_path, FakeBackend()).restore("slot-1")
+ 
+ 
+ def test_restore_rejects_unsafe_slot_id(tmp_path):
+-    """slot_id becomes a path segment under slots/ — traversal/odd values are rejected."""
+-    mgr = SnapshotManager(tmp_path, FakeLauncher())
++    """slot_id becomes a path segment under slots/ — traversal/odd values rejected."""
++    mgr = SnapshotManager(tmp_path, FakeBackend())
+     mgr.build()
+-    for bad in ("../escape", "a/b", "..", ".", "", "x\x00y"):
++    for bad in ("", "../escape", "a/b", "..", ".", "x\x00y"):
+         with pytest.raises(SnapshotRestoreError, match="unsafe slot_id"):
+             mgr.restore(bad)
+ 
+ 
+-def test_restore_kills_handle_on_load_failure(tmp_path):
+-    """If snapshot/load fails, the spawned firecracker must be killed (no leak)."""
+-    handle = type("H", (), {})()
+-    handle.api = FakeApi(fail_on=("PUT", "/snapshot/load"))
+-    handle.vsock_uds = "v"
+-    handle.killed = False
+-    handle.kill = lambda: setattr(handle, "killed", True)
++def test_restore_wraps_backend_failure_as_restore_error(tmp_path):
++    class BoomBackend(FakeBackend):
++        def restore_in(self, slot_workdir, artifact):
++            raise RuntimeError("load failed")
+ 
+-    class Launcher:
+-        def boot_base(self):
+-            return FakeBoot(FakeApi())
+-
+-        def restore_in(self, wd):
+-            return handle
+-
+-    mgr = SnapshotManager(tmp_path, Launcher())
++    mgr = SnapshotManager(tmp_path, BoomBackend())
+     mgr.build()
+     with pytest.raises(SnapshotRestoreError):
+         mgr.restore("slot-x")
+-    assert handle.killed is True
+-
+-
+-def test_build_puts_mem_on_separate_mem_dir(tmp_path):
+-    """mem_dir (e.g. tmpfs /dev/shm) holds the big mem file; snapshot stays in base."""
+-    base = tmp_path / "base"
+-    memdir = tmp_path / "ram"  # stand-in for /dev/shm
+-    art = SnapshotManager(base, FakeLauncher(), mem_dir=memdir).build()
+-    assert art.snapshot_path == base / "warm.snapshot"
+-    assert art.mem_path == memdir / "warm.mem"  # mem on the RAM-backed dir
+-    assert memdir.is_dir()
+-
+-
+-# --- RAM-preload toggle (resolve_mem_dir / from_env) ----------------------
+ 
+ 
+-def test_resolve_mem_dir_default_off(monkeypatch):
+-    """Unset toggle → None (mem stays on disk; safe on a low-RAM host)."""
+-    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", raising=False)
+-    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_DIR", raising=False)
+-    assert resolve_mem_dir() is None
++def test_restore_preserves_snapshot_error_subclasses(tmp_path):
++    class BoomBackend(FakeBackend):
++        def restore_in(self, slot_workdir, artifact):
++            raise SnapshotRestoreError("backend already chose the error")
+ 
+-
+-def test_resolve_mem_dir_tmpfs_toggle(monkeypatch):
+-    """BLASTBOX_SNAPSHOT_MEM_TMPFS truthy → the default tmpfs /dev/shm."""
+-    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_DIR", raising=False)
+-    monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", "1")
+-    assert resolve_mem_dir() == Path("/dev/shm")
+-
+-
+-def test_resolve_mem_dir_tmpfs_falsey_is_off(monkeypatch):
+-    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_DIR", raising=False)
+-    for val in ("0", "false", "no", ""):
+-        monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", val)
+-        assert resolve_mem_dir() is None
+-
+-
+-def test_resolve_mem_dir_explicit_dir_wins(monkeypatch):
+-    """Explicit dir beats the tmpfs toggle (for non-/dev/shm tmpfs mounts)."""
+-    monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", "1")
+-    monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_DIR", "/mnt/hugeram")
+-    assert resolve_mem_dir() == Path("/mnt/hugeram")
+-
+-
+-def test_from_env_default_off_keeps_mem_on_base(tmp_path, monkeypatch):
+-    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", raising=False)
+-    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_DIR", raising=False)
+-    art = SnapshotManager.from_env(tmp_path, FakeLauncher()).build()
+-    assert art.mem_path == tmp_path / "warm.mem"  # disk-backed, in base
+-
+-
+-def test_from_env_explicit_dir_puts_mem_there(tmp_path, monkeypatch):
+-    base = tmp_path / "base"
+-    ram = tmp_path / "ram"  # stand-in for the tmpfs mount
+-    monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_DIR", str(ram))
+-    art = SnapshotManager.from_env(base, FakeLauncher()).build()
+-    assert art.mem_path == ram / "warm.mem"
+-    assert ram.is_dir()
+-
+-
+-def test_from_env_explicit_mem_dir_arg_overrides_env(tmp_path, monkeypatch):
+-    """An explicit mem_dir= arg short-circuits env resolution."""
+-    monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", "1")  # would pick /dev/shm
+-    arg_dir = tmp_path / "explicit"
+-    art = SnapshotManager.from_env(
+-        tmp_path / "base", FakeLauncher(), mem_dir=arg_dir
+-    ).build()
+-    assert art.mem_path == arg_dir / "warm.mem"
++    mgr = SnapshotManager(tmp_path, BoomBackend())
++    mgr.build()
++    with pytest.raises(SnapshotRestoreError, match="backend already chose"):
++        mgr.restore("slot-x")
+diff --git a/tests/host/runtime/test_fc_snapshot_backend.py b/tests/host/runtime/test_fc_snapshot_backend.py
+new file mode 100644
+index 0000000..bec9d06
+--- /dev/null
++++ b/tests/host/runtime/test_fc_snapshot_backend.py
+@@ -0,0 +1,291 @@
++"""Unit tests for the Firecracker SnapshotBackend (the FC mechanics behind the seam).
++
++These cover the FC-specific pieces that used to live on the manager:
++- ``_create_snapshot`` / ``_restore_from_snapshot`` (the FC API call sequences),
++- ``resolve_mem_dir`` + ``FcSnapshotBackend.from_env`` (the RAM-preload toggle),
++- ``boot_base().checkpoint(dest)`` producing an ``FcSnapshotArtifact``, and
++- ``restore_in`` issuing load+resume and exposing the per-slot vsock.
++"""
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from blastbox.host.runtime.fc_api import FcApiError
++from blastbox.host.runtime.fc_snapshot import (
++    SnapshotBuildError,
++    SnapshotRestoreError,
++)
++from blastbox.host.runtime.fc_snapshot_backend import (
++    FcSnapshotArtifact,
++    FcSnapshotBackend,
++    _create_snapshot,
++    _restore_from_snapshot,
++    resolve_mem_dir,
++)
++
++
++# --- FC test doubles (copied from the old test_fc_snapshot.py) -------------
++
++
++class FakeApi:
++    def __init__(self, fail_on=None):
++        self.calls = []
++        self._fail_on = fail_on  # (method, path) to raise FcApiError on
++
++    def put(self, path, body=None):
++        self.calls.append(("PUT", path, body))
++        if self._fail_on == ("PUT", path):
++            raise FcApiError("PUT", path, 400, "bad request")
++        return 204
++
++    def patch(self, path, body=None):
++        self.calls.append(("PATCH", path, body))
++        if self._fail_on == ("PATCH", path):
++            raise FcApiError("PATCH", path, 400, "bad request")
++        return 204
++
++
++# --- _create_snapshot / _restore_from_snapshot ----------------------------
++
++
++def test_create_snapshot_pauses_then_snapshots():
++    api = FakeApi()
++    _create_snapshot(api, "/s/state", "/s/mem")
++    assert api.calls == [
++        ("PATCH", "/vm", {"state": "Paused"}),
++        (
++            "PUT",
++            "/snapshot/create",
++            {"snapshot_type": "Full", "snapshot_path": "/s/state", "mem_file_path": "/s/mem"},
++        ),
++    ]
++
++
++def test_create_snapshot_wraps_api_error_as_build_error():
++    api = FakeApi(fail_on=("PUT", "/snapshot/create"))
++    with pytest.raises(SnapshotBuildError):
++        _create_snapshot(api, "/s/state", "/s/mem")
++
++
++def test_restore_loads_mem_backend_and_resumes():
++    api = FakeApi()
++    _restore_from_snapshot(api, "/s/state", "/s/mem")
++    assert api.calls == [
++        (
++            "PUT",
++            "/snapshot/load",
++            {
++                "snapshot_path": "/s/state",
++                "mem_backend": {"backend_type": "File", "backend_path": "/s/mem"},
++                "enable_diff_snapshots": False,
++                "resume_vm": True,
++            },
++        ),
++    ]
++
++
++def test_restore_respects_resume_false():
++    api = FakeApi()
++    _restore_from_snapshot(api, "/s/state", "/s/mem", resume=False)
++    assert api.calls[0][2]["resume_vm"] is False
++
++
++def test_restore_wraps_api_error_as_restore_error():
++    api = FakeApi(fail_on=("PUT", "/snapshot/load"))
++    with pytest.raises(SnapshotRestoreError):
++        _restore_from_snapshot(api, "/s/state", "/s/mem")
++
++
++# --- RAM-preload toggle (resolve_mem_dir / from_env) ----------------------
++
++
++def test_resolve_mem_dir_default_off(monkeypatch):
++    """Unset toggle → None (mem stays on disk; safe on a low-RAM host)."""
++    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", raising=False)
++    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_DIR", raising=False)
++    assert resolve_mem_dir() is None
++
++
++def test_resolve_mem_dir_tmpfs_toggle(monkeypatch):
++    """BLASTBOX_SNAPSHOT_MEM_TMPFS truthy → the default tmpfs /dev/shm."""
++    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_DIR", raising=False)
++    monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", "1")
++    assert resolve_mem_dir() == Path("/dev/shm")
++
++
++def test_resolve_mem_dir_tmpfs_falsey_is_off(monkeypatch):
++    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_DIR", raising=False)
++    for val in ("0", "false", "no", ""):
++        monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", val)
++        assert resolve_mem_dir() is None
++
++
++def test_resolve_mem_dir_explicit_dir_wins(monkeypatch):
++    """Explicit dir beats the tmpfs toggle (for non-/dev/shm tmpfs mounts)."""
++    monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", "1")
++    monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_DIR", "/mnt/hugeram")
++    assert resolve_mem_dir() == Path("/mnt/hugeram")
++
++
++def test_from_env_default_off_keeps_mem_on_base(tmp_path, monkeypatch):
++    """Default OFF → from_env falls back to base_dir for the mem file."""
++    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", raising=False)
++    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_DIR", raising=False)
++    backend = FcSnapshotBackend.from_env(tmp_path, object())
++    assert backend.mem_dir == tmp_path
++
++
++def test_from_env_tmpfs_toggle_points_mem_at_dev_shm(tmp_path, monkeypatch):
++    """BLASTBOX_SNAPSHOT_MEM_TMPFS=1 → from_env points mem_dir at /dev/shm."""
++    monkeypatch.delenv("BLASTBOX_SNAPSHOT_MEM_DIR", raising=False)
++    monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", "1")
++    backend = FcSnapshotBackend.from_env(tmp_path, object())
++    assert backend.mem_dir == Path("/dev/shm")
++
++
++def test_from_env_explicit_mem_dir_env(tmp_path, monkeypatch):
++    """BLASTBOX_SNAPSHOT_MEM_DIR=<path> → from_env honors it."""
++    ram = tmp_path / "ram"
++    monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_DIR", str(ram))
++    backend = FcSnapshotBackend.from_env(tmp_path / "base", object())
++    assert backend.mem_dir == ram
++
++
++def test_from_env_explicit_mem_dir_arg_overrides_env(tmp_path, monkeypatch):
++    """An explicit mem_dir= arg short-circuits env resolution."""
++    monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", "1")  # would pick /dev/shm
++    arg_dir = tmp_path / "explicit"
++    backend = FcSnapshotBackend.from_env(
++        tmp_path / "base", object(), mem_dir=arg_dir
++    )
++    assert backend.mem_dir == arg_dir
++
++
++# --- boot_base().checkpoint + restore_in (fake launcher) ------------------
++
++
++class FakeBootHandle:
++    """A boot handle whose checkpoint() PATCHes /vm + PUTs /snapshot/create Full,
++    like the real launcher._Handle, writing mem under mem_dir."""
++
++    def __init__(self, base_dir: Path, mem_dir: Path):
++        self.api = FakeApi()
++        self._base_dir = Path(base_dir)
++        self._mem_dir = Path(mem_dir)
++        self.killed = False
++
++    def wait_ready(self, timeout_s):
++        pass
++
++    def checkpoint(self, dest_dir):
++        from blastbox.host.runtime.fc_snapshot_backend import _create_snapshot
++
++        dest = Path(dest_dir)
++        snap = dest / "warm.snapshot"
++        mem = self._mem_dir / "warm.mem"
++        _create_snapshot(self.api, str(snap), str(mem))
++        return FcSnapshotArtifact(snap, mem)
++
++    def kill(self):
++        self.killed = True
++
++
++class FakeRestoreHandle:
++    def __init__(self, slot_workdir: Path, *, fail_load=False):
++        self.api = FakeApi(
++            fail_on=("PUT", "/snapshot/load") if fail_load else None
++        )
++        self.vsock_uds = str(Path(slot_workdir) / "vsock.sock")
++        self.killed = False
++
++    def kill(self):
++        self.killed = True
++
++
++class FakeLauncher:
++    def __init__(self, base_dir: Path, mem_dir: Path, *, fail_load=False):
++        self._base_dir = Path(base_dir)
++        self._mem_dir = Path(mem_dir)
++        self._fail_load = fail_load
++        self.boots = []
++        self.restores = []
++
++    def boot_base(self):
++        h = FakeBootHandle(self._base_dir, self._mem_dir)
++        self.boots.append(h)
++        return h
++
++    def restore_in(self, slot_workdir):
++        h = FakeRestoreHandle(slot_workdir, fail_load=self._fail_load)
++        self.restores.append(h)
++        return h
++
++
++def test_boot_base_checkpoint_pauses_creates_full_and_returns_artifact(tmp_path):
++    base = tmp_path / "base"
++    memdir = tmp_path / "ram"
++    backend = FcSnapshotBackend(base, FakeLauncher(base, memdir), mem_dir=memdir)
++    boot = backend.boot_base()
++    art = boot.checkpoint(base)
++
++    assert isinstance(art, FcSnapshotArtifact)
++    assert art.snapshot_path == base / "warm.snapshot"
++    assert art.mem_path == memdir / "warm.mem"  # mem under mem_dir
++    # checkpoint PATCHed /vm Paused then PUT /snapshot/create Full with mem under mem_dir
++    assert boot.api.calls == [
++        ("PATCH", "/vm", {"state": "Paused"}),
++        (
++            "PUT",
++            "/snapshot/create",
++            {
++                "snapshot_type": "Full",
++                "snapshot_path": str(base / "warm.snapshot"),
++                "mem_file_path": str(memdir / "warm.mem"),
++            },
++        ),
++    ]
++
++
++def test_restore_in_loads_resumes_and_exposes_vsock(tmp_path):
++    base = tmp_path / "base"
++    backend = FcSnapshotBackend(base, FakeLauncher(base, base))
++    artifact = FcSnapshotArtifact(base / "warm.snapshot", base / "warm.mem")
++    slot = base / "slots" / "slot-7"
++    handle = backend.restore_in(slot, artifact)
++
++    # restore_in PUT /snapshot/load with mem_backend File + resume.
++    assert handle.api.calls == [
++        (
++            "PUT",
++            "/snapshot/load",
++            {
++                "snapshot_path": str(base / "warm.snapshot"),
++                "mem_backend": {
++                    "backend_type": "File",
++                    "backend_path": str(base / "warm.mem"),
++                },
++                "enable_diff_snapshots": False,
++                "resume_vm": True,
++            },
++        ),
++    ]
++    # the handle exposes the per-slot vsock (read by SnapshotSlotRuntime)
++    assert handle.vsock_uds == str(slot / "vsock.sock")
++    assert handle.killed is False
++
++
++def test_restore_in_kills_handle_on_load_failure(tmp_path):
++    """If /snapshot/load fails, the spawned firecracker must be killed (no leak)."""
++    base = tmp_path / "base"
++    backend = FcSnapshotBackend(base, FakeLauncher(base, base, fail_load=True))
++    artifact = FcSnapshotArtifact(base / "warm.snapshot", base / "warm.mem")
++    with pytest.raises(SnapshotRestoreError):
++        backend.restore_in(base / "slots" / "s1", artifact)
++    assert backend._launcher.restores[0].killed is True
++
++
++def test_available_is_true(tmp_path):
++    backend = FcSnapshotBackend(tmp_path, FakeLauncher(tmp_path, tmp_path))
++    assert backend.available() is True
+diff --git a/tests/host/runtime/test_fc_snapshot_launcher.py b/tests/host/runtime/test_fc_snapshot_launcher.py
+index c11c972..32f409e 100644
+--- a/tests/host/runtime/test_fc_snapshot_launcher.py
++++ b/tests/host/runtime/test_fc_snapshot_launcher.py
+@@ -106,6 +106,66 @@ def test_boot_base_uses_api_socket_and_runs_full_config(tmp_path):
+     assert handle.vsock_uds == str(tmp_path / "snap" / "base" / REL_VSOCK)
+ 
+ 
++class FakeApiPatch(FakeApi):
++    """FakeApi that also records PATCH (checkpoint needs Pause + CreateSnapshot)."""
++
++    def patch(self, path, body=None):
++        self.calls.append((path, body))
++        return 204
++
++
++def test_boot_base_handle_checkpoint_writes_artifact_under_base_and_mem_dir(tmp_path):
++    """boot_base()'s handle.checkpoint(dest) Pause+Full-snapshots: the state file lands
++    under dest (base), the mem file under the launcher's mem_dir (the RAM-preload toggle
++    flows through the launcher to the boot handle)."""
++    base = tmp_path / "snap"
++    memdir = tmp_path / "ram"  # stand-in for /dev/shm
++    launcher = FcSnapshotLauncher(
++        FakeCfg(),
++        base,
++        mem_dir=memdir,
++        popen=lambda argv, cwd=None: FakeProc(),
++        api_factory=FakeApiPatch,
++        wait_socket=lambda p: None,
++        make_outdisk=lambda p: None,
++    )
++    handle = launcher.boot_base()
++    dest = base / "base"
++    art = handle.checkpoint(dest)
++
++    from blastbox.host.runtime.fc_snapshot_backend import FcSnapshotArtifact
++
++    assert isinstance(art, FcSnapshotArtifact)
++    assert art.snapshot_path == dest / "warm.snapshot"
++    assert art.mem_path == memdir / "warm.mem"  # mem on the launcher's mem_dir
++    # The boot PUTs ran first; checkpoint appended PATCH /vm Paused + PUT create Full.
++    assert ("/vm", {"state": "Paused"}) in handle.api.calls
++    assert (
++        "/snapshot/create",
++        {
++            "snapshot_type": "Full",
++            "snapshot_path": str(dest / "warm.snapshot"),
++            "mem_file_path": str(memdir / "warm.mem"),
++        },
++    ) in handle.api.calls
++
++
++def test_boot_base_handle_checkpoint_defaults_mem_to_base_dir(tmp_path):
++    """No mem_dir given → the boot handle's checkpoint writes warm.mem under base_dir."""
++    base = tmp_path / "snap"
++    launcher = FcSnapshotLauncher(
++        FakeCfg(),
++        base,
++        popen=lambda argv, cwd=None: FakeProc(),
++        api_factory=FakeApiPatch,
++        wait_socket=lambda p: None,
++        make_outdisk=lambda p: None,
++    )
++    handle = launcher.boot_base()
++    art = handle.checkpoint(base / "base")
++    assert art.mem_path == base / "warm.mem"  # defaults to base_dir
++
++
+ def test_restore_in_spawns_in_slot_cwd_and_copies_base_outdisk(tmp_path):
+     spawned = []
+     made = []
+diff --git a/tests/host/runtime/test_gvisor_snapshot.py b/tests/host/runtime/test_gvisor_snapshot.py
+new file mode 100644
+index 0000000..92dcf15
+--- /dev/null
++++ b/tests/host/runtime/test_gvisor_snapshot.py
+@@ -0,0 +1,141 @@
++from pathlib import Path
++
++import pytest
++
++from blastbox.host.runtime.gvisor_snapshot import GvisorSnapshotBackend, GvisorConfig, _oci_config
++
++
++class _Rec:
++    def __init__(self) -> None:
++        self.calls: list[list[str]] = []
++
++    def __call__(self, argv: list[str], **kw: object) -> int:
++        self.calls.append(argv)
++        return 0
++
++
++def _cfg(tmp_path: Path, **kw: object) -> GvisorConfig:
++    base: dict = dict(
++        runsc_bin="runsc",
++        root=tmp_path / "root",
++        image_rootfs=tmp_path / "rootfs",
++        network="none",
++        warm_argv=["/warm-entrypoint"],
++    )
++    base.update(kw)
++    return GvisorConfig(**base)
++
++
++def test_boot_base_runs_then_checkpoint(tmp_path: Path) -> None:
++    rec = _Rec()
++    be = GvisorSnapshotBackend(_cfg(tmp_path), run=rec, ready_wait=lambda d, t: None)
++    boot = be.boot_base()
++    boot.wait_ready(5.0)
++    art = boot.checkpoint(tmp_path / "ckpt")
++    joined = [" ".join(c) for c in rec.calls]
++    assert any("run" in c and "-detach" in c for c in joined)
++    assert any("checkpoint" in c and "-image-path" in c for c in joined)
++    assert Path(str(art)).name == "checkpoint"
++
++
++def test_restore_in_creates_dirs_and_restores(tmp_path: Path) -> None:
++    rec = _Rec()
++    be = GvisorSnapshotBackend(_cfg(tmp_path), run=rec, ready_wait=lambda d, t: None)
++    wd = tmp_path / "slots" / "s1"
++    wd.mkdir(parents=True)
++    h = be.restore_in(wd, str(tmp_path / "ckpt" / "checkpoint"))
++    joined = [" ".join(c) for c in rec.calls]
++    assert any("restore" in c and "-image-path" in c for c in joined)
++    for sub in ("in", "out", "ctrl"):
++        assert (wd / sub).is_dir()
++    assert h.output_dir == wd / "out" and h.control_dir == wd / "ctrl"
++
++
++def test_available_uses_probe(tmp_path: Path) -> None:
++    assert GvisorSnapshotBackend(_cfg(tmp_path), run=lambda a, **k: 0, probe=lambda: True).available() is True
++    assert GvisorSnapshotBackend(_cfg(tmp_path), run=lambda a, **k: 0, probe=lambda: False).available() is False
++
++
++def test_kill_is_best_effort(tmp_path: Path) -> None:
++    def boom(argv: list[str], **kw: object) -> int:
++        raise RuntimeError("runsc gone")
++
++    be = GvisorSnapshotBackend(_cfg(tmp_path), run=boom, ready_wait=lambda d, t: None)
++    # restore_in calls run() which raises -> should propagate; but handle.kill must swallow
++    with pytest.raises(RuntimeError):
++        be.restore_in(tmp_path / "s", "img")
++
++
++def test_oci_config_has_bind_mounts_args_and_ld_preload(tmp_path: Path) -> None:
++    cfg = _cfg(tmp_path, warm_argv=["/bin/sh", "-c", "x"], ld_preload="/opt/clippyshot/accept-retry.so")
++    spec = _oci_config(cfg, tmp_path / "wd", in_ro=True)
++    assert spec["process"]["args"] == ["/bin/sh", "-c", "x"]
++    assert any(e == "LD_PRELOAD=/opt/clippyshot/accept-retry.so" for e in spec["process"]["env"])
++    dests = {m["destination"]: m for m in spec["mounts"]}
++    assert dests["/in"]["options"][-1] == "ro" and dests["/out"]["options"][-1] == "rw"
++    assert dests["/ctrl"]["source"] == str(tmp_path / "wd" / "ctrl")
++
++
++def test_oci_config_no_ld_preload_when_unset(tmp_path: Path) -> None:
++    spec = _oci_config(_cfg(tmp_path), tmp_path / "wd", in_ro=True)
++    assert not any(e.startswith("LD_PRELOAD") for e in spec["process"]["env"])
++
++
++def test_oci_config_security_posture_non_root_no_caps_no_new_privs(tmp_path: Path) -> None:
++    # The untrusted-document worker must run NON-ROOT with NO capabilities and no-new-privs,
++    # matching the docker (--user/--cap-drop=ALL) and FC (setpriv 65532) tiers.
++    spec = _oci_config(_cfg(tmp_path), tmp_path / "wd", in_ro=True)
++    proc = spec["process"]
++    assert proc["user"]["uid"] != 0 and proc["user"]["uid"] == 65532
++    assert proc["noNewPrivileges"] is True
++    assert all(caps == [] for caps in proc["capabilities"].values())
++    assert spec["root"]["readonly"] is True
++
++
++def test_oci_config_honors_custom_uid(tmp_path: Path) -> None:
++    spec = _oci_config(_cfg(tmp_path, uid=10001, gid=10001), tmp_path / "wd", in_ro=True)
++    assert spec["process"]["user"] == {"uid": 10001, "gid": 10001}
++
++
++def test_restore_handle_alive_running(tmp_path: Path) -> None:
++    from blastbox.host.runtime.gvisor_snapshot import GvisorRestoreHandle
++    cfg = _cfg(tmp_path)
++    handle = GvisorRestoreHandle(
++        cfg,
++        run=lambda a, **k: 0,
++        cid="test-cid",
++        slot_workdir=tmp_path,
++        run_text=lambda argv: '{"status": "running"}',
++    )
++    assert handle.alive() is True
++
++
++def test_restore_handle_alive_stopped(tmp_path: Path) -> None:
++    from blastbox.host.runtime.gvisor_snapshot import GvisorRestoreHandle
++    cfg = _cfg(tmp_path)
++    handle = GvisorRestoreHandle(
++        cfg,
++        run=lambda a, **k: 0,
++        cid="test-cid",
++        slot_workdir=tmp_path,
++        run_text=lambda argv: '{"status": "stopped"}',
++    )
++    assert handle.alive() is False
++
++
++def test_restore_handle_alive_runsc_error(tmp_path: Path) -> None:
++    from blastbox.host.runtime.gvisor_snapshot import GvisorRestoreHandle
++
++    def _boom(argv: list[str]) -> str:
++        raise RuntimeError("runsc gone")
++
++    cfg = _cfg(tmp_path)
++    handle = GvisorRestoreHandle(
++        cfg,
++        run=lambda a, **k: 0,
++        cid="test-cid",
++        slot_workdir=tmp_path,
++        run_text=_boom,
++    )
++    # alive() must be False (not raise) when run_text raises
++    assert handle.alive() is False
+diff --git a/tests/host/runtime/test_gvisor_snapshot_runtime.py b/tests/host/runtime/test_gvisor_snapshot_runtime.py
+new file mode 100644
+index 0000000..8fae07f
+--- /dev/null
++++ b/tests/host/runtime/test_gvisor_snapshot_runtime.py
+@@ -0,0 +1,188 @@
++import json
++from pathlib import Path
++
++import pytest
++
++from blastbox.host.runtime.gvisor_snapshot_runtime import (
++    GvisorHostWarmControl,
++    GvisorSnapshotSlotRuntime,
++    GvisorUnavailable,
++    select_gvisor_snapshot_runtime,
++)
++from blastbox.worker.warm import WarmJobSpec
++
++
++class _FakeHandle:
++    def __init__(self, wd):
++        self.slot_workdir = wd
++        self.killed = False
++
++    def kill(self):
++        self.killed = True
++
++
++class _FakeMgr:
++    def __init__(self, base):
++        self.base = Path(base)
++        self.built = 0
++        self.restores = 0
++
++    def build(self):
++        self.built += 1
++
++    def restore(self, slot_id):
++        self.restores += 1
++        wd = self.base / "slots" / str(slot_id)
++        for s in ("in", "out", "ctrl"):
++            (wd / s).mkdir(parents=True, exist_ok=True)
++        return _FakeHandle(wd)
++
++
++def test_spawn_builds_once_then_restores(tmp_path):
++    m = _FakeMgr(tmp_path)
++    rt = GvisorSnapshotSlotRuntime(m, settle_s=0.0)
++    s1 = rt.spawn()
++    rt.spawn()
++    # build() called each spawn but is idempotent in the real mgr
++    assert m.built == 2 and m.restores == 2
++    assert s1.state.name == "WARMING" and s1.control_dir.name == "ctrl"
++    assert rt.is_ready(s1) is True
++
++
++def test_host_warm_control_returns_translating_control(tmp_path):
++    rt = GvisorSnapshotSlotRuntime(_FakeMgr(tmp_path), settle_s=0.0)
++    assert isinstance(rt.host_warm_control(rt.spawn()), GvisorHostWarmControl)
++
++
++def test_gvisor_control_translates_paths_to_sandbox(tmp_path):
++    ctrl_dir = tmp_path / "ctrl"
++    ctrl_dir.mkdir()
++    GvisorHostWarmControl(ctrl_dir).signal_go(
++        WarmJobSpec(
++            input_path=tmp_path / "slots" / "x" / "in" / "doc.docx",
++            output_dir=tmp_path / "slots" / "x" / "out",
++            params={"a": "b"},
++        )
++    )
++    go = json.loads((ctrl_dir / "go.json").read_text())
++    assert go["input_path"] == "/in/doc.docx"
++    assert go["output_dir"] == "/out"
++    assert go["params"] == {"a": "b"}
++
++
++def test_settle_gates_readiness(tmp_path):
++    clock = {"t": 0.0}
++    rt = GvisorSnapshotSlotRuntime(_FakeMgr(tmp_path), settle_s=1.0, clock=lambda: clock["t"])
++    s = rt.spawn()
++    assert rt.is_ready(s) is False
++    clock["t"] = 2.0
++    assert rt.is_ready(s) is True
++
++
++def test_is_ready_false_when_handle_dead(tmp_path):
++    """control_dir exists (created on the host before restore) but the sandbox died
++    (alive()=False) → NOT ready, so dead slots aren't promoted to IDLE."""
++    class _DeadHandle(_FakeHandle):
++        def alive(self):
++            return False
++
++    class _DeadMgr(_FakeMgr):
++        def restore(self, slot_id):
++            wd = self.base / "slots" / str(slot_id)
++            for s in ("in", "out", "ctrl"):
++                (wd / s).mkdir(parents=True, exist_ok=True)
++            return _DeadHandle(wd)
++
++    rt = GvisorSnapshotSlotRuntime(_DeadMgr(tmp_path), settle_s=0.0)
++    assert rt.is_ready(rt.spawn()) is False
++
++
++def test_materialize_output_noop_keeps_output(tmp_path):
++    rt = GvisorSnapshotSlotRuntime(_FakeMgr(tmp_path), settle_s=0.0)
++    s = rt.spawn()
++    (s.output_dir / "x.pdf").write_bytes(b"%PDF")
++    assert rt.materialize_warm_output(s) is None
++    assert (s.output_dir / "x.pdf").exists()
++
++
++def test_reap_kills_and_cleans(tmp_path):
++    rt = GvisorSnapshotSlotRuntime(_FakeMgr(tmp_path), settle_s=0.0)
++    s = rt.spawn()
++    rt.reap(s)
++    assert not Path(s.output_dir).parent.exists()
++    assert rt.is_alive(s) is False
++
++
++def test_is_alive_dead_handle_returns_false(tmp_path):
++    """A handle whose alive() returns False makes is_alive() return False."""
++
++    class _DeadHandle(_FakeHandle):
++        def alive(self) -> bool:
++            return False
++
++    class _DeadMgr(_FakeMgr):
++        def restore(self, slot_id):
++            self.restores += 1
++            wd = self.base / "slots" / str(slot_id)
++            for s in ("in", "out", "ctrl"):
++                (wd / s).mkdir(parents=True, exist_ok=True)
++            return _DeadHandle(wd)
++
++    rt = GvisorSnapshotSlotRuntime(_DeadMgr(tmp_path), settle_s=0.0)
++    slot = rt.spawn()
++    assert rt.is_alive(slot) is False
++
++
++def test_is_alive_alive_handle_returns_true(tmp_path):
++    """A handle whose alive() returns True makes is_alive() return True."""
++
++    class _AliveHandle(_FakeHandle):
++        def alive(self) -> bool:
++            return True
++
++    class _AliveMgr(_FakeMgr):
++        def restore(self, slot_id):
++            self.restores += 1
++            wd = self.base / "slots" / str(slot_id)
++            for s in ("in", "out", "ctrl"):
++                (wd / s).mkdir(parents=True, exist_ok=True)
++            return _AliveHandle(wd)
++
++    rt = GvisorSnapshotSlotRuntime(_AliveMgr(tmp_path), settle_s=0.0)
++    slot = rt.spawn()
++    assert rt.is_alive(slot) is True
++
++
++def test_is_alive_handle_without_alive_method_returns_true(tmp_path):
++    """A handle without alive() (e.g. legacy fake) is assumed alive."""
++    rt = GvisorSnapshotSlotRuntime(_FakeMgr(tmp_path), settle_s=0.0)
++    slot = rt.spawn()
++    # _FakeHandle has no alive() method — should default to True
++    assert rt.is_alive(slot) is True
++
++
++def test_stage_warm_input_copies(tmp_path):
++    rt = GvisorSnapshotSlotRuntime(_FakeMgr(tmp_path), settle_s=0.0)
++    s = rt.spawn()
++    src = tmp_path / "src.docx"
++    src.write_bytes(b"doc")
++    dst = rt.stage_warm_input(s, src)
++    assert dst.read_bytes() == b"doc" and dst.parent == s.input_dir
++
++
++def test_select_with_injected_manager(tmp_path):
++    rt = select_gvisor_snapshot_runtime(manager=_FakeMgr(tmp_path), settle_s=0.0)
++    assert isinstance(rt, GvisorSnapshotSlotRuntime)
++
++
++def test_select_unavailable_returns_none(monkeypatch):
++    import blastbox.host.runtime.gvisor_snapshot as g
++    monkeypatch.setattr(g, "shutil", g.shutil)  # noop; force backend.available() False via a bad binary
++    monkeypatch.setenv("BLASTBOX_GVISOR_RUNSC", "definitely-not-a-real-binary-xyz")
++    assert select_gvisor_snapshot_runtime(require_available=False) is None
++
++
++def test_select_unavailable_raises_when_required(monkeypatch):
++    monkeypatch.setenv("BLASTBOX_GVISOR_RUNSC", "definitely-not-a-real-binary-xyz")
++    with pytest.raises(GvisorUnavailable):
++        select_gvisor_snapshot_runtime(require_available=True)
+diff --git a/tests/host/runtime/test_snapshot_backend.py b/tests/host/runtime/test_snapshot_backend.py
+new file mode 100644
+index 0000000..2be51ca
+--- /dev/null
++++ b/tests/host/runtime/test_snapshot_backend.py
+@@ -0,0 +1,35 @@
++from pathlib import Path
++
++from blastbox.host.runtime.snapshot_backend import BootHandle, RestoreHandle, SnapshotBackend
++
++
++def test_protocols_are_runtime_checkable():
++    # A minimal fake satisfies the Protocols structurally.
++    class FakeBoot:
++        def wait_ready(self, timeout_s: float) -> None:
++            ...
++
++        def checkpoint(self, dest_dir: Path) -> object:
++            return {"art": str(dest_dir)}
++
++        def kill(self) -> None:
++            ...
++
++    class FakeRestore:
++        def kill(self) -> None:
++            ...
++
++    class FakeBackend:
++        def available(self) -> bool:
++            return True
++
++        def boot_base(self) -> BootHandle:
++            return FakeBoot()
++
++        def restore_in(self, slot_workdir: Path, artifact: object) -> RestoreHandle:
++            return FakeRestore()
++
++    b = FakeBackend()
++    assert isinstance(b, SnapshotBackend)
++    assert isinstance(b.boot_base(), BootHandle)
++    assert isinstance(b.restore_in(Path("/x"), {"art": "y"}), RestoreHandle)
+diff --git a/tests/host/test_pool_config.py b/tests/host/test_pool_config.py
+index 8f17597..5b03bcf 100644
+--- a/tests/host/test_pool_config.py
++++ b/tests/host/test_pool_config.py
+@@ -142,6 +142,25 @@ def test_build_pool_cold_path_unaffected_when_snapshot_off(monkeypatch):
+     assert pool is not None and pool.runtime is sentinel
+ 
+ 
++def test_gvisor_runtime_routes_to_gvisor_snapshot(monkeypatch):
++    monkeypatch.setenv("BLASTBOX_POOL_RUNTIME", "gvisor")
++    sentinel = _FakeRuntime()
++    calls = {}
++
++    def _capture(**kwargs):
++        calls.update(kwargs)
++        return sentinel
++
++    import blastbox.host.runtime.gvisor_snapshot_runtime as g
++    monkeypatch.setattr(g, "select_gvisor_snapshot_runtime", _capture)
++    from blastbox.host.pool_config import build_warm_pool, PoolConfig
++    pool = build_warm_pool(PoolConfig.from_env())
++    # The pool must wrap the runtime the gvisor selector returned...
++    assert pool is not None and pool.runtime is sentinel
++    # ...and it must be selected fail-loud (require_available=True), like the FC tier.
++    assert calls.get("require_available") is True
++
++
+ @pytest.mark.skipif(
+     _HAS_FC,
+     reason="this host HAS the FC tier; the unavailable-path only holds without it",
+diff --git a/tests/integration/__init__.py b/tests/integration/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/integration/test_gvisor_snapshot_roundtrip.py b/tests/integration/test_gvisor_snapshot_roundtrip.py
+new file mode 100644
+index 0000000..13f2435
+--- /dev/null
++++ b/tests/integration/test_gvisor_snapshot_roundtrip.py
+@@ -0,0 +1,181 @@
++"""Gated end-to-end integration test: gVisor C/R warm-tier round-trip.
++
++Proven manually on toolz2 (runsc 20250301.0 or later); this test documents that
++proof as a runnable gate. It is NOT expected to execute on a dev host without runsc.
++
++Design spec: docs/specs/2026-06-05-gvisor-cr-snapshot-design.md
++
++Required environment variables to run (all have defaults where sensible):
++
++    BLASTBOX_GVISOR_ROOTFS      Path to an exported OCI rootfs dir for the warm
++                                 container (clippyshot or Tika worker image rootfs).
++                                 REQUIRED — test is skipped if unset or non-existent.
++
++    BLASTBOX_GVISOR_RUNSC       Path to the runsc binary (default: "runsc").
++    BLASTBOX_GVISOR_WARM_ARGV   JSON-encoded argv for the warm entrypoint inside the
++                                 container (default: ["worker", "warm"]).
++    BLASTBOX_GVISOR_LD_PRELOAD  Optional path to an LD_PRELOAD .so to inject
++                                 (default: unset).
++    BLASTBOX_SNAPSHOT_SETTLE_S  Post-restore settle window in seconds before the
++                                 slot is considered ready (default: "1.0").
++
++Example invocation on toolz2:
++    BLASTBOX_GVISOR_ROOTFS=/var/lib/blastbox/gvisor-rootfs \\
++    BLASTBOX_GVISOR_RUNSC=/usr/local/bin/runsc \\
++    pytest tests/integration/test_gvisor_snapshot_roundtrip.py -v
++"""
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import subprocess
++import time
++from pathlib import Path
++
++import pytest
++
++# ---------------------------------------------------------------------------
++# Host capability helpers (evaluated at collection time so skipif works)
++# ---------------------------------------------------------------------------
++
++
++def _runsc_cr_available() -> bool:
++    """Return True iff the configured runsc binary advertises checkpoint/restore.
++
++    Honors ``BLASTBOX_GVISOR_RUNSC`` (the same override the test uses to build the
++    GvisorConfig): an absolute path is probed as-is, a bare name is resolved on PATH —
++    so setting an absolute path no longer spuriously skips the test."""
++    runsc = os.environ.get("BLASTBOX_GVISOR_RUNSC", "runsc").strip() or "runsc"
++    if os.sep in runsc:
++        if not Path(runsc).is_file():
++            return False
++    elif not shutil.which(runsc):
++        return False
++    try:
++        result = subprocess.run(
++            [runsc, "help"],
++            capture_output=True,
++            text=True,
++            timeout=10,
++        )
++        output = result.stdout + result.stderr
++        return "checkpoint" in output and "restore" in output
++    except Exception:  # noqa: BLE001
++        return False
++
++
++def _warm_rootfs() -> str | None:
++    """Return the BLASTBOX_GVISOR_ROOTFS path if set and the directory exists."""
++    val = os.environ.get("BLASTBOX_GVISOR_ROOTFS", "").strip()
++    if not val:
++        return None
++    if Path(val).is_dir():
++        return val
++    return None
++
++
++def _fixture_doc() -> Path | None:
++    """Return a path to any small fixture file under tests/fixtures, or None."""
++    here = Path(__file__).parent.parent  # tests/
++    candidates = list(here.glob("fixtures/**/*.docx")) + list(here.glob("fixtures/**/*.txt"))
++    if candidates:
++        return candidates[0]
++    # fallback: any non-Python file in the fixtures tree
++    all_files = [p for p in here.glob("fixtures/**/*") if p.is_file() and p.suffix not in (".py", ".pyc")]
++    return all_files[0] if all_files else None
++
++
++# ---------------------------------------------------------------------------
++# pytest module-level marker
++# ---------------------------------------------------------------------------
++
++pytestmark = pytest.mark.integration
++
++# ---------------------------------------------------------------------------
++# E2E round-trip
++# ---------------------------------------------------------------------------
++
++_RUNSC_SKIP_REASON = (
++    "needs runsc binary with checkpoint/restore support "
++    "(run on a runsc-C/R host such as toolz2 with BLASTBOX_GVISOR_ROOTFS set)"
++)
++
++
++@pytest.mark.skipif(not _runsc_cr_available(), reason=_RUNSC_SKIP_REASON)
++def test_gvisor_snapshot_roundtrip(tmp_path: Path) -> None:
++    """Full warm-tier round-trip through gVisor C/R.
++
++    spawn() → wait ready → stage input → signal_go → wait_for_done → assert outputs.
++    """
++    rootfs = _warm_rootfs()
++    if rootfs is None:
++        pytest.skip(
++            "BLASTBOX_GVISOR_ROOTFS is not set or does not point to an existing directory; "
++            "set it to an exported clippyshot/Tika OCI rootfs dir to run this test"
++        )
++
++    fixture = _fixture_doc()
++    if fixture is None:
++        pytest.skip(
++            "no fixture document found under tests/fixtures/; "
++            "populate tests/fixtures/ with at least one .docx or .txt file"
++        )
++
++    from blastbox.host.runtime.fc_snapshot import SnapshotManager
++    from blastbox.host.runtime.gvisor_snapshot import GvisorConfig, GvisorSnapshotBackend
++    from blastbox.host.runtime.gvisor_snapshot_runtime import GvisorSnapshotSlotRuntime
++    from blastbox.worker.warm import HostWarmControl, WarmJobSpec
++
++    # --- env-driven config (mirrors _gvisor_config_from_env) ---
++    runsc_bin = os.environ.get("BLASTBOX_GVISOR_RUNSC", "runsc")
++    raw_argv = os.environ.get("BLASTBOX_GVISOR_WARM_ARGV", "").strip()
++    warm_argv: list[str] = json.loads(raw_argv) if raw_argv else ["worker", "warm"]
++    ld_preload: str | None = os.environ.get("BLASTBOX_GVISOR_LD_PRELOAD") or None
++    settle_s = float(os.environ.get("BLASTBOX_SNAPSHOT_SETTLE_S", "1.0"))
++
++    cfg = GvisorConfig(
++        runsc_bin=runsc_bin,
++        root=tmp_path / "root",
++        image_rootfs=Path(rootfs),
++        network="none",
++        warm_argv=warm_argv,
++        ld_preload=ld_preload,
++    )
++    backend = GvisorSnapshotBackend(cfg)
++    mgr = SnapshotManager(tmp_path / "snap", backend)
++    rt = GvisorSnapshotSlotRuntime(mgr, settle_s=settle_s)
++
++    slot = rt.spawn()
++    slot_reaped = False
++    try:
++        # Wait up to 30 s for the restored container to be ready.
++        deadline = time.monotonic() + 30.0
++        while time.monotonic() < deadline:
++            if rt.is_ready(slot):
++                break
++            time.sleep(0.25)
++        assert rt.is_ready(slot), "gVisor restored container was not ready within 30 s"
++
++        # Stage the fixture document into the slot's input dir.
++        staged = rt.stage_warm_input(slot, fixture)
++        assert staged.exists(), f"stage_warm_input did not copy fixture to {staged}"
++
++        # Signal go and wait for done.
++        ctrl: HostWarmControl = rt.host_warm_control(slot)  # type: ignore[assignment]
++        ctrl.signal_go(WarmJobSpec(input_path=staged, output_dir=slot.output_dir))
++        status = ctrl.wait_for_done(timeout_s=60.0)
++
++        assert status == "ok", f"warm worker exited with status={status!r} (expected 'ok')"
++
++        # At least one output file must be present.
++        output_files = list(slot.output_dir.iterdir())
++        assert output_files, (
++            f"slot.output_dir ({slot.output_dir}) is empty after a successful warm job"
++        )
++
++    finally:
++        rt.reap(slot)
++        slot_reaped = True
++
++    assert slot_reaped  # reap() must not raise

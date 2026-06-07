@@ -9,15 +9,20 @@ Security properties (review will check):
 2. Output is validated through ``trust.validate_worker_output`` BEFORE the job
    is marked DONE.  A worker that writes a traversal/tampered/oversized
    metadata.json produces FAILED, not DONE.
-3. Input is deleted on EVERY terminal path (success, failure, timeout, launch
-   error, unknown engine, insecure runtime) via a ``finally`` block.
+3. Input is deleted whenever a dispatcher reaches a terminal path FOR A JOB IT STILL
+   OWNS (success, failure, timeout, launch error, unknown engine, insecure runtime) via a
+   ``finally`` block; on a lost-claim abort the input is left for the dispatcher that
+   reclaimed it, and a time-recovered (owner-gone) job's input is deleted by the recovery
+   sweep — so untrusted input never persists permanently, but never races a live new owner.
 4. ``job.params`` → ``extra_env`` only for keys matching ``^[A-Z][A-Z0-9_]*$``
    with length-capped values; never raw.
 5. All error strings stored on the job pass through ``sanitize_public_error``.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -26,6 +31,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Mapping
 
+from blastbox.contract.envelope import (
+    atomic_write_confined,
+    confined_atomic_writer,
+    open_confined_regular_fd,
+)
 from blastbox.errors import OutputTrustError, WarmTimeout, sanitize_public_error
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.runtime.docker import (
@@ -55,6 +65,10 @@ _MAX_ENV_VALUE_LEN = 4096
 # Must start with an uppercase letter, contain only uppercase letters, digits,
 # and underscores.  This prevents any lowercase/symbol injection.
 _VALID_ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+# Max number of entries (files + dirs) allowed in a worker output dir — bounds inode + walk-time
+# exhaustion from undeclared files even under the byte cap.
+_MAX_OUTPUT_ENTRIES = 65536
 
 
 @dataclass(frozen=True)
@@ -91,6 +105,7 @@ class Dispatcher:
         job_retention_seconds: int = 0,
         pool: "WarmPool | None" = None,
         warm_claim_timeout_s: float = 2.0,
+        requeue_grace_s: float = 60.0,
     ) -> None:
         self._job_store = job_store
         # engines is kept as an immutable mapping snapshot so callers cannot
@@ -104,6 +119,14 @@ class Dispatcher:
         self._job_retention_seconds = max(0, int(job_retention_seconds))
         self._pool = pool
         self._warm_claim_timeout_s = float(warm_claim_timeout_s)
+        self._requeue_grace_s = max(0.0, float(requeue_grace_s))
+        # Safety floor for warm recovery: the warm staleness cutoff anchors on started_at (set at
+        # CLAIM time), but a warm job's bounding deadline is only established later — after
+        # pool.claim (<= warm_claim_timeout_s) + input staging. requeue_grace_s is the slack that
+        # must cover that pre-deadline overhead, so a concurrent dispatcher never judges a live
+        # warm job stale. Floor it at the claim window when a pool is configured.
+        if self._pool is not None:
+            self._requeue_grace_s = max(self._requeue_grace_s, self._warm_claim_timeout_s)
 
     # ------------------------------------------------------------------
     # Public API
@@ -125,8 +148,15 @@ class Dispatcher:
         *,
         poll_interval_s: float = 1.0,
         stop: Callable[[], bool] | None = None,
+        maintenance_interval_s: float = 60.0,
     ) -> None:
-        """Continuously claim and dispatch jobs until ``stop()`` returns True."""
+        """Continuously claim and dispatch jobs until ``stop()`` returns True.
+
+        Every ``maintenance_interval_s`` it also runs _run_maintenance: requeue orphaned RUNNING
+        jobs (crash recovery) and expire retention-due artifacts (so untrusted output doesn't
+        accumulate forever). Set ``maintenance_interval_s<=0`` to disable.
+        """
+        last_maint = time.monotonic()
         while True:
             if stop is not None and stop():
                 break
@@ -139,43 +169,127 @@ class Dispatcher:
                 # returns it to the queue. Log and keep serving.
                 _log.exception("dispatch_once failed; continuing")
                 progressed = False
+            if maintenance_interval_s > 0 and time.monotonic() - last_maint >= maintenance_interval_s:
+                last_maint = time.monotonic()
+                self._run_maintenance()
             if not progressed:
                 time.sleep(poll_interval_s)
 
     def requeue_orphaned_jobs(self, *, exclude: frozenset[str] | None = None) -> int:
-        """Re-queue RUNNING jobs whose worker container is no longer alive.
+        """Recover RUNNING jobs whose owning dispatcher is gone, in two independent passes.
 
-        Uses ``docker ps --filter label=blastbox.role=worker`` to determine
-        which worker containers are still running.  On any ``docker ps`` failure
-        the method returns 0 without modifying any jobs (fail-safe: never
-        accidentally requeue a job that is still live).
+        WARM pass (first; needs NO docker): warm slots have no docker label, so liveness is
+        TIME-based — a warm job still RUNNING past ``worker_timeout_s + requeue_grace_s`` (from a
+        started_at that ``_dispatch_warm`` refreshes before its sealing phase) has a gone owner.
+        It is FAILED (terminal), NOT requeued — a requeue would let a second worker re-detonate
+        the same untrusted input, and orphaned sandboxes don't die with a crashed dispatcher.
+        Running this pass first means a ``docker ps`` failure can't strand warm jobs.
 
-        ``exclude`` is an optional set of job_ids to skip (claimed in-process
-        this tick).
+        COLD pass (needs docker): uses ``docker ps --filter label=blastbox.role=worker`` to find
+        live worker containers; a cold job absent from it (and past the grace window) is requeued.
+        On a ``docker ps`` failure the COLD pass is skipped (fail-safe — never requeue a job that
+        may still be live), but the WARM pass already ran.
+
+        All recovery + terminal writes are CAS-fenced on (status, claim_id), so a stale owner can
+        never clobber a job that was reclaimed (RUNNING->QUEUED->RUNNING), and recovery never
+        clobbers a terminal status the owner wrote.
+
+        ``exclude`` is an optional set of job_ids to skip (claimed in-process this tick).
         """
+        excluded = exclude or frozenset()
+        now = time.time()
+        grace_cutoff = now - self._requeue_grace_s
+        warm_stale_cutoff = now - (self._worker_timeout_s + self._requeue_grace_s)
+        running = self._job_store.list(status=JobStatus.RUNNING)
+        recovered = 0
+
+        # --- WARM recovery (time-based; needs NO docker) -------------------------------------
+        # A warm slot carries no docker label, so docker ps can't attest its liveness — recovery
+        # is purely TIME-based, so it runs FIRST and is NOT blocked by a docker-ps failure. A warm
+        # job still RUNNING past worker_timeout_s + grace (started_at refreshed before the bounded
+        # sealing phase) has a GONE owner; we FAIL it (terminal), NOT requeue — a requeue would let
+        # a second worker re-detonate the same untrusted input, and orphaned sandboxes don't die
+        # with a crashed dispatcher. CAS-fenced on (RUNNING, the observed claim_id): never clobbers
+        # a terminal status the owner wrote, and never fails a job that was reclaimed (ABA-safe).
+        for job in running:
+            if job.job_id in excluded or job.worker_runtime != "warm":
+                continue
+            if job.started_at is None or job.started_at >= warm_stale_cutoff:
+                continue
+            if self._fail_if_running(
+                job,
+                "warm worker abandoned: owning dispatcher gone "
+                f"(no progress for >{self._worker_timeout_s + self._requeue_grace_s:.0f}s)",
+                warning="recovered: warm worker owner gone",
+            ):
+                recovered += 1
+                # The owner is gone and the job is now terminal (FAILED is not claim_next-able),
+                # so nothing else will clean up its staged input. Delete it here so a recovered
+                # job's untrusted input doesn't leak on disk even when retention is disabled.
+                self._delete_input(
+                    self._job_root / job.job_id / "input" / Path(job.filename).name
+                )
+
+        # --- COLD requeue (needs docker liveness) -------------------------------------------
         active_job_ids = self._list_active_worker_job_ids()
         if active_job_ids is None:
-            # docker ps failed — don't touch anything
-            return 0
-
-        excluded = exclude or frozenset()
-        recovered = 0
-        for job in self._job_store.list(status=JobStatus.RUNNING):
-            if job.job_id in excluded or job.job_id in active_job_ids:
+            # docker ps failed — skip cold requeue (warm recovery above already ran).
+            return recovered
+        for job in running:
+            if (
+                job.job_id in excluded
+                or job.job_id in active_job_ids
+                or job.worker_runtime == "warm"  # handled above
+            ):
                 continue
-            self._job_store.update(
+            # Grace window: a just-claimed cold job's worker container may not appear in
+            # `docker ps` yet, so requeuing it now would double-detonate the same (malicious)
+            # input in two workers. Only requeue jobs whose started_at is older than the window.
+            if job.started_at is not None and job.started_at > grace_cutoff:
+                continue
+            # Claim-fenced (RUNNING, observed claim_id) so we never requeue a job that was
+            # reclaimed since the list() snapshot, and clear claim_id so the next claim is fresh.
+            if self._job_store.update_if_status(
                 job.job_id,
+                JobStatus.RUNNING,
+                expect_claim_id=job.claim_id,
                 status=JobStatus.QUEUED,
                 started_at=None,
                 worker_runtime=None,
+                claim_id=None,
                 security_warnings=[
                     *job.security_warnings,
                     "requeued: worker container disappeared",
                 ],
                 error=None,
-            )
-            recovered += 1
+            ):
+                recovered += 1
         return recovered
+
+    def _fail_if_running(self, job: Job, reason: str, *, warning: str | None = None) -> bool:
+        """CAS terminal-fail: mark ``job`` FAILED only while it is STILL RUNNING (so a concurrent
+        terminal write by its owner is never clobbered). Mirrors ``_fail_job``'s fields + error
+        scrubbing + retention expiry. Returns whether the transition applied."""
+        finished_at = time.time()
+        expires_at = (
+            finished_at + self._job_retention_seconds
+            if self._job_retention_seconds > 0
+            else None
+        )
+        fields: dict = dict(
+            status=JobStatus.FAILED,
+            finished_at=finished_at,
+            expires_at=expires_at,
+            error=sanitize_public_error(reason),
+        )
+        if warning is not None:
+            fields["security_warnings"] = [*job.security_warnings, warning]
+        # Fence on the claim_id observed in the list() snapshot: if the job was reclaimed
+        # (RUNNING->QUEUED->RUNNING with a new claim) since we read it, do NOT fail the fresh
+        # claim — closes the status-only ABA hole.
+        return self._job_store.update_if_status(
+            job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id, **fields
+        )
 
     # ------------------------------------------------------------------
     # Internal dispatch flow
@@ -184,8 +298,9 @@ class Dispatcher:
     def _dispatch_claimed_job(self, job: Job) -> None:
         """Execute one claimed job (status is already RUNNING on entry).
 
-        Security: input is ALWAYS deleted via a finally block — every branch
-        ultimately falls into the ``finally`` at the bottom of this method.
+        Security: input is deleted via a finally block on every branch — but only when we
+        still own the claim (``_delete_input_if_owned``); a job a peer reclaimed keeps its
+        input for the new owner (the recovery sweep deletes a time-recovered job's input).
 
         If a warm pool is configured, attempt to claim a slot.  On success, the
         WARM path runs.  If no slot is available (pool.claim returns None), the
@@ -202,13 +317,16 @@ class Dispatcher:
             record_warm_claim(hit=slot is not None)
             if slot is not None:
                 # WARM PATH — the slot, not input_path/output_dir, owns I/O dirs.
-                # Staged input is still deleted in the finally block.
+                # Staged input is deleted in the finally block (only if we still own the claim;
+                # a reclaimed job's input is left for the new owner — see _delete_input_if_owned).
                 t0 = time.monotonic()
                 try:
-                    self._dispatch_warm(job, staged_input_path=input_path, slot=slot)
+                    self._dispatch_warm(
+                        job, staged_input_path=input_path, slot=slot, output_dir=output_dir
+                    )
                 finally:
-                    # Security: delete staged input on EVERY terminal path.
-                    self._delete_input(input_path)
+                    # Delete the staged input on every terminal path WE own.
+                    self._delete_input_if_owned(job, input_path)
                     self._record_outcome(job, path="warm", started=t0)
                 return
             else:
@@ -219,11 +337,27 @@ class Dispatcher:
         try:
             self._dispatch_inner(job, input_path, output_dir)
         finally:
-            # Security guarantee: delete the malicious input on every path,
-            # regardless of success, failure, exception, or unknown engine.
-            # We never touch output/ here.
-            self._delete_input(input_path)
+            # Delete the malicious input on every terminal path WE own, regardless of success,
+            # failure, exception, or unknown engine. We never touch output/ here.
+            self._delete_input_if_owned(job, input_path)
             self._record_outcome(job, path="cold", started=t0)
+
+    def _delete_input_if_owned(self, job: Job, input_path: Path) -> None:
+        """Delete the shared staged input ONLY if we still hold the claim (or the job
+        terminalized under it). The input at job_root/<id>/input is spooled ONCE at submission
+        and shared across reclaims; if a peer dispatcher requeued+reclaimed this job (claim_id
+        changed/cleared — e.g. we ABORTED a lost claim), the NEW owner still needs it on disk, so
+        we must NOT delete it. On the normal owned terminal path claim_id still matches and the
+        untrusted input is deleted exactly as before; a leak only occurs if the reclaiming owner
+        also dies before its own cleanup, bounded by the retention sweep of job_root/<id>."""
+        final = self._job_store.get(job.job_id)
+        if final is None or final.claim_id == job.claim_id:
+            self._delete_input(input_path)
+        else:
+            _log.info(
+                "job %s reclaimed by another dispatcher (claim changed); leaving its staged "
+                "input for the new owner", job.job_id,
+            )
 
     def _record_outcome(self, job: Job, *, path: str, started: float) -> None:
         """Record the dispatched-job outcome + duration (warm|cold). Read the
@@ -239,6 +373,7 @@ class Dispatcher:
         *,
         staged_input_path: Path,
         slot: "Slot",
+        output_dir: Path,
     ) -> None:
         """Execute one claimed job via a pre-warmed slot.
 
@@ -270,7 +405,28 @@ class Dispatcher:
                 return
 
             # ------------------------------------------------------------------
-            # Step 2: Stage input — over the wire (vsock) or into slot.input_dir
+            # Step 2: Mark warm BEFORE staging (claim-fenced).
+            # A slow staging copy (e.g. the gVisor input copy) would otherwise leave the job
+            # looking COLD (worker_runtime=None) to a PEER dispatcher's maintenance sweep, which
+            # would docker-ps-requeue it (a warm job has no container) and double-detonate. Mark
+            # warm first so the sweep routes it to time-based warm recovery. CAS on our claim so
+            # if a peer already requeued/reclaimed it we abort BEFORE staging+detonating.
+            # ------------------------------------------------------------------
+            if not self._job_store.update_if_status(
+                job.job_id,
+                JobStatus.RUNNING,
+                expect_claim_id=job.claim_id,
+                worker_runtime="warm",
+            ):
+                _log.warning(
+                    "warm job %s lost its claim before staging (requeued/recovered by another "
+                    "dispatcher); aborting", job.job_id,
+                )
+                return
+            job.worker_runtime = "warm"
+
+            # ------------------------------------------------------------------
+            # Step 3: Stage input — over the wire (vsock) or into slot.input_dir
             # ------------------------------------------------------------------
             if callable(stage_fn):
                 input_path = stage_fn(slot, staged_input_path)
@@ -282,14 +438,6 @@ class Dispatcher:
                     self._fail_job(job, f"failed to stage input to warm slot: {exc}")
                     return
                 input_path = slot_input_copy
-
-            # ------------------------------------------------------------------
-            # Step 3: Mark RUNNING with warm worker_runtime
-            # ------------------------------------------------------------------
-            self._job_store.update(
-                job.job_id,
-                worker_runtime="warm",
-            )
 
             # ------------------------------------------------------------------
             # Step 4: Signal go to warm worker (atomic write of go.json)
@@ -306,21 +454,51 @@ class Dispatcher:
                 output_dir=slot.output_dir,
                 params=self._sanitize_params(job.params),
             )
+            # One absolute deadline bounds the input send + wait (the only steps a slow guest
+            # can stall) to worker_timeout_s, so the upload (which runs BEFORE the wait) can't
+            # pin dispatch. NOTE: the post-wait sealing phase (Step 5b+) is NOT under this
+            # deadline; its staleness is covered separately by refreshing started_at below.
+            warm_deadline = time.monotonic() + self._worker_timeout_s
             try:
-                control.signal_go(spec)
+                control.signal_go(spec, deadline=warm_deadline)
             except Exception as exc:  # noqa: BLE001
                 self._fail_job(job, f"failed to signal go to warm worker: {exc}")
                 return
 
             # ------------------------------------------------------------------
-            # Step 5: Wait for done signal
+            # Step 5: Wait for done signal (same deadline; remaining budget after the send)
             # ------------------------------------------------------------------
+            remaining = warm_deadline - time.monotonic()
+            if remaining <= 0:
+                self._fail_job(
+                    job, f"warm worker timed out after {self._worker_timeout_s}s"
+                )
+                return
             try:
-                control.wait_for_done(timeout_s=self._worker_timeout_s)
+                control.wait_for_done(timeout_s=remaining)
             except WarmTimeout:
                 self._fail_job(
                     job,
                     f"warm worker timed out after {self._worker_timeout_s}s",
+                )
+                return
+
+            # The guest is done; the sealing phase below (rdump materialize, output-cap, validate,
+            # re-seal of up to max_total_artifact_bytes) is real wall-clock work NOT bounded by
+            # warm_deadline. Refresh started_at so requeue_orphaned_jobs (which fails a warm job
+            # RUNNING past worker_timeout_s + grace) measures the sealing phase from a fresh clock
+            # — otherwise a legitimately slow/large seal could be judged "owner gone" and FAILed
+            # out from under a live owner. Claim-fenced (like every other owner write): if a peer
+            # already recovered/reclaimed us, abort before the pointless seal.
+            if not self._job_store.update_if_status(
+                job.job_id,
+                JobStatus.RUNNING,
+                expect_claim_id=job.claim_id,
+                started_at=time.time(),
+            ):
+                _log.warning(
+                    "warm job %s lost its claim before sealing (recovered/reclaimed by another "
+                    "dispatcher); aborting", job.job_id,
                 )
                 return
 
@@ -334,6 +512,27 @@ class Dispatcher:
                 except Exception as exc:  # noqa: BLE001
                     self._fail_job(job, f"failed to read warm worker output: {exc}")
                     return
+
+            # Bound TOTAL on-disk output (declared + UNDECLARED) before trusting it. The gVisor
+            # warm /out is a live 0o777 host bind mount with NO kernel size/inode quota, so a
+            # compromised worker can fill job_root with undeclared files just like the cold path
+            # — this closes the cold/warm asymmetry. (FC's output is already bounded by its
+            # fixed-size ext4 disk, so this is a cheap no-op there.)
+            #
+            # KNOWN RESIDUAL (post-run gate, not a runtime quota): this rejects + reclaims
+            # oversized output AFTER the worker exits, so oversized output is never trusted or
+            # served. It does NOT stop a compromised worker from TRANSIENTLY filling host disk
+            # DURING execution on the docker-cold + gVisor-warm tiers (bounded by worker_timeout_s,
+            # then SIGKILL + reclaim; partially capped by the worker's per-file RLIMIT_FSIZE). A
+            # true in-execution kernel quota isn't portable here (gVisor reads /out via this very
+            # host bind — a sentry-internal tmpfs would be unreadable; docker bind sizing needs a
+            # storage-driver quota). Mitigate operationally: put job_root on a project-quota'd /
+            # size-capped filesystem. FC is immune (fixed ext4 disk).
+            try:
+                self._enforce_output_size_cap(slot.output_dir)
+            except OutputTrustError as exc:
+                self._fail_job(job, f"warm output too large: {exc}")
+                return
 
             # ------------------------------------------------------------------
             # Step 6: Validate output through trust gate
@@ -354,6 +553,19 @@ class Dispatcher:
                 return
 
             # ------------------------------------------------------------------
+            # Step 6b: Materialize the SEALED, validated output from the (possibly still-live)
+            # slot dir into the host-only job_root output dir, re-verifying each artifact's sha.
+            # This makes warm results fetchable from the API (they were validated in the slot dir,
+            # which is reaped) AND makes the served bytes == the sealed shas (#5/#6 + the live-dir
+            # validation residual).
+            # ------------------------------------------------------------------
+            try:
+                self._materialize_sealed_warm_output(envelope, slot.output_dir, output_dir)
+            except OutputTrustError as exc:
+                self._fail_job(job, f"failed to materialize warm output: {exc}")
+                return
+
+            # ------------------------------------------------------------------
             # Step 7: Mark DONE
             # ------------------------------------------------------------------
             finished_at = time.time()
@@ -367,14 +579,27 @@ class Dispatcher:
                 "artifact_count": len(envelope.artifacts),
                 "warning_count": len(envelope.warnings),
             }
-            self._job_store.update(
+            # CAS-fence the terminal DONE on RUNNING (symmetric with the recovery FAIL): under a
+            # multi-dispatcher topology a peer may have already FAILED this warm job as stale (its
+            # output possibly retention-deleted). A blind DONE would resurrect that terminal state
+            # to DONE with no artifacts on disk + a self-contradictory "owner gone" warning. "First
+            # writer wins": if the job is no longer RUNNING, leave the recovery's terminal state.
+            applied = self._job_store.update_if_status(
                 job.job_id,
+                JobStatus.RUNNING,
+                expect_claim_id=job.claim_id,
                 status=JobStatus.DONE,
                 finished_at=finished_at,
                 expires_at=expires_at,
                 result_summary=result_summary,
                 error=None,
             )
+            if not applied:
+                _log.warning(
+                    "warm job %s no longer our RUNNING claim at DONE write (recovered/reclaimed "
+                    "by another dispatcher); leaving its terminal state untouched",
+                    job.job_id,
+                )
 
         finally:
             # Security: release the slot on EVERY terminal path (success, trust-fail,
@@ -411,13 +636,24 @@ class Dispatcher:
             self._fail_job(job, f"runtime selection failed: {exc}")
             return
 
-        # Update job to RUNNING state with runtime info.
-        # (claim_next already set status=RUNNING; we enrich with runtime data.)
-        self._job_store.update(
+        # Enrich the RUNNING job with runtime info — claim-fenced (the cold twin of the warm
+        # mark-warm fence). _runtime_selector() can block on `docker info` (no timeout); a peer's
+        # docker-ps requeue can fire during that stall and reclaim the row under a new claim. A
+        # BLIND write here would overwrite worker_runtime on the reclaimed job — mis-routing the
+        # peer's warm-vs-cold recovery (a relabeled warm job gets cold-requeued -> re-detonation).
+        # If we lost the claim, abort BEFORE launching our own (stale) worker.
+        if not self._job_store.update_if_status(
             job.job_id,
+            JobStatus.RUNNING,
+            expect_claim_id=job.claim_id,
             worker_runtime=runtime.runtime,
             security_warnings=list(job.security_warnings) + list(runtime.warnings),
-        )
+        ):
+            _log.warning(
+                "cold job %s lost its claim before launch (requeued/reclaimed by another "
+                "dispatcher); aborting before detonation", job.job_id,
+            )
+            return
 
         # ------------------------------------------------------------------
         # Step 4: Build argv and launch worker container
@@ -438,7 +674,15 @@ class Dispatcher:
                 "blastbox.role": "worker",
                 "blastbox.job_id": job.job_id,
             },
-            extra_env=self._sanitize_params(job.params),
+            extra_env={
+                **self._sanitize_params(job.params),
+                # Tell the harness where the dispatcher mounted I/O (it mounts the input file at
+                # /input/<name> and output at /output; the harness defaults are /in,/out, so
+                # without this the cold path is broken-as-wired). Dispatcher-set keys are merged
+                # LAST so a hostile job.param can't override them.
+                "BLASTBOX_INPUT_DIR": "/input",
+                "BLASTBOX_OUTPUT_DIR": "/output",
+            },
         )
 
         try:
@@ -459,6 +703,14 @@ class Dispatcher:
             return
         except Exception as exc:  # noqa: BLE001
             self._fail_job(job, f"docker launch failed: {exc}")
+            return
+
+        # Bound TOTAL on-disk output (declared + UNDECLARED) before trusting it, so a worker
+        # that wrote a huge undeclared file can't exhaust job_root (#3 disk-exhaustion DoS).
+        try:
+            self._enforce_output_size_cap(output_dir)
+        except OutputTrustError as exc:
+            self._fail_job(job, f"output too large: {exc}")
             return
 
         # ------------------------------------------------------------------
@@ -485,6 +737,10 @@ class Dispatcher:
             self._fail_job(job, f"unexpected trust validation error: {exc}")
             return
 
+        # Persist the host-SEALED metadata over the worker's raw file so the API serves trusted
+        # hashes/sizes/payload, not worker-fabricated ones (#5).
+        self._write_sealed_metadata(envelope, output_dir)
+
         # Note: a non-zero worker exit with *no* valid output is already FAILED
         # via the OutputTrustError branch above (missing/invalid metadata.json
         # raises). A non-zero exit WITH valid, trust-passing output is treated as
@@ -506,21 +762,35 @@ class Dispatcher:
             "artifact_count": len(envelope.artifacts),
             "warning_count": len(envelope.warnings),
         }
-        self._job_store.update(
+        # Claim-fenced (RUNNING, our claim_id): a peer's docker-ps sweep on another host can't
+        # see this container, so it may have requeued the job; don't resurrect a reclaimed job to
+        # DONE with this (stale) detonation's result.
+        if not self._job_store.update_if_status(
             job.job_id,
+            JobStatus.RUNNING,
+            expect_claim_id=job.claim_id,
             status=JobStatus.DONE,
             finished_at=finished_at,
             expires_at=expires_at,
             result_summary=result_summary,
             error=None,
-        )
+        ):
+            _log.warning(
+                "cold job %s no longer our RUNNING claim at DONE write (recovered/reclaimed by "
+                "another dispatcher); leaving its terminal state untouched",
+                job.job_id,
+            )
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
     def _fail_job(self, job: Job, reason: str) -> None:
-        """Mark a job FAILED, scrubbing the error string before storage."""
+        """Mark a job FAILED, scrubbing the error string before storage.
+
+        Claim-fenced on (RUNNING, our claim_id): if a peer dispatcher already requeued/recovered
+        this job, the owner's FAILED is a no-op (don't clobber the new owner's state). In the
+        normal path the job is RUNNING under our claim, so it applies as before."""
         error = sanitize_public_error(reason)
         finished_at = time.time()
         expires_at = (
@@ -528,8 +798,10 @@ class Dispatcher:
             if self._job_retention_seconds > 0
             else None
         )
-        self._job_store.update(
+        self._job_store.update_if_status(
             job.job_id,
+            JobStatus.RUNNING,
+            expect_claim_id=job.claim_id,
             status=JobStatus.FAILED,
             finished_at=finished_at,
             expires_at=expires_at,
@@ -551,6 +823,114 @@ class Dispatcher:
             input_path.parent.rmdir()
         except OSError:
             pass
+
+    def _enforce_output_size_cap(self, output_dir: Path) -> None:
+        """Reject if the TOTAL on-disk output exceeds the total-artifact cap.
+
+        The trust gate only sums DECLARED artifacts, so a worker can write a huge UNDECLARED
+        file (e.g. /output/pad.bin) that passes validation yet fills job_root. This counts every
+        regular file (declared or not) and fails the job before DONE if the sum exceeds the cap.
+        The cold worker is already exited (--rm) so the dir is static (no TOCTOU)."""
+        cap = self._limits.max_total_artifact_bytes
+        total = 0
+        count = 0
+        for p in output_dir.rglob("*"):
+            count += 1
+            # Bound entry count too: many tiny/empty files exhaust inodes + traversal time even
+            # under the byte cap. Checked first so the walk itself can't run unbounded.
+            if count > _MAX_OUTPUT_ENTRIES:
+                raise OutputTrustError(
+                    f"output entry count exceeds {_MAX_OUTPUT_ENTRIES} (inode/traversal DoS)"
+                )
+            try:
+                if p.is_symlink() or not p.is_file():
+                    continue
+                total += p.stat().st_size
+            except OSError:
+                continue
+            if total > cap:
+                raise OutputTrustError(
+                    f"total output {total} bytes exceeds cap {cap} (undeclared files counted)"
+                )
+
+    def _write_sealed_metadata(self, envelope, output_dir: Path) -> None:
+        """Overwrite metadata.json with the host-SEALED envelope (recomputed sha256/bytes/payload)
+        atomically AND symlink-safely, so the API serves host-trusted metadata — not the raw
+        worker file. atomic_write_confined uses a random O_EXCL|O_NOFOLLOW temp + renameat, so a
+        worker that pre-planted .metadata.json.tmp (or metadata.json) as a symlink can't redirect
+        the host write to clobber an outside file."""
+        data = envelope.model_dump_json(by_alias=True).encode("utf-8")
+        # 0o644: in compose mode the API serves this from a separate process/uid than the
+        # dispatcher that writes it; 0o600 would make /metadata + /result unreadable. Not secret.
+        atomic_write_confined(output_dir, "metadata.json", data, mode=0o644)
+
+    def _materialize_sealed_warm_output(self, envelope, src_dir: Path, dst_dir: Path) -> None:
+        """Copy the validated declared artifacts from the warm slot dir (``src_dir``, possibly a
+        still-live bind mount) into the host-only job_root output dir (``dst_dir``) using
+        TOCTOU-safe reads, RE-VERIFYING each artifact's sha against the sealed envelope (so a
+        mid-flight content swap is detected and fails the job), then writing the sealed
+        metadata.json. After this the API serves a stable, host-trusted copy — closing both the
+        'warm results unreachable' gap and the live-dir validation residual.
+
+        ``dst_dir`` is job_root/<id>/output — the SAME dir a prior COLD attempt of this job
+        bind-mounts writable into the untrusted worker (a requeue after a cold crash reuses it),
+        so it can contain worker-planted symlinks. We therefore (1) wipe+recreate it (rmtree
+        unlinks symlinks, never follows them) and (2) write each artifact via confined_atomic_writer
+        (per-segment O_NOFOLLOW walk + O_EXCL temp + renameat) — exactly the symlink defence the
+        sibling metadata write already uses — so a planted symlink can never redirect a
+        host-trusted write to clobber a file outside dst_dir."""
+        shutil.rmtree(dst_dir, ignore_errors=True)
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for a in envelope.artifacts:
+            fd = open_confined_regular_fd(src_dir, a.path)
+            digest = hashlib.sha256()
+            n = 0
+            try:
+                with confined_atomic_writer(
+                    dst_dir, a.path, mode=0o644, dir_mode=0o755
+                ) as out_fd:
+                    while True:
+                        chunk = os.read(fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        n += len(chunk)
+                        # Cap the copy at the sealed size — a still-live worker growing the file
+                        # past its declared bytes can't force unbounded host I/O (#4).
+                        if n > a.bytes:
+                            raise OutputTrustError(
+                                f"artifact {a.id} grew past {a.bytes} bytes during materialization"
+                            )
+                        digest.update(chunk)
+                        mv = memoryview(chunk)
+                        while mv:
+                            mv = mv[os.write(out_fd, mv):]
+                    # Re-verify INSIDE the writer ctx: a mismatch raises -> the temp is unlinked
+                    # and nothing is published (no partial/forged artifact ever lands in dst_dir).
+                    if digest.hexdigest() != a.sha256 or n != a.bytes:
+                        raise OutputTrustError(
+                            f"artifact {a.id} changed during materialization (live-dir swap)"
+                        )
+            finally:
+                os.close(fd)
+        self._write_sealed_metadata(envelope, dst_dir)
+
+    def _run_maintenance(self) -> None:
+        """Periodic upkeep from run_forever: requeue jobs whose worker vanished (so a crash
+        mid-dispatch doesn't strand a RUNNING zombie forever) and expire retention-due artifacts
+        (so output of untrusted documents doesn't accumulate on disk forever)."""
+        try:
+            self.requeue_orphaned_jobs()
+        except Exception:  # noqa: BLE001
+            _log.exception("requeue_orphaned_jobs failed")
+        if self._job_retention_seconds > 0:
+            try:
+                from blastbox.host.jobs.retention import JobRetentionSweeper
+
+                expired = JobRetentionSweeper(self._job_root).expire_due(self._job_store)
+                if expired:
+                    _log.info("retention_sweep_expired count=%d", len(expired))
+            except Exception:  # noqa: BLE001
+                _log.exception("retention sweep failed")
 
     def _kill_container(self, container_name: str) -> None:
         """Best-effort ``docker kill`` on a timed-out worker."""

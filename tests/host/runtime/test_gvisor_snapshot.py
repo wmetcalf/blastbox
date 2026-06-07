@@ -1,0 +1,277 @@
+from pathlib import Path
+
+import pytest
+
+from blastbox.host.runtime.gvisor_snapshot import GvisorSnapshotBackend, GvisorConfig, _oci_config
+
+
+class _Rec:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv: list[str], **kw: object) -> int:
+        self.calls.append(argv)
+        return 0
+
+
+def _cfg(tmp_path: Path, **kw: object) -> GvisorConfig:
+    base: dict = dict(
+        runsc_bin="runsc",
+        root=tmp_path / "root",
+        image_rootfs=tmp_path / "rootfs",
+        network="none",
+        warm_argv=["/warm-entrypoint"],
+    )
+    base.update(kw)
+    return GvisorConfig(**base)
+
+
+def test_boot_base_runs_then_checkpoint(tmp_path: Path) -> None:
+    rec = _Rec()
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=rec, ready_wait=lambda d, t: None)
+    boot = be.boot_base()
+    boot.wait_ready(5.0)
+    art = boot.checkpoint(tmp_path / "ckpt")
+    joined = [" ".join(c) for c in rec.calls]
+    assert any("run" in c and "-detach" in c for c in joined)
+    assert any("checkpoint" in c and "-image-path" in c for c in joined)
+    assert Path(str(art)).name == "checkpoint"
+
+
+def test_restore_in_creates_dirs_and_restores(tmp_path: Path) -> None:
+    rec = _Rec()
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=rec, ready_wait=lambda d, t: None)
+    wd = tmp_path / "slots" / "s1"
+    wd.mkdir(parents=True)
+    h = be.restore_in(wd, str(tmp_path / "ckpt" / "checkpoint"))
+    joined = [" ".join(c) for c in rec.calls]
+    assert any("restore" in c and "-image-path" in c for c in joined)
+    for sub in ("in", "out", "ctrl"):
+        assert (wd / sub).is_dir()
+    assert h.output_dir == wd / "out" and h.control_dir == wd / "ctrl"
+
+
+def test_restore_in_force_deletes_leaked_container_on_failure(tmp_path: Path) -> None:
+    # A restore that fails partway can leave registered runsc state; restore_in must
+    # tear down its cid (best-effort) before re-raising rather than orphan a sandbox.
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kw: object) -> int:
+        calls.append(argv)
+        if "restore" in argv:
+            raise RuntimeError("restore failed mid-way")
+        return 0
+
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=run, ready_wait=lambda d, t: None)
+    with pytest.raises(RuntimeError):
+        be.restore_in(tmp_path / "s", "img")
+    joined = [" ".join(c) for c in calls]
+    assert any("restore" in c for c in joined)
+    assert any("delete" in c and "-force" in c for c in joined), joined
+
+
+def test_boot_base_uses_unique_cid_per_call(tmp_path: Path) -> None:
+    # Two builds sharing this -root parent must not collide on a fixed cid / bundle path.
+    rec = _Rec()
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=rec, ready_wait=lambda d, t: None)
+    be.boot_base()
+    be.boot_base()
+    run_cids = [c[-1] for c in rec.calls if "run" in c and "-detach" in c]
+    assert len(run_cids) == 2
+    assert run_cids[0] != run_cids[1]
+    assert all(cid != "warm-base" for cid in run_cids)
+
+
+def test_available_uses_probe(tmp_path: Path) -> None:
+    assert GvisorSnapshotBackend(_cfg(tmp_path), run=lambda a, **k: 0, probe=lambda: True).available() is True
+    assert GvisorSnapshotBackend(_cfg(tmp_path), run=lambda a, **k: 0, probe=lambda: False).available() is False
+
+
+def test_available_missing_binary_is_false(tmp_path: Path) -> None:
+    # No probe override + a binary that doesn't resolve -> fail-closed before the C/R probe.
+    be = GvisorSnapshotBackend(
+        _cfg(tmp_path, runsc_bin="definitely-not-a-real-binary-xyz"),
+        cr_capable=lambda b: pytest.fail("cr_capable must not run when the binary is missing"),
+    )
+    assert be.available() is False
+
+
+def test_available_requires_checkpoint_restore_capability(tmp_path: Path) -> None:
+    # Binary EXISTS (sys.executable resolves) but the runsc build lacks C/R -> fail-closed,
+    # so the pool never selects gVisor and then errors at restore time.
+    import sys
+
+    seen: list[str] = []
+
+    def _incapable(binary: str) -> bool:
+        seen.append(binary)
+        return False
+
+    be = GvisorSnapshotBackend(_cfg(tmp_path, runsc_bin=sys.executable), cr_capable=_incapable)
+    assert be.available() is False
+    assert seen == [sys.executable]  # the capability probe actually ran on the resolved binary
+
+    ok = GvisorSnapshotBackend(_cfg(tmp_path, runsc_bin=sys.executable), cr_capable=lambda b: True)
+    assert ok.available() is True
+
+
+def test_default_cr_capable_parses_help_output(monkeypatch, tmp_path: Path) -> None:
+    # _default_cr_capable runs `runsc help` and requires BOTH subcommands in the output.
+    import subprocess as _sp
+
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    class _Completed:
+        def __init__(self, out: str) -> None:
+            self.stdout, self.stderr = out, ""
+
+    def _fake_run_both(argv, **kw):
+        return _Completed("Subcommands:\n\tcheckpoint\n\trestore\n\trun\n")
+
+    def _fake_run_missing(argv, **kw):
+        return _Completed("Subcommands:\n\trun\n\tdelete\n")  # no checkpoint/restore
+
+    monkeypatch.setattr(gs.subprocess, "run", _fake_run_both)
+    assert gs._default_cr_capable("runsc") is True
+
+    monkeypatch.setattr(gs.subprocess, "run", _fake_run_missing)
+    assert gs._default_cr_capable("runsc") is False
+
+    def _boom(argv, **kw):
+        raise _sp.TimeoutExpired(argv, 5)
+
+    monkeypatch.setattr(gs.subprocess, "run", _boom)
+    assert gs._default_cr_capable("runsc") is False  # timeout -> not capable (fail-closed)
+
+
+def test_restore_in_propagates_run_error(tmp_path: Path) -> None:
+    def boom(argv: list[str], **kw: object) -> int:
+        raise RuntimeError("runsc gone")
+
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=boom, ready_wait=lambda d, t: None)
+    # The `runsc restore` failure must propagate (the best-effort cleanup that runs in the
+    # except — swallowing its own errors — must not mask it). The leaked-container teardown
+    # itself is asserted by test_restore_in_force_deletes_leaked_container_on_failure.
+    with pytest.raises(RuntimeError):
+        be.restore_in(tmp_path / "s", "img")
+
+
+def test_oci_config_has_bind_mounts_args_and_ld_preload(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path, warm_argv=["/bin/sh", "-c", "x"], ld_preload="/opt/clippyshot/accept-retry.so")
+    spec = _oci_config(cfg, tmp_path / "wd", in_ro=True)
+    assert spec["process"]["args"] == ["/bin/sh", "-c", "x"]
+    assert any(e == "LD_PRELOAD=/opt/clippyshot/accept-retry.so" for e in spec["process"]["env"])
+    dests = {m["destination"]: m for m in spec["mounts"]}
+    assert dests["/in"]["options"][-1] == "ro" and dests["/out"]["options"][-1] == "rw"
+    assert dests["/ctrl"]["source"] == str(tmp_path / "wd" / "ctrl")
+
+
+def test_oci_config_no_ld_preload_when_unset(tmp_path: Path) -> None:
+    spec = _oci_config(_cfg(tmp_path), tmp_path / "wd", in_ro=True)
+    assert not any(e.startswith("LD_PRELOAD") for e in spec["process"]["env"])
+
+
+def test_oci_config_security_posture_non_root_no_caps_no_new_privs(tmp_path: Path) -> None:
+    # The untrusted-document worker must run NON-ROOT with NO capabilities and no-new-privs,
+    # matching the docker (--user/--cap-drop=ALL) and FC (setpriv 65532) tiers.
+    spec = _oci_config(_cfg(tmp_path), tmp_path / "wd", in_ro=True)
+    proc = spec["process"]
+    assert proc["user"]["uid"] != 0 and proc["user"]["uid"] == 65532
+    assert proc["noNewPrivileges"] is True
+    assert all(caps == [] for caps in proc["capabilities"].values())
+    assert spec["root"]["readonly"] is True
+
+
+def test_oci_config_honors_custom_uid(tmp_path: Path) -> None:
+    spec = _oci_config(_cfg(tmp_path, uid=10001, gid=10001), tmp_path / "wd", in_ro=True)
+    assert spec["process"]["user"] == {"uid": 10001, "gid": 10001}
+
+
+def test_oci_config_sets_resource_rlimits(tmp_path: Path) -> None:
+    # Bound the untrusted worker so a malicious-doc fork-bomb / fd-exhaustion can't degrade the
+    # pool (the FC tier bounds via the microVM; -ignore-cgroups disables cgroup pids here).
+    spec = _oci_config(_cfg(tmp_path), tmp_path / "wd", in_ro=True)
+    rlimits = {r["type"]: r for r in spec["process"].get("rlimits", [])}
+    assert rlimits["RLIMIT_NPROC"]["hard"] == 4096  # generous fork-bomb bound
+    assert rlimits["RLIMIT_NOFILE"]["hard"] == 65536  # generous fd-exhaustion bound
+    assert all(r["soft"] == r["hard"] for r in rlimits.values())
+
+
+def test_oci_config_omits_rlimits_when_disabled(tmp_path: Path) -> None:
+    spec = _oci_config(
+        _cfg(tmp_path, rlimit_nproc=0, rlimit_nofile=0), tmp_path / "wd", in_ro=True
+    )
+    assert "rlimits" not in spec["process"]
+
+
+def test_prepare_slot_dirs_perms_are_locked_down(tmp_path: Path) -> None:
+    import stat
+
+    rec = _Rec()
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=rec, ready_wait=lambda d, t: None)
+    wd = tmp_path / "slots" / "s1"
+    be.restore_in(wd, "img")
+    # The 0o700 leaf is what blocks other local users from reaching the 0o777 out/ctrl scratch.
+    assert stat.S_IMODE(wd.stat().st_mode) == 0o700
+    assert stat.S_IMODE((wd / "in").stat().st_mode) == 0o755
+    assert stat.S_IMODE((wd / "out").stat().st_mode) == 0o777
+    assert stat.S_IMODE((wd / "ctrl").stat().st_mode) == 0o777
+
+
+def test_restore_handle_alive_running(tmp_path: Path) -> None:
+    from blastbox.host.runtime.gvisor_snapshot import GvisorRestoreHandle
+    cfg = _cfg(tmp_path)
+    handle = GvisorRestoreHandle(
+        cfg,
+        run=lambda a, **k: 0,
+        cid="test-cid",
+        slot_workdir=tmp_path,
+        run_text=lambda argv: '{"status": "running"}',
+    )
+    assert handle.alive() is True
+
+
+def test_restore_handle_alive_created_is_not_live(tmp_path: Path) -> None:
+    from blastbox.host.runtime.gvisor_snapshot import GvisorRestoreHandle
+    cfg = _cfg(tmp_path)
+    handle = GvisorRestoreHandle(
+        cfg,
+        run=lambda a, **k: 0,
+        cid="test-cid",
+        slot_workdir=tmp_path,
+        run_text=lambda argv: '{"status": "created"}',
+    )
+    # 'created' = restored but init never started → must NOT be promoted to live, else a
+    # wedged slot gets a job and hangs until the worker timeout.
+    assert handle.alive() is False
+
+
+def test_restore_handle_alive_stopped(tmp_path: Path) -> None:
+    from blastbox.host.runtime.gvisor_snapshot import GvisorRestoreHandle
+    cfg = _cfg(tmp_path)
+    handle = GvisorRestoreHandle(
+        cfg,
+        run=lambda a, **k: 0,
+        cid="test-cid",
+        slot_workdir=tmp_path,
+        run_text=lambda argv: '{"status": "stopped"}',
+    )
+    assert handle.alive() is False
+
+
+def test_restore_handle_alive_runsc_error(tmp_path: Path) -> None:
+    from blastbox.host.runtime.gvisor_snapshot import GvisorRestoreHandle
+
+    def _boom(argv: list[str]) -> str:
+        raise RuntimeError("runsc gone")
+
+    cfg = _cfg(tmp_path)
+    handle = GvisorRestoreHandle(
+        cfg,
+        run=lambda a, **k: 0,
+        cid="test-cid",
+        slot_workdir=tmp_path,
+        run_text=_boom,
+    )
+    # alive() must be False (not raise) when run_text raises
+    assert handle.alive() is False

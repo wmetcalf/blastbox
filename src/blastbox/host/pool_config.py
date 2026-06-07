@@ -18,6 +18,7 @@ _log = logging.getLogger("blastbox.host.pool_config")
 # Pool runtime identifiers.
 RUNTIME_NONE = "none"
 RUNTIME_FIRECRACKER = "firecracker"
+RUNTIME_GVISOR = "gvisor"
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,12 @@ def build_warm_pool(
                 from blastbox.host.runtime.firecracker import select_fc_runtime
 
                 runtime = select_fc_runtime(require_available=True)
+        elif cfg.runtime == RUNTIME_GVISOR:
+            from blastbox.host.runtime.gvisor_snapshot_runtime import (
+                select_gvisor_snapshot_runtime,
+            )
+
+            runtime = select_gvisor_snapshot_runtime(require_available=True)
         else:
             raise ValueError(f"unknown pool runtime: {cfg.runtime!r}")
 
