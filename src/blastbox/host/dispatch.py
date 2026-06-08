@@ -665,6 +665,9 @@ class Dispatcher:
                     "by another dispatcher); leaving its terminal state untouched",
                     job.job_id,
                 )
+            else:
+                # DONE applied + still ours: index per-page perceptual hashes for /similar.
+                self._index_page_hashes(job.job_id, envelope)
 
         finally:
             # Security: release the slot on EVERY terminal path (success, trust-fail,
@@ -861,10 +864,25 @@ class Dispatcher:
                 "another dispatcher); leaving its terminal state untouched",
                 job.job_id,
             )
+            return
+        # DONE applied + still ours: index per-page perceptual hashes for /similar search.
+        self._index_page_hashes(job.job_id, envelope)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _index_page_hashes(self, job_id: str, envelope: object) -> None:
+        """Best-effort: index the job's per-page perceptual hashes (phash/colorhash/sha256)
+        for similarity search. Skipped if the store lacks the capability (memory/redis);
+        an indexing failure NEVER fails an otherwise-DONE job."""
+        indexer = getattr(self._job_store, "index_page_hashes", None)
+        if indexer is None:
+            return
+        try:
+            indexer(job_id, envelope)
+        except Exception:  # noqa: BLE001
+            _log.exception("page-hash indexing failed for job %s; continuing", job_id)
 
     def _fail_job(self, job: Job, reason: str) -> None:
         """Mark a job FAILED, scrubbing the error string before storage.
