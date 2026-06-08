@@ -233,8 +233,12 @@ class Dispatcher:
                 time.sleep(min(poll_interval_s, 1.0))
         finally:
             stop_evt.set()
+            # Collective deadline: bound TOTAL shutdown to ~(worker_timeout+5), not
+            # concurrency*(worker_timeout) — sequential joins each with the full timeout
+            # would accumulate if several threads are mid-detonation.
+            join_deadline = time.monotonic() + self._worker_timeout_s + 5
             for t in threads:
-                t.join(timeout=self._worker_timeout_s + 5)
+                t.join(timeout=max(0.0, join_deadline - time.monotonic()))
 
     def requeue_orphaned_jobs(self, *, exclude: frozenset[str] | None = None) -> int:
         """Recover RUNNING jobs whose owning dispatcher is gone, in two independent passes.
