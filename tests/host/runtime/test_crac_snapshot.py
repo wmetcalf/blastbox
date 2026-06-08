@@ -6,6 +6,7 @@ Real validation is Phase 4 (redtusk's CRaC JVM + Tika workload).
 """
 from __future__ import annotations
 
+import os
 
 import pytest
 
@@ -77,8 +78,9 @@ def test_boot_base_then_checkpoint_produces_artifact(tmp_path):
     spawned: dict = {}
     ran: dict = {}
 
-    def fake_popen(argv, cwd=None):
+    def fake_popen(argv, cwd=None, env=None):
         spawned["argv"] = argv
+        spawned["env"] = env
         return _FakeProc()
 
     def fake_runner(argv, **kw):
@@ -108,8 +110,9 @@ def test_backend_restore_rejects_wrong_artifact_type(tmp_path):
 def test_backend_restore_spawns_java_restore(tmp_path):
     spawned: dict = {}
 
-    def fake_popen(argv, cwd=None):
+    def fake_popen(argv, cwd=None, env=None):
         spawned["argv"] = argv
+        spawned["env"] = env
         return _FakeProc()
 
     backend = CracSnapshotBackend(
@@ -128,3 +131,41 @@ def test_config_from_env(monkeypatch):
     cfg = CracConfig.from_env()
     assert cfg.java_bin == "/opt/jdk/bin/java"
     assert cfg.engine_argv == ("-jar", "redtusk.jar", "--warm")
+
+
+def test_config_from_env_shlex_quoted(monkeypatch):
+    monkeypatch.setenv("BLASTBOX_CRAC_ENGINE_ARGV", '-Dfoo="a b" -jar e.jar')
+    cfg = CracConfig.from_env()
+    assert cfg.engine_argv == ("-Dfoo=a b", "-jar", "e.jar")
+
+
+# --- PR #7 review fixes -----------------------------------------------------
+
+def test_boot_base_empty_engine_argv_raises(tmp_path):
+    lr = CracSnapshotLauncher(
+        CracConfig(engine_argv=()), tmp_path, popen=lambda *a, **k: _FakeProc()
+    )
+    with pytest.raises(ValueError):
+        lr.boot_base()
+
+
+def test_boot_base_prepends_custom_criu_dir_to_path(tmp_path):
+    spawned: dict = {}
+
+    def fake_popen(argv, cwd=None, env=None):
+        spawned["env"] = env
+        return _FakeProc()
+
+    cfg = CracConfig(engine_argv=("-jar", "e.jar"), criu_bin=str(tmp_path / "crbin" / "criu"))
+    CracSnapshotLauncher(cfg, tmp_path, popen=fake_popen).boot_base()
+    assert spawned["env"]["PATH"].split(os.pathsep)[0] == str((tmp_path / "crbin").resolve())
+
+
+def test_boot_base_cleans_stale_checkpoint_dir(tmp_path):
+    stale = tmp_path / "base" / "cracimg" / "stale.img"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("old")
+    CracSnapshotLauncher(
+        CracConfig(engine_argv=("-jar", "e.jar")), tmp_path, popen=lambda *a, **k: _FakeProc()
+    ).boot_base()
+    assert not stale.exists()  # stale image removed before the new boot

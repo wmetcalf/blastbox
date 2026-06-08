@@ -15,6 +15,7 @@ is wired into any deployed pool. Unit-mockable now; not deployment-ready.
 from __future__ import annotations
 
 import os
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -43,7 +44,8 @@ class CracConfig:
     @classmethod
     def from_env(cls) -> "CracConfig":
         raw = os.environ.get("BLASTBOX_CRAC_ENGINE_ARGV", "").strip()
-        engine_argv = tuple(p for p in raw.split() if p) if raw else ()
+        # shlex.split so quoted args survive (e.g. -Dprop="a b", a -cp with spaces).
+        engine_argv = tuple(shlex.split(raw)) if raw else ()
         return cls(
             java_bin=os.environ.get("BLASTBOX_CRAC_JAVA_BIN", "java"),
             jcmd_bin=os.environ.get("BLASTBOX_CRAC_JCMD_BIN", "jcmd"),

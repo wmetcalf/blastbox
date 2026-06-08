@@ -12,6 +12,7 @@ pattern; redtusk's exact wiring must be ground-truthed in Phase 4.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -116,14 +117,34 @@ class CracSnapshotLauncher:
             for b in (self._cfg.java_bin, self._cfg.jcmd_bin, self._cfg.criu_bin)
         )
 
+    def _spawn_env(self) -> dict[str, str]:
+        """Env for the spawned JVMs. The JVM's CRaC machinery invokes ``criu`` off
+        ``PATH``; if a custom ``criu_bin`` dir is configured, prepend it so both
+        checkpoint and restore find the right binary."""
+        env = os.environ.copy()
+        criu = Path(self._cfg.criu_bin)
+        if criu.parent != Path("."):
+            env["PATH"] = f"{criu.parent.resolve()}{os.pathsep}{env.get('PATH', '')}"
+        return env
+
     def boot_base(self) -> _CracHandle:
         """Boot the base JVM (with ``-XX:CRaCCheckpointTo``) for warming + checkpoint."""
+        if not self._cfg.engine_argv:
+            # `java` with no application exits with a help message → a cryptic
+            # checkpoint failure later. Fail loud and early.
+            raise ValueError(
+                "CRaC engine_argv is empty; cannot boot a base JVM without an application"
+            )
         workdir = self._base_dir / "base"
         checkpoint_dir = workdir / "cracimg"
+        # Clean any stale image from a previous/failed build so criu gets a clean slate.
+        if checkpoint_dir.exists():
+            shutil.rmtree(checkpoint_dir, ignore_errors=True)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         proc = self._popen(
             crac_boot_argv(self._cfg.java_bin, str(checkpoint_dir), list(self._cfg.engine_argv)),
             cwd=str(workdir),
+            env=self._spawn_env(),
         )
         ready = self._ready_check_factory(workdir) if self._ready_check_factory else None
         return _CracHandle(
@@ -141,5 +162,6 @@ class CracSnapshotLauncher:
         proc = self._popen(
             crac_restore_argv(self._cfg.java_bin, str(artifact.image_dir)),
             cwd=str(slot_workdir),
+            env=self._spawn_env(),
         )
         return _CracHandle(proc)
