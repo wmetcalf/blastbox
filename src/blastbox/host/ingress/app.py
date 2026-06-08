@@ -117,17 +117,34 @@ def _safe_artifact_path(output_dir: Path, relative: str) -> Path | None:
 # ---------------------------------------------------------------------------
 
 
-def _zip_validated_artifacts(output_dir: Path, artifact_rels: list[str], dest) -> None:
+def _zip_validated_artifacts(
+    output_dir: Path, artifact_rels: list[str], dest, password: str | None = None
+) -> None:
     """Write a ZIP of ONLY the dispatcher-validated artifacts (+ ``metadata.json``) to ``dest``
     (a writable binary file object). The caller streams from a TEMP FILE, so the ZIP — up to
     max_total_artifact_bytes — is never held in host memory.
+
+    If ``password`` is a non-empty string the archive is **AES-256 encrypted** (pyzipper) —
+    the standard malware-handling convention for shipping detonated artifacts so AV/scanners
+    don't auto-open or quarantine them in transit (default password ``"infected"``). An
+    empty/None password writes a plain ``ZIP_DEFLATED`` archive.
 
     A compromised worker can drop EXTRA undeclared files or a symlink (``output/leak ->
     /etc/passwd``) into output/; we serve only the relative paths the trust gate declared in
     ``metadata.json``, each run through ``_safe_artifact_path`` (resolve + containment) and
     skipped if it is a symlink or not a regular file."""
+    if password:
+        import pyzipper  # type: ignore[import-untyped]
+
+        zf_cm = pyzipper.AESZipFile(
+            dest, "w", compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES
+        )
+    else:
+        zf_cm = zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED)
     seen: set[str] = set()
-    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zf_cm as zf:
+        if password:
+            zf.setpassword(password.encode("utf-8"))
         for rel in ["metadata.json", *artifact_rels]:
             if not rel or rel in seen:
                 continue
@@ -157,6 +174,7 @@ def build_app(
     api_key: str | None = None,
     metrics_public: bool | None = None,
     extension: IngressExtension | None = None,
+    zip_password: str | None = None,
 ) -> FastAPI:
     """Construct and return the blastbox ingress FastAPI application.
 
@@ -229,6 +247,16 @@ def build_app(
         if metrics_public is not None
         else os.environ.get("BLASTBOX_METRICS_PUBLIC", "true").strip().lower()
         not in ("false", "0", "no", "off")
+    )
+
+    # Result-ZIP encryption (BLASTBOX_ZIP_PASSWORD). Default "infected" — the
+    # malware-handling convention: detonated artifacts ship AES-256 encrypted so
+    # AV/scanners don't auto-open or quarantine them in transit. Set to an empty
+    # string to disable encryption (plain ZIP).
+    _zip_password = (
+        zip_password
+        if zip_password is not None
+        else os.environ.get("BLASTBOX_ZIP_PASSWORD", "infected")
     )
 
     # -------------------------------------------------------------------
@@ -620,7 +648,7 @@ def build_app(
             fd, tmp_path = tempfile.mkstemp(prefix="bbresult-", suffix=".zip")
             try:
                 with os.fdopen(fd, "wb") as fh:
-                    _zip_validated_artifacts(out, rels, fh)
+                    _zip_validated_artifacts(out, rels, fh, password=_zip_password)
                 return tmp_path
             except BaseException:
                 os.unlink(tmp_path)
