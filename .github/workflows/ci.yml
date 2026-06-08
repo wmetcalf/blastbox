@@ -42,12 +42,18 @@ jobs:
           docker run -d --name bbpg \
             -e POSTGRES_USER=test -e POSTGRES_PASSWORD=test -e POSTGRES_DB=test \
             -p 5432:5432 blastbox-postgres-bktree:ci
+          # pg_isready passes against the bootstrap server BEFORE initdb creates
+          # the `test` DB + runs init-bktree.sql, so poll until the extension is
+          # actually queryable in `test` (that implies init scripts completed).
+          ok=
           for i in $(seq 1 60); do
-            docker exec bbpg pg_isready -U test >/dev/null 2>&1 && break
-            sleep 1
+            if [ "$(docker exec bbpg psql -U test -d test -tAc \
+                  "SELECT 1 FROM pg_extension WHERE extname='bktree'" 2>/dev/null)" = "1" ]; then
+              echo "postgres + bktree ready after ~$((i*2))s"; ok=1; break
+            fi
+            sleep 2
           done
-          docker exec bbpg psql -U test -d test \
-            -c "SELECT extname FROM pg_extension WHERE extname='bktree'"
+          if [ -z "$ok" ]; then echo "postgres+bktree not ready"; docker logs bbpg | tail -60; exit 1; fi
       - name: Pytest (Postgres + pg_bktree search)
         env:
           BLASTBOX_TEST_PG_DSN: postgresql://test:test@localhost:5432/test
