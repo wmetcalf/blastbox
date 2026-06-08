@@ -138,6 +138,34 @@ def test_warm_argv_rejects_non_list_json():
     ).warm_argv == ["python3", "/custom/entry.py"]
 
 
+def test_extra_env_passthrough_into_oci_spec():
+    """BLASTBOX_GVISOR_EXTRA_ENV lets an adopter hand the worker engine-specific env
+    (e.g. clippyshot's CLIPPYSHOT_SANDBOX=container + CLIPPYSHOT_WARN_ON_INSECURE=1 for the
+    runsc inner-sandbox, which gVisor's virtualized /proc/self/status hides). A JSON array of
+    'KEY=VALUE' strings that must flow through to the OCI process.env, with malformed input
+    ignored rather than crashing host startup."""
+    from pathlib import Path
+
+    from blastbox.host.runtime.gvisor_snapshot import _oci_config
+    from blastbox.host.runtime.gvisor_snapshot_runtime import _gvisor_config_from_env
+
+    # absent → empty (no behaviour change for engines that need nothing)
+    assert _gvisor_config_from_env({}).extra_env == []
+
+    # a valid KEY=VALUE array passes through AND reaches the OCI spec env
+    cfg = _gvisor_config_from_env(
+        {"BLASTBOX_GVISOR_EXTRA_ENV": '["CLIPPYSHOT_SANDBOX=container", "CLIPPYSHOT_WARN_ON_INSECURE=1"]'}
+    )
+    assert cfg.extra_env == ["CLIPPYSHOT_SANDBOX=container", "CLIPPYSHOT_WARN_ON_INSECURE=1"]
+    spec_env = _oci_config(cfg, Path("/tmp/slot"), in_ro=True)["process"]["env"]
+    assert "CLIPPYSHOT_SANDBOX=container" in spec_env
+    assert "CLIPPYSHOT_WARN_ON_INSECURE=1" in spec_env
+
+    # malformed (bad JSON / non-list / entries missing '=') is ignored, not fatal
+    for bad in ("not json", '"KEY=VALUE"', "[1, 2]", '["NO_EQUALS_SIGN"]', "{}"):
+        assert _gvisor_config_from_env({"BLASTBOX_GVISOR_EXTRA_ENV": bad}).extra_env == [], bad
+
+
 def test_settle_gates_readiness(tmp_path):
     clock = {"t": 0.0}
     rt = GvisorSnapshotSlotRuntime(_FakeMgr(tmp_path), settle_s=1.0, clock=lambda: clock["t"])

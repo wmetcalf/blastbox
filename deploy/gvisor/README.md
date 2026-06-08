@@ -80,9 +80,12 @@ container's env at snapshot time.
 > **Required for the soffice tier — fails SILENTLY if omitted.** The gVisor OCI spec
 > is built from scratch (image `ENV` is dropped), so baking the `.so` into the image is
 > **not** enough — you must also set `BLASTBOX_GVISOR_LD_PRELOAD` on the **dispatcher host**.
-> If you forget it, every soffice restore hangs on the osl_acceptPipe EINTR, the slot never
-> reaches READY, and the pool silently churns + falls back to the cold path (no warm speedup,
-> no loud error). The Tika/JVM tier is unaffected (it doesn't need the shim).
+> If you forget it, a **pipe-based** soffice (`--accept=pipe`) restore hangs on the
+> osl_acceptPipe EINTR, the slot never reaches READY, and the pool silently churns + falls back
+> to the cold path (no warm speedup, no loud error). The Tika/JVM tier is unaffected (it doesn't
+> need the shim). **Note:** ClippyShot's unoserver uses `--accept=socket` (not a pipe), so it
+> does *not* hang on this — but its warm-UNO has a different limitation under gVisor C/R; see the
+> ClippyShot recipe under [Enabling the tier](#enabling-the-tier).
 
 ## Enabling the tier
 
@@ -96,8 +99,9 @@ reads the following env vars (all optional, defaults shown):
 | `BLASTBOX_GVISOR_ROOT` | `/var/lib/blastbox/gvisor-root` | `--root` state directory for runsc |
 | `BLASTBOX_GVISOR_ROOTFS` | _(image rootfs)_ | OCI rootfs path for the warm container |
 | `BLASTBOX_GVISOR_NETWORK` | `none` | `none` or `sandbox` (use `none` for the warm tier) |
-| `BLASTBOX_GVISOR_WARM_ARGV` | `["python3","/opt/blastbox/run_warm.py"]` | JSON list; argv of the warm entrypoint (see below). Must be a non-empty list of strings or it falls back to the default |
+| `BLASTBOX_GVISOR_WARM_ARGV` | `["python3","/opt/blastbox/run_warm.py"]` | JSON list; argv of the warm entrypoint (see below). Must be a non-empty list of strings or it falls back to the default. **venv-based engine images** (e.g. clippyshot installs into `/opt/clippyshot`) must point this at the venv interpreter — `["/opt/clippyshot/bin/python3", …]` — because the default bare `python3` resolves on the spec `PATH` to the *system* interpreter, which can't `import blastbox`/the engine package (silent `ModuleNotFoundError` → never reaches READY → ready-timeout) |
 | `BLASTBOX_GVISOR_LD_PRELOAD` | _(unset)_ | Set to `/opt/clippyshot/accept-retry.so` for the soffice warm container |
+| `BLASTBOX_GVISOR_EXTRA_ENV` | `[]` | JSON array of `"KEY=VALUE"` strings appended to the worker's OCI `process.env`. Engine-agnostic passthrough for env the image can't bake (the OCI spec is built from scratch; image `ENV` is dropped). Malformed input is ignored, not fatal. ClippyShot needs `CLIPPYSHOT_SANDBOX=container` + `CLIPPYSHOT_WARN_ON_INSECURE=1` here (see recipe below) |
 | `BLASTBOX_GVISOR_PLATFORM` | _(runsc default)_ | `ptrace` or `kvm`; leave unset to let runsc choose |
 | `BLASTBOX_GVISOR_CPUFEATURES` | _(unset)_ | `dev.gvisor.internal.cpufeatures` OCI annotation for cross-host CPU pinning |
 | `BLASTBOX_SNAPSHOT_SETTLE_S` | `1.0` | Seconds to wait after restore before sending the job (post-restore settle) |
@@ -106,6 +110,39 @@ reads the following env vars (all optional, defaults shown):
 
 `_gvisor_config_from_env()` assembles a `GvisorConfig` dataclass from these
 vars; `select_gvisor_snapshot_runtime()` returns the configured runtime object.
+
+### ClippyShot warm tier recipe
+
+ClippyShot installs into a venv at `/opt/clippyshot` and runs an **inner** sandbox
+(`CLIPPYSHOT_SANDBOX`). Inside gVisor the inner backend must be `container` (gVisor is the
+outer isolation; nested nsjail/bwrap need a user namespace gVisor does not provide), and the
+inner ContainerSandbox's `/proc/self/status` hardening checks always read insecure under
+gVisor (the sentry virtualizes `Seccomp`/`NoNewPrivs`), so it needs `CLIPPYSHOT_WARN_ON_INSECURE=1`
+— the exact env the production dispatcher already auto-sets for `runsc`. Build the warm image
+from a base that has `unoserver` (`deploy/firecracker/Dockerfile.clippyshot`) if you want warm-UNO,
+then:
+
+```sh
+BLASTBOX_POOL_RUNTIME=gvisor
+BLASTBOX_GVISOR_ROOTFS=/var/lib/blastbox/clippyshot-gvisor-rootfs
+BLASTBOX_GVISOR_WARM_ARGV='["/opt/clippyshot/bin/python3","/opt/blastbox/run_warm.py"]'   # venv interpreter
+BLASTBOX_GVISOR_LD_PRELOAD=/opt/clippyshot/accept-retry.so
+BLASTBOX_GVISOR_EXTRA_ENV='["CLIPPYSHOT_SANDBOX=container","CLIPPYSHOT_WARN_ON_INSECURE=1","CLIPPYSHOT_WARM_UNO=1"]'
+```
+
+> **Reality check — clippyshot's warm-UNO does NOT survive gVisor C/R, and that is OK.**
+> ClippyShot's `unoserver` listens on a **TCP socket** (`--accept=socket,port=2002`), not a
+> named pipe, so the restore-time EINTR does **not** hang it on `osl_acceptPipe` — the soffice
+> tier does *not* silently churn here. But the established unoserver↔soffice loopback connection
+> does **not** cleanly survive `runsc checkpoint`/`restore`, so the post-restore `unoconvert`
+> fails and the converter **fail-safes to the cold `--convert-to` path** (correct output,
+> `status=ok`). Measured: warm-UNO is ~1.9 s faster than cold *without* C/R (5.5 s vs 7.4 s), but
+> *with* gVisor C/R warm ≈ cold (no speedup) — with or without the accept-retry shim. So for
+> clippyshot the gVisor tier is effectively a **warm-container** tier (it saves the python +
+> engine import, ~1–2 s), not warm-soffice. The accept-retry shim is still wired (it is harmless
+> and correct for a future pipe-based UNO config), but it is **not** load-bearing for the
+> socket-based warm-UNO. **Firecracker is the proven warm-soffice tier** — its full-VM memory
+> snapshot preserves the established UNO connection (see `project_warm_uno_snapshot`).
 
 ## I/O plane
 

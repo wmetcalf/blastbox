@@ -222,12 +222,29 @@ def _gvisor_config_from_env(env):
             _DEFAULT_WARM_ARGV,
         )
         warm_argv = list(_DEFAULT_WARM_ARGV)
+    # Engine-agnostic env passthrough: an adopter bakes its rootfs but still needs to hand the
+    # worker engine-specific env (e.g. clippyshot's CLIPPYSHOT_SANDBOX=container +
+    # CLIPPYSHOT_WARN_ON_INSECURE=1 for the runsc inner-sandbox, which gVisor's virtualized
+    # /proc/self/status hides). A JSON array of "KEY=VALUE" strings — the OCI process.env shape.
+    raw_extra_env = env.get("BLASTBOX_GVISOR_EXTRA_ENV", "").strip()
+    try:
+        extra_env = json.loads(raw_extra_env) if raw_extra_env else []
+    except json.JSONDecodeError:
+        _log.warning("invalid BLASTBOX_GVISOR_EXTRA_ENV JSON %r; ignoring", raw_extra_env)
+        extra_env = []
+    if not (isinstance(extra_env, list) and all(isinstance(e, str) and "=" in e for e in extra_env)):
+        _log.warning(
+            "BLASTBOX_GVISOR_EXTRA_ENV must be a JSON array of 'KEY=VALUE' strings; got %r; ignoring",
+            raw_extra_env,
+        )
+        extra_env = []
     return GvisorConfig(
         runsc_bin=env.get("BLASTBOX_GVISOR_RUNSC", "runsc"),
         root=Path(root),
         image_rootfs=Path(rootfs),
         network=env.get("BLASTBOX_GVISOR_NETWORK", "none"),
         warm_argv=warm_argv,
+        extra_env=extra_env,
         ld_preload=env.get("BLASTBOX_GVISOR_LD_PRELOAD") or None,
         platform=env.get("BLASTBOX_GVISOR_PLATFORM") or None,
         cpu_features_annotation=env.get("BLASTBOX_GVISOR_CPUFEATURES") or None,
