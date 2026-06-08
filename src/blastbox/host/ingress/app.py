@@ -47,6 +47,7 @@ from blastbox.observability import (
     record_rejection,
     JOBS_IN_FLIGHT,
 )
+from .extension import IngressExtension
 from .middleware import BearerAuthMiddleware, BodySizeLimitMiddleware
 
 _log = get_logger("blastbox.ingress")
@@ -155,6 +156,7 @@ def build_app(
     api_workers: int | None = None,
     api_key: str | None = None,
     metrics_public: bool | None = None,
+    extension: IngressExtension | None = None,
 ) -> FastAPI:
     """Construct and return the blastbox ingress FastAPI application.
 
@@ -644,6 +646,12 @@ def build_app(
         shutil.rmtree(root, ignore_errors=True)
         _job_store.delete(job_id)
         return {"deleted": job_id}
+
+    # Product routes mounted on the shared core. They inherit the app's
+    # middleware (bearer auth, limits); the core owns auth + path-confinement.
+    if extension is not None:
+        for router in extension.routers:
+            app.include_router(router)
 
     return app
 
