@@ -94,16 +94,19 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         engines=engines,
         limits=limits,
         job_root=job_root,
-        worker_timeout_s=int(os.environ.get("BLASTBOX_WORKER_TIMEOUT_S", "300")),
+        # `or "<default>"` (not the get() default) so a SET-BUT-EMPTY var — the
+        # common compose idiom `${VAR:-}` meaning "use the default" — falls back
+        # instead of raising int("").
+        worker_timeout_s=int(os.environ.get("BLASTBOX_WORKER_TIMEOUT_S") or "300"),
         # Retention: 0 (default) keeps artifacts forever; set a TTL (seconds) so run_forever's
         # periodic sweep deletes expired terminal jobs' output (of untrusted documents).
-        job_retention_seconds=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS", "0")),
+        job_retention_seconds=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"),
         pool=pool,
     )
     try:
         dispatcher.run_forever(
             poll_interval_s=args.poll_interval,
-            concurrency=int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY", "1")),
+            concurrency=int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1"),
         )
     finally:
         if pool is not None:
