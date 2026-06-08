@@ -42,6 +42,42 @@ def test_seal_rejects_oversize_artifact_before_reading(tmp_path):
                       max_artifact_bytes=10)
 
 
+def test_seal_count_guard_rejects_before_hashing(tmp_path):
+    """An over-COUNT declared list is rejected BEFORE the hashing loop runs (the
+    count cap previously only ran in validate_envelope, after every artifact was
+    already opened + hashed)."""
+    (tmp_path / "f.bin").write_bytes(b"data")
+    declared = [DeclaredArtifact(id=f"a{i}", path="f.bin", kind="x") for i in range(5)]
+    with pytest.raises(ValueError, match="artifact count"):
+        seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+                      declared=declared, warnings=[],
+                      payload=ExtractedText(text="x", char_count=1), max_artifacts=3)
+
+
+def test_seal_dedups_inode_no_read_amplification(tmp_path, monkeypatch):
+    """N distinct ids pointing at the SAME file are hashed ONCE — a sub-MB metadata
+    declaring one small file thousands of times must not amplify into thousands of
+    host reads of that file (the confirmed HIGH-severity DoS)."""
+    import blastbox.contract.envelope as env_mod
+
+    (tmp_path / "f.bin").write_bytes(b"shared-bytes")
+    calls = {"n": 0}
+    orig = env_mod._hash_fd
+
+    def counting(fd, max_bytes=None):
+        calls["n"] += 1
+        return orig(fd, max_bytes=max_bytes)
+
+    monkeypatch.setattr(env_mod, "_hash_fd", counting)
+    declared = [DeclaredArtifact(id=f"a{i}", path="f.bin", kind="x") for i in range(20)]
+    env = seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+                        declared=declared, warnings=[],
+                        payload=ExtractedText(text="x", char_count=1))
+    assert len(env.artifacts) == 20                       # all ids present
+    assert len({a.sha256 for a in env.artifacts}) == 1    # same file -> same hash
+    assert calls["n"] == 1                                # hashed ONCE despite 20 refs
+
+
 def test_seal_within_cap_uses_stat_size(tmp_path):
     (tmp_path / "ok.bin").write_bytes(b"x" * 5)
     env = seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),

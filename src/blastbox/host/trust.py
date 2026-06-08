@@ -112,6 +112,10 @@ def validate_worker_output(
             status=parsed.status,
             # Reject an oversized declared artifact at stat() time, before re-hashing reads it.
             max_artifact_bytes=limits.max_artifact_bytes,
+            # Reject an over-COUNT artifact list BEFORE the hashing loop runs (the
+            # count cap previously only ran in validate_envelope, AFTER every
+            # declared artifact had already been opened + hashed).
+            max_artifacts=limits.max_artifacts,
         )
     except (ValueError, Exception) as exc:
         raise OutputTrustError(

@@ -31,6 +31,13 @@ class Artifact(BaseModel):
     bytes: int = Field(ge=0)
 
 
+# Hard ceiling on the artifact LIST length. Caps parse-time memory + the seal
+# loop's per-artifact stat/open work so a hostile worker can't make the
+# untrusted-metadata re-parse/re-seal iterate an enormous list. The real
+# amplification fix (N ids -> one file) is the inode-dedup in seal_envelope below.
+_MAX_ARTIFACTS = 16384
+
+
 class Envelope(BaseModel):
     """A signed, sealed, and validated job result envelope.
 
@@ -46,7 +53,7 @@ class Envelope(BaseModel):
     status: Literal["ok", "rejected", "engine_error"] = "ok"
     input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     detected: Detection
-    artifacts: list[Artifact] = Field(default_factory=list)
+    artifacts: list[Artifact] = Field(default_factory=list, max_length=_MAX_ARTIFACTS)
     warnings: list[Warning] = Field(default_factory=list)
     # Initial annotation uses ChildNode (the base union); _rebuild_envelope()
     # replaces model_fields["payload"].annotation with the live Node union after
@@ -276,7 +283,8 @@ def seal_envelope(*, engine: str, outdir: Path, input_sha256: str,
                   detected: Detection, declared: list[DeclaredArtifact],
                   warnings: list[Warning], payload: ChildNode,
                   status: Literal["ok", "rejected", "engine_error"] = "ok",
-                  max_artifact_bytes: int | None = None) -> Envelope:
+                  max_artifact_bytes: int | None = None,
+                  max_artifacts: int = _MAX_ARTIFACTS) -> Envelope:
     """Seal declared artifacts + payload into a validated Envelope.
 
     Computes sha256/bytes from disk, confines every path under outdir, and
@@ -288,8 +296,19 @@ def seal_envelope(*, engine: str, outdir: Path, input_sha256: str,
     malicious worker declaring a giant artifact is rejected without the host ever reading
     the whole file into memory.
     """
+    # Count guard BEFORE any I/O: enforce the artifact-count cap here (not only in
+    # the later validate_envelope) so a hostile worker (the untrusted re-seal path)
+    # can't make this loop do unbounded stat()/open() work — the count cap used to
+    # run AFTER this whole loop had already hashed every declared artifact.
+    if len(declared) > max_artifacts:
+        raise ValueError(f"artifact count {len(declared)} exceeds {max_artifacts}")
     artifacts: list[Artifact] = []
     declared_ids: set[str] = set()
+    # Hash each unique on-disk INODE once. N distinct ids pointing at the SAME file
+    # must not amplify into N reads of that file — a sub-MB metadata.json declaring
+    # one small file tens of thousands of times would otherwise force ~TB of host
+    # read I/O per job (a DoS on the dispatcher/worker fleet).
+    inode_cache: dict[tuple[int, int], tuple[str, int]] = {}
     for d in declared:
         if d.id in declared_ids:
             raise ValueError(f"duplicate artifact id: {d.id}")
@@ -315,13 +334,23 @@ def seal_envelope(*, engine: str, outdir: Path, input_sha256: str,
                 f"{d.path} ({exc})"
             ) from exc
         try:
-            size = os.fstat(fd).st_size
+            st = os.fstat(fd)
+            size = st.st_size
             if max_artifact_bytes is not None and size > max_artifact_bytes:
                 # Reject BEFORE reading — no unbounded read into memory from a hostile worker.
                 raise ValueError(
                     f"declared artifact {d.path} size {size} exceeds {max_artifact_bytes}"
                 )
-            sha256, n = _hash_fd(fd, max_bytes=max_artifact_bytes)
+            # Already hashed this exact inode (a different id pointing at the same
+            # file)? Reuse — never re-read the bytes. open_confined_regular_fd has
+            # already proved this fd is a confined regular file under outdir.
+            inode_key = (st.st_dev, st.st_ino)
+            cached = inode_cache.get(inode_key)
+            if cached is not None:
+                sha256, n = cached
+            else:
+                sha256, n = _hash_fd(fd, max_bytes=max_artifact_bytes)
+                inode_cache[inode_key] = (sha256, n)
         finally:
             os.close(fd)
         artifacts.append(Artifact(id=d.id, path=d.path, kind=d.kind, sha256=sha256, bytes=n))
