@@ -660,6 +660,13 @@ class Dispatcher:
         # Security: image is engine.image (operator-configured), never job data.
         # extra_env is filtered through _sanitize_params.
         # ------------------------------------------------------------------
+        # The worker runs unprivileged (--user 10001:10001); make the output bind
+        # dir writable by it (cold-path parity with the warm /out 0o777). The host
+        # re-seals + size-caps the result regardless, so 0o777 here widens no trust
+        # boundary — the worker's output is untrusted on every path.
+        output_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(output_dir, 0o777)
+
         container_name = f"blastbox-worker-{job.job_id[:12]}"
         argv = build_worker_docker_run_argv(
             image=engine.image,          # NEVER job.engine / job.filename / job.params

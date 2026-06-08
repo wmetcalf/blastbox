@@ -21,9 +21,16 @@ RUN /opt/clippyshot/bin/pip install --no-cache-dir --force-reinstall --no-deps /
     && /opt/clippyshot/bin/python -c "import blastbox.worker.cold; print('cold entrypoint present')"
 
 # Engine is fixed per image (operator-configured, never job-derived). The worker
-# runs inside the runsc sandbox, so the inner sandbox backend is `container`.
+# runs inside the runsc (gVisor) sandbox, so the inner sandbox backend is
+# `container` and ClippyShot defers isolation to the outer runtime. gVisor IS the
+# hardening, but ClippyShot's in-VM self-check can't verify the host's
+# seccomp/apparmor/no-new-privs from inside the sandbox — so it must be told to
+# trust the outer runtime. This is the SAME setting deploy/firecracker/
+# guest.clippyshot.env uses and that ClippyShot's own dispatcher auto-flips for
+# runsc. This image is runsc-only; do NOT run it under bare runc.
 ENV BLASTBOX_ENGINE=clippyshot.engine:ClippyShotEngine \
-    CLIPPYSHOT_SANDBOX=container
+    CLIPPYSHOT_SANDBOX=container \
+    CLIPPYSHOT_WARN_ON_INSECURE=1
 
 USER clippy
 ENTRYPOINT ["/opt/clippyshot/bin/python", "-m", "blastbox.worker.cold"]
