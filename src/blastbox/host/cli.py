@@ -23,12 +23,14 @@ def _serve_cmd(args: argparse.Namespace) -> int:
     import uvicorn
 
     from blastbox.host.ingress.app import build_app
+    from blastbox.host.ingress.extension import load_ingress_extension
 
     allowed: set[str] = set()
     if args.allowed_engines:
         allowed = {e.strip() for e in args.allowed_engines.split(",") if e.strip()}
 
-    app = build_app(allowed_engines=allowed or None)
+    extension = load_ingress_extension(os.environ.get("BLASTBOX_INGRESS_EXTENSION"))
+    app = build_app(allowed_engines=allowed or None, extension=extension)
     uvicorn.run(app, host=args.host, port=args.port, workers=1)
     return 0
 

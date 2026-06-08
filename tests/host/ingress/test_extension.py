@@ -5,11 +5,12 @@ IngressExtension, and `blastbox serve` resolves one from BLASTBOX_INGRESS_EXTENS
 """
 from __future__ import annotations
 
+import pytest
 from fastapi import APIRouter
 from fastapi.testclient import TestClient
 
 from blastbox.host.ingress.app import build_app
-from blastbox.host.ingress.extension import IngressExtension
+from blastbox.host.ingress.extension import IngressExtension, load_ingress_extension
 
 
 def _dummy_router() -> APIRouter:
@@ -22,9 +23,16 @@ def _dummy_router() -> APIRouter:
     return r
 
 
+def _factory() -> IngressExtension:
+    """Module-level factory resolved by BLASTBOX_INGRESS_EXTENSION in tests."""
+    return IngressExtension(routers=(_dummy_router(),))
+
+
 def _app(**kw):
     return build_app(allowed_engines={"probe"}, **kw)
 
+
+# --- Task 1: the seam -------------------------------------------------------
 
 def test_extension_router_is_mounted():
     c = TestClient(_app(extension=IngressExtension(routers=(_dummy_router(),))))
@@ -49,3 +57,21 @@ def test_extension_route_inherits_bearer_auth():
     assert c.get("/v1/ext/ping").status_code == 401
     ok = c.get("/v1/ext/ping", headers={"Authorization": "Bearer secret"})
     assert ok.json() == {"pong": True}
+
+
+# --- Task 2: the env loader -------------------------------------------------
+
+def test_load_ingress_extension_resolves_factory():
+    ext = load_ingress_extension("tests.host.ingress.test_extension:_factory")
+    assert isinstance(ext, IngressExtension)
+    assert len(ext.routers) == 1
+
+
+def test_load_ingress_extension_empty_is_none():
+    assert load_ingress_extension(None) is None
+    assert load_ingress_extension("") is None
+
+
+def test_load_ingress_extension_bad_spec_raises():
+    with pytest.raises(ValueError):
+        load_ingress_extension("no_colon_here")
