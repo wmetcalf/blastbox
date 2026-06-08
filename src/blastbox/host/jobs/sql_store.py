@@ -65,6 +65,7 @@ class SqlJobStore:
         self._lock = threading.RLock()
         self._driver, self._param = self._parse_url(database_url)
         self._pool = None
+        self._bktree_available = False  # set once in _init_db (static per process)
         if self._driver == "postgres":
             from psycopg_pool import ConnectionPool  # type: ignore[import-not-found]
 
@@ -167,7 +168,12 @@ class SqlJobStore:
             conn.execute(sql)
             conn.execute(page_hashes_sql)
             self._ensure_columns(conn)
-            self._ensure_page_hash_indexes(conn)
+        # Best-effort page_hashes indexes run AFTER the table-creation
+        # transaction commits, each in its OWN transaction. On Postgres a failed
+        # statement (a CREATE INDEX lock/permission error) aborts the WHOLE
+        # transaction, so creating them inline would risk rolling back the
+        # page_hashes table itself. Also caches bktree availability (static).
+        self._ensure_page_hash_indexes()
 
     def _ensure_columns(self, conn) -> None:
         """Add any columns that don't exist yet (forward-compat migrations)."""
@@ -176,71 +182,69 @@ class SqlJobStore:
             if col not in existing:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
 
-    def _ensure_page_hash_indexes(self, conn) -> None:
-        """Create page_hashes indexes the backend supports (all non-fatal).
+    def _try_ddl(self, stmt: str) -> bool:
+        """Run one best-effort DDL statement in its OWN transaction.
 
-        - Portable btrees on (colorhash), (sha256), (phash) — created on both
-          SQLite and Postgres.
-        - Postgres + pg_bktree: an SP-GiST ``bktree_ops`` index on phash for
-          fast Hamming range scans, plus an on-the-fly ``colorhash_bin_distance``
-          SQL function for the per-bin L1 colorhash path.  Both are skipped
-          silently when the extension is absent — Postgres then falls back to a
-          ``bit_count`` seq-scan and SQLite to in-Python popcount / nibble L1.
-
-        Every statement is wrapped so a dev install lacking CREATE privileges
-        (or a benign index race) never makes store init fatal.
+        Returns True on success.  Each statement is isolated so a failure (a
+        missing CREATE privilege, an index lock, a benign IF-NOT-EXISTS race)
+        aborts only its own transaction — on Postgres a failure inside a SHARED
+        transaction poisons every later statement in it (and rolls the lot back).
         """
         try:
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ph_colorhash ON page_hashes (colorhash)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ph_sha256 ON page_hashes (sha256)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ph_phash ON page_hashes (phash)"
-            )
+            with self._lock, self._connect() as conn:
+                conn.execute(stmt)
+            return True
         except Exception:
-            pass
-        if self._driver != "postgres":
+            return False
+
+    def _ensure_page_hash_indexes(self) -> None:
+        """Create the page_hashes indexes the backend supports + cache bktree availability.
+
+        - Portable btrees on (colorhash), (sha256), (phash) — on both backends.
+        - Postgres + pg_bktree: an SP-GiST ``bktree_ops`` index on phash for fast
+          Hamming range scans, plus a ``colorhash_bin_distance`` SQL function for
+          the per-bin L1 colorhash path.  Both are skipped silently when the
+          extension is absent — Postgres then falls back to a ``bit_count``
+          seq-scan and SQLite to in-Python popcount / nibble L1.
+
+        Every statement is best-effort and individually transaction-isolated (see
+        :meth:`_try_ddl`): a dev install lacking CREATE privileges never makes
+        store init fatal, and one failure can't roll back the others (or the
+        table).  Also caches ``_bktree_available`` once — static per process, so
+        re-probing ``pg_extension`` on every search is a wasted round-trip.
+        """
+        for stmt in (
+            "CREATE INDEX IF NOT EXISTS idx_ph_colorhash ON page_hashes (colorhash)",
+            "CREATE INDEX IF NOT EXISTS idx_ph_sha256 ON page_hashes (sha256)",
+            "CREATE INDEX IF NOT EXISTS idx_ph_phash ON page_hashes (phash)",
+        ):
+            self._try_ddl(stmt)
+        self._bktree_available = self._bktree_extension_available()
+        if not self._bktree_available:
             return
-        try:
-            row = conn.execute(
-                "SELECT 1 FROM pg_extension WHERE extname = 'bktree' LIMIT 1"
-            ).fetchone()
-        except Exception:
-            return
-        if not row:
-            return
-        try:
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ph_phash_bktree "
-                "ON page_hashes USING spgist (phash bktree_ops)"
-            )
-        except Exception:
-            pass
+        self._try_ddl(
+            "CREATE INDEX IF NOT EXISTS idx_ph_phash_bktree "
+            "ON page_hashes USING spgist (phash bktree_ops)"
+        )
         # colorhash_bin_distance(a, b, first_bin, last_bin): per-bin L1 over hex
         # nibbles in [first_bin, last_bin).  IMMUTABLE/PARALLEL SAFE; idempotent
         # via CREATE OR REPLACE.  Sentinel 2147483647 if either hash isn't 14
         # nibbles wide.
-        try:
-            conn.execute(
-                "CREATE OR REPLACE FUNCTION colorhash_bin_distance("
-                "a text, b text, first_bin int DEFAULT 0, last_bin int DEFAULT 14"
-                ") RETURNS int AS $$ "
-                "SELECT CASE "
-                "WHEN length(a) <> 14 OR length(b) <> 14 THEN 2147483647 "
-                "ELSE coalesce(("
-                "SELECT sum(abs("
-                "('x' || substring(a FROM i+1 FOR 1))::bit(4)::int "
-                "- ('x' || substring(b FROM i+1 FOR 1))::bit(4)::int"
-                "))::int "
-                "FROM generate_series(first_bin, last_bin - 1) AS i"
-                "), 0) END "
-                "$$ LANGUAGE SQL IMMUTABLE PARALLEL SAFE"
-            )
-        except Exception:
-            pass
+        self._try_ddl(
+            "CREATE OR REPLACE FUNCTION colorhash_bin_distance("
+            "a text, b text, first_bin int DEFAULT 0, last_bin int DEFAULT 14"
+            ") RETURNS int AS $$ "
+            "SELECT CASE "
+            "WHEN length(a) <> 14 OR length(b) <> 14 THEN 2147483647 "
+            "ELSE coalesce(("
+            "SELECT sum(abs("
+            "('x' || substring(a FROM i+1 FOR 1))::bit(4)::int "
+            "- ('x' || substring(b FROM i+1 FOR 1))::bit(4)::int"
+            "))::int "
+            "FROM generate_series(first_bin, last_bin - 1) AS i"
+            "), 0) END "
+            "$$ LANGUAGE SQL IMMUTABLE PARALLEL SAFE"
+        )
 
     def _bktree_extension_available(self) -> bool:
         if self._driver != "postgres":
@@ -618,7 +622,7 @@ class SqlJobStore:
                     out.append({**r, "distance": dist})
             out.sort(key=lambda x: (x["distance"], x["job_id"], x["page_index"]))
             return out[:limit]
-        if self._bktree_extension_available():
+        if self._bktree_available:
             sql = (
                 f"SELECT {self._SEARCH_COLS}, "
                 f"hamming_distance(ph.phash, {self._param}::int8) AS distance "
@@ -701,17 +705,22 @@ class SqlJobStore:
                 ch = r.get("colorhash") or ""
                 if len(ch) != 14 or len(target) != 14:
                     continue
-                dists = {}
-                keep = True
-                for cap, first, last, alias in groups:
-                    d = sum(
-                        abs(int(ch[i], 16) - int(target[i], 16))
-                        for i in range(first, last)
-                    )
-                    dists[alias] = d
-                    if cap is not None and d > cap:
-                        keep = False
-                        break
+                try:
+                    dists = {}
+                    keep = True
+                    for cap, first, last, alias in groups:
+                        d = sum(
+                            abs(int(ch[i], 16) - int(target[i], 16))
+                            for i in range(first, last)
+                        )
+                        dists[alias] = d
+                        if cap is not None and d > cap:
+                            keep = False
+                            break
+                except ValueError:
+                    # A stored colorhash with non-hex chars (a buggy or hostile
+                    # engine) must not crash the whole search — skip that row.
+                    continue
                 if keep:
                     out.append({**r, **dists})
             out.sort(key=lambda x: (x["distance"], x["job_id"], x["page_index"]))

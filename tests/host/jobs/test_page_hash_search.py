@@ -285,6 +285,21 @@ def test_find_similar_colorhash_total_cap(store, tmp_path):
     assert {h["page_index"] for h in hits} == {0, 1, 2}
 
 
+def test_find_similar_colorhash_skips_non_hex_rows(store):
+    """A stored colorhash with non-hex chars (buggy/hostile engine) must not
+    crash the L1 search — the corrupt row is skipped, valid matches still surface."""
+    job = _done_job(store)
+    store.upsert_page_hashes(
+        job.job_id,
+        [
+            {"page_index": 0, "phash": None, "colorhash": "0" * 14, "sha256": "0" * 64},
+            {"page_index": 1, "phash": None, "colorhash": "z" * 14, "sha256": "1" * 64},
+        ],
+    )
+    hits = store.find_similar_colorhash("0" * 14, total_max=5)
+    assert {h["page_index"] for h in hits} == {0}
+
+
 def test_find_similar_colorhash_no_caps_delegates_to_exact(store, tmp_path):
     job = _done_job(store)
     target = "1234567890abcd"
