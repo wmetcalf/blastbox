@@ -33,6 +33,29 @@ class Hash(_Frozen):
         return v.lower()
 
 
+def phash_hex_to_int8(hex_str: str) -> int:
+    """Convert a 16-char unsigned-64-bit hex pHash to a signed int64.
+
+    A ``phash`` ``Hash.value`` is a 16-char unsigned 64-bit hex string, but the
+    similarity index stores it as a signed two's-complement int64 (Postgres
+    ``BIGINT``) so pg_bktree's SP-GiST opclass can range-scan it for Hamming
+    distance. Values with the high bit set are reinterpreted as negative. The
+    same mapping is applied on query so round-trips are exact, and the Hamming
+    math is masked back to unsigned 64-bit so the sign reinterpretation never
+    affects distance. Consolidated here from the two identical ClippyShot
+    bodies (dispatcher + api).
+    """
+    val = int(hex_str, 16)
+    if val >= 1 << 63:
+        val -= 1 << 64
+    return val
+
+
+def int8_to_phash_hex(value: int) -> str:
+    """Inverse of :func:`phash_hex_to_int8`: signed int64 -> 16-char unsigned hex."""
+    return f"{value & ((1 << 64) - 1):016x}"
+
+
 class ArtifactRef(_Frozen):
     """A reference into the Envelope's artifact set by id (never a path)."""
     id: str

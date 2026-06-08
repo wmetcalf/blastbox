@@ -7,10 +7,12 @@ import sqlite3
 import threading
 import time
 import uuid
+from builtins import list as _list  # explicit ref: SqlJobStore.list shadows the builtin
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+from blastbox.contract import Envelope, Page, find_by_type, phash_hex_to_int8
 from blastbox.host.jobs.base import Job, JobStatus
 
 
@@ -63,6 +65,7 @@ class SqlJobStore:
         self._lock = threading.RLock()
         self._driver, self._param = self._parse_url(database_url)
         self._pool = None
+        self._bktree_available = False  # set once in _init_db (static per process)
         if self._driver == "postgres":
             from psycopg_pool import ConnectionPool  # type: ignore[import-not-found]
 
@@ -134,9 +137,48 @@ class SqlJobStore:
             claim_id          TEXT
         )
         """
+        # Per-page perceptual-hash index for generalized similarity search.
+        #
+        # Grain: one row per (job_id, page_index).  Unlike ClippyShot's monolith
+        # (which keys on (job_id, page_index, variant) because its raw
+        # metadata.json nests trimmed/focused sub-dicts each with their own
+        # hashes), the blastbox ``Page`` contract carries a single flat
+        # ``hashes`` list for one image — there is no variant concept on the
+        # wire — so the PK drops ``variant`` entirely.
+        #
+        # phash is stored as a signed int8 (int64) so a Postgres pg_bktree
+        # SP-GiST index can range-scan it for Hamming distance; it is NULLABLE
+        # because a Page may legitimately omit a phash (only colorhash/sha256
+        # present).  colorhash and sha256 are exact-match (btree) lookups.
+        # ``BIGINT`` is ``int8`` on Postgres and degrades to ``INTEGER`` on
+        # SQLite, so the same DDL runs on both backends; the bktree/L1 SQL
+        # paths are Postgres-only and SQLite falls back to in-Python scans.
+        page_hashes_sql = """
+        CREATE TABLE IF NOT EXISTS page_hashes (
+            job_id      TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+            page_index  INTEGER NOT NULL,
+            phash       BIGINT,
+            colorhash   TEXT,
+            sha256      TEXT,
+            created_at  DOUBLE PRECISION NOT NULL,
+            PRIMARY KEY (job_id, page_index)
+        )
+        """
         with self._lock, self._connect() as conn:
             conn.execute(sql)
+            # page_hashes + its indexes are Postgres-only: perceptual-hash search
+            # is Postgres + pg_bktree ONLY, so SQLite gets no page_hashes table
+            # and supports_hash_search() stays False.
+            if self._driver == "postgres":
+                conn.execute(page_hashes_sql)
             self._ensure_columns(conn)
+        # Best-effort page_hashes indexes run AFTER the table-creation
+        # transaction commits, each in its OWN transaction. On Postgres a failed
+        # statement (a CREATE INDEX lock/permission error) aborts the WHOLE
+        # transaction, so creating them inline would risk rolling back the
+        # page_hashes table itself. Also caches bktree availability (static).
+        if self._driver == "postgres":
+            self._ensure_page_hash_indexes()
 
     def _ensure_columns(self, conn) -> None:
         """Add any columns that don't exist yet (forward-compat migrations)."""
@@ -144,6 +186,119 @@ class SqlJobStore:
         for col in ("engine", "params", "result_summary", "claim_id"):
             if col not in existing:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
+
+    def _try_ddl(self, stmt: str) -> bool:
+        """Run one best-effort DDL statement in its OWN transaction.
+
+        Returns True on success.  Each statement is isolated so a failure (a
+        missing CREATE privilege, an index lock, a benign IF-NOT-EXISTS race)
+        aborts only its own transaction — on Postgres a failure inside a SHARED
+        transaction poisons every later statement in it (and rolls the lot back).
+        """
+        try:
+            with self._lock, self._connect() as conn:
+                conn.execute(stmt)
+            return True
+        except Exception:
+            return False
+
+    def _ensure_page_hash_indexes(self) -> None:
+        """Create the page_hashes indexes/functions (Postgres-only) + cache bktree avail.
+
+        Called only on Postgres (search is Postgres + pg_bktree only).  Creates:
+
+        - btrees on (colorhash), (sha256), (phash) for the exact-match lookups;
+        - when pg_bktree is present: an SP-GiST ``bktree_ops`` index on phash for
+          fast Hamming range scans, plus the two helper SQL functions the search
+          methods call — ``hamming_distance(int8, int8)`` and
+          ``colorhash_bin_distance(text, text, int, int)``.  The store creates its
+          OWN helpers (CREATE OR REPLACE, idempotent) so it depends only on the
+          extension, not on any product's database-init script.
+
+        Every statement is best-effort and individually transaction-isolated (see
+        :meth:`_try_ddl`): a dev install lacking CREATE privileges never makes
+        store init fatal, and one failure can't roll back the others (or the
+        table).  Also caches ``_bktree_available`` once — static per process, so
+        re-probing ``pg_extension`` on every search is a wasted round-trip.
+        """
+        for stmt in (
+            "CREATE INDEX IF NOT EXISTS idx_ph_colorhash ON page_hashes (colorhash)",
+            "CREATE INDEX IF NOT EXISTS idx_ph_sha256 ON page_hashes (sha256)",
+            "CREATE INDEX IF NOT EXISTS idx_ph_phash ON page_hashes (phash)",
+        ):
+            self._try_ddl(stmt)
+        self._bktree_available = self._bktree_extension_available()
+        if not self._bktree_available:
+            return
+        self._try_ddl(
+            "CREATE INDEX IF NOT EXISTS idx_ph_phash_bktree "
+            "ON page_hashes USING spgist (phash bktree_ops)"
+        )
+        # hamming_distance(a, b): popcount of the int8 XOR — the displayed/ordered
+        # distance for a bktree range scan (the <@ operator filters but doesn't
+        # surface the distance).  Portable popcount (bit(64) text, count '1's) so
+        # it carries no PostgreSQL-14+ bit_count() dependency.
+        self._try_ddl(
+            "CREATE OR REPLACE FUNCTION hamming_distance(a int8, b int8) "
+            "RETURNS int4 AS $$ "
+            "SELECT length(replace((a # b)::bit(64)::text, '0', ''))::int4 "
+            "$$ LANGUAGE SQL IMMUTABLE PARALLEL SAFE"
+        )
+        # colorhash_bin_distance(a, b, first_bin, last_bin): per-bin L1 over hex
+        # nibbles in [first_bin, last_bin).  IMMUTABLE/PARALLEL SAFE; idempotent
+        # via CREATE OR REPLACE.  Sentinel 2147483647 if either hash isn't 14
+        # hex nibbles wide — the regex guard MUST precede the ('x'||nibble)::bit(4)
+        # cast (CASE short-circuits) so a stored non-hex colorhash (a buggy/hostile
+        # engine) yields the sentinel instead of an "invalid hexadecimal digit" error
+        # that would abort the whole search query.
+        self._try_ddl(
+            "CREATE OR REPLACE FUNCTION colorhash_bin_distance("
+            "a text, b text, first_bin int DEFAULT 0, last_bin int DEFAULT 14"
+            ") RETURNS int AS $$ "
+            "SELECT CASE "
+            "WHEN a !~ '^[0-9a-fA-F]{14}$' OR b !~ '^[0-9a-fA-F]{14}$' THEN 2147483647 "
+            "ELSE coalesce(("
+            "SELECT sum(abs("
+            "('x' || substring(a FROM i+1 FOR 1))::bit(4)::int "
+            "- ('x' || substring(b FROM i+1 FOR 1))::bit(4)::int"
+            "))::int "
+            "FROM generate_series(first_bin, last_bin - 1) AS i"
+            "), 0) END "
+            "$$ LANGUAGE SQL IMMUTABLE PARALLEL SAFE"
+        )
+
+    def _bktree_extension_available(self) -> bool:
+        if self._driver != "postgres":
+            return False
+        with self._lock, self._connect() as conn:
+            try:
+                row = conn.execute(
+                    "SELECT 1 FROM pg_extension WHERE extname = 'bktree' LIMIT 1"
+                ).fetchone()
+            except Exception:
+                return False
+            return bool(row)
+
+    def supports_hash_search(self) -> bool:
+        """Whether this store can serve perceptual-hash similarity search.
+
+        Search is **Postgres + pg_bktree only**: the SP-GiST BK-tree index is the
+        single supported backend — there is no SQLite in-Python scan and no
+        plain-Postgres seq-scan fallback.  SQLite stores and Postgres without the
+        extension return ``False``; callers (the dispatcher's on-DONE indexer and
+        the ``/v1/similar`` route) feature-detect on this and simply skip
+        indexing / don't mount the route.
+        """
+        return self._driver == "postgres" and self._bktree_available
+
+    def _require_search(self) -> None:
+        """Guard the page-hash capability methods (defense-in-depth past the gate)."""
+        if not self.supports_hash_search():
+            raise RuntimeError(
+                "perceptual-hash search requires Postgres with the pg_bktree "
+                f"extension (driver={self._driver!r}, bktree={self._bktree_available}); "
+                "use supports_hash_search() to feature-detect"
+            )
 
     def _existing_columns(self, conn) -> set[str]:
         if self._driver == "sqlite":
@@ -382,3 +537,216 @@ class SqlJobStore:
         sql = f"DELETE FROM jobs WHERE job_id = {self._param}"
         with self._lock, self._connect() as conn:
             conn.execute(sql, (job_id,))
+
+    # ------------------------------------------------------------------
+    # Per-page perceptual-hash index (optional; not in the JobStore Protocol
+    # core — see base.py.  Consumers hasattr-guard these.)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _page_hash_rows(envelope: Envelope) -> _list[dict]:
+        """Extract per-page hash rows from a *validated* sealed Envelope.
+
+        Walks the typed payload tree for ``Page`` nodes and reads each page's
+        flat ``hashes`` list (``{algo: value}``), pulling the ``phash`` /
+        ``colorhash`` / ``sha256`` hex values.  The phash hex is converted to a
+        signed int64 (the index storage form); colorhash/sha256 are kept as hex
+        verbatim.  A page contributes a row as long as it has *any* of the three
+        hashes — phash is nullable in the table, so a page with only
+        colorhash/sha256 is still indexed (just not phash-searchable).
+        """
+        rows: _list[dict] = []
+        for page in find_by_type(envelope.payload, Page):
+            by_algo = {h.algo: h.value for h in page.hashes}
+            phash_hex = by_algo.get("phash")
+            colorhash = by_algo.get("colorhash")
+            sha256 = by_algo.get("sha256")
+            if phash_hex is None and colorhash is None and sha256 is None:
+                continue
+            rows.append(
+                {
+                    "page_index": page.index,
+                    "phash": (
+                        phash_hex_to_int8(phash_hex) if phash_hex is not None else None
+                    ),
+                    "colorhash": colorhash,
+                    "sha256": sha256,
+                }
+            )
+        return rows
+
+    def index_page_hashes(self, job_id: str, envelope: Envelope) -> int:
+        """Extract + persist a completed job's per-page hashes for search.
+
+        Pulls ``Page`` hashes out of the sealed ``envelope`` and upserts one row
+        per page into ``page_hashes``.  Returns the number of rows written.
+        Requires the Postgres + pg_bktree backend (see
+        :meth:`supports_hash_search`) — the dispatcher gates the on-DONE call on
+        that capability, so SQLite / plain-Postgres stores simply never index.
+        """
+        self._require_search()
+        rows = self._page_hash_rows(envelope)
+        self.upsert_page_hashes(job_id, rows)
+        return len(rows)
+
+    def upsert_page_hashes(self, job_id: str, rows: _list[dict]) -> None:
+        """Write a batch of per-page hash rows for a job (idempotent upsert).
+
+        Each row is ``{page_index, phash (signed int8 | None), colorhash (hex |
+        None), sha256 (hex | None)}``.  Postgres ``ON CONFLICT (job_id,
+        page_index) DO UPDATE``.  No-ops on an empty list.  Requires the
+        Postgres + pg_bktree backend (see :meth:`supports_hash_search`).
+        """
+        self._require_search()
+        if not rows:
+            return
+        now = time.time()
+        sql = (
+            "INSERT INTO page_hashes "
+            "(job_id, page_index, phash, colorhash, sha256, created_at) "
+            f"VALUES ({self._param}, {self._param}, {self._param}, "
+            f"{self._param}, {self._param}, {self._param}) "
+            "ON CONFLICT (job_id, page_index) DO UPDATE SET "
+            "phash = EXCLUDED.phash, "
+            "colorhash = EXCLUDED.colorhash, "
+            "sha256 = EXCLUDED.sha256, "
+            "created_at = EXCLUDED.created_at"
+        )
+        params = [
+            (
+                job_id,
+                int(r["page_index"]),
+                None if r.get("phash") is None else int(r["phash"]),
+                None if r.get("colorhash") is None else str(r["colorhash"]),
+                None if r.get("sha256") is None else str(r["sha256"]),
+                now,
+            )
+            for r in rows
+        ]
+        with self._lock, self._connect() as conn:
+            # executemany lives on the cursor in psycopg3 (the connection has no
+            # such method); sqlite3 cursors support it too, so go via a cursor.
+            conn.cursor().executemany(sql, params)
+
+    # The SELECT column set shared by every search method.  All JOIN page_hashes
+    # to jobs and filter j.status = 'done' (only completed jobs are searchable).
+    _SEARCH_COLS = (
+        "ph.job_id, ph.page_index, ph.phash, ph.colorhash, ph.sha256, j.filename"
+    )
+
+    def find_similar_phash(
+        self, target_int8: int, max_distance: int, limit: int = 50
+    ) -> _list[dict]:
+        """Pages within Hamming distance ``max_distance`` of ``target_int8``.
+
+        ``target_int8`` is the already-converted signed int64 form of the query
+        phash (use :func:`blastbox.contract.phash_hex_to_int8`).  Served by the
+        Postgres pg_bktree SP-GiST index via an ``<@ ROW(center, radius)::
+        bktree_area`` range scan — the single supported backend (see
+        :meth:`supports_hash_search`).  Rows whose phash is NULL are excluded.
+        Returns rows with an added ``distance`` field, ordered
+        ``(distance, job_id, page_index)``.
+        """
+        self._require_search()
+        sql = (
+            f"SELECT {self._SEARCH_COLS}, "
+            f"hamming_distance(ph.phash, {self._param}::int8) AS distance "
+            "FROM page_hashes ph JOIN jobs j ON j.job_id = ph.job_id "
+            f"WHERE j.status = {self._param} AND ph.phash IS NOT NULL "
+            f"AND ph.phash <@ ROW({self._param}::int8, {self._param}::int8)::bktree_area "
+            f"ORDER BY distance, ph.job_id, ph.page_index LIMIT {self._param}"
+        )
+        params = (target_int8, JobStatus.DONE.value, target_int8, max_distance, limit)
+        return self._query_all(sql, params)
+
+    def find_by_colorhash(self, colorhash: str, limit: int = 50) -> _list[dict]:
+        """Pages whose colorhash matches ``colorhash`` exactly."""
+        self._require_search()
+        sql = (
+            f"SELECT {self._SEARCH_COLS} "
+            "FROM page_hashes ph JOIN jobs j ON j.job_id = ph.job_id "
+            f"WHERE j.status = {self._param} AND ph.colorhash = {self._param} "
+            f"ORDER BY ph.job_id, ph.page_index LIMIT {self._param}"
+        )
+        return self._query_all(sql, (JobStatus.DONE.value, colorhash, limit))
+
+    def find_by_page_sha256(self, sha256: str, limit: int = 50) -> _list[dict]:
+        """Pages whose rendered-image sha256 matches exactly (identical page)."""
+        self._require_search()
+        sql = (
+            f"SELECT {self._SEARCH_COLS} "
+            "FROM page_hashes ph JOIN jobs j ON j.job_id = ph.job_id "
+            f"WHERE j.status = {self._param} AND ph.sha256 = {self._param} "
+            f"ORDER BY ph.job_id, ph.page_index LIMIT {self._param}"
+        )
+        return self._query_all(sql, (JobStatus.DONE.value, sha256, limit))
+
+    def find_similar_colorhash(
+        self,
+        target: str,
+        *,
+        total_max: int | None = None,
+        frac_max: int | None = None,
+        faint_max: int | None = None,
+        bright_max: int | None = None,
+        limit: int = 50,
+    ) -> _list[dict]:
+        """Pages whose colorhash is within the given per-bin L1 distances.
+
+        colorhash encodes 14 hex nibbles (binbits=4, each a 0-15 count):
+            bins 0-1:   fraction bins (black, gray)
+            bins 2-7:   6 faint-color hue bins
+            bins 8-13:  6 bright-color hue bins
+        The metric is L1 (sum of absolute nibble differences) over a bin range.
+        Caps are cumulative AND — a row must satisfy *every* set cap.  Passing no
+        caps delegates to :meth:`find_by_colorhash` (exact match).  Returns rows
+        with ``distance``, ``frac_distance``, ``faint_distance``,
+        ``bright_distance`` fields, ordered ``(distance, job_id, page_index)``.
+        """
+        self._require_search()
+        if not any(v is not None for v in (total_max, frac_max, faint_max, bright_max)):
+            return self.find_by_colorhash(target, limit=limit)
+        groups = [
+            (total_max, 0, 14, "distance"),
+            (frac_max, 0, 2, "frac_distance"),
+            (faint_max, 2, 8, "faint_distance"),
+            (bright_max, 8, 14, "bright_distance"),
+        ]
+        # Per-group colorhash_bin_distance() function (L1 has no usable index ->
+        # seq scan). SELECT placeholders precede WHERE placeholders in the param
+        # tuple, so build the two param lists separately and concatenate.
+        select_cols: _list[str] = []
+        select_params: list = []
+        where_clauses: _list[str] = []
+        where_params: list = []
+        for cap, first, last, alias in groups:
+            select_cols.append(
+                f"colorhash_bin_distance(ph.colorhash, {self._param}, {first}, {last}) AS {alias}"
+            )
+            select_params.append(target)
+            if cap is not None:
+                where_clauses.append(
+                    f"colorhash_bin_distance(ph.colorhash, {self._param}, {first}, {last}) "
+                    f"<= {self._param}"
+                )
+                where_params.extend([target, cap])
+        sql = (
+            f"SELECT {self._SEARCH_COLS}, "
+            + ", ".join(select_cols)
+            + " FROM page_hashes ph JOIN jobs j ON j.job_id = ph.job_id "
+            + f"WHERE j.status = {self._param} AND ph.colorhash IS NOT NULL "
+            + (f"AND {' AND '.join(where_clauses)} " if where_clauses else "")
+            + f"ORDER BY distance, ph.job_id, ph.page_index LIMIT {self._param}"
+        )
+        params = select_params + [JobStatus.DONE.value] + where_params + [limit]
+        return self._query_all(sql, tuple(params))
+
+    def _query_all(self, sql: str, params: tuple = ()) -> _list[dict]:
+        """Run a SELECT and return rows as list-of-dicts, portable across drivers."""
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(sql, params)
+            rows = cur.fetchall()
+            if self._driver == "sqlite":
+                return [dict(r) for r in rows]
+            cols = [d[0] for d in cur.description] if cur.description else []
+            return [dict(zip(cols, r, strict=True)) for r in rows]

@@ -22,3 +22,43 @@ jobs:
       - name: Pytest
         # Firecracker + Postgres suites self-skip without /dev/kvm + a DSN.
         run: pytest -q
+
+  pg-search:
+    # Perceptual-hash search is Postgres + pg_bktree only — there is no SQLite
+    # search path — so its tests skip in the plain `test` job. Build a Postgres
+    # image with the extension compiled in and run them against it for real.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install -e ".[host,dev]"
+      - name: Build pg_bktree Postgres image
+        run: docker build -t blastbox-postgres-bktree:ci deploy/docker/postgres
+      - name: Start Postgres + pg_bktree
+        run: |
+          docker run -d --name bbpg \
+            -e POSTGRES_USER=test -e POSTGRES_PASSWORD=test -e POSTGRES_DB=test \
+            -p 5432:5432 blastbox-postgres-bktree:ci
+          # pg_isready passes against the bootstrap server BEFORE initdb creates
+          # the `test` DB + runs init-bktree.sql, so poll until the extension is
+          # actually queryable in `test` (that implies init scripts completed).
+          ok=
+          for i in $(seq 1 60); do
+            if [ "$(docker exec bbpg psql -U test -d test -tAc \
+                  "SELECT 1 FROM pg_extension WHERE extname='bktree'" 2>/dev/null)" = "1" ]; then
+              echo "postgres + bktree ready after ~$((i*2))s"; ok=1; break
+            fi
+            sleep 2
+          done
+          if [ -z "$ok" ]; then echo "postgres+bktree not ready"; docker logs bbpg | tail -60; exit 1; fi
+      - name: Pytest (Postgres + pg_bktree search)
+        env:
+          BLASTBOX_TEST_PG_DSN: postgresql://test:test@localhost:5432/test
+        run: >-
+          pytest -q
+          tests/host/jobs/test_page_hash_search.py
+          tests/host/jobs/test_sql_store.py
+          tests/host/ingress/test_similar.py

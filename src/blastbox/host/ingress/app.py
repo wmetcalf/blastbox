@@ -680,6 +680,15 @@ def build_app(
     app.state.job_root = _job_root
     app.state.serve_artifact_file = _serve_artifact_file
 
+    # Generic perceptual-hash search (GET /v1/similar), mounted only when the
+    # store can actually serve it (the SQL store; memory/redis cannot). Keeps the
+    # surface honest: absent route -> 404 -> "this deployment doesn't index hashes".
+    from .similar import build_similar_router
+
+    similar_router = build_similar_router(_job_store)
+    if similar_router is not None:
+        app.include_router(similar_router)
+
     # Product routes mounted on the shared core. They inherit the app's
     # middleware (bearer auth, limits); the core owns auth + path-confinement.
     if extension is not None:

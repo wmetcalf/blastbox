@@ -665,6 +665,9 @@ class Dispatcher:
                     "by another dispatcher); leaving its terminal state untouched",
                     job.job_id,
                 )
+            else:
+                # DONE applied + still ours: index per-page perceptual hashes for /similar.
+                self._index_page_hashes(job.job_id, envelope)
 
         finally:
             # Security: release the slot on EVERY terminal path (success, trust-fail,
@@ -861,10 +864,28 @@ class Dispatcher:
                 "another dispatcher); leaving its terminal state untouched",
                 job.job_id,
             )
+            return
+        # DONE applied + still ours: index per-page perceptual hashes for /similar search.
+        self._index_page_hashes(job.job_id, envelope)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _index_page_hashes(self, job_id: str, envelope: object) -> None:
+        """Best-effort: index the job's per-page perceptual hashes (phash/colorhash/
+        sha256) for similarity search. Only the Postgres + pg_bktree store can serve
+        search, so gate on ``supports_hash_search()`` — a SQL store on SQLite / plain
+        Postgres *has* the method but it raises; memory/redis lack it entirely. An
+        indexing failure NEVER fails an otherwise-DONE job."""
+        supports = getattr(self._job_store, "supports_hash_search", None)
+        indexer = getattr(self._job_store, "index_page_hashes", None)
+        if supports is None or indexer is None or not supports():
+            return
+        try:
+            indexer(job_id, envelope)
+        except Exception:  # noqa: BLE001
+            _log.exception("page-hash indexing failed for job %s; continuing", job_id)
 
     def _fail_job(self, job: Job, reason: str) -> None:
         """Mark a job FAILED, scrubbing the error string before storage.
