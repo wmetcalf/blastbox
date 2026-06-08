@@ -5,10 +5,14 @@ from __future__ import annotations
 import enum
 import time
 import uuid
+from builtins import list as _list  # explicit ref: JobStore.list shadows the builtin
 from dataclasses import asdict, dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from blastbox.errors import sanitize_public_error
+
+if TYPE_CHECKING:
+    from blastbox.contract import Envelope
 
 
 class JobStatus(str, enum.Enum):
@@ -163,3 +167,53 @@ class JobStore(Protocol):
 
     def claim_next(self) -> Job | None: ...
     def delete(self, job_id: str) -> None: ...
+
+
+@runtime_checkable
+class PageHashSearch(Protocol):
+    """OPTIONAL per-page perceptual-hash index + similarity search surface.
+
+    This is deliberately a SEPARATE Protocol that ``JobStore`` does NOT inherit:
+    only SQL-backed stores implement it (Hamming / L1 search needs a queryable
+    index the in-memory and Redis backends can't provide), so folding it into
+    ``JobStore`` would make those backends fail the structural contract.
+
+    Consumers feature-detect with ``isinstance(store, PageHashSearch)`` or
+    ``getattr(store, "index_page_hashes", None)`` and treat absence as "search
+    unavailable" (e.g. an HTTP 501) — mirroring how ClippyShot's dispatcher
+    duck-types its best-effort ``upsert_page_hashes`` and skips it when absent.
+    A store that omits these still satisfies ``JobStore``.
+    """
+
+    def index_page_hashes(self, job_id: str, envelope: "Envelope") -> int:
+        """Extract per-page hashes from a sealed ``envelope`` and persist them
+        for similarity search; return the number of rows written."""
+        ...
+
+    def find_similar_phash(
+        self, target_int8: int, max_distance: int, limit: int = 50
+    ) -> _list[dict]:
+        """Pages within Hamming distance ``max_distance`` of the signed-int64
+        query phash."""
+        ...
+
+    def find_similar_colorhash(
+        self,
+        target: str,
+        *,
+        total_max: int | None = None,
+        frac_max: int | None = None,
+        faint_max: int | None = None,
+        bright_max: int | None = None,
+        limit: int = 50,
+    ) -> _list[dict]:
+        """Pages within the given per-bin L1 colorhash distances."""
+        ...
+
+    def find_by_colorhash(self, colorhash: str, limit: int = 50) -> _list[dict]:
+        """Pages whose colorhash matches exactly."""
+        ...
+
+    def find_by_page_sha256(self, sha256: str, limit: int = 50) -> _list[dict]:
+        """Pages whose rendered-image sha256 matches exactly."""
+        ...

@@ -3,7 +3,10 @@
 Engines emit a typed payload tree + declared artifacts; the worker SDK seals
 them into an Envelope (hashes, sizes, path-confinement); the host re-validates.
 """
-from .leaf import Hash, Detection, Warning, ArtifactRef, Dimensions, Lang
+from .leaf import (
+    Hash, Detection, Warning, ArtifactRef, Dimensions, Lang,
+    phash_hex_to_int8, int8_to_phash_hex,
+)
 from .nodes import (
     Record, ExtractedText, Page, EmbeddedResource,
     parse_node, register_node_type, rebuild_node_union,
@@ -22,6 +25,7 @@ def json_schema() -> dict:
 
 __all__ = [
     "Hash", "Detection", "Warning", "ArtifactRef", "Dimensions", "Lang",
+    "phash_hex_to_int8", "int8_to_phash_hex",
     "Record", "ExtractedText", "Page", "EmbeddedResource",
     "parse_node", "register_node_type", "rebuild_node_union",
     "DeclaredArtifact", "Artifact", "Envelope",
