@@ -47,6 +47,7 @@ from blastbox.observability import (
     record_rejection,
     JOBS_IN_FLIGHT,
 )
+from .extension import IngressExtension
 from .middleware import BearerAuthMiddleware, BodySizeLimitMiddleware
 
 _log = get_logger("blastbox.ingress")
@@ -155,6 +156,7 @@ def build_app(
     api_workers: int | None = None,
     api_key: str | None = None,
     metrics_public: bool | None = None,
+    extension: IngressExtension | None = None,
 ) -> FastAPI:
     """Construct and return the blastbox ingress FastAPI application.
 
@@ -296,6 +298,34 @@ def build_app(
 
     def _public_detail(exc: Exception | str) -> str:
         return sanitize_public_error(str(exc))
+
+    def _serve_artifact_file(
+        job_id: str,
+        relative: str,
+        *,
+        media_type: str | None = None,
+        filename: str | None = None,
+    ):
+        """Serve a FIXED relative artifact path from a job's output dir.
+
+        Exposed on ``app.state`` so product ingress extensions (e.g. ClippyShot's
+        ``/pdf`` + typed page-PNG routes) reuse the core's confinement: DONE-gated,
+        ``resolve()+relative_to()`` containment, and no-symlink-follow — identical
+        to ``get_artifact`` but keyed by a fixed relative path, not an artifact id.
+        """
+        from fastapi.responses import FileResponse
+
+        _validate_job_id(job_id)
+        _require_done(job_id)
+        out = _output_dir_for(job_id)
+        if not out.is_dir():
+            raise HTTPException(410, "result expired")
+        if (out / relative).is_symlink():
+            raise HTTPException(404, "artifact file not found")
+        safe = _safe_artifact_path(out, relative)
+        if safe is None or safe.is_symlink() or not safe.is_file():
+            raise HTTPException(404, "artifact file not found")
+        return FileResponse(safe, media_type=media_type, filename=filename)
 
     # -------------------------------------------------------------------
     # Health / version / metrics (always public)
@@ -644,6 +674,17 @@ def build_app(
         shutil.rmtree(root, ignore_errors=True)
         _job_store.delete(job_id)
         return {"deleted": job_id}
+
+    # Context for product ingress extensions (job lookups + confined artifact serving).
+    app.state.job_store = _job_store
+    app.state.job_root = _job_root
+    app.state.serve_artifact_file = _serve_artifact_file
+
+    # Product routes mounted on the shared core. They inherit the app's
+    # middleware (bearer auth, limits); the core owns auth + path-confinement.
+    if extension is not None:
+        for router in extension.routers:
+            app.include_router(router)
 
     return app
 
