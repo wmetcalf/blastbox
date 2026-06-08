@@ -632,12 +632,19 @@ class SqlJobStore:
                 f"ORDER BY distance, ph.job_id, ph.page_index LIMIT {self._param}"
             )
         else:
+            # bit_count() is PostgreSQL 14+; this branch is the no-bktree
+            # fallback whose whole purpose is maximum compatibility, so use a
+            # portable popcount: XOR the two int8s, cast to a bit(64) text, and
+            # count the '1's. (The ::bit(64) cast itself is already proven by the
+            # prior bit_count form.) Seq-scan either way — readability over micro-perf.
+            popcount = (
+                f"length(replace((ph.phash # {self._param}::int8)::bit(64)::text, '0', ''))"
+            )
             sql = (
-                f"SELECT {self._SEARCH_COLS}, "
-                f"bit_count((ph.phash # {self._param}::int8)::bit(64)) AS distance "
+                f"SELECT {self._SEARCH_COLS}, {popcount} AS distance "
                 "FROM page_hashes ph JOIN jobs j ON j.job_id = ph.job_id "
                 f"WHERE j.status = {self._param} AND ph.phash IS NOT NULL "
-                f"AND bit_count((ph.phash # {self._param}::int8)::bit(64)) <= {self._param} "
+                f"AND {popcount} <= {self._param} "
                 f"ORDER BY distance, ph.job_id, ph.page_index LIMIT {self._param}"
             )
         params = (target_int8, JobStatus.DONE.value, target_int8, max_distance, limit)
