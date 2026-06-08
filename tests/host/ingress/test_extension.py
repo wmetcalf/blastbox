@@ -75,3 +75,9 @@ def test_load_ingress_extension_empty_is_none():
 def test_load_ingress_extension_bad_spec_raises():
     with pytest.raises(ValueError):
         load_ingress_extension("no_colon_here")
+
+
+def test_load_ingress_extension_whitespace_is_none():
+    # operator-provided whitespace-only config is treated as empty, not a ValueError
+    assert load_ingress_extension("   ") is None
+    assert load_ingress_extension("\t\n") is None

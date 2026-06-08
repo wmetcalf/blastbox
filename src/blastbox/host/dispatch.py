@@ -813,6 +813,15 @@ class Dispatcher:
         # hashes/sizes/payload, not worker-fabricated ones (#5).
         self._write_sealed_metadata(envelope, output_dir)
 
+        # The output dir was 0o777 so the unprivileged worker (uid 10001) could write it. The
+        # worker is done and the host has re-sealed, so re-tighten to close the post-seal tamper
+        # window before the ingress serves these bytes (served files are NOT re-hashed per request).
+        # Best-effort: a chmod failure must not fail an otherwise-valid, sealed job.
+        try:
+            os.chmod(output_dir, 0o755)
+        except OSError:
+            pass
+
         # Note: a non-zero worker exit with *no* valid output is already FAILED
         # via the OutputTrustError branch above (missing/invalid metadata.json
         # raises). A non-zero exit WITH valid, trust-passing output is treated as

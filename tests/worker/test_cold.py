@@ -50,3 +50,9 @@ def test_cold_main_loads_engine_and_delegates_to_harness(monkeypatch):
     assert rc == 0
     assert isinstance(captured["engine"], _StubEngine)
     assert captured["argv"] == []
+
+
+def test_cold_main_unloadable_engine_returns_nonzero_no_traceback(monkeypatch):
+    # operator-config error (bad module:Class) -> clean stderr + exit 4, not a traceback
+    monkeypatch.setenv("BLASTBOX_ENGINE", "no.such.module:Nope")
+    assert cold.main([]) == 4

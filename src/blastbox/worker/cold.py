@@ -25,7 +25,13 @@ def main(argv: list[str] | None = None) -> int:
             "(e.g. clippyshot.engine:ClippyShotEngine)\n"
         )
         return 4
-    engine = load_engine(spec)
+    try:
+        engine = load_engine(spec)
+    except Exception as exc:  # noqa: BLE001 — operator-config error, not a programmer bug
+        sys.stderr.write(
+            f"BLASTBOX_ENGINE={spec!r} could not be loaded (expected 'module:Class'): {exc}\n"
+        )
+        return 4
     return harness_main(engine, argv)
 
 

@@ -26,8 +26,10 @@ def load_ingress_extension(spec: str | None) -> IngressExtension | None:
 
     ``factory`` is a zero-arg callable returning an IngressExtension. This is
     operator-configured and never derived from job data — it mirrors the engine
-    seam (``BLASTBOX_FC_ENGINE='module:Class'``). Returns None for an empty spec.
+    seam (``BLASTBOX_FC_ENGINE='module:Class'``). Returns None for an empty or
+    whitespace-only spec.
     """
+    spec = (spec or "").strip()
     if not spec:
         return None
     mod, sep, attr = spec.partition(":")
