@@ -178,12 +178,21 @@ class PageHashSearch(Protocol):
     index the in-memory and Redis backends can't provide), so folding it into
     ``JobStore`` would make those backends fail the structural contract.
 
-    Consumers feature-detect with ``isinstance(store, PageHashSearch)`` or
-    ``getattr(store, "index_page_hashes", None)`` and treat absence as "search
-    unavailable" (e.g. an HTTP 501) — mirroring how ClippyShot's dispatcher
-    duck-types its best-effort ``upsert_page_hashes`` and skips it when absent.
-    A store that omits these still satisfies ``JobStore``.
+    Search is **Postgres + pg_bktree only** — the SP-GiST BK-tree index is the
+    single supported phash backend.  Structural presence is therefore necessary
+    but NOT sufficient: a SQL store opened on SQLite (or on Postgres without the
+    extension) still satisfies this Protocol's shape, but its capability methods
+    raise.  Consumers MUST gate on the runtime ``supports_hash_search()`` flag,
+    not merely ``isinstance(store, PageHashSearch)`` / ``hasattr`` — the
+    dispatcher's on-DONE indexer and the ``/v1/similar`` route both do.
     """
+
+    def supports_hash_search(self) -> bool:
+        """Whether this store can actually serve search right now (PG + pg_bktree).
+
+        ``False`` for SQLite and for Postgres without the extension; the other
+        methods on this Protocol raise when this is ``False``."""
+        ...
 
     def index_page_hashes(self, job_id: str, envelope: "Envelope") -> int:
         """Extract per-page hashes from a sealed ``envelope`` and persist them

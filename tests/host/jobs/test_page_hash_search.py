@@ -1,17 +1,19 @@
-"""Per-page perceptual-hash index + similarity search (SQLite path).
+"""Per-page perceptual-hash index + similarity search (Postgres + pg_bktree).
 
-Exercises the optional ``index_page_hashes`` / ``find_*`` surface on
-``SqlJobStore``: a sealed Envelope's ``Page.hashes`` are extracted and persisted,
-then the four search methods (phash Hamming, colorhash exact, sha256 exact,
-colorhash per-bin L1) are asserted to return the right matches inside and outside
-their distance thresholds.
+Exercises the ``index_page_hashes`` / ``find_*`` surface on ``SqlJobStore``: a
+sealed Envelope's ``Page.hashes`` are extracted and persisted, then the four
+search methods (phash Hamming via the bktree SP-GiST index, colorhash exact,
+sha256 exact, colorhash per-bin L1) are asserted to return the right matches
+inside and outside their distance thresholds.
 
-Postgres-only paths (bktree SP-GiST, colorhash_bin_distance) are NOT covered
-here — gated by BLASTBOX_TEST_PG_DSN elsewhere; SQLite uses the in-Python
-fallbacks, which is the default test backend.
+Search is **Postgres + pg_bktree only** — there is no SQLite search path — so
+these tests are gated on ``BLASTBOX_TEST_PG_DSN`` pointing at a Postgres with the
+``bktree`` extension (CI builds one from ``deploy/docker/postgres``). They skip
+when the DSN is unset or the extension is absent.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -38,9 +40,20 @@ ZERO_SHA = "0" * 64
 
 
 @pytest.fixture
-def store(tmp_path):
-    db = tmp_path / "test.db"
-    return SqlJobStore(f"sqlite:///{db}")
+def store():
+    dsn = os.environ.get("BLASTBOX_TEST_PG_DSN")
+    if not dsn:
+        pytest.skip(
+            "BLASTBOX_TEST_PG_DSN not set "
+            "(perceptual-hash search is Postgres + pg_bktree only)"
+        )
+    s = SqlJobStore(dsn)
+    if not s.supports_hash_search():
+        pytest.skip("pg_bktree extension not available on the test Postgres")
+    # Shared DB across tests -> truncate for per-test isolation (cascades to page_hashes).
+    with s._lock, s._connect() as conn:
+        conn.execute("TRUNCATE jobs CASCADE")
+    return s
 
 
 def _phash_hex(value: int) -> str:
@@ -342,18 +355,29 @@ def test_find_similar_colorhash_per_group_caps_are_cumulative_and(store, tmp_pat
     assert store.find_similar_colorhash(target, total_max=10, bright_max=3) == []
 
 
-def test_search_methods_are_optional_on_protocol(store):
-    """SqlJobStore satisfies the optional PageHashSearch protocol; the in-memory
-    store does NOT (consumers feature-detect, never assume)."""
+def test_search_is_runtime_gated_not_just_structural(store, tmp_path):
+    """Structural Protocol membership is necessary but NOT sufficient: a SQL store
+    on SQLite has the methods but supports_hash_search() is False and they raise.
+    Only PG+bktree (the ``store`` fixture) actually serves search."""
     from blastbox.host.jobs.base import PageHashSearch
     from blastbox.host.jobs.memory import InMemoryJobStore
 
+    # memory store: not even structurally a PageHashSearch
     mem = InMemoryJobStore()
     assert not isinstance(mem, PageHashSearch)
-    assert not hasattr(mem, "index_page_hashes")
-    assert not hasattr(mem, "find_similar_phash")
+    assert not hasattr(mem, "supports_hash_search")
 
+    # PG+bktree store: structurally a PageHashSearch AND runtime-capable
     assert isinstance(store, PageHashSearch)
+    assert store.supports_hash_search() is True
+
+    # SQLite SQL store: structurally a PageHashSearch but NOT runtime-capable;
+    # the capability methods raise rather than silently mis-answer.
+    sqlite_store = SqlJobStore(f"sqlite:///{tmp_path / 'x.db'}")
+    assert isinstance(sqlite_store, PageHashSearch)
+    assert sqlite_store.supports_hash_search() is False
+    with pytest.raises(RuntimeError):
+        sqlite_store.find_by_page_sha256("a" * 64)
 
 
 # ---------------------------------------------------------------------------

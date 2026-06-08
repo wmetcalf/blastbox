@@ -166,14 +166,19 @@ class SqlJobStore:
         """
         with self._lock, self._connect() as conn:
             conn.execute(sql)
-            conn.execute(page_hashes_sql)
+            # page_hashes + its indexes are Postgres-only: perceptual-hash search
+            # is Postgres + pg_bktree ONLY, so SQLite gets no page_hashes table
+            # and supports_hash_search() stays False.
+            if self._driver == "postgres":
+                conn.execute(page_hashes_sql)
             self._ensure_columns(conn)
         # Best-effort page_hashes indexes run AFTER the table-creation
         # transaction commits, each in its OWN transaction. On Postgres a failed
         # statement (a CREATE INDEX lock/permission error) aborts the WHOLE
         # transaction, so creating them inline would risk rolling back the
         # page_hashes table itself. Also caches bktree availability (static).
-        self._ensure_page_hash_indexes()
+        if self._driver == "postgres":
+            self._ensure_page_hash_indexes()
 
     def _ensure_columns(self, conn) -> None:
         """Add any columns that don't exist yet (forward-compat migrations)."""
@@ -198,14 +203,17 @@ class SqlJobStore:
             return False
 
     def _ensure_page_hash_indexes(self) -> None:
-        """Create the page_hashes indexes the backend supports + cache bktree availability.
+        """Create the page_hashes indexes/functions (Postgres-only) + cache bktree avail.
 
-        - Portable btrees on (colorhash), (sha256), (phash) — on both backends.
-        - Postgres + pg_bktree: an SP-GiST ``bktree_ops`` index on phash for fast
-          Hamming range scans, plus a ``colorhash_bin_distance`` SQL function for
-          the per-bin L1 colorhash path.  Both are skipped silently when the
-          extension is absent — Postgres then falls back to a ``bit_count``
-          seq-scan and SQLite to in-Python popcount / nibble L1.
+        Called only on Postgres (search is Postgres + pg_bktree only).  Creates:
+
+        - btrees on (colorhash), (sha256), (phash) for the exact-match lookups;
+        - when pg_bktree is present: an SP-GiST ``bktree_ops`` index on phash for
+          fast Hamming range scans, plus the two helper SQL functions the search
+          methods call — ``hamming_distance(int8, int8)`` and
+          ``colorhash_bin_distance(text, text, int, int)``.  The store creates its
+          OWN helpers (CREATE OR REPLACE, idempotent) so it depends only on the
+          extension, not on any product's database-init script.
 
         Every statement is best-effort and individually transaction-isolated (see
         :meth:`_try_ddl`): a dev install lacking CREATE privileges never makes
@@ -226,16 +234,29 @@ class SqlJobStore:
             "CREATE INDEX IF NOT EXISTS idx_ph_phash_bktree "
             "ON page_hashes USING spgist (phash bktree_ops)"
         )
+        # hamming_distance(a, b): popcount of the int8 XOR — the displayed/ordered
+        # distance for a bktree range scan (the <@ operator filters but doesn't
+        # surface the distance).  Portable popcount (bit(64) text, count '1's) so
+        # it carries no PostgreSQL-14+ bit_count() dependency.
+        self._try_ddl(
+            "CREATE OR REPLACE FUNCTION hamming_distance(a int8, b int8) "
+            "RETURNS int4 AS $$ "
+            "SELECT length(replace((a # b)::bit(64)::text, '0', ''))::int4 "
+            "$$ LANGUAGE SQL IMMUTABLE PARALLEL SAFE"
+        )
         # colorhash_bin_distance(a, b, first_bin, last_bin): per-bin L1 over hex
         # nibbles in [first_bin, last_bin).  IMMUTABLE/PARALLEL SAFE; idempotent
         # via CREATE OR REPLACE.  Sentinel 2147483647 if either hash isn't 14
-        # nibbles wide.
+        # hex nibbles wide — the regex guard MUST precede the ('x'||nibble)::bit(4)
+        # cast (CASE short-circuits) so a stored non-hex colorhash (a buggy/hostile
+        # engine) yields the sentinel instead of an "invalid hexadecimal digit" error
+        # that would abort the whole search query.
         self._try_ddl(
             "CREATE OR REPLACE FUNCTION colorhash_bin_distance("
             "a text, b text, first_bin int DEFAULT 0, last_bin int DEFAULT 14"
             ") RETURNS int AS $$ "
             "SELECT CASE "
-            "WHEN length(a) <> 14 OR length(b) <> 14 THEN 2147483647 "
+            "WHEN a !~ '^[0-9a-fA-F]{14}$' OR b !~ '^[0-9a-fA-F]{14}$' THEN 2147483647 "
             "ELSE coalesce(("
             "SELECT sum(abs("
             "('x' || substring(a FROM i+1 FOR 1))::bit(4)::int "
@@ -257,6 +278,27 @@ class SqlJobStore:
             except Exception:
                 return False
             return bool(row)
+
+    def supports_hash_search(self) -> bool:
+        """Whether this store can serve perceptual-hash similarity search.
+
+        Search is **Postgres + pg_bktree only**: the SP-GiST BK-tree index is the
+        single supported backend — there is no SQLite in-Python scan and no
+        plain-Postgres seq-scan fallback.  SQLite stores and Postgres without the
+        extension return ``False``; callers (the dispatcher's on-DONE indexer and
+        the ``/v1/similar`` route) feature-detect on this and simply skip
+        indexing / don't mount the route.
+        """
+        return self._driver == "postgres" and self._bktree_available
+
+    def _require_search(self) -> None:
+        """Guard the page-hash capability methods (defense-in-depth past the gate)."""
+        if not self.supports_hash_search():
+            raise RuntimeError(
+                "perceptual-hash search requires Postgres with the pg_bktree "
+                f"extension (driver={self._driver!r}, bktree={self._bktree_available}); "
+                "use supports_hash_search() to feature-detect"
+            )
 
     def _existing_columns(self, conn) -> set[str]:
         if self._driver == "sqlite":
@@ -538,10 +580,11 @@ class SqlJobStore:
 
         Pulls ``Page`` hashes out of the sealed ``envelope`` and upserts one row
         per page into ``page_hashes``.  Returns the number of rows written.
-        Best-effort by contract: callers wrap it in try/except and treat a
-        missing method (in-memory / redis stores) as a silent no-op, so an
-        index failure never fails an otherwise-DONE job.
+        Requires the Postgres + pg_bktree backend (see
+        :meth:`supports_hash_search`) — the dispatcher gates the on-DONE call on
+        that capability, so SQLite / plain-Postgres stores simply never index.
         """
+        self._require_search()
         rows = self._page_hash_rows(envelope)
         self.upsert_page_hashes(job_id, rows)
         return len(rows)
@@ -550,32 +593,25 @@ class SqlJobStore:
         """Write a batch of per-page hash rows for a job (idempotent upsert).
 
         Each row is ``{page_index, phash (signed int8 | None), colorhash (hex |
-        None), sha256 (hex | None)}``.  SQLite uses ``INSERT OR REPLACE``;
-        Postgres uses ``ON CONFLICT (job_id, page_index) DO UPDATE``.  No-ops on
-        an empty list.
+        None), sha256 (hex | None)}``.  Postgres ``ON CONFLICT (job_id,
+        page_index) DO UPDATE``.  No-ops on an empty list.  Requires the
+        Postgres + pg_bktree backend (see :meth:`supports_hash_search`).
         """
+        self._require_search()
         if not rows:
             return
         now = time.time()
-        if self._driver == "sqlite":
-            sql = (
-                "INSERT OR REPLACE INTO page_hashes "
-                "(job_id, page_index, phash, colorhash, sha256, created_at) "
-                f"VALUES ({self._param}, {self._param}, {self._param}, "
-                f"{self._param}, {self._param}, {self._param})"
-            )
-        else:
-            sql = (
-                "INSERT INTO page_hashes "
-                "(job_id, page_index, phash, colorhash, sha256, created_at) "
-                f"VALUES ({self._param}, {self._param}, {self._param}, "
-                f"{self._param}, {self._param}, {self._param}) "
-                "ON CONFLICT (job_id, page_index) DO UPDATE SET "
-                "phash = EXCLUDED.phash, "
-                "colorhash = EXCLUDED.colorhash, "
-                "sha256 = EXCLUDED.sha256, "
-                "created_at = EXCLUDED.created_at"
-            )
+        sql = (
+            "INSERT INTO page_hashes "
+            "(job_id, page_index, phash, colorhash, sha256, created_at) "
+            f"VALUES ({self._param}, {self._param}, {self._param}, "
+            f"{self._param}, {self._param}, {self._param}) "
+            "ON CONFLICT (job_id, page_index) DO UPDATE SET "
+            "phash = EXCLUDED.phash, "
+            "colorhash = EXCLUDED.colorhash, "
+            "sha256 = EXCLUDED.sha256, "
+            "created_at = EXCLUDED.created_at"
+        )
         params = [
             (
                 job_id,
@@ -588,7 +624,9 @@ class SqlJobStore:
             for r in rows
         ]
         with self._lock, self._connect() as conn:
-            conn.executemany(sql, params)
+            # executemany lives on the cursor in psycopg3 (the connection has no
+            # such method); sqlite3 cursors support it too, so go via a cursor.
+            conn.cursor().executemany(sql, params)
 
     # The SELECT column set shared by every search method.  All JOIN page_hashes
     # to jobs and filter j.status = 'done' (only completed jobs are searchable).
@@ -602,56 +640,28 @@ class SqlJobStore:
         """Pages within Hamming distance ``max_distance`` of ``target_int8``.
 
         ``target_int8`` is the already-converted signed int64 form of the query
-        phash (use :func:`blastbox.contract.phash_hex_to_int8`).  Postgres with
-        pg_bktree uses the indexed ``<@ ROW(center, radius)::bktree_area`` range
-        scan; plain Postgres a ``bit_count`` XOR seq-scan; SQLite an in-Python
-        popcount.  Rows whose phash is NULL are excluded.  Returns rows with an
-        added ``distance`` field, ordered ``(distance, job_id, page_index)``.
+        phash (use :func:`blastbox.contract.phash_hex_to_int8`).  Served by the
+        Postgres pg_bktree SP-GiST index via an ``<@ ROW(center, radius)::
+        bktree_area`` range scan — the single supported backend (see
+        :meth:`supports_hash_search`).  Rows whose phash is NULL are excluded.
+        Returns rows with an added ``distance`` field, ordered
+        ``(distance, job_id, page_index)``.
         """
-        if self._driver == "sqlite":
-            rows = self._query_all(
-                f"SELECT {self._SEARCH_COLS} "
-                "FROM page_hashes ph JOIN jobs j ON j.job_id = ph.job_id "
-                f"WHERE j.status = {self._param} AND ph.phash IS NOT NULL",
-                (JobStatus.DONE.value,),
-            )
-            out = []
-            for r in rows:
-                dist = bin((r["phash"] ^ target_int8) & ((1 << 64) - 1)).count("1")
-                if dist <= max_distance:
-                    out.append({**r, "distance": dist})
-            out.sort(key=lambda x: (x["distance"], x["job_id"], x["page_index"]))
-            return out[:limit]
-        if self._bktree_available:
-            sql = (
-                f"SELECT {self._SEARCH_COLS}, "
-                f"hamming_distance(ph.phash, {self._param}::int8) AS distance "
-                "FROM page_hashes ph JOIN jobs j ON j.job_id = ph.job_id "
-                f"WHERE j.status = {self._param} AND ph.phash IS NOT NULL "
-                f"AND ph.phash <@ ROW({self._param}::int8, {self._param}::int8)::bktree_area "
-                f"ORDER BY distance, ph.job_id, ph.page_index LIMIT {self._param}"
-            )
-        else:
-            # bit_count() is PostgreSQL 14+; this branch is the no-bktree
-            # fallback whose whole purpose is maximum compatibility, so use a
-            # portable popcount: XOR the two int8s, cast to a bit(64) text, and
-            # count the '1's. (The ::bit(64) cast itself is already proven by the
-            # prior bit_count form.) Seq-scan either way — readability over micro-perf.
-            popcount = (
-                f"length(replace((ph.phash # {self._param}::int8)::bit(64)::text, '0', ''))"
-            )
-            sql = (
-                f"SELECT {self._SEARCH_COLS}, {popcount} AS distance "
-                "FROM page_hashes ph JOIN jobs j ON j.job_id = ph.job_id "
-                f"WHERE j.status = {self._param} AND ph.phash IS NOT NULL "
-                f"AND {popcount} <= {self._param} "
-                f"ORDER BY distance, ph.job_id, ph.page_index LIMIT {self._param}"
-            )
+        self._require_search()
+        sql = (
+            f"SELECT {self._SEARCH_COLS}, "
+            f"hamming_distance(ph.phash, {self._param}::int8) AS distance "
+            "FROM page_hashes ph JOIN jobs j ON j.job_id = ph.job_id "
+            f"WHERE j.status = {self._param} AND ph.phash IS NOT NULL "
+            f"AND ph.phash <@ ROW({self._param}::int8, {self._param}::int8)::bktree_area "
+            f"ORDER BY distance, ph.job_id, ph.page_index LIMIT {self._param}"
+        )
         params = (target_int8, JobStatus.DONE.value, target_int8, max_distance, limit)
         return self._query_all(sql, params)
 
     def find_by_colorhash(self, colorhash: str, limit: int = 50) -> _list[dict]:
         """Pages whose colorhash matches ``colorhash`` exactly."""
+        self._require_search()
         sql = (
             f"SELECT {self._SEARCH_COLS} "
             "FROM page_hashes ph JOIN jobs j ON j.job_id = ph.job_id "
@@ -662,6 +672,7 @@ class SqlJobStore:
 
     def find_by_page_sha256(self, sha256: str, limit: int = 50) -> _list[dict]:
         """Pages whose rendered-image sha256 matches exactly (identical page)."""
+        self._require_search()
         sql = (
             f"SELECT {self._SEARCH_COLS} "
             "FROM page_hashes ph JOIN jobs j ON j.job_id = ph.job_id "
@@ -692,6 +703,7 @@ class SqlJobStore:
         with ``distance``, ``frac_distance``, ``faint_distance``,
         ``bright_distance`` fields, ordered ``(distance, job_id, page_index)``.
         """
+        self._require_search()
         if not any(v is not None for v in (total_max, frac_max, faint_max, bright_max)):
             return self.find_by_colorhash(target, limit=limit)
         groups = [
@@ -700,40 +712,8 @@ class SqlJobStore:
             (faint_max, 2, 8, "faint_distance"),
             (bright_max, 8, 14, "bright_distance"),
         ]
-        if self._driver == "sqlite":
-            rows = self._query_all(
-                f"SELECT {self._SEARCH_COLS} "
-                "FROM page_hashes ph JOIN jobs j ON j.job_id = ph.job_id "
-                f"WHERE j.status = {self._param} AND ph.colorhash IS NOT NULL",
-                (JobStatus.DONE.value,),
-            )
-            out: _list[dict] = []
-            for r in rows:
-                ch = r.get("colorhash") or ""
-                if len(ch) != 14 or len(target) != 14:
-                    continue
-                try:
-                    dists = {}
-                    keep = True
-                    for cap, first, last, alias in groups:
-                        d = sum(
-                            abs(int(ch[i], 16) - int(target[i], 16))
-                            for i in range(first, last)
-                        )
-                        dists[alias] = d
-                        if cap is not None and d > cap:
-                            keep = False
-                            break
-                except ValueError:
-                    # A stored colorhash with non-hex chars (a buggy or hostile
-                    # engine) must not crash the whole search — skip that row.
-                    continue
-                if keep:
-                    out.append({**r, **dists})
-            out.sort(key=lambda x: (x["distance"], x["job_id"], x["page_index"]))
-            return out[:limit]
-        # Postgres: per-group SQL function (no usable index for L1 -> seq scan).
-        # SELECT placeholders must precede WHERE placeholders in the param
+        # Per-group colorhash_bin_distance() function (L1 has no usable index ->
+        # seq scan). SELECT placeholders precede WHERE placeholders in the param
         # tuple, so build the two param lists separately and concatenate.
         select_cols: _list[str] = []
         select_params: list = []

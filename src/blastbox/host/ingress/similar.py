@@ -64,12 +64,15 @@ def _rows_to_response(rows: list[dict]) -> list[dict]:
 def build_similar_router(job_store: object) -> APIRouter | None:
     """Return a router exposing ``GET /v1/similar``, or ``None`` if unsupported.
 
-    Capability probe: the SQL store implements ``find_similar_phash``; the
-    in-memory and redis stores do not.  When the method is absent, ``build_app``
-    skips mounting the route entirely (so the surface honestly reflects whether
-    page-hash search is available in this deployment).
+    Capability probe: search is **Postgres + pg_bktree only**, so gate on the
+    runtime ``supports_hash_search()`` flag — NOT mere structural presence. A SQL
+    store on SQLite (or Postgres without the extension) has the search methods but
+    they raise, so a ``hasattr`` probe would wrongly mount a route that 500s. When
+    unsupported, ``build_app`` skips mounting the route entirely (so the surface
+    honestly reflects whether page-hash search is available in this deployment).
     """
-    if not hasattr(job_store, "find_similar_phash"):
+    supports = getattr(job_store, "supports_hash_search", None)
+    if supports is None or not supports():
         return None
 
     router = APIRouter()

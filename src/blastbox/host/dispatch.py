@@ -873,11 +873,14 @@ class Dispatcher:
     # ------------------------------------------------------------------
 
     def _index_page_hashes(self, job_id: str, envelope: object) -> None:
-        """Best-effort: index the job's per-page perceptual hashes (phash/colorhash/sha256)
-        for similarity search. Skipped if the store lacks the capability (memory/redis);
-        an indexing failure NEVER fails an otherwise-DONE job."""
+        """Best-effort: index the job's per-page perceptual hashes (phash/colorhash/
+        sha256) for similarity search. Only the Postgres + pg_bktree store can serve
+        search, so gate on ``supports_hash_search()`` — a SQL store on SQLite / plain
+        Postgres *has* the method but it raises; memory/redis lack it entirely. An
+        indexing failure NEVER fails an otherwise-DONE job."""
+        supports = getattr(self._job_store, "supports_hash_search", None)
         indexer = getattr(self._job_store, "index_page_hashes", None)
-        if indexer is None:
+        if supports is None or indexer is None or not supports():
             return
         try:
             indexer(job_id, envelope)
