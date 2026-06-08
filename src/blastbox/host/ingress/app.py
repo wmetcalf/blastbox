@@ -47,7 +47,7 @@ from blastbox.observability import (
     record_rejection,
     JOBS_IN_FLIGHT,
 )
-from .extension import IngressExtension
+from .extension import IngressExtension, StaticUI
 from .middleware import BearerAuthMiddleware, BodySizeLimitMiddleware
 
 _log = get_logger("blastbox.ingress")
@@ -700,7 +700,7 @@ def build_app(
     return app
 
 
-def _mount_static_ui(app: FastAPI, ui) -> None:
+def _mount_static_ui(app: FastAPI, ui: StaticUI) -> None:
     """Serve a per-engine web UI: ``GET /`` -> index, ``/assets`` -> static dir.
 
     Operator-configured (an engine's packaged ``static/`` dir), so the paths are
