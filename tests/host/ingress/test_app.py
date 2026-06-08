@@ -56,10 +56,17 @@ def _make_client(
     api_key: str | None = None,
     metrics_public: bool | None = None,
     store: InMemoryJobStore | None = None,
+    zip_password: str | None = "",
 ) -> tuple[TestClient, InMemoryJobStore]:
-    """Build a TestClient wired to a temp job_root + InMemoryJobStore."""
+    """Build a TestClient wired to a temp job_root + InMemoryJobStore.
+
+    ``zip_password`` controls /result encryption: ``""`` (default) => plain ZIP
+    (deterministic for the structure/confinement tests); a string => AES-encrypted
+    with it; ``None`` => omit the arg so build_app uses its "infected" default.
+    """
     job_store = store or InMemoryJobStore()
     limits = Limits(max_input_bytes=max_input_bytes)
+    extra = {} if zip_password is None else {"zip_password": zip_password}
     app = build_app(
         job_store=job_store,
         job_root=tmp_path / "jobs",
@@ -68,6 +75,7 @@ def _make_client(
         api_workers=api_workers,
         api_key=api_key,
         metrics_public=metrics_public,
+        **extra,
     )
     client = TestClient(app, raise_server_exceptions=False)
     return client, job_store
@@ -93,6 +101,62 @@ def test_result_zip_serves_only_validated_artifacts(tmp_path):
     names = set(zipfile.ZipFile(io.BytesIO(resp.content)).namelist())
     assert names == {"metadata.json", "page-001.png"}, names
     assert b"OUTSIDE-SECRET" not in resp.content  # symlink target bytes never disclosed
+
+
+def test_result_zip_encrypted_with_infected_password_by_default(tmp_path, monkeypatch):
+    """The /result ZIP is AES-256 encrypted with the 'infected' convention by DEFAULT
+    (no zip_password arg, no env) — detonated malware artifacts must never ship plain."""
+    import io
+
+    import pyzipper
+
+    monkeypatch.delenv("BLASTBOX_ZIP_PASSWORD", raising=False)
+    client, store = _make_client(tmp_path, zip_password=None)  # use build_app's default
+    job, output_dir = _make_done_job(tmp_path, store)
+
+    resp = client.get(f"/v1/jobs/{job.job_id}/result")
+    assert resp.status_code == 200
+    data = resp.content
+    # The right password decrypts; the content matches the on-disk artifact.
+    with pyzipper.AESZipFile(io.BytesIO(data)) as zf:
+        zf.setpassword(b"infected")
+        assert zf.read("page-001.png") == (output_dir / "page-001.png").read_bytes()
+    # A wrong password cannot decrypt the entry (AES auth fails).
+    with pyzipper.AESZipFile(io.BytesIO(data)) as zf:
+        zf.setpassword(b"wrong")
+        try:
+            zf.read("page-001.png")
+            wrong_pw_ok = True
+        except Exception:
+            wrong_pw_ok = False
+    assert not wrong_pw_ok, "a wrong password must not decrypt the AES result ZIP"
+
+
+def test_result_zip_encrypted_with_custom_password(tmp_path):
+    import io
+
+    import pyzipper
+
+    client, store = _make_client(tmp_path, zip_password="s3cret!")
+    job, output_dir = _make_done_job(tmp_path, store)
+    resp = client.get(f"/v1/jobs/{job.job_id}/result")
+    assert resp.status_code == 200
+    with pyzipper.AESZipFile(io.BytesIO(resp.content)) as zf:
+        zf.setpassword(b"s3cret!")
+        assert zf.read("page-001.png") == (output_dir / "page-001.png").read_bytes()
+
+
+def test_result_zip_plain_when_password_disabled(tmp_path):
+    """An empty BLASTBOX_ZIP_PASSWORD is the explicit opt-out: a plain ZIP."""
+    import io
+    import zipfile
+
+    client, store = _make_client(tmp_path, zip_password="")
+    job, output_dir = _make_done_job(tmp_path, store)
+    resp = client.get(f"/v1/jobs/{job.job_id}/result")
+    assert resp.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        assert zf.read("page-001.png") == (output_dir / "page-001.png").read_bytes()
 
 
 def test_readyz_does_not_leak_store_error(tmp_path):

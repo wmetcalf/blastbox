@@ -41,6 +41,7 @@ host = [
     "prometheus-client>=0.20",
     "psycopg[binary,pool]>=3.2",  # [pool] -> psycopg-pool, imported by SqlJobStore for Postgres
     "redis>=5.0",
+    "pyzipper>=0.3.6",            # AES-256 result ZIPs (the 'infected' malware-handling convention)
 ]
 dev = [
     "blastbox[host]",            # the http/ingress tests need the host stack (fastapi, etc.)
