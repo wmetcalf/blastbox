@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -149,13 +150,27 @@ class Dispatcher:
         poll_interval_s: float = 1.0,
         stop: Callable[[], bool] | None = None,
         maintenance_interval_s: float = 60.0,
+        concurrency: int = 1,
     ) -> None:
         """Continuously claim and dispatch jobs until ``stop()`` returns True.
 
         Every ``maintenance_interval_s`` it also runs _run_maintenance: requeue orphaned RUNNING
         jobs (crash recovery) and expire retention-due artifacts (so untrusted output doesn't
         accumulate forever). Set ``maintenance_interval_s<=0`` to disable.
+
+        ``concurrency`` > 1 runs that many dispatch-loop threads (each claims+dispatches
+        independently; correctness comes from the claim fence + the thread-safe stores). Each
+        concurrent worker is one more in-flight detonation, so size
+        ``BLASTBOX_WORKER_MEMORY * concurrency`` to the host's RAM.
         """
+        if max(1, int(concurrency)) > 1:
+            self._run_forever_concurrent(
+                poll_interval_s=poll_interval_s,
+                stop=stop,
+                maintenance_interval_s=maintenance_interval_s,
+                concurrency=int(concurrency),
+            )
+            return
         last_maint = time.monotonic()
         while True:
             if stop is not None and stop():
@@ -174,6 +189,52 @@ class Dispatcher:
                 self._run_maintenance()
             if not progressed:
                 time.sleep(poll_interval_s)
+
+    def _run_forever_concurrent(
+        self,
+        *,
+        poll_interval_s: float,
+        stop: "Callable[[], bool] | None",
+        maintenance_interval_s: float,
+        concurrency: int,
+    ) -> None:
+        """N dispatch-loop threads claim+dispatch independently; maintenance runs from
+        this coordinator thread (a global sweep — must NOT run N times concurrently)."""
+        stop_evt = threading.Event()
+
+        def _should_stop() -> bool:
+            return stop_evt.is_set() or (stop is not None and stop())
+
+        def _worker() -> None:
+            while not _should_stop():
+                try:
+                    progressed = self.dispatch_once()
+                except Exception:  # noqa: BLE001
+                    _log.exception("dispatch_once failed; continuing")
+                    progressed = False
+                if not progressed:
+                    time.sleep(poll_interval_s)
+
+        threads = [
+            threading.Thread(target=_worker, name=f"bb-dispatch-{i}", daemon=True)
+            for i in range(concurrency)
+        ]
+        for t in threads:
+            t.start()
+        last_maint = time.monotonic()
+        try:
+            while not _should_stop():
+                if (
+                    maintenance_interval_s > 0
+                    and time.monotonic() - last_maint >= maintenance_interval_s
+                ):
+                    last_maint = time.monotonic()
+                    self._run_maintenance()
+                time.sleep(min(poll_interval_s, 1.0))
+        finally:
+            stop_evt.set()
+            for t in threads:
+                t.join(timeout=self._worker_timeout_s + 5)
 
     def requeue_orphaned_jobs(self, *, exclude: frozenset[str] | None = None) -> int:
         """Recover RUNNING jobs whose owning dispatcher is gone, in two independent passes.

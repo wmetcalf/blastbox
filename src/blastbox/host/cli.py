@@ -101,7 +101,10 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         pool=pool,
     )
     try:
-        dispatcher.run_forever(poll_interval_s=args.poll_interval)
+        dispatcher.run_forever(
+            poll_interval_s=args.poll_interval,
+            concurrency=int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY", "1")),
+        )
     finally:
         if pool is not None:
             pool.stop()
