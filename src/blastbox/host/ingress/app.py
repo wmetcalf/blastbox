@@ -694,8 +694,34 @@ def build_app(
     if extension is not None:
         for router in extension.routers:
             app.include_router(router)
+        if extension.static_ui is not None:
+            _mount_static_ui(app, extension.static_ui)
 
     return app
+
+
+def _mount_static_ui(app: FastAPI, ui) -> None:
+    """Serve a per-engine web UI: ``GET /`` -> index, ``/assets`` -> static dir.
+
+    Operator-configured (an engine's packaged ``static/`` dir), so the paths are
+    trusted — but StaticUI.index_path()/assets_path() still resolve+confine them,
+    and StaticFiles handles per-request traversal safety on /assets. Mounted last
+    so it never shadows /v1/* or product routes (only the bare site root + /assets).
+    """
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
+
+    index_path = ui.index_path()
+    assets_path = ui.assets_path()
+
+    @app.get("/", include_in_schema=False)
+    def _ui_root():
+        if not index_path.is_file():
+            raise HTTPException(404, "UI not found")
+        return FileResponse(index_path, media_type="text/html")
+
+    if assets_path is not None:
+        app.mount("/assets", StaticFiles(directory=assets_path), name="assets")
 
 
 # ---------------------------------------------------------------------------
