@@ -96,6 +96,9 @@ def test_boot_base_then_checkpoint_produces_artifact(tmp_path):
 
     art = handle.checkpoint(tmp_path / "dest")
     assert isinstance(art, CracSnapshotArtifact)
+    # honors the manager-provided dest_dir (FC/gVisor parity), not the boot-time dir
+    assert art.image_dir == tmp_path / "dest" / "cracimg"
+    assert art.image_dir.exists()
     assert ran["argv"][0] == "jcmd" and ran["argv"][-1] == "JDK.checkpoint"
 
 

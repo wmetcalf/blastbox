@@ -1,6 +1,6 @@
 # CRaC `SnapshotBackend` — Design (Phase 3 groundwork)
 
-**Status:** DESIGN / groundwork. Implementation + real validation is Phase 4 (needs redtusk's CRaC JVM + Tika workload). No production code until the design is reviewed.
+**Status:** DESIGN + PROVISIONAL groundwork code. This branch ships the unit-mocked **backend + launcher** (`crac_snapshot_backend.py`, `crac_snapshot_launcher.py`); the runtime/pool wiring, the Java warm entrypoint, and **real validation** are Phase 4 (needs redtusk's CRaC JVM + Tika workload). The code here is inert — not wired into any pool — until that grounding.
 **Date:** 2026-06-08
 
 ## Goal
@@ -27,13 +27,18 @@ CRaC maps onto this 1:1, mirroring `FcSnapshotBackend` (a thin adapter delegatin
 | `restore_in(slot, artifact)` | spawn FC + `/snapshot/load` + resume | `java -XX:CRaCRestoreFrom=<image>` → restored warm JVM (~10s of ms) |
 | `RestoreHandle` | FC vsock I/O | the restored JVM's job I/O channel |
 
-## Components (new, on a `CracSnapshotBackend` branch)
+## Components
 
-1. **`host/runtime/crac_snapshot_backend.py`** — `CracSnapshotBackend` + `CracBootHandle` + `CracRestoreHandle`, modeled on `fc_snapshot_backend.py`. Thin; delegates to:
-2. **`host/runtime/crac_snapshot_launcher.py`** — `CracSnapshotLauncher`: constructs the `java`/`jcmd`/`criu` argv, spawns the base + restored processes (subprocess-injectable for tests, exactly like `FcSnapshotLauncher`).
-3. **`host/runtime/crac_snapshot_runtime.py`** — `select_crac_snapshot_runtime()` builds `CracSnapshotBackend.from_env()` + `SnapshotManager` + a `CracSnapshotSlotRuntime` (the per-slot control plane), mirroring `fc_snapshot_runtime.py` / `gvisor_snapshot_runtime.py`.
+**In this PR (provisional, unit-mocked):**
+1. **`host/runtime/crac_snapshot_backend.py`** — `CracSnapshotBackend` + `CracConfig` + `CracSnapshotArtifact`, modeled on `fc_snapshot_backend.py`. Thin; delegates to:
+2. **`host/runtime/crac_snapshot_launcher.py`** — `CracSnapshotLauncher` (constructs the `java`/`jcmd`/`criu` argv, spawns the base + restored processes — subprocess-injectable like `FcSnapshotLauncher`) + a combined `_CracHandle` serving as both the boot handle (`wait_ready`/`checkpoint`) and the restore handle (`kill`).
+
+**Phase 4 (designed here, NOT in this PR):**
+3. **`host/runtime/crac_snapshot_runtime.py`** — `select_crac_snapshot_runtime()` wiring `CracSnapshotBackend.from_env()` + `SnapshotManager` + a per-slot control plane, mirroring `fc_snapshot_runtime.py` / `gvisor_snapshot_runtime.py`.
 4. **Pool wiring** — `pool_config.py`: extend the `BLASTBOX_POOL_RUNTIME` switch with `"crac"` (today: `none`/`fc`/`gvisor`).
-5. **Java-side warm entrypoint** — the CRaC counterpart of `deploy/gvisor/run_warm.py` / `deploy/firecracker/run_guest.py`: a JVM process that boots → warms → signals READY (checkpoint fires) → **post-restore** enters the job-processing loop (read trigger, run the Java engine's `detonate`, write sealed output). Lives in the engine image (redtusk's), not blastbox core.
+5. **Java-side warm entrypoint** — the CRaC counterpart of `deploy/gvisor/run_warm.py` / `deploy/firecracker/run_guest.py`: a JVM that boots → warms → signals READY (checkpoint fires) → **post-restore** enters the job-processing loop. Lives in the engine image (redtusk's), not blastbox core.
+
+(Note: this PR uses one combined `_CracHandle` rather than separate `CracBootHandle`/`CracRestoreHandle` classes — the seam only requires the methods, and FC does the same with its `_Handle`.)
 
 ## Control plane
 

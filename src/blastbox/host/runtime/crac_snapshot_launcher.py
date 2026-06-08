@@ -70,7 +70,19 @@ class _CracHandle:
             check=True,
             capture_output=True,
         )
-        return CracSnapshotArtifact(Path(self._checkpoint_dir))
+        # The JVM wrote its image to the boot-time -XX:CRaCCheckpointTo dir; relocate it
+        # UNDER the manager-provided dest_dir so the artifact lives where the manager
+        # expects (FC/gVisor parity — they persist to dest_dir too). Real runtime: wait
+        # for the JVM to finish writing before moving (a Phase-4 detail with a real JVM).
+        dest = Path(dest_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+        image = dest / "cracimg"
+        src = Path(self._checkpoint_dir)
+        if src.resolve() != image.resolve():
+            if image.exists():
+                shutil.rmtree(image, ignore_errors=True)
+            shutil.move(str(src), str(image))
+        return CracSnapshotArtifact(image)
 
     def kill(self) -> None:
         if self.proc is None or self.proc.poll() is not None:
