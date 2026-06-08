@@ -764,7 +764,7 @@ class Dispatcher:
             # Run to completion (or timeout). The worker's exit code is not the
             # authority — the trust gate below decides DONE/FAILED from the
             # re-sealed output. capture_output keeps worker stdio off our streams.
-            self._subprocess_runner(
+            proc = self._subprocess_runner(
                 argv,
                 capture_output=True,
                 text=True,
@@ -779,6 +779,22 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             self._fail_job(job, f"docker launch failed: {exc}")
             return
+
+        # The worker's exit code is NOT the authority (the trust gate below is), but a non-zero
+        # `docker run` (e.g. a malformed flag → RC 125 "invalid argument for --memory", or an
+        # OOM-killed worker) produces NO output, so the trust gate then fails with an opaque
+        # "metadata.json not found". Log the launcher's exit + stderr tail so that whole class of
+        # launch failure is diagnosable instead of being silently mislabeled as missing output.
+        launch_rc = getattr(proc, "returncode", None)
+        if launch_rc:
+            stderr_tail = (getattr(proc, "stderr", "") or "")[-500:].strip()
+            _log.warning(
+                "worker launcher for job %s exited rc=%s (output is trust-gated regardless); "
+                "docker/worker stderr tail: %s",
+                job.job_id,
+                launch_rc,
+                stderr_tail,
+            )
 
         # Bound TOTAL on-disk output (declared + UNDECLARED) before trusting it, so a worker
         # that wrote a huge undeclared file can't exhaust job_root (#3 disk-exhaustion DoS).
