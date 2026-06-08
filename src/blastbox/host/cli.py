@@ -35,13 +35,16 @@ def _serve_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
-def _dispatch_cmd(args: argparse.Namespace) -> int:
-    from blastbox.host.dispatch import Dispatcher, EngineSpec
-    from blastbox.host.jobs.factory import build_job_store_from_env
+def _parse_engine_specs(engines_raw: str) -> dict:
+    """Parse ``BLASTBOX_ENGINES='NAME=image:tag[,NAME2=image2:tag2]'`` into a
+    ``{name: EngineSpec}`` map.
 
-    # Build engine specs from env or CLI.
-    # Format expected: ENGINE_NAME=image:tag[,ENGINE_NAME2=image2:tag2]
-    engines_raw = args.engines or os.environ.get("BLASTBOX_ENGINES", "")
+    ``worker_argv`` defaults to ``[]`` — the engine image's ENTRYPOINT is
+    self-contained (e.g. ``python -m blastbox.worker.cold``). Malformed entries
+    are warned about and skipped.
+    """
+    from blastbox.host.dispatch import EngineSpec
+
     engines: dict[str, EngineSpec] = {}
     for spec_str in engines_raw.split(","):
         spec_str = spec_str.strip()
@@ -58,9 +61,18 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         name = name.strip()
         image = image.strip()
         if name and image:
-            engines[name] = EngineSpec(
-                name=name, image=image, worker_argv=["worker", "run"]
-            )
+            engines[name] = EngineSpec(name=name, image=image, worker_argv=[])
+    return engines
+
+
+def _dispatch_cmd(args: argparse.Namespace) -> int:
+    from blastbox.host.dispatch import Dispatcher
+    from blastbox.host.jobs.factory import build_job_store_from_env
+
+    # Build engine specs from env or CLI.
+    # Format expected: ENGINE_NAME=image:tag[,ENGINE_NAME2=image2:tag2]
+    engines_raw = args.engines or os.environ.get("BLASTBOX_ENGINES", "")
+    engines = _parse_engine_specs(engines_raw)
 
     if not engines:
         print("error: no engines configured (set --engines or BLASTBOX_ENGINES)", file=sys.stderr)
