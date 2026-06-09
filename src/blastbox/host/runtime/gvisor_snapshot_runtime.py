@@ -197,19 +197,39 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
 
 def _secure_snapshot_base(base_dir: Path) -> Path:
     """Create the warm-snapshot base dir 0o700 and owned by us, refusing to ADOPT a pre-existing
-    dir owned by another uid (L3).
+    dir owned by another uid OR a symlink (L3).
 
     The base holds the runsc checkpoint memory image that is restored into EVERY per-slot
     container, so under a world-writable parent — notably ``/dev/shm`` when
     ``BLASTBOX_SNAPSHOT_MEM_TMPFS=1`` pins it in RAM — a co-tenant could otherwise pre-create the
     predictable path and read or replace the image. 0o700 makes the whole subtree (the checkpoint
-    AND the per-slot ``slots/`` dirs) untraversable by anyone else; refusing a non-owned existing
-    dir fails closed rather than silently adopting an attacker's. ``mkdir(exist_ok=True)`` in the
-    SnapshotManager then reuses this already-hardened dir."""
+    AND the per-slot ``slots/`` dirs) untraversable by anyone else; refusing a non-owned/symlinked
+    base fails closed rather than silently adopting an attacker's.
+
+    The hardening is done over a single ``O_NOFOLLOW | O_DIRECTORY`` fd: a co-tenant must not be
+    able to pre-create the path as a SYMLINK and redirect our ownership check / chmod to an
+    arbitrary target (symlink traversal → arbitrary permission change), and the ownership check +
+    chmod must operate on the SAME object (no exists()->stat()->chmod() TOCTOU). The mkdir uses
+    mode 0o700 directly so a freshly-created base is never briefly group/other-accessible."""
     base_dir = Path(base_dir)
     euid = os.geteuid()
-    if base_dir.exists():
-        owner = base_dir.stat().st_uid
+    base_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.mkdir(base_dir, mode=0o700)
+    except FileExistsError:
+        pass  # already exists — validated (not adopted blindly) via the O_NOFOLLOW open below
+    # O_NOFOLLOW refuses a symlink (ELOOP), O_DIRECTORY refuses a non-dir (ENOTDIR); both close the
+    # symlink-swap. fstat + fchmod operate on the opened fd, so ownership is checked and 0o700 set
+    # on the exact same object — no path is re-resolved after the open.
+    try:
+        fd = os.open(base_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise PermissionError(
+            f"warm-snapshot base {base_dir} is not a real directory we can safely open "
+            f"(a symlink or non-dir may have been swapped in): {exc}"
+        ) from exc
+    try:
+        owner = os.fstat(fd).st_uid
         if owner != euid:
             raise PermissionError(
                 f"warm-snapshot base {base_dir} is owned by uid {owner}, not {euid}; refusing to "
@@ -217,8 +237,9 @@ def _secure_snapshot_base(base_dir: Path) -> Path:
                 "Point BLASTBOX_SNAPSHOT_MEM_DIR at a dir you own (0o700), or disable the tmpfs "
                 "toggle."
             )
-    base_dir.mkdir(parents=True, exist_ok=True)
-    base_dir.chmod(0o700)
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
     return base_dir
 
 

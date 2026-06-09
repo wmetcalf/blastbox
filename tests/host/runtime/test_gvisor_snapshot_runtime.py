@@ -308,3 +308,19 @@ def test_secure_snapshot_base_refuses_non_owned(tmp_path, monkeypatch):
     monkeypatch.setattr(_os, "geteuid", lambda: real_stat(base).st_uid + 1)
     with pytest.raises(PermissionError):
         _secure_snapshot_base(base)
+
+
+def test_secure_snapshot_base_refuses_symlink(tmp_path):
+    """L3 hardening: a co-tenant who pre-creates the predictable base path as a SYMLINK must not
+    get us to follow it — else our ownership check / chmod 0o700 would hit the symlink's target
+    (symlink traversal → arbitrary permission change). The O_NOFOLLOW open refuses it."""
+    from blastbox.host.runtime.gvisor_snapshot_runtime import _secure_snapshot_base
+
+    victim = tmp_path / "victim"
+    victim.mkdir(mode=0o755)
+    link = tmp_path / "gvisor-snapshot"
+    link.symlink_to(victim)
+    with pytest.raises(PermissionError):
+        _secure_snapshot_base(link)
+    # The victim's perms must be untouched (no fchmod-through-symlink).
+    assert (victim.stat().st_mode & 0o777) == 0o755
