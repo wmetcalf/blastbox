@@ -344,13 +344,19 @@ def seal_envelope(*, engine: str, outdir: Path, input_sha256: str,
             # Already hashed this exact inode (a different id pointing at the same
             # file)? Reuse — never re-read the bytes. open_confined_regular_fd has
             # already proved this fd is a confined regular file under outdir.
-            inode_key = (st.st_dev, st.st_ino)
-            cached = inode_cache.get(inode_key)
+            # st_ino==0 is NOT a usable identity: some virtualized / overlay / FUSE mounts return
+            # 0 (or non-unique) inodes, where caching on (dev, 0) would alias DISTINCT files to one
+            # hash — a correctness break worse than the read amplification it saves. Treat a zero
+            # inode as "no identity": always hash, never cache. (The fd already pins this exact
+            # file, so a concurrent rename/recreate can't swap what we hash.)
+            inode_key = (st.st_dev, st.st_ino) if st.st_ino != 0 else None
+            cached = inode_cache.get(inode_key) if inode_key is not None else None
             if cached is not None:
                 sha256, n = cached
             else:
                 sha256, n = _hash_fd(fd, max_bytes=max_artifact_bytes)
-                inode_cache[inode_key] = (sha256, n)
+                if inode_key is not None:
+                    inode_cache[inode_key] = (sha256, n)
         finally:
             os.close(fd)
         artifacts.append(Artifact(id=d.id, path=d.path, kind=d.kind, sha256=sha256, bytes=n))
