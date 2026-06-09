@@ -98,6 +98,13 @@ class EngineSpec:
     name: str
     image: str
     worker_argv: list[str]
+    # Operator-configured allowlist of job.param keys forwardable to the worker
+    # as env. Empty (default) = no allowlist (legacy shape+denylist behaviour);
+    # non-empty = ONLY these keys are forwarded (default-deny, per engine). This
+    # keeps the privilege of opening the worker's env namespace with the operator
+    # who configures the engine — not with any client who can guess a key the
+    # worker happens to read (e.g. CLIPPYSHOT_SANDBOX / CLIPPYSHOT_WARN_ON_INSECURE).
+    allowed_param_keys: frozenset[str] = frozenset()
 
 
 class Dispatcher:
@@ -531,7 +538,7 @@ class Dispatcher:
             spec = WarmJobSpec(
                 input_path=input_path,
                 output_dir=slot.output_dir,
-                params=self._sanitize_params(job.params),
+                params=self._sanitize_params(job.params, engine.allowed_param_keys),
             )
             # One absolute deadline bounds the input send + wait (the only steps a slow guest
             # can stall) to worker_timeout_s, so the upload (which runs BEFORE the wait) can't
@@ -775,7 +782,7 @@ class Dispatcher:
                 "blastbox.job_id": job.job_id,
             },
             extra_env={
-                **self._sanitize_params(job.params),
+                **self._sanitize_params(job.params, engine.allowed_param_keys),
                 # Tell the harness where the dispatcher mounted I/O (it mounts the input file at
                 # /input/<name> and output at /output; the harness defaults are /in,/out, so
                 # without this the cold path is broken-as-wired). Dispatcher-set keys are merged
@@ -1134,7 +1141,9 @@ class Dispatcher:
         return job_ids
 
     @staticmethod
-    def _sanitize_params(params: dict[str, str]) -> dict[str, str]:
+    def _sanitize_params(
+        params: dict[str, str], allowed_keys: frozenset[str] = frozenset()
+    ) -> dict[str, str]:
         """Filter job.params to a safe subset suitable for extra_env.
 
         Security:
@@ -1144,6 +1153,11 @@ class Dispatcher:
           (BLASTBOX_*, LD_*, PYTHON*, and specific engine breadcrumb keys): a
           client must not be able to re-select the engine (BLASTBOX_ENGINE),
           re-wire I/O, flip the security posture, or hijack the loader/interpreter.
+        - If ``allowed_keys`` is non-empty, it is an explicit per-engine
+          ALLOWLIST: only those keys are forwarded (default-deny). This is the
+          sound model when the worker reads an open-ended, product-defined env
+          namespace (e.g. clippyshot's CLIPPYSHOT_*) — the denylist alone leaks
+          by default. Empty = no allowlist (legacy shape+denylist behaviour).
         - Values are capped at _MAX_ENV_VALUE_LEN characters.
         - Everything is coerced to str before inclusion.
 
@@ -1158,6 +1172,12 @@ class Dispatcher:
                 continue
             if _is_reserved_env_key(key):
                 _log.warning("dropping reserved extra_env key from job.params: %r", key)
+                continue
+            if allowed_keys and key not in allowed_keys:
+                _log.warning(
+                    "dropping non-allowlisted extra_env key %r from job.params "
+                    "(per-engine allowlist in effect)", key,
+                )
                 continue
             str_val = str(value) if value is not None else ""
             if len(str_val) > _MAX_ENV_VALUE_LEN:
