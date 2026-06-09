@@ -345,11 +345,14 @@ def build_worker_docker_run_argv(
     # (the key exists), yielding a bare ``--memory '' --cpus '' --pids-limit ''`` that makes
     # ``docker run`` fail at launch with ``invalid argument "" for "--memory"`` (RC 125), which
     # the cold path's ``check=False`` swallows into an opaque "metadata.json not found". Treat
-    # set-but-empty as unset.
-    memory = os.environ.get("BLASTBOX_WORKER_MEMORY") or _DEFAULT_WORKER_MEMORY
-    pids_limit = os.environ.get("BLASTBOX_WORKER_PIDS_LIMIT") or _DEFAULT_WORKER_PIDS_LIMIT
-    cpus = os.environ.get("BLASTBOX_WORKER_CPUS") or _DEFAULT_WORKER_CPUS
-    nofile = os.environ.get("BLASTBOX_WORKER_NOFILE") or _DEFAULT_WORKER_NOFILE
+    # set-but-empty — AND set-but-whitespace-only (e.g. ``BLASTBOX_WORKER_MEMORY=" "`` from a
+    # malformed env file) — as unset; both would otherwise reach ``docker run`` as an invalid arg.
+    memory = (os.environ.get("BLASTBOX_WORKER_MEMORY") or "").strip() or _DEFAULT_WORKER_MEMORY
+    pids_limit = (
+        os.environ.get("BLASTBOX_WORKER_PIDS_LIMIT") or ""
+    ).strip() or _DEFAULT_WORKER_PIDS_LIMIT
+    cpus = (os.environ.get("BLASTBOX_WORKER_CPUS") or "").strip() or _DEFAULT_WORKER_CPUS
+    nofile = (os.environ.get("BLASTBOX_WORKER_NOFILE") or "").strip() or _DEFAULT_WORKER_NOFILE
 
     # Tell the worker's sandbox self-check to be lenient. Under runsc that's because
     # /proc doesn't reflect the host-applied flags (still secure); under an insecure
