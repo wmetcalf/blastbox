@@ -317,7 +317,8 @@ def test_secure_snapshot_base_refuses_symlink(tmp_path):
     from blastbox.host.runtime.gvisor_snapshot_runtime import _secure_snapshot_base
 
     victim = tmp_path / "victim"
-    victim.mkdir(mode=0o755)
+    victim.mkdir()
+    victim.chmod(0o755)  # explicit chmod, not mkdir(mode=) — the latter is masked by the umask
     link = tmp_path / "gvisor-snapshot"
     link.symlink_to(victim)
     with pytest.raises(PermissionError):
