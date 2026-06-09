@@ -67,6 +67,20 @@ _MAX_ENV_VALUE_LEN = 4096
 # and underscores.  This prevents any lowercase/symbol injection.
 _VALID_ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
+# Reserved env keys/prefixes a client job MUST NOT be able to set via job.params — the key-SHAPE
+# regex alone is not enough (it matches BLASTBOX_ENGINE, LD_PRELOAD, PYTHONPATH, …). These select
+# the engine, wire sandbox I/O, set the security posture, or hijack the interpreter/loader; their
+# image-baked / dispatcher-set values must always win. Clients have no legitimate BLASTBOX_*
+# (host/dispatcher control), LD_* (loader), or PYTHON* (interpreter) to supply.
+_RESERVED_ENV_PREFIXES = ("BLASTBOX_", "LD_", "PYTHON")
+# Exact reserved keys outside those prefixes (e.g. an engine breadcrumb path that would otherwise
+# be an attacker-controlled file-write target inside the worker — clippyshot L5).
+_RESERVED_ENV_KEYS = frozenset({"CLIPPYSHOT_WARM_DIAG_FILE"})
+
+
+def _is_reserved_env_key(key: str) -> bool:
+    return key in _RESERVED_ENV_KEYS or key.startswith(_RESERVED_ENV_PREFIXES)
+
 # Max number of entries (files + dirs) allowed in a worker output dir — bounds inode + walk-time
 # exhaustion from undeclared files even under the byte cap.
 _MAX_OUTPUT_ENTRIES = 65536
@@ -1126,6 +1140,10 @@ class Dispatcher:
         Security:
         - Keys must match ``^[A-Z][A-Z0-9_]*$`` (uppercase start, no symbols).
           A key like ``"x; --privileged"`` is silently dropped.
+        - Reserved keys/prefixes are dropped even though they match the shape
+          (BLASTBOX_*, LD_*, PYTHON*, and specific engine breadcrumb keys): a
+          client must not be able to re-select the engine (BLASTBOX_ENGINE),
+          re-wire I/O, flip the security posture, or hijack the loader/interpreter.
         - Values are capped at _MAX_ENV_VALUE_LEN characters.
         - Everything is coerced to str before inclusion.
 
@@ -1137,6 +1155,9 @@ class Dispatcher:
                 continue
             if not _VALID_ENV_KEY_RE.match(key):
                 _log.debug("dropping invalid extra_env key: %r", key)
+                continue
+            if _is_reserved_env_key(key):
+                _log.warning("dropping reserved extra_env key from job.params: %r", key)
                 continue
             str_val = str(value) if value is not None else ""
             if len(str_val) > _MAX_ENV_VALUE_LEN:

@@ -427,7 +427,9 @@ def build_app(
 
         # Bound params at ingest: cap count + entry length so a hostile client can't bloat the
         # persisted job (and amplify the full-list job listing). Reject (400) rather than
-        # silently truncate. (The dispatcher additionally key-allowlists + length-caps for env.)
+        # silently truncate. (Before reaching worker env the dispatcher's _sanitize_params
+        # enforces the key SHAPE, DROPS reserved keys — BLASTBOX_*/LD_*/PYTHON*/engine
+        # breadcrumbs — and length-caps each value.)
         if len(params) > _MAX_PARAMS:
             raise HTTPException(400, f"too many params (max {_MAX_PARAMS})")
         parsed_params: dict[str, str] = {}

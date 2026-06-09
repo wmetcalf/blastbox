@@ -655,6 +655,58 @@ def test_params_key_filtering_bad_dropped_good_passes(tmp_path):
     assert not any("123STARTS" in k for k in env_keys)
 
 
+def test_params_reserved_keys_dropped(tmp_path):
+    """M2: a client must not set reserved env keys via job.params even though they match the key
+    SHAPE — BLASTBOX_ENGINE (engine re-selection → arbitrary module import), LD_PRELOAD,
+    PYTHONPATH, and the engine breadcrumb path are dropped; ordinary CLIPPYSHOT_* keys pass."""
+    store = InMemoryJobStore()
+    job = _make_job(
+        params={
+            "CLIPPYSHOT_DPI": "200",  # legitimate per-job tunable -> passes
+            "BLASTBOX_ENGINE": "evil.module:Backdoor",  # reserved: engine re-selection
+            "LD_PRELOAD": "/tmp/evil.so",  # reserved: loader hijack
+            "PYTHONPATH": "/tmp",  # reserved: interpreter hijack
+            "BLASTBOX_OUTPUT_DIR": "/etc",  # reserved: I/O rewire
+            "CLIPPYSHOT_WARM_DIAG_FILE": "/tmp/x",  # reserved: breadcrumb path (L5)
+        }
+    )
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    captured_argv: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        captured_argv.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher.dispatch_once()
+
+    docker_run_argv = next(
+        (a for a in captured_argv if len(a) >= 2 and a[:2] == ["docker", "run"]), None
+    )
+    assert docker_run_argv is not None
+    env_keys = {
+        docker_run_argv[i + 1].split("=", 1)[0]
+        for i, tok in enumerate(docker_run_argv)
+        if tok == "-e" and i + 1 < len(docker_run_argv)
+    }
+    assert "CLIPPYSHOT_DPI" in env_keys  # ordinary tunable survives
+    for reserved in ("BLASTBOX_ENGINE", "LD_PRELOAD", "PYTHONPATH", "CLIPPYSHOT_WARM_DIAG_FILE"):
+        assert reserved not in env_keys, f"reserved key {reserved} leaked from job.params"
+    # The dispatcher still sets BLASTBOX_OUTPUT_DIR itself (merged last) — to /output, never /etc.
+    out_dir_vals = [
+        docker_run_argv[i + 1].split("=", 1)[1]
+        for i, tok in enumerate(docker_run_argv)
+        if tok == "-e" and i + 1 < len(docker_run_argv)
+        and docker_run_argv[i + 1].startswith("BLASTBOX_OUTPUT_DIR=")
+    ]
+    assert out_dir_vals == ["/output"], f"client overrode BLASTBOX_OUTPUT_DIR: {out_dir_vals}"
+
+
 # ---------------------------------------------------------------------------
 # Test 11: Error strings on FAILED jobs are scrubbed of filesystem paths
 # ---------------------------------------------------------------------------
