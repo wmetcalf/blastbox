@@ -173,7 +173,7 @@ class Dispatcher:
         # Warm-sidecar claim-gate: don't pull a job unless a warm slot is free right NOW.
         # Overflow stays queued for the cold dispatcher / another warm sidecar — a warm-only
         # dispatcher has no cold path, so it must not claim work it can't immediately serve.
-        if self._warm_only and (self._pool is None or self._pool.idle_count() <= 0):
+        if self._warm_only and (self._pool is None or self._pool.idle_count <= 0):
             return False
         job = self._job_store.claim_next()
         if job is None:

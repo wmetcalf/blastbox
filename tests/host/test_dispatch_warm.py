@@ -940,13 +940,14 @@ def test_warm_recovery_deletes_stale_input(tmp_path, monkeypatch):
 
 
 class _CapPool:
-    """Minimal WarmPool double exposing idle_count() + claim() for sidecar tests."""
+    """Minimal WarmPool double exposing idle_count + claim() for sidecar tests."""
 
     def __init__(self, *, idle: int, slot: Slot | None = None) -> None:
         self._idle = idle
         self._slot = slot
 
-    def idle_count(self) -> int:
+    @property
+    def idle_count(self) -> int:  # MUST mirror WarmPool.idle_count (a @property, not a method)
         return self._idle
 
     def claim(self, *, timeout_s: float) -> Slot | None:  # noqa: ARG002
