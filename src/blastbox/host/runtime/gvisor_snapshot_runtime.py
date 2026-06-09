@@ -10,6 +10,7 @@ SlotRuntime + warm-path seam so the dispatcher's per-slot job flow is identical.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import threading
 import time
@@ -189,9 +190,36 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
     from blastbox.host.runtime.fc_snapshot_backend import resolve_mem_dir
 
     snapshot_parent = resolve_mem_dir() or Path(gcfg.root).parent
-    base_dir = snapshot_parent / "gvisor-snapshot"
+    base_dir = _secure_snapshot_base(snapshot_parent / "gvisor-snapshot")
     mgr = SnapshotManager(base_dir, backend)
     return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle())
+
+
+def _secure_snapshot_base(base_dir: Path) -> Path:
+    """Create the warm-snapshot base dir 0o700 and owned by us, refusing to ADOPT a pre-existing
+    dir owned by another uid (L3).
+
+    The base holds the runsc checkpoint memory image that is restored into EVERY per-slot
+    container, so under a world-writable parent — notably ``/dev/shm`` when
+    ``BLASTBOX_SNAPSHOT_MEM_TMPFS=1`` pins it in RAM — a co-tenant could otherwise pre-create the
+    predictable path and read or replace the image. 0o700 makes the whole subtree (the checkpoint
+    AND the per-slot ``slots/`` dirs) untraversable by anyone else; refusing a non-owned existing
+    dir fails closed rather than silently adopting an attacker's. ``mkdir(exist_ok=True)`` in the
+    SnapshotManager then reuses this already-hardened dir."""
+    base_dir = Path(base_dir)
+    euid = os.geteuid()
+    if base_dir.exists():
+        owner = base_dir.stat().st_uid
+        if owner != euid:
+            raise PermissionError(
+                f"warm-snapshot base {base_dir} is owned by uid {owner}, not {euid}; refusing to "
+                "adopt it — a co-tenant under a world-writable parent may have pre-created it. "
+                "Point BLASTBOX_SNAPSHOT_MEM_DIR at a dir you own (0o700), or disable the tmpfs "
+                "toggle."
+            )
+    base_dir.mkdir(parents=True, exist_ok=True)
+    base_dir.chmod(0o700)
+    return base_dir
 
 
 def _int_env(env, key: str, default: int) -> int:

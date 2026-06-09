@@ -282,3 +282,29 @@ def test_select_unavailable_raises_when_required(monkeypatch):
     monkeypatch.setenv("BLASTBOX_GVISOR_RUNSC", "definitely-not-a-real-binary-xyz")
     with pytest.raises(GvisorUnavailable):
         select_gvisor_snapshot_runtime(require_available=True)
+
+
+def test_secure_snapshot_base_chmods_0700(tmp_path):
+    """L3: the warm-snapshot base (holds the checkpoint image restored into every slot) must be
+    created 0o700 so a co-tenant can't traverse it under a world-writable parent like /dev/shm."""
+    from blastbox.host.runtime.gvisor_snapshot_runtime import _secure_snapshot_base
+
+    base = _secure_snapshot_base(tmp_path / "gvisor-snapshot")
+    assert base.exists()
+    assert (base.stat().st_mode & 0o777) == 0o700
+
+
+def test_secure_snapshot_base_refuses_non_owned(tmp_path, monkeypatch):
+    """L3: refuse to ADOPT a pre-existing base owned by another uid (fail closed) rather than
+    silently restoring from a possibly-attacker-planted checkpoint image."""
+    from blastbox.host.runtime.gvisor_snapshot_runtime import _secure_snapshot_base
+
+    base = tmp_path / "gvisor-snapshot"
+    base.mkdir()
+    import os as _os
+
+    # Pretend the existing dir is owned by someone else.
+    real_stat = _os.stat
+    monkeypatch.setattr(_os, "geteuid", lambda: real_stat(base).st_uid + 1)
+    with pytest.raises(PermissionError):
+        _secure_snapshot_base(base)
