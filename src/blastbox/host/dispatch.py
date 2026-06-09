@@ -128,6 +128,7 @@ class Dispatcher:
         pool: "WarmPool | None" = None,
         warm_claim_timeout_s: float = 2.0,
         requeue_grace_s: float = 60.0,
+        warm_only: bool = False,
     ) -> None:
         self._job_store = job_store
         # engines is kept as an immutable mapping snapshot so callers cannot
@@ -149,6 +150,16 @@ class Dispatcher:
         # warm job stale. Floor it at the claim window when a pool is configured.
         if self._pool is not None:
             self._requeue_grace_s = max(self._requeue_grace_s, self._warm_claim_timeout_s)
+        # Warm-pool SIDECAR mode: claim a job ONLY when a warm slot is free (claim-gate) and
+        # NEVER cold-fall-back — overflow stays queued for the cold dispatcher / other warm
+        # sidecars. This lets a single-purpose, socket-less warm dispatcher run beside the
+        # hardened cold one, with each warm backend's privilege (FC: /dev/kvm; gVisor: scoped
+        # caps) confined to it. The main dispatcher keeps the docker socket + full hardening.
+        self._warm_only = bool(warm_only)
+        if self._warm_only and self._pool is None:
+            raise ValueError(
+                "warm_only dispatcher requires a warm pool (set BLASTBOX_POOL_RUNTIME)"
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -159,6 +170,11 @@ class Dispatcher:
 
         Returns True if a job was claimed, False if the queue was empty.
         """
+        # Warm-sidecar claim-gate: don't pull a job unless a warm slot is free right NOW.
+        # Overflow stays queued for the cold dispatcher / another warm sidecar — a warm-only
+        # dispatcher has no cold path, so it must not claim work it can't immediately serve.
+        if self._warm_only and (self._pool is None or self._pool.idle_count() <= 0):
+            return False
         job = self._job_store.claim_next()
         if job is None:
             return False
@@ -414,6 +430,23 @@ class Dispatcher:
                     # Delete the staged input on every terminal path WE own.
                     self._delete_input_if_owned(job, input_path)
                     self._record_outcome(job, path="warm", started=t0)
+                return
+            elif self._warm_only:
+                # Warm-sidecar: never cold-fall-back (it has no docker). Requeue
+                # (RUNNING->QUEUED, clear claim) for the cold dispatcher / another sidecar;
+                # leave the staged input on disk for the next owner (do NOT delete). Rare:
+                # the claim-gate checked idle_count just before, so a miss needs the last
+                # idle slot to die inside the warm_claim_timeout_s window.
+                self._job_store.update_if_status(
+                    job.job_id,
+                    JobStatus.RUNNING,
+                    expect_claim_id=job.claim_id,
+                    status=JobStatus.QUEUED,
+                    claim_id=None,
+                    started_at=None,
+                    worker_runtime=None,
+                )
+                _log.info("warm_pool_miss job_id=%s; warm-only, requeued", job.job_id)
                 return
             else:
                 _log.info("warm_pool_miss job_id=%s; falling back to cold path", job.job_id)

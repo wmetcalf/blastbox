@@ -112,6 +112,9 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         # periodic sweep deletes expired terminal jobs' output (of untrusted documents).
         job_retention_seconds=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"),
         pool=pool,
+        # Warm-pool sidecar: claim-gate on free warm capacity + no cold fallback (needs a pool).
+        warm_only=os.environ.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower()
+        not in ("", "0", "false", "no"),
     )
     try:
         dispatcher.run_forever(

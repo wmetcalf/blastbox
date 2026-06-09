@@ -932,3 +932,57 @@ def test_warm_recovery_deletes_stale_input(tmp_path, monkeypatch):
     assert disp.requeue_orphaned_jobs() == 1
     assert store.get(job.job_id).status == JobStatus.FAILED
     assert not input_path.exists()  # recovered job's input cleaned up by the sweep
+
+
+# ---------------------------------------------------------------------------
+# Warm-pool SIDECAR mode (warm_only): claim-gate + requeue-on-miss + no cold
+# ---------------------------------------------------------------------------
+
+
+class _CapPool:
+    """Minimal WarmPool double exposing idle_count() + claim() for sidecar tests."""
+
+    def __init__(self, *, idle: int, slot: Slot | None = None) -> None:
+        self._idle = idle
+        self._slot = slot
+
+    def idle_count(self) -> int:
+        return self._idle
+
+    def claim(self, *, timeout_s: float) -> Slot | None:  # noqa: ARG002
+        return self._slot
+
+
+def test_warm_only_requires_pool(tmp_path):
+    with pytest.raises(ValueError):
+        Dispatcher(
+            job_store=InMemoryJobStore(), engines={}, limits=_limits(),
+            job_root=tmp_path, pool=None, warm_only=True,
+        )
+
+
+def test_warm_only_claim_gate_leaves_job_queued_when_no_idle(tmp_path):
+    store = InMemoryJobStore()
+    job = _make_job()
+    store.create(job)
+    d = Dispatcher(
+        job_store=store, engines={}, limits=_limits(), job_root=tmp_path,
+        pool=_CapPool(idle=0), warm_only=True,
+    )
+    assert d.dispatch_once() is False  # gated: no free warm slot, nothing claimed
+    assert store.get(job.job_id).status == JobStatus.QUEUED
+
+
+def test_warm_only_requeues_on_slot_miss(tmp_path):
+    store = InMemoryJobStore()
+    job = _make_job()
+    store.create(job)
+    # Gate passes (idle=1) but the slot dies -> claim() returns None -> requeue, never cold.
+    d = Dispatcher(
+        job_store=store, engines={}, limits=_limits(), job_root=tmp_path,
+        pool=_CapPool(idle=1, slot=None), warm_only=True,
+    )
+    assert d.dispatch_once() is True  # a job was claimed
+    final = store.get(job.job_id)
+    assert final.status == JobStatus.QUEUED  # requeued for the cold dispatcher / another sidecar
+    assert final.claim_id is None
