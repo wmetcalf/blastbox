@@ -617,6 +617,17 @@ class Dispatcher:
                 self._fail_job(job, f"unexpected trust validation error: {exc}")
                 return
 
+            # The trust gate validates output STRUCTURE, not the engine's verdict: an engine that
+            # honestly reports a FAILED conversion (status="engine_error", typically 0 artifacts)
+            # still produces a structurally valid envelope. Gate on it here — else a failed convert
+            # is silently marked DONE (a false green that lets a broken warm tier pass a corpus).
+            # "rejected" (unsupported/encrypted input) is a legitimate engine verdict, not an error,
+            # so it stays DONE.
+            if envelope.status == "engine_error":
+                detail = envelope.warnings[0].message if envelope.warnings else "engine_error"
+                self._fail_job(job, f"engine_error: {detail}")
+                return
+
             # ------------------------------------------------------------------
             # Step 6b: Materialize the SEALED, validated output from the (possibly still-live)
             # slot dir into the host-only job_root output dir, re-verifying each artifact's sha.
@@ -826,6 +837,15 @@ class Dispatcher:
             return
         except Exception as exc:  # noqa: BLE001
             self._fail_job(job, f"unexpected trust validation error: {exc}")
+            return
+
+        # The trust gate validates output STRUCTURE, not the engine's verdict: a structurally valid
+        # envelope can still report a FAILED conversion (status="engine_error"). Gate on it here —
+        # else a failed convert is silently marked DONE (a false green). "rejected" (unsupported/
+        # encrypted input) is a legitimate engine verdict, not an error, so it stays DONE.
+        if envelope.status == "engine_error":
+            detail = envelope.warnings[0].message if envelope.warnings else "engine_error"
+            self._fail_job(job, f"engine_error: {detail}")
             return
 
         # Persist the host-SEALED metadata over the worker's raw file so the API serves trusted

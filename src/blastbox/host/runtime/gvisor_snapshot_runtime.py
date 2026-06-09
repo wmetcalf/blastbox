@@ -181,7 +181,15 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
                                     "set BLASTBOX_GVISOR_RUNSC / install runsc")
         _log.debug("select_gvisor_snapshot_runtime: runsc unavailable")
         return None
-    base_dir = Path(gcfg.root).parent / "gvisor-snapshot"
+    # RAM-preload (COW-image-to-RAM): the runsc checkpoint image holds the guest's memory pages
+    # (~guest RAM with soffice live) and dominates restore cost. Holding the checkpoint dir on
+    # tmpfs (/dev/shm) pins it in RAM, so every per-slot restore pages the COW-shared base in from
+    # RAM, not disk — the gVisor twin of the FC mem-dir toggle. Same generic engine toggle
+    # (BLASTBOX_SNAPSHOT_MEM_TMPFS / BLASTBOX_SNAPSHOT_MEM_DIR); opt-in, default disk.
+    from blastbox.host.runtime.fc_snapshot_backend import resolve_mem_dir
+
+    snapshot_parent = resolve_mem_dir() or Path(gcfg.root).parent
+    base_dir = snapshot_parent / "gvisor-snapshot"
     mgr = SnapshotManager(base_dir, backend)
     return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle())
 
