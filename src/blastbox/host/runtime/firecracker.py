@@ -410,15 +410,18 @@ def rdump_ext4(
 
     dest.mkdir(parents=True, exist_ok=True)
 
-    def _debugfs_rdump() -> "subprocess.CompletedProcess[bytes]":
+    def _debugfs_rdump(check: bool) -> "subprocess.CompletedProcess[bytes]":
         return subprocess.run(
             ["debugfs", "-R", f"rdump / {dest_str}", str(image)],
-            check=True,
+            check=check,
             capture_output=True,
             timeout=timeout_s,
         )
 
-    proc = _debugfs_rdump()
+    # First pass is TOLERANT (check=False): the common failure isn't a non-zero exit but
+    # "exit 0, extracts nothing" (see below) — but a non-zero exit must ALSO fall through
+    # to the e2fsck recovery rather than raise and bypass it.
+    proc = _debugfs_rdump(check=False)
     # The guest is SIGKILLed off this disk (never cleanly unmounted), so on a no-journal
     # ext4 its block/inode bitmaps can be left inconsistent at reap. debugfs then refuses
     # to OPEN the filesystem ("Block bitmap checksum does not match bitmap" -> "Filesystem
@@ -429,7 +432,11 @@ def rdump_ext4(
     # intact, fsync'd inode tree (userspace, no mount — same trust posture as debugfs),
     # then re-rdump. The retry is OFF the common path (only fires on the failure signature).
     _stderr = proc.stderr if isinstance(proc.stderr, (bytes, bytearray)) else b""
-    _bad = b"Filesystem not open" in _stderr or b"checksum does not match" in _stderr
+    _bad = (
+        proc.returncode != 0
+        or b"Filesystem not open" in _stderr
+        or b"checksum does not match" in _stderr
+    )
     if _bad or not any(dest.iterdir()):
         subprocess.run(
             ["e2fsck", "-fy", str(image)],
@@ -439,7 +446,9 @@ def rdump_ext4(
         )
         shutil.rmtree(dest, ignore_errors=True)
         dest.mkdir(parents=True, exist_ok=True)
-        _debugfs_rdump()
+        # After recovery a failure IS fatal (check=True) — surface it loudly rather than
+        # silently producing empty output that becomes an opaque "metadata.json not found".
+        _debugfs_rdump(check=True)
 
     # debugfs rdump always creates lost+found; remove it so it isn't mistaken
     # for an artifact.

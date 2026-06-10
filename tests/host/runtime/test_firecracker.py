@@ -823,6 +823,34 @@ class TestRdumpExt4:
         assert calls == ["debugfs", "e2fsck", "debugfs"], calls
         assert "metadata.json" in names
 
+    def test_e2fsck_recover_when_first_rdump_exits_nonzero(self, tmp_path, monkeypatch):
+        """A NON-zero debugfs exit must also fall through to the e2fsck recovery, not raise
+        and bypass it (the first rdump is check=False; the post-recovery rdump is fatal)."""
+        img = tmp_path / "disk.ext4"
+        self._write_valid_ext4_magic(img)
+        dest = tmp_path / "out"
+        calls: list[str] = []
+
+        def fake_run(cmd, **kwargs):  # noqa: ANN001
+            tool = cmd[0]
+            calls.append(tool)
+            res = MagicMock()
+            res.stderr = b""
+            if tool == "debugfs":
+                if calls.count("debugfs") == 1:
+                    res.returncode = 1  # non-zero: previously raised + bypassed recovery
+                else:
+                    res.returncode = 0
+                    (dest / "metadata.json").write_text("{}")
+            else:
+                res.returncode = 0
+            return res
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        names = rdump_ext4(img, dest, max_bytes=1024 * 1024)
+        assert calls == ["debugfs", "e2fsck", "debugfs"], calls
+        assert "metadata.json" in names
+
     def test_size_cap_enforced(self, tmp_path, monkeypatch):
         """If total extracted bytes exceed max_bytes, ValueError is raised."""
         img = tmp_path / "disk.ext4"
