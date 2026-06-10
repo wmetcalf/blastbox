@@ -65,7 +65,7 @@ _MAX_ENV_VALUE_LEN = 4096
 # Pattern for valid extra_env keys derived from job.params.
 # Must start with an uppercase letter, contain only uppercase letters, digits,
 # and underscores.  This prevents any lowercase/symbol injection.
-_VALID_ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_VALID_ENV_KEY_RE = re.compile(r"\A[A-Z][A-Z0-9_]*\Z")  # \Z (not $) — $ also matches a trailing \n
 
 # Reserved env keys/prefixes a client job MUST NOT be able to set via job.params — the key-SHAPE
 # regex alone is not enough (it matches BLASTBOX_ENGINE, LD_PRELOAD, PYTHONPATH, …). These select
