@@ -87,9 +87,13 @@ class PolicyDraft:
         }
 
     def to_nono_profile(self, name: str = "engine", depth: int = 2) -> dict:
-        """A nono (Landlock) profile from the read roots + the net verdict."""
+        """A nono (Landlock) profile from the read roots + the net verdict.
+
+        Conforms to nono's profile schema (validated via ``nono profile validate``):
+        ``meta`` only takes name/version/description/author — no free-form comments.
+        """
         return {
-            "meta": {"name": name, "_comment": "auto-derived from a profiling sweep"},
+            "meta": {"name": name, "description": "auto-derived from a blastbox profiling sweep"},
             "groups": {"include": ["deny_credentials"]},
             "workdir": {"access": "readwrite"},
             "network": {"block": not self.net.inet},

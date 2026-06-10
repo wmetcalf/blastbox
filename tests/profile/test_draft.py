@@ -46,3 +46,11 @@ def test_nono_profile_unblocks_when_egress_seen():
     d = PolicyDraft()
     d.net.inet.add(("1.2.3.4", 443))
     assert d.to_nono_profile()["network"]["block"] is False
+
+
+def test_nono_profile_conforms_to_schema_fields():
+    """meta/network only carry keys nono's schema accepts (no free-form _comment)."""
+    p = PolicyDraft().to_nono_profile("eng")
+    assert set(p["meta"]) <= {"name", "version", "description", "author"}
+    assert set(p["network"]) <= {"block", "network_profile", "allow_domain"}
+    assert "_comment" not in str(p)  # the bug nono's validator rejected
