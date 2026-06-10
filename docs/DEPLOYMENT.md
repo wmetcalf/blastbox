@@ -39,8 +39,12 @@ redundant, and (for nono) Landlock isn't even available under runsc (below).
 
 - **Bare-metal host, no KVM, no gVisor** → `runc` + an inner namespace sandbox. Prefer
   **`nsjail`** (full seccomp); use **`nono`** where unprivileged user namespaces are
-  disabled (`nsjail`/`bwrap` can't run) — Landlock needs no userns. On Ubuntu 24.04+ load the
-  AppArmor userns profiles first (`deploy/apparmor/`), or `nsjail`/`bwrap` can't create userns.
+  disabled (`nsjail`/`bwrap` can't run) — Landlock needs no userns.
+  - **Ubuntu 24.04+ userns gate:** `kernel.apparmor_restrict_unprivileged_userns=1` blocks the
+    user namespaces `nsjail`/`bwrap` need. Load the **scoped per-binary** AppArmor profiles
+    (`deploy/apparmor/blastbox-{bwrap,nsjail}` — they grant `userns` to *only* those two binaries,
+    leaving the host-wide restriction in force; see `deploy/apparmor/README.md`). Do **not** use
+    `sysctl …unprivileged_userns=0` — that lowers the control host-wide.
 - **Host with gVisor** → `runsc` (the secure default; `runc` is fail-closed-refused unless
   `BLASTBOX_ALLOW_RUNC=1`). Inner sandbox = `container`.
 - **Host with KVM** → `firecracker` — the strongest boundary (hardware VM, no guest NIC).

@@ -48,9 +48,15 @@ runsc ... : Error executing inside namespace: re-executing self:
 (`cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns` → `1` confirms it.)
 
 **This only affects the namespace-based sandboxes** (`runsc`, `bwrap`, `nsjail`) — **not
-Firecracker**, which is a KVM hypervisor and doesn't create user namespaces. For the affected
-tests, **run them as root** (`sudo -E env BLASTBOX_*=… .venv/bin/pytest …`) — the gVisor backend
-drives `runsc` rootful anyway, and root isn't subject to the restriction. (You *can* `sudo sysctl
+Firecracker**, which is a KVM hypervisor and doesn't create user namespaces.
+
+For the **`bwrap`/`nsjail`** backends specifically, the cleanest fix is the **scoped per-binary
+AppArmor profiles** in `deploy/apparmor/` (`blastbox-{bwrap,nsjail}`): they grant `userns` to
+*only* those binaries while the host-wide restriction stays in force (see
+`deploy/apparmor/README.md`), so they run **unprivileged, no root needed**.
+
+For the rootful **gVisor C/R** tests, **run them as root** (`sudo -E env BLASTBOX_*=… .venv/bin/pytest …`)
+— the gVisor backend drives `runsc` rootful anyway, and root isn't subject to the restriction. (You *can* `sudo sysctl
 kernel.apparmor_restrict_unprivileged_userns=0`, but that lowers a system-wide kernel-attack-surface
 control until reboot and only helps *unprivileged* `bwrap`/`nsjail` — it does **not** remove the
 root requirement for the rootful gVisor C/R tests, so it buys nothing here. Don't.) A permissioned
