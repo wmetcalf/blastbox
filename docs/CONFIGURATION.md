@@ -1,0 +1,124 @@
+# Configuration reference
+
+Every `BLASTBOX_*` knob, grouped by subsystem, with its default. **You set almost none of
+these** — the defaults run a secure single-host deployment. The large surface is for tuning
+the optional warm-pool / runtime / sandbox tiers. Engine-specific knobs (e.g. ClippyShot's
+`CLIPPYSHOT_*`) are documented by the engine; the host forwards a per-engine **allowlist** of
+them (see *Per-engine params* below), never the whole environment.
+
+> **How values are read.** Most knobs are read as `os.environ.get(...) or default` — a
+> **set-but-empty** value (e.g. `FOO=` from a compose `${FOO:-}`) is treated as *unset*.
+> Booleans are truthy unless one of `"" 0 false no`.
+
+See **[DEPLOYMENT.md](DEPLOYMENT.md)** for which of these to set for each deployment shape
+and the tier-capability matrix.
+
+---
+
+## Core / ingress / job store
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_DATABASE_URL` | in-memory | **Required for the 2-process (serve+dispatch) flow.** `sqlite:///…`, `postgresql://…`, or `redis://…`. Unset → each process gets its own in-memory store (jobs invisible across processes; a warning is logged). |
+| `BLASTBOX_JOB_ROOT` | `/var/lib/blastbox/jobs` | Shared per-job directory root (staged input + sealed output). Must be the same path for serve, dispatch, and the worker mount. |
+| `BLASTBOX_ENGINES` | `""` | Engine registry: `name=worker_image[,name2=image2]`. The dispatcher launches the mapped image per job. |
+| `BLASTBOX_ALLOWED_ENGINES` | `""` (all) | Restrict which engine names ingress will accept. |
+| `BLASTBOX_INPUT_DIR` / `BLASTBOX_OUTPUT_DIR` | under `JOB_ROOT` | Override per-job input/output staging dirs. |
+| `BLASTBOX_JOB_RETENTION_SECONDS` | store default | TTL after which finished jobs + artifacts are reaped. |
+| `BLASTBOX_API_KEY` | `""` (open) | Optional bearer token required on the API. Usually unset — auth is delegated to a reverse proxy. |
+| `BLASTBOX_API_WORKERS` | `4` | uvicorn worker processes for `blastbox serve`. |
+| `BLASTBOX_METRICS_PUBLIC` | `true` | Serve `/metrics` without auth. |
+| `BLASTBOX_INGRESS_EXTENSION` | `""` | Optional ingress extension entry point. |
+| `BLASTBOX_ZIP_PASSWORD` | `infected` | Password tried for password-protected sample archives (the malware-corpus convention). |
+
+## Dispatch
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_DISPATCH_CONCURRENCY` | `1` | Dispatch-loop worker threads. **On a warm tier this MUST equal the warm pool size** — the warm path blocks until the job finishes, so N threads are needed to keep N slots busy (default 1 starves the pool). |
+| `BLASTBOX_DISPATCH_WARM_ONLY` | `""` (off) | Claim-gate primitive: only claim jobs when a warm slot is free, and **never cold-fall-back** — overflow stays queued for the cold dispatcher. This is what makes a process a *warm sidecar*. |
+
+## Runtime selection (docker: runc / runsc)
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_WORKER_RUNTIME` | auto | Force `runsc` or `runc`. Forcing `runc` still requires `BLASTBOX_ALLOW_RUNC=1`. |
+| `BLASTBOX_ALLOW_RUNC` | `0` | Explicit consent to run the worker under plain `runc` (no gVisor) in deliberate degraded mode. Without it, the dispatcher **fails closed** (`InsecureRuntimeRefused`) when no secure runtime exists. |
+| `BLASTBOX_REQUIRE_SECURE_RUNTIME` | `0` | Hard lockdown — refuse `runc` **even if** `ALLOW_RUNC` is set. |
+| `BLASTBOX_SECCOMP_JSON_HOST` | `""` | **Host** path to the worker seccomp profile (`--security-opt=seccomp=…`). Unset → docker-default seccomp applies (a warning is recorded). |
+| `BLASTBOX_APPARMOR_PROFILES` | `""` | Hint that the host AppArmor worker profile is available. |
+| `BLASTBOX_WARN_ON_INSECURE` | — | Set by the dispatcher into the worker (under runsc — `/proc` can't reflect host flags; or under opted-in runc) so the worker's sandbox self-check runs leniently instead of aborting. Not normally set by hand. |
+
+## Worker resource caps
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_WORKER_MEMORY` | `4g` | `--memory` (and `--memory-swap`, swap disabled). |
+| `BLASTBOX_WORKER_PIDS_LIMIT` | `256` | `--pids-limit` (fork-bomb cap). |
+| `BLASTBOX_WORKER_CPUS` | `1.0` | `--cpus`. |
+| `BLASTBOX_WORKER_NOFILE` | `4096` | `--ulimit nofile`. |
+| `BLASTBOX_WORKER_TIMEOUT_S` | engine | Per-job wall-clock budget. |
+
+## Worker in-process sandbox + nono
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_SANDBOX` | auto | Force the inner backend: `nsjail` → `bwrap` → `nono` → `container`. Auto picks the best available; `container` is chosen inside an OCI host. |
+| `BLASTBOX_NONO_BIN` | `nono` on PATH | nono binary for the standalone `NonoSandbox` backend. |
+| `BLASTBOX_NONO_STATE_DIR` | `/var/lib/blastbox/nono-state` | nono's relocated `$HOME/.nono` state root (must be **off** the grants). |
+| `BLASTBOX_WORKER_NONO_WRAP` | off | **Outer** nono-wrap of the *whole worker command* (cold path). Landlock-gated: applied under `runc`, **skipped+warned under `runsc`** (gVisor Sentry has no Landlock — see DEPLOYMENT). |
+| `BLASTBOX_WORKER_NONO_BIN` | `/usr/local/bin/nono` | nono binary for the outer wrap (baked into the worker image). |
+| `BLASTBOX_WORKER_NONO_PROFILE` | `""` | nono profile JSON (e.g. a `blastbox.profile`-generated policy) for the outer wrap; preferred over the coarse baseline grants. |
+| `BLASTBOX_WORKER_NONO_STATE_DIR` | `/run/nono` | Dedicated writable tmpfs for the outer wrap's nono state (off the grants). |
+| `BLASTBOX_ENGINE` | `""` | Worker-side engine selector breadcrumb (reserved; not client-settable). |
+
+## Warm pool
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_POOL_RUNTIME` | runtime default | Warm backend: `firecracker` or `gvisor`. |
+| `BLASTBOX_POOL_WARM_SIZE` | — | Number of pre-warmed slots. |
+| `BLASTBOX_POOL_CEILING` | — | Max concurrent slots (warm + burst). |
+| `BLASTBOX_POOL_BURST_SIZE` | — | Extra cold-burst slots above the warm set under load. |
+| `BLASTBOX_POOL_SPAWN_RATE` | — | Slot replenish rate. |
+| `BLASTBOX_POOL_WARM_SNAPSHOT` | `0` | FC only: restore from a memory snapshot (warm-UNO) instead of cold-booting the guest. |
+
+## Runtime: Firecracker
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_FC_BIN` / `BLASTBOX_FC_KERNEL` / `BLASTBOX_FC_ROOTFS` | — | Paths to the firecracker binary, guest `vmlinux`, and `rootfs.ext4`. |
+| `BLASTBOX_FC_VCPU` | `1` | **Pinned at 1** — the vsock stream-corruption mitigation. Do not raise without validating the guest vsock driver under concurrency. |
+| `BLASTBOX_FC_MEM_MIB` | `512` | Guest RAM (compose sets 2048 for LibreOffice). |
+| `BLASTBOX_FC_OUTDISK_MIB` | — | Size of the per-slot ext4 output disk the host reads via `debugfs`. |
+| `BLASTBOX_SNAPSHOT_MEM_DIR` / `BLASTBOX_SNAPSHOT_MEM_TMPFS` | — | Where the warm memory-snapshot base lives; `_TMPFS` pins the CoW base in RAM (per-host toggle). |
+| `BLASTBOX_SNAPSHOT_SETTLE_S` | `""` | Settle delay before snapshotting a freshly-warmed guest. |
+
+## Runtime: gVisor C/R (runsc checkpoint/restore)
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_GVISOR_RUNSC` / `BLASTBOX_GVISOR_ROOT` / `BLASTBOX_GVISOR_ROOTFS` | — | runsc binary, `--root` state dir, and the warm OCI rootfs. |
+| `BLASTBOX_GVISOR_PLATFORM` | `systrap` | `systrap` (modern default) vs `ptrace`/`kvm`. systrap is required for the C/R warm OCR throughput. |
+| `BLASTBOX_GVISOR_NETWORK` | `none` | runsc `-network`. |
+| `BLASTBOX_GVISOR_NPROC` | `4096` | RLIMIT_NPROC (fork-bomb cap; cgroups are ignored under `-ignore-cgroups`). |
+| `BLASTBOX_GVISOR_NOFILE` | `65536` | RLIMIT_NOFILE (fd-exhaustion cap). |
+| `BLASTBOX_GVISOR_WARM_ARGV` | — | The in-guest warm entrypoint argv (JSON list). |
+| `BLASTBOX_GVISOR_LD_PRELOAD` | — | `LD_PRELOAD` inside the guest (the accept-retry shim for soffice-on-restore). |
+| `BLASTBOX_GVISOR_EXTRA_ENV` | — | Extra guest env (JSON list), e.g. `CLIPPYSHOT_SANDBOX=container`. |
+| `BLASTBOX_GVISOR_CPUFEATURES` | — | CPU-feature mask for snapshot portability across hosts. |
+
+## Runtime: CRaC (JVM engines, e.g. Tika)
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_CRAC_CRIU_BIN` | `criu` | CRIU binary for JVM checkpoint/restore. |
+| `BLASTBOX_CRAC_JAVA_BIN` | `java` | JVM used for the CRaC warmup. |
+| `BLASTBOX_CRAC_JCMD_BIN` | `jcmd` | `jcmd` for triggering the checkpoint. |
+| `BLASTBOX_CRAC_ENGINE_ARGV` | `""` | The JVM engine's launch argv (JSON list). |
+
+## Per-engine params (engine ↔ host boundary)
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_ENGINE_<NAME>_PARAM_KEYS` | `""` (default-deny) | **Allowlist** of `job.params` keys forwardable to that engine's worker as env. Empty ⇒ the host falls back to shape+denylist only (a hostile job's params could reach engine knobs) — so set this on **every** tier that runs the engine. e.g. `BLASTBOX_ENGINE_CLIPPYSHOT_PARAM_KEYS=CLIPPYSHOT_OCR,CLIPPYSHOT_QR,…`. |

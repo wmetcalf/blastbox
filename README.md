@@ -106,6 +106,11 @@ blastbox dispatch                                    # the worker dispatcher loo
 `POST /v1/jobs` (multipart `file` + `engine`) enqueues a job; the dispatcher launches a hardened
 disposable worker for it; `GET /v1/jobs/{id}/artifacts/{artifact_id}` serves validated output.
 
+The defaults run a secure single-host deployment — you set almost nothing. For the warm-pool /
+runtime / sandbox tiers, **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** is the tier-decision guide
+(incl. the per-tier capability matrix) and **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** is the
+full `BLASTBOX_*` reference.
+
 ## Testing
 
 ```sh
