@@ -50,3 +50,18 @@ def test_parse_path_in_memory(tmp_path: Path):
     log.write_text(_SAMPLE)
     d = StraceCapture().parse(log)
     assert d.denylist_violations({"ptrace", "bpf", "kexec_load"}) == set()
+
+
+def test_parse_is_line_bounded_no_bleed(tmp_path):
+    """A truncated/odd line must not let a path match bleed across lines into garbage
+    (the bug: whole-text [^"]+ spanning newlines produced paths like '/, O_RDONLY) = 13')."""
+    log = tmp_path / "t.log"
+    log.write_text(
+        '1 openat(AT_FDCWD, "/usr/lib/a", O_RDONLY) = 3\n'
+        '2 openat(AT_FDCWD, "/etc/b", O_RDONLY) = 4\n'
+        '3 write(5, "junk with ) and , chars no path here", 36) = 36\n'
+    )
+    d = StraceCapture().parse(log)
+    assert d.read_paths == {"/usr/lib/a", "/etc/b"}
+    for p in d.read_paths | d.write_paths:
+        assert ")" not in p and "O_RDONLY" not in p and "\n" not in p

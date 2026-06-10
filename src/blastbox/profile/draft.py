@@ -86,16 +86,39 @@ class PolicyDraft:
             "validate broadly before shipping.",
         }
 
+    # Volatile trees collapse to their top component (a trace captures per-run paths
+    # like /tmp/luXXXX or /run/user/1000 that must NOT leak into the profile as-is).
+    _VOLATILE_TREES = ("/tmp", "/run", "/dev", "/proc", "/sys", "/var")
+
+    def _stable_roots(self, paths: set[str], depth: int) -> set[str]:
+        roots: set[str] = set()
+        for p in paths:
+            parts = [c for c in p.split("/") if c]
+            if not parts:
+                continue
+            top = "/" + parts[0]
+            roots.add(top if top in self._VOLATILE_TREES else "/" + "/".join(parts[:depth]))
+        return roots
+
     def to_nono_profile(self, name: str = "engine", depth: int = 2) -> dict:
-        """A nono (Landlock) profile from the read roots + the net verdict.
+        """A nono (Landlock) profile from the observed read/write roots + the net verdict.
 
         Conforms to nono's profile schema (validated via ``nono profile validate``):
         ``meta`` only takes name/version/description/author — no free-form comments.
+        Writable roots come from ``write_paths`` (so /dev, /tmp scratch are granted rw, not
+        just read); read-only roots exclude any that are also writable (nono grants must not
+        overlap). Volatile trees (/tmp, /run, /dev, …) collapse to their top component so a
+        trace's per-run temp dirs don't leak in. Still a CANDIDATE — review before shipping.
         """
+        write_roots = self._stable_roots(self.write_paths, depth)
+        read_roots = self._stable_roots(self.read_paths, depth) - write_roots
         return {
             "meta": {"name": name, "description": "auto-derived from a blastbox profiling sweep"},
             "groups": {"include": ["deny_credentials"]},
             "workdir": {"access": "readwrite"},
             "network": {"block": not self.net.inet},
-            "filesystem": {"read": self.grant_roots(depth), "allow": ["$WORKDIR"]},
+            "filesystem": {
+                "read": sorted(read_roots),
+                "allow": ["$WORKDIR", *sorted(write_roots)],
+            },
         }

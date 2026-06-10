@@ -19,19 +19,17 @@ from typing import Callable, Protocol, Sequence
 from blastbox.profile.draft import NetDraft, PolicyDraft
 
 # A syscall line: optional "<pid> " prefix, then "name(" at the start.
-_SYSCALL_RE = re.compile(r"^(?:\d+\s+)?([a-z_][a-z0-9_]*)\(", re.MULTILINE)
-# A path argument to a path-taking syscall: name(..."<path>"...
-_PATH_RE = re.compile(
-    r"\b(?:openat2?|open|stat|lstat|newfstatat|access|faccessat2?|readlink(?:at)?|statx)"
-    r"\((?:[^)\"]*)\"([^\"]+)\"",
+# All parsing is LINE-BASED: a negated char class like [^"]+ matches newlines, so a
+# whole-text regex bleeds across lines on a truncated/odd line. Anchor every match to one line.
+_SYSCALL_RE = re.compile(r"^(?:\d+\s+)?([a-z_][a-z0-9_]*)\(")
+# A path-taking syscall + its first quoted ABSOLUTE path argument, within one line.
+_PATH_LINE_RE = re.compile(
+    r"^(?:\d+\s+)?(?:openat2?|open|stat|lstat|newfstatat|access|faccessat[0-9]?"
+    r"|readlink(?:at)?|statx)\([^\"]*\"(/[^\"]+)\"",
 )
-# Whether an open* call is for writing (O_WRONLY/O_RDWR/O_CREAT in the flags).
-_WRITE_OPEN_RE = re.compile(
-    r"\b(?:openat2?|open)\([^)]*\"([^\"]+)\"[^)]*O_(?:WRONLY|RDWR|CREAT)",
-)
-_HAS_AF_UNIX = re.compile(r"sa_family=AF_UNIX")
 _INET_PORT_RE = re.compile(r"htons\((\d+)\)")
 _INET_ADDR_RE = re.compile(r"inet6?_addr\(\"([^\"]+)\"\)")
+_NON_SYSCALL = frozenset({"exit", "killed", "Process", "strace"})
 
 
 class Capture(Protocol):
@@ -53,31 +51,40 @@ class StraceCapture:
         self.strace_bin = strace_bin
 
     def wrap(self, argv: Sequence[str], trace_path: Path) -> list[str]:
+        # No -y: fd path annotations (<path>) add noise; paths come from the syscall args.
         return [
-            self.strace_bin, "-f", "-qq", "-y", "-s", "256",
+            self.strace_bin, "-f", "-qq", "-s", "256",
             "-e", "trace=all", "-o", str(trace_path), *argv,
         ]
 
     def parse(self, trace_path: Path) -> PolicyDraft:
-        text = Path(trace_path).read_text(errors="replace")
         draft = PolicyDraft()
-        draft.syscalls = {m.group(1) for m in _SYSCALL_RE.finditer(text)}
-        # signal/exit pseudo-lines aren't real syscalls
-        draft.syscalls -= {"exit", "killed", "Process", "strace"}
-        writes = {m.group(1) for m in _WRITE_OPEN_RE.finditer(text)}
+        syscalls: set[str] = set()
+        reads: set[str] = set()
+        writes: set[str] = set()
+        net = NetDraft()
+        for line in Path(trace_path).read_text(errors="replace").splitlines():
+            sm = _SYSCALL_RE.match(line)
+            if sm and sm.group(1) not in _NON_SYSCALL:
+                syscalls.add(sm.group(1))
+            pm = _PATH_LINE_RE.match(line)
+            if pm:
+                path = pm.group(1)
+                if "O_WRONLY" in line or "O_RDWR" in line or "O_CREAT" in line:
+                    writes.add(path)
+                else:
+                    reads.add(path)
+            if "sa_family=AF_UNIX" in line:
+                net.unix = True
+            if "connect(" in line and "AF_INET" in line:
+                port_m = _INET_PORT_RE.search(line)
+                addr_m = _INET_ADDR_RE.search(line)
+                net.inet.add(
+                    (addr_m.group(1) if addr_m else "?", int(port_m.group(1)) if port_m else 0)
+                )
+        draft.syscalls = syscalls
         draft.write_paths = writes
-        draft.read_paths = {m.group(1) for m in _PATH_RE.finditer(text)} - writes
-        net = NetDraft(unix=bool(_HAS_AF_UNIX.search(text)))
-        # Per-line: a connect() to an AF_INET sockaddr is real egress. Pair the port +
-        # addr within the same line (robust against inet_addr(...)'s own parens).
-        for line in text.splitlines():
-            if "connect(" not in line or "AF_INET" not in line:
-                continue
-            port_m = _INET_PORT_RE.search(line)
-            addr_m = _INET_ADDR_RE.search(line)
-            net.inet.add(
-                (addr_m.group(1) if addr_m else "?", int(port_m.group(1)) if port_m else 0)
-            )
+        draft.read_paths = reads - writes
         draft.net = net
         return draft
 
