@@ -35,7 +35,13 @@ RUN apt-get update \
 # the guest init dies → kernel panic). A wrapper execs the venv python by its
 # literal in-venv path, so pyvenv.cfg is found and the venv is active. java is not a
 # venv, so a plain symlink is fine.
-RUN printf '#!/bin/sh\nexec /opt/redtusk/bin/python3 "$@"\n' > /usr/local/bin/python3 \
+# rm -f first: if a base ever ships /usr/local/bin/python3 as a symlink, `printf >`
+# would follow it and overwrite the *target* (e.g. system python3.12) — and since
+# the venv python symlinks back to it, the wrapper would exec itself (recursion).
+# Removing it guarantees a fresh regular file. (Not the case for the current base,
+# where it does not pre-exist, but cheap insurance against base drift.)
+RUN rm -f /usr/local/bin/python3 \
+    && printf '#!/bin/sh\nexec /opt/redtusk/bin/python3 "$@"\n' > /usr/local/bin/python3 \
     && chmod +x /usr/local/bin/python3 \
     && ln -sf /opt/java/openjdk/bin/java /usr/local/bin/java
 
