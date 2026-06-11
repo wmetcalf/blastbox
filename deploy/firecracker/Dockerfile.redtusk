@@ -1,0 +1,51 @@
+# blastbox FC worker rootfs built ON TOP OF redtusk-cold-worker:dev, so RedTusk's
+# JVM/Tika recursive-extraction worker runs inside a hardened, disposable
+# Firecracker microVM.
+#
+# The base already provides JRE 25 + the Tika worker jar + the flag-sensitive AOT
+# cache (/app) + the redtusk engine adapter + blastbox core in the /opt/redtusk
+# venv + the non-root `redtusk` user (uid 10001). This overlay adds the blastbox FC
+# guest agent + init + per-rootfs config. The engine loads via the module:Class
+# seam (redtusk.engine:RedTuskEngine) — no engine-adapter staging (unlike
+# clippyshot, redtusk is pip-installed in the base).
+#
+# Build context = blastbox repo root (build-rootfs.sh sets that):
+#   ENGINE=redtusk BASE_IMAGE=redtusk-cold-worker:dev ROOTFS_MIB=3072 \
+#     DOCKERFILE=deploy/firecracker/Dockerfile.redtusk \
+#     deploy/firecracker/build-rootfs.sh redtusk-rootfs.ext4
+ARG BASE_IMAGE=redtusk-cold-worker:dev
+FROM ${BASE_IMAGE}
+ARG ENGINE=redtusk   # unused (engine is baked via /opt/blastbox/engine); silences the warning
+USER root
+
+# util-linux: `mount` for the init + `setpriv` to drop privileges (the minimal
+# temurin base may not ship setpriv).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+# `docker export` DROPS Docker ENV (incl. the temurin PATH + the base's REDTUSK_*),
+# and the shared /init execs `python3 run_guest.py` + the engine Popens `java`,
+# both resolved via the init's fixed PATH (…/usr/local/bin:/usr/bin…). Point those
+# at the redtusk venv python (has redtusk + blastbox) and the temurin java.
+#
+# python3 MUST be a WRAPPER, not a symlink: a symlink (/usr/local/bin/python3 ->
+# /opt/redtusk/bin/python3) gets realpath-resolved down the venv→system python3.12
+# chain, so venv detection lands on /usr/bin (no blastbox/redtusk → ModuleNotFound,
+# the guest init dies → kernel panic). A wrapper execs the venv python by its
+# literal in-venv path, so pyvenv.cfg is found and the venv is active. java is not a
+# venv, so a plain symlink is fine.
+RUN printf '#!/bin/sh\nexec /opt/redtusk/bin/python3 "$@"\n' > /usr/local/bin/python3 \
+    && chmod +x /usr/local/bin/python3 \
+    && ln -sf /opt/java/openjdk/bin/java /usr/local/bin/java
+
+# blastbox FC guest agent + init + per-rootfs config. The output-disk mountpoint
+# MUST exist at build time (the root fs boots read-only).
+COPY deploy/firecracker/run_guest.py /opt/blastbox/run_guest.py
+COPY deploy/firecracker/engines.py /opt/blastbox/engines.py
+COPY deploy/firecracker/init /init
+COPY deploy/firecracker/guest.redtusk.env /opt/blastbox/guest.env
+RUN chmod +x /init && mkdir -p /mnt/outdisk \
+    && printf '%s' 'redtusk.engine:RedTuskEngine' > /opt/blastbox/engine \
+    # Strip setuid/setgid (the in-VM worker runs java directly, no setuid).
+    && find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true
