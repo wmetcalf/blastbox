@@ -63,25 +63,29 @@ class StraceCapture:
         reads: set[str] = set()
         writes: set[str] = set()
         net = NetDraft()
-        for line in Path(trace_path).read_text(errors="replace").splitlines():
-            sm = _SYSCALL_RE.match(line)
-            if sm and sm.group(1) not in _NON_SYSCALL:
-                syscalls.add(sm.group(1))
-            pm = _PATH_LINE_RE.match(line)
-            if pm:
-                path = pm.group(1)
-                if "O_WRONLY" in line or "O_RDWR" in line or "O_CREAT" in line:
-                    writes.add(path)
-                else:
-                    reads.add(path)
-            if "sa_family=AF_UNIX" in line:
-                net.unix = True
-            if "connect(" in line and "AF_INET" in line:
-                port_m = _INET_PORT_RE.search(line)
-                addr_m = _INET_ADDR_RE.search(line)
-                net.inet.add(
-                    (addr_m.group(1) if addr_m else "?", int(port_m.group(1)) if port_m else 0)
-                )
+        # Stream the trace line-by-line — a `strace -f` log over a real corpus run can be
+        # hundreds of MB; read_text() would load it all into memory.
+        with open(trace_path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                sm = _SYSCALL_RE.match(line)
+                if sm and sm.group(1) not in _NON_SYSCALL:
+                    syscalls.add(sm.group(1))
+                pm = _PATH_LINE_RE.match(line)
+                if pm:
+                    path = pm.group(1)
+                    if "O_WRONLY" in line or "O_RDWR" in line or "O_CREAT" in line:
+                        writes.add(path)
+                    else:
+                        reads.add(path)
+                if "sa_family=AF_UNIX" in line:
+                    net.unix = True
+                if "connect(" in line and "AF_INET" in line:
+                    port_m = _INET_PORT_RE.search(line)
+                    addr_m = _INET_ADDR_RE.search(line)
+                    net.inet.add(
+                        (addr_m.group(1) if addr_m else "?",
+                         int(port_m.group(1)) if port_m else 0)
+                    )
         draft.syscalls = syscalls
         draft.write_paths = writes
         draft.read_paths = reads - writes
@@ -104,6 +108,7 @@ def profile_command(
     exit status is ignored — a non-zero conversion still produced a useful trace.
     """
     cap = capture or StraceCapture()
+    Path(trace_dir).mkdir(parents=True, exist_ok=True)  # else strace can't write the trace
     trace = Path(trace_dir) / f"trace_{label}.log"
     traced = cap.wrap(argv, trace)
     run = runner or (lambda a: subprocess.run(list(a), capture_output=True, timeout=180))
