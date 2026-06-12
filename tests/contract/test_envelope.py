@@ -433,3 +433,18 @@ def test_seal_rejects_metadata_json_as_declared_artifact(tmp_path):
         seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
                       declared=[DeclaredArtifact(id="a0", path="metadata.json", kind="json")],
                       warnings=[], payload=ExtractedText(text="x", char_count=1))
+
+
+def test_seal_allows_nested_metadata_json_artifact(tmp_path):
+    """A NESTED metadata.json (e.g. RedTusk's rmeta/metadata.json) is a normal artifact the host
+    never overwrites — only the ROOT metadata.json is reserved. It must remain declarable so the
+    fixed-filename /rmeta serve route stays trust-gated. Regression for the basename-vs-path
+    over-reservation that engine_error'd RedTusk's warm tier."""
+    (tmp_path / "rmeta").mkdir()
+    (tmp_path / "rmeta" / "metadata.json").write_bytes(b'{"extraction": {}}')
+    env = seal_envelope(
+        engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+        declared=[DeclaredArtifact(id="rmeta", path="rmeta/metadata.json", kind="json")],
+        warnings=[], payload=ExtractedText(text="x", char_count=1),
+    )
+    assert "rmeta/metadata.json" in [a.path for a in env.artifacts]
