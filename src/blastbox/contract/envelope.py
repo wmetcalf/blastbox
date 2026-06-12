@@ -313,12 +313,14 @@ def seal_envelope(*, engine: str, outdir: Path, input_sha256: str,
         if d.id in declared_ids:
             raise ValueError(f"duplicate artifact id: {d.id}")
         declared_ids.add(d.id)
-        # Reserve metadata.json (+ the atomic-write temp prefix): the host OVERWRITES
-        # metadata.json with the SEALED envelope after sealing, so a worker declaring it as an
-        # artifact would record a sha256/bytes for the OLD raw file while the host serves the new
-        # sealed one — desyncing served-bytes from the sealed hash. Reject it.
-        _name = Path(d.path).name
-        if _name == "metadata.json" or _name.startswith(".metadata.json."):
+        # Reserve the ROOT-level metadata.json (+ its atomic-write temp prefix): the host
+        # OVERWRITES outdir/metadata.json with the SEALED envelope after sealing, so a worker
+        # declaring THAT file would record a sha256/bytes for the OLD raw file while the host
+        # serves the new sealed one — desyncing served-bytes from the sealed hash. Reject it.
+        # Match the relative PATH, not the basename: a NESTED metadata.json (e.g. an engine's
+        # rmeta/metadata.json — RedTusk's canonical rmeta doc) is a normal artifact the host
+        # never clobbers, so it must remain declarable (and thus trust-gated on serve).
+        if d.path == "metadata.json" or d.path.startswith(".metadata.json."):
             raise ValueError(f"reserved output path may not be a declared artifact: {d.path}")
         # TOCTOU-safe open: confines under outdir AND rejects symlink/.. components + special
         # files in one walk (no separate resolve()/is_file()/open() the worker could race on a
