@@ -10,6 +10,7 @@ SlotRuntime + warm-path seam so the dispatcher's per-slot job flow is identical.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import threading
 import time
@@ -181,9 +182,65 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
                                     "set BLASTBOX_GVISOR_RUNSC / install runsc")
         _log.debug("select_gvisor_snapshot_runtime: runsc unavailable")
         return None
-    base_dir = Path(gcfg.root).parent / "gvisor-snapshot"
+    # RAM-preload (COW-image-to-RAM): the runsc checkpoint image holds the guest's memory pages
+    # (~guest RAM with soffice live) and dominates restore cost. Holding the checkpoint dir on
+    # tmpfs (/dev/shm) pins it in RAM, so every per-slot restore pages the COW-shared base in from
+    # RAM, not disk — the gVisor twin of the FC mem-dir toggle. Same generic engine toggle
+    # (BLASTBOX_SNAPSHOT_MEM_TMPFS / BLASTBOX_SNAPSHOT_MEM_DIR); opt-in, default disk.
+    from blastbox.host.runtime.fc_snapshot_backend import resolve_mem_dir
+
+    snapshot_parent = resolve_mem_dir() or Path(gcfg.root).parent
+    base_dir = _secure_snapshot_base(snapshot_parent / "gvisor-snapshot")
     mgr = SnapshotManager(base_dir, backend)
     return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle())
+
+
+def _secure_snapshot_base(base_dir: Path) -> Path:
+    """Create the warm-snapshot base dir 0o700 and owned by us, refusing to ADOPT a pre-existing
+    dir owned by another uid OR a symlink (L3).
+
+    The base holds the runsc checkpoint memory image that is restored into EVERY per-slot
+    container, so under a world-writable parent — notably ``/dev/shm`` when
+    ``BLASTBOX_SNAPSHOT_MEM_TMPFS=1`` pins it in RAM — a co-tenant could otherwise pre-create the
+    predictable path and read or replace the image. 0o700 makes the whole subtree (the checkpoint
+    AND the per-slot ``slots/`` dirs) untraversable by anyone else; refusing a non-owned/symlinked
+    base fails closed rather than silently adopting an attacker's.
+
+    The hardening is done over a single ``O_NOFOLLOW | O_DIRECTORY`` fd: a co-tenant must not be
+    able to pre-create the path as a SYMLINK and redirect our ownership check / chmod to an
+    arbitrary target (symlink traversal → arbitrary permission change), and the ownership check +
+    chmod must operate on the SAME object (no exists()->stat()->chmod() TOCTOU). The mkdir uses
+    mode 0o700 directly so a freshly-created base is never briefly group/other-accessible."""
+    base_dir = Path(base_dir)
+    euid = os.geteuid()
+    base_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.mkdir(base_dir, mode=0o700)
+    except FileExistsError:
+        pass  # already exists — validated (not adopted blindly) via the O_NOFOLLOW open below
+    # O_NOFOLLOW refuses a symlink (ELOOP), O_DIRECTORY refuses a non-dir (ENOTDIR); both close the
+    # symlink-swap. fstat + fchmod operate on the opened fd, so ownership is checked and 0o700 set
+    # on the exact same object — no path is re-resolved after the open.
+    try:
+        fd = os.open(base_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise PermissionError(
+            f"warm-snapshot base {base_dir} is not a real directory we can safely open "
+            f"(a symlink or non-dir may have been swapped in): {exc}"
+        ) from exc
+    try:
+        owner = os.fstat(fd).st_uid
+        if owner != euid:
+            raise PermissionError(
+                f"warm-snapshot base {base_dir} is owned by uid {owner}, not {euid}; refusing to "
+                "adopt it — a co-tenant under a world-writable parent may have pre-created it. "
+                "Point BLASTBOX_SNAPSHOT_MEM_DIR at a dir you own (0o700), or disable the tmpfs "
+                "toggle."
+            )
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+    return base_dir
 
 
 def _int_env(env, key: str, default: int) -> int:
@@ -222,12 +279,33 @@ def _gvisor_config_from_env(env):
             _DEFAULT_WARM_ARGV,
         )
         warm_argv = list(_DEFAULT_WARM_ARGV)
+    # Extra env injected into the warm worker's OCI process env (e.g.
+    # ["JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=2"] for the redtusk JVM tier, or
+    # ["CLIPPYSHOT_SANDBOX=container", ...] for clippyshot). A JSON array of "KEY=VALUE"
+    # strings; same fail-loud-to-default shape validation as warm_argv (a malformed value
+    # must not crash host startup, and a non-list/non-string entry would corrupt the OCI env).
+    raw_extra = env.get("BLASTBOX_GVISOR_EXTRA_ENV", "").strip()
+    extra_env: list[str] = []
+    if raw_extra:
+        try:
+            parsed = json.loads(raw_extra)
+        except json.JSONDecodeError:
+            _log.warning("invalid BLASTBOX_GVISOR_EXTRA_ENV JSON %r; ignoring", raw_extra)
+            parsed = None
+        if isinstance(parsed, list) and all(isinstance(e, str) and "=" in e for e in parsed):
+            extra_env = parsed
+        elif parsed is not None:
+            _log.warning(
+                "BLASTBOX_GVISOR_EXTRA_ENV must be a JSON array of 'KEY=VALUE' strings; got %r; ignoring",
+                raw_extra,
+            )
     return GvisorConfig(
         runsc_bin=env.get("BLASTBOX_GVISOR_RUNSC", "runsc"),
         root=Path(root),
         image_rootfs=Path(rootfs),
         network=env.get("BLASTBOX_GVISOR_NETWORK", "none"),
         warm_argv=warm_argv,
+        extra_env=extra_env,
         ld_preload=env.get("BLASTBOX_GVISOR_LD_PRELOAD") or None,
         platform=env.get("BLASTBOX_GVISOR_PLATFORM") or None,
         cpu_features_annotation=env.get("BLASTBOX_GVISOR_CPUFEATURES") or None,

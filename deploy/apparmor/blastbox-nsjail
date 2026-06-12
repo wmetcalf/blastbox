@@ -1,0 +1,12 @@
+abi <abi/4.0>,
+include <tunables/global>
+
+# Mirror of blastbox-bwrap for the nsjail backend: grant ONLY `userns` to nsjail so it
+# can create unprivileged user namespaces on Ubuntu 24.04+. SCOPED to this one binary.
+# nsjail is commonly installed at /usr/local/bin/nsjail (source build) — adjust the path
+# to match your install (`which nsjail`).
+#
+# Load:  sudo cp blastbox-nsjail /etc/apparmor.d/ && sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-nsjail
+profile blastbox-nsjail /usr/local/bin/nsjail flags=(unconfined) {
+  userns,
+}

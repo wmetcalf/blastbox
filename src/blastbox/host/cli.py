@@ -61,7 +61,23 @@ def _parse_engine_specs(engines_raw: str) -> dict:
         name = name.strip()
         image = image.strip()
         if name and image:
-            engines[name] = EngineSpec(name=name, image=image, worker_argv=[])
+            # Optional per-engine forwardable-param allowlist (default-deny once set):
+            #   BLASTBOX_ENGINE_<NAME>_PARAM_KEYS='KEY1,KEY2'
+            # UNSET preserves the legacy shape+denylist behaviour; SET (even to an empty
+            # value) is an explicit allowlist (empty = block all). This is how an operator
+            # opens the worker's env namespace to specific client params (e.g. clippyshot's
+            # scanner toggles) without exposing every CLIPPYSHOT_* the worker reads
+            # (sandbox/limits) to client override.
+            # None when UNSET (legacy denylist); a frozenset when SET (even if empty after
+            # stripping → blocks all client params, the operator's explicit intent).
+            keys_raw = os.environ.get(f"BLASTBOX_ENGINE_{name.upper()}_PARAM_KEYS")
+            allowed = (
+                None if keys_raw is None
+                else frozenset(k.strip() for k in keys_raw.split(",") if k.strip())
+            )
+            engines[name] = EngineSpec(
+                name=name, image=image, worker_argv=[], allowed_param_keys=allowed,
+            )
     return engines
 
 
@@ -102,6 +118,11 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         # periodic sweep deletes expired terminal jobs' output (of untrusted documents).
         job_retention_seconds=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"),
         pool=pool,
+        # Warm-ONLY sidecar (socket-less gVisor C/R or FC warm dispatcher): on a warm-pool
+        # miss, REQUEUE the job for the cold dispatcher instead of cold-falling-back (which
+        # would fail closed here — no docker socket). Inert without a pool.
+        warm_only=(os.environ.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower()
+                   in ("1", "true", "yes", "on")),
     )
     try:
         dispatcher.run_forever(

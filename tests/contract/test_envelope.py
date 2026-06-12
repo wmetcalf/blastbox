@@ -42,6 +42,80 @@ def test_seal_rejects_oversize_artifact_before_reading(tmp_path):
                       max_artifact_bytes=10)
 
 
+def test_seal_count_guard_rejects_before_hashing(tmp_path):
+    """An over-COUNT declared list is rejected BEFORE the hashing loop runs (the
+    count cap previously only ran in validate_envelope, after every artifact was
+    already opened + hashed)."""
+    (tmp_path / "f.bin").write_bytes(b"data")
+    declared = [DeclaredArtifact(id=f"a{i}", path="f.bin", kind="x") for i in range(5)]
+    with pytest.raises(ValueError, match="artifact count"):
+        seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+                      declared=declared, warnings=[],
+                      payload=ExtractedText(text="x", char_count=1), max_artifacts=3)
+
+
+def test_seal_dedups_inode_no_read_amplification(tmp_path, monkeypatch):
+    """N distinct ids pointing at the SAME file are hashed ONCE — a sub-MB metadata
+    declaring one small file thousands of times must not amplify into thousands of
+    host reads of that file (the confirmed HIGH-severity DoS)."""
+    import blastbox.contract.envelope as env_mod
+
+    (tmp_path / "f.bin").write_bytes(b"shared-bytes")
+    calls = {"n": 0}
+    orig = env_mod._hash_fd
+
+    def counting(fd, max_bytes=None):
+        calls["n"] += 1
+        return orig(fd, max_bytes=max_bytes)
+
+    monkeypatch.setattr(env_mod, "_hash_fd", counting)
+    declared = [DeclaredArtifact(id=f"a{i}", path="f.bin", kind="x") for i in range(20)]
+    env = seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+                        declared=declared, warnings=[],
+                        payload=ExtractedText(text="x", char_count=1))
+    assert len(env.artifacts) == 20                       # all ids present
+    assert len({a.sha256 for a in env.artifacts}) == 1    # same file -> same hash
+    assert calls["n"] == 1                                # hashed ONCE despite 20 refs
+
+
+def test_seal_zero_inode_does_not_alias_distinct_files(tmp_path, monkeypatch):
+    """st_ino==0 (some virtualized / overlay / FUSE mounts return 0 or non-unique inodes) is NOT
+    a usable identity — caching on (dev, 0) would alias DISTINCT files of the same size to ONE
+    hash. With a zero inode, distinct files must still each get their own CORRECT hash
+    (correctness over the dedup optimization)."""
+    import hashlib
+    import os
+
+    import blastbox.contract.envelope as env_mod
+
+    (tmp_path / "a.bin").write_bytes(b"AAAAAAAA")  # 8 bytes
+    (tmp_path / "b.bin").write_bytes(b"BBBBBBBB")  # SAME size, different content
+
+    real_fstat = os.fstat
+
+    def zero_ino_fstat(fd):
+        st = real_fstat(fd)
+        # Preserve every field (so open_confined_regular_fd's regular-file check still works) —
+        # only force st_ino to 0, as a non-POSIX mount would.
+        return os.stat_result((
+            st.st_mode, 0, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
+            st.st_size, int(st.st_atime), int(st.st_mtime), int(st.st_ctime),
+        ))
+
+    monkeypatch.setattr(env_mod.os, "fstat", zero_ino_fstat)
+    declared = [
+        DeclaredArtifact(id="a", path="a.bin", kind="x"),
+        DeclaredArtifact(id="b", path="b.bin", kind="x"),
+    ]
+    env = seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),
+                        declared=declared, warnings=[],
+                        payload=ExtractedText(text="x", char_count=1))
+    by_id = {a.id: a for a in env.artifacts}
+    assert by_id["a"].sha256 == hashlib.sha256(b"AAAAAAAA").hexdigest()
+    assert by_id["b"].sha256 == hashlib.sha256(b"BBBBBBBB").hexdigest()
+    assert by_id["a"].sha256 != by_id["b"].sha256  # NOT aliased to a single hash
+
+
 def test_seal_within_cap_uses_stat_size(tmp_path):
     (tmp_path / "ok.bin").write_bytes(b"x" * 5)
     env = seal_envelope(engine="e", outdir=tmp_path, input_sha256="b" * 64, detected=_det(),

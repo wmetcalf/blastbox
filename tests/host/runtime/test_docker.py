@@ -478,6 +478,31 @@ def test_worker_nofile_env_override(tmp_path, monkeypatch):
     assert argv[ulimit_idx + 1] == "nofile=8192:8192"
 
 
+@pytest.mark.parametrize("blank", ["", "   ", "\t", " \n "])
+def test_worker_caps_blank_env_use_defaults(tmp_path, monkeypatch, blank):
+    """docker-compose passes ``BLASTBOX_WORKER_MEMORY=${BLASTBOX_WORKER_MEMORY:-}`` which sets the
+    var to the EMPTY string when the operator leaves it unset. ``get(K, default)`` returns that ""
+    (the key exists) → a bare ``--memory '' --cpus '' --pids-limit ''`` that makes ``docker run``
+    fail at launch with ``invalid argument "" for "--memory"`` (RC 125). Set-but-empty AND
+    set-but-whitespace-only (a malformed env file) MUST fall back to the default exactly like
+    unset — and no empty/whitespace token may ever land in a value position."""
+    for var in (
+        "BLASTBOX_WORKER_MEMORY",
+        "BLASTBOX_WORKER_PIDS_LIMIT",
+        "BLASTBOX_WORKER_CPUS",
+        "BLASTBOX_WORKER_NOFILE",
+    ):
+        monkeypatch.setenv(var, blank)
+    argv = _argv(tmp_path=tmp_path)
+    assert argv[argv.index("--memory") + 1] == "4g"
+    assert argv[argv.index("--memory-swap") + 1] == "4g"
+    assert argv[argv.index("--pids-limit") + 1] == "256"
+    assert argv[argv.index("--cpus") + 1] == "1.0"
+    assert argv[argv.index("--ulimit") + 1] == "nofile=4096:4096"
+    assert "" not in argv  # no empty value in any position
+    assert blank not in argv  # the raw blank value never lands in a value position
+
+
 # ---------------------------------------------------------------------------
 # seccomp / apparmor optional attachment
 # ---------------------------------------------------------------------------
@@ -582,3 +607,56 @@ def test_workdir_custom(tmp_path):
     )
     wd_idx = argv.index("--workdir")
     assert argv[wd_idx + 1] == "/workspace"
+
+
+# ---------------------------------------------------------------------------
+# Optional outer nono (Landlock) wrap of the worker command (cold path)
+# ---------------------------------------------------------------------------
+
+def _runc():
+    return RuntimeSelection(runtime="runc", secure=False, warnings=[])
+
+
+def _runsc():
+    return RuntimeSelection(runtime="runsc", secure=True, warnings=[])
+
+
+def test_nono_wrap_off_by_default(monkeypatch):
+    monkeypatch.delenv("BLASTBOX_WORKER_NONO_WRAP", raising=False)
+    argv = _argv(worker_argv=["blastbox", "worker"], runtime=_runc())
+    assert argv[-2:] == ["blastbox", "worker"]          # verbatim, no wrap
+    assert "nono" not in " ".join(argv)
+    assert "/run/nono" not in " ".join(argv)
+
+
+def test_nono_wrap_on_under_runc(monkeypatch):
+    monkeypatch.setenv("BLASTBOX_WORKER_NONO_WRAP", "1")
+    monkeypatch.delenv("BLASTBOX_WORKER_NONO_PROFILE", raising=False)
+    monkeypatch.delenv("BLASTBOX_WORKER_NONO_BIN", raising=False)
+    argv = _argv(worker_argv=["blastbox", "worker"], runtime=_runc())
+    # dedicated off-grant state tmpfs added
+    assert "--tmpfs" in argv and any("/run/nono:rw" in a for a in argv)
+    # worker command wrapped: env HOME=/run/nono nono wrap ... -- env HOME=/tmp blastbox worker
+    assert "/usr/local/bin/nono" in argv and "wrap" in argv and "--block-net" in argv
+    assert "HOME=/run/nono" in argv and "HOME=/tmp" in argv
+    assert argv[-2:] == ["blastbox", "worker"]           # real worker still the tail
+    # baseline grants present (read system dirs, write /tmp + output + dev)
+    assert "-r" in argv and "/usr" in argv
+    assert argv[argv.index("/job/output") - 1] == "-a"
+
+
+def test_nono_wrap_skipped_under_runsc(monkeypatch):
+    monkeypatch.setenv("BLASTBOX_WORKER_NONO_WRAP", "1")
+    rt = _runsc()
+    argv = _argv(worker_argv=["blastbox", "worker"], runtime=rt)
+    assert "nono" not in " ".join(argv)                  # ENOSYS on gVisor -> skipped
+    assert argv[-2:] == ["blastbox", "worker"]
+    assert any("Landlock" in w for w in rt.warnings)     # and warned
+
+
+def test_nono_wrap_with_profile(monkeypatch):
+    monkeypatch.setenv("BLASTBOX_WORKER_NONO_WRAP", "1")
+    monkeypatch.setenv("BLASTBOX_WORKER_NONO_PROFILE", "/etc/blastbox/worker.nono.json")
+    argv = _argv(worker_argv=["blastbox", "worker"], runtime=_runc())
+    assert "-p" in argv and "/etc/blastbox/worker.nono.json" in argv
+    assert "/usr" not in argv                            # profile replaces the baseline grants

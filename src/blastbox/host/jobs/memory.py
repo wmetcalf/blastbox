@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import threading
 import time
@@ -13,6 +14,19 @@ from blastbox.host.jobs.base import Job, JobStatus
 # SqlJobStore._COLUMNS so all three backends fail closed identically on an unknown field
 # name (a typo'd/invalid key that prod SQL/Redis reject must not silently succeed here).
 _JOB_FIELDS = frozenset(f.name for f in dataclasses.fields(Job))
+
+
+def _snapshot(job: Job | None) -> Job | None:
+    """Return a deep copy so callers get a stable SNAPSHOT, never the live store object.
+
+    The multi-dispatcher safety model rests on ``update_if_status(expect_claim_id=...)``: it
+    compares the caller's expected claim_id against the LIVE store value. The SQL/Redis backends
+    return freshly-deserialized objects, so the caller's expectation is a fixed snapshot. If THIS
+    store handed back the live object, a concurrent requeue+reclaim (RUNNING->QUEUED[None]->
+    RUNNING[NEW]) would mutate that shared object — so both sides of the CAS would read NEW and the
+    guard would wrongly pass, defeating the exact ABA fence claim_id exists to close (and aliasing
+    _delete_input_if_owned the same way). Deep-copy on the way out closes it; match SQL/Redis."""
+    return copy.deepcopy(job) if job is not None else None
 
 
 class InMemoryJobStore:
@@ -32,7 +46,7 @@ class InMemoryJobStore:
 
     def get(self, job_id: str) -> Job | None:
         with self._lock:
-            return self._jobs.get(job_id)
+            return _snapshot(self._jobs.get(job_id))
 
     def update(self, job_id: str, **fields) -> Job:
         with self._lock:
@@ -43,7 +57,8 @@ class InMemoryJobStore:
                 if k not in _JOB_FIELDS:
                     raise ValueError(f"unknown Job field in update(): {k!r}")
                 setattr(job, k, v)
-            return job
+            # job is non-None here (KeyError raised above), so return a Job (not Job|None).
+            return copy.deepcopy(job)
 
     def update_if_status(
         self,
@@ -87,7 +102,7 @@ class InMemoryJobStore:
             jobs = jobs[offset:]
         if limit is not None:
             jobs = jobs[:limit]
-        return jobs
+        return [copy.deepcopy(j) for j in jobs]
 
     def count(self, status: JobStatus | None = None) -> int:
         with self._lock:
@@ -108,7 +123,7 @@ class InMemoryJobStore:
             job.status = JobStatus.RUNNING
             job.started_at = time.time()
             job.claim_id = uuid.uuid4().hex  # fresh ownership token per claim
-            return job
+            return _snapshot(job)
 
     def delete(self, job_id: str) -> None:
         with self._lock:

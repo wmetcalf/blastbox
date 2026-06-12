@@ -92,6 +92,11 @@ def _oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> dict:
             {"destination": "/proc", "type": "proc", "source": "proc"},
             {"destination": "/dev", "type": "tmpfs", "source": "tmpfs",
              "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]},
+            # POSIX shared memory. The /dev tmpfs above shadows the rootfs's /dev/shm, so
+            # without this multiprocessing.SemLock() fails (FileNotFoundError/PermissionError)
+            # — which breaks pypdfium2's multiprocessing page-render pool on multi-page PDFs.
+            {"destination": "/dev/shm", "type": "tmpfs", "source": "tmpfs",
+             "options": ["rw", "nosuid", "nodev", "mode=1777", "size=256m"]},
             {"destination": "/tmp", "type": "tmpfs", "source": "tmpfs",
              # mode=1777 (sticky world-writable like a real /tmp) so the NON-ROOT worker can
              # write soffice's profile + the OSL UNO pipe under /tmp.

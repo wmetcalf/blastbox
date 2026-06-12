@@ -29,4 +29,10 @@ COPY deploy/gvisor/run_warm.py /opt/blastbox/run_warm.py
 COPY deploy/firecracker/engines.py /opt/blastbox/engines.py
 RUN printf '%s' "${ENGINE}" > /opt/blastbox/engine
 
+# Bind mountpoints for the per-slot /in /out /ctrl dirs. The OCI rootfs is mounted
+# READ-ONLY at restore, so runsc cannot mkdir these targets itself — they MUST exist
+# in the image. Without them the base boot dies: "mounting /in: mkdir(...): read-only
+# file system", before warmup/checkpoint ever runs.
+RUN mkdir -p /in /out /ctrl
+
 # The warm worker env then sets LD_PRELOAD=/opt/clippyshot/accept-retry.so (soffice only).

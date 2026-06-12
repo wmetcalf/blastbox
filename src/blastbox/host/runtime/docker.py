@@ -94,6 +94,21 @@ _APPARMOR_WARNING = (
 _SECCOMP_WARNING = (
     "BLASTBOX_SECCOMP_JSON_HOST not set; worker runs under docker-default seccomp"
 )
+_NONO_SKIP_RUNSC_WARNING = (
+    "BLASTBOX_WORKER_NONO_WRAP set but skipped under runsc: the gVisor Sentry does not "
+    "implement Landlock (ENOSYS), so nono cannot enforce there — gVisor is the boundary"
+)
+
+# Optional outer nono (Landlock) wrap of the WHOLE worker command (cold path). Opt-in via
+# BLASTBOX_WORKER_NONO_WRAP; Landlock-gated (runc + the FC guest, NOT runsc). A profile
+# (BLASTBOX_WORKER_NONO_PROFILE) is preferred; otherwise a coarse write-confinement baseline
+# (read system dirs, write only /tmp + the output mount + /dev, block net). nono's state goes
+# on a dedicated tmpfs OFF the grants (the read-only worker rootfs has only /tmp writable, and
+# /tmp is itself granted — so state can't live there).
+_DEFAULT_WORKER_NONO_BIN = "/usr/local/bin/nono"
+_DEFAULT_NONO_STATE_DIR = "/run/nono"
+# Read-only roots a worker needs (engine install lands in /opt or /usr; fonts in /usr/share).
+_NONO_RO_ROOTS = ("/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/opt", "/var", "/proc", "/sys")
 
 # ---------------------------------------------------------------------------
 # Worker resource-cap defaults.  Overridable via BLASTBOX_WORKER_* env vars.
@@ -297,6 +312,39 @@ def select_worker_runtime(
 _WORKER_APPARMOR_PROFILE = "blastbox-worker"
 
 
+def _nono_launch_wrap(
+    worker_argv: Sequence[str],
+    *,
+    nono_bin: str,
+    profile: str,
+    state_dir: str,
+    input_mount_path: str,
+    output_mount_path: str,
+) -> list[str]:
+    """Wrap a worker command in ``nono wrap`` (Landlock). Returns the new command.
+
+    Shape: ``env HOME=<state> nono wrap <grants> --block-net -- env HOME=/tmp <worker>``.
+    The outer ``env`` relocates nono's own $HOME/.nono state onto a dedicated tmpfs OFF
+    the grants; the inner ``env HOME=/tmp`` restores the worker's HOME while inheriting the
+    rest of the container env. Every grant source is a value arg after its flag — no caller
+    value lands in a flag position (the module's security contract). A profile (``-p``) is
+    preferred; otherwise a coarse write-confinement baseline.
+    """
+    grants: list[str] = []
+    if profile:
+        grants += ["-p", profile]
+    else:
+        for d in _NONO_RO_ROOTS:
+            grants += ["-r", d]
+        grants += ["-a", "/tmp", "-a", "/dev", "-a", output_mount_path,
+                   "--read-file", input_mount_path]
+    return [
+        "/usr/bin/env", f"HOME={state_dir}",
+        nono_bin, "wrap", "--silent", *grants, "--block-net", "--",
+        "/usr/bin/env", "HOME=/tmp", *worker_argv,
+    ]
+
+
 def build_worker_docker_run_argv(
     *,
     image: str,
@@ -338,11 +386,21 @@ def build_worker_docker_run_argv(
     bind_input = str(Path(input_path).expanduser().resolve(strict=False))
     bind_output = str(Path(output_dir).expanduser().resolve(strict=False))
 
-    # Resource caps.  Each env var, if set, overrides the default.
-    memory = os.environ.get("BLASTBOX_WORKER_MEMORY", _DEFAULT_WORKER_MEMORY)
-    pids_limit = os.environ.get("BLASTBOX_WORKER_PIDS_LIMIT", _DEFAULT_WORKER_PIDS_LIMIT)
-    cpus = os.environ.get("BLASTBOX_WORKER_CPUS", _DEFAULT_WORKER_CPUS)
-    nofile = os.environ.get("BLASTBOX_WORKER_NOFILE", _DEFAULT_WORKER_NOFILE)
+    # Resource caps.  Each env var, if set to a NON-EMPTY value, overrides the default.
+    # Use ``get(K) or default`` (not ``get(K, default)``): docker-compose passes
+    # ``BLASTBOX_WORKER_MEMORY=${BLASTBOX_WORKER_MEMORY:-}`` which sets the var to the EMPTY
+    # string when the operator leaves it unset — and ``get(K, default)`` returns that ""
+    # (the key exists), yielding a bare ``--memory '' --cpus '' --pids-limit ''`` that makes
+    # ``docker run`` fail at launch with ``invalid argument "" for "--memory"`` (RC 125), which
+    # the cold path's ``check=False`` swallows into an opaque "metadata.json not found". Treat
+    # set-but-empty — AND set-but-whitespace-only (e.g. ``BLASTBOX_WORKER_MEMORY=" "`` from a
+    # malformed env file) — as unset; both would otherwise reach ``docker run`` as an invalid arg.
+    memory = (os.environ.get("BLASTBOX_WORKER_MEMORY") or "").strip() or _DEFAULT_WORKER_MEMORY
+    pids_limit = (
+        os.environ.get("BLASTBOX_WORKER_PIDS_LIMIT") or ""
+    ).strip() or _DEFAULT_WORKER_PIDS_LIMIT
+    cpus = (os.environ.get("BLASTBOX_WORKER_CPUS") or "").strip() or _DEFAULT_WORKER_CPUS
+    nofile = (os.environ.get("BLASTBOX_WORKER_NOFILE") or "").strip() or _DEFAULT_WORKER_NOFILE
 
     # Tell the worker's sandbox self-check to be lenient. Under runsc that's because
     # /proc doesn't reflect the host-applied flags (still secure); under an insecure
@@ -351,6 +409,22 @@ def build_worker_docker_run_argv(
     warn_on_insecure: str | None = None
     if runtime.runtime == "runsc" or not runtime.secure:
         warn_on_insecure = "1"
+
+    # Optional outer nono (Landlock) wrap of the whole worker command — opt-in via
+    # BLASTBOX_WORKER_NONO_WRAP, Landlock-gated. The gVisor Sentry returns ENOSYS for the
+    # landlock_* syscalls, so under runsc it is SKIPPED + warned (gVisor is already the
+    # boundary); runc + the FC guest expose Landlock and enforce it.
+    nono_enabled = (os.environ.get("BLASTBOX_WORKER_NONO_WRAP") or "").strip().lower() \
+        not in ("", "0", "false", "no")
+    apply_nono = False
+    nono_state_dir = (
+        os.environ.get("BLASTBOX_WORKER_NONO_STATE_DIR") or ""
+    ).strip() or _DEFAULT_NONO_STATE_DIR
+    if nono_enabled:
+        if runtime.runtime == "runsc":
+            runtime.warnings.append(_NONO_SKIP_RUNSC_WARNING)
+        else:
+            apply_nono = True
 
     # ------------------------------------------------------------------
     # Core hardened argv — every flag is unconditional.
@@ -391,6 +465,11 @@ def build_worker_docker_run_argv(
         "--workdir",
         workdir,
     ]
+
+    # Dedicated writable tmpfs for nono's state, OFF the grants (the worker rootfs is
+    # read-only and /tmp is itself granted, so nono's $HOME/.nono can't live there).
+    if apply_nono:
+        argv.extend(["--tmpfs", f"{nono_state_dir}:rw,nosuid,nodev,size=32m"])
 
     # ------------------------------------------------------------------
     # Optional AppArmor profile (if loaded on the host kernel).
@@ -441,8 +520,24 @@ def build_worker_docker_run_argv(
     argv.append(image)
 
     # ------------------------------------------------------------------
-    # Worker command (passed verbatim, already a list).
+    # Worker command — verbatim, OR wrapped in `nono wrap` (opt-in, Landlock-gated).
     # ------------------------------------------------------------------
-    argv.extend(worker_argv)
+    if apply_nono:
+        nono_bin = (
+            os.environ.get("BLASTBOX_WORKER_NONO_BIN") or ""
+        ).strip() or _DEFAULT_WORKER_NONO_BIN
+        nono_profile = (os.environ.get("BLASTBOX_WORKER_NONO_PROFILE") or "").strip()
+        argv.extend(
+            _nono_launch_wrap(
+                worker_argv,
+                nono_bin=nono_bin,
+                profile=nono_profile,
+                state_dir=nono_state_dir,
+                input_mount_path=input_mount_path,
+                output_mount_path=output_mount_path,
+            )
+        )
+    else:
+        argv.extend(worker_argv)
 
     return argv

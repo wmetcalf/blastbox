@@ -122,28 +122,29 @@ def test_gvisor_snapshot_roundtrip(tmp_path: Path) -> None:
             "populate tests/fixtures/ with at least one .docx or .txt file"
         )
 
+    import dataclasses
+
     from blastbox.host.runtime.fc_snapshot import SnapshotManager
-    from blastbox.host.runtime.gvisor_snapshot import GvisorConfig, GvisorSnapshotBackend
+    from blastbox.host.runtime.gvisor_snapshot import GvisorSnapshotBackend
     from blastbox.host.runtime.gvisor_snapshot_runtime import (
-        _DEFAULT_WARM_ARGV,
         GvisorSnapshotSlotRuntime,
+        _gvisor_config_from_env,
     )
     from blastbox.worker.warm import HostWarmControl, WarmJobSpec
 
-    # --- env-driven config (mirrors _gvisor_config_from_env) ---
-    runsc_bin = os.environ.get("BLASTBOX_GVISOR_RUNSC", "runsc")
-    raw_argv = os.environ.get("BLASTBOX_GVISOR_WARM_ARGV", "").strip()
-    warm_argv: list[str] = json.loads(raw_argv) if raw_argv else list(_DEFAULT_WARM_ARGV)
-    ld_preload: str | None = os.environ.get("BLASTBOX_GVISOR_LD_PRELOAD") or None
     settle_s = float(os.environ.get("BLASTBOX_SNAPSHOT_SETTLE_S", "1.0"))
 
-    cfg = GvisorConfig(
-        runsc_bin=runsc_bin,
-        root=tmp_path / "root",
+    # Build the config through the REAL env-driven path so EVERY BLASTBOX_GVISOR_* knob
+    # (warm_argv, ld_preload, extra_env, rlimits, ...) is exercised end-to-end. A hand-rolled
+    # mirror silently drops new knobs — it did exactly that: BLASTBOX_GVISOR_EXTRA_ENV (needed to
+    # hand the clippyshot worker CLIPPYSHOT_SANDBOX=container + CLIPPYSHOT_WARN_ON_INSECURE=1 for
+    # the runsc inner-sandbox, which gVisor's virtualized /proc/self/status hides) was missed.
+    # Override only image_rootfs (the exported test rootfs) + root (BLASTBOX_GVISOR_ROOT defaults
+    # to a shared /var/lib path) for per-test isolation.
+    cfg = dataclasses.replace(
+        _gvisor_config_from_env(os.environ),
         image_rootfs=Path(rootfs),
-        network="none",
-        warm_argv=warm_argv,
-        ld_preload=ld_preload,
+        root=tmp_path / "root",
     )
     backend = GvisorSnapshotBackend(cfg)
     mgr = SnapshotManager(tmp_path / "snap", backend)

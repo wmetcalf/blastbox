@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -361,6 +362,16 @@ def serve_warm(
     # ------------------------------------------------------------------
     # Step 4: process the one job through the unchanged cold-path harness
     # ------------------------------------------------------------------
+    # The warm process's environment is frozen at snapshot time, so per-job params
+    # can't arrive as container `-e` env the way the cold path gets them. Apply the
+    # dispatcher-allowlisted params (e.g. clippyshot's CLIPPYSHOT_* scanner toggles)
+    # to os.environ here — before detonation — so engine.detonate honours them. The
+    # dispatcher already restricts these to the engine's allowlist; the key-shape
+    # check is belt-and-braces against a malformed go.json.
+    for _k, _v in (spec.params or {}).items():
+        if isinstance(_k, str) and re.fullmatch(r"[A-Z][A-Z0-9_]*", _k):
+            os.environ[_k] = str(_v)
+
     rc: int = 1
     try:
         rc = run_detonation(

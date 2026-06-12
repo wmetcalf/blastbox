@@ -65,7 +65,35 @@ _MAX_ENV_VALUE_LEN = 4096
 # Pattern for valid extra_env keys derived from job.params.
 # Must start with an uppercase letter, contain only uppercase letters, digits,
 # and underscores.  This prevents any lowercase/symbol injection.
-_VALID_ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_VALID_ENV_KEY_RE = re.compile(r"\A[A-Z][A-Z0-9_]*\Z")  # \Z (not $) — $ also matches a trailing \n
+
+# Reserved env keys/prefixes that a client's job.params may NEVER set, even when they
+# match the key shape and even if an engine's allowlist is misconfigured (belt-and-
+# suspenders / fail-safe). Prefixes cover framework + loader/interpreter control
+# (re-selecting the engine, re-wiring I/O, hijacking the dynamic loader or Python).
+# The exact keys additionally reserve worker SECURITY-POSTURE knobs an audit flagged
+# as client-reachable weakening (inner-sandbox selection, insecure-mode fallback,
+# security-internals disclosure, and the warm-diag write primitive). The primary
+# control is the per-engine default-deny allowlist below; this denylist is the
+# unconditional floor that holds even with no allowlist configured.
+_RESERVED_ENV_PREFIXES = ("BLASTBOX_", "LD_", "PYTHON")
+_RESERVED_ENV_KEYS = frozenset({
+    # Executable/command resolution — a client setting PATH (or IFS) could redirect the
+    # worker's `java`/`soffice`/`python` lookup to an attacker-planted binary under a
+    # writable mount (e.g. /tmp), i.e. arbitrary code as the worker uid. LD_* is already
+    # prefix-reserved; PATH/IFS close the rest of the loader/shell-resolution surface.
+    "PATH",
+    "IFS",
+    "CLIPPYSHOT_WARM_DIAG_FILE",
+    "CLIPPYSHOT_SANDBOX",
+    "CLIPPYSHOT_WARN_ON_INSECURE",
+    "CLIPPYSHOT_DISCLOSE_SECURITY_INTERNALS",
+})
+
+
+def _is_reserved_env_key(key: str) -> bool:
+    return key in _RESERVED_ENV_KEYS or key.startswith(_RESERVED_ENV_PREFIXES)
+
 
 # Max number of entries (files + dirs) allowed in a worker output dir — bounds inode + walk-time
 # exhaustion from undeclared files even under the byte cap.
@@ -84,6 +112,13 @@ class EngineSpec:
     name: str
     image: str
     worker_argv: list[str]
+    # Operator-configured allowlist of job.param keys forwardable to the worker as env.
+    # None (default) = no allowlist configured (legacy shape+denylist behaviour); a
+    # frozenset = ONLY those keys forward (default-deny, per engine) — and an EXPLICITLY
+    # EMPTY frozenset blocks ALL client params (it does not collapse to legacy). This keeps
+    # the privilege of opening the worker's env namespace with the operator who configures
+    # the engine — not any client who can guess a key the worker reads.
+    allowed_param_keys: frozenset[str] | None = None
 
 
 class Dispatcher:
@@ -107,6 +142,8 @@ class Dispatcher:
         pool: "WarmPool | None" = None,
         warm_claim_timeout_s: float = 2.0,
         requeue_grace_s: float = 60.0,
+        warm_only: bool = False,
+        warm_requeue_backoff_s: float = 1.0,
     ) -> None:
         self._job_store = job_store
         # engines is kept as an immutable mapping snapshot so callers cannot
@@ -121,6 +158,21 @@ class Dispatcher:
         self._pool = pool
         self._warm_claim_timeout_s = float(warm_claim_timeout_s)
         self._requeue_grace_s = max(0.0, float(requeue_grace_s))
+        # Warm-ONLY dispatcher (a socket-less warm-pool SIDECAR, e.g. the gVisor C/R or
+        # Firecracker tier): on a warm-pool miss, RE-QUEUE the job instead of cold-falling-back.
+        # Such a sidecar holds NO docker socket, so _dispatch_inner (cold) would fail closed
+        # ("runtime 'runc' is insecure: runsc unavailable") and FAIL the job rather than let the
+        # cold dispatcher take it. Only meaningful WITH a pool (guarded at the call site); a
+        # warm-only dispatcher with no pool would requeue every job forever, so it stays inert
+        # there and the cold path runs. Requires a separate cold dispatcher to drain overflow.
+        self._warm_only = bool(warm_only)
+        # Backoff after a warm-only requeue. dispatch_once() returns True (a job WAS claimed),
+        # so run_forever does NOT sleep its poll interval and would immediately re-claim — and the
+        # job we just released to QUEUED is the oldest, so THIS dispatcher would keep re-grabbing
+        # it, starving the cold dispatcher and churning the job store. (Not a tight CPU loop:
+        # pool.claim already blocks up to warm_claim_timeout_s each iteration.) Sleeping briefly
+        # before returning yields the requeued job to a peer dispatcher / lets a warm slot free.
+        self._warm_requeue_backoff_s = max(0.0, float(warm_requeue_backoff_s))
         # Safety floor for warm recovery: the warm staleness cutoff anchors on started_at (set at
         # CLAIM time), but a warm job's bounding deadline is only established later — after
         # pool.claim (<= warm_claim_timeout_s) + input staging. requeue_grace_s is the slack that
@@ -128,6 +180,16 @@ class Dispatcher:
         # warm job stale. Floor it at the claim window when a pool is configured.
         if self._pool is not None:
             self._requeue_grace_s = max(self._requeue_grace_s, self._warm_claim_timeout_s)
+        # Warm-pool SIDECAR mode: claim a job ONLY when a warm slot is free (claim-gate) and
+        # NEVER cold-fall-back — overflow stays queued for the cold dispatcher / other warm
+        # sidecars. This lets a single-purpose, socket-less warm dispatcher run beside the
+        # hardened cold one, with each warm backend's privilege (FC: /dev/kvm; gVisor: scoped
+        # caps) confined to it. The main dispatcher keeps the docker socket + full hardening.
+        self._warm_only = bool(warm_only)
+        if self._warm_only and self._pool is None:
+            raise ValueError(
+                "warm_only dispatcher requires a warm pool (set BLASTBOX_POOL_RUNTIME)"
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -138,6 +200,11 @@ class Dispatcher:
 
         Returns True if a job was claimed, False if the queue was empty.
         """
+        # Warm-sidecar claim-gate: don't pull a job unless a warm slot is free right NOW.
+        # Overflow stays queued for the cold dispatcher / another warm sidecar — a warm-only
+        # dispatcher has no cold path, so it must not claim work it can't immediately serve.
+        if self._warm_only and (self._pool is None or self._pool.idle_count <= 0):
+            return False
         job = self._job_store.claim_next()
         if job is None:
             return False
@@ -394,6 +461,35 @@ class Dispatcher:
                     self._delete_input_if_owned(job, input_path)
                     self._record_outcome(job, path="warm", started=t0)
                 return
+            elif self._warm_only:
+                # Warm-only sidecar: do NOT cold-fall-back (no docker socket here — the cold
+                # path would fail closed and FAIL the job). Release the claim back to QUEUED so
+                # the cold dispatcher (or another warm tier) claims it. CAS-fenced on OUR
+                # claim_id and clears it, so a job reclaimed since we claimed is left untouched;
+                # started_at/worker_runtime are reset so it looks fresh. The staged input is NOT
+                # deleted — the next owner needs it (we only delete input on paths WE terminate).
+                requeued = self._job_store.update_if_status(
+                    job.job_id,
+                    JobStatus.RUNNING,
+                    expect_claim_id=job.claim_id,
+                    status=JobStatus.QUEUED,
+                    started_at=None,
+                    worker_runtime=None,
+                    claim_id=None,
+                    error=None,
+                )
+                _log.info(
+                    "warm_pool_miss job_id=%s; warm_only requeue=%s (no cold fallback)",
+                    job.job_id,
+                    requeued,
+                )
+                # Yield before returning: dispatch_once() reports progress (a job was claimed),
+                # so run_forever loops without its poll sleep — without this, THIS dispatcher
+                # re-claims the just-requeued job in a ~warm_claim_timeout_s-paced churn loop and
+                # the cold dispatcher never gets a turn at it. The backoff hands it off.
+                if self._warm_requeue_backoff_s:
+                    time.sleep(self._warm_requeue_backoff_s)
+                return
             else:
                 _log.info("warm_pool_miss job_id=%s; falling back to cold path", job.job_id)
 
@@ -517,7 +613,7 @@ class Dispatcher:
             spec = WarmJobSpec(
                 input_path=input_path,
                 output_dir=slot.output_dir,
-                params=self._sanitize_params(job.params),
+                params=self._sanitize_params(job.params, engine.allowed_param_keys),
             )
             # One absolute deadline bounds the input send + wait (the only steps a slow guest
             # can stall) to worker_timeout_s, so the upload (which runs BEFORE the wait) can't
@@ -615,6 +711,17 @@ class Dispatcher:
                 return
             except Exception as exc:  # noqa: BLE001
                 self._fail_job(job, f"unexpected trust validation error: {exc}")
+                return
+
+            # The trust gate validates output STRUCTURE, not the engine's verdict: an engine that
+            # honestly reports a FAILED conversion (status="engine_error", typically 0 artifacts)
+            # still produces a structurally valid envelope. Gate on it here — else a failed convert
+            # is silently marked DONE (a false green that lets a broken warm tier pass a corpus).
+            # "rejected" (unsupported/encrypted input) is a legitimate engine verdict, not an error,
+            # so it stays DONE.
+            if envelope.status == "engine_error":
+                detail = envelope.warnings[0].message if envelope.warnings else "engine_error"
+                self._fail_job(job, f"engine_error: {detail}")
                 return
 
             # ------------------------------------------------------------------
@@ -732,6 +839,12 @@ class Dispatcher:
         # dir writable by it (cold-path parity with the warm /out 0o777). The host
         # re-seals + size-caps the result regardless, so 0o777 here widens no trust
         # boundary — the worker's output is untrusted on every path.
+        # Wipe-then-recreate for a clean slate (mirrors the warm path): a requeued
+        # job must NOT inherit files a prior crashed/compromised worker left behind —
+        # stale undeclared files would otherwise count against the output size cap
+        # (a spurious-failure DoS) and, pre the serve-route manifest check, be
+        # servable. The host owns this dir between attempts, so the wipe is safe.
+        shutil.rmtree(output_dir, ignore_errors=True)
         output_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(output_dir, 0o777)
 
@@ -750,7 +863,7 @@ class Dispatcher:
                 "blastbox.job_id": job.job_id,
             },
             extra_env={
-                **self._sanitize_params(job.params),
+                **self._sanitize_params(job.params, engine.allowed_param_keys),
                 # Tell the harness where the dispatcher mounted I/O (it mounts the input file at
                 # /input/<name> and output at /output; the harness defaults are /in,/out, so
                 # without this the cold path is broken-as-wired). Dispatcher-set keys are merged
@@ -764,7 +877,7 @@ class Dispatcher:
             # Run to completion (or timeout). The worker's exit code is not the
             # authority — the trust gate below decides DONE/FAILED from the
             # re-sealed output. capture_output keeps worker stdio off our streams.
-            self._subprocess_runner(
+            proc = self._subprocess_runner(
                 argv,
                 capture_output=True,
                 text=True,
@@ -779,6 +892,22 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             self._fail_job(job, f"docker launch failed: {exc}")
             return
+
+        # The worker's exit code is NOT the authority (the trust gate below is), but a non-zero
+        # `docker run` (e.g. a malformed flag → RC 125 "invalid argument for --memory", or an
+        # OOM-killed worker) produces NO output, so the trust gate then fails with an opaque
+        # "metadata.json not found". Log the launcher's exit + stderr tail so that whole class of
+        # launch failure is diagnosable instead of being silently mislabeled as missing output.
+        launch_rc = getattr(proc, "returncode", None)
+        if launch_rc:
+            stderr_tail = (getattr(proc, "stderr", "") or "")[-500:].strip()
+            _log.warning(
+                "worker launcher for job %s exited rc=%s (output is trust-gated regardless); "
+                "docker/worker stderr tail: %s",
+                job.job_id,
+                launch_rc,
+                stderr_tail,
+            )
 
         # Bound TOTAL on-disk output (declared + UNDECLARED) before trusting it, so a worker
         # that wrote a huge undeclared file can't exhaust job_root (#3 disk-exhaustion DoS).
@@ -810,6 +939,15 @@ class Dispatcher:
             return
         except Exception as exc:  # noqa: BLE001
             self._fail_job(job, f"unexpected trust validation error: {exc}")
+            return
+
+        # The trust gate validates output STRUCTURE, not the engine's verdict: a structurally valid
+        # envelope can still report a FAILED conversion (status="engine_error"). Gate on it here —
+        # else a failed convert is silently marked DONE (a false green). "rejected" (unsupported/
+        # encrypted input) is a legitimate engine verdict, not an error, so it stays DONE.
+        if envelope.status == "engine_error":
+            detail = envelope.warnings[0].message if envelope.warnings else "engine_error"
+            self._fail_job(job, f"engine_error: {detail}")
             return
 
         # Persist the host-SEALED metadata over the worker's raw file so the API serves trusted
@@ -1084,12 +1222,25 @@ class Dispatcher:
         return job_ids
 
     @staticmethod
-    def _sanitize_params(params: dict[str, str]) -> dict[str, str]:
+    def _sanitize_params(
+        params: dict[str, str], allowed_keys: frozenset[str] | None = None
+    ) -> dict[str, str]:
         """Filter job.params to a safe subset suitable for extra_env.
 
         Security:
         - Keys must match ``^[A-Z][A-Z0-9_]*$`` (uppercase start, no symbols).
           A key like ``"x; --privileged"`` is silently dropped.
+        - Reserved keys/prefixes are dropped even though they match the shape
+          (BLASTBOX_*, LD_*, PYTHON*, PATH/IFS, and specific security/breadcrumb keys):
+          a client must not be able to re-select the engine (BLASTBOX_ENGINE), re-wire
+          I/O, flip the security posture (sandbox selection / insecure fallback /
+          internals disclosure), or hijack the loader/interpreter resolution.
+        - ``allowed_keys`` per-engine ALLOWLIST, with a deliberate None-vs-empty split:
+          * ``None`` (UNSET) = no allowlist configured → legacy shape+denylist behaviour.
+          * a frozenset (incl. the EMPTY one) = explicit allowlist → ONLY those keys
+            forward (default-deny). An explicitly-empty allowlist therefore blocks ALL
+            client params — which is what an operator configuring an empty set means,
+            and must NOT silently collapse to legacy.
         - Values are capped at _MAX_ENV_VALUE_LEN characters.
         - Everything is coerced to str before inclusion.
 
@@ -1101,6 +1252,15 @@ class Dispatcher:
                 continue
             if not _VALID_ENV_KEY_RE.match(key):
                 _log.debug("dropping invalid extra_env key: %r", key)
+                continue
+            if _is_reserved_env_key(key):
+                _log.warning("dropping reserved extra_env key from job.params: %r", key)
+                continue
+            if allowed_keys is not None and key not in allowed_keys:
+                _log.warning(
+                    "dropping non-allowlisted extra_env key %r from job.params "
+                    "(per-engine allowlist in effect)", key,
+                )
                 continue
             str_val = str(value) if value is not None else ""
             if len(str_val) > _MAX_ENV_VALUE_LEN:
