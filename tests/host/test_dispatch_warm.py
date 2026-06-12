@@ -250,6 +250,7 @@ def _make_dispatcher_with_pool(
         pool=pool,
         warm_claim_timeout_s=warm_claim_timeout_s,
         warm_only=warm_only,
+        warm_requeue_backoff_s=0.0,  # tests must not sleep the real 1.0s requeue backoff
     )
 
 
@@ -705,6 +706,37 @@ def test_warm_only_requeues_on_miss_instead_of_cold(tmp_path):
     # Input preserved for the next owner.
     assert input_path.exists()
     assert len(pool.release_calls) == 0
+
+
+def test_warm_only_requeue_backs_off_before_returning(tmp_path, monkeypatch):
+    """A warm-only requeue sleeps warm_requeue_backoff_s before returning, so this dispatcher
+    doesn't immediately re-claim the just-requeued job (dispatch_once reports progress, so
+    run_forever skips its poll sleep). Without it, the cold dispatcher gets starved."""
+    import blastbox.host.dispatch as dispatch_mod
+
+    slept: list[float] = []
+    monkeypatch.setattr(dispatch_mod.time, "sleep", lambda s: slept.append(s))
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    d = Dispatcher(
+        job_store=store,
+        engines={_ENGINE_NAME: _engine_spec()},
+        limits=_limits(),
+        job_root=tmp_path / "jobs",
+        runtime_selector=_fake_runtime,
+        pool=FakeWarmPool(None),  # always misses
+        warm_only=True,
+        warm_requeue_backoff_s=0.75,
+    )
+    d.dispatch_once()
+
+    assert store.get(job.job_id).status == JobStatus.QUEUED
+    assert 0.75 in slept, f"expected a 0.75s requeue backoff; slept={slept}"
 
 
 # ===========================================================================

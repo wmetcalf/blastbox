@@ -108,6 +108,7 @@ class Dispatcher:
         warm_claim_timeout_s: float = 2.0,
         requeue_grace_s: float = 60.0,
         warm_only: bool = False,
+        warm_requeue_backoff_s: float = 1.0,
     ) -> None:
         self._job_store = job_store
         # engines is kept as an immutable mapping snapshot so callers cannot
@@ -130,6 +131,13 @@ class Dispatcher:
         # warm-only dispatcher with no pool would requeue every job forever, so it stays inert
         # there and the cold path runs. Requires a separate cold dispatcher to drain overflow.
         self._warm_only = bool(warm_only)
+        # Backoff after a warm-only requeue. dispatch_once() returns True (a job WAS claimed),
+        # so run_forever does NOT sleep its poll interval and would immediately re-claim — and the
+        # job we just released to QUEUED is the oldest, so THIS dispatcher would keep re-grabbing
+        # it, starving the cold dispatcher and churning the job store. (Not a tight CPU loop:
+        # pool.claim already blocks up to warm_claim_timeout_s each iteration.) Sleeping briefly
+        # before returning yields the requeued job to a peer dispatcher / lets a warm slot free.
+        self._warm_requeue_backoff_s = max(0.0, float(warm_requeue_backoff_s))
         # Safety floor for warm recovery: the warm staleness cutoff anchors on started_at (set at
         # CLAIM time), but a warm job's bounding deadline is only established later — after
         # pool.claim (<= warm_claim_timeout_s) + input staging. requeue_grace_s is the slack that
@@ -425,6 +433,12 @@ class Dispatcher:
                     job.job_id,
                     requeued,
                 )
+                # Yield before returning: dispatch_once() reports progress (a job was claimed),
+                # so run_forever loops without its poll sleep — without this, THIS dispatcher
+                # re-claims the just-requeued job in a ~warm_claim_timeout_s-paced churn loop and
+                # the cold dispatcher never gets a turn at it. The backoff hands it off.
+                if self._warm_requeue_backoff_s:
+                    time.sleep(self._warm_requeue_backoff_s)
                 return
             else:
                 _log.info("warm_pool_miss job_id=%s; falling back to cold path", job.job_id)
