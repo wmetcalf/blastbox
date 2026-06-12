@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "blastbox"
-version = "0.1.10"
+version = "0.1.11"
 description = "Reusable detonation framework: run untrusted documents through disposable, hardened workers"
 readme = "README.md"
 requires-python = ">=3.12"

@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import tarfile
 import threading
 import time
 import uuid
@@ -120,8 +121,47 @@ class GvisorSnapshotSlotRuntime:
         return dst
 
     def materialize_warm_output(self, slot: Slot) -> None:
-        # Output is written directly into the bind-mounted out/ dir; nothing to read back.
-        return None
+        # A C/R-restored container propagates FILES written at the /out root to the host bind
+        # source, but NOT directories it creates post-restore (the restored process's gofer/VFS view
+        # is stale) — so a TREE-output engine (e.g. RedTusk's rmeta/) loses everything below /out
+        # from the host's view, while a FLAT-output engine (clippyshot's page-NNN.png at the root)
+        # is unaffected. Recover the tree: have the still-alive container pack /out into a ROOT-level
+        # archive (which DOES propagate), then extract it here over the host slot out/. Fail-OPEN:
+        # any error leaves whatever the bind mount already carried, so flat-output engines (and the
+        # case where there's nothing nested to recover) are never worse off than the old no-op.
+        from blastbox.host.runtime.gvisor_snapshot import WARM_OUTPUT_ARCHIVE
+
+        with self._lock:
+            handle = self._handles.get(slot.slot_id)
+        archiver = getattr(handle, "archive_output", None)
+        if not callable(archiver):
+            return
+        out = Path(slot.output_dir)
+        arc = out / WARM_OUTPUT_ARCHIVE
+        try:
+            if not archiver():
+                _log.warning("gvisor materialize: archive_output exec failed slot=%s", slot.slot_id)
+                return
+            if not arc.is_file():
+                # The container's root-level archive didn't reach the host bind source — nothing to
+                # recover beyond what already propagated (e.g. flat output).
+                return
+            with tarfile.open(arc, "r:") as tf:
+                # 'data' filter (3.12+) blocks path traversal, absolute paths, and special files.
+                tf.extractall(out, filter="data")
+            _log.info(
+                "gvisor materialize: recovered warm output tree slot=%s (%d bytes)",
+                slot.slot_id, arc.stat().st_size,
+            )
+        except Exception as exc:  # noqa: BLE001 — materialize must never raise
+            _log.warning(
+                "gvisor materialize_warm_output recovery failed slot=%s: %s", slot.slot_id, exc
+            )
+        finally:
+            try:
+                arc.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 class GvisorHostWarmControl:
