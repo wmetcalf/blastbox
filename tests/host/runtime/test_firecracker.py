@@ -792,6 +792,65 @@ class TestRdumpExt4:
         with pytest.raises(ValueError, match="cannot read"):
             rdump_ext4(img, dest, max_bytes=1024)
 
+    def test_e2fsck_recover_and_retry_when_first_rdump_empty(self, tmp_path, monkeypatch):
+        """A guest SIGKILLed off a no-journal ext4 can leave bitmaps inconsistent so the
+        first debugfs rdump reads NOTHING ('Filesystem not open'). rdump_ext4 must then
+        run e2fsck -fy (rebuilds bitmaps from the intact inode tree) and retry the rdump,
+        which then sees the file."""
+        img = tmp_path / "disk.ext4"
+        self._write_valid_ext4_magic(img)
+        dest = tmp_path / "out"
+
+        calls: list[str] = []
+
+        def fake_run(cmd, **kwargs):  # noqa: ANN001
+            tool = cmd[0]
+            calls.append(tool)
+            res = MagicMock()
+            res.returncode = 0
+            res.stderr = b""
+            if tool == "debugfs":
+                if calls.count("debugfs") == 1:
+                    # First rdump: unreadable fs -> writes nothing, error on stderr.
+                    res.stderr = b"disk.ext4: Filesystem not open\n"
+                else:
+                    # Post-e2fsck retry: the file is now extractable.
+                    (dest / "metadata.json").write_text("{}")
+            return res
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        names = rdump_ext4(img, dest, max_bytes=1024 * 1024)
+        assert calls == ["debugfs", "e2fsck", "debugfs"], calls
+        assert "metadata.json" in names
+
+    def test_e2fsck_recover_when_first_rdump_exits_nonzero(self, tmp_path, monkeypatch):
+        """A NON-zero debugfs exit must also fall through to the e2fsck recovery, not raise
+        and bypass it (the first rdump is check=False; the post-recovery rdump is fatal)."""
+        img = tmp_path / "disk.ext4"
+        self._write_valid_ext4_magic(img)
+        dest = tmp_path / "out"
+        calls: list[str] = []
+
+        def fake_run(cmd, **kwargs):  # noqa: ANN001
+            tool = cmd[0]
+            calls.append(tool)
+            res = MagicMock()
+            res.stderr = b""
+            if tool == "debugfs":
+                if calls.count("debugfs") == 1:
+                    res.returncode = 1  # non-zero: previously raised + bypassed recovery
+                else:
+                    res.returncode = 0
+                    (dest / "metadata.json").write_text("{}")
+            else:
+                res.returncode = 0
+            return res
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        names = rdump_ext4(img, dest, max_bytes=1024 * 1024)
+        assert calls == ["debugfs", "e2fsck", "debugfs"], calls
+        assert "metadata.json" in names
+
     def test_size_cap_enforced(self, tmp_path, monkeypatch):
         """If total extracted bytes exceed max_bytes, ValueError is raised."""
         img = tmp_path / "disk.ext4"
@@ -856,6 +915,22 @@ class TestMakeExt4:
             f.seek(0x438)
             magic = f.read(2)
         assert magic == b"\x53\xef", "Expected ext4 magic 0xEF53"
+
+    def test_no_metadata_csum_so_unclean_disk_stays_debugfs_readable(self, tmp_path):
+        """The single-use outdisk MUST be made without metadata_csum: the guest is
+        SIGKILLed off it (never unmounted), leaving bitmaps inconsistent — with
+        metadata_csum debugfs would refuse to open it ("Block bitmap checksum does not
+        match") and rdump would return nothing, recording a good job as
+        'metadata.json not found'."""
+        import subprocess as _sp
+
+        img = tmp_path / "test.ext4"
+        make_ext4(img, size_mib=16)
+        feats = _sp.run(
+            ["debugfs", "-R", "features", str(img)], capture_output=True, text=True
+        ).stdout
+        assert "metadata_csum" not in feats, f"outdisk must NOT have metadata_csum: {feats}"
+        assert "has_journal" not in feats, f"outdisk must NOT have a journal: {feats}"
 
 
 # ---------------------------------------------------------------------------

@@ -386,11 +386,21 @@ def build_worker_docker_run_argv(
     bind_input = str(Path(input_path).expanduser().resolve(strict=False))
     bind_output = str(Path(output_dir).expanduser().resolve(strict=False))
 
-    # Resource caps.  Each env var, if set, overrides the default.
-    memory = os.environ.get("BLASTBOX_WORKER_MEMORY", _DEFAULT_WORKER_MEMORY)
-    pids_limit = os.environ.get("BLASTBOX_WORKER_PIDS_LIMIT", _DEFAULT_WORKER_PIDS_LIMIT)
-    cpus = os.environ.get("BLASTBOX_WORKER_CPUS", _DEFAULT_WORKER_CPUS)
-    nofile = os.environ.get("BLASTBOX_WORKER_NOFILE", _DEFAULT_WORKER_NOFILE)
+    # Resource caps.  Each env var, if set to a NON-EMPTY value, overrides the default.
+    # Use ``get(K) or default`` (not ``get(K, default)``): docker-compose passes
+    # ``BLASTBOX_WORKER_MEMORY=${BLASTBOX_WORKER_MEMORY:-}`` which sets the var to the EMPTY
+    # string when the operator leaves it unset — and ``get(K, default)`` returns that ""
+    # (the key exists), yielding a bare ``--memory '' --cpus '' --pids-limit ''`` that makes
+    # ``docker run`` fail at launch with ``invalid argument "" for "--memory"`` (RC 125), which
+    # the cold path's ``check=False`` swallows into an opaque "metadata.json not found". Treat
+    # set-but-empty — AND set-but-whitespace-only (e.g. ``BLASTBOX_WORKER_MEMORY=" "`` from a
+    # malformed env file) — as unset; both would otherwise reach ``docker run`` as an invalid arg.
+    memory = (os.environ.get("BLASTBOX_WORKER_MEMORY") or "").strip() or _DEFAULT_WORKER_MEMORY
+    pids_limit = (
+        os.environ.get("BLASTBOX_WORKER_PIDS_LIMIT") or ""
+    ).strip() or _DEFAULT_WORKER_PIDS_LIMIT
+    cpus = (os.environ.get("BLASTBOX_WORKER_CPUS") or "").strip() or _DEFAULT_WORKER_CPUS
+    nofile = (os.environ.get("BLASTBOX_WORKER_NOFILE") or "").strip() or _DEFAULT_WORKER_NOFILE
 
     # Tell the worker's sandbox self-check to be lenient. Under runsc that's because
     # /proc doesn't reflect the host-applied flags (still secure); under an insecure

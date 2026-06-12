@@ -142,24 +142,46 @@ class VsockWarmControl:
         )
 
     def _fsync_output(self) -> None:
-        """fsync every output file + the dir, so the host's post-DONE debugfs
-        rdump sees flushed bytes even though the VM is SIGKILLed (not unmounted).
-        Without this, output sits in the guest page cache and is lost on reap."""
+        """Flush output to the disk so the host's post-DONE debugfs rdump sees the
+        bytes even though the VM is SIGKILLed (not unmounted). Without this, output
+        sits in the guest page cache and is lost on reap.
+
+        Each file fsync is ISOLATED: a single transient open/fsync error (more likely
+        on big multi-page jobs) must NOT skip the subsequent files or — critically —
+        the directory fsync that persists the dir entries (esp. the last-written
+        metadata.json). A final os.sync() is the belt-and-braces global flush of every
+        dirty page on every mount; combined with the outdisk's Writeback cache_type it
+        forces a virtio FLUSH that FC writes through to the host backing file."""
         try:
             for path in self._output_dir.rglob("*"):
-                if path.is_file():
+                if not path.is_file():
+                    continue
+                try:
                     fd = os.open(path, os.O_RDONLY)
                     try:
                         os.fsync(fd)
                     finally:
                         os.close(fd)
+                except OSError as exc:
+                    _log.warning("fc_warm.fsync_output file %s failed: %s", path, exc)
+        except OSError as exc:
+            # rglob itself failed (dir unreadable) — fall through to fsync(dir)+sync.
+            _log.warning("fc_warm.fsync_output walk failed: %s", exc)
+        # Directory fsync persists the dir entries; run it regardless of any per-file error.
+        try:
             dfd = os.open(self._output_dir, os.O_RDONLY)
             try:
                 os.fsync(dfd)
             finally:
                 os.close(dfd)
         except OSError as exc:
-            _log.warning("fc_warm.fsync_output failed: %s", exc)
+            _log.warning("fc_warm.fsync_output dir fsync failed: %s", exc)
+        # Global flush: catches anything the targeted fsyncs missed (subdir inodes,
+        # allocation bitmaps) and issues the virtio FLUSH honored under Writeback.
+        try:
+            os.sync()
+        except OSError as exc:  # noqa: BLE001 — never fail the job on a flush hiccup
+            _log.warning("fc_warm.fsync_output os.sync failed: %s", exc)
 
     def signal_done(self, *, status: str) -> None:
         # Flush output to the disk BEFORE telling the host we're done — the host

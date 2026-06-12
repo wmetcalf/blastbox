@@ -328,9 +328,20 @@ def firecracker_available(cfg: FCConfig | None = None) -> bool:
 def make_ext4(path: Path, size_mib: int) -> None:
     """Create a sparse ext4 image at ``path`` of ``size_mib`` MiB.
 
-    Uses ``mkfs.ext4 -F -O ^has_journal -m 0`` for fast, single-use images:
-    no journal (the disk is written once in-guest, read once on the host),
-    0 reserved blocks (maximum usable space for small output disks).
+    Uses ``mkfs.ext4 -F -O ^has_journal,^metadata_csum -m 0`` for fast, single-use
+    images:
+    - no journal (the disk is written once in-guest, read once on the host);
+    - 0 reserved blocks (maximum usable space for small output disks);
+    - NO metadata_csum: this disk is a single-use transfer medium that the guest
+      is SIGKILLed off of (never cleanly unmounted), so its block/inode bitmaps are
+      always left inconsistent at reap. With metadata_csum, that inconsistency is a
+      *checksum mismatch* and ``debugfs`` REFUSES to open the filesystem ("Block
+      bitmap checksum does not match bitmap" -> "Filesystem not open"), so rdump
+      extracts nothing and a successful job is recorded as
+      "metadata.json not found". The intact, fsync'd inodes + dir entries are still
+      readable by inode; dropping the checksum lets debugfs open the fs and rdump
+      them. Checksums add no value here (they detect long-term on-disk corruption,
+      irrelevant for a read-once disk). rdump_ext4 also e2fsck-recovers as a fallback.
 
     No root required; the caller must own the target path.
     """
@@ -343,7 +354,7 @@ def make_ext4(path: Path, size_mib: int) -> None:
             "-q",
             "-F",
             "-O",
-            "^has_journal",
+            "^has_journal,^metadata_csum",
             "-m",
             "0",
             str(file_path),
@@ -398,12 +409,46 @@ def rdump_ext4(
         )
 
     dest.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["debugfs", "-R", f"rdump / {dest_str}", str(image)],
-        check=True,
-        capture_output=True,
-        timeout=timeout_s,
+
+    def _debugfs_rdump(check: bool) -> "subprocess.CompletedProcess[bytes]":
+        return subprocess.run(
+            ["debugfs", "-R", f"rdump / {dest_str}", str(image)],
+            check=check,
+            capture_output=True,
+            timeout=timeout_s,
+        )
+
+    # First pass is TOLERANT (check=False): the common failure isn't a non-zero exit but
+    # "exit 0, extracts nothing" (see below) — but a non-zero exit must ALSO fall through
+    # to the e2fsck recovery rather than raise and bypass it.
+    proc = _debugfs_rdump(check=False)
+    # The guest is SIGKILLed off this disk (never cleanly unmounted), so on a no-journal
+    # ext4 its block/inode bitmaps can be left inconsistent at reap. debugfs then refuses
+    # to OPEN the filesystem ("Block bitmap checksum does not match bitmap" -> "Filesystem
+    # not open") and silently extracts NOTHING despite exit 0 — turning a successful job
+    # into "metadata.json not found". make_ext4 drops metadata_csum so this no longer
+    # presents as a fatal checksum error, but recover defensively too: if debugfs reports
+    # an unreadable fs (or extracts nothing), e2fsck -fy rebuilds the bitmaps from the
+    # intact, fsync'd inode tree (userspace, no mount — same trust posture as debugfs),
+    # then re-rdump. The retry is OFF the common path (only fires on the failure signature).
+    _stderr = proc.stderr if isinstance(proc.stderr, (bytes, bytearray)) else b""
+    _bad = (
+        proc.returncode != 0
+        or b"Filesystem not open" in _stderr
+        or b"checksum does not match" in _stderr
     )
+    if _bad or not any(dest.iterdir()):
+        subprocess.run(
+            ["e2fsck", "-fy", str(image)],
+            check=False,  # rc 0=clean, 1=fixed; both fine. >1 -> let the retry rdump decide.
+            capture_output=True,
+            timeout=timeout_s,
+        )
+        shutil.rmtree(dest, ignore_errors=True)
+        dest.mkdir(parents=True, exist_ok=True)
+        # After recovery a failure IS fatal (check=True) — surface it loudly rather than
+        # silently producing empty output that becomes an opaque "metadata.json not found".
+        _debugfs_rdump(check=True)
 
     # debugfs rdump always creates lost+found; remove it so it isn't mistaken
     # for an artifact.

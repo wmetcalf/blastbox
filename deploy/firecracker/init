@@ -23,6 +23,12 @@ mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sys /sys 2>/dev/null
 # Most FC kernels auto-mount devtmpfs; mount it too in case they don't.
 mount -t devtmpfs dev /dev 2>/dev/null
+# POSIX shared memory — required by multiprocessing.SemLock(), which pypdfium2's
+# page-render pool uses; without /dev/shm, multi-page rasterize fails (FileNotFound/
+# PermissionError on the semaphore). The devtmpfs above doesn't provide it.
+mkdir -p /dev/shm 2>/dev/null
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm 2>/dev/null \
+    || echo "blastbox-fc-guest: WARNING /dev/shm tmpfs mount failed; multiprocessing rasterize may fail" > /dev/console 2>&1
 # tmpfs /tmp, sticky world-writable (1777) so the non-root agent can create
 # /tmp/in (input scratch) and any tool profiles. Kept OFF the output disk so
 # rdump returns only artifacts + metadata.json.

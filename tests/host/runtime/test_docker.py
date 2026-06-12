@@ -478,6 +478,31 @@ def test_worker_nofile_env_override(tmp_path, monkeypatch):
     assert argv[ulimit_idx + 1] == "nofile=8192:8192"
 
 
+@pytest.mark.parametrize("blank", ["", "   ", "\t", " \n "])
+def test_worker_caps_blank_env_use_defaults(tmp_path, monkeypatch, blank):
+    """docker-compose passes ``BLASTBOX_WORKER_MEMORY=${BLASTBOX_WORKER_MEMORY:-}`` which sets the
+    var to the EMPTY string when the operator leaves it unset. ``get(K, default)`` returns that ""
+    (the key exists) → a bare ``--memory '' --cpus '' --pids-limit ''`` that makes ``docker run``
+    fail at launch with ``invalid argument "" for "--memory"`` (RC 125). Set-but-empty AND
+    set-but-whitespace-only (a malformed env file) MUST fall back to the default exactly like
+    unset — and no empty/whitespace token may ever land in a value position."""
+    for var in (
+        "BLASTBOX_WORKER_MEMORY",
+        "BLASTBOX_WORKER_PIDS_LIMIT",
+        "BLASTBOX_WORKER_CPUS",
+        "BLASTBOX_WORKER_NOFILE",
+    ):
+        monkeypatch.setenv(var, blank)
+    argv = _argv(tmp_path=tmp_path)
+    assert argv[argv.index("--memory") + 1] == "4g"
+    assert argv[argv.index("--memory-swap") + 1] == "4g"
+    assert argv[argv.index("--pids-limit") + 1] == "256"
+    assert argv[argv.index("--cpus") + 1] == "1.0"
+    assert argv[argv.index("--ulimit") + 1] == "nofile=4096:4096"
+    assert "" not in argv  # no empty value in any position
+    assert blank not in argv  # the raw blank value never lands in a value position
+
+
 # ---------------------------------------------------------------------------
 # seccomp / apparmor optional attachment
 # ---------------------------------------------------------------------------

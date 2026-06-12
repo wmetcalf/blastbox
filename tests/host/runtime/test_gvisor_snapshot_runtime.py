@@ -138,6 +138,34 @@ def test_warm_argv_rejects_non_list_json():
     ).warm_argv == ["python3", "/custom/entry.py"]
 
 
+def test_extra_env_passthrough_into_oci_spec():
+    """BLASTBOX_GVISOR_EXTRA_ENV lets an adopter hand the worker engine-specific env
+    (e.g. clippyshot's CLIPPYSHOT_SANDBOX=container + CLIPPYSHOT_WARN_ON_INSECURE=1 for the
+    runsc inner-sandbox, which gVisor's virtualized /proc/self/status hides). A JSON array of
+    'KEY=VALUE' strings that must flow through to the OCI process.env, with malformed input
+    ignored rather than crashing host startup."""
+    from pathlib import Path
+
+    from blastbox.host.runtime.gvisor_snapshot import _oci_config
+    from blastbox.host.runtime.gvisor_snapshot_runtime import _gvisor_config_from_env
+
+    # absent → empty (no behaviour change for engines that need nothing)
+    assert _gvisor_config_from_env({}).extra_env == []
+
+    # a valid KEY=VALUE array passes through AND reaches the OCI spec env
+    cfg = _gvisor_config_from_env(
+        {"BLASTBOX_GVISOR_EXTRA_ENV": '["CLIPPYSHOT_SANDBOX=container", "CLIPPYSHOT_WARN_ON_INSECURE=1"]'}
+    )
+    assert cfg.extra_env == ["CLIPPYSHOT_SANDBOX=container", "CLIPPYSHOT_WARN_ON_INSECURE=1"]
+    spec_env = _oci_config(cfg, Path("/tmp/slot"), in_ro=True)["process"]["env"]
+    assert "CLIPPYSHOT_SANDBOX=container" in spec_env
+    assert "CLIPPYSHOT_WARN_ON_INSECURE=1" in spec_env
+
+    # malformed (bad JSON / non-list / entries missing '=') is ignored, not fatal
+    for bad in ("not json", '"KEY=VALUE"', "[1, 2]", '["NO_EQUALS_SIGN"]', "{}"):
+        assert _gvisor_config_from_env({"BLASTBOX_GVISOR_EXTRA_ENV": bad}).extra_env == [], bad
+
+
 def test_settle_gates_readiness(tmp_path):
     clock = {"t": 0.0}
     rt = GvisorSnapshotSlotRuntime(_FakeMgr(tmp_path), settle_s=1.0, clock=lambda: clock["t"])
@@ -254,3 +282,46 @@ def test_select_unavailable_raises_when_required(monkeypatch):
     monkeypatch.setenv("BLASTBOX_GVISOR_RUNSC", "definitely-not-a-real-binary-xyz")
     with pytest.raises(GvisorUnavailable):
         select_gvisor_snapshot_runtime(require_available=True)
+
+
+def test_secure_snapshot_base_chmods_0700(tmp_path):
+    """L3: the warm-snapshot base (holds the checkpoint image restored into every slot) must be
+    created 0o700 so a co-tenant can't traverse it under a world-writable parent like /dev/shm."""
+    from blastbox.host.runtime.gvisor_snapshot_runtime import _secure_snapshot_base
+
+    base = _secure_snapshot_base(tmp_path / "gvisor-snapshot")
+    assert base.exists()
+    assert (base.stat().st_mode & 0o777) == 0o700
+
+
+def test_secure_snapshot_base_refuses_non_owned(tmp_path, monkeypatch):
+    """L3: refuse to ADOPT a pre-existing base owned by another uid (fail closed) rather than
+    silently restoring from a possibly-attacker-planted checkpoint image."""
+    from blastbox.host.runtime.gvisor_snapshot_runtime import _secure_snapshot_base
+
+    base = tmp_path / "gvisor-snapshot"
+    base.mkdir()
+    import os as _os
+
+    # Pretend the existing dir is owned by someone else.
+    real_stat = _os.stat
+    monkeypatch.setattr(_os, "geteuid", lambda: real_stat(base).st_uid + 1)
+    with pytest.raises(PermissionError):
+        _secure_snapshot_base(base)
+
+
+def test_secure_snapshot_base_refuses_symlink(tmp_path):
+    """L3 hardening: a co-tenant who pre-creates the predictable base path as a SYMLINK must not
+    get us to follow it — else our ownership check / chmod 0o700 would hit the symlink's target
+    (symlink traversal → arbitrary permission change). The O_NOFOLLOW open refuses it."""
+    from blastbox.host.runtime.gvisor_snapshot_runtime import _secure_snapshot_base
+
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    victim.chmod(0o755)  # explicit chmod, not mkdir(mode=) — the latter is masked by the umask
+    link = tmp_path / "gvisor-snapshot"
+    link.symlink_to(victim)
+    with pytest.raises(PermissionError):
+        _secure_snapshot_base(link)
+    # The victim's perms must be untouched (no fchmod-through-symlink).
+    assert (victim.stat().st_mode & 0o777) == 0o755

@@ -61,7 +61,17 @@ def _parse_engine_specs(engines_raw: str) -> dict:
         name = name.strip()
         image = image.strip()
         if name and image:
-            engines[name] = EngineSpec(name=name, image=image, worker_argv=[])
+            # Optional per-engine forwardable-param allowlist (default-deny once set):
+            #   BLASTBOX_ENGINE_<NAME>_PARAM_KEYS='KEY1,KEY2'
+            # Unset/empty preserves the legacy shape+denylist behaviour. This is how an
+            # operator opens the worker's env namespace to specific client params (e.g.
+            # clippyshot's scanner toggles) without exposing every CLIPPYSHOT_* the worker
+            # reads (sandbox/limits) to client override.
+            keys_raw = os.environ.get(f"BLASTBOX_ENGINE_{name.upper()}_PARAM_KEYS", "")
+            allowed = frozenset(k.strip() for k in keys_raw.split(",") if k.strip())
+            engines[name] = EngineSpec(
+                name=name, image=image, worker_argv=[], allowed_param_keys=allowed,
+            )
     return engines
 
 
@@ -102,6 +112,9 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         # periodic sweep deletes expired terminal jobs' output (of untrusted documents).
         job_retention_seconds=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"),
         pool=pool,
+        # Warm-pool sidecar: claim-gate on free warm capacity + no cold fallback (needs a pool).
+        warm_only=os.environ.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower()
+        not in ("", "0", "false", "no"),
     )
     try:
         dispatcher.run_forever(

@@ -190,3 +190,62 @@ def test_wait_for_done_before_signal_go_raises(tmp_path):
     host = VsockHostWarmControl(tmp_path / "vsock.sock")
     with pytest.raises(WarmTimeout):
         host.wait_for_done(timeout_s=0.1)
+
+
+# ---------------------------------------------------------------------------
+# _fsync_output durability hardening
+# ---------------------------------------------------------------------------
+
+
+def test_fsync_output_dir_and_sync_run_even_if_a_file_fsync_raises(tmp_path, monkeypatch):
+    """A transient per-file fsync error (more likely on big multi-page jobs) must
+    NOT skip the directory fsync (persists the metadata.json dir entry) or the final
+    os.sync(). Regression for the shared-try that aborted the whole flush on one
+    file's error -> host rdumped an empty disk ('metadata.json not found')."""
+    import os as _os
+
+    import blastbox.worker.fc_warm as fc_warm
+
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    for i in range(3):
+        (outdir / f"page_{i}.png").write_bytes(b"x" * 100)
+    (outdir / "metadata.json").write_text("{}")
+
+    guest = VsockWarmControl(tmp_path / "in", outdir, listener=_FakeListener(socket.socketpair()[0]))
+
+    real_open, real_fsync = _os.open, _os.fsync
+    fsynced_dir = {"hit": False}
+    sync_called = {"hit": False}
+
+    def fake_fsync(fd):
+        # Raise on the FIRST file fsync to simulate a transient error mid-loop.
+        if not fake_fsync.first and not fsynced_dir["hit"]:
+            fake_fsync.first = True
+            raise OSError("simulated transient fsync failure")
+        return real_fsync(fd)
+
+    fake_fsync.first = False
+
+    # Detect the directory fsync: the dir fd is the one opened on outdir itself.
+    dir_fd_holder = {}
+
+    def fake_open(path, flags, *a, **k):
+        fd = real_open(path, flags, *a, **k)
+        if _os.path.realpath(path) == _os.path.realpath(outdir):
+            dir_fd_holder["fd"] = fd
+        return fd
+
+    def fsync_wrapper(fd):
+        if dir_fd_holder.get("fd") == fd:
+            fsynced_dir["hit"] = True
+        return fake_fsync(fd)
+
+    monkeypatch.setattr(fc_warm.os, "open", fake_open)
+    monkeypatch.setattr(fc_warm.os, "fsync", fsync_wrapper)
+    monkeypatch.setattr(fc_warm.os, "sync", lambda: sync_called.__setitem__("hit", True))
+
+    guest._fsync_output()  # must not raise; must reach dir-fsync + os.sync()
+
+    assert fsynced_dir["hit"], "directory fsync was skipped after a per-file fsync error"
+    assert sync_called["hit"], "os.sync() global flush was not reached"
