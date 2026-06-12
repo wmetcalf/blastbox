@@ -570,14 +570,21 @@ class WarmPool:
         if not dead:
             return
 
-        # Demote dead slots under the lock, then reap+remove outside
+        # Demote dead slots under the lock, capturing ONLY the ones we actually
+        # transitioned to DRAINING. A slot a dispatcher claimed (IDLE->ASSIGNED) between
+        # the outside-lock is_alive() check and now is NOT demoted by the guard above —
+        # and must NOT be reaped out from under the live detonation. Reaping `dead`
+        # unconditionally would kill the just-claimed worker (job spuriously FAILED +
+        # double-reap on release). Reap only what we demoted, so the claim wins the race.
+        to_reap: list[Slot] = []
         with self._lock:
             for slot in dead:
                 cur = self._slots.get(slot.slot_id)
                 if cur is not None and cur.state in (SlotState.IDLE, SlotState.WARMING):
                     cur.state = SlotState.DRAINING
+                    to_reap.append(slot)
 
-        for slot in dead:
+        for slot in to_reap:
             logger.warning("pool.health_evicted_dead_slot slot_id=%s", slot.slot_id)
             try:
                 self._reap_and_count(slot)
