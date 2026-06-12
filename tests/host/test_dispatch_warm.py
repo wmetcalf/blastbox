@@ -168,6 +168,13 @@ class FakeWarmPool:
     def runtime(self) -> object:
         return self._runtime
 
+    @property
+    def idle_count(self) -> int:
+        # Report one idle slot so a warm_only dispatcher's claim-gate passes and proceeds
+        # to claim(); claim() is the real hit/miss arbiter (None → requeue path). This also
+        # models the gate-saw-idle-then-slot-died race the requeue exists to handle.
+        return 1
+
     def claim(self, *, timeout_s: float) -> Slot | None:
         return self._slot
 
