@@ -7,6 +7,8 @@ DONE-gate + resolve()+relative_to() + no-symlink-follow protections.
 """
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Request
 from fastapi.testclient import TestClient
 
@@ -70,3 +72,16 @@ def test_undeclared_file_on_disk_is_404_trust_gate(tmp_path):
     # sanity: the DECLARED artifact still serves
     c2 = TestClient(_app(tmp_path, store, _router("/v1/jobs/{job_id}/png", "page-001.png", media_type="image/png")))
     assert c2.get(f"/v1/jobs/{job.job_id}/png").status_code == 200
+
+
+def test_non_list_artifacts_manifest_is_404_not_500(tmp_path):
+    """Gemini #18: a manifest whose ``artifacts`` is not a list ("artifacts": null / 5 / {})
+    must NOT crash the serve route — `for a in meta.get("artifacts", [])` would raise a
+    TypeError OUTSIDE the json try/except → 500. _declared_artifact_paths fails closed to the
+    empty set so the fixed-filename route 404s on the malformed manifest."""
+    store = InMemoryJobStore()
+    job, output_dir = _make_done_job(tmp_path, store)
+    c = TestClient(_app(tmp_path, store, _router("/v1/jobs/{job_id}/png", "page-001.png", media_type="image/png")))
+    for bad in (None, 5, {"path": "x"}):
+        (output_dir / "metadata.json").write_text(json.dumps({"artifacts": bad}))
+        assert c.get(f"/v1/jobs/{job.job_id}/png").status_code == 404

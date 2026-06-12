@@ -121,9 +121,15 @@ def _declared_artifact_paths(output_dir: Path) -> frozenset[str]:
     if not isinstance(meta, dict):
         # A top-level JSON array/scalar (e.g. "[]") would make .get() raise — fail closed.
         return frozenset()
+    artifacts = meta.get("artifacts", [])
+    if not isinstance(artifacts, list):
+        # "artifacts": null / 5 / {} would make `for a in ...` raise (TypeError) OUTSIDE the
+        # json try/except → a 500 on the serve route. A non-list manifest is malformed — fail
+        # closed to the empty set so the caller 404s rather than crashing.
+        return frozenset()
     paths = {
         a["path"]
-        for a in meta.get("artifacts", [])
+        for a in artifacts
         if isinstance(a, dict) and isinstance(a.get("path"), str)
     }
     return frozenset(paths)

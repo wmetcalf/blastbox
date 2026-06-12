@@ -185,7 +185,7 @@ class Dispatcher:
         # sidecars. This lets a single-purpose, socket-less warm dispatcher run beside the
         # hardened cold one, with each warm backend's privilege (FC: /dev/kvm; gVisor: scoped
         # caps) confined to it. The main dispatcher keeps the docker socket + full hardening.
-        self._warm_only = bool(warm_only)
+        # (self._warm_only is set above, grouped with the warm-pool/backoff init.)
         if self._warm_only and self._pool is None:
             raise ValueError(
                 "warm_only dispatcher requires a warm pool (set BLASTBOX_POOL_RUNTIME)"
