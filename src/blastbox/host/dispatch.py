@@ -761,6 +761,12 @@ class Dispatcher:
         # dir writable by it (cold-path parity with the warm /out 0o777). The host
         # re-seals + size-caps the result regardless, so 0o777 here widens no trust
         # boundary — the worker's output is untrusted on every path.
+        # Wipe-then-recreate for a clean slate (mirrors the warm path): a requeued
+        # job must NOT inherit files a prior crashed/compromised worker left behind —
+        # stale undeclared files would otherwise count against the output size cap
+        # (a spurious-failure DoS) and, pre the serve-route manifest check, be
+        # servable. The host owns this dir between attempts, so the wipe is safe.
+        shutil.rmtree(output_dir, ignore_errors=True)
         output_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(output_dir, 0o777)
 
