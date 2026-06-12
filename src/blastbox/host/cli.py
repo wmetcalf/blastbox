@@ -112,9 +112,11 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         # periodic sweep deletes expired terminal jobs' output (of untrusted documents).
         job_retention_seconds=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"),
         pool=pool,
-        # Warm-pool sidecar: claim-gate on free warm capacity + no cold fallback (needs a pool).
-        warm_only=os.environ.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower()
-        not in ("", "0", "false", "no"),
+        # Warm-ONLY sidecar (socket-less gVisor C/R or FC warm dispatcher): on a warm-pool
+        # miss, REQUEUE the job for the cold dispatcher instead of cold-falling-back (which
+        # would fail closed here — no docker socket). Inert without a pool.
+        warm_only=(os.environ.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower()
+                   in ("1", "true", "yes", "on")),
     )
     try:
         dispatcher.run_forever(

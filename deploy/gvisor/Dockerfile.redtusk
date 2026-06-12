@@ -1,0 +1,58 @@
+# gVisor C/R warm-tier rootfs for RedTusk — the gVisor analog of
+# deploy/firecracker/Dockerfile.redtusk. Built ON TOP OF redtusk-cold-worker:dev so
+# RedTusk's JVM/Tika recursive-extraction worker runs inside a runsc sandbox that is
+# CHECKPOINTED at READY and RESTORED per job (warm JVM, no Firecracker / no KVM).
+#
+# Why a warm gVisor tier: Firecracker needs /dev/kvm; many cloud hosts (nested-virt-
+# disabled VMs, some AWS instance types, CI runners) don't expose it. runsc C/R is the
+# KVM-less warm path — `runsc checkpoint` the booted-and-warmed container, then
+# `runsc restore` a disposable copy per untrusted document.
+#
+# The base already provides JRE 25 + the Tika worker jar + the flag-sensitive AOT
+# cache (/app/redtusk.aot) + the redtusk engine adapter + blastbox core in the
+# /opt/redtusk venv. This overlay adds the blastbox gVisor warm agent (run_warm.py,
+# the file-trigger analog of FC's run_guest.py) + the bind-mount destinations.
+#
+# Unlike the clippyshot gVisor rootfs (deploy/gvisor/Dockerfile.shim) there is NO
+# accept-retry LD_PRELOAD shim: that shim fixes soffice's osl_acceptPipe accept()
+# returning EINTR after a runsc restore. RedTusk's warm worker is FILE-IPC — the JVM
+# polls for control.go on the filesystem, there is no socket accept() to retry — so
+# the shim is unnecessary (and /opt/clippyshot doesn't exist here anyway).
+#
+# Build context = blastbox repo root:
+#   docker build --build-arg BASE=redtusk-cold-worker:dev \
+#     -f deploy/gvisor/Dockerfile.redtusk -t redtusk-warm:gvisor .
+ARG BASE=redtusk-cold-worker:dev
+FROM ${BASE}
+ARG ENGINE=redtusk.engine:RedTuskEngine
+USER root
+
+# `docker export` (used to materialise the OCI rootfs dir) DROPS Docker ENV, incl.
+# the temurin PATH. The warm worker's engine Popens `java` (REDTUSK_JAVA_BIN default
+# "java") resolved via the OCI spec PATH (/usr/local/bin:/usr/bin:…), which does NOT
+# include /opt/java/openjdk/bin — so symlink java onto that PATH. The jar
+# (/app/redtusk-worker.jar), AOT cache (/app/redtusk.aot) and native lib dir (/app)
+# are all at the engine's default paths, so no extra env is needed.
+#
+# No /usr/local/bin/python3 wrapper: the warm argv invokes the venv python by its
+# literal path (/opt/redtusk/bin/python3), so pyvenv.cfg is found and blastbox +
+# redtusk import cleanly without the symlink-realpath venv-detection pitfall.
+RUN ln -sf /opt/java/openjdk/bin/java /usr/local/bin/java
+
+# blastbox gVisor warm agent. run_warm.py imports `engines` from its own dir
+# (sys.path[0]); the engine name is baked into a FILE because Docker ENV is dropped
+# by `docker export`. The bind-mount destinations (/in ro, /out rw, /ctrl rw) MUST
+# exist at build time — the rootfs is restored read-only, so runsc can't create them.
+COPY deploy/gvisor/run_warm.py /opt/blastbox/run_warm.py
+COPY deploy/firecracker/engines.py /opt/blastbox/engines.py
+RUN printf '%s' "${ENGINE}" > /opt/blastbox/engine \
+    && mkdir -p /in /out /ctrl \
+    # Strip setuid/setgid: the warm worker runs java directly as a non-root uid.
+    && find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true
+
+# The warm entrypoint is supplied by the host via BLASTBOX_GVISOR_WARM_ARGV
+# (= ["/opt/redtusk/bin/python3", "/opt/blastbox/run_warm.py"]); no ENTRYPOINT/CMD
+# is baked because `docker export` drops it and the OCI spec sets args explicitly.
+LABEL org.opencontainers.image.title="redtusk-warm-gvisor" \
+      org.opencontainers.image.description="RedTusk warm-JVM gVisor C/R rootfs (runsc checkpoint/restore; KVM-less warm tier)" \
+      org.opencontainers.image.version="0.1.0"

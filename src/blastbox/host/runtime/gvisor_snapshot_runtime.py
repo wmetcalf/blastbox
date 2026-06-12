@@ -279,22 +279,26 @@ def _gvisor_config_from_env(env):
             _DEFAULT_WARM_ARGV,
         )
         warm_argv = list(_DEFAULT_WARM_ARGV)
-    # Engine-agnostic env passthrough: an adopter bakes its rootfs but still needs to hand the
-    # worker engine-specific env (e.g. clippyshot's CLIPPYSHOT_SANDBOX=container +
-    # CLIPPYSHOT_WARN_ON_INSECURE=1 for the runsc inner-sandbox, which gVisor's virtualized
-    # /proc/self/status hides). A JSON array of "KEY=VALUE" strings — the OCI process.env shape.
-    raw_extra_env = env.get("BLASTBOX_GVISOR_EXTRA_ENV", "").strip()
-    try:
-        extra_env = json.loads(raw_extra_env) if raw_extra_env else []
-    except json.JSONDecodeError:
-        _log.warning("invalid BLASTBOX_GVISOR_EXTRA_ENV JSON %r; ignoring", raw_extra_env)
-        extra_env = []
-    if not (isinstance(extra_env, list) and all(isinstance(e, str) and "=" in e for e in extra_env)):
-        _log.warning(
-            "BLASTBOX_GVISOR_EXTRA_ENV must be a JSON array of 'KEY=VALUE' strings; got %r; ignoring",
-            raw_extra_env,
-        )
-        extra_env = []
+    # Extra env injected into the warm worker's OCI process env (e.g.
+    # ["JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=2"] for the redtusk JVM tier, or
+    # ["CLIPPYSHOT_SANDBOX=container", ...] for clippyshot). A JSON array of "KEY=VALUE"
+    # strings; same fail-loud-to-default shape validation as warm_argv (a malformed value
+    # must not crash host startup, and a non-list/non-string entry would corrupt the OCI env).
+    raw_extra = env.get("BLASTBOX_GVISOR_EXTRA_ENV", "").strip()
+    extra_env: list[str] = []
+    if raw_extra:
+        try:
+            parsed = json.loads(raw_extra)
+        except json.JSONDecodeError:
+            _log.warning("invalid BLASTBOX_GVISOR_EXTRA_ENV JSON %r; ignoring", raw_extra)
+            parsed = None
+        if isinstance(parsed, list) and all(isinstance(e, str) and "=" in e for e in parsed):
+            extra_env = parsed
+        elif parsed is not None:
+            _log.warning(
+                "BLASTBOX_GVISOR_EXTRA_ENV must be a JSON array of 'KEY=VALUE' strings; got %r; ignoring",
+                raw_extra,
+            )
     return GvisorConfig(
         runsc_bin=env.get("BLASTBOX_GVISOR_RUNSC", "runsc"),
         root=Path(root),

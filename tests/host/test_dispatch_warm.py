@@ -232,6 +232,7 @@ def _make_dispatcher_with_pool(
     subprocess_runner: Any = None,
     worker_timeout_s: int = 30,
     warm_claim_timeout_s: float = 0.5,
+    warm_only: bool = False,
 ) -> Dispatcher:
     if engines is None:
         engines = {_ENGINE_NAME: _engine_spec()}
@@ -248,6 +249,8 @@ def _make_dispatcher_with_pool(
         worker_timeout_s=worker_timeout_s,
         pool=pool,
         warm_claim_timeout_s=warm_claim_timeout_s,
+        warm_only=warm_only,
+        warm_requeue_backoff_s=0.0,  # tests must not sleep the real 1.0s requeue backoff
     )
 
 
@@ -656,6 +659,84 @@ def test_4_cold_fallback_when_no_slot(tmp_path):
 
     # Pool.release was NOT called (no slot was claimed)
     assert len(pool.release_calls) == 0
+
+
+def test_warm_only_requeues_on_miss_instead_of_cold(tmp_path):
+    """warm_only=True + pool.claim returns None → the job is REQUEUED (back to QUEUED,
+    claim_id cleared, started_at reset), the cold path is NOT run, and the staged input
+    is NOT deleted (the next owner needs it). This is the socket-less warm-only sidecar
+    behavior: a warm-pool miss must hand the job to the cold dispatcher, never fail closed.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+    input_path = tmp_path / "jobs" / job.job_id / "input" / job.filename
+    assert input_path.exists()
+
+    pool = FakeWarmPool(None)  # always misses
+
+    cold_launched: list[list[str]] = []
+
+    def cold_runner(argv, **kw):
+        cold_launched.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher_with_pool(
+        store,
+        job_root=tmp_path / "jobs",
+        pool=pool,
+        subprocess_runner=cold_runner,
+        worker_timeout_s=10,
+        warm_only=True,
+    )
+    dispatcher.dispatch_once()
+
+    final_job = store.get(job.job_id)
+    assert final_job is not None
+    # Requeued, not failed, not done — claim released for the cold dispatcher.
+    assert final_job.status == JobStatus.QUEUED
+    assert final_job.claim_id is None
+    assert final_job.started_at is None
+    # The cold path (docker run) was NEVER invoked on this socket-less sidecar.
+    assert not any(a[:2] == ["docker", "run"] for a in cold_launched), (
+        f"warm_only must NOT cold-fall-back; calls: {cold_launched}"
+    )
+    # Input preserved for the next owner.
+    assert input_path.exists()
+    assert len(pool.release_calls) == 0
+
+
+def test_warm_only_requeue_backs_off_before_returning(tmp_path, monkeypatch):
+    """A warm-only requeue sleeps warm_requeue_backoff_s before returning, so this dispatcher
+    doesn't immediately re-claim the just-requeued job (dispatch_once reports progress, so
+    run_forever skips its poll sleep). Without it, the cold dispatcher gets starved."""
+    import blastbox.host.dispatch as dispatch_mod
+
+    slept: list[float] = []
+    monkeypatch.setattr(dispatch_mod.time, "sleep", lambda s: slept.append(s))
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    d = Dispatcher(
+        job_store=store,
+        engines={_ENGINE_NAME: _engine_spec()},
+        limits=_limits(),
+        job_root=tmp_path / "jobs",
+        runtime_selector=_fake_runtime,
+        pool=FakeWarmPool(None),  # always misses
+        warm_only=True,
+        warm_requeue_backoff_s=0.75,
+    )
+    d.dispatch_once()
+
+    assert store.get(job.job_id).status == JobStatus.QUEUED
+    assert 0.75 in slept, f"expected a 0.75s requeue backoff; slept={slept}"
 
 
 # ===========================================================================
