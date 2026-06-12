@@ -1,0 +1,13 @@
+abi <abi/4.0>,
+include <tunables/global>
+
+# Grant ONLY the `userns` capability to bwrap, so it can create unprivileged user
+# namespaces on Ubuntu 24.04+ (where kernel.apparmor_restrict_unprivileged_userns=1
+# blocks them by default). SCOPED to this one binary — the host-wide restriction stays
+# in force for every other process; bwrap is otherwise unconfined and enforces isolation
+# via the namespaces it creates. Adjust the path to match your install (`which bwrap`).
+#
+# Load:  sudo cp blastbox-bwrap /etc/apparmor.d/ && sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-bwrap
+profile blastbox-bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+}
