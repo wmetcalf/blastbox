@@ -222,12 +222,33 @@ def _gvisor_config_from_env(env):
             _DEFAULT_WARM_ARGV,
         )
         warm_argv = list(_DEFAULT_WARM_ARGV)
+    # Extra env injected into the warm worker's OCI process env (e.g.
+    # ["JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=2"] for the redtusk JVM tier, or
+    # ["CLIPPYSHOT_SANDBOX=container", ...] for clippyshot). A JSON array of "KEY=VALUE"
+    # strings; same fail-loud-to-default shape validation as warm_argv (a malformed value
+    # must not crash host startup, and a non-list/non-string entry would corrupt the OCI env).
+    raw_extra = env.get("BLASTBOX_GVISOR_EXTRA_ENV", "").strip()
+    extra_env: list[str] = []
+    if raw_extra:
+        try:
+            parsed = json.loads(raw_extra)
+        except json.JSONDecodeError:
+            _log.warning("invalid BLASTBOX_GVISOR_EXTRA_ENV JSON %r; ignoring", raw_extra)
+            parsed = None
+        if isinstance(parsed, list) and all(isinstance(e, str) and "=" in e for e in parsed):
+            extra_env = parsed
+        elif parsed is not None:
+            _log.warning(
+                "BLASTBOX_GVISOR_EXTRA_ENV must be a JSON array of 'KEY=VALUE' strings; got %r; ignoring",
+                raw_extra,
+            )
     return GvisorConfig(
         runsc_bin=env.get("BLASTBOX_GVISOR_RUNSC", "runsc"),
         root=Path(root),
         image_rootfs=Path(rootfs),
         network=env.get("BLASTBOX_GVISOR_NETWORK", "none"),
         warm_argv=warm_argv,
+        extra_env=extra_env,
         ld_preload=env.get("BLASTBOX_GVISOR_LD_PRELOAD") or None,
         platform=env.get("BLASTBOX_GVISOR_PLATFORM") or None,
         cpu_features_annotation=env.get("BLASTBOX_GVISOR_CPUFEATURES") or None,

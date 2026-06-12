@@ -138,6 +138,23 @@ def test_warm_argv_rejects_non_list_json():
     ).warm_argv == ["python3", "/custom/entry.py"]
 
 
+def test_extra_env_from_env():
+    """BLASTBOX_GVISOR_EXTRA_ENV injects KEY=VALUE strings into the warm worker's OCI env
+    (e.g. JAVA_TOOL_OPTIONS for the redtusk JVM tier, CLIPPYSHOT_SANDBOX for clippyshot).
+    A malformed value must fall back to [] rather than corrupt the OCI env / crash startup."""
+    from blastbox.host.runtime.gvisor_snapshot_runtime import _gvisor_config_from_env
+
+    # absent → empty
+    assert _gvisor_config_from_env({}).extra_env == []
+    # well-formed array of KEY=VALUE strings passes through
+    assert _gvisor_config_from_env(
+        {"BLASTBOX_GVISOR_EXTRA_ENV": '["JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=2", "FOO=bar"]'}
+    ).extra_env == ["JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=2", "FOO=bar"]
+    # malformed JSON / wrong shape / entries without '=' → ignored (empty), never raises
+    for bad in ("not json", '"BAR=baz"', "[1, 2]", '["no_equals_sign"]', "{}"):
+        assert _gvisor_config_from_env({"BLASTBOX_GVISOR_EXTRA_ENV": bad}).extra_env == [], bad
+
+
 def test_settle_gates_readiness(tmp_path):
     clock = {"t": 0.0}
     rt = GvisorSnapshotSlotRuntime(_FakeMgr(tmp_path), settle_s=1.0, clock=lambda: clock["t"])
