@@ -19,3 +19,8 @@ venv/
 *.db
 .env
 deploy/firecracker/clippyshot_engine.py
+
+# local draft design docs (kept untracked, not ready to commit)
+/AGENTS.md
+/docs/specs/2026-06-08-contract-extensible-fields-design.md
+/docs/specs/2026-06-08-detections-and-fleet-roadmap.md

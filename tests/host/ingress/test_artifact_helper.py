@@ -55,3 +55,18 @@ def test_traversal_is_confined(tmp_path):
     job, _ = _make_done_job(tmp_path, store)
     c = TestClient(_app(tmp_path, store, _router("/v1/jobs/{job_id}/evil", "../../../../etc/passwd")))
     assert c.get(f"/v1/jobs/{job.job_id}/evil").status_code == 404
+
+
+def test_undeclared_file_on_disk_is_404_trust_gate(tmp_path):
+    """H-1 regression: a compromised worker that declares a benign manifest yet ALSO drops
+    an undeclared file on disk must NOT have it served — only DECLARED (re-hashed) artifacts
+    are trustworthy. Without the manifest check this 200s and serves un-re-hashed bytes."""
+    store = InMemoryJobStore()
+    job, output_dir = _make_done_job(tmp_path, store)  # declares page-001.png only
+    # Worker-planted undeclared file (NOT in metadata.json artifacts[]) — exists on disk.
+    (output_dir / "document.pdf").write_bytes(b"%PDF-1.4 attacker-controlled un-re-hashed bytes")
+    c = TestClient(_app(tmp_path, store, _router("/v1/jobs/{job_id}/pdf", "document.pdf", media_type="application/pdf")))
+    assert c.get(f"/v1/jobs/{job.job_id}/pdf").status_code == 404
+    # sanity: the DECLARED artifact still serves
+    c2 = TestClient(_app(tmp_path, store, _router("/v1/jobs/{job_id}/png", "page-001.png", media_type="image/png")))
+    assert c2.get(f"/v1/jobs/{job.job_id}/png").status_code == 200

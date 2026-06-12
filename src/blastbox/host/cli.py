@@ -63,12 +63,18 @@ def _parse_engine_specs(engines_raw: str) -> dict:
         if name and image:
             # Optional per-engine forwardable-param allowlist (default-deny once set):
             #   BLASTBOX_ENGINE_<NAME>_PARAM_KEYS='KEY1,KEY2'
-            # Unset/empty preserves the legacy shape+denylist behaviour. This is how an
-            # operator opens the worker's env namespace to specific client params (e.g.
-            # clippyshot's scanner toggles) without exposing every CLIPPYSHOT_* the worker
-            # reads (sandbox/limits) to client override.
-            keys_raw = os.environ.get(f"BLASTBOX_ENGINE_{name.upper()}_PARAM_KEYS", "")
-            allowed = frozenset(k.strip() for k in keys_raw.split(",") if k.strip())
+            # UNSET preserves the legacy shape+denylist behaviour; SET (even to an empty
+            # value) is an explicit allowlist (empty = block all). This is how an operator
+            # opens the worker's env namespace to specific client params (e.g. clippyshot's
+            # scanner toggles) without exposing every CLIPPYSHOT_* the worker reads
+            # (sandbox/limits) to client override.
+            # None when UNSET (legacy denylist); a frozenset when SET (even if empty after
+            # stripping → blocks all client params, the operator's explicit intent).
+            keys_raw = os.environ.get(f"BLASTBOX_ENGINE_{name.upper()}_PARAM_KEYS")
+            allowed = (
+                None if keys_raw is None
+                else frozenset(k.strip() for k in keys_raw.split(",") if k.strip())
+            )
             engines[name] = EngineSpec(
                 name=name, image=image, worker_argv=[], allowed_param_keys=allowed,
             )

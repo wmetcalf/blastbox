@@ -105,6 +105,30 @@ def _safe_artifact_path(output_dir: Path, relative: str) -> Path | None:
     return candidate
 
 
+def _declared_artifact_paths(output_dir: Path) -> frozenset[str]:
+    """Return the set of ``artifacts[].path`` declared in the dispatcher-sealed
+    ``metadata.json`` — the only paths the trust gate re-hashed and thus the only
+    paths a fixed-filename serve route may return. Fail-closed: a missing /
+    symlinked / unparseable manifest yields the empty set (→ caller 404s), so an
+    undeclared file a compromised worker dropped is never served as trusted output."""
+    meta_json = output_dir / "metadata.json"
+    try:
+        if meta_json.is_symlink() or not meta_json.is_file():
+            return frozenset()
+        meta = json.loads(meta_json.read_bytes())
+    except (OSError, ValueError):
+        return frozenset()
+    if not isinstance(meta, dict):
+        # A top-level JSON array/scalar (e.g. "[]") would make .get() raise — fail closed.
+        return frozenset()
+    paths = {
+        a["path"]
+        for a in meta.get("artifacts", [])
+        if isinstance(a, dict) and isinstance(a.get("path"), str)
+    }
+    return frozenset(paths)
+
+
 # ---------------------------------------------------------------------------
 # Upload I/O helpers
 # ---------------------------------------------------------------------------
@@ -338,8 +362,17 @@ def build_app(
 
         Exposed on ``app.state`` so product ingress extensions (e.g. ClippyShot's
         ``/pdf`` + typed page-PNG routes) reuse the core's confinement: DONE-gated,
-        ``resolve()+relative_to()`` containment, and no-symlink-follow — identical
-        to ``get_artifact`` but keyed by a fixed relative path, not an artifact id.
+        ``resolve()+relative_to()`` containment, and no-symlink-follow.
+
+        TRUST-GATE ENFORCEMENT: unlike ``get_artifact`` (which resolves the served
+        path *from* the sealed manifest by id), this route is keyed by a fixed
+        relative path — so it MUST additionally require that ``relative`` is a
+        **declared** artifact in the dispatcher-sealed ``metadata.json``. Without
+        this, a compromised worker that declares a benign/empty manifest yet also
+        drops an undeclared ``document.pdf`` / ``page-NNN.png`` would have those
+        un-re-hashed bytes served as "trustworthy output" (the zero-trust re-seal
+        bypass). The host re-hashes only DECLARED artifacts, so anything not in the
+        manifest was never validated and must 404.
         """
         from fastapi.responses import FileResponse
 
@@ -348,6 +381,9 @@ def build_app(
         out = _output_dir_for(job_id)
         if not out.is_dir():
             raise HTTPException(410, "result expired")
+        if relative not in _declared_artifact_paths(out):
+            # Not a sealed/declared artifact → never re-validated by the trust gate.
+            raise HTTPException(404, "artifact file not found")
         if (out / relative).is_symlink():
             raise HTTPException(404, "artifact file not found")
         safe = _safe_artifact_path(out, relative)
