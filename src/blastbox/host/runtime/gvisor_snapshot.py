@@ -20,6 +20,12 @@ from typing import Any, Callable
 
 _log = logging.getLogger(__name__)
 
+# Root-level filename the warm container packs its /out tree into so a C/R-restored container's
+# nested output (subdirs the restored process's stale gofer/VFS view doesn't write through to the
+# host bind source) still reaches the host. A leading '.' keeps it out of the way; the host strips
+# it after extracting, and it is never a declared artifact (engine manifests don't reference it).
+WARM_OUTPUT_ARCHIVE = ".blastbox_warm_output.tar"
+
 
 @dataclass(frozen=True)
 class GvisorConfig:
@@ -299,6 +305,28 @@ class GvisorRestoreHandle:
             status = _json.loads(out).get("status", "")
             return status == "running"
         except Exception:  # noqa: BLE001
+            return False
+
+    def archive_output(self) -> bool:
+        """Pack the container's ``/out`` tree into a ROOT-level archive ``/out/<WARM_OUTPUT_ARCHIVE>``.
+
+        A C/R-restored gVisor container propagates FILES written at the ``/out`` root to the host
+        bind source, but NOT directories it creates post-restore (the restored process's gofer/VFS
+        view is stale) — so an engine whose output is a TREE (e.g. RedTusk's ``rmeta/``) loses
+        everything below ``/out`` from the host's view. We exec a ``tar`` as a FRESH process INSIDE
+        the still-alive container (a fresh exec gets a consistent view of ``/out``, unlike the
+        restored worker) writing the archive at the ``/out`` ROOT; that single root file DOES
+        propagate, so the host can read+extract it (see ``materialize_warm_output``). Best-effort:
+        returns False if the exec fails (caller then falls back to whatever the bind mount carried).
+        """
+        cmd = (
+            f"cd /out && rm -f {WARM_OUTPUT_ARCHIVE} && "
+            f"tar cf {WARM_OUTPUT_ARCHIVE} --exclude={WARM_OUTPUT_ARCHIVE} . && sync"
+        )
+        try:
+            self._run([*_runsc(self._cfg), "exec", self._cid, "sh", "-c", cmd])
+            return True
+        except Exception:  # noqa: BLE001 — materialize must never raise; fall back to the bind mount
             return False
 
     def kill(self) -> None:

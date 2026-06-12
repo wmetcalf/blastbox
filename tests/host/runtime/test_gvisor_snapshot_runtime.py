@@ -194,11 +194,52 @@ def test_is_ready_false_when_handle_dead(tmp_path):
 
 
 def test_materialize_output_noop_keeps_output(tmp_path):
+    # A handle without archive_output (flat-output engines / test doubles) → unchanged no-op.
     rt = GvisorSnapshotSlotRuntime(_FakeMgr(tmp_path), settle_s=0.0)
     s = rt.spawn()
     (s.output_dir / "x.pdf").write_bytes(b"%PDF")
     assert rt.materialize_warm_output(s) is None
     assert (s.output_dir / "x.pdf").exists()
+
+
+def test_materialize_recovers_subdir_tree_from_root_archive(tmp_path):
+    """C/R loses post-restore subdirs from the host bind view. materialize_warm_output has the
+    still-alive container pack /out into a ROOT-level archive (archive_output) that DOES propagate,
+    then extracts it host-side — recovering e.g. RedTusk's rmeta/ tree the stale view dropped."""
+    import io
+    import tarfile as _tf
+
+    from blastbox.host.runtime.gvisor_snapshot import WARM_OUTPUT_ARCHIVE
+
+    class _ArchiveHandle(_FakeHandle):
+        def archive_output(self):
+            # Stand in for the in-container `tar`: drop a ROOT-level archive in out/ carrying a
+            # NESTED file (the bind mount would have lost it). The flat metadata.json is already there.
+            buf = io.BytesIO()
+            with _tf.open(fileobj=buf, mode="w:") as tf:
+                payload = b'{"extraction": {}}'
+                ti = _tf.TarInfo("rmeta/metadata.json")
+                ti.size = len(payload)
+                tf.addfile(ti, io.BytesIO(payload))
+            (self.slot_workdir / "out" / WARM_OUTPUT_ARCHIVE).write_bytes(buf.getvalue())
+            return True
+
+    class _Mgr(_FakeMgr):
+        def restore(self, slot_id):
+            self.restores += 1
+            wd = self.base / "slots" / str(slot_id)
+            for s in ("in", "out", "ctrl"):
+                (wd / s).mkdir(parents=True, exist_ok=True)
+            (wd / "out" / "metadata.json").write_text("{}")  # flat root file already propagated
+            return _ArchiveHandle(wd)
+
+    rt = GvisorSnapshotSlotRuntime(_Mgr(tmp_path), settle_s=0.0)
+    s = rt.spawn()
+    rt.materialize_warm_output(s)
+    out = Path(s.output_dir)
+    assert (out / "rmeta" / "metadata.json").read_text() == '{"extraction": {}}'  # subdir recovered
+    assert not (out / WARM_OUTPUT_ARCHIVE).exists()  # archive stripped after extraction
+    assert (out / "metadata.json").exists()  # flat root file untouched
 
 
 def test_reap_kills_and_cleans(tmp_path):
