@@ -78,6 +78,12 @@ _VALID_ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 # unconditional floor that holds even with no allowlist configured.
 _RESERVED_ENV_PREFIXES = ("BLASTBOX_", "LD_", "PYTHON")
 _RESERVED_ENV_KEYS = frozenset({
+    # Executable/command resolution — a client setting PATH (or IFS) could redirect the
+    # worker's `java`/`soffice`/`python` lookup to an attacker-planted binary under a
+    # writable mount (e.g. /tmp), i.e. arbitrary code as the worker uid. LD_* is already
+    # prefix-reserved; PATH/IFS close the rest of the loader/shell-resolution surface.
+    "PATH",
+    "IFS",
     "CLIPPYSHOT_WARM_DIAG_FILE",
     "CLIPPYSHOT_SANDBOX",
     "CLIPPYSHOT_WARN_ON_INSECURE",
@@ -106,13 +112,13 @@ class EngineSpec:
     name: str
     image: str
     worker_argv: list[str]
-    # Operator-configured allowlist of job.param keys forwardable to the worker
-    # as env. Empty (default) = no allowlist (legacy shape+denylist behaviour);
-    # non-empty = ONLY these keys are forwarded (default-deny, per engine). This
-    # keeps the privilege of opening the worker's env namespace with the operator
-    # who configures the engine — not with any client who can guess a key the
-    # worker happens to read (e.g. CLIPPYSHOT_SANDBOX / CLIPPYSHOT_WARN_ON_INSECURE).
-    allowed_param_keys: frozenset[str] = frozenset()
+    # Operator-configured allowlist of job.param keys forwardable to the worker as env.
+    # None (default) = no allowlist configured (legacy shape+denylist behaviour); a
+    # frozenset = ONLY those keys forward (default-deny, per engine) — and an EXPLICITLY
+    # EMPTY frozenset blocks ALL client params (it does not collapse to legacy). This keeps
+    # the privilege of opening the worker's env namespace with the operator who configures
+    # the engine — not any client who can guess a key the worker reads.
+    allowed_param_keys: frozenset[str] | None = None
 
 
 class Dispatcher:
@@ -1120,7 +1126,7 @@ class Dispatcher:
 
     @staticmethod
     def _sanitize_params(
-        params: dict[str, str], allowed_keys: frozenset[str] = frozenset()
+        params: dict[str, str], allowed_keys: frozenset[str] | None = None
     ) -> dict[str, str]:
         """Filter job.params to a safe subset suitable for extra_env.
 
@@ -1128,15 +1134,16 @@ class Dispatcher:
         - Keys must match ``^[A-Z][A-Z0-9_]*$`` (uppercase start, no symbols).
           A key like ``"x; --privileged"`` is silently dropped.
         - Reserved keys/prefixes are dropped even though they match the shape
-          (BLASTBOX_*, LD_*, PYTHON*, and specific security/breadcrumb keys): a
-          client must not be able to re-select the engine (BLASTBOX_ENGINE),
-          re-wire I/O, flip the security posture (sandbox selection / insecure
-          fallback / internals disclosure), or hijack the loader/interpreter.
-        - If ``allowed_keys`` is non-empty, it is an explicit per-engine
-          ALLOWLIST: only those keys are forwarded (default-deny). This is the
-          sound model when the worker reads an open-ended, product-defined env
-          namespace (e.g. clippyshot's CLIPPYSHOT_*) — the denylist alone leaks
-          by default. Empty = no allowlist (legacy shape+denylist behaviour).
+          (BLASTBOX_*, LD_*, PYTHON*, PATH/IFS, and specific security/breadcrumb keys):
+          a client must not be able to re-select the engine (BLASTBOX_ENGINE), re-wire
+          I/O, flip the security posture (sandbox selection / insecure fallback /
+          internals disclosure), or hijack the loader/interpreter resolution.
+        - ``allowed_keys`` per-engine ALLOWLIST, with a deliberate None-vs-empty split:
+          * ``None`` (UNSET) = no allowlist configured → legacy shape+denylist behaviour.
+          * a frozenset (incl. the EMPTY one) = explicit allowlist → ONLY those keys
+            forward (default-deny). An explicitly-empty allowlist therefore blocks ALL
+            client params — which is what an operator configuring an empty set means,
+            and must NOT silently collapse to legacy.
         - Values are capped at _MAX_ENV_VALUE_LEN characters.
         - Everything is coerced to str before inclusion.
 
@@ -1152,7 +1159,7 @@ class Dispatcher:
             if _is_reserved_env_key(key):
                 _log.warning("dropping reserved extra_env key from job.params: %r", key)
                 continue
-            if allowed_keys and key not in allowed_keys:
+            if allowed_keys is not None and key not in allowed_keys:
                 _log.warning(
                     "dropping non-allowlisted extra_env key %r from job.params "
                     "(per-engine allowlist in effect)", key,

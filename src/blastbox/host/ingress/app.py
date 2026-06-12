@@ -118,6 +118,9 @@ def _declared_artifact_paths(output_dir: Path) -> frozenset[str]:
         meta = json.loads(meta_json.read_bytes())
     except (OSError, ValueError):
         return frozenset()
+    if not isinstance(meta, dict):
+        # A top-level JSON array/scalar (e.g. "[]") would make .get() raise — fail closed.
+        return frozenset()
     paths = {
         a["path"]
         for a in meta.get("artifacts", [])
