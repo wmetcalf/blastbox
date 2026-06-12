@@ -57,7 +57,8 @@ class InMemoryJobStore:
                 if k not in _JOB_FIELDS:
                     raise ValueError(f"unknown Job field in update(): {k!r}")
                 setattr(job, k, v)
-            return _snapshot(job)
+            # job is non-None here (KeyError raised above), so return a Job (not Job|None).
+            return copy.deepcopy(job)
 
     def update_if_status(
         self,
