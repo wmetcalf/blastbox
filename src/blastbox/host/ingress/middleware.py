@@ -142,3 +142,47 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if not hmac.compare_digest(provided, self._key):
             return PlainTextResponse("invalid bearer token", status_code=401)
         return await call_next(request)
+
+
+# Default Content-Security-Policy: blocks external resource loads + framing, but
+# tolerates inline <script>/<style> because the engine UIs use them (clippyshot's
+# index.html inlines its JS; both inline style attrs). Engines that don't need
+# inline (e.g. redtusk's external app.js) can tighten via BLASTBOX_CSP. The app
+# still escapes all untrusted text (filenames / extracted text / QR payloads) at
+# render time, so 'unsafe-inline' is defense-in-depth-weakened, not the only guard.
+DEFAULT_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "font-src 'self'; "
+    "connect-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'none'; "
+    "frame-ancestors 'none'"
+)
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Set hardening response headers on every response.
+
+    Restores the posture the engines' bespoke hosts enforced before the
+    blastbox.host migration (clickjacking, MIME-sniffing, referrer leakage, and a
+    baseline CSP) — a host that processes untrusted uploads and renders
+    attacker-influenced strings in its UI must not ship these open. CSP is
+    overridable via ``BLASTBOX_CSP`` (empty string disables the CSP header only;
+    the other three headers are unconditional).
+    """
+
+    def __init__(self, app, csp: str = DEFAULT_CSP) -> None:
+        super().__init__(app)
+        self._csp = csp
+
+    async def dispatch(self, request, call_next):
+        resp = await call_next(request)
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("Referrer-Policy", "no-referrer")
+        if self._csp:
+            resp.headers.setdefault("Content-Security-Policy", self._csp)
+        return resp

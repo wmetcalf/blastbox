@@ -48,7 +48,12 @@ from blastbox.observability import (
     JOBS_IN_FLIGHT,
 )
 from .extension import IngressExtension, StaticUI
-from .middleware import BearerAuthMiddleware, BodySizeLimitMiddleware
+from .middleware import (
+    DEFAULT_CSP,
+    BearerAuthMiddleware,
+    BodySizeLimitMiddleware,
+    SecurityHeadersMiddleware,
+)
 
 _log = get_logger("blastbox.ingress")
 
@@ -293,7 +298,26 @@ def build_app(
     # App + middleware
     # -------------------------------------------------------------------
 
-    app = FastAPI(title="blastbox", version=__version__)
+    # A malware-processing service must not publish its API surface by default —
+    # withhold /docs, /redoc, /openapi.json unless an operator opts in. (The
+    # engines' bespoke hosts gated these; the migration lost the gate.)
+    _expose_docs = os.environ.get("BLASTBOX_EXPOSE_DOCS", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    app = FastAPI(
+        title="blastbox",
+        version=__version__,
+        docs_url="/docs" if _expose_docs else None,
+        redoc_url="/redoc" if _expose_docs else None,
+        openapi_url="/openapi.json" if _expose_docs else None,
+    )
+
+    # Hardening headers on every response (clickjacking / MIME-sniff / referrer /
+    # CSP) — restored from the bespoke hosts. CSP overridable via BLASTBOX_CSP.
+    app.add_middleware(
+        SecurityHeadersMiddleware,
+        csp=os.environ.get("BLASTBOX_CSP", DEFAULT_CSP),
+    )
 
     # Requirement 1: 413 before spool (Content-Length fast path + streaming).
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=_limits.max_input_bytes)
