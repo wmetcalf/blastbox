@@ -95,6 +95,36 @@ def _is_reserved_env_key(key: str) -> bool:
     return key in _RESERVED_ENV_KEYS or key.startswith(_RESERVED_ENV_PREFIXES)
 
 
+def _build_result_summary(envelope) -> dict:
+    """Small derivative of the envelope persisted on the Job for list views — kept
+    minimal so the generic job layer stays small. Carries the generic detection
+    label + a bounded set of the engine's SCALAR payload fields (page counts,
+    labels, …) so a list view can show them without fetching /metadata. Large
+    strings (the embedded ``*_metadata`` JSON) and nested structures are excluded.
+    """
+    det = getattr(envelope, "detected", None)
+    summary: dict = {
+        "status": envelope.status,
+        "artifact_count": len(envelope.artifacts),
+        "warning_count": len(envelope.warnings),
+        "detected": getattr(det, "label", None),
+    }
+    try:
+        pm = envelope.payload.metadata
+        if pm and pm.fields:
+            meta = {
+                k: v
+                for k, v in pm.fields.items()
+                if isinstance(v, (bool, int, float))
+                or (isinstance(v, str) and len(v) <= 64)
+            }
+            if meta:
+                summary["meta"] = meta
+    except Exception:  # noqa: BLE001 — best-effort enrichment, never fail the job
+        pass
+    return summary
+
+
 # Max number of entries (files + dirs) allowed in a worker output dir — bounds inode + walk-time
 # exhaustion from undeclared files even under the byte cap.
 _MAX_OUTPUT_ENTRIES = 65536
@@ -746,11 +776,7 @@ class Dispatcher:
                 if self._job_retention_seconds > 0
                 else None
             )
-            result_summary = {
-                "status": envelope.status,
-                "artifact_count": len(envelope.artifacts),
-                "warning_count": len(envelope.warnings),
-            }
+            result_summary = _build_result_summary(envelope)
             # CAS-fence the terminal DONE on RUNNING (symmetric with the recovery FAIL): under a
             # multi-dispatcher topology a peer may have already FAILED this warm job as stale (its
             # output possibly retention-deleted). A blind DONE would resurrect that terminal state
@@ -979,11 +1005,7 @@ class Dispatcher:
             if self._job_retention_seconds > 0
             else None
         )
-        result_summary = {
-            "status": envelope.status,
-            "artifact_count": len(envelope.artifacts),
-            "warning_count": len(envelope.warnings),
-        }
+        result_summary = _build_result_summary(envelope)
         # Claim-fenced (RUNNING, our claim_id): a peer's docker-ps sweep on another host can't
         # see this container, so it may have requeued the job; don't resurrect a reclaimed job to
         # DONE with this (stale) detonation's result.

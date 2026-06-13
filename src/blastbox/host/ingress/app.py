@@ -567,6 +567,9 @@ def build_app(
         offset: int = 0,
         limit: int = 100,
         status: str | None = None,
+        q: str | None = None,
+        sort: str | None = None,
+        order: str = "desc",
     ):
         """List jobs.  Single-tenant: all jobs are returned (no per-user scoping).
 
@@ -587,9 +590,13 @@ def build_app(
             except ValueError:
                 raise HTTPException(400, f"unknown status: {status!r}")
 
-        total = _job_store.count(status=filter_status)
+        # Optional filename substring search (q) + whitelisted column sort — restored
+        # from the engines' bespoke list views (the generic host had only status).
+        q = (q or "").strip() or None
+        total = _job_store.count(status=filter_status, q=q)
         page = _job_store.list(
-            status=filter_status, limit=limit, offset=offset, newest_first=True
+            status=filter_status, limit=limit, offset=offset, newest_first=True,
+            q=q, sort=sort, order=order,
         )
         return {
             "jobs": [j.to_public_dict() for j in page],

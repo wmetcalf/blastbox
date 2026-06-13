@@ -111,6 +111,49 @@ class Job:
         )
 
 
+# Whitelist of fields ``list(sort=...)`` accepts. A whitelist (not a free column
+# name) keeps the SQL backend injection-safe and the in-memory/Redis backends
+# uniform. Anything else falls back to newest-first.
+LISTABLE_SORT_FIELDS = ("created_at", "filename", "status", "finished_at")
+
+
+def _job_sort_key(field: str):
+    if field == "filename":
+        return lambda j: ((j.filename or "").lower(), j.job_id)
+    if field == "status":
+        return lambda j: (str(j.status.value), j.job_id)
+    if field == "finished_at":
+        return lambda j: (j.finished_at or 0.0, j.job_id)
+    return lambda j: (j.created_at or 0.0, j.job_id)  # created_at / default
+
+
+def filter_sort_window(
+    jobs: _list[Job],
+    *,
+    q: str | None = None,
+    sort: str | None = None,
+    order: str = "desc",
+    newest_first: bool = False,
+    offset: int = 0,
+    limit: int | None = None,
+) -> _list[Job]:
+    """In-process q-filter (filename substring, case-insensitive) + whitelist sort
+    + page window. Shared by the in-memory and Redis backends (the SQL backend
+    pushes the same semantics into the query)."""
+    if q:
+        ql = q.lower()
+        jobs = [j for j in jobs if ql in (j.filename or "").lower()]
+    if sort in LISTABLE_SORT_FIELDS:
+        jobs = sorted(jobs, key=_job_sort_key(sort), reverse=(order or "desc").lower() != "asc")
+    elif newest_first:
+        jobs = sorted(jobs, key=lambda j: (j.created_at or 0.0, j.job_id), reverse=True)
+    if offset:
+        jobs = jobs[offset:]
+    if limit is not None:
+        jobs = jobs[:limit]
+    return jobs
+
+
 @runtime_checkable
 class JobStore(Protocol):
     def create(self, job: Job) -> None: ...
@@ -141,8 +184,13 @@ class JobStore(Protocol):
         limit: int | None = None,
         offset: int = 0,
         newest_first: bool = False,
+        q: str | None = None,
+        sort: str | None = None,
+        order: str = "desc",
     ) -> list[Job]:
-        """Return jobs, optionally filtered by ``status``.
+        """Return jobs, optionally filtered by ``status`` and a filename substring
+        ``q`` (case-insensitive), ordered by ``sort`` (one of LISTABLE_SORT_FIELDS;
+        else newest-first) ``order`` asc/desc.
 
         ``limit``/``offset`` page the result and ``newest_first`` orders by
         ``created_at`` descending.  SQL backends push these down into the query
@@ -157,8 +205,8 @@ class JobStore(Protocol):
         """
         ...
 
-    def count(self, status: JobStatus | None = None) -> int:
-        """Total number of jobs (optionally filtered by ``status``).
+    def count(self, status: JobStatus | None = None, *, q: str | None = None) -> int:
+        """Total number of jobs (optionally filtered by ``status`` + filename ``q``).
 
         Paired with ``list(..., limit=, offset=)`` so the listing endpoint can
         report ``total`` without materializing every row.

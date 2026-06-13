@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from blastbox.contract import Envelope, Page, find_by_type, phash_hex_to_int8
-from blastbox.host.jobs.base import Job, JobStatus
+from blastbox.host.jobs.base import LISTABLE_SORT_FIELDS, Job, JobStatus
 
 
 # Allowlist of column names in the ``jobs`` table.  ``update()`` validates
@@ -421,13 +421,23 @@ class SqlJobStore:
         limit: int | None = None,
         offset: int = 0,
         newest_first: bool = False,
+        q: str | None = None,
+        sort: str | None = None,
+        order: str = "desc",
     ) -> list[Job]:
         sql = f"SELECT {', '.join(_COLUMNS)} FROM jobs"
-        params: list = []
-        if status is not None:
-            sql += f" WHERE status = {self._param}"
-            params.append(status.value)
-        if newest_first:
+        where, params = self._where_status_q(status, q)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        # sort is whitelisted (LISTABLE_SORT_FIELDS) so the column can't inject.
+        order_dir = "ASC" if (order or "desc").lower() == "asc" else "DESC"
+        if sort in LISTABLE_SORT_FIELDS:
+            # finished_at is nullable; COALESCE to 0 so NULL ordering matches the
+            # in-memory/Redis backends (None→0.0). Without it Postgres sorts NULLs
+            # high in DESC and SQLite low — the order would diverge across backends.
+            col = "COALESCE(finished_at, 0)" if sort == "finished_at" else sort
+            sql += f" ORDER BY {col} {order_dir}, job_id {order_dir}"
+        elif newest_first:
             sql += " ORDER BY created_at DESC, job_id DESC"
         # Push the page window into the query so large tables never fully
         # materialize.  SQLite requires a LIMIT clause syntactically before
@@ -446,15 +456,31 @@ class SqlJobStore:
             rows = conn.execute(sql, tuple(params)).fetchall()
         return [job for row in rows if (job := self._row_to_job(row)) is not None]
 
-    def count(self, status: JobStatus | None = None) -> int:
+    def count(self, status: JobStatus | None = None, *, q: str | None = None) -> int:
         sql = "SELECT COUNT(*) FROM jobs"
-        params: tuple = ()
-        if status is not None:
-            sql += f" WHERE status = {self._param}"
-            params = (status.value,)
+        where, params = self._where_status_q(status, q)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
         with self._lock, self._connect() as conn:
-            row = conn.execute(sql, params).fetchone()
+            row = conn.execute(sql, tuple(params)).fetchone()
         return int(row[0]) if row else 0
+
+    def _where_status_q(
+        self, status: JobStatus | None, q: str | None
+    ) -> tuple[_list[str], _list]:
+        """Build the shared WHERE clauses + params for status + filename-``q`` search.
+        ``q`` is a case-insensitive substring; LIKE metacharacters are escaped so a
+        user's ``%``/``_`` is literal."""
+        where: _list[str] = []
+        params: _list = []
+        if status is not None:
+            where.append(f"status = {self._param}")
+            params.append(status.value)
+        if q:
+            esc = q.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            where.append(f"LOWER(filename) LIKE {self._param} ESCAPE '\\'")
+            params.append(f"%{esc}%")
+        return where, params
 
     def claim_next(self) -> Job | None:
         if self._driver == "sqlite":
