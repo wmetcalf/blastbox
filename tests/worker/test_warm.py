@@ -419,3 +419,64 @@ def test_host_wait_for_done_rejects_symlinked_done(tmp_path: Path) -> None:
     (ctrl / "done").symlink_to(tmp_path / "outside")
     with pytest.raises(WarmTimeout):
         HostWarmControl(ctrl).wait_for_done(timeout_s=0.5)
+
+
+# ---------------------------------------------------------------------------
+# Per-job param injection on the warm tier
+# ---------------------------------------------------------------------------
+# The warm process's env is frozen at snapshot time, so per-job toggles (a job
+# sending REDTUSK_ENABLE_THUMBNAILS=0 / CLIPPYSHOT_OCR=1) can't arrive as
+# container -e env the way the cold path gets them. serve_warm bridges that gap
+# by applying the job's allowlisted UPPERCASE params to os.environ BEFORE
+# detonate, so engine.detonate (which reads them via env) honours per-job
+# toggles on warm. This guards that bridge — a regression here silently reverts
+# warm tiers to "default-only", which is exactly the bug class it was added for.
+
+
+def test_serve_warm_injects_uppercase_params_into_environ_before_detonate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_file = tmp_path / "input" / "doc.docx"
+    input_file.parent.mkdir()
+    input_file.write_bytes(b"warm param-injection docx bytes")
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    # serve_warm writes the injected keys DIRECTLY to os.environ. monkeypatch.delenv
+    # on an absent key registers no undo, so those writes would leak into other tests.
+    # set-then-delete records the original (absent) state — teardown then removes
+    # whatever serve_warm injects — while keeping each key absent at the test start.
+    for k in ("CLIPPYSHOT_OCR", "REDTUSK_ENABLE_THUMBNAILS", "lowercase_key", "BAD-KEY"):
+        monkeypatch.setenv(k, "")
+        monkeypatch.delenv(k)
+
+    seen: dict[str, str | None] = {}
+
+    class _EnvCaptureEngine(_WarmEngine):
+        def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
+            # Snapshot the env exactly as engine.detonate would observe it.
+            seen["ocr"] = os.environ.get("CLIPPYSHOT_OCR")
+            seen["thumb_off"] = os.environ.get("REDTUSK_ENABLE_THUMBNAILS")
+            seen["lower"] = os.environ.get("lowercase_key")
+            seen["bad"] = os.environ.get("BAD-KEY")
+            return super().detonate(input, outdir, limits)
+
+    spec = WarmJobSpec(
+        input_path=input_file,
+        output_dir=output_dir,
+        params={
+            "CLIPPYSHOT_OCR": "1",            # uppercase, allowlisted shape → injected
+            "REDTUSK_ENABLE_THUMBNAILS": "0",  # the toggle-OFF value must reach the engine
+            "lowercase_key": "x",             # lowercase → dropped
+            "BAD-KEY": "y",                   # has '-' → fails [A-Z][A-Z0-9_]* → dropped
+        },
+    )
+    control = _FakeControl(specs=[spec])
+
+    rc = serve_warm(_EnvCaptureEngine(), control=control, limits=_limits(), idle_timeout_s=10.0)
+
+    assert rc == 0
+    assert seen["ocr"] == "1"          # uppercase allowlisted param reached detonate
+    assert seen["thumb_off"] == "0"    # toggle-OFF is honoured per job (not just the default)
+    assert seen["lower"] is None       # lowercase dropped
+    assert seen["bad"] is None         # malformed-shape key dropped
