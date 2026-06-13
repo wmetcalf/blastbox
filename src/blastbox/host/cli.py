@@ -70,13 +70,31 @@ def _parse_engine_specs(engines_raw: str) -> dict:
             # (sandbox/limits) to client override.
             # None when UNSET (legacy denylist); a frozenset when SET (even if empty after
             # stripping → blocks all client params, the operator's explicit intent).
-            keys_raw = os.environ.get(f"BLASTBOX_ENGINE_{name.upper()}_PARAM_KEYS")
+            # Env var names can't contain hyphens, so normalize the engine name (test-engine
+            # → TEST_ENGINE). Keys are upper-cased to match the UPPERCASE-only client keys
+            # (_VALID_ENV_KEY_RE): a lowercase allowlist entry would silently never match
+            # (fail-closed); a lowercase RESERVED entry would silently never match and BYPASS
+            # the denylist (fail-DANGEROUS) — so normalize on parse, here, for both.
+            env_name = name.upper().replace("-", "_")
+            keys_raw = os.environ.get(f"BLASTBOX_ENGINE_{env_name}_PARAM_KEYS")
             allowed = (
                 None if keys_raw is None
-                else frozenset(k.strip() for k in keys_raw.split(",") if k.strip())
+                else frozenset(k.strip().upper() for k in keys_raw.split(",") if k.strip())
+            )
+            # Optional per-engine RESERVED keys (engine-OWNED denylist):
+            #   BLASTBOX_ENGINE_<NAME>_RESERVED_KEYS='KEY1,KEY2'
+            # Client params this engine's worker reads that flip its security posture or
+            # are code-exec vectors (clippyshot inner-sandbox selector; redtusk JVM
+            # binary/jar/opts/library path / CRaC dir). Dropped UNCONDITIONALLY — even if
+            # the allowlist is unset/misconfigured. This keeps blastbox core engine-
+            # agnostic: the engine names its own dangerous keys, here, in its deploy config.
+            reserved_raw = os.environ.get(f"BLASTBOX_ENGINE_{env_name}_RESERVED_KEYS")
+            reserved = frozenset(
+                k.strip().upper() for k in (reserved_raw or "").split(",") if k.strip()
             )
             engines[name] = EngineSpec(
-                name=name, image=image, worker_argv=[], allowed_param_keys=allowed,
+                name=name, image=image, worker_argv=[],
+                allowed_param_keys=allowed, reserved_param_keys=reserved,
             )
     return engines
 

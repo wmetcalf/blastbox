@@ -30,11 +30,16 @@ def _limits() -> Limits:
     return Limits()
 
 
-def _engine_spec(name: str = _ENGINE_NAME, image: str = _ENGINE_IMAGE) -> EngineSpec:
+def _engine_spec(
+    name: str = _ENGINE_NAME,
+    image: str = _ENGINE_IMAGE,
+    reserved_param_keys: frozenset[str] = frozenset(),
+) -> EngineSpec:
     return EngineSpec(
         name=name,
         image=image,
         worker_argv=["worker", "run"],
+        reserved_param_keys=reserved_param_keys,
     )
 
 
@@ -657,8 +662,10 @@ def test_params_key_filtering_bad_dropped_good_passes(tmp_path):
 
 def test_params_reserved_keys_dropped(tmp_path):
     """M2: a client must not set reserved env keys via job.params even though they match the key
-    SHAPE — BLASTBOX_ENGINE (engine re-selection → arbitrary module import), LD_PRELOAD,
-    PYTHONPATH, and the engine breadcrumb path are dropped; ordinary CLIPPYSHOT_* keys pass."""
+    SHAPE. The engine-AGNOSTIC floor — BLASTBOX_ENGINE (engine re-selection → arbitrary module
+    import), LD_PRELOAD, PYTHONPATH, BLASTBOX_OUTPUT_DIR (I/O rewire) — is dropped unconditionally.
+    An ENGINE-declared reserved key (here CLIPPYSHOT_WARM_DIAG_FILE, via EngineSpec.reserved_param_keys)
+    is also dropped, without blastbox core naming it; ordinary tunables (CLIPPYSHOT_DPI) pass."""
     store = InMemoryJobStore()
     job = _make_job(
         params={
@@ -682,7 +689,12 @@ def test_params_reserved_keys_dropped(tmp_path):
             _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner,
+        engines={_ENGINE_NAME: _engine_spec(
+            reserved_param_keys=frozenset({"CLIPPYSHOT_WARM_DIAG_FILE"}),
+        )},
+    )
     dispatcher.dispatch_once()
 
     docker_run_argv = next(
