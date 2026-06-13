@@ -660,3 +660,51 @@ def test_nono_wrap_with_profile(monkeypatch):
     argv = _argv(worker_argv=["blastbox", "worker"], runtime=_runc())
     assert "-p" in argv and "/etc/blastbox/worker.nono.json" in argv
     assert "/usr" not in argv                            # profile replaces the baseline grants
+
+
+# ---------------------------------------------------------------------------
+# Resource caps: a set-but-EMPTY env must fall back to the default, never emit
+# an empty `--memory ""` (docker rejects it pre-create → worker never runs →
+# misleading "metadata.json not found"). Regression for the clippyshot cold-runsc
+# 0/50 outage, where compose `${BLASTBOX_WORKER_MEMORY:-}` set the var to "".
+# ---------------------------------------------------------------------------
+def test_resource_caps_empty_env_fall_back_to_defaults(monkeypatch):
+    from blastbox.host.runtime.docker import (
+        _DEFAULT_WORKER_CPUS,
+        _DEFAULT_WORKER_MEMORY,
+        _DEFAULT_WORKER_NOFILE,
+        _DEFAULT_WORKER_PIDS_LIMIT,
+    )
+
+    for var in (
+        "BLASTBOX_WORKER_MEMORY",
+        "BLASTBOX_WORKER_CPUS",
+        "BLASTBOX_WORKER_PIDS_LIMIT",
+        "BLASTBOX_WORKER_NOFILE",
+    ):
+        monkeypatch.setenv(var, "")  # set-but-empty, exactly like ${VAR:-} in compose
+
+    argv = _argv()
+
+    def _val_after(flag: str) -> str:
+        return argv[argv.index(flag) + 1]
+
+    assert _val_after("--memory") == _DEFAULT_WORKER_MEMORY
+    assert _val_after("--memory-swap") == _DEFAULT_WORKER_MEMORY
+    assert _val_after("--pids-limit") == _DEFAULT_WORKER_PIDS_LIMIT
+    assert _val_after("--cpus") == _DEFAULT_WORKER_CPUS
+    # The ulimit token must not degenerate to "nofile=:" either.
+    ulimit = argv[argv.index("--ulimit") + 1]
+    assert ulimit == f"nofile={_DEFAULT_WORKER_NOFILE}:{_DEFAULT_WORKER_NOFILE}"
+    # No value-position token following a resource flag may be empty.
+    for i, tok in enumerate(argv):
+        if tok in ("--memory", "--memory-swap", "--pids-limit", "--cpus"):
+            assert argv[i + 1] != "", f"{tok} followed by an empty value"
+
+
+def test_resource_caps_explicit_env_override_wins(monkeypatch):
+    monkeypatch.setenv("BLASTBOX_WORKER_MEMORY", "3g")
+    monkeypatch.setenv("BLASTBOX_WORKER_CPUS", "2")
+    argv = _argv()
+    assert argv[argv.index("--memory") + 1] == "3g"
+    assert argv[argv.index("--cpus") + 1] == "2"

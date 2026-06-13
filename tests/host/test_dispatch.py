@@ -822,3 +822,35 @@ def test_cold_enrichment_claim_fenced_aborts_on_reclaim(tmp_path):
     assert final.worker_runtime == "warm"  # the new owner's label is NOT clobbered to "runc"
     assert final.status == JobStatus.RUNNING  # still the new owner's live claim
     assert input_path.exists()  # shared input preserved for the new owner (not deleted on abort)
+
+
+# ---------------------------------------------------------------------------
+# Param-key SHAPE: a purely-lowercase key (valid letters, no symbols) is still
+# dropped — keys must be UPPERCASE env-shaped. Regression for the redtusk thumbnail
+# trap: `enable_thumbnails` silently never reached the worker; `REDTUSK_ENABLE_*` did.
+# (The existing key-filtering test covers symbols/hyphens/digits, not lowercase.)
+# ---------------------------------------------------------------------------
+def test_sanitize_params_lowercase_dropped_uppercase_forwarded():
+    allow = frozenset(
+        {"REDTUSK_ENABLE_THUMBNAILS", "REDTUSK_ENABLE_QR", "enable_thumbnails"}
+    )
+    out = Dispatcher._sanitize_params(
+        {
+            "enable_thumbnails": "true",          # lowercase → dropped by the shape floor
+            "REDTUSK_ENABLE_THUMBNAILS": "true",  # uppercase + allowlisted → forwarded
+            "REDTUSK_ENABLE_QR": "false",
+            "Redtusk_Mixed": "x",                 # not uppercase-only → dropped
+        },
+        allow,
+    )
+    assert out == {"REDTUSK_ENABLE_THUMBNAILS": "true", "REDTUSK_ENABLE_QR": "false"}
+    assert "enable_thumbnails" not in out  # the bug: lowercase never forwards
+
+
+def test_sanitize_params_allowlist_default_deny():
+    """A non-empty allowlist is default-deny: an uppercase key NOT in it is dropped."""
+    out = Dispatcher._sanitize_params(
+        {"REDTUSK_ENABLE_THUMBNAILS": "true", "REDTUSK_SECRET_KNOB": "1"},
+        frozenset({"REDTUSK_ENABLE_THUMBNAILS"}),
+    )
+    assert out == {"REDTUSK_ENABLE_THUMBNAILS": "true"}
