@@ -8,6 +8,6 @@ launch, output-trust validation, and serving.
 from blastbox.worker.engine import DetonationResult, Engine
 from blastbox.worker.harness import run_detonation
 
-__version__ = "0.1.7"  # keep in sync with pyproject [project].version
+__version__ = "0.1.12"  # keep in sync with pyproject [project].version
 
 __all__ = ["Engine", "DetonationResult", "run_detonation", "__version__"]
