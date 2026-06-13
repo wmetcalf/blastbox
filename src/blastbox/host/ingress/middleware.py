@@ -142,3 +142,65 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if not hmac.compare_digest(provided, self._key):
             return PlainTextResponse("invalid bearer token", status_code=401)
         return await call_next(request)
+
+
+# Default Content-Security-Policy: blocks external resource loads + framing, but
+# tolerates inline <script>/<style> because the engine UIs use them (clippyshot's
+# index.html inlines its JS; both inline style attrs). Engines that don't need
+# inline (e.g. redtusk's external app.js) can tighten via BLASTBOX_CSP. The app
+# still escapes all untrusted text (filenames / extracted text / QR payloads) at
+# render time, so 'unsafe-inline' is defense-in-depth-weakened, not the only guard.
+DEFAULT_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "font-src 'self'; "
+    "connect-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'none'; "
+    "frame-ancestors 'none'"
+)
+
+
+class SecurityHeadersMiddleware:
+    """Set hardening response headers on every response.
+
+    Restores the posture the engines' bespoke hosts enforced before the
+    blastbox.host migration (clickjacking, MIME-sniffing, referrer leakage, and a
+    baseline CSP) — a host that processes untrusted uploads and renders
+    attacker-influenced strings in its UI must not ship these open. CSP is
+    overridable via ``BLASTBOX_CSP`` (empty string disables the CSP header only;
+    the other three headers are unconditional).
+
+    Pure ASGI (not BaseHTTPMiddleware): it only injects headers into the
+    ``http.response.start`` message and never touches the body, so it is safe for
+    the host's many streaming ``FileResponse``s (pdf / pages / result zip) — which
+    BaseHTTPMiddleware would buffer.
+    """
+
+    def __init__(self, app, csp: str = DEFAULT_CSP) -> None:
+        self.app = app
+        self._headers: list[tuple[bytes, bytes]] = [
+            (b"x-frame-options", b"DENY"),
+            (b"x-content-type-options", b"nosniff"),
+            (b"referrer-policy", b"no-referrer"),
+        ]
+        if csp:
+            self._headers.append((b"content-security-policy", csp.encode("latin-1")))
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = message.setdefault("headers", [])
+                present = {k.lower() for k, _ in headers}
+                for k, v in self._headers:
+                    if k not in present:  # don't clobber a header a route already set
+                        headers.append((k, v))
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
