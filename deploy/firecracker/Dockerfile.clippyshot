@@ -2,11 +2,11 @@
 # real Converter (LibreOffice 25.8 + poppler + tesseract + magika) runs inside a
 # warm, hardened, disposable Firecracker microVM.
 #
-# The base image already provides LibreOffice + clippyshot + a /opt/clippyshot
-# venv + the non-root `clippy` user. This overlay adds: blastbox (the engine
-# seam), the self-contained ClippyShot engine adapter, and the blastbox FC guest
-# agent + init. Build context = blastbox repo root; clippyshot_engine.py is
-# staged in (it lives in the ClippyShot repo, copied in at build time).
+# The base image already provides LibreOffice + clippyshot (engine adapter +
+# warm-UNO modules) + a /opt/clippyshot venv + the non-root `clippy` user. This
+# overlay adds only blastbox (the engine seam) + the blastbox FC guest agent +
+# init — the ClippyShot code is inherited from the base, not staged in.
+# Build context = blastbox repo root.
 ARG BASE_IMAGE=clippyshot:dev
 FROM ${BASE_IMAGE}
 ARG ENGINE=clippyshot   # unused (engine is baked via /opt/blastbox/engine); silences the warning
@@ -17,20 +17,15 @@ COPY pyproject.toml README.md /src/blastbox/
 COPY src /src/blastbox/src
 RUN /opt/clippyshot/bin/pip install --no-cache-dir /src/blastbox && rm -rf /src
 
-# Stage the warm-UNO ClippyShot code into the installed package: the engine adapter
-# + the UNO server module + the runner's warm fast-path. The base clippyshot:dev is
-# built from ClippyShot master, which lacks uno.py + the warm runner, so all three
-# are staged. (When ClippyShot's warm-uno branch merges and clippyshot:dev is rebuilt
-# with them, only the engine-adapter staging remains needed.)
-COPY deploy/firecracker/clippyshot_engine.py /tmp/cs/engine.py
-COPY deploy/firecracker/clippyshot_uno.py /tmp/cs/uno.py
-COPY deploy/firecracker/clippyshot_runner.py /tmp/cs/runner.py
-RUN PKG="$(/opt/clippyshot/bin/python -c 'import clippyshot,os;print(os.path.dirname(clippyshot.__file__))')" \
-    && cp /tmp/cs/engine.py "$PKG/engine.py" \
-    && cp /tmp/cs/uno.py "$PKG/libreoffice/uno.py" \
-    && cp /tmp/cs/runner.py "$PKG/libreoffice/runner.py" \
-    && rm -rf /tmp/cs \
-    && /opt/clippyshot/bin/python -c 'import clippyshot.engine, clippyshot.libreoffice.uno, clippyshot.libreoffice.runner'  # fail build if any cannot import
+# The ClippyShot engine adapter + warm-UNO modules (libreoffice/uno.py + the warm
+# runner) come from the base clippyshot:dev — same as the cold-worker overlay and
+# the gVisor shim, which both use the base's code directly. These were once staged
+# in from the ClippyShot repo (clippyshot:dev was built from a master that lacked
+# them); now that the base ships the current code, copying stale local snapshots
+# over it only risked silently regressing FC (e.g. an older engine that dropped the
+# envelope-embedded metadata while cold/gVisor kept it). Sanity-check the imports so
+# a base image missing any of them fails the build loudly, not at first convert.
+RUN /opt/clippyshot/bin/python -c 'import clippyshot.engine, clippyshot.libreoffice.uno, clippyshot.libreoffice.runner'
 
 # Warm-UNO: the engine's warmup() runs a persistent soffice UNO server (the warm
 # conversion path; see guest.clippyshot.env CLIPPYSHOT_WARM_UNO). VALIDATED on
