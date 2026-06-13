@@ -442,11 +442,13 @@ def test_serve_warm_injects_uppercase_params_into_environ_before_detonate(
     output_dir = tmp_path / "output"
     output_dir.mkdir()
 
-    # Keys the test touches — delenv now so monkeypatch restores (removes) whatever
-    # serve_warm writes directly to os.environ, keeping the global env clean for
-    # other tests.
+    # serve_warm writes the injected keys DIRECTLY to os.environ. monkeypatch.delenv
+    # on an absent key registers no undo, so those writes would leak into other tests.
+    # set-then-delete records the original (absent) state — teardown then removes
+    # whatever serve_warm injects — while keeping each key absent at the test start.
     for k in ("CLIPPYSHOT_OCR", "REDTUSK_ENABLE_THUMBNAILS", "lowercase_key", "BAD-KEY"):
-        monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv(k, "")
+        monkeypatch.delenv(k)
 
     seen: dict[str, str | None] = {}
 
