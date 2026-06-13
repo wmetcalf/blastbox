@@ -163,7 +163,7 @@ DEFAULT_CSP = (
 )
 
 
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+class SecurityHeadersMiddleware:
     """Set hardening response headers on every response.
 
     Restores the posture the engines' bespoke hosts enforced before the
@@ -172,17 +172,35 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     attacker-influenced strings in its UI must not ship these open. CSP is
     overridable via ``BLASTBOX_CSP`` (empty string disables the CSP header only;
     the other three headers are unconditional).
+
+    Pure ASGI (not BaseHTTPMiddleware): it only injects headers into the
+    ``http.response.start`` message and never touches the body, so it is safe for
+    the host's many streaming ``FileResponse``s (pdf / pages / result zip) — which
+    BaseHTTPMiddleware would buffer.
     """
 
     def __init__(self, app, csp: str = DEFAULT_CSP) -> None:
-        super().__init__(app)
-        self._csp = csp
+        self.app = app
+        self._headers: list[tuple[bytes, bytes]] = [
+            (b"x-frame-options", b"DENY"),
+            (b"x-content-type-options", b"nosniff"),
+            (b"referrer-policy", b"no-referrer"),
+        ]
+        if csp:
+            self._headers.append((b"content-security-policy", csp.encode("latin-1")))
 
-    async def dispatch(self, request, call_next):
-        resp = await call_next(request)
-        resp.headers.setdefault("X-Frame-Options", "DENY")
-        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
-        resp.headers.setdefault("Referrer-Policy", "no-referrer")
-        if self._csp:
-            resp.headers.setdefault("Content-Security-Policy", self._csp)
-        return resp
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = message.setdefault("headers", [])
+                present = {k.lower() for k, _ in headers}
+                for k, v in self._headers:
+                    if k not in present:  # don't clobber a header a route already set
+                        headers.append((k, v))
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
