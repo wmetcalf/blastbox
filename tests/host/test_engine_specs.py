@@ -79,6 +79,19 @@ def test_reserved_param_keys_from_env(monkeypatch):
     )
 
 
+def test_param_keys_env_name_and_keys_are_normalized(monkeypatch):
+    """Two normalizations matter for correctness + security:
+    - the engine name → env var: hyphens become underscores (env vars can't hold hyphens),
+    - keys → UPPERCASE: client keys are uppercase-only, so a lowercase RESERVED entry would
+      silently never match and BYPASS the denylist (fail-dangerous); allowlist entries
+      uppercase too (a lowercase allowlist entry would fail-closed, also wrong)."""
+    monkeypatch.setenv("BLASTBOX_ENGINE_TEST_ENGINE_PARAM_KEYS", "foo_ocr, Foo_Qr")
+    monkeypatch.setenv("BLASTBOX_ENGINE_TEST_ENGINE_RESERVED_KEYS", "foo_java_bin, Foo_Sandbox")
+    specs = _parse_engine_specs("test-engine=img:t")
+    assert specs["test-engine"].allowed_param_keys == frozenset({"FOO_OCR", "FOO_QR"})
+    assert specs["test-engine"].reserved_param_keys == frozenset({"FOO_JAVA_BIN", "FOO_SANDBOX"})
+
+
 def test_sanitize_params_allowlist_drops_security_keys():
     """A non-empty allowlist forwards ONLY scanner keys — the inner-sandbox
     downgrade keys (CLIPPYSHOT_SANDBOX / CLIPPYSHOT_WARN_ON_INSECURE) are dropped."""
