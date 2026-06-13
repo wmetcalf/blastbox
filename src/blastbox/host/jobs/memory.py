@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 
-from blastbox.host.jobs.base import Job, JobStatus
+from blastbox.host.jobs.base import Job, JobStatus, filter_sort_window
 
 # Allowlist of Job fields that update() may set — mirrors RedisJobStore._JOB_FIELDS and
 # SqlJobStore._COLUMNS so all three backends fail closed identically on an unknown field
@@ -91,24 +91,29 @@ class InMemoryJobStore:
         limit: int | None = None,
         offset: int = 0,
         newest_first: bool = False,
+        q: str | None = None,
+        sort: str | None = None,
+        order: str = "desc",
     ) -> list[Job]:
         with self._lock:
             jobs = list(self._jobs.values())
         if status is not None:
             jobs = [j for j in jobs if j.status == status]
-        if newest_first:
-            jobs.sort(key=lambda j: (j.created_at, j.job_id), reverse=True)
-        if offset:
-            jobs = jobs[offset:]
-        if limit is not None:
-            jobs = jobs[:limit]
+        jobs = filter_sort_window(
+            jobs, q=q, sort=sort, order=order, newest_first=newest_first,
+            offset=offset, limit=limit,
+        )
         return [copy.deepcopy(j) for j in jobs]
 
-    def count(self, status: JobStatus | None = None) -> int:
+    def count(self, status: JobStatus | None = None, *, q: str | None = None) -> int:
         with self._lock:
-            if status is None:
-                return len(self._jobs)
-            return sum(1 for j in self._jobs.values() if j.status == status)
+            jobs = list(self._jobs.values())
+        if status is not None:
+            jobs = [j for j in jobs if j.status == status]
+        if q:
+            ql = q.lower()
+            jobs = [j for j in jobs if ql in (j.filename or "").lower()]
+        return len(jobs)
 
     def claim_next(self) -> Job | None:
         """Atomically claim the oldest QUEUED job and flip it to RUNNING."""

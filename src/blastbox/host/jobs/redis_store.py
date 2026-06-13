@@ -15,7 +15,7 @@ import uuid
 
 from redis.exceptions import WatchError
 
-from blastbox.host.jobs.base import Job, JobStatus
+from blastbox.host.jobs.base import Job, JobStatus, filter_sort_window
 
 _log = logging.getLogger("blastbox.host.jobs.redis_store")
 
@@ -152,10 +152,13 @@ class RedisJobStore:
         limit: int | None = None,
         offset: int = 0,
         newest_first: bool = False,
+        q: str | None = None,
+        sort: str | None = None,
+        order: str = "desc",
     ) -> list[Job]:
         # Redis has no server-side ORDER BY/LIMIT over a scanned key space, so we
-        # still collect matching jobs, then apply the same window the SQL backend
-        # pushes down — keeping the protocol uniform for the listing endpoint.
+        # still collect matching jobs, then apply the same q-filter/sort/window the
+        # SQL backend pushes down — keeping the protocol uniform for the endpoint.
         jobs: list[Job] = []
         for k in self._r.scan_iter(match=_PREFIX + "*", count=200):
             raw = self._r.get(k)
@@ -166,16 +169,14 @@ class RedisJobStore:
                 continue
             if status is None or job.status == status:
                 jobs.append(job)
-        if newest_first:
-            jobs.sort(key=lambda j: (j.created_at, j.job_id), reverse=True)
-        if offset:
-            jobs = jobs[offset:]
-        if limit is not None:
-            jobs = jobs[:limit]
-        return jobs
+        return filter_sort_window(
+            jobs, q=q, sort=sort, order=order, newest_first=newest_first,
+            offset=offset, limit=limit,
+        )
 
-    def count(self, status: JobStatus | None = None) -> int:
+    def count(self, status: JobStatus | None = None, *, q: str | None = None) -> int:
         n = 0
+        ql = q.lower() if q else None
         for k in self._r.scan_iter(match=_PREFIX + "*", count=200):
             raw = self._r.get(k)
             if raw is None:
@@ -183,8 +184,11 @@ class RedisJobStore:
             job = _decode_job(raw)
             if job is None:
                 continue
-            if status is None or job.status == status:
-                n += 1
+            if status is not None and job.status != status:
+                continue
+            if ql and ql not in (job.filename or "").lower():
+                continue
+            n += 1
         return n
 
     def claim_next(self) -> Job | None:
