@@ -49,3 +49,10 @@ def test_robust_to_missing_payload():
     s = _build_result_summary(env)
     assert s["detected"] is None
     assert "meta" not in s  # no payload → no meta, no crash
+
+
+def test_detected_without_label_does_not_raise():
+    # a `detected` that's non-None but lacks `.label` must not AttributeError
+    env = types.SimpleNamespace(status="ok", artifacts=[], warnings=[],
+                                detected=object(), payload=None)
+    assert _build_result_summary(env)["detected"] is None

@@ -432,7 +432,11 @@ class SqlJobStore:
         # sort is whitelisted (LISTABLE_SORT_FIELDS) so the column can't inject.
         order_dir = "ASC" if (order or "desc").lower() == "asc" else "DESC"
         if sort in LISTABLE_SORT_FIELDS:
-            sql += f" ORDER BY {sort} {order_dir}, job_id {order_dir}"
+            # finished_at is nullable; COALESCE to 0 so NULL ordering matches the
+            # in-memory/Redis backends (None→0.0). Without it Postgres sorts NULLs
+            # high in DESC and SQLite low — the order would diverge across backends.
+            col = "COALESCE(finished_at, 0)" if sort == "finished_at" else sort
+            sql += f" ORDER BY {col} {order_dir}, job_id {order_dir}"
         elif newest_first:
             sql += " ORDER BY created_at DESC, job_id DESC"
         # Push the page window into the query so large tables never fully

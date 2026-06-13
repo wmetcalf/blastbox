@@ -154,13 +154,6 @@ def filter_sort_window(
     return jobs
 
 
-def _q_filter(jobs: _list[Job], q: str | None) -> _list[Job]:
-    if not q:
-        return jobs
-    ql = q.lower()
-    return [j for j in jobs if ql in (j.filename or "").lower()]
-
-
 @runtime_checkable
 class JobStore(Protocol):
     def create(self, job: Job) -> None: ...

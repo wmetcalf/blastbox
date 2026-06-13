@@ -107,7 +107,7 @@ def _build_result_summary(envelope) -> dict:
         "status": envelope.status,
         "artifact_count": len(envelope.artifacts),
         "warning_count": len(envelope.warnings),
-        "detected": (det.label if det else None),
+        "detected": getattr(det, "label", None),
     }
     try:
         pm = envelope.payload.metadata
