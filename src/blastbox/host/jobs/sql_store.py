@@ -463,12 +463,12 @@ class SqlJobStore:
 
     def _where_status_q(
         self, status: JobStatus | None, q: str | None
-    ) -> tuple[list[str], list]:
+    ) -> tuple[_list[str], _list]:
         """Build the shared WHERE clauses + params for status + filename-``q`` search.
         ``q`` is a case-insensitive substring; LIKE metacharacters are escaped so a
         user's ``%``/``_`` is literal."""
-        where: list[str] = []
-        params: list = []
+        where: _list[str] = []
+        params: _list = []
         if status is not None:
             where.append(f"status = {self._param}")
             params.append(status.value)
