@@ -67,15 +67,17 @@ _MAX_ENV_VALUE_LEN = 4096
 # and underscores.  This prevents any lowercase/symbol injection.
 _VALID_ENV_KEY_RE = re.compile(r"\A[A-Z][A-Z0-9_]*\Z")  # \Z (not $) — $ also matches a trailing \n
 
-# Reserved env keys/prefixes that a client's job.params may NEVER set, even when they
-# match the key shape and even if an engine's allowlist is misconfigured (belt-and-
-# suspenders / fail-safe). Prefixes cover framework + loader/interpreter control
-# (re-selecting the engine, re-wiring I/O, hijacking the dynamic loader or Python).
-# The exact keys additionally reserve worker SECURITY-POSTURE knobs an audit flagged
-# as client-reachable weakening (inner-sandbox selection, insecure-mode fallback,
-# security-internals disclosure, and the warm-diag write primitive). The primary
-# control is the per-engine default-deny allowlist below; this denylist is the
-# unconditional floor that holds even with no allowlist configured.
+# Engine-AGNOSTIC reserved env keys/prefixes that a client's job.params may NEVER set,
+# even when they match the key shape and even if an engine's allowlist is misconfigured
+# (belt-and-suspenders / fail-safe). These cover framework + loader/interpreter control
+# that applies to EVERY engine — re-selecting the engine (BLASTBOX_*), hijacking the
+# dynamic loader (LD_*) or Python (PYTHON*), or redirecting executable resolution
+# (PATH/IFS). ENGINE-SPECIFIC dangerous keys (a clippyshot inner-sandbox selector, a
+# redtusk JVM binary/jar/opts path, …) are NOT named here — blastbox stays engine-
+# agnostic; each engine declares its own reserved keys via the per-engine
+# ``EngineSpec.reserved_param_keys`` (BLASTBOX_ENGINE_<NAME>_RESERVED_KEYS), unioned in
+# below. The per-engine default-deny allowlist is the primary control; this floor +
+# the engine's declared reserved set are the unconditional belt-and-suspenders.
 _RESERVED_ENV_PREFIXES = ("BLASTBOX_", "LD_", "PYTHON")
 _RESERVED_ENV_KEYS = frozenset({
     # Executable/command resolution — a client setting PATH (or IFS) could redirect the
@@ -84,15 +86,15 @@ _RESERVED_ENV_KEYS = frozenset({
     # prefix-reserved; PATH/IFS close the rest of the loader/shell-resolution surface.
     "PATH",
     "IFS",
-    "CLIPPYSHOT_WARM_DIAG_FILE",
-    "CLIPPYSHOT_SANDBOX",
-    "CLIPPYSHOT_WARN_ON_INSECURE",
-    "CLIPPYSHOT_DISCLOSE_SECURITY_INTERNALS",
 })
 
 
-def _is_reserved_env_key(key: str) -> bool:
-    return key in _RESERVED_ENV_KEYS or key.startswith(_RESERVED_ENV_PREFIXES)
+def _is_reserved_env_key(key: str, engine_reserved: frozenset[str] = frozenset()) -> bool:
+    return (
+        key in _RESERVED_ENV_KEYS
+        or key in engine_reserved
+        or key.startswith(_RESERVED_ENV_PREFIXES)
+    )
 
 
 def _build_result_summary(envelope) -> dict:
@@ -149,6 +151,13 @@ class EngineSpec:
     # the privilege of opening the worker's env namespace with the operator who configures
     # the engine — not any client who can guess a key the worker reads.
     allowed_param_keys: frozenset[str] | None = None
+    # Engine-OWNED reserved keys: client params this engine's worker reads that flip its
+    # security posture or are code-exec vectors (a clippyshot inner-sandbox selector, a
+    # redtusk JVM binary/jar/opts/library path, a CRaC checkpoint dir, …). Dropped from
+    # job.params UNCONDITIONALLY — even if allowed_param_keys is unset/misconfigured — so
+    # an engine declares its own dangerous keys without blastbox core naming them. The
+    # engine-agnostic floor (PATH/IFS/BLASTBOX_*/LD_*/PYTHON*) is separate (module-level).
+    reserved_param_keys: frozenset[str] = frozenset()
 
 
 class Dispatcher:
@@ -643,7 +652,9 @@ class Dispatcher:
             spec = WarmJobSpec(
                 input_path=input_path,
                 output_dir=slot.output_dir,
-                params=self._sanitize_params(job.params, engine.allowed_param_keys),
+                params=self._sanitize_params(
+                    job.params, engine.allowed_param_keys, engine.reserved_param_keys,
+                ),
             )
             # One absolute deadline bounds the input send + wait (the only steps a slow guest
             # can stall) to worker_timeout_s, so the upload (which runs BEFORE the wait) can't
@@ -889,7 +900,9 @@ class Dispatcher:
                 "blastbox.job_id": job.job_id,
             },
             extra_env={
-                **self._sanitize_params(job.params, engine.allowed_param_keys),
+                **self._sanitize_params(
+                    job.params, engine.allowed_param_keys, engine.reserved_param_keys,
+                ),
                 # Tell the harness where the dispatcher mounted I/O (it mounts the input file at
                 # /input/<name> and output at /output; the harness defaults are /in,/out, so
                 # without this the cold path is broken-as-wired). Dispatcher-set keys are merged
@@ -1245,7 +1258,8 @@ class Dispatcher:
 
     @staticmethod
     def _sanitize_params(
-        params: dict[str, str], allowed_keys: frozenset[str] | None = None
+        params: dict[str, str], allowed_keys: frozenset[str] | None = None,
+        reserved_keys: frozenset[str] = frozenset(),
     ) -> dict[str, str]:
         """Filter job.params to a safe subset suitable for extra_env.
 
@@ -1275,7 +1289,7 @@ class Dispatcher:
             if not _VALID_ENV_KEY_RE.match(key):
                 _log.debug("dropping invalid extra_env key: %r", key)
                 continue
-            if _is_reserved_env_key(key):
+            if _is_reserved_env_key(key, reserved_keys):
                 _log.warning("dropping reserved extra_env key from job.params: %r", key)
                 continue
             if allowed_keys is not None and key not in allowed_keys:

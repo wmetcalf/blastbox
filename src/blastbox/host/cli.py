@@ -75,8 +75,20 @@ def _parse_engine_specs(engines_raw: str) -> dict:
                 None if keys_raw is None
                 else frozenset(k.strip() for k in keys_raw.split(",") if k.strip())
             )
+            # Optional per-engine RESERVED keys (engine-OWNED denylist):
+            #   BLASTBOX_ENGINE_<NAME>_RESERVED_KEYS='KEY1,KEY2'
+            # Client params this engine's worker reads that flip its security posture or
+            # are code-exec vectors (clippyshot inner-sandbox selector; redtusk JVM
+            # binary/jar/opts/library path / CRaC dir). Dropped UNCONDITIONALLY — even if
+            # the allowlist is unset/misconfigured. This keeps blastbox core engine-
+            # agnostic: the engine names its own dangerous keys, here, in its deploy config.
+            reserved_raw = os.environ.get(f"BLASTBOX_ENGINE_{name.upper()}_RESERVED_KEYS")
+            reserved = frozenset(
+                k.strip() for k in (reserved_raw or "").split(",") if k.strip()
+            )
             engines[name] = EngineSpec(
-                name=name, image=image, worker_argv=[], allowed_param_keys=allowed,
+                name=name, image=image, worker_argv=[],
+                allowed_param_keys=allowed, reserved_param_keys=reserved,
             )
     return engines
 

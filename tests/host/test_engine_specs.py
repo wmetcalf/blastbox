@@ -60,6 +60,25 @@ def test_allowed_param_keys_from_env(monkeypatch):
     )
 
 
+def test_reserved_param_keys_default_empty_when_unset():
+    # UNSET -> empty frozenset (no engine-declared reserved keys); the generic floor still applies.
+    specs = _parse_engine_specs("foo=img:t")
+    assert specs["foo"].reserved_param_keys == frozenset()
+
+
+def test_reserved_param_keys_from_env(monkeypatch):
+    # BLASTBOX_ENGINE_<NAME>_RESERVED_KEYS parses like the allowlist. Generic names — the
+    # engine OWNS its dangerous keys; blastbox just carries whatever the deploy declares.
+    monkeypatch.setenv(
+        "BLASTBOX_ENGINE_FOO_RESERVED_KEYS",
+        "FOO_JAVA_BIN, FOO_SANDBOX ,FOO_OPTS",
+    )
+    specs = _parse_engine_specs("foo=img:t")
+    assert specs["foo"].reserved_param_keys == frozenset(
+        {"FOO_JAVA_BIN", "FOO_SANDBOX", "FOO_OPTS"}
+    )
+
+
 def test_sanitize_params_allowlist_drops_security_keys():
     """A non-empty allowlist forwards ONLY scanner keys — the inner-sandbox
     downgrade keys (CLIPPYSHOT_SANDBOX / CLIPPYSHOT_WARN_ON_INSECURE) are dropped."""
@@ -77,22 +96,39 @@ def test_sanitize_params_allowlist_drops_security_keys():
     assert out == {"CLIPPYSHOT_OCR": "1", "CLIPPYSHOT_OCR_ALL": "1"}
 
 
-def test_sanitize_params_no_allowlist_is_legacy_denylist():
-    """allowed_keys=None (UNSET) preserves legacy behaviour: shape + reserved denylist only,
-    so a genuinely non-reserved key still passes. But security-posture keys (CLIPPYSHOT_
-    SANDBOX / WARN_ON_INSECURE / DISCLOSE_SECURITY_INTERNALS), the framework prefixes
-    (BLASTBOX_/LD_/PYTHON), and resolution keys (PATH/IFS) are reserved UNCONDITIONALLY —
-    never client-settable, even with no per-engine allowlist (fail-safe floor)."""
+def test_sanitize_params_generic_floor_is_unconditional():
+    """allowed_keys=None (UNSET) = legacy shape+denylist. The ENGINE-AGNOSTIC floor —
+    framework/loader/interpreter prefixes (BLASTBOX_/LD_/PYTHON) + executable-resolution
+    keys (PATH/IFS) — is reserved UNCONDITIONALLY, for EVERY engine, even with no allowlist.
+    A genuinely non-reserved key still passes. (Generic key names: blastbox names no engine.)"""
     out = Dispatcher._sanitize_params(
         {
-            "CLIPPYSHOT_OCR": "1",               # non-reserved → passes on the legacy path
-            "CLIPPYSHOT_SANDBOX": "bwrap",       # reserved: inner-sandbox downgrade
-            "CLIPPYSHOT_WARN_ON_INSECURE": "1",  # reserved: insecure-mode fallback
-            "BLASTBOX_ENGINE": "evil",           # reserved: framework prefix
-            "PATH": "/tmp",                      # reserved: executable resolution hijack
+            "SOME_TOGGLE": "1",          # non-reserved → passes on the legacy path
+            "BLASTBOX_ENGINE": "evil",   # reserved: framework prefix
+            "LD_PRELOAD": "/tmp/x.so",   # reserved: loader hijack
+            "PYTHONPATH": "/tmp",        # reserved: interpreter hijack
+            "PATH": "/tmp",              # reserved: executable resolution hijack
+            "IFS": " ",                  # reserved: shell field-splitting
         }
     )
-    assert out == {"CLIPPYSHOT_OCR": "1"}
+    assert out == {"SOME_TOGGLE": "1"}
+
+
+def test_sanitize_params_engine_reserved_keys_dropped_even_without_allowlist():
+    """Engine-OWNED reserved keys (a sandbox selector, a JVM binary/jar/opts path) are
+    dropped UNCONDITIONALLY — even with allowed_keys=None — via the per-engine reserved set,
+    so blastbox core never names them. Generic placeholders: no engine-specific strings."""
+    reserved = frozenset({"ENGINE_SANDBOX", "ENGINE_JAVA_BIN"})
+    out = Dispatcher._sanitize_params(
+        {
+            "ENGINE_TOGGLE": "1",          # not reserved → passes (legacy path, no allowlist)
+            "ENGINE_SANDBOX": "weak",      # engine-reserved → dropped
+            "ENGINE_JAVA_BIN": "/tmp/evil",  # engine-reserved → dropped
+        },
+        None,            # no allowlist configured
+        reserved,        # the engine's declared reserved set (belt-and-suspenders floor)
+    )
+    assert out == {"ENGINE_TOGGLE": "1"}
 
 
 def test_sanitize_params_explicit_empty_allowlist_blocks_all():
