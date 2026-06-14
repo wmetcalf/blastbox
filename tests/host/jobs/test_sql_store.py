@@ -262,3 +262,23 @@ def test_postgres_claim_next_skip_locked():
     assert claimed is not None
     assert claimed.status == JobStatus.RUNNING
     store.delete(job.job_id)
+
+
+@pytest.mark.skipif(not POSTGRES_DSN, reason="BLASTBOX_TEST_PG_DSN not set")
+def test_postgres_claim_next_respects_target_tier():
+    """Exercise the Postgres-specific claim CTE param binding (separate SQL string from sqlite)
+    with a non-NULL target_tier — guards the off-by-one risk if that params tuple is ever
+    reordered (sqlite/memory/redis coverage can't catch a PG-only mis-bind)."""
+    store = SqlJobStore(POSTGRES_DSN)
+    job = _make_job()
+    job.target_tier = "gvisor"
+    store.create(job)
+    try:
+        assert store.claim_next(claimant_tier="firecracker") is None  # non-match → not claimed
+        assert store.claim_next(claimant_tier=None) is None            # untiered → not claimed
+        claimed = store.claim_next(claimant_tier="gvisor")            # match → claimed
+        assert claimed is not None
+        assert claimed.target_tier == "gvisor"
+        assert claimed.status == JobStatus.RUNNING
+    finally:
+        store.delete(job.job_id)

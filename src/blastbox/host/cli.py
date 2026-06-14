@@ -128,11 +128,13 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     # have a known warm runtime; no pool ⇒ "cold". (build_warm_pool only builds a pool for a
     # valid runtime, so the raise is a belt-and-suspenders guard against drift.)
     if pool is not None:
+        from blastbox.host.jobs.base import WARM_TIERS
+
         _pool_rt = os.environ.get("BLASTBOX_POOL_RUNTIME", "none").strip().lower()
-        if _pool_rt not in ("firecracker", "gvisor"):
+        if _pool_rt not in WARM_TIERS:
             raise ValueError(
                 f"a warm pool was built but BLASTBOX_POOL_RUNTIME={_pool_rt!r} is not a known "
-                "warm tier (firecracker/gvisor); cannot derive the dispatcher tier identity"
+                f"warm tier ({'/'.join(WARM_TIERS)}); cannot derive the dispatcher tier identity"
             )
         tier = _pool_rt
     else:
@@ -150,6 +152,9 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         # Retention: 0 (default) keeps artifacts forever; set a TTL (seconds) so run_forever's
         # periodic sweep deletes expired terminal jobs' output (of untrusted documents).
         job_retention_seconds=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"),
+        # Opt-in ceiling (0 = off) on time a job may sit QUEUED before being FAILed + its input
+        # deleted — bounds a target_tier pinned to a tier with no running dispatcher.
+        max_queued_age_s=float(os.environ.get("BLASTBOX_MAX_QUEUED_AGE_S") or "0"),
         pool=pool,
         tier=tier,
         # Warm-ONLY sidecar (socket-less gVisor C/R or FC warm dispatcher): on a warm-pool

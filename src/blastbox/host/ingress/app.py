@@ -517,18 +517,20 @@ def build_app(
         # or starve a pool (DoS) or force the break-glass cold tier: it's honored ONLY when the
         # operator sets BLASTBOX_ALLOW_TIER_ROUTING. Off (default) → silently ignored, like a
         # non-allowlisted param. On → validated against the tier vocabulary and routed at claim.
-        if target_tier:
+        tt_raw = (target_tier or "").strip()  # missing / empty / whitespace-only all → ignored
+        if tt_raw:
             if os.environ.get("BLASTBOX_ALLOW_TIER_ROUTING", "").strip().lower() in (
                 "1", "true", "yes", "on"
             ):
-                tt = target_tier.strip().lower()
+                tt = tt_raw.lower()
                 if tt not in VALID_TIERS:
                     raise HTTPException(
                         400, f"invalid target_tier (allowed: {', '.join(VALID_TIERS)})"
                     )
                 job.target_tier = tt
             else:
-                _log.info("target_tier_ignored_routing_disabled", requested=target_tier)
+                # Dropped (routing disabled); cap the attacker-controlled value in the log line.
+                _log.info("target_tier_ignored_routing_disabled", requested=tt_raw[:64])
 
         root, input_dir, output_dir = _job_dirs(job.job_id)
 

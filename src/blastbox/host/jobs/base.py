@@ -84,6 +84,12 @@ class Job:
         Strips ``result_dir`` (internal server path), ``params`` (may contain
         sensitive engine options), and ``claim_id`` (an internal ownership token),
         and sanitizes the ``error`` field to remove internal filesystem paths.
+
+        ``worker_tier`` and ``target_tier`` are INTENTIONALLY kept public: this is
+        observability for the testing the feature exists for (read back which warm
+        backend ran a job, and that a routed request was honored). It exposes only
+        backend identity — strictly finer-grained than the already-public
+        ``worker_runtime`` — not paths/secrets/credentials.
         """
         d = self.to_dict()
         d.pop("result_dir", None)
@@ -122,9 +128,10 @@ class Job:
 
 
 # Canonical dispatcher tier names. A warm sidecar's tier is its BLASTBOX_POOL_RUNTIME
-# ("firecracker"/"gvisor"); the cold dispatcher is "cold". A job's target_tier (when set)
-# and a claimant's tier are matched against this vocabulary.
-VALID_TIERS = ("cold", "firecracker", "gvisor")
+# (one of WARM_TIERS); the cold dispatcher is "cold". A job's target_tier (when set) and a
+# claimant's tier are matched against this vocabulary.
+WARM_TIERS = ("firecracker", "gvisor")
+VALID_TIERS = ("cold", *WARM_TIERS)
 
 
 # Whitelist of fields ``list(sort=...)`` accepts. A whitelist (not a free column
