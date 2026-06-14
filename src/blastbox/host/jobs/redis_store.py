@@ -233,6 +233,11 @@ class RedisJobStore:
                     if job.status != JobStatus.QUEUED:
                         # Another claimer won the race; retry from the scan.
                         continue
+                    # Re-check the tier predicate inside the WATCH too (target_tier is write-once
+                    # today, so this can't currently change between scan and claim — but keep the
+                    # atomic re-validation symmetric with the SQL/memory backends).
+                    if job.target_tier is not None and job.target_tier != claimant_tier:
+                        continue
                     job.status = JobStatus.RUNNING
                     job.started_at = time.time()
                     job.claim_id = uuid.uuid4().hex  # fresh ownership token per claim

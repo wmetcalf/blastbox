@@ -240,6 +240,7 @@ def _make_dispatcher_with_pool(
     worker_timeout_s: int = 30,
     warm_claim_timeout_s: float = 0.5,
     warm_only: bool = False,
+    tier: str = "cold",
 ) -> Dispatcher:
     if engines is None:
         engines = {_ENGINE_NAME: _engine_spec()}
@@ -255,6 +256,7 @@ def _make_dispatcher_with_pool(
         subprocess_runner=subprocess_runner,
         worker_timeout_s=worker_timeout_s,
         pool=pool,
+        tier=tier,
         warm_claim_timeout_s=warm_claim_timeout_s,
         warm_only=warm_only,
         warm_requeue_backoff_s=0.0,  # tests must not sleep the real 1.0s requeue backoff
@@ -469,6 +471,34 @@ def test_1_warm_happy_path(tmp_path):
     # slot input dir copy must be gone too
     slot_input = slot.input_dir / Path(job.filename).name
     assert not slot_input.exists()
+
+
+def test_warm_dispatch_stamps_worker_tier(tmp_path):
+    """Feature #1: a warm dispatch records WHICH backend ran the job (worker_tier), alongside the
+    generic worker_runtime="warm" — so FC-warm and gVisor-warm are distinguishable in the result.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)
+    _start_fake_worker(
+        slot,
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
+    )
+
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10, tier="gvisor",
+    )
+    assert dispatcher.dispatch_once() is True
+    final_job = store.get(job.job_id)
+    assert final_job is not None
+    assert final_job.status == JobStatus.DONE
+    assert final_job.worker_runtime == "warm"   # generic tier marker (unchanged)
+    assert final_job.worker_tier == "gvisor"     # specific backend (new)
 
 
 def test_warm_done_cas_fenced_against_concurrent_recovery(tmp_path):

@@ -15,10 +15,15 @@ from blastbox.host.jobs.memory import InMemoryJobStore
 from blastbox.host.jobs.sql_store import SqlJobStore
 
 
-@pytest.fixture(params=["memory", "sqlite"])
+@pytest.fixture(params=["memory", "sqlite", "redis"])
 def store(request, tmp_path):
     if request.param == "memory":
         return InMemoryJobStore()
+    if request.param == "redis":
+        import fakeredis
+
+        from blastbox.host.jobs.redis_store import RedisJobStore
+        return RedisJobStore(fakeredis.FakeRedis(), ttl_seconds=3600)
     return SqlJobStore(f"sqlite:///{tmp_path / 'jobs.db'}")
 
 

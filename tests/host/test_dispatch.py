@@ -113,6 +113,7 @@ def _make_dispatcher(
     worker_timeout_s: int = 30,
     job_retention_seconds: int = 0,
     tier: str = "cold",
+    max_queued_age_s: float = 0.0,
 ) -> Dispatcher:
     if engines is None:
         engines = {_ENGINE_NAME: _engine_spec()}
@@ -128,6 +129,7 @@ def _make_dispatcher(
         worker_timeout_s=worker_timeout_s,
         job_retention_seconds=job_retention_seconds,
         tier=tier,
+        max_queued_age_s=max_queued_age_s,
     )
 
 
@@ -894,3 +896,28 @@ def test_dispatcher_passes_its_tier_to_claim_next(tmp_path):
     assert warm._tier == "gvisor"
     warm.dispatch_once()
     assert seen["tier"] == "gvisor"
+
+
+def test_stale_queued_jobs_failed_after_max_age(tmp_path):
+    """A job stuck QUEUED past max_queued_age_s (e.g. target_tier pinned to a tier with no
+    running dispatcher) is FAILed + its input deleted by the maintenance sweep. The default
+    (0 = off) is a no-op, and a recent job is left alone."""
+    store = InMemoryJobStore()
+    old = _make_job(filename="old.docx")
+    old.created_at = time.time() - 100  # stale
+    store.create(old)
+    _setup_job_dirs(tmp_path, old)
+    fresh = _make_job(filename="fresh.docx")
+    store.create(fresh)
+    _setup_job_dirs(tmp_path, fresh)
+
+    # Disabled by default → no-op even for the stale job.
+    _make_dispatcher(store, job_root=tmp_path, max_queued_age_s=0)._fail_stale_queued_jobs()
+    assert store.get(old.job_id).status == JobStatus.QUEUED
+
+    # Enabled → stale job FAILed (input gone), fresh one untouched.
+    d = _make_dispatcher(store, job_root=tmp_path, max_queued_age_s=60)
+    assert d._fail_stale_queued_jobs() == 1
+    assert store.get(old.job_id).status == JobStatus.FAILED
+    assert store.get(fresh.job_id).status == JobStatus.QUEUED
+    assert not (tmp_path / old.job_id / "input" / "old.docx").exists()

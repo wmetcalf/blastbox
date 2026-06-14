@@ -178,6 +178,7 @@ class Dispatcher:
         subprocess_runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
         worker_timeout_s: int = 300,
         job_retention_seconds: int = 0,
+        max_queued_age_s: float = 0.0,
         pool: "WarmPool | None" = None,
         tier: str = "cold",
         warm_claim_timeout_s: float = 2.0,
@@ -195,6 +196,10 @@ class Dispatcher:
         self._subprocess_runner = subprocess_runner
         self._worker_timeout_s = max(1, int(worker_timeout_s))
         self._job_retention_seconds = max(0, int(job_retention_seconds))
+        # Opt-in ceiling (0 = off) on how long a job may sit QUEUED before the maintenance sweep
+        # FAILs it + deletes its input. Bounds the target_tier footgun: a job pinned to a tier
+        # with no running dispatcher is claimable by nobody and would otherwise persist forever.
+        self._max_queued_age_s = max(0.0, float(max_queued_age_s))
         self._pool = pool
         self._warm_claim_timeout_s = float(warm_claim_timeout_s)
         self._requeue_grace_s = max(0.0, float(requeue_grace_s))
@@ -438,6 +443,10 @@ class Dispatcher:
                 status=JobStatus.QUEUED,
                 started_at=None,
                 worker_runtime=None,
+                # Clear the warm-backend label too, so a re-dispatch by a different tier never
+                # inherits a stale one (defensive: this cold path skips warm jobs today, so the
+                # field is None here — but keep worker_runtime/worker_tier reset in lockstep).
+                worker_tier=None,
                 claim_id=None,
                 security_warnings=[
                     *job.security_warnings,
@@ -525,6 +534,7 @@ class Dispatcher:
                     status=JobStatus.QUEUED,
                     started_at=None,
                     worker_runtime=None,
+                    worker_tier=None,  # reset in lockstep with worker_runtime (see cold requeue)
                     claim_id=None,
                     error=None,
                 )
@@ -1075,6 +1085,46 @@ class Dispatcher:
         except Exception:  # noqa: BLE001
             _log.exception("page-hash indexing failed for job %s; continuing", job_id)
 
+    def _fail_stale_queued_jobs(self) -> int:
+        """FAIL jobs stuck QUEUED past ``max_queued_age_s`` and delete their (untrusted) input.
+
+        Opt-in (0 = disabled → no-op, the default). Bounds the ``target_tier`` footgun: a job
+        pinned to a tier with no running dispatcher is claimable by nobody and the retention
+        sweep only touches TERMINAL jobs, so it would otherwise sit QUEUED with its input on disk
+        forever. CAS on QUEUED so a job claimed since the ``list()`` snapshot (→ RUNNING) is left
+        to its claimer untouched. Returns the count failed."""
+        if self._max_queued_age_s <= 0:
+            return 0
+        cutoff = time.time() - self._max_queued_age_s
+        failed = 0
+        for job in self._job_store.list(status=JobStatus.QUEUED):
+            if job.created_at > cutoff:
+                continue
+            finished_at = time.time()
+            expires_at = (
+                finished_at + self._job_retention_seconds
+                if self._job_retention_seconds > 0
+                else None
+            )
+            if self._job_store.update_if_status(
+                job.job_id,
+                JobStatus.QUEUED,
+                status=JobStatus.FAILED,
+                finished_at=finished_at,
+                expires_at=expires_at,
+                error=sanitize_public_error(
+                    f"job exceeded the max queued age ({self._max_queued_age_s:.0f}s) without "
+                    f"being claimed (no dispatcher for target_tier={job.target_tier!r}?)"
+                ),
+            ):
+                failed += 1
+                self._delete_input(
+                    self._job_root / job.job_id / "input" / Path(job.filename).name
+                )
+        if failed:
+            _log.info("stale_queued_failed count=%d", failed)
+        return failed
+
     def _fail_job(self, job: Job, reason: str) -> None:
         """Mark a job FAILED, scrubbing the error string before storage.
 
@@ -1212,6 +1262,10 @@ class Dispatcher:
             self.requeue_orphaned_jobs()
         except Exception:  # noqa: BLE001
             _log.exception("requeue_orphaned_jobs failed")
+        try:
+            self._fail_stale_queued_jobs()
+        except Exception:  # noqa: BLE001
+            _log.exception("stale-queued sweep failed")
         if self._job_retention_seconds > 0:
             try:
                 from blastbox.host.jobs.retention import JobRetentionSweeper
