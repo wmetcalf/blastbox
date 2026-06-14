@@ -179,6 +179,7 @@ class Dispatcher:
         worker_timeout_s: int = 300,
         job_retention_seconds: int = 0,
         pool: "WarmPool | None" = None,
+        tier: str = "cold",
         warm_claim_timeout_s: float = 2.0,
         requeue_grace_s: float = 60.0,
         warm_only: bool = False,
@@ -230,18 +231,15 @@ class Dispatcher:
                 "warm_only dispatcher requires a warm pool (set BLASTBOX_POOL_RUNTIME)"
             )
 
-        # This dispatcher's tier identity, for optional per-job routing (target_tier) and the
-        # warm-backend result label (worker_tier): a warm-pool dispatcher's tier is its
-        # BLASTBOX_POOL_RUNTIME ("firecracker"/"gvisor"); anything else is "cold". Passed to
-        # claim_next so a job targeting a specific tier is only claimed here when it matches;
-        # an untargeted job (the default) is claimable by every tier. Inert until an operator
-        # enables routing at the API (BLASTBOX_ALLOW_TIER_ROUTING) — existing jobs have no
-        # target, so the claim predicate is a no-op for them.
-        _pool_rt = os.environ.get("BLASTBOX_POOL_RUNTIME", "none").strip().lower()
-        self._tier = (
-            _pool_rt if (self._pool is not None and _pool_rt in ("firecracker", "gvisor"))
-            else "cold"
-        )
+        # This dispatcher's tier identity ("cold"/"firecracker"/"gvisor"), for optional per-job
+        # routing (target_tier) and the warm-backend result label (worker_tier). Passed to
+        # claim_next so a job targeting a specific tier is only claimed here when it matches; an
+        # untargeted job (the default) is claimable by every tier. The CALLER derives this
+        # (the CLI from BLASTBOX_POOL_RUNTIME, validated against the built pool — see
+        # _dispatch_cmd) so the Dispatcher stays env-agnostic and a misconfig fails fast there,
+        # not by silently mislabeling warm jobs as cold here. Inert until an operator enables
+        # routing at the API (BLASTBOX_ALLOW_TIER_ROUTING) — existing jobs have no target.
+        self._tier = tier
 
     # ------------------------------------------------------------------
     # Public API
