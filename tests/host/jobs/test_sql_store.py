@@ -181,7 +181,7 @@ def test_claim_next_cas_guards_concurrent_status_change(sqlite_store):
 
     original_method = sqlite_store._claim_next_sqlite
 
-    def claim_with_interleave():
+    def claim_with_interleave(claimant_tier=None):
         import sqlite3
         from urllib.parse import unquote, urlparse
 
@@ -196,7 +196,7 @@ def test_claim_next_cas_guards_concurrent_status_change(sqlite_store):
         conn2.commit()
         conn2.close()
 
-        return original_method()
+        return original_method(claimant_tier)
 
     with unittest.mock.patch.object(sqlite_store, "_claim_next_sqlite", claim_with_interleave):
         result = sqlite_store.claim_next()

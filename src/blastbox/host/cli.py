@@ -123,6 +123,21 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     if pool is not None:
         pool.start()
 
+    # Tier identity, derived ALONGSIDE the pool so a misconfig fails fast HERE rather than the
+    # dispatcher silently mislabeling/misrouting warm jobs as "cold". A built warm pool MUST
+    # have a known warm runtime; no pool ⇒ "cold". (build_warm_pool only builds a pool for a
+    # valid runtime, so the raise is a belt-and-suspenders guard against drift.)
+    if pool is not None:
+        _pool_rt = os.environ.get("BLASTBOX_POOL_RUNTIME", "none").strip().lower()
+        if _pool_rt not in ("firecracker", "gvisor"):
+            raise ValueError(
+                f"a warm pool was built but BLASTBOX_POOL_RUNTIME={_pool_rt!r} is not a known "
+                "warm tier (firecracker/gvisor); cannot derive the dispatcher tier identity"
+            )
+        tier = _pool_rt
+    else:
+        tier = "cold"
+
     dispatcher = Dispatcher(
         job_store=store,
         engines=engines,
@@ -136,6 +151,7 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         # periodic sweep deletes expired terminal jobs' output (of untrusted documents).
         job_retention_seconds=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"),
         pool=pool,
+        tier=tier,
         # Warm-ONLY sidecar (socket-less gVisor C/R or FC warm dispatcher): on a warm-pool
         # miss, REQUEUE the job for the cold dispatcher instead of cold-falling-back (which
         # would fail closed here — no docker socket). Inert without a pool.

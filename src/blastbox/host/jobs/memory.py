@@ -115,12 +115,17 @@ class InMemoryJobStore:
             jobs = [j for j in jobs if ql in (j.filename or "").lower()]
         return len(jobs)
 
-    def claim_next(self) -> Job | None:
-        """Atomically claim the oldest QUEUED job and flip it to RUNNING."""
+    def claim_next(self, *, claimant_tier: str | None = None) -> Job | None:
+        """Atomically claim the oldest QUEUED job and flip it to RUNNING.
+
+        ``claimant_tier`` routes: a job with ``target_tier`` set is claimable only by a
+        claimant whose tier matches; an untargeted job (the default) by anyone.
+        """
         with self._lock:
             queued = [
                 job for job in self._jobs.values()
                 if job.status == JobStatus.QUEUED
+                and (job.target_tier is None or job.target_tier == claimant_tier)
             ]
             if not queued:
                 return None

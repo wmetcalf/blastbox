@@ -45,6 +45,14 @@ class Job:
     input_sha256: str | None = None
     result_dir: str | None = None       # server-set; stripped from public dict
     worker_runtime: str | None = None
+    # The specific warm backend that ran the job ("firecracker"/"gvisor"); None for cold
+    # (worker_runtime already carries the cold OCI runtime, runc/runsc). Both warm tiers
+    # otherwise report worker_runtime="warm" indistinguishably — this disambiguates them.
+    worker_tier: str | None = None
+    # OPERATOR/TEST routing hint: when set, ONLY a dispatcher whose tier matches claims this
+    # job ("cold"/"firecracker"/"gvisor"); None = any dispatcher (default). Honored at claim
+    # by every backend; only settable at submit when BLASTBOX_ALLOW_TIER_ROUTING is on.
+    target_tier: str | None = None
     error: str | None = None
     # Per-claim ownership token: claim_next() stamps a fresh value on each QUEUED->RUNNING
     # transition; requeue clears it. Terminal/recovery writes CAS on (status, claim_id) so a
@@ -99,6 +107,8 @@ class Job:
             input_sha256=d.get("input_sha256"),
             result_dir=d.get("result_dir"),
             worker_runtime=d.get("worker_runtime"),
+            worker_tier=d.get("worker_tier"),
+            target_tier=d.get("target_tier"),
             error=d.get("error"),
             claim_id=d.get("claim_id"),
             security_warnings=(
@@ -109,6 +119,12 @@ class Job:
             params=dict(d.get("params") or {}),
             result_summary=d.get("result_summary"),
         )
+
+
+# Canonical dispatcher tier names. A warm sidecar's tier is its BLASTBOX_POOL_RUNTIME
+# ("firecracker"/"gvisor"); the cold dispatcher is "cold". A job's target_tier (when set)
+# and a claimant's tier are matched against this vocabulary.
+VALID_TIERS = ("cold", "firecracker", "gvisor")
 
 
 # Whitelist of fields ``list(sort=...)`` accepts. A whitelist (not a free column
@@ -213,7 +229,7 @@ class JobStore(Protocol):
         """
         ...
 
-    def claim_next(self) -> Job | None: ...
+    def claim_next(self, *, claimant_tier: str | None = None) -> Job | None: ...
     def delete(self, job_id: str) -> None: ...
 
 

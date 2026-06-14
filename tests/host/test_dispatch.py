@@ -112,6 +112,7 @@ def _make_dispatcher(
     subprocess_runner=None,
     worker_timeout_s: int = 30,
     job_retention_seconds: int = 0,
+    tier: str = "cold",
 ) -> Dispatcher:
     if engines is None:
         engines = {_ENGINE_NAME: _engine_spec()}
@@ -126,6 +127,7 @@ def _make_dispatcher(
         subprocess_runner=subprocess_runner or (lambda *a, **kw: subprocess.CompletedProcess(a[0], 0, "", "")),
         worker_timeout_s=worker_timeout_s,
         job_retention_seconds=job_retention_seconds,
+        tier=tier,
     )
 
 
@@ -866,3 +868,29 @@ def test_sanitize_params_allowlist_default_deny():
         frozenset({"REDTUSK_ENABLE_THUMBNAILS"}),
     )
     assert out == {"REDTUSK_ENABLE_THUMBNAILS": "true"}
+
+
+def test_dispatcher_passes_its_tier_to_claim_next(tmp_path):
+    """The dispatcher claims with its tier identity so per-job target_tier routing works.
+    A plain dispatcher (no warm pool) identifies as 'cold'; the CLI passes a warm sidecar's
+    backend explicitly (derived + validated next to the pool — kept out of the Dispatcher)."""
+    store = InMemoryJobStore()
+    seen = {}
+    orig = store.claim_next
+
+    def spy(*, claimant_tier=None):
+        seen["tier"] = claimant_tier
+        return orig(claimant_tier=claimant_tier)
+
+    store.claim_next = spy  # type: ignore[method-assign]
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    assert dispatcher._tier == "cold"
+    dispatcher.dispatch_once()
+    assert seen["tier"] == "cold"
+
+    # An explicit tier (as the CLI passes for a warm sidecar) is honored + claimed with.
+    seen.clear()
+    warm = _make_dispatcher(store, job_root=tmp_path, tier="gvisor")
+    assert warm._tier == "gvisor"
+    warm.dispatch_once()
+    assert seen["tier"] == "gvisor"

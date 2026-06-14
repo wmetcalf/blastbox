@@ -179,6 +179,7 @@ class Dispatcher:
         worker_timeout_s: int = 300,
         job_retention_seconds: int = 0,
         pool: "WarmPool | None" = None,
+        tier: str = "cold",
         warm_claim_timeout_s: float = 2.0,
         requeue_grace_s: float = 60.0,
         warm_only: bool = False,
@@ -230,6 +231,16 @@ class Dispatcher:
                 "warm_only dispatcher requires a warm pool (set BLASTBOX_POOL_RUNTIME)"
             )
 
+        # This dispatcher's tier identity ("cold"/"firecracker"/"gvisor"), for optional per-job
+        # routing (target_tier) and the warm-backend result label (worker_tier). Passed to
+        # claim_next so a job targeting a specific tier is only claimed here when it matches; an
+        # untargeted job (the default) is claimable by every tier. The CALLER derives this
+        # (the CLI from BLASTBOX_POOL_RUNTIME, validated against the built pool — see
+        # _dispatch_cmd) so the Dispatcher stays env-agnostic and a misconfig fails fast there,
+        # not by silently mislabeling warm jobs as cold here. Inert until an operator enables
+        # routing at the API (BLASTBOX_ALLOW_TIER_ROUTING) — existing jobs have no target.
+        self._tier = tier
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -244,7 +255,7 @@ class Dispatcher:
         # dispatcher has no cold path, so it must not claim work it can't immediately serve.
         if self._warm_only and (self._pool is None or self._pool.idle_count <= 0):
             return False
-        job = self._job_store.claim_next()
+        job = self._job_store.claim_next(claimant_tier=self._tier)
         if job is None:
             return False
         self._dispatch_claimed_job(job)
@@ -617,6 +628,9 @@ class Dispatcher:
                 JobStatus.RUNNING,
                 expect_claim_id=job.claim_id,
                 worker_runtime="warm",
+                # Disambiguate the two warm backends in the result (both else report just
+                # "warm"): self._tier is "firecracker"/"gvisor" on a warm dispatcher.
+                worker_tier=self._tier,
             ):
                 _log.warning(
                     "warm job %s lost its claim before staging (requeued/recovered by another "
@@ -624,6 +638,7 @@ class Dispatcher:
                 )
                 return
             job.worker_runtime = "warm"
+            job.worker_tier = self._tier
 
             # ------------------------------------------------------------------
             # Step 3: Stage input — over the wire (vsock) or into slot.input_dir

@@ -1102,3 +1102,43 @@ class TestOutputDirRederived:
             assert "evil.txt" not in names, (
                 "Result ZIP included files from tampered result_dir outside job_root!"
             )
+
+
+# ===========================================================================
+# POST /v1/jobs — target_tier routing gate (operator/test only, default-off)
+# ===========================================================================
+
+
+class TestTierRoutingGate:
+    """A client must not be able to pin/flood a tier unless an operator opts in via
+    BLASTBOX_ALLOW_TIER_ROUTING. Off (default) → target_tier is silently dropped;
+    on → validated + persisted onto the job (then honored at claim by the store)."""
+
+    def _submit(self, client, target_tier):
+        return client.post(
+            "/v1/jobs",
+            data={"engine": "clippyshot", "target_tier": target_tier},
+            files={"file": ("doc.docx", io.BytesIO(b"hi"), "application/octet-stream")},
+        )
+
+    def test_target_tier_ignored_when_routing_disabled(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("BLASTBOX_ALLOW_TIER_ROUTING", raising=False)
+        client, store = _make_client(tmp_path)
+        resp = self._submit(client, "gvisor")
+        assert resp.status_code == 202
+        job = store.get(resp.json()["job_id"])
+        assert job.target_tier is None  # dropped — not honored without the operator flag
+
+    def test_target_tier_honored_when_routing_enabled(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BLASTBOX_ALLOW_TIER_ROUTING", "1")
+        client, store = _make_client(tmp_path)
+        resp = self._submit(client, "gvisor")
+        assert resp.status_code == 202
+        job = store.get(resp.json()["job_id"])
+        assert job.target_tier == "gvisor"
+
+    def test_invalid_target_tier_rejected_when_enabled(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BLASTBOX_ALLOW_TIER_ROUTING", "1")
+        client, store = _make_client(tmp_path)
+        resp = self._submit(client, "nonsense")
+        assert resp.status_code == 400
