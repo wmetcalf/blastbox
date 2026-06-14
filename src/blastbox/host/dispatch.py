@@ -28,7 +28,7 @@ import shutil
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Mapping
 
@@ -158,6 +158,16 @@ class EngineSpec:
     # an engine declares its own dangerous keys without blastbox core naming them. The
     # engine-agnostic floor (PATH/IFS/BLASTBOX_*/LD_*/PYTHON*) is separate (module-level).
     reserved_param_keys: frozenset[str] = frozenset()
+    # Operator-configured DEFAULT params (BLASTBOX_ENGINE_<NAME>_DEFAULT_PARAMS): applied for
+    # any key a job does NOT set, so the job-level value ALWAYS wins. This makes an enablement
+    # default (e.g. a scanner toggle) a *runtime* decision in the dispatcher env instead of a
+    # value hardcoded in the engine — flip it + restart the dispatcher, no image/snapshot
+    # rebuild, and it reaches cold AND warm tiers (warm.py injects forwarded params into the
+    # guest env before detonate). Merged UNDER job.params then passed through the SAME
+    # _sanitize_params gate (shape + engine-agnostic floor + reserved + allowlist): a defaulted
+    # key must itself be forwardable (allowlisted, if an allowlist is set) and non-reserved —
+    # one gate, fail-closed, no broader trust path for operator policy than for client params.
+    default_params: dict[str, str] = field(default_factory=dict)
 
 
 class Dispatcher:
@@ -679,6 +689,7 @@ class Dispatcher:
                 output_dir=slot.output_dir,
                 params=self._sanitize_params(
                     job.params, engine.allowed_param_keys, engine.reserved_param_keys,
+                    engine.default_params,
                 ),
             )
             # One absolute deadline bounds the input send + wait (the only steps a slow guest
@@ -927,6 +938,7 @@ class Dispatcher:
             extra_env={
                 **self._sanitize_params(
                     job.params, engine.allowed_param_keys, engine.reserved_param_keys,
+                    engine.default_params,
                 ),
                 # Tell the harness where the dispatcher mounted I/O (it mounts the input file at
                 # /input/<name> and output at /output; the harness defaults are /in,/out, so
@@ -1329,8 +1341,16 @@ class Dispatcher:
     def _sanitize_params(
         params: dict[str, str], allowed_keys: frozenset[str] | None = None,
         reserved_keys: frozenset[str] = frozenset(),
+        default_params: dict[str, str] | None = None,
     ) -> dict[str, str]:
         """Filter job.params to a safe subset suitable for extra_env.
+
+        ``default_params`` (operator-configured per engine) are applied UNDER ``params``:
+        the union ``{**default_params, **params}`` is filtered, so a job-level value always
+        overrides the default and a defaulted key still has to clear the SAME gate below
+        (shape + reserved + allowlist). This lets an operator make an enablement default a
+        runtime decision without widening the trust model — the default reaches the worker
+        only if a client param with that key would have, too.
 
         Security:
         - Keys must match ``^[A-Z][A-Z0-9_]*$`` (uppercase start, no symbols).
@@ -1351,19 +1371,22 @@ class Dispatcher:
 
         Returns a new dict; never modifies params in place.
         """
+        # Operator defaults first, job params second → job wins on key collisions. The merged
+        # union is filtered as one, so defaults get no privileged path past the gate.
+        merged = {**(default_params or {}), **(params or {})}
         out: dict[str, str] = {}
-        for key, value in (params or {}).items():
+        for key, value in merged.items():
             if not isinstance(key, str):
                 continue
             if not _VALID_ENV_KEY_RE.match(key):
                 _log.debug("dropping invalid extra_env key: %r", key)
                 continue
             if _is_reserved_env_key(key, reserved_keys):
-                _log.warning("dropping reserved extra_env key from job.params: %r", key)
+                _log.warning("dropping reserved extra_env key from job.params/defaults: %r", key)
                 continue
             if allowed_keys is not None and key not in allowed_keys:
                 _log.warning(
-                    "dropping non-allowlisted extra_env key %r from job.params "
+                    "dropping non-allowlisted extra_env key %r from job.params/defaults "
                     "(per-engine allowlist in effect)", key,
                 )
                 continue

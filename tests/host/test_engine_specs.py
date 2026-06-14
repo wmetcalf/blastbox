@@ -149,3 +149,86 @@ def test_sanitize_params_explicit_empty_allowlist_blocks_all():
     (default-deny), the operator's explicit intent. It must not collapse to legacy."""
     out = Dispatcher._sanitize_params({"CLIPPYSHOT_OCR": "1", "FOO": "bar"}, frozenset())
     assert out == {}
+
+
+# ---------------------------------------------------------------------------
+# Operator DEFAULT params (BLASTBOX_ENGINE_<NAME>_DEFAULT_PARAMS) — make an
+# enablement default a runtime decision in the dispatcher env, not a hardcoded
+# engine value. Applied UNDER job.params (job wins), through the same gate.
+# ---------------------------------------------------------------------------
+
+
+def test_default_params_default_empty_when_unset():
+    specs = _parse_engine_specs("foo=img:t")
+    assert specs["foo"].default_params == {}
+
+
+def test_default_params_parsed_and_uppercased(monkeypatch):
+    """Keys upper-cased (UPPERCASE-only forwardable shape — a lowercase default would
+    silently never forward); values kept verbatim; engine name hyphen→underscore."""
+    monkeypatch.setenv(
+        "BLASTBOX_ENGINE_TEST_ENGINE_DEFAULT_PARAMS",
+        "foo_qr=1, Foo_Ocr=0 ,FOO_LANG=eng",
+    )
+    specs = _parse_engine_specs("test-engine=img:t")
+    assert specs["test-engine"].default_params == {
+        "FOO_QR": "1",
+        "FOO_OCR": "0",
+        "FOO_LANG": "eng",
+    }
+
+
+def test_default_params_malformed_entries_skipped(monkeypatch):
+    # No '=' and empty-key entries are skipped (warned), like _parse_engine_specs.
+    monkeypatch.setenv(
+        "BLASTBOX_ENGINE_FOO_DEFAULT_PARAMS",
+        "FOO_QR=1, garbage , =novalue, FOO_OCR=0",
+    )
+    specs = _parse_engine_specs("foo=img:t")
+    assert specs["foo"].default_params == {"FOO_QR": "1", "FOO_OCR": "0"}
+
+
+def test_sanitize_params_default_applied_when_job_omits_key():
+    """A defaulted key the job doesn't set is forwarded (the new runtime default)."""
+    out = Dispatcher._sanitize_params(
+        {},                                  # job sends nothing
+        frozenset({"FOO_QR", "FOO_OCR"}),    # allowlist
+        frozenset(),                         # no engine-reserved
+        {"FOO_QR": "1", "FOO_OCR": "0"},     # operator defaults
+    )
+    assert out == {"FOO_QR": "1", "FOO_OCR": "0"}
+
+
+def test_sanitize_params_job_value_overrides_default():
+    """A per-job value always beats the operator default (default is a floor, not a cap)."""
+    out = Dispatcher._sanitize_params(
+        {"FOO_QR": "0"},                     # job explicitly turns it off
+        frozenset({"FOO_QR"}),
+        frozenset(),
+        {"FOO_QR": "1"},                     # default would turn it on
+    )
+    assert out == {"FOO_QR": "0"}
+
+
+def test_sanitize_params_default_must_clear_the_allowlist():
+    """Defaults get NO privileged path: a defaulted key absent from the allowlist is dropped,
+    exactly as a client param would be. One gate for operator policy and client input alike."""
+    out = Dispatcher._sanitize_params(
+        {},
+        frozenset({"FOO_QR"}),               # only FOO_QR forwardable
+        frozenset(),
+        {"FOO_QR": "1", "FOO_SECRET": "x"},  # FOO_SECRET not allowlisted
+    )
+    assert out == {"FOO_QR": "1"}
+
+
+def test_sanitize_params_default_cannot_set_reserved_key():
+    """A defaulted RESERVED key (engine-owned or generic floor) is dropped — an operator
+    can't accidentally default a security-posture/code-exec key via this convenience knob."""
+    out = Dispatcher._sanitize_params(
+        {},
+        None,                                # legacy (no allowlist)
+        frozenset({"FOO_JAVA_BIN"}),         # engine-reserved
+        {"FOO_TOGGLE": "1", "FOO_JAVA_BIN": "/tmp/evil", "LD_PRELOAD": "/tmp/x.so"},
+    )
+    assert out == {"FOO_TOGGLE": "1"}
