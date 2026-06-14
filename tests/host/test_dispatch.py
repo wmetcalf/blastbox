@@ -866,3 +866,21 @@ def test_sanitize_params_allowlist_default_deny():
         frozenset({"REDTUSK_ENABLE_THUMBNAILS"}),
     )
     assert out == {"REDTUSK_ENABLE_THUMBNAILS": "true"}
+
+
+def test_dispatcher_passes_its_tier_to_claim_next(tmp_path):
+    """The dispatcher claims with its tier identity so per-job target_tier routing works.
+    A plain dispatcher (no warm pool) identifies as 'cold'."""
+    store = InMemoryJobStore()
+    seen = {}
+    orig = store.claim_next
+
+    def spy(*, claimant_tier=None):
+        seen["tier"] = claimant_tier
+        return orig(claimant_tier=claimant_tier)
+
+    store.claim_next = spy  # type: ignore[method-assign]
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    assert dispatcher._tier == "cold"
+    dispatcher.dispatch_once()
+    assert seen["tier"] == "cold"

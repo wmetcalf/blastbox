@@ -33,6 +33,8 @@ _COLUMNS = (
     "input_sha256",
     "result_dir",
     "worker_runtime",
+    "worker_tier",
+    "target_tier",
     "error",
     "security_warnings",
     "params",
@@ -130,6 +132,8 @@ class SqlJobStore:
             input_sha256      TEXT,
             result_dir        TEXT,
             worker_runtime    TEXT,
+            worker_tier       TEXT,
+            target_tier       TEXT,
             error             TEXT,
             security_warnings TEXT,
             params            TEXT,
@@ -183,7 +187,8 @@ class SqlJobStore:
     def _ensure_columns(self, conn) -> None:
         """Add any columns that don't exist yet (forward-compat migrations)."""
         existing = self._existing_columns(conn)
-        for col in ("engine", "params", "result_summary", "claim_id"):
+        for col in ("engine", "params", "result_summary", "claim_id",
+                    "worker_tier", "target_tier"):
             if col not in existing:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
 
@@ -482,15 +487,20 @@ class SqlJobStore:
             params.append(f"%{esc}%")
         return where, params
 
-    def claim_next(self) -> Job | None:
+    def claim_next(self, *, claimant_tier: str | None = None) -> Job | None:
         if self._driver == "sqlite":
-            return self._claim_next_sqlite()
-        return self._claim_next_postgres()
+            return self._claim_next_sqlite(claimant_tier)
+        return self._claim_next_postgres(claimant_tier)
 
-    def _claim_next_sqlite(self) -> Job | None:
+    def _claim_next_sqlite(self, claimant_tier: str | None = None) -> Job | None:
+        # target_tier routing: claim a job only if it has no target, or its target matches
+        # this claimant's tier. Binding claimant_tier=None makes `target_tier = NULL` (never
+        # true in SQL), so the predicate collapses to `target_tier IS NULL` — an untiered
+        # claimant takes only untargeted jobs. Existing rows are NULL → unchanged behaviour.
         select_sql = (
             f"SELECT {', '.join(_COLUMNS)} FROM jobs "
             f"WHERE status = {self._param} "
+            f"AND (target_tier IS NULL OR target_tier = {self._param}) "
             f"ORDER BY created_at ASC, job_id ASC LIMIT 1"
         )
         # The UPDATE is a compare-and-swap: it only fires if the row is STILL
@@ -506,7 +516,9 @@ class SqlJobStore:
         )
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(select_sql, (JobStatus.QUEUED.value,)).fetchone()
+            row = conn.execute(
+                select_sql, (JobStatus.QUEUED.value, claimant_tier)
+            ).fetchone()
             if row is None:
                 return None
             job = self._row_to_job(row)
@@ -532,13 +544,16 @@ class SqlJobStore:
             job.claim_id = claim_id
             return job
 
-    def _claim_next_postgres(self) -> Job | None:
+    def _claim_next_postgres(self, claimant_tier: str | None = None) -> Job | None:
         cols_jobs = ", ".join(f"jobs.{col}" for col in _COLUMNS)
+        # target_tier routing (see _claim_next_sqlite): only rows with no target or a target
+        # matching this claimant are eligible; claimant_tier=None ⇒ target_tier IS NULL only.
         sql = f"""
         WITH next_job AS (
             SELECT job_id
             FROM jobs
             WHERE status = {self._param}
+            AND (target_tier IS NULL OR target_tier = {self._param})
             ORDER BY created_at ASC, job_id ASC
             FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -551,6 +566,7 @@ class SqlJobStore:
         """
         params = (
             JobStatus.QUEUED.value,
+            claimant_tier,
             JobStatus.RUNNING.value,
             time.time(),
             uuid.uuid4().hex,  # fresh ownership token per claim

@@ -36,7 +36,7 @@ from prometheus_client import CONTENT_TYPE_LATEST
 
 from blastbox import __version__
 from blastbox.errors import sanitize_public_error
-from blastbox.host.jobs.base import Job, JobStatus, JobStore
+from blastbox.host.jobs.base import VALID_TIERS, Job, JobStatus, JobStore
 from blastbox.host.jobs.factory import build_job_store_from_env
 from blastbox.limits import Limits
 from blastbox.observability import (
@@ -462,6 +462,7 @@ def build_app(
         file: UploadFile = File(...),
         engine: str = Form(...),
         params: list[str] = Form(default=[]),
+        target_tier: str | None = Form(default=None),
     ):
         """Submit a file for detonation by the named engine.
 
@@ -510,6 +511,24 @@ def build_app(
 
         job = Job.new(engine=engine, filename=safe_name)
         job.params = parsed_params
+
+        # Optional per-job tier routing — an OPERATOR/TEST knob, default-OFF. Pinning a job to a
+        # specific tier is a scheduling control, so an untrusted client must not be able to flood
+        # or starve a pool (DoS) or force the break-glass cold tier: it's honored ONLY when the
+        # operator sets BLASTBOX_ALLOW_TIER_ROUTING. Off (default) → silently ignored, like a
+        # non-allowlisted param. On → validated against the tier vocabulary and routed at claim.
+        if target_tier:
+            if os.environ.get("BLASTBOX_ALLOW_TIER_ROUTING", "").strip().lower() in (
+                "1", "true", "yes", "on"
+            ):
+                tt = target_tier.strip().lower()
+                if tt not in VALID_TIERS:
+                    raise HTTPException(
+                        400, f"invalid target_tier (allowed: {', '.join(VALID_TIERS)})"
+                    )
+                job.target_tier = tt
+            else:
+                _log.info("target_tier_ignored_routing_disabled", requested=target_tier)
 
         root, input_dir, output_dir = _job_dirs(job.job_id)
 
