@@ -35,6 +35,40 @@ def _serve_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_default_params(raw: str | None) -> dict[str, str]:
+    """Parse ``BLASTBOX_ENGINE_<NAME>_DEFAULT_PARAMS='KEY=VAL,KEY2=VAL2'`` into a dict.
+
+    Operator-set per-engine defaults applied to any job that doesn't specify the key (the
+    dispatcher merges them UNDER job.params; see EngineSpec.default_params). Keys are
+    upper-cased (to match the UPPERCASE-only forwardable-key shape — a lowercase default
+    would silently never forward); values are kept verbatim. Comma-separated, so a value
+    may not contain a comma (fine for the enablement flags this is for). Malformed entries
+    (no ``=`` or empty key) are warned about and skipped, mirroring _parse_engine_specs.
+    Returns ``{}`` when unset/empty.
+    """
+    out: dict[str, str] = {}
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            print(
+                f"warning: ignoring malformed default-param {item!r} (expected KEY=VALUE)",
+                file=sys.stderr,
+            )
+            continue
+        key, _, value = item.partition("=")
+        key = key.strip().upper()
+        if not key:
+            print(
+                f"warning: ignoring default-param with empty key: {item!r}",
+                file=sys.stderr,
+            )
+            continue
+        out[key] = value.strip()
+    return out
+
+
 def _parse_engine_specs(engines_raw: str) -> dict:
     """Parse ``BLASTBOX_ENGINES='NAME=image:tag[,NAME2=image2:tag2]'`` into a
     ``{name: EngineSpec}`` map.
@@ -92,9 +126,18 @@ def _parse_engine_specs(engines_raw: str) -> dict:
             reserved = frozenset(
                 k.strip().upper() for k in (reserved_raw or "").split(",") if k.strip()
             )
+            # Optional per-engine DEFAULT params (operator policy):
+            #   BLASTBOX_ENGINE_<NAME>_DEFAULT_PARAMS='KEY=VAL,KEY2=VAL2'
+            # Applied for any key a job doesn't set (job wins), forwarded through the same
+            # allowlist/reserved gate as client params. Makes an enablement default a runtime
+            # decision (flip + restart, no rebuild) instead of a hardcoded engine value.
+            default_params = _parse_default_params(
+                os.environ.get(f"BLASTBOX_ENGINE_{env_name}_DEFAULT_PARAMS")
+            )
             engines[name] = EngineSpec(
                 name=name, image=image, worker_argv=[],
                 allowed_param_keys=allowed, reserved_param_keys=reserved,
+                default_params=default_params,
             )
     return engines
 
