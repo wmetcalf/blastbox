@@ -251,6 +251,19 @@ def build_app(
         raw_engines = os.environ.get("BLASTBOX_ALLOWED_ENGINES", "")
         _allowed_engines = {e.strip() for e in raw_engines.split(",") if e.strip()}
     if not _allowed_engines:
+        # An empty allowlist means ANY engine name is accepted (and the upload spooled to disk)
+        # before the dispatcher rejects unknown engines — a permissive default kept for dev/test.
+        # Operators who want fail-closed ingress (reject unknown engines BEFORE the disk spool)
+        # set BLASTBOX_REQUIRE_ENGINE_ALLOWLIST=1, which turns an empty/unset allowlist into a
+        # hard startup error rather than a silent accept-any.
+        if os.environ.get("BLASTBOX_REQUIRE_ENGINE_ALLOWLIST", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        ):
+            raise RuntimeError(
+                "BLASTBOX_REQUIRE_ENGINE_ALLOWLIST is set but the engine allowlist is empty: "
+                "refusing to start with an open allowlist. Set BLASTBOX_ALLOWED_ENGINES to the "
+                "engines this ingress should accept (comma-separated)."
+            )
         # Don't let the ingress allowlist silently become a no-op: an empty set means ANY engine
         # name is accepted (and spooled) before the dispatcher rejects unknown engines. Surface it.
         _log.warning(

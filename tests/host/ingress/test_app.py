@@ -25,6 +25,7 @@ import time
 import uuid
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from blastbox.contract.envelope import (
@@ -1142,3 +1143,17 @@ class TestTierRoutingGate:
         client, store = _make_client(tmp_path)
         resp = self._submit(client, "nonsense")
         assert resp.status_code == 400
+
+
+def test_require_engine_allowlist_empty_raises(tmp_path, monkeypatch):
+    """BLASTBOX_REQUIRE_ENGINE_ALLOWLIST=1 + empty allowlist => fail-closed at startup."""
+    monkeypatch.setenv("BLASTBOX_REQUIRE_ENGINE_ALLOWLIST", "1")
+    with pytest.raises(RuntimeError, match="allowlist is empty"):
+        _make_client(tmp_path, allowed_engines=set())
+
+
+def test_empty_allowlist_permissive_without_require_flag(tmp_path, monkeypatch):
+    """Default (flag unset): an empty allowlist stays permissive — builds, just warns."""
+    monkeypatch.delenv("BLASTBOX_REQUIRE_ENGINE_ALLOWLIST", raising=False)
+    client, _ = _make_client(tmp_path, allowed_engines=set())
+    assert client is not None

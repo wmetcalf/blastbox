@@ -22,9 +22,11 @@ and the tier-capability matrix.
 | `BLASTBOX_DATABASE_URL` | in-memory | **Required for the 2-process (serve+dispatch) flow.** `sqlite:///…`, `postgresql://…`, or `redis://…`. Unset → each process gets its own in-memory store (jobs invisible across processes; a warning is logged). |
 | `BLASTBOX_JOB_ROOT` | `/var/lib/blastbox/jobs` | Shared per-job directory root (staged input + sealed output). Must be the same path for serve, dispatch, and the worker mount. |
 | `BLASTBOX_ENGINES` | `""` | Engine registry: `name=worker_image[,name2=image2]`. The dispatcher launches the mapped image per job. |
-| `BLASTBOX_ALLOWED_ENGINES` | `""` (all) | Restrict which engine names ingress will accept. |
-| `BLASTBOX_INPUT_DIR` / `BLASTBOX_OUTPUT_DIR` | under `JOB_ROOT` | Override per-job input/output staging dirs. |
+| `BLASTBOX_ALLOWED_ENGINES` | `""` (all) | Restrict which engine names ingress will accept. Empty ⇒ accept any (a warning is logged); set `BLASTBOX_REQUIRE_ENGINE_ALLOWLIST=1` to make an empty allowlist a hard startup error instead. |
+| `BLASTBOX_REQUIRE_ENGINE_ALLOWLIST` | `0` | When truthy, ingress refuses to start if `BLASTBOX_ALLOWED_ENGINES` is empty (fail-closed; rejects unknown engines before the disk spool instead of at dispatch). |
+| `BLASTBOX_INPUT_DIR` / `BLASTBOX_OUTPUT_DIR` | `/input` / `/output` | **Worker-side** mount points — the dispatcher injects these into the worker container env. They do **not** relocate host staging, which is always `JOB_ROOT/<job_id>/{input,output}`. |
 | `BLASTBOX_JOB_RETENTION_SECONDS` | store default | TTL after which finished jobs + artifacts are reaped. |
+| `BLASTBOX_REDIS_TTL_SECONDS` | `86400` (24h) | Per-key expiry for the Redis job store. Keep it `>= BLASTBOX_JOB_RETENTION_SECONDS`, or `0` to disable key expiry — otherwise a key can expire before retention sweeps it, orphaning the on-disk job dir under `JOB_ROOT` (no record left for retention/API-delete). Redis store only. |
 | `BLASTBOX_API_KEY` | `""` (open) | Optional bearer token required on the API. Usually unset — auth is delegated to a reverse proxy. |
 | `BLASTBOX_API_WORKERS` | `4` | uvicorn worker processes for `blastbox serve`. |
 | `BLASTBOX_METRICS_PUBLIC` | `true` | Serve `/metrics` without auth. |
@@ -121,5 +123,5 @@ and the tier-capability matrix.
 
 | Var | Default | Notes |
 |---|---|---|
-| `BLASTBOX_ENGINE_<NAME>_PARAM_KEYS` | `""` (default-deny) | **Allowlist** of `job.params` keys forwardable to that engine's worker as env. Empty ⇒ the host falls back to shape+denylist only (a hostile job's params could reach engine knobs) — so set this on **every** tier that runs the engine. e.g. `BLASTBOX_ENGINE_CLIPPYSHOT_PARAM_KEYS=CLIPPYSHOT_OCR,CLIPPYSHOT_QR,…`. |
+| `BLASTBOX_ENGINE_<NAME>_PARAM_KEYS` | unset | **Allowlist** of `job.params` keys forwardable to that engine's worker as env. **Unset** ⇒ legacy shape+denylist only (a hostile job's params could reach engine knobs — so set this on **every** tier that runs the engine). **Set** (even to an empty value) ⇒ strict allowlist: only the listed keys pass, and an empty value blocks **all** params. e.g. `BLASTBOX_ENGINE_CLIPPYSHOT_PARAM_KEYS=CLIPPYSHOT_OCR,CLIPPYSHOT_QR,…`. |
 | `BLASTBOX_ENGINE_<NAME>_DEFAULT_PARAMS` | `""` | **Operator default params**: `KEY=VAL,KEY2=VAL2` applied for any key a job does **not** set (the per-job value always wins). Makes an enablement default — e.g. a scanner toggle — a **runtime** decision in the dispatcher env instead of a value hardcoded in the engine: flip it + restart the dispatcher, no image/snapshot rebuild, and it reaches **cold and warm** tiers alike. Each defaulted key must itself be forwardable (in `_PARAM_KEYS`) and non-reserved — it passes the same gate as a client param, so the default reaches the worker only where a client param with that key would have. Set on **every** tier that runs the engine (it's read where params are forwarded). e.g. `BLASTBOX_ENGINE_REDTUSK_DEFAULT_PARAMS=REDTUSK_ENABLE_QR=1,REDTUSK_ENABLE_OCR=0`. |

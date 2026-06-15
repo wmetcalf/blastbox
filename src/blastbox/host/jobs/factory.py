@@ -47,9 +47,26 @@ def build_job_store_from_env(env: dict[str, str] | None = None) -> JobStore:
 
         # NOTE: RedisJobStore list()/count()/claim_next() are O(N) in the live job count
         # (full scan_iter + decode; no server-side ORDER BY/LIMIT). Fine for modest histories
-        # bounded by the 24h TTL; for LARGE/high-throughput deployments prefer Postgres
+        # bounded by the TTL; for LARGE/high-throughput deployments prefer Postgres
         # (postgresql://...), whose SqlJobStore pushes the window + COUNT down into the query.
-        return RedisJobStore(redis.from_url(url))
+        #
+        # BLASTBOX_REDIS_TTL_SECONDS overrides the per-key expiry (default 24h). The on-disk
+        # job dir under BLASTBOX_JOB_ROOT is reaped by the store-driven retention sweeper, which
+        # can only see jobs that still have a Redis key — so if a key TTL-expires before the
+        # sweeper runs, its dir is orphaned (no record left for retention/API-delete). Keep the
+        # Redis TTL >= BLASTBOX_JOB_RETENTION_SECONDS, or set BLASTBOX_REDIS_TTL_SECONDS=0 to
+        # disable key expiry entirely and let retention own all cleanup.
+        redis_kwargs: dict[str, int] = {}
+        ttl_raw = e.get("BLASTBOX_REDIS_TTL_SECONDS", "").strip()
+        if ttl_raw:
+            try:
+                redis_kwargs["ttl_seconds"] = int(ttl_raw)
+            except ValueError:
+                _log.warning(
+                    "BLASTBOX_REDIS_TTL_SECONDS=%r is not an integer; using the store default",
+                    ttl_raw,
+                )
+        return RedisJobStore(redis.from_url(url), **redis_kwargs)
 
     from blastbox.host.jobs.sql_store import SqlJobStore
 

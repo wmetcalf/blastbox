@@ -884,43 +884,11 @@ class Dispatcher:
             self._fail_job(job, f"runtime selection failed: {exc}")
             return
 
-        # Enrich the RUNNING job with runtime info — claim-fenced (the cold twin of the warm
-        # mark-warm fence). _runtime_selector() can block on `docker info` (no timeout); a peer's
-        # docker-ps requeue can fire during that stall and reclaim the row under a new claim. A
-        # BLIND write here would overwrite worker_runtime on the reclaimed job — mis-routing the
-        # peer's warm-vs-cold recovery (a relabeled warm job gets cold-requeued -> re-detonation).
-        # If we lost the claim, abort BEFORE launching our own (stale) worker.
-        if not self._job_store.update_if_status(
-            job.job_id,
-            JobStatus.RUNNING,
-            expect_claim_id=job.claim_id,
-            worker_runtime=runtime.runtime,
-            security_warnings=list(job.security_warnings) + list(runtime.warnings),
-        ):
-            _log.warning(
-                "cold job %s lost its claim before launch (requeued/reclaimed by another "
-                "dispatcher); aborting before detonation", job.job_id,
-            )
-            return
-
-        # ------------------------------------------------------------------
-        # Step 4: Build argv and launch worker container
-        # Security: image is engine.image (operator-configured), never job data.
-        # extra_env is filtered through _sanitize_params.
-        # ------------------------------------------------------------------
-        # The worker runs unprivileged (--user 10001:10001); make the output bind
-        # dir writable by it (cold-path parity with the warm /out 0o777). The host
-        # re-seals + size-caps the result regardless, so 0o777 here widens no trust
-        # boundary — the worker's output is untrusted on every path.
-        # Wipe-then-recreate for a clean slate (mirrors the warm path): a requeued
-        # job must NOT inherit files a prior crashed/compromised worker left behind —
-        # stale undeclared files would otherwise count against the output size cap
-        # (a spurious-failure DoS) and, pre the serve-route manifest check, be
-        # servable. The host owns this dir between attempts, so the wipe is safe.
-        shutil.rmtree(output_dir, ignore_errors=True)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(output_dir, 0o777)
-
+        # Build the worker argv BEFORE the claim-fenced RUNNING write below, so the persisted
+        # security_warnings are complete: build_worker_docker_run_argv() appends the
+        # nono-skipped-under-runsc / missing-AppArmor / missing-seccomp warnings onto
+        # runtime.warnings. argv assembly is pure (no filesystem or container side effects), so
+        # doing it here cannot lose the claim or launch anything early.
         container_name = f"blastbox-worker-{job.job_id[:12]}"
         argv = build_worker_docker_run_argv(
             image=engine.image,          # NEVER job.engine / job.filename / job.params
@@ -948,6 +916,42 @@ class Dispatcher:
                 "BLASTBOX_OUTPUT_DIR": "/output",
             },
         )
+
+        # Enrich the RUNNING job with runtime info — claim-fenced (the cold twin of the warm
+        # mark-warm fence). _runtime_selector() can block on `docker info` (no timeout); a peer's
+        # docker-ps requeue can fire during that stall and reclaim the row under a new claim. A
+        # BLIND write here would overwrite worker_runtime on the reclaimed job — mis-routing the
+        # peer's warm-vs-cold recovery (a relabeled warm job gets cold-requeued -> re-detonation).
+        # If we lost the claim, abort BEFORE launching our own (stale) worker.
+        if not self._job_store.update_if_status(
+            job.job_id,
+            JobStatus.RUNNING,
+            expect_claim_id=job.claim_id,
+            worker_runtime=runtime.runtime,
+            security_warnings=list(job.security_warnings) + list(runtime.warnings),
+        ):
+            _log.warning(
+                "cold job %s lost its claim before launch (requeued/reclaimed by another "
+                "dispatcher); aborting before detonation", job.job_id,
+            )
+            return
+
+        # ------------------------------------------------------------------
+        # Step 4: Launch worker container (argv already built above, before the
+        # claim-fenced RUNNING write, so security_warnings persisted complete).
+        # ------------------------------------------------------------------
+        # The worker runs unprivileged (--user 10001:10001); make the output bind
+        # dir writable by it (cold-path parity with the warm /out 0o777). The host
+        # re-seals + size-caps the result regardless, so 0o777 here widens no trust
+        # boundary — the worker's output is untrusted on every path.
+        # Wipe-then-recreate for a clean slate (mirrors the warm path): a requeued
+        # job must NOT inherit files a prior crashed/compromised worker left behind —
+        # stale undeclared files would otherwise count against the output size cap
+        # (a spurious-failure DoS) and, pre the serve-route manifest check, be
+        # servable. The host owns this dir between attempts, so the wipe is safe.
+        shutil.rmtree(output_dir, ignore_errors=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(output_dir, 0o777)
 
         try:
             # Run to completion (or timeout). The worker's exit code is not the

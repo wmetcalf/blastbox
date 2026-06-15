@@ -921,3 +921,37 @@ def test_stale_queued_jobs_failed_after_max_age(tmp_path):
     assert store.get(old.job_id).status == JobStatus.FAILED
     assert store.get(fresh.job_id).status == JobStatus.QUEUED
     assert not (tmp_path / old.job_id / "input" / "old.docx").exists()
+
+
+def test_argv_build_warnings_reach_security_warnings(tmp_path, monkeypatch):
+    """Hardening warnings appended while BUILDING the docker argv (e.g. skipped nono under
+    runsc, missing AppArmor/seccomp) must land in job.security_warnings. Regression: the
+    claim-fenced RUNNING write used to persist warnings BEFORE argv was built, silently
+    dropping them so a job looked clean even though a MAC layer was absent."""
+    import blastbox.host.dispatch as dispatch_mod
+
+    def _spy_argv(*args, **kwargs):
+        # Simulate build_worker_docker_run_argv appending a hardening warning to runtime.
+        kwargs["runtime"].warnings.append("argv-time: seccomp profile missing")
+        return ["docker", "run", "--rm", kwargs["image"]]
+
+    monkeypatch.setattr(dispatch_mod, "build_worker_docker_run_argv", _spy_argv)
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    assert dispatcher.dispatch_once() is True
+
+    final_job = store.get(job.job_id)
+    # The argv-build-time warning AND the runtime-selection warning are both persisted.
+    assert "argv-time: seccomp profile missing" in final_job.security_warnings
+    assert "no runsc" in final_job.security_warnings
