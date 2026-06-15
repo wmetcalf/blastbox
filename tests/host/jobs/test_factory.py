@@ -71,3 +71,27 @@ def test_redis_ttl_seconds_unset_uses_store_default(monkeypatch):
 
     build_job_store_from_env({"BLASTBOX_DATABASE_URL": "redis://localhost:6379/0"})
     assert captured["ttl_seconds"] == "STORE_DEFAULT"
+
+
+def test_redis_ttl_seconds_negative_uses_store_default(monkeypatch):
+    """A negative TTL is rejected (logged) and the store default applies — not silent no-expiry."""
+    import redis
+
+    import blastbox.host.jobs.redis_store as redis_store_mod
+
+    captured = {}
+
+    class _FakeRedisStore:
+        def __init__(self, client, *, ttl_seconds="STORE_DEFAULT"):
+            captured["ttl_seconds"] = ttl_seconds
+
+    monkeypatch.setattr(redis, "from_url", lambda url: object())
+    monkeypatch.setattr(redis_store_mod, "RedisJobStore", _FakeRedisStore)
+
+    build_job_store_from_env(
+        {
+            "BLASTBOX_DATABASE_URL": "redis://localhost:6379/0",
+            "BLASTBOX_REDIS_TTL_SECONDS": "-5",
+        }
+    )
+    assert captured["ttl_seconds"] == "STORE_DEFAULT"

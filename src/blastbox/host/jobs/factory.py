@@ -60,12 +60,21 @@ def build_job_store_from_env(env: dict[str, str] | None = None) -> JobStore:
         ttl_raw = e.get("BLASTBOX_REDIS_TTL_SECONDS", "").strip()
         if ttl_raw:
             try:
-                redis_kwargs["ttl_seconds"] = int(ttl_raw)
+                ttl_val = int(ttl_raw)
             except ValueError:
                 _log.warning(
                     "BLASTBOX_REDIS_TTL_SECONDS=%r is not an integer; using the store default",
                     ttl_raw,
                 )
+            else:
+                if ttl_val < 0:
+                    _log.warning(
+                        "BLASTBOX_REDIS_TTL_SECONDS=%r is negative; using the store default "
+                        "(set 0 to disable key expiry)",
+                        ttl_raw,
+                    )
+                else:
+                    redis_kwargs["ttl_seconds"] = ttl_val
         return RedisJobStore(redis.from_url(url), **redis_kwargs)
 
     from blastbox.host.jobs.sql_store import SqlJobStore
