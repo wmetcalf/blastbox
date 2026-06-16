@@ -52,10 +52,16 @@ class DetonateEngine:
     name = "detonate"
     formats = frozenset({"*"})
 
-    def __init__(self, argv: list[str] | None = None) -> None:
+    def __init__(self, argv: list[str] | None = None, name: str | None = None) -> None:
         # argv may be injected directly (tests / a host that builds the spec) or read
         # from the environment at detonate time (the dispatched-worker path).
         self._argv = argv
+        # The engine's reported name (sealed into the Envelope). When this engine is
+        # cold-dispatched, the host trust gate requires it to equal the dispatcher's
+        # EngineSpec name — so per-tool images set it via BLASTBOX_DETONATE_NAME
+        # (operator-fixed, never job-derived). Defaults to the class name.
+        if name is not None or "BLASTBOX_DETONATE_NAME" in os.environ:
+            self.name = name or os.environ["BLASTBOX_DETONATE_NAME"]
 
     def _resolve_argv(self) -> list[str]:
         if self._argv is not None:
