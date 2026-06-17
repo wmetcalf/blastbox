@@ -99,9 +99,23 @@ def _default_fetch(
     regardless — and most malware C2 / fakenet uses certs a public trust store would reject."""
     handlers: list[urllib.request.BaseHandler] = [_CappedRedirect()]
     if not verify_tls:
+        # "Grab anything" TLS: a grabber must connect to weak/legacy/MITM endpoints (FakeNet, old
+        # malware C2 with SHA1/small-key/legacy-cipher certs). Disabling cert verification alone is
+        # not enough — modern OpenSSL rejects those at the HANDSHAKE (cipher/seclevel), before any
+        # cert check — so also drop the security level + allow old TLS + legacy renegotiation.
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.minimum_version = ssl.TLSVersion.TLSv1
+        except (ValueError, AttributeError):
+            pass
+        try:
+            ctx.set_ciphers("DEFAULT@SECLEVEL=0")
+        except ssl.SSLError:
+            pass
+        if hasattr(ssl, "OP_LEGACY_SERVER_CONNECT"):
+            ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
         handlers.append(urllib.request.HTTPSHandler(context=ctx))
     opener = urllib.request.build_opener(*handlers)
     req = urllib.request.Request(url, headers={"User-Agent": _DEFAULT_UA}, method="GET")
