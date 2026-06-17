@@ -318,6 +318,25 @@ def test_gateway_route_hex_little_endian() -> None:
     assert _gateway_route_hex("10.0.0.1") == "0100000A"
 
 
+def test_default_route_via_dev_for_tun(tmp_path: Path, monkeypatch) -> None:
+    import builtins
+
+    from blastbox.worker import harness
+    route = tmp_path / "route"
+    # the socks tier installs `default dev tun0` (no gateway) — Iface=tun0, Destination=00000000
+    route.write_text(
+        "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n"
+        "eth0\t000020AC\t00000000\t0001\t0\t0\t0\t0000FFFF\n"
+        "tun0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\n"
+    )
+    real_open = builtins.open
+    monkeypatch.setattr(builtins, "open", lambda p, *a, **k: (
+        real_open(route, *a, **k) if p == "/proc/net/route" else real_open(p, *a, **k)
+    ))
+    assert harness._default_route_via_dev("tun0") is True
+    assert harness._default_route_via_dev("eth0") is False  # eth0 has no default route here
+
+
 def test_default_route_via_reads_proc_route(tmp_path: Path, monkeypatch) -> None:
     import builtins
 

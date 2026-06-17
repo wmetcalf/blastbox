@@ -1010,17 +1010,21 @@ class Dispatcher:
                 "BLASTBOX_NET_EGRESS": (
                     "1" if personality.exit_driver not in ("none", "drop") else "0"
                 ),
-                # Egress-readiness barrier for netd route-wired tiers (inspect/vpn): netd installs
-                # the worker's only route out AFTER the container starts, so tell the harness which
-                # gateway to wait for before detonating — otherwise a fast one-shot engine reaches
-                # the network first and fails closed. The gateway is the personality's declared
-                # `gateway=` (must match netd's --inspect-gateway/--vpn-gateway). Empty string =
-                # no wait (merged last so a hostile job.param can't suppress it).
+                # Egress-readiness barrier for netd-wired tiers: netd installs the worker's only
+                # route out AFTER the container starts, so tell the harness what to wait for before
+                # detonating — otherwise a fast one-shot engine reaches the network first and fails
+                # closed. inspect/vpn wait for the gateway route (personality `gateway=`, must match
+                # netd's --inspect-gateway/--vpn-gateway); socks waits for the tun2socks TUN device.
+                # Empty = no wait. Merged last so a hostile job.param can't suppress it.
                 "BLASTBOX_NET_WAIT_GATEWAY": (
                     personality.config.get("gateway", "")
                     if (personality.inspect
                         or personality.exit_driver in ("openvpn", "wireguard"))
                     else ""
+                ),
+                "BLASTBOX_NET_WAIT_TUN": (
+                    "tun0" if (personality.exit_driver == "socks"
+                               and not personality.inspect) else ""
                 ),
             },
         )

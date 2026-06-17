@@ -47,7 +47,8 @@ _CHUNK_SIZE = 64 * 1024  # 64 KiB read chunks
 # one-shot worker that reaches the network immediately races the wiring and fails closed
 # ("Temporary failure in name resolution"). When BLASTBOX_NET_WAIT_GATEWAY is set the harness
 # blocks until the default route points at that gateway (netd's wiring signal) before detonating.
-_NET_WAIT_GATEWAY_ENV = "BLASTBOX_NET_WAIT_GATEWAY"
+_NET_WAIT_GATEWAY_ENV = "BLASTBOX_NET_WAIT_GATEWAY"  # inspect/vpn: default route via this gateway
+_NET_WAIT_TUN_ENV = "BLASTBOX_NET_WAIT_TUN"          # socks: default route via this TUN device
 _NET_WAIT_S_ENV = "BLASTBOX_NET_WAIT_S"
 _DEFAULT_NET_WAIT_S = 20.0
 
@@ -78,19 +79,43 @@ def _default_route_via(gateway_ip: str) -> bool:
     return False
 
 
-def _wait_for_egress_gateway(
-    gateway_ip: str, timeout_s: float, *, sleep_fn=time.sleep, clock=time.monotonic
+def _default_route_via_dev(dev: str) -> bool:
+    """True iff the default route's interface is ``dev`` — the readiness signal for the SOCKS tier,
+    whose tun2socks installs ``default dev tun0`` (a point-to-point TUN, no gateway IP)."""
+    try:
+        with open("/proc/net/route", encoding="ascii") as fh:
+            next(fh, None)  # header row
+            for line in fh:
+                cols = line.split()
+                if len(cols) >= 2 and cols[0] == dev and cols[1] == "00000000":
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _wait_for_egress(
+    probe, timeout_s: float, *, sleep_fn=time.sleep, clock=time.monotonic
 ) -> bool:
-    """Block until the default route is via ``gateway_ip`` (netd wired us) or ``timeout_s`` elapses.
-    Returns True if wired, False on timeout (caller proceeds anyway — fail-open to the engine, which
-    fails closed on its own if egress never came up)."""
+    """Block until ``probe()`` is True (netd wired us) or ``timeout_s`` elapses. Returns True if
+    wired, False on timeout (caller proceeds anyway — fail-open to the engine, which fails closed on
+    its own if egress never came up)."""
     deadline = clock() + timeout_s
     while True:
-        if _default_route_via(gateway_ip):
+        if probe():
             return True
         if clock() >= deadline:
             return False
         sleep_fn(0.1)
+
+
+def _wait_for_egress_gateway(
+    gateway_ip: str, timeout_s: float, *, sleep_fn=time.sleep, clock=time.monotonic
+) -> bool:
+    """Block until the default route is via ``gateway_ip`` (the inspect/vpn route-wired tiers)."""
+    return _wait_for_egress(
+        lambda: _default_route_via(gateway_ip), timeout_s, sleep_fn=sleep_fn, clock=clock
+    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -299,16 +324,22 @@ def main(engine: "Engine", argv: list[str] | None = None) -> int:
     limits = Limits.from_env()
 
     # Egress-readiness barrier (netd-wired tiers only): wait for our route out before detonating,
-    # so a fast one-shot engine doesn't reach the network before netd finishes wiring it.
+    # so a fast one-shot engine doesn't reach the network before netd finishes wiring it. Two
+    # signals: a gateway IP (inspect/vpn route-wired) or a TUN device (socks tun2socks).
     wait_gateway = os.environ.get(_NET_WAIT_GATEWAY_ENV, "").strip()
-    if wait_gateway:
+    wait_tun = os.environ.get(_NET_WAIT_TUN_ENV, "").strip()
+    if wait_gateway or wait_tun:
         timeout_s = float(os.environ.get(_NET_WAIT_S_ENV) or _DEFAULT_NET_WAIT_S)
-        if _wait_for_egress_gateway(wait_gateway, timeout_s):
-            logger.info("egress ready: default route via %s", wait_gateway)
+        if wait_tun:
+            target, probe = f"dev {wait_tun}", (lambda: _default_route_via_dev(wait_tun))
+        else:
+            target, probe = f"via {wait_gateway}", (lambda: _default_route_via(wait_gateway))
+        if _wait_for_egress(probe, timeout_s):
+            logger.info("egress ready: default route %s", target)
         else:
             logger.warning(
-                "egress gateway %s not wired after %.0fs; proceeding (engine may fail closed)",
-                wait_gateway, timeout_s,
+                "egress (%s) not wired after %.0fs; proceeding (engine may fail closed)",
+                target, timeout_s,
             )
 
     return run_detonation(engine, input_path=input_path, output_dir=output_dir, limits=limits)

@@ -1374,6 +1374,8 @@ def test_socks_personality_labels_worker_for_wiring_and_uses_bb_socks(tmp_path, 
     assert "blastbox.net.wire=socks" in argv
     # DNS-over-TCP resolv.conf is injected for the socks exit.
     assert any("dst=/etc/resolv.conf" in t for t in argv)
+    # The socks worker waits for the tun2socks TUN before detonating (egress barrier).
+    assert any(t == "BLASTBOX_NET_WAIT_TUN=tun0" for t in argv)
 
 
 def test_inspect_personality_labels_worker_for_inspect_wiring_and_uses_bb_inspect(
