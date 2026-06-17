@@ -284,6 +284,12 @@ class Dispatcher:
         self._gogorobocap_bin = (
             os.environ.get("BLASTBOX_GOGOROBOCAP_BIN") or "gogorobocap"
         ).strip()
+        # netd drops the per-job TLS keylog (sslkeys.log) on the worker's DIE event, which races
+        # this dispatcher's post-worker seal. Briefly poll for it so an inspect job's decrypt isn't
+        # silently skipped just because the snapshot landed a beat after we started sealing.
+        self._decrypt_keylog_wait_s = float(
+            os.environ.get("BLASTBOX_NET_DECRYPT_KEYLOG_WAIT_S") or "8"
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -1004,6 +1010,18 @@ class Dispatcher:
                 "BLASTBOX_NET_EGRESS": (
                     "1" if personality.exit_driver not in ("none", "drop") else "0"
                 ),
+                # Egress-readiness barrier for netd route-wired tiers (inspect/vpn): netd installs
+                # the worker's only route out AFTER the container starts, so tell the harness which
+                # gateway to wait for before detonating — otherwise a fast one-shot engine reaches
+                # the network first and fails closed. The gateway is the personality's declared
+                # `gateway=` (must match netd's --inspect-gateway/--vpn-gateway). Empty string =
+                # no wait (merged last so a hostile job.param can't suppress it).
+                "BLASTBOX_NET_WAIT_GATEWAY": (
+                    personality.config.get("gateway", "")
+                    if (personality.inspect
+                        or personality.exit_driver in ("openvpn", "wireguard"))
+                    else ""
+                ),
             },
         )
 
@@ -1367,7 +1385,14 @@ class Dispatcher:
         cap_dir = output_dir / "capture"           # the sealed (host-owned) capture dir
         pcap = cap_dir / "dump.pcap"
         keylog = output_dir.parent / "capture" / "sslkeys.log"  # host-only key drop
-        if not pcap.is_file() or not keylog.is_file() or keylog.stat().st_size == 0:
+        if not pcap.is_file():
+            return envelope
+        # The keylog is dropped by netd on the worker's die event, which races this seal. If we have
+        # a capture but the keylog hasn't landed yet, wait briefly for it rather than skip decrypt.
+        deadline = time.monotonic() + self._decrypt_keylog_wait_s
+        while (not keylog.is_file() or keylog.stat().st_size == 0) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if not keylog.is_file() or keylog.stat().st_size == 0:
             return envelope
         try:
             result = decrypt_capture(

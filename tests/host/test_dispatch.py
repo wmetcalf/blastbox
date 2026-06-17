@@ -1381,7 +1381,9 @@ def test_inspect_personality_labels_worker_for_inspect_wiring_and_uses_bb_inspec
 ):
     """An inspect personality (egress exit + inspect=1) → worker on the internal bb-inspect bridge
     + labeled blastbox.net.wire=inspect, so netd routes it through the sslproxy/MITM gateway."""
-    monkeypatch.setenv("BLASTBOX_NETPOLICY_MITM", "exit=inetsim,inspect=1,dns=172.28.100.2")
+    monkeypatch.setenv(
+        "BLASTBOX_NETPOLICY_MITM", "exit=inetsim,inspect=1,dns=172.28.100.2,gateway=172.32.0.10"
+    )
 
     store = InMemoryJobStore()
     job = _make_job()
@@ -1412,6 +1414,8 @@ def test_inspect_personality_labels_worker_for_inspect_wiring_and_uses_bb_inspec
     assert "blastbox.net.wire=inspect" in argv
     # An inspected egress worker still has egress (through the gateway) → net-share granted.
     assert any(t == "BLASTBOX_NET_EGRESS=1" for t in argv)
+    # The worker is told which gateway to wait for (netd wires it after start) — egress barrier.
+    assert any(t == "BLASTBOX_NET_WAIT_GATEWAY=172.32.0.10" for t in argv)
 
 
 def test_no_capture_artifact_when_netd_produced_none(tmp_path, monkeypatch):
