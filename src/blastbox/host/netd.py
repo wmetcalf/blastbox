@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
 import time
 from collections.abc import Callable, Mapping
@@ -45,6 +46,9 @@ _STOP_TIMEOUT_S = 5.0
 # How long to wait for tun2socks to create the TUN before configuring routes (tries × interval).
 _TUN_WAIT_TRIES = 40
 _TUN_WAIT_INTERVAL_S = 0.25
+# Name the per-job TLS keylog snapshot takes in the capture dir; the dispatcher's
+# _seal_decrypted_capture reads exactly this (alongside dump.pcap) to run GoGoRoboCap.
+_SSLKEYS_NAME = "sslkeys.log"
 
 
 @dataclass
@@ -72,10 +76,17 @@ class CaptureDaemon:
     socks_proxy_url: str | None = None      # socks mode: tun2socks → this SOCKS5 URL
     vpn_gateway_ip: str | None = None       # vpn mode: default route → this gateway sidecar IP
     inspect_gateway_ip: str | None = None   # inspect mode: default route → the sslproxy/MITM gw IP
+    # inspect mode: host path to the shared sslproxy gateway's SSLKEYLOGFILE (-M). On an inspect
+    # worker's die, netd snapshots it next to that worker's pcap as sslkeys.log, so the dispatcher
+    # can decrypt. Per-job attribution is free: GoGoRoboCap matches keys to flows by client_random,
+    # so the worker's own pcap + the whole keylog decrypts ONLY that worker's TLS.
+    inspect_keylog_path: str | None = None
     nsenter_spawn_fn: Callable[[int, list[str]], Any] | None = None  # long-lived in worker netns
     nsenter_run_fn: Callable[[int, list[str]], int] | None = None    # run cmd in netns → rc
+    keylog_copy_fn: Callable[[str, str], Any] = shutil.copyfile       # src,dst keylog snapshot seam
     sleep_fn: Callable[[float], None] = time.sleep
     wired: dict[str, Any] = field(default_factory=dict)  # container_id → proc-or-None
+    inspect_wired: set[str] = field(default_factory=set)  # container_ids wired in inspect mode
 
     # ------------------------------------------------------------------ handlers
     def handle_start(self, container_id: str) -> None:
@@ -196,6 +207,7 @@ class CaptureDaemon:
             _log.warning("netd: failed to wire inspect for job %s: %s", wt.job_id, exc)
             return
         self.wired[container_id] = None  # route-only; nothing to terminate on die
+        self.inspect_wired.add(container_id)  # mark for keylog snapshot on die
         _log.info("netd: wired inspect job=%s pid=%s -> gateway %s",
                   wt.job_id, wt.pid, self.inspect_gateway_ip)
 
@@ -209,6 +221,12 @@ class CaptureDaemon:
             except Exception as exc:  # noqa: BLE001
                 _log.warning("netd: stopping capture for job %s: %s", ac.target.job_id, exc)
             _log.info("netd: capture finalized job=%s -> %s", ac.target.job_id, ac.target.pcap_path)
+        # Inspect tier: snapshot the gateway's TLS keylog next to this worker's pcap so the
+        # dispatcher can decrypt it. Needs the worker's pcap (the per-flow client_random binds the
+        # right keys), so it's a no-op without an active capture. Best-effort: never fail on die.
+        if container_id in self.inspect_wired:
+            self.inspect_wired.discard(container_id)
+            self._snapshot_inspect_keylog(ac)
         wproc = self.wired.pop(container_id, None)
         if wproc is not None:
             try:
@@ -216,6 +234,27 @@ class CaptureDaemon:
                 wproc.wait(timeout=_STOP_TIMEOUT_S)
             except Exception as exc:  # noqa: BLE001
                 _log.warning("netd: stopping socks wire for %s: %s", container_id[:12], exc)
+
+    def _snapshot_inspect_keylog(self, ac: _ActiveCapture | None) -> None:
+        """Copy the shared sslproxy gateway keylog into this job's capture dir as ``sslkeys.log``
+        (sibling of the pcap), so _seal_decrypted_capture can run GoGoRoboCap. No-op unless a keylog
+        path is configured, the file exists+non-empty, and the worker had a capture to pair it with.
+        Copying the WHOLE shared keylog is correct: GoGoRoboCap only uses keys whose client_random
+        matches a flow in THIS worker's pcap, so cross-job keys are inert."""
+        if ac is None or not self.inspect_keylog_path:
+            return
+        try:
+            src = self.inspect_keylog_path
+            if not os.path.isfile(src) or os.path.getsize(src) == 0:
+                return
+            dst = os.path.join(os.path.dirname(ac.target.pcap_path), _SSLKEYS_NAME)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            self.keylog_copy_fn(src, dst)
+        except Exception as exc:  # noqa: BLE001 — decrypt enrichment is best-effort
+            _log.warning("netd: snapshot inspect keylog for job %s failed: %s",
+                         ac.target.job_id, exc)
+            return
+        _log.info("netd: snapshot inspect keylog job=%s -> %s", ac.target.job_id, dst)
 
     # ------------------------------------------------------------------ event loop
     def run(self, events_cmd: list[str] | None = None) -> None:  # pragma: no cover - I/O loop
@@ -337,6 +376,12 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry poin
         help="sslproxy/MITM gateway sidecar IP for the inspect tier; default-routes workers "
              "labeled blastbox.net.wire=inspect through it. Empty = disabled.",
     )
+    parser.add_argument(
+        "--inspect-keylog",
+        default=os.environ.get("BLASTBOX_NETD_INSPECT_KEYLOG", ""),
+        help="host path to the sslproxy gateway's SSLKEYLOGFILE (-M master_keys.log); snapshotted "
+             "into each inspect job's capture dir as sslkeys.log so the dispatcher can decrypt.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     ns = parser.parse_args(argv)
     logging.basicConfig(
@@ -346,6 +391,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry poin
     socks = ns.socks_proxy.strip() or None
     vpn = ns.vpn_gateway.strip() or None
     inspect_gw = ns.inspect_gateway.strip() or None
+    inspect_keylog = ns.inspect_keylog.strip() or None
     wiring_on = bool(socks or vpn or inspect_gw)
     daemon = CaptureDaemon(
         job_root=ns.job_root,
@@ -355,13 +401,14 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry poin
         socks_proxy_url=socks,
         vpn_gateway_ip=vpn,
         inspect_gateway_ip=inspect_gw,
+        inspect_keylog_path=inspect_keylog,
         nsenter_spawn_fn=_nsenter_spawn if wiring_on else None,
         nsenter_run_fn=_nsenter_run if wiring_on else None,
     )
     _log.info(
-        "blastbox-netd starting; job_root=%s socks=%s vpn=%s inspect=%s",
+        "blastbox-netd starting; job_root=%s socks=%s vpn=%s inspect=%s keylog=%s",
         ns.job_root, "on" if socks else "off", "on" if vpn else "off",
-        "on" if inspect_gw else "off",
+        "on" if inspect_gw else "off", "on" if inspect_keylog else "off",
     )
     try:
         daemon.run()

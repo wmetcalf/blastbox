@@ -319,3 +319,64 @@ def test_inspect_die_is_clean_noop(tmp_path):
     d.handle_start("i1")
     d.handle_die("i1")  # route-only wire → no proc to terminate, must not raise
     assert "i1" not in d.wired
+
+
+# --------------------------------------------------------------------------- inspect keylog snapshot
+def _inspect_captured(job_id="K1", ip="172.32.0.5", net_id="netidI", pid=999):
+    """An inspect worker that is BOTH captured (net.capture=1) and inspect-wired."""
+    return {
+        "Name": f"/blastbox-worker-{job_id}-1",
+        "Config": {"Labels": {
+            "blastbox.net.capture": "1",
+            "blastbox.net.wire": "inspect",
+            "blastbox.job_id": job_id,
+        }},
+        "NetworkSettings": {"Networks": {"bb-inspect": {"IPAddress": ip, "NetworkID": net_id}}},
+        "State": {"Pid": pid, "Running": True},
+    }
+
+
+def _keylog_daemon(tmp_path, inspect_fn, keylog_path):
+    return CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=inspect_fn,
+        network_iface_fn=lambda: {"netidI": "br-inspect"},
+        spawn_fn=lambda argv, pcap: _FakeProc(argv),
+        inspect_gateway_ip="172.32.0.10",
+        inspect_keylog_path=keylog_path,
+        nsenter_run_fn=lambda pid, argv: 0,
+        sleep_fn=lambda s: None,
+    )
+
+
+def test_inspect_die_snapshots_keylog_next_to_pcap(tmp_path):
+    keylog = tmp_path / "gw" / "master_keys.log"
+    keylog.parent.mkdir()
+    keylog.write_text("CLIENT_TRAFFIC_SECRET_0 deadbeef cafef00d\n")
+    d = _keylog_daemon(tmp_path, lambda cid: _inspect_captured(), str(keylog))
+    d.handle_start("k1")
+    assert "k1" in d.active and "k1" in d.inspect_wired  # captured AND inspect-wired
+    d.handle_die("k1")
+    dst = tmp_path / "K1" / "capture" / "sslkeys.log"
+    assert dst.is_file()
+    assert dst.read_text() == "CLIENT_TRAFFIC_SECRET_0 deadbeef cafef00d\n"
+    assert "k1" not in d.inspect_wired  # cleared
+
+
+def test_inspect_die_no_keylog_snapshot_without_capture(tmp_path):
+    # inspect-wired but NOT captured → no pcap to pair the keys with → no snapshot.
+    keylog = tmp_path / "master_keys.log"
+    keylog.write_text("X Y Z\n")
+    d = _keylog_daemon(tmp_path, lambda cid: _inspect_mode_inspect(job_id="K2", pid=7), str(keylog))
+    d.handle_start("k2")
+    assert "k2" in d.inspect_wired and "k2" not in d.active
+    d.handle_die("k2")
+    assert not (tmp_path / "K2" / "capture" / "sslkeys.log").exists()
+
+
+def test_inspect_die_no_keylog_snapshot_when_unconfigured(tmp_path):
+    # captured + inspect-wired but no keylog path configured → nothing copied.
+    d = _keylog_daemon(tmp_path, lambda cid: _inspect_captured(job_id="K3"), None)
+    d.handle_start("k3")
+    d.handle_die("k3")
+    assert not (tmp_path / "K3" / "capture" / "sslkeys.log").exists()
