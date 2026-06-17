@@ -26,12 +26,42 @@ def _run(tmp_path: Path, engine: UrlGrabEngine, url_text: bytes,
 
 
 def _ok_fetch(body=b"<html>evil</html>", status=200, ct="text/html", truncated=False, final=None):
-    def fetch(url, *, timeout, max_bytes, max_redirects):
+    def fetch(url, *, timeout, max_bytes, max_redirects, verify_tls=True):
         return FetchResult(
             final_url=final or url, status=status, content_type=ct, server="nginx",
             body=body[:max_bytes], truncated=truncated,
         )
     return fetch
+
+
+def test_verify_tls_passed_to_fetch_and_recorded(tmp_path: Path) -> None:
+    seen = {}
+
+    def fetch(url, *, timeout, max_bytes, max_redirects, verify_tls):
+        seen["verify_tls"] = verify_tls
+        return FetchResult(final_url=url, status=200, content_type="text/html",
+                           server="FakeNet/1.3", body=b"ok", truncated=False)
+
+    # default = verify ON
+    _run(tmp_path, UrlGrabEngine(fetch_fn=fetch), b"https://x/")
+    assert seen["verify_tls"] is True
+    # opt out → passed through + recorded in the envelope for provenance
+    _, meta, _ = _run(tmp_path, UrlGrabEngine(fetch_fn=fetch, verify_tls=False), b"https://x/")
+    assert seen["verify_tls"] is False
+    assert meta["payload"]["fields"]["tls_verified"] is False
+
+
+def test_verify_tls_env_default(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("BLASTBOX_URLGRAB_VERIFY_TLS", "0")
+    seen = {}
+
+    def fetch(url, *, timeout, max_bytes, max_redirects, verify_tls):
+        seen["v"] = verify_tls
+        return FetchResult(final_url=url, status=200, content_type="t", server="s",
+                           body=b"x", truncated=False)
+
+    _run(tmp_path, UrlGrabEngine(fetch_fn=fetch), b"https://x/")
+    assert seen["v"] is False
 
 
 def test_successful_fetch_seals_body_and_metadata(tmp_path: Path) -> None:
@@ -60,7 +90,7 @@ def test_http_error_status_is_still_a_response(tmp_path: Path) -> None:
 
 def test_dead_url_is_ok_not_engine_error(tmp_path: Path) -> None:
     # DNS NXDOMAIN / connection refused → a normal "dead URL" verdict, NOT engine_error.
-    def boom(url, *, timeout, max_bytes, max_redirects):
+    def boom(url, *, timeout, max_bytes, max_redirects, verify_tls=True):
         raise FetchError("Name or service not known")
     rc, meta, outdir = _run(tmp_path, UrlGrabEngine(fetch_fn=boom), b"http://sinkholed.example/")
     assert meta["status"] == "ok"  # must not FAIL the job

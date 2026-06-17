@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import os
 import socket
+import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -36,6 +37,7 @@ from blastbox.worker.engine import DetonationResult
 
 _DEFAULT_MAX_REDIRECTS = 5
 _DEFAULT_UA = "blastbox-urlgrab/1"
+_VERIFY_TLS_ENV = "BLASTBOX_URLGRAB_VERIFY_TLS"
 
 
 class FetchError(Exception):
@@ -86,10 +88,22 @@ class _CappedRedirect(urllib.request.HTTPRedirectHandler):
     max_redirections = _DEFAULT_MAX_REDIRECTS
 
 
-def _default_fetch(url: str, *, timeout: float, max_bytes: int, max_redirects: int) -> FetchResult:
+def _default_fetch(
+    url: str, *, timeout: float, max_bytes: int, max_redirects: int, verify_tls: bool = True
+) -> FetchResult:
     """One GET via urllib: cap redirects + body, treat a 4xx/5xx as a real response (it has a
-    body), and raise :class:`FetchError` only on a transport failure (DNS/connection/timeout)."""
-    opener = urllib.request.build_opener(_CappedRedirect)
+    body), and raise :class:`FetchError` only on a transport failure (DNS/connection/timeout).
+
+    ``verify_tls=False`` accepts ANY TLS cert (self-signed, FakeNet's MITM, expired). A grabber's
+    job is to *retrieve* whatever the URL serves — the body is untrusted + sealed-as-artifact
+    regardless — and most malware C2 / fakenet uses certs a public trust store would reject."""
+    handlers: list[urllib.request.BaseHandler] = [_CappedRedirect()]
+    if not verify_tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+    opener = urllib.request.build_opener(*handlers)
     req = urllib.request.Request(url, headers={"User-Agent": _DEFAULT_UA}, method="GET")
     try:
         resp = opener.open(req, timeout=timeout)
@@ -119,8 +133,16 @@ class UrlGrabEngine:
     name = "urlgrab"
     formats = frozenset({"*"})
 
-    def __init__(self, *, fetch_fn=None, name: str | None = None) -> None:
+    def __init__(self, *, fetch_fn=None, name: str | None = None, verify_tls: bool | None = None) -> None:
         self._fetch = fetch_fn or _default_fetch
+        # Verify TLS certs? Default ON (safe); operators run a grabber with
+        # BLASTBOX_URLGRAB_VERIFY_TLS=0 to fetch self-signed / MITM (FakeNet) / expired-cert URLs.
+        if verify_tls is not None:
+            self._verify_tls = verify_tls
+        else:
+            self._verify_tls = os.environ.get(_VERIFY_TLS_ENV, "1").strip().lower() not in (
+                "0", "false", "no", "off",
+            )
         # Sealed-into-envelope name; the host trust gate requires it to match the EngineSpec name.
         if name is not None or "BLASTBOX_DETONATE_NAME" in os.environ:
             self.name = name or os.environ["BLASTBOX_DETONATE_NAME"]
@@ -143,6 +165,7 @@ class UrlGrabEngine:
                 timeout=limits.timeout_s,
                 max_bytes=limits.max_artifact_bytes,
                 max_redirects=_DEFAULT_MAX_REDIRECTS,
+                verify_tls=self._verify_tls,
             )
         except FetchError as exc:
             # A dead / sinkholed / blocked URL is a normal verdict, not an engine failure.
@@ -171,6 +194,7 @@ class UrlGrabEngine:
                 "body_sha256": hashlib.sha256(r.body).hexdigest(),
                 "body_len": len(r.body),
                 "truncated": r.truncated,
+                "tls_verified": self._verify_tls,
             }),
             artifacts=[DeclaredArtifact(id="body", path="body.bin", kind="raw")],
             detected=_detected(r.content_type),
