@@ -907,7 +907,7 @@ class Dispatcher:
         # per-job override (only honoured when BLASTBOX_ALLOW_NETPOLICY_OVERRIDE is set). Any
         # unknown driver falls back to --network=none in docker_network_args.
         from blastbox.host.netpolicy import resolve_net_policy
-        from blastbox.host.netapply import docker_network_args
+        from blastbox.host.netapply import docker_network_args, worker_resolv_conf
         personality = resolve_net_policy(
             job_net_policy=job.net_policy,
             engine_default=engine.net_policy,
@@ -920,6 +920,17 @@ class Dispatcher:
         )
         network_args = docker_network_args(personality)
 
+        # Optional resolv.conf injection for an egress personality (per-personality ``dns=``).
+        # On a docker user-defined bridge the worker's only nameserver is docker's embedded
+        # 127.0.0.11 — unreachable from a gVisor (runsc) worker — so without this an egress
+        # worker on the default cold runtime gets L3 connectivity but cannot resolve names.
+        # Compute the path now so it lands in the argv; the file is written below, once the job
+        # dir exists (it's a sibling of output/, never inside the /output mount).
+        resolv_conf_content = worker_resolv_conf(personality)
+        resolv_conf_src: str | None = (
+            str(output_dir.parent / "resolv.conf") if resolv_conf_content else None
+        )
+
         container_name = f"blastbox-worker-{job.job_id[:12]}"
         argv = build_worker_docker_run_argv(
             image=engine.image,          # NEVER job.engine / job.filename / job.params
@@ -930,6 +941,7 @@ class Dispatcher:
             worker_argv=list(engine.worker_argv),
             runtime=runtime,
             network_args=network_args,
+            resolv_conf_src=resolv_conf_src,
             container_name=container_name,
             labels={
                 "blastbox.role": "worker",
@@ -984,6 +996,12 @@ class Dispatcher:
         shutil.rmtree(output_dir, ignore_errors=True)
         output_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(output_dir, 0o777)
+
+        # Materialize the egress resolv.conf (its path is already wired into argv) now that the
+        # per-job dir exists. Written to the job root, a sibling of output/, so it is never
+        # visible in the worker's /output artifacts; only the single file is bind-mounted.
+        if resolv_conf_src and resolv_conf_content:
+            Path(resolv_conf_src).write_text(resolv_conf_content, encoding="ascii")
 
         try:
             # Run to completion (or timeout). The worker's exit code is not the

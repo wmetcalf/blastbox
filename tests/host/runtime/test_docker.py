@@ -30,6 +30,8 @@ def _argv(
     extra_env: dict[str, str] | None = None,
     worker_uid: int = 10001,
     worker_gid: int = 10001,
+    network_args: list[str] | None = None,
+    resolv_conf_src: str | None = None,
     tmp_path: Path | None = None,
 ) -> list[str]:
     if tmp_path is None:
@@ -50,6 +52,8 @@ def _argv(
         output_mount_path="/job/output",
         worker_argv=worker_argv,
         runtime=runtime,
+        network_args=network_args,
+        resolv_conf_src=resolv_conf_src,
         container_name=container_name,
         labels=labels,
         extra_env=extra_env,
@@ -201,6 +205,22 @@ def test_rm_flag_present(tmp_path):
 def test_network_none_present(tmp_path):
     argv = _argv(tmp_path=tmp_path)
     assert "--network=none" in argv
+
+
+def test_resolv_conf_mount_absent_by_default(tmp_path):
+    # No resolv_conf_src -> docker's generated /etc/resolv.conf is left in place.
+    argv = _argv(tmp_path=tmp_path)
+    assert not any("dst=/etc/resolv.conf" in tok for tok in argv)
+
+
+def test_resolv_conf_mount_present_when_src_given(tmp_path):
+    src = str(tmp_path / "resolv.conf")
+    argv = _argv(tmp_path=tmp_path, resolv_conf_src=src)
+    # Single --mount token, value position, read-only.
+    spec = f"type=bind,src={src},dst=/etc/resolv.conf,readonly"
+    assert spec in argv
+    # It must be a value following a --mount flag (never a standalone flag).
+    assert argv[argv.index(spec) - 1] == "--mount"
 
 
 def test_cap_drop_all_present(tmp_path):

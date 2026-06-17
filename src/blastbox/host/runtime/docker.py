@@ -355,6 +355,7 @@ def build_worker_docker_run_argv(
     worker_argv: Sequence[str],
     runtime: RuntimeSelection,
     network_args: list[str] | None = None,
+    resolv_conf_src: str | None = None,
     container_name: str | None = None,
     worker_uid: int = _DEFAULT_WORKER_UID,
     worker_gid: int = _DEFAULT_WORKER_GID,
@@ -463,6 +464,16 @@ def build_worker_docker_run_argv(
         f"type=bind,src={bind_input},dst={input_mount_path},readonly",
         "--mount",
         f"type=bind,src={bind_output},dst={output_mount_path}",
+        # Optional: pin /etc/resolv.conf to a real resolver for an egress personality. On a
+        # docker user-defined bridge the generated resolv.conf names only the embedded resolver
+        # 127.0.0.11, which a gVisor (runsc) worker can't reach — so egress workers get L3 but
+        # no DNS. Docker honors an explicit /etc/resolv.conf bind-mount (does not overwrite it),
+        # so this restores DNS under runsc and is a no-op under runc. Read-only; value position.
+        *(
+            ["--mount", f"type=bind,src={resolv_conf_src},dst=/etc/resolv.conf,readonly"]
+            if resolv_conf_src
+            else []
+        ),
         "--workdir",
         workdir,
     ]

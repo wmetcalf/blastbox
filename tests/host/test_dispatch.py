@@ -1046,3 +1046,95 @@ def test_netpolicy_default_none_engine_has_network_none_in_argv(tmp_path, monkey
     assert "bb-net0" not in docker_run_argv, (
         f"bb-net0 should not appear for none: {docker_run_argv}"
     )
+
+
+def test_netpolicy_direct_with_dns_injects_resolv_conf(tmp_path, monkeypatch):
+    """An egress personality declaring dns= → a resolv.conf bind-mount in argv + a real file
+    written naming that resolver (closes the gVisor embedded-DNS gap)."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRECT", "exit=direct,dns=1.1.1.1")
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    launched_argv: list[list[str]] = []
+    resolv_seen: dict[str, str] = {}
+
+    def fake_runner(argv, **kw):
+        launched_argv.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            # The dispatcher writes the resolv.conf before launching the worker; capture its
+            # on-disk content at run time (the job dir is cleaned up after).
+            for tok in argv:
+                if "dst=/etc/resolv.conf" in tok:
+                    src = tok.split("src=", 1)[1].split(",", 1)[0]
+                    resolv_seen["content"] = Path(src).read_text()
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    direct_engine = EngineSpec(
+        name=_ENGINE_NAME,
+        image=_ENGINE_IMAGE,
+        worker_argv=["worker", "run"],
+        net_policy="direct",
+    )
+    dispatcher = _make_dispatcher(
+        store,
+        job_root=tmp_path,
+        engines={_ENGINE_NAME: direct_engine},
+        subprocess_runner=fake_runner,
+    )
+    assert dispatcher.dispatch_once() is True
+
+    docker_run_argv = next(
+        (a for a in launched_argv if len(a) >= 2 and a[:2] == ["docker", "run"]), None
+    )
+    assert docker_run_argv is not None, "docker run not called"
+    assert any("dst=/etc/resolv.conf,readonly" in tok for tok in docker_run_argv), (
+        f"resolv.conf mount missing: {docker_run_argv}"
+    )
+    assert resolv_seen.get("content") == "nameserver 1.1.1.1\n", (
+        f"resolv.conf content wrong: {resolv_seen!r}"
+    )
+
+
+def test_netpolicy_direct_without_dns_no_resolv_conf(tmp_path, monkeypatch):
+    """An egress personality with NO dns= leaves docker's resolv.conf untouched (opt-in)."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRECT", "exit=direct")
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    launched_argv: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched_argv.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    direct_engine = EngineSpec(
+        name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+        net_policy="direct",
+    )
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, engines={_ENGINE_NAME: direct_engine},
+        subprocess_runner=fake_runner,
+    )
+    assert dispatcher.dispatch_once() is True
+
+    docker_run_argv = next(
+        (a for a in launched_argv if len(a) >= 2 and a[:2] == ["docker", "run"]), None
+    )
+    assert docker_run_argv is not None
+    assert "bb-net0" in docker_run_argv  # egress wired…
+    assert not any("dst=/etc/resolv.conf" in tok for tok in docker_run_argv), (
+        f"resolv.conf must NOT be injected without dns=: {docker_run_argv}"
+    )
