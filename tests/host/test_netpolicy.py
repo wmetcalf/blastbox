@@ -3,6 +3,7 @@ from blastbox.host.netpolicy import (
     VALID_EXIT_DRIVERS,
     Personality,
     parse_personalities,
+    resolve_net_policy,
 )
 
 
@@ -54,3 +55,46 @@ def test_parse_unknown_driver_skipped_failclosed(capsys):
 def test_parse_missing_exit_skipped(capsys):
     reg = parse_personalities({"BLASTBOX_NETPOLICY_NOEXIT": "inspect=true"})
     assert "noexit" not in reg
+
+
+def _reg():
+    return parse_personalities(
+        {"BLASTBOX_NETPOLICY_FAKENET": "exit=inetsim",
+         "BLASTBOX_NETPOLICY_DIRECT": "exit=direct"}
+    )
+
+
+def test_resolve_defaults_to_none_when_engine_default_unset():
+    p = resolve_net_policy(job_net_policy=None, engine_default="none",
+                           registry=_reg(), allow_override=False)
+    assert p.name == "none"
+
+
+def test_resolve_uses_engine_default():
+    p = resolve_net_policy(job_net_policy=None, engine_default="fakenet",
+                           registry=_reg(), allow_override=False)
+    assert p.name == "fakenet"
+
+
+def test_resolve_engine_default_unknown_failscloses_to_none():
+    p = resolve_net_policy(job_net_policy=None, engine_default="bogus",
+                           registry=_reg(), allow_override=False)
+    assert p.name == "none"
+
+
+def test_resolve_job_override_ignored_when_gate_off():
+    p = resolve_net_policy(job_net_policy="direct", engine_default="fakenet",
+                           registry=_reg(), allow_override=False)
+    assert p.name == "fakenet"
+
+
+def test_resolve_job_override_honored_when_gate_on_and_declared():
+    p = resolve_net_policy(job_net_policy="direct", engine_default="fakenet",
+                           registry=_reg(), allow_override=True)
+    assert p.name == "direct"
+
+
+def test_resolve_job_override_undeclared_failscloses_to_default():
+    p = resolve_net_policy(job_net_policy="nope", engine_default="fakenet",
+                           registry=_reg(), allow_override=True)
+    assert p.name == "fakenet"

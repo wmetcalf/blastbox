@@ -75,3 +75,20 @@ def parse_personalities(env: Mapping[str, str]) -> dict[str, Personality]:
         if p is not None:
             registry[name] = p
     return registry
+
+
+def resolve_net_policy(
+    *,
+    job_net_policy: str | None,
+    engine_default: str,
+    registry: Mapping[str, Personality],
+    allow_override: bool,
+) -> Personality:
+    """Resolve the effective personality, FAIL-CLOSED to ``none``. Order: per-job override
+    (only when ``allow_override`` AND the name is declared) → per-engine default (when declared)
+    → ``none``. An unknown name at any step collapses to ``none`` rather than erroring."""
+    if allow_override and job_net_policy and job_net_policy in registry:
+        return registry[job_net_policy]
+    if engine_default in registry:
+        return registry[engine_default]
+    return registry.get("none", NONE)
