@@ -68,6 +68,36 @@ def test_vpn_drivers_return_bb_vpn(driver):
 
 
 # ---------------------------------------------------------------------------
+# Inspect layer: an inspected egress worker rides bb-inspect (faces the MITM gateway), regardless
+# of the underlying exit driver. Inspect is ignored for no-egress (none/drop) exits.
+# ---------------------------------------------------------------------------
+
+
+def _inspect_p(exit_driver: str, config: dict[str, str] | None = None) -> Personality:
+    return Personality(
+        name=f"inspect-{exit_driver}", exit_driver=exit_driver, inspect=True, config=config or {}
+    )
+
+
+@pytest.mark.parametrize("driver", ["direct", "inetsim", "socks", "openvpn", "wireguard"])
+def test_inspect_egress_rides_bb_inspect(driver):
+    # The worker faces the sslproxy/MITM gateway on bb-inspect, NOT the exit's own bridge.
+    assert docker_network_args(_inspect_p(driver)) == ["--network", "bb-inspect"]
+
+
+@pytest.mark.parametrize("driver", ["none", "drop"])
+def test_inspect_ignored_for_no_egress(driver):
+    # Nothing to intercept without an exit — fail-closed to --network=none, inspect is a no-op.
+    assert docker_network_args(_inspect_p(driver)) == ["--network=none"]
+
+
+def test_inspect_with_unknown_driver_still_fails_closed(caplog):
+    # An unknown exit driver must not be granted bb-inspect on the strength of inspect=True.
+    with caplog.at_level(logging.WARNING, logger="blastbox.host.netapply"):
+        assert docker_network_args(_inspect_p("tor")) == ["--network=none"]
+
+
+# ---------------------------------------------------------------------------
 # Return type is always list[str]
 # ---------------------------------------------------------------------------
 

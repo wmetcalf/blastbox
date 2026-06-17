@@ -71,6 +71,7 @@ class CaptureDaemon:
     # exit (socks proxy / vpn gateway) AND provides the nsenter seams. ---
     socks_proxy_url: str | None = None      # socks mode: tun2socks → this SOCKS5 URL
     vpn_gateway_ip: str | None = None       # vpn mode: default route → this gateway sidecar IP
+    inspect_gateway_ip: str | None = None   # inspect mode: default route → the sslproxy/MITM gw IP
     nsenter_spawn_fn: Callable[[int, list[str]], Any] | None = None  # long-lived in worker netns
     nsenter_run_fn: Callable[[int, list[str]], int] | None = None    # run cmd in netns → rc
     sleep_fn: Callable[[float], None] = time.sleep
@@ -132,6 +133,8 @@ class CaptureDaemon:
             self._wire_socks(container_id, wt)
         elif wt.mode == "vpn":
             self._wire_vpn(container_id, wt)
+        elif wt.mode == "inspect":
+            self._wire_inspect(container_id, wt)
 
     def _wire_socks(self, container_id: str, wt: Any) -> None:
         if not self.socks_proxy_url or self.nsenter_spawn_fn is None or self.nsenter_run_fn is None:
@@ -174,6 +177,27 @@ class CaptureDaemon:
             return
         self.wired[container_id] = None  # route-only; nothing to terminate on die
         _log.info("netd: wired vpn job=%s pid=%s -> gateway %s", wt.job_id, wt.pid, self.vpn_gateway_ip)
+
+    def _wire_inspect(self, container_id: str, wt: Any) -> None:
+        """Inspect tier: point the worker's default route at the sslproxy/MITM gateway sidecar
+        (which transparently REDIRECTs :443 → its sslproxy, forges certs with the inspect CA the
+        worker trusts, exports TLS master keys for decrypt, and forwards to the real exit). Same
+        route-only mechanism as the VPN tier — the gateway owns the interception; the route dies
+        with the netns. Inert unless an operator configured the gateway IP."""
+        if not self.inspect_gateway_ip or self.nsenter_run_fn is None:
+            return
+        try:
+            for cmd in gateway_route_commands(self.inspect_gateway_ip):
+                rc = self.nsenter_run_fn(wt.pid, cmd)
+                if rc != 0:
+                    _log.warning("netd: inspect route cmd failed (rc=%s) for job %s", rc, wt.job_id)
+                    return
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("netd: failed to wire inspect for job %s: %s", wt.job_id, exc)
+            return
+        self.wired[container_id] = None  # route-only; nothing to terminate on die
+        _log.info("netd: wired inspect job=%s pid=%s -> gateway %s",
+                  wt.job_id, wt.pid, self.inspect_gateway_ip)
 
     def handle_die(self, container_id: str) -> None:
         """A container died — stop its capture and/or SOCKS wiring. Never raises."""
@@ -307,6 +331,12 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry poin
         help="VPN+NAT gateway sidecar IP for the vpn tier; default-routes workers labeled "
              "blastbox.net.wire=vpn through it. Empty = disabled.",
     )
+    parser.add_argument(
+        "--inspect-gateway",
+        default=os.environ.get("BLASTBOX_NETD_INSPECT_GATEWAY", ""),
+        help="sslproxy/MITM gateway sidecar IP for the inspect tier; default-routes workers "
+             "labeled blastbox.net.wire=inspect through it. Empty = disabled.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     ns = parser.parse_args(argv)
     logging.basicConfig(
@@ -315,7 +345,8 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry poin
     )
     socks = ns.socks_proxy.strip() or None
     vpn = ns.vpn_gateway.strip() or None
-    wiring_on = bool(socks or vpn)
+    inspect_gw = ns.inspect_gateway.strip() or None
+    wiring_on = bool(socks or vpn or inspect_gw)
     daemon = CaptureDaemon(
         job_root=ns.job_root,
         inspect_fn=_docker_inspect,
@@ -323,12 +354,14 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry poin
         spawn_fn=_spawn_tcpdump,
         socks_proxy_url=socks,
         vpn_gateway_ip=vpn,
+        inspect_gateway_ip=inspect_gw,
         nsenter_spawn_fn=_nsenter_spawn if wiring_on else None,
         nsenter_run_fn=_nsenter_run if wiring_on else None,
     )
     _log.info(
-        "blastbox-netd starting; job_root=%s socks=%s vpn=%s",
+        "blastbox-netd starting; job_root=%s socks=%s vpn=%s inspect=%s",
         ns.job_root, "on" if socks else "off", "on" if vpn else "off",
+        "on" if inspect_gw else "off",
     )
     try:
         daemon.run()

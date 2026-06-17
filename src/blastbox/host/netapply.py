@@ -56,6 +56,12 @@ _EGRESS_DRIVERS = frozenset({"direct", "inetsim", "socks", "wireguard", "openvpn
 # Drivers whose egress is a SOCKS proxy that can't carry UDP DNS — DNS must go over TCP.
 _SOCKS_DRIVERS = frozenset({"socks"})
 
+# The internal bridge an INSPECTED worker rides. When ``personality.inspect`` is set, the worker
+# faces an sslproxy/MITM gateway sidecar here (which forges TLS certs, exports master keys for
+# decrypt, then forwards to the real exit network). The worker never attaches the exit's own
+# bridge — netd points its default route at the gateway. Operators pre-create ``bb-inspect``.
+INSPECT_BRIDGE = "bb-inspect"
+
 
 def docker_network_args(personality: Personality) -> list[str]:
     """Return the ``--network`` fragment for a worker ``docker run`` argv.
@@ -72,6 +78,12 @@ def docker_network_args(personality: Personality) -> list[str]:
     # Fast path: no-network exits.
     if driver in ("none", "drop"):
         return ["--network=none"]
+
+    # Inspect layer: an inspected egress worker rides the internal bb-inspect bridge facing the
+    # MITM gateway, NOT the exit's own bridge (the gateway forwards to the real exit). Only applies
+    # to a valid egress driver — an unknown driver still falls through to the fail-closed warning.
+    if personality.inspect and driver in _EGRESS_DRIVERS:
+        return ["--network", INSPECT_BRIDGE]
 
     # Known bridge exits: directly supported.
     bridge = _BRIDGE_NETWORKS.get(driver)

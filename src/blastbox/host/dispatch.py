@@ -958,12 +958,17 @@ class Dispatcher:
         }
         if capture_on:
             worker_labels["blastbox.net.capture"] = "1"
-        # SOCKS / VPN personalities run the worker on an INTERNAL bridge (no direct egress); netd
-        # wires the only route out in the worker netns. The label requests that wiring by mode;
-        # until netd wires it the worker simply has no egress (fail-closed).
+        # SOCKS / VPN / inspect personalities run the worker on an INTERNAL bridge (no direct
+        # egress); netd wires the only route out in the worker netns. The label requests that wiring
+        # by mode; until netd wires it the worker simply has no egress (fail-closed).
+        #   inspect (any egress exit)      → default route via sslproxy/MITM gw (bb-inspect)
         #   socks (tor/BrightData)         → tun2socks in the netns   (bb-socks)
         #   openvpn / wireguard (all-IP)   → default route via gateway (bb-vpn)
-        if personality.exit_driver == "socks":
+        # Inspect WINS: an inspected worker faces the MITM gateway (which chains onward to the real
+        # exit), so it is routed to the gateway regardless of the underlying exit driver.
+        if personality.inspect and personality.exit_driver not in ("none", "drop"):
+            worker_labels["blastbox.net.wire"] = "inspect"
+        elif personality.exit_driver == "socks":
             worker_labels["blastbox.net.wire"] = "socks"
         elif personality.exit_driver in ("openvpn", "wireguard"):
             worker_labels["blastbox.net.wire"] = "vpn"

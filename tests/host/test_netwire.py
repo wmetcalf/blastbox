@@ -132,6 +132,11 @@ def test_wire_target_accepts_vpn_mode():
     assert wt is not None and wt.mode == "vpn" and wt.pid == 321
 
 
+def test_wire_target_accepts_inspect_mode():
+    wt = wire_target_from_inspect(_wire_inspect(mode="inspect", pid=654))
+    assert wt is not None and wt.mode == "inspect" and wt.pid == 654
+
+
 # --------------------------------------------------------------------------- gateway (vpn) route
 def test_gateway_route_replaces_default_via_gw():
     assert gateway_route_commands("172.31.0.10") == \

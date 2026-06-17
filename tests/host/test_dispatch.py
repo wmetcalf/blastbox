@@ -1376,6 +1376,44 @@ def test_socks_personality_labels_worker_for_wiring_and_uses_bb_socks(tmp_path, 
     assert any("dst=/etc/resolv.conf" in t for t in argv)
 
 
+def test_inspect_personality_labels_worker_for_inspect_wiring_and_uses_bb_inspect(
+    tmp_path, monkeypatch
+):
+    """An inspect personality (egress exit + inspect=1) → worker on the internal bb-inspect bridge
+    + labeled blastbox.net.wire=inspect, so netd routes it through the sslproxy/MITM gateway."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_MITM", "exit=inetsim,inspect=1,dns=172.28.100.2")
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    launched: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    inspect_engine = EngineSpec(
+        name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+        net_policy="mitm",
+    )
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, engines={_ENGINE_NAME: inspect_engine},
+        subprocess_runner=fake_runner,
+    )
+    assert dispatcher.dispatch_once() is True
+    argv = next(a for a in launched if a[:2] == ["docker", "run"])
+    assert "bb-inspect" in argv          # rides the inspect bridge, NOT bb-fakenet
+    assert "bb-fakenet" not in argv
+    assert "blastbox.net.wire=inspect" in argv
+    # An inspected egress worker still has egress (through the gateway) → net-share granted.
+    assert any(t == "BLASTBOX_NET_EGRESS=1" for t in argv)
+
+
 def test_no_capture_artifact_when_netd_produced_none(tmp_path, monkeypatch):
     """capture enabled but no pcap on disk (netd not running) → envelope unchanged, job still DONE."""
     monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRECT", "exit=direct")

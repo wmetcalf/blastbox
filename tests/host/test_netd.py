@@ -265,3 +265,57 @@ def test_vpn_die_is_clean_noop(tmp_path):
     d.handle_start("v1")
     d.handle_die("v1")  # route-only wire → no proc to terminate, must not raise
     assert "v1" not in d.wired
+
+
+# --------------------------------------------------------------------------- inspect wiring
+def _inspect_mode_inspect(job_id="I1", pid=777):
+    return {
+        "Name": f"/blastbox-worker-{job_id}-1",
+        "Config": {"Labels": {"blastbox.net.wire": "inspect", "blastbox.job_id": job_id}},
+        "NetworkSettings": {"Networks": {"bb-inspect": {"IPAddress": "172.32.0.5", "NetworkID": "z"}}},
+        "State": {"Pid": pid, "Running": True},
+    }
+
+
+def test_inspect_wire_sets_default_route_via_gateway(tmp_path):
+    runs: list = []
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: _inspect_mode_inspect(pid=4242),
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        inspect_gateway_ip="172.32.0.10",
+        nsenter_run_fn=lambda pid, argv: runs.append((pid, argv)) or 0,
+        sleep_fn=lambda s: None,
+    )
+    d.handle_start("i1")
+    assert runs == [(4242, ["ip", "route", "replace", "default", "via", "172.32.0.10"])]
+    assert "i1" in d.wired and d.wired["i1"] is None  # route-only, no proc
+
+
+def test_inspect_wire_inert_without_gateway(tmp_path):
+    runs: list = []
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: _inspect_mode_inspect(),
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        nsenter_run_fn=lambda pid, argv: runs.append((pid, argv)) or 0,
+        # no inspect_gateway_ip → inspect wiring disabled (fail-closed: worker has no egress)
+    )
+    d.handle_start("i1")
+    assert runs == [] and d.wired == {}
+
+
+def test_inspect_die_is_clean_noop(tmp_path):
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: _inspect_mode_inspect(),
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        inspect_gateway_ip="172.32.0.10",
+        nsenter_run_fn=lambda pid, argv: 0,
+    )
+    d.handle_start("i1")
+    d.handle_die("i1")  # route-only wire → no proc to terminate, must not raise
+    assert "i1" not in d.wired

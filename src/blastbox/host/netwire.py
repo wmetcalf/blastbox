@@ -25,11 +25,14 @@ from dataclasses import dataclass
 
 # Docker label an egress worker carries to request netd netns wiring (set by the dispatcher).
 # Value is the wire MODE:
-#   socks → tun2socks in the worker netns → a SOCKS5 exit (TCP+TCP-DNS; tor/BrightData).
-#   vpn   → move the worker's default route onto a VPN+NAT gateway sidecar (all-IP; OpenVPN/WG).
+#   socks   → tun2socks in the worker netns → a SOCKS5 exit (TCP+TCP-DNS; tor/BrightData).
+#   vpn     → move the worker's default route onto a VPN+NAT gateway sidecar (all-IP; OpenVPN/WG).
+#   inspect → move the default route onto an sslproxy/MITM gateway sidecar (transparent TLS
+#             intercept that exports master keys for decrypt, then forwards to the real exit).
+#             Same route-only mechanism as ``vpn`` (default route → gateway), distinct gateway IP.
 WIRE_LABEL = "blastbox.net.wire"
 JOB_ID_LABEL = "blastbox.job_id"
-_WIRE_MODES = frozenset({"socks", "vpn"})
+_WIRE_MODES = frozenset({"socks", "vpn", "inspect"})
 
 
 @dataclass(frozen=True)
