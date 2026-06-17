@@ -955,3 +955,94 @@ def test_argv_build_warnings_reach_security_warnings(tmp_path, monkeypatch):
     # The argv-build-time warning AND the runtime-selection warning are both persisted.
     assert "argv-time: seccomp profile missing" in final_job.security_warnings
     assert "no runsc" in final_job.security_warnings
+
+
+# ---------------------------------------------------------------------------
+# Network personality → argv integration tests (Plan 2)
+# ---------------------------------------------------------------------------
+
+
+def test_netpolicy_direct_engine_puts_bb_net0_in_argv(tmp_path, monkeypatch):
+    """An engine with net_policy='direct' (registry declaring it) → argv contains 'bb-net0'."""
+    # Declare the 'direct' personality in the env BEFORE constructing the Dispatcher
+    # so __init__ picks it up via parse_personalities(os.environ).
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRECT", "exit=direct")
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    launched_argv: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched_argv.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    # Build an engine with net_policy="direct" — use EngineSpec directly since _engine_spec
+    # doesn't expose that field.
+    direct_engine = EngineSpec(
+        name=_ENGINE_NAME,
+        image=_ENGINE_IMAGE,
+        worker_argv=["worker", "run"],
+        net_policy="direct",
+    )
+    dispatcher = _make_dispatcher(
+        store,
+        job_root=tmp_path,
+        engines={_ENGINE_NAME: direct_engine},
+        subprocess_runner=fake_runner,
+    )
+    assert dispatcher.dispatch_once() is True
+
+    docker_run_argv = next(
+        (a for a in launched_argv if len(a) >= 2 and a[:2] == ["docker", "run"]), None
+    )
+    assert docker_run_argv is not None, "docker run not called"
+    assert "bb-net0" in docker_run_argv, f"bb-net0 not in argv: {docker_run_argv}"
+    assert "--network=none" not in docker_run_argv, (
+        f"--network=none should not appear for direct: {docker_run_argv}"
+    )
+
+
+def test_netpolicy_default_none_engine_has_network_none_in_argv(tmp_path, monkeypatch):
+    """A default engine (net_policy='none') → argv contains '--network=none', not 'bb-net0'."""
+    import os
+    # Scrub any BLASTBOX_NETPOLICY_* vars from the ambient env that could bleed in.
+    for k in list(os.environ):
+        if k.startswith("BLASTBOX_NETPOLICY_"):
+            monkeypatch.delenv(k, raising=False)
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    launched_argv: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched_argv.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    # Default engine spec has net_policy="none" (the EngineSpec default).
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    assert dispatcher.dispatch_once() is True
+
+    docker_run_argv = next(
+        (a for a in launched_argv if len(a) >= 2 and a[:2] == ["docker", "run"]), None
+    )
+    assert docker_run_argv is not None, "docker run not called"
+    assert "--network=none" in docker_run_argv, (
+        f"--network=none not in argv: {docker_run_argv}"
+    )
+    assert "bb-net0" not in docker_run_argv, (
+        f"bb-net0 should not appear for none: {docker_run_argv}"
+    )

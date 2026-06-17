@@ -901,6 +901,25 @@ class Dispatcher:
         # nono-skipped-under-runsc / missing-AppArmor / missing-seccomp warnings onto
         # runtime.warnings. argv assembly is pure (no filesystem or container side effects), so
         # doing it here cannot lose the claim or launch anything early.
+
+        # Resolve the effective network personality FAIL-CLOSED. Uses the registry built once at
+        # __init__ (from the operator env), the per-engine default (engine.net_policy), and the
+        # per-job override (only honoured when BLASTBOX_ALLOW_NETPOLICY_OVERRIDE is set). Any
+        # unknown driver falls back to --network=none in docker_network_args.
+        from blastbox.host.netpolicy import resolve_net_policy
+        from blastbox.host.netapply import docker_network_args
+        personality = resolve_net_policy(
+            job_net_policy=job.net_policy,
+            engine_default=engine.net_policy,
+            registry=self._net_policies,
+            allow_override=self._allow_net_override,
+        )
+        _log.info(
+            "net_policy_resolved job=%s personality=%s driver=%s",
+            job.job_id, personality.name, personality.exit_driver,
+        )
+        network_args = docker_network_args(personality)
+
         container_name = f"blastbox-worker-{job.job_id[:12]}"
         argv = build_worker_docker_run_argv(
             image=engine.image,          # NEVER job.engine / job.filename / job.params
@@ -910,6 +929,7 @@ class Dispatcher:
             output_mount_path="/output",
             worker_argv=list(engine.worker_argv),
             runtime=runtime,
+            network_args=network_args,
             container_name=container_name,
             labels={
                 "blastbox.role": "worker",
