@@ -1,3 +1,7 @@
+import dataclasses
+
+import pytest
+
 from blastbox.host.netpolicy import (
     NONE,
     VALID_EXIT_DRIVERS,
@@ -5,6 +9,12 @@ from blastbox.host.netpolicy import (
     parse_personalities,
     resolve_net_policy,
 )
+
+
+def test_personality_is_immutable():
+    # NONE is returned directly from resolve_net_policy; mutating it would corrupt global state.
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        NONE.inspect = True  # type: ignore[misc]
 
 
 def test_none_builtin_is_no_egress():

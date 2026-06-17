@@ -18,10 +18,14 @@ VALID_EXIT_DRIVERS = (
 )
 
 
-@dataclass
+@dataclass(frozen=True)
 class Personality:
     """A named egress personality. ``config`` is opaque exit-specific data (socks endpoint,
-    wireguard conf ref, dns, …) consumed by a later plan — kept verbatim here."""
+    wireguard conf ref, dns, …) consumed by a later plan — kept verbatim here.
+
+    Frozen: ``NONE`` is a module-level singleton returned directly from
+    ``resolve_net_policy``, so scalar fields must not be mutable per-process global state.
+    (``config`` stays a plain dict — frozen blocks the more likely scalar-field accidents.)"""
 
     name: str
     exit_driver: str
