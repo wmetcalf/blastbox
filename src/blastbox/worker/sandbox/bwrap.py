@@ -332,8 +332,13 @@ class BubblewrapSandbox:
             "--tmpfs", "/tmp",
             "--tmpfs", "/run",
             "--cap-drop", "ALL",
-            "--unshare-net",
         ]
+        # Network namespace. `--unshare-all` already unshares net; by default we ALSO pass the
+        # explicit `--unshare-net` (isolated, fail-closed). When the worker's netpolicy grants an
+        # exit (limits.net_egress), RETAIN the parent netns with `--share-net` (undoes the net part
+        # of `--unshare-all`) so the process rides the worker's rooter-routed netns and the
+        # host-side rooter can steer its egress.
+        argv.append("--share-net" if req.limits.net_egress else "--unshare-net")
 
         # Bind read-only system directories; skip symlinks (handled below).
         for d in _RO_SYSTEM_DIRS:

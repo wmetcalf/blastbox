@@ -60,11 +60,21 @@ class TestNsjailArgvBuilding:
         assert argv[idx + 1] == "o"
 
     def test_no_lo_interface(self) -> None:
-        """--iface_no_lo is always present (no loopback network)."""
+        """--iface_no_lo is present BY DEFAULT (net_egress off → sealed netns, fail-closed)."""
         sb = _make_sandbox()
         req = SandboxRequest(argv=["/usr/bin/true"])
         argv = sb._build_argv(req)
         assert "--iface_no_lo" in argv
+        assert "--disable_clone_newnet" not in argv
+
+    def test_net_shares_when_egress_enabled(self) -> None:
+        """net_egress on → --disable_clone_newnet (share the rooter-routed parent netns)."""
+        from blastbox.limits import Limits
+        sb = _make_sandbox(nsjail_path="/bin/true")
+        req = SandboxRequest(argv=["/usr/bin/true"], limits=Limits(net_egress=True))
+        argv = sb._build_argv(req)
+        assert "--disable_clone_newnet" in argv
+        assert "--iface_no_lo" not in argv
 
     def test_time_limit_from_limits(self) -> None:
         """--time_limit matches request.limits.timeout_s."""

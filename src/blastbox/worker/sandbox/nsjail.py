@@ -294,7 +294,6 @@ class NsjailSandbox:
             "--mode", "o",          # one-shot
             "--quiet",
             "--really_quiet",
-            "--iface_no_lo",
             "--time_limit", str(req.limits.timeout_s),
             "--rlimit_as", str(mem_mb),
             "--rlimit_fsize", str(fsize_mb),
@@ -305,6 +304,11 @@ class NsjailSandbox:
             "--group", "65534",
             "--hostname", "blastbox",
         ]
+        # Network namespace. By default nsjail clones a FRESH net namespace; `--iface_no_lo`
+        # leaves it with no usable interface = sealed, fail-closed. When the worker's netpolicy
+        # grants an exit (limits.net_egress), SHARE the parent (rooter-routed) netns instead via
+        # `--disable_clone_newnet`. (No new netns ⇒ --iface_no_lo would be a no-op, so it's dropped.)
+        argv.append("--disable_clone_newnet" if req.limits.net_egress else "--iface_no_lo")
 
         # Read-only system bind mounts.
         for d in _USR_DIRS:

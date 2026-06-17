@@ -992,6 +992,13 @@ class Dispatcher:
                 # LAST so a hostile job.param can't override them.
                 "BLASTBOX_INPUT_DIR": "/input",
                 "BLASTBOX_OUTPUT_DIR": "/output",
+                # Tell an engine that nests an inner namespace sandbox (bwrap/nsjail) whether to
+                # NET-SHARE the worker's (rooter-routed) netns or ISOLATE it. Only personalities
+                # with an actual exit grant egress; none/drop stay sealed. Set EXPLICITLY (merged
+                # last, after job.params) so a hostile job.param can't flip a sealed worker open.
+                "BLASTBOX_NET_EGRESS": (
+                    "1" if personality.exit_driver not in ("none", "drop") else "0"
+                ),
             },
         )
 

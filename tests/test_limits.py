@@ -114,6 +114,23 @@ def test_from_env_max_input(monkeypatch):
     assert lim.max_input_bytes == 50 * 1024 * 1024
 
 
+def test_net_egress_defaults_off():
+    # Fail-closed: a worker has no egress (inner sandbox isolates) unless a policy grants one.
+    assert Limits().net_egress is False
+
+
+def test_net_egress_from_env_truthy(monkeypatch):
+    monkeypatch.setenv("BLASTBOX_NET_EGRESS", "1")
+    assert Limits.from_env().net_egress is True
+
+
+def test_net_egress_from_env_fail_closed(monkeypatch):
+    # Only an explicit truthy token opens egress; anything else stays OFF (a typo can't net-share).
+    for bad in ("0", "false", "no", "off", "", "maybe", "2"):
+        monkeypatch.setenv("BLASTBOX_NET_EGRESS", bad)
+        assert Limits.from_env().net_egress is False, bad
+
+
 def test_from_env_non_numeric_names_var(monkeypatch):
     """A non-numeric env value must raise ValueError naming the variable."""
     monkeypatch.setenv("BLASTBOX_TIMEOUT", "notanumber")

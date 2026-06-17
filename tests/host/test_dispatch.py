@@ -1306,6 +1306,42 @@ def test_decrypt_noop_without_keylog(tmp_path, monkeypatch):
     assert store.get(job.job_id).status == JobStatus.DONE
 
 
+def test_net_egress_env_reflects_personality(tmp_path, monkeypatch):
+    """The dispatcher tells the worker BLASTBOX_NET_EGRESS=1 only when the personality has an
+    exit (so an inner bwrap/nsjail net-shares); none/drop → '0' (isolate, fail-closed)."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRECT", "exit=direct")
+
+    def run_with(net_policy_driver):
+        store = InMemoryJobStore()
+        job = _make_job()
+        job.input_sha256 = _INPUT_SHA
+        store.create(job)
+        _setup_job_dirs(tmp_path, job)
+        output_dir = tmp_path / job.job_id / "output"
+        launched: list[list[str]] = []
+
+        def fake_runner(argv, **kw):
+            launched.append(list(argv))
+            if argv[:2] == ["docker", "run"]:
+                _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        engine = EngineSpec(
+            name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+            net_policy=net_policy_driver,
+        )
+        _make_dispatcher(
+            store, job_root=tmp_path, engines={_ENGINE_NAME: engine},
+            subprocess_runner=fake_runner,
+        ).dispatch_once()
+        argv = next(a for a in launched if a[:2] == ["docker", "run"])
+        # find the -e BLASTBOX_NET_EGRESS=<v> token
+        return next(t.split("=", 1)[1] for t in argv if t.startswith("BLASTBOX_NET_EGRESS="))
+
+    assert run_with("direct") == "1"   # has an exit → net-share allowed
+    assert run_with("none") == "0"     # sealed → isolate
+
+
 def test_socks_personality_labels_worker_for_wiring_and_uses_bb_socks(tmp_path, monkeypatch):
     """A socks personality → worker on bb-socks (internal) + labeled blastbox.net.wire=socks."""
     monkeypatch.setenv("BLASTBOX_NETPOLICY_TOR", "exit=socks,dns=1.1.1.1")
