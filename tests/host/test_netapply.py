@@ -181,3 +181,11 @@ def test_resolv_direct_does_not_force_tcp():
     # A direct egress worker has normal UDP DNS — no use-vc.
     out = worker_resolv_conf(_p("direct", config={"dns": "1.1.1.1"}))
     assert "use-vc" not in out
+
+
+def test_resolv_socks_dns_tcp_opt_out():
+    # dns_tcp=0 → DNS goes UDP-direct to a dedicated resolver (e.g. tor's DNSPort, which refuses
+    # TCP); use-vc must NOT be forced or resolution breaks.
+    out = worker_resolv_conf(_p("socks", config={"dns": "172.30.0.20", "dns_tcp": "0"}))
+    assert out == "nameserver 172.30.0.20\n"
+    assert "use-vc" not in out

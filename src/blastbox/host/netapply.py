@@ -122,8 +122,11 @@ def worker_resolv_conf(personality: Personality) -> str | None:
     if not servers:
         return None
     body = "".join(f"nameserver {s}\n" for s in servers)
-    # A SOCKS exit (tor included) usually can't carry UDP DNS (no UDP ASSOCIATE), so force DNS
-    # over TCP — without this, name resolution silently fails behind the tunnel.
-    if personality.exit_driver in _SOCKS_DRIVERS:
+    # A SOCKS exit (tor included) usually can't carry UDP DNS (no UDP ASSOCIATE), so DNS tunneled
+    # THROUGH the proxy must go over TCP (options use-vc). But when ``dns=`` points at a dedicated
+    # UDP resolver reached DIRECTLY (not via the proxy) — e.g. tor's own DNSPort, which answers UDP
+    # and REFUSES TCP — forcing use-vc breaks resolution. Operators opt out with ``dns_tcp=0``.
+    if personality.exit_driver in _SOCKS_DRIVERS and \
+            personality.config.get("dns_tcp", "1").strip().lower() not in ("0", "false", "no"):
         body += "options use-vc\n"
     return body
