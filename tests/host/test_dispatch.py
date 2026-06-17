@@ -1157,7 +1157,9 @@ def test_capture_label_set_for_egress_when_enabled(tmp_path, monkeypatch):
     monkeypatch.setenv("BLASTBOX_NET_CAPTURE", "1")
 
     store = InMemoryJobStore()
-    job = _make_job(); job.input_sha256 = _INPUT_SHA; store.create(job)
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
     _setup_job_dirs(tmp_path, job)
     output_dir = tmp_path / job.job_id / "output"
     launched: list[list[str]] = []
@@ -1179,7 +1181,9 @@ def test_capture_label_absent_when_disabled(tmp_path, monkeypatch):
     monkeypatch.delenv("BLASTBOX_NET_CAPTURE", raising=False)
 
     store = InMemoryJobStore()
-    job = _make_job(); job.input_sha256 = _INPUT_SHA; store.create(job)
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
     _setup_job_dirs(tmp_path, job)
     output_dir = tmp_path / job.job_id / "output"
     launched: list[list[str]] = []
@@ -1201,7 +1205,9 @@ def test_network_capture_sealed_as_trusted_artifact(tmp_path, monkeypatch):
     monkeypatch.setenv("BLASTBOX_NET_CAPTURE", "1")
 
     store = InMemoryJobStore()
-    job = _make_job(); job.input_sha256 = _INPUT_SHA; store.create(job)
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
     _setup_job_dirs(tmp_path, job)
     output_dir = tmp_path / job.job_id / "output"
     pcap_bytes = b"\xd4\xc3\xb2\xa1fake-pcap-capture-bytes"
@@ -1227,12 +1233,87 @@ def test_network_capture_sealed_as_trusted_artifact(tmp_path, monkeypatch):
     assert (output_dir / "capture" / "dump.pcap").read_bytes() == pcap_bytes
 
 
+def test_decrypt_seals_decrypted_and_mixed_when_keylog_present(tmp_path, monkeypatch):
+    """With BLASTBOX_NET_DECRYPT + a keylog in the capture dir, the dispatcher runs GoGoRoboCap
+    and seals decrypted+mixed pcaps as trusted artifacts."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRECT", "exit=direct")
+    monkeypatch.setenv("BLASTBOX_NET_CAPTURE", "1")
+    monkeypatch.setenv("BLASTBOX_NET_DECRYPT", "1")
+    monkeypatch.setenv("BLASTBOX_GOGOROBOCAP_BIN", "/bin/fake-ggrc")
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    cap = tmp_path / job.job_id / "capture"
+
+    def fake_runner(argv, **kw):
+        if argv[:2] == ["docker", "run"]:
+            # netd-style capture + an sslproxy-style keylog drop in the host-only capture dir.
+            cap.mkdir(parents=True, exist_ok=True)
+            (cap / "dump.pcap").write_bytes(b"\xd4\xc3\xb2\xa1" + b"raw-tls" * 40)
+            (cap / "sslkeys.log").write_text("SERVER_HANDSHAKE_TRAFFIC_SECRET a b\n")
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:1] == ["/bin/fake-ggrc"]:
+            # Emulate GoGoRoboCap writing a non-trivial output pcap.
+            out = argv[argv.index("-o") + 1]
+            Path(out).write_bytes(b"\xd4\xc3\xb2\xa1" + b"decrypted" * 40)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _direct_dispatcher(store, tmp_path, fake_runner)
+    assert dispatcher.dispatch_once() is True
+
+    sealed = json.loads((output_dir / "metadata.json").read_text())
+    kinds = {a["kind"] for a in sealed["artifacts"]}
+    assert "network_capture" in kinds
+    assert "network_capture_decrypted" in kinds
+    assert "network_capture_mixed" in kinds
+    # The decrypted pcap is servable from the output dir + hash matches.
+    dec = next(a for a in sealed["artifacts"] if a["kind"] == "network_capture_decrypted")
+    served = (output_dir / dec["path"]).read_bytes()
+    assert dec["sha256"] == hashlib.sha256(served).hexdigest()
+
+
+def test_decrypt_noop_without_keylog(tmp_path, monkeypatch):
+    """decrypt enabled but no keylog → no decrypted artifacts, job still DONE."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRECT", "exit=direct")
+    monkeypatch.setenv("BLASTBOX_NET_CAPTURE", "1")
+    monkeypatch.setenv("BLASTBOX_NET_DECRYPT", "1")
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    cap = tmp_path / job.job_id / "capture"
+
+    def fake_runner(argv, **kw):
+        if argv[:2] == ["docker", "run"]:
+            cap.mkdir(parents=True, exist_ok=True)
+            (cap / "dump.pcap").write_bytes(b"\xd4\xc3\xb2\xa1" + b"raw" * 40)  # no keylog
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
+    sealed = json.loads((output_dir / "metadata.json").read_text())
+    kinds = {a["kind"] for a in sealed["artifacts"]}
+    assert "network_capture_decrypted" not in kinds
+    assert store.get(job.job_id).status == JobStatus.DONE
+
+
 def test_socks_personality_labels_worker_for_wiring_and_uses_bb_socks(tmp_path, monkeypatch):
     """A socks personality → worker on bb-socks (internal) + labeled blastbox.net.wire=socks."""
     monkeypatch.setenv("BLASTBOX_NETPOLICY_TOR", "exit=socks,dns=1.1.1.1")
 
     store = InMemoryJobStore()
-    job = _make_job(); job.input_sha256 = _INPUT_SHA; store.create(job)
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
     _setup_job_dirs(tmp_path, job)
     output_dir = tmp_path / job.job_id / "output"
     launched: list[list[str]] = []
@@ -1265,7 +1346,9 @@ def test_no_capture_artifact_when_netd_produced_none(tmp_path, monkeypatch):
     monkeypatch.setenv("BLASTBOX_NET_CAPTURE", "1")
 
     store = InMemoryJobStore()
-    job = _make_job(); job.input_sha256 = _INPUT_SHA; store.create(job)
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
     _setup_job_dirs(tmp_path, job)
     output_dir = tmp_path / job.job_id / "output"
 

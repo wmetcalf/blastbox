@@ -154,7 +154,8 @@ def _wire_daemon(tmp_path, inspect_map, *, spawned, runs):
 
 
 def test_wire_spawns_tun2socks_and_sets_routes(tmp_path):
-    spawned: list = []; runs: list = []
+    spawned: list = []
+    runs: list = []
     d = _wire_daemon(tmp_path, {"c1": _wire_inspect(pid=7777)}, spawned=spawned, runs=runs)
 
     d.handle_start("c1")
@@ -170,7 +171,6 @@ def test_wire_spawns_tun2socks_and_sets_routes(tmp_path):
 
 
 def test_wire_inert_without_proxy_configured(tmp_path):
-    spawned: list = []
     d = CaptureDaemon(
         job_root=str(tmp_path),
         inspect_fn=lambda cid: _wire_inspect(),
@@ -203,7 +203,8 @@ def test_wire_aborts_if_tun_never_appears(tmp_path):
 
 
 def test_die_tears_down_wiring(tmp_path):
-    spawned: list = []; runs: list = []
+    spawned: list = []
+    runs: list = []
     d = _wire_daemon(tmp_path, {"c1": _wire_inspect()}, spawned=spawned, runs=runs)
     d.handle_start("c1")
     wproc = spawned[0][2]

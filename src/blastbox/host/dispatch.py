@@ -275,6 +275,15 @@ class Dispatcher:
         self._net_capture = os.environ.get(
             "BLASTBOX_NET_CAPTURE", ""
         ).strip().lower() in ("1", "true", "yes", "on")
+        # Optional TLS decrypt of the capture (P5): when on AND a keylog sits in the job's capture
+        # dir, run GoGoRoboCap to seal decrypted+mixed pcaps alongside the raw capture. Default off
+        # (needs the binary + key material); a hostile/absent keylog is a silent no-op.
+        self._net_decrypt = os.environ.get(
+            "BLASTBOX_NET_DECRYPT", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        self._gogorobocap_bin = (
+            os.environ.get("BLASTBOX_GOGOROBOCAP_BIN") or "gogorobocap"
+        ).strip()
 
     # ------------------------------------------------------------------
     # Public API
@@ -1111,6 +1120,8 @@ class Dispatcher:
         # capture (netd not running, or a none/drop personality) is a silent no-op.
         if capture_on:
             envelope = self._seal_network_capture(envelope, output_dir)
+            if self._net_decrypt:
+                envelope = self._seal_decrypted_capture(envelope, output_dir)
 
         # Persist the host-SEALED metadata over the worker's raw file so the API serves trusted
         # hashes/sizes/payload, not worker-fabricated ones (#5).
@@ -1332,6 +1343,61 @@ class Dispatcher:
             return envelope
         _log.info("sealed network capture artifact (%d bytes) for output %s", size, output_dir)
         return envelope.model_copy(update={"artifacts": [*envelope.artifacts, artifact]})
+
+    def _seal_decrypted_capture(self, envelope, output_dir: Path):
+        """If a TLS keylog sits in the job's capture dir, run GoGoRoboCap over the sealed capture
+        pcap to produce decrypted+mixed pcaps and seal them as TRUSTED host artifacts. Best-effort:
+        no keylog / no binary / no TLS flows / any error → envelope unchanged. The keylog is a
+        host-side input (an sslproxy/MITM sidecar or an instrumented runtime writes it to the
+        host-only capture dir); the worker never had write access to the capture dir."""
+        from blastbox.host.decrypt import decrypt_capture
+
+        cap_dir = output_dir / "capture"           # the sealed (host-owned) capture dir
+        pcap = cap_dir / "dump.pcap"
+        keylog = output_dir.parent / "capture" / "sslkeys.log"  # host-only key drop
+        if not pcap.is_file() or not keylog.is_file() or keylog.stat().st_size == 0:
+            return envelope
+        try:
+            result = decrypt_capture(
+                binary=self._gogorobocap_bin,
+                pcap_path=str(pcap),
+                keylog_path=str(keylog),
+                out_dir=str(cap_dir),
+                run_fn=lambda argv: self._subprocess_runner(
+                    argv, capture_output=True, text=True, check=False, timeout=300
+                ).returncode,
+            )
+        except Exception as exc:  # noqa: BLE001 — decrypt is best-effort enrichment
+            _log.warning("decrypt seal for output %s failed: %s", output_dir, exc)
+            return envelope
+        if result is None:
+            return envelope
+        new_artifacts = list(envelope.artifacts)
+        for art_id, kind, path in (
+            ("network.capture.decrypted.pcap", "network_capture_decrypted", result.decrypted_path),
+            ("network.capture.mixed.pcap", "network_capture_mixed", result.mixed_path),
+        ):
+            if not path:
+                continue
+            try:
+                p = Path(path)
+                if not p.is_file() or p.stat().st_size > self._limits.max_artifact_bytes:
+                    continue
+                h = hashlib.sha256()
+                with open(p, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(chunk)
+                new_artifacts.append(Artifact(
+                    id=art_id, path=f"capture/{p.name}", kind=kind,
+                    sha256=h.hexdigest(), bytes=p.stat().st_size,
+                ))
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("sealing decrypt artifact %s failed: %s", art_id, exc)
+        if len(new_artifacts) == len(envelope.artifacts):
+            return envelope
+        _log.info("sealed %d decrypted capture artifact(s) for output %s",
+                  len(new_artifacts) - len(envelope.artifacts), output_dir)
+        return envelope.model_copy(update={"artifacts": new_artifacts})
 
     def _write_sealed_metadata(self, envelope, output_dir: Path) -> None:
         """Overwrite metadata.json with the host-SEALED envelope (recomputed sha256/bytes/payload)
