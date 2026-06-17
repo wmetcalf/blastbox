@@ -31,3 +31,47 @@ class Personality:
 
 # The always-present safe default: no egress. Resolution falls back here fail-closed.
 NONE = Personality(name="none", exit_driver="none")
+
+
+_NETPOLICY_PREFIX = "BLASTBOX_NETPOLICY_"
+
+
+def _parse_decl(name: str, raw: str) -> Personality | None:
+    """Parse one ``exit=...,k=v,...`` declaration into a Personality, or None (warn) if
+    malformed. Comma-separated KEY=VALUE (values can't contain a comma — fine here)."""
+    kv: dict[str, str] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            print(f"warning: ignoring malformed netpolicy {name!r} entry {item!r} "
+                  "(expected KEY=VALUE)", file=sys.stderr)
+            return None
+        k, _, v = item.partition("=")
+        kv[k.strip().lower()] = v.strip()
+
+    exit_driver = kv.pop("exit", "")
+    if exit_driver not in VALID_EXIT_DRIVERS:
+        print(f"warning: ignoring netpolicy {name!r}: exit={exit_driver!r} not one of "
+              f"{', '.join(VALID_EXIT_DRIVERS)}", file=sys.stderr)
+        return None
+    inspect = kv.pop("inspect", "").lower() in ("1", "true", "yes", "on")
+    return Personality(name=name, exit_driver=exit_driver, inspect=inspect, config=kv)
+
+
+def parse_personalities(env: Mapping[str, str]) -> dict[str, Personality]:
+    """Build the personality registry from ``BLASTBOX_NETPOLICY_<NAME>`` env vars. ``none`` is
+    always present (the fail-closed default). A declaration with an unknown exit-driver or
+    missing ``exit`` is warned-and-skipped, so it never becomes selectable."""
+    registry: dict[str, Personality] = {"none": NONE}
+    for env_key, raw in env.items():
+        if not env_key.startswith(_NETPOLICY_PREFIX):
+            continue
+        name = env_key[len(_NETPOLICY_PREFIX):].lower()
+        if not name:
+            continue
+        p = _parse_decl(name, raw or "")
+        if p is not None:
+            registry[name] = p
+    return registry
