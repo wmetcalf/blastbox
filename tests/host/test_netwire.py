@@ -12,6 +12,7 @@ from blastbox.host.netwire import (
     TUN_ADDR,
     TUN_DEV,
     WireTarget,
+    gateway_route_commands,
     socks_proxy_url,
     socks_resolv_conf,
     tun2socks_argv,
@@ -124,3 +125,21 @@ def test_wire_target_none_without_pid():
     insp = _wire_inspect()
     insp["State"]["Pid"] = 0
     assert wire_target_from_inspect(insp) is None
+
+
+def test_wire_target_accepts_vpn_mode():
+    wt = wire_target_from_inspect(_wire_inspect(mode="vpn", pid=321))
+    assert wt is not None and wt.mode == "vpn" and wt.pid == 321
+
+
+# --------------------------------------------------------------------------- gateway (vpn) route
+def test_gateway_route_replaces_default_via_gw():
+    assert gateway_route_commands("172.31.0.10") == \
+        [["ip", "route", "replace", "default", "via", "172.31.0.10"]]
+
+
+def test_gateway_route_rejects_non_ip():
+    with pytest.raises(ValueError):
+        gateway_route_commands("not-an-ip")
+    with pytest.raises(ValueError):
+        gateway_route_commands("10.0.0.1 ; rm -rf")

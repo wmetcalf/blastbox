@@ -210,3 +210,57 @@ def test_die_tears_down_wiring(tmp_path):
     d.handle_die("c1")
     assert wproc.terminated is True
     assert "c1" not in d.wired
+
+
+# --------------------------------------------------------------------------- VPN wiring
+def _vpn_inspect(job_id="V1", pid=555):
+    return {
+        "Name": f"/blastbox-worker-{job_id}-1",
+        "Config": {"Labels": {"blastbox.net.wire": "vpn", "blastbox.job_id": job_id}},
+        "NetworkSettings": {"Networks": {"bb-vpn": {"IPAddress": "172.31.0.5", "NetworkID": "y"}}},
+        "State": {"Pid": pid, "Running": True},
+    }
+
+
+def test_vpn_wire_sets_default_route_via_gateway(tmp_path):
+    runs: list = []
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: _vpn_inspect(pid=888),
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        vpn_gateway_ip="172.31.0.10",
+        nsenter_run_fn=lambda pid, argv: runs.append((pid, argv)) or 0,
+        sleep_fn=lambda s: None,
+    )
+    d.handle_start("v1")
+    assert runs == [(888, ["ip", "route", "replace", "default", "via", "172.31.0.10"])]
+    assert "v1" in d.wired and d.wired["v1"] is None  # route-only, no proc
+
+
+def test_vpn_wire_inert_without_gateway(tmp_path):
+    runs: list = []
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: _vpn_inspect(),
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        nsenter_run_fn=lambda pid, argv: runs.append((pid, argv)) or 0,
+        # no vpn_gateway_ip → vpn wiring disabled
+    )
+    d.handle_start("v1")
+    assert runs == [] and d.wired == {}
+
+
+def test_vpn_die_is_clean_noop(tmp_path):
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: _vpn_inspect(),
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        vpn_gateway_ip="172.31.0.10",
+        nsenter_run_fn=lambda pid, argv: 0,
+    )
+    d.handle_start("v1")
+    d.handle_die("v1")  # route-only wire → no proc to terminate, must not raise
+    assert "v1" not in d.wired

@@ -39,10 +39,15 @@ _BRIDGE_NETWORKS: dict[str, str] = {
     "direct": "bb-net0",
     "inetsim": "bb-fakenet",
     "socks": "bb-socks",
+    # IP-tunnel VPN exits (all-IP). INTERNAL bridge: no direct egress; netd points the worker's
+    # default route at the VPN+NAT gateway sidecar on bb-vpn (an OpenVPN/WireGuard client). Same
+    # fail-closed property as bb-socks — no gateway wiring ⇒ no egress.
+    "openvpn": "bb-vpn",
+    "wireguard": "bb-vpn",
 }
 
-# Drivers still fail-closed on the docker path (IP-tunnel VPN exits — P4).
-_UNSUPPORTED_DRIVERS = frozenset({"wireguard", "openvpn"})
+# Every named driver is now wired on the docker path; nothing is fail-closed-unsupported.
+_UNSUPPORTED_DRIVERS: frozenset[str] = frozenset()
 
 # Exit drivers that put the worker on a network where name resolution matters. ``none`` /
 # ``drop`` never reach a resolver, so they are excluded.

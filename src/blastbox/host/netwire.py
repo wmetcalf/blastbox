@@ -24,10 +24,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 # Docker label an egress worker carries to request netd netns wiring (set by the dispatcher).
-# Value is the wire mode — only "socks" today.
+# Value is the wire MODE:
+#   socks → tun2socks in the worker netns → a SOCKS5 exit (TCP+TCP-DNS; tor/BrightData).
+#   vpn   → move the worker's default route onto a VPN+NAT gateway sidecar (all-IP; OpenVPN/WG).
 WIRE_LABEL = "blastbox.net.wire"
 JOB_ID_LABEL = "blastbox.job_id"
-_WIRE_MODES = frozenset({"socks"})
+_WIRE_MODES = frozenset({"socks", "vpn"})
 
 
 @dataclass(frozen=True)
@@ -130,3 +132,15 @@ def socks_resolv_conf(nameserver: str) -> str:
     force DNS over TCP (so it tunnels through a no-UDP SOCKS proxy)."""
     ipaddress.ip_address(nameserver.strip())  # raises ValueError on a non-IP
     return f"nameserver {nameserver.strip()}\noptions use-vc\n"
+
+
+def gateway_route_commands(gateway_ip: str) -> list[list[str]]:
+    """The ``ip(8)`` sequence (run in the worker netns) for the VPN tier: point the default route
+    at a VPN+NAT gateway sidecar. ``replace`` because an internal bridge has no pre-existing
+    default. The gateway (an OpenVPN/WireGuard client that NATs through its tunnel) is on the
+    worker's subnet, so it stays reachable via the link route after the default moves.
+
+    Unlike the SOCKS tier this is a full IP path (ICMP/UDP/raw all work) and needs no in-netns
+    TUN — the gateway sidecar owns the tunnel; the worker just routes through it."""
+    ip = str(ipaddress.ip_address(gateway_ip.strip()))  # raises ValueError on a non-IP
+    return [["ip", "route", "replace", "default", "via", ip]]

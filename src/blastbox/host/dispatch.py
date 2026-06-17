@@ -949,11 +949,15 @@ class Dispatcher:
         }
         if capture_on:
             worker_labels["blastbox.net.capture"] = "1"
-        # A SOCKS personality runs the worker on the INTERNAL bb-socks bridge (no direct egress);
-        # netd wires a TUN + tun2socks → the SOCKS proxy in the worker netns. The label requests
-        # that wiring; until netd wires it the worker simply has no egress (fail-closed).
+        # SOCKS / VPN personalities run the worker on an INTERNAL bridge (no direct egress); netd
+        # wires the only route out in the worker netns. The label requests that wiring by mode;
+        # until netd wires it the worker simply has no egress (fail-closed).
+        #   socks (tor/BrightData)         → tun2socks in the netns   (bb-socks)
+        #   openvpn / wireguard (all-IP)   → default route via gateway (bb-vpn)
         if personality.exit_driver == "socks":
             worker_labels["blastbox.net.wire"] = "socks"
+        elif personality.exit_driver in ("openvpn", "wireguard"):
+            worker_labels["blastbox.net.wire"] = "vpn"
 
         container_name = f"blastbox-worker-{job.job_id[:12]}"
         argv = build_worker_docker_run_argv(

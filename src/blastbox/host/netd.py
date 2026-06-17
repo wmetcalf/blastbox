@@ -31,6 +31,7 @@ from blastbox.host.capture import (
 )
 from blastbox.host.netwire import (
     TUN_DEV,
+    gateway_route_commands,
     tun2socks_argv,
     tun_setup_commands,
     wire_target_from_inspect,
@@ -66,13 +67,14 @@ class CaptureDaemon:
     network_iface_fn: Callable[[], Mapping[str, str]]
     spawn_fn: Callable[[list[str], str], Any]
     active: dict[str, _ActiveCapture] = field(default_factory=dict)
-    # --- SOCKS-tier wiring (P3), all optional: wiring is inert unless an operator configures a
-    # SOCKS proxy AND provides the nsenter seams. ---
-    socks_proxy_url: str | None = None
+    # --- netns wiring (P3/P4), all optional: wiring is inert unless an operator configures the
+    # exit (socks proxy / vpn gateway) AND provides the nsenter seams. ---
+    socks_proxy_url: str | None = None      # socks mode: tun2socks → this SOCKS5 URL
+    vpn_gateway_ip: str | None = None       # vpn mode: default route → this gateway sidecar IP
     nsenter_spawn_fn: Callable[[int, list[str]], Any] | None = None  # long-lived in worker netns
     nsenter_run_fn: Callable[[int, list[str]], int] | None = None    # run cmd in netns → rc
     sleep_fn: Callable[[float], None] = time.sleep
-    wired: dict[str, Any] = field(default_factory=dict)
+    wired: dict[str, Any] = field(default_factory=dict)  # container_id → proc-or-None
 
     # ------------------------------------------------------------------ handlers
     def handle_start(self, container_id: str) -> None:
@@ -84,7 +86,7 @@ class CaptureDaemon:
             _log.warning("netd: inspect for %s failed: %s", container_id[:12], exc)
             return
         self._maybe_capture(container_id, inspect)
-        self._maybe_wire_socks(container_id, inspect)
+        self._maybe_wire(container_id, inspect)
 
     def _maybe_capture(self, container_id: str, inspect: Mapping[str, object]) -> None:
         if container_id in self.active:
@@ -112,13 +114,12 @@ class CaptureDaemon:
             target.job_id, target.iface, target.worker_ip, target.pcap_path,
         )
 
-    def _maybe_wire_socks(self, container_id: str, inspect: Mapping[str, object]) -> None:
-        """Wire a SOCKS worker's netns: run tun2socks in it, then move the default route onto the
-        TUN. Inert unless a proxy URL + nsenter seams are configured. Best-effort — a failure
-        leaves the worker on its internal (no-egress) bridge, i.e. fail-closed, never crashes."""
-        if not self.socks_proxy_url or self.nsenter_spawn_fn is None or self.nsenter_run_fn is None:
-            return
-        if container_id in self.wired:
+    def _maybe_wire(self, container_id: str, inspect: Mapping[str, object]) -> None:
+        """Wire a worker's netns for its exit. Dispatches on the wire mode (socks → tun2socks;
+        vpn → default route via a gateway sidecar). Inert unless the matching exit + nsenter seams
+        are configured. Best-effort — a failure leaves the worker on its internal (no-egress)
+        bridge, i.e. fail-closed, and never crashes the daemon."""
+        if self.nsenter_run_fn is None or container_id in self.wired:
             return
         try:
             wt = wire_target_from_inspect(inspect)
@@ -126,6 +127,14 @@ class CaptureDaemon:
             _log.warning("netd: wire target for %s failed: %s", container_id[:12], exc)
             return
         if wt is None:
+            return
+        if wt.mode == "socks":
+            self._wire_socks(container_id, wt)
+        elif wt.mode == "vpn":
+            self._wire_vpn(container_id, wt)
+
+    def _wire_socks(self, container_id: str, wt: Any) -> None:
+        if not self.socks_proxy_url or self.nsenter_spawn_fn is None or self.nsenter_run_fn is None:
             return
         try:
             proc = self.nsenter_spawn_fn(wt.pid, tun2socks_argv(self.socks_proxy_url))
@@ -147,6 +156,24 @@ class CaptureDaemon:
             return
         self.wired[container_id] = proc
         _log.info("netd: wired socks job=%s pid=%s -> %s", wt.job_id, wt.pid, self.socks_proxy_url)
+
+    def _wire_vpn(self, container_id: str, wt: Any) -> None:
+        """VPN tier: point the worker's default route at the VPN+NAT gateway sidecar. No in-netns
+        TUN/proc — the gateway owns the tunnel; the route dies with the netns, so nothing to tear
+        down (we still record the wire so a duplicate start event is a no-op)."""
+        if not self.vpn_gateway_ip or self.nsenter_run_fn is None:
+            return
+        try:
+            for cmd in gateway_route_commands(self.vpn_gateway_ip):
+                rc = self.nsenter_run_fn(wt.pid, cmd)
+                if rc != 0:
+                    _log.warning("netd: vpn route cmd failed (rc=%s) for job %s", rc, wt.job_id)
+                    return
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("netd: failed to wire vpn for job %s: %s", wt.job_id, exc)
+            return
+        self.wired[container_id] = None  # route-only; nothing to terminate on die
+        _log.info("netd: wired vpn job=%s pid=%s -> gateway %s", wt.job_id, wt.pid, self.vpn_gateway_ip)
 
     def handle_die(self, container_id: str) -> None:
         """A container died — stop its capture and/or SOCKS wiring. Never raises."""
@@ -272,7 +299,13 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry poin
         "--socks-proxy",
         default=os.environ.get("BLASTBOX_NETD_SOCKS_PROXY", ""),
         help="SOCKS5 proxy URL (socks5://[user:pass@]host:port) for the socks tier; enables "
-             "netns wiring of workers labeled blastbox.net.wire=socks. Empty = wiring disabled.",
+             "netns wiring of workers labeled blastbox.net.wire=socks. Empty = disabled.",
+    )
+    parser.add_argument(
+        "--vpn-gateway",
+        default=os.environ.get("BLASTBOX_NETD_VPN_GATEWAY", ""),
+        help="VPN+NAT gateway sidecar IP for the vpn tier; default-routes workers labeled "
+             "blastbox.net.wire=vpn through it. Empty = disabled.",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     ns = parser.parse_args(argv)
@@ -281,17 +314,21 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry poin
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     socks = ns.socks_proxy.strip() or None
+    vpn = ns.vpn_gateway.strip() or None
+    wiring_on = bool(socks or vpn)
     daemon = CaptureDaemon(
         job_root=ns.job_root,
         inspect_fn=_docker_inspect,
         network_iface_fn=_docker_network_iface_map,
         spawn_fn=_spawn_tcpdump,
         socks_proxy_url=socks,
-        nsenter_spawn_fn=_nsenter_spawn if socks else None,
-        nsenter_run_fn=_nsenter_run if socks else None,
+        vpn_gateway_ip=vpn,
+        nsenter_spawn_fn=_nsenter_spawn if wiring_on else None,
+        nsenter_run_fn=_nsenter_run if wiring_on else None,
     )
     _log.info(
-        "blastbox-netd starting; job_root=%s socks_wiring=%s", ns.job_root, "on" if socks else "off"
+        "blastbox-netd starting; job_root=%s socks=%s vpn=%s",
+        ns.job_root, "on" if socks else "off", "on" if vpn else "off",
     )
     try:
         daemon.run()

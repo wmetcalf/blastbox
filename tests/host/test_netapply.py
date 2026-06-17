@@ -61,16 +61,10 @@ def test_socks_driver_returns_bb_socks():
     assert docker_network_args(_p("socks")) == ["--network", "bb-socks"]
 
 
-@pytest.mark.parametrize("driver", ["wireguard", "openvpn"])
-def test_unsupported_driver_falls_back_to_none(driver, caplog):
-    with caplog.at_level(logging.WARNING, logger="blastbox.host.netapply"):
-        result = docker_network_args(_p(driver))
-
-    assert result == ["--network=none"], f"expected --network=none for {driver!r}"
-    assert any(
-        "not yet supported" in r.message and driver in r.message
-        for r in caplog.records
-    ), f"expected warning mentioning {driver!r}, got: {[r.message for r in caplog.records]}"
+@pytest.mark.parametrize("driver", ["openvpn", "wireguard"])
+def test_vpn_drivers_return_bb_vpn(driver):
+    # IP-tunnel VPN exits → the INTERNAL bb-vpn bridge (netd routes via the VPN gateway sidecar).
+    assert docker_network_args(_p(driver)) == ["--network", "bb-vpn"]
 
 
 # ---------------------------------------------------------------------------
