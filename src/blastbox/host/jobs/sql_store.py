@@ -35,6 +35,7 @@ _COLUMNS = (
     "worker_runtime",
     "worker_tier",
     "target_tier",
+    "net_policy",
     "error",
     "security_warnings",
     "params",
@@ -134,6 +135,7 @@ class SqlJobStore:
             worker_runtime    TEXT,
             worker_tier       TEXT,
             target_tier       TEXT,
+            net_policy        TEXT,
             error             TEXT,
             security_warnings TEXT,
             params            TEXT,
@@ -188,7 +190,7 @@ class SqlJobStore:
         """Add any columns that don't exist yet (forward-compat migrations)."""
         existing = self._existing_columns(conn)
         for col in ("engine", "params", "result_summary", "claim_id",
-                    "worker_tier", "target_tier"):
+                    "worker_tier", "target_tier", "net_policy"):
             if col not in existing:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
 
