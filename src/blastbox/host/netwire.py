@@ -20,6 +20,47 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+
+# Docker label an egress worker carries to request netd netns wiring (set by the dispatcher).
+# Value is the wire mode — only "socks" today.
+WIRE_LABEL = "blastbox.net.wire"
+JOB_ID_LABEL = "blastbox.job_id"
+_WIRE_MODES = frozenset({"socks"})
+
+
+@dataclass(frozen=True)
+class WireTarget:
+    """What netd needs to wire one worker's netns for a SOCKS exit."""
+
+    container: str
+    job_id: str
+    pid: int
+    mode: str
+
+
+def wire_target_from_inspect(inspect: Mapping[str, object]) -> WireTarget | None:
+    """Decide whether a container wants netns wiring, from its ``docker inspect`` payload. Returns
+    ``None`` unless it is labeled ``blastbox.net.wire=<mode>`` with a known mode AND the runtime
+    exposed a real ``State.Pid`` (the netns to enter). A gVisor worker has no host-visible
+    pid/netns to wire — it would yield pid 0 here and be skipped (gVisor is SOCKS-excluded)."""
+    config = inspect.get("Config") or {}
+    labels = config.get("Labels") if isinstance(config, Mapping) else None
+    if not isinstance(labels, Mapping):
+        return None
+    mode = str(labels.get(WIRE_LABEL, "")).strip().lower()
+    if mode not in _WIRE_MODES:
+        return None
+    job_id = labels.get(JOB_ID_LABEL)
+    if not job_id:
+        return None
+    state = inspect.get("State") or {}
+    pid = state.get("Pid") if isinstance(state, Mapping) else None
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    name = str(inspect.get("Name") or "").lstrip("/") or str(job_id)
+    return WireTarget(container=name, job_id=str(job_id), pid=pid, mode=mode)
 
 # tun2socks' default fake gateway range; 198.18.0.0/15 (RFC 2544 benchmark) deliberately avoids
 # the worker's RFC1918 bridge IP so the TUN addressing never collides with bb-socks.

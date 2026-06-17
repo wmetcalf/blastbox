@@ -11,11 +11,21 @@ import pytest
 from blastbox.host.netwire import (
     TUN_ADDR,
     TUN_DEV,
+    WireTarget,
     socks_proxy_url,
     socks_resolv_conf,
     tun2socks_argv,
     tun_setup_commands,
+    wire_target_from_inspect,
 )
+
+
+def _wire_inspect(*, mode="socks", job_id="J1", pid=4242):
+    return {
+        "Name": f"/blastbox-worker-{job_id}-1",
+        "Config": {"Labels": {"blastbox.net.wire": mode, "blastbox.job_id": job_id}},
+        "State": {"Pid": pid, "Running": True},
+    }
 
 
 # --------------------------------------------------------------------------- proxy URL
@@ -90,3 +100,27 @@ def test_socks_resolv_forces_tcp():
 def test_socks_resolv_rejects_non_ip():
     with pytest.raises(ValueError):
         socks_resolv_conf("not-an-ip")
+
+
+# --------------------------------------------------------------------------- wire_target
+def test_wire_target_built_for_socks_worker():
+    wt = wire_target_from_inspect(_wire_inspect(pid=9999))
+    assert isinstance(wt, WireTarget)
+    assert wt.mode == "socks" and wt.job_id == "J1" and wt.pid == 9999
+
+
+def test_wire_target_none_without_label():
+    insp = _wire_inspect()
+    insp["Config"]["Labels"] = {"blastbox.job_id": "J1"}
+    assert wire_target_from_inspect(insp) is None
+
+
+def test_wire_target_none_for_unknown_mode():
+    assert wire_target_from_inspect(_wire_inspect(mode="teleport")) is None
+
+
+def test_wire_target_none_without_pid():
+    # A gVisor worker exposes no host pid (0) → not wireable (gVisor is SOCKS-excluded).
+    insp = _wire_inspect()
+    insp["State"]["Pid"] = 0
+    assert wire_target_from_inspect(insp) is None

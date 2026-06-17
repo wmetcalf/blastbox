@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import subprocess
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -28,12 +29,21 @@ from blastbox.host.capture import (
     capture_target_from_inspect,
     tcpdump_argv,
 )
+from blastbox.host.netwire import (
+    TUN_DEV,
+    tun2socks_argv,
+    tun_setup_commands,
+    wire_target_from_inspect,
+)
 
 _log = logging.getLogger("blastbox.host.netd")
 
 # How long to wait for tcpdump to flush + exit after SIGTERM before giving up (the pcap is
 # line-buffered via -U, so even a hard miss leaves a usable capture).
 _STOP_TIMEOUT_S = 5.0
+# How long to wait for tun2socks to create the TUN before configuring routes (tries × interval).
+_TUN_WAIT_TRIES = 40
+_TUN_WAIT_INTERVAL_S = 0.25
 
 
 @dataclass
@@ -56,20 +66,35 @@ class CaptureDaemon:
     network_iface_fn: Callable[[], Mapping[str, str]]
     spawn_fn: Callable[[list[str], str], Any]
     active: dict[str, _ActiveCapture] = field(default_factory=dict)
+    # --- SOCKS-tier wiring (P3), all optional: wiring is inert unless an operator configures a
+    # SOCKS proxy AND provides the nsenter seams. ---
+    socks_proxy_url: str | None = None
+    nsenter_spawn_fn: Callable[[int, list[str]], Any] | None = None  # long-lived in worker netns
+    nsenter_run_fn: Callable[[int, list[str]], int] | None = None    # run cmd in netns → rc
+    sleep_fn: Callable[[float], None] = time.sleep
+    wired: dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ handlers
     def handle_start(self, container_id: str) -> None:
-        """A container started — begin capture if it is a labeled egress worker. Never raises:
-        a container that vanished between the event and the inspect must not kill the daemon."""
+        """A container started — capture and/or wire it if labeled. Never raises: a container that
+        vanished between the event and the inspect must not kill the daemon."""
+        try:
+            inspect = self.inspect_fn(container_id)
+        except Exception as exc:  # noqa: BLE001 — daemon resilience: log + skip, never crash
+            _log.warning("netd: inspect for %s failed: %s", container_id[:12], exc)
+            return
+        self._maybe_capture(container_id, inspect)
+        self._maybe_wire_socks(container_id, inspect)
+
+    def _maybe_capture(self, container_id: str, inspect: Mapping[str, object]) -> None:
         if container_id in self.active:
             return  # duplicate start event
         try:
-            inspect = self.inspect_fn(container_id)
             target = capture_target_from_inspect(
                 inspect, job_root=self.job_root, network_iface=self.network_iface_fn()
             )
-        except Exception as exc:  # noqa: BLE001 — daemon resilience: log + skip, never crash
-            _log.warning("netd: inspect/target for %s failed: %s", container_id[:12], exc)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("netd: capture target for %s failed: %s", container_id[:12], exc)
             return
         if target is None:
             return
@@ -87,17 +112,59 @@ class CaptureDaemon:
             target.job_id, target.iface, target.worker_ip, target.pcap_path,
         )
 
-    def handle_die(self, container_id: str) -> None:
-        """A container died — stop its capture and flush the pcap. Never raises."""
-        ac = self.active.pop(container_id, None)
-        if ac is None:
+    def _maybe_wire_socks(self, container_id: str, inspect: Mapping[str, object]) -> None:
+        """Wire a SOCKS worker's netns: run tun2socks in it, then move the default route onto the
+        TUN. Inert unless a proxy URL + nsenter seams are configured. Best-effort — a failure
+        leaves the worker on its internal (no-egress) bridge, i.e. fail-closed, never crashes."""
+        if not self.socks_proxy_url or self.nsenter_spawn_fn is None or self.nsenter_run_fn is None:
+            return
+        if container_id in self.wired:
             return
         try:
-            ac.proc.terminate()
-            ac.proc.wait(timeout=_STOP_TIMEOUT_S)
+            wt = wire_target_from_inspect(inspect)
         except Exception as exc:  # noqa: BLE001
-            _log.warning("netd: stopping capture for job %s: %s", ac.target.job_id, exc)
-        _log.info("netd: capture finalized job=%s -> %s", ac.target.job_id, ac.target.pcap_path)
+            _log.warning("netd: wire target for %s failed: %s", container_id[:12], exc)
+            return
+        if wt is None:
+            return
+        try:
+            proc = self.nsenter_spawn_fn(wt.pid, tun2socks_argv(self.socks_proxy_url))
+            # tun2socks creates the TUN asynchronously; wait for it before configuring routes.
+            ready = False
+            for _ in range(_TUN_WAIT_TRIES):
+                if self.nsenter_run_fn(wt.pid, ["ip", "link", "show", TUN_DEV]) == 0:
+                    ready = True
+                    break
+                self.sleep_fn(_TUN_WAIT_INTERVAL_S)
+            if not ready:
+                _log.warning("netd: tun2socks TUN never appeared for job %s; aborting wire", wt.job_id)
+                proc.terminate()
+                return
+            for cmd in tun_setup_commands():
+                self.nsenter_run_fn(wt.pid, cmd)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("netd: failed to wire socks for job %s: %s", wt.job_id, exc)
+            return
+        self.wired[container_id] = proc
+        _log.info("netd: wired socks job=%s pid=%s -> %s", wt.job_id, wt.pid, self.socks_proxy_url)
+
+    def handle_die(self, container_id: str) -> None:
+        """A container died — stop its capture and/or SOCKS wiring. Never raises."""
+        ac = self.active.pop(container_id, None)
+        if ac is not None:
+            try:
+                ac.proc.terminate()
+                ac.proc.wait(timeout=_STOP_TIMEOUT_S)
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("netd: stopping capture for job %s: %s", ac.target.job_id, exc)
+            _log.info("netd: capture finalized job=%s -> %s", ac.target.job_id, ac.target.pcap_path)
+        wproc = self.wired.pop(container_id, None)
+        if wproc is not None:
+            try:
+                wproc.terminate()
+                wproc.wait(timeout=_STOP_TIMEOUT_S)
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("netd: stopping socks wire for %s: %s", container_id[:12], exc)
 
     # ------------------------------------------------------------------ event loop
     def run(self, events_cmd: list[str] | None = None) -> None:  # pragma: no cover - I/O loop
@@ -176,6 +243,22 @@ def _spawn_tcpdump(argv: list[str], pcap_path: str) -> subprocess.Popen:  # prag
     return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
 
 
+def _nsenter_spawn(pid: int, argv: list[str]) -> subprocess.Popen:  # pragma: no cover - I/O
+    # Run a long-lived command (tun2socks) inside the worker's network namespace.
+    return subprocess.Popen(
+        ["nsenter", "-t", str(pid), "-n", *argv],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+    )
+
+
+def _nsenter_run(pid: int, argv: list[str]) -> int:  # pragma: no cover - I/O
+    # Run a short command (ip route/link/addr, tun0 probe) inside the worker's netns; return rc.
+    return subprocess.run(
+        ["nsenter", "-t", str(pid), "-n", *argv],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode
+
+
 def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry point
     import argparse
 
@@ -185,19 +268,31 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry poin
         default=os.environ.get("BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs"),
         help="per-job root; pcaps land under <job_root>/<job_id>/capture/ (must match dispatcher)",
     )
+    parser.add_argument(
+        "--socks-proxy",
+        default=os.environ.get("BLASTBOX_NETD_SOCKS_PROXY", ""),
+        help="SOCKS5 proxy URL (socks5://[user:pass@]host:port) for the socks tier; enables "
+             "netns wiring of workers labeled blastbox.net.wire=socks. Empty = wiring disabled.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     ns = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if ns.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    socks = ns.socks_proxy.strip() or None
     daemon = CaptureDaemon(
         job_root=ns.job_root,
         inspect_fn=_docker_inspect,
         network_iface_fn=_docker_network_iface_map,
         spawn_fn=_spawn_tcpdump,
+        socks_proxy_url=socks,
+        nsenter_spawn_fn=_nsenter_spawn if socks else None,
+        nsenter_run_fn=_nsenter_run if socks else None,
     )
-    _log.info("blastbox-netd starting; job_root=%s", ns.job_root)
+    _log.info(
+        "blastbox-netd starting; job_root=%s socks_wiring=%s", ns.job_root, "on" if socks else "off"
+    )
     try:
         daemon.run()
     except KeyboardInterrupt:

@@ -1227,6 +1227,38 @@ def test_network_capture_sealed_as_trusted_artifact(tmp_path, monkeypatch):
     assert (output_dir / "capture" / "dump.pcap").read_bytes() == pcap_bytes
 
 
+def test_socks_personality_labels_worker_for_wiring_and_uses_bb_socks(tmp_path, monkeypatch):
+    """A socks personality → worker on bb-socks (internal) + labeled blastbox.net.wire=socks."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_TOR", "exit=socks,dns=1.1.1.1")
+
+    store = InMemoryJobStore()
+    job = _make_job(); job.input_sha256 = _INPUT_SHA; store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    launched: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    socks_engine = EngineSpec(
+        name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+        net_policy="tor",
+    )
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, engines={_ENGINE_NAME: socks_engine},
+        subprocess_runner=fake_runner,
+    )
+    assert dispatcher.dispatch_once() is True
+    argv = next(a for a in launched if a[:2] == ["docker", "run"])
+    assert "bb-socks" in argv
+    assert "blastbox.net.wire=socks" in argv
+    # DNS-over-TCP resolv.conf is injected for the socks exit.
+    assert any("dst=/etc/resolv.conf" in t for t in argv)
+
+
 def test_no_capture_artifact_when_netd_produced_none(tmp_path, monkeypatch):
     """capture enabled but no pcap on disk (netd not running) → envelope unchanged, job still DONE."""
     monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRECT", "exit=direct")

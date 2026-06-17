@@ -27,19 +27,29 @@ from blastbox.host.netpolicy import Personality
 
 _log = logging.getLogger("blastbox.host.netapply")
 
-# Maps exit_driver → docker network name for bridge-type exits.
+# Maps exit_driver → docker network name for bridge-attached exits.
 # ``none`` and ``drop`` are handled directly (no bridge needed).
+#   direct  → bb-net0    (egress bridge)
+#   inetsim → bb-fakenet (internal; FakeNet-NG sidecar answers everything)
+#   socks   → bb-socks   (INTERNAL: no direct egress. netd wires a TUN + tun2socks → the SOCKS
+#             proxy sidecar [dual-homed on bb-socks + an egress net], so the worker can ONLY
+#             egress through the proxy — fail-closed. The internal bridge IS the fail-closed
+#             property; if netd never wires it, the worker simply has no egress.)
 _BRIDGE_NETWORKS: dict[str, str] = {
     "direct": "bb-net0",
     "inetsim": "bb-fakenet",
+    "socks": "bb-socks",
 }
 
-# Drivers not yet implemented on the docker path (Plan 2 scope).
-_UNSUPPORTED_DRIVERS = frozenset({"socks", "wireguard", "openvpn"})
+# Drivers still fail-closed on the docker path (IP-tunnel VPN exits — P4).
+_UNSUPPORTED_DRIVERS = frozenset({"wireguard", "openvpn"})
 
 # Exit drivers that put the worker on a network where name resolution matters. ``none`` /
 # ``drop`` never reach a resolver, so they are excluded.
 _EGRESS_DRIVERS = frozenset({"direct", "inetsim", "socks", "wireguard", "openvpn"})
+
+# Drivers whose egress is a SOCKS proxy that can't carry UDP DNS — DNS must go over TCP.
+_SOCKS_DRIVERS = frozenset({"socks"})
 
 
 def docker_network_args(personality: Personality) -> list[str]:
@@ -94,4 +104,9 @@ def worker_resolv_conf(personality: Personality) -> str | None:
     servers = (personality.config.get("dns") or "").split()
     if not servers:
         return None
-    return "".join(f"nameserver {s}\n" for s in servers)
+    body = "".join(f"nameserver {s}\n" for s in servers)
+    # A SOCKS exit (tor included) usually can't carry UDP DNS (no UDP ASSOCIATE), so force DNS
+    # over TCP — without this, name resolution silently fails behind the tunnel.
+    if personality.exit_driver in _SOCKS_DRIVERS:
+        body += "options use-vc\n"
+    return body

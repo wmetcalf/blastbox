@@ -56,7 +56,12 @@ def test_inetsim_driver_returns_bb_fakenet():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("driver", ["socks", "wireguard", "openvpn"])
+def test_socks_driver_returns_bb_socks():
+    # socks → the INTERNAL bb-socks bridge (netd wires the TUN+tun2socks egress).
+    assert docker_network_args(_p("socks")) == ["--network", "bb-socks"]
+
+
+@pytest.mark.parametrize("driver", ["wireguard", "openvpn"])
 def test_unsupported_driver_falls_back_to_none(driver, caplog):
     with caplog.at_level(logging.WARNING, logger="blastbox.host.netapply"):
         result = docker_network_args(_p(driver))
@@ -140,3 +145,15 @@ def test_resolv_blank_dns_is_treated_as_unset():
 def test_resolv_ends_with_newline():
     out = worker_resolv_conf(_p("socks", config={"dns": "9.9.9.9"}))
     assert out is not None and out.endswith("\n")
+
+
+def test_resolv_socks_forces_dns_over_tcp():
+    # A socks exit can't carry UDP DNS → resolv.conf must add options use-vc (force TCP).
+    out = worker_resolv_conf(_p("socks", config={"dns": "1.1.1.1"}))
+    assert out == "nameserver 1.1.1.1\noptions use-vc\n"
+
+
+def test_resolv_direct_does_not_force_tcp():
+    # A direct egress worker has normal UDP DNS — no use-vc.
+    out = worker_resolv_conf(_p("direct", config={"dns": "1.1.1.1"}))
+    assert "use-vc" not in out

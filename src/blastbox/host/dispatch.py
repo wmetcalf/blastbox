@@ -949,6 +949,11 @@ class Dispatcher:
         }
         if capture_on:
             worker_labels["blastbox.net.capture"] = "1"
+        # A SOCKS personality runs the worker on the INTERNAL bb-socks bridge (no direct egress);
+        # netd wires a TUN + tun2socks → the SOCKS proxy in the worker netns. The label requests
+        # that wiring; until netd wires it the worker simply has no egress (fail-closed).
+        if personality.exit_driver == "socks":
+            worker_labels["blastbox.net.wire"] = "socks"
 
         container_name = f"blastbox-worker-{job.job_id[:12]}"
         argv = build_worker_docker_run_argv(
