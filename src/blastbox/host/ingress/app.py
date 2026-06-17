@@ -476,6 +476,7 @@ def build_app(
         engine: str = Form(...),
         params: list[str] = Form(default=[]),
         target_tier: str | None = Form(default=None),
+        net_policy: str | None = Form(default=None),
     ):
         """Submit a file for detonation by the named engine.
 
@@ -544,6 +545,19 @@ def build_app(
             else:
                 # Dropped (routing disabled); cap the attacker-controlled value in the log line.
                 _log.info("target_tier_ignored_routing_disabled", requested=tt_raw[:64])
+
+        # Per-job network personality: ignored unless the operator sets
+        # BLASTBOX_ALLOW_NETPOLICY_OVERRIDE. Off (default) → silently ignored, mirroring
+        # target_tier. The NAME is validated against the registry at dispatch (fail-closed),
+        # so ingress only needs the gate here.
+        np_raw = (net_policy or "").strip()
+        if np_raw:
+            if os.environ.get("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "").strip().lower() in (
+                "1", "true", "yes", "on",
+            ):
+                job.net_policy = np_raw.lower()
+            else:
+                _log.info("net_policy_ignored_override_disabled", requested=np_raw[:64])
 
         root, input_dir, output_dir = _job_dirs(job.job_id)
 
