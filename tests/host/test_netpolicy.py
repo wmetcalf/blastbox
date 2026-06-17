@@ -108,3 +108,10 @@ def test_resolve_job_override_undeclared_failscloses_to_default():
     p = resolve_net_policy(job_net_policy="nope", engine_default="fakenet",
                            registry=_reg(), allow_override=True)
     assert p.name == "fakenet"
+
+
+def test_parse_cannot_override_none_builtin(capsys):
+    # BLASTBOX_NETPOLICY_NONE must NOT redefine the fail-closed default to live egress.
+    reg = parse_personalities({"BLASTBOX_NETPOLICY_NONE": "exit=direct"})
+    assert reg["none"].exit_driver == "none"
+    assert "reserved" in capsys.readouterr().err

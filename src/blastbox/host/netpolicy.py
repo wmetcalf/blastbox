@@ -75,6 +75,13 @@ def parse_personalities(env: Mapping[str, str]) -> dict[str, Personality]:
         name = env_key[len(_NETPOLICY_PREFIX):].lower()
         if not name:
             continue
+        if name == "none":
+            # "none" is the reserved fail-closed default; an operator must not be able to
+            # redefine it (e.g. BLASTBOX_NETPOLICY_NONE=exit=direct), or resolve_net_policy's
+            # `registry["none"]` fallback would silently grant egress. Surface + ignore.
+            print("warning: BLASTBOX_NETPOLICY_NONE is reserved (the fail-closed default) and "
+                  "is ignored", file=sys.stderr)
+            continue
         p = _parse_decl(name, raw or "")
         if p is not None:
             registry[name] = p
