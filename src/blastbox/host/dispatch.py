@@ -261,6 +261,13 @@ class Dispatcher:
         # routing at the API (BLASTBOX_ALLOW_TIER_ROUTING) — existing jobs have no target.
         self._tier = tier
 
+        # Personality registry built ONCE from the operator env (does not change per job).
+        from blastbox.host.netpolicy import parse_personalities
+        self._net_policies = parse_personalities(os.environ)
+        self._allow_net_override = os.environ.get(
+            "BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
