@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from blastbox.host.cli import build_parser, main
+from blastbox.host.cli import _parse_engine_specs, build_parser, main
 
 
 class TestVersionCmd:
@@ -102,3 +102,14 @@ class TestCliParser:
     def test_invalid_command_raises_systemexit(self):
         with pytest.raises(SystemExit):
             build_parser().parse_args(["bogus"])
+
+
+def test_engine_net_policy_default_is_none():
+    engines = _parse_engine_specs("redtusk=img:tag")
+    assert engines["redtusk"].net_policy == "none"
+
+
+def test_engine_net_policy_from_env(monkeypatch):
+    monkeypatch.setenv("BLASTBOX_ENGINE_REDTUSK_NETPOLICY", "fakenet")
+    engines = _parse_engine_specs("redtusk=img:tag")
+    assert engines["redtusk"].net_policy == "fakenet"

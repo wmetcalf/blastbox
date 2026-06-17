@@ -134,10 +134,17 @@ def _parse_engine_specs(engines_raw: str) -> dict:
             default_params = _parse_default_params(
                 os.environ.get(f"BLASTBOX_ENGINE_{env_name}_DEFAULT_PARAMS")
             )
+            # Optional per-engine DEFAULT network personality (BLASTBOX_ENGINE_<NAME>_NETPOLICY).
+            # A name from the operator's BLASTBOX_NETPOLICY_<NAME> registry; "none" (default) =
+            # no egress. Validated/resolved fail-closed at dispatch (netpolicy.resolve).
+            net_policy = (
+                os.environ.get(f"BLASTBOX_ENGINE_{env_name}_NETPOLICY") or "none"
+            ).strip().lower()
             engines[name] = EngineSpec(
                 name=name, image=image, worker_argv=[],
                 allowed_param_keys=allowed, reserved_param_keys=reserved,
                 default_params=default_params,
+                net_policy=net_policy,
             )
     return engines
 

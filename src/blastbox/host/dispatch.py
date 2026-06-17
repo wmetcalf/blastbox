@@ -168,6 +168,11 @@ class EngineSpec:
     # key must itself be forwardable (allowlisted, if an allowlist is set) and non-reserved —
     # one gate, fail-closed, no broader trust path for operator policy than for client params.
     default_params: dict[str, str] = field(default_factory=dict)
+    # Per-engine DEFAULT network personality (BLASTBOX_ENGINE_<NAME>_NETPOLICY). Ships "none"
+    # (no egress). Resolved per job against the operator's personality registry, fail-closed
+    # (see netpolicy.resolve_net_policy). Runtime-configurable like default_params: flip the
+    # env + restart the dispatcher, no rebuild. This task only carries it; applying it is later.
+    net_policy: str = "none"
 
 
 class Dispatcher:
