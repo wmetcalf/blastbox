@@ -1138,3 +1138,111 @@ def test_netpolicy_direct_without_dns_no_resolv_conf(tmp_path, monkeypatch):
     assert not any("dst=/etc/resolv.conf" in tok for tok in docker_run_argv), (
         f"resolv.conf must NOT be injected without dns=: {docker_run_argv}"
     )
+
+
+def _direct_dispatcher(store, tmp_path, fake_runner):
+    direct_engine = EngineSpec(
+        name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+        net_policy="direct",
+    )
+    return _make_dispatcher(
+        store, job_root=tmp_path, engines={_ENGINE_NAME: direct_engine},
+        subprocess_runner=fake_runner,
+    )
+
+
+def test_capture_label_set_for_egress_when_enabled(tmp_path, monkeypatch):
+    """BLASTBOX_NET_CAPTURE=1 + an egress personality → the worker is labeled for netd."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRECT", "exit=direct")
+    monkeypatch.setenv("BLASTBOX_NET_CAPTURE", "1")
+
+    store = InMemoryJobStore()
+    job = _make_job(); job.input_sha256 = _INPUT_SHA; store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    launched: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
+    argv = next(a for a in launched if a[:2] == ["docker", "run"])
+    assert "blastbox.net.capture=1" in argv
+
+
+def test_capture_label_absent_when_disabled(tmp_path, monkeypatch):
+    """Default (no BLASTBOX_NET_CAPTURE) → no capture label even for an egress personality."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRECT", "exit=direct")
+    monkeypatch.delenv("BLASTBOX_NET_CAPTURE", raising=False)
+
+    store = InMemoryJobStore()
+    job = _make_job(); job.input_sha256 = _INPUT_SHA; store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    launched: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
+    argv = next(a for a in launched if a[:2] == ["docker", "run"])
+    assert not any("blastbox.net.capture" in t for t in argv)
+
+
+def test_network_capture_sealed_as_trusted_artifact(tmp_path, monkeypatch):
+    """A netd pcap at <job>/capture/dump.pcap is sealed into metadata.json with a host hash."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRECT", "exit=direct")
+    monkeypatch.setenv("BLASTBOX_NET_CAPTURE", "1")
+
+    store = InMemoryJobStore()
+    job = _make_job(); job.input_sha256 = _INPUT_SHA; store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    pcap_bytes = b"\xd4\xc3\xb2\xa1fake-pcap-capture-bytes"
+
+    def fake_runner(argv, **kw):
+        if argv[:2] == ["docker", "run"]:
+            # Simulate netd having written the host-only pcap during the worker's run.
+            cap = tmp_path / job.job_id / "capture"
+            cap.mkdir(parents=True, exist_ok=True)
+            (cap / "dump.pcap").write_bytes(pcap_bytes)
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
+
+    sealed = json.loads((output_dir / "metadata.json").read_text())
+    caps = [a for a in sealed["artifacts"] if a["kind"] == "network_capture"]
+    assert len(caps) == 1, f"capture artifact not sealed: {sealed['artifacts']}"
+    assert caps[0]["path"] == "capture/dump.pcap"
+    assert caps[0]["sha256"] == hashlib.sha256(pcap_bytes).hexdigest()
+    assert caps[0]["bytes"] == len(pcap_bytes)
+    # The pcap is now servable from within the output dir.
+    assert (output_dir / "capture" / "dump.pcap").read_bytes() == pcap_bytes
+
+
+def test_no_capture_artifact_when_netd_produced_none(tmp_path, monkeypatch):
+    """capture enabled but no pcap on disk (netd not running) → envelope unchanged, job still DONE."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRECT", "exit=direct")
+    monkeypatch.setenv("BLASTBOX_NET_CAPTURE", "1")
+
+    store = InMemoryJobStore()
+    job = _make_job(); job.input_sha256 = _INPUT_SHA; store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)  # no pcap written
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
+    sealed = json.loads((output_dir / "metadata.json").read_text())
+    assert not any(a["kind"] == "network_capture" for a in sealed["artifacts"])
+    assert store.get(job.job_id).status == JobStatus.DONE

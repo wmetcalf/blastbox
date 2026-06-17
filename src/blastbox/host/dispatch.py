@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Mapping
 
 from blastbox.contract.envelope import (
+    Artifact,
     atomic_write_confined,
     confined_atomic_writer,
     open_confined_regular_fd,
@@ -266,6 +267,13 @@ class Dispatcher:
         self._net_policies = parse_personalities(os.environ)
         self._allow_net_override = os.environ.get(
             "BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        # Per-job packet capture (opt-in). When on, egress workers are LABELLED for blastbox-netd
+        # (the privileged host capture helper) and the resulting host-only pcap is sealed into the
+        # envelope as a trusted artifact. Default OFF — capture has storage/privacy implications and
+        # needs netd running; the dispatcher itself stays cap-drop=ALL and never captures.
+        self._net_capture = os.environ.get(
+            "BLASTBOX_NET_CAPTURE", ""
         ).strip().lower() in ("1", "true", "yes", "on")
 
     # ------------------------------------------------------------------
@@ -931,6 +939,17 @@ class Dispatcher:
             str(output_dir.parent / "resolv.conf") if resolv_conf_content else None
         )
 
+        # Per-job capture: label the worker for blastbox-netd ONLY when capture is enabled AND
+        # the personality actually has egress (none/drop have no traffic to capture). netd reads
+        # this label off `docker events`; the dispatcher never touches a raw socket.
+        capture_on = self._net_capture and personality.exit_driver not in ("none", "drop")
+        worker_labels = {
+            "blastbox.role": "worker",
+            "blastbox.job_id": job.job_id,
+        }
+        if capture_on:
+            worker_labels["blastbox.net.capture"] = "1"
+
         container_name = f"blastbox-worker-{job.job_id[:12]}"
         argv = build_worker_docker_run_argv(
             image=engine.image,          # NEVER job.engine / job.filename / job.params
@@ -943,10 +962,7 @@ class Dispatcher:
             network_args=network_args,
             resolv_conf_src=resolv_conf_src,
             container_name=container_name,
-            labels={
-                "blastbox.role": "worker",
-                "blastbox.job_id": job.job_id,
-            },
+            labels=worker_labels,
             extra_env={
                 **self._sanitize_params(
                     job.params, engine.allowed_param_keys, engine.reserved_param_keys,
@@ -1079,6 +1095,13 @@ class Dispatcher:
             detail = envelope.warnings[0].message if envelope.warnings else "engine_error"
             self._fail_job(job, f"engine_error: {detail}")
             return
+
+        # Fold a per-job network capture (if blastbox-netd produced one) into the sealed envelope
+        # as a TRUSTED host artifact. The pcap lives off the worker /output mount, so the worker
+        # never had write access to it; the host hashes it here. Best-effort — a missing/empty
+        # capture (netd not running, or a none/drop personality) is a silent no-op.
+        if capture_on:
+            envelope = self._seal_network_capture(envelope, output_dir)
 
         # Persist the host-SEALED metadata over the worker's raw file so the API serves trusted
         # hashes/sizes/payload, not worker-fabricated ones (#5).
@@ -1258,6 +1281,48 @@ class Dispatcher:
                 raise OutputTrustError(
                     f"total output {total} bytes exceeds cap {cap} (undeclared files counted)"
                 )
+
+    def _seal_network_capture(self, envelope, output_dir: Path):
+        """Fold blastbox-netd's per-job pcap into the sealed envelope as a TRUSTED host artifact.
+
+        netd writes the capture to ``<job_root>/<id>/capture/dump.pcap`` — a sibling of
+        ``output/``, OFF the worker ``/output`` mount, so the untrusted worker never had write
+        access to it. We move it INTO ``output_dir/capture/`` (so the ingress serve route, which
+        confines artifacts to the output dir, can serve it), host-hash it, and append an
+        :class:`Artifact`. Best-effort: any miss (no pcap, empty, oversized, copy/hash error)
+        leaves the envelope unchanged so a capture hiccup never fails an otherwise-valid job.
+        """
+        src = output_dir.parent / "capture" / "dump.pcap"
+        try:
+            if not src.is_file() or src.stat().st_size == 0:
+                return envelope
+            size = src.stat().st_size
+            if size > self._limits.max_artifact_bytes:
+                _log.warning(
+                    "netd capture for output %s is %d bytes (> max_artifact_bytes %d); not sealed",
+                    output_dir, size, self._limits.max_artifact_bytes,
+                )
+                return envelope
+            dst_dir = output_dir / "capture"
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            dst = dst_dir / "dump.pcap"
+            shutil.copy2(src, dst)
+            h = hashlib.sha256()
+            with open(dst, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            artifact = Artifact(
+                id="network.capture.pcap",
+                path="capture/dump.pcap",
+                kind="network_capture",
+                sha256=h.hexdigest(),
+                bytes=dst.stat().st_size,
+            )
+        except Exception as exc:  # noqa: BLE001 — capture is best-effort, never fail the job
+            _log.warning("sealing netd capture for output %s failed: %s", output_dir, exc)
+            return envelope
+        _log.info("sealed network capture artifact (%d bytes) for output %s", size, output_dir)
+        return envelope.model_copy(update={"artifacts": [*envelope.artifacts, artifact]})
 
     def _write_sealed_metadata(self, envelope, output_dir: Path) -> None:
         """Overwrite metadata.json with the host-SEALED envelope (recomputed sha256/bytes/payload)
