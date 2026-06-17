@@ -1,0 +1,209 @@
+"""``blastbox-netd`` — the privileged host capture daemon.
+
+netd is the netpolicy analogue of CAPE's separate ``rooter``: a small root helper that runs on
+the host (it holds the real docker socket and ``CAP_NET_RAW`` for ``tcpdump``), while the
+hardened dispatcher stays ``cap-drop=ALL`` and reaches docker only through the locked-down proxy.
+The dispatcher never captures; it merely LABELS an egress worker (``blastbox.net.capture=1`` +
+``blastbox.job_id``). netd watches ``docker events`` and, per labeled worker, sniffs that
+worker's traffic off the docker bridge into a per-job pcap.
+
+The pure decisions (which iface, which BPF filter, where to write) live in
+:mod:`blastbox.host.capture`; this module is the I/O shell: a docker-events loop plus
+start/die handlers. The handlers take injected seams (``inspect_fn`` / ``network_iface_fn`` /
+``spawn_fn``) so the lifecycle is unit-testable without docker or root.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from typing import Any
+
+from blastbox.host.capture import (
+    CaptureTarget,
+    bridge_iface_for_network,
+    capture_target_from_inspect,
+    tcpdump_argv,
+)
+
+_log = logging.getLogger("blastbox.host.netd")
+
+# How long to wait for tcpdump to flush + exit after SIGTERM before giving up (the pcap is
+# line-buffered via -U, so even a hard miss leaves a usable capture).
+_STOP_TIMEOUT_S = 5.0
+
+
+@dataclass
+class _ActiveCapture:
+    target: CaptureTarget
+    proc: Any  # a Popen-like handle: terminate() / wait(timeout) / poll()
+
+
+@dataclass
+class CaptureDaemon:
+    """Event-driven per-job capture lifecycle.
+
+    ``inspect_fn(container_id) -> dict``          : ``docker inspect`` payload for one container.
+    ``network_iface_fn() -> Mapping[netid,iface]``: docker NetworkID → host bridge iface.
+    ``spawn_fn(argv, pcap_path) -> proc``         : start the capture process (Popen-like).
+    """
+
+    job_root: str
+    inspect_fn: Callable[[str], Mapping[str, object]]
+    network_iface_fn: Callable[[], Mapping[str, str]]
+    spawn_fn: Callable[[list[str], str], Any]
+    active: dict[str, _ActiveCapture] = field(default_factory=dict)
+
+    # ------------------------------------------------------------------ handlers
+    def handle_start(self, container_id: str) -> None:
+        """A container started — begin capture if it is a labeled egress worker. Never raises:
+        a container that vanished between the event and the inspect must not kill the daemon."""
+        if container_id in self.active:
+            return  # duplicate start event
+        try:
+            inspect = self.inspect_fn(container_id)
+            target = capture_target_from_inspect(
+                inspect, job_root=self.job_root, network_iface=self.network_iface_fn()
+            )
+        except Exception as exc:  # noqa: BLE001 — daemon resilience: log + skip, never crash
+            _log.warning("netd: inspect/target for %s failed: %s", container_id[:12], exc)
+            return
+        if target is None:
+            return
+        try:
+            os.makedirs(os.path.dirname(target.pcap_path), exist_ok=True)
+            proc = self.spawn_fn(
+                tcpdump_argv(target.iface, target.worker_ip, target.pcap_path), target.pcap_path
+            )
+        except Exception as exc:  # noqa: BLE001 — capture is best-effort; the job still runs
+            _log.warning("netd: failed to start capture for job %s: %s", target.job_id, exc)
+            return
+        self.active[container_id] = _ActiveCapture(target=target, proc=proc)
+        _log.info(
+            "netd: capturing job=%s iface=%s ip=%s -> %s",
+            target.job_id, target.iface, target.worker_ip, target.pcap_path,
+        )
+
+    def handle_die(self, container_id: str) -> None:
+        """A container died — stop its capture and flush the pcap. Never raises."""
+        ac = self.active.pop(container_id, None)
+        if ac is None:
+            return
+        try:
+            ac.proc.terminate()
+            ac.proc.wait(timeout=_STOP_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("netd: stopping capture for job %s: %s", ac.target.job_id, exc)
+        _log.info("netd: capture finalized job=%s -> %s", ac.target.job_id, ac.target.pcap_path)
+
+    # ------------------------------------------------------------------ event loop
+    def run(self, events_cmd: list[str] | None = None) -> None:  # pragma: no cover - I/O loop
+        """Follow ``docker events`` and dispatch start/die to the handlers. The thin untestable
+        shell around the (tested) handlers."""
+        cmd = events_cmd or [
+            "docker", "events", "--format", "{{json .}}",
+            "--filter", "type=container",
+            "--filter", "event=start", "--filter", "event=die",
+        ]
+        _log.info("netd: watching docker events: %s", " ".join(cmd))
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True) as proc:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                status = evt.get("status") or evt.get("Action")
+                cid = evt.get("id") or evt.get("Actor", {}).get("ID")
+                if not cid:
+                    continue
+                if status == "start":
+                    self.handle_start(cid)
+                elif status == "die":
+                    self.handle_die(cid)
+
+
+def build_network_iface_map(network_inspect_all: list[Mapping[str, object]]) -> dict[str, str]:
+    """Build a docker NetworkID → host bridge iface map from ``docker network inspect`` output
+    (the list form). Skips non-bridge networks that have no derivable iface."""
+    out: dict[str, str] = {}
+    for net in network_inspect_all:
+        net_id = net.get("Id")
+        if not net_id:
+            continue
+        try:
+            out[str(net_id)] = bridge_iface_for_network(net)
+        except ValueError:
+            continue
+    return out
+
+
+# --------------------------------------------------------------------------- production seams
+# These talk to the real docker daemon + spawn real tcpdump; they are the daemon's I/O edge and
+# are exercised by the on-host integration run, not the unit tests (which inject fakes).
+
+def _docker_inspect(container_id: str) -> Mapping[str, object]:  # pragma: no cover - I/O
+    out = subprocess.run(
+        ["docker", "inspect", container_id],
+        capture_output=True, text=True, check=True, timeout=10,
+    ).stdout
+    data = json.loads(out)
+    return data[0] if isinstance(data, list) and data else {}
+
+
+def _docker_network_iface_map() -> Mapping[str, str]:  # pragma: no cover - I/O
+    ids = subprocess.run(
+        ["docker", "network", "ls", "-q"],
+        capture_output=True, text=True, check=True, timeout=10,
+    ).stdout.split()
+    if not ids:
+        return {}
+    out = subprocess.run(
+        ["docker", "network", "inspect", *ids],
+        capture_output=True, text=True, check=True, timeout=10,
+    ).stdout
+    return build_network_iface_map(json.loads(out))
+
+
+def _spawn_tcpdump(argv: list[str], pcap_path: str) -> subprocess.Popen:  # pragma: no cover - I/O
+    # tcpdump writes the pcap itself (-w); inherit no stdin, drop stdout, keep stderr for diag.
+    return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+
+
+def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry point
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="blastbox-netd", description=__doc__)
+    parser.add_argument(
+        "--job-root",
+        default=os.environ.get("BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs"),
+        help="per-job root; pcaps land under <job_root>/<job_id>/capture/ (must match dispatcher)",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true")
+    ns = parser.parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if ns.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    daemon = CaptureDaemon(
+        job_root=ns.job_root,
+        inspect_fn=_docker_inspect,
+        network_iface_fn=_docker_network_iface_map,
+        spawn_fn=_spawn_tcpdump,
+    )
+    _log.info("blastbox-netd starting; job_root=%s", ns.job_root)
+    try:
+        daemon.run()
+    except KeyboardInterrupt:
+        _log.info("blastbox-netd stopping")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
