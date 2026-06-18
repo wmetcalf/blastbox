@@ -12,10 +12,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 # Exit drivers the design names. `none` (default) and `drop` need no sidecar; `direct`/`inetsim`
-# are ship-cheap; `tor` is CAPE's transparent recipe (TransPort + DNSPort, host rooter); `socks`
-# (BrightData / generic SOCKS5) is the SOCKS5-client tier; `wireguard`/`openvpn` are BYO creds.
+# are ship-cheap; `tor` is CAPE's transparent recipe (TransPort + DNSPort, host rooter); `socks` is
+# the transparent SOCKS5-client tier (tun2socks); `httpproxy` injects an HTTP(S)_PROXY env pointing
+# at a creds-holding chaining sidecar (e.g. gost→BrightData); `wireguard`/`openvpn` are BYO creds.
 VALID_EXIT_DRIVERS = (
-    "none", "drop", "direct", "inetsim", "tor", "socks", "wireguard", "openvpn",
+    "none", "drop", "direct", "inetsim", "tor", "socks", "httpproxy", "wireguard", "openvpn",
 )
 
 

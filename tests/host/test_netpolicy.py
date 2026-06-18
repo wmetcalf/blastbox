@@ -25,7 +25,7 @@ def test_none_builtin_is_no_egress():
 
 def test_valid_exit_drivers_set():
     assert VALID_EXIT_DRIVERS == (
-        "none", "drop", "direct", "inetsim", "tor", "socks", "wireguard", "openvpn",
+        "none", "drop", "direct", "inetsim", "tor", "socks", "httpproxy", "wireguard", "openvpn",
     )
 
 

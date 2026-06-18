@@ -43,6 +43,11 @@ _BRIDGE_NETWORKS: dict[str, str] = {
     # dropping everything else. Same fail-closed property as bb-socks — no host rules ⇒ no egress.
     "tor": "bb-socks",
     "socks": "bb-socks",
+    # httpproxy: INTERNAL bridge; the worker's ONLY egress is the HTTP(S)_PROXY env the dispatcher
+    # injects, pointing at a chaining proxy sidecar on this bridge (e.g. gost → BrightData). No netd
+    # wiring + no resolv.conf needed — the proxy does CONNECT-by-hostname, so DNS happens at the
+    # exit. Fail-closed: without the env (or for a non-proxy-aware engine) the worker has no egress.
+    "httpproxy": "bb-socks",
     # IP-tunnel VPN exits (all-IP). INTERNAL bridge: no direct egress; netd points the worker's
     # default route at the VPN+NAT gateway sidecar on bb-vpn (an OpenVPN/WireGuard client). Same
     # fail-closed property as bb-socks — no gateway wiring ⇒ no egress.

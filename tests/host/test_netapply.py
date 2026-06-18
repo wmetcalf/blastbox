@@ -72,6 +72,16 @@ def test_tor_driver_returns_bb_socks_internal():
     assert docker_network_args(_p("tor")) == ["--network", "bb-socks"]
 
 
+def test_httpproxy_driver_returns_bb_socks_internal():
+    # httpproxy rides the INTERNAL bb-socks bridge; egress is only the injected HTTP(S)_PROXY env.
+    assert docker_network_args(_p("httpproxy")) == ["--network", "bb-socks"]
+
+
+def test_httpproxy_injects_no_resolv_conf():
+    # No local DNS for httpproxy — the proxy does CONNECT-by-hostname (DNS at the exit).
+    assert worker_resolv_conf(_p("httpproxy", config={"dns": "1.1.1.1"})) is None
+
+
 def test_resolv_tor_is_udp_not_use_vc():
     # tor DNS is REDIRECTed to tor's DNSPort (UDP-only); use-vc would break it.
     out = worker_resolv_conf(_p("tor", config={"dns": "172.30.0.1"}))

@@ -1029,6 +1029,14 @@ class Dispatcher:
                     "tun0" if (personality.exit_driver == "socks"
                                and not personality.inspect) else ""
                 ),
+                # httpproxy tier: the worker's only egress is an HTTP(S) proxy. Inject it as the
+                # standard proxy env (both case-variants for client coverage) from the personality's
+                # `proxy=` — a creds-holding chaining sidecar, so the upstream provider creds never
+                # enter the untrusted worker env. Merged last so a hostile job.param can't override.
+                **({k: personality.config["proxy"]
+                    for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}
+                   if personality.exit_driver == "httpproxy" and personality.config.get("proxy")
+                   else {}),
             },
         )
 
