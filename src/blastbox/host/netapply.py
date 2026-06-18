@@ -20,6 +20,7 @@ never creates or inspects them.
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 
 from blastbox.host.netpolicy import Personality
@@ -155,7 +156,14 @@ def worker_resolv_conf(personality: Personality) -> str | None:
     """
     if personality.exit_driver not in _RESOLV_DRIVERS:
         return None
-    servers = (personality.config.get("dns") or "").split()
+    # Validate each dns= server is an IP literal (operator config, but a typo would otherwise write a
+    # broken resolv.conf). Skip non-IP tokens; if none survive, leave docker's default untouched.
+    servers = []
+    for tok in (personality.config.get("dns") or "").split():
+        try:
+            servers.append(str(ipaddress.ip_address(tok)))
+        except ValueError:
+            _log.warning("netpolicy %r: ignoring non-IP dns= server %r", personality.name, tok)
     if not servers:
         return None
     body = "".join(f"nameserver {s}\n" for s in servers)

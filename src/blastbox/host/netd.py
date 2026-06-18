@@ -197,9 +197,14 @@ class CaptureDaemon:
         try:
             for rule in leak_guard_rules_v6():
                 if self.nsenter_run_fn(pid, rule) != 0:
-                    v6_present = self.nsenter_run_fn(
-                        pid, ["ip", "-6", "route", "get", _V6_PROBE_ADDR]
-                    ) == 0
+                    # v6 guard couldn't install. Treat v6 as present (→ fail closed) if the netns has
+                    # ANY usable v6: a routable global address (off-bridge leak) OR link-local (the
+                    # all-nodes ff02::1 route exists iff an interface has IPv6 up at all — catches a
+                    # bridge with only link-local v6). Only "no v6 whatsoever" is safe to continue v4.
+                    v6_present = (
+                        self.nsenter_run_fn(pid, ["ip", "-6", "route", "get", _V6_PROBE_ADDR]) == 0
+                        or self.nsenter_run_fn(pid, ["ip", "-6", "route", "get", "ff02::1"]) == 0
+                    )
                     if v6_present:
                         _log.warning("netd: ip6 leak guard failed AND IPv6 egress present for %s; "
                                      "failing closed", container_id[:12])
@@ -366,13 +371,22 @@ class CaptureDaemon:
             dns_port=self.transproxy_dns_port, add=True,
         )
         try:
-            for cmd in gateway_route_commands(self.transproxy_gateway):
-                if self.nsenter_run_fn(wt.pid, cmd) != 0:
-                    _log.warning("netd: transproxy route failed for job %s", wt.job_id)
-                    return
+            # Install the HOST REDIRECT/DROP enforcement FIRST, then the in-netns default route
+            # LAST. The worker's egress barrier releases on the route, so the route must be the final
+            # step — otherwise a worker could observe the route and egress through the host gateway
+            # while the REDIRECT/DROP rules aren't in place yet (a leak window), and a host-rule
+            # failure would leave a live route with no enforcement (fail-OPEN). This mirrors the
+            # socks tier (route onto tun0 is its last step). On any failure, nothing is left wired:
+            # a host-rule failure rolls back the host rules and never installs the route; a route
+            # failure rolls back the host rules (the route `replace` failed, so none is installed).
             for rule in rules:
                 if self.host_run_fn(rule) != 0:
                     _log.warning("netd: transproxy rule failed for job %s; rolling back", wt.job_id)
+                    self._teardown_transproxy(wt.worker_ip)
+                    return
+            for cmd in gateway_route_commands(self.transproxy_gateway):
+                if self.nsenter_run_fn(wt.pid, cmd) != 0:
+                    _log.warning("netd: transproxy route failed for job %s; rolling back", wt.job_id)
                     self._teardown_transproxy(wt.worker_ip)
                     return
         except Exception as exc:  # noqa: BLE001

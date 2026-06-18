@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Mapping
@@ -537,6 +538,33 @@ class Dispatcher:
     # ------------------------------------------------------------------
     # Internal dispatch flow
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _httpproxy_env(personality) -> dict[str, str]:
+        """The HTTP(S)_PROXY env to inject for an httpproxy personality, or {} if the driver isn't
+        httpproxy or the proxy= URL is malformed (fail closed — no env, no egress). Validates scheme
+        + host:port so an operator typo can't silently produce a broken/leaky proxy env."""
+        if personality.exit_driver != "httpproxy":
+            return {}
+        proxy = (personality.config.get("proxy") or "").strip()
+        if not proxy:
+            return {}
+        parsed = urllib.parse.urlparse(proxy)
+        ok = (
+            parsed.scheme in ("http", "https", "socks5", "socks5h")
+            and bool(parsed.hostname)
+            and " " not in proxy and "\n" not in proxy
+        )
+        if not ok:
+            _log.warning("httpproxy proxy= %r is malformed; not injecting proxy env (fail closed)",
+                         proxy[:80])
+            return {}
+        try:  # urlparse only validates the port lazily on access
+            _ = parsed.port
+        except ValueError:
+            _log.warning("httpproxy proxy= %r has a bad port; not injecting proxy env", proxy[:80])
+            return {}
+        return {k: proxy for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}
 
     def _resolve_personality(self, job: Job):
         """Resolve a job's effective network personality (fail-closed to ``none``). Used both to
@@ -1119,10 +1147,10 @@ class Dispatcher:
                 # standard proxy env (both case-variants for client coverage) from the personality's
                 # `proxy=` — a creds-holding chaining sidecar, so the upstream provider creds never
                 # enter the untrusted worker env. Merged last so a hostile job.param can't override.
-                **({k: personality.config["proxy"]
-                    for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}
-                   if personality.exit_driver == "httpproxy" and personality.config.get("proxy")
-                   else {}),
+                # The URL is validated (parity with the socks tier): a malformed proxy= injects no
+                # env → the worker fails closed (internal bridge, no egress) rather than racing some
+                # client's direct-fallback behaviour.
+                **self._httpproxy_env(personality),
             },
         )
 
@@ -1533,11 +1561,14 @@ class Dispatcher:
         host-only capture dir); the worker never had write access to the capture dir."""
         from blastbox.host.decrypt import decrypt_capture
 
-        cap_dir = self._confined_capture_dir(output_dir)  # refuse a worker-planted symlink
-        if cap_dir is None:
-            return envelope
-        pcap = cap_dir / "dump.pcap"
-        keylog = output_dir.parent / "capture" / "sslkeys.log"  # host-only key drop
+        # Decrypt the HOST-ONLY original pcap and write GoGoRoboCap's output into the host-only
+        # capture dir (a sibling of output/, OFF the worker /output mount). The worker never had
+        # write access there, so it can't pre-plant a symlink for ggrc's -o write to follow outside
+        # the job tree. We then confined-COPY each output into output/capture/ with the SAME
+        # symlink/collision/cap guards as the raw pcap (parity with _seal_network_capture).
+        host_cap = output_dir.parent / "capture"
+        pcap = host_cap / "dump.pcap"
+        keylog = host_cap / "sslkeys.log"  # host-only key drop
         if not pcap.is_file() or pcap.is_symlink():
             return envelope
         # The keylog is dropped by netd on the worker's die event, which races this seal. If we have
@@ -1552,7 +1583,7 @@ class Dispatcher:
                 binary=self._gogorobocap_bin,
                 pcap_path=str(pcap),
                 keylog_path=str(keylog),
-                out_dir=str(cap_dir),
+                out_dir=str(host_cap),  # host-only scratch — worker can't plant a symlink here
                 run_fn=lambda argv: self._subprocess_runner(
                     argv, capture_output=True, text=True, check=False, timeout=300
                 ).returncode,
@@ -1562,7 +1593,11 @@ class Dispatcher:
             return envelope
         if result is None:
             return envelope
+        dst_dir = self._confined_capture_dir(output_dir)  # output/capture, refuse a symlinked dir
+        if dst_dir is None:
+            return envelope
         new_artifacts = list(envelope.artifacts)
+        total = sum(a.bytes for a in new_artifacts)
         for art_id, kind, path in (
             ("network.capture.decrypted.pcap", "network_capture_decrypted", result.decrypted_path),
             ("network.capture.mixed.pcap", "network_capture_mixed", result.mixed_path),
@@ -1570,17 +1605,32 @@ class Dispatcher:
             if not path:
                 continue
             try:
-                p = Path(path)
-                if not p.is_file() or p.stat().st_size > self._limits.max_artifact_bytes:
+                src = Path(path)
+                if not src.is_file() or src.is_symlink():
                     continue
+                size = src.stat().st_size
+                if size > self._limits.max_artifact_bytes:
+                    continue
+                rel = f"capture/{src.name}"
+                if any(a.path == rel for a in new_artifacts):  # path already declared by the worker
+                    continue
+                if len(new_artifacts) >= self._limits.max_artifacts:
+                    break
+                if total + size > self._limits.max_total_artifact_bytes:
+                    break
+                dst = dst_dir / src.name
+                if dst.is_symlink():
+                    continue
+                shutil.copy2(src, dst)
                 h = hashlib.sha256()
-                with open(p, "rb") as fh:
+                with open(dst, "rb") as fh:
                     for chunk in iter(lambda: fh.read(1 << 20), b""):
                         h.update(chunk)
                 new_artifacts.append(Artifact(
-                    id=art_id, path=f"capture/{p.name}", kind=kind,
-                    sha256=h.hexdigest(), bytes=p.stat().st_size,
+                    id=art_id, path=rel, kind=kind,
+                    sha256=h.hexdigest(), bytes=dst.stat().st_size,
                 ))
+                total += dst.stat().st_size
             except Exception as exc:  # noqa: BLE001
                 _log.warning("sealing decrypt artifact %s failed: %s", art_id, exc)
         if len(new_artifacts) == len(envelope.artifacts):

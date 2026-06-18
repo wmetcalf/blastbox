@@ -90,6 +90,16 @@ def test_httpproxy_no_resolv_without_dns():
     assert worker_resolv_conf(_p("httpproxy")) is None
 
 
+def test_resolv_skips_non_ip_dns_servers():
+    # A typo'd / non-IP dns= token is dropped (would otherwise write a broken resolv.conf).
+    out = worker_resolv_conf(_p("direct", config={"dns": "1.1.1.1 not-an-ip 8.8.8.8"}))
+    assert out == "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+
+
+def test_resolv_none_when_all_dns_invalid():
+    assert worker_resolv_conf(_p("direct", config={"dns": "bogus"})) is None
+
+
 def test_resolv_tor_is_udp_not_use_vc():
     # tor DNS is REDIRECTed to tor's DNSPort (UDP-only); use-vc would break it.
     out = worker_resolv_conf(_p("tor", config={"dns": "172.30.0.1"}))

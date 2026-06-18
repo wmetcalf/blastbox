@@ -511,6 +511,65 @@ def test_transproxy_wire_routes_and_installs_host_redirects(tmp_path):
     assert d.transproxy_wired["t1"] == "172.30.0.9"
 
 
+def test_transproxy_installs_host_rules_before_route(tmp_path):
+    """Host REDIRECT/DROP enforcement is installed BEFORE the in-netns default route (the barrier
+    signal) — so a worker can't observe the route and egress through the host gateway before the
+    REDIRECT/DROP rules exist."""
+    order: list = []
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: _transproxy_inspect(),
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        transproxy_gateway="172.30.0.1",
+        nsenter_run_fn=lambda pid, argv: order.append("route") or 0,  # the in-netns route
+        host_run_fn=lambda argv: order.append("host") or 0,          # the host REDIRECT/DROP rules
+        sleep_fn=lambda s: None,
+    )
+    d.handle_start("t1")
+    assert order.count("host") == 4 and order.count("route") == 1
+    assert order[-1] == "route" and all(x == "host" for x in order[:-1])  # route is strictly last
+
+
+def test_transproxy_host_rule_failure_leaves_no_route(tmp_path):
+    """If a host enforcement rule fails, the in-netns route must NEVER be installed (fail closed —
+    no live route without the REDIRECT/DROP behind it)."""
+    routes: list = []
+    calls = {"n": 0}
+
+    def host_run(argv):
+        calls["n"] += 1
+        return 0 if calls["n"] <= 2 else 1  # 3rd host rule fails
+
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: _transproxy_inspect(),
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        transproxy_gateway="172.30.0.1",
+        nsenter_run_fn=lambda pid, argv: routes.append(argv) or 0,
+        host_run_fn=host_run,
+        sleep_fn=lambda s: None,
+    )
+    d.handle_start("t1")
+    assert routes == []                       # route never installed
+    assert "t1" not in d.transproxy_wired     # fail closed
+
+
+def test_leakguard_v6_link_local_fails_closed(tmp_path):
+    """If ip6tables can't install AND the netns has link-local v6 (ff02::1 reachable) but no global
+    route, still fail closed — link-local v6 is real v6 the guard couldn't cover."""
+    def nsenter_run(pid, argv):
+        if argv[0] == "ip6tables":
+            return 1                                   # v6 guard fails
+        if argv[:4] == ["ip", "-6", "route", "get"]:
+            return 1 if argv[-1] == "2606:4700:4700::1111" else 0  # no GUA, but ff02::1 reachable
+        return 0
+    d = _leakguard_only_daemon(tmp_path, nsenter_run)
+    d.handle_start("l3")
+    assert "l3" not in d.leakguarded and "l3" in d.leakguard_failed
+
+
 def test_transproxy_die_tears_down_host_redirects(tmp_path):
     runs, host_cmds = [], []
     d = _transproxy_daemon(tmp_path, runs, host_cmds)

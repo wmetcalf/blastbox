@@ -1425,6 +1425,64 @@ def test_netd_wired_personality_refused_under_runsc(tmp_path, monkeypatch):
     assert "host-visible netns" in (final.error or "")
 
 
+def test_httpproxy_env_validates_proxy_url(tmp_path):
+    """The httpproxy proxy= URL is validated before injection — a malformed value injects no proxy
+    env (fail closed), matching the socks tier's validation."""
+    from blastbox.host.netpolicy import Personality
+    d = _make_dispatcher(InMemoryJobStore(), job_root=tmp_path)
+    good = Personality(name="brd", exit_driver="httpproxy",
+                       config={"proxy": "http://172.30.0.30:8888"})
+    assert d._httpproxy_env(good)["HTTP_PROXY"] == "http://172.30.0.30:8888"
+    assert d._httpproxy_env(good)["https_proxy"] == "http://172.30.0.30:8888"
+    for bad in ("not a url", "ftp://x:1", "http://", "http://h:99999x", "http://h:1 ; rm -rf"):
+        p = Personality(name="brd", exit_driver="httpproxy", config={"proxy": bad})
+        assert d._httpproxy_env(p) == {}
+    # non-httpproxy driver → never injects proxy env
+    assert d._httpproxy_env(Personality(name="d", exit_driver="direct", config={})) == {}
+
+
+def test_decrypt_seal_refuses_symlinked_output(tmp_path, monkeypatch):
+    """A worker that plants output/capture/decrypted.pcap as a symlink must NOT get GoGoRoboCap's
+    output written or hashed through it — ggrc writes to a host-only scratch and the copy into
+    output/capture is symlink-checked, so the escape target is never touched and the symlinked
+    artifact is skipped."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRECT", "exit=direct")
+    monkeypatch.setenv("BLASTBOX_NET_CAPTURE", "1")
+    monkeypatch.setenv("BLASTBOX_NET_DECRYPT", "1")
+    monkeypatch.setenv("BLASTBOX_GOGOROBOCAP_BIN", "/bin/fake-ggrc")
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    cap = tmp_path / job.job_id / "capture"
+    escape = tmp_path / "escape-secret"
+    escape.write_bytes(b"DO NOT TOUCH")
+
+    def fake_runner(argv, **kw):
+        if argv[:2] == ["docker", "run"]:
+            cap.mkdir(parents=True, exist_ok=True)
+            (cap / "dump.pcap").write_bytes(b"\xd4\xc3\xb2\xa1" + b"raw-tls" * 40)
+            (cap / "dump.pcap.done").write_text("done")
+            (cap / "sslkeys.log").write_text("SERVER_HANDSHAKE_TRAFFIC_SECRET a b\n")
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+            (output_dir / "capture").mkdir(parents=True, exist_ok=True)
+            (output_dir / "capture" / "decrypted.pcap").symlink_to(escape)  # worker tampering
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:1] == ["/bin/fake-ggrc"]:
+            Path(argv[argv.index("-o") + 1]).write_bytes(b"\xd4\xc3\xb2\xa1" + b"dec" * 40)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
+    assert escape.read_bytes() == b"DO NOT TOUCH"  # the symlink target was never written through
+    sealed = json.loads((output_dir / "metadata.json").read_text())
+    paths = [a["path"] for a in sealed["artifacts"]]
+    assert "capture/decrypted.pcap" not in paths      # symlinked output skipped
+    assert "capture/mixed.pcap" in paths              # the non-symlinked output still sealed
+
+
 def test_routed_personality_without_gateway_fails_fast(tmp_path, monkeypatch):
     """A gateway-routed tier (tor/vpn/inspect) with no gateway= can't give the worker a wait target,
     so egress would race netd. The dispatcher must FAIL FAST with a clear diagnostic."""
