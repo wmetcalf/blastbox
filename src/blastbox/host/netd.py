@@ -54,6 +54,11 @@ _TUN_WAIT_INTERVAL_S = 0.25
 # Name the per-job TLS keylog snapshot takes in the capture dir; the dispatcher's
 # _seal_decrypted_capture reads exactly this (alongside dump.pcap) to run GoGoRoboCap.
 _SSLKEYS_NAME = "sslkeys.log"
+# Probe address used to decide whether the worker netns actually HAS IPv6 egress: `ip -6 route get`
+# returns rc 0 iff a route to it exists. If the ip6tables leak guard fails but there's no v6 route,
+# the host is v4-only and the failure is harmless; if a v6 route DOES exist, the failure is a real
+# leak path → fail closed. (Cloudflare's public v6 resolver — only used as a routing target.)
+_V6_PROBE_ADDR = "2606:4700:4700::1111"
 
 
 def _terminate(proc: Any) -> None:
@@ -118,6 +123,9 @@ class CaptureDaemon:
     # container_id → worker_ip for transproxy workers (so die can tear down the host REDIRECT rules)
     transproxy_wired: dict[str, str] = field(default_factory=dict)
     leakguarded: set[str] = field(default_factory=set)  # container_ids with an in-netns leak guard
+    # container_ids whose REQUIRED leak guard could not be installed → wiring is refused (fail
+    # closed: no egress without the guard, so a sample can't leak non-TCP past a TCP-only tier).
+    leakguard_failed: set[str] = field(default_factory=set)
 
     # ------------------------------------------------------------------ handlers
     def handle_start(self, container_id: str) -> None:
@@ -135,6 +143,12 @@ class CaptureDaemon:
         # and egressing while the non-TCP DROP is not yet in place. The guard only appends OUTPUT
         # rules and does not depend on the route existing, so this ordering is strictly safer.
         self._maybe_leakguard(container_id, inspect)
+        # The leak guard is a precondition for egress: if a REQUIRED guard could not be installed,
+        # refuse to wire the route out — a sample must never get egress without the non-TCP DROP.
+        if container_id in self.leakguard_failed:
+            _log.warning("netd: leak guard required but failed for %s; refusing to wire egress",
+                         container_id[:12])
+            return
         self._maybe_wire(container_id, inspect)
 
     def _maybe_leakguard(self, container_id: str, inspect: Mapping[str, object]) -> None:
@@ -152,29 +166,51 @@ class CaptureDaemon:
         if lg is None:
             return
         pid, allow_udp_dns = lg
+        # The leak guard is a PRECONDITION for wiring: if it can't be installed, handle_start refuses
+        # to wire egress (no egress without the guard). The v4 rules are the hard guarantee — any
+        # failure fails closed.
         try:
             for rule in leak_guard_rules(allow_udp_dns=allow_udp_dns):
                 if self.nsenter_run_fn(pid, rule) != 0:
-                    _log.warning("netd: leak-guard rule failed for %s", container_id[:12])
+                    _log.warning("netd: leak-guard rule failed for %s; failing closed", container_id[:12])
+                    self.leakguard_failed.add(container_id)
                     return
         except Exception as exc:  # noqa: BLE001
             _log.warning("netd: failed to install leak guard for %s: %s", container_id[:12], exc)
+            self.leakguard_failed.add(container_id)
             return
-        # IPv6 twin — fail v6 fully closed. BEST-EFFORT: a v4-only host may lack the ip6tables
-        # module, and that must NOT tear down the (now-applied) v4 guard, which is the hard
-        # guarantee. A v6 failure is logged and we stop the v6 pass, keeping v4 in force.
-        try:
-            for rule in leak_guard_rules_v6():
-                if self.nsenter_run_fn(pid, rule) != 0:
-                    _log.warning("netd: ip6 leak-guard rule failed for %s "
-                                 "(continuing; v4 guard active)", container_id[:12])
-                    break
-        except Exception as exc:  # noqa: BLE001
-            _log.warning("netd: ip6 leak guard error for %s: %s (v4 guard active)",
-                         container_id[:12], exc)
+        # IPv6 twin. A v4-only host may lack the ip6tables module — that failure is harmless (no v6 to
+        # leak). But if the netns actually HAS a v6 egress route, a failed v6 guard IS a real leak path
+        # → fail closed. So on any v6-rule failure, probe for a v6 route and decide.
+        if not self._install_v6_guard(pid, container_id):
+            self.leakguard_failed.add(container_id)
+            return
         self.leakguarded.add(container_id)
         _log.info("netd: leak guard installed (non-TCP DROP v4+v6, udp_dns=%s) for %s",
                   allow_udp_dns, container_id[:12])
+
+    def _install_v6_guard(self, pid: int, container_id: str) -> bool:
+        """Install the ip6tables leak guard. Returns True if v6 is safely covered (rules applied, OR
+        the netns has no v6 egress so the absence of ip6tables is harmless), False if a v6 leak path
+        exists that we could not close (→ caller fails closed)."""
+        assert self.nsenter_run_fn is not None
+        try:
+            for rule in leak_guard_rules_v6():
+                if self.nsenter_run_fn(pid, rule) != 0:
+                    v6_present = self.nsenter_run_fn(
+                        pid, ["ip", "-6", "route", "get", _V6_PROBE_ADDR]
+                    ) == 0
+                    if v6_present:
+                        _log.warning("netd: ip6 leak guard failed AND IPv6 egress present for %s; "
+                                     "failing closed", container_id[:12])
+                        return False
+                    _log.warning("netd: ip6 leak-guard rule failed for %s but no IPv6 egress; "
+                                 "continuing v4-only", container_id[:12])
+                    return True
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("netd: ip6 leak guard error for %s: %s; failing closed", container_id[:12], exc)
+            return False
+        return True
 
     def _maybe_capture(self, container_id: str, inspect: Mapping[str, object]) -> None:
         if container_id in self.active:
@@ -381,6 +417,7 @@ class CaptureDaemon:
             self._teardown_transproxy(tp_ip)
         # leak-guard rules live in the worker netns → die with the container; just forget the id.
         self.leakguarded.discard(container_id)
+        self.leakguard_failed.discard(container_id)
         wproc = self.wired.pop(container_id, None)
         if wproc is not None:
             try:
@@ -430,10 +467,21 @@ class CaptureDaemon:
         if self.list_running_fn is None:
             return
         try:
-            running = self.list_running_fn()
+            running = set(self.list_running_fn())
         except Exception as exc:  # noqa: BLE001 — reconcile is best-effort, never crash the daemon
             _log.warning("netd: reconcile listing failed: %s", exc)
             return
+        # Tear down workers we still track that are no longer running: if a worker DIED during the
+        # events-stream gap, netd never saw its `die` event, so its capture proc, tun2socks, and —
+        # critically — its HOST-side transproxy REDIRECT/DROP rules would survive. On bridge-IP reuse
+        # those stale host rules would mis-route/capture an unrelated container. handle_die is
+        # idempotent, so replaying it for a vanished id cleanly releases everything.
+        tracked = (set(self.active) | set(self.wired) | set(self.transproxy_wired)
+                   | set(self.leakguarded) | set(self.inspect_wired))
+        for cid in tracked - running:
+            _log.info("netd: reconcile tearing down vanished worker %s", cid[:12])
+            self.handle_die(cid)
+        # Pick up workers that started during the gap (or before netd) — handle_start is idempotent.
         for cid in running:
             self.handle_start(cid)
 

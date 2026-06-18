@@ -116,6 +116,7 @@ def _make_dispatcher(
     job_retention_seconds: int = 0,
     tier: str = "cold",
     max_queued_age_s: float = 0.0,
+    pool=None,
 ) -> Dispatcher:
     if engines is None:
         engines = {_ENGINE_NAME: _engine_spec()}
@@ -130,6 +131,7 @@ def _make_dispatcher(
         subprocess_runner=subprocess_runner or (lambda *a, **kw: subprocess.CompletedProcess(a[0], 0, "", "")),
         worker_timeout_s=worker_timeout_s,
         job_retention_seconds=job_retention_seconds,
+        pool=pool,
         tier=tier,
         max_queued_age_s=max_queued_age_s,
     )
@@ -1264,6 +1266,163 @@ def test_network_capture_seal_proceeds_when_done_sentinel_never_lands(tmp_path, 
     caps = [a for a in sealed["artifacts"] if a["kind"] == "network_capture"]
     assert len(caps) == 1  # sealed anyway after the bounded wait
     assert caps[0]["sha256"] == hashlib.sha256(pcap_bytes).hexdigest()
+
+
+class _FakeArt:
+    def __init__(self, path, nbytes=0):
+        self.path = path
+        self.bytes = nbytes
+
+
+class _FakeEnv:
+    def __init__(self, artifacts):
+        self.artifacts = artifacts
+
+    def model_copy(self, update):
+        self.artifacts = update["artifacts"]
+        return self
+
+
+def _capture_src(tmp_path, job_id="J"):
+    cap = tmp_path / job_id / "capture"
+    cap.mkdir(parents=True, exist_ok=True)
+    (cap / "dump.pcap").write_bytes(b"\xd4\xc3\xb2\xa1pcap-bytes")
+    (cap / "dump.pcap.done").write_text("done")
+    out = tmp_path / job_id / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def test_seal_capture_refuses_path_collision(tmp_path):
+    """If the worker already declared an artifact at capture/dump.pcap, the host must NOT overwrite
+    it (served bytes would mismatch that artifact's sealed sha) — leave the envelope unchanged."""
+    d = _make_dispatcher(InMemoryJobStore(), job_root=tmp_path)
+    out = _capture_src(tmp_path)
+    env = _FakeEnv([_FakeArt("capture/dump.pcap", 10)])
+    result = d._seal_network_capture(env, out)
+    assert len(result.artifacts) == 1  # capture not sealed over the worker's artifact
+
+
+def test_seal_capture_respects_artifact_count_cap(tmp_path):
+    """The host capture artifact is appended after worker-output cap enforcement, so it must honor
+    the same max_artifacts ceiling rather than silently exceed it."""
+    d = _make_dispatcher(InMemoryJobStore(), job_root=tmp_path)
+    d._limits = Limits(max_artifacts=1)
+    out = _capture_src(tmp_path)
+    env = _FakeEnv([_FakeArt("other", 10)])  # already at the cap of 1
+    result = d._seal_network_capture(env, out)
+    assert len(result.artifacts) == 1  # capture not appended past the cap
+
+
+def test_capture_refuses_symlinked_capture_dir(tmp_path, monkeypatch):
+    """A worker that plants output/capture as a SYMLINK must not be able to redirect the host pcap
+    write outside the job tree — the seal refuses a symlinked capture dir and writes nothing."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRECT", "exit=direct")
+    monkeypatch.setenv("BLASTBOX_NET_CAPTURE", "1")
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    escape = tmp_path / "escape"
+    escape.mkdir()
+
+    def fake_runner(argv, **kw):
+        if argv[:2] == ["docker", "run"]:
+            cap = tmp_path / job.job_id / "capture"
+            cap.mkdir(parents=True, exist_ok=True)
+            (cap / "dump.pcap").write_bytes(b"\xd4\xc3\xb2\xa1pcap")
+            (cap / "dump.pcap.done").write_text("done")
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+            (output_dir / "capture").symlink_to(escape)  # worker tampering
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
+    sealed = json.loads((output_dir / "metadata.json").read_text())
+    assert not [a for a in sealed["artifacts"] if a["kind"] == "network_capture"]  # refused
+    assert not (escape / "dump.pcap").exists()  # nothing written through the symlink
+
+
+class _FakePool:
+    """Minimal warm pool stand-in that records claim() calls and never hands out a slot (so a job
+    that DOES try the warm path cold-falls-back)."""
+    def __init__(self):
+        self.claim_calls = 0
+        self.idle_count = 1
+        self.runtime = RuntimeSelection(runtime="runc", secure=False, warnings=[])
+
+    def claim(self, timeout_s=None):
+        self.claim_calls += 1
+        return None
+
+    def release(self, slot):  # pragma: no cover - never reached (claim returns None)
+        pass
+
+
+def test_warm_egress_job_bypasses_warm_slot(tmp_path, monkeypatch):
+    """An egress personality needs the COLD path (netd wiring + network args/labels), which the warm
+    tier can't apply — so the dispatcher must NOT claim a warm slot for it (else it would silently
+    run with no egress). A no-egress job still tries the warm slot."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRECT", "exit=direct")
+    store = InMemoryJobStore()
+    output_dirs = {}
+
+    def fake_runner(argv, **kw):
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dirs["cur"], input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    # egress job (exit=direct) → must bypass the warm slot and run cold to DONE
+    egress_pool = _FakePool()
+    egress_job = _make_job()
+    egress_job.input_sha256 = _INPUT_SHA
+    egress_job.net_policy = "direct"
+    store.create(egress_job)
+    _setup_job_dirs(tmp_path, egress_job)
+    output_dirs["cur"] = tmp_path / egress_job.job_id / "output"
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"])
+    monkeypatch.setenv("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "1")
+    d = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
+                         subprocess_runner=fake_runner, pool=egress_pool)
+    assert d.dispatch_once() is True
+    assert egress_pool.claim_calls == 0                      # warm slot bypassed
+    assert store.get(egress_job.job_id).status == JobStatus.DONE
+
+    # no-egress job (default none) → DOES try the warm slot (claim called, then cold-falls-back)
+    none_pool = _FakePool()
+    none_job = _make_job()
+    none_job.input_sha256 = _INPUT_SHA
+    store.create(none_job)
+    _setup_job_dirs(tmp_path, none_job)
+    output_dirs["cur"] = tmp_path / none_job.job_id / "output"
+    d2 = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
+                          subprocess_runner=fake_runner, pool=none_pool)
+    assert d2.dispatch_once() is True
+    assert none_pool.claim_calls == 1                        # warm slot attempted
+
+
+def test_netd_wired_personality_refused_under_runsc(tmp_path, monkeypatch):
+    """tor/socks/vpn/inspect need netd to nsenter the worker netns, which a runsc (gVisor) worker
+    doesn't expose. Under the default secure runtime such a job must FAIL FAST with a clear
+    diagnostic, not silently wait-then-fail-closed."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_SX", "exit=socks,proxy=socks5://172.30.0.40:9050")
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="sx")
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
+        runtime_selector=lambda: RuntimeSelection(runtime="runsc", secure=True, warnings=[]),
+    )
+    assert dispatcher.dispatch_once() is True
+    final = store.get(job.job_id)
+    assert final.status == JobStatus.FAILED
+    assert "host-visible netns" in (final.error or "")
 
 
 def test_decrypt_seals_decrypted_and_mixed_when_keylog_present(tmp_path, monkeypatch):

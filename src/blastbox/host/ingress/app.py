@@ -552,12 +552,18 @@ def build_app(
         # so ingress only needs the gate here.
         np_raw = (net_policy or "").strip()
         if np_raw:
-            if os.environ.get("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "").strip().lower() in (
+            if os.environ.get("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "").strip().lower() not in (
                 "1", "true", "yes", "on",
             ):
-                job.net_policy = np_raw.lower()
-            else:
                 _log.info("net_policy_ignored_override_disabled", requested=np_raw[:64])
+            elif len(np_raw) > 64 or not re.fullmatch(r"[A-Za-z0-9_-]+", np_raw):
+                # A personality name is a short token (the BLASTBOX_NETPOLICY_<NAME> suffix). Bound
+                # length + charset before persisting — net_policy is stored on the job and echoed in
+                # list/status responses, so an unbounded form value must not be accepted (it would
+                # fail closed as an unknown name at dispatch anyway, but never get stored/echoed).
+                _log.info("net_policy_rejected_invalid_name", requested=np_raw[:64])
+            else:
+                job.net_policy = np_raw.lower()
 
         root, input_dir, output_dir = _job_dirs(job.job_id)
 

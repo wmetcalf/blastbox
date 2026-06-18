@@ -508,33 +508,91 @@ def test_leakguard_installs_in_netns_output_drop(tmp_path):
     assert (4321, ["ip6tables", "-A", "OUTPUT", "-j", "DROP"]) in runs
 
 
-def test_leakguard_v6_failure_does_not_tear_down_v4_guard(tmp_path):
-    """A v4-only host may lack the ip6tables module: a failing ip6tables rule must NOT abort the
-    (already-applied) v4 guard, which is the hard guarantee. The worker stays leakguarded."""
-    runs: list = []
-
-    def nsenter_run(pid, argv):
-        runs.append(argv)
-        return 1 if argv[0] == "ip6tables" else 0  # all v6 rules fail; v4 succeed
-
-    d = CaptureDaemon(
+def _leakguard_only_daemon(tmp_path, nsenter_run, job_id="L3"):
+    return CaptureDaemon(
         job_root=str(tmp_path),
         inspect_fn=lambda cid: {
-            "Config": {"Labels": {"blastbox.net.leakguard": "strict", "blastbox.job_id": "L3"}},
+            "Config": {"Labels": {"blastbox.net.leakguard": "strict", "blastbox.job_id": job_id}},
             "State": {"Pid": 7, "Running": True},
         },
         network_iface_fn=lambda: {},
         spawn_fn=lambda *a, **k: None,
         nsenter_run_fn=nsenter_run,
     )
+
+
+def test_leakguard_v6_fail_without_v6_route_stays_guarded(tmp_path):
+    """On a v4-only host (no ip6tables module / no v6 route), a failing ip6tables rule is harmless:
+    there's no IPv6 to leak, so the v4 guard (the hard guarantee) stays in force and the worker is
+    still leakguarded."""
+    def nsenter_run(pid, argv):
+        if argv[0] == "ip6tables":
+            return 1                       # v6 guard can't install
+        if argv[:3] == ["ip", "-6", "route"]:
+            return 1                       # ...and there is NO v6 route → nothing to leak
+        return 0                           # v4 rules succeed
+    d = _leakguard_only_daemon(tmp_path, nsenter_run)
     d.handle_start("l3")
-    # v4 DROP applied, v6 attempted then bailed — but the worker is still guarded (v4 in force).
-    assert ["iptables", "-A", "OUTPUT", "!", "-p", "tcp", "-j", "DROP"] in runs
-    assert any(a[0] == "ip6tables" for a in runs)
-    assert "l3" in d.leakguarded
+    assert "l3" in d.leakguarded and "l3" not in d.leakguard_failed
 
 
-def test_leakguard_installed_before_egress_is_wired(tmp_path):
+def test_leakguard_v6_fail_with_v6_route_fails_closed(tmp_path):
+    """If ip6tables fails AND the netns actually has IPv6 egress, that's a real leak path the guard
+    is meant to close → fail closed: the worker is NOT marked guarded (and handle_start will refuse
+    to wire it)."""
+    def nsenter_run(pid, argv):
+        if argv[0] == "ip6tables":
+            return 1                       # v6 guard fails
+        if argv[:3] == ["ip", "-6", "route"]:
+            return 0                       # ...but a v6 route EXISTS → real leak path
+        return 0
+    d = _leakguard_only_daemon(tmp_path, nsenter_run)
+    d.handle_start("l3")
+    assert "l3" not in d.leakguarded and "l3" in d.leakguard_failed
+
+
+def test_leakguard_failure_refuses_egress_wiring(tmp_path):
+    """The leak guard is a PRECONDITION for egress: if a required guard can't be installed, the
+    worker must NOT be wired (no egress without the non-TCP DROP). tun2socks is never spawned."""
+    insp = _wire_inspect(pid=4242)
+    insp["Config"]["Labels"]["blastbox.net.leakguard"] = "strict"
+    spawned: list = []
+
+    def nsenter_run(pid, argv):
+        if argv[0] == "iptables":
+            return 1   # the v4 leak-guard rule fails → fail closed
+        return 0
+
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: insp,
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        socks_proxy_url="socks5://bb:bb@172.30.0.10:1080",
+        nsenter_spawn_fn=lambda pid, argv: spawned.append(_FakeProc(argv)) or spawned[-1],
+        nsenter_run_fn=nsenter_run,
+        sleep_fn=lambda s: None,
+    )
+    d.handle_start("c1")
+    assert "c1" in d.leakguard_failed
+    assert "c1" not in d.wired       # egress refused
+    assert spawned == []             # tun2socks never spawned
+
+
+def test_reconcile_tears_down_vanished_worker(tmp_path):
+    """A worker that died during an events-stream gap is absent from the running set on reconnect;
+    reconcile must handle_die it so its capture proc + host rules don't survive (bridge-IP reuse
+    would otherwise mis-capture an unrelated container)."""
+    spawned: list = []
+    d = _make_daemon(tmp_path, {"c1": _labeled_inspect(job_id="J1")}, spawned)
+    d.handle_start("c1")
+    assert "c1" in d.active
+    proc = spawned[0][2]
+    # c1 is no longer running (died during the gap) — reconcile sees an empty running set.
+    d.list_running_fn = lambda: []
+    d._reconcile()
+    assert proc.terminated is True   # its capture was torn down
+    assert "c1" not in d.active
     """The non-TCP DROP must be in place BEFORE the route out — otherwise the worker's egress
     barrier could release (it watches the route) while the guard is not yet up. Assert ordering:
     every leakguard rule precedes the first wiring command in the call sequence."""

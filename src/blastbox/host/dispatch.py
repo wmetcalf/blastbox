@@ -538,6 +538,18 @@ class Dispatcher:
     # Internal dispatch flow
     # ------------------------------------------------------------------
 
+    def _resolve_personality(self, job: Job):
+        """Resolve a job's effective network personality (fail-closed to ``none``). Used both to
+        decide warm-vs-cold routing here and inside the cold path; same inputs → same result."""
+        from blastbox.host.netpolicy import resolve_net_policy
+        engine = self._engines.get(job.engine)
+        return resolve_net_policy(
+            job_net_policy=job.net_policy,
+            engine_default=engine.net_policy if engine else "none",
+            registry=self._net_policies,
+            allow_override=self._allow_net_override,
+        )
+
     def _dispatch_claimed_job(self, job: Job) -> None:
         """Execute one claimed job (status is already RUNNING on entry).
 
@@ -554,10 +566,20 @@ class Dispatcher:
         output_dir = root / "output"
         input_path = input_dir / Path(job.filename).name
 
-        # Try the warm path if a pool is configured
+        # Try the warm path if a pool is configured. EXCEPTION: an egress personality needs the cold
+        # path's netd netns-wiring + dispatcher network args/labels, which the warm tier can't apply
+        # (warm-tier networking is a future phase) — so an egress job on a warm slot would silently
+        # fail closed. Don't claim a warm slot for it: a warm-only sidecar then requeues it for a
+        # cold dispatcher (existing branch below); a warm+cold dispatcher cold-falls-through. Either
+        # way the job runs WITH egress instead of failing.
         if self._pool is not None:
-            slot = self._pool.claim(timeout_s=self._warm_claim_timeout_s)
-            record_warm_claim(hit=slot is not None)
+            egress = self._resolve_personality(job).exit_driver not in ("none", "drop")
+            if egress:
+                _log.info("net_policy egress job_id=%s → bypassing warm slot (cold wires egress)",
+                          job.job_id)
+            slot = None if egress else self._pool.claim(timeout_s=self._warm_claim_timeout_s)
+            if not egress:
+                record_warm_claim(hit=slot is not None)
             if slot is not None:
                 # WARM PATH — the slot, not input_path/output_dir, owns I/O dirs.
                 # Staged input is deleted in the finally block (only if we still own the claim;
@@ -952,6 +974,26 @@ class Dispatcher:
             "net_policy_resolved job=%s personality=%s driver=%s",
             job.job_id, personality.name, personality.exit_driver,
         )
+        # netd wires these tiers by entering the worker's network namespace (nsenter by host pid),
+        # which only a runc worker exposes — a runsc (gVisor) worker's network lives in the Sentry's
+        # userspace netstack, not a host-visible netns, so wiring is impossible and the worker would
+        # just wait for a route that never comes and fail closed. Refuse early with a clear, fixable
+        # diagnostic instead. (direct/inetsim ride a plain bridge and httpproxy is env-based — those
+        # need no netns wiring and run under runsc fine; only the route/tunnel tiers are gated.)
+        needs_netns_wiring = (
+            personality.exit_driver in ("tor", "socks", "openvpn", "wireguard")
+            or inspect_routes_via_gateway(personality)
+        )
+        if needs_netns_wiring and runtime.runtime != "runc":
+            self._fail_job(
+                job,
+                f"netpolicy {personality.name!r} (exit={personality.exit_driver}) needs netd to wire "
+                f"the worker's network namespace, which the {runtime.runtime!r} runtime does not "
+                f"expose (host-visible netns is runc-only today). Run this tier under runc "
+                f"(BLASTBOX_ALLOW_RUNC=1 + BLASTBOX_WORKER_RUNTIME=runc), or use a non-wired exit "
+                f"(direct / inetsim / httpproxy).",
+            )
+            return
         network_args = docker_network_args(personality)
 
         # Optional resolv.conf injection for an egress personality (per-personality ``dns=``).
@@ -1374,6 +1416,28 @@ class Dispatcher:
                     f"total output {total} bytes exceeds cap {cap} (undeclared files counted)"
                 )
 
+    def _confined_capture_dir(self, output_dir: Path) -> Path | None:
+        """``output_dir/capture`` as a real directory confined under ``output_dir`` (created if
+        absent), or ``None`` if the untrusted worker planted a SYMLINK there. The capture/decrypt
+        artifacts are written HOST-side after worker-output validation, so a worker-planted symlink
+        at ``output/capture`` would otherwise let the host pcap copy / GoGoRoboCap output follow it
+        OUTSIDE the job tree (a containment escape). The worker has already exited by seal time, so
+        the symlink is static — a check-then-write here has no live TOCTOU."""
+        cap = output_dir / "capture"
+        try:
+            if cap.is_symlink():
+                _log.warning("refusing capture seal: %s is a symlink (worker tampering)", cap)
+                return None
+            cap.mkdir(parents=True, exist_ok=True)
+            real_out, real_cap = os.path.realpath(output_dir), os.path.realpath(cap)
+            if os.path.commonpath([real_out, real_cap]) != real_out:
+                _log.warning("refusing capture seal: %s escapes %s", cap, output_dir)
+                return None
+        except (OSError, ValueError) as exc:
+            _log.warning("capture dir guard failed for %s: %s", output_dir, exc)
+            return None
+        return cap
+
     def _seal_network_capture(self, envelope, output_dir: Path):
         """Fold blastbox-netd's per-job pcap into the sealed envelope as a TRUSTED host artifact.
 
@@ -1403,9 +1467,29 @@ class Dispatcher:
                     output_dir, size, self._limits.max_artifact_bytes,
                 )
                 return envelope
-            dst_dir = output_dir / "capture"
-            dst_dir.mkdir(parents=True, exist_ok=True)
+            # Don't overwrite a path the worker already declared as its own artifact — the served
+            # bytes would then mismatch that artifact's sealed sha. Leave the worker's artifact be.
+            if any(a.path == "capture/dump.pcap" for a in envelope.artifacts):
+                _log.warning("capture/dump.pcap already declared by the worker; not sealing netd "
+                             "capture for %s", output_dir)
+                return envelope
+            # This host artifact is appended AFTER worker-output validation/cap enforcement, so honor
+            # the same ceilings here rather than silently exceeding them in the final metadata.
+            if len(envelope.artifacts) >= self._limits.max_artifacts:
+                _log.warning("artifact count cap reached; not sealing netd capture for %s", output_dir)
+                return envelope
+            if (sum(a.bytes for a in envelope.artifacts) + size) > \
+                    self._limits.max_total_artifact_bytes:
+                _log.warning("total artifact-bytes cap reached; not sealing netd capture for %s",
+                             output_dir)
+                return envelope
+            dst_dir = self._confined_capture_dir(output_dir)
+            if dst_dir is None:
+                return envelope
             dst = dst_dir / "dump.pcap"
+            if dst.is_symlink():
+                _log.warning("refusing capture seal: %s is a symlink (worker tampering)", dst)
+                return envelope
             shutil.copy2(src, dst)
             h = hashlib.sha256()
             with open(dst, "rb") as fh:
@@ -1432,10 +1516,12 @@ class Dispatcher:
         host-only capture dir); the worker never had write access to the capture dir."""
         from blastbox.host.decrypt import decrypt_capture
 
-        cap_dir = output_dir / "capture"           # the sealed (host-owned) capture dir
+        cap_dir = self._confined_capture_dir(output_dir)  # refuse a worker-planted symlink
+        if cap_dir is None:
+            return envelope
         pcap = cap_dir / "dump.pcap"
         keylog = output_dir.parent / "capture" / "sslkeys.log"  # host-only key drop
-        if not pcap.is_file():
+        if not pcap.is_file() or pcap.is_symlink():
             return envelope
         # The keylog is dropped by netd on the worker's die event, which races this seal. If we have
         # a capture but the keylog hasn't landed yet, wait briefly for it rather than skip decrypt.
