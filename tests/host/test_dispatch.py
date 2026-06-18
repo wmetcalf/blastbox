@@ -1376,6 +1376,8 @@ def test_socks_personality_labels_worker_for_wiring_and_uses_bb_socks(tmp_path, 
     assert any("dst=/etc/resolv.conf" in t for t in argv)
     # The socks worker waits for the tun2socks TUN before detonating (egress barrier).
     assert any(t == "BLASTBOX_NET_WAIT_TUN=tun0" for t in argv)
+    # TCP-only tier → non-TCP leak guard (strict: no UDP needed, DNS is TCP-over-vc).
+    assert "blastbox.net.leakguard=strict" in argv
 
 
 def test_httpproxy_personality_injects_proxy_env_on_bb_socks(tmp_path, monkeypatch):
@@ -1406,6 +1408,7 @@ def test_httpproxy_personality_injects_proxy_env_on_bb_socks(tmp_path, monkeypat
     assert any(t == "http_proxy=http://172.30.0.30:8888" for t in argv)
     assert not any(t.startswith("blastbox.net.wire=") for t in argv)   # no netd wiring
     assert not any("dst=/etc/resolv.conf" in t for t in argv)          # no resolv injection
+    assert "blastbox.net.leakguard=strict" in argv                     # TCP-only → non-TCP dropped
 
 
 def test_transproxy_personality_labels_worker_and_waits_for_gateway(tmp_path, monkeypatch):
@@ -1437,6 +1440,8 @@ def test_transproxy_personality_labels_worker_and_waits_for_gateway(tmp_path, mo
     assert "blastbox.net.wire=transproxy" in argv
     assert any(t == "BLASTBOX_NET_WAIT_GATEWAY=172.30.0.1" for t in argv)
     assert not any(t.startswith("BLASTBOX_NET_WAIT_TUN=tun0") for t in argv)
+    # tor carries TCP + its own DNSPort (UDP:53) → leak guard in "dns" mode.
+    assert "blastbox.net.leakguard=dns" in argv
 
 
 def test_inspect_personality_labels_worker_for_inspect_wiring_and_uses_bb_inspect(

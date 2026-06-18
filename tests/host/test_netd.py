@@ -427,6 +427,44 @@ def test_transproxy_die_tears_down_host_redirects(tmp_path):
     assert "t1" not in d.transproxy_wired
 
 
+def test_leakguard_installs_in_netns_output_drop(tmp_path):
+    runs: list = []
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: {
+            "Config": {"Labels": {"blastbox.net.leakguard": "strict", "blastbox.job_id": "L1"}},
+            "State": {"Pid": 4321, "Running": True},
+        },
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        nsenter_run_fn=lambda pid, argv: runs.append((pid, argv)) or 0,
+    )
+    d.handle_start("l1")
+    assert "l1" in d.leakguarded
+    # all rules run in the worker netns (pid 4321), ending in a non-TCP DROP
+    assert all(pid == 4321 for pid, _ in runs)
+    assert (4321, ["iptables", "-A", "OUTPUT", "!", "-p", "tcp", "-j", "DROP"]) in runs
+    assert not any("--dport" in argv and "53" in argv for _, argv in runs)  # strict = no udp:53
+
+
+def test_leakguard_dns_mode_allows_udp53(tmp_path):
+    runs: list = []
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: {
+            "Config": {"Labels": {"blastbox.net.leakguard": "dns", "blastbox.job_id": "L2"}},
+            "State": {"Pid": 99, "Running": True},
+        },
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        nsenter_run_fn=lambda pid, argv: runs.append((pid, argv)) or 0,
+    )
+    d.handle_start("l2")
+    assert (99, ["iptables", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", "ACCEPT"]) in runs
+    d.handle_die("l2")
+    assert "l2" not in d.leakguarded  # forgotten on die (rules die with the netns)
+
+
 def test_transproxy_inert_without_gateway_or_host_seam(tmp_path):
     runs, host_cmds = [], []
     d = CaptureDaemon(

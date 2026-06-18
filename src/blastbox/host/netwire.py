@@ -204,3 +204,50 @@ def transproxy_redirect_rules(
          "-s", ip, "-p", "tcp", "--syn", "-j", "REDIRECT", "--to-ports", tp],
         ["iptables", "-t", "filter", filt_op, "FORWARD", "-s", ip, "-j", "DROP"],
     ]
+
+
+# A worker carries this label so netd installs an in-netns non-TCP leak guard. Value is the mode:
+#   strict → drop ALL non-TCP egress (the SOCKS/httpproxy tiers carry only TCP).
+#   dns    → also ACCEPT UDP:53 (the tor tier needs it to reach the host DNSPort REDIRECT).
+LEAKGUARD_LABEL = "blastbox.net.leakguard"
+_LEAKGUARD_MODES = frozenset({"strict", "dns"})
+
+
+def leakguard_from_inspect(inspect: Mapping[str, object]) -> tuple[int, bool] | None:
+    """``(pid, allow_udp_dns)`` if the container is labeled ``blastbox.net.leakguard=strict|dns`` and
+    exposes a host-visible ``State.Pid`` (runc/FC), else ``None``. ``allow_udp_dns`` is True for the
+    ``dns`` mode (tor tier)."""
+    config = inspect.get("Config") or {}
+    labels = config.get("Labels") if isinstance(config, Mapping) else None
+    if not isinstance(labels, Mapping):
+        return None
+    mode = str(labels.get(LEAKGUARD_LABEL, "")).strip().lower()
+    if mode not in _LEAKGUARD_MODES:
+        return None
+    state = inspect.get("State") or {}
+    pid = state.get("Pid") if isinstance(state, Mapping) else None
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    return (pid, mode == "dns")
+
+
+def leak_guard_rules(*, allow_udp_dns: bool) -> list[list[str]]:
+    """The WORKER-netns ``OUTPUT`` firewall that makes a TCP-only proxy tier leak-proof: ACCEPT
+    loopback + TCP (+ UDP:53 for the tor tier), LOG (rate-limited) then DROP everything else —
+    so a sample's UDP/ICMP/raw can NEVER leave the worker netns, independent of the internal-bridge
+    / tun2socks containment. The LOG (``blastbox-leak-drop`` prefix → kernel log) is the audit trail
+    of attempted non-TCP egress. Run via ``nsenter`` into the worker netns; OUTPUT is empty there
+    (the worker has no CAP_NET_ADMIN), so appended rules apply in order."""
+    rules = [
+        ["iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"],
+        ["iptables", "-A", "OUTPUT", "-p", "tcp", "-j", "ACCEPT"],
+    ]
+    if allow_udp_dns:
+        rules.append(["iptables", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
+    rules += [
+        ["iptables", "-A", "OUTPUT", "!", "-p", "tcp",
+         "-m", "limit", "--limit", "10/min",
+         "-j", "LOG", "--log-prefix", "blastbox-leak-drop ", "--log-level", "4"],
+        ["iptables", "-A", "OUTPUT", "!", "-p", "tcp", "-j", "DROP"],
+    ]
+    return rules

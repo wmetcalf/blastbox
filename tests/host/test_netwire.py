@@ -13,6 +13,8 @@ from blastbox.host.netwire import (
     TUN_DEV,
     WireTarget,
     gateway_route_commands,
+    leak_guard_rules,
+    leakguard_from_inspect,
     socks_proxy_url,
     socks_resolv_conf,
     transproxy_redirect_rules,
@@ -169,6 +171,41 @@ def test_transproxy_rules_teardown_is_symmetric_delete():
 def test_transproxy_rules_reject_bad_ip(bad):
     with pytest.raises(ValueError):
         transproxy_redirect_rules(bad, trans_port=9040, dns_port=5353)
+
+
+# --------------------------------------------------------------------------- non-TCP leak guard
+def _lg(mode="strict", pid=77):
+    return {
+        "Config": {"Labels": {"blastbox.net.leakguard": mode, "blastbox.job_id": "J"}},
+        "State": {"Pid": pid, "Running": True},
+    }
+
+
+def test_leakguard_from_inspect_strict_and_dns():
+    assert leakguard_from_inspect(_lg("strict", 5)) == (5, False)
+    assert leakguard_from_inspect(_lg("dns", 9)) == (9, True)
+
+
+def test_leakguard_from_inspect_none_without_label_or_pid():
+    assert leakguard_from_inspect({"Config": {"Labels": {}}, "State": {"Pid": 5}}) is None
+    assert leakguard_from_inspect(_lg("bogus")) is None
+    assert leakguard_from_inspect(_lg("strict", 0)) is None  # gVisor: no host pid
+
+
+def test_leak_guard_rules_strict_drops_all_non_tcp():
+    rules = leak_guard_rules(allow_udp_dns=False)
+    # ACCEPT lo, ACCEPT tcp, LOG non-tcp, DROP non-tcp — no udp:53 accept
+    assert ["iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"] == rules[0]
+    assert ["iptables", "-A", "OUTPUT", "-p", "tcp", "-j", "ACCEPT"] == rules[1]
+    assert not any("--dport" in r and "53" in r for r in rules)
+    assert rules[-1] == ["iptables", "-A", "OUTPUT", "!", "-p", "tcp", "-j", "DROP"]
+    assert any("LOG" in r and "blastbox-leak-drop " in r for r in rules)
+
+
+def test_leak_guard_rules_dns_mode_allows_udp_53():
+    rules = leak_guard_rules(allow_udp_dns=True)
+    assert ["iptables", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", "ACCEPT"] in rules
+    assert rules[-1] == ["iptables", "-A", "OUTPUT", "!", "-p", "tcp", "-j", "DROP"]
 
 
 def test_transproxy_rules_reject_bad_port():

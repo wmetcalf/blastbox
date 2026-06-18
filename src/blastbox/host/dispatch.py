@@ -982,6 +982,15 @@ class Dispatcher:
         elif personality.exit_driver in ("openvpn", "wireguard"):
             worker_labels["blastbox.net.wire"] = "vpn"
 
+        # Non-TCP leak guard for the TCP-only proxy tiers (tor/socks/httpproxy): netd installs an
+        # in-netns OUTPUT firewall that DROPs all non-TCP egress (UDP/ICMP/raw) — these tiers carry
+        # only TCP, so a sample must not be able to leak non-TCP past the worker. The VPN tier is the
+        # all-IP path and gets NO guard. tor needs UDP:53 out (the host DNSPort REDIRECT) → "dns".
+        if personality.exit_driver == "tor":
+            worker_labels["blastbox.net.leakguard"] = "dns"
+        elif personality.exit_driver in ("socks", "httpproxy"):
+            worker_labels["blastbox.net.leakguard"] = "strict"
+
         container_name = f"blastbox-worker-{job.job_id[:12]}"
         argv = build_worker_docker_run_argv(
             image=engine.image,          # NEVER job.engine / job.filename / job.params

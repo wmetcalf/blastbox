@@ -33,6 +33,8 @@ from blastbox.host.capture import (
 from blastbox.host.netwire import (
     TUN_DEV,
     gateway_route_commands,
+    leak_guard_rules,
+    leakguard_from_inspect,
     transproxy_redirect_rules,
     tun2socks_argv,
     tun_setup_commands,
@@ -97,6 +99,7 @@ class CaptureDaemon:
     inspect_wired: set[str] = field(default_factory=set)  # container_ids wired in inspect mode
     # container_id → worker_ip for transproxy workers (so die can tear down the host REDIRECT rules)
     transproxy_wired: dict[str, str] = field(default_factory=dict)
+    leakguarded: set[str] = field(default_factory=set)  # container_ids with an in-netns leak guard
 
     # ------------------------------------------------------------------ handlers
     def handle_start(self, container_id: str) -> None:
@@ -109,6 +112,34 @@ class CaptureDaemon:
             return
         self._maybe_capture(container_id, inspect)
         self._maybe_wire(container_id, inspect)
+        self._maybe_leakguard(container_id, inspect)
+
+    def _maybe_leakguard(self, container_id: str, inspect: Mapping[str, object]) -> None:
+        """Install the in-netns non-TCP leak guard for a TCP-only proxy-tier worker (labeled
+        ``blastbox.net.leakguard``). Defense-in-depth: even if the internal bridge / tun2socks
+        containment failed, the worker's UDP/ICMP/raw cannot leave its netns. Best-effort, never
+        crashes the daemon."""
+        if self.nsenter_run_fn is None or container_id in self.leakguarded:
+            return
+        try:
+            lg = leakguard_from_inspect(inspect)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("netd: leakguard inspect for %s failed: %s", container_id[:12], exc)
+            return
+        if lg is None:
+            return
+        pid, allow_udp_dns = lg
+        try:
+            for rule in leak_guard_rules(allow_udp_dns=allow_udp_dns):
+                if self.nsenter_run_fn(pid, rule) != 0:
+                    _log.warning("netd: leak-guard rule failed for %s", container_id[:12])
+                    return
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("netd: failed to install leak guard for %s: %s", container_id[:12], exc)
+            return
+        self.leakguarded.add(container_id)
+        _log.info("netd: leak guard installed (non-TCP DROP, udp_dns=%s) for %s",
+                  allow_udp_dns, container_id[:12])
 
     def _maybe_capture(self, container_id: str, inspect: Mapping[str, object]) -> None:
         if container_id in self.active:
@@ -289,6 +320,8 @@ class CaptureDaemon:
         tp_ip = self.transproxy_wired.pop(container_id, None)
         if tp_ip is not None:
             self._teardown_transproxy(tp_ip)
+        # leak-guard rules live in the worker netns → die with the container; just forget the id.
+        self.leakguarded.discard(container_id)
         wproc = self.wired.pop(container_id, None)
         if wproc is not None:
             try:
