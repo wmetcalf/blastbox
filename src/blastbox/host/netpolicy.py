@@ -12,9 +12,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 # Exit drivers the design names. `none` (default) and `drop` need no sidecar; `direct`/`inetsim`
-# are ship-cheap; `socks` (tor/BrightData) + `wireguard`/`openvpn` (BYO creds) come with config.
+# are ship-cheap; `tor` is CAPE's transparent recipe (TransPort + DNSPort, host rooter); `socks`
+# (BrightData / generic SOCKS5) is the SOCKS5-client tier; `wireguard`/`openvpn` are BYO creds.
 VALID_EXIT_DRIVERS = (
-    "none", "drop", "direct", "inetsim", "socks", "wireguard", "openvpn",
+    "none", "drop", "direct", "inetsim", "tor", "socks", "wireguard", "openvpn",
 )
 
 

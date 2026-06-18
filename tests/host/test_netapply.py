@@ -67,6 +67,18 @@ def test_vpn_drivers_return_bb_vpn(driver):
     assert docker_network_args(_p(driver)) == ["--network", "bb-vpn"]
 
 
+def test_tor_driver_returns_bb_socks_internal():
+    # tor (CAPE transparent) rides the INTERNAL bb-socks bridge; the host REDIRECTs it to tor.
+    assert docker_network_args(_p("tor")) == ["--network", "bb-socks"]
+
+
+def test_resolv_tor_is_udp_not_use_vc():
+    # tor DNS is REDIRECTed to tor's DNSPort (UDP-only); use-vc would break it.
+    out = worker_resolv_conf(_p("tor", config={"dns": "172.30.0.1"}))
+    assert out == "nameserver 172.30.0.1\n"
+    assert "use-vc" not in out
+
+
 # ---------------------------------------------------------------------------
 # Inspect layer: an inspected egress worker rides bb-inspect (faces the MITM gateway), regardless
 # of the underlying exit driver. Inspect is ignored for no-egress (none/drop) exits.
@@ -94,7 +106,7 @@ def test_inspect_ignored_for_no_egress(driver):
 def test_inspect_with_unknown_driver_still_fails_closed(caplog):
     # An unknown exit driver must not be granted bb-inspect on the strength of inspect=True.
     with caplog.at_level(logging.WARNING, logger="blastbox.host.netapply"):
-        assert docker_network_args(_inspect_p("tor")) == ["--network=none"]
+        assert docker_network_args(_inspect_p("i2p")) == ["--network=none"]
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +129,7 @@ def test_return_type_is_list_of_str(driver):
 def test_unknown_driver_falls_back_to_none(caplog):
     """Any exit_driver that is not none/drop/direct/inetsim falls back to --network=none."""
     with caplog.at_level(logging.WARNING, logger="blastbox.host.netapply"):
-        result = docker_network_args(_p("tor"))  # hypothetical future driver
+        result = docker_network_args(_p("i2p"))  # hypothetical future driver
 
     assert result == ["--network=none"]
     assert any("not yet supported" in r.message for r in caplog.records)

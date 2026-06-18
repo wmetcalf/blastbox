@@ -38,6 +38,10 @@ _log = logging.getLogger("blastbox.host.netapply")
 _BRIDGE_NETWORKS: dict[str, str] = {
     "direct": "bb-net0",
     "inetsim": "bb-fakenet",
+    # tor (CAPE transparent recipe): INTERNAL bridge; netd default-routes the worker at the host
+    # gateway and the HOST REDIRECTs its TCP→tor TransPort / DNS→tor DNSPort (keyed on worker IP),
+    # dropping everything else. Same fail-closed property as bb-socks — no host rules ⇒ no egress.
+    "tor": "bb-socks",
     "socks": "bb-socks",
     # IP-tunnel VPN exits (all-IP). INTERNAL bridge: no direct egress; netd points the worker's
     # default route at the VPN+NAT gateway sidecar on bb-vpn (an OpenVPN/WireGuard client). Same
@@ -51,9 +55,10 @@ _UNSUPPORTED_DRIVERS: frozenset[str] = frozenset()
 
 # Exit drivers that put the worker on a network where name resolution matters. ``none`` /
 # ``drop`` never reach a resolver, so they are excluded.
-_EGRESS_DRIVERS = frozenset({"direct", "inetsim", "socks", "wireguard", "openvpn"})
+_EGRESS_DRIVERS = frozenset({"direct", "inetsim", "tor", "socks", "wireguard", "openvpn"})
 
-# Drivers whose egress is a SOCKS proxy that can't carry UDP DNS — DNS must go over TCP.
+# Drivers whose egress is a SOCKS proxy that can't carry UDP DNS — DNS must go over TCP. NOT ``tor``:
+# its DNS is REDIRECTed straight to tor's DNSPort (UDP), which refuses TCP, so use-vc would break it.
 _SOCKS_DRIVERS = frozenset({"socks"})
 
 # The internal bridge an INSPECTED worker rides. When ``personality.inspect`` is set, the worker

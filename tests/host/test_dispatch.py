@@ -1379,10 +1379,10 @@ def test_socks_personality_labels_worker_for_wiring_and_uses_bb_socks(tmp_path, 
 
 
 def test_transproxy_personality_labels_worker_and_waits_for_gateway(tmp_path, monkeypatch):
-    """A socks personality with mode=transproxy (CAPE tor) → worker on bb-socks labeled
+    """A first-class tor personality (CAPE transparent recipe) → worker on bb-socks labeled
     blastbox.net.wire=transproxy, and it waits for the host gateway route (not a TUN)."""
     monkeypatch.setenv(
-        "BLASTBOX_NETPOLICY_TORTP", "exit=socks,mode=transproxy,gateway=172.30.0.1"
+        "BLASTBOX_NETPOLICY_TORTP", "exit=tor,gateway=172.30.0.1,dns=172.30.0.1"
     )
     store = InMemoryJobStore()
     job = _make_job(); job.input_sha256 = _INPUT_SHA
