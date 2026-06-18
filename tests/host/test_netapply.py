@@ -101,9 +101,10 @@ def _inspect_p(exit_driver: str, config: dict[str, str] | None = None) -> Person
     )
 
 
-@pytest.mark.parametrize("driver", ["direct", "inetsim", "socks", "openvpn", "wireguard"])
+@pytest.mark.parametrize("driver", ["direct", "inetsim", "tor", "socks", "openvpn", "wireguard"])
 def test_inspect_egress_rides_bb_inspect(driver):
-    # The worker faces the sslproxy/MITM gateway on bb-inspect, NOT the exit's own bridge.
+    # The worker faces the sslproxy/MITM gateway on bb-inspect, NOT the exit's own bridge. Every
+    # route-inspectable egress driver qualifies (httpproxy does NOT — see below).
     assert docker_network_args(_inspect_p(driver)) == ["--network", "bb-inspect"]
 
 
@@ -117,6 +118,46 @@ def test_inspect_with_unknown_driver_still_fails_closed(caplog):
     # An unknown exit driver must not be granted bb-inspect on the strength of inspect=True.
     with caplog.at_level(logging.WARNING, logger="blastbox.host.netapply"):
         assert docker_network_args(_inspect_p("i2p")) == ["--network=none"]
+
+
+def test_inspect_httpproxy_fails_closed_not_degraded(caplog):
+    # httpproxy is an app-level CONNECT proxy (not a routed path) → cannot be route-MITM'd. inspect
+    # must NOT silently degrade it to a plain proxy on bb-socks (that would drop the inspection
+    # guarantee); it fails closed to --network=none + warns.
+    with caplog.at_level(logging.WARNING, logger="blastbox.host.netapply"):
+        assert docker_network_args(
+            _inspect_p("httpproxy", {"proxy": "http://172.30.0.30:8888"})
+        ) == ["--network=none"]
+    assert any("inspect is not supported" in r.message for r in caplog.records)
+
+
+def test_httpproxy_without_inspect_still_rides_bb_socks():
+    # Sanity: plain (un-inspected) httpproxy is unaffected — still its normal internal bridge.
+    assert docker_network_args(_p("httpproxy")) == ["--network", "bb-socks"]
+
+
+def test_inspect_routes_via_gateway_predicate():
+    from blastbox.host.netapply import inspect_routes_via_gateway
+    assert inspect_routes_via_gateway(_inspect_p("socks")) is True
+    assert inspect_routes_via_gateway(_inspect_p("tor")) is True
+    assert inspect_routes_via_gateway(_inspect_p("httpproxy")) is False  # not route-inspectable
+    assert inspect_routes_via_gateway(_p("socks")) is False  # inspect not requested
+
+
+def test_driver_set_consistency():
+    # Guard against the "added a driver to one set but forgot another" drift class. Every set the
+    # netapply/netwire layer keys on must be a subset of the canonical VALID_EXIT_DRIVERS.
+    from blastbox.host import netapply
+    from blastbox.host.netpolicy import VALID_EXIT_DRIVERS
+
+    valid = set(VALID_EXIT_DRIVERS)
+    assert netapply._EGRESS_DRIVERS <= valid
+    assert netapply._SOCKS_DRIVERS <= netapply._EGRESS_DRIVERS
+    assert set(netapply._BRIDGE_NETWORKS) <= valid
+    # httpproxy is the one egress driver deliberately excluded from the route-inspectable set.
+    assert "httpproxy" in valid and "httpproxy" not in netapply._EGRESS_DRIVERS
+    # Every non-no-egress valid driver has a bridge mapping (else docker_network_args fails closed).
+    assert set(netapply._BRIDGE_NETWORKS) == valid - {"none", "drop"}
 
 
 # ---------------------------------------------------------------------------

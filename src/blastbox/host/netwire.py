@@ -138,6 +138,31 @@ def socks_proxy_url(endpoint: str, *, user: str | None, password: str | None) ->
     return f"socks5://{endpoint}"
 
 
+def validate_socks_url(url: str) -> str:
+    """Validate a FULL ``socks5://[user:pass@]host:port`` URL (netd's ``--socks-proxy`` default OR a
+    per-worker ``blastbox.net.socks-proxy`` label) before it becomes a ``tun2socks`` argument, by
+    round-tripping it through the same endpoint/credential validators as :func:`socks_proxy_url`.
+
+    The per-worker URL is operator-supplied (not attacker-supplied), and it lands as a single argv
+    element (no shell), so this is not an injection fix — it closes a validation ASYMMETRY: an
+    operator typo (stray whitespace/newline, malformed ``user:pass@``) would otherwise be passed
+    verbatim to the proxy process. Returns the canonical URL; raises ``ValueError`` on anything
+    malformed so the caller can fail closed (no wire ⇒ no egress)."""
+    if url != url.strip() or not url.startswith("socks5://"):
+        raise ValueError(f"socks proxy url must be socks5://…, got {url!r}")
+    rest = url[len("socks5://"):]
+    user: str | None = None
+    password: str | None = None
+    if "@" in rest:
+        creds, _, endpoint = rest.rpartition("@")
+        if ":" not in creds:
+            raise ValueError(f"socks credentials must be user:pass, got {creds!r}")
+        user, _, password = creds.partition(":")
+    else:
+        endpoint = rest
+    return socks_proxy_url(endpoint, user=user, password=password)
+
+
 def tun2socks_argv(proxy_url: str, *, device: str = TUN_DEV, loglevel: str = "info") -> list[str]:
     """The proven ``tun2socks`` invocation: create+serve ``device`` (a TUN), forward everything to
     ``proxy_url`` (a ``socks5://…`` URL). ``loglevel`` is allow-listed — ``warning`` is fatal."""
@@ -258,3 +283,21 @@ def leak_guard_rules(*, allow_udp_dns: bool) -> list[list[str]]:
         ["iptables", "-A", "OUTPUT", "!", "-p", "tcp", "-j", "DROP"],
     ]
     return rules
+
+
+def leak_guard_rules_v6() -> list[list[str]]:
+    """The IPv6 twin of :func:`leak_guard_rules`. The leak-guarded proxy tiers (socks/httpproxy/tor)
+    egress over **IPv4 only** — the ``bb-socks`` bridge, the SOCKS proxy, and tor's TransPort/DNSPort
+    REDIRECT are all v4 — so a leak-guarded worker has NO legitimate IPv6 egress, including DNS (tor's
+    DNSPort is v4). Fail v6 fully closed: ACCEPT loopback (``::1``), LOG (rate-limited) then DROP all
+    other OUTPUT, so a sample cannot escape over IPv6 even if an egress bridge were (mis)configured
+    with ``--ipv6``. ``iptables`` is v4-only and cannot express this; hence a separate ``ip6tables``
+    rule set. netd runs these BEST-EFFORT (a v4-only host may lack the ip6tables module) — a failure
+    here must never tear down the (hard-guarantee) v4 guard."""
+    return [
+        ["ip6tables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"],
+        ["ip6tables", "-A", "OUTPUT",
+         "-m", "limit", "--limit", "10/min",
+         "-j", "LOG", "--log-prefix", "blastbox-leak-drop6 ", "--log-level", "4"],
+        ["ip6tables", "-A", "OUTPUT", "-j", "DROP"],
+    ]

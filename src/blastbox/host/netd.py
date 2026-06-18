@@ -34,10 +34,12 @@ from blastbox.host.netwire import (
     TUN_DEV,
     gateway_route_commands,
     leak_guard_rules,
+    leak_guard_rules_v6,
     leakguard_from_inspect,
     transproxy_redirect_rules,
     tun2socks_argv,
     tun_setup_commands,
+    validate_socks_url,
     wire_target_from_inspect,
 )
 
@@ -95,6 +97,11 @@ class CaptureDaemon:
     nsenter_run_fn: Callable[[int, list[str]], int] | None = None    # run cmd in netns → rc
     keylog_copy_fn: Callable[[str, str], Any] = shutil.copyfile       # src,dst keylog snapshot seam
     sleep_fn: Callable[[float], None] = time.sleep
+    # Lists currently-running worker container ids (for startup/post-reconnect reconciliation). If
+    # the docker-events stream dies (daemon restart, transient exit) netd reconnects and replays
+    # handle_start over the already-running workers, so a stream gap doesn't silently drop their
+    # capture/wiring. None disables reconciliation (unit tests that drive handlers directly).
+    list_running_fn: Callable[[], list[str]] | None = None
     wired: dict[str, Any] = field(default_factory=dict)  # container_id → proc-or-None
     inspect_wired: set[str] = field(default_factory=set)  # container_ids wired in inspect mode
     # container_id → worker_ip for transproxy workers (so die can tear down the host REDIRECT rules)
@@ -111,8 +118,13 @@ class CaptureDaemon:
             _log.warning("netd: inspect for %s failed: %s", container_id[:12], exc)
             return
         self._maybe_capture(container_id, inspect)
-        self._maybe_wire(container_id, inspect)
+        # Install the non-TCP leak guard BEFORE wiring egress: _maybe_wire installs the worker's
+        # only route out, and the worker's egress barrier releases as soon as it observes that
+        # route — so if the guard went last there would be a window where the worker is unblocked
+        # and egressing while the non-TCP DROP is not yet in place. The guard only appends OUTPUT
+        # rules and does not depend on the route existing, so this ordering is strictly safer.
         self._maybe_leakguard(container_id, inspect)
+        self._maybe_wire(container_id, inspect)
 
     def _maybe_leakguard(self, container_id: str, inspect: Mapping[str, object]) -> None:
         """Install the in-netns non-TCP leak guard for a TCP-only proxy-tier worker (labeled
@@ -137,8 +149,20 @@ class CaptureDaemon:
         except Exception as exc:  # noqa: BLE001
             _log.warning("netd: failed to install leak guard for %s: %s", container_id[:12], exc)
             return
+        # IPv6 twin — fail v6 fully closed. BEST-EFFORT: a v4-only host may lack the ip6tables
+        # module, and that must NOT tear down the (now-applied) v4 guard, which is the hard
+        # guarantee. A v6 failure is logged and we stop the v6 pass, keeping v4 in force.
+        try:
+            for rule in leak_guard_rules_v6():
+                if self.nsenter_run_fn(pid, rule) != 0:
+                    _log.warning("netd: ip6 leak-guard rule failed for %s "
+                                 "(continuing; v4 guard active)", container_id[:12])
+                    break
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("netd: ip6 leak guard error for %s: %s (v4 guard active)",
+                         container_id[:12], exc)
         self.leakguarded.add(container_id)
-        _log.info("netd: leak guard installed (non-TCP DROP, udp_dns=%s) for %s",
+        _log.info("netd: leak guard installed (non-TCP DROP v4+v6, udp_dns=%s) for %s",
                   allow_udp_dns, container_id[:12])
 
     def _maybe_capture(self, container_id: str, inspect: Mapping[str, object]) -> None:
@@ -195,6 +219,15 @@ class CaptureDaemon:
         # wins over netd's global --socks-proxy, so one netd serves a whole fleet of socks backends.
         proxy_url = getattr(wt, "socks_proxy", "") or self.socks_proxy_url
         if not proxy_url or self.nsenter_spawn_fn is None or self.nsenter_run_fn is None:
+            return
+        # Validate the (operator-supplied) URL through the same endpoint/cred checks as netd's CLI
+        # default — a per-worker proxy label otherwise reaches tun2socks unvalidated. Fail closed
+        # on a malformed URL: refuse to wire ⇒ the worker stays on its no-egress internal bridge.
+        try:
+            proxy_url = validate_socks_url(proxy_url)
+        except ValueError as exc:
+            _log.warning("netd: invalid socks proxy url for job %s (%s); refusing to wire",
+                         wt.job_id, exc)
             return
         try:
             proc = self.nsenter_spawn_fn(wt.pid, tun2socks_argv(proxy_url))
@@ -354,15 +387,53 @@ class CaptureDaemon:
             return
         _log.info("netd: snapshot inspect keylog job=%s -> %s", ac.target.job_id, dst)
 
+    # ------------------------------------------------------------------ reconcile
+    def _reconcile(self) -> None:
+        """Replay ``handle_start`` over the workers already running — on first boot (netd started
+        after a job) and after every events-stream reconnect (a docker-daemon restart / stream
+        hiccup would otherwise leave already-running workers uncaptured and unwired). ``handle_start``
+        is idempotent (each ``_maybe_*`` is membership-gated), so re-running it over a worker netd
+        already tracks is a no-op. No-op if no ``list_running_fn`` seam is configured."""
+        if self.list_running_fn is None:
+            return
+        try:
+            running = self.list_running_fn()
+        except Exception as exc:  # noqa: BLE001 — reconcile is best-effort, never crash the daemon
+            _log.warning("netd: reconcile listing failed: %s", exc)
+            return
+        for cid in running:
+            self.handle_start(cid)
+
     # ------------------------------------------------------------------ event loop
-    def run(self, events_cmd: list[str] | None = None) -> None:  # pragma: no cover - I/O loop
-        """Follow ``docker events`` and dispatch start/die to the handlers. The thin untestable
-        shell around the (tested) handlers."""
+    def run(  # pragma: no cover - I/O loop
+        self, events_cmd: list[str] | None = None, *, reconnect: bool = True
+    ) -> None:
+        """Follow ``docker events`` and dispatch start/die to the handlers, RECONNECTING with capped
+        backoff if the stream ends (docker-daemon restart, transient exit). Reconciles already-running
+        workers on each (re)connect. The thin untestable shell around the (tested) handlers/reconcile;
+        ``reconnect=False`` runs a single pass (kept for the on-host integration harness)."""
         cmd = events_cmd or [
             "docker", "events", "--format", "{{json .}}",
             "--filter", "type=container",
             "--filter", "event=start", "--filter", "event=die",
         ]
+        backoff = 1.0
+        while True:
+            self._reconcile()
+            try:
+                self._follow_events(cmd)
+            except Exception as exc:  # noqa: BLE001 — never let a stream error kill the daemon
+                _log.warning("netd: docker events stream error: %s", exc)
+            if not reconnect:
+                return
+            _log.warning("netd: docker events stream ended; reconnecting in %.0fs", backoff)
+            self.sleep_fn(backoff)
+            backoff = min(backoff * 2.0, 30.0)
+
+    def _follow_events(self, cmd: list[str]) -> None:  # pragma: no cover - I/O loop
+        """One connection to ``docker events``: read+dispatch until the stream ends. A malformed
+        line or an event for a non-worker container is skipped; an exception handling one event is
+        contained so it can never kill the daemon (the handlers are themselves non-raising)."""
         _log.info("netd: watching docker events: %s", " ".join(cmd))
         with subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True) as proc:
             assert proc.stdout is not None
@@ -378,10 +449,13 @@ class CaptureDaemon:
                 cid = evt.get("id") or evt.get("Actor", {}).get("ID")
                 if not cid:
                     continue
-                if status == "start":
-                    self.handle_start(cid)
-                elif status == "die":
-                    self.handle_die(cid)
+                try:
+                    if status == "start":
+                        self.handle_start(cid)
+                    elif status == "die":
+                        self.handle_die(cid)
+                except Exception as exc:  # noqa: BLE001 — belt-and-suspenders: handlers don't raise
+                    _log.warning("netd: error handling %s for %s: %s", status, str(cid)[:12], exc)
 
 
 def build_network_iface_map(network_inspect_all: list[Mapping[str, object]]) -> dict[str, str]:
@@ -424,6 +498,16 @@ def _docker_network_iface_map() -> Mapping[str, str]:  # pragma: no cover - I/O
         capture_output=True, text=True, check=True, timeout=10,
     ).stdout
     return build_network_iface_map(json.loads(out))
+
+
+def _docker_list_workers() -> list[str]:  # pragma: no cover - I/O
+    # Currently-running worker containers (for reconcile). Filter on the dispatcher's role label so
+    # netd only re-inspects workers, not every container on the host.
+    out = subprocess.run(
+        ["docker", "ps", "-q", "--no-trunc", "--filter", "label=blastbox.role=worker"],
+        capture_output=True, text=True, check=True, timeout=10,
+    ).stdout
+    return out.split()
 
 
 def _spawn_tcpdump(argv: list[str], pcap_path: str) -> subprocess.Popen:  # pragma: no cover - I/O
@@ -530,6 +614,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry poin
         host_run_fn=_host_run if transproxy_gw else None,
         nsenter_spawn_fn=_nsenter_spawn if wiring_on else None,
         nsenter_run_fn=_nsenter_run if wiring_on else None,
+        list_running_fn=_docker_list_workers,
     )
     _log.info(
         "blastbox-netd starting; job_root=%s socks=%s vpn=%s inspect=%s keylog=%s transproxy=%s",

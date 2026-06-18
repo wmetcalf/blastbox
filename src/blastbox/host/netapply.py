@@ -55,11 +55,11 @@ _BRIDGE_NETWORKS: dict[str, str] = {
     "wireguard": "bb-vpn",
 }
 
-# Every named driver is now wired on the docker path; nothing is fail-closed-unsupported.
-_UNSUPPORTED_DRIVERS: frozenset[str] = frozenset()
-
 # Exit drivers that put the worker on a network where name resolution matters. ``none`` /
-# ``drop`` never reach a resolver, so they are excluded.
+# ``drop`` never reach a resolver, so they are excluded. This is ALSO the set of drivers that can be
+# transparently route-INSPECTED (the MITM gateway intercepts a routed L3 path): ``httpproxy`` is the
+# one egress driver excluded — it is an app-level CONNECT proxy (env-injected), not a routed path, so
+# it cannot be MITM'd by rerouting and inspect+httpproxy is unsupported (fails closed, see below).
 _EGRESS_DRIVERS = frozenset({"direct", "inetsim", "tor", "socks", "wireguard", "openvpn"})
 
 # Drivers whose egress is a SOCKS proxy that can't carry UDP DNS — DNS must go over TCP. NOT ``tor``:
@@ -71,6 +71,17 @@ _SOCKS_DRIVERS = frozenset({"socks"})
 # decrypt, then forwards to the real exit network). The worker never attaches the exit's own
 # bridge — netd points its default route at the gateway. Operators pre-create ``bb-inspect``.
 INSPECT_BRIDGE = "bb-inspect"
+
+
+def inspect_routes_via_gateway(personality: Personality) -> bool:
+    """True iff an inspected worker is route-wired to the MITM gateway (rides ``bb-inspect``).
+
+    Only the route-wireable egress drivers (:data:`_EGRESS_DRIVERS`) can be transparently inspected.
+    ``httpproxy`` (an app-level CONNECT proxy reached via injected ``HTTP(S)_PROXY`` env) is NOT a
+    routed path, so it cannot be MITM'd by rerouting — ``inspect`` + ``httpproxy`` is unsupported and
+    fails closed (no egress). The single source of truth for both the bridge decision
+    (:func:`docker_network_args`) and the dispatcher's ``blastbox.net.wire=inspect`` label."""
+    return personality.inspect and personality.exit_driver in _EGRESS_DRIVERS
 
 
 def docker_network_args(personality: Personality) -> list[str]:
@@ -90,10 +101,20 @@ def docker_network_args(personality: Personality) -> list[str]:
         return ["--network=none"]
 
     # Inspect layer: an inspected egress worker rides the internal bb-inspect bridge facing the
-    # MITM gateway, NOT the exit's own bridge (the gateway forwards to the real exit). Only applies
-    # to a valid egress driver — an unknown driver still falls through to the fail-closed warning.
-    if personality.inspect and driver in _EGRESS_DRIVERS:
+    # MITM gateway, NOT the exit's own bridge (the gateway forwards to the real exit).
+    if inspect_routes_via_gateway(personality):
         return ["--network", INSPECT_BRIDGE]
+
+    # Inspect requested for an egress driver that CANNOT be route-inspected (httpproxy). Do NOT
+    # silently degrade to a plain proxy (that would drop the inspection guarantee the operator
+    # asked for) — fail closed + warn so the misconfiguration is visible.
+    if personality.inspect and driver not in ("none", "drop"):
+        _log.warning(
+            "netpolicy: inspect is not supported for exit_driver %r (not a routed path); "
+            "failing closed to --network=none",
+            driver,
+        )
+        return ["--network=none"]
 
     # Known bridge exits: directly supported.
     bridge = _BRIDGE_NETWORKS.get(driver)

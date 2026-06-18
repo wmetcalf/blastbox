@@ -16,6 +16,12 @@ A failed reach-out (DNS NXDOMAIN, connection refused, timeout) is a NORMAL resul
 sinkholed malware URL → ``status="ok"`` with the error recorded, NOT ``engine_error`` (which would
 fail the job). Only a malformed input URL is ``rejected``.
 
+SSRF note: this engine does NOT screen the target host (it will GET ``http://169.254.169.254/…``,
+``http://127.0.0.1``, RFC1918, etc.). That is deliberate — SSRF containment is delegated ENTIRELY to
+the netpolicy/egress isolation: the worker is network-confined to the resolved exit (none/fakenet/
+proxy/vpn) and cannot reach a host metadata endpoint or internal service. The corollary: urlgrab must
+never be paired with a ``direct`` personality on a bridge that can reach internal/host services.
+
 The actual fetch is an injected seam (``fetch_fn``) so the engine logic is unit-testable without a
 network; the default uses ``urllib`` with a redirect cap and a capped read.
 """

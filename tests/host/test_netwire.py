@@ -14,12 +14,14 @@ from blastbox.host.netwire import (
     WireTarget,
     gateway_route_commands,
     leak_guard_rules,
+    leak_guard_rules_v6,
     leakguard_from_inspect,
     socks_proxy_url,
     socks_resolv_conf,
     transproxy_redirect_rules,
     tun2socks_argv,
     tun_setup_commands,
+    validate_socks_url,
     wire_target_from_inspect,
 )
 
@@ -47,6 +49,29 @@ def test_proxy_url_with_auth():
 def test_proxy_url_rejects_bad_endpoint(bad):
     with pytest.raises(ValueError):
         socks_proxy_url(bad, user=None, password=None)
+
+
+# --------------------------------------------------------------------------- validate_socks_url
+def test_validate_socks_url_no_auth_roundtrips():
+    assert validate_socks_url("socks5://172.30.0.40:9050") == "socks5://172.30.0.40:9050"
+
+
+def test_validate_socks_url_with_auth_roundtrips():
+    assert validate_socks_url("socks5://bb:bb@10.0.0.5:1080") == "socks5://bb:bb@10.0.0.5:1080"
+
+
+@pytest.mark.parametrize("bad", [
+    "http://h:1",                  # wrong scheme
+    "socks5://h:1 ",               # trailing whitespace (would split into a stray arg)
+    " socks5://h:1",               # leading whitespace
+    "socks5://nocreds@h:1",        # '@' but no user:pass
+    "socks5://a b:c@h:1",          # space in creds
+    "socks5://h:notaport",         # bad port
+    "socks5://h:1:2",              # extra colon in endpoint
+])
+def test_validate_socks_url_rejects_malformed(bad):
+    with pytest.raises(ValueError):
+        validate_socks_url(bad)
 
 
 def test_proxy_url_rejects_injection_in_creds():
@@ -214,6 +239,18 @@ def test_leak_guard_rules_dns_mode_allows_udp_53():
     rules = leak_guard_rules(allow_udp_dns=True)
     assert ["iptables", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", "ACCEPT"] in rules
     assert rules[-1] == ["iptables", "-A", "OUTPUT", "!", "-p", "tcp", "-j", "DROP"]
+
+
+def test_leak_guard_rules_v6_fails_closed():
+    # The proxy tiers egress over IPv4 only — v6 has NO legitimate path (incl. DNS), so v6 OUTPUT
+    # is dropped entirely except loopback. All rules are ip6tables (iptables can't express v6).
+    rules = leak_guard_rules_v6()
+    assert all(r[0] == "ip6tables" for r in rules)
+    assert ["ip6tables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"] == rules[0]
+    assert rules[-1] == ["ip6tables", "-A", "OUTPUT", "-j", "DROP"]
+    # no udp:53 carve-out even for the tor/dns case (tor's DNSPort REDIRECT is v4)
+    assert not any("--dport" in r for r in rules)
+    assert any("LOG" in r and "blastbox-leak-drop6 " in r for r in rules)
 
 
 def test_transproxy_rules_reject_bad_port():

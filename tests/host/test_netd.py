@@ -184,6 +184,19 @@ def test_wire_socks_uses_per_worker_proxy_over_global(tmp_path):
     assert "c1" in d.wired
 
 
+def test_wire_socks_refuses_malformed_per_worker_proxy(tmp_path):
+    """A malformed per-worker socks-proxy label is rejected before it reaches tun2socks — the worker
+    stays unwired (fail-closed: no egress), rather than passing the bad URL verbatim to the proxy."""
+    insp = _wire_inspect(pid=8888)
+    insp["Config"]["Labels"]["blastbox.net.socks-proxy"] = "socks5://h:1 ; rm -rf"
+    spawned: list = []
+    runs: list = []
+    d = _wire_daemon(tmp_path, {"c1": insp}, spawned=spawned, runs=runs)
+    d.handle_start("c1")
+    assert spawned == []          # tun2socks never spawned
+    assert "c1" not in d.wired    # fail-closed: no wire
+
+
 def test_wire_inert_without_proxy_configured(tmp_path):
     d = CaptureDaemon(
         job_root=str(tmp_path),
@@ -459,6 +472,64 @@ def test_leakguard_installs_in_netns_output_drop(tmp_path):
     assert all(pid == 4321 for pid, _ in runs)
     assert (4321, ["iptables", "-A", "OUTPUT", "!", "-p", "tcp", "-j", "DROP"]) in runs
     assert not any("--dport" in argv and "53" in argv for _, argv in runs)  # strict = no udp:53
+    # IPv6 twin installed too — v6 fully dropped (the proxy tiers are v4-only).
+    assert (4321, ["ip6tables", "-A", "OUTPUT", "-j", "DROP"]) in runs
+
+
+def test_leakguard_v6_failure_does_not_tear_down_v4_guard(tmp_path):
+    """A v4-only host may lack the ip6tables module: a failing ip6tables rule must NOT abort the
+    (already-applied) v4 guard, which is the hard guarantee. The worker stays leakguarded."""
+    runs: list = []
+
+    def nsenter_run(pid, argv):
+        runs.append(argv)
+        return 1 if argv[0] == "ip6tables" else 0  # all v6 rules fail; v4 succeed
+
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: {
+            "Config": {"Labels": {"blastbox.net.leakguard": "strict", "blastbox.job_id": "L3"}},
+            "State": {"Pid": 7, "Running": True},
+        },
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        nsenter_run_fn=nsenter_run,
+    )
+    d.handle_start("l3")
+    # v4 DROP applied, v6 attempted then bailed — but the worker is still guarded (v4 in force).
+    assert ["iptables", "-A", "OUTPUT", "!", "-p", "tcp", "-j", "DROP"] in runs
+    assert any(a[0] == "ip6tables" for a in runs)
+    assert "l3" in d.leakguarded
+
+
+def test_leakguard_installed_before_egress_is_wired(tmp_path):
+    """The non-TCP DROP must be in place BEFORE the route out — otherwise the worker's egress
+    barrier could release (it watches the route) while the guard is not yet up. Assert ordering:
+    every leakguard rule precedes the first wiring command in the call sequence."""
+    order: list = []
+    insp = _wire_inspect(pid=4242)
+    insp["Config"]["Labels"]["blastbox.net.leakguard"] = "strict"
+
+    def nsenter_run(pid, argv):
+        order.append(argv[0])
+        return 0  # tun0 probe + ip cmds succeed
+
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: insp,
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        socks_proxy_url="socks5://bb:bb@172.30.0.10:1080",
+        nsenter_spawn_fn=lambda pid, argv: _FakeProc(argv),
+        nsenter_run_fn=nsenter_run,
+        sleep_fn=lambda s: None,
+    )
+    d.handle_start("c1")
+    # the wiring uses `ip` (link/route); the guard uses iptables/ip6tables. Last guard rule must
+    # come before the first `ip` wiring command.
+    last_guard = max(i for i, t in enumerate(order) if t in ("iptables", "ip6tables"))
+    first_wire = min(i for i, t in enumerate(order) if t == "ip")
+    assert last_guard < first_wire
 
 
 def test_leakguard_dns_mode_allows_udp53(tmp_path):
@@ -480,7 +551,7 @@ def test_leakguard_dns_mode_allows_udp53(tmp_path):
 
 
 def test_transproxy_inert_without_gateway_or_host_seam(tmp_path):
-    runs, host_cmds = [], []
+    runs = []
     d = CaptureDaemon(
         job_root=str(tmp_path),
         inspect_fn=lambda cid: _transproxy_inspect(),
@@ -494,7 +565,6 @@ def test_transproxy_inert_without_gateway_or_host_seam(tmp_path):
 
 
 def test_transproxy_rolls_back_on_partial_host_failure(tmp_path):
-    runs = []
     calls = {"n": 0}
 
     def host_run(argv):
@@ -514,3 +584,36 @@ def test_transproxy_rolls_back_on_partial_host_failure(tmp_path):
     d.handle_start("t1")
     # the failed wire is not recorded, and teardown (-D) rules were issued to clean up
     assert "t1" not in d.transproxy_wired
+
+
+# --------------------------------------------------------------------------- reconcile
+def test_reconcile_replays_handle_start_over_running_workers(tmp_path):
+    """On (re)connect netd replays handle_start over already-running workers (e.g. started during a
+    docker-events stream gap), so capture/wiring isn't silently dropped for them."""
+    spawned: list = []
+    d = _make_daemon(tmp_path, {"c1": _labeled_inspect(job_id="J1")}, spawned)
+    d.list_running_fn = lambda: ["c1"]
+    d._reconcile()
+    assert len(spawned) == 1  # the running worker got captured
+    # idempotent: a second reconcile (next reconnect) does not double-capture
+    d._reconcile()
+    assert len(spawned) == 1
+
+
+def test_reconcile_noop_without_seam(tmp_path):
+    spawned: list = []
+    d = _make_daemon(tmp_path, {}, spawned)  # list_running_fn defaults to None
+    d._reconcile()
+    assert spawned == []
+
+
+def test_reconcile_survives_listing_error(tmp_path):
+    spawned: list = []
+    d = _make_daemon(tmp_path, {}, spawned)
+
+    def boom():
+        raise RuntimeError("docker ps failed")
+
+    d.list_running_fn = boom
+    d._reconcile()  # must not raise
+    assert spawned == []

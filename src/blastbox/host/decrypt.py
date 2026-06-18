@@ -76,7 +76,9 @@ def decrypt_capture(
     Best-effort: a missing keylog, an empty output, or a runner error returns ``None`` and never
     raises — TLS decrypt is an enrichment, it must never fail the job. Produces both a fully
     ``decrypted.pcap`` and a ``mixed.pcap`` (encrypted + decrypted) à la CAPE."""
-    if not _usable(keylog_path) and not (os.path.isfile(keylog_path) and os.path.getsize(keylog_path) > 0):
+    # A keylog just needs to be non-empty (a single line is valid key material) — the _PCAP_HEADER
+    # size floor that _usable() applies is for pcap outputs, not the keylog.
+    if not (os.path.isfile(keylog_path) and os.path.getsize(keylog_path) > 0):
         return None  # no keys → nothing to do
     decrypted = os.path.join(out_dir, "decrypted.pcap")
     mixed = os.path.join(out_dir, "mixed.pcap")

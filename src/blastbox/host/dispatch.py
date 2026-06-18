@@ -286,10 +286,11 @@ class Dispatcher:
         ).strip()
         # netd drops the per-job TLS keylog (sslkeys.log) on the worker's DIE event, which races
         # this dispatcher's post-worker seal. Briefly poll for it so an inspect job's decrypt isn't
-        # silently skipped just because the snapshot landed a beat after we started sealing.
-        self._decrypt_keylog_wait_s = float(
-            os.environ.get("BLASTBOX_NET_DECRYPT_KEYLOG_WAIT_S") or "8"
-        )
+        # silently skipped just because the snapshot landed a beat after we started sealing. Clamped
+        # to [0, 60]s: this poll blocks a dispatch thread, so a fat-fingered env can't wedge one.
+        self._decrypt_keylog_wait_s = max(0.0, min(
+            float(os.environ.get("BLASTBOX_NET_DECRYPT_KEYLOG_WAIT_S") or "8"), 60.0
+        ))
 
     # ------------------------------------------------------------------
     # Public API
@@ -930,7 +931,11 @@ class Dispatcher:
         # per-job override (only honoured when BLASTBOX_ALLOW_NETPOLICY_OVERRIDE is set). Any
         # unknown driver falls back to --network=none in docker_network_args.
         from blastbox.host.netpolicy import resolve_net_policy
-        from blastbox.host.netapply import docker_network_args, worker_resolv_conf
+        from blastbox.host.netapply import (
+            docker_network_args,
+            inspect_routes_via_gateway,
+            worker_resolv_conf,
+        )
         personality = resolve_net_policy(
             job_net_policy=job.net_policy,
             engine_default=engine.net_policy,
@@ -972,8 +977,11 @@ class Dispatcher:
         #   socks (BrightData/SOCKS5)      → tun2socks in the netns   (bb-socks)
         #   openvpn / wireguard (all-IP)   → default route via gateway (bb-vpn)
         # Inspect WINS: an inspected worker faces the MITM gateway (which chains onward to the real
-        # exit), so it is routed to the gateway regardless of the underlying exit driver.
-        if personality.inspect and personality.exit_driver not in ("none", "drop"):
+        # exit), so it is routed to the gateway regardless of the underlying exit driver — but ONLY
+        # for a route-inspectable driver. inspect+httpproxy is unsupported: docker_network_args
+        # fails it closed to --network=none, so we must NOT label it wire=inspect (which would send
+        # netd chasing a gateway route that doesn't apply). Same predicate, single source of truth.
+        if inspect_routes_via_gateway(personality):
             worker_labels["blastbox.net.wire"] = "inspect"
         elif personality.exit_driver == "tor":
             worker_labels["blastbox.net.wire"] = "transproxy"
@@ -1034,7 +1042,7 @@ class Dispatcher:
                 # Empty = no wait. Merged last so a hostile job.param can't suppress it.
                 "BLASTBOX_NET_WAIT_GATEWAY": (
                     personality.config.get("gateway", "")
-                    if (personality.inspect or personality.exit_driver
+                    if (inspect_routes_via_gateway(personality) or personality.exit_driver
                         in ("tor", "openvpn", "wireguard"))
                     else ""
                 ),

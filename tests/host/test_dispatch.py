@@ -10,6 +10,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 from blastbox.host.dispatch import Dispatcher, EngineSpec
 from blastbox.host.jobs.base import Job, JobStatus
 from blastbox.host.jobs.memory import InMemoryJobStore
@@ -1306,6 +1308,21 @@ def test_decrypt_noop_without_keylog(tmp_path, monkeypatch):
     assert store.get(job.job_id).status == JobStatus.DONE
 
 
+@pytest.mark.parametrize("env,expected", [
+    ("100", 60.0),     # clamped to the ceiling so a fat-fingered env can't wedge a dispatch thread
+    ("-5", 0.0),       # negative → floored to 0 (no wait)
+    ("3", 3.0),        # in-range value preserved
+    (None, 8.0),       # default
+])
+def test_decrypt_keylog_wait_is_clamped(tmp_path, monkeypatch, env, expected):
+    monkeypatch.delenv("BLASTBOX_NET_DECRYPT_KEYLOG_WAIT_S", raising=False)
+    if env is not None:
+        monkeypatch.setenv("BLASTBOX_NET_DECRYPT_KEYLOG_WAIT_S", env)
+    store = InMemoryJobStore()
+    d = _make_dispatcher(store, job_root=tmp_path)
+    assert d._decrypt_keylog_wait_s == expected
+
+
 def test_net_egress_env_reflects_personality(tmp_path, monkeypatch):
     """The dispatcher tells the worker BLASTBOX_NET_EGRESS=1 only when the personality has an
     exit (so an inner bwrap/nsjail net-shares); none/drop → '0' (isolate, fail-closed)."""
@@ -1389,7 +1406,8 @@ def test_httpproxy_personality_injects_proxy_env_on_bb_socks(tmp_path, monkeypat
     the personality's proxy= (a creds-holding sidecar); NO net.wire wiring, NO resolv.conf."""
     monkeypatch.setenv("BLASTBOX_NETPOLICY_BRD", "exit=httpproxy,proxy=http://172.30.0.30:8888")
     store = InMemoryJobStore()
-    job = _make_job(); job.input_sha256 = _INPUT_SHA
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
     store.create(job)
     _setup_job_dirs(tmp_path, job)
     output_dir = tmp_path / job.job_id / "output"
@@ -1415,6 +1433,39 @@ def test_httpproxy_personality_injects_proxy_env_on_bb_socks(tmp_path, monkeypat
     assert "blastbox.net.leakguard=strict" in argv                     # TCP-only → non-TCP dropped
 
 
+def test_inspect_httpproxy_fails_closed_no_inspect_label(tmp_path, monkeypatch):
+    """inspect+httpproxy is unsupported (httpproxy is not a routed path). The worker must fail
+    closed to --network=none and carry NO blastbox.net.wire=inspect label / gateway-wait — i.e. it
+    is NOT silently routed onto the MITM gateway nor degraded to a plain proxy."""
+    monkeypatch.setenv(
+        "BLASTBOX_NETPOLICY_BRDINS", "exit=httpproxy,inspect=1,proxy=http://172.30.0.30:8888"
+    )
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    launched: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="brdins")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
+                                  subprocess_runner=fake_runner)
+    assert dispatcher.dispatch_once() is True
+    argv = next(a for a in launched if a[:2] == ["docker", "run"])
+    assert "--network=none" in argv                                    # fail-closed
+    assert not any("blastbox.net.wire=inspect" in t for t in argv)     # NOT routed to MITM gw
+    assert not any(t.startswith("BLASTBOX_NET_WAIT_GATEWAY=") and t != "BLASTBOX_NET_WAIT_GATEWAY="
+                   for t in argv)                                       # no gateway wait
+
+
 def test_transproxy_personality_labels_worker_and_waits_for_gateway(tmp_path, monkeypatch):
     """A first-class tor personality (CAPE transparent recipe) → worker on bb-socks labeled
     blastbox.net.wire=transproxy, and it waits for the host gateway route (not a TUN)."""
@@ -1422,7 +1473,8 @@ def test_transproxy_personality_labels_worker_and_waits_for_gateway(tmp_path, mo
         "BLASTBOX_NETPOLICY_TORTP", "exit=tor,gateway=172.30.0.1,dns=172.30.0.1"
     )
     store = InMemoryJobStore()
-    job = _make_job(); job.input_sha256 = _INPUT_SHA
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
     store.create(job)
     _setup_job_dirs(tmp_path, job)
     output_dir = tmp_path / job.job_id / "output"
