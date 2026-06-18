@@ -22,11 +22,16 @@ _ENV_MAP = {
     "max_total_artifact_bytes": "MAX_TOTAL_ARTIFACTS",
     "max_artifacts": "MAX_ARTIFACTS",
     "disclose_security_internals": "DISCLOSE_SECURITY_INTERNALS",
+    "net_egress": "NET_EGRESS",
 }
 
 # Fields that need non-int coercion from env strings.
 _ENV_COERCE: dict[str, Callable[[str], object]] = {
     "disclose_security_internals": lambda s: s.lower() not in ("0", "false", "no"),
+    # net_egress is FAIL-CLOSED: only an explicit truthy token opens egress, so a typo or an
+    # unexpected value can never silently net-share an untrusted worker (unlike the permissive
+    # not-in-falsey style above).
+    "net_egress": lambda s: s.strip().lower() in ("1", "true", "yes", "on"),
 }
 
 # Hard ceilings — prevent a hostile or fat-fingered env var from silently
@@ -58,6 +63,13 @@ class Limits:
     max_total_artifact_bytes: int = 500 * 1024 * 1024  # 500 MiB total
     max_artifacts: int = 1000
     disclose_security_internals: bool = False
+    # Network egress for the sandboxed worker process. Default OFF = an inner namespace sandbox
+    # (bwrap/nsjail) ISOLATES its netns (no egress) — fail-closed. When a netpolicy grants this
+    # worker an exit, the dispatcher sets BLASTBOX_NET_EGRESS=1 so the inner sandbox NET-SHARES
+    # the worker's (rooter-routed) netns instead. nono ignores it (no netns to share — stays
+    # --block-net); the container backend already rides the outer netns. This flag only decides
+    # isolate-vs-share; the host-side rooter is what steers that netns through fakenet/socks/vpn.
+    net_egress: bool = False
 
     def __post_init__(self) -> None:
         if not 1 <= self.timeout_s <= _MAX_TIMEOUT_S:

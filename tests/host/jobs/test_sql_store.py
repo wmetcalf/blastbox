@@ -264,6 +264,17 @@ def test_postgres_claim_next_skip_locked():
     store.delete(job.job_id)
 
 
+def test_net_policy_persists(tmp_path):
+    from blastbox.host.jobs.base import Job
+    from blastbox.host.jobs.sql_store import SqlJobStore
+
+    store = SqlJobStore(f"sqlite:///{tmp_path / 'j.db'}")
+    job = Job.new(engine="redtusk", filename="x.doc")
+    job.net_policy = "fakenet"
+    store.create(job)
+    assert store.get(job.job_id).net_policy == "fakenet"
+
+
 @pytest.mark.skipif(not POSTGRES_DSN, reason="BLASTBOX_TEST_PG_DSN not set")
 def test_postgres_claim_next_respects_target_tier():
     """Exercise the Postgres-specific claim CTE param binding (separate SQL string from sqlite)

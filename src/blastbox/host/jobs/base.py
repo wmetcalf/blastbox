@@ -53,6 +53,11 @@ class Job:
     # job ("cold"/"firecracker"/"gvisor"); None = any dispatcher (default). Honored at claim
     # by every backend; only settable at submit when BLASTBOX_ALLOW_TIER_ROUTING is on.
     target_tier: str | None = None
+    # OPERATOR/CLIENT routing hint: the requested network personality name (a key in the
+    # operator's BLASTBOX_NETPOLICY_<NAME> registry). None = use the engine default. Only
+    # honored at submit when BLASTBOX_ALLOW_NETPOLICY_OVERRIDE is on; resolved fail-closed at
+    # dispatch. Mirrors target_tier.
+    net_policy: str | None = None
     error: str | None = None
     # Per-claim ownership token: claim_next() stamps a fresh value on each QUEUED->RUNNING
     # transition; requeue clears it. Terminal/recovery writes CAS on (status, claim_id) so a
@@ -115,6 +120,7 @@ class Job:
             worker_runtime=d.get("worker_runtime"),
             worker_tier=d.get("worker_tier"),
             target_tier=d.get("target_tier"),
+            net_policy=d.get("net_policy"),
             error=d.get("error"),
             claim_id=d.get("claim_id"),
             security_warnings=(

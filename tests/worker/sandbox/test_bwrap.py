@@ -52,11 +52,20 @@ class TestBwrapArgvBuilding:
         assert all(isinstance(t, str) for t in result)
 
     def test_contains_unshare_net(self) -> None:
-        """--unshare-net is always present (network isolation)."""
+        """--unshare-net is present BY DEFAULT (net_egress off → network isolated, fail-closed)."""
         sb = _make_sandbox()
         req = SandboxRequest(argv=["/usr/bin/true"])
         argv = sb._build_argv(req)
         assert "--unshare-net" in argv
+        assert "--share-net" not in argv
+
+    def test_net_shares_when_egress_enabled(self) -> None:
+        """net_egress on → --share-net (retain the rooter-routed netns), drop --unshare-net."""
+        sb = _make_sandbox(bwrap_path="/bin/true")
+        req = SandboxRequest(argv=["/usr/bin/true"], limits=Limits(net_egress=True))
+        argv = sb._build_argv(req)
+        assert "--share-net" in argv
+        assert "--unshare-net" not in argv
 
     def test_contains_cap_drop_all(self) -> None:
         """--cap-drop ALL is always present."""

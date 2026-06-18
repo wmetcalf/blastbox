@@ -28,11 +28,13 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Mapping
 
 from blastbox.contract.envelope import (
+    Artifact,
     atomic_write_confined,
     confined_atomic_writer,
     open_confined_regular_fd,
@@ -168,6 +170,11 @@ class EngineSpec:
     # key must itself be forwardable (allowlisted, if an allowlist is set) and non-reserved —
     # one gate, fail-closed, no broader trust path for operator policy than for client params.
     default_params: dict[str, str] = field(default_factory=dict)
+    # Per-engine DEFAULT network personality (BLASTBOX_ENGINE_<NAME>_NETPOLICY). Ships "none"
+    # (no egress). Resolved per job against the operator's personality registry, fail-closed
+    # (see netpolicy.resolve_net_policy). Runtime-configurable like default_params: flip the
+    # env + restart the dispatcher, no rebuild. This task only carries it; applying it is later.
+    net_policy: str = "none"
 
 
 class Dispatcher:
@@ -255,6 +262,42 @@ class Dispatcher:
         # not by silently mislabeling warm jobs as cold here. Inert until an operator enables
         # routing at the API (BLASTBOX_ALLOW_TIER_ROUTING) — existing jobs have no target.
         self._tier = tier
+
+        # Personality registry built ONCE from the operator env (does not change per job).
+        from blastbox.host.netpolicy import parse_personalities
+        self._net_policies = parse_personalities(os.environ)
+        self._allow_net_override = os.environ.get(
+            "BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        # Per-job packet capture (opt-in). When on, egress workers are LABELLED for blastbox-netd
+        # (the privileged host capture helper) and the resulting host-only pcap is sealed into the
+        # envelope as a trusted artifact. Default OFF — capture has storage/privacy implications and
+        # needs netd running; the dispatcher itself stays cap-drop=ALL and never captures.
+        self._net_capture = os.environ.get(
+            "BLASTBOX_NET_CAPTURE", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        # Optional TLS decrypt of the capture (P5): when on AND a keylog sits in the job's capture
+        # dir, run GoGoRoboCap to seal decrypted+mixed pcaps alongside the raw capture. Default off
+        # (needs the binary + key material); a hostile/absent keylog is a silent no-op.
+        self._net_decrypt = os.environ.get(
+            "BLASTBOX_NET_DECRYPT", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        self._gogorobocap_bin = (
+            os.environ.get("BLASTBOX_GOGOROBOCAP_BIN") or "gogorobocap"
+        ).strip()
+        # netd drops the per-job TLS keylog (sslkeys.log) on the worker's DIE event, which races
+        # this dispatcher's post-worker seal. Briefly poll for it so an inspect job's decrypt isn't
+        # silently skipped just because the snapshot landed a beat after we started sealing. Clamped
+        # to [0, 60]s: this poll blocks a dispatch thread, so a fat-fingered env can't wedge one.
+        self._decrypt_keylog_wait_s = max(0.0, min(
+            float(os.environ.get("BLASTBOX_NET_DECRYPT_KEYLOG_WAIT_S") or "8"), 60.0
+        ))
+        # netd finalizes the pcap (terminates tcpdump) on the worker's DIE event, asynchronously to
+        # this dispatcher's post-worker seal. Wait (bounded) for netd's <pcap>.done sentinel before
+        # copying so the capture isn't sealed mid-write (truncated tail). Clamped like the keylog wait.
+        self._net_capture_wait_s = max(0.0, min(
+            float(os.environ.get("BLASTBOX_NET_CAPTURE_WAIT_S") or "5"), 60.0
+        ))
 
     # ------------------------------------------------------------------
     # Public API
@@ -496,6 +539,45 @@ class Dispatcher:
     # Internal dispatch flow
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _httpproxy_env(personality) -> dict[str, str]:
+        """The HTTP(S)_PROXY env to inject for an httpproxy personality, or {} if the driver isn't
+        httpproxy or the proxy= URL is malformed (fail closed — no env, no egress). Validates scheme
+        + host:port so an operator typo can't silently produce a broken/leaky proxy env."""
+        if personality.exit_driver != "httpproxy":
+            return {}
+        proxy = (personality.config.get("proxy") or "").strip()
+        if not proxy:
+            return {}
+        parsed = urllib.parse.urlparse(proxy)
+        ok = (
+            parsed.scheme in ("http", "https", "socks5", "socks5h")
+            and bool(parsed.hostname)
+            and " " not in proxy and "\n" not in proxy
+        )
+        if not ok:
+            _log.warning("httpproxy proxy= %r is malformed; not injecting proxy env (fail closed)",
+                         proxy[:80])
+            return {}
+        try:  # urlparse only validates the port lazily on access
+            _ = parsed.port
+        except ValueError:
+            _log.warning("httpproxy proxy= %r has a bad port; not injecting proxy env", proxy[:80])
+            return {}
+        return {k: proxy for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}
+
+    def _resolve_personality(self, job: Job):
+        """Resolve a job's effective network personality (fail-closed to ``none``). Used both to
+        decide warm-vs-cold routing here and inside the cold path; same inputs → same result."""
+        from blastbox.host.netpolicy import resolve_net_policy
+        engine = self._engines.get(job.engine)
+        return resolve_net_policy(
+            job_net_policy=job.net_policy,
+            engine_default=engine.net_policy if engine else "none",
+            registry=self._net_policies,
+            allow_override=self._allow_net_override,
+        )
+
     def _dispatch_claimed_job(self, job: Job) -> None:
         """Execute one claimed job (status is already RUNNING on entry).
 
@@ -512,10 +594,20 @@ class Dispatcher:
         output_dir = root / "output"
         input_path = input_dir / Path(job.filename).name
 
-        # Try the warm path if a pool is configured
+        # Try the warm path if a pool is configured. EXCEPTION: an egress personality needs the cold
+        # path's netd netns-wiring + dispatcher network args/labels, which the warm tier can't apply
+        # (warm-tier networking is a future phase) — so an egress job on a warm slot would silently
+        # fail closed. Don't claim a warm slot for it: a warm-only sidecar then requeues it for a
+        # cold dispatcher (existing branch below); a warm+cold dispatcher cold-falls-through. Either
+        # way the job runs WITH egress instead of failing.
         if self._pool is not None:
-            slot = self._pool.claim(timeout_s=self._warm_claim_timeout_s)
-            record_warm_claim(hit=slot is not None)
+            egress = self._resolve_personality(job).exit_driver not in ("none", "drop")
+            if egress:
+                _log.info("net_policy egress job_id=%s → bypassing warm slot (cold wires egress)",
+                          job.job_id)
+            slot = None if egress else self._pool.claim(timeout_s=self._warm_claim_timeout_s)
+            if not egress:
+                record_warm_claim(hit=slot is not None)
             if slot is not None:
                 # WARM PATH — the slot, not input_path/output_dir, owns I/O dirs.
                 # Staged input is deleted in the finally block (only if we still own the claim;
@@ -889,6 +981,121 @@ class Dispatcher:
         # nono-skipped-under-runsc / missing-AppArmor / missing-seccomp warnings onto
         # runtime.warnings. argv assembly is pure (no filesystem or container side effects), so
         # doing it here cannot lose the claim or launch anything early.
+
+        # Resolve the effective network personality FAIL-CLOSED. Uses the registry built once at
+        # __init__ (from the operator env), the per-engine default (engine.net_policy), and the
+        # per-job override (only honoured when BLASTBOX_ALLOW_NETPOLICY_OVERRIDE is set). Any
+        # unknown driver falls back to --network=none in docker_network_args.
+        from blastbox.host.netpolicy import resolve_net_policy
+        from blastbox.host.netapply import (
+            docker_network_args,
+            inspect_routes_via_gateway,
+            worker_resolv_conf,
+        )
+        personality = resolve_net_policy(
+            job_net_policy=job.net_policy,
+            engine_default=engine.net_policy,
+            registry=self._net_policies,
+            allow_override=self._allow_net_override,
+        )
+        _log.info(
+            "net_policy_resolved job=%s personality=%s driver=%s",
+            job.job_id, personality.name, personality.exit_driver,
+        )
+        # netd wires these tiers by entering the worker's network namespace (nsenter by host pid),
+        # which only a runc worker exposes — a runsc (gVisor) worker's network lives in the Sentry's
+        # userspace netstack, not a host-visible netns, so wiring is impossible and the worker would
+        # just wait for a route that never comes and fail closed. Refuse early with a clear, fixable
+        # diagnostic instead. (direct/inetsim ride a plain bridge and httpproxy is env-based — those
+        # need no netns wiring and run under runsc fine; only the route/tunnel tiers are gated.)
+        needs_netns_wiring = (
+            personality.exit_driver in ("tor", "socks", "openvpn", "wireguard")
+            or inspect_routes_via_gateway(personality)
+        )
+        if needs_netns_wiring and runtime.runtime != "runc":
+            self._fail_job(
+                job,
+                f"netpolicy {personality.name!r} (exit={personality.exit_driver}) needs netd to wire "
+                f"the worker's network namespace, which the {runtime.runtime!r} runtime does not "
+                f"expose (host-visible netns is runc-only today). Run this tier under runc "
+                f"(BLASTBOX_ALLOW_RUNC=1 + BLASTBOX_WORKER_RUNTIME=runc), or use a non-wired exit "
+                f"(direct / inetsim / httpproxy).",
+            )
+            return
+        # Gateway-routed tiers (tor/openvpn/wireguard/inspect) have netd install the default route
+        # AFTER the container starts; the worker waits for that route via BLASTBOX_NET_WAIT_GATEWAY,
+        # which is derived from the personality's gateway=. Without it the barrier is empty and a fast
+        # engine races netd (flapping / fail-closed). Require gateway= rather than launch a racey job.
+        # (socks waits for the TUN device, not a gateway, so it is exempt.)
+        routed_via_gateway = (
+            personality.exit_driver in ("tor", "openvpn", "wireguard")
+            or inspect_routes_via_gateway(personality)
+        )
+        if routed_via_gateway and not personality.config.get("gateway"):
+            self._fail_job(
+                job,
+                f"netpolicy {personality.name!r} (exit={personality.exit_driver}) is a gateway-routed "
+                f"tier but declares no gateway=; the worker can't be told which route to wait for, so "
+                f"egress would race netd. Add gateway=<netd gateway IP> to the personality.",
+            )
+            return
+        network_args = docker_network_args(personality)
+
+        # Optional resolv.conf injection for an egress personality (per-personality ``dns=``).
+        # On a docker user-defined bridge the worker's only nameserver is docker's embedded
+        # 127.0.0.11 — unreachable from a gVisor (runsc) worker — so without this an egress
+        # worker on the default cold runtime gets L3 connectivity but cannot resolve names.
+        # Compute the path now so it lands in the argv; the file is written below, once the job
+        # dir exists (it's a sibling of output/, never inside the /output mount).
+        resolv_conf_content = worker_resolv_conf(personality)
+        resolv_conf_src: str | None = (
+            str(output_dir.parent / "resolv.conf") if resolv_conf_content else None
+        )
+
+        # Per-job capture: label the worker for blastbox-netd ONLY when capture is enabled AND
+        # the personality actually has egress (none/drop have no traffic to capture). netd reads
+        # this label off `docker events`; the dispatcher never touches a raw socket.
+        capture_on = self._net_capture and personality.exit_driver not in ("none", "drop")
+        worker_labels = {
+            "blastbox.role": "worker",
+            "blastbox.job_id": job.job_id,
+        }
+        if capture_on:
+            worker_labels["blastbox.net.capture"] = "1"
+        # tor / SOCKS / VPN / inspect personalities run the worker on an INTERNAL bridge (no direct
+        # egress); netd wires the only route out. The label requests that wiring by mode; until netd
+        # wires it the worker simply has no egress (fail-closed).
+        #   inspect (any egress exit)      → default route via sslproxy/MITM gw (bb-inspect)
+        #   tor (CAPE transparent)         → default route → host gw + host REDIRECT to tor (bb-socks)
+        #   socks (BrightData/SOCKS5)      → tun2socks in the netns   (bb-socks)
+        #   openvpn / wireguard (all-IP)   → default route via gateway (bb-vpn)
+        # Inspect WINS: an inspected worker faces the MITM gateway (which chains onward to the real
+        # exit), so it is routed to the gateway regardless of the underlying exit driver — but ONLY
+        # for a route-inspectable driver. inspect+httpproxy is unsupported: docker_network_args
+        # fails it closed to --network=none, so we must NOT label it wire=inspect (which would send
+        # netd chasing a gateway route that doesn't apply). Same predicate, single source of truth.
+        if inspect_routes_via_gateway(personality):
+            worker_labels["blastbox.net.wire"] = "inspect"
+        elif personality.exit_driver == "tor":
+            worker_labels["blastbox.net.wire"] = "transproxy"
+        elif personality.exit_driver == "socks":
+            worker_labels["blastbox.net.wire"] = "socks"
+            # Per-personality SOCKS endpoint (e.g. a specific country's tor SocksPort) overrides
+            # netd's global --socks-proxy, so one netd fronts a whole fleet of socks backends.
+            if personality.config.get("proxy"):
+                worker_labels["blastbox.net.socks-proxy"] = personality.config["proxy"]
+        elif personality.exit_driver in ("openvpn", "wireguard"):
+            worker_labels["blastbox.net.wire"] = "vpn"
+
+        # Non-TCP leak guard for the TCP-only proxy tiers (tor/socks/httpproxy): netd installs an
+        # in-netns OUTPUT firewall that DROPs all non-TCP egress (UDP/ICMP/raw) — these tiers carry
+        # only TCP, so a sample must not be able to leak non-TCP past the worker. The VPN tier is the
+        # all-IP path and gets NO guard. tor needs UDP:53 out (the host DNSPort REDIRECT) → "dns".
+        if personality.exit_driver == "tor":
+            worker_labels["blastbox.net.leakguard"] = "dns"
+        elif personality.exit_driver in ("socks", "httpproxy"):
+            worker_labels["blastbox.net.leakguard"] = "strict"
+
         container_name = f"blastbox-worker-{job.job_id[:12]}"
         argv = build_worker_docker_run_argv(
             image=engine.image,          # NEVER job.engine / job.filename / job.params
@@ -898,11 +1105,10 @@ class Dispatcher:
             output_mount_path="/output",
             worker_argv=list(engine.worker_argv),
             runtime=runtime,
+            network_args=network_args,
+            resolv_conf_src=resolv_conf_src,
             container_name=container_name,
-            labels={
-                "blastbox.role": "worker",
-                "blastbox.job_id": job.job_id,
-            },
+            labels=worker_labels,
             extra_env={
                 **self._sanitize_params(
                     job.params, engine.allowed_param_keys, engine.reserved_param_keys,
@@ -914,6 +1120,37 @@ class Dispatcher:
                 # LAST so a hostile job.param can't override them.
                 "BLASTBOX_INPUT_DIR": "/input",
                 "BLASTBOX_OUTPUT_DIR": "/output",
+                # Tell an engine that nests an inner namespace sandbox (bwrap/nsjail) whether to
+                # NET-SHARE the worker's (rooter-routed) netns or ISOLATE it. Only personalities
+                # with an actual exit grant egress; none/drop stay sealed. Set EXPLICITLY (merged
+                # last, after job.params) so a hostile job.param can't flip a sealed worker open.
+                "BLASTBOX_NET_EGRESS": (
+                    "1" if personality.exit_driver not in ("none", "drop") else "0"
+                ),
+                # Egress-readiness barrier for netd-wired tiers: netd installs the worker's only
+                # route out AFTER the container starts, so tell the harness what to wait for before
+                # detonating — otherwise a fast one-shot engine reaches the network first and fails
+                # closed. inspect/vpn wait for the gateway route (personality `gateway=`, must match
+                # netd's --inspect-gateway/--vpn-gateway); socks waits for the tun2socks TUN device.
+                # Empty = no wait. Merged last so a hostile job.param can't suppress it.
+                "BLASTBOX_NET_WAIT_GATEWAY": (
+                    personality.config.get("gateway", "")
+                    if (inspect_routes_via_gateway(personality) or personality.exit_driver
+                        in ("tor", "openvpn", "wireguard"))
+                    else ""
+                ),
+                "BLASTBOX_NET_WAIT_TUN": (
+                    "tun0" if (personality.exit_driver == "socks"
+                               and not personality.inspect) else ""
+                ),
+                # httpproxy tier: the worker's only egress is an HTTP(S) proxy. Inject it as the
+                # standard proxy env (both case-variants for client coverage) from the personality's
+                # `proxy=` — a creds-holding chaining sidecar, so the upstream provider creds never
+                # enter the untrusted worker env. Merged last so a hostile job.param can't override.
+                # The URL is validated (parity with the socks tier): a malformed proxy= injects no
+                # env → the worker fails closed (internal bridge, no egress) rather than racing some
+                # client's direct-fallback behaviour.
+                **self._httpproxy_env(personality),
             },
         )
 
@@ -952,6 +1189,12 @@ class Dispatcher:
         shutil.rmtree(output_dir, ignore_errors=True)
         output_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(output_dir, 0o777)
+
+        # Materialize the egress resolv.conf (its path is already wired into argv) now that the
+        # per-job dir exists. Written to the job root, a sibling of output/, so it is never
+        # visible in the worker's /output artifacts; only the single file is bind-mounted.
+        if resolv_conf_src and resolv_conf_content:
+            Path(resolv_conf_src).write_text(resolv_conf_content, encoding="ascii")
 
         try:
             # Run to completion (or timeout). The worker's exit code is not the
@@ -1029,6 +1272,15 @@ class Dispatcher:
             detail = envelope.warnings[0].message if envelope.warnings else "engine_error"
             self._fail_job(job, f"engine_error: {detail}")
             return
+
+        # Fold a per-job network capture (if blastbox-netd produced one) into the sealed envelope
+        # as a TRUSTED host artifact. The pcap lives off the worker /output mount, so the worker
+        # never had write access to it; the host hashes it here. Best-effort — a missing/empty
+        # capture (netd not running, or a none/drop personality) is a silent no-op.
+        if capture_on:
+            envelope = self._seal_network_capture(envelope, output_dir)
+            if self._net_decrypt:
+                envelope = self._seal_decrypted_capture(envelope, output_dir)
 
         # Persist the host-SEALED metadata over the worker's raw file so the API serves trusted
         # hashes/sizes/payload, not worker-fabricated ones (#5).
@@ -1208,6 +1460,184 @@ class Dispatcher:
                 raise OutputTrustError(
                     f"total output {total} bytes exceeds cap {cap} (undeclared files counted)"
                 )
+
+    def _confined_capture_dir(self, output_dir: Path) -> Path | None:
+        """``output_dir/capture`` as a real directory confined under ``output_dir`` (created if
+        absent), or ``None`` if the untrusted worker planted a SYMLINK there. The capture/decrypt
+        artifacts are written HOST-side after worker-output validation, so a worker-planted symlink
+        at ``output/capture`` would otherwise let the host pcap copy / GoGoRoboCap output follow it
+        OUTSIDE the job tree (a containment escape). The worker has already exited by seal time, so
+        the symlink is static — a check-then-write here has no live TOCTOU."""
+        cap = output_dir / "capture"
+        try:
+            if cap.is_symlink():
+                _log.warning("refusing capture seal: %s is a symlink (worker tampering)", cap)
+                return None
+            cap.mkdir(parents=True, exist_ok=True)
+            real_out, real_cap = os.path.realpath(output_dir), os.path.realpath(cap)
+            if os.path.commonpath([real_out, real_cap]) != real_out:
+                _log.warning("refusing capture seal: %s escapes %s", cap, output_dir)
+                return None
+        except (OSError, ValueError) as exc:
+            _log.warning("capture dir guard failed for %s: %s", output_dir, exc)
+            return None
+        return cap
+
+    def _seal_network_capture(self, envelope, output_dir: Path):
+        """Fold blastbox-netd's per-job pcap into the sealed envelope as a TRUSTED host artifact.
+
+        netd writes the capture to ``<job_root>/<id>/capture/dump.pcap`` — a sibling of
+        ``output/``, OFF the worker ``/output`` mount, so the untrusted worker never had write
+        access to it. We move it INTO ``output_dir/capture/`` (so the ingress serve route, which
+        confines artifacts to the output dir, can serve it), host-hash it, and append an
+        :class:`Artifact`. Best-effort: any miss (no pcap, empty, oversized, copy/hash error)
+        leaves the envelope unchanged so a capture hiccup never fails an otherwise-valid job.
+        """
+        src = output_dir.parent / "capture" / "dump.pcap"
+        done = output_dir.parent / "capture" / "dump.pcap.done"
+        try:
+            # If a capture exists but netd's die-handler hasn't finalized it yet, wait (bounded) for
+            # the .done sentinel so we copy a COMPLETE pcap, not one tcpdump is still appending to.
+            # Gated on the pcap existing → no wait when capture is off (no netd, sentinel never lands).
+            if src.is_file() and not done.is_file():
+                deadline = time.monotonic() + self._net_capture_wait_s
+                while not done.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            if not src.is_file() or src.stat().st_size == 0:
+                return envelope
+            size = src.stat().st_size
+            if size > self._limits.max_artifact_bytes:
+                _log.warning(
+                    "netd capture for output %s is %d bytes (> max_artifact_bytes %d); not sealed",
+                    output_dir, size, self._limits.max_artifact_bytes,
+                )
+                return envelope
+            # Don't overwrite a path the worker already declared as its own artifact — the served
+            # bytes would then mismatch that artifact's sealed sha. Leave the worker's artifact be.
+            if any(a.path == "capture/dump.pcap" for a in envelope.artifacts):
+                _log.warning("capture/dump.pcap already declared by the worker; not sealing netd "
+                             "capture for %s", output_dir)
+                return envelope
+            # This host artifact is appended AFTER worker-output validation/cap enforcement, so honor
+            # the same ceilings here rather than silently exceeding them in the final metadata.
+            if len(envelope.artifacts) >= self._limits.max_artifacts:
+                _log.warning("artifact count cap reached; not sealing netd capture for %s", output_dir)
+                return envelope
+            if (sum(a.bytes for a in envelope.artifacts) + size) > \
+                    self._limits.max_total_artifact_bytes:
+                _log.warning("total artifact-bytes cap reached; not sealing netd capture for %s",
+                             output_dir)
+                return envelope
+            dst_dir = self._confined_capture_dir(output_dir)
+            if dst_dir is None:
+                return envelope
+            dst = dst_dir / "dump.pcap"
+            if dst.is_symlink():
+                _log.warning("refusing capture seal: %s is a symlink (worker tampering)", dst)
+                return envelope
+            shutil.copy2(src, dst)
+            h = hashlib.sha256()
+            with open(dst, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            artifact = Artifact(
+                id="network.capture.pcap",
+                path="capture/dump.pcap",
+                kind="network_capture",
+                sha256=h.hexdigest(),
+                bytes=dst.stat().st_size,
+            )
+        except Exception as exc:  # noqa: BLE001 — capture is best-effort, never fail the job
+            _log.warning("sealing netd capture for output %s failed: %s", output_dir, exc)
+            return envelope
+        _log.info("sealed network capture artifact (%d bytes) for output %s", size, output_dir)
+        return envelope.model_copy(update={"artifacts": [*envelope.artifacts, artifact]})
+
+    def _seal_decrypted_capture(self, envelope, output_dir: Path):
+        """If a TLS keylog sits in the job's capture dir, run GoGoRoboCap over the sealed capture
+        pcap to produce decrypted+mixed pcaps and seal them as TRUSTED host artifacts. Best-effort:
+        no keylog / no binary / no TLS flows / any error → envelope unchanged. The keylog is a
+        host-side input (an sslproxy/MITM sidecar or an instrumented runtime writes it to the
+        host-only capture dir); the worker never had write access to the capture dir."""
+        from blastbox.host.decrypt import decrypt_capture
+
+        # Decrypt the HOST-ONLY original pcap and write GoGoRoboCap's output into the host-only
+        # capture dir (a sibling of output/, OFF the worker /output mount). The worker never had
+        # write access there, so it can't pre-plant a symlink for ggrc's -o write to follow outside
+        # the job tree. We then confined-COPY each output into output/capture/ with the SAME
+        # symlink/collision/cap guards as the raw pcap (parity with _seal_network_capture).
+        host_cap = output_dir.parent / "capture"
+        pcap = host_cap / "dump.pcap"
+        keylog = host_cap / "sslkeys.log"  # host-only key drop
+        if not pcap.is_file() or pcap.is_symlink():
+            return envelope
+        # The keylog is dropped by netd on the worker's die event, which races this seal. If we have
+        # a capture but the keylog hasn't landed yet, wait briefly for it rather than skip decrypt.
+        deadline = time.monotonic() + self._decrypt_keylog_wait_s
+        while (not keylog.is_file() or keylog.stat().st_size == 0) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if not keylog.is_file() or keylog.stat().st_size == 0:
+            return envelope
+        try:
+            result = decrypt_capture(
+                binary=self._gogorobocap_bin,
+                pcap_path=str(pcap),
+                keylog_path=str(keylog),
+                out_dir=str(host_cap),  # host-only scratch — worker can't plant a symlink here
+                run_fn=lambda argv: self._subprocess_runner(
+                    argv, capture_output=True, text=True, check=False, timeout=300
+                ).returncode,
+            )
+        except Exception as exc:  # noqa: BLE001 — decrypt is best-effort enrichment
+            _log.warning("decrypt seal for output %s failed: %s", output_dir, exc)
+            return envelope
+        if result is None:
+            return envelope
+        dst_dir = self._confined_capture_dir(output_dir)  # output/capture, refuse a symlinked dir
+        if dst_dir is None:
+            return envelope
+        new_artifacts = list(envelope.artifacts)
+        total = sum(a.bytes for a in new_artifacts)
+        for art_id, kind, path in (
+            ("network.capture.decrypted.pcap", "network_capture_decrypted", result.decrypted_path),
+            ("network.capture.mixed.pcap", "network_capture_mixed", result.mixed_path),
+        ):
+            if not path:
+                continue
+            try:
+                src = Path(path)
+                if not src.is_file() or src.is_symlink():
+                    continue
+                size = src.stat().st_size
+                if size > self._limits.max_artifact_bytes:
+                    continue
+                rel = f"capture/{src.name}"
+                if any(a.path == rel for a in new_artifacts):  # path already declared by the worker
+                    continue
+                if len(new_artifacts) >= self._limits.max_artifacts:
+                    break
+                if total + size > self._limits.max_total_artifact_bytes:
+                    break
+                dst = dst_dir / src.name
+                if dst.is_symlink():
+                    continue
+                shutil.copy2(src, dst)
+                h = hashlib.sha256()
+                with open(dst, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(chunk)
+                new_artifacts.append(Artifact(
+                    id=art_id, path=rel, kind=kind,
+                    sha256=h.hexdigest(), bytes=dst.stat().st_size,
+                ))
+                total += dst.stat().st_size
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("sealing decrypt artifact %s failed: %s", art_id, exc)
+        if len(new_artifacts) == len(envelope.artifacts):
+            return envelope
+        _log.info("sealed %d decrypted capture artifact(s) for output %s",
+                  len(new_artifacts) - len(envelope.artifacts), output_dir)
+        return envelope.model_copy(update={"artifacts": new_artifacts})
 
     def _write_sealed_metadata(self, envelope, output_dir: Path) -> None:
         """Overwrite metadata.json with the host-SEALED envelope (recomputed sha256/bytes/payload)

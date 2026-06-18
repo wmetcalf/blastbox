@@ -1,0 +1,36 @@
+# Cold-path (runsc/runc) worker image for the generic DetonateEngine.
+#
+# Runs an allow-listed CLI tool on the input inside a disposable, hardened worker
+# and seals the result into the typed Envelope. The engine + the tool argv are
+# OPERATOR-FIXED per image (baked as ENV, never job-derived) — build one image per
+# detonation tool. This example bakes `tr a-z A-Z`. Build context = blastbox root:
+#
+#   docker build -t blastbox-detonate-tr:dev \
+#     -f deploy/docker/Dockerfile.detonate-cold-worker .
+#
+# Run it under gVisor (runsc) — it is a cold worker image; the outer runtime is the
+# sandbox (the engine runs the tool as a plain subprocess).
+FROM python:3.12-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends coreutils \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -u 10001 -m worker
+
+# Install THIS-tree blastbox (which ships blastbox.engines.detonate + worker.cold).
+COPY pyproject.toml README.md /src/blastbox/
+COPY src /src/blastbox/src
+RUN pip install --no-cache-dir /src/blastbox \
+    && rm -rf /src \
+    && python -c "import blastbox.worker.cold, blastbox.engines.detonate; print('detonate worker ready')"
+
+# Operator-fixed engine + tool argv (per image, never from job data). The dispatcher
+# injects BLASTBOX_INPUT_DIR=/input and BLASTBOX_OUTPUT_DIR=/output at run time.
+# BLASTBOX_DETONATE_NAME must equal the dispatcher's EngineSpec name for this image
+# (the host trust gate matches envelope.engine to the job's engine).
+ENV BLASTBOX_ENGINE=blastbox.engines.detonate:DetonateEngine \
+    BLASTBOX_DETONATE_NAME=upper \
+    BLASTBOX_DETONATE_ARGV='["tr","a-z","A-Z"]'
+
+USER 10001:10001
+ENTRYPOINT ["python", "-m", "blastbox.worker.cold"]

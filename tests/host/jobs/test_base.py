@@ -147,3 +147,20 @@ def test_jobstore_is_protocol():
     assert "list" in members
     assert "claim_next" in members
     assert "delete" in members
+
+
+# ---------------------------------------------------------------------------
+# Job.net_policy field
+# ---------------------------------------------------------------------------
+
+def test_job_net_policy_defaults_none():
+    from blastbox.host.jobs.base import Job
+    j = Job.new(engine="redtusk", filename="x.doc")
+    assert j.net_policy is None
+
+
+def test_job_net_policy_roundtrips_through_dict():
+    from blastbox.host.jobs.base import Job
+    j = Job.new(engine="redtusk", filename="x.doc")
+    j.net_policy = "fakenet"
+    assert Job.from_dict(j.to_dict()).net_policy == "fakenet"

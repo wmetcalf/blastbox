@@ -1145,6 +1145,46 @@ class TestTierRoutingGate:
         assert resp.status_code == 400
 
 
+def test_net_policy_ignored_when_override_disabled(tmp_path, monkeypatch):
+    monkeypatch.delenv("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", raising=False)
+    client, store = _make_client(tmp_path)
+    resp = client.post(
+        "/v1/jobs",
+        data={"engine": "clippyshot", "net_policy": "fakenet"},
+        files={"file": ("x.docx", b"data", "application/octet-stream")},
+    )
+    assert resp.status_code in (200, 202)
+    jid = resp.json()["job_id"]
+    assert store.get(jid).net_policy is None  # ignored
+
+
+def test_net_policy_set_when_override_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "1")
+    client, store = _make_client(tmp_path)
+    resp = client.post(
+        "/v1/jobs",
+        data={"engine": "clippyshot", "net_policy": "fakenet"},
+        files={"file": ("x.docx", b"data", "application/octet-stream")},
+    )
+    assert resp.status_code in (200, 202)
+    assert store.get(resp.json()["job_id"]).net_policy == "fakenet"
+
+
+def test_net_policy_invalid_name_rejected(tmp_path, monkeypatch):
+    """A personality name is a short token. Even with override enabled, an over-long / out-of-charset
+    value is rejected (not persisted) rather than stored + echoed in list/status."""
+    monkeypatch.setenv("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "1")
+    client, store = _make_client(tmp_path)
+    for bad in ("a" * 65, "has space", "semi;colon", "../etc"):
+        resp = client.post(
+            "/v1/jobs",
+            data={"engine": "clippyshot", "net_policy": bad},
+            files={"file": ("x.docx", b"data", "application/octet-stream")},
+        )
+        assert resp.status_code in (200, 202)
+        assert store.get(resp.json()["job_id"]).net_policy is None  # rejected, not stored
+
+
 def test_require_engine_allowlist_empty_raises(tmp_path, monkeypatch):
     """BLASTBOX_REQUIRE_ENGINE_ALLOWLIST=1 + empty allowlist => fail-closed at startup."""
     monkeypatch.setenv("BLASTBOX_REQUIRE_ENGINE_ALLOWLIST", "1")

@@ -38,6 +38,15 @@ class TestArgv:
         assert argv[0] == _FAKE_NONO and argv[1] == "wrap"
         assert "--block-net" in argv
 
+    def test_block_net_invariant_regardless_of_net_egress(self):
+        # INVARIANT: nono owns no netns, so it can NEVER carry egress — it stays --block-net even
+        # when a worker's policy would grant egress (that egress is for the outer netns sandbox).
+        for egress in (False, True):
+            argv = _sb()._build_argv(
+                SandboxRequest(argv=["/usr/bin/true"], limits=Limits(net_egress=egress))
+            )
+            assert "--block-net" in argv, f"nono must stay block-net (net_egress={egress})"
+
     def test_grants_system_dirs_read_only(self):
         argv = _sb()._build_argv(SandboxRequest(argv=["/usr/bin/true"]))
         # -r /usr present (read-only system dir grant)

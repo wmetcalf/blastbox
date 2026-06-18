@@ -308,3 +308,71 @@ def test_main_multiple_files_in_input_dir_returns_nonzero(tmp_path: Path) -> Non
     ])
 
     assert rc != 0
+
+
+# --------------------------------------------------------------------------- egress-readiness barrier
+def test_gateway_route_hex_little_endian() -> None:
+    from blastbox.worker.harness import _gateway_route_hex
+    # 172.32.0.10 → bytes AC 20 00 0A → little-endian hex 0A0020AC (matches /proc/net/route)
+    assert _gateway_route_hex("172.32.0.10") == "0A0020AC"
+    assert _gateway_route_hex("10.0.0.1") == "0100000A"
+
+
+def test_default_route_via_dev_for_tun(tmp_path: Path, monkeypatch) -> None:
+    import builtins
+
+    from blastbox.worker import harness
+    route = tmp_path / "route"
+    # the socks tier installs `default dev tun0` (no gateway) — Iface=tun0, Destination=00000000
+    route.write_text(
+        "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n"
+        "eth0\t000020AC\t00000000\t0001\t0\t0\t0\t0000FFFF\n"
+        "tun0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\n"
+    )
+    real_open = builtins.open
+    monkeypatch.setattr(builtins, "open", lambda p, *a, **k: (
+        real_open(route, *a, **k) if p == "/proc/net/route" else real_open(p, *a, **k)
+    ))
+    assert harness._default_route_via_dev("tun0") is True
+    assert harness._default_route_via_dev("eth0") is False  # eth0 has no default route here
+
+
+def test_default_route_via_reads_proc_route(tmp_path: Path, monkeypatch) -> None:
+    import builtins
+
+    from blastbox.worker import harness
+    route = tmp_path / "route"
+    # header + a non-default link route + the default via 172.32.0.10 (gw 0A0020AC)
+    route.write_text(
+        "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n"
+        "eth0\t000020AC\t00000000\t0001\t0\t0\t0\t0000FFFF\n"
+        "eth0\t00000000\t0A0020AC\t0003\t0\t0\t0\t00000000\n"
+    )
+    real_open = builtins.open
+    monkeypatch.setattr(builtins, "open", lambda p, *a, **k: (
+        real_open(route, *a, **k) if p == "/proc/net/route" else real_open(p, *a, **k)
+    ))
+    assert harness._default_route_via("172.32.0.10") is True
+    assert harness._default_route_via("172.32.0.99") is False
+
+
+def test_wait_for_egress_gateway_returns_when_wired(monkeypatch) -> None:
+    from blastbox.worker import harness
+    calls = {"n": 0}
+    # not wired for the first 2 probes, then wired
+    monkeypatch.setattr(harness, "_default_route_via",
+                        lambda gw: calls.__setitem__("n", calls["n"] + 1) or calls["n"] >= 3)
+    slept = []
+    ok = harness._wait_for_egress_gateway("172.32.0.10", 5.0, sleep_fn=slept.append)
+    assert ok is True and calls["n"] == 3 and len(slept) == 2
+
+
+def test_wait_for_egress_gateway_times_out(monkeypatch) -> None:
+    from blastbox.worker import harness
+    monkeypatch.setattr(harness, "_default_route_via", lambda gw: False)
+    t = {"now": 0.0}
+    ok = harness._wait_for_egress_gateway(
+        "172.32.0.10", 1.0, sleep_fn=lambda s: t.__setitem__("now", t["now"] + 0.1),
+        clock=lambda: t["now"],
+    )
+    assert ok is False
