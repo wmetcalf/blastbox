@@ -1220,6 +1220,7 @@ def test_network_capture_sealed_as_trusted_artifact(tmp_path, monkeypatch):
             cap = tmp_path / job.job_id / "capture"
             cap.mkdir(parents=True, exist_ok=True)
             (cap / "dump.pcap").write_bytes(pcap_bytes)
+            (cap / "dump.pcap.done").write_text("done")  # netd finalized the capture
             _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -1233,6 +1234,36 @@ def test_network_capture_sealed_as_trusted_artifact(tmp_path, monkeypatch):
     assert caps[0]["bytes"] == len(pcap_bytes)
     # The pcap is now servable from within the output dir.
     assert (output_dir / "capture" / "dump.pcap").read_bytes() == pcap_bytes
+
+
+def test_network_capture_seal_proceeds_when_done_sentinel_never_lands(tmp_path, monkeypatch):
+    """The .done-sentinel wait is BOUNDED: if netd never finalizes (no sentinel), the seal still
+    proceeds after the (short) timeout rather than blocking — the pcap is still sealed best-effort."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRECT", "exit=direct")
+    monkeypatch.setenv("BLASTBOX_NET_CAPTURE", "1")
+    monkeypatch.setenv("BLASTBOX_NET_CAPTURE_WAIT_S", "0.2")  # short bound so the test is fast
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    pcap_bytes = b"\xd4\xc3\xb2\xa1pcap-without-a-done-sentinel"
+
+    def fake_runner(argv, **kw):
+        if argv[:2] == ["docker", "run"]:
+            cap = tmp_path / job.job_id / "capture"
+            cap.mkdir(parents=True, exist_ok=True)
+            (cap / "dump.pcap").write_bytes(pcap_bytes)  # NOTE: no .done sentinel
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
+    sealed = json.loads((output_dir / "metadata.json").read_text())
+    caps = [a for a in sealed["artifacts"] if a["kind"] == "network_capture"]
+    assert len(caps) == 1  # sealed anyway after the bounded wait
+    assert caps[0]["sha256"] == hashlib.sha256(pcap_bytes).hexdigest()
 
 
 def test_decrypt_seals_decrypted_and_mixed_when_keylog_present(tmp_path, monkeypatch):
@@ -1256,6 +1287,7 @@ def test_decrypt_seals_decrypted_and_mixed_when_keylog_present(tmp_path, monkeyp
             # netd-style capture + an sslproxy-style keylog drop in the host-only capture dir.
             cap.mkdir(parents=True, exist_ok=True)
             (cap / "dump.pcap").write_bytes(b"\xd4\xc3\xb2\xa1" + b"raw-tls" * 40)
+            (cap / "dump.pcap.done").write_text("done")  # netd finalized the capture
             (cap / "sslkeys.log").write_text("SERVER_HANDSHAKE_TRAFFIC_SECRET a b\n")
             _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
             return subprocess.CompletedProcess(argv, 0, "", "")
@@ -1298,6 +1330,7 @@ def test_decrypt_noop_without_keylog(tmp_path, monkeypatch):
         if argv[:2] == ["docker", "run"]:
             cap.mkdir(parents=True, exist_ok=True)
             (cap / "dump.pcap").write_bytes(b"\xd4\xc3\xb2\xa1" + b"raw" * 40)  # no keylog
+            (cap / "dump.pcap.done").write_text("done")  # netd finalized the capture
             _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -1321,6 +1354,16 @@ def test_decrypt_keylog_wait_is_clamped(tmp_path, monkeypatch, env, expected):
     store = InMemoryJobStore()
     d = _make_dispatcher(store, job_root=tmp_path)
     assert d._decrypt_keylog_wait_s == expected
+
+
+@pytest.mark.parametrize("env,expected", [("100", 60.0), ("-5", 0.0), ("2", 2.0), (None, 5.0)])
+def test_net_capture_wait_is_clamped(tmp_path, monkeypatch, env, expected):
+    monkeypatch.delenv("BLASTBOX_NET_CAPTURE_WAIT_S", raising=False)
+    if env is not None:
+        monkeypatch.setenv("BLASTBOX_NET_CAPTURE_WAIT_S", env)
+    store = InMemoryJobStore()
+    d = _make_dispatcher(store, job_root=tmp_path)
+    assert d._net_capture_wait_s == expected
 
 
 def test_net_egress_env_reflects_personality(tmp_path, monkeypatch):

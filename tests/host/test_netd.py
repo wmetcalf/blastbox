@@ -91,6 +91,9 @@ def test_die_terminates_the_capture(tmp_path):
     assert proc.waited is True
     # No longer tracked.
     assert "c1" not in d.active
+    # A .done sentinel is written next to the pcap AFTER tcpdump exits, so the dispatcher's seal
+    # can wait for a complete capture instead of copying one mid-write.
+    assert (tmp_path / "J1" / "capture" / "dump.pcap.done").is_file()
 
 
 def test_die_unknown_container_is_noop(tmp_path):
@@ -195,6 +198,35 @@ def test_wire_socks_refuses_malformed_per_worker_proxy(tmp_path):
     d.handle_start("c1")
     assert spawned == []          # tun2socks never spawned
     assert "c1" not in d.wired    # fail-closed: no wire
+
+
+def test_wire_socks_aborts_and_kills_tun2socks_if_route_cmd_fails(tmp_path):
+    """If a tun_setup route command fails (non-zero rc), the worker would be left with no default
+    route (broken/no egress) — so fail closed: don't record it as wired, and terminate tun2socks
+    so it isn't orphaned."""
+    spawned: list = []
+
+    def nsenter_run(pid, argv):
+        # tun0 probe (link show) succeeds; the route-setup `ip route replace` fails.
+        if argv[:3] == ["ip", "link", "show"]:
+            return 0
+        if argv[:2] == ["ip", "route"]:
+            return 1  # route command fails
+        return 0
+
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: _wire_inspect(),
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        socks_proxy_url="socks5://bb:bb@172.30.0.10:1080",
+        nsenter_spawn_fn=lambda pid, argv: spawned.append(_FakeProc(argv)) or spawned[-1],
+        nsenter_run_fn=nsenter_run,
+        sleep_fn=lambda s: None,
+    )
+    d.handle_start("c1")
+    assert "c1" not in d.wired                  # fail-closed: not recorded as wired
+    assert spawned[0].terminated is True        # tun2socks killed, not orphaned
 
 
 def test_wire_inert_without_proxy_configured(tmp_path):

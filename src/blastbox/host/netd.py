@@ -56,6 +56,17 @@ _TUN_WAIT_INTERVAL_S = 0.25
 _SSLKEYS_NAME = "sslkeys.log"
 
 
+def _terminate(proc: Any) -> None:
+    """Best-effort terminate a Popen-like handle (None-safe, never raises). Used to avoid orphaning
+    a spawned tun2socks when wiring aborts after the spawn."""
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+    except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+        _log.warning("netd: terminate failed: %s", exc)
+
+
 @dataclass
 class _ActiveCapture:
     target: CaptureTarget
@@ -229,6 +240,7 @@ class CaptureDaemon:
             _log.warning("netd: invalid socks proxy url for job %s (%s); refusing to wire",
                          wt.job_id, exc)
             return
+        proc = None
         try:
             proc = self.nsenter_spawn_fn(wt.pid, tun2socks_argv(proxy_url))
             # tun2socks creates the TUN asynchronously; wait for it before configuring routes.
@@ -240,12 +252,19 @@ class CaptureDaemon:
                 self.sleep_fn(_TUN_WAIT_INTERVAL_S)
             if not ready:
                 _log.warning("netd: tun2socks TUN never appeared for job %s; aborting wire", wt.job_id)
-                proc.terminate()
+                _terminate(proc)
                 return
+            # Check each route command: a silently-ignored failure leaves the worker half-wired
+            # (no default route → no egress) yet recorded as wired. Fail closed: kill tun2socks.
             for cmd in tun_setup_commands():
-                self.nsenter_run_fn(wt.pid, cmd)
+                if self.nsenter_run_fn(wt.pid, cmd) != 0:
+                    _log.warning("netd: socks route cmd %s failed for job %s; aborting wire",
+                                 cmd, wt.job_id)
+                    _terminate(proc)
+                    return
         except Exception as exc:  # noqa: BLE001
             _log.warning("netd: failed to wire socks for job %s: %s", wt.job_id, exc)
+            _terminate(proc)  # don't orphan tun2socks if setup raised after the spawn
             return
         self.wired[container_id] = proc
         _log.info("netd: wired socks job=%s pid=%s -> %s", wt.job_id, wt.pid, proxy_url)
@@ -345,6 +364,10 @@ class CaptureDaemon:
             except Exception as exc:  # noqa: BLE001
                 _log.warning("netd: stopping capture for job %s: %s", ac.target.job_id, exc)
             _log.info("netd: capture finalized job=%s -> %s", ac.target.job_id, ac.target.pcap_path)
+            # Write a .done sentinel AFTER tcpdump has fully exited+flushed, so the dispatcher's
+            # seal (which races this async die handler) can wait for a COMPLETE pcap instead of
+            # copying one mid-write and truncating its tail. Best-effort: the seal also size-checks.
+            self._write_capture_done(ac.target.pcap_path)
         # Inspect tier: snapshot the gateway's TLS keylog next to this worker's pcap so the
         # dispatcher can decrypt it. Needs the worker's pcap (the per-flow client_random binds the
         # right keys), so it's a no-op without an active capture. Best-effort: never fail on die.
@@ -365,6 +388,16 @@ class CaptureDaemon:
                 wproc.wait(timeout=_STOP_TIMEOUT_S)
             except Exception as exc:  # noqa: BLE001
                 _log.warning("netd: stopping socks wire for %s: %s", container_id[:12], exc)
+
+    def _write_capture_done(self, pcap_path: str) -> None:
+        """Drop a ``<pcap>.done`` marker once tcpdump has fully terminated (capture is complete).
+        The dispatcher's _seal_network_capture waits for this before copying the pcap, closing the
+        race where it would otherwise seal a still-active capture. Best-effort — never fail on die."""
+        try:
+            with open(pcap_path + ".done", "w") as fh:
+                fh.write("done")
+        except Exception as exc:  # noqa: BLE001 — sentinel is an optimisation, not load-bearing
+            _log.warning("netd: failed to write capture done-sentinel for %s: %s", pcap_path, exc)
 
     def _snapshot_inspect_keylog(self, ac: _ActiveCapture | None) -> None:
         """Copy the shared sslproxy gateway keylog into this job's capture dir as ``sslkeys.log``

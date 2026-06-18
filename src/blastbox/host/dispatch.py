@@ -291,6 +291,12 @@ class Dispatcher:
         self._decrypt_keylog_wait_s = max(0.0, min(
             float(os.environ.get("BLASTBOX_NET_DECRYPT_KEYLOG_WAIT_S") or "8"), 60.0
         ))
+        # netd finalizes the pcap (terminates tcpdump) on the worker's DIE event, asynchronously to
+        # this dispatcher's post-worker seal. Wait (bounded) for netd's <pcap>.done sentinel before
+        # copying so the capture isn't sealed mid-write (truncated tail). Clamped like the keylog wait.
+        self._net_capture_wait_s = max(0.0, min(
+            float(os.environ.get("BLASTBOX_NET_CAPTURE_WAIT_S") or "5"), 60.0
+        ))
 
     # ------------------------------------------------------------------
     # Public API
@@ -1379,7 +1385,15 @@ class Dispatcher:
         leaves the envelope unchanged so a capture hiccup never fails an otherwise-valid job.
         """
         src = output_dir.parent / "capture" / "dump.pcap"
+        done = output_dir.parent / "capture" / "dump.pcap.done"
         try:
+            # If a capture exists but netd's die-handler hasn't finalized it yet, wait (bounded) for
+            # the .done sentinel so we copy a COMPLETE pcap, not one tcpdump is still appending to.
+            # Gated on the pcap existing → no wait when capture is off (no netd, sentinel never lands).
+            if src.is_file() and not done.is_file():
+                deadline = time.monotonic() + self._net_capture_wait_s
+                while not done.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.05)
             if not src.is_file() or src.stat().st_size == 0:
                 return envelope
             size = src.stat().st_size

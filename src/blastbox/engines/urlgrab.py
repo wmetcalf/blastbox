@@ -77,12 +77,16 @@ def _detected(content_type: str) -> Detection:
 
 
 def _read_url(input_path: Path) -> str:
-    """Take the first non-empty line of the input as the URL (the job input carries one URL)."""
-    text = input_path.read_text(errors="replace")
-    for line in text.splitlines():
-        line = line.strip()
-        if line:
-            return line
+    """Take the first non-empty line of the input as the URL (the job input carries one URL).
+    Reads line-by-line (not the whole file) so a pathologically large input can't blow up memory."""
+    try:
+        with input_path.open("r", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    return line
+    except OSError:
+        return ""
     return ""
 
 
