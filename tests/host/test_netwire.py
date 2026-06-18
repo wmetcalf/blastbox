@@ -15,6 +15,7 @@ from blastbox.host.netwire import (
     gateway_route_commands,
     socks_proxy_url,
     socks_resolv_conf,
+    transproxy_redirect_rules,
     tun2socks_argv,
     tun_setup_commands,
     wire_target_from_inspect,
@@ -135,6 +136,44 @@ def test_wire_target_accepts_vpn_mode():
 def test_wire_target_accepts_inspect_mode():
     wt = wire_target_from_inspect(_wire_inspect(mode="inspect", pid=654))
     assert wt is not None and wt.mode == "inspect" and wt.pid == 654
+
+
+def test_wire_target_extracts_worker_ip_for_transproxy():
+    insp = _wire_inspect(mode="transproxy", pid=99)
+    insp["NetworkSettings"] = {"Networks": {"bb-socks": {"IPAddress": "172.30.0.7"}}}
+    wt = wire_target_from_inspect(insp)
+    assert wt is not None and wt.mode == "transproxy" and wt.worker_ip == "172.30.0.7"
+
+
+# --------------------------------------------------------------------------- transproxy (CAPE tor)
+def test_transproxy_rules_redirect_tcp_and_dns_keyed_on_worker_ip():
+    rules = transproxy_redirect_rules("172.30.0.7", trans_port=9040, dns_port=5353, add=True)
+    # 3 nat REDIRECTs (udp53, tcp53, tcp-syn) + 1 filter FORWARD DROP, all -s the worker IP
+    assert all("172.30.0.7" in r for r in rules) and len(rules) == 4
+    assert ["iptables", "-t", "nat", "-I", "PREROUTING", "-s", "172.30.0.7", "-p", "udp",
+            "--dport", "53", "-j", "REDIRECT", "--to-ports", "5353"] == rules[0]
+    assert rules[2][-3:] == ["REDIRECT", "--to-ports", "9040"] and "--syn" in rules[2]
+    assert rules[3] == ["iptables", "-t", "filter", "-I", "FORWARD", "-s", "172.30.0.7", "-j", "DROP"]
+
+
+def test_transproxy_rules_teardown_is_symmetric_delete():
+    add = transproxy_redirect_rules("10.0.0.5", trans_port=9040, dns_port=5353, add=True)
+    rm = transproxy_redirect_rules("10.0.0.5", trans_port=9040, dns_port=5353, add=False)
+    # same match spec; only -I → -D so teardown removes exactly what wiring inserted
+    assert all(("-I" in a) and ("-D" in d) for a, d in zip(add, rm))
+    assert [[t for t in r if t not in ("-I", "-D")] for r in add] == \
+           [[t for t in r if t not in ("-I", "-D")] for r in rm]
+
+
+@pytest.mark.parametrize("bad", ["not-an-ip", "10.0.0.1; rm -rf"])
+def test_transproxy_rules_reject_bad_ip(bad):
+    with pytest.raises(ValueError):
+        transproxy_redirect_rules(bad, trans_port=9040, dns_port=5353)
+
+
+def test_transproxy_rules_reject_bad_port():
+    with pytest.raises(ValueError):
+        transproxy_redirect_rules("10.0.0.1", trans_port=70000, dns_port=5353)
 
 
 # --------------------------------------------------------------------------- gateway (vpn) route

@@ -1378,6 +1378,37 @@ def test_socks_personality_labels_worker_for_wiring_and_uses_bb_socks(tmp_path, 
     assert any(t == "BLASTBOX_NET_WAIT_TUN=tun0" for t in argv)
 
 
+def test_transproxy_personality_labels_worker_and_waits_for_gateway(tmp_path, monkeypatch):
+    """A socks personality with mode=transproxy (CAPE tor) → worker on bb-socks labeled
+    blastbox.net.wire=transproxy, and it waits for the host gateway route (not a TUN)."""
+    monkeypatch.setenv(
+        "BLASTBOX_NETPOLICY_TORTP", "exit=socks,mode=transproxy,gateway=172.30.0.1"
+    )
+    store = InMemoryJobStore()
+    job = _make_job(); job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    launched: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="tortp")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
+                                  subprocess_runner=fake_runner)
+    assert dispatcher.dispatch_once() is True
+    argv = next(a for a in launched if a[:2] == ["docker", "run"])
+    assert "bb-socks" in argv
+    assert "blastbox.net.wire=transproxy" in argv
+    assert any(t == "BLASTBOX_NET_WAIT_GATEWAY=172.30.0.1" for t in argv)
+    assert not any(t.startswith("BLASTBOX_NET_WAIT_TUN=tun0") for t in argv)
+
+
 def test_inspect_personality_labels_worker_for_inspect_wiring_and_uses_bb_inspect(
     tmp_path, monkeypatch
 ):

@@ -33,6 +33,7 @@ from blastbox.host.capture import (
 from blastbox.host.netwire import (
     TUN_DEV,
     gateway_route_commands,
+    transproxy_redirect_rules,
     tun2socks_argv,
     tun_setup_commands,
     wire_target_from_inspect,
@@ -81,12 +82,21 @@ class CaptureDaemon:
     # can decrypt. Per-job attribution is free: GoGoRoboCap matches keys to flows by client_random,
     # so the worker's own pcap + the whole keylog decrypts ONLY that worker's TLS.
     inspect_keylog_path: str | None = None
+    # transproxy (CAPE tor): host gateway the worker default-routes through + tor TransPort/DNSPort
+    # the host REDIRECTs to. host_run_fn runs iptables in the HOST netns (where tor listens), NOT
+    # the worker netns — so it is a SEPARATE seam from nsenter_run_fn. All optional; inert unless set.
+    transproxy_gateway: str | None = None
+    transproxy_trans_port: int = 9040
+    transproxy_dns_port: int = 5353
+    host_run_fn: Callable[[list[str]], int] | None = None  # run argv in the host netns → rc
     nsenter_spawn_fn: Callable[[int, list[str]], Any] | None = None  # long-lived in worker netns
     nsenter_run_fn: Callable[[int, list[str]], int] | None = None    # run cmd in netns → rc
     keylog_copy_fn: Callable[[str, str], Any] = shutil.copyfile       # src,dst keylog snapshot seam
     sleep_fn: Callable[[float], None] = time.sleep
     wired: dict[str, Any] = field(default_factory=dict)  # container_id → proc-or-None
     inspect_wired: set[str] = field(default_factory=set)  # container_ids wired in inspect mode
+    # container_id → worker_ip for transproxy workers (so die can tear down the host REDIRECT rules)
+    transproxy_wired: dict[str, str] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ handlers
     def handle_start(self, container_id: str) -> None:
@@ -146,6 +156,8 @@ class CaptureDaemon:
             self._wire_vpn(container_id, wt)
         elif wt.mode == "inspect":
             self._wire_inspect(container_id, wt)
+        elif wt.mode == "transproxy":
+            self._wire_transproxy(container_id, wt)
 
     def _wire_socks(self, container_id: str, wt: Any) -> None:
         if not self.socks_proxy_url or self.nsenter_spawn_fn is None or self.nsenter_run_fn is None:
@@ -211,6 +223,51 @@ class CaptureDaemon:
         _log.info("netd: wired inspect job=%s pid=%s -> gateway %s",
                   wt.job_id, wt.pid, self.inspect_gateway_ip)
 
+    def _wire_transproxy(self, container_id: str, wt: Any) -> None:
+        """CAPE's tor recipe: point the worker's default route at the host bridge gateway, then
+        install HOST-netns iptables REDIRECTs (keyed on the worker IP) sending its TCP → tor
+        TransPort and DNS → tor DNSPort, dropping everything else. tor runs on the host so its
+        TransPort can read SO_ORIGINAL_DST. Inert unless the gateway + host_run seam are configured.
+        Best-effort: a partial failure tears its own rules back down (fail-closed: no egress)."""
+        if (not self.transproxy_gateway or self.host_run_fn is None
+                or self.nsenter_run_fn is None or not wt.worker_ip):
+            return
+        rules = transproxy_redirect_rules(
+            wt.worker_ip, trans_port=self.transproxy_trans_port,
+            dns_port=self.transproxy_dns_port, add=True,
+        )
+        try:
+            for cmd in gateway_route_commands(self.transproxy_gateway):
+                if self.nsenter_run_fn(wt.pid, cmd) != 0:
+                    _log.warning("netd: transproxy route failed for job %s", wt.job_id)
+                    return
+            for rule in rules:
+                if self.host_run_fn(rule) != 0:
+                    _log.warning("netd: transproxy rule failed for job %s; rolling back", wt.job_id)
+                    self._teardown_transproxy(wt.worker_ip)
+                    return
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("netd: failed to wire transproxy for job %s: %s", wt.job_id, exc)
+            self._teardown_transproxy(wt.worker_ip)
+            return
+        self.wired[container_id] = None  # the in-netns part is route-only
+        self.transproxy_wired[container_id] = wt.worker_ip  # host rules to remove on die
+        _log.info("netd: wired transproxy job=%s ip=%s -> tor TransPort %s / DNSPort %s",
+                  wt.job_id, wt.worker_ip, self.transproxy_trans_port, self.transproxy_dns_port)
+
+    def _teardown_transproxy(self, worker_ip: str) -> None:
+        """Remove the host REDIRECT/DROP rules for ``worker_ip`` (best-effort, idempotent)."""
+        if self.host_run_fn is None or not worker_ip:
+            return
+        for rule in transproxy_redirect_rules(
+            worker_ip, trans_port=self.transproxy_trans_port,
+            dns_port=self.transproxy_dns_port, add=False,
+        ):
+            try:
+                self.host_run_fn(rule)
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("netd: transproxy teardown rule failed for %s: %s", worker_ip, exc)
+
     def handle_die(self, container_id: str) -> None:
         """A container died — stop its capture and/or SOCKS wiring. Never raises."""
         ac = self.active.pop(container_id, None)
@@ -227,6 +284,11 @@ class CaptureDaemon:
         if container_id in self.inspect_wired:
             self.inspect_wired.discard(container_id)
             self._snapshot_inspect_keylog(ac)
+        # transproxy tier: remove this worker's host REDIRECT/DROP rules (the netns dies with the
+        # container, but the HOST-side rules don't — they must be torn down explicitly).
+        tp_ip = self.transproxy_wired.pop(container_id, None)
+        if tp_ip is not None:
+            self._teardown_transproxy(tp_ip)
         wproc = self.wired.pop(container_id, None)
         if wproc is not None:
             try:
@@ -349,6 +411,13 @@ def _nsenter_run(pid: int, argv: list[str]) -> int:  # pragma: no cover - I/O
     ).returncode
 
 
+def _host_run(argv: list[str]) -> int:  # pragma: no cover - I/O
+    # Run a short command (iptables) in the HOST netns — netd already runs there as root.
+    return subprocess.run(
+        argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode
+
+
 def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry point
     import argparse
 
@@ -382,6 +451,22 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry poin
         help="host path to the sslproxy gateway's SSLKEYLOGFILE (-M master_keys.log); snapshotted "
              "into each inspect job's capture dir as sslkeys.log so the dispatcher can decrypt.",
     )
+    parser.add_argument(
+        "--transproxy-gateway",
+        default=os.environ.get("BLASTBOX_NETD_TRANSPROXY_GATEWAY", ""),
+        help="host bridge gateway IP that transproxy (CAPE tor) workers default-route through "
+             "before the host REDIRECTs their TCP/DNS to tor. Empty = transproxy disabled.",
+    )
+    parser.add_argument(
+        "--transproxy-trans-port", type=int,
+        default=int(os.environ.get("BLASTBOX_NETD_TRANSPROXY_TRANS_PORT") or "9040"),
+        help="tor TransPort the host REDIRECTs worker TCP to (default 9040).",
+    )
+    parser.add_argument(
+        "--transproxy-dns-port", type=int,
+        default=int(os.environ.get("BLASTBOX_NETD_TRANSPROXY_DNS_PORT") or "5353"),
+        help="tor DNSPort the host REDIRECTs worker :53 to (default 5353).",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     ns = parser.parse_args(argv)
     logging.basicConfig(
@@ -392,7 +477,8 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry poin
     vpn = ns.vpn_gateway.strip() or None
     inspect_gw = ns.inspect_gateway.strip() or None
     inspect_keylog = ns.inspect_keylog.strip() or None
-    wiring_on = bool(socks or vpn or inspect_gw)
+    transproxy_gw = ns.transproxy_gateway.strip() or None
+    wiring_on = bool(socks or vpn or inspect_gw or transproxy_gw)
     daemon = CaptureDaemon(
         job_root=ns.job_root,
         inspect_fn=_docker_inspect,
@@ -402,13 +488,18 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry poin
         vpn_gateway_ip=vpn,
         inspect_gateway_ip=inspect_gw,
         inspect_keylog_path=inspect_keylog,
+        transproxy_gateway=transproxy_gw,
+        transproxy_trans_port=ns.transproxy_trans_port,
+        transproxy_dns_port=ns.transproxy_dns_port,
+        host_run_fn=_host_run if transproxy_gw else None,
         nsenter_spawn_fn=_nsenter_spawn if wiring_on else None,
         nsenter_run_fn=_nsenter_run if wiring_on else None,
     )
     _log.info(
-        "blastbox-netd starting; job_root=%s socks=%s vpn=%s inspect=%s keylog=%s",
+        "blastbox-netd starting; job_root=%s socks=%s vpn=%s inspect=%s keylog=%s transproxy=%s",
         ns.job_root, "on" if socks else "off", "on" if vpn else "off",
         "on" if inspect_gw else "off", "on" if inspect_keylog else "off",
+        "on" if transproxy_gw else "off",
     )
     try:
         daemon.run()

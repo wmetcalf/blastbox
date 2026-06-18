@@ -25,24 +25,28 @@ from dataclasses import dataclass
 
 # Docker label an egress worker carries to request netd netns wiring (set by the dispatcher).
 # Value is the wire MODE:
-#   socks   → tun2socks in the worker netns → a SOCKS5 exit (TCP+TCP-DNS; tor/BrightData).
-#   vpn     → move the worker's default route onto a VPN+NAT gateway sidecar (all-IP; OpenVPN/WG).
-#   inspect → move the default route onto an sslproxy/MITM gateway sidecar (transparent TLS
-#             intercept that exports master keys for decrypt, then forwards to the real exit).
-#             Same route-only mechanism as ``vpn`` (default route → gateway), distinct gateway IP.
+#   socks      → tun2socks in the worker netns → a SOCKS5 exit (TCP+TCP-DNS; tor/BrightData).
+#   vpn        → move the worker's default route onto a VPN+NAT gateway sidecar (all-IP; OpenVPN/WG).
+#   inspect    → move the default route onto an sslproxy/MITM gateway sidecar (transparent TLS
+#                intercept that exports master keys for decrypt, then forwards to the real exit).
+#   transproxy → CAPE's tor recipe: default route → host gateway + HOST-side iptables REDIRECT of
+#                the worker's TCP → tor TransPort and DNS → tor DNSPort, keyed on the worker IP.
+#                Block everything else. tor runs on the host netns so SO_ORIGINAL_DST works.
 WIRE_LABEL = "blastbox.net.wire"
 JOB_ID_LABEL = "blastbox.job_id"
-_WIRE_MODES = frozenset({"socks", "vpn", "inspect"})
+_WIRE_MODES = frozenset({"socks", "vpn", "inspect", "transproxy"})
 
 
 @dataclass(frozen=True)
 class WireTarget:
-    """What netd needs to wire one worker's netns for a SOCKS exit."""
+    """What netd needs to wire one worker's netns for a SOCKS exit. ``worker_ip`` is the worker's
+    egress-bridge address (needed only by the host-side ``transproxy`` rooter, keyed on source IP)."""
 
     container: str
     job_id: str
     pid: int
     mode: str
+    worker_ip: str = ""
 
 
 def wire_target_from_inspect(inspect: Mapping[str, object]) -> WireTarget | None:
@@ -65,7 +69,26 @@ def wire_target_from_inspect(inspect: Mapping[str, object]) -> WireTarget | None
     if not isinstance(pid, int) or pid <= 0:
         return None
     name = str(inspect.get("Name") or "").lstrip("/") or str(job_id)
-    return WireTarget(container=name, job_id=str(job_id), pid=pid, mode=mode)
+    return WireTarget(
+        container=name, job_id=str(job_id), pid=pid, mode=mode,
+        worker_ip=_first_worker_ip(inspect),
+    )
+
+
+def _first_worker_ip(inspect: Mapping[str, object]) -> str:
+    """The worker's egress-bridge IPv4 (an egress worker is single-homed by design). Empty if none —
+    only the host-side ``transproxy`` rooter needs it; other modes nsenter the netns by pid."""
+    netsettings = inspect.get("NetworkSettings") or {}
+    networks = netsettings.get("Networks") if isinstance(netsettings, Mapping) else None
+    if not isinstance(networks, Mapping):
+        return ""
+    for net in networks.values():
+        if isinstance(net, Mapping) and net.get("IPAddress"):
+            try:
+                return str(ipaddress.ip_address(str(net["IPAddress"])))
+            except ValueError:
+                continue
+    return ""
 
 # tun2socks' default fake gateway range; 198.18.0.0/15 (RFC 2544 benchmark) deliberately avoids
 # the worker's RFC1918 bridge IP so the TUN addressing never collides with bb-socks.
@@ -147,3 +170,37 @@ def gateway_route_commands(gateway_ip: str) -> list[list[str]]:
     TUN — the gateway sidecar owns the tunnel; the worker just routes through it."""
     ip = str(ipaddress.ip_address(gateway_ip.strip()))  # raises ValueError on a non-IP
     return [["ip", "route", "replace", "default", "via", ip]]
+
+
+def _port(p: int) -> str:
+    if not isinstance(p, int) or not (1 <= p <= 65535):
+        raise ValueError(f"invalid port {p!r}")
+    return str(p)
+
+
+def transproxy_redirect_rules(
+    worker_ip: str, *, trans_port: int, dns_port: int, add: bool = True
+) -> list[list[str]]:
+    """CAPE's tor recipe as HOST-netns ``iptables`` argv, keyed on the worker's source IP:
+
+    * DNS (udp+tcp :53)  → REDIRECT to tor's DNSPort  — tor resolves over the tor network.
+    * TCP (--syn)        → REDIRECT to tor's TransPort — tor connects to SO_ORIGINAL_DST over tor.
+    * everything else    → FORWARD DROP (leak guard; the worker's only escape is the two REDIRECTs).
+
+    These run in the HOST netns (where tor listens, so REDIRECT's SO_ORIGINAL_DST is readable),
+    NOT the worker netns. ``add`` toggles ``-I`` (insert, on wire) vs ``-D`` (delete, on teardown);
+    the match spec is identical so teardown removes exactly what wiring inserted. The worker's
+    default route must already point at the host bridge gateway (see ``gateway_route_commands``)."""
+    ip = str(ipaddress.ip_address(worker_ip.strip()))  # raises ValueError on a non-IP
+    tp, dp = _port(trans_port), _port(dns_port)
+    nat_op = "-I" if add else "-D"
+    filt_op = "-I" if add else "-D"
+    return [
+        ["iptables", "-t", "nat", nat_op, "PREROUTING",
+         "-s", ip, "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", dp],
+        ["iptables", "-t", "nat", nat_op, "PREROUTING",
+         "-s", ip, "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-ports", dp],
+        ["iptables", "-t", "nat", nat_op, "PREROUTING",
+         "-s", ip, "-p", "tcp", "--syn", "-j", "REDIRECT", "--to-ports", tp],
+        ["iptables", "-t", "filter", filt_op, "FORWARD", "-s", ip, "-j", "DROP"],
+    ]

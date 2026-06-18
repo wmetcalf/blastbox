@@ -965,15 +965,20 @@ class Dispatcher:
         if capture_on:
             worker_labels["blastbox.net.capture"] = "1"
         # SOCKS / VPN / inspect personalities run the worker on an INTERNAL bridge (no direct
-        # egress); netd wires the only route out in the worker netns. The label requests that wiring
-        # by mode; until netd wires it the worker simply has no egress (fail-closed).
+        # egress); netd wires the only route out. The label requests that wiring by mode; until netd
+        # wires it the worker simply has no egress (fail-closed).
         #   inspect (any egress exit)      → default route via sslproxy/MITM gw (bb-inspect)
+        #   socks + mode=transproxy        → CAPE tor: default route → host gw + host REDIRECT to tor
         #   socks (tor/BrightData)         → tun2socks in the netns   (bb-socks)
         #   openvpn / wireguard (all-IP)   → default route via gateway (bb-vpn)
         # Inspect WINS: an inspected worker faces the MITM gateway (which chains onward to the real
         # exit), so it is routed to the gateway regardless of the underlying exit driver.
+        is_transproxy = (personality.exit_driver == "socks"
+                         and personality.config.get("mode") == "transproxy")
         if personality.inspect and personality.exit_driver not in ("none", "drop"):
             worker_labels["blastbox.net.wire"] = "inspect"
+        elif is_transproxy:
+            worker_labels["blastbox.net.wire"] = "transproxy"
         elif personality.exit_driver == "socks":
             worker_labels["blastbox.net.wire"] = "socks"
         elif personality.exit_driver in ("openvpn", "wireguard"):
@@ -1018,13 +1023,13 @@ class Dispatcher:
                 # Empty = no wait. Merged last so a hostile job.param can't suppress it.
                 "BLASTBOX_NET_WAIT_GATEWAY": (
                     personality.config.get("gateway", "")
-                    if (personality.inspect
+                    if (personality.inspect or is_transproxy
                         or personality.exit_driver in ("openvpn", "wireguard"))
                     else ""
                 ),
                 "BLASTBOX_NET_WAIT_TUN": (
                     "tun0" if (personality.exit_driver == "socks"
-                               and not personality.inspect) else ""
+                               and not personality.inspect and not is_transproxy) else ""
                 ),
             },
         )

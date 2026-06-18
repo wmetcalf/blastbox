@@ -380,3 +380,85 @@ def test_inspect_die_no_keylog_snapshot_when_unconfigured(tmp_path):
     d.handle_start("k3")
     d.handle_die("k3")
     assert not (tmp_path / "K3" / "capture" / "sslkeys.log").exists()
+
+
+# --------------------------------------------------------------------------- transproxy (CAPE tor)
+def _transproxy_inspect(job_id="T1", ip="172.30.0.9", pid=321):
+    return {
+        "Name": f"/blastbox-worker-{job_id}-1",
+        "Config": {"Labels": {"blastbox.net.wire": "transproxy", "blastbox.job_id": job_id}},
+        "NetworkSettings": {"Networks": {"bb-socks": {"IPAddress": ip, "NetworkID": "s"}}},
+        "State": {"Pid": pid, "Running": True},
+    }
+
+
+def _transproxy_daemon(tmp_path, runs, host_cmds):
+    return CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: _transproxy_inspect(),
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        transproxy_gateway="172.30.0.1",
+        nsenter_run_fn=lambda pid, argv: runs.append((pid, argv)) or 0,
+        host_run_fn=lambda argv: host_cmds.append(argv) or 0,
+        sleep_fn=lambda s: None,
+    )
+
+
+def test_transproxy_wire_routes_and_installs_host_redirects(tmp_path):
+    runs, host_cmds = [], []
+    d = _transproxy_daemon(tmp_path, runs, host_cmds)
+    d.handle_start("t1")
+    # in-netns: default route via the host gateway
+    assert runs == [(321, ["ip", "route", "replace", "default", "via", "172.30.0.1"])]
+    # host: 4 iptables rules keyed on the worker IP (all -I / add)
+    assert len(host_cmds) == 4 and all("172.30.0.9" in c and "-I" in c for c in host_cmds)
+    assert d.transproxy_wired["t1"] == "172.30.0.9"
+
+
+def test_transproxy_die_tears_down_host_redirects(tmp_path):
+    runs, host_cmds = [], []
+    d = _transproxy_daemon(tmp_path, runs, host_cmds)
+    d.handle_start("t1")
+    host_cmds.clear()
+    d.handle_die("t1")
+    # teardown issues the symmetric -D rules and forgets the worker
+    assert len(host_cmds) == 4 and all("-D" in c and "172.30.0.9" in c for c in host_cmds)
+    assert "t1" not in d.transproxy_wired
+
+
+def test_transproxy_inert_without_gateway_or_host_seam(tmp_path):
+    runs, host_cmds = [], []
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: _transproxy_inspect(),
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        nsenter_run_fn=lambda pid, argv: runs.append((pid, argv)) or 0,
+        # no transproxy_gateway / host_run_fn → disabled
+    )
+    d.handle_start("t1")
+    assert runs == [] and "t1" not in d.transproxy_wired
+
+
+def test_transproxy_rolls_back_on_partial_host_failure(tmp_path):
+    runs = []
+    calls = {"n": 0}
+
+    def host_run(argv):
+        calls["n"] += 1
+        return 0 if calls["n"] <= 2 else 1  # 3rd rule fails
+
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: _transproxy_inspect(),
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        transproxy_gateway="172.30.0.1",
+        nsenter_run_fn=lambda pid, argv: 0,
+        host_run_fn=host_run,
+        sleep_fn=lambda s: None,
+    )
+    d.handle_start("t1")
+    # the failed wire is not recorded, and teardown (-D) rules were issued to clean up
+    assert "t1" not in d.transproxy_wired
