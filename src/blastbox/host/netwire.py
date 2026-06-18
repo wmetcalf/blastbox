@@ -34,19 +34,25 @@ from dataclasses import dataclass
 #                Block everything else. tor runs on the host netns so SO_ORIGINAL_DST works.
 WIRE_LABEL = "blastbox.net.wire"
 JOB_ID_LABEL = "blastbox.job_id"
+# Per-worker SOCKS5 endpoint for the socks tier (overrides netd's global --socks-proxy). Lets one
+# netd serve MANY socks backends at once — e.g. a fleet of country-pinned tor SocksPort exits, each
+# personality routing to a different one. Value is a socks5://[user:pass@]host:port URL.
+SOCKS_PROXY_LABEL = "blastbox.net.socks-proxy"
 _WIRE_MODES = frozenset({"socks", "vpn", "inspect", "transproxy"})
 
 
 @dataclass(frozen=True)
 class WireTarget:
     """What netd needs to wire one worker's netns for a SOCKS exit. ``worker_ip`` is the worker's
-    egress-bridge address (needed only by the host-side ``transproxy`` rooter, keyed on source IP)."""
+    egress-bridge address (needed only by the host-side ``transproxy`` rooter, keyed on source IP).
+    ``socks_proxy`` is the per-worker SOCKS5 URL (socks tier), empty → netd's global proxy."""
 
     container: str
     job_id: str
     pid: int
     mode: str
     worker_ip: str = ""
+    socks_proxy: str = ""
 
 
 def wire_target_from_inspect(inspect: Mapping[str, object]) -> WireTarget | None:
@@ -72,6 +78,7 @@ def wire_target_from_inspect(inspect: Mapping[str, object]) -> WireTarget | None
     return WireTarget(
         container=name, job_id=str(job_id), pid=pid, mode=mode,
         worker_ip=_first_worker_ip(inspect),
+        socks_proxy=str(labels.get(SOCKS_PROXY_LABEL, "")).strip(),
     )
 
 

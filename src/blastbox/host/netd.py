@@ -191,10 +191,13 @@ class CaptureDaemon:
             self._wire_transproxy(container_id, wt)
 
     def _wire_socks(self, container_id: str, wt: Any) -> None:
-        if not self.socks_proxy_url or self.nsenter_spawn_fn is None or self.nsenter_run_fn is None:
+        # Per-worker SOCKS endpoint (the personality's proxy=, e.g. a specific country tor exit)
+        # wins over netd's global --socks-proxy, so one netd serves a whole fleet of socks backends.
+        proxy_url = getattr(wt, "socks_proxy", "") or self.socks_proxy_url
+        if not proxy_url or self.nsenter_spawn_fn is None or self.nsenter_run_fn is None:
             return
         try:
-            proc = self.nsenter_spawn_fn(wt.pid, tun2socks_argv(self.socks_proxy_url))
+            proc = self.nsenter_spawn_fn(wt.pid, tun2socks_argv(proxy_url))
             # tun2socks creates the TUN asynchronously; wait for it before configuring routes.
             ready = False
             for _ in range(_TUN_WAIT_TRIES):
@@ -212,7 +215,7 @@ class CaptureDaemon:
             _log.warning("netd: failed to wire socks for job %s: %s", wt.job_id, exc)
             return
         self.wired[container_id] = proc
-        _log.info("netd: wired socks job=%s pid=%s -> %s", wt.job_id, wt.pid, self.socks_proxy_url)
+        _log.info("netd: wired socks job=%s pid=%s -> %s", wt.job_id, wt.pid, proxy_url)
 
     def _wire_vpn(self, container_id: str, wt: Any) -> None:
         """VPN tier: point the worker's default route at the VPN+NAT gateway sidecar. No in-netns

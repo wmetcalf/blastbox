@@ -979,6 +979,10 @@ class Dispatcher:
             worker_labels["blastbox.net.wire"] = "transproxy"
         elif personality.exit_driver == "socks":
             worker_labels["blastbox.net.wire"] = "socks"
+            # Per-personality SOCKS endpoint (e.g. a specific country's tor SocksPort) overrides
+            # netd's global --socks-proxy, so one netd fronts a whole fleet of socks backends.
+            if personality.config.get("proxy"):
+                worker_labels["blastbox.net.socks-proxy"] = personality.config["proxy"]
         elif personality.exit_driver in ("openvpn", "wireguard"):
             worker_labels["blastbox.net.wire"] = "vpn"
 

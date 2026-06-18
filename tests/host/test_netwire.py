@@ -111,6 +111,14 @@ def test_wire_target_built_for_socks_worker():
     wt = wire_target_from_inspect(_wire_inspect(pid=9999))
     assert isinstance(wt, WireTarget)
     assert wt.mode == "socks" and wt.job_id == "J1" and wt.pid == 9999
+    assert wt.socks_proxy == ""  # no per-worker proxy label → use netd's global
+
+
+def test_wire_target_extracts_per_worker_socks_proxy():
+    insp = _wire_inspect(pid=5)
+    insp["Config"]["Labels"]["blastbox.net.socks-proxy"] = "socks5://172.30.0.40:9050"
+    wt = wire_target_from_inspect(insp)
+    assert wt is not None and wt.socks_proxy == "socks5://172.30.0.40:9050"
 
 
 def test_wire_target_none_without_label():

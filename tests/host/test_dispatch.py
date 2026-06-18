@@ -1344,7 +1344,9 @@ def test_net_egress_env_reflects_personality(tmp_path, monkeypatch):
 
 def test_socks_personality_labels_worker_for_wiring_and_uses_bb_socks(tmp_path, monkeypatch):
     """A socks personality → worker on bb-socks (internal) + labeled blastbox.net.wire=socks."""
-    monkeypatch.setenv("BLASTBOX_NETPOLICY_TOR", "exit=socks,dns=1.1.1.1")
+    monkeypatch.setenv(
+        "BLASTBOX_NETPOLICY_TOR", "exit=socks,dns=1.1.1.1,proxy=socks5://172.30.0.40:9050"
+    )
 
     store = InMemoryJobStore()
     job = _make_job()
@@ -1378,6 +1380,8 @@ def test_socks_personality_labels_worker_for_wiring_and_uses_bb_socks(tmp_path, 
     assert any(t == "BLASTBOX_NET_WAIT_TUN=tun0" for t in argv)
     # TCP-only tier → non-TCP leak guard (strict: no UDP needed, DNS is TCP-over-vc).
     assert "blastbox.net.leakguard=strict" in argv
+    # Per-personality SOCKS endpoint (e.g. a specific country tor exit) → labelled for netd.
+    assert "blastbox.net.socks-proxy=socks5://172.30.0.40:9050" in argv
 
 
 def test_httpproxy_personality_injects_proxy_env_on_bb_socks(tmp_path, monkeypatch):

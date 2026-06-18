@@ -167,6 +167,20 @@ def test_wire_spawns_tun2socks_and_sets_routes(tmp_path):
     assert "socks5://bb:bb@172.30.0.10:1080" in argv
     # The default route was moved onto the TUN inside the netns.
     assert any(a[:3] == ["ip", "route", "replace"] and a[-1] == "tun0" for _, a in runs)
+
+
+def test_wire_socks_uses_per_worker_proxy_over_global(tmp_path):
+    """A worker labeled blastbox.net.socks-proxy=<url> (e.g. a specific country's tor exit) is
+    wired through THAT proxy, not netd's global --socks-proxy — so one netd serves a fleet."""
+    insp = _wire_inspect(pid=8888)
+    insp["Config"]["Labels"]["blastbox.net.socks-proxy"] = "socks5://172.30.0.41:9050"
+    spawned: list = []
+    runs: list = []
+    d = _wire_daemon(tmp_path, {"c1": insp}, spawned=spawned, runs=runs)
+    d.handle_start("c1")
+    _, argv, _ = spawned[0]
+    assert "socks5://172.30.0.41:9050" in argv           # the per-worker DE tor exit
+    assert "socks5://bb:bb@172.30.0.10:1080" not in argv  # NOT the global default
     assert "c1" in d.wired
 
 
