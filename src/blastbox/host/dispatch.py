@@ -994,6 +994,23 @@ class Dispatcher:
                 f"(direct / inetsim / httpproxy).",
             )
             return
+        # Gateway-routed tiers (tor/openvpn/wireguard/inspect) have netd install the default route
+        # AFTER the container starts; the worker waits for that route via BLASTBOX_NET_WAIT_GATEWAY,
+        # which is derived from the personality's gateway=. Without it the barrier is empty and a fast
+        # engine races netd (flapping / fail-closed). Require gateway= rather than launch a racey job.
+        # (socks waits for the TUN device, not a gateway, so it is exempt.)
+        routed_via_gateway = (
+            personality.exit_driver in ("tor", "openvpn", "wireguard")
+            or inspect_routes_via_gateway(personality)
+        )
+        if routed_via_gateway and not personality.config.get("gateway"):
+            self._fail_job(
+                job,
+                f"netpolicy {personality.name!r} (exit={personality.exit_driver}) is a gateway-routed "
+                f"tier but declares no gateway=; the worker can't be told which route to wait for, so "
+                f"egress would race netd. Add gateway=<netd gateway IP> to the personality.",
+            )
+            return
         network_args = docker_network_args(personality)
 
         # Optional resolv.conf injection for an egress personality (per-personality ``dns=``).

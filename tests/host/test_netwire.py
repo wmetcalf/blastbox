@@ -185,19 +185,23 @@ def test_transproxy_rules_redirect_tcp_and_dns_keyed_on_worker_ip():
     rules = transproxy_redirect_rules("172.30.0.7", trans_port=9040, dns_port=5353, add=True)
     # 3 nat REDIRECTs (udp53, tcp53, tcp-syn) + 1 filter FORWARD DROP, all -s the worker IP
     assert all("172.30.0.7" in r for r in rules) and len(rules) == 4
-    assert ["iptables", "-t", "nat", "-I", "PREROUTING", "-s", "172.30.0.7", "-p", "udp",
+    # nat rules are APPENDED (-A) so the DNS :53 rules stay ABOVE the TCP-SYN catch-all in-chain.
+    assert ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", "172.30.0.7", "-p", "udp",
             "--dport", "53", "-j", "REDIRECT", "--to-ports", "5353"] == rules[0]
+    assert rules[1][:6] == ["iptables", "-t", "nat", "-A", "PREROUTING", "-s"] and "--dport" in rules[1]
     assert rules[2][-3:] == ["REDIRECT", "--to-ports", "9040"] and "--syn" in rules[2]
+    # the FORWARD DROP is inserted (-I) at the head for leak-guard precedence
     assert rules[3] == ["iptables", "-t", "filter", "-I", "FORWARD", "-s", "172.30.0.7", "-j", "DROP"]
 
 
 def test_transproxy_rules_teardown_is_symmetric_delete():
     add = transproxy_redirect_rules("10.0.0.5", trans_port=9040, dns_port=5353, add=True)
     rm = transproxy_redirect_rules("10.0.0.5", trans_port=9040, dns_port=5353, add=False)
-    # same match spec; only -I → -D so teardown removes exactly what wiring inserted
-    assert all(("-I" in a) and ("-D" in d) for a, d in zip(add, rm))
-    assert [[t for t in r if t not in ("-I", "-D")] for r in add] == \
-           [[t for t in r if t not in ("-I", "-D")] for r in rm]
+    # teardown is all -D; the add ops are -A (nat) / -I (filter). Same match spec once the op token
+    # is stripped, so teardown removes exactly what wiring installed.
+    assert all(("-A" in a or "-I" in a) and ("-D" in d) for a, d in zip(add, rm))
+    assert [[t for t in r if t not in ("-A", "-I", "-D")] for r in add] == \
+           [[t for t in r if t not in ("-A", "-I", "-D")] for r in rm]
 
 
 @pytest.mark.parametrize("bad", ["not-an-ip", "10.0.0.1; rm -rf"])

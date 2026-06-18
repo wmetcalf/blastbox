@@ -226,6 +226,13 @@ class CaptureDaemon:
             return
         try:
             os.makedirs(os.path.dirname(target.pcap_path), exist_ok=True)
+            # A retried job reuses its job_id with output/ wiped but capture/ kept, so a stale
+            # <pcap>.done from the prior attempt could survive — the dispatcher would then skip its
+            # completion wait and copy THIS capture mid-flush. Clear it before the fresh tcpdump.
+            try:
+                os.unlink(target.pcap_path + ".done")
+            except FileNotFoundError:
+                pass
             proc = self.spawn_fn(
                 tcpdump_argv(target.iface, target.worker_ip, target.pcap_path), target.pcap_path
             )
@@ -394,16 +401,21 @@ class CaptureDaemon:
         """A container died — stop its capture and/or SOCKS wiring. Never raises."""
         ac = self.active.pop(container_id, None)
         if ac is not None:
+            # The .done sentinel must only be written once tcpdump has ACTUALLY exited — otherwise
+            # the dispatcher would treat a still-flushing pcap as complete. terminate→wait; if it
+            # won't stop, force-kill; only mark done when we've confirmed it's gone.
+            stopped = True
             try:
                 ac.proc.terminate()
                 ac.proc.wait(timeout=_STOP_TIMEOUT_S)
             except Exception as exc:  # noqa: BLE001
                 _log.warning("netd: stopping capture for job %s: %s", ac.target.job_id, exc)
+                stopped = self._force_stop(ac.proc, ac.target.job_id)
             _log.info("netd: capture finalized job=%s -> %s", ac.target.job_id, ac.target.pcap_path)
-            # Write a .done sentinel AFTER tcpdump has fully exited+flushed, so the dispatcher's
-            # seal (which races this async die handler) can wait for a COMPLETE pcap instead of
-            # copying one mid-write and truncating its tail. Best-effort: the seal also size-checks.
-            self._write_capture_done(ac.target.pcap_path)
+            # Best-effort: if we couldn't confirm tcpdump exited, skip the sentinel — the dispatcher
+            # then falls back to its bounded wait rather than sealing a possibly-incomplete pcap.
+            if stopped:
+                self._write_capture_done(ac.target.pcap_path)
         # Inspect tier: snapshot the gateway's TLS keylog next to this worker's pcap so the
         # dispatcher can decrypt it. Needs the worker's pcap (the per-flow client_random binds the
         # right keys), so it's a no-op without an active capture. Best-effort: never fail on die.
@@ -425,6 +437,19 @@ class CaptureDaemon:
                 wproc.wait(timeout=_STOP_TIMEOUT_S)
             except Exception as exc:  # noqa: BLE001
                 _log.warning("netd: stopping socks wire for %s: %s", container_id[:12], exc)
+
+    def _force_stop(self, proc: Any, job_id: str) -> bool:
+        """SIGKILL a capture proc that ignored SIGTERM and confirm it's gone. Returns True if the
+        process has exited (so its pcap is final), False if we still can't confirm it stopped."""
+        try:
+            proc.kill()
+            proc.wait(timeout=_STOP_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("netd: could not force-stop capture for job %s: %s", job_id, exc)
+        try:
+            return proc.poll() is not None
+        except Exception:  # noqa: BLE001
+            return False
 
     def _write_capture_done(self, pcap_path: str) -> None:
         """Drop a ``<pcap>.done`` marker once tcpdump has fully terminated (capture is complete).

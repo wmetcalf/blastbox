@@ -96,6 +96,40 @@ def test_die_terminates_the_capture(tmp_path):
     assert (tmp_path / "J1" / "capture" / "dump.pcap.done").is_file()
 
 
+def test_capture_done_sentinel_skipped_when_proc_wont_stop(tmp_path):
+    """The .done sentinel must only appear once tcpdump has actually exited. If the proc can't be
+    confirmed stopped, skip it so the dispatcher falls back to its bounded wait (not a false
+    'complete' signal over a still-flushing pcap)."""
+    class _StuckProc:
+        def terminate(self): pass
+        def wait(self, timeout=None): raise RuntimeError("won't die")
+        def kill(self): pass
+        def poll(self): return None  # never confirmed dead
+
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: _labeled_inspect(job_id="J1"),
+        network_iface_fn=lambda: {"netid0": "br-netid0"},
+        spawn_fn=lambda argv, pcap: _StuckProc(),
+    )
+    d.handle_start("c1")
+    d.handle_die("c1")
+    assert not (tmp_path / "J1" / "capture" / "dump.pcap.done").is_file()
+
+
+def test_capture_clears_stale_done_sentinel_on_start(tmp_path):
+    """A retried job (same job_id, capture/ kept) must not inherit the prior attempt's .done — it
+    is cleared before the fresh tcpdump so the dispatcher waits for THIS capture."""
+    spawned: list = []
+    d = _make_daemon(tmp_path, {"c1": _labeled_inspect(job_id="J1")}, spawned)
+    cap = tmp_path / "J1" / "capture"
+    cap.mkdir(parents=True, exist_ok=True)
+    stale = cap / "dump.pcap.done"
+    stale.write_text("stale")
+    d.handle_start("c1")
+    assert not stale.is_file()  # cleared before the new capture spawned
+
+
 def test_die_unknown_container_is_noop(tmp_path):
     d = _make_daemon(tmp_path, {}, [])
     d.handle_die("never-seen")  # must not raise
@@ -470,8 +504,10 @@ def test_transproxy_wire_routes_and_installs_host_redirects(tmp_path):
     d.handle_start("t1")
     # in-netns: default route via the host gateway
     assert runs == [(321, ["ip", "route", "replace", "default", "via", "172.30.0.1"])]
-    # host: 4 iptables rules keyed on the worker IP (all -I / add)
-    assert len(host_cmds) == 4 and all("172.30.0.9" in c and "-I" in c for c in host_cmds)
+    # host: 4 iptables rules keyed on the worker IP — 3 nat REDIRECTs appended (-A, so DNS sits
+    # above the TCP-SYN catch-all), 1 FORWARD DROP inserted (-I, head precedence).
+    assert len(host_cmds) == 4 and all("172.30.0.9" in c for c in host_cmds)
+    assert sum("-A" in c for c in host_cmds) == 3 and sum("-I" in c for c in host_cmds) == 1
     assert d.transproxy_wired["t1"] == "172.30.0.9"
 
 

@@ -66,6 +66,12 @@ _EGRESS_DRIVERS = frozenset({"direct", "inetsim", "tor", "socks", "wireguard", "
 # its DNS is REDIRECTed straight to tor's DNSPort (UDP), which refuses TCP, so use-vc would break it.
 _SOCKS_DRIVERS = frozenset({"socks"})
 
+# Drivers eligible for ``dns=`` resolv.conf injection. ``httpproxy`` is NOT a routed egress (so it's
+# excluded from _EGRESS_DRIVERS for the bridge/inspect decisions), but the worker STILL has to
+# resolve the proxy sidecar's hostname before it can CONNECT — and a runsc worker can't reach
+# docker's 127.0.0.11 — so honor ``dns=`` for it too when the operator names the sidecar by host.
+_RESOLV_DRIVERS = _EGRESS_DRIVERS | frozenset({"httpproxy"})
+
 # The internal bridge an INSPECTED worker rides. When ``personality.inspect`` is set, the worker
 # faces an sslproxy/MITM gateway sidecar here (which forges TLS certs, exports master keys for
 # decrypt, then forwards to the real exit network). The worker never attaches the exit's own
@@ -147,7 +153,7 @@ def worker_resolv_conf(personality: Personality) -> str | None:
     (whitespace-separated for multiple — ``,`` is the decl's KV separator). With no ``dns=``
     set, return ``None`` so the operator keeps docker's default (opt-in, prior behavior).
     """
-    if personality.exit_driver not in _EGRESS_DRIVERS:
+    if personality.exit_driver not in _RESOLV_DRIVERS:
         return None
     servers = (personality.config.get("dns") or "").split()
     if not servers:

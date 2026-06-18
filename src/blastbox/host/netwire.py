@@ -220,12 +220,17 @@ def transproxy_redirect_rules(
     * everything else    → FORWARD DROP (leak guard; the worker's only escape is the two REDIRECTs).
 
     These run in the HOST netns (where tor listens, so REDIRECT's SO_ORIGINAL_DST is readable),
-    NOT the worker netns. ``add`` toggles ``-I`` (insert, on wire) vs ``-D`` (delete, on teardown);
-    the match spec is identical so teardown removes exactly what wiring inserted. The worker's
-    default route must already point at the host bridge gateway (see ``gateway_route_commands``)."""
+    NOT the worker netns. ``add`` toggles add vs ``-D`` (delete, on teardown); the match spec is
+    identical so teardown removes exactly what wiring inserted. The worker's default route must
+    already point at the host bridge gateway (see ``gateway_route_commands``).
+
+    The nat REDIRECTs are **appended** (``-A``) so their in-chain order matches this list order — the
+    DNS (:53) rules must sit ABOVE the TCP-SYN catch-all, or a TCP-DNS SYN would match the catch-all
+    first and be sent to TransPort instead of DNSPort. The FORWARD DROP is **inserted** (``-I``) at
+    the head so it takes precedence over any broader docker ACCEPT (the leak-guard property)."""
     ip = str(ipaddress.ip_address(worker_ip.strip()))  # raises ValueError on a non-IP
     tp, dp = _port(trans_port), _port(dns_port)
-    nat_op = "-I" if add else "-D"
+    nat_op = "-A" if add else "-D"
     filt_op = "-I" if add else "-D"
     return [
         ["iptables", "-t", "nat", nat_op, "PREROUTING",

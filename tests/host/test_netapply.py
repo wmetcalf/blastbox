@@ -77,9 +77,17 @@ def test_httpproxy_driver_returns_bb_socks_internal():
     assert docker_network_args(_p("httpproxy")) == ["--network", "bb-socks"]
 
 
-def test_httpproxy_injects_no_resolv_conf():
-    # No local DNS for httpproxy — the proxy does CONNECT-by-hostname (DNS at the exit).
-    assert worker_resolv_conf(_p("httpproxy", config={"dns": "1.1.1.1"})) is None
+def test_httpproxy_honors_dns_for_sidecar_resolution():
+    # The proxy does CONNECT-by-hostname for the TARGET (DNS at the exit), but the worker STILL must
+    # resolve the proxy SIDECAR's hostname — and a runsc worker can't reach docker's 127.0.0.11 — so
+    # httpproxy honors dns= when set. NOT use-vc (httpproxy isn't a no-UDP SOCKS proxy).
+    out = worker_resolv_conf(_p("httpproxy", config={"dns": "1.1.1.1"}))
+    assert out == "nameserver 1.1.1.1\n"
+
+
+def test_httpproxy_no_resolv_without_dns():
+    # No dns= set → keep docker's default resolv.conf (opt-in only).
+    assert worker_resolv_conf(_p("httpproxy")) is None
 
 
 def test_resolv_tor_is_udp_not_use_vc():
@@ -153,6 +161,8 @@ def test_driver_set_consistency():
     valid = set(VALID_EXIT_DRIVERS)
     assert netapply._EGRESS_DRIVERS <= valid
     assert netapply._SOCKS_DRIVERS <= netapply._EGRESS_DRIVERS
+    assert netapply._RESOLV_DRIVERS <= valid
+    assert netapply._EGRESS_DRIVERS <= netapply._RESOLV_DRIVERS  # resolv covers egress + httpproxy
     assert set(netapply._BRIDGE_NETWORKS) <= valid
     # httpproxy is the one egress driver deliberately excluded from the route-inspectable set.
     assert "httpproxy" in valid and "httpproxy" not in netapply._EGRESS_DRIVERS

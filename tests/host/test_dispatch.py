@@ -1425,6 +1425,24 @@ def test_netd_wired_personality_refused_under_runsc(tmp_path, monkeypatch):
     assert "host-visible netns" in (final.error or "")
 
 
+def test_routed_personality_without_gateway_fails_fast(tmp_path, monkeypatch):
+    """A gateway-routed tier (tor/vpn/inspect) with no gateway= can't give the worker a wait target,
+    so egress would race netd. The dispatcher must FAIL FAST with a clear diagnostic."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_TORNOGW", "exit=tor")  # routed tier, but NO gateway=
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="tornogw")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng})  # runc
+    assert dispatcher.dispatch_once() is True
+    final = store.get(job.job_id)
+    assert final.status == JobStatus.FAILED
+    assert "gateway=" in (final.error or "")
+
+
 def test_decrypt_seals_decrypted_and_mixed_when_keylog_present(tmp_path, monkeypatch):
     """With BLASTBOX_NET_DECRYPT + a keylog in the capture dir, the dispatcher runs GoGoRoboCap
     and seals decrypted+mixed pcaps as trusted artifacts."""
