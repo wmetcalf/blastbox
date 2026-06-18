@@ -1,9 +1,14 @@
-"""URL-grabber engine: fetch one URL, seal the response.
+"""URL-grabber engine — the REFERENCE EXAMPLE for the network overlay.
 
-The first *network* blastbox engine — the consumer of the netpolicy/egress tiers. Given an input
-file containing a single URL, it does ONE bounded HTTP GET and seals the response body as an
+blastbox ships no domain engines (those live in their own repos); this is one of two runnable
+*examples* (with ``detonate``), here to demonstrate the opt-in egress overlay end-to-end. Given an
+input file containing a single URL, it does ONE bounded HTTP GET and seals the response body as an
 artifact plus structured metadata (status, final URL after redirects, content-type, server,
 body sha256/len). It does NOT execute or render anything — it is a *fetch*, not a browser.
+
+As the first *network* consumer of the netpolicy/egress tiers it shows the safe-egress story: under
+``net_policy=fakenet`` it exercises the whole pipe against a sinkhole; under ``net_policy=tor`` it
+fetches attribution-protected. Both example tiers need no credentials.
 
 Isolation + egress are the dispatcher's job: this engine runs in a disposable hardened worker
 whose network is whatever the resolved netpolicy granted —

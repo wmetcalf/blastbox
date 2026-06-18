@@ -36,18 +36,23 @@ blastbox/
 │   │               CPU-feature-mismatch detect + a probe; a non-JVM engine without)
 │   ├── pool        warm slot pool (one-doc-per-slot, never-reuse; burst + health loops)
 │   ├── trust       output-trust validator — re-seals worker output from disk
+│   ├── netpolicy   opt-in egress OVERLAY: personality → exit driver, fail-closed to `none`
+│   ├── netd        privileged rooter: per-worker pcap + netns wiring + non-TCP leak guard (v4+v6)
 │   └── observability
-└── worker/     LAYER 2 — worker SDK (runs inside the disposable worker) — lean core
-    ├── engine      the seam: detect / warmup / detonate
-    ├── harness     read input → detonate → seal → write metadata.json
-    ├── sandbox/    auto-selected in-process hardening: nsjail / bwrap / nono / container
-    │               (BLASTBOX_SANDBOX override; container inside OCI; nono = Landlock, no userns)
-    ├── warm        service lifecycle: boot → warmup → one job → exit
-    └── fc_warm / fc_guest   Firecracker guest: AF_VSOCK control plane + warm protocol
+├── worker/     LAYER 2 — worker SDK (runs inside the disposable worker) — lean core
+│   ├── engine      the seam: detect / warmup / detonate
+│   ├── harness     read input → detonate → seal → write metadata.json (+ egress-readiness barrier)
+│   ├── sandbox/    auto-selected in-process hardening: nsjail / bwrap / nono / container
+│   │               (BLASTBOX_SANDBOX override; container inside OCI; nono = Landlock, no userns)
+│   ├── warm        service lifecycle: boot → warmup → one job → exit
+│   └── fc_warm / fc_guest   Firecracker guest: AF_VSOCK control plane + warm protocol
+└── engines/    reference EXAMPLES only (detonate, urlgrab) — domain engines live in their own repos
 ```
 
 The host never imports an engine; it depends only on the **contract**. An engine never handles
-hashes/paths defensively; the worker SDK and host do that in audited code.
+hashes/paths defensively; the worker SDK and host do that in audited code. blastbox ships **no domain
+engines** — `engines/` holds runnable *examples* (`detonate`, `urlgrab`); real engines (ClippyShot,
+RedTusk, …) live in their own repos and plug in via `BLASTBOX_ENGINE=module:Class`.
 
 ## Writing an engine
 
@@ -127,7 +132,8 @@ for the full setup (incl. building a `probe`-engine rootfs and the userns workar
 ## Security model
 
 - Disposable worker per job: `--network=none --cap-drop=ALL --no-new-privileges --read-only`; the
-  input is deleted after conversion.
+  input is deleted after conversion. **No network is the default** — egress is an explicit opt-in
+  (see *Network overlay* below) and is fail-closed at every layer.
 - **runsc (gVisor) is required by default — fail-closed.** If no secure runtime is available the
   dispatcher refuses the job *early* with an actionable `InsecureRuntimeRefused` (rather than letting
   the worker start and fail its own sandbox self-check opaquely). To run **without** gVisor, the
@@ -142,6 +148,48 @@ for the full setup (incl. building a `probe`-engine rootfs and the userns workar
   a confined path, and (optionally) sits behind a bearer token / auth proxy.
 - The contract bounds payload size/depth and validates every node; engine subtypes are validated
   against their registered schema.
+
+## Network overlay (opt-in egress)
+
+Most detonation is done sealed (`--network=none`). But some analysis *needs* the network — a URL
+fetch, a sample that only behaves when it can call home. blastbox exposes a **safe, opt-in egress
+overlay** that any engine can choose to use, **the same way across every sandbox type** (runc /
+gVisor / Firecracker microVM). The overlay is a capability the framework provides; the engine just
+declares it wants an exit.
+
+**Fail-closed by default, at every layer.** A worker cannot grant itself the network:
+
+- The effective egress is a named **personality** (`BLASTBOX_NETPOLICY_<NAME>='exit=…,k=v'`).
+  Resolution order is per-job override (only when `BLASTBOX_ALLOW_NETPOLICY_OVERRIDE=1` *and* the
+  name is declared) → per-engine default → **`none`**. An unknown name at any step collapses to
+  `none`; `none` is reserved and cannot be redefined to grant egress.
+- The disposable worker attaches **`--network=none`** unless a personality with a real exit resolved;
+  the in-process sandbox keeps its netns **unshared** unless egress was explicitly granted.
+- To get *any* egress, all of these must line up: an operator declares a personality **and** stands
+  up the exit infra **and** an engine opts in (or a job overrides, with the gate on).
+
+**`netd`** — a small privileged host rooter (the analogue of CAPE's `rooter`, now containerized and
+`cap-drop=ALL` + minimal caps, reaching Docker through a read-only socket-proxy) — watches container
+events and, per opted-in worker: captures its traffic to a per-job pcap, wires its network namespace
+to the chosen exit, and installs a **non-TCP leak guard** (an in-netns `iptables`/`ip6tables` OUTPUT
+firewall) so a sample can't punch UDP/ICMP/raw or IPv6 out past a TCP-only tier.
+
+**Egress methodologies** (all exposed to any engine, all fail-closed):
+
+| Exit | What it does | Credentials |
+|------|--------------|-------------|
+| `inetsim` (**fakenet**) | sinkhole — a FakeNet-NG sidecar answers everything | **none — example** |
+| `tor` | transparent CAPE recipe (TransPort/DNSPort) or a country-pinned SocksPort fleet | **none — example** |
+| `socks` | transparent tunnel through any SOCKS5 exit (tun2socks) | bring-your-own provider |
+| `httpproxy` | HTTP(S)_PROXY through any chaining proxy sidecar | bring-your-own provider |
+| `openvpn` / `wireguard` | all-IP path via a VPN+NAT gateway sidecar | bring-your-own provider |
+| `inspect` | route through a TLS-MITM gateway; export keys → decrypt the capture | (layered on an exit) |
+
+**tor and fakenet need no accounts and no credentials**, so they are the worked examples; the others
+are provider-agnostic *mechanism* (bring your own SOCKS/HTTP-proxy/VPN — blastbox ships no provider
+secrets). The reference engine **`blastbox.engines.urlgrab`** (fetch one URL, seal the response — it
+does *not* render or execute) is the example consumer used to demonstrate the overlay end-to-end:
+`net_policy=fakenet` proves the whole pipe safely, `net_policy=tor` fetches attribution-protected.
 
 ## Status
 
