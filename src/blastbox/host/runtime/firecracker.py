@@ -912,8 +912,14 @@ class FirecrackerSlotRuntime:
         fc_config = {
             "boot-source": {
                 "kernel_image_path": self._cfg.fc_kernel,
+                # `random.trust_cpu=on`: seed the guest CRNG from RDRAND at boot so a
+                # workload that needs randomness (e.g. a JVM's SecureRandom/getrandom)
+                # doesn't block ~120s on an uninitialised CRNG. Paired with the
+                # virtio-rng `entropy` device below — together they cover guests with
+                # CONFIG_RANDOM_TRUST_CPU and/or CONFIG_HW_RANDOM_VIRTIO.
                 "boot_args": (
-                    "console=ttyS0 reboot=k panic=1 pci=off init=/init ro"
+                    "console=ttyS0 reboot=k panic=1 pci=off init=/init ro "
+                    "random.trust_cpu=on"
                 ),
             },
             "drives": [
@@ -944,6 +950,11 @@ class FirecrackerSlotRuntime:
                 "guest_cid": self._cfg.fc_vsock_guest_cid,
                 "uds_path": str(vsock_uds),
             },
+            # virtio-rng: a host-fed entropy source so the guest CRNG initialises
+            # promptly. Without it (and with no RDRAND trust) getrandom() blocks until
+            # the kernel self-seeds (~2 min), which collides with the warm worker
+            # timeout and fails the job. Empty body = no rate limiter.
+            "entropy": {},
         }
 
         config_path = slot_dir / "fc-config.json"

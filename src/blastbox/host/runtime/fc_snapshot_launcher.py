@@ -27,7 +27,11 @@ from blastbox.host.runtime.fc_api import FcApiClient
 # Relative per-slot resource names (resolved against each firecracker's cwd).
 REL_VSOCK = "vsock.sock"
 REL_OUTDISK = "outdisk.ext4"
-_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off init=/init ro"
+# `random.trust_cpu=on` seeds the guest CRNG from RDRAND at boot; paired with the
+# virtio-rng `/entropy` device in `api_boot_sequence`, this stops a guest workload
+# (e.g. a JVM's SecureRandom/getrandom) blocking ~120s on an uninitialised CRNG —
+# which otherwise collides with the warm worker timeout and fails every job.
+_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off init=/init ro random.trust_cpu=on"
 _DEFAULT_OUTDISK_MIB = 600
 
 
@@ -78,6 +82,9 @@ def api_boot_sequence(
             "/vsock",
             {"guest_cid": cfg.fc_vsock_guest_cid, "uds_path": vsock_uds},
         ),
+        # virtio-rng entropy device — host-fed randomness so the guest CRNG seeds
+        # promptly (see _BOOT_ARGS). Captured in the snapshot, so every restore has it.
+        ("/entropy", {}),
         ("/actions", {"action_type": "InstanceStart"}),
     ]
 

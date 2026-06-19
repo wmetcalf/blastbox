@@ -84,7 +84,9 @@ class CpuProbeConfig:
     fc_bin: str
     kernel: str
     rootfs: str
-    boot_args: str = "console=ttyS0 reboot=k panic=1 pci=off init=/init ro"
+    # Mirror the prod boot cmdline (incl. random.trust_cpu=on) so the probe boots
+    # like the real warm/cold VMs it is vouching for.
+    boot_args: str = "console=ttyS0 reboot=k panic=1 pci=off init=/init ro random.trust_cpu=on"
     vcpu_count: int = 1          # vsock-corruption mitigation; matches the warm tier
     mem_mib: int = 1024          # boot at the SAME mem as prod so restore behaves the same
     timeout_s: float = 25.0

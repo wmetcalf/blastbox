@@ -425,6 +425,14 @@ class TestFCConfigJson:
         args = config["boot-source"]["boot_args"]
         assert "reboot=k" in args
         assert "panic=1" in args
+        # RDRAND-seed the guest CRNG so getrandom() doesn't block ~120s at first use.
+        assert "random.trust_cpu=on" in args
+
+    def test_entropy_device_present(self, tmp_path):
+        # virtio-rng so the guest CRNG has a host-fed entropy source (pairs with
+        # random.trust_cpu=on) — without it a JVM/getrandom workload stalls ~120s.
+        config = self._spawn_and_read_config(tmp_path)
+        assert config.get("entropy") == {}
 
     def test_drives_has_two_entries(self, tmp_path):
         config = self._spawn_and_read_config(tmp_path)
