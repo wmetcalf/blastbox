@@ -1425,6 +1425,37 @@ def test_netd_wired_personality_refused_under_runsc(tmp_path, monkeypatch):
     assert "host-visible netns" in (final.error or "")
 
 
+def test_socks_dns_tcp_off_uses_dns_leakguard(tmp_path, monkeypatch):
+    """A socks personality with dns_tcp=0 resolves over UDP:53 (its resolv.conf omits use-vc), so it
+    must get the 'dns' leakguard (allow udp:53) — the default 'strict' guard would drop its DNS."""
+    monkeypatch.setenv(
+        "BLASTBOX_NETPOLICY_SUDP",
+        "exit=socks,proxy=socks5://172.30.0.40:9050,dns=172.30.0.40,dns_tcp=0",
+    )
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    launched: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="sudp")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
+                                  subprocess_runner=fake_runner)
+    assert dispatcher.dispatch_once() is True
+    argv = next(a for a in launched if a[:2] == ["docker", "run"])
+    assert "blastbox.net.leakguard=dns" in argv
+    assert "blastbox.net.leakguard=strict" not in argv
+
+
 def test_httpproxy_env_validates_proxy_url(tmp_path):
     """The httpproxy proxy= URL is validated before injection — a malformed value injects no proxy
     env (fail closed), matching the socks tier's validation."""

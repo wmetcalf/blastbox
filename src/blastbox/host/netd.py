@@ -231,13 +231,15 @@ class CaptureDaemon:
             return
         try:
             os.makedirs(os.path.dirname(target.pcap_path), exist_ok=True)
-            # A retried job reuses its job_id with output/ wiped but capture/ kept, so a stale
-            # <pcap>.done from the prior attempt could survive — the dispatcher would then skip its
-            # completion wait and copy THIS capture mid-flush. Clear it before the fresh tcpdump.
-            try:
-                os.unlink(target.pcap_path + ".done")
-            except FileNotFoundError:
-                pass
+            # A retried job reuses its job_id with output/ wiped but capture/ kept, so the prior
+            # attempt's pcap + .done sentinel could survive. Clear BOTH before the fresh tcpdump: a
+            # stale .done would make the dispatcher copy THIS capture mid-flush; a stale pcap would be
+            # sealed as this job's capture if the fresh tcpdump fails to spawn (leaving the old file).
+            for stale in (target.pcap_path + ".done", target.pcap_path):
+                try:
+                    os.unlink(stale)
+                except OSError:
+                    pass
             proc = self.spawn_fn(
                 tcpdump_argv(target.iface, target.worker_ip, target.pcap_path), target.pcap_path
             )
@@ -718,7 +720,6 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry poin
     inspect_gw = ns.inspect_gateway.strip() or None
     inspect_keylog = ns.inspect_keylog.strip() or None
     transproxy_gw = ns.transproxy_gateway.strip() or None
-    wiring_on = bool(socks or vpn or inspect_gw or transproxy_gw)
     daemon = CaptureDaemon(
         job_root=ns.job_root,
         inspect_fn=_docker_inspect,
@@ -732,8 +733,12 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - entry poin
         transproxy_trans_port=ns.transproxy_trans_port,
         transproxy_dns_port=ns.transproxy_dns_port,
         host_run_fn=_host_run if transproxy_gw else None,
-        nsenter_spawn_fn=_nsenter_spawn if wiring_on else None,
-        nsenter_run_fn=_nsenter_run if wiring_on else None,
+        # Always provide the worker-netns seams. They are inert unless a worker carries a
+        # dispatcher-set wire/leakguard label, and gating them on a configured GLOBAL exit broke the
+        # per-worker socks-proxy fleet (a worker labeled blastbox.net.socks-proxy with no global
+        # --socks-proxy) AND the leak guard (which only needs nsenter, not any global exit).
+        nsenter_spawn_fn=_nsenter_spawn,
+        nsenter_run_fn=_nsenter_run,
         list_running_fn=_docker_list_workers,
     )
     _log.info(

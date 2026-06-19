@@ -77,6 +77,24 @@ def test_decrypt_capture_runs_decrypted_and_mixed(tmp_path):
     assert res.mixed_path == str(tmp_path / "mixed.pcap")
 
 
+def test_decrypt_rejects_output_on_nonzero_rc_and_clears_stale(tmp_path):
+    """A failed GoGoRoboCap run (rc != 0) must NOT yield a result — and a stale decrypted.pcap from
+    a prior attempt must be cleared before the run, so it can't be sealed as this attempt's output."""
+    pcap = tmp_path / "dump.pcap"
+    pcap.write_bytes(b"\xd4\xc3\xb2\xa1" + b"y" * 200)
+    keylog = tmp_path / "sslkeys.log"
+    keylog.write_text("SERVER_HANDSHAKE_TRAFFIC_SECRET abc def\n")
+    stale = tmp_path / "decrypted.pcap"
+    stale.write_bytes(b"\xd4\xc3\xb2\xa1" + b"STALE" * 50)  # usable-sized leftover
+
+    res = decrypt_capture(
+        binary="/bin/ggrc", pcap_path=str(pcap), keylog_path=str(keylog),
+        out_dir=str(tmp_path), run_fn=_seam([], rc=1, make_output=False),  # run fails, writes nothing
+    )
+    assert res is None                 # failed run → no result
+    assert not stale.exists()          # the stale leftover was removed, not sealed
+
+
 def test_decrypt_capture_skips_when_no_keylog(tmp_path):
     pcap = tmp_path / "dump.pcap"
     pcap.write_bytes(b"\xd4\xc3\xb2\xa1" + b"y" * 200)
