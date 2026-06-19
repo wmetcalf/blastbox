@@ -82,14 +82,22 @@ def decrypt_capture(
         return None  # no keys → nothing to do
     decrypted = os.path.join(out_dir, "decrypted.pcap")
     mixed = os.path.join(out_dir, "mixed.pcap")
+    # Remove any pre-existing outputs first so we never accept a STALE file from a prior attempt
+    # (retries reuse out_dir) and only treat a file as a result if THIS run produced it with rc 0.
+    for stale in (decrypted, mixed):
+        try:
+            os.unlink(stale)
+        except FileNotFoundError:
+            pass
     try:
-        run_fn(gogorobocap_keylog_argv(binary, pcap_path, keylog_path, "decrypted", decrypted))
-        run_fn(gogorobocap_keylog_argv(binary, pcap_path, keylog_path, "mixed", mixed))
+        rc_dec = run_fn(gogorobocap_keylog_argv(binary, pcap_path, keylog_path, "decrypted", decrypted))
+        rc_mix = run_fn(gogorobocap_keylog_argv(binary, pcap_path, keylog_path, "mixed", mixed))
     except Exception as exc:  # noqa: BLE001 — decrypt is best-effort enrichment
         _log.warning("decrypt: GoGoRoboCap run failed for %s: %s", pcap_path, exc)
         return None
-    dec = decrypted if _usable(decrypted) else None
-    mix = mixed if _usable(mixed) else None
+    # Only accept an output the run actually generated successfully (rc 0) AND that is a usable pcap.
+    dec = decrypted if (rc_dec == 0 and _usable(decrypted)) else None
+    mix = mixed if (rc_mix == 0 and _usable(mixed)) else None
     if dec is None and mix is None:
         return None  # ran but no TLS flows / no output
     _log.info("decrypt: produced %s%s for %s",

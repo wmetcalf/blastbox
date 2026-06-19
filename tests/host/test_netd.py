@@ -117,17 +117,41 @@ def test_capture_done_sentinel_skipped_when_proc_wont_stop(tmp_path):
     assert not (tmp_path / "J1" / "capture" / "dump.pcap.done").is_file()
 
 
-def test_capture_clears_stale_done_sentinel_on_start(tmp_path):
-    """A retried job (same job_id, capture/ kept) must not inherit the prior attempt's .done — it
-    is cleared before the fresh tcpdump so the dispatcher waits for THIS capture."""
+def test_capture_clears_stale_pcap_and_sentinel_on_start(tmp_path):
+    """A retried job (same job_id, capture/ kept) must inherit NEITHER the prior attempt's .done NOR
+    its dump.pcap — both are cleared before the fresh tcpdump, so a spawn failure can't leave the old
+    pcap to be sealed as this job's capture, and the dispatcher waits for THIS capture's sentinel."""
     spawned: list = []
     d = _make_daemon(tmp_path, {"c1": _labeled_inspect(job_id="J1")}, spawned)
     cap = tmp_path / "J1" / "capture"
     cap.mkdir(parents=True, exist_ok=True)
-    stale = cap / "dump.pcap.done"
-    stale.write_text("stale")
+    (cap / "dump.pcap.done").write_text("stale")
+    (cap / "dump.pcap").write_bytes(b"STALE-prior-attempt")
     d.handle_start("c1")
-    assert not stale.is_file()  # cleared before the new capture spawned
+    # the fake spawn_fn writes no pcap, so if the stale one weren't removed it'd survive
+    assert not (cap / "dump.pcap.done").is_file()
+    assert not (cap / "dump.pcap").is_file()
+
+
+def test_wire_socks_per_worker_proxy_works_without_global(tmp_path):
+    """The per-worker socks-proxy label (the country tor fleet) wires even when netd has NO global
+    --socks-proxy — the nsenter seams are available regardless of a configured global exit."""
+    insp = _wire_inspect(pid=42)
+    insp["Config"]["Labels"]["blastbox.net.socks-proxy"] = "socks5://172.30.0.41:9050"
+    spawned: list = []
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: insp,
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        socks_proxy_url=None,  # NO global proxy configured
+        nsenter_spawn_fn=lambda pid, argv: spawned.append(_FakeProc(argv)) or spawned[-1],
+        nsenter_run_fn=lambda pid, argv: 0,
+        sleep_fn=lambda s: None,
+    )
+    d.handle_start("c1")
+    assert "c1" in d.wired
+    assert any("socks5://172.30.0.41:9050" in a for a in spawned[0].argv)
 
 
 def test_die_unknown_container_is_noop(tmp_path):

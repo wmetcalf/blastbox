@@ -1091,7 +1091,14 @@ class Dispatcher:
         # in-netns OUTPUT firewall that DROPs all non-TCP egress (UDP/ICMP/raw) — these tiers carry
         # only TCP, so a sample must not be able to leak non-TCP past the worker. The VPN tier is the
         # all-IP path and gets NO guard. tor needs UDP:53 out (the host DNSPort REDIRECT) → "dns".
-        if personality.exit_driver == "tor":
+        # A socks personality that opted OUT of use-vc (dns_tcp=0) resolves over UDP:53 to a directly
+        # reachable resolver, so it ALSO needs the "dns" guard or its DNS would be dropped (its
+        # resolv.conf has no use-vc — see worker_resolv_conf — so strict would break resolution).
+        socks_udp_dns = (
+            personality.exit_driver == "socks"
+            and personality.config.get("dns_tcp", "1").strip().lower() in ("0", "false", "no")
+        )
+        if personality.exit_driver == "tor" or socks_udp_dns:
             worker_labels["blastbox.net.leakguard"] = "dns"
         elif personality.exit_driver in ("socks", "httpproxy"):
             worker_labels["blastbox.net.leakguard"] = "strict"
