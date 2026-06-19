@@ -86,6 +86,10 @@ def api_boot_sequence(
         # promptly (see _BOOT_ARGS). Captured in the snapshot, so every restore has it.
         # REQUIRES Firecracker >= 1.15.1 (earlier versions have a guest-reachable
         # virtio-rng host-memory DoS); we run v1.16.0.
+        # NOTE: seeding before checkpoint means the CRNG STATE is cloned into every
+        # restore; the guest reseeds from this device's fresh per-restore /dev/hwrng
+        # bytes post-restore (serve_warm -> _reseed_crng_after_restore) so clones
+        # don't repeat random output on guests without VMGenID (Linux < 5.18).
         ("/entropy", {}),
         ("/actions", {"action_type": "InstanceStart"}),
     ]

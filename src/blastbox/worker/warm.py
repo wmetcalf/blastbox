@@ -344,6 +344,68 @@ class HostWarmControl:
 
 
 # ---------------------------------------------------------------------------
+# Post-restore CRNG reseed
+# ---------------------------------------------------------------------------
+
+# RNDADDENTROPY = _IOW('R', 3, int[2]) from <linux/random.h>: mix a buffer into
+# the input pool AND credit entropy, forcing a CRNG reseed.
+_RNDADDENTROPY = 0x40085203
+_RESEED_BYTES = 32
+
+
+def _reseed_crng_after_restore() -> None:
+    """Mix fresh per-restore entropy from virtio-rng into the kernel CRNG.
+
+    The warm-snapshot tier checkpoints ONE base VM (CRNG already seeded by the
+    virtio-rng device + boot) and restores it per job, so the kernel CRNG state is
+    *cloned* into every restored worker. Without a reseed, clones can repeat
+    "random" output (UUIDs / secrets / nonces) right after restore until the
+    kernel self-reseeds — VMGenID handles this automatically only on Linux >= 5.18
+    guests, so older guests are exposed. ``/dev/hwrng`` is the Firecracker
+    virtio-rng device, fed FRESH by the host on each restore, so its bytes differ
+    per clone; mixing them in diverges every clone regardless of guest kernel.
+
+    Best-effort and never fatal: a tier without virtio-rng (no ``/dev/hwrng``, e.g.
+    the gVisor file tier) or a missing privilege just logs and skips.
+    """
+    import fcntl
+    import struct
+
+    try:
+        with open("/dev/hwrng", "rb") as hw:
+            seed = hw.read(_RESEED_BYTES)
+    except OSError as exc:
+        logger.debug("crng reseed skipped: /dev/hwrng unavailable (%s)", exc)
+        return
+    if len(seed) < _RESEED_BYTES:
+        logger.debug("crng reseed skipped: short hwrng read (%d bytes)", len(seed))
+        return
+
+    # Prefer RNDADDENTROPY (mixes AND credits → forces an immediate reseed); the
+    # microVM guest worker runs as uid 0 with CAP_SYS_ADMIN. Fall back to a plain
+    # write to /dev/urandom (mixes into the pool without crediting) if not allowed.
+    try:
+        fd = os.open("/dev/random", os.O_WRONLY)
+        try:
+            # struct rand_pool_info { int entropy_count; int buf_size; __u32 buf[]; }
+            payload = struct.pack("ii", len(seed) * 8, len(seed)) + seed
+            fcntl.ioctl(fd, _RNDADDENTROPY, payload)
+            logger.info("crng reseeded from /dev/hwrng after restore (RNDADDENTROPY)")
+            return
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        logger.debug("RNDADDENTROPY failed (%s); writing /dev/urandom instead", exc)
+
+    try:
+        with open("/dev/urandom", "wb") as ur:
+            ur.write(seed)
+        logger.info("crng reseeded from /dev/hwrng after restore (/dev/urandom write)")
+    except OSError as exc:
+        logger.warning("crng reseed after restore failed entirely: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # serve_warm
 # ---------------------------------------------------------------------------
 
@@ -414,6 +476,11 @@ def serve_warm(
         except Exception as sig_exc:  # noqa: BLE001
             logger.error("signal_done(idle_timeout) failed: %s", sig_exc)
         return 0
+
+    # A job arrived → this worker has just been restored from the warm snapshot.
+    # Reseed the kernel CRNG with fresh per-restore entropy BEFORE detonation so a
+    # workload's randomness doesn't repeat across snapshot clones (best-effort).
+    _reseed_crng_after_restore()
 
     # ------------------------------------------------------------------
     # Step 4: process the one job through the unchanged cold-path harness

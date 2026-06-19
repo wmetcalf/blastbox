@@ -282,6 +282,69 @@ def test_idle_timeout_signals_done_and_exits_zero(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Post-restore CRNG reseed
+# ---------------------------------------------------------------------------
+
+
+def test_serve_warm_reseeds_crng_after_restore(tmp_path: Path, monkeypatch) -> None:
+    """A job arriving means the worker was just restored from the warm snapshot;
+    serve_warm reseeds the CRNG exactly once, AFTER wait_for_go and BEFORE done."""
+    import blastbox.worker.warm as warm
+
+    input_file = tmp_path / "input" / "doc.docx"
+    input_file.parent.mkdir()
+    input_file.write_bytes(b"x")
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    spec = WarmJobSpec(input_path=input_file, output_dir=output_dir)
+    engine = _WarmEngine()
+    control = _FakeControl(specs=[spec])
+
+    # Record the control-call count at reseed time to assert ordering.
+    calls: list[int] = []
+    monkeypatch.setattr(
+        warm, "_reseed_crng_after_restore", lambda: calls.append(len(control.call_log))
+    )
+
+    rc = serve_warm(engine, control=control, limits=_limits(), idle_timeout_s=10.0)
+    assert rc == 0
+    assert len(calls) == 1, "reseed must run exactly once per job"
+    # signal_ready + wait_for_go have happened (>=2 calls), signal_done has NOT yet.
+    wfg_idx = control.call_log.index(("wait_for_go",))
+    assert calls[0] >= wfg_idx + 1, "reseed must run after wait_for_go (post-restore)"
+
+
+def test_serve_warm_does_not_reseed_on_idle_timeout(tmp_path: Path, monkeypatch) -> None:
+    """No job arrived (idle timeout) → no restore-for-a-job → no reseed."""
+    import blastbox.worker.warm as warm
+
+    control = _FakeControl(specs=[WarmTimeout])  # type: ignore[list-item]
+    calls: list[int] = []
+    monkeypatch.setattr(warm, "_reseed_crng_after_restore", lambda: calls.append(1))
+
+    rc = serve_warm(_WarmEngine(), control=control, limits=_limits(), idle_timeout_s=10.0)
+    assert rc == 0
+    assert calls == [], "reseed must not run when no job arrived"
+
+
+def test_reseed_crng_after_restore_noop_without_hwrng(monkeypatch) -> None:
+    """A tier without virtio-rng (no /dev/hwrng) → best-effort skip, never raises."""
+    import builtins
+
+    import blastbox.worker.warm as warm
+
+    real_open = builtins.open
+
+    def fake_open(path, *a, **k):
+        if str(path) == "/dev/hwrng":
+            raise FileNotFoundError("no /dev/hwrng on this tier")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    warm._reseed_crng_after_restore()  # must return cleanly, no exception
+
+
+# ---------------------------------------------------------------------------
 # Test 5: FileWarmControl round-trip
 # ---------------------------------------------------------------------------
 
