@@ -954,6 +954,9 @@ class FirecrackerSlotRuntime:
             # promptly. Without it (and with no RDRAND trust) getrandom() blocks until
             # the kernel self-seeds (~2 min), which collides with the warm worker
             # timeout and fails the job. Empty body = no rate limiter.
+            # REQUIRES Firecracker >= 1.15.1: earlier versions have a virtio-rng bug
+            # where guest-controlled descriptor chains can drive excessive HOST memory
+            # allocation — reachable by an untrusted detonation guest. We run v1.16.0.
             "entropy": {},
         }
 

@@ -98,8 +98,13 @@ def _restore_from_snapshot(
     api: FcApi, snapshot_path: str, mem_path: str, *, resume: bool = True
 ) -> None:
     """Load a snapshot (state + memory) into a fresh firecracker and (optionally)
-    resume. Field shapes per FC v1.12.1 ``LoadSnapshotConfig`` — ``mem_backend``
-    (not the deprecated ``mem_file_path``), no vsock override (see module note)."""
+    resume. Field shapes valid FC v1.12.1–v1.16.0 ``LoadSnapshotConfig`` —
+    ``mem_backend`` (not the deprecated ``mem_file_path``), ``track_dirty_pages``
+    (the FC ≥1.13 replacement for the deprecated ``enable_diff_snapshots``; False
+    since we only take Full snapshots), no vsock override (see module note).
+    ``clock_realtime`` is intentionally left unset (default False): FC resumes the
+    guest CLOCK_MONOTONIC frozen from snapshot time, which is exactly what the warm
+    handshake relies on — advancing it would reintroduce the restore clock-jump."""
     from blastbox.host.runtime.fc_api import FcApiError
 
     try:
@@ -108,7 +113,7 @@ def _restore_from_snapshot(
             {
                 "snapshot_path": snapshot_path,
                 "mem_backend": {"backend_type": "File", "backend_path": mem_path},
-                "enable_diff_snapshots": False,
+                "track_dirty_pages": False,
                 "resume_vm": resume,
             },
         )

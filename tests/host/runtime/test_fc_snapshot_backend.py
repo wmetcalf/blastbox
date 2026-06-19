@@ -79,7 +79,7 @@ def test_restore_loads_mem_backend_and_resumes():
             {
                 "snapshot_path": "/s/state",
                 "mem_backend": {"backend_type": "File", "backend_path": "/s/mem"},
-                "enable_diff_snapshots": False,
+                "track_dirty_pages": False,
                 "resume_vm": True,
             },
         ),
@@ -266,7 +266,7 @@ def test_restore_in_loads_resumes_and_exposes_vsock(tmp_path):
                     "backend_type": "File",
                     "backend_path": str(base / "warm.mem"),
                 },
-                "enable_diff_snapshots": False,
+                "track_dirty_pages": False,
                 "resume_vm": True,
             },
         ),

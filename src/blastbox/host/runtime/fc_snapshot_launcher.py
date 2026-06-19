@@ -84,6 +84,8 @@ def api_boot_sequence(
         ),
         # virtio-rng entropy device — host-fed randomness so the guest CRNG seeds
         # promptly (see _BOOT_ARGS). Captured in the snapshot, so every restore has it.
+        # REQUIRES Firecracker >= 1.15.1 (earlier versions have a guest-reachable
+        # virtio-rng host-memory DoS); we run v1.16.0.
         ("/entropy", {}),
         ("/actions", {"action_type": "InstanceStart"}),
     ]
