@@ -47,6 +47,49 @@ _POLL_INTERVAL_S: float = 0.05
 _RESTORE_JUMP_S: float = 5.0
 
 
+class _RestoreAwareDeadline:
+    """An idle-timeout deadline that survives a checkpoint/restore clock-jump.
+
+    A warm worker is checkpointed BLOCKED waiting for its single job. gVisor C/R
+    (and, defensively, FC snapshot restore) can advance CLOCK_MONOTONIC by the
+    wall-time spent checkpointed; a deadline computed *before* the checkpoint is
+    then already-expired the instant the worker resumes and would abandon the
+    job the host just handed it (empty output → "metadata.json not found").
+    :meth:`expired` watches for a monotonic leap far larger than the caller's
+    poll cadence — which can only be a restore, never a normal sleep/accept tick
+    — and restarts the countdown, so a restored worker behaves like a freshly
+    ready one.
+
+    Both the deadline and the leap reference are seeded from a SINGLE
+    ``time.monotonic()`` sample, so a checkpoint can never land *between* two
+    samples and desync them (which would hide the very jump being watched for).
+    """
+
+    __slots__ = ("_timeout", "_deadline", "_last")
+
+    def __init__(self, timeout_s: float) -> None:
+        self._timeout = timeout_s
+        self._restart(time.monotonic())
+
+    def _restart(self, now: float) -> None:
+        self._deadline = now + self._timeout
+        self._last = now
+
+    def expired(self) -> bool:
+        """Whether the idle timeout has genuinely elapsed; call once per tick.
+
+        A monotonic jump greater than ``_RESTORE_JUMP_S`` since the previous call
+        is treated as a restore: the countdown restarts and this returns ``False``
+        (the worker is effectively freshly ready).
+        """
+        now = time.monotonic()
+        if now - self._last > _RESTORE_JUMP_S:
+            self._restart(now)
+            return False
+        self._last = now
+        return now >= self._deadline
+
+
 # ---------------------------------------------------------------------------
 # WarmJobSpec
 # ---------------------------------------------------------------------------
@@ -160,8 +203,13 @@ class FileWarmControl:
             WarmTimeout: if ``go.json`` does not appear before the deadline.
         """
         go_path = self._dir / "go.json"
-        deadline = time.monotonic() + timeout_s
-        last = time.monotonic()
+        # This worker is checkpointed BLOCKED in this loop (at "ready"); a restore
+        # from a snapshot older than `timeout_s` resumes with the monotonic clock
+        # already advanced past the original deadline, which would instantly raise
+        # WarmTimeout and abandon the job the host just handed us (empty output ->
+        # "metadata.json not found"). _RestoreAwareDeadline restarts the countdown
+        # when it detects the restore jump, so the worker is "freshly ready".
+        deadline = _RestoreAwareDeadline(timeout_s)
 
         while True:
             if go_path.exists():
@@ -191,18 +239,7 @@ class FileWarmControl:
                     params=params,
                 )
 
-            now = time.monotonic()
-            # This worker is checkpointed BLOCKED in this loop (at "ready"); a restore
-            # from a snapshot older than `timeout_s` resumes here with the monotonic
-            # clock already advanced past `deadline`, which would instantly raise
-            # WarmTimeout and abandon the job the host just handed us (empty output ->
-            # "metadata.json not found"). A leap far beyond the poll interval can only be
-            # that restore — restart the idle countdown so the worker is "freshly ready".
-            if now - last > _RESTORE_JUMP_S:
-                deadline = now + timeout_s
-            last = now
-
-            if now >= deadline:
+            if deadline.expired():
                 raise WarmTimeout(
                     f"no job arrived within {timeout_s}s idle timeout"
                 )

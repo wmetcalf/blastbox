@@ -357,9 +357,10 @@ def test_file_warm_control_wait_for_go_survives_restore_clock_jump(
     ctrl = FileWarmControl(ctrl_dir)
 
     timeout_s = 3600.0
-    # monotonic: deadline=0, last=0, then a huge leap (a multi-day restore) on the
-    # first poll tick — far past the original deadline.
-    times = iter([0.0, 0.0, timeout_s + 100.0])
+    # monotonic samples: the deadline is seeded once at 0.0 (single sample, so a
+    # checkpoint can't desync deadline/last), then the first poll tick reads a huge
+    # leap (a multi-day restore) far past the original deadline.
+    times = iter([0.0, timeout_s + 100.0, timeout_s + 100.0])
     monkeypatch.setattr(warm.time, "monotonic", lambda: next(times))
 
     go_data = {"input_path": str(input_file), "output_dir": str(output_dir), "params": {}}
@@ -373,6 +374,58 @@ def test_file_warm_control_wait_for_go_survives_restore_clock_jump(
     spec = ctrl.wait_for_go(timeout_s=timeout_s)  # must NOT raise despite the clock jump
     assert spec.input_path == input_file
     assert spec.output_dir == output_dir
+
+
+# ---------------------------------------------------------------------------
+# _RestoreAwareDeadline (the shared restore-jump-resilient idle timer)
+# ---------------------------------------------------------------------------
+
+
+def test_restore_aware_deadline_seeds_from_a_single_monotonic_sample(monkeypatch):
+    """Both the deadline and the leap reference must come from ONE monotonic
+    sample — otherwise a checkpoint landing between two samples desyncs them and
+    the very jump being watched for is hidden (PR #37 review, codex)."""
+    import blastbox.worker.warm as warm
+
+    calls = []
+
+    def counting_monotonic():
+        calls.append(1)
+        return 100.0
+
+    monkeypatch.setattr(warm.time, "monotonic", counting_monotonic)
+    warm._RestoreAwareDeadline(60.0)
+    assert len(calls) == 1  # exactly one sample at construction
+
+
+def test_restore_aware_deadline_expires_normally(monkeypatch):
+    """With no jump, expired() flips to True once the idle window elapses."""
+    import blastbox.worker.warm as warm
+
+    # Ticks step by <_RESTORE_JUMP_S each so none is misread as a restore jump.
+    times = iter([0.0, 4.0, 8.0, 11.0])  # init, then three ticks
+    monkeypatch.setattr(warm.time, "monotonic", lambda: next(times))
+    d = warm._RestoreAwareDeadline(10.0)  # deadline = 10.0
+    assert d.expired() is False  # t=4.0
+    assert d.expired() is False  # t=8.0
+    assert d.expired() is True   # t=11.0 >= 10.0 (gap 3.0 < jump threshold)
+
+
+def test_restore_aware_deadline_restarts_on_clock_jump(monkeypatch):
+    """A leap larger than _RESTORE_JUMP_S restarts the countdown (returns False)
+    even though the raw clock is far past the original deadline."""
+    import blastbox.worker.warm as warm
+
+    # init=0.0 (deadline=10.0); first tick leaps to 10_000 (a multi-hour restore),
+    # resetting the deadline to 10_010. The remaining ticks step by <_RESTORE_JUMP_S
+    # so they're read as normal time, climbing to the RESTARTED deadline.
+    times = iter([0.0, 10_000.0, 10_004.0, 10_008.0, 10_011.0])
+    monkeypatch.setattr(warm.time, "monotonic", lambda: next(times))
+    d = warm._RestoreAwareDeadline(10.0)
+    assert d.expired() is False  # t=10_000: jump detected -> restart (deadline 10_010)
+    assert d.expired() is False  # t=10_004: fresh window, not yet elapsed
+    assert d.expired() is False  # t=10_008: still within the restarted window
+    assert d.expired() is True   # t=10_011 >= restarted deadline 10_010
 
 
 def test_file_warm_control_atomic_writes(tmp_path: Path) -> None:

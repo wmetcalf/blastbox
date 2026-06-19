@@ -39,12 +39,17 @@ from blastbox.worker.fc_guest import (
     send_frame,
     signal_ready_vsock,
 )
-from blastbox.worker.warm import WarmJobSpec
+from blastbox.worker.warm import WarmJobSpec, _RestoreAwareDeadline
 
 _log = logging.getLogger("blastbox.worker.fc_warm")
 
 # VMADDR_CID_ANY — bind a guest vsock listener on any local CID.
 _VMADDR_CID_ANY = getattr(socket, "VMADDR_CID_ANY", 0xFFFFFFFF)
+
+# Per-iteration accept() timeout for the restore-aware wait loop. A pending host
+# connect waits in the listen backlog, so a short poll never drops it; it only
+# bounds how quickly a restore clock-jump is noticed (see _RestoreAwareDeadline).
+_ACCEPT_POLL_S: float = 1.0
 
 ListenerFactory = Callable[[int], "socket.socket"]
 
@@ -102,11 +107,29 @@ class VsockWarmControl:
             raise ConnectionError("failed to signal READY over vsock")
 
     def wait_for_go(self, *, timeout_s: float) -> WarmJobSpec:
-        self._listener.settimeout(timeout_s)
-        try:
-            conn, _ = self._listener.accept()
-        except (TimeoutError, socket.timeout, OSError) as exc:
-            raise WarmTimeout(f"no job within {timeout_s}s: {exc}") from exc
+        # Poll accept() with a SHORT per-iteration timeout rather than one long
+        # blocking accept(timeout_s): this guest is checkpointed BLOCKED here, and
+        # a restore from a snapshot older than timeout_s can resume with the
+        # monotonic clock already advanced past a one-shot accept deadline ->
+        # instant timeout, abandoning the job the host just sent. The pending host
+        # connect waits in the listen backlog, so the short poll never drops it.
+        # _RestoreAwareDeadline restarts the countdown on the restore jump — parity
+        # with the gVisor FileWarmControl path.
+        idle = _RestoreAwareDeadline(timeout_s)
+        conn: "socket.socket | None" = None
+        while conn is None:
+            self._listener.settimeout(_ACCEPT_POLL_S)
+            try:
+                conn, _ = self._listener.accept()
+            except (TimeoutError, socket.timeout):
+                # Per-tick accept timeout (or a restore jump just reset us): only a
+                # genuinely elapsed idle deadline retires the slot.
+                if idle.expired():
+                    raise WarmTimeout(
+                        f"no job arrived within {timeout_s}s idle timeout"
+                    ) from None
+            except OSError as exc:
+                raise WarmTimeout(f"job accept failed: {exc}") from exc
         self._conn = conn
         # The accepted conn does NOT inherit the listener timeout — bound the
         # header/input reads with an absolute deadline, and close the conn if the
