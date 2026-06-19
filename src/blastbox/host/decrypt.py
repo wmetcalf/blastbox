@@ -87,7 +87,7 @@ def decrypt_capture(
     for stale in (decrypted, mixed):
         try:
             os.unlink(stale)
-        except FileNotFoundError:
+        except OSError:
             pass
     try:
         rc_dec = run_fn(gogorobocap_keylog_argv(binary, pcap_path, keylog_path, "decrypted", decrypted))

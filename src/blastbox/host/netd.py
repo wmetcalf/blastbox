@@ -238,7 +238,7 @@ class CaptureDaemon:
             for stale in (target.pcap_path + ".done", target.pcap_path):
                 try:
                     os.unlink(stale)
-                except FileNotFoundError:
+                except OSError:
                     pass
             proc = self.spawn_fn(
                 tcpdump_argv(target.iface, target.worker_ip, target.pcap_path), target.pcap_path
