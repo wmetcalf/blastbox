@@ -337,6 +337,44 @@ def test_file_warm_control_wait_for_go_raises_warm_timeout(tmp_path: Path) -> No
         ctrl.wait_for_go(timeout_s=0.1)
 
 
+def test_file_warm_control_wait_for_go_survives_restore_clock_jump(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A worker restored from a snapshot OLDER than the idle timeout must still pick
+    up the job it was handed. The restore advances CLOCK_MONOTONIC past the original
+    deadline; wait_for_go must detect that jump and restart the idle countdown rather
+    than instantly raising WarmTimeout (the gVisor warm "metadata.json not found" bug).
+    """
+    import blastbox.worker.warm as warm
+
+    input_file = tmp_path / "in" / "doc"
+    input_file.parent.mkdir()
+    input_file.write_bytes(b"x")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    ctrl_dir = tmp_path / "ctrl"
+    ctrl_dir.mkdir()
+    ctrl = FileWarmControl(ctrl_dir)
+
+    timeout_s = 3600.0
+    # monotonic: deadline=0, last=0, then a huge leap (a multi-day restore) on the
+    # first poll tick — far past the original deadline.
+    times = iter([0.0, 0.0, timeout_s + 100.0])
+    monkeypatch.setattr(warm.time, "monotonic", lambda: next(times))
+
+    go_data = {"input_path": str(input_file), "output_dir": str(output_dir), "params": {}}
+
+    def fake_sleep(_seconds: float) -> None:
+        # The host delivers the job just after the restore (between poll ticks).
+        (ctrl_dir / "go.json").write_text(json.dumps(go_data), encoding="utf-8")
+
+    monkeypatch.setattr(warm.time, "sleep", fake_sleep)
+
+    spec = ctrl.wait_for_go(timeout_s=timeout_s)  # must NOT raise despite the clock jump
+    assert spec.input_path == input_file
+    assert spec.output_dir == output_dir
+
+
 def test_file_warm_control_atomic_writes(tmp_path: Path) -> None:
     """ready and done files are written atomically (no partial file observed by racing reader)."""
     # We verify that the files are created via os.replace (temp+rename) by checking

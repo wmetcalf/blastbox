@@ -39,6 +39,13 @@ logger = logging.getLogger(__name__)
 # Polling interval for FileWarmControl.wait_for_go
 _POLL_INTERVAL_S: float = 0.05
 
+# A jump in CLOCK_MONOTONIC larger than this between two poll ticks cannot be a
+# normal sleep — it means the sandbox was checkpoint/restored (gVisor C/R, FC
+# snapshot), which advances the monotonic clock by the time spent checkpointed.
+# When detected, the idle countdown is restarted so a restore from a snapshot
+# older than the idle timeout does not instantly abandon the job it was handed.
+_RESTORE_JUMP_S: float = 5.0
+
 
 # ---------------------------------------------------------------------------
 # WarmJobSpec
@@ -154,6 +161,7 @@ class FileWarmControl:
         """
         go_path = self._dir / "go.json"
         deadline = time.monotonic() + timeout_s
+        last = time.monotonic()
 
         while True:
             if go_path.exists():
@@ -183,7 +191,18 @@ class FileWarmControl:
                     params=params,
                 )
 
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            # This worker is checkpointed BLOCKED in this loop (at "ready"); a restore
+            # from a snapshot older than `timeout_s` resumes here with the monotonic
+            # clock already advanced past `deadline`, which would instantly raise
+            # WarmTimeout and abandon the job the host just handed us (empty output ->
+            # "metadata.json not found"). A leap far beyond the poll interval can only be
+            # that restore — restart the idle countdown so the worker is "freshly ready".
+            if now - last > _RESTORE_JUMP_S:
+                deadline = now + timeout_s
+            last = now
+
+            if now >= deadline:
                 raise WarmTimeout(
                     f"no job arrived within {timeout_s}s idle timeout"
                 )
