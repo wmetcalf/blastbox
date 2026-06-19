@@ -47,6 +47,7 @@ from blastbox.host.runtime.firecracker import (
     FirecrackerSlotRuntime,
     firecracker_available,
     firecracker_version,
+    guest_kernel_version,
     make_ext4,
     rdump_ext4,
     select_fc_runtime,
@@ -437,6 +438,33 @@ class TestFirecrackerVersion:
 
     def test_none_when_binary_missing(self):
         assert firecracker_version("/nonexistent/firecracker") is None
+
+
+class TestGuestKernelVersion:
+    def test_parses_vmgenid_capable_kernel(self, tmp_path):
+        vmlinux = tmp_path / "vmlinux"
+        vmlinux.write_bytes(b"padding\x00Linux version 6.1.0 (ci@fc) gcc\x00more")
+        assert guest_kernel_version(str(vmlinux)) == (6, 1)
+
+    def test_parses_old_kernel(self, tmp_path):
+        vmlinux = tmp_path / "vmlinux"
+        vmlinux.write_bytes(b"\x00\x00Linux version 5.10.220 (build@host)\x00")
+        assert guest_kernel_version(str(vmlinux)) == (5, 10)
+
+    def test_finds_banner_across_chunk_boundary(self, tmp_path):
+        # Straddle the 1 MiB read boundary to exercise the overlap carry-over.
+        vmlinux = tmp_path / "vmlinux"
+        blob = b"\x00" * (1024 * 1024 - 5) + b"Linux version 6.8.0 (x)\x00"
+        vmlinux.write_bytes(blob)
+        assert guest_kernel_version(str(vmlinux)) == (6, 8)
+
+    def test_none_when_no_banner(self, tmp_path):
+        vmlinux = tmp_path / "vmlinux"
+        vmlinux.write_bytes(b"not a kernel image")
+        assert guest_kernel_version(str(vmlinux)) is None
+
+    def test_none_when_missing(self):
+        assert guest_kernel_version("/nonexistent/vmlinux") is None
 
 
 # ---------------------------------------------------------------------------

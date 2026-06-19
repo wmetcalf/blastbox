@@ -87,9 +87,9 @@ def api_boot_sequence(
         # REQUIRES Firecracker >= 1.15.1 (earlier versions have a guest-reachable
         # virtio-rng host-memory DoS); we run v1.16.0.
         # NOTE: seeding before checkpoint means the CRNG STATE is cloned into every
-        # restore; the guest reseeds from this device's fresh per-restore /dev/hwrng
-        # bytes post-restore (serve_warm -> _reseed_crng_after_restore) so clones
-        # don't repeat random output on guests without VMGenID (Linux < 5.18).
+        # restore. The reseed is the guest kernel's job via VMGenID, so the snapshot
+        # tier REQUIRES a >= 5.18 guest kernel (enforced in select_snapshot_runtime);
+        # a privilege-dropped userspace reseed can't credit entropy and was dropped.
         ("/entropy", {}),
         ("/actions", {"action_type": "InstanceStart"}),
     ]

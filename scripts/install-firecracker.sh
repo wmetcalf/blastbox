@@ -28,12 +28,16 @@ install -m755 "$tmp/release-${ver}-${ARCH}/firecracker-${ver}-${ARCH}" "$BIN_DIR
 echo ">> installed firecracker $ver -> $BIN_DIR/firecracker"
 "$BIN_DIR/firecracker" --version 2>/dev/null | head -1 || true
 
-# best-effort guest kernel; override with BLASTBOX_FC_KERNEL
+# best-effort guest kernel; override with BLASTBOX_FC_KERNEL.
+# Must be >= 5.18 (VMGenID) for the warm-SNAPSHOT tier: restoring a snapshot clones
+# the base VM's kernel CRNG, and only a VMGenID-aware guest reseeds it on restore
+# (otherwise restored clones can repeat random output). 5.10 is too old and the
+# snapshot-runtime selector now refuses it; fetch a 6.1 CI kernel instead.
 kern="$DEST/vmlinux"
 if [[ ! -s "$kern" ]]; then
-  echo ">> fetching a guest kernel (best-effort)"
+  echo ">> fetching a guest kernel (best-effort, >= 5.18 for VMGenID)"
   for u in \
-    "https://s3.amazonaws.com/spec.ccfc.min/ci-artifacts/kernels/${ARCH}/vmlinux-5.10.bin" \
+    "https://s3.amazonaws.com/spec.ccfc.min/ci-artifacts/kernels/${ARCH}/vmlinux-6.1.bin" \
     "https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/${ARCH}/kernels/vmlinux.bin" ; do
     if curl -fsSL "$u" -o "$kern" 2>/dev/null && [[ -s "$kern" ]]; then
       echo "   kernel -> $kern  (from $u)"; break

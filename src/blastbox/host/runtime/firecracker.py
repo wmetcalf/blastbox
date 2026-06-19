@@ -98,6 +98,13 @@ _ENV_FC_OUTDISK_MIB = "BLASTBOX_FC_OUTDISK_MIB"
 # refuses the tier (falls back to cold) rather than expose the host to that DoS.
 _MIN_FC_VERSION: tuple[int, int, int] = (1, 15, 1)
 
+# Minimum guest kernel for the warm-SNAPSHOT tier. Restoring a snapshot clones the
+# base VM's kernel CRNG state into every worker; only a VMGenID-aware guest
+# (Linux >= 5.18) reseeds the CRNG automatically on restore, so without it clones
+# can repeat random output. The snapshot-runtime selector enforces this (the cold
+# FC tier boots fresh per job and is unaffected).
+_MIN_SNAPSHOT_KERNEL: tuple[int, int] = (5, 18)
+
 # Ready marker filename written by the guest worker into the output disk root.
 # The host checks for this file via debugfs after the VM exits.  In the vsock
 # control plane the worker sends a READY frame before the warm signal.
@@ -300,6 +307,33 @@ def firecracker_version(fc_bin: str) -> tuple[int, int, int] | None:
     if not m:
         return None
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def guest_kernel_version(vmlinux_path: str) -> tuple[int, int] | None:
+    """Best-effort ``(major, minor)`` of the guest kernel from its vmlinux image.
+
+    Reads the ``Linux version X.Y.Z`` banner that lives in the (uncompressed, as
+    Firecracker requires) vmlinux ``.rodata``. Returns ``None`` if the file can't
+    be read or no banner is found — callers MUST treat that as "unknown", never as
+    "new enough". Bounded + chunked so a large image isn't slurped whole.
+    """
+    pat = re.compile(rb"Linux version (\d+)\.(\d+)")
+    try:
+        with open(vmlinux_path, "rb") as fh:
+            prev = b""
+            read = 0
+            while read < 128 * 1024 * 1024:  # cap the scan at 128 MiB
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                read += len(chunk)
+                m = pat.search(prev + chunk)
+                if m:
+                    return (int(m.group(1)), int(m.group(2)))
+                prev = chunk[-32:]  # overlap so a boundary-straddling match isn't lost
+    except OSError:
+        return None
+    return None
 
 
 def firecracker_available(cfg: FCConfig | None = None) -> bool:
