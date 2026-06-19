@@ -94,6 +94,11 @@ def test_config_json_single_ro_root_disk_no_extras():
     assert j["machine-config"]["mem_size_mib"] == 1024
     assert "console=ttyS0" in j["boot-source"]["boot_args"]
     assert j["boot-source"]["kernel_image_path"] == "/k"
+    # Entropy parity with the prod cold/warm boots: random.trust_cpu=on AND the
+    # virtio-rng device, so the probe doesn't false-timeout on a no-RDRAND host
+    # (where trust_cpu alone can't seed the CRNG) while prod VMs would succeed.
+    assert "random.trust_cpu=on" in j["boot-source"]["boot_args"]
+    assert j["entropy"] == {}
 
 
 # --------------------------------------------------------------------------- #

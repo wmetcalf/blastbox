@@ -129,6 +129,15 @@ def build_probe_config_json(cfg: CpuProbeConfig) -> dict:
             "mem_size_mib": cfg.mem_mib,
             "smt": False,
         },
+        # virtio-rng entropy device — MUST mirror the prod cold/warm boots (see
+        # firecracker.py / fc_snapshot_launcher.py). The boot_args carry
+        # random.trust_cpu=on, but on a host without RDRAND (or where the
+        # hypervisor doesn't pass it through) trust_cpu alone can't seed the
+        # CRNG, so the JVM's getrandom() blocks ~120s during the restore and the
+        # probe times out at timeout_s (25s) as a false INCONCLUSIVE — even
+        # though the real prod VMs (which DO have this device) would succeed.
+        # Empty body = no rate limiter.
+        "entropy": {},
     }
 
 
