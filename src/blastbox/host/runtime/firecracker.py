@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import selectors
 import shutil
 import socket
@@ -88,6 +89,14 @@ _ENV_FC_ROOTFS = "BLASTBOX_FC_ROOTFS"
 _ENV_FC_VCPU = "BLASTBOX_FC_VCPU"
 _ENV_FC_MEM_MIB = "BLASTBOX_FC_MEM_MIB"
 _ENV_FC_OUTDISK_MIB = "BLASTBOX_FC_OUTDISK_MIB"
+
+# Minimum supported Firecracker version. The FC tier unconditionally configures a
+# virtio-rng `entropy` device (so the guest CRNG seeds promptly — see the per-slot
+# fc-config and the snapshot launcher). FC < 1.15.1 has a virtio-rng bug where
+# guest-controlled descriptor chains can drive excessive HOST memory allocation,
+# reachable by an untrusted detonation guest. Below this, firecracker_available()
+# refuses the tier (falls back to cold) rather than expose the host to that DoS.
+_MIN_FC_VERSION: tuple[int, int, int] = (1, 15, 1)
 
 # Ready marker filename written by the guest worker into the output disk root.
 # The host checks for this file via debugfs after the VM exits.  In the vsock
@@ -271,6 +280,28 @@ class FCConfig:
 # ---------------------------------------------------------------------------
 
 
+def firecracker_version(fc_bin: str) -> tuple[int, int, int] | None:
+    """Parse ``<fc_bin> --version`` into a ``(major, minor, patch)`` tuple.
+
+    Returns ``None`` if the binary can't be run or no version can be parsed —
+    callers MUST treat that as "unknown / unusable", never as "new enough".
+    """
+    try:
+        proc = subprocess.run(
+            [fc_bin, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # First line is e.g. "Firecracker v1.16.0" (possibly with a build suffix).
+    m = re.search(r"\bv?(\d+)\.(\d+)\.(\d+)", proc.stdout + proc.stderr)
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
 def firecracker_available(cfg: FCConfig | None = None) -> bool:
     """Return True iff all FC prerequisites are present on this host.
 
@@ -279,8 +310,10 @@ def firecracker_available(cfg: FCConfig | None = None) -> bool:
     - ``/dev/kvm`` is present (hardware virtualisation).
     - The kernel image path is set and the file exists.
     - The rootfs image path is set and the file exists.
+    - The firecracker binary is >= ``_MIN_FC_VERSION`` (the virtio-rng entropy
+      device this tier configures is a guest-reachable host DoS on older FC).
 
-    Any missing component → False.  This function never raises.
+    Any missing/too-old component → False.  This function never raises.
     """
     try:
         if cfg is None:
@@ -311,6 +344,21 @@ def firecracker_available(cfg: FCConfig | None = None) -> bool:
         # Rootfs
         if not cfg.fc_rootfs or not Path(cfg.fc_rootfs).is_file():
             _log.debug("firecracker_available=False: rootfs %r not found", cfg.fc_rootfs)
+            return False
+
+        # Version (probe LAST — only spawn the subprocess once the cheap checks pass).
+        # The FC config adds an unconditional virtio-rng entropy device, which is a
+        # guest-reachable host-memory DoS on FC < 1.15.1; refuse an older/unknown binary.
+        ver = firecracker_version(bin_path)
+        if ver is None or ver < _MIN_FC_VERSION:
+            _log.warning(
+                "firecracker_available=False: %s is version %s, need >= %s "
+                "(the virtio-rng entropy device has a guest-reachable host-memory DoS "
+                "below this) — falling back off the FC tier",
+                bin_path,
+                ".".join(map(str, ver)) if ver else "unknown",
+                ".".join(map(str, _MIN_FC_VERSION)),
+            )
             return False
 
         return True

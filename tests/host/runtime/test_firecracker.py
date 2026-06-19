@@ -46,6 +46,7 @@ from blastbox.host.runtime.firecracker import (
     FileReadySignal,
     FirecrackerSlotRuntime,
     firecracker_available,
+    firecracker_version,
     make_ext4,
     rdump_ext4,
     select_fc_runtime,
@@ -375,6 +376,67 @@ class TestFirecrackerAvailable:
 
         monkeypatch.setattr(Path, "exists", _patched_exists)
         assert firecracker_available(cfg) is False
+
+    @staticmethod
+    def _prereqs(tmp_path, monkeypatch, version_line):
+        """All FC prereqs present + /dev/kvm patched present + a fake firecracker
+        whose --version prints ``version_line``. Returns the cfg to probe."""
+        k = tmp_path / "vmlinux"
+        r = tmp_path / "rootfs.ext4"
+        k.touch()
+        r.touch()
+        fake_fc = tmp_path / "firecracker"
+        fake_fc.write_text(f'#!/bin/sh\necho "{version_line}"\n')
+        fake_fc.chmod(0o755)
+        real_exists = Path.exists
+
+        def _kvm_present(self: Path) -> bool:
+            if str(self) == "/dev/kvm":
+                return True
+            return real_exists(self)
+
+        monkeypatch.setattr(Path, "exists", _kvm_present)
+        return FCConfig(fc_bin=str(fake_fc), fc_kernel=str(k), fc_rootfs=str(r))
+
+    def test_true_on_supported_firecracker(self, tmp_path, monkeypatch):
+        """All prereqs present and FC >= 1.15.1 → available."""
+        cfg = self._prereqs(tmp_path, monkeypatch, "Firecracker v1.16.0")
+        assert firecracker_available(cfg) is True
+
+    def test_false_on_too_old_firecracker(self, tmp_path, monkeypatch):
+        """FC < 1.15.1 has the guest-reachable virtio-rng host DoS → unavailable
+        even with every other prerequisite satisfied."""
+        cfg = self._prereqs(tmp_path, monkeypatch, "Firecracker v1.12.1")
+        assert firecracker_available(cfg) is False
+
+    def test_false_when_version_unparseable(self, tmp_path, monkeypatch):
+        """A binary whose --version yields no parseable version is treated as
+        unusable (never as 'new enough')."""
+        cfg = self._prereqs(tmp_path, monkeypatch, "not a version")
+        assert firecracker_available(cfg) is False
+
+
+class TestFirecrackerVersion:
+    def test_parses_standard_version_line(self, tmp_path):
+        fc = tmp_path / "firecracker"
+        fc.write_text('#!/bin/sh\necho "Firecracker v1.16.0"\n')
+        fc.chmod(0o755)
+        assert firecracker_version(str(fc)) == (1, 16, 0)
+
+    def test_parses_version_with_build_suffix(self, tmp_path):
+        fc = tmp_path / "firecracker"
+        fc.write_text('#!/bin/sh\necho "Firecracker v1.15.1-dirty"\n')
+        fc.chmod(0o755)
+        assert firecracker_version(str(fc)) == (1, 15, 1)
+
+    def test_none_on_unparseable(self, tmp_path):
+        fc = tmp_path / "firecracker"
+        fc.write_text('#!/bin/sh\necho "no version here"\n')
+        fc.chmod(0o755)
+        assert firecracker_version(str(fc)) is None
+
+    def test_none_when_binary_missing(self):
+        assert firecracker_version("/nonexistent/firecracker") is None
 
 
 # ---------------------------------------------------------------------------
