@@ -361,6 +361,32 @@ def test_egress_filter_from_inspect_block_internal_falsey():
     assert egress_filter_from_inspect(_egress_inspect(block="0")) == (None, False)
 
 
+def test_parse_egress_ports_dedups_preserving_order():
+    # Duplicate ports waste multiport slots (which are capped at 15) — dedup, keep first-seen order.
+    assert parse_egress_ports("80,443,80,53,443") == (80, 443, 53)
+
+
+def test_leak_guard_rules_web_only_chunks_over_multiport_limit():
+    # iptables multiport caps at 15 ports per rule; >15 ports must split into multiple ACCEPT rules
+    # (else iptables rejects the rule and the worker fails closed with no egress).
+    ports = tuple(range(1000, 1020))  # 20 ports
+    rules = leak_guard_rules(allow_udp_dns=False, allowed_ports=ports)
+    multiport = [r for r in rules if "multiport" in r]
+    assert len(multiport) == 2
+    for r in multiport:
+        assert 1 <= len(r[r.index("--dports") + 1].split(",")) <= 15
+    covered = [int(p) for r in multiport for p in r[r.index("--dports") + 1].split(",")]
+    assert covered == list(ports)  # every port covered, order preserved
+
+
+def test_egress_filter_from_inspect_tolerates_none_label_values():
+    # Labels come from `docker inspect` (Mapping[str, object]) — a present-but-None value must not
+    # crash or be mis-parsed as the string "None".
+    inspect = {"Config": {"Labels": {
+        EGRESS_PORTS_LABEL: None, BLOCK_INTERNAL_LABEL: None, "blastbox.job_id": "J"}}}
+    assert egress_filter_from_inspect(inspect) == (None, False)
+
+
 def test_transproxy_rules_reject_bad_port():
     with pytest.raises(ValueError):
         transproxy_redirect_rules("10.0.0.1", trans_port=70000, dns_port=5353)

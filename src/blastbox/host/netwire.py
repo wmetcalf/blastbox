@@ -289,8 +289,12 @@ def egress_filter_from_inspect(
     labels = config.get("Labels") if isinstance(config, Mapping) else None
     if not isinstance(labels, Mapping):
         return (None, False)
-    allowed_ports = parse_egress_ports(str(labels.get(EGRESS_PORTS_LABEL, "")) or None)
-    block_internal = str(labels.get(BLOCK_INTERNAL_LABEL, "")).strip().lower() in (
+    # Label values are typed ``object`` (from ``docker inspect``) — only a real string is meaningful;
+    # a present-but-None / non-str value is ignored, not coerced to the string "None".
+    raw_ports = labels.get(EGRESS_PORTS_LABEL)
+    allowed_ports = parse_egress_ports(raw_ports if isinstance(raw_ports, str) else None)
+    raw_block = labels.get(BLOCK_INTERNAL_LABEL)
+    block_internal = isinstance(raw_block, str) and raw_block.strip().lower() in (
         "1", "true", "yes", "on",
     )
     return (allowed_ports, block_internal)
@@ -317,7 +321,8 @@ def parse_egress_ports(raw: str | None) -> tuple[int, ...] | None:
             continue
         if 1 <= p <= 65535:
             ports.append(p)
-    return tuple(ports) or None
+    # Dedup (keep first-seen order): duplicates waste the capped multiport slots downstream.
+    return tuple(dict.fromkeys(ports)) or None
 
 
 def leak_guard_rules(
@@ -348,10 +353,12 @@ def leak_guard_rules(
         # WEB-ONLY: explicit allowlist, then drop EVERYTHING unmatched (other ports + all non-TCP).
         if allow_udp_dns:
             rules.append(["iptables", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
-        if allowed_ports:
+        # iptables ``multiport`` accepts at most 15 ports per rule → chunk, so a >15-port allowlist
+        # produces several ACCEPT rules instead of one rejected rule (which would fail the worker closed).
+        for i in range(0, len(allowed_ports), 15):
             rules.append([
                 "iptables", "-A", "OUTPUT", "-p", "tcp", "-m", "multiport",
-                "--dports", ",".join(_port(p) for p in allowed_ports), "-j", "ACCEPT",
+                "--dports", ",".join(_port(p) for p in allowed_ports[i:i + 15]), "-j", "ACCEPT",
             ])
         rules += [
             ["iptables", "-A", "OUTPUT", "-m", "limit", "--limit", "10/min",
