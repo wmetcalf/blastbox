@@ -84,7 +84,9 @@ class CpuProbeConfig:
     fc_bin: str
     kernel: str
     rootfs: str
-    boot_args: str = "console=ttyS0 reboot=k panic=1 pci=off init=/init ro"
+    # Mirror the prod boot cmdline (incl. random.trust_cpu=on) so the probe boots
+    # like the real warm/cold VMs it is vouching for.
+    boot_args: str = "console=ttyS0 reboot=k panic=1 pci=off init=/init ro random.trust_cpu=on"
     vcpu_count: int = 1          # vsock-corruption mitigation; matches the warm tier
     mem_mib: int = 1024          # boot at the SAME mem as prod so restore behaves the same
     timeout_s: float = 25.0
@@ -106,10 +108,15 @@ def _default_subprocess_runner(argv: list[str], **kwargs: object) -> "subprocess
     return subprocess.Popen(argv, **kwargs)  # type: ignore[call-overload]
 
 
-def build_probe_config_json(cfg: CpuProbeConfig) -> dict:
+def build_probe_config_json(cfg: CpuProbeConfig, *, include_entropy: bool = True) -> dict:
     """Minimal FC config for a one-shot probe: a single read-only root disk, no
-    output disk, no vsock — we only need the guest console up to the restore."""
-    return {
+    output disk, no vsock — we only need the guest console up to the restore.
+
+    ``include_entropy`` adds the virtio-rng device (default); the caller omits it
+    on a Firecracker older than the entropy-DoS fix — see
+    :func:`probe_guest_cpu_features`.
+    """
+    config: dict = {
         "boot-source": {
             "kernel_image_path": cfg.kernel,
             "boot_args": cfg.boot_args,
@@ -128,6 +135,18 @@ def build_probe_config_json(cfg: CpuProbeConfig) -> dict:
             "smt": False,
         },
     }
+    if include_entropy:
+        # virtio-rng entropy device — MUST mirror the prod cold/warm boots (see
+        # firecracker.py / fc_snapshot_launcher.py). The boot_args carry
+        # random.trust_cpu=on, but on a host without RDRAND (or where the
+        # hypervisor doesn't pass it through) trust_cpu alone can't seed the
+        # CRNG, so the JVM's getrandom() blocks ~120s during the restore and the
+        # probe times out at timeout_s (25s) as a false INCONCLUSIVE — even
+        # though the real prod VMs (which DO have this device) would succeed.
+        # Empty body = no rate limiter. Gated on the FC version by the caller: the
+        # device has a guest-reachable host-memory DoS on FC < 1.15.1.
+        config["entropy"] = {}
+    return config
 
 
 def classify_probe_console(
@@ -195,10 +214,32 @@ def probe_guest_cpu_features(
         if not p or not Path(p).is_file():
             raise CpuProbeError(f"probe {label} not found: {p!r}")
 
+    # Gate the virtio-rng entropy device on the FC version, like the production
+    # selector (firecracker_available): the device has a guest-reachable host-memory
+    # DoS on FC < 1.15.1, and this probe boots FC directly (not via that selector).
+    # Omit it on an older/unknown binary — the probe may then block on getrandom and
+    # return INCONCLUSIVE on a no-RDRAND host, which the caller already treats safely.
+    from blastbox.host.runtime.firecracker import _MIN_FC_VERSION, firecracker_version
+
+    fc_ver = firecracker_version(cfg.fc_bin)
+    include_entropy = fc_ver is not None and fc_ver >= _MIN_FC_VERSION
+    if not include_entropy:
+        _log.warning(
+            "cpu_probe: firecracker %s < %s (or unknown) — omitting the virtio-rng "
+            "entropy device (unpatched host-memory DoS below %s); the probe may block "
+            "on getrandom and report INCONCLUSIVE on a no-RDRAND host.",
+            ".".join(map(str, fc_ver)) if fc_ver else "unknown",
+            ".".join(map(str, _MIN_FC_VERSION)),
+            ".".join(map(str, _MIN_FC_VERSION)),
+        )
+
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
     config_path = work / "probe-fc-config.json"
-    config_path.write_text(json.dumps(build_probe_config_json(cfg), indent=2), encoding="utf-8")
+    config_path.write_text(
+        json.dumps(build_probe_config_json(cfg, include_entropy=include_entropy), indent=2),
+        encoding="utf-8",
+    )
     log_path = work / "probe-fc.log"
 
     # ALWAYS a list, NEVER shell=True; fc_bin is the only source of the binary.

@@ -98,6 +98,59 @@ def test_wait_for_go_times_out_when_no_job(tmp_path):
         guest.wait_for_go(timeout_s=0.1)
 
 
+def test_wait_for_go_survives_restore_clock_jump(tmp_path, monkeypatch):
+    """The FC vsock warm path must restart its idle countdown after a restore
+    clock-jump, like the gVisor file path (PR #37 review, codex P1). Without the
+    reset, a restore from a snapshot older than timeout_s makes the first
+    post-restore accept() deadline already-expired and drops the just-sent job.
+    """
+    import blastbox.worker.warm as warm
+
+    host_end, guest_end = socket.socketpair()
+    src = tmp_path / "doc.bin"
+    src.write_bytes(b"restored-doc")
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+
+    class _RestoreListener:
+        """First accept() reports a timeout (still 'blocked' at the checkpoint),
+        then hands back the connection (host connected after the restore)."""
+
+        def __init__(self, conn: socket.socket) -> None:
+            self._conn = conn
+            self._calls = 0
+
+        def settimeout(self, t: float) -> None:
+            pass
+
+        def accept(self):
+            self._calls += 1
+            if self._calls == 1:
+                raise TimeoutError("still waiting at checkpoint")
+            return self._conn, ("vsock", 0)
+
+    # monotonic: init=0.0 (deadline=5.0); the first expired() check leaps to
+    # 10_000 (a multi-hour restore) — already past the original deadline, so
+    # WITHOUT the reset this would raise WarmTimeout. Stable after, so the
+    # post-accept recv deadline stays in the future and the header/input read OK.
+    state = {"n": 0}
+    seq = [0.0, 10_000.0]
+
+    def fake_monotonic() -> float:
+        i = state["n"]
+        state["n"] += 1
+        return seq[i] if i < len(seq) else 10_000.0
+
+    monkeypatch.setattr(warm.time, "monotonic", fake_monotonic)
+
+    host = VsockHostWarmControl(tmp_path / "vsock.sock", connect_fn=lambda: host_end)
+    guest = VsockWarmControl(tmp_path / "in", outdir, listener=_RestoreListener(guest_end))
+    host.signal_go(WarmJobSpec(input_path=src, output_dir=outdir, params={}))
+
+    spec = guest.wait_for_go(timeout_s=5.0)  # must NOT raise despite the clock jump
+    assert spec.input_path.read_bytes() == b"restored-doc"
+
+
 def test_safe_name_strips_traversal():
     assert _safe_name("../../etc/passwd") == "passwd"
     assert _safe_name("/abs/path/doc.docx") == "doc.docx"

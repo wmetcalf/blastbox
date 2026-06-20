@@ -292,9 +292,11 @@ def select_snapshot_runtime(
     )
     from blastbox.host.runtime.fc_snapshot_launcher import FcSnapshotLauncher
     from blastbox.host.runtime.firecracker import (
+        _MIN_SNAPSHOT_KERNEL,
         FCConfig,
         FCUnavailable,
         firecracker_available,
+        guest_kernel_version,
     )
 
     # Post-restore vsock settle window (see SnapshotSlotRuntime); tunable per host.
@@ -334,6 +336,25 @@ def select_snapshot_runtime(
                 "firecracker binary, /dev/kvm, BLASTBOX_FC_KERNEL, BLASTBOX_FC_ROOTFS."
             )
         _log.debug("select_snapshot_runtime: prerequisites not met")
+        return None
+
+    # VMGenID guest-kernel gate (snapshot tier ONLY — cold FC boots fresh per job
+    # and never clones CRNG state). Restoring a snapshot clones the base VM's kernel
+    # CRNG; only a >= 5.18 guest (VMGenID) reseeds it automatically on restore, so an
+    # older guest would let restored clones repeat random output. Refuse the snapshot
+    # tier on a detectably-too-old kernel (falls back to cold FC). An unparseable
+    # version is left to proceed — we can't verify, and must not break on a parse miss.
+    kver = guest_kernel_version(cfg.fc_kernel)  # type: ignore[attr-defined]
+    if kver is not None and kver < _MIN_SNAPSHOT_KERNEL:
+        need = ".".join(map(str, _MIN_SNAPSHOT_KERNEL))
+        have = ".".join(map(str, kver))
+        msg = (
+            f"snapshot warm tier needs a VMGenID-capable guest kernel >= {need} so "
+            f"the CRNG reseeds on restore; {cfg.fc_kernel} is {have}."  # type: ignore[attr-defined]
+        )
+        if require_available:
+            raise FCUnavailable(msg)
+        _log.warning("%s Snapshot tier unavailable; falling back to cold FC.", msg)
         return None
 
     base_dir = Path(cfg.scratch_root)  # type: ignore[attr-defined]

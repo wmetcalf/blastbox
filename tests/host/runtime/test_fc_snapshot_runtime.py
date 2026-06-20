@@ -206,3 +206,28 @@ def test_select_snapshot_runtime_uses_injected_manager(tmp_path):
     # The injected manager drives spawn (no FCConfig.from_env / availability needed).
     slot = rt.spawn()
     assert mgr.restored == [slot.slot_id]
+
+
+def test_select_snapshot_runtime_refuses_old_guest_kernel(tmp_path, monkeypatch):
+    """A guest kernel < 5.18 (no VMGenID) is refused for the snapshot tier:
+    restoring a snapshot clones the CRNG and an old guest won't reseed on restore."""
+    import blastbox.host.runtime.firecracker as fc_mod
+    from blastbox.host.runtime.firecracker import FCConfig, FCUnavailable
+
+    vmlinux = tmp_path / "vmlinux"
+    vmlinux.write_bytes(b"\x00Linux version 5.10.0 (ci@fc) gcc\x00")
+    rootfs = tmp_path / "rootfs.ext4"
+    rootfs.touch()
+    cfg = FCConfig(
+        fc_bin="firecracker",
+        fc_kernel=str(vmlinux),
+        fc_rootfs=str(rootfs),
+        scratch_root=str(tmp_path),
+    )
+    # Pass the binary/kvm/FC-version prerequisites so the KERNEL gate is what fires.
+    monkeypatch.setattr(fc_mod, "firecracker_available", lambda c: True)
+
+    with pytest.raises(FCUnavailable):
+        select_snapshot_runtime(cfg=cfg, require_available=True)
+    # Soft path: refuse quietly (falls back to cold FC) rather than raise.
+    assert select_snapshot_runtime(cfg=cfg, require_available=False) is None

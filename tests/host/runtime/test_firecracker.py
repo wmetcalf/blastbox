@@ -46,6 +46,8 @@ from blastbox.host.runtime.firecracker import (
     FileReadySignal,
     FirecrackerSlotRuntime,
     firecracker_available,
+    firecracker_version,
+    guest_kernel_version,
     make_ext4,
     rdump_ext4,
     select_fc_runtime,
@@ -376,6 +378,94 @@ class TestFirecrackerAvailable:
         monkeypatch.setattr(Path, "exists", _patched_exists)
         assert firecracker_available(cfg) is False
 
+    @staticmethod
+    def _prereqs(tmp_path, monkeypatch, version_line):
+        """All FC prereqs present + /dev/kvm patched present + a fake firecracker
+        whose --version prints ``version_line``. Returns the cfg to probe."""
+        k = tmp_path / "vmlinux"
+        r = tmp_path / "rootfs.ext4"
+        k.touch()
+        r.touch()
+        fake_fc = tmp_path / "firecracker"
+        fake_fc.write_text(f'#!/bin/sh\necho "{version_line}"\n')
+        fake_fc.chmod(0o755)
+        real_exists = Path.exists
+
+        def _kvm_present(self: Path) -> bool:
+            if str(self) == "/dev/kvm":
+                return True
+            return real_exists(self)
+
+        monkeypatch.setattr(Path, "exists", _kvm_present)
+        return FCConfig(fc_bin=str(fake_fc), fc_kernel=str(k), fc_rootfs=str(r))
+
+    def test_true_on_supported_firecracker(self, tmp_path, monkeypatch):
+        """All prereqs present and FC >= 1.15.1 → available."""
+        cfg = self._prereqs(tmp_path, monkeypatch, "Firecracker v1.16.0")
+        assert firecracker_available(cfg) is True
+
+    def test_false_on_too_old_firecracker(self, tmp_path, monkeypatch):
+        """FC < 1.15.1 has the guest-reachable virtio-rng host DoS → unavailable
+        even with every other prerequisite satisfied."""
+        cfg = self._prereqs(tmp_path, monkeypatch, "Firecracker v1.12.1")
+        assert firecracker_available(cfg) is False
+
+    def test_false_when_version_unparseable(self, tmp_path, monkeypatch):
+        """A binary whose --version yields no parseable version is treated as
+        unusable (never as 'new enough')."""
+        cfg = self._prereqs(tmp_path, monkeypatch, "not a version")
+        assert firecracker_available(cfg) is False
+
+
+class TestFirecrackerVersion:
+    def test_parses_standard_version_line(self, tmp_path):
+        fc = tmp_path / "firecracker"
+        fc.write_text('#!/bin/sh\necho "Firecracker v1.16.0"\n')
+        fc.chmod(0o755)
+        assert firecracker_version(str(fc)) == (1, 16, 0)
+
+    def test_parses_version_with_build_suffix(self, tmp_path):
+        fc = tmp_path / "firecracker"
+        fc.write_text('#!/bin/sh\necho "Firecracker v1.15.1-dirty"\n')
+        fc.chmod(0o755)
+        assert firecracker_version(str(fc)) == (1, 15, 1)
+
+    def test_none_on_unparseable(self, tmp_path):
+        fc = tmp_path / "firecracker"
+        fc.write_text('#!/bin/sh\necho "no version here"\n')
+        fc.chmod(0o755)
+        assert firecracker_version(str(fc)) is None
+
+    def test_none_when_binary_missing(self):
+        assert firecracker_version("/nonexistent/firecracker") is None
+
+
+class TestGuestKernelVersion:
+    def test_parses_vmgenid_capable_kernel(self, tmp_path):
+        vmlinux = tmp_path / "vmlinux"
+        vmlinux.write_bytes(b"padding\x00Linux version 6.1.0 (ci@fc) gcc\x00more")
+        assert guest_kernel_version(str(vmlinux)) == (6, 1)
+
+    def test_parses_old_kernel(self, tmp_path):
+        vmlinux = tmp_path / "vmlinux"
+        vmlinux.write_bytes(b"\x00\x00Linux version 5.10.220 (build@host)\x00")
+        assert guest_kernel_version(str(vmlinux)) == (5, 10)
+
+    def test_finds_banner_across_chunk_boundary(self, tmp_path):
+        # Straddle the 1 MiB read boundary to exercise the overlap carry-over.
+        vmlinux = tmp_path / "vmlinux"
+        blob = b"\x00" * (1024 * 1024 - 5) + b"Linux version 6.8.0 (x)\x00"
+        vmlinux.write_bytes(blob)
+        assert guest_kernel_version(str(vmlinux)) == (6, 8)
+
+    def test_none_when_no_banner(self, tmp_path):
+        vmlinux = tmp_path / "vmlinux"
+        vmlinux.write_bytes(b"not a kernel image")
+        assert guest_kernel_version(str(vmlinux)) is None
+
+    def test_none_when_missing(self):
+        assert guest_kernel_version("/nonexistent/vmlinux") is None
+
 
 # ---------------------------------------------------------------------------
 # fc-config.json structure
@@ -425,6 +515,14 @@ class TestFCConfigJson:
         args = config["boot-source"]["boot_args"]
         assert "reboot=k" in args
         assert "panic=1" in args
+        # RDRAND-seed the guest CRNG so getrandom() doesn't block ~120s at first use.
+        assert "random.trust_cpu=on" in args
+
+    def test_entropy_device_present(self, tmp_path):
+        # virtio-rng so the guest CRNG has a host-fed entropy source (pairs with
+        # random.trust_cpu=on) — without it a JVM/getrandom workload stalls ~120s.
+        config = self._spawn_and_read_config(tmp_path)
+        assert config.get("entropy") == {}
 
     def test_drives_has_two_entries(self, tmp_path):
         config = self._spawn_and_read_config(tmp_path)

@@ -39,6 +39,56 @@ logger = logging.getLogger(__name__)
 # Polling interval for FileWarmControl.wait_for_go
 _POLL_INTERVAL_S: float = 0.05
 
+# A jump in CLOCK_MONOTONIC larger than this between two poll ticks cannot be a
+# normal sleep — it means the sandbox was checkpoint/restored (gVisor C/R, FC
+# snapshot), which advances the monotonic clock by the time spent checkpointed.
+# When detected, the idle countdown is restarted so a restore from a snapshot
+# older than the idle timeout does not instantly abandon the job it was handed.
+_RESTORE_JUMP_S: float = 5.0
+
+
+class _RestoreAwareDeadline:
+    """An idle-timeout deadline that survives a checkpoint/restore clock-jump.
+
+    A warm worker is checkpointed BLOCKED waiting for its single job. gVisor C/R
+    (and, defensively, FC snapshot restore) can advance CLOCK_MONOTONIC by the
+    wall-time spent checkpointed; a deadline computed *before* the checkpoint is
+    then already-expired the instant the worker resumes and would abandon the
+    job the host just handed it (empty output → "metadata.json not found").
+    :meth:`expired` watches for a monotonic leap far larger than the caller's
+    poll cadence — which can only be a restore, never a normal sleep/accept tick
+    — and restarts the countdown, so a restored worker behaves like a freshly
+    ready one.
+
+    Both the deadline and the leap reference are seeded from a SINGLE
+    ``time.monotonic()`` sample, so a checkpoint can never land *between* two
+    samples and desync them (which would hide the very jump being watched for).
+    """
+
+    __slots__ = ("_timeout", "_deadline", "_last")
+
+    def __init__(self, timeout_s: float) -> None:
+        self._timeout = timeout_s
+        self._restart(time.monotonic())
+
+    def _restart(self, now: float) -> None:
+        self._deadline = now + self._timeout
+        self._last = now
+
+    def expired(self) -> bool:
+        """Whether the idle timeout has genuinely elapsed; call once per tick.
+
+        A monotonic jump greater than ``_RESTORE_JUMP_S`` since the previous call
+        is treated as a restore: the countdown restarts and this returns ``False``
+        (the worker is effectively freshly ready).
+        """
+        now = time.monotonic()
+        if now - self._last > _RESTORE_JUMP_S:
+            self._restart(now)
+            return False
+        self._last = now
+        return now >= self._deadline
+
 
 # ---------------------------------------------------------------------------
 # WarmJobSpec
@@ -153,7 +203,13 @@ class FileWarmControl:
             WarmTimeout: if ``go.json`` does not appear before the deadline.
         """
         go_path = self._dir / "go.json"
-        deadline = time.monotonic() + timeout_s
+        # This worker is checkpointed BLOCKED in this loop (at "ready"); a restore
+        # from a snapshot older than `timeout_s` resumes with the monotonic clock
+        # already advanced past the original deadline, which would instantly raise
+        # WarmTimeout and abandon the job the host just handed us (empty output ->
+        # "metadata.json not found"). _RestoreAwareDeadline restarts the countdown
+        # when it detects the restore jump, so the worker is "freshly ready".
+        deadline = _RestoreAwareDeadline(timeout_s)
 
         while True:
             if go_path.exists():
@@ -183,7 +239,7 @@ class FileWarmControl:
                     params=params,
                 )
 
-            if time.monotonic() >= deadline:
+            if deadline.expired():
                 raise WarmTimeout(
                     f"no job arrived within {timeout_s}s idle timeout"
                 )
@@ -358,6 +414,13 @@ def serve_warm(
         except Exception as sig_exc:  # noqa: BLE001
             logger.error("signal_done(idle_timeout) failed: %s", sig_exc)
         return 0
+
+    # NOTE on snapshot RNG: a job arriving means this worker was just restored from
+    # the warm snapshot, which clones the base VM's kernel CRNG state. We do NOT
+    # reseed in userspace here — the worker is privilege-dropped (see
+    # deploy/firecracker/init), so it can't credit entropy/force a reseed. The
+    # reseed is the kernel's job via VMGenID, which the snapshot tier requires a
+    # >= 5.18 guest kernel for (enforced in select_snapshot_runtime).
 
     # ------------------------------------------------------------------
     # Step 4: process the one job through the unchanged cold-path harness

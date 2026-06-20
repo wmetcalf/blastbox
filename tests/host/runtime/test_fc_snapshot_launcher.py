@@ -31,10 +31,15 @@ def test_api_boot_sequence_mirrors_cold_config_and_starts_last():
         "/drives/outdisk",
         "/machine-config",
         "/vsock",
+        "/entropy",
         "/actions",
     ]
     bodies = dict(seq)
     assert bodies["/boot-source"]["kernel_image_path"] == "/assets/vmlinux"
+    # virtio-rng entropy device + RDRAND seeding so the guest CRNG inits promptly
+    # (otherwise getrandom() blocks ~120s and the warm worker times out).
+    assert bodies["/entropy"] == {}
+    assert "random.trust_cpu=on" in bodies["/boot-source"]["boot_args"]
     assert bodies["/drives/rootfs"]["path_on_host"] == "/assets/rootfs.ext4"
     assert bodies["/drives/rootfs"]["is_read_only"] is True
     # writable per-slot resources are RELATIVE (the per-slot-cwd mechanism)
@@ -101,6 +106,7 @@ def test_boot_base_uses_api_socket_and_runs_full_config(tmp_path):
         "/drives/outdisk",
         "/machine-config",
         "/vsock",
+        "/entropy",
         "/actions",
     ]
     assert handle.vsock_uds == str(tmp_path / "snap" / "base" / REL_VSOCK)

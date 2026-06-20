@@ -6,10 +6,12 @@ snapshot/restore is API-only (``PUT /snapshot/create``, ``PUT /snapshot/load``,
 ``PATCH /vm``, …). This is a tiny stdlib client so the host process pulls in no
 third-party HTTP dependency.
 
-Field shapes target Firecracker v1.12.1 (confirmed from the binary's embedded API
-schema): ``CreateSnapshotParams{snapshot_type, snapshot_path, mem_file_path}``,
+Field shapes are valid for Firecracker v1.12.1 through v1.16.0 (the version we run
+since the virtio-rng descriptor-chain host-memory DoS was fixed in v1.15.1):
+``CreateSnapshotParams{snapshot_type, snapshot_path, mem_file_path}``,
 ``LoadSnapshotConfig{snapshot_path, mem_backend{backend_type, backend_path},
-enable_diff_snapshots, resume_vm}``, ``Vm{state}``.
+track_dirty_pages, resume_vm}``, ``Vm{state}``. ``track_dirty_pages`` is the FC
+≥1.13 replacement for the deprecated ``enable_diff_snapshots``.
 """
 from __future__ import annotations
 
