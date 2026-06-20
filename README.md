@@ -174,6 +174,18 @@ events and, per opted-in worker: captures its traffic to a per-job pcap, wires i
 to the chosen exit, and installs a **non-TCP leak guard** (an in-netns `iptables`/`ip6tables` OUTPUT
 firewall) so a sample can't punch UDP/ICMP/raw or IPv6 out past a TCP-only tier.
 
+**Per-personality egress hardening** — two composable knobs, declared in the
+`BLASTBOX_NETPOLICY_<NAME>` entry and layered on *any* exit above:
+
+- `egress_ports=53 80 443` — a **web-only L4 allowlist** (DNS/HTTP/HTTPS): drop every other TCP port
+  *and* all non-TCP, fail-closed via a catch-all DROP.
+- `block_internal=1` — drop all **RFC1918 + link-local/metadata** destinations: no SSRF into the host
+  LAN, no `169.254.169.254`, no lateral movement to sibling workers.
+
+`netd` folds both into the in-netns leak guard, so they apply even on a tier that otherwise has none
+(e.g. `direct`/`openvpn`). Both are protocol-agnostic enforcement at the worker netns OUTPUT chain —
+the same shape proven live against a per-VM iptables policy (web-only via VPN + internal blocked).
+
 **Egress methodologies** (all exposed to any engine, all fail-closed):
 
 | Exit | What it does | Credentials |

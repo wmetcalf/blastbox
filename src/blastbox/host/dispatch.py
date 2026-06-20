@@ -992,6 +992,11 @@ class Dispatcher:
             inspect_routes_via_gateway,
             worker_resolv_conf,
         )
+        from blastbox.host.netwire import (
+            BLOCK_INTERNAL_LABEL,
+            EGRESS_PORTS_LABEL,
+            parse_egress_ports,
+        )
         personality = resolve_net_policy(
             job_net_policy=job.net_policy,
             engine_default=engine.net_policy,
@@ -1102,6 +1107,23 @@ class Dispatcher:
             worker_labels["blastbox.net.leakguard"] = "dns"
         elif personality.exit_driver in ("socks", "httpproxy"):
             worker_labels["blastbox.net.leakguard"] = "strict"
+
+        # Optional egress-hardening knobs (apply to ANY egress tier): a web-only L4 allowlist
+        # (egress_ports) + an RFC1918/metadata block (block_internal). netd folds these into the
+        # worker-netns leak guard, so a personality that declares either MUST get the leak guard
+        # wired — even on a tier that normally has none (direct/vpn). egress_ports needs DNS → 'dns'.
+        if personality.exit_driver not in ("none", "drop"):
+            egress_ports = parse_egress_ports(personality.config.get("egress_ports"))
+            block_internal = personality.config.get("block_internal", "").strip().lower() in (
+                "1", "true", "yes", "on")
+            if egress_ports is not None:
+                worker_labels[EGRESS_PORTS_LABEL] = ",".join(str(p) for p in egress_ports)
+            if block_internal:
+                worker_labels[BLOCK_INTERNAL_LABEL] = "1"
+            if (egress_ports is not None or block_internal) and \
+                    "blastbox.net.leakguard" not in worker_labels:
+                worker_labels["blastbox.net.leakguard"] = (
+                    "dns" if egress_ports is not None else "strict")
 
         container_name = f"blastbox-worker-{job.job_id[:12]}"
         argv = build_worker_docker_run_argv(

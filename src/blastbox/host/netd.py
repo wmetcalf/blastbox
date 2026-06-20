@@ -32,6 +32,7 @@ from blastbox.host.capture import (
 )
 from blastbox.host.netwire import (
     TUN_DEV,
+    egress_filter_from_inspect,
     gateway_route_commands,
     leak_guard_rules,
     leak_guard_rules_v6,
@@ -166,11 +167,18 @@ class CaptureDaemon:
         if lg is None:
             return
         pid, allow_udp_dns = lg
+        # Optional per-personality egress-hardening knobs (web-only port allowlist + RFC1918/metadata
+        # block), carried via labels. A no-op for workers that didn't opt in.
+        allowed_ports, block_internal = egress_filter_from_inspect(inspect)
         # The leak guard is a PRECONDITION for wiring: if it can't be installed, handle_start refuses
         # to wire egress (no egress without the guard). The v4 rules are the hard guarantee — any
         # failure fails closed.
         try:
-            for rule in leak_guard_rules(allow_udp_dns=allow_udp_dns):
+            for rule in leak_guard_rules(
+                allow_udp_dns=allow_udp_dns,
+                allowed_ports=allowed_ports,
+                block_internal=block_internal,
+            ):
                 if self.nsenter_run_fn(pid, rule) != 0:
                     _log.warning("netd: leak-guard rule failed for %s; failing closed", container_id[:12])
                     self.leakguard_failed.add(container_id)

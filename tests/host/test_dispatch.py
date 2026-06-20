@@ -1456,6 +1456,39 @@ def test_socks_dns_tcp_off_uses_dns_leakguard(tmp_path, monkeypatch):
     assert "blastbox.net.leakguard=strict" not in argv
 
 
+def test_egress_ports_and_block_internal_labels_set(tmp_path, monkeypatch):
+    """A personality declaring egress_ports + block_internal → the worker carries the egress-filter
+    labels AND a leakguard label, so netd wires the web-only guard even on a direct tier (which
+    normally has none). The decl uses whitespace for multi-value (',' is the KV separator)."""
+    monkeypatch.setenv(
+        "BLASTBOX_NETPOLICY_WEBONLY",
+        "exit=direct,egress_ports=53 80 443,block_internal=1",
+    )
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    launched: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="webonly")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
+                                  subprocess_runner=fake_runner)
+    assert dispatcher.dispatch_once() is True
+    argv = next(a for a in launched if a[:2] == ["docker", "run"])
+    assert "blastbox.net.egress-ports=53,80,443" in argv
+    assert "blastbox.net.block-internal=1" in argv
+    assert "blastbox.net.leakguard=dns" in argv   # egress_ports ⇒ dns mode (UDP:53 allowed)
+
+
 def test_httpproxy_env_validates_proxy_url(tmp_path):
     """The httpproxy proxy= URL is validated before injection — a malformed value injects no proxy
     env (fail closed), matching the socks tier's validation."""
