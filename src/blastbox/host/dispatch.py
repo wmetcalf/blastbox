@@ -1044,6 +1044,35 @@ class Dispatcher:
                 f"egress would race netd. Add gateway=<netd gateway IP> to the personality.",
             )
             return
+        # Egress-hardening knobs (egress_ports / block_internal) are only enforceable on the
+        # gateway-routed, netd-gated tiers (tor/openvpn/wireguard): there the worker's OWN netns OUTPUT
+        # carries the real destination IP:port (so a port/destination filter is meaningful) AND egress
+        # is fail-closed until netd installs the leak guard (the knobs ride it as a precondition). On a
+        # SOCKS/httpproxy proxy hop the OUTPUT is the proxy connection (the filter would drop the
+        # tunnel); on a plain bridge (direct/inetsim) it fails OPEN under runsc / before netd wires.
+        raw_egress_ports = personality.config.get("egress_ports")
+        wants_egress_filter = bool(raw_egress_ports and raw_egress_ports.strip()) or (
+            personality.config.get("block_internal", "").strip().lower() in ("1", "true", "yes", "on")
+        )
+        if wants_egress_filter and personality.exit_driver not in ("tor", "openvpn", "wireguard"):
+            self._fail_job(
+                job,
+                f"netpolicy {personality.name!r} (exit={personality.exit_driver}) declares "
+                f"egress_ports or block_internal, which are only enforceable on the netd-gated tiers "
+                f"tor, openvpn, or wireguard (the worker's OUTPUT carries the real destination there "
+                f"and egress is fail-closed until the leak guard installs). A proxy hop (socks or "
+                f"httpproxy) would drop its own tunnel; a plain bridge (direct or inetsim) fails open. "
+                f"Use tor, openvpn, or wireguard, or drop the knob.",
+            )
+            return
+        if (raw_egress_ports and raw_egress_ports.strip()
+                and parse_egress_ports(raw_egress_ports) is None):
+            self._fail_job(
+                job,
+                f"netpolicy {personality.name!r}: egress_ports={raw_egress_ports!r} has no valid port "
+                f"(1-65535) — refusing rather than widen egress.",
+            )
+            return
         network_args = docker_network_args(personality)
 
         # Optional resolv.conf injection for an egress personality (per-personality ``dns=``).
@@ -1108,22 +1137,18 @@ class Dispatcher:
         elif personality.exit_driver in ("socks", "httpproxy"):
             worker_labels["blastbox.net.leakguard"] = "strict"
 
-        # Optional egress-hardening knobs (apply to ANY egress tier): a web-only L4 allowlist
-        # (egress_ports) + an RFC1918/metadata block (block_internal). netd folds these into the
-        # worker-netns leak guard, so a personality that declares either MUST get the leak guard
-        # wired — even on a tier that normally has none (direct/vpn). egress_ports needs DNS → 'dns'.
-        if personality.exit_driver not in ("none", "drop"):
+        # Egress-filter labels for the gateway-routed tiers (already gated to tor/openvpn/wireguard +
+        # validated above). netd folds these into the in-netns leak guard, which is a PRECONDITION for
+        # wiring → fail-closed. tor already carries 'dns' (TCP+DNS only) from the block above; the
+        # all-IP vpn tiers get 'allip' so block_internal keeps non-internal UDP/ICMP.
+        if wants_egress_filter:
             egress_ports = parse_egress_ports(personality.config.get("egress_ports"))
-            block_internal = personality.config.get("block_internal", "").strip().lower() in (
-                "1", "true", "yes", "on")
             if egress_ports is not None:
                 worker_labels[EGRESS_PORTS_LABEL] = ",".join(str(p) for p in egress_ports)
-            if block_internal:
+            if personality.config.get("block_internal", "").strip().lower() in (
+                    "1", "true", "yes", "on"):
                 worker_labels[BLOCK_INTERNAL_LABEL] = "1"
-            if (egress_ports is not None or block_internal) and \
-                    "blastbox.net.leakguard" not in worker_labels:
-                worker_labels["blastbox.net.leakguard"] = (
-                    "dns" if egress_ports is not None else "strict")
+            worker_labels.setdefault("blastbox.net.leakguard", "allip")
 
         container_name = f"blastbox-worker-{job.job_id[:12]}"
         argv = build_worker_docker_run_argv(

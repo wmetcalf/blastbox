@@ -175,16 +175,19 @@ to the chosen exit, and installs a **non-TCP leak guard** (an in-netns `iptables
 firewall) so a sample can't punch UDP/ICMP/raw or IPv6 out past a TCP-only tier.
 
 **Per-personality egress hardening** — two composable knobs, declared in the
-`BLASTBOX_NETPOLICY_<NAME>` entry and layered on *any* exit above:
+`BLASTBOX_NETPOLICY_<NAME>` entry, for the **netd-gated tiers `tor` / `openvpn` / `wireguard`**:
 
 - `egress_ports=53 80 443` — a **web-only L4 allowlist** (DNS/HTTP/HTTPS): drop every other TCP port
-  *and* all non-TCP, fail-closed via a catch-all DROP.
+  *and* all non-TCP (UDP:53 only when 53 is itself listed), fail-closed via a catch-all DROP.
 - `block_internal=1` — drop all **RFC1918 + link-local/metadata** destinations: no SSRF into the host
-  LAN, no `169.254.169.254`, no lateral movement to sibling workers.
+  LAN, no `169.254.169.254`, no lateral movement to sibling workers (non-internal UDP/ICMP preserved).
 
-`netd` folds both into the in-netns leak guard, so they apply even on a tier that otherwise has none
-(e.g. `direct`/`openvpn`). Both are protocol-agnostic enforcement at the worker netns OUTPUT chain —
-the same shape proven live against a per-VM iptables policy (web-only via VPN + internal blocked).
+`netd` folds both into the in-netns leak guard — a **precondition** for wiring, so they are
+fail-closed (no guard ⇒ no egress). The restriction to those tiers is deliberate: there the worker's
+own OUTPUT carries the real destination IP:port (so the filter is meaningful) *and* egress only exists
+once netd has wired it. A SOCKS/httpproxy *proxy hop* would have its own tunnel dropped, and a plain
+bridge (`direct`/`inetsim`) would fail **open** under the gVisor default runtime — both are refused
+with a clear diagnostic. Proven live (toolz3): web-only via VPN, internal blocked.
 
 **Egress methodologies** (all exposed to any engine, all fail-closed):
 

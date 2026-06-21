@@ -222,9 +222,11 @@ def _lg(mode="strict", pid=77):
     }
 
 
-def test_leakguard_from_inspect_strict_and_dns():
-    assert leakguard_from_inspect(_lg("strict", 5)) == (5, False)
-    assert leakguard_from_inspect(_lg("dns", 9)) == (9, True)
+def test_leakguard_from_inspect_modes():
+    # (pid, allow_udp_dns, drop_non_tcp)
+    assert leakguard_from_inspect(_lg("strict", 5)) == (5, False, True)
+    assert leakguard_from_inspect(_lg("dns", 9)) == (9, True, True)
+    assert leakguard_from_inspect(_lg("allip", 7)) == (7, False, False)  # all-IP tier: keep non-TCP
 
 
 def test_leakguard_from_inspect_none_without_label_or_pid():
@@ -377,6 +379,23 @@ def test_leak_guard_rules_web_only_chunks_over_multiport_limit():
         assert 1 <= len(r[r.index("--dports") + 1].split(",")) <= 15
     covered = [int(p) for r in multiport for p in r[r.index("--dports") + 1].split(",")]
     assert covered == list(ports)  # every port covered, order preserved
+
+
+def test_leak_guard_rules_web_only_dns_only_when_53_listed():
+    # UDP/53 is allowed iff 53 is in the allowlist — an explicit list that omits 53 must not get DNS.
+    assert any("udp" in r for r in leak_guard_rules(allow_udp_dns=True, allowed_ports=(53, 80, 443)))
+    assert not any("udp" in r for r in leak_guard_rules(allow_udp_dns=True, allowed_ports=(80, 443)))
+
+
+def test_leak_guard_rules_block_internal_only_allip_preserves_non_tcp():
+    # An all-IP tier (drop_non_tcp=False) that only blocks internal must keep non-internal UDP/ICMP:
+    # just loopback ACCEPT + the internal DROPs, no protocol match at all.
+    rules = leak_guard_rules(allow_udp_dns=False, block_internal=True, drop_non_tcp=False)
+    assert rules[0] == ["iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"]
+    assert ["iptables", "-A", "OUTPUT", "-d", "10.0.0.0/8", "-j", "DROP"] in rules
+    assert ["iptables", "-A", "OUTPUT", "!", "-p", "tcp", "-j", "DROP"] not in rules
+    assert ["iptables", "-A", "OUTPUT", "-j", "DROP"] not in rules  # no catch-all
+    assert not any("-p" in r for r in rules)  # nothing matched/dropped by protocol
 
 
 def test_egress_filter_from_inspect_tolerates_none_label_values():

@@ -166,7 +166,7 @@ class CaptureDaemon:
             return
         if lg is None:
             return
-        pid, allow_udp_dns = lg
+        pid, allow_udp_dns, drop_non_tcp = lg
         # Optional per-personality egress-hardening knobs (web-only port allowlist + RFC1918/metadata
         # block), carried via labels. A no-op for workers that didn't opt in.
         allowed_ports, block_internal = egress_filter_from_inspect(inspect)
@@ -178,6 +178,7 @@ class CaptureDaemon:
                 allow_udp_dns=allow_udp_dns,
                 allowed_ports=allowed_ports,
                 block_internal=block_internal,
+                drop_non_tcp=drop_non_tcp,
             ):
                 if self.nsenter_run_fn(pid, rule) != 0:
                     _log.warning("netd: leak-guard rule failed for %s; failing closed", container_id[:12])

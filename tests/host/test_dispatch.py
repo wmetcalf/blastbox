@@ -1456,13 +1456,13 @@ def test_socks_dns_tcp_off_uses_dns_leakguard(tmp_path, monkeypatch):
     assert "blastbox.net.leakguard=strict" not in argv
 
 
-def test_egress_ports_and_block_internal_labels_set(tmp_path, monkeypatch):
-    """A personality declaring egress_ports + block_internal → the worker carries the egress-filter
-    labels AND a leakguard label, so netd wires the web-only guard even on a direct tier (which
-    normally has none). The decl uses whitespace for multi-value (',' is the KV separator)."""
+def test_egress_filter_labels_set_on_vpn_tier(tmp_path, monkeypatch):
+    """egress_ports + block_internal on a gateway-routed all-IP tier (openvpn) → the worker carries the
+    egress-filter labels AND the 'allip' leakguard (all-IP: keep non-internal UDP/ICMP). The decl uses
+    whitespace for multi-value (',' is the KV separator)."""
     monkeypatch.setenv(
-        "BLASTBOX_NETPOLICY_WEBONLY",
-        "exit=direct,egress_ports=53 80 443,block_internal=1",
+        "BLASTBOX_NETPOLICY_WEBVPN",
+        "exit=openvpn,gateway=10.8.0.1,egress_ports=53 80 443,block_internal=1",
     )
     store = InMemoryJobStore()
     job = _make_job()
@@ -1479,14 +1479,55 @@ def test_egress_ports_and_block_internal_labels_set(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
-                     net_policy="webonly")
+                     net_policy="webvpn")
     dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
                                   subprocess_runner=fake_runner)
     assert dispatcher.dispatch_once() is True
     argv = next(a for a in launched if a[:2] == ["docker", "run"])
     assert "blastbox.net.egress-ports=53,80,443" in argv
     assert "blastbox.net.block-internal=1" in argv
-    assert "blastbox.net.leakguard=dns" in argv   # egress_ports ⇒ dns mode (UDP:53 allowed)
+    assert "blastbox.net.leakguard=allip" in argv   # all-IP tier keeps non-internal UDP/ICMP
+
+
+@pytest.mark.parametrize("decl,driver", [
+    ("exit=socks,proxy=socks5://172.30.0.40:9050,egress_ports=53 80 443", "socks"),
+    ("exit=direct,block_internal=1", "direct"),
+    ("exit=inetsim,egress_ports=80 443", "inetsim"),
+])
+def test_egress_filter_refused_on_unsupported_tier(tmp_path, monkeypatch, decl, driver):
+    """egress_ports/block_internal are only sound on tor/openvpn/wireguard (the worker's OUTPUT carries
+    the real dst:port AND egress is fail-closed until netd wires). On a proxy hop (socks/httpproxy) the
+    filter would drop the tunnel; on a plain bridge (direct/inetsim) it fails open. Refuse, fail-closed."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_BAD", decl)
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="bad")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng})
+    assert dispatcher.dispatch_once() is True
+    final = store.get(job.job_id)
+    assert final.status == JobStatus.FAILED
+    assert "tor, openvpn, or wireguard" in (final.error or "")
+
+
+def test_egress_ports_invalid_value_refused(tmp_path, monkeypatch):
+    """A non-empty but all-invalid egress_ports (typo) must FAIL the job, not silently widen egress."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_TYPO", "exit=openvpn,gateway=10.8.0.1,egress_ports=htts")
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="typo")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng})
+    assert dispatcher.dispatch_once() is True
+    final = store.get(job.job_id)
+    assert final.status == JobStatus.FAILED
+    assert "egress_ports" in (final.error or "")
 
 
 def test_httpproxy_env_validates_proxy_url(tmp_path):
