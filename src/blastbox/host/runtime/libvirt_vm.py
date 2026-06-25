@@ -162,6 +162,7 @@ class LibvirtVmRuntime:
 
     def __init__(self, config: LibvirtVmConfig) -> None:
         self.cfg = config
+        self._bridge_name: str | None = None  # resolved lazily from cfg.network (cached)
 
     # ---- prereq check (fail-closed selection) --------------------------------
     def available(self) -> bool:
@@ -291,8 +292,17 @@ class LibvirtVmRuntime:
         Post-revert the guest clock is frozen at snapshot time, so sync it to host time FIRST —
         for a cert validator the system clock IS the trust decision (validity windows, revocation
         freshness). Then confirm the worker is still healthy (smoke) before returning it to IDLE."""
-        self._virsh("snapshot-revert", slot.domain, self.cfg.snapshot_name)
-        slot.jobs = 0
+        rv = self._virsh("snapshot-revert", slot.domain, self.cfg.snapshot_name)
+        if rv.returncode != 0:
+            # The revert FAILED — the guest is still the contaminated post-job VM (its agent port
+            # may well still answer). Raise so WarmPool.release() falls back to reap+respawn instead
+            # of smoke-checking and returning a dirty slot to IDLE.
+            slot.state = SlotState.DRAINING
+            raise RuntimeError(
+                f"{slot.domain}: snapshot-revert failed (rc={rv.returncode}): {rv.stderr.strip()[:200]}")
+        # NB: do NOT reset slot.jobs here — WarmPool owns that counter and uses the cumulative count
+        # to enforce max_jobs_per_slot (reap+respawn after M total jobs). Zeroing it would make the
+        # reprovision ceiling unreachable. recycles is our own informational tally.
         slot.recycles += 1
         # Sync the clock only AFTER the guest is back on the network: a revert restores the saved
         # RAM state, and qemu-ga's virtio channel (and SSH) take a moment to reconnect — syncing at
@@ -354,10 +364,22 @@ class LibvirtVmRuntime:
                 return p[-1]
         return None
 
+    def _bridge(self) -> str:
+        """The host bridge device for the configured libvirt network (e.g. ``default`` → virbr0).
+        Cached. Derived via ``virsh net-info`` so a non-default ``network`` still resolves IPs from
+        the right bridge (the neighbour table is per-device)."""
+        if self._bridge_name is None:
+            self._bridge_name = "virbr0"
+            for line in self._virsh("net-info", self.cfg.network).stdout.splitlines():
+                if line.lower().startswith("bridge:"):
+                    self._bridge_name = line.split(":", 1)[1].strip() or "virbr0"
+                    break
+        return self._bridge_name
+
     def _ip_for_mac(self, mac: str | None) -> str | None:
         if not mac:
             return None
-        for line in _run(["ip", "neigh", "show", "dev", "virbr0"]).stdout.splitlines():
+        for line in _run(["ip", "neigh", "show", "dev", self._bridge()]).stdout.splitlines():
             p = line.split()
             if (len(p) >= 3 and p[1] == "lladdr" and p[2].lower() == mac.lower()
                     and p[0].startswith(self.cfg.subnet_prefix)):

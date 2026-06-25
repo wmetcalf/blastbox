@@ -8,6 +8,14 @@ from blastbox.host.runtime.libvirt_vm import LibvirtVmRuntime
 from blastbox.host.runtime.vm_compose import VmImageSpec, VmWorkerSpec, _ports
 
 
+def test_ports_accepts_single_int_and_rejects_bool():
+    assert _ports(443) == (443,)            # a single port
+    assert _ports("80,443") == (80, 443)
+    assert _ports([80, 443]) == (80, 443)
+    assert _ports(True) is None             # YAML bool is not a port list
+    assert _ports(None) is None
+
+
 def test_from_dict_builds_full_spec():
     spec = VmWorkerSpec.from_dict("authenticode", {
         "image": "/g.qcow2", "mem_mb": 8192, "vcpus": 4, "warm_size": 3, "agent_port": 9000,

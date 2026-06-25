@@ -147,18 +147,21 @@ class VmWorkerSpec:
         risk×cost declaration) overrides the spec default — the safe fallback is the spec's value
         (default 1 = reset every job). ``health_check``/``pre_snapshot`` are the engine's smoke-test
         and pre-snapshot (cache-warm) hooks."""
+        rt = self.runtime(health_check=health_check, pre_snapshot=pre_snapshot, on_ready=on_ready)
         return WarmPool(
             # LibvirtVmRuntime operates on VmSlot (a network endpoint) rather than the container
             # Slot (control/input/output dirs); WarmPool only ever touches the common
             # state/jobs/slot_id/spawned_at fields, so it drives this runtime fine at runtime
             # (Phase-3 validated). The static types diverge — hence the localized ignore.
-            runtime=self.runtime(health_check=health_check, pre_snapshot=pre_snapshot,  # type: ignore[arg-type]
-                                 on_ready=on_ready),
+            runtime=rt,  # type: ignore[arg-type]
             warm_size=warm_size if warm_size is not None else self.warm_size,
             concurrent_ceiling=self.concurrent_ceiling,
             spawn_rate_limit=self.spawn_rate_limit,
             jobs_per_recycle=jobs_per_recycle if jobs_per_recycle is not None else self.jobs_per_recycle,
             max_jobs_per_slot=self.max_jobs_per_slot,
+            # A VM cold-boot+finalize takes up to boot_timeout_s (default 240s) — well past the pool's
+            # 120s warming default, which would evict workers mid-boot. Give finalize headroom.
+            warming_timeout_s=rt.cfg.boot_timeout_s + 60,
         )
 
     # ---- image build (the "build" half) ----
@@ -201,6 +204,10 @@ def load_compose(path: str) -> dict[str, VmWorkerSpec]:
 def _ports(v: object) -> tuple[int, ...] | None:
     if v is None:
         return None
+    if isinstance(v, bool):   # bool is an int subclass; a YAML bool is not a port list
+        return None
+    if isinstance(v, int):    # a single port, e.g. `egress_ports: 443`
+        return (v,)
     if isinstance(v, str):
         return tuple(int(x) for x in v.replace(",", " ").split())
     if isinstance(v, (list, tuple)):

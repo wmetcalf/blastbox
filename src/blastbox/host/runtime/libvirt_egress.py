@@ -167,8 +167,9 @@ def forward_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | N
     r: list[list[str]] = [
         ["-A", c, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
     ]
-    if gateway:
-        # DNS to the bridge resolver only (not arbitrary internal hosts).
+    if gateway and policy.exit_driver not in ("none", "drop"):
+        # DNS to the bridge resolver only (not arbitrary internal hosts). Skipped for none/drop —
+        # a no-egress policy must not leak even DNS.
         r.append(["-A", c, "-d", gateway, "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
         r.append(["-A", c, "-d", gateway, "-p", "tcp", "--dport", "53", "-j", "ACCEPT"])
     if policy.block_internal:
@@ -231,6 +232,14 @@ class LibvirtEgress:
         Atomic / fail-closed: any failed rule rolls back the whole install via ``remove`` and
         re-raises, so a worker is never left with a half-built (permissive) chain.
         """
+        # Fail closed: a routed exit (vpn/tor/inetsim) needs ExitRouting to actually pin the worker's
+        # egress through the tunnel/redirect. Without it the FORWARD filter alone would let traffic
+        # take the host's default route (its real IP) — a silent deanonymization leak. Refuse rather
+        # than install a filter-only policy that looks restrictive but isn't.
+        if policy.exit_driver in _ROUTING_DRIVERS and self._routing is None:
+            raise ValueError(
+                f"exit_driver {policy.exit_driver!r} requires ExitRouting; refusing a leaky "
+                "filter-only policy (traffic would egress via the host default route)")
         chain = _chain_name(worker_ip)
         self.remove(worker_ip, mac=mac)  # idempotent: clear any prior incarnation (any exit driver)
         try:
@@ -247,7 +256,9 @@ class LibvirtEgress:
             # the worker (matched on its MAC) — a v6-capable guest must not egress around the policy.
             # Best-effort: requires ip6tables (worker nets are v4-only by design, this is belt-and-braces).
             if mac:
-                self._priv(["ip6tables", "-A", "FORWARD", "-m", "mac", "--mac-source", mac, "-j", "DROP"])
+                # Insert at the HEAD of FORWARD (like the IPv4 jump) so it beats any permissive
+                # IPv6 ACCEPT already in the chain — appending could let v6 slip past a prior accept.
+                self._priv(["ip6tables", "-I", "FORWARD", "1", "-m", "mac", "--mac-source", mac, "-j", "DROP"])
         except Exception:
             self.remove(worker_ip, mac=mac)  # roll back to fail-closed (no partial chain)
             raise

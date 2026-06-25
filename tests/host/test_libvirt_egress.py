@@ -1,8 +1,11 @@
 """Unit tests for the libvirt VM-worker egress rule builder (pure; no iptables needed)."""
 from __future__ import annotations
 
+import pytest
+
 from blastbox.host.netpolicy import Personality
 from blastbox.host.runtime.libvirt_egress import (
+    LibvirtEgress,
     VmEgressPolicy,
     _chain_name,
     forward_chain_rules,
@@ -11,6 +14,23 @@ from blastbox.host.runtime.libvirt_egress import (
 
 def _flat(rules):
     return [" ".join(r) for r in rules]
+
+
+def test_apply_fails_closed_when_routed_exit_has_no_routing():
+    # A routed exit (vpn/tor/inetsim) with no ExitRouting would egress via the host default route
+    # (its real IP) — apply() must refuse rather than install a leaky filter-only policy. The raise
+    # happens before any iptables call, so this is safe to run without root.
+    eg = LibvirtEgress(sudo=False, routing=None)
+    pol = VmEgressPolicy(exit_driver="openvpn", block_internal=True)
+    with pytest.raises(ValueError):
+        eg.apply("192.168.122.5", pol, "192.168.122.1", mac="52:54:00:aa:bb:cc")
+
+
+def test_drop_policy_has_no_dns_exemption():
+    # exit=none/drop must not leak even gateway DNS.
+    rules = _flat(forward_chain_rules("192.168.122.5", VmEgressPolicy(exit_driver="drop"),
+                                      "192.168.122.1"))
+    assert not any("--dport 53" in r and "ACCEPT" in r for r in rules)
 
 
 def test_chain_name():

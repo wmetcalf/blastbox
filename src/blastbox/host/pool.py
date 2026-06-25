@@ -301,11 +301,12 @@ class WarmPool:
         ):
             try:
                 if jobs % self._jobs_per_recycle == 0:
-                    with self._lock:
-                        slot.state = SlotState.WARMING  # transient: resetting in place, NOT gone —
-                        # WARMING (not DRAINING) keeps it counted as active so _spawn_to_deficit
-                        # doesn't spawn a spurious replacement during the (seconds-long) reset.
-                    self._recycle(slot)  # e.g. VM snapshot-revert
+                    # Reset in place while the slot stays ASSIGNED. ASSIGNED is counted as active
+                    # (state != DRAINING) so _spawn_to_deficit won't spawn a spurious replacement,
+                    # AND it is neither claimable (claim() picks IDLE) nor promotable
+                    # (_promote_warming only touches WARMING) — so the background tick cannot hand
+                    # this slot out mid-reset. Flip to IDLE only once the reset completes.
+                    self._recycle(slot)  # e.g. VM snapshot-revert (seconds-long)
                 if self._runtime.is_alive(slot):
                     with self._lock:
                         if slot.slot_id in self._slots:
@@ -318,6 +319,8 @@ class WarmPool:
             # recycle failed / slot died / max-jobs reached → fall through to reap (fail-safe)
 
         with self._lock:
+            if slot.slot_id not in self._slots:
+                return  # already removed+reaped concurrently (e.g. stop()/eviction) — don't double-reap
             slot.state = SlotState.DRAINING
         # Reap in-place (synchronous) so the caller is certain cleanup happened.
         # The replacement will be spawned by the next tick() call.

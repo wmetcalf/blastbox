@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from blastbox.host.pool import SlotRuntime
+from blastbox.host.pool import SlotRuntime, SlotState
 from blastbox.host.runtime.libvirt_vm import LibvirtVmConfig, LibvirtVmRuntime, VmSlot
 
 
@@ -95,7 +95,35 @@ def test_on_ready_fallback_fires_at_finalize_and_recycle_when_no_qemuga(monkeypa
 
     rt.recycle(slot, ready_timeout_s=5)        # revert
     assert calls == ["ready", "ready"]         # fired again post-revert
-    assert slot.recycles == 1 and slot.jobs == 0
+    assert slot.recycles == 1
+
+
+class _RevertFail:
+    returncode = 1
+    stdout = ""
+    stderr = "snapshot 'clean' not found"
+
+
+def test_recycle_raises_on_revert_failure(monkeypatch):
+    # A failed snapshot-revert leaves the contaminated VM (its port may still answer); recycle must
+    # raise so WarmPool.release() reaps instead of returning a dirty slot to IDLE.
+    rt = _rt()
+    monkeypatch.setattr(rt, "_virsh", lambda *a, **k: _RevertFail())
+    monkeypatch.setattr(rt, "_port_up", lambda *a, **k: True)
+    slot = VmSlot(slot_id="z", domain="bbvm-z", overlay="/o", agent_port=8765, ip="192.168.122.9")
+    with pytest.raises(RuntimeError):
+        rt.recycle(slot, ready_timeout_s=2)
+    assert slot.state == SlotState.DRAINING
+
+
+def test_recycle_does_not_reset_cumulative_jobs(monkeypatch):
+    # WarmPool owns slot.jobs (it drives max_jobs_per_slot); recycle must NOT zero it.
+    rt = _rt()
+    _stub_virsh(rt, monkeypatch, domtime_ok=True)
+    slot = VmSlot(slot_id="z", domain="bbvm-z", overlay="/o", agent_port=8765,
+                  ip="192.168.122.9", jobs=7)
+    rt.recycle(slot, ready_timeout_s=2)
+    assert slot.jobs == 7 and slot.recycles == 1
 
 
 def test_on_ready_skipped_when_domtime_succeeds(monkeypatch):
