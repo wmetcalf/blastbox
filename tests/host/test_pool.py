@@ -701,3 +701,77 @@ def test_burst_suppressed_while_warm_tier_building() -> None:
     assert pool.burst_active is False
     assert pool.effective_target == 1  # warm_size only, NOT warm_size + burst_size
     assert pool.slot_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Reuse mode (jobs_per_recycle / max_jobs_per_slot) — opt-in for recycle-capable runtimes
+# ---------------------------------------------------------------------------
+
+
+class _RecycleRuntime(_FakeRuntime):
+    """A SlotRuntime that supports in-place reset (e.g. a VM snapshot-revert)."""
+
+    def __init__(self, recycle_raises: bool = False) -> None:
+        super().__init__()
+        self.recycled: list[str] = []
+        self._recycle_raises = recycle_raises
+
+    def recycle(self, slot: Slot) -> None:
+        if self._recycle_raises:
+            raise RuntimeError("snapshot-revert failed")
+        self.recycled.append(slot.slot_id)
+
+
+def _warm_one(pool: WarmPool) -> None:
+    pool.tick()  # spawn
+    pool.tick()  # promote to IDLE
+
+
+def test_reuse_returns_slot_to_idle_and_recycles_on_cadence() -> None:
+    rt = _RecycleRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=2)
+    _warm_one(pool)
+    s1 = pool.claim(timeout_s=1.0)
+    assert s1 is not None
+    pool.release(s1)  # job 1: 1 % 2 != 0 → reuse without reset
+    assert rt.reaped == [] and rt.recycled == []
+    s2 = pool.claim(timeout_s=1.0)
+    assert s2 is not None and s2.slot_id == s1.slot_id  # SAME slot reused
+    pool.release(s2)  # job 2: 2 % 2 == 0 → recycle (reset) then back to IDLE
+    assert rt.recycled == [s1.slot_id] and rt.reaped == []
+    pool.stop()
+
+
+def test_reuse_reaps_at_max_jobs_per_slot() -> None:
+    rt = _RecycleRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0,
+                    jobs_per_recycle=1, max_jobs_per_slot=2)
+    _warm_one(pool)
+    s1 = pool.claim(timeout_s=1.0)
+    pool.release(s1)  # job 1: reset (1%1==0), reused
+    assert rt.recycled == [s1.slot_id] and rt.reaped == []
+    s2 = pool.claim(timeout_s=1.0)
+    assert s2.slot_id == s1.slot_id
+    pool.release(s2)  # job 2: jobs == max_jobs_per_slot → reap+respawn (no reuse)
+    assert rt.reaped == [s1.slot_id]
+    pool.stop()
+
+
+def test_no_recycle_method_always_reaps_even_with_jobs_per_recycle() -> None:
+    rt = _FakeRuntime()  # no recycle() → never reused, regardless of config
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=5)
+    _warm_one(pool)
+    s1 = pool.claim(timeout_s=1.0)
+    pool.release(s1)
+    assert rt.reaped == [s1.slot_id]  # disposable-per-job, byte-identical to before
+    pool.stop()
+
+
+def test_recycle_failure_falls_back_to_reap() -> None:
+    rt = _RecycleRuntime(recycle_raises=True)
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=1)
+    _warm_one(pool)
+    s1 = pool.claim(timeout_s=1.0)
+    pool.release(s1)  # recycle raises → must reap, never return a broken slot to IDLE
+    assert rt.reaped == [s1.slot_id]
+    pool.stop()

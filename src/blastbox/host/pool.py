@@ -7,8 +7,14 @@ State machine
                    +→ (reap on spawn failure) ───────────+
 
 Invariants enforced:
-- One job per slot (warm ≠ reuse): release() ALWAYS reaps; there is no
-  ASSIGNED→IDLE path. A reaped slot_id never reappears as IDLE.
+- One job per slot by default (warm ≠ reuse): release() reaps; a reaped slot_id never
+  reappears as IDLE. This is the right posture for cheap-reset tiers (container/FC/gVisor) —
+  a fresh disposable sandbox per job, zero cross-job contamination.
+- OPT-IN reuse (expensive-reset tiers, e.g. a full-VM snapshot-revert is ~seconds, too slow
+  per job): a runtime that implements ``recycle(slot)`` enables an ASSIGNED→IDLE reuse path.
+  The slot serves up to ``jobs_per_recycle`` jobs, then ``recycle()`` resets it in place and it
+  returns to IDLE; after ``max_jobs_per_slot`` total jobs it is reaped+respawned for a fresh one.
+  Runtimes WITHOUT ``recycle`` are never reused — behaviour is byte-identical to before.
 - Liveness race: claim() re-checks is_alive() inside the lock; a slot that
   died between IDLE and claim is dropped+replaced, never handed out.
 - No double-claim: the slot dict is mutated under a single threading.Lock so
@@ -59,6 +65,7 @@ class Slot:
     state: SlotState
     container_id: str | None = None
     spawned_at: float = 0.0
+    jobs: int = 0            # cumulative jobs served (reuse mode: drives recycle/reprovision)
 
 
 @runtime_checkable
@@ -80,6 +87,13 @@ class SlotRuntime(Protocol):
     def reap(self, slot: Slot) -> None:
         """Kill+rm the container/process and clean up slot dirs."""
         ...
+
+    # Optional (hasattr-guarded by WarmPool — NOT part of the structural Protocol, so existing
+    # runtimes that omit it still satisfy isinstance(.., SlotRuntime)):
+    #
+    #   def recycle(self, slot: Slot) -> None:
+    #       """Reset a reused slot IN PLACE (e.g. VM snapshot-revert) and leave it serving.
+    #       Implementing this opts the runtime into WarmPool's reuse path."""
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +146,16 @@ class WarmPool:
         burst_drain_s:      Seconds of no misses before burst target drains back.
         warmup_grace_s:     Seconds after start() during which is_healthy() is True
                             even if no idle slots exist yet.
+        jobs_per_recycle:   REUSE knob (only if the runtime implements recycle()). Reset the slot in
+                            place every N jobs. THIS IS AN ENGINE-THREAT DECISION, not a generic
+                            tuning knob: the value should come from the engine's risk profile. Default
+                            1 = reset every job. A parse-only engine (e.g. signature validation, which
+                            never executes the sample) may safely raise it for throughput; an engine
+                            that RENDERS or EXECUTES untrusted input (LibreOffice, a headless browser,
+                            any detonation engine) MUST keep it at 1 — and on a cheap-reset tier the
+                            point is moot (no recycle() → disposable per job regardless).
+        max_jobs_per_slot:  Reap+respawn a fully fresh slot after this many jobs (0 = unlimited reuse
+                            with periodic resets). Bounds drift in the reused overlay/snapshot.
     """
 
     def __init__(
@@ -148,8 +172,16 @@ class WarmPool:
         burst_drain_s: float = 60.0,
         warmup_grace_s: float = 30.0,
         warming_timeout_s: float = 120.0,
+        jobs_per_recycle: int = 1,
+        max_jobs_per_slot: int = 0,
     ) -> None:
         self._runtime = runtime
+        # Reuse mode (only active when the runtime implements recycle()): serve N jobs, reset every
+        # ``jobs_per_recycle`` via runtime.recycle(), reap+respawn after ``max_jobs_per_slot`` (0 =
+        # unlimited reuse with periodic resets). Cheap-reset runtimes have no recycle() → disposable.
+        self._recycle = getattr(runtime, "recycle", None)
+        self._jobs_per_recycle = max(1, jobs_per_recycle)
+        self._max_jobs_per_slot = max_jobs_per_slot
         self._warm_size = warm_size
         self._concurrent_ceiling = concurrent_ceiling
         self._poll_interval = poll_interval
@@ -251,14 +283,42 @@ class WarmPool:
                 return None
 
     def release(self, slot: Slot) -> None:
-        """ASSIGNED → DRAINING → reap.  Spawns a replacement on the next tick.
+        """Finish a job on ``slot``.
 
-        There is NO path back to IDLE. This is the structural guarantee of
-        warm ≠ reuse.
+        Default (no ``recycle`` on the runtime): ASSIGNED → DRAINING → reap (warm ≠ reuse); the
+        replacement is spawned on the next tick. REUSE mode (runtime implements ``recycle``): the
+        slot is reset every ``jobs_per_recycle`` jobs and returned to IDLE, until it reaches
+        ``max_jobs_per_slot`` (then reaped+respawned). On any recycle failure or a dead slot it
+        falls back to reap, so a broken slot is never returned to IDLE.
         """
         with self._lock:
-            slot.state = SlotState.DRAINING
+            slot.jobs += 1
+            jobs = slot.jobs
+            tracked = slot.slot_id in self._slots
 
+        if callable(self._recycle) and tracked and not (
+            self._max_jobs_per_slot and jobs >= self._max_jobs_per_slot
+        ):
+            try:
+                if jobs % self._jobs_per_recycle == 0:
+                    with self._lock:
+                        slot.state = SlotState.WARMING  # transient: resetting in place, NOT gone —
+                        # WARMING (not DRAINING) keeps it counted as active so _spawn_to_deficit
+                        # doesn't spawn a spurious replacement during the (seconds-long) reset.
+                    self._recycle(slot)  # e.g. VM snapshot-revert
+                if self._runtime.is_alive(slot):
+                    with self._lock:
+                        if slot.slot_id in self._slots:
+                            slot.state = SlotState.IDLE
+                            self._last_idle_at = self._clock()
+                            self._idle_event.set()
+                            return
+            except Exception:
+                logger.exception("pool.recycle_error slot_id=%s", slot.slot_id)
+            # recycle failed / slot died / max-jobs reached → fall through to reap (fail-safe)
+
+        with self._lock:
+            slot.state = SlotState.DRAINING
         # Reap in-place (synchronous) so the caller is certain cleanup happened.
         # The replacement will be spawned by the next tick() call.
         try:
