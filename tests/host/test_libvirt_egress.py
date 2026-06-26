@@ -208,6 +208,9 @@ def test_vpn_killswitch_scopes_egress_to_tunnel():
                                     "192.168.122.1", egress_if="tun0"))
     assert any(r.endswith("-o tun0 -j ACCEPT") for r in fwd)  # egress only via the tunnel
     assert fwd[-1].endswith("-j DROP")                        # kill-switch
+    # the established-flow accept is ALSO tunnel-scoped, else an in-flight connection would leak over
+    # the host WAN when the tunnel drops mid-stream (the conntrack accept beats the -o tun accepts).
+    assert fwd[0] == "-A BBVM_192_168_122_5 -o tun0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
     # with an allow-list, even the allowlisted ports are tunnel-scoped
     fwd2 = _flat(forward_chain_rules("192.168.122.5",
                  VmEgressPolicy(exit_driver="openvpn", egress_ports=(80, 443)), "192.168.122.1",

@@ -38,6 +38,10 @@ def test_ports_accepts_single_int_and_rejects_bool():
     assert _ports([80, 443]) == (80, 443)
     assert _ports(True) is None             # YAML bool is not a port list
     assert _ports(None) is None
+    # out-of-range / invalid tokens are range-filtered (not emitted as a broken --dports that would
+    # reap every worker for the spec); a list that filters to nothing fails closed to None.
+    assert _ports([80, 70000, 443]) == (80, 443)
+    assert _ports("70000 99999") is None
 
 
 def test_from_dict_builds_full_spec():

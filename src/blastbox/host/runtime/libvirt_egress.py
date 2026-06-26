@@ -200,8 +200,15 @@ def forward_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | N
     ``gateway`` (the libvirt bridge IP, dnsmasq) is exempted for DNS *before* the internal block so a
     NAT/direct worker can still resolve revocation responders even with ``block_internal``."""
     c = _chain_name(worker_ip)
+    # ``egress_if`` (set only for tunneled openvpn/wireguard exits) scopes EVERY accept — including
+    # this established-flow accept — to the tunnel. The chain is entered only via ``FORWARD -s
+    # <worker>`` so it sees the worker's OUTBOUND packets only (replies, ``-s <remote>``, never reach
+    # it), so scoping the established accept can't strand inbound return traffic — and it closes the
+    # kill-switch hole where an already-established flow would otherwise leak over the host WAN if the
+    # tunnel drops mid-connection (the conntrack ACCEPT short-circuits before the ``-o tun`` accepts).
+    oif = ["-o", egress_if] if egress_if else []
     r: list[list[str]] = [
-        ["-A", c, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+        ["-A", c, *oif, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
     ]
     if gateway and policy.exit_driver not in ("none", "drop", "tor"):
         # DNS to the bridge resolver only (not arbitrary internal hosts). Skipped for none/drop —
@@ -232,8 +239,7 @@ def forward_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | N
     # packets fall back to the host's default route — they hit the catch-all DROP instead of leaking
     # out the host's WAN with the worker's traffic. ``direct`` has no egress_if (egress via host is
     # the intent), so it ACCEPTs unscoped.
-    oif = ["-o", egress_if] if egress_if else []
-    if policy.egress_ports is not None:
+    if policy.egress_ports is not None:  # oif computed at the top of this function
         if 53 in policy.egress_ports:
             r.append(["-A", c, "-p", "udp", "--dport", "53", *oif, "-j", "ACCEPT"])
         for i in range(0, len(policy.egress_ports), 15):  # multiport caps at 15 dports/rule

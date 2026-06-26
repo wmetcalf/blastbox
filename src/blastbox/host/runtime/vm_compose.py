@@ -30,6 +30,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from blastbox.host.netwire import parse_egress_ports
 from blastbox.host.pool import WarmPool
 from blastbox.host.runtime.libvirt_egress import ExitRouting, VmEgressPolicy
 from blastbox.host.runtime.libvirt_vm import LibvirtVmConfig, LibvirtVmRuntime
@@ -222,17 +223,21 @@ def _truthy(v: object) -> bool:
 
 
 def _ports(v: object) -> tuple[int, ...] | None:
-    if v is None:
+    # Normalize whatever YAML produced (int / str / list) to a string, then hand it to the ONE
+    # validated parser shared with the container path. That range-checks (1-65535), dedups, and
+    # fails closed on nothing-valid — so a compose typo like `egress_ports: [80, 70000]` drops the
+    # bad token instead of emitting a broken `--dports` that reaps every worker for the spec.
+    if v is None or isinstance(v, bool):  # bool is an int subclass; a YAML bool is not a port list
         return None
-    if isinstance(v, bool):   # bool is an int subclass; a YAML bool is not a port list
+    if isinstance(v, int):                # a single port, e.g. `egress_ports: 443`
+        raw: str = str(v)
+    elif isinstance(v, str):
+        raw = v
+    elif isinstance(v, (list, tuple)):
+        raw = " ".join(str(x) for x in v)
+    else:
         return None
-    if isinstance(v, int):    # a single port, e.g. `egress_ports: 443`
-        return (v,)
-    if isinstance(v, str):
-        return tuple(int(x) for x in v.replace(",", " ").split())
-    if isinstance(v, (list, tuple)):
-        return tuple(int(x) for x in v)
-    return None
+    return parse_egress_ports(raw)
 
 
 def _run(args: list[str], check: bool = False) -> subprocess.CompletedProcess:
