@@ -83,6 +83,7 @@ class ExitRouting:
 
 
 _ROUTING_DRIVERS = ("openvpn", "wireguard", "tor", "inetsim")  # drivers that install routing rules
+_SUPPORTED_EXITS = frozenset({"none", "drop", "direct", *_ROUTING_DRIVERS})  # exits the VM rooter wires
 
 
 def _rule_priority(worker_ip: str, routing: ExitRouting) -> int:
@@ -126,9 +127,14 @@ def routing_commands(worker_ip: str, exit_driver: str, routing: ExitRouting) -> 
         ]
     if exit_driver == "tor":
         return [
-            ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip, "-d", local, "-j", "RETURN"],
+            # DNS FIRST (udp+tcp 53), BEFORE the local-subnet RETURN — otherwise DNS to the bridge
+            # resolver (192.168.122.1:53) matches the RETURN and resolves OUTSIDE tor (a deanon leak).
+            # Redirect it to tor's DNSPort so name resolution goes through tor too.
             ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip,
              "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", str(routing.tor_dns_port)],
+            ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip,
+             "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-ports", str(routing.tor_dns_port)],
+            ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip, "-d", local, "-j", "RETURN"],
             ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip,
              "-p", "tcp", "-j", "REDIRECT", "--to-ports", str(routing.tor_trans_port)],
         ]
@@ -247,6 +253,16 @@ class LibvirtEgress:
             raise ValueError(
                 f"exit_driver {policy.exit_driver!r} requires ExitRouting; refusing a leaky "
                 "filter-only policy (traffic would egress via the host default route)")
+        if policy.exit_driver == "inetsim" and not (self._routing and self._routing.fakenet_addr):
+            raise ValueError(
+                "exit_driver 'inetsim' requires ExitRouting.fakenet_addr (the FakeNet sink) — "
+                "without it nothing is DNATed and traffic egresses via the host default route")
+        if policy.exit_driver not in _SUPPORTED_EXITS:
+            # socks / httpproxy / anything else have no VM routing path here; the filter chain would
+            # otherwise ACCEPT and the worker would get direct host-network egress. Fail closed.
+            raise ValueError(
+                f"exit_driver {policy.exit_driver!r} is not supported by the VM rooter "
+                "(no routing path) — refusing to apply a permissive filter")
         chain = _chain_name(worker_ip)
         self.remove(worker_ip, mac=mac)  # idempotent: clear any prior incarnation (any exit driver)
         try:
@@ -255,6 +271,12 @@ class LibvirtEgress:
                 self._ipt_run(*body, check=True)
             # hook at the TOP of FORWARD so the worker's policy is evaluated before generic rules
             self._ipt_run("-I", "FORWARD", "1", "-s", worker_ip, "-j", chain, check=True)
+            # ANTI-SPOOF (inserted above the jump): a sample with guest admin/root could re-IP the VM
+            # to dodge the per-IP jump + policy routes above. Drop any forwarded packet from this
+            # worker's MAC whose source is NOT its assigned IP, so it can't egress around the policy.
+            if mac:
+                self._ipt_run("-I", "FORWARD", "1", "-m", "mac", "--mac-source", mac,
+                              "!", "-s", worker_ip, "-j", "DROP", check=True)
             # rooter-style exit routing (policy-route / REDIRECT / DNAT), single-NIC
             if self._routing is not None:
                 for cmd in routing_commands(worker_ip, policy.exit_driver, self._routing):
@@ -279,6 +301,8 @@ class LibvirtEgress:
                     self._priv(cmd)  # best-effort: del-by-match, ignore "not found"
         if mac:
             self._priv(["ip6tables", "-D", "FORWARD", "-m", "mac", "--mac-source", mac, "-j", "DROP"])
+            self._priv(["iptables", "-D", "FORWARD", "-m", "mac", "--mac-source", mac,
+                        "!", "-s", worker_ip, "-j", "DROP"])  # anti-spoof teardown
         chain = _chain_name(worker_ip)
         while self._ipt_run("-D", "FORWARD", "-s", worker_ip, "-j", chain).returncode == 0:
             pass

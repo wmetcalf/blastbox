@@ -26,6 +26,23 @@ def test_apply_fails_closed_when_routed_exit_has_no_routing():
         eg.apply("192.168.122.5", pol, "192.168.122.1", mac="52:54:00:aa:bb:cc")
 
 
+def test_apply_fails_closed_for_inetsim_without_fakenet_addr():
+    # inetsim with routing but no fakenet_addr DNATs nothing -> would egress via host default route.
+    eg = LibvirtEgress(sudo=False, routing=ExitRouting())  # fakenet_addr unset
+    with pytest.raises(ValueError):
+        eg.apply("192.168.122.5", VmEgressPolicy(exit_driver="inetsim"), "192.168.122.1",
+                 mac="52:54:00:aa:bb:cc")
+
+
+def test_apply_rejects_unsupported_exit_driver():
+    # socks/httpproxy have no VM routing path -> must NOT fall through to a permissive ACCEPT.
+    eg = LibvirtEgress(sudo=False, routing=ExitRouting())
+    for drv in ("socks", "httpproxy", "bogus"):
+        with pytest.raises(ValueError):
+            eg.apply("192.168.122.5", VmEgressPolicy(exit_driver=drv), "192.168.122.1",
+                     mac="52:54:00:aa:bb:cc")
+
+
 def test_drop_policy_has_no_dns_exemption():
     # exit=none/drop must not leak even gateway DNS.
     rules = _flat(forward_chain_rules("192.168.122.5", VmEgressPolicy(exit_driver="drop"),
@@ -122,10 +139,14 @@ def test_routing_vpn_policy_routes_with_local_exemption():
 
 
 def test_routing_tor_redirects_tcp_and_dns_keeps_local():
-    cmds = _flat(routing_commands("192.168.122.7", "tor", ExitRouting(tor_trans_port=9040, tor_dns_port=5353)))
+    cmds = _flat(routing_commands("192.168.122.7", "tor", ExitRouting(tor_trans_port=9040, tor_dns_port=9053)))
     assert any("-d 192.168.122.0/24 -j RETURN" in c for c in cmds)
     assert any("-p tcp -j REDIRECT --to-ports 9040" in c for c in cmds)
-    assert any("--dport 53 -j REDIRECT --to-ports 5353" in c for c in cmds)
+    assert any("--dport 53 -j REDIRECT --to-ports 9053" in c for c in cmds)
+    # DNS redirect MUST precede the local RETURN, else DNS to the bridge resolver resolves outside
+    # tor (a deanonymization leak).
+    assert cmds.index(next(c for c in cmds if "--dport 53" in c)) < \
+        cmds.index(next(c for c in cmds if "RETURN" in c))
 
 
 def test_routing_fakenet_dnats_when_addr_set():

@@ -230,38 +230,44 @@ class LibvirtVmRuntime:
         if not (ip and self._port_up(ip, timeout=2)):
             return False
         slot.ip = ip
-        if self.cfg.egress_policy is not None:
-            LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing).apply(
-                ip, self.cfg.egress_policy, self.cfg.resolved_gateway, mac=slot.mac)
-        # Correct the clock before the worker is smoked + snapshotted — a fresh golden boot can
-        # carry a stale/wrong clock (observed ~7h off), and for a cert validator the clock IS the
-        # trust decision, so the smoke + snapshot baseline must be time-correct. PRIMARY = the
-        # libvirt-native `virsh domtime --sync` (qemu-ga sets the guest's UTC clock from the host,
-        # TZ-robust); the on_ready engine hook is the FALLBACK only when qemu-ga isn't connected.
-        if not self._sync_time(slot.domain):
-            self._on_ready(slot)
-        # Install guest TLS trust anchors (e.g. a FakeNet/mitmproxy CA for HTTPS interception) BEFORE
-        # the snapshot, so every warm-restore inherits them. Best-effort — interception silently
-        # won't decrypt if this fails, but the worker is otherwise fine.
-        self._install_trust_anchors(slot)
-        # SMOKE before snapshot: only checkpoint a worker that actually validates correctly, so the
-        # warm-restore baseline is known-good (port-open alone can hide a broken validator).
-        if self.cfg.health_check is not None and not self._smoke(slot):
-            logger.warning("%s: smoke test failed pre-snapshot; not ready", slot.domain)
+        # FAIL-CLOSED finalize: if applying egress (or any finalize step) RAISES, the guest is
+        # already reachable on the libvirt network — reap it rather than leave a booted, un-firewalled
+        # VM running until the warming timeout. (A smoke/snapshot that merely returns False is a
+        # transient retry, not an error, so it is NOT reaped.)
+        try:
+            if self.cfg.egress_policy is not None:
+                LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing).apply(
+                    ip, self.cfg.egress_policy, self.cfg.resolved_gateway, mac=slot.mac)
+            # Correct the clock before the worker is smoked + snapshotted — a fresh golden boot can
+            # carry a stale/wrong clock (observed ~7h off), and for a cert validator the clock IS the
+            # trust decision, so the baseline must be time-correct. PRIMARY = the libvirt-native
+            # `virsh domtime` (qemu-ga, TZ-robust); on_ready is the fallback when qemu-ga isn't up.
+            if not self._sync_time(slot.domain):
+                self._on_ready(slot)
+            # Install guest TLS trust anchors (e.g. a FakeNet/mitmproxy CA for HTTPS interception)
+            # BEFORE the snapshot, so every warm-restore inherits them. Best-effort.
+            self._install_trust_anchors(slot)
+            # SMOKE before snapshot: only checkpoint a worker that actually validates correctly, so
+            # the warm-restore baseline is known-good (port-open alone can hide a broken validator).
+            if self.cfg.health_check is not None and not self._smoke(slot):
+                logger.warning("%s: smoke test failed pre-snapshot; not ready", slot.domain)
+                return False
+            # Warm transient state (e.g. CRL/OCSP cache) INTO the snapshot. Best-effort.
+            if self.cfg.pre_snapshot is not None:
+                try:
+                    self.cfg.pre_snapshot(slot)
+                except Exception:
+                    logger.warning("%s: pre_snapshot hook failed (non-fatal)", slot.domain, exc_info=True)
+            if self._virsh("snapshot-create-as", slot.domain, self.cfg.snapshot_name,
+                           "warm clean checkpoint").returncode != 0:
+                logger.warning("%s: snapshot-create-as failed; retry next tick", slot.domain)
+                return False
+            slot.finalized = True
+            return True
+        except Exception:
+            logger.warning("%s: finalize failed; reaping fail-closed", slot.domain, exc_info=True)
+            self.reap(slot)
             return False
-        # Warm transient state (e.g. CRL/OCSP cache) INTO the snapshot so every warm-restore
-        # inherits it. Best-effort — the worker is already healthy.
-        if self.cfg.pre_snapshot is not None:
-            try:
-                self.cfg.pre_snapshot(slot)
-            except Exception:
-                logger.warning("%s: pre_snapshot hook failed (non-fatal)", slot.domain, exc_info=True)
-        if self._virsh("snapshot-create-as", slot.domain, self.cfg.snapshot_name,
-                       "warm clean checkpoint").returncode != 0:
-            logger.warning("%s: snapshot-create-as failed; retry next tick", slot.domain)
-            return False
-        slot.finalized = True
-        return True
 
     def _smoke(self, slot: VmSlot) -> bool:
         """Run the engine health_check, treating any exception as unhealthy."""
@@ -354,7 +360,11 @@ class LibvirtVmRuntime:
                         self._on_ready(slot)
                     synced = True
                 if self.cfg.health_check is None or self._smoke(slot):
-                    slot.state = SlotState.IDLE
+                    # Do NOT set IDLE here. When WarmPool.release() drives recycle the slot must stay
+                    # ASSIGNED until release() republishes it under the pool lock — flipping it to
+                    # IDLE mid-recycle would let a concurrent claim grab this VM before release()
+                    # finishes (double-claim). The caller owns the IDLE transition; recycle just
+                    # returns on success / raises on failure.
                     return
             time.sleep(1)
         slot.state = SlotState.DRAINING
@@ -391,7 +401,13 @@ class LibvirtVmRuntime:
         return _run((["sudo"] if self.cfg.sudo else []) + args, timeout=600)
 
     def _destroy_domain(self, name: str) -> None:
-        self._virsh("destroy", name)
+        r = self._virsh("destroy", name)
+        err = (r.stderr or "").lower()
+        if r.returncode != 0 and "not running" not in err and "not found" not in err:
+            # A failed destroy (≠ already-off) means the VM may STILL be running — surface it; the
+            # overlay rm + undefine that follow would otherwise hide a leaked, unmanaged guest.
+            logger.warning("%s: virsh destroy failed (rc=%s): %s — guest may still be running",
+                           name, r.returncode, (r.stderr or "").strip()[:160])
         self._virsh("undefine", name, "--snapshots-metadata")
 
     def _domain_mac(self, name: str) -> str | None:
@@ -418,8 +434,12 @@ class LibvirtVmRuntime:
             return None
         for line in _run(["ip", "neigh", "show", "dev", self._bridge()]).stdout.splitlines():
             p = line.split()
-            if (len(p) >= 3 and p[1] == "lladdr" and p[2].lower() == mac.lower()
-                    and p[0].startswith(self.cfg.subnet_prefix)):
+            # Find the lladdr token by NAME, not a fixed index: `ip neigh show dev X` emits
+            # "IP lladdr MAC STATE" but some forms include the dev ("IP dev X lladdr MAC STATE").
+            if not p or "lladdr" not in p or not p[0].startswith(self.cfg.subnet_prefix):
+                continue
+            li = p.index("lladdr")
+            if li + 1 < len(p) and p[li + 1].lower() == mac.lower():
                 return p[0]
         return None
 

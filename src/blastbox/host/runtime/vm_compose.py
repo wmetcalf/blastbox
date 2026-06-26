@@ -112,7 +112,7 @@ class VmWorkerSpec:
             egress = VmEgressPolicy(
                 exit_driver=eg.get("exit", "direct"),
                 egress_ports=_ports(eg.get("egress_ports")),
-                block_internal=bool(eg.get("block_internal", False)),
+                block_internal=_truthy(eg.get("block_internal", False)),
             )
             routing = ExitRouting(**{k: eg[k] for k in (
                 "vpn_table", "vpn_tun", "tor_trans_port", "tor_dns_port", "fakenet_addr",
@@ -211,6 +211,14 @@ def load_compose(path: str) -> dict[str, VmWorkerSpec]:
     import yaml  # type: ignore[import-untyped]  # lazy: only needed when loading a file
     doc = yaml.safe_load(Path(path).read_text()) or {}
     return {name: VmWorkerSpec.from_dict(name, d) for name, d in (doc.get("workers") or {}).items()}
+
+
+def _truthy(v: object) -> bool:
+    # A quoted YAML scalar like block_internal: "false" arrives as the string "false", which
+    # bool() would read as True. Treat the usual false-y spellings as False.
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
 
 
 def _ports(v: object) -> tuple[int, ...] | None:

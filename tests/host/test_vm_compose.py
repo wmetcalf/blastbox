@@ -8,6 +8,16 @@ from blastbox.host.runtime.libvirt_vm import LibvirtVmRuntime
 from blastbox.host.runtime.vm_compose import VmImageSpec, VmWorkerSpec, _ports
 
 
+def test_from_dict_block_internal_quoted_false_is_false():
+    # A quoted YAML scalar "false" must not read as truthy.
+    spec = VmWorkerSpec.from_dict("w", {"image": "/g.qcow2",
+                                        "egress": {"exit": "direct", "block_internal": "false"}})
+    assert spec.egress.block_internal is False
+    spec2 = VmWorkerSpec.from_dict("w", {"image": "/g.qcow2",
+                                         "egress": {"exit": "direct", "block_internal": "true"}})
+    assert spec2.egress.block_internal is True
+
+
 def test_from_dict_parses_trust_anchors_and_guest_ssh():
     spec = VmWorkerSpec.from_dict("interceptor", {
         "image": "/g.qcow2",
