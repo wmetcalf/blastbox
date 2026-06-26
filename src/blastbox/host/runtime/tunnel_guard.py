@@ -20,6 +20,15 @@ from collections.abc import Callable
 logger = logging.getLogger(__name__)
 
 
+def systemctl_restart(service: str, runner: Callable = subprocess.run) -> bool:
+    """Restart a systemd unit — the usual VPN recovery (``openvpn@pia``, a ``wg-quick@wg0``, …).
+    Returns True on success; logs and returns False otherwise (recovery is best-effort)."""
+    r = runner(["systemctl", "restart", service], capture_output=True, text=True)
+    if r.returncode != 0:
+        logger.warning("systemctl restart %s failed: %s", service, (r.stderr or "").strip()[:160])
+    return r.returncode == 0
+
+
 def interface_is_up(tun: str, runner: Callable = subprocess.run) -> bool:
     """True iff ``tun`` exists and carries the UP flag. A dropped OpenVPN/WireGuard tunnel usually
     removes the interface (rc != 0) or clears UP."""
@@ -37,11 +46,14 @@ def interface_is_up(tun: str, runner: Callable = subprocess.run) -> bool:
 class TunnelGuard:
     """Edge-triggered tunnel monitor. Call :meth:`check` periodically (or :meth:`run` to loop).
 
-    on_down(tun)/on_up(tun): notification hooks (page, bump a metric). recover(tun): best-effort
-    bring-back (e.g. ``systemctl restart openvpn@pia``); invoked once per down-edge. is_up: the
-    liveness probe (injectable for tests; defaults to the interface UP check)."""
+    Recovery: pass ``service`` (the systemd unit backing the tunnel) and the guard just
+    ``systemctl restart``s it on each down-edge — the common case. For a non-systemd tunnel (a
+    container, a custom script) pass ``recover`` instead to override. on_down(tun)/on_up(tun) are
+    notification hooks (page, bump a metric). is_up is the liveness probe (injectable; defaults to
+    the interface UP check)."""
 
     def __init__(self, tun: str, *,
+                 service: str | None = None,
                  on_down: Callable[[str], None] | None = None,
                  on_up: Callable[[str], None] | None = None,
                  recover: Callable[[str], None] | None = None,
@@ -49,6 +61,10 @@ class TunnelGuard:
         self.tun = tun
         self._on_down = on_down
         self._on_up = on_up
+        # Default recovery = restart the tunnel's systemd unit; `recover` overrides for non-systemd.
+        if recover is None and service is not None:
+            def recover(_t: str, _s: str = service) -> None:
+                systemctl_restart(_s)
         self._recover = recover
         self._is_up = is_up or interface_is_up
         self._last_up: bool | None = None  # unknown until the first check

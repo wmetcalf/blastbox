@@ -1,12 +1,17 @@
 """Unit tests for the VPN/tunnel monitor (pure; no real interface)."""
 from __future__ import annotations
 
-from blastbox.host.runtime.tunnel_guard import TunnelGuard, interface_is_up
+from blastbox.host.runtime.tunnel_guard import (
+    TunnelGuard,
+    interface_is_up,
+    systemctl_restart,
+)
 
 
 class _Link:
     def __init__(self, out, rc=0):
         self.stdout = out
+        self.stderr = out
         self.returncode = rc
 
 
@@ -42,6 +47,25 @@ def test_guard_fires_down_then_recovers():
     state["up"] = True
     assert g.check() is True
     assert events == ["down", "recover", "up"]  # up-edge fires on_up
+
+
+def test_service_param_restarts_unit_on_down(monkeypatch):
+    # service= => default recovery just restarts that systemd unit on each down-edge.
+    import blastbox.host.runtime.tunnel_guard as tg
+    restarted: list[str] = []
+    monkeypatch.setattr(tg, "systemctl_restart", lambda s: restarted.append(s) or True)
+    state = {"up": True}
+    g = TunnelGuard("tun0", service="openvpn@pia", is_up=lambda t: state["up"])
+    g.check()
+    assert restarted == []
+    state["up"] = False
+    g.check()
+    assert restarted == ["openvpn@pia"]
+
+
+def test_systemctl_restart_reports_failure():
+    assert systemctl_restart("x", runner=_runner("boom", 1)) is False
+    assert systemctl_restart("x", runner=_runner("", 0)) is True
 
 
 def test_guard_callback_failure_is_non_fatal():
