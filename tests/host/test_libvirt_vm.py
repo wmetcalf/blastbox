@@ -139,6 +139,43 @@ def test_on_ready_skipped_when_domtime_succeeds(monkeypatch):
     assert calls == []                         # domtime won; fallback never ran
 
 
+def test_trust_anchors_installed_at_finalize_before_snapshot(monkeypatch):
+    # When trust_anchors + SSH creds are set, finalize installs them into the guest BEFORE the
+    # snapshot-create-as, so the warm baseline captures them.
+    order: list[str] = []
+    rt = LibvirtVmRuntime(LibvirtVmConfig(
+        golden_base="/dev/shm/g.qcow2",
+        trust_anchors=["/host/fakenet_ca.crt"],
+        guest_ssh_user="Administrator", guest_ssh_key="/k"))
+    _stub_virsh(rt, monkeypatch, domtime_ok=True)
+
+    def _snap(*a, **k):
+        if "snapshot-create-as" in a:
+            order.append("snapshot")
+        return _OK()
+    monkeypatch.setattr(rt, "_virsh", _snap)
+    import blastbox.host.runtime.libvirt_vm as mod
+    monkeypatch.setattr(mod.guest_ca, "install_trust_anchors",
+                        lambda *a, **k: (order.append("anchors"), True)[1])
+    slot = VmSlot(slot_id="z", domain="bbvm-z", overlay="/o", agent_port=8765,
+                  ip="192.168.122.9", mac="52:54:00:aa:bb:cc")
+    assert rt.is_ready(slot) is True
+    assert order == ["anchors", "snapshot"]
+
+
+def test_trust_anchors_skipped_without_creds(monkeypatch):
+    # No anchors / no SSH creds -> install is never attempted (no behavior change for normal workers).
+    called = []
+    rt = _rt(trust_anchors=["/c.crt"])  # creds missing -> skip
+    _stub_virsh(rt, monkeypatch, domtime_ok=True)
+    import blastbox.host.runtime.libvirt_vm as mod
+    monkeypatch.setattr(mod.guest_ca, "install_trust_anchors",
+                        lambda *a, **k: called.append(1) or True)
+    slot = VmSlot(slot_id="z", domain="bbvm-z", overlay="/o", agent_port=8765, ip="1.2.3.4")
+    rt.is_ready(slot)
+    assert called == []
+
+
 def test_on_ready_failure_is_non_fatal(monkeypatch):
     # a raising fallback hook must not strand the worker — finalize still completes.
     def boom(slot):

@@ -84,6 +84,13 @@ class VmWorkerSpec:
     routing: ExitRouting | None = None
     gateway: str | None = None
 
+    # guest TLS trust anchors (for HTTPS/TLS interception workers — NOT trust-judging ones)
+    trust_anchors: list[str] = field(default_factory=list)
+    guest_os: str = "windows"
+    guest_ssh_user: str | None = None
+    guest_ssh_key: str | None = None
+    guest_ssh_port: int = 22
+
     # pool / reuse policy
     warm_size: int = 2
     jobs_per_recycle: int = 1
@@ -132,6 +139,11 @@ class VmWorkerSpec:
             egress_policy=self.egress,
             exit_routing=self.routing,
             gateway=self.gateway,
+            trust_anchors=self.trust_anchors,
+            guest_os=self.guest_os,
+            guest_ssh_user=self.guest_ssh_user,
+            guest_ssh_key=self.guest_ssh_key,
+            guest_ssh_port=self.guest_ssh_port,
             health_check=health_check,
             pre_snapshot=pre_snapshot,
             on_ready=on_ready,

@@ -8,6 +8,20 @@ from blastbox.host.runtime.libvirt_vm import LibvirtVmRuntime
 from blastbox.host.runtime.vm_compose import VmImageSpec, VmWorkerSpec, _ports
 
 
+def test_from_dict_parses_trust_anchors_and_guest_ssh():
+    spec = VmWorkerSpec.from_dict("interceptor", {
+        "image": "/g.qcow2",
+        "trust_anchors": ["./fakenet_ca.crt"],
+        "guest_os": "windows",
+        "guest_ssh_user": "Administrator",
+        "guest_ssh_key": "/home/x/.ssh/win_golden",
+    })
+    cfg = spec.to_vm_config()
+    assert cfg.trust_anchors == ["./fakenet_ca.crt"]
+    assert cfg.guest_ssh_user == "Administrator"
+    assert cfg.guest_os == "windows"
+
+
 def test_ports_accepts_single_int_and_rejects_bool():
     assert _ports(443) == (443,)            # a single port
     assert _ports("80,443") == (80, 443)

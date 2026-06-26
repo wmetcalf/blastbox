@@ -34,10 +34,11 @@ import subprocess
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from blastbox.host.pool import SlotState
+from blastbox.host.runtime import guest_ca
 from blastbox.host.runtime.libvirt_egress import ExitRouting, LibvirtEgress, VmEgressPolicy
 
 
@@ -119,6 +120,21 @@ class LibvirtVmConfig:
     revocation freshness). The engine resets it to host time the CAPE way — an in-guest
     ``SetLocalTime`` to a host-provided 'now' (no qemu-ga / NTP). The runtime also tries
     ``virsh domtime --sync`` post-revert as a best-effort for qemu-ga goldens. Best-effort, not fatal."""
+
+    # --- guest TLS trust anchors (for HTTPS/TLS interception workers) ---------
+    trust_anchors: list[str] = field(default_factory=list)
+    """CA cert files (host paths) to install into the GUEST trust store at finalize, before the
+    clean snapshot, so every warm-restore inherits them. The use case is a TLS-interception worker:
+    routing its egress through a FakeNet/mitmproxy sinkhole that MITMs HTTPS only decrypts if the
+    guest trusts the interceptor's CA. Requires ``guest_ssh_user`` + ``guest_ssh_key``.
+    SECURITY: a MITM CA is a trusted root — NEVER set this on a worker whose job is to *judge* trust
+    (a cert validator); it would let anything the CA signs validate. Interception workers only."""
+    guest_os: str = "windows"
+    """``windows`` (LocalMachine\\Root via Import-Certificate) or ``linux`` (ca-certificates dir)."""
+    guest_ssh_user: str | None = None
+    guest_ssh_key: str | None = None
+    guest_ssh_port: int = 22
+    """SSH used to push + install ``trust_anchors`` (and available to engines for guest provisioning)."""
 
     @property
     def resolved_gateway(self) -> str:
@@ -224,6 +240,10 @@ class LibvirtVmRuntime:
         # TZ-robust); the on_ready engine hook is the FALLBACK only when qemu-ga isn't connected.
         if not self._sync_time(slot.domain):
             self._on_ready(slot)
+        # Install guest TLS trust anchors (e.g. a FakeNet/mitmproxy CA for HTTPS interception) BEFORE
+        # the snapshot, so every warm-restore inherits them. Best-effort — interception silently
+        # won't decrypt if this fails, but the worker is otherwise fine.
+        self._install_trust_anchors(slot)
         # SMOKE before snapshot: only checkpoint a worker that actually validates correctly, so the
         # warm-restore baseline is known-good (port-open alone can hide a broken validator).
         if self.cfg.health_check is not None and not self._smoke(slot):
@@ -259,6 +279,23 @@ class LibvirtVmRuntime:
                 self.cfg.on_ready(slot)
             except Exception:
                 logger.warning("%s: on_ready hook failed (non-fatal)", slot.domain, exc_info=True)
+
+    def _install_trust_anchors(self, slot: VmSlot) -> None:
+        """Push the configured guest CA trust anchors into the worker over SSH (finalize-time, so the
+        warm snapshot captures them). No-op unless ``trust_anchors`` + SSH creds are set. Non-fatal."""
+        if not (self.cfg.trust_anchors and self.cfg.guest_ssh_user
+                and self.cfg.guest_ssh_key and slot.ip):
+            return
+        try:
+            if not guest_ca.install_trust_anchors(
+                slot.ip, self.cfg.trust_anchors,
+                user=self.cfg.guest_ssh_user, key_path=self.cfg.guest_ssh_key,
+                port=self.cfg.guest_ssh_port, guest_os=self.cfg.guest_os,
+            ):
+                logger.warning("%s: one or more guest trust anchors failed to install "
+                               "(HTTPS interception may not decrypt)", slot.domain)
+        except Exception:
+            logger.warning("%s: trust-anchor install raised (non-fatal)", slot.domain, exc_info=True)
 
     def spawn_ready(self, timeout_s: float | None = None) -> VmSlot:
         """Convenience for non-pool callers: spawn() then block until ready (or timeout). The
