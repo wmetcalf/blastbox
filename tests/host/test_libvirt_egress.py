@@ -130,9 +130,16 @@ def test_routing_tor_redirects_tcp_and_dns_keeps_local():
 
 def test_routing_fakenet_dnats_when_addr_set():
     assert routing_commands("192.168.122.9", "inetsim", ExitRouting()) == []  # no addr -> disabled
-    cmds = _flat(routing_commands("192.168.122.9", "inetsim", ExitRouting(fakenet_addr="172.28.100.1")))
-    assert any("-j DNAT --to-destination 172.28.100.1" in c for c in cmds)
+    cmds = _flat(routing_commands("192.168.122.9", "inetsim", ExitRouting(fakenet_addr="172.28.100.2")))
+    # DNS redirected to FakeNet (so C2 domains resolve to the sinkhole, not NXDOMAIN at dnsmasq)
+    assert any("--dport 53 -j DNAT --to-destination 172.28.100.2:53" in c for c in cmds)
+    # catch-all DNAT for everything else, host/agent control path stays local
+    assert any(c.endswith("-j DNAT --to-destination 172.28.100.2") for c in cmds)
     assert any("-d 192.168.122.0/24 -j RETURN" in c for c in cmds)
+    # DNS rules must precede the local RETURN so DNS to the bridge resolver is still caught
+    flat = cmds
+    assert flat.index(next(c for c in flat if "--dport 53" in c)) < \
+        flat.index(next(c for c in flat if "RETURN" in c))
 
 
 def test_routing_teardown_inverts():

@@ -66,7 +66,7 @@ class ExitRouting:
     vpn_table: str = "vpn"          # rt_tables entry whose default route is the VPN tun
     vpn_tun: str = "tun0"           # device to MASQUERADE the worker's source onto
     tor_trans_port: int = 9040      # tor TransPort (transparent TCP)
-    tor_dns_port: int = 5353        # tor DNSPort
+    tor_dns_port: int = 9053        # tor DNSPort (NOT 5353 — that collides with mDNS/avahi)
     fakenet_addr: str | None = None  # FakeNet-NG listen IP (e.g. 172.28.100.1); None disables inetsim
     rule_priority_base: int = 1000  # ip-rule priority = base + low-16-bits of IP (unique per /16)
 
@@ -135,11 +135,18 @@ def routing_commands(worker_ip: str, exit_driver: str, routing: ExitRouting) -> 
     if exit_driver == "inetsim":
         if not routing.fakenet_addr:
             return []
-        # everything external → the FakeNet-NG listener (preserving dport); local stays local
+        fn = routing.fakenet_addr
+        # DNS FIRST (even to the local bridge resolver) → FakeNet, so attacker C2 domains resolve to
+        # the sinkhole instead of NXDOMAIN'ing at dnsmasq. Then keep other host/agent control traffic
+        # local, and DNAT everything else (preserving dport) to the FakeNet-NG listener.
         return [
+            ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip,
+             "-p", "udp", "--dport", "53", "-j", "DNAT", "--to-destination", fn + ":53"],
+            ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip,
+             "-p", "tcp", "--dport", "53", "-j", "DNAT", "--to-destination", fn + ":53"],
             ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip, "-d", local, "-j", "RETURN"],
             ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip,
-             "-j", "DNAT", "--to-destination", routing.fakenet_addr],
+             "-j", "DNAT", "--to-destination", fn],
         ]
     return []
 
