@@ -159,7 +159,13 @@ class VmWorkerSpec:
         """A warm pool of VM workers for this spec. ``jobs_per_recycle`` (e.g. from the engine's
         risk×cost declaration) overrides the spec default — the safe fallback is the spec's value
         (default 1 = reset every job). ``health_check``/``pre_snapshot`` are the engine's smoke-test
-        and pre-snapshot (cache-warm) hooks."""
+        and pre-snapshot (cache-warm) hooks.
+
+        Drive the returned pool with :class:`~blastbox.host.runtime.vm_dispatch.VmJobDispatcher`, NOT
+        the container ``Dispatcher``: a ``VmSlot`` is a network endpoint (talk to ``slot.endpoint``),
+        not a control/input/output-dir container ``Slot``, so the container dispatcher's file-IPC
+        warm path doesn't apply. VmJobDispatcher claims jobs and hands each to the engine's
+        ``validate`` callable, which talks the warm VM worker over its own transport."""
         rt = self.runtime(health_check=health_check, pre_snapshot=pre_snapshot, on_ready=on_ready)
         return WarmPool(
             # LibvirtVmRuntime operates on VmSlot (a network endpoint) rather than the container
@@ -181,8 +187,10 @@ class VmWorkerSpec:
     def build_image(self, *, force: bool = False) -> str:
         """Bake the golden if it's missing (or ``force``). Returns the golden path.
 
-        ``builder=qemu``: ``base_qcow2`` → boot an overlay, run ``provisioners`` (operator-supplied
-        shell, typically ssh/scp into the guest), then flatten to ``image.golden``.
+        ``builder=qemu``: create ``image.golden`` as a fresh qcow2 overlay backed by ``base_qcow2``,
+        run ``provisioners`` (operator-supplied shell — OS install/config against the booted overlay),
+        then flatten the backing chain so the golden is self-contained (workers boot independent
+        copies, so it must not depend on the base path at runtime).
         ``builder=packer``: delegate to a Packer template (from-ISO install). Provisioner *content*
         is OS-specific and lives with the engine; this only drives the lifecycle.
         """
@@ -197,12 +205,20 @@ class VmWorkerSpec:
         if img.builder == "qemu":
             if not img.base_qcow2:
                 raise ValueError(f"{self.name}: builder=qemu needs image.base_qcow2")
-            # provisioners are operator shell commands (they handle boot/ssh/flatten); we run them
-            # in order and fail fast. Kept deliberately thin — the heavy OS-specific logic is theirs.
+            # Create the golden as a fresh overlay backed by the base, so provisioners boot a ready
+            # disk instead of each reimplementing overlay creation. (Provisioners do the OS-specific
+            # install/config + guest shutdown against this disk.)
+            _run(["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", img.base_qcow2,
+                  img.golden], check=True)
             for cmd in img.provisioners:
                 _run(shlex.split(cmd) if isinstance(cmd, str) else cmd, check=True)
             if not img.exists():
                 raise RuntimeError(f"{self.name}: provisioners ran but {img.golden} was not produced")
+            # Flatten: collapse the backing chain into a standalone qcow2 so the golden carries no
+            # dependency on base_qcow2 (a worker copy with a dangling backing file won't boot).
+            flat = img.golden + ".flat"
+            _run(["qemu-img", "convert", "-O", "qcow2", img.golden, flat], check=True)
+            _run(["mv", flat, img.golden], check=True)
             return img.golden
         raise ValueError(f"{self.name}: unknown builder {img.builder!r}")
 

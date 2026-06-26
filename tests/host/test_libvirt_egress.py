@@ -8,7 +8,9 @@ from blastbox.host.runtime.libvirt_egress import (
     LibvirtEgress,
     VmEgressPolicy,
     _chain_name,
+    _tor_redirect_deletes,
     forward_chain_rules,
+    input_chain_rules,
 )
 
 
@@ -216,6 +218,68 @@ def test_vpn_killswitch_scopes_egress_to_tunnel():
                  VmEgressPolicy(exit_driver="openvpn", egress_ports=(80, 443)), "192.168.122.1",
                  egress_if="tun0"))
     assert any("multiport --dports 80,443 -o tun0 -j ACCEPT" in r for r in fwd2)
+
+
+def test_input_chain_direct_allows_host_resolver_dns_only():
+    pol = VmEgressPolicy(exit_driver="direct")
+    flat = _flat(input_chain_rules("192.168.122.9", pol, gateway="192.168.122.1", routing=None))
+    c = "BBVMIN_192_168_122_9"
+    assert flat[0] == f"-A {c} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"  # agent return
+    assert f"-A {c} -p udp --dport 67 -j ACCEPT" in flat                              # DHCP renew
+    assert f"-A {c} -d 192.168.122.1 -p udp --dport 53 -j ACCEPT" in flat             # host resolver
+    assert f"-A {c} -d 192.168.122.1 -p tcp --dport 53 -j ACCEPT" in flat
+    assert flat[-1] == f"-A {c} -j DROP"                                              # everything else
+
+
+def test_input_chain_vpn_drops_host_resolver_dns():
+    # the DNS leak fix: a tunneled exit must NOT be able to resolve via the host's clearnet dnsmasq.
+    flat = _flat(input_chain_rules("192.168.122.9", VmEgressPolicy(exit_driver="openvpn"),
+                                   gateway="192.168.122.1", routing=None))
+    assert not any("--dport 53" in f for f in flat)   # no host-resolver DNS exemption at all
+    assert flat[-1].endswith("-j DROP")
+
+
+def test_input_chain_none_reaches_no_host_service():
+    flat = _flat(input_chain_rules("10.0.0.5", VmEgressPolicy(exit_driver="none"),
+                                   gateway="10.0.0.1", routing=None))
+    # only established (agent) + DHCP survive; no DNS, then drop.
+    assert any("ESTABLISHED,RELATED -j ACCEPT" in f for f in flat)
+    assert any("--dport 67 -j ACCEPT" in f for f in flat)
+    assert not any("--dport 53" in f for f in flat)
+    assert flat[-1].endswith("-j DROP")
+
+
+def test_input_chain_tor_accepts_redirect_targets():
+    rt = ExitRouting(tor_trans_port=9040, tor_dns_port=9053)
+    flat = _flat(input_chain_rules("192.168.122.9", VmEgressPolicy(exit_driver="tor"),
+                                   gateway="192.168.122.1", routing=rt))
+    # tor REDIRECTs land DNS+TCP on the host's tor ports (post-NAT, host-destined) — accept those,
+    # not raw :53 (that would resolve outside tor).
+    assert any("-p udp --dport 9053 -j ACCEPT" in f for f in flat)
+    assert any("-p tcp --dport 9040 -j ACCEPT" in f for f in flat)
+    assert not any("--dport 53 " in f or f.endswith("--dport 53") for f in flat)
+
+
+def test_input_chain_inetsim_accepts_fakenet_listener():
+    rt = ExitRouting(fakenet_addr="172.28.100.1")
+    flat = _flat(input_chain_rules("192.168.122.9", VmEgressPolicy(exit_driver="inetsim"),
+                                   gateway="192.168.122.1", routing=rt))
+    assert any("-d 172.28.100.1 -j ACCEPT" in f for f in flat)
+
+
+def test_tor_redirect_deletes_sweeps_only_target_worker():
+    dump = "\n".join([
+        "-P PREROUTING ACCEPT",
+        "-A PREROUTING -s 192.168.122.50/32 -p tcp -j REDIRECT --to-ports 9040",        # catch-all
+        "-A PREROUTING -s 192.168.122.50/32 -p tcp -m tcp --dport 443 -j REDIRECT --to-ports 9040",
+        "-A PREROUTING -s 192.168.122.5/32 -p tcp -j REDIRECT --to-ports 9040",         # other worker
+        "-A PREROUTING -s 192.168.122.50/32 -p udp --dport 53 -j REDIRECT --to-ports 9053",  # DNS, not TCP
+    ])
+    dels = _tor_redirect_deletes("192.168.122.50", 9040, dump)
+    assert len(dels) == 2                                  # both .50 TCP redirects, not .5, not DNS
+    assert all(d[:4] == ["iptables", "-t", "nat", "-D"] for d in dels)
+    assert all("192.168.122.50/32" in " ".join(d) for d in dels)
+    assert all(d[4] == "PREROUTING" for d in dels)
 
 
 def test_direct_egress_is_not_tunnel_scoped():
