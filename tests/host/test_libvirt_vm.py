@@ -186,3 +186,60 @@ def test_on_ready_failure_is_non_fatal(monkeypatch):
     slot = VmSlot(slot_id="z", domain="bbvm-z", overlay="/o.qcow2", agent_port=8765,
                   ip="192.168.122.9", mac="52:54:00:aa:bb:cc")
     assert rt.is_ready(slot) is True and slot.finalized is True
+
+
+# --- reap ordering + fail-closed finalize (containment) ----------------------------
+from blastbox.host.runtime import libvirt_vm as _mod  # noqa: E402
+from blastbox.host.runtime.libvirt_egress import VmEgressPolicy  # noqa: E402
+
+
+class _RecEgress:
+    events: list[str] = []
+
+    def __init__(self, **kw):
+        pass
+
+    def remove(self, *a, **k):
+        _RecEgress.events.append("egress-remove")
+
+
+def _reap_rt(monkeypatch, *, destroyed: bool):
+    rt = _rt(egress_policy=VmEgressPolicy(exit_driver="direct"))
+    _RecEgress.events = []
+    order: list[str] = []
+    monkeypatch.setattr(rt, "_destroy_domain", lambda name: order.append("destroy") or destroyed)
+    monkeypatch.setattr(rt, "_sh", lambda *a, **k: order.append("rm-overlay") or _OK())
+    monkeypatch.setattr(_mod, "LibvirtEgress", _RecEgress)
+    return rt, order
+
+
+def test_reap_destroys_guest_before_removing_egress(monkeypatch):
+    rt, order = _reap_rt(monkeypatch, destroyed=True)
+    slot = VmSlot(slot_id="r", domain="bbvm-r", overlay="/o.qcow2", agent_port=8765,
+                  ip="192.168.122.5", mac="52:54:00:aa:bb:cc")
+    rt.reap(slot)
+    # destroy the guest FIRST (while egress is up), THEN unhook egress, THEN free the overlay.
+    assert order == ["destroy", "rm-overlay"]
+    assert _RecEgress.events == ["egress-remove"]
+    assert order.index("destroy") < order.index("rm-overlay")
+
+
+def test_reap_keeps_egress_and_overlay_when_destroy_fails(monkeypatch):
+    rt, order = _reap_rt(monkeypatch, destroyed=False)  # guest may still be running
+    slot = VmSlot(slot_id="r", domain="bbvm-r", overlay="/o.qcow2", agent_port=8765,
+                  ip="192.168.122.5", mac="52:54:00:aa:bb:cc")
+    rt.reap(slot)
+    assert order == ["destroy"]          # bailed after the failed destroy
+    assert _RecEgress.events == []        # egress LEFT in place — possibly-live guest stays contained
+    assert "rm-overlay" not in order      # overlay not freed under a live guest
+
+
+def test_finalize_fails_closed_without_mac(monkeypatch):
+    rt = _rt(egress_policy=VmEgressPolicy(exit_driver="direct"))
+    _stub_virsh(rt, monkeypatch, domtime_ok=True)
+    reaped: list[str] = []
+    monkeypatch.setattr(rt, "reap", lambda slot: reaped.append(slot.domain))
+    slot = VmSlot(slot_id="m", domain="bbvm-m", overlay="/o.qcow2", agent_port=8765,
+                  ip="192.168.122.5", mac=None)  # domiflist missed the MAC
+    assert rt.is_ready(slot) is False    # an under-firewalled finalize is rejected...
+    assert reaped == ["bbvm-m"]          # ...and the VM is reaped (fail-closed)

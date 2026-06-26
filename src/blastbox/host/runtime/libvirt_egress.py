@@ -308,9 +308,11 @@ def input_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | Non
         ["-A", c, "-p", "udp", "--dport", "67", "-j", "ACCEPT"],
     ]
     drv = policy.exit_driver
-    if drv == "direct" and gateway:
+    if drv == "direct" and gateway and (policy.egress_ports is None or 53 in policy.egress_ports):
         # direct: the worker may use the host's dnsmasq resolver — clearnet DNS is the intent (CRL/
         # OCSP responders resolve here, then the connection itself is FORWARDed under egress_ports).
+        # Gated on the allowlist the same way FORWARD is: an explicit egress_ports that omits 53
+        # means "no DNS", so the host-resolver exemption is withheld too (no INPUT-side bypass).
         r.append(["-A", c, "-d", gateway, "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
         r.append(["-A", c, "-d", gateway, "-p", "tcp", "--dport", "53", "-j", "ACCEPT"])
     elif drv == "tor" and routing is not None:
@@ -320,7 +322,10 @@ def input_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | Non
         r.append(["-A", c, "-p", "tcp", "--dport", str(routing.tor_dns_port), "-j", "ACCEPT"])
         r.append(["-A", c, "-p", "tcp", "--dport", str(routing.tor_trans_port), "-j", "ACCEPT"])
     elif drv == "inetsim" and routing is not None and routing.fakenet_addr:
-        # inetsim DNATs DNS + everything to the FakeNet listener (a host-local addr → INPUT).
+        # inetsim DNATs DNS + everything to the FakeNet listener (a host-local addr → INPUT). The
+        # sink captures ALL ports by design — egress_ports does NOT constrain it (the allowlist
+        # governs real egress drivers; reaching a controlled local sinkhole on any port is not a
+        # leak), so this accept is intentionally not port-scoped.
         r.append(["-A", c, "-d", routing.fakenet_addr, "-j", "ACCEPT"])
     # openvpn / wireguard / none / drop: NO host-resolver DNS exemption. A tunneled exit must resolve
     # THROUGH the tunnel (an external resolver reached over the policy route), never via the host's

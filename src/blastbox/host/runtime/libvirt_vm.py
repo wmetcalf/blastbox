@@ -236,6 +236,14 @@ class LibvirtVmRuntime:
         # transient retry, not an error, so it is NOT reaped.)
         try:
             if self.cfg.egress_policy is not None:
+                # Fail closed without a MAC: the anti-spoof + IPv6-drop rules are MAC-matched, so a
+                # None mac (e.g. a transient `virsh domiflist` miss) would silently apply a WEAKER
+                # egress (a re-IP'ing guest could dodge the per-IP policy, and v6 wouldn't be dropped).
+                # Raise so this finalize is reaped rather than warming an under-firewalled VM.
+                if not slot.mac:
+                    raise RuntimeError(
+                        f"{slot.domain}: egress requires the worker MAC for anti-spoof/v6 rules but "
+                        "domiflist returned none — refusing to finalize an under-firewalled guest")
                 LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing).apply(
                     ip, self.cfg.egress_policy, self.cfg.resolved_gateway, mac=slot.mac)
             # Correct the clock before the worker is smoked + snapshotted — a fresh golden boot can
@@ -321,11 +329,19 @@ class LibvirtVmRuntime:
 
     def reap(self, slot: VmSlot) -> None:
         slot.state = SlotState.DRAINING
+        # Destroy the guest FIRST, while its egress filter is still in place — so there is never a
+        # window where a live guest is forwarding with its rules already gone. Only once the VM is
+        # confirmed dead do we tear egress down + free the overlay. If destroy FAILS (the guest may
+        # still be running), LEAVE the egress rules + overlay in place so it stays contained, and
+        # surface it for manual cleanup rather than unconfining a leaked, unmanaged VM.
+        if not self._destroy_domain(slot.domain):
+            logger.error("%s: destroy failed — leaving egress rules + overlay in place so the "
+                         "possibly-live guest stays contained (manual cleanup needed)", slot.domain)
+            return
         if self.cfg.egress_policy is not None and slot.ip is not None:
             LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing).remove(
                 slot.ip, self.cfg.egress_policy.exit_driver, mac=slot.mac,
-                egress_ports=self.cfg.egress_policy.egress_ports)  # unhook before IP freed
-        self._destroy_domain(slot.domain)
+                egress_ports=self.cfg.egress_policy.egress_ports)  # unhook AFTER the guest is gone
         self._sh(["rm", "-f", slot.overlay])
 
     # ---- snapshot-recycle extension -----------------------------------------
@@ -401,17 +417,21 @@ class LibvirtVmRuntime:
     def _sh(self, args: list[str], sudo_tool: str | None = None) -> subprocess.CompletedProcess:
         return _run((["sudo"] if self.cfg.sudo else []) + args, timeout=600)
 
-    def _destroy_domain(self, name: str) -> None:
+    def _destroy_domain(self, name: str) -> bool:
+        """Destroy + undefine ``name``. Returns whether the guest is GONE (destroyed, or already
+        off/absent). On a non-benign destroy failure the VM may STILL be running, so we do NOT
+        undefine it (undefining a live domain leaves it running but unmanaged) and return False so
+        the caller keeps it contained."""
         r = self._virsh("destroy", name)
         err = (r.stderr or "").lower()
         # benign: the domain was already off / already gone (we still undefine to clean metadata).
         benign = ("not running", "not found", "failed to get domain", "does not exist")
         if r.returncode != 0 and not any(b in err for b in benign):
-            # A failed destroy (≠ already-off) means the VM may STILL be running — surface it; the
-            # overlay rm + undefine that follow would otherwise hide a leaked, unmanaged guest.
             logger.warning("%s: virsh destroy failed (rc=%s): %s — guest may still be running",
                            name, r.returncode, (r.stderr or "").strip()[:160])
+            return False
         self._virsh("undefine", name, "--snapshots-metadata")
+        return True
 
     def _domain_mac(self, name: str) -> str | None:
         for line in self._virsh("domiflist", name).stdout.splitlines():
