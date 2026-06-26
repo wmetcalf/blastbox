@@ -323,7 +323,8 @@ class LibvirtVmRuntime:
         slot.state = SlotState.DRAINING
         if self.cfg.egress_policy is not None and slot.ip is not None:
             LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing).remove(
-                slot.ip, self.cfg.egress_policy.exit_driver, mac=slot.mac)  # unhook before the IP is freed
+                slot.ip, self.cfg.egress_policy.exit_driver, mac=slot.mac,
+                egress_ports=self.cfg.egress_policy.egress_ports)  # unhook before the IP is freed
         self._destroy_domain(slot.domain)
         self._sh(["rm", "-f", slot.overlay])
 
@@ -403,7 +404,9 @@ class LibvirtVmRuntime:
     def _destroy_domain(self, name: str) -> None:
         r = self._virsh("destroy", name)
         err = (r.stderr or "").lower()
-        if r.returncode != 0 and "not running" not in err and "not found" not in err:
+        # benign: the domain was already off / already gone (we still undefine to clean metadata).
+        benign = ("not running", "not found", "failed to get domain", "does not exist")
+        if r.returncode != 0 and not any(b in err for b in benign):
             # A failed destroy (≠ already-off) means the VM may STILL be running — surface it; the
             # overlay rm + undefine that follow would otherwise hide a leaked, unmanaged guest.
             logger.warning("%s: virsh destroy failed (rc=%s): %s — guest may still be running",

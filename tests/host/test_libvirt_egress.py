@@ -163,6 +163,32 @@ def test_routing_fakenet_dnats_when_addr_set():
         flat.index(next(c for c in flat if "RETURN" in c))
 
 
+def test_routing_tor_port_scoped_to_egress_ports():
+    # With egress_ports set, only those TCP ports REDIRECT into tor — NO catch-all (so 22/25 fall
+    # through to the FORWARD allowlist DROP instead of tunneling through tor).
+    cmds = _flat(routing_commands("192.168.122.7", "tor",
+                                  ExitRouting(tor_trans_port=9040, tor_dns_port=9053),
+                                  egress_ports=(53, 80, 443)))
+    assert any("--dport 80 -j REDIRECT --to-ports 9040" in c for c in cmds)
+    assert any("--dport 443 -j REDIRECT --to-ports 9040" in c for c in cmds)
+    assert not any(c.endswith("-p tcp -j REDIRECT --to-ports 9040") for c in cmds)  # no catch-all
+    assert not any("--dport 53 -j REDIRECT --to-ports 9040" in c for c in cmds)     # 53 -> DNSPort, not TransPort
+
+
+def test_routing_tor_catchall_without_egress_ports():
+    cmds = _flat(routing_commands("192.168.122.7", "tor", ExitRouting(tor_trans_port=9040)))
+    assert any(c.endswith("-p tcp -j REDIRECT --to-ports 9040") for c in cmds)  # catch-all
+
+
+def test_routing_teardown_inverts_port_scoped_tor():
+    R = ExitRouting(tor_trans_port=9040, tor_dns_port=9053)
+    add = routing_commands("192.168.122.7", "tor", R, egress_ports=(80, 443))
+    rm = routing_teardown_commands("192.168.122.7", "tor", R, egress_ports=(80, 443))
+    assert len(rm) == len(add)
+    for a, d in zip(add, rm):
+        assert d == [("-D" if t == "-A" else t) for t in a]  # each -A inverted to -D
+
+
 def test_routing_teardown_inverts():
     R = ExitRouting(fakenet_addr="172.28.100.1")
     for drv in ("openvpn", "tor", "inetsim"):
