@@ -16,11 +16,14 @@ sibling workers or a co-resident rooter's rules.
 """
 from __future__ import annotations
 
+import logging
 import subprocess
 from dataclasses import dataclass
 
 from blastbox.host.netpolicy import Personality
 from blastbox.host.netwire import _INTERNAL_NETS, parse_egress_ports
+
+logger = logging.getLogger(__name__)
 
 
 def _run(args: list[str], timeout: float = 20) -> subprocess.CompletedProcess:
@@ -445,12 +448,11 @@ class LibvirtEgress:
                     self._priv(cmd, check=True)
             # IPv6 fail-closed: the filter/routing above is IPv4-only, so drop ALL forwarded v6 from
             # the worker (matched on its MAC) — a v6-capable guest must not egress around the policy.
-            # Best-effort: requires ip6tables (worker nets are v4-only by design, this is belt-and-braces).
             if mac:
                 # Insert at the HEAD of FORWARD + INPUT (like the IPv4 jumps) so it beats any
                 # permissive IPv6 ACCEPT already in those chains — appending could let v6 slip past.
-                self._priv(["ip6tables", "-I", "FORWARD", "1", "-m", "mac", "--mac-source", mac, "-j", "DROP"])
-                self._priv(["ip6tables", "-I", "INPUT", "1", "-m", "mac", "--mac-source", mac, "-j", "DROP"])
+                self._v6_drop("FORWARD", mac)
+                self._v6_drop("INPUT", mac)
         except Exception:
             self.remove(worker_ip, mac=mac, egress_ports=policy.egress_ports)  # roll back fail-closed
             raise
@@ -485,6 +487,28 @@ class LibvirtEgress:
             pass
         self._ipt_run("-F", in_chain)
         self._ipt_run("-X", in_chain)
+
+    def _v6_drop(self, chain: str, mac: str) -> None:
+        """Install the IPv6 fail-closed DROP for this worker's MAC at the head of ``chain``.
+
+        RAISES on a real rule rejection — a working v6 firewall that REFUSED the rule means the v6
+        bypass is live and unguarded, so finalize must fail closed (reap), not silently proceed (the
+        old best-effort behaviour). A host with no IPv6 filter table at all (worker nets are v4-only
+        by design; nothing to bypass) is tolerated with a warning. A missing ip6tables BINARY raises
+        from subprocess and is caught by apply()'s rollback — also fail-closed."""
+        cp = self._priv(["ip6tables", "-I", chain, "1", "-m", "mac", "--mac-source", mac, "-j", "DROP"])
+        if cp.returncode == 0:
+            return
+        err = (cp.stderr or "").lower()
+        # benign: the host has no usable IPv6 filter stack (module/table absent) — there is no v6
+        # path to bypass, so don't reap every worker over it.
+        benign = ("table does not exist", "no such file", "not supported", "can't initialize",
+                  "address family not supported", "no chain/target/match")
+        if not any(b in err for b in benign):
+            raise RuntimeError(f"ip6tables {chain} v6 fail-closed DROP failed (rc={cp.returncode}): "
+                               f"{(cp.stderr or '').strip()[:160]}")
+        logger.warning("ip6tables %s v6 DROP not installed (%s) — host has no IPv6 filter stack; "
+                       "worker nets are v4-only by design", chain, err.strip()[:80] or "rc!=0")
 
     def _sweep_tor_tcp_redirects(self, worker_ip: str) -> None:
         """Delete EVERY live nat-PREROUTING TCP REDIRECT this worker has into tor's TransPort, so an

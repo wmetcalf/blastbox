@@ -220,6 +220,32 @@ def test_vpn_killswitch_scopes_egress_to_tunnel():
     assert any("multiport --dports 80,443 -o tun0 -j ACCEPT" in r for r in fwd2)
 
 
+def test_v6_drop_raises_on_real_rejection(monkeypatch):
+    # a working v6 firewall that REFUSES the drop = a live v6 bypass → must fail closed (raise).
+    import subprocess
+    eg = LibvirtEgress(sudo=False)
+    monkeypatch.setattr(eg, "_priv",
+                        lambda argv, **k: subprocess.CompletedProcess(argv, 1, "", "Bad rule (does a matching rule exist?)"))
+    with pytest.raises(RuntimeError, match="v6 fail-closed"):
+        eg._v6_drop("FORWARD", "52:54:00:aa:bb:cc")
+
+
+def test_v6_drop_tolerates_absent_v6_stack(monkeypatch):
+    # a host with no usable IPv6 filter table has no v6 path to bypass — tolerate (don't reap workers).
+    import subprocess
+    eg = LibvirtEgress(sudo=False)
+    monkeypatch.setattr(eg, "_priv",
+                        lambda argv, **k: subprocess.CompletedProcess(argv, 3, "", "ip6tables v1.8: can't initialize ip6tables table `filter': Table does not exist"))
+    eg._v6_drop("FORWARD", "52:54:00:aa:bb:cc")  # no raise
+
+
+def test_v6_drop_ok_is_silent(monkeypatch):
+    import subprocess
+    eg = LibvirtEgress(sudo=False)
+    monkeypatch.setattr(eg, "_priv", lambda argv, **k: subprocess.CompletedProcess(argv, 0, "", ""))
+    eg._v6_drop("INPUT", "52:54:00:aa:bb:cc")
+
+
 def test_forward_inetsim_block_internal_exempts_sink():
     # inetsim DNATs everything to the RFC1918 FakeNet sink; without the exemption block_internal would
     # DROP the very traffic it's meant to sink. The sink ACCEPT must precede the internal DROPs.

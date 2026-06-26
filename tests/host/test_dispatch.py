@@ -1544,6 +1544,12 @@ def test_httpproxy_env_validates_proxy_url(tmp_path):
         assert d._httpproxy_env(p) == {}
     # non-httpproxy driver → never injects proxy env
     assert d._httpproxy_env(Personality(name="d", exit_driver="direct", config={})) == {}
+    # inline user:pass@ is STRIPPED before reaching the worker env (creds stay in the sidecar)
+    creds = Personality(name="brd", exit_driver="httpproxy",
+                        config={"proxy": "http://user:s3cr3t@172.30.0.30:8888"})
+    env = d._httpproxy_env(creds)
+    assert env["HTTP_PROXY"] == "http://172.30.0.30:8888"  # host:port kept, userinfo dropped
+    assert all("s3cr3t" not in v and "user" not in v for v in env.values())
 
 
 def test_decrypt_seal_refuses_symlinked_output(tmp_path, monkeypatch):

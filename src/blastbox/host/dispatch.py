@@ -564,6 +564,16 @@ class Dispatcher:
         except ValueError:
             _log.warning("httpproxy proxy= %r has a bad port; not injecting proxy env", proxy[:80])
             return {}
+        # Strip any inline user:pass@ — the upstream provider's credentials must NOT cross into the
+        # untrusted worker env (the documented design is a creds-holding chaining sidecar that the
+        # worker reaches credential-free). A creds-bearing proxy= is an operator misconfiguration;
+        # drop the userinfo (and warn) so it can't leak to a sample via HTTP_PROXY.
+        if parsed.username or parsed.password:
+            _log.warning("httpproxy proxy= carries inline credentials; stripping userinfo before "
+                         "injecting into the worker env (use a creds-holding sidecar instead)")
+            host = parsed.hostname or ""
+            netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
+            proxy = urllib.parse.urlunparse(parsed._replace(netloc=netloc))
         return {k: proxy for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}
 
     def _resolve_personality(self, job: Job):

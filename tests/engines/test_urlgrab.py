@@ -3,11 +3,32 @@ from __future__ import annotations
 
 import hashlib
 import json
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-from blastbox.engines.urlgrab import FetchError, FetchResult, UrlGrabEngine
+import pytest
+
+from blastbox.engines.urlgrab import FetchError, FetchResult, UrlGrabEngine, _CappedRedirect
 from blastbox.limits import Limits
 from blastbox.worker.harness import run_detonation
+
+
+def test_redirect_to_non_http_scheme_is_blocked():
+    # a 302 to file:// (or ftp:// etc.) must NOT be followed — build_opener's default FileHandler
+    # would otherwise read a worker-local file into the sealed body artifact (SSRF / local read).
+    h = _CappedRedirect()
+    req = urllib.request.Request("http://evil.example/start")
+    for bad in ("file:///etc/passwd", "ftp://evil.example/x", "gopher://evil/x"):
+        with pytest.raises(urllib.error.HTTPError):
+            h.redirect_request(req, None, 302, "Found", {}, bad)
+
+
+def test_redirect_to_http_scheme_is_allowed():
+    h = _CappedRedirect()
+    req = urllib.request.Request("http://evil.example/start")
+    nxt = h.redirect_request(req, None, 302, "Found", {}, "https://ok.example/next")
+    assert nxt is not None and nxt.full_url == "https://ok.example/next"
 
 
 def _run(tmp_path: Path, engine: UrlGrabEngine, url_text: bytes,

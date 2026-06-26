@@ -102,6 +102,17 @@ class _CappedRedirect(urllib.request.HTTPRedirectHandler):
     max_repeats = _DEFAULT_MAX_REDIRECTS
     max_redirections = _DEFAULT_MAX_REDIRECTS
 
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Keep the fetcher a bounded HTTP(S) client across the WHOLE redirect chain, not just the
+        # initial URL: a malicious server can 30x to file:// (or ftp://, etc.), and build_opener's
+        # default FileHandler/FTPHandler would happily service it — reading a worker-local file into
+        # the sealed `body` artifact (SSRF / local-file read). Reject any non-HTTP(S) redirect target
+        # so the only schemes ever fetched are the validated http/https.
+        if urlparse(newurl).scheme not in ("http", "https"):
+            raise urllib.error.HTTPError(
+                newurl, code, f"redirect to non-HTTP(S) scheme blocked: {newurl[:80]}", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
 
 def _default_fetch(
     url: str, *, timeout: float, max_bytes: int, max_redirects: int, verify_tls: bool = True

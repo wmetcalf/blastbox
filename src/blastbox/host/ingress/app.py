@@ -601,7 +601,12 @@ def build_app(
             _log.warning("job_store_create_failed", error=str(exc))
             raise HTTPException(503, "store unavailable") from exc
 
-        record_job_submitted(engine, nbytes)
+        # Bound the engine metrics label to the allowlist: in open-allowlist mode (empty set) an
+        # attacker could submit unbounded distinct `engine` strings, each retained as a Prometheus
+        # series (cardinality blow-up). An allowlisted engine keeps its real label; anything else
+        # collapses to "other". In configured mode unknown engines are already rejected above, so
+        # this only bites the open dev/test default.
+        record_job_submitted(engine if engine in _allowed_engines else "other", nbytes)
 
         return {
             "job_id": job.job_id,
