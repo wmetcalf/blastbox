@@ -192,7 +192,8 @@ def routing_teardown_commands(worker_ip: str, exit_driver: str, routing: ExitRou
     return cmds
 
 
-def forward_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | None) -> list[list[str]]:
+def forward_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | None,
+                        egress_if: str | None = None) -> list[list[str]]:
     """The ordered ``iptables`` rule bodies (sans ``iptables``) for the worker's dedicated FORWARD
     chain. Order: return-traffic → gateway DNS → block-internal → exit disposition → web allowlist.
 
@@ -226,18 +227,30 @@ def forward_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | N
         r.append(["-A", c, "-j", "DROP"])
         return r
 
-    # direct / openvpn / wireguard: the routing is layered separately; here we filter.
+    # direct / openvpn / wireguard. ``egress_if`` (set for tunneled exits) is the KILL-SWITCH: scope
+    # the egress ACCEPTs to the tunnel/leg interface so that if the tunnel drops — and the worker's
+    # packets fall back to the host's default route — they hit the catch-all DROP instead of leaking
+    # out the host's WAN with the worker's traffic. ``direct`` has no egress_if (egress via host is
+    # the intent), so it ACCEPTs unscoped.
+    oif = ["-o", egress_if] if egress_if else []
     if policy.egress_ports is not None:
         if 53 in policy.egress_ports:
-            r.append(["-A", c, "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
+            r.append(["-A", c, "-p", "udp", "--dport", "53", *oif, "-j", "ACCEPT"])
         for i in range(0, len(policy.egress_ports), 15):  # multiport caps at 15 dports/rule
             chunk = ",".join(str(p) for p in policy.egress_ports[i:i + 15])
-            r.append(["-A", c, "-p", "tcp", "-m", "multiport", "--dports", chunk, "-j", "ACCEPT"])
+            r.append(["-A", c, "-p", "tcp", "-m", "multiport", "--dports", chunk, *oif, "-j", "ACCEPT"])
         r.append(["-A", c, "-m", "limit", "--limit", "10/min", "-j", "LOG",
                   "--log-prefix", "bbvm-egress-drop ", "--log-level", "4"])
         r.append(["-A", c, "-j", "DROP"])
+    elif oif:
+        # tunneled exit, no port allowlist: permit ALL traffic, but ONLY out the tunnel. The trailing
+        # DROP is the kill-switch — tunnel down → no egress (fail closed), not a host-IP leak.
+        r.append(["-A", c, *oif, "-j", "ACCEPT"])
+        r.append(["-A", c, "-m", "limit", "--limit", "10/min", "-j", "LOG",
+                  "--log-prefix", "bbvm-killswitch-drop ", "--log-level", "4"])
+        r.append(["-A", c, "-j", "DROP"])
     else:
-        # direct / openvpn / wireguard: no port allowlist → permit (NAT/tunnel handles the path)
+        # direct: no port allowlist, no tunnel → permit (egress via the host is the intent)
         r.append(["-A", c, "-j", "ACCEPT"])
     return r
 
@@ -294,7 +307,14 @@ class LibvirtEgress:
         self.remove(worker_ip, mac=mac, egress_ports=policy.egress_ports)
         try:
             self._ipt_run("-N", chain, check=True)
-            for body in forward_chain_rules(worker_ip, policy, gateway):
+            # Kill-switch interface for a tunneled exit: the local tun for an on-host VPN, or the leg
+            # for next-hop/shared-router mode (the worker's traffic must leave via the router's leg).
+            egress_if = None
+            if policy.exit_driver in ("openvpn", "wireguard") and self._routing is not None:
+                egress_if = (self._routing.leg
+                             if (self._routing.gateway and self._routing.leg)
+                             else self._routing.vpn_tun)
+            for body in forward_chain_rules(worker_ip, policy, gateway, egress_if):
                 self._ipt_run(*body, check=True)
             # hook at the TOP of FORWARD so the worker's policy is evaluated before generic rules
             self._ipt_run("-I", "FORWARD", "1", "-s", worker_ip, "-j", chain, check=True)

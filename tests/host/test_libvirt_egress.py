@@ -200,6 +200,29 @@ def test_routing_teardown_inverts_port_scoped_tor():
         assert d == [("-D" if t == "-A" else t) for t in a]
 
 
+def test_vpn_killswitch_scopes_egress_to_tunnel():
+    # A tunneled exit (openvpn/wireguard) must only ACCEPT egress OUT the tunnel interface, with a
+    # trailing DROP — so if the tunnel drops and packets fall to the host route, they're blocked
+    # (fail closed) instead of leaking out the host WAN.
+    fwd = _flat(forward_chain_rules("192.168.122.5", VmEgressPolicy(exit_driver="openvpn"),
+                                    "192.168.122.1", egress_if="tun0"))
+    assert any(r.endswith("-o tun0 -j ACCEPT") for r in fwd)  # egress only via the tunnel
+    assert fwd[-1].endswith("-j DROP")                        # kill-switch
+    # with an allow-list, even the allowlisted ports are tunnel-scoped
+    fwd2 = _flat(forward_chain_rules("192.168.122.5",
+                 VmEgressPolicy(exit_driver="openvpn", egress_ports=(80, 443)), "192.168.122.1",
+                 egress_if="tun0"))
+    assert any("multiport --dports 80,443 -o tun0 -j ACCEPT" in r for r in fwd2)
+
+
+def test_direct_egress_is_not_tunnel_scoped():
+    # direct egress (via the host) has no egress_if -> plain ACCEPT, no kill-switch DROP.
+    fwd = _flat(forward_chain_rules("192.168.122.5", VmEgressPolicy(exit_driver="direct"),
+                                    "192.168.122.1"))
+    assert fwd[-1].endswith("-j ACCEPT")
+    assert not any("-o tun" in r for r in fwd)
+
+
 def test_routing_teardown_inverts():
     R = ExitRouting(fakenet_addr="172.28.100.1")
     for drv in ("openvpn", "tor", "inetsim"):
