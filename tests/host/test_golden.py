@@ -1,6 +1,8 @@
 """Unit tests for the generic golden rotation/gate (pure; runner + runtime injected)."""
 from __future__ import annotations
 
+import pytest
+
 from blastbox.host.runtime import golden
 
 
@@ -47,6 +49,26 @@ def test_rotate_backs_up_promotes_and_chmods(tmp_path):
     assert any(f"cp --reflink=auto {tmp_path}/cand.qcow2 {live}.new" in c for c in flat)   # promote disk
     assert any(f"{shm}.new" in c for c in flat)                                            # promote shm
     assert any(c[:2] == ["sudo", "chmod"] for c in rec.cmds)
+
+
+def test_rotate_aborts_on_failed_copy(tmp_path):
+    # a failed cp/mv (disk full, no perms) must raise — not press on and report a stale/partial golden.
+    live = tmp_path / "g.qcow2"
+    live.write_text("cur")
+
+    class _FailCpMv:
+        def __call__(self, argv, **k):
+            rc = 1 if argv and argv[0] in ("cp", "mv") else 0  # fail copies/moves, pass mkdir/chmod
+
+            class _R:
+                returncode = rc
+                stdout = ""
+                stderr = "No space left on device"
+            return _R()
+
+    with pytest.raises(RuntimeError, match="golden rotate"):
+        golden.rotate(str(tmp_path / "cand.qcow2"), live_disk=str(live), backup_dir=str(tmp_path / "b"),
+                      ts="T", sudo=False, runner=_FailCpMv())
 
 
 def test_prune_keeps_newest_n(tmp_path):

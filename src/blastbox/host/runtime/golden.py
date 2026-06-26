@@ -57,16 +57,26 @@ def rotate(candidate: str, *, live_disk: str, backup_dir: str, keep_n: int = 5,
     workers actually boot from. ``ts`` (a timestamp string) names the backup — passed in so the op
     is deterministic/testable. All writes go through ``sudo`` (libvirt image dirs are root-owned)."""
     pfx = ["sudo"] if sudo else []
+
+    def _checked(argv: list[str], what: str) -> None:
+        # A failed cp/mv (missing candidate, no perms, disk full) must ABORT the rotation, not press
+        # on — else promote_if_valid() reports success while the live golden is stale, or a partial
+        # `.new` from a half-finished cp gets mv'd over the live disk. Raise so the caller sees it.
+        cp = runner([*pfx, *argv], capture_output=True, text=True)
+        if getattr(cp, "returncode", 0) != 0:
+            raise RuntimeError(f"golden rotate: {what} failed ({' '.join(argv)}): "
+                               f"{getattr(cp, 'stderr', '') or ''}".strip())
+
     runner([*pfx, "mkdir", "-p", backup_dir], capture_output=True, text=True)
     runner([*pfx, "chmod", "755", backup_dir], capture_output=True, text=True)
     if Path(live_disk).exists():
         bak = f"{backup_dir}/golden-base.{ts}.qcow2"
         logger.info("backing up current golden -> %s", bak)
-        runner([*pfx, "cp", "--reflink=auto", live_disk, bak], capture_output=True, text=True)
+        _checked(["cp", "--reflink=auto", live_disk, bak], "backup")
     logger.info("promoting candidate -> %s%s", live_disk, f" (+ {live_shm})" if live_shm else "")
     for dest in [live_disk] + ([live_shm] if live_shm else []):
-        runner([*pfx, "cp", "--reflink=auto", candidate, dest + ".new"], capture_output=True, text=True)
-        runner([*pfx, "mv", dest + ".new", dest], capture_output=True, text=True)
+        _checked(["cp", "--reflink=auto", candidate, dest + ".new"], "stage candidate")
+        _checked(["mv", dest + ".new", dest], "promote")
     runner([*pfx, "chmod", "644", live_disk, *([live_shm] if live_shm else [])], capture_output=True, text=True)
     prune_backups(backup_dir, keep_n, sudo=sudo, runner=runner)
 

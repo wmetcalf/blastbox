@@ -31,45 +31,84 @@ logger = logging.getLogger(__name__)
 
 
 class VmJobDispatcher:
-    """Drive queued jobs through an engine's warm VM pool. ``validate`` is the engine seam."""
+    """Drive queued jobs through an engine's warm VM pool. ``validate`` is the engine seam.
+
+    ``engine`` scopes claims in a SHARED multi-engine JobStore: this dispatcher has a single
+    engine-specific ``validate``, so a job for another engine that it happens to claim is requeued
+    (not run through the wrong validator). Leave ``None`` for a single-engine store (claim anything).
+    ``worker_tier`` is the warm-backend label surfaced to UIs (``worker_runtime`` is always the
+    sweep-recognized ``"warm"`` so a peer's crash-recovery treats an in-flight VM job as warm — TIME-
+    based fail, never a cold re-detonation). ``job_retention_s`` sets ``expires_at`` on terminal jobs
+    so the retention sweeper reclaims their dirs (None = keep indefinitely)."""
 
     def __init__(self, store: JobStore, job_root: str,
                  validate: Callable[[Path], tuple[dict | None, bool]], *,
-                 concurrency: int = 1, poll_s: float = 0.5) -> None:
+                 engine: str | None = None, worker_tier: str = "libvirt-vm",
+                 job_retention_s: int = 0, concurrency: int = 1, poll_s: float = 0.5) -> None:
         self._store = store
         self._job_root = Path(job_root)
         self._validate = validate
+        self._engine = engine
+        self._worker_tier = worker_tier
+        self._retention_s = max(0, int(job_retention_s))
         self._concurrency = max(1, concurrency)
         self._poll_s = poll_s
         self._stop = threading.Event()
 
     def _input_path(self, job: Job) -> Path:
         # ingress spools to <result_dir>/input/<filename>; result_dir falls back to job_root/<id>.
+        # Path(...).name strips any directory components a non-ingress producer left in `filename`,
+        # so the join (and the finally-block unlink) can never escape the job's own input/ dir.
         root = Path(job.result_dir) if job.result_dir else (self._job_root / job.job_id)
-        return root / "input" / job.filename
+        return root / "input" / Path(job.filename).name
+
+    def _expiry(self, finished_at: float) -> float | None:
+        return finished_at + self._retention_s if self._retention_s > 0 else None
+
+    def _claim_is_ours(self, job: Job) -> bool:
+        """True if we should run this claimed job. In a shared multi-engine store ``claim_next`` can't
+        filter by engine, so a job for another engine is requeued here (CAS back to QUEUED, claim
+        cleared) and ``False`` returned — the right dispatcher picks it up. ``engine=None`` = any."""
+        if self._engine is None or job.engine == self._engine:
+            return True
+        self._store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
+                                     status=JobStatus.QUEUED, claim_id=None, started_at=None)
+        return False
 
     def _process(self, job: Job) -> None:
+        # Mark the in-flight job as a warm worker BEFORE the (possibly long) validate, so a peer's
+        # requeue_orphaned_jobs sweep — which treats a RUNNING job with worker_runtime != "warm" as a
+        # dead COLD Docker job and requeues it — doesn't re-detonate it under us. CAS-fenced; best-effort.
+        self._store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
+                                     worker_runtime="warm", worker_tier=self._worker_tier)
         in_path = self._input_path(job)
+        owned = False
         try:
             if not in_path.exists():
                 raise FileNotFoundError(f"spooled input missing: {in_path}")
             summary, ok = self._validate(in_path)
+            finished = time.time()
             # CAS on (status, claim_id) so a stale owner can't clobber a job that was reclaimed
-            # (RUNNING->QUEUED->RUNNING under another dispatcher).
-            self._store.update_if_status(
+            # (RUNNING->QUEUED->RUNNING under another dispatcher). The return value is OUR ownership.
+            owned = self._store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                 status=JobStatus.DONE if ok else JobStatus.FAILED,
-                finished_at=time.time(), result_summary=summary)
+                finished_at=finished, result_summary=summary, expires_at=self._expiry(finished))
         except Exception as exc:  # noqa: BLE001 — one bad job must not sink the dispatcher
             logger.warning("vm_dispatch: job %s failed: %s", job.job_id, exc, exc_info=True)
-            self._store.update_if_status(
+            finished = time.time()
+            owned = self._store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
-                status=JobStatus.FAILED, finished_at=time.time(), error=type(exc).__name__)
+                status=JobStatus.FAILED, finished_at=finished, error=type(exc).__name__,
+                expires_at=self._expiry(finished))
         finally:
-            try:  # the sample is consumed; drop the spooled input (keep any sealed output)
-                in_path.unlink()
-            except OSError:
-                pass
+            # Drop the spooled input ONLY if WE still own the job (terminal write applied). If it was
+            # reclaimed, the CAS returned False and the input now belongs to the new owner — leave it.
+            if owned:
+                try:  # the sample is consumed; drop the spooled input (keep any sealed output)
+                    in_path.unlink()
+                except OSError:
+                    pass
 
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
@@ -81,7 +120,14 @@ class VmJobDispatcher:
             if job is None:
                 self._stop.wait(self._poll_s)
                 continue
-            self._process(job)
+            if not self._claim_is_ours(job):
+                # Requeued for another engine's dispatcher; back off so we don't hot-loop reclaiming it.
+                self._stop.wait(self._poll_s)
+                continue
+            try:
+                self._process(job)
+            except Exception:  # noqa: BLE001 — a crash in _process must not kill the claim thread
+                logger.warning("vm_dispatch: _process crashed for %s", job.job_id, exc_info=True)
 
     def run(self) -> None:
         """Block, claiming + processing jobs on ``concurrency`` threads until :meth:`stop`."""

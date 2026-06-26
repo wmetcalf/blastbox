@@ -1,6 +1,8 @@
 """Unit tests for the libvirt pool job dispatcher (in-memory store; validate stubbed)."""
 from __future__ import annotations
 
+import pytest
+
 from blastbox.host.jobs.base import Job, JobStatus
 from blastbox.host.jobs.memory import InMemoryJobStore
 from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
@@ -25,13 +27,61 @@ def test_dispatch_marks_done_with_summary_and_unlinks_input(tmp_path):
         seen["path"] = path
         return ({"verdict": {"status": "Revoked"}}, True)
 
-    d = VmJobDispatcher(store, str(tmp_path), validate)
+    d = VmJobDispatcher(store, str(tmp_path), validate, worker_tier="libvirt-vm")
     d._process(store.claim_next())                       # claim_next -> RUNNING + claim_id
     got = store.get(job.job_id)
     assert got.status is JobStatus.DONE
     assert got.result_summary["verdict"]["status"] == "Revoked"
     assert seen["path"].name == "evil.dll"
     assert not (tmp_path / job.job_id / "input" / "evil.dll").exists()   # input consumed
+    # marked as a warm worker so a peer's crash-recovery sweep won't treat it as a dead cold job.
+    assert got.worker_runtime == "warm"
+    assert got.worker_tier == "libvirt-vm"
+
+
+def test_dispatch_sets_retention_expiry(tmp_path):
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), job_retention_s=100)
+    d._process(store.claim_next())
+    got = store.get(job.job_id)
+    assert got.finished_at is not None and got.expires_at is not None
+    assert got.expires_at == pytest.approx(got.finished_at + 100)   # retention sweeper can reclaim it
+
+
+def test_dispatch_keeps_input_when_job_was_reclaimed(tmp_path):
+    # if validation outran a recovery requeue and another dispatcher reclaimed the job, our terminal
+    # CAS fails (stale claim_id) and we must NOT unlink the shared input out from under the new owner.
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    stale = store.claim_next()                                       # claim A
+    store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=stale.claim_id,
+                           status=JobStatus.QUEUED, claim_id=None, started_at=None)  # requeue
+    store.claim_next()                                              # reclaim B (now RUNNING under B)
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"v": 1}, True))
+    d._process(stale)                                              # process with the STALE claim A
+    assert (tmp_path / job.job_id / "input" / "evil.dll").exists()  # preserved for the new owner
+    assert store.get(job.job_id).status is JobStatus.RUNNING        # stale owner couldn't terminate it
+
+
+def test_claim_is_ours_requeues_foreign_engine(tmp_path):
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)                  # engine="authenticode"
+    ran = []
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: (ran.append(p), ({}, True))[1], engine="other")
+    assert d._claim_is_ours(store.claim_next()) is False
+    got = store.get(job.job_id)
+    assert got.status is JobStatus.QUEUED and got.claim_id is None  # requeued for the right dispatcher
+    assert ran == []                                               # foreign job never validated
+
+
+def test_claim_is_ours_accepts_matching_and_unscoped(tmp_path):
+    store = InMemoryJobStore()
+    _queue_job(store, tmp_path)
+    claimed = store.claim_next()
+    assert VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True))._claim_is_ours(claimed) is True
+    assert VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
+                           engine="authenticode")._claim_is_ours(claimed) is True
 
 
 def test_dispatch_marks_failed_when_engine_reports_not_ok(tmp_path):

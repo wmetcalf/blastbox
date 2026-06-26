@@ -220,6 +220,35 @@ def test_vpn_killswitch_scopes_egress_to_tunnel():
     assert any("multiport --dports 80,443 -o tun0 -j ACCEPT" in r for r in fwd2)
 
 
+def test_forward_inetsim_block_internal_exempts_sink():
+    # inetsim DNATs everything to the RFC1918 FakeNet sink; without the exemption block_internal would
+    # DROP the very traffic it's meant to sink. The sink ACCEPT must precede the internal DROPs.
+    pol = VmEgressPolicy(exit_driver="inetsim", block_internal=True)
+    flat = _flat(forward_chain_rules("192.168.122.9", pol, gateway="192.168.122.1",
+                                     sink_addr="172.28.100.1"))
+    assert any("-d 172.28.100.1 -j ACCEPT" in f for f in flat)
+    sink_i = next(i for i, f in enumerate(flat) if "-d 172.28.100.1 -j ACCEPT" in f)
+    drops = [i for i, f in enumerate(flat) if f.endswith("-j DROP") and " -d " in f]
+    assert drops and sink_i < min(drops)
+
+
+def test_routing_tor_block_internal_returns_internal_before_redirect():
+    rt = ExitRouting()
+    flat = [" ".join(c) for c in routing_commands("192.168.122.5", "tor", rt, None, block_internal=True)]
+    ret = [i for i, f in enumerate(flat) if "-p tcp -j RETURN" in f]                       # internal RETURNs
+    red = [i for i, f in enumerate(flat) if "REDIRECT --to-ports" in f and "--dport 53" not in f]
+    assert ret and red and max(ret) < min(red)        # internal RETURNs precede the TransPort REDIRECT
+    # default (block_internal off) installs no internal RETURNs
+    flat2 = [" ".join(c) for c in routing_commands("192.168.122.5", "tor", rt)]
+    assert not any("-p tcp -j RETURN" in f for f in flat2)
+
+
+def test_tor_teardown_inverts_block_internal_returns():
+    td = [" ".join(c) for c in routing_teardown_commands("192.168.122.5", "tor", ExitRouting(),
+                                                         None, block_internal=True)]
+    assert any("-D PREROUTING" in f and "-p tcp -j RETURN" in f for f in td)
+
+
 def test_input_chain_direct_allows_host_resolver_dns_only():
     pol = VmEgressPolicy(exit_driver="direct")
     flat = _flat(input_chain_rules("192.168.122.9", pol, gateway="192.168.122.1", routing=None))
