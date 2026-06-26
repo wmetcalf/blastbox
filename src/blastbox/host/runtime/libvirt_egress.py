@@ -93,28 +93,11 @@ def _rule_priority(worker_ip: str, routing: ExitRouting) -> int:
     return routing.rule_priority_base + (int(o[2]) << 8) + int(o[3])
 
 
-def _tor_tcp_redirects(worker_ip: str, routing: ExitRouting,
-                       egress_ports: tuple[int, ...] | None) -> list[list[str]]:
-    """TCP REDIRECT(s) into tor's TransPort: one per allowlisted port (excluding 53, which the DNS
-    redirect already handles) when egress_ports is set, else a single catch-all (all TCP)."""
-    tcp_ports = [p for p in (egress_ports or ()) if p != 53]
-    base = ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip, "-p", "tcp"]
-    tail = ["-j", "REDIRECT", "--to-ports", str(routing.tor_trans_port)]
-    if tcp_ports:
-        return [base + ["--dport", str(p)] + tail for p in tcp_ports]
-    return [base + tail]
-
-
-def routing_commands(worker_ip: str, exit_driver: str, routing: ExitRouting,
-                     egress_ports: tuple[int, ...] | None = None) -> list[list[str]]:
+def routing_commands(worker_ip: str, exit_driver: str, routing: ExitRouting) -> list[list[str]]:
     """The privileged argv (``ip``/``iptables`` nat) that *steer* the worker's external egress for
     its exit driver — the rooter half, separate from the FORWARD *filter*. ``direct``/``none``/
     ``drop`` need none (direct = main-table default; none/drop are filter-dropped). Each command is
-    idempotently torn down by :meth:`LibvirtEgress.remove` (delete-by-match, no priority guessing).
-
-    ``egress_ports`` PORT-SCOPES a tor exit: when set, only those TCP ports are REDIRECTed into tor
-    (the rest fall through to the FORWARD allowlist DROP), so a ``tor`` + ``egress_ports=80,443``
-    worker can't tunnel 22/25 through tor. Unset = the catch-all "all TCP via tor" transparent proxy."""
+    idempotently torn down by :meth:`LibvirtEgress.remove` (delete-by-match, no priority guessing)."""
     if exit_driver in ("direct", "none", "drop"):
         return []
     local = ".".join(worker_ip.split(".")[:3]) + ".0/24"  # keep host/agent traffic on the local subnet
@@ -152,7 +135,12 @@ def routing_commands(worker_ip: str, exit_driver: str, routing: ExitRouting,
             ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip,
              "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-ports", str(routing.tor_dns_port)],
             ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip, "-d", local, "-j", "RETURN"],
-        ] + _tor_tcp_redirects(worker_ip, routing, egress_ports)
+            # ALL TCP → tor's TransPort. Tor is a SOCKS/transparent proxy: it carries every TCP
+            # stream and applies its OWN per-port exit policy, so the host does not port-restrict TCP
+            # here (that's not the rooter's layer). The non-TCP leak vectors are blocked in FORWARD.
+            ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip,
+             "-p", "tcp", "-j", "REDIRECT", "--to-ports", str(routing.tor_trans_port)],
+        ]
     if exit_driver == "inetsim":
         if not routing.fakenet_addr:
             return []
@@ -172,13 +160,10 @@ def routing_commands(worker_ip: str, exit_driver: str, routing: ExitRouting,
     return []
 
 
-def routing_teardown_commands(worker_ip: str, exit_driver: str, routing: ExitRouting,
-                              egress_ports: tuple[int, ...] | None = None) -> list[list[str]]:
-    """Inverse of :func:`routing_commands` — ``ip rule del`` + ``iptables -t nat -D`` by exact match.
-    ``egress_ports`` must match what was applied so a port-scoped tor's per-port REDIRECTs are torn
-    down (deployments are homogeneous, so the worker's own policy ports are the right set)."""
+def routing_teardown_commands(worker_ip: str, exit_driver: str, routing: ExitRouting) -> list[list[str]]:
+    """Inverse of :func:`routing_commands` — ``ip rule del`` + ``iptables -t nat -D`` by exact match."""
     cmds: list[list[str]] = []
-    for c in routing_commands(worker_ip, exit_driver, routing, egress_ports):
+    for c in routing_commands(worker_ip, exit_driver, routing):
         if c[:2] == ["ip", "route"]:
             continue  # the shared per-gateway default route is reusable infra — leave it in place
         if c[:2] == ["ip", "rule"]:
@@ -198,9 +183,10 @@ def forward_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | N
     r: list[list[str]] = [
         ["-A", c, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
     ]
-    if gateway and policy.exit_driver not in ("none", "drop"):
+    if gateway and policy.exit_driver not in ("none", "drop", "tor"):
         # DNS to the bridge resolver only (not arbitrary internal hosts). Skipped for none/drop —
-        # a no-egress policy must not leak even DNS.
+        # a no-egress policy must not leak even DNS — and for tor, whose DNS is fully REDIRECTed to
+        # the DNSPort in PREROUTING (so no FORWARD exemption is needed or wanted).
         r.append(["-A", c, "-d", gateway, "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
         r.append(["-A", c, "-d", gateway, "-p", "tcp", "--dport", "53", "-j", "ACCEPT"])
     if policy.block_internal:
@@ -210,22 +196,24 @@ def forward_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | N
         r.append(["-A", c, "-j", "DROP"])
         return r
 
-    # direct / openvpn / wireguard / tor: the routing is layered separately; here we filter.
+    if policy.exit_driver == "tor":
+        # tor is a SOCKS/transparent TCP proxy. ALL TCP and DNS(53) were REDIRECTed into tor in
+        # PREROUTING, so they never traverse FORWARD; anything reaching here is a NON-TCP protocol
+        # (UDP≠53, ICMP, QUIC over UDP, …) that tor's TCP-only transport can't carry. DROP it so it
+        # can't leak straight to clearnet around tor. egress_ports does NOT port-restrict tor —
+        # tor applies its own exit policy. (ESTABLISHED return traffic was ACCEPTed above.)
+        r.append(["-A", c, "-m", "limit", "--limit", "10/min", "-j", "LOG",
+                  "--log-prefix", "bbvm-tor-nontcp-drop ", "--log-level", "4"])
+        r.append(["-A", c, "-j", "DROP"])
+        return r
+
+    # direct / openvpn / wireguard: the routing is layered separately; here we filter.
     if policy.egress_ports is not None:
         if 53 in policy.egress_ports:
             r.append(["-A", c, "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
         for i in range(0, len(policy.egress_ports), 15):  # multiport caps at 15 dports/rule
             chunk = ",".join(str(p) for p in policy.egress_ports[i:i + 15])
             r.append(["-A", c, "-p", "tcp", "-m", "multiport", "--dports", chunk, "-j", "ACCEPT"])
-        r.append(["-A", c, "-m", "limit", "--limit", "10/min", "-j", "LOG",
-                  "--log-prefix", "bbvm-egress-drop ", "--log-level", "4"])
-        r.append(["-A", c, "-j", "DROP"])
-    elif policy.exit_driver == "tor":
-        # tor transports TCP (transparent) + DNS only. Without an egress_ports allowlist the worker
-        # would otherwise ACCEPT-all here, and non-redirected protocols (QUIC/UDP, raw) would forward
-        # straight to clearnet around the REDIRECT. Permit only TCP + DNS; LOG+DROP the rest.
-        r.append(["-A", c, "-p", "tcp", "-j", "ACCEPT"])
-        r.append(["-A", c, "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
         r.append(["-A", c, "-m", "limit", "--limit", "10/min", "-j", "LOG",
                   "--log-prefix", "bbvm-egress-drop ", "--log-level", "4"])
         r.append(["-A", c, "-j", "DROP"])
@@ -282,9 +270,7 @@ class LibvirtEgress:
                 f"exit_driver {policy.exit_driver!r} is not supported by the VM rooter "
                 "(no routing path) — refusing to apply a permissive filter")
         chain = _chain_name(worker_ip)
-        # clear any prior incarnation (any exit driver); pass this policy's ports so a prior
-        # port-scoped tor's per-port REDIRECTs are swept (homogeneous deployment).
-        self.remove(worker_ip, mac=mac, egress_ports=policy.egress_ports)
+        self.remove(worker_ip, mac=mac)  # idempotent: clear any prior incarnation (any exit driver)
         try:
             self._ipt_run("-N", chain, check=True)
             for body in forward_chain_rules(worker_ip, policy, gateway):
@@ -299,8 +285,7 @@ class LibvirtEgress:
                               "!", "-s", worker_ip, "-j", "DROP", check=True)
             # rooter-style exit routing (policy-route / REDIRECT / DNAT), single-NIC
             if self._routing is not None:
-                for cmd in routing_commands(worker_ip, policy.exit_driver, self._routing,
-                                            policy.egress_ports):
+                for cmd in routing_commands(worker_ip, policy.exit_driver, self._routing):
                     self._priv(cmd, check=True)
             # IPv6 fail-closed: the filter/routing above is IPv4-only, so drop ALL forwarded v6 from
             # the worker (matched on its MAC) — a v6-capable guest must not egress around the policy.
@@ -310,17 +295,15 @@ class LibvirtEgress:
                 # IPv6 ACCEPT already in the chain — appending could let v6 slip past a prior accept.
                 self._priv(["ip6tables", "-I", "FORWARD", "1", "-m", "mac", "--mac-source", mac, "-j", "DROP"])
         except Exception:
-            self.remove(worker_ip, mac=mac, egress_ports=policy.egress_ports)  # roll back fail-closed
+            self.remove(worker_ip, mac=mac)  # roll back to fail-closed (no partial chain)
             raise
 
-    def remove(self, worker_ip: str, exit_driver: str | None = None, mac: str | None = None,
-               egress_ports: tuple[int, ...] | None = None) -> None:
+    def remove(self, worker_ip: str, exit_driver: str | None = None, mac: str | None = None) -> None:
         # Tear down routing for EVERY driver (a prior incarnation on this IP may have used a different
         # exit), so no orphan nat/policy-route rule survives an exit-driver switch on a reused IP.
-        # egress_ports lets a port-scoped tor's per-port REDIRECTs be swept by del-by-match.
         if self._routing is not None:
             for drv in _ROUTING_DRIVERS:
-                for cmd in routing_teardown_commands(worker_ip, drv, self._routing, egress_ports):
+                for cmd in routing_teardown_commands(worker_ip, drv, self._routing):
                     self._priv(cmd)  # best-effort: del-by-match, ignore "not found"
         if mac:
             self._priv(["ip6tables", "-D", "FORWARD", "-m", "mac", "--mac-source", mac, "-j", "DROP"])

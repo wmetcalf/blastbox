@@ -323,8 +323,7 @@ class LibvirtVmRuntime:
         slot.state = SlotState.DRAINING
         if self.cfg.egress_policy is not None and slot.ip is not None:
             LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing).remove(
-                slot.ip, self.cfg.egress_policy.exit_driver, mac=slot.mac,
-                egress_ports=self.cfg.egress_policy.egress_ports)  # unhook before the IP is freed
+                slot.ip, self.cfg.egress_policy.exit_driver, mac=slot.mac)  # unhook before IP freed
         self._destroy_domain(slot.domain)
         self._sh(["rm", "-f", slot.overlay])
 

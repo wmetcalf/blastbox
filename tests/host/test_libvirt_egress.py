@@ -163,30 +163,19 @@ def test_routing_fakenet_dnats_when_addr_set():
         flat.index(next(c for c in flat if "RETURN" in c))
 
 
-def test_routing_tor_port_scoped_to_egress_ports():
-    # With egress_ports set, only those TCP ports REDIRECT into tor — NO catch-all (so 22/25 fall
-    # through to the FORWARD allowlist DROP instead of tunneling through tor).
-    cmds = _flat(routing_commands("192.168.122.7", "tor",
-                                  ExitRouting(tor_trans_port=9040, tor_dns_port=9053),
-                                  egress_ports=(53, 80, 443)))
-    assert any("--dport 80 -j REDIRECT --to-ports 9040" in c for c in cmds)
-    assert any("--dport 443 -j REDIRECT --to-ports 9040" in c for c in cmds)
-    assert not any(c.endswith("-p tcp -j REDIRECT --to-ports 9040") for c in cmds)  # no catch-all
-    assert not any("--dport 53 -j REDIRECT --to-ports 9040" in c for c in cmds)     # 53 -> DNSPort, not TransPort
-
-
-def test_routing_tor_catchall_without_egress_ports():
+def test_tor_carries_all_tcp_and_forward_blocks_non_tcp():
+    # tor is a SOCKS proxy: ALL TCP is redirected to its TransPort (no per-port restriction — tor
+    # owns the exit policy), and the FORWARD chain only blocks the NON-TCP leak vectors.
     cmds = _flat(routing_commands("192.168.122.7", "tor", ExitRouting(tor_trans_port=9040)))
-    assert any(c.endswith("-p tcp -j REDIRECT --to-ports 9040") for c in cmds)  # catch-all
-
-
-def test_routing_teardown_inverts_port_scoped_tor():
-    R = ExitRouting(tor_trans_port=9040, tor_dns_port=9053)
-    add = routing_commands("192.168.122.7", "tor", R, egress_ports=(80, 443))
-    rm = routing_teardown_commands("192.168.122.7", "tor", R, egress_ports=(80, 443))
-    assert len(rm) == len(add)
-    for a, d in zip(add, rm):
-        assert d == [("-D" if t == "-A" else t) for t in a]  # each -A inverted to -D
+    assert any(c.endswith("-p tcp -j REDIRECT --to-ports 9040") for c in cmds)  # all-TCP catch-all
+    fwd = _flat(forward_chain_rules("192.168.122.5",
+                VmEgressPolicy(exit_driver="tor", egress_ports=(80, 443)), "192.168.122.1"))
+    assert fwd[-1].endswith("-j DROP")                       # everything non-redirected (non-TCP) dropped
+    assert not any("multiport" in r for r in fwd)            # egress_ports does NOT port-restrict tor
+    assert not any("--dport 80" in r for r in fwd)
+    assert not any(r.endswith("-p tcp -j ACCEPT") for r in fwd)  # no blanket TCP accept in FORWARD
+    # no gateway DNS exemption for tor (DNS is redirected to the DNSPort, not accepted in FORWARD)
+    assert not any("-d 192.168.122.1 -p udp --dport 53 -j ACCEPT" in r for r in fwd)
 
 
 def test_routing_teardown_inverts():
