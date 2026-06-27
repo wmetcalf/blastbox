@@ -475,8 +475,11 @@ class LibvirtVmRuntime:
         the caller keeps it contained."""
         r = self._virsh("destroy", name)
         err = (r.stderr or "").lower()
-        # benign: the domain was already off / already gone (we still undefine to clean metadata).
-        benign = ("not running", "not found", "failed to get domain", "does not exist")
+        # benign: the DOMAIN was already off / already gone (we still undefine to clean metadata).
+        # NB "domain not found"/"failed to get domain", NOT a bare "not found" — `sudo virsh` with
+        # virsh missing from root's PATH says "virsh: command not found", which is NOT a benign absent
+        # domain: treating it benign would let reap() unconfine + orphan a still-running VM.
+        benign = ("not running", "domain not found", "failed to get domain", "does not exist")
         if r.returncode != 0 and not any(b in err for b in benign):
             logger.warning("%s: virsh destroy failed (rc=%s): %s — guest may still be running",
                            name, r.returncode, (r.stderr or "").strip()[:160])

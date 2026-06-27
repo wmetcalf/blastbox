@@ -465,6 +465,20 @@ def test_unknown_engine_fails_job_no_subprocess_input_gone(tmp_path):
     assert not input_path.parent.exists()
 
 
+def test_default_claim_keeps_legacy_store_signature(tmp_path):
+    # default (scoping OFF): claim_next must be called WITHOUT engine= so a store implementing only
+    # the original claim_next(*, claimant_tier=) shape doesn't raise TypeError.
+    store = InMemoryJobStore()
+    orig = store.claim_next
+
+    def legacy(*, claimant_tier=None):    # NO engine kwarg (pre-engine-scoping protocol)
+        return orig(claimant_tier=claimant_tier)
+
+    store.claim_next = legacy  # type: ignore[method-assign]
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    assert dispatcher.dispatch_once() is False    # no TypeError; just an empty queue
+
+
 def test_engine_scoped_dispatcher_leaves_foreign_engine_jobs(tmp_path, monkeypatch):
     """OPT-IN (BLASTBOX_DISPATCHER_ENGINE_SCOPED=1): a job for an engine this dispatcher doesn't
     handle is LEFT UNCLAIMED for its real (e.g. VM) dispatcher — not stolen + failed."""

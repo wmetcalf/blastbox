@@ -84,6 +84,22 @@ def test_available_fail_closed_without_golden():
         LibvirtVmConfig(golden_base="/no/such/golden.qcow2", sudo=False)).available() is False
 
 
+def test_destroy_domain_command_not_found_is_a_failed_destroy(monkeypatch):
+    # `sudo virsh` with virsh missing from root's PATH → "virsh: command not found": NOT a benign
+    # absent-domain case (no destroy happened), so reap() must treat it as failed (→ quarantine).
+    rt = _rt()
+    monkeypatch.setattr(rt, "_virsh", lambda *a, **k: type(
+        "C", (), {"returncode": 127, "stdout": "", "stderr": "sudo: virsh: command not found"})())
+    assert rt._destroy_domain("bbvm-x") is False
+
+
+def test_destroy_domain_absent_domain_is_benign(monkeypatch):
+    rt = _rt()
+    monkeypatch.setattr(rt, "_virsh", lambda *a, **k: type(
+        "C", (), {"returncode": 1, "stdout": "", "stderr": "error: failed to get domain 'bbvm-x'"})())
+    assert rt._destroy_domain("bbvm-x") is True       # domain already gone → benign
+
+
 def test_available_uses_privileged_existence_probe(monkeypatch):
     # a root-only golden dir: an unprivileged Path.exists() would falsely report unavailable. available()
     # must probe with the configured privilege model (sudo test -e), matching spawn's qemu-img/virsh.

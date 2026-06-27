@@ -108,6 +108,12 @@ class VmWorkerSpec:
         eg = d.get("egress")
         egress = None
         routing = None
+        if eg is not None and not isinstance(eg, dict):
+            # A PROVIDED but malformed egress block (e.g. `egress: drop` or a list) must NOT silently
+            # leave egress=None — that starts the VM with NO per-worker firewall (whatever the libvirt
+            # network permits). Reject so the operator fixes the typo (they meant `egress: {exit: ..}`).
+            raise ValueError(f"{name}: 'egress' must be a mapping (e.g. {{exit: drop}}), got "
+                             f"{type(eg).__name__}")
         if isinstance(eg, dict):
             egress = VmEgressPolicy(
                 exit_driver=eg.get("exit", "direct"),

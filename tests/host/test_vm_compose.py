@@ -94,6 +94,13 @@ def test_build_image_packer_requires_golden(monkeypatch, tmp_path):
         spec.build_image()
 
 
+def test_from_dict_rejects_non_mapping_egress():
+    # a malformed egress block must NOT silently disable the per-worker firewall (egress=None).
+    for bad in ("drop", ["drop"], 5):
+        with pytest.raises(ValueError, match="egress"):
+            VmWorkerSpec.from_dict("w", {"image": "/g.qcow2", "egress": bad})
+
+
 def test_from_dict_coerces_quoted_gateway_masquerade():
     # a quoted YAML scalar "false" must disable SNAT, not stay a truthy string that installs MASQUERADE.
     spec = VmWorkerSpec.from_dict("auth", {

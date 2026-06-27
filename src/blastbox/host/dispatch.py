@@ -322,9 +322,13 @@ class Dispatcher:
             return False
         # Engine scoping is OPT-IN (shared multi-dispatcher stores): scoped → leave another
         # dispatcher's engine's jobs for it; unscoped (default) → claim anything, and the
-        # _dispatch_claimed_job path FAILs a genuinely-unknown engine fast.
-        engine = frozenset(self._engines) if self._engine_scoped else None
-        job = self._job_store.claim_next(claimant_tier=self._tier, engine=engine)
+        # _dispatch_claimed_job path FAILs a genuinely-unknown engine fast. Only pass engine= when
+        # scoping is on, so the default path keeps the original claim_next(*, claimant_tier=) shape an
+        # injected/legacy JobStore double may implement (no new keyword forced on it).
+        if self._engine_scoped:
+            job = self._job_store.claim_next(claimant_tier=self._tier, engine=frozenset(self._engines))
+        else:
+            job = self._job_store.claim_next(claimant_tier=self._tier)
         if job is None:
             return False
         self._dispatch_claimed_job(job)
