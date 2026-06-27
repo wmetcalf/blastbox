@@ -48,6 +48,16 @@ def test_domain_xml_reflects_config(kw, needle):
     assert xml.startswith("<domain type='kvm'>") and xml.endswith("</domain>")
 
 
+def test_domain_xml_virtio_disk_omits_invalid_controller():
+    # libvirt has no `<controller type='virtio'>` — emitting one makes virsh define reject the XML.
+    xml = _rt(disk_bus="virtio")._domain_xml("bbvm-x", "/o.qcow2")
+    assert "controller type='virtio'" not in xml
+    assert "dev='vda'" in xml and "bus='virtio'" in xml          # virtio-blk targets vd*
+    # a bus that DOES take a controller still emits one
+    xml2 = _rt(disk_bus="sata")._domain_xml("bbvm-x", "/o.qcow2")
+    assert "controller type='sata'" in xml2 and "dev='sda'" in xml2
+
+
 def test_vmslot_endpoint():
     s = VmSlot(slot_id="a", domain="bbvm-a", overlay="/o.qcow2", agent_port=8765, ip="192.168.122.5")
     assert s.endpoint == ("192.168.122.5", 8765)
@@ -142,6 +152,21 @@ def test_recycle_does_not_reset_cumulative_jobs(monkeypatch):
     assert slot.jobs == 7 and slot.recycles == 1
 
 
+def test_finalize_snapshot_is_atomic(monkeypatch):
+    # the clean snapshot must be created with --atomic (all-or-nothing) so a failed create can't leave
+    # partial metadata that breaks the retry on a duplicate name.
+    rt = _rt()
+    calls = []
+    monkeypatch.setattr(rt, "_virsh", lambda *a, **k: calls.append(a) or _OK())
+    monkeypatch.setattr(rt, "_port_up", lambda *a, **k: True)
+    monkeypatch.setattr(rt, "_sync_time", lambda *a, **k: True)
+    slot = VmSlot(slot_id="z", domain="bbvm-z", overlay="/o.qcow2", agent_port=8765,
+                  ip="192.168.122.9", mac="52:54:00:aa:bb:cc")
+    rt.is_ready(slot)
+    snap = [c for c in calls if c and c[0] == "snapshot-create-as"]
+    assert snap and "--atomic" in snap[0]
+
+
 def test_on_ready_skipped_when_domtime_succeeds(monkeypatch):
     # When domtime --sync succeeds (qemu-ga baked in), the on_ready fallback must NOT fire — the
     # libvirt-native UTC sync already set the clock; double-setting risks TZ corruption.
@@ -218,9 +243,6 @@ class _RecEgress:
     def remove(self, *a, **k):
         _RecEgress.events.append("egress-remove")
 
-    def preboot_unblock(self, *a, **k):
-        _RecEgress.events.append("preboot-unblock")
-
 
 def _reap_rt(monkeypatch, *, destroyed: bool):
     rt = _rt(egress_policy=VmEgressPolicy(exit_driver="direct"))
@@ -239,7 +261,7 @@ def test_reap_destroys_guest_before_removing_egress(monkeypatch):
     rt.reap(slot)
     # destroy the guest FIRST (while egress is up), THEN unhook egress, THEN free the overlay.
     assert order == ["destroy", "rm-overlay"]
-    assert _RecEgress.events == ["egress-remove", "preboot-unblock"]  # policy unhooked + boot-block lifted
+    assert _RecEgress.events == ["egress-remove"]   # policy unhooked after the guest is destroyed
     assert order.index("destroy") < order.index("rm-overlay")
 
 

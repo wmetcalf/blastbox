@@ -29,8 +29,10 @@ agent on ``agent_port`` at boot. Egress policy for the worker's tap/IP is applie
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import subprocess
+import tempfile
 import time
 import uuid
 from collections.abc import Callable
@@ -208,21 +210,29 @@ class LibvirtVmRuntime:
                          "-F", "qcow2", overlay], sudo_tool="qemu-img").returncode != 0:
                 raise RuntimeError(f"{name}: qemu-img create overlay off {self.cfg.golden_base} failed")
             self._sh(["chmod", "644", overlay])
-            xml_path = f"/tmp/{name}.xml"
-            Path(xml_path).write_text(self._domain_xml(name, overlay))
+            # Private 0600 tempfile (random name) for the domain XML, NOT a predictable /tmp/<name>.xml:
+            # on a multi-user host another local user could race a predictable path and swap in
+            # attacker-controlled XML before `sudo virsh define` reads it (defining a hostile domain
+            # with the dispatcher's libvirt privileges). mkstemp gives an unguessable name + 0600;
+            # root (virsh) can still read it.
+            fd, xml_path = tempfile.mkstemp(suffix=".xml", prefix=f"{name}-")
             try:
+                with os.fdopen(fd, "w") as fh:
+                    fh.write(self._domain_xml(name, overlay))
                 if self._virsh("define", xml_path).returncode != 0:
                     raise RuntimeError(f"{name}: virsh define failed")
             finally:
-                Path(xml_path).unlink(missing_ok=True)  # don't leave per-spawn XML in /tmp
-            # MAC is known once defined (domiflist reads the persisted config). Install a blanket
-            # by-MAC egress block BEFORE start, so the guest can't establish any flow during boot —
-            # before is_ready() installs the real IP-keyed policy. finalize/reap lift it.
-            slot.mac = self._domain_mac(name)
-            if self.cfg.egress_policy is not None and slot.mac:
-                LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing).preboot_block(slot.mac)
+                Path(xml_path).unlink(missing_ok=True)  # don't leave per-spawn XML behind
             if self._virsh("start", name).returncode != 0:
                 raise RuntimeError(f"{name}: virsh start failed")
+            slot.mac = self._domain_mac(name)
+            # NOTE (boot-window residual risk): the guest is on the libvirt network from `start` until
+            # is_ready() installs the IP-keyed egress policy (it needs the DHCP-assigned IP first). A
+            # pre-boot blanket block was tried and reverted — it had to permit DHCP (else the guest
+            # never gets an IP to become ready) and collided with the policy's own MAC rules. The
+            # exposure is low here: the golden is trusted and the untrusted sample only arrives as a
+            # job AFTER warm+snapshot, so nothing hostile runs during boot. Revisit with a DHCP-aware
+            # pre-policy drop if the threat model ever includes an untrusted golden.
             slot.state = SlotState.WARMING
             return slot
         except Exception:
@@ -252,11 +262,8 @@ class LibvirtVmRuntime:
                     raise RuntimeError(
                         f"{slot.domain}: egress requires the worker MAC for anti-spoof/v6 rules but "
                         "domiflist returned none — refusing to finalize an under-firewalled guest")
-                eg = LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing)
-                eg.apply(ip, self.cfg.egress_policy, self.cfg.resolved_gateway, mac=slot.mac)
-                # real IP-keyed policy is now in place — lift the pre-boot blanket MAC block so it
-                # doesn't shadow the policy (the policy keeps its own anti-spoof + v6 MAC drops).
-                eg.preboot_unblock(slot.mac)
+                LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing).apply(
+                    ip, self.cfg.egress_policy, self.cfg.resolved_gateway, mac=slot.mac)
             # Correct the clock before the worker is smoked + snapshotted — a fresh golden boot can
             # carry a stale/wrong clock (observed ~7h off), and for a cert validator the clock IS the
             # trust decision, so the baseline must be time-correct. PRIMARY = the libvirt-native
@@ -277,8 +284,11 @@ class LibvirtVmRuntime:
                     self.cfg.pre_snapshot(slot)
                 except Exception:
                     logger.warning("%s: pre_snapshot hook failed (non-fatal)", slot.domain, exc_info=True)
+            # --atomic: all-or-nothing snapshot creation. Without it a failed create can leave partial
+            # snapshot metadata/disk state that makes the retry fail on a duplicate name or revert to
+            # an incomplete baseline; --atomic guarantees no half-created `clean` snapshot is left.
             if self._virsh("snapshot-create-as", slot.domain, self.cfg.snapshot_name,
-                           "warm clean checkpoint").returncode != 0:
+                           "warm clean checkpoint", "--atomic").returncode != 0:
                 logger.warning("%s: snapshot-create-as failed; retry next tick", slot.domain)
                 return False
             slot.finalized = True
@@ -349,14 +359,10 @@ class LibvirtVmRuntime:
             logger.error("%s: destroy failed — leaving egress rules + overlay in place so the "
                          "possibly-live guest stays contained (manual cleanup needed)", slot.domain)
             return
-        if self.cfg.egress_policy is not None and slot.mac:
-            eg = LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing)
-            if slot.ip is not None:
-                eg.remove(slot.ip, self.cfg.egress_policy.exit_driver, mac=slot.mac,
-                          egress_ports=self.cfg.egress_policy.egress_ports)  # unhook AFTER guest gone
-            # lift the pre-boot blanket block too, in case finalize never ran (reaped mid-boot) so it
-            # doesn't outlive the worker and block a future MAC reuse.
-            eg.preboot_unblock(slot.mac)
+        if self.cfg.egress_policy is not None and slot.ip is not None:
+            LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing).remove(
+                slot.ip, self.cfg.egress_policy.exit_driver, mac=slot.mac,
+                egress_ports=self.cfg.egress_policy.egress_ports)  # unhook AFTER the guest is gone
         self._sh(["rm", "-f", slot.overlay])
 
     # ---- snapshot-recycle extension -----------------------------------------
@@ -490,6 +496,12 @@ class LibvirtVmRuntime:
 
     def _domain_xml(self, name: str, overlay: str) -> str:
         c = self.cfg
+        # virtio-blk attaches directly to the PCI root and has NO controller element — libvirt has no
+        # `<controller type='virtio'>` type, so emitting one makes `virsh define` reject the XML and
+        # the tier can't spawn. sata/scsi/usb DO take a matching controller; ide is implicit. Only
+        # emit a controller for the bus types that have one. virtio disks target vd*, the rest sd*.
+        _ctrl = "" if c.disk_bus in ("virtio", "ide") else f"<controller type='{c.disk_bus}' index='0'/>"
+        _dev = "vda" if c.disk_bus == "virtio" else "sda"
         return (
             "<domain type='kvm'>"
             f"<name>{name}</name>"
@@ -503,8 +515,8 @@ class LibvirtVmRuntime:
             "<on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash>"
             "<devices><emulator>/usr/bin/qemu-system-x86_64</emulator>"
             "<disk type='file' device='disk'><driver name='qemu' type='qcow2' cache='none' io='native' discard='unmap'/>"
-            f"<source file='{overlay}'/><target dev='sda' bus='{c.disk_bus}'/></disk>"
-            f"<controller type='{c.disk_bus}' index='0'/>"
+            f"<source file='{overlay}'/><target dev='{_dev}' bus='{c.disk_bus}'/></disk>"
+            f"{_ctrl}"
             f"<interface type='network'><source network='{c.network}'/><model type='{c.nic_model}'/></interface>"
             "<serial type='pty'><target type='isa-serial' port='0'/></serial><console type='pty'/>"
             # QEMU guest-agent channel — enables `virsh domtime --sync` (post-revert clock sync) +

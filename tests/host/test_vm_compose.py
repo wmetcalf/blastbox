@@ -26,6 +26,15 @@ def test_build_image_packer_requires_golden(monkeypatch, tmp_path):
         spec.build_image()
 
 
+def test_from_dict_threads_worker_cidr_into_routing():
+    # non-/24 nets need ExitRouting.worker_cidr; the compose egress allowlist must not drop it.
+    spec = VmWorkerSpec.from_dict("auth", {
+        "image": "/g.qcow2",
+        "egress": {"exit": "openvpn", "worker_cidr": "192.168.0.0/16", "vpn_tun": "tun0"},
+    })
+    assert spec.routing is not None and spec.routing.worker_cidr == "192.168.0.0/16"
+
+
 def test_run_provisioner_string_runs_through_shell(tmp_path):
     # the spec documents provisioners as SHELL commands — && / redirection must work (argv-splitting
     # would silently drop everything after the && and leave an incomplete golden looking successful).

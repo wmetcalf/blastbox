@@ -268,18 +268,24 @@ def test_v6_drop_raises_on_missing_mac_match_extension(monkeypatch):
         eg._v6_drop("FORWARD", "52:54:00:aa:bb:cc")
 
 
-def test_preboot_block_installs_v4_required_and_v6_besteffort(monkeypatch):
-    eg = LibvirtEgress(sudo=False)
-    calls = []
-    monkeypatch.setattr(eg, "_ipt_run",
-                        lambda *a, **k: calls.append(("ipt", " ".join(a))) or subprocess.CompletedProcess(list(a), 0, "", ""))
+def test_apply_installs_routing_before_forward_jump(monkeypatch):
+    # L460: the sink/tunnel routing (nat DNAT/REDIRECT) must be wired BEFORE the FORWARD jump goes
+    # live, else an inetsim worker's traffic is ACCEPTed out the host route before the DNAT exists.
+    eg = LibvirtEgress(sudo=False, routing=ExitRouting(fakenet_addr="172.28.100.1"))
+    issued = []
+
+    def fake_ipt(*a, **k):
+        issued.append(" ".join(a))
+        return subprocess.CompletedProcess(list(a), 1 if "-D" in a else 0, "", "")
+
+    monkeypatch.setattr(eg, "_ipt_run", fake_ipt)
     monkeypatch.setattr(eg, "_priv",
-                        lambda argv, **k: calls.append(("priv", " ".join(argv))) or subprocess.CompletedProcess(argv, 0, "", ""))
-    eg.preboot_block("52:54:00:aa:bb:cc")
-    ipt = [c[1] for c in calls if c[0] == "ipt"]   # v4 FORWARD+INPUT, checked
-    priv = [c[1] for c in calls if c[0] == "priv"]  # v6 FORWARD+INPUT, best-effort
-    assert len(ipt) == 2 and all("-m mac --mac-source 52:54:00:aa:bb:cc -j DROP" in s for s in ipt)
-    assert len(priv) == 2 and all(s.startswith("ip6tables") for s in priv)
+                        lambda argv, **k: issued.append(" ".join(argv)) or subprocess.CompletedProcess(argv, 0, "", ""))
+    eg.apply("192.168.122.5", VmEgressPolicy(exit_driver="inetsim"), gateway="192.168.122.1",
+             mac="52:54:00:aa:bb:cc")
+    dnat = next(i for i, s in enumerate(issued) if "DNAT --to-destination 172.28.100.1" in s)
+    jump = next(i for i, s in enumerate(issued) if "FORWARD 1 -s 192.168.122.5 -j BBVM_192_168_122_5" in s)
+    assert dnat < jump   # sink DNAT installed before the FORWARD jump → no clearnet window
 
 
 def test_apply_installs_sibling_spoof_complement(monkeypatch):

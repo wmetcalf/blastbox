@@ -444,6 +444,16 @@ class LibvirtEgress:
         # REDIRECTs are swept (deployments are homogeneous).
         self.remove(worker_ip, mac=mac, egress_ports=policy.egress_ports)
         try:
+            # Install the rooter-style exit ROUTING (nat DNAT/REDIRECT + policy routes) FIRST — before
+            # the FORWARD jump goes live — so an inetsim/tor/vpn worker's traffic is already steered to
+            # the sink/tor/tunnel the instant the filter jump is hooked. Otherwise the per-worker
+            # FORWARD chain (which ACCEPTs for inetsim) would briefly let traffic out the host route
+            # before the DNAT exists (L460). Routing decides WHERE traffic goes; the filter chain below
+            # decides WHAT's allowed — wiring the destination first leaves no clearnet window.
+            if self._routing is not None:
+                for cmd in routing_commands(worker_ip, policy.exit_driver, self._routing,
+                                            policy.egress_ports, policy.block_internal):
+                    self._priv(cmd, check=True)
             self._ipt_run("-N", chain, check=True)
             # Kill-switch interface for a tunneled exit: the local tun for an on-host VPN, or the leg
             # for next-hop/shared-router mode (the worker's traffic must leave via the router's leg).
@@ -483,11 +493,7 @@ class LibvirtEgress:
                               "!", "-s", worker_ip, "-j", "DROP", check=True)
                 self._ipt_run("-I", "INPUT", "1", "-s", worker_ip, "-m", "mac",
                               "!", "--mac-source", mac, "-j", "DROP", check=True)  # sibling-spoof drop
-            # rooter-style exit routing (policy-route / REDIRECT / DNAT), single-NIC
-            if self._routing is not None:
-                for cmd in routing_commands(worker_ip, policy.exit_driver, self._routing,
-                                            policy.egress_ports, policy.block_internal):
-                    self._priv(cmd, check=True)
+            # (exit routing was installed at the TOP of this try, before the FORWARD jump — see L460.)
             # IPv6 fail-closed: the filter/routing above is IPv4-only, so drop ALL forwarded v6 from
             # the worker (matched on its MAC) — a v6-capable guest must not egress around the policy.
             if mac:
@@ -534,24 +540,6 @@ class LibvirtEgress:
             pass
         self._ipt_run("-F", in_chain)
         self._ipt_run("-X", in_chain)
-
-    def preboot_block(self, mac: str) -> None:
-        """Blanket-DROP all of a worker's forwarded + host-bound traffic by MAC, installed BEFORE the
-        domain is started — so a boot-time updater/telemetry or a compromised golden can't establish
-        egress flows in the window before the real (IP-keyed) policy goes on in finalize (and the
-        later ESTABLISHED accept can't then preserve such a flow). The IPv4 FORWARD+INPUT drops are
-        required (fail closed — the egress model already needs the `mac` match); the IPv6 ones are
-        best-effort (worker nets are v4-only by design). finalize/reap call :meth:`preboot_unblock`."""
-        for chain in ("FORWARD", "INPUT"):
-            self._ipt_run("-I", chain, "1", "-m", "mac", "--mac-source", mac, "-j", "DROP", check=True)
-            self._priv(["ip6tables", "-I", chain, "1", "-m", "mac", "--mac-source", mac, "-j", "DROP"])
-
-    def preboot_unblock(self, mac: str) -> None:
-        """Remove the :meth:`preboot_block` blanket drops once the real policy is installed (finalize)
-        or the worker is reaped. Best-effort del-by-match — a no-op if they were never installed."""
-        for chain in ("FORWARD", "INPUT"):
-            self._priv(["iptables", "-D", chain, "-m", "mac", "--mac-source", mac, "-j", "DROP"])
-            self._priv(["ip6tables", "-D", chain, "-m", "mac", "--mac-source", mac, "-j", "DROP"])
 
     def _v6_drop(self, chain: str, mac: str) -> None:
         """Install the IPv6 fail-closed DROP for this worker's MAC at the head of ``chain``.

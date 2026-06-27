@@ -116,7 +116,8 @@ class VmWorkerSpec:
             )
             routing = ExitRouting(**{k: eg[k] for k in (
                 "vpn_table", "vpn_tun", "tor_trans_port", "tor_dns_port", "fakenet_addr",
-                "gateway", "leg", "gateway_table_base", "gateway_masquerade") if k in eg})
+                "gateway", "leg", "gateway_table_base", "gateway_masquerade",
+                "worker_cidr") if k in eg})  # worker_cidr: non-/24 nets need it for the local exemption
         known = {f for f in cls.__dataclass_fields__ if f not in ("name", "image", "egress", "routing")}
         return cls(name=name, image=image, egress=egress, routing=routing,
                    **{k: v for k, v in d.items() if k in known})
