@@ -182,7 +182,10 @@ class LibvirtVmRuntime:
 
     # ---- prereq check (fail-closed selection) --------------------------------
     def available(self) -> bool:
-        if not Path(self.cfg.golden_base).exists():
+        # Probe the golden with the SAME privilege model as spawn (`sudo test -e` when cfg.sudo):
+        # libvirt image dirs are commonly root-only, so an unprivileged Path.exists() would falsely
+        # report this tier unavailable on a perfectly usable layout.
+        if self._sh(["test", "-e", self.cfg.golden_base]).returncode != 0:
             return False
         return _run(self._virsh_argv("version"), timeout=15).returncode == 0
 

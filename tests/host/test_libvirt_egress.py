@@ -370,6 +370,17 @@ def test_routing_next_hop_shared_router_mode():
     assert any("POSTROUTING -s 192.168.122.5 -o br-routers -j MASQUERADE" in c for c in cmds)
 
 
+def test_routing_local_exemption_uses_worker_cidr_override():
+    # a non-/24 worker net must keep host/agent traffic on `main` across the WHOLE subnet, not just
+    # the worker IP's /24 — else the bridge/agent address outside that /24 gets steered to the VPN.
+    R = ExitRouting(vpn_table="vpn", vpn_tun="tun0", worker_cidr="192.168.0.0/16")
+    flat = _flat(routing_commands("192.168.122.5", "openvpn", R))
+    assert any("from 192.168.122.5 to 192.168.0.0/16 lookup main" in c for c in flat)
+    # default (no override) keeps the /24 derivation (libvirt default net)
+    flat2 = _flat(routing_commands("192.168.122.5", "openvpn", ExitRouting()))
+    assert any("to 192.168.122.0/24 lookup main" in c for c in flat2)
+
+
 def test_routing_next_hop_table_id_avoids_cross_subnet_collision():
     # gateways differing only in the 3rd octet must NOT share a route table (last-octet-only keying
     # collided 10.99.0.2 and 10.99.1.2 → both table 202, corrupting isolation).

@@ -114,10 +114,11 @@ class VmJobDispatcher:
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                # Engine-scoped claim: the store filters to our engine, so we never claim (and then
-                # have to requeue) another engine's head-of-queue job — which would head-of-line-block
-                # our own work behind it in a shared multi-engine store.
-                job = self._store.claim_next(engine=self._engine)
+                # Engine-scoped + tier-scoped claim: the store filters to our engine (so we never
+                # claim+requeue another engine's head job and HOL-block our own work) AND honours
+                # target_tier — a job tagged target_tier=<worker_tier> (e.g. "libvirt-vm") is claimed
+                # here, not by the cold dispatcher, while untargeted jobs are still claimable by anyone.
+                job = self._store.claim_next(claimant_tier=self._worker_tier, engine=self._engine)
             except Exception:  # noqa: BLE001 — a transient store error must not kill the loop
                 logger.warning("vm_dispatch: claim_next failed", exc_info=True)
                 job = None

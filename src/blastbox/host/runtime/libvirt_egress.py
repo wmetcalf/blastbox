@@ -77,6 +77,10 @@ class ExitRouting:
     tor_dns_port: int = 9053        # tor DNSPort (NOT 5353 — that collides with mDNS/avahi)
     fakenet_addr: str | None = None  # FakeNet-NG listen IP (e.g. 172.28.100.1); None disables inetsim
     rule_priority_base: int = 1000  # ip-rule priority = base + low-16-bits of IP (unique per /16)
+    worker_cidr: str | None = None  # the worker network's CIDR (e.g. 192.168.0.0/16) for the local
+    # "keep host/agent traffic on main" exemption. None ⇒ derive worker_ip's /24 (the libvirt
+    # default). Set this when the worker net is NOT a /24, else the bridge/agent address can fall
+    # outside the assumed /24 and host-control traffic gets steered through the VPN table.
 
     # --- shared-router / next-hop mode -------------------------------------------------
     # When ``gateway`` + ``leg`` are set, openvpn/wireguard route the worker to a next-hop ROUTER VM
@@ -129,7 +133,9 @@ def routing_commands(worker_ip: str, exit_driver: str, routing: ExitRouting,
     FORWARD block-internal DROP instead of being transparently proxied (which would bypass it)."""
     if exit_driver in ("direct", "none", "drop"):
         return []
-    local = ".".join(worker_ip.split(".")[:3]) + ".0/24"  # keep host/agent traffic on the local subnet
+    # keep host/agent traffic on the local subnet: the configured worker CIDR if given, else the
+    # worker IP's /24 (libvirt default). A non-/24 net MUST set ExitRouting.worker_cidr.
+    local = routing.worker_cidr or (".".join(worker_ip.split(".")[:3]) + ".0/24")
     if exit_driver in ("openvpn", "wireguard"):
         prio = _rule_priority(worker_ip, routing)
         if routing.gateway and routing.leg:

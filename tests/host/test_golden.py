@@ -118,6 +118,34 @@ def test_promote_if_valid_rotates_only_on_pass(tmp_path):
     assert ok is True and any(c[0] == "cp" for c in rec.cmds)
 
 
+def test_rotate_stages_all_targets_before_swapping(tmp_path):
+    # all-or-nothing: BOTH candidate->.new stages must precede ANY mv into place, so a failure
+    # staging the RAM mirror can't leave the disk golden already advanced while the mirror is stale.
+    live = tmp_path / "g.qcow2"
+    live.write_text("cur")
+    shm = tmp_path / "shm.qcow2"
+    rec = _Rec()
+    golden.rotate(str(tmp_path / "cand.qcow2"), live_disk=str(live), live_shm=str(shm),
+                  backup_dir=str(tmp_path / "b"), ts="T", sudo=False, runner=rec)
+    stage = [i for i, c in enumerate(rec.cmds) if c[0] == "cp" and c[-1].endswith(".new")]
+    swap = [i for i, c in enumerate(rec.cmds) if c[0] == "mv"]
+    assert len(stage) == 2 and len(swap) == 2
+    assert max(stage) < min(swap)          # stage disk+shm, THEN swap both
+
+
+def test_promote_if_valid_rejects_when_factory_raises(tmp_path):
+    # a malformed candidate that makes runtime_factory() itself raise is a FAILED gate (False +
+    # on_reject), not an uncaught crash — the factory call is inside the guarded path now.
+    def boom_factory(q):
+        raise RuntimeError("bad candidate config")
+
+    rejected: list[str] = []
+    ok = golden.promote_if_valid("/cand.qcow2", runtime_factory=boom_factory, check=lambda s: True,
+                                 live_disk="/g", backup_dir="/b", ts="T", runner=_Rec(),
+                                 on_reject=rejected.append)
+    assert ok is False and rejected == ["/cand.qcow2"]
+
+
 def test_promote_if_valid_keeps_current_on_reject(tmp_path):
     rejected: list[str] = []
     rec = _Rec()

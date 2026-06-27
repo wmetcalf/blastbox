@@ -60,6 +60,18 @@ def test_available_fail_closed_without_golden():
     assert LibvirtVmRuntime(LibvirtVmConfig(golden_base="/no/such/golden.qcow2")).available() is False
 
 
+def test_available_uses_privileged_existence_probe(monkeypatch):
+    # a root-only golden dir: an unprivileged Path.exists() would falsely report unavailable. available()
+    # must probe with the configured privilege model (sudo test -e), matching spawn's qemu-img/virsh.
+    import blastbox.host.runtime.libvirt_vm as mod
+    rt = _rt()  # golden_base=/dev/shm/golden.qcow2 — not present on the unprivileged fs here
+    calls = []
+    monkeypatch.setattr(rt, "_sh", lambda args, **k: calls.append(args) or _OK())   # sudo test -e → rc0
+    monkeypatch.setattr(mod, "_run", lambda *a, **k: _OK())                          # virsh version → rc0
+    assert rt.available() is True
+    assert ["test", "-e", "/dev/shm/golden.qcow2"] in calls
+
+
 def test_ip_for_mac_none_when_no_mac():
     assert _rt()._ip_for_mac(None) is None
 

@@ -32,10 +32,13 @@ def validate_golden(qcow2: str, *, runtime_factory: Callable[[str], object],
     ``runtime_factory(qcow2)`` returns a LibvirtVmRuntime booting off that qcow2 (typically
     ``VmWorkerSpec(image=VmImageSpec(golden=qcow2)).runtime()``). ``check(slot)`` is the engine's
     health assertion against the ready worker (e.g. validate a benign sample == Valid)."""
-    rt = runtime_factory(qcow2)
     try:
+        # The factory call is INSIDE the gate's try: a malformed candidate path/config that makes
+        # runtime_factory() itself raise is a failed gate (→ promote_if_valid returns False + runs
+        # on_reject), not an uncaught crash. Fail closed consistently.
+        rt = runtime_factory(qcow2)
         slot = rt.spawn_ready(timeout_s=timeout_s)  # type: ignore[attr-defined]
-    except Exception as exc:  # noqa: BLE001 — any boot failure = gate fail
+    except Exception as exc:  # noqa: BLE001 — any boot/factory failure = gate fail
         logger.error("golden gate: candidate %s did not boot a healthy worker: %s", qcow2, exc)
         return False
     try:
@@ -77,8 +80,15 @@ def rotate(candidate: str, *, live_disk: str, backup_dir: str, keep_n: int = 5,
         logger.info("backing up current golden -> %s", bak)
         _checked(["cp", "--reflink=auto", live_disk, bak], "backup")
     logger.info("promoting candidate -> %s%s", live_disk, f" (+ {live_shm})" if live_shm else "")
-    for dest in [live_disk] + ([live_shm] if live_shm else []):
+    dests = [live_disk] + ([live_shm] if live_shm else [])
+    # STAGE every target first (cp to <dest>.new). If staging the RAM mirror fails we haven't yet
+    # moved anything over the live disk, so a failure here leaves both at the old version (all-or-
+    # nothing) instead of advancing the disk golden while the boot mirror stays stale.
+    for dest in dests:
         _checked(["cp", "--reflink=auto", candidate, dest + ".new"], "stage candidate")
+    # Only once ALL targets are staged, SWAP them into place (rename is ~atomic; the gap between the
+    # two renames is a single syscall apart, far tighter than a full cp between them).
+    for dest in dests:
         _checked(["mv", dest + ".new", dest], "promote")
     runner([*pfx, "chmod", "644", live_disk, *([live_shm] if live_shm else [])], capture_output=True, text=True)
     prune_backups(backup_dir, keep_n, sudo=sudo, runner=runner)

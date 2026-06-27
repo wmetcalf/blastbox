@@ -8,6 +8,24 @@ from blastbox.host.runtime.libvirt_vm import LibvirtVmRuntime
 from blastbox.host.runtime.vm_compose import VmImageSpec, VmWorkerSpec, _ports, _run_provisioner
 
 
+def test_build_image_packer_requires_golden(monkeypatch, tmp_path):
+    # parity with the qemu branch: a packer template that exits 0 but doesn't produce image.golden
+    # must fail at build time, not return a missing/stale path that the pool trips over later.
+    import blastbox.host.runtime.vm_compose as mod
+
+    class _OK:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+    monkeypatch.setattr(mod, "_run", lambda *a, **k: _OK())   # packer build "succeeds", writes nothing
+    spec = VmWorkerSpec.from_dict("auth", {
+        "image": {"golden": str(tmp_path / "missing.qcow2"), "builder": "packer",
+                  "packer_template": "/t.pkr.hcl"},
+    })
+    with pytest.raises(RuntimeError, match="packer build ran but"):
+        spec.build_image()
+
+
 def test_run_provisioner_string_runs_through_shell(tmp_path):
     # the spec documents provisioners as SHELL commands — && / redirection must work (argv-splitting
     # would silently drop everything after the && and leave an incomplete golden looking successful).

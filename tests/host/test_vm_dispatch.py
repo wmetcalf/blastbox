@@ -84,6 +84,13 @@ def test_claim_is_ours_accepts_matching_and_unscoped(tmp_path):
                            engine="authenticode")._claim_is_ours(claimed) is True
 
 
+def test_libvirt_vm_is_a_routable_tier():
+    # operators must be able to target_tier=libvirt-vm so VM-only jobs aren't claimed+failed by the
+    # cold dispatcher in a shared store (ingress validates target_tier against VALID_TIERS).
+    from blastbox.host.jobs.base import VALID_TIERS
+    assert "libvirt-vm" in VALID_TIERS
+
+
 def test_engine_scoped_claim_skips_older_foreign_head(tmp_path):
     # the store-side fix: an engine-scoped claim must reach OUR job even when an older foreign job is
     # at the queue head (no head-of-line block, no claim+requeue churn).

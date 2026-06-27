@@ -136,7 +136,7 @@ class Job:
 # Canonical dispatcher tier names. A warm sidecar's tier is its BLASTBOX_POOL_RUNTIME
 # (one of WARM_TIERS); the cold dispatcher is "cold". A job's target_tier (when set) and a
 # claimant's tier are matched against this vocabulary.
-WARM_TIERS = ("firecracker", "gvisor")
+WARM_TIERS = ("firecracker", "gvisor", "libvirt-vm")
 VALID_TIERS = ("cold", *WARM_TIERS)
 
 

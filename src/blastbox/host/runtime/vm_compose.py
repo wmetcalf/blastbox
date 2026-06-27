@@ -200,6 +200,11 @@ class VmWorkerSpec:
             if not img.packer_template:
                 raise ValueError(f"{self.name}: builder=packer needs packer_template")
             _run(["packer", "build", img.packer_template], check=True)
+            # Verify the template actually wrote image.golden (parity with the qemu branch): a
+            # template that exits 0 but emits its artifact elsewhere — or, with force=True, leaves the
+            # old golden in place — would otherwise return a missing/stale path that fails in the pool.
+            if not img.exists():
+                raise RuntimeError(f"{self.name}: packer build ran but {img.golden} was not produced")
             return img.golden
         if img.builder == "qemu":
             if not img.base_qcow2:
