@@ -48,6 +48,16 @@ def test_domain_xml_reflects_config(kw, needle):
     assert xml.startswith("<domain type='kvm'>") and xml.endswith("</domain>")
 
 
+def test_domain_xml_pins_mac_ip_via_nwfilter():
+    # clean-traffic nwfilter pins MAC+IP at the ebtables layer so a root guest can't spoof both to
+    # escape the IP/MAC-keyed host policy.
+    xml = _rt()._domain_xml("bbvm-x", "/o.qcow2")
+    assert "<filterref filter='clean-traffic'/>" in xml
+    # configurable / disable-able
+    assert "filterref" not in _rt(nwfilter="")._domain_xml("bbvm-x", "/o.qcow2")
+    assert "filter='custom-nf'" in _rt(nwfilter="custom-nf")._domain_xml("bbvm-x", "/o.qcow2")
+
+
 def test_domain_xml_virtio_disk_omits_invalid_controller():
     # libvirt has no `<controller type='virtio'>` — emitting one makes virsh define reject the XML.
     xml = _rt(disk_bus="virtio")._domain_xml("bbvm-x", "/o.qcow2")

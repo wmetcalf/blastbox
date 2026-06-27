@@ -420,38 +420,22 @@ def _ip_rule_deletes(worker_ip: str, ip_rule_dump: str) -> list[list[str]]:
     return out
 
 
-def _fakenet_dnat_deletes(worker_ip: str, prerouting_dump: str) -> list[list[str]]:
-    """From ``iptables -t nat -S PREROUTING``, the ``-D`` argv for EVERY DNAT this worker has —
-    whatever sink address installed it. del-by-match teardown only removes DNATs for the CURRENT
-    ``fakenet_addr``, so a reused DHCP IP whose prior inetsim worker DNATed to a now-changed sink
-    would leave an orphan catch-all DNAT ahead of the new rules, silently sending its traffic to the
-    OLD sink. Enumerate and delete all of the worker's DNATs regardless of target."""
-    src = f"-s {worker_ip}/32"
+def _nat_chain_deletes(worker_ip: str, chain: str, verdicts: tuple[str, ...], dump: str) -> list[list[str]]:
+    """From ``iptables -t nat -S <chain>`` output, the ``-D`` argv for EVERY rule of this worker whose
+    target is one of ``verdicts`` (e.g. REDIRECT/DNAT in PREROUTING, MASQUERADE in POSTROUTING).
+
+    Matched by SOURCE IP only — independent of the tor ports / sink address / masquerade mode the
+    rule was installed with. del-by-match teardown can only delete rules matching the CURRENT routing
+    config, so a reused DHCP IP whose prior incarnation used different tor ports, a different sink, or
+    gateway_masquerade=True (now disabled), or a routed exit the current (direct/drop) policy lacks
+    entirely, would otherwise leave an orphan rule ahead of the new ones — silently redirecting/
+    SNATing the new VM. Enumerating every ``-s <ip>`` rule with these targets closes that for good."""
+    src = f"-s {worker_ip}/32"  # iptables -S always prints /32 for a host; avoids .5 ↔ .50 prefixing
     out: list[list[str]] = []
-    for line in prerouting_dump.splitlines():
+    for line in dump.splitlines():
         toks = line.split()
-        if toks[:2] == ["-A", "PREROUTING"] and src in line and "-j DNAT" in line:
-            out.append(["iptables", "-t", "nat", "-D", *toks[1:]])
-    return out
-
-
-def _tor_redirect_deletes(worker_ip: str, tor_trans_port: int, tor_dns_port: int,
-                          prerouting_dump: str) -> list[list[str]]:
-    """From ``iptables -t nat -S PREROUTING`` output, the ``-D`` argv for EVERY REDIRECT this worker
-    has into tor — both the TCP TransPort redirects AND the DNS (53→DNSPort, udp+tcp) redirects,
-    whatever port set installed them.
-
-    del-by-match teardown can only remove the exact ports the *current* policy names, so a reused
-    DHCP IP whose prior worker had a different ``egress_ports`` (e.g. a tor worker with DNS allowed,
-    then a policy omitting 53 or switching to inetsim) would otherwise leave an orphan REDIRECT —
-    catch-all TransPort OR a 53→DNSPort — ahead of the new rules, silently bypassing the new policy.
-    Enumerating the live rules and deleting all redirects to either tor port closes that."""
-    src = f"-s {worker_ip}/32"  # iptables -S always prints /32 for a host; exact match avoids .5
-    needles = (f"--to-ports {tor_trans_port}", f"--to-ports {tor_dns_port}")  # prefix-matching .50/32
-    out: list[list[str]] = []
-    for line in prerouting_dump.splitlines():
-        toks = line.split()
-        if toks[:2] == ["-A", "PREROUTING"] and src in line and any(n in line for n in needles):
+        if (toks[:2] == ["-A", chain] and src in line
+                and any(f"-j {v}" in line for v in verdicts)):
             out.append(["iptables", "-t", "nat", "-D", *toks[1:]])
     return out
 
@@ -580,9 +564,12 @@ class LibvirtEgress:
                 for cmd in routing_teardown_commands(worker_ip, drv, self._routing, egress_ports,
                                                      block_internal=True):
                     self._priv(cmd)  # best-effort: del-by-match, ignore "not found"
-            self._sweep_tor_redirects(worker_ip)      # orphan tor REDIRECTs (TransPort + DNSPort)
-            self._sweep_fakenet_dnat(worker_ip)       # orphan DNATs left by a changed sink address
-            self._sweep_ip_rules(worker_ip)           # orphan policy routes left by changed routing
+        # SOURCE-IP sweeps run UNCONDITIONALLY (not gated on the current routing): a reused IP that
+        # moved from a routed policy to direct/drop has self._routing=None now, but prior incarnations'
+        # nat redirects/DNATs/MASQUERADE + policy routes must still be cleared so they can't steer the
+        # new VM. They match by -s <ip> only, so the current config is irrelevant.
+        self._sweep_nat(worker_ip)                # tor REDIRECTs + FakeNet DNATs + gateway MASQUERADE
+        self._sweep_ip_rules(worker_ip)           # orphan policy routes (any table) for this IP
         if mac:
             self._priv(["ip6tables", "-D", "FORWARD", "-m", "mac", "--mac-source", mac, "-j", "DROP"])
             self._priv(["ip6tables", "-D", "INPUT", "-m", "mac", "--mac-source", mac, "-j", "DROP"])
@@ -633,26 +620,26 @@ class LibvirtEgress:
         logger.warning("ip6tables %s v6 DROP not installed (%s) — host has no IPv6 filter stack; "
                        "worker nets are v4-only by design", chain, err.strip()[:80] or "rc!=0")
 
-    def _sweep_tor_redirects(self, worker_ip: str) -> None:
-        """Delete EVERY live nat-PREROUTING REDIRECT this worker has into tor — TransPort TCP AND the
-        53→DNSPort (udp+tcp) — so an orphan left by a prior incarnation with a different ``egress_ports``
-        (catch-all ↔ port-scoped, or DNS-allowed ↔ DNS-omitted) can't survive a reused DHCP IP and
-        bypass/misroute the new policy. Best-effort; no-op without routing or if the dump fails."""
-        if self._routing is None:
-            return
-        cp = self._ipt_run("-t", "nat", "-S", "PREROUTING")
-        if cp.returncode != 0:
-            return
-        for argv in _tor_redirect_deletes(worker_ip, self._routing.tor_trans_port,
-                                          self._routing.tor_dns_port, cp.stdout):
-            self._priv(argv)
+    def _sweep_nat(self, worker_ip: str) -> None:
+        """Delete EVERY live nat rule for this worker by SOURCE IP — PREROUTING REDIRECT/DNAT (tor
+        redirects, FakeNet DNATs) and POSTROUTING MASQUERADE (shared-router SNAT) — regardless of the
+        ports / sink / masquerade mode a prior incarnation used. Routing-config-INDEPENDENT, so a
+        reused DHCP IP that changed tor ports, changed sink, disabled gateway_masquerade, or dropped
+        a routed exit entirely (now direct/drop, no ExitRouting) still has its leftovers removed.
+        Best-effort; per-chain no-op on a dump fail."""
+        pre = self._ipt_run("-t", "nat", "-S", "PREROUTING")
+        if pre.returncode == 0:
+            for argv in _nat_chain_deletes(worker_ip, "PREROUTING", ("REDIRECT", "DNAT"), pre.stdout):
+                self._priv(argv)
+        post = self._ipt_run("-t", "nat", "-S", "POSTROUTING")
+        if post.returncode == 0:
+            for argv in _nat_chain_deletes(worker_ip, "POSTROUTING", ("MASQUERADE",), post.stdout):
+                self._priv(argv)
 
     def _sweep_ip_rules(self, worker_ip: str) -> None:
         """Delete EVERY live ``ip rule`` selecting ``from <worker_ip>``, whatever table/priority a
         prior incarnation installed — so a reused DHCP IP can't keep a stale policy route to an old
-        VPN table after ExitRouting changed. Best-effort; no-op without routing or on a dump fail."""
-        if self._routing is None:
-            return
+        VPN table after ExitRouting changed (or was dropped). Best-effort; no-op on a dump fail."""
         cp = self._priv(["ip", "rule", "show"])
         if cp.returncode != 0:
             return
@@ -669,18 +656,6 @@ class LibvirtEgress:
                 continue
             for argv in _spoof_drop_deletes(worker_ip, chain, cp.stdout):
                 self._priv(argv)
-
-    def _sweep_fakenet_dnat(self, worker_ip: str) -> None:
-        """Delete EVERY live nat-PREROUTING DNAT this worker has, so an orphan from a prior inetsim
-        incarnation whose sink address has since changed can't survive a reused DHCP IP and keep
-        sending traffic to the old FakeNet sink. Best-effort; no-op without routing or on a dump fail."""
-        if self._routing is None:
-            return
-        cp = self._ipt_run("-t", "nat", "-S", "PREROUTING")
-        if cp.returncode != 0:
-            return
-        for argv in _fakenet_dnat_deletes(worker_ip, cp.stdout):
-            self._priv(argv)
 
     def installed(self, worker_ip: str) -> bool:
         return self._ipt_run("-L", _chain_name(worker_ip)).returncode == 0

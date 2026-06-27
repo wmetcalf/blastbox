@@ -83,6 +83,11 @@ class LibvirtVmConfig:
     machine: str = "pc"
     disk_bus: str = "sata"
     nic_model: str = "e1000"
+    nwfilter: str = "clean-traffic"
+    """libvirt nwfilter on the worker NIC (default ``clean-traffic``: no-mac/no-ip/no-arp-spoofing).
+    The host egress policy keys on the worker's IP + MAC; a guest with root could change BOTH to dodge
+    the per-IP jump + MAC anti-spoof and follow the bridge default route. This pins them at the
+    libvirt/ebtables layer so they can't. Set to "" to disable (e.g. a host pinning MAC elsewhere)."""
     subnet_prefix: str = "192.168.122."
     """DHCP subnet of ``network``; used to resolve the worker IP via the host neigh table."""
 
@@ -542,7 +547,10 @@ class LibvirtVmRuntime:
             "<disk type='file' device='disk'><driver name='qemu' type='qcow2' cache='none' io='native' discard='unmap'/>"
             f"<source file='{overlay}'/><target dev='{_dev}' bus='{c.disk_bus}'/></disk>"
             f"{_ctrl}"
-            f"<interface type='network'><source network='{c.network}'/><model type='{c.nic_model}'/></interface>"
+            f"<interface type='network'><source network='{c.network}'/><model type='{c.nic_model}'/>"
+            # clean-traffic nwfilter: pin MAC + IP (no-mac/no-ip/no-arp-spoofing) at the libvirt
+            # ebtables layer so a root guest can't change them to escape the IP/MAC-keyed host policy.
+            f"{f'''<filterref filter='{c.nwfilter}'/>''' if c.nwfilter else ''}</interface>"
             "<serial type='pty'><target type='isa-serial' port='0'/></serial><console type='pty'/>"
             # QEMU guest-agent channel — enables `virsh domtime --sync` (post-revert clock sync) +
             # in-guest exec; needs qemu-ga running in the golden.

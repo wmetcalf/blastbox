@@ -12,11 +12,10 @@ from blastbox.host.runtime.libvirt_egress import (
     LibvirtEgress,
     VmEgressPolicy,
     _chain_name,
-    _fakenet_dnat_deletes,
     _ip_rule_deletes,
+    _nat_chain_deletes,
     _rule_priority,
     _spoof_drop_deletes,
-    _tor_redirect_deletes,
     forward_chain_rules,
     input_chain_rules,
 )
@@ -280,17 +279,24 @@ def test_input_chain_tor_dnsport_gated_on_allowlist():
     assert any("--dport 9040 -j ACCEPT" in f for f in flat)
 
 
-def test_fakenet_dnat_deletes_sweeps_only_target_worker():
-    dump = "\n".join([
+def test_nat_chain_deletes_sweep_target_worker_by_source_ip():
+    pre = "\n".join([
         "-A PREROUTING -s 192.168.122.50/32 -p udp --dport 53 -j DNAT --to-destination 172.28.100.1:53",
-        "-A PREROUTING -s 192.168.122.50/32 -j DNAT --to-destination 172.28.100.1",         # catch-all
-        "-A PREROUTING -s 192.168.122.5/32 -j DNAT --to-destination 10.0.0.1",               # other worker
-        "-A PREROUTING -s 192.168.122.50/32 -p tcp -j REDIRECT --to-ports 9040",             # not a DNAT
+        "-A PREROUTING -s 192.168.122.50/32 -j DNAT --to-destination 172.28.100.1",         # DNAT
+        "-A PREROUTING -s 192.168.122.50/32 -p tcp -j REDIRECT --to-ports 7777",            # REDIRECT (any port)
+        "-A PREROUTING -s 192.168.122.5/32 -j DNAT --to-destination 10.0.0.1",              # other worker
     ])
-    dels = _fakenet_dnat_deletes("192.168.122.50", dump)
-    assert len(dels) == 2                                  # both .50 DNATs, not .5, not the REDIRECT
+    dels = _nat_chain_deletes("192.168.122.50", "PREROUTING", ("REDIRECT", "DNAT"), pre)
+    assert len(dels) == 3                                  # all .50 REDIRECT+DNAT (any port), not .5
     assert all(d[:4] == ["iptables", "-t", "nat", "-D"] for d in dels)
     assert all("192.168.122.50/32" in " ".join(d) for d in dels)
+    # POSTROUTING MASQUERADE swept too (e.g. a now-disabled gateway_masquerade leftover)
+    post = "\n".join([
+        "-A POSTROUTING -s 192.168.122.50/32 -o br-r -j MASQUERADE",
+        "-A POSTROUTING -s 192.168.122.5/32 -o tun0 -j MASQUERADE",                          # other worker
+    ])
+    md = _nat_chain_deletes("192.168.122.50", "POSTROUTING", ("MASQUERADE",), post)
+    assert len(md) == 1 and "br-r" in " ".join(md[0])
 
 
 def test_v6_drop_raises_on_permission_denied(monkeypatch):
@@ -492,19 +498,18 @@ def test_input_chain_inetsim_accepts_fakenet_listener():
     assert any("-d 172.28.100.1 -j ACCEPT" in f for f in flat)
 
 
-def test_tor_redirect_deletes_sweeps_only_target_worker():
+def test_nat_chain_deletes_sweep_redirects_regardless_of_port():
+    # REDIRECTs to DIFFERENT tor ports (a port changed between incarnations) are ALL swept by source IP
     dump = "\n".join([
         "-P PREROUTING ACCEPT",
-        "-A PREROUTING -s 192.168.122.50/32 -p tcp -j REDIRECT --to-ports 9040",        # catch-all
-        "-A PREROUTING -s 192.168.122.50/32 -p tcp -m tcp --dport 443 -j REDIRECT --to-ports 9040",
+        "-A PREROUTING -s 192.168.122.50/32 -p tcp -j REDIRECT --to-ports 9040",        # old TransPort
+        "-A PREROUTING -s 192.168.122.50/32 -p tcp -j REDIRECT --to-ports 19040",       # NEW TransPort
+        "-A PREROUTING -s 192.168.122.50/32 -p udp --dport 53 -j REDIRECT --to-ports 9053",  # DNSPort
         "-A PREROUTING -s 192.168.122.5/32 -p tcp -j REDIRECT --to-ports 9040",         # other worker
-        "-A PREROUTING -s 192.168.122.50/32 -p udp --dport 53 -j REDIRECT --to-ports 9053",  # DNS, not TCP
     ])
-    dels = _tor_redirect_deletes("192.168.122.50", 9040, 9053, dump)
-    assert len(dels) == 3                # both .50 TransPort redirects + the .50 DNS redirect, not .5
-    assert all(d[:4] == ["iptables", "-t", "nat", "-D"] for d in dels)
+    dels = _nat_chain_deletes("192.168.122.50", "PREROUTING", ("REDIRECT", "DNAT"), dump)
+    assert len(dels) == 3                # all .50 redirects regardless of --to-ports, not .5
     assert all("192.168.122.50/32" in " ".join(d) for d in dels)
-    assert all(d[4] == "PREROUTING" for d in dels)
     assert any("9053" in " ".join(d) for d in dels)       # the DNS→DNSPort redirect is swept too
 
 
