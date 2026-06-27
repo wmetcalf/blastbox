@@ -56,8 +56,12 @@ def test_vmslot_endpoint():
 
 
 def test_available_fail_closed_without_golden():
-    # missing golden short-circuits to False before any virsh call
-    assert LibvirtVmRuntime(LibvirtVmConfig(golden_base="/no/such/golden.qcow2")).available() is False
+    # missing golden short-circuits to False before any virsh call. sudo=False so the privileged
+    # existence probe runs `test -e` WITHOUT sudo — a real `sudo` call would block on a CI runner
+    # that prompts for a password (the production default sudo=True needs passwordless sudo, which a
+    # libvirt host already has). See test_available_uses_privileged_existence_probe for the sudo path.
+    assert LibvirtVmRuntime(
+        LibvirtVmConfig(golden_base="/no/such/golden.qcow2", sudo=False)).available() is False
 
 
 def test_available_uses_privileged_existence_probe(monkeypatch):
