@@ -7,14 +7,41 @@ from blastbox.host.netpolicy import Personality
 import subprocess
 
 from blastbox.host.runtime.libvirt_egress import (
+    _MAIN_RULE_PRIORITY,
+    ExitRouting,
     LibvirtEgress,
     VmEgressPolicy,
     _chain_name,
     _fakenet_dnat_deletes,
+    _ip_rule_priorities,
+    _rule_priority,
     _tor_redirect_deletes,
     forward_chain_rules,
     input_chain_rules,
 )
+
+
+def test_rule_priority_stays_below_main():
+    r = ExitRouting()
+    # high third octet must NOT collide with / sort after the kernel `main` rule (32766), else the
+    # worker rule never selects the tunnel table.
+    for ip in ("192.168.124.22", "10.0.255.255", "192.168.200.7"):
+        assert _rule_priority(ip, r) < _MAIN_RULE_PRIORITY
+    # within a /24, every host gets a distinct priority
+    prios = {_rule_priority(f"192.168.124.{n}", r) for n in range(256)}
+    assert len(prios) == 256
+
+
+def test_ip_rule_priorities_match_only_target_worker():
+    dump = "\n".join([
+        "0:\tfrom all lookup local",
+        "32237:\tfrom 192.168.122.5 lookup vpn",
+        "32236:\tfrom 192.168.122.5 to 192.168.122.0/24 lookup main",
+        "1500:\tfrom 192.168.122.50 lookup vpn",        # different worker (.50, not .5)
+        "32766:\tfrom all lookup main",
+    ])
+    prios = _ip_rule_priorities("192.168.122.5", dump)
+    assert sorted(prios) == ["32236", "32237"]          # both .5 rules, not .50, not from-all
 
 
 def _flat(rules):
@@ -123,7 +150,6 @@ def test_from_personality_defaults_off():
 
 # --- exit routing (rooter model: policy-route / REDIRECT / DNAT) -------------------
 from blastbox.host.runtime.libvirt_egress import (  # noqa: E402
-    ExitRouting,
     routing_commands,
     routing_teardown_commands,
 )

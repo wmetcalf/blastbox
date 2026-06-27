@@ -76,6 +76,27 @@ class _FakeRuntime:
             self.reaped.append(slot.slot_id)
 
 
+class _ReapFailRuntime(_FakeRuntime):
+    """Models a runtime whose reap() RAISES because it couldn't dispose the worker (e.g. a libvirt VM
+    whose `virsh destroy` failed and may still be running)."""
+
+    def reap(self, slot: Slot) -> None:
+        raise RuntimeError("destroy failed; worker may still be running")
+
+
+def test_release_quarantines_slot_when_reap_fails() -> None:
+    # a reap that RAISES (worker not disposed) must NOT pop the slot — keep it tracked/quarantined so
+    # it counts against the ceiling and surfaces, instead of orphaning a live worker off the books.
+    rt = _ReapFailRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    slot.state = SlotState.ASSIGNED
+    pool.release(slot)
+    assert slot.slot_id in pool._slots                       # NOT popped — quarantined
+    assert pool._slots[slot.slot_id].state == SlotState.DRAINING
+
+
 class _FinalizeFailRuntime(_FakeRuntime):
     """Models a runtime (e.g. libvirt) whose finalize fails closed: it reaps the VM INSIDE is_ready()
     — flipping the slot to DRAINING — and returns False."""

@@ -98,11 +98,19 @@ _ROUTING_DRIVERS = ("openvpn", "wireguard", "tor", "inetsim")  # drivers that in
 _SUPPORTED_EXITS = frozenset({"none", "drop", "direct", *_ROUTING_DRIVERS})  # exits the VM rooter wires
 
 
+_MAIN_RULE_PRIORITY = 32766  # the kernel's default `main` ip-rule priority
+
+
 def _rule_priority(worker_ip: str, routing: ExitRouting) -> int:
     # Use the low 16 bits of the IP (third+fourth octets), not just the last octet, so two workers
-    # in *different* /24s of the same supernet (or a /16 libvirt net) never share a priority slot.
+    # in *different* /24s of the same supernet rarely share a priority slot. CLAMP into a window
+    # strictly BELOW `main` (32766): a raw base + 16-bit value reaches ~33000, so for a third octet
+    # >= ~124 the worker rule would sort at/after `main` and never select the tunnel table (traffic
+    # then follows the host route → killed by the kill-switch or misrouted). The modulo keeps every
+    # priority in [base, base+span) < main; within a /24 the 256 values stay distinct.
     o = worker_ip.split(".")
-    return routing.rule_priority_base + (int(o[2]) << 8) + int(o[3])
+    span = (_MAIN_RULE_PRIORITY - 1) - routing.rule_priority_base  # leave the slot just under main free
+    return routing.rule_priority_base + (((int(o[2]) << 8) + int(o[3])) % span)
 
 
 def _tor_tcp_redirects(worker_ip: str, routing: ExitRouting,
@@ -360,6 +368,23 @@ def input_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | Non
     return r
 
 
+def _ip_rule_priorities(worker_ip: str, ip_rule_dump: str) -> list[str]:
+    """From ``ip rule show`` output, the priorities of EVERY rule selecting ``from <worker_ip>``.
+
+    The per-driver teardown only deletes the exact ``ip rule`` argv generated from the CURRENT
+    ExitRouting, so if a reused DHCP IP's prior worker used a different vpn_table / next-hop gateway /
+    worker_cidr, the stale ``ip rule from <worker_ip> lookup <old-table>`` survives at the same
+    priority and keeps steering this worker through the old table. Enumerate every ``from
+    <worker_ip>`` rule by priority so remove() can delete them all regardless of the old config."""
+    prios: list[str] = []
+    for line in ip_rule_dump.splitlines():
+        # e.g. "32237:\tfrom 192.168.122.5 lookup vpn"  → priority "32237", selector "from <ip> ..."
+        toks = line.replace(":", " ", 1).split()
+        if len(toks) >= 3 and toks[0].isdigit() and toks[1] == "from" and toks[2] == worker_ip:
+            prios.append(toks[0])
+    return prios
+
+
 def _fakenet_dnat_deletes(worker_ip: str, prerouting_dump: str) -> list[list[str]]:
     """From ``iptables -t nat -S PREROUTING``, the ``-D`` argv for EVERY DNAT this worker has —
     whatever sink address installed it. del-by-match teardown only removes DNATs for the CURRENT
@@ -519,6 +544,7 @@ class LibvirtEgress:
                     self._priv(cmd)  # best-effort: del-by-match, ignore "not found"
             self._sweep_tor_tcp_redirects(worker_ip)  # orphan REDIRECTs left by a prior port set
             self._sweep_fakenet_dnat(worker_ip)       # orphan DNATs left by a changed sink address
+            self._sweep_ip_rules(worker_ip)           # orphan policy routes left by changed routing
         if mac:
             self._priv(["ip6tables", "-D", "FORWARD", "-m", "mac", "--mac-source", mac, "-j", "DROP"])
             self._priv(["ip6tables", "-D", "INPUT", "-m", "mac", "--mac-source", mac, "-j", "DROP"])
@@ -576,6 +602,18 @@ class LibvirtEgress:
             return
         for argv in _tor_redirect_deletes(worker_ip, self._routing.tor_trans_port, cp.stdout):
             self._priv(argv)
+
+    def _sweep_ip_rules(self, worker_ip: str) -> None:
+        """Delete EVERY live ``ip rule`` selecting ``from <worker_ip>``, whatever table/priority a
+        prior incarnation installed — so a reused DHCP IP can't keep a stale policy route to an old
+        VPN table after ExitRouting changed. Best-effort; no-op without routing or on a dump fail."""
+        if self._routing is None:
+            return
+        cp = self._priv(["ip", "rule", "show"])
+        if cp.returncode != 0:
+            return
+        for prio in _ip_rule_priorities(worker_ip, cp.stdout):
+            self._priv(["ip", "rule", "del", "priority", prio])
 
     def _sweep_fakenet_dnat(self, worker_ip: str) -> None:
         """Delete EVERY live nat-PREROUTING DNAT this worker has, so an orphan from a prior inetsim

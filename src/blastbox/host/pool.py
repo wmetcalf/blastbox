@@ -324,13 +324,21 @@ class WarmPool:
             slot.state = SlotState.DRAINING
         # Reap in-place (synchronous) so the caller is certain cleanup happened.
         # The replacement will be spawned by the next tick() call.
+        reaped = False
         try:
             self._reap_and_count(slot)
+            reaped = True
         except Exception:
-            logger.exception("pool.reap_error slot_id=%s", slot.slot_id)
+            # reap() raises when it could NOT dispose the worker (e.g. a libvirt VM whose `virsh
+            # destroy` failed and may still be running). Do NOT pop the slot: keep it tracked
+            # (DRAINING) so it still counts against the ceiling and surfaces, instead of silently
+            # orphaning a live worker outside pool accounting while a replacement spawns.
+            logger.exception("pool.reap_error slot_id=%s — quarantining slot (worker may persist)",
+                             slot.slot_id)
         finally:
             with self._lock:
-                self._slots.pop(slot.slot_id, None)
+                if reaped:
+                    self._slots.pop(slot.slot_id, None)
 
     def tick(self) -> None:
         """One maintenance step: promote WARMING→IDLE, health-check, burst, spawn to deficit.

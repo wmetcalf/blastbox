@@ -356,9 +356,12 @@ class LibvirtVmRuntime:
         # still be running), LEAVE the egress rules + overlay in place so it stays contained, and
         # surface it for manual cleanup rather than unconfining a leaked, unmanaged VM.
         if not self._destroy_domain(slot.domain):
-            logger.error("%s: destroy failed — leaving egress rules + overlay in place so the "
-                         "possibly-live guest stays contained (manual cleanup needed)", slot.domain)
-            return
+            # The guest may still be running. Leave egress + overlay in place (containment) and RAISE
+            # so the pool QUARANTINES this slot (keeps it in accounting) instead of treating reap as a
+            # success and dropping a live, untracked VM while spawning a replacement.
+            raise RuntimeError(
+                f"{slot.domain}: virsh destroy failed; guest may still be running — egress + overlay "
+                "left in place, slot quarantined for manual cleanup")
         if self.cfg.egress_policy is not None and slot.ip is not None:
             LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing).remove(
                 slot.ip, self.cfg.egress_policy.exit_driver, mac=slot.mac,

@@ -18,6 +18,7 @@ client-facing — its inputs are the queue + the spooled files.
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -65,6 +66,24 @@ class VmJobDispatcher:
     def _expiry(self, finished_at: float) -> float | None:
         return finished_at + self._retention_s if self._retention_s > 0 else None
 
+    def _ensure_metadata(self, job: Job, summary: dict | None) -> None:
+        """The ingress ``/metadata``, ``/artifacts/{id}``, ``/result`` routes all require
+        ``<output>/metadata.json`` to exist once a job is DONE. A VM ``validate()`` returns a result
+        summary, not necessarily a sealed output dir, so write a metadata.json from the summary if the
+        validator didn't already produce one (don't clobber a real one) — otherwise those routes 404
+        on a job that looks done. Best-effort: a write hiccup must not fail an otherwise-valid job
+        (the authoritative result is the stored ``result_summary``)."""
+        root = Path(job.result_dir) if job.result_dir else (self._job_root / job.job_id)
+        meta = root / "output" / "metadata.json"
+        if meta.exists():
+            return
+        try:
+            meta.parent.mkdir(parents=True, exist_ok=True)
+            meta.write_text(json.dumps(summary or {}))
+        except OSError:
+            logger.warning("vm_dispatch: could not write metadata.json for %s (result routes may "
+                           "404)", job.job_id, exc_info=True)
+
     def _claim_is_ours(self, job: Job) -> bool:
         """True if we should run this claimed job. ``claim_next(engine=)`` already filters at the
         store, so this is a DEFENSIVE fallback: if a store ignored the filter and handed us another
@@ -88,6 +107,8 @@ class VmJobDispatcher:
             if not in_path.exists():
                 raise FileNotFoundError(f"spooled input missing: {in_path}")
             summary, ok = self._validate(in_path)
+            if ok:  # DONE ⇒ the ingress result routes require output/metadata.json to exist
+                self._ensure_metadata(job, summary)
             finished = time.time()
             # CAS on (status, claim_id) so a stale owner can't clobber a job that was reclaimed
             # (RUNNING->QUEUED->RUNNING under another dispatcher). The return value is OUR ownership.

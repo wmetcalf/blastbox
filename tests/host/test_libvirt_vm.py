@@ -269,7 +269,8 @@ def test_reap_keeps_egress_and_overlay_when_destroy_fails(monkeypatch):
     rt, order = _reap_rt(monkeypatch, destroyed=False)  # guest may still be running
     slot = VmSlot(slot_id="r", domain="bbvm-r", overlay="/o.qcow2", agent_port=8765,
                   ip="192.168.122.5", mac="52:54:00:aa:bb:cc")
-    rt.reap(slot)
+    with pytest.raises(RuntimeError, match="quarantined"):   # raise so the pool quarantines the slot
+        rt.reap(slot)
     assert order == ["destroy"]          # bailed after the failed destroy
     assert _RecEgress.events == []        # egress LEFT in place — possibly-live guest stays contained
     assert "rm-overlay" not in order      # overlay not freed under a live guest

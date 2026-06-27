@@ -39,6 +39,27 @@ def test_dispatch_marks_done_with_summary_and_unlinks_input(tmp_path):
     assert got.worker_tier == "libvirt-vm"
 
 
+def test_dispatch_writes_metadata_json_on_done(tmp_path):
+    # ingress /metadata, /artifacts, /result require <output>/metadata.json once a job is DONE; the
+    # dispatcher materializes it from the summary so those routes don't 404 on a VM job.
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"verdict": {"status": "Valid"}}, True))
+    d._process(store.claim_next())
+    meta = tmp_path / job.job_id / "output" / "metadata.json"
+    assert meta.is_file()
+    import json
+    assert json.loads(meta.read_text())["verdict"]["status"] == "Valid"
+
+
+def test_dispatch_does_not_write_metadata_on_failure(tmp_path):
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"err": 1}, False))
+    d._process(store.claim_next())
+    assert not (tmp_path / job.job_id / "output" / "metadata.json").exists()   # only on success
+
+
 def test_dispatch_sets_retention_expiry(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
