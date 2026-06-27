@@ -155,13 +155,14 @@ def routing_commands(worker_ip: str, exit_driver: str, routing: ExitRouting,
             # `ip route replace ... table <id>` would silently re-point the earlier gateway's table,
             # sending in-flight workers' tunnel traffic through the wrong router (isolation break).
             go = routing.gateway.split(".")
-            # Table id from the gateway's low 24 BITS (2nd+3rd+4th octets), not just 16: two routers
-            # on different /16s with the same low 16 bits (10.98.0.2 vs 10.99.0.2) would otherwise
-            # collide on base+2, and the later `ip route replace ... table <id>` would re-point the
-            # earlier router's table (mixing VPN attribution). rt_tables ids are u32, so 24 bits +
-            # base fits comfortably. (Routers across different /8s sharing octets 2-4 is negligible.)
-            table = str(routing.gateway_table_base
-                        + (int(go[1]) << 16) + (int(go[2]) << 8) + int(go[3]))
+            # Table id = the gateway IP as a full 32-bit int — COLLISION-FREE for distinct routers.
+            # Any partial-octet key collides for gateways sharing those octets (last octet: .0.2/.1.2;
+            # 16-bit: 10.99/10.98; 24-bit: 10.99/172.99), and the later `ip route replace ... table
+            # <id>` then re-points an earlier router's table (mixing VPN attribution). The full IP can't
+            # collide; rt_tables ids are u32 and any real router IP is far above the reserved low ids
+            # (253/254/255). gateway_table_base is not used here (a single base can't stay collision-
+            # free); set a per-router table explicitly upstream if a specific id is required.
+            table = str((int(go[0]) << 24) + (int(go[1]) << 16) + (int(go[2]) << 8) + int(go[3]))
             cmds = [
                 ["ip", "route", "replace", "default", "via", routing.gateway, "dev", routing.leg, "table", table],
                 ["ip", "rule", "add", "from", worker_ip, "to", local, "lookup", "main", "priority", str(prio - 1)],
@@ -268,13 +269,15 @@ def forward_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | N
     r: list[list[str]] = [
         ["-A", c, *oif, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
     ]
-    if (gateway and policy.exit_driver not in ("none", "drop", "tor")
+    if (gateway and policy.exit_driver not in ("none", "drop", "tor", "openvpn", "wireguard")
             and (policy.egress_ports is None or 53 in policy.egress_ports)):
-        # DNS to the bridge resolver only (not arbitrary internal hosts). Skipped for none/drop —
-        # a no-egress policy must not leak even DNS — and for tor, whose DNS is fully REDIRECTed to
-        # the DNSPort in PREROUTING (so no FORWARD exemption is needed or wanted). Also gated on the
-        # allowlist (parity with the INPUT chain): an explicit egress_ports omitting 53 means "no DNS",
-        # so a forwarded/custom gateway resolver can't bypass a no-DNS policy.
+        # DNS to the bridge resolver only (not arbitrary internal hosts). Skipped for: none/drop (a
+        # no-egress policy must not leak even DNS); tor (DNS is fully REDIRECTed to the DNSPort in
+        # PREROUTING); and openvpn/wireguard — the policy route keeps local-subnet (gateway) traffic
+        # in `main`, so a gateway-DNS accept there would resolve OUTSIDE the tunnel while the rest of
+        # the chain is kill-switched to `-o tun`, leaking DNS past the VPN. A tunneled exit must use a
+        # tunnel-side resolver. Also gated on the allowlist (parity with INPUT): an explicit
+        # egress_ports omitting 53 means "no DNS", so a forwarded/custom resolver can't bypass it.
         r.append(["-A", c, "-d", gateway, "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
         r.append(["-A", c, "-d", gateway, "-p", "tcp", "--dport", "53", "-j", "ACCEPT"])
     if policy.block_internal:
@@ -618,10 +621,12 @@ class LibvirtEgress:
             return
         err = (cp.stderr or "").lower()
         # benign ONLY when the host has no usable IPv6 filter TABLE/stack — there is no v6 path to
-        # bypass, so don't reap every worker over it. A narrow list: a missing `mac` MATCH extension
-        # ("couldn't load match `mac`: no such file...") must NOT be tolerated — the v6 drop wouldn't
-        # install while the guest may still have working IPv6, so that case raises (fail closed).
-        benign = ("table does not exist", "can't initialize", "address family not supported")
+        # bypass, so don't reap every worker over it. A NARROW list keyed on table/address-family
+        # absence: a missing `mac` MATCH ("couldn't load match `mac`...") AND a PERMISSION error
+        # (legacy iptables: "can't initialize ip6tables table `filter': Permission denied") must NOT
+        # be tolerated — the v6 drop wouldn't install while the guest may still have working IPv6, so
+        # those raise (fail closed). (Don't match bare "can't initialize" — it covers both.)
+        benign = ("table does not exist", "address family not supported")
         if not any(b in err for b in benign):
             raise RuntimeError(f"ip6tables {chain} v6 fail-closed DROP failed (rc={cp.returncode}): "
                                f"{(cp.stderr or '').strip()[:160]}")

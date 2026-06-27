@@ -120,6 +120,20 @@ def test_promote_warming_evicts_slot_reaped_during_finalize() -> None:
     assert set(rt.reaped) == ids         # and they were reaped
 
 
+def test_health_check_quarantines_slot_when_reap_fails() -> None:
+    # a dead IDLE slot whose reap RAISES (destroy failed → VM may still run) must stay quarantined in
+    # _slots (not popped), so the health sweep can't orphan a live worker off pool accounting.
+    rt = _ReapFailRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=4)
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots))
+    pool._slots[sid].state = SlotState.IDLE
+    rt.set_alive(sid, False)            # mark it dead so _health_check tries to evict it
+    pool._health_check()
+    assert sid in pool._slots           # NOT popped — quarantined
+    assert pool._slots[sid].state == SlotState.DRAINING
+
+
 class _FinalizeReapRaisesRuntime(_FakeRuntime):
     """is_ready() RAISES (e.g. finalize's reap couldn't `virsh destroy` the VM — it may still run)."""
 

@@ -490,14 +490,20 @@ class WarmPool:
             with self._lock:
                 candidate.state = SlotState.DRAINING
 
-            # Reap + remove (best-effort; don't crash claim on failure)
+            # Reap + remove (best-effort; don't crash claim on failure). If reap RAISES (could not
+            # dispose the worker — e.g. a libvirt VM whose `virsh destroy` failed and may still run),
+            # do NOT pop: keep it quarantined/tracked, like release(), so a live worker isn't orphaned
+            # off the books while a replacement spawns.
+            reaped = False
             try:
                 self._reap_and_count(candidate)
+                reaped = True
             except Exception:
-                logger.exception("pool.reap_dead_slot_error slot_id=%s", candidate.slot_id)
+                logger.exception("pool.reap_dead_slot_error slot_id=%s — quarantining", candidate.slot_id)
             finally:
-                with self._lock:
-                    self._slots.pop(candidate.slot_id, None)
+                if reaped:
+                    with self._lock:
+                        self._slots.pop(candidate.slot_id, None)
 
             # Loop: try to find another IDLE slot
 
@@ -668,13 +674,18 @@ class WarmPool:
 
         for slot in to_reap:
             logger.warning("pool.health_evicted_dead_slot slot_id=%s", slot.slot_id)
+            reaped = False
             try:
                 self._reap_and_count(slot)
+                reaped = True
             except Exception:
-                logger.exception("pool.health_reap_error slot_id=%s", slot.slot_id)
+                # reap raised (worker not disposed — may still run): quarantine, don't pop (like
+                # release()), so a live worker isn't orphaned off pool accounting.
+                logger.exception("pool.health_reap_error slot_id=%s — quarantining", slot.slot_id)
             finally:
-                with self._lock:
-                    self._slots.pop(slot.slot_id, None)
+                if reaped:
+                    with self._lock:
+                        self._slots.pop(slot.slot_id, None)
 
     def _background_loop(self) -> None:
         """Run tick() repeatedly until stop() is called."""

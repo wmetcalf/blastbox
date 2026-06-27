@@ -216,6 +216,8 @@ class VmWorkerSpec:
             except Exception:
                 if had_golden:   # restore the previous working golden
                     _run(["mv", prev, img.golden])
+                else:            # FIRST build: drop the partial artifact so a later build_image(
+                    _run(["rm", "-f", img.golden])  # force=False) can't return a half-built golden
                 raise
             if had_golden:
                 _run(["rm", "-f", prev])
@@ -290,7 +292,8 @@ def _ports(v: object) -> tuple[int, ...] | None:
     elif isinstance(v, (list, tuple)):
         raw = " ".join(str(x) for x in v)
     else:
-        return None
+        return ()   # a PROVIDED but unsupported type (e.g. a mapping `{http: 80}`) fails CLOSED to
+        #             () = "drop everything", never None = "no allowlist" (which would widen to all).
     return parse_egress_ports(raw) or ()   # provided-but-all-invalid → () (closed), never None (open)
 
 

@@ -31,6 +31,28 @@ def test_build_image_qemu_removes_partial_first_build(monkeypatch, tmp_path):
     assert ["rm", "-f", str(g), str(g) + ".flat"] in calls       # partial first-build golden removed
 
 
+def test_build_image_packer_removes_partial_first_build(monkeypatch, tmp_path):
+    # a FAILED first packer build must delete the partial golden (parity with the qemu first build).
+    import blastbox.host.runtime.vm_compose as mod
+    g = tmp_path / "g.qcow2"   # does not exist (first build)
+    calls = []
+
+    def fake_run(args, check=False):
+        calls.append(args)
+        if args[:2] == ["packer", "build"]:
+            g.write_text("partial")          # packer created it...
+            raise RuntimeError("packer then failed")
+        return type("C", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(mod, "_run", fake_run)
+    spec = VmWorkerSpec.from_dict("auth", {
+        "image": {"golden": str(g), "builder": "packer", "packer_template": "/t.pkr.hcl"},
+    })
+    with pytest.raises(RuntimeError):
+        spec.build_image()
+    assert ["rm", "-f", str(g)] in calls         # partial first-build golden removed
+
+
 def test_build_image_packer_restores_golden_on_failed_forced_rebuild(monkeypatch, tmp_path):
     # a forced packer rebuild that fails must restore the previous working golden, not destroy it.
     import blastbox.host.runtime.vm_compose as mod
@@ -137,6 +159,8 @@ def test_ports_accepts_single_int_and_rejects_bool():
     # a web-only policy to unrestricted egress).
     assert _ports("70000 99999") == ()
     assert _ports([70000]) == ()
+    # a PROVIDED but unsupported YAML type (e.g. a mapping) also fails closed to (), not None
+    assert _ports({"http": 80}) == ()
 
 
 def test_from_dict_builds_full_spec():

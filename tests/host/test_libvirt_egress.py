@@ -95,7 +95,9 @@ def test_chain_name():
 
 
 def test_web_only_block_internal():
-    pol = VmEgressPolicy(exit_driver="openvpn", egress_ports=(53, 80, 443), block_internal=True)
+    # direct exit: it keeps the host-resolver (gateway) DNS exemption (a tunneled exit must resolve
+    # tunnel-side, so openvpn/wireguard intentionally do NOT get this gateway-DNS accept).
+    pol = VmEgressPolicy(exit_driver="direct", egress_ports=(53, 80, 443), block_internal=True)
     flat = _flat(forward_chain_rules("192.168.122.50", pol, gateway="192.168.122.1"))
     c = "BBVM_192_168_122_50"
     # return traffic first
@@ -289,6 +291,26 @@ def test_fakenet_dnat_deletes_sweeps_only_target_worker():
     assert len(dels) == 2                                  # both .50 DNATs, not .5, not the REDIRECT
     assert all(d[:4] == ["iptables", "-t", "nat", "-D"] for d in dels)
     assert all("192.168.122.50/32" in " ".join(d) for d in dels)
+
+
+def test_v6_drop_raises_on_permission_denied(monkeypatch):
+    # legacy iptables reports a privilege problem as "can't initialize ... Permission denied" — that
+    # is NOT a benign "no v6 table" case: the drop didn't install while v6 may work → fail closed.
+    eg = LibvirtEgress(sudo=False)
+    monkeypatch.setattr(eg, "_priv", lambda argv, **k: subprocess.CompletedProcess(
+        argv, 4, "", "ip6tables: can't initialize ip6tables table `filter': Permission denied"))
+    with pytest.raises(RuntimeError, match="v6 fail-closed"):
+        eg._v6_drop("FORWARD", "52:54:00:aa:bb:cc")
+
+
+def test_forward_gateway_dns_skipped_for_vpn_exits():
+    # openvpn/wireguard must NOT get the gateway-DNS exemption: the policy route keeps gateway traffic
+    # in `main`, so it would resolve OUTSIDE the tunnel while the rest is kill-switched.
+    for drv in ("openvpn", "wireguard"):
+        flat = _flat(forward_chain_rules("192.168.122.5",
+                                         VmEgressPolicy(exit_driver=drv, egress_ports=(53, 80)),
+                                         gateway="192.168.122.1"))
+        assert not any("-d 192.168.122.1" in f and "--dport 53" in f for f in flat)
 
 
 def test_v6_drop_raises_on_missing_mac_match_extension(monkeypatch):
@@ -511,10 +533,10 @@ def test_routing_next_hop_shared_router_mode():
     R = ExitRouting(gateway="10.99.0.2", leg="br-routers", gateway_table_base=200)
     cmds = _flat(routing_commands("192.168.122.5", "openvpn", R))
     # per-gateway table default via the router VM on the leg (table id = base + low-24-bits of gw IP)
-    assert any("route replace default via 10.99.0.2 dev br-routers table 6488266" in c for c in cmds)
+    assert any("route replace default via 10.99.0.2 dev br-routers table 174260226" in c for c in cmds)
     # local exemption + select the per-gateway table
     assert any("rule add from 192.168.122.5 to 192.168.122.0/24 lookup main" in c for c in cmds)
-    assert any("rule add from 192.168.122.5 lookup 6488266" in c for c in cmds)
+    assert any("rule add from 192.168.122.5 lookup 174260226" in c for c in cmds)
     # SNAT onto the leg so the router replies to this host
     assert any("POSTROUTING -s 192.168.122.5 -o br-routers -j MASQUERADE" in c for c in cmds)
 
@@ -531,21 +553,22 @@ def test_routing_local_exemption_uses_worker_cidr_override():
 
 
 def test_routing_next_hop_table_id_avoids_collisions():
-    # gateways must NOT share a route table across the 2nd/3rd octets: last-octet-only collided
-    # 10.99.0.2 / 10.99.1.2; 16-bit keying collided 10.98.0.2 / 10.99.0.2. The 24-bit key separates all.
+    # the full-IP table id must separate gateways differing in ANY octet — last-octet-only collided
+    # .0.2/.1.2; 16-bit collided 10.98/10.99; 24-bit collided 10.99/172.99 (1st octet). All distinct now.
     def _table(gw):
         cmds = _flat(routing_commands("192.168.122.5", "openvpn",
-                                      ExitRouting(gateway=gw, leg="br-routers", gateway_table_base=200)))
+                                      ExitRouting(gateway=gw, leg="br-routers")))
         return next(c.split("table ")[1] for c in cmds if "route replace default" in c)
-    tables = {_table(gw) for gw in ("10.99.0.2", "10.99.1.2", "10.98.0.2", "10.99.0.3")}
-    assert len(tables) == 4                       # all distinct — no cross-/24 or cross-/16 collision
+    gws = ("10.99.0.2", "10.99.1.2", "10.98.0.2", "10.99.0.3", "172.99.0.2")
+    assert len({_table(gw) for gw in gws}) == len(gws)     # all distinct, incl. the cross-/8 pair
+    assert _table("10.99.0.2") == "174260226"              # full IP as u32
 
 
 def test_routing_next_hop_no_masquerade():
     R = ExitRouting(gateway="10.99.0.3", leg="br-routers", gateway_masquerade=False)
     cmds = _flat(routing_commands("192.168.122.5", "wireguard", R))
     assert not any("MASQUERADE" in c for c in cmds)
-    assert any("route replace default via 10.99.0.3 dev br-routers table 6488267" in c for c in cmds)
+    assert any("route replace default via 10.99.0.3 dev br-routers table 174260227" in c for c in cmds)
 
 
 def test_routing_next_hop_teardown_keeps_shared_route():
@@ -554,5 +577,5 @@ def test_routing_next_hop_teardown_keeps_shared_route():
     # the shared per-gateway route must NOT be torn down (other workers/hosts use it)
     assert not any(c.startswith("ip route") for c in rm)
     # but the per-worker rules + masquerade are removed
-    assert any("rule del from 192.168.122.5 lookup 6488266" in c for c in rm)
+    assert any("rule del from 192.168.122.5 lookup 174260226" in c for c in rm)
     assert any("POSTROUTING -s 192.168.122.5 -o br-routers -j MASQUERADE" in c and "-D" in c for c in rm)
