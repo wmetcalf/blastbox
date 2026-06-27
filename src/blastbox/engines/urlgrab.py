@@ -148,7 +148,14 @@ def _default_fetch(
     req = urllib.request.Request(url, headers={"User-Agent": _DEFAULT_UA}, method="GET")
     try:
         resp = opener.open(req, timeout=timeout)
-    except urllib.error.HTTPError as e:  # 4xx/5xx are responses, not transport failures
+    except urllib.error.HTTPError as e:  # 4xx/5xx are responses, not transport failures —
+        # EXCEPT a redirect to a scheme urllib itself refuses (file://, gopher://): HTTPRedirectHandler
+        # raises HTTPError directly (before our redirect_request hook runs) with e.url = the blocked
+        # target. That's NOT a real fetched 302 — treat it as a fetch FAILURE, not a response, so the
+        # result isn't mislabeled fetched=True with final_url pointing at the blocked URL.
+        if urlparse(getattr(e, "url", "") or url).scheme not in ("http", "https"):
+            raise FetchError(f"blocked redirect to non-HTTP(S) scheme: "
+                             f"{(getattr(e, 'url', '') or '')[:80]}") from e
         resp = e
     except (urllib.error.URLError, socket.timeout, OSError, ValueError) as e:
         raise FetchError(str(e)) from e

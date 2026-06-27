@@ -587,6 +587,8 @@ class Dispatcher:
             _log.warning("httpproxy proxy= carries inline credentials; stripping userinfo before "
                          "injecting into the worker env (use a creds-holding sidecar instead)")
             host = parsed.hostname or ""
+            if ":" in host:        # IPv6 literal: parsed.hostname drops the brackets — restore them,
+                host = f"[{host}]"  # else "2001:db8::1:8080" is an invalid host/port to URL parsers.
             netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
             proxy = urllib.parse.urlunparse(parsed._replace(netloc=netloc))
         return {k: proxy for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}

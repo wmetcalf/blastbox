@@ -109,8 +109,11 @@ def rotate(candidate: str, *, live_disk: str, backup_dir: str, keep_n: int = 5,
         logger.error("golden rotate: promote failed — rolling back to the previous consistent pair")
         for dest in dests:
             runner([*pfx, "rm", "-f", dest + ".new"], capture_output=True, text=True)  # drop partial new
+            # Always clear any already-promoted new file at dest, THEN restore the stash if there was
+            # one. Without the unconditional rm, a FIRST rotation (no prior file → not stashed) whose
+            # earlier target promoted but later one failed would leave that half-promoted new in place.
+            runner([*pfx, "rm", "-f", dest], capture_output=True, text=True)
             if dest in stashed:                                                          # restore old
-                runner([*pfx, "rm", "-f", dest], capture_output=True, text=True)
                 runner([*pfx, "mv", dest + ".rollback", dest], capture_output=True, text=True)
         raise
     for dest in stashed:  # success — drop the stashes

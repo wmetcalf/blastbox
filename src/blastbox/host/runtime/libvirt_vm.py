@@ -289,9 +289,12 @@ class LibvirtVmRuntime:
             # Correct the clock before the worker is smoked + snapshotted — a fresh golden boot can
             # carry a stale/wrong clock (observed ~7h off), and for a cert validator the clock IS the
             # trust decision, so the baseline must be time-correct. PRIMARY = the libvirt-native
-            # `virsh domtime` (qemu-ga, TZ-robust); on_ready is the fallback when qemu-ga isn't up.
-            if not self._sync_time(slot.domain):
-                self._on_ready(slot)
+            # `virsh domtime` (qemu-ga, TZ-robust).
+            self._sync_time(slot.domain)
+            # on_ready runs at EVERY ready transition (finalize + each revert), NOT only as the clock
+            # fallback: engines use it for guest-side readiness repair beyond the clock, so it must run
+            # even when domtime succeeded (it's also the clock fallback if qemu-ga is down).
+            self._on_ready(slot)
             # Install guest TLS trust anchors (e.g. a FakeNet/mitmproxy CA for HTTPS interception)
             # BEFORE the snapshot, so every warm-restore inherits them. Best-effort.
             self._install_trust_anchors(slot)
@@ -424,8 +427,8 @@ class LibvirtVmRuntime:
         while time.time() < deadline:
             if slot.ip and self._port_up(slot.ip, timeout=2):
                 if not synced:
-                    if not self._sync_time(slot.domain):
-                        self._on_ready(slot)
+                    self._sync_time(slot.domain)
+                    self._on_ready(slot)   # runs at every revert too (readiness repair, not just clock)
                     synced = True
                 if self.cfg.health_check is None or self._smoke(slot):
                     # Do NOT set IDLE here. When WarmPool.release() drives recycle the slot must stay

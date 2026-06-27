@@ -48,7 +48,7 @@ class VmJobDispatcher:
                  engine: str | None = None, worker_tier: str = "libvirt-vm",
                  job_retention_s: int = 0, concurrency: int = 1, poll_s: float = 0.5,
                  heartbeat_s: float = 30.0, maintenance_interval_s: float = 60.0,
-                 orphan_timeout_s: float = 600.0) -> None:
+                 orphan_timeout_s: float = 600.0, sole_owner: bool = False) -> None:
         self._store = store
         self._job_root = Path(job_root)
         self._validate = validate
@@ -63,6 +63,11 @@ class VmJobDispatcher:
         # this long has a dead owner → FAIL it (keep it comfortably above heartbeat_s).
         self._maintenance_interval_s = float(maintenance_interval_s)
         self._orphan_timeout_s = max(self._heartbeat_s * 4, float(orphan_timeout_s))
+        # sole_owner: this is the ONLY dispatcher on the store (VM-only deployment, no cold/container
+        # dispatcher). Then orphan recovery can also reclaim a stale RUNNING job that was claimed but
+        # crashed BEFORE _process stamped worker_runtime="warm" — there's no cold job to mistake it
+        # for. Default False keeps recovery scoped to our own warm-stamped claims (shared-store safe).
+        self._sole_owner = bool(sole_owner)
         self._retention = JobRetentionSweeper(self._job_root)
         self._stop = threading.Event()
 
@@ -86,13 +91,19 @@ class VmJobDispatcher:
         summary, not necessarily a sealed output dir, so write a metadata.json from the summary if the
         validator didn't already produce one (don't clobber a real one) — otherwise those routes 404
         on a job that looks done. Best-effort: a write hiccup must not fail an otherwise-valid job
-        (the authoritative result is the stored ``result_summary``)."""
+        (the authoritative result is the stored ``result_summary``).
+
+        SECURITY: force ``artifacts: []``. The ingress treats metadata.json's artifact list as
+        dispatcher-VALIDATED (re-hashed by the host trust gate), and drives ``/artifacts``/``/result``
+        file serving off it. A VM ``validate()`` summary is NOT that — it never went through the trust
+        gate — so an ``artifacts`` list in it (guest-influenced) must never make unsealed output files
+        downloadable. We surface the summary as the metadata body but neuter its artifact manifest."""
         meta = self._job_dir(job) / "output" / "metadata.json"
         if meta.exists():
             return
         try:
             meta.parent.mkdir(parents=True, exist_ok=True)
-            meta.write_text(json.dumps(summary or {}))
+            meta.write_text(json.dumps({**(summary or {}), "artifacts": []}))
         except OSError:
             logger.warning("vm_dispatch: could not write metadata.json for %s (result routes may "
                            "404)", job.job_id, exc_info=True)
@@ -213,11 +224,14 @@ class VmJobDispatcher:
             for job in self._store.list(status=JobStatus.RUNNING):
                 if self._engine is not None and job.engine != self._engine:
                     continue
-                # Recover ONLY jobs a VM dispatcher of OUR tier owns (worker_runtime="warm" +
-                # matching worker_tier, both set by _process). In a shared store a long COLD/container
-                # job for the same engine has worker_runtime=None/"runc" — its Docker worker may still
-                # be running, so failing it + deleting its input here would be a cross-tier clobber.
-                if job.worker_runtime != "warm" or job.worker_tier != self._worker_tier:
+                # Recover jobs a VM dispatcher of OUR tier owns (worker_runtime="warm" + matching
+                # worker_tier, both set by _process). In a SHARED store a long COLD/container job for
+                # the same engine has worker_runtime=None/"runc" — its Docker worker may still be
+                # running, so failing it would be a cross-tier clobber. EXCEPT when sole_owner: then
+                # there's no cold dispatcher, so also reclaim an unmarked claim that crashed before the
+                # warm stamp (it would otherwise be stuck RUNNING forever).
+                if not self._sole_owner and (
+                        job.worker_runtime != "warm" or job.worker_tier != self._worker_tier):
                     continue
                 if job.started_at is None or job.started_at >= cutoff:
                     continue  # fresh (heartbeat-refreshed) → still alive

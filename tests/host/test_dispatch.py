@@ -1582,6 +1582,10 @@ def test_httpproxy_env_validates_proxy_url(tmp_path):
     env = d._httpproxy_env(creds)
     assert env["HTTP_PROXY"] == "http://172.30.0.30:8888"  # host:port kept, userinfo dropped
     assert all("s3cr3t" not in v and "user" not in v for v in env.values())
+    # IPv6 literal: brackets must be preserved when rebuilding the credential-stripped netloc
+    v6 = Personality(name="brd", exit_driver="httpproxy",
+                     config={"proxy": "http://u:p@[2001:db8::1]:8080"})
+    assert d._httpproxy_env(v6)["HTTP_PROXY"] == "http://[2001:db8::1]:8080"
 
 
 def test_decrypt_seal_refuses_symlinked_output(tmp_path, monkeypatch):

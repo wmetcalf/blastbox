@@ -50,12 +50,23 @@ def windows_install_command(cert_bytes: bytes, name: str) -> str:
 
 
 def linux_install_command(cert_bytes: bytes, name: str) -> str:
-    """A self-contained Debian/RHEL remote command: decode the embedded cert into the ca-certificates
-    dir and refresh the trust store."""
-    cert_b64 = base64.b64encode(cert_bytes).decode()
-    dest = f"/usr/local/share/ca-certificates/bb_anchor_{name}.crt"
-    return (f"sh -c 'echo {cert_b64} | base64 -d > {dest} && "
-            "(update-ca-certificates || update-ca-trust extract)'")
+    """A self-contained Debian/RHEL remote command: decode the embedded cert into the trust-source dir
+    that the AVAILABLE tool actually reads, then refresh the store.
+
+    Debian's ``update-ca-certificates`` reads ``/usr/local/share/ca-certificates``; RHEL/Fedora's
+    ``update-ca-trust`` reads ``/etc/pki/ca-trust/source/anchors``. Writing to the Debian path and
+    falling back to ``update-ca-trust extract`` would leave the CA UNTRUSTED on RHEL (wrong source
+    dir), so pick the destination by which tool exists."""
+    cert_b64 = base64.b64encode(cert_bytes).decode()  # [A-Za-z0-9+/=] — safe unquoted in `b=...`
+    deb = f"/usr/local/share/ca-certificates/bb_anchor_{name}.crt"
+    rhel = f"/etc/pki/ca-trust/source/anchors/bb_anchor_{name}.crt"
+    return ("sh -c '"
+            f"b={cert_b64}; "
+            "if command -v update-ca-certificates >/dev/null 2>&1; then "
+            f"echo $b | base64 -d > {deb} && update-ca-certificates; "
+            "elif command -v update-ca-trust >/dev/null 2>&1; then "
+            f"echo $b | base64 -d > {rhel} && update-ca-trust extract; "
+            "else exit 1; fi'")
 
 
 def install_trust_anchors(

@@ -193,9 +193,9 @@ def test_finalize_snapshot_is_atomic(monkeypatch):
     assert snap and "--atomic" in snap[0]
 
 
-def test_on_ready_skipped_when_domtime_succeeds(monkeypatch):
-    # When domtime --sync succeeds (qemu-ga baked in), the on_ready fallback must NOT fire — the
-    # libvirt-native UTC sync already set the clock; double-setting risks TZ corruption.
+def test_on_ready_runs_even_when_domtime_succeeds(monkeypatch):
+    # on_ready is a per-ready-transition hook (guest readiness repair beyond the clock), so it runs at
+    # finalize AND each revert EVEN when domtime succeeded — not only as the clock fallback.
     calls: list[str] = []
     rt = _rt(on_ready=lambda slot: calls.append("ready"))
     _stub_virsh(rt, monkeypatch, domtime_ok=True)
@@ -203,7 +203,7 @@ def test_on_ready_skipped_when_domtime_succeeds(monkeypatch):
                   ip="192.168.122.9", mac="52:54:00:aa:bb:cc")
     assert rt.is_ready(slot) is True
     rt.recycle(slot, ready_timeout_s=5)
-    assert calls == []                         # domtime won; fallback never ran
+    assert calls == ["ready", "ready"]         # finalize + revert, despite domtime winning
 
 
 def test_trust_anchors_installed_at_finalize_before_snapshot(monkeypatch):

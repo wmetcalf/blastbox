@@ -34,6 +34,24 @@ def test_redirect_to_http_scheme_is_allowed():
     assert nxt is not None and nxt.full_url == "https://ok.example/next"
 
 
+def test_default_fetch_blocked_scheme_redirect_is_a_fetch_failure(monkeypatch):
+    # urllib's HTTPRedirectHandler raises HTTPError (before our hook) for schemes it refuses
+    # (file://, gopher://); that must surface as a FETCH FAILURE, not a fake fetched 302 response.
+    import io
+    from blastbox.engines.urlgrab import FetchError, _default_fetch
+
+    def blocked(self, req, timeout=None):
+        raise urllib.error.HTTPError("file:///etc/passwd", 302, "Found", {}, None)
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", blocked)
+    with pytest.raises(FetchError):
+        _default_fetch("http://evil/", timeout=5, max_bytes=100, max_redirects=3)
+
+    def http404(self, req, timeout=None):     # a genuine 4xx (http url) is still a RESPONSE
+        raise urllib.error.HTTPError("http://x/missing", 404, "Not Found", {}, io.BytesIO(b"nope"))
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", http404)
+    assert _default_fetch("http://x/", timeout=5, max_bytes=100, max_redirects=3).status == 404
+
+
 def _run(tmp_path: Path, engine: UrlGrabEngine, url_text: bytes,
          limits: Limits | None = None) -> tuple[int, dict, Path]:
     import tempfile

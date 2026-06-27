@@ -181,6 +181,34 @@ def test_rotate_rolls_back_split_promotion(tmp_path):
     assert any(f"mv {shm}.rollback {shm}" in c for c in flat)      # mirror restored too
 
 
+def test_rotate_removes_half_promoted_target_on_first_rotation(tmp_path):
+    # FIRST rotation (no prior live files → nothing stashed): if live_disk promotes but the shm mirror
+    # promote fails, rollback must REMOVE the already-promoted disk (not leave a half-promoted pair).
+    live = tmp_path / "g.qcow2"            # does NOT exist yet (first rotation)
+    shm = tmp_path / "shm.qcow2"
+
+    class _R:
+        def __init__(self):
+            self.cmds = []
+
+        def __call__(self, argv, **k):
+            self.cmds.append(argv)
+            # nothing exists yet (test -e fails); fail the SHM promote (2nd mv)
+            rc = 0
+            if argv[:1] == ["test"]:
+                rc = 1                                          # no existing file → not stashed
+            elif argv[:1] == ["mv"] and argv[1].endswith("shm.qcow2.new"):
+                rc = 1                                          # SHM promote fails
+            return type("C", (), {"returncode": rc, "stdout": "", "stderr": "x"})()
+
+    r = _R()
+    with pytest.raises(RuntimeError, match="promote"):
+        golden.rotate(str(tmp_path / "cand.qcow2"), live_disk=str(live), live_shm=str(shm),
+                      backup_dir=str(tmp_path / "b"), ts="T", sudo=False, runner=r)
+    flat = [" ".join(c) for c in r.cmds]
+    assert any(c == f"rm -f {live}" for c in flat)   # the half-promoted disk golden is removed
+
+
 def test_promote_if_valid_rejects_when_factory_raises(tmp_path):
     # a malformed candidate that makes runtime_factory() itself raise is a FAILED gate (False +
     # on_reject), not an uncaught crash — the factory call is inside the guarded path now.

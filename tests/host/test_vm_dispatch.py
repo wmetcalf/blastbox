@@ -173,6 +173,25 @@ def test_maintenance_leaves_fresh_running_job_alone(tmp_path):
     assert store.get(job.job_id).status is JobStatus.RUNNING   # still alive, untouched
 
 
+def test_maintenance_sole_owner_recovers_unmarked_claim(tmp_path):
+    # a claim that crashed BEFORE the warm stamp (worker_runtime unset) is stuck forever in a VM-only
+    # deployment; sole_owner=True lets maintenance reclaim it (no cold dispatcher to mistake it for).
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    _claim_as_vm(store, job, started_at=1.0, worker_runtime=None, worker_tier=None)  # unmarked, stale
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), orphan_timeout_s=10.0,
+                        sole_owner=True)
+    d._run_maintenance()
+    assert store.get(job.job_id).status is JobStatus.FAILED       # reclaimed
+    # without sole_owner an unmarked claim is left alone (could be a cold job)
+    store2 = InMemoryJobStore()
+    job2 = _queue_job(store2, tmp_path / "b")
+    _claim_as_vm(store2, job2, started_at=1.0, worker_runtime=None, worker_tier=None)
+    VmJobDispatcher(store2, str(tmp_path / "b"), lambda p: ({}, True),
+                    orphan_timeout_s=10.0)._run_maintenance()
+    assert store2.get(job2.job_id).status is JobStatus.RUNNING
+
+
 def test_maintenance_does_not_recover_a_cold_job(tmp_path):
     # a stale-but-not-ours job (a cold/container job, worker_runtime != "warm") must NOT be failed —
     # its Docker worker may still be running; failing + deleting input would be a cross-tier clobber.

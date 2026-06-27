@@ -21,9 +21,14 @@ def test_windows_install_command_embeds_cert_and_imports():
 
 def test_linux_install_command_embeds_cert_and_updates_store():
     cmd = linux_install_command(b"PEMDATA", "0")
-    assert "/usr/local/share/ca-certificates/bb_anchor_0.crt" in cmd
     assert "base64 -d" in cmd
+    # writes to the dir the AVAILABLE tool reads: Debian (update-ca-certificates) AND RHEL
+    # (update-ca-trust) paths, selected by `command -v`, so the CA is trusted on either distro.
+    assert "/usr/local/share/ca-certificates/bb_anchor_0.crt" in cmd
     assert "update-ca-certificates" in cmd
+    assert "/etc/pki/ca-trust/source/anchors/bb_anchor_0.crt" in cmd
+    assert "update-ca-trust extract" in cmd
+    assert "command -v" in cmd                  # picks the dir by which tool exists
 
 
 class _Runner:

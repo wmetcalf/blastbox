@@ -281,10 +281,21 @@ def load_compose(path: str) -> dict[str, VmWorkerSpec]:
 
 
 def _truthy(v: object) -> bool:
-    # A quoted YAML scalar like block_internal: "false" arrives as the string "false", which
-    # bool() would read as True. Treat the usual false-y spellings as False.
+    # Coerce a YAML scalar to bool for SECURITY knobs (block_internal, gateway_masquerade). A quoted
+    # "false" arrives as the string "false" (bool() would read it True). REJECT an unrecognized string
+    # (e.g. a typo `block_internal: "treu"`) rather than silently defaulting it to False — a security
+    # control must not be disabled by a typo.
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
     if isinstance(v, str):
-        return v.strip().lower() in ("1", "true", "yes", "on")
+        s = v.strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return True
+        if s in ("", "0", "false", "no", "off"):
+            return False
+        raise ValueError(f"malformed boolean value {v!r} (use true/false)")
     return bool(v)
 
 
