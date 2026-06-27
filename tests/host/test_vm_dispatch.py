@@ -144,6 +144,45 @@ def test_claim_next_engine_set_keeps_vm_jobs_off_cold_dispatcher():
     assert vm is not None and vm.engine == "authenticode"
 
 
+def test_maintenance_recovers_orphaned_running_job(tmp_path):
+    # a RUNNING job whose heartbeat went stale (claiming dispatcher crashed) is FAILED by maintenance
+    # and its input dropped — not left RUNNING forever.
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    claimed = store.claim_next()                         # RUNNING + claim_id
+    store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=claimed.claim_id,
+                           started_at=1.0)               # ancient started_at (no heartbeat)
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), orphan_timeout_s=10.0)
+    d._run_maintenance()
+    got = store.get(job.job_id)
+    assert got.status is JobStatus.FAILED and got.error == "orphaned"
+    assert not (tmp_path / job.job_id / "input" / "evil.dll").exists()
+
+
+def test_maintenance_leaves_fresh_running_job_alone(tmp_path):
+    import time as _t
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    claimed = store.claim_next()
+    store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=claimed.claim_id,
+                           started_at=_t.time())          # freshly heartbeated
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), orphan_timeout_s=600.0)
+    d._run_maintenance()
+    assert store.get(job.job_id).status is JobStatus.RUNNING   # still alive, untouched
+
+
+def test_maintenance_expires_terminal_job_dir(tmp_path):
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    job.result_dir = str(tmp_path / job.job_id / "output")
+    (tmp_path / job.job_id / "output").mkdir(parents=True)
+    store.update(job.job_id, status=JobStatus.DONE, result_dir=job.result_dir, expires_at=1.0)  # past
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True))
+    d._run_maintenance()
+    assert not (tmp_path / job.job_id).exists()           # retention reclaimed the whole job dir
+    assert store.get(job.job_id).status is JobStatus.EXPIRED
+
+
 def test_libvirt_vm_is_a_routable_tier():
     # operators must be able to target_tier=libvirt-vm so VM-only jobs aren't claimed+failed by the
     # cold dispatcher in a shared store (ingress validates target_tier against VALID_TIERS).

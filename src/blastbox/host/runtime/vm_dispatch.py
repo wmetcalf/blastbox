@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
+from blastbox.host.jobs.retention import JobRetentionSweeper
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,8 @@ class VmJobDispatcher:
                  validate: Callable[[Path], tuple[dict | None, bool]], *,
                  engine: str | None = None, worker_tier: str = "libvirt-vm",
                  job_retention_s: int = 0, concurrency: int = 1, poll_s: float = 0.5,
-                 heartbeat_s: float = 30.0) -> None:
+                 heartbeat_s: float = 30.0, maintenance_interval_s: float = 60.0,
+                 orphan_timeout_s: float = 600.0) -> None:
         self._store = store
         self._job_root = Path(job_root)
         self._validate = validate
@@ -56,6 +58,12 @@ class VmJobDispatcher:
         self._concurrency = max(1, concurrency)
         self._poll_s = poll_s
         self._heartbeat_s = max(1.0, float(heartbeat_s))
+        # Maintenance (retention + orphan recovery): a VM-only deployment has no container Dispatcher
+        # to run it. interval<=0 disables. orphan_timeout: a RUNNING job not heartbeat-refreshed in
+        # this long has a dead owner → FAIL it (keep it comfortably above heartbeat_s).
+        self._maintenance_interval_s = float(maintenance_interval_s)
+        self._orphan_timeout_s = max(self._heartbeat_s * 4, float(orphan_timeout_s))
+        self._retention = JobRetentionSweeper(self._job_root)
         self._stop = threading.Event()
 
     def _job_dir(self, job: Job) -> Path:
@@ -189,13 +197,53 @@ class VmJobDispatcher:
             except Exception:  # noqa: BLE001 — a crash in _process must not kill the claim thread
                 logger.warning("vm_dispatch: _process crashed for %s", job.job_id, exc_info=True)
 
+    def _run_maintenance(self) -> None:
+        """Periodic upkeep a VM-only deployment otherwise lacks (the container Dispatcher does its own):
+        reclaim terminal job dirs past ``expires_at`` (retention), and FAIL orphaned RUNNING jobs whose
+        heartbeat went stale because the dispatcher that claimed them crashed (so they don't sit
+        RUNNING forever with their input on disk). Orphan recovery is CAS-fenced on the observed claim
+        (won't clobber a reclaimed job) and scoped to our engine; we FAIL (never requeue) — a requeue
+        would let a second worker re-detonate the same untrusted input."""
+        try:
+            self._retention.expire_due(self._store)
+        except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
+            logger.warning("vm_dispatch: retention sweep failed", exc_info=True)
+        try:
+            cutoff = time.time() - self._orphan_timeout_s
+            for job in self._store.list(status=JobStatus.RUNNING):
+                if self._engine is not None and job.engine != self._engine:
+                    continue
+                if job.started_at is None or job.started_at >= cutoff:
+                    continue  # fresh (heartbeat-refreshed) → still alive
+                now = time.time()
+                if self._store.update_if_status(
+                        job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
+                        status=JobStatus.FAILED, finished_at=now, error="orphaned",
+                        expires_at=self._expiry(now)):
+                    logger.warning("vm_dispatch: recovered orphaned job %s (no heartbeat >%.0fs)",
+                                   job.job_id, self._orphan_timeout_s)
+                    try:  # the owner is gone + the job is terminal; drop its leaked input
+                        self._input_path(job).unlink()
+                    except OSError:
+                        pass
+        except Exception:  # noqa: BLE001
+            logger.warning("vm_dispatch: orphan recovery failed", exc_info=True)
+
+    def _maintenance_loop(self) -> None:
+        while not self._stop.wait(self._maintenance_interval_s):
+            self._run_maintenance()
+
     def run(self) -> None:
-        """Block, claiming + processing jobs on ``concurrency`` threads until :meth:`stop`."""
+        """Block, claiming + processing jobs on ``concurrency`` threads until :meth:`stop`. Also runs
+        periodic maintenance (retention + orphan recovery) so a VM-only deployment doesn't accumulate
+        terminal output dirs / leave crashed claims RUNNING forever."""
         logger.info("vm_dispatch: claiming from %s (%d workers)", type(self._store).__name__,
                     self._concurrency)
-        with ThreadPoolExecutor(max_workers=self._concurrency, thread_name_prefix="vmclaim") as ex:
+        with ThreadPoolExecutor(max_workers=self._concurrency + 1, thread_name_prefix="vmclaim") as ex:
             for _ in range(self._concurrency):
                 ex.submit(self._worker_loop)
+            if self._maintenance_interval_s > 0:
+                ex.submit(self._maintenance_loop)
             self._stop.wait()
 
     def stop(self, *_: object) -> None:

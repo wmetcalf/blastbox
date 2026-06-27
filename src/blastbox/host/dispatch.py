@@ -262,6 +262,13 @@ class Dispatcher:
         # not by silently mislabeling warm jobs as cold here. Inert until an operator enables
         # routing at the API (BLASTBOX_ALLOW_TIER_ROUTING) — existing jobs have no target.
         self._tier = tier
+        # OPT-IN engine scoping for SHARED multi-dispatcher stores: when set, claim only jobs for
+        # engines this dispatcher handles, so it can't grab (and fail "unknown engine") a job that a
+        # co-resident VM/other-engine dispatcher owns. Default OFF preserves the single-dispatcher
+        # contract — claim anything + FAIL a genuinely-unknown engine fast (an open-allowlist typo
+        # would otherwise sit QUEUED forever). Enable this only when peers handle the other engines.
+        self._engine_scoped = os.environ.get(
+            "BLASTBOX_DISPATCHER_ENGINE_SCOPED", "").strip().lower() in ("1", "true", "yes", "on")
 
         # Personality registry built ONCE from the operator env (does not change per job).
         from blastbox.host.netpolicy import parse_personalities
@@ -313,11 +320,11 @@ class Dispatcher:
         # dispatcher has no cold path, so it must not claim work it can't immediately serve.
         if self._warm_only and (self._pool is None or self._pool.idle_count <= 0):
             return False
-        # Claim ONLY jobs for engines this dispatcher actually handles: in a shared store beside a
-        # VM/other-engine dispatcher, claiming an unknown-engine job here would just fail it
-        # "unknown engine" before its real dispatcher sees it. Engine-scoping leaves it for them; a
-        # genuinely-unknown engine (ingress open-allowlist typo) stays queued for the stale reaper.
-        job = self._job_store.claim_next(claimant_tier=self._tier, engine=frozenset(self._engines))
+        # Engine scoping is OPT-IN (shared multi-dispatcher stores): scoped → leave another
+        # dispatcher's engine's jobs for it; unscoped (default) → claim anything, and the
+        # _dispatch_claimed_job path FAILs a genuinely-unknown engine fast.
+        engine = frozenset(self._engines) if self._engine_scoped else None
+        job = self._job_store.claim_next(claimant_tier=self._tier, engine=engine)
         if job is None:
             return False
         self._dispatch_claimed_job(job)

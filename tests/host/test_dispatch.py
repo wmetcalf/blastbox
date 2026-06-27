@@ -438,15 +438,11 @@ def test_trust_failure_fails_job_input_gone(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_job_for_unhandled_engine_left_unclaimed(tmp_path):
-    """A job for an engine this dispatcher doesn't handle is LEFT UNCLAIMED — not stolen + failed.
-
-    The dispatcher claims engine-scoped (engine=set(self._engines)), so in a shared store beside a
-    VM/other-engine dispatcher it can't grab a foreign-engine job and fail it "unknown engine" before
-    the real dispatcher sees it. A genuinely-unknown engine (which the ingress allowlist rejects at
-    submit in production) stays QUEUED for its dispatcher / the stale-queued reaper — input intact."""
+def test_unknown_engine_fails_job_no_subprocess_input_gone(tmp_path):
+    """DEFAULT (engine scoping OFF): a job with an unknown engine → FAILED fast, no subprocess, input
+    gone. The single-dispatcher contract — so an open-allowlist typo can't sit QUEUED forever."""
     store = InMemoryJobStore()
-    job = _make_job(engine="no-such-engine")          # not in this dispatcher's {test-engine}
+    job = _make_job(engine="no-such-engine")
     job.input_sha256 = _INPUT_SHA
     store.create(job)
 
@@ -458,13 +454,32 @@ def test_job_for_unhandled_engine_left_unclaimed(tmp_path):
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
-    assert dispatcher.dispatch_once() is False         # nothing claimable for our engine
+    dispatcher.dispatch_once()
 
     final_job = store.get(job.job_id)
     assert final_job is not None
-    assert final_job.status == JobStatus.QUEUED         # left for the right dispatcher, not failed
-    assert subprocess_calls == [], "subprocess must NOT be launched"
-    assert input_path.exists()                          # input preserved (job not consumed)
+    assert final_job.status == JobStatus.FAILED
+    assert "engine" in (final_job.error or "").lower()
+    assert subprocess_calls == [], "subprocess must NOT be launched for unknown engine"
+    assert not input_path.exists()
+    assert not input_path.parent.exists()
+
+
+def test_engine_scoped_dispatcher_leaves_foreign_engine_jobs(tmp_path, monkeypatch):
+    """OPT-IN (BLASTBOX_DISPATCHER_ENGINE_SCOPED=1): a job for an engine this dispatcher doesn't
+    handle is LEFT UNCLAIMED for its real (e.g. VM) dispatcher — not stolen + failed."""
+    monkeypatch.setenv("BLASTBOX_DISPATCHER_ENGINE_SCOPED", "1")
+    store = InMemoryJobStore()
+    job = _make_job(engine="no-such-engine")          # not in this dispatcher's {test-engine}
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    input_path = _setup_job_dirs(tmp_path, job)
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    assert dispatcher.dispatch_once() is False         # nothing claimable for our engine
+    final_job = store.get(job.job_id)
+    assert final_job is not None and final_job.status == JobStatus.QUEUED  # left, not failed
+    assert input_path.exists()                          # input preserved
 
 
 # ---------------------------------------------------------------------------
