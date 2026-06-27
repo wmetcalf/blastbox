@@ -66,9 +66,10 @@ class VmJobDispatcher:
         return finished_at + self._retention_s if self._retention_s > 0 else None
 
     def _claim_is_ours(self, job: Job) -> bool:
-        """True if we should run this claimed job. In a shared multi-engine store ``claim_next`` can't
-        filter by engine, so a job for another engine is requeued here (CAS back to QUEUED, claim
-        cleared) and ``False`` returned — the right dispatcher picks it up. ``engine=None`` = any."""
+        """True if we should run this claimed job. ``claim_next(engine=)`` already filters at the
+        store, so this is a DEFENSIVE fallback: if a store ignored the filter and handed us another
+        engine's job, requeue it (CAS back to QUEUED, claim cleared) and return ``False`` so the
+        right dispatcher picks it up. ``engine=None`` = any engine (no scoping)."""
         if self._engine is None or job.engine == self._engine:
             return True
         self._store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
@@ -113,7 +114,10 @@ class VmJobDispatcher:
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                job = self._store.claim_next()
+                # Engine-scoped claim: the store filters to our engine, so we never claim (and then
+                # have to requeue) another engine's head-of-queue job — which would head-of-line-block
+                # our own work behind it in a shared multi-engine store.
+                job = self._store.claim_next(engine=self._engine)
             except Exception:  # noqa: BLE001 — a transient store error must not kill the loop
                 logger.warning("vm_dispatch: claim_next failed", exc_info=True)
                 job = None
@@ -121,7 +125,8 @@ class VmJobDispatcher:
                 self._stop.wait(self._poll_s)
                 continue
             if not self._claim_is_ours(job):
-                # Requeued for another engine's dispatcher; back off so we don't hot-loop reclaiming it.
+                # Defensive: a store that ignores the engine= filter could still hand us a foreign
+                # job — requeue it for the right dispatcher and back off (shouldn't normally happen).
                 self._stop.wait(self._poll_s)
                 continue
             try:

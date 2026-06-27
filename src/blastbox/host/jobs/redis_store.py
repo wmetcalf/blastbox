@@ -191,7 +191,8 @@ class RedisJobStore:
             n += 1
         return n
 
-    def claim_next(self, *, claimant_tier: str | None = None) -> Job | None:
+    def claim_next(self, *, claimant_tier: str | None = None,
+                   engine: str | None = None) -> Job | None:
         """Atomically claim the oldest QUEUED job.
 
         Scans all keys with the store prefix, picks the oldest QUEUED job,
@@ -200,7 +201,8 @@ class RedisJobStore:
 
         ``claimant_tier`` routes: a job with ``target_tier`` set is claimable only by a
         claimant whose tier matches; the scan already decodes every job, so the filter is
-        free here (the claim stays O(N)-scan as before).
+        free here (the claim stays O(N)-scan as before). ``engine`` (when set) restricts the
+        claim to that engine's jobs (shared multi-engine stores).
         """
         while True:
             candidates: list[tuple[float, str, str]] = []
@@ -212,6 +214,8 @@ class RedisJobStore:
                 if job is None:
                     continue
                 if job.target_tier is not None and job.target_tier != claimant_tier:
+                    continue
+                if engine is not None and job.engine != engine:
                     continue
                 if job.status == JobStatus.QUEUED:
                     # Decode key to str for comparison; fakeredis may return bytes

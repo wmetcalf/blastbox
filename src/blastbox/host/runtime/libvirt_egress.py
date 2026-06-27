@@ -136,7 +136,12 @@ def routing_commands(worker_ip: str, exit_driver: str, routing: ExitRouting,
             # SHARED-ROUTER / next-hop mode: forward the worker to a router VM on the leg network
             # that holds the VPN. The per-gateway table's default is via that router; many
             # workers/hosts reusing the same router share one VPN link.
-            table = str(routing.gateway_table_base + int(routing.gateway.split(".")[-1]))
+            # Key the table on the gateway's LOW 16 BITS (3rd+4th octet), not just the last octet:
+            # otherwise 10.99.0.2 and 10.99.1.2 would both hash to base+2 and the later worker's
+            # `ip route replace ... table <id>` would silently re-point the earlier gateway's table,
+            # sending in-flight workers' tunnel traffic through the wrong router (isolation break).
+            go = routing.gateway.split(".")
+            table = str(routing.gateway_table_base + (int(go[2]) << 8) + int(go[3]))
             cmds = [
                 ["ip", "route", "replace", "default", "via", routing.gateway, "dev", routing.leg, "table", table],
                 ["ip", "rule", "add", "from", worker_ip, "to", local, "lookup", "main", "priority", str(prio - 1)],

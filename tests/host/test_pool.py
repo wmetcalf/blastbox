@@ -76,6 +76,29 @@ class _FakeRuntime:
             self.reaped.append(slot.slot_id)
 
 
+class _FinalizeFailRuntime(_FakeRuntime):
+    """Models a runtime (e.g. libvirt) whose finalize fails closed: it reaps the VM INSIDE is_ready()
+    — flipping the slot to DRAINING — and returns False."""
+
+    def is_ready(self, slot: Slot) -> bool:
+        slot.state = SlotState.DRAINING
+        self.reap(slot)
+        return False
+
+
+def test_promote_warming_evicts_slot_reaped_during_finalize() -> None:
+    # a slot the runtime reaped internally (DRAINING, is_ready False) must be EVICTED from the pool,
+    # not left as a husk that eats concurrent_ceiling headroom and eventually stops new spawns.
+    rt = _FinalizeFailRuntime()
+    pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=4)
+    pool._spawn_to_deficit(ready=True)
+    ids = set(pool._slots.keys())
+    assert len(ids) == 2
+    pool._promote_warming()
+    assert pool.slot_count == 0          # both dead husks removed (not stuck DRAINING)
+    assert set(rt.reaped) == ids         # and they were reaped
+
+
 # ---------------------------------------------------------------------------
 # Fake clock (injectable)
 # ---------------------------------------------------------------------------

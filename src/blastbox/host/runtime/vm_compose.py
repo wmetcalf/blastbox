@@ -25,7 +25,6 @@ provisioner scripts stay with the engine (e.g. the win-validator golden).
 """
 from __future__ import annotations
 
-import shlex
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -211,7 +210,7 @@ class VmWorkerSpec:
             _run(["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", img.base_qcow2,
                   img.golden], check=True)
             for cmd in img.provisioners:
-                _run(shlex.split(cmd) if isinstance(cmd, str) else cmd, check=True)
+                _run_provisioner(cmd)
             if not img.exists():
                 raise RuntimeError(f"{self.name}: provisioners ran but {img.golden} was not produced")
             # Flatten: collapse the backing chain into a standalone qcow2 so the golden carries no
@@ -261,3 +260,19 @@ def _run(args: list[str], check: bool = False) -> subprocess.CompletedProcess:
     if check and cp.returncode != 0:
         raise RuntimeError(f"{' '.join(args)} failed: {cp.stderr.strip()[:300]}")
     return cp
+
+
+def _run_provisioner(cmd: "str | list[str]") -> None:
+    """Run one provisioner and fail closed on a non-zero exit. The spec documents provisioners as
+    SHELL commands, so a STRING runs through the shell — operators rely on ``&&``/pipes/redirection/
+    ``VAR=x`` prefixes; argv-splitting one would silently drop everything after a shell operator and
+    let a golden build look successful after incomplete provisioning. A LIST runs as argv (no shell).
+    These are operator-supplied, trusted compose inputs (not attacker data)."""
+    if isinstance(cmd, str):
+        cp = subprocess.run(cmd, shell=True, capture_output=True, text=True)  # noqa: S602 — operator-trusted shell command by spec
+        shown = cmd
+    else:
+        cp = subprocess.run(cmd, capture_output=True, text=True)
+        shown = " ".join(cmd)
+    if cp.returncode != 0:
+        raise RuntimeError(f"provisioner failed ({shown[:200]}): {cp.stderr.strip()[:300]}")

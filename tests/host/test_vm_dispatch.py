@@ -84,6 +84,19 @@ def test_claim_is_ours_accepts_matching_and_unscoped(tmp_path):
                            engine="authenticode")._claim_is_ours(claimed) is True
 
 
+def test_engine_scoped_claim_skips_older_foreign_head(tmp_path):
+    # the store-side fix: an engine-scoped claim must reach OUR job even when an older foreign job is
+    # at the queue head (no head-of-line block, no claim+requeue churn).
+    store = InMemoryJobStore()
+    other = Job.new(engine="other-engine", filename="b.dll")
+    store.create(other)                       # older, head of queue
+    mine = Job.new(engine="authenticode", filename="a.dll")
+    store.create(mine)
+    claimed = store.claim_next(engine="authenticode")
+    assert claimed is not None and claimed.job_id == mine.job_id   # skipped the foreign head
+    assert store.get(other.job_id).status is JobStatus.QUEUED      # foreign job left untouched
+
+
 def test_dispatch_marks_failed_when_engine_reports_not_ok(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)

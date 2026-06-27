@@ -5,7 +5,27 @@ import pytest
 
 from blastbox.host.pool import SlotRuntime
 from blastbox.host.runtime.libvirt_vm import LibvirtVmRuntime
-from blastbox.host.runtime.vm_compose import VmImageSpec, VmWorkerSpec, _ports
+from blastbox.host.runtime.vm_compose import VmImageSpec, VmWorkerSpec, _ports, _run_provisioner
+
+
+def test_run_provisioner_string_runs_through_shell(tmp_path):
+    # the spec documents provisioners as SHELL commands — && / redirection must work (argv-splitting
+    # would silently drop everything after the && and leave an incomplete golden looking successful).
+    marker = tmp_path / "ok"
+    _run_provisioner(f"true && echo hi > {marker}")
+    assert marker.read_text().strip() == "hi"
+
+
+def test_run_provisioner_failure_fails_closed():
+    with pytest.raises(RuntimeError, match="provisioner failed"):
+        _run_provisioner("false && echo never-reached")
+
+
+def test_run_provisioner_list_runs_as_argv():
+    # list form is argv (no shell) — a successful argv command returns without raising
+    _run_provisioner(["true"])
+    with pytest.raises(RuntimeError, match="provisioner failed"):
+        _run_provisioner(["false"])
 
 
 def test_from_dict_block_internal_quoted_false_is_false():

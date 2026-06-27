@@ -20,8 +20,11 @@ def test_redirect_to_non_http_scheme_is_blocked():
     h = _CappedRedirect()
     req = urllib.request.Request("http://evil.example/start")
     for bad in ("file:///etc/passwd", "ftp://evil.example/x", "gopher://evil/x"):
-        with pytest.raises(urllib.error.HTTPError):
+        with pytest.raises(urllib.error.URLError) as ei:
             h.redirect_request(req, None, 302, "Found", {}, bad)
+        # must be a transport-style URLError, NOT an HTTPError (which _default_fetch would record as
+        # a successful 302 response instead of a fetch failure).
+        assert not isinstance(ei.value, urllib.error.HTTPError)
 
 
 def test_redirect_to_http_scheme_is_allowed():

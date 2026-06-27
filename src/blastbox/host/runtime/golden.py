@@ -69,7 +69,10 @@ def rotate(candidate: str, *, live_disk: str, backup_dir: str, keep_n: int = 5,
 
     runner([*pfx, "mkdir", "-p", backup_dir], capture_output=True, text=True)
     runner([*pfx, "chmod", "755", backup_dir], capture_output=True, text=True)
-    if Path(live_disk).exists():
+    # Existence check via the SAME privileged runner: libvirt image dirs are often root-only, so an
+    # unprivileged Path.exists() would report False and silently SKIP the backup, overwriting the live
+    # golden with no rollback copy. `test -e` under sudo sees what the cp/mv below actually see.
+    if runner([*pfx, "test", "-e", live_disk], capture_output=True, text=True).returncode == 0:
         bak = f"{backup_dir}/golden-base.{ts}.qcow2"
         logger.info("backing up current golden -> %s", bak)
         _checked(["cp", "--reflink=auto", live_disk, bak], "backup")

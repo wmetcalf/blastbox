@@ -370,6 +370,18 @@ def test_routing_next_hop_shared_router_mode():
     assert any("POSTROUTING -s 192.168.122.5 -o br-routers -j MASQUERADE" in c for c in cmds)
 
 
+def test_routing_next_hop_table_id_avoids_cross_subnet_collision():
+    # gateways differing only in the 3rd octet must NOT share a route table (last-octet-only keying
+    # collided 10.99.0.2 and 10.99.1.2 → both table 202, corrupting isolation).
+    def _table(gw):
+        cmds = _flat(routing_commands("192.168.122.5", "openvpn",
+                                      ExitRouting(gateway=gw, leg="br-routers", gateway_table_base=200)))
+        return next(c.split("table ")[1] for c in cmds if "route replace default" in c)
+    assert _table("10.99.0.2") == "202"          # base + 0*256 + 2
+    assert _table("10.99.1.2") == "458"          # base + 1*256 + 2 — distinct, no collision
+    assert _table("10.99.0.2") != _table("10.99.1.2")
+
+
 def test_routing_next_hop_no_masquerade():
     R = ExitRouting(gateway="10.99.0.3", leg="br-routers", gateway_masquerade=False)
     cmds = _flat(routing_commands("192.168.122.5", "wireguard", R))

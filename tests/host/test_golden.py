@@ -71,6 +71,18 @@ def test_rotate_aborts_on_failed_copy(tmp_path):
                       ts="T", sudo=False, runner=_FailCpMv())
 
 
+def test_rotate_backs_up_root_only_golden_via_privileged_check(tmp_path):
+    # the live golden lives in a root-only dir: an unprivileged Path.exists() would say "absent" and
+    # SKIP the backup. The existence check must go through the SAME privileged runner as cp/mv.
+    live = tmp_path / "rootonly" / "golden-base.qcow2"  # NOT created on the unprivileged fs
+    rec = _Rec()  # recorder: `test -e` returns rc 0 (as a sudo check would for a root-readable file)
+    golden.rotate(str(tmp_path / "cand.qcow2"), live_disk=str(live), backup_dir=str(tmp_path / "b"),
+                  ts="T", sudo=True, runner=rec)
+    flat = [" ".join(c) for c in rec.cmds]
+    assert any(c[:3] == ["sudo", "test", "-e"] for c in rec.cmds)          # privileged existence probe
+    assert any("cp --reflink=auto" in c and "golden-base.T.qcow2" in c for c in flat)  # backup taken
+
+
 def test_prune_keeps_newest_n(tmp_path):
     for i in range(5):
         (tmp_path / f"golden-base.2026010{i}-000000.qcow2").write_text("x")

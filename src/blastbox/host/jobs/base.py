@@ -242,7 +242,14 @@ class JobStore(Protocol):
         """
         ...
 
-    def claim_next(self, *, claimant_tier: str | None = None) -> Job | None: ...
+    def claim_next(self, *, claimant_tier: str | None = None,
+                   engine: str | None = None) -> Job | None:
+        """Atomically claim the oldest eligible QUEUED job → RUNNING. ``claimant_tier`` routes by
+        ``target_tier``; ``engine`` (when set) restricts the claim to jobs for that engine, so a
+        single-engine claimant (e.g. a VM dispatcher with one ``validate``) in a SHARED multi-engine
+        store doesn't head-of-line-block on — or claim+requeue — another engine's queued jobs.
+        ``engine=None`` = any engine (default; unchanged behaviour)."""
+        ...
     def delete(self, job_id: str) -> None: ...
 
 

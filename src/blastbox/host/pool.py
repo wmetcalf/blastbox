@@ -511,6 +511,15 @@ class WarmPool:
                     if slot.slot_id in self._slots and slot.state == SlotState.WARMING:
                         slot.state = SlotState.IDLE
                         newly_idle.append(slot.slot_id)
+            elif slot.state == SlotState.DRAINING:
+                # A runtime whose finalize fails closed (e.g. libvirt egress/snapshot error) reaps the
+                # VM *inside* is_ready() and returns False, leaving the slot DRAINING. If we leave it
+                # in _slots it still counts against concurrent_ceiling headroom, so repeated finalize
+                # failures pile up dead husks and eventually stop new spawns. The runtime already
+                # reaped it, so just evict the record (count it) — don't reap again.
+                with self._lock:
+                    if self._slots.pop(slot.slot_id, None) is not None:
+                        record_slot_reaped()
 
         if newly_idle:
             with self._lock:

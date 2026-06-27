@@ -106,11 +106,12 @@ class _CappedRedirect(urllib.request.HTTPRedirectHandler):
         # Keep the fetcher a bounded HTTP(S) client across the WHOLE redirect chain, not just the
         # initial URL: a malicious server can 30x to file:// (or ftp://, etc.), and build_opener's
         # default FileHandler/FTPHandler would happily service it — reading a worker-local file into
-        # the sealed `body` artifact (SSRF / local-file read). Reject any non-HTTP(S) redirect target
-        # so the only schemes ever fetched are the validated http/https.
+        # the sealed `body` artifact (SSRF / local-file read). Reject any non-HTTP(S) redirect target.
+        # Raise URLError (NOT HTTPError): _default_fetch treats an HTTPError as a real 4xx/5xx
+        # *response* (it would record fetched=True, status=302, final_url=the unsafe URL), whereas a
+        # URLError is a transport failure → FetchError → the result correctly reads fetch_failed.
         if urlparse(newurl).scheme not in ("http", "https"):
-            raise urllib.error.HTTPError(
-                newurl, code, f"redirect to non-HTTP(S) scheme blocked: {newurl[:80]}", headers, fp)
+            raise urllib.error.URLError(f"blocked redirect to non-HTTP(S) scheme: {newurl[:80]}")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
