@@ -155,7 +155,13 @@ def routing_commands(worker_ip: str, exit_driver: str, routing: ExitRouting,
             # `ip route replace ... table <id>` would silently re-point the earlier gateway's table,
             # sending in-flight workers' tunnel traffic through the wrong router (isolation break).
             go = routing.gateway.split(".")
-            table = str(routing.gateway_table_base + (int(go[2]) << 8) + int(go[3]))
+            # Table id from the gateway's low 24 BITS (2nd+3rd+4th octets), not just 16: two routers
+            # on different /16s with the same low 16 bits (10.98.0.2 vs 10.99.0.2) would otherwise
+            # collide on base+2, and the later `ip route replace ... table <id>` would re-point the
+            # earlier router's table (mixing VPN attribution). rt_tables ids are u32, so 24 bits +
+            # base fits comfortably. (Routers across different /8s sharing octets 2-4 is negligible.)
+            table = str(routing.gateway_table_base
+                        + (int(go[1]) << 16) + (int(go[2]) << 8) + int(go[3]))
             cmds = [
                 ["ip", "route", "replace", "default", "via", routing.gateway, "dev", routing.leg, "table", table],
                 ["ip", "rule", "add", "from", worker_ip, "to", local, "lookup", "main", "priority", str(prio - 1)],
@@ -404,20 +410,23 @@ def _fakenet_dnat_deletes(worker_ip: str, prerouting_dump: str) -> list[list[str
     return out
 
 
-def _tor_redirect_deletes(worker_ip: str, tor_trans_port: int, prerouting_dump: str) -> list[list[str]]:
-    """From ``iptables -t nat -S PREROUTING`` output, the ``-D`` argv for EVERY TCP REDIRECT this
-    worker has into tor's TransPort — whatever port set installed them (catch-all vs per-port).
+def _tor_redirect_deletes(worker_ip: str, tor_trans_port: int, tor_dns_port: int,
+                          prerouting_dump: str) -> list[list[str]]:
+    """From ``iptables -t nat -S PREROUTING`` output, the ``-D`` argv for EVERY REDIRECT this worker
+    has into tor — both the TCP TransPort redirects AND the DNS (53→DNSPort, udp+tcp) redirects,
+    whatever port set installed them.
 
     del-by-match teardown can only remove the exact ports the *current* policy names, so a reused
-    DHCP IP whose prior worker had a different ``egress_ports`` (e.g. a catch-all tor worker followed
-    by a port-scoped one) would otherwise leave an orphan REDIRECT that silently bypasses the new
-    allow-list. Enumerating the live rules and deleting them all closes that, regardless of history."""
-    src = f"-s {worker_ip}/32"  # iptables -S always prints /32 for a host; exact match avoids a
-    needle = f"--to-ports {tor_trans_port}"  # .5 prefix-matching .50/32
+    DHCP IP whose prior worker had a different ``egress_ports`` (e.g. a tor worker with DNS allowed,
+    then a policy omitting 53 or switching to inetsim) would otherwise leave an orphan REDIRECT —
+    catch-all TransPort OR a 53→DNSPort — ahead of the new rules, silently bypassing the new policy.
+    Enumerating the live rules and deleting all redirects to either tor port closes that."""
+    src = f"-s {worker_ip}/32"  # iptables -S always prints /32 for a host; exact match avoids .5
+    needles = (f"--to-ports {tor_trans_port}", f"--to-ports {tor_dns_port}")  # prefix-matching .50/32
     out: list[list[str]] = []
     for line in prerouting_dump.splitlines():
         toks = line.split()
-        if toks[:2] == ["-A", "PREROUTING"] and src in line and "-p tcp" in line and needle in line:
+        if toks[:2] == ["-A", "PREROUTING"] and src in line and any(n in line for n in needles):
             out.append(["iptables", "-t", "nat", "-D", *toks[1:]])
     return out
 
@@ -546,7 +555,7 @@ class LibvirtEgress:
                 for cmd in routing_teardown_commands(worker_ip, drv, self._routing, egress_ports,
                                                      block_internal=True):
                     self._priv(cmd)  # best-effort: del-by-match, ignore "not found"
-            self._sweep_tor_tcp_redirects(worker_ip)  # orphan REDIRECTs left by a prior port set
+            self._sweep_tor_redirects(worker_ip)      # orphan tor REDIRECTs (TransPort + DNSPort)
             self._sweep_fakenet_dnat(worker_ip)       # orphan DNATs left by a changed sink address
             self._sweep_ip_rules(worker_ip)           # orphan policy routes left by changed routing
         if mac:
@@ -594,17 +603,18 @@ class LibvirtEgress:
         logger.warning("ip6tables %s v6 DROP not installed (%s) — host has no IPv6 filter stack; "
                        "worker nets are v4-only by design", chain, err.strip()[:80] or "rc!=0")
 
-    def _sweep_tor_tcp_redirects(self, worker_ip: str) -> None:
-        """Delete EVERY live nat-PREROUTING TCP REDIRECT this worker has into tor's TransPort, so an
-        orphan left by a prior incarnation with a different ``egress_ports`` (catch-all ↔ port-scoped)
-        can't survive a reused DHCP IP and bypass the new allow-list. Best-effort; no-op without
-        routing or if the dump fails."""
+    def _sweep_tor_redirects(self, worker_ip: str) -> None:
+        """Delete EVERY live nat-PREROUTING REDIRECT this worker has into tor — TransPort TCP AND the
+        53→DNSPort (udp+tcp) — so an orphan left by a prior incarnation with a different ``egress_ports``
+        (catch-all ↔ port-scoped, or DNS-allowed ↔ DNS-omitted) can't survive a reused DHCP IP and
+        bypass/misroute the new policy. Best-effort; no-op without routing or if the dump fails."""
         if self._routing is None:
             return
         cp = self._ipt_run("-t", "nat", "-S", "PREROUTING")
         if cp.returncode != 0:
             return
-        for argv in _tor_redirect_deletes(worker_ip, self._routing.tor_trans_port, cp.stdout):
+        for argv in _tor_redirect_deletes(worker_ip, self._routing.tor_trans_port,
+                                          self._routing.tor_dns_port, cp.stdout):
             self._priv(argv)
 
     def _sweep_ip_rules(self, worker_ip: str) -> None:

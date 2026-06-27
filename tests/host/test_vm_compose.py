@@ -8,6 +8,29 @@ from blastbox.host.runtime.libvirt_vm import LibvirtVmRuntime
 from blastbox.host.runtime.vm_compose import VmImageSpec, VmWorkerSpec, _ports, _run_provisioner
 
 
+def test_build_image_qemu_removes_partial_first_build(monkeypatch, tmp_path):
+    # a FAILED first qemu build must delete the partial golden, else a later build_image(force=False)
+    # would return the half-provisioned image as if valid.
+    import blastbox.host.runtime.vm_compose as mod
+    g = tmp_path / "g.qcow2"   # does not exist at start (first build)
+    calls = []
+
+    def fake_run(args, check=False):
+        calls.append(args)
+        if args[:2] == ["qemu-img", "create"]:
+            g.write_text("partial")     # create produced the file...
+        return type("C", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(mod, "_run", fake_run)
+    spec = VmWorkerSpec.from_dict("auth", {
+        "image": {"golden": str(g), "builder": "qemu", "base_qcow2": "/b.qcow2",
+                  "provisioners": ["false"]},   # ...but the provisioner (real `false`) fails
+    })
+    with pytest.raises(RuntimeError):
+        spec.build_image()
+    assert ["rm", "-f", str(g), str(g) + ".flat"] in calls       # partial first-build golden removed
+
+
 def test_build_image_packer_requires_golden(monkeypatch, tmp_path):
     # parity with the qemu branch: a packer template that exits 0 but doesn't produce image.golden
     # must fail at build time, not return a missing/stale path that the pool trips over later.

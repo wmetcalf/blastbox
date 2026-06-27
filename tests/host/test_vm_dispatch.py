@@ -60,6 +60,30 @@ def test_dispatch_does_not_write_metadata_on_failure(tmp_path):
     assert not (tmp_path / job.job_id / "output" / "metadata.json").exists()   # only on success
 
 
+def test_heartbeat_refreshes_started_at_during_validate(tmp_path):
+    # a long validate() must not look abandoned to a peer recovery sweep: the heartbeat refreshes
+    # started_at while it runs.
+    import time as _t
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    claimed = store.claim_next()
+    t0 = store.get(job.job_id).started_at
+
+    def slow_validate(p):
+        deadline = _t.time() + 3.0
+        while _t.time() < deadline:           # wait until the heartbeat bumps started_at
+            if (store.get(job.job_id).started_at or 0) > t0:
+                return ({}, True)
+            _t.sleep(0.02)
+        return ({}, False)                    # heartbeat never fired → fail the assertion below
+
+    d = VmJobDispatcher(store, str(tmp_path), slow_validate, heartbeat_s=0.05)
+    d._process(claimed)
+    got = store.get(job.job_id)
+    assert got.status is JobStatus.DONE       # heartbeat fired (validate returned ok=True)
+    assert got.started_at > t0                # started_at was refreshed past claim time
+
+
 def test_dispatch_sets_retention_expiry(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)

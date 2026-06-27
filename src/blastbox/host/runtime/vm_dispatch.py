@@ -45,7 +45,8 @@ class VmJobDispatcher:
     def __init__(self, store: JobStore, job_root: str,
                  validate: Callable[[Path], tuple[dict | None, bool]], *,
                  engine: str | None = None, worker_tier: str = "libvirt-vm",
-                 job_retention_s: int = 0, concurrency: int = 1, poll_s: float = 0.5) -> None:
+                 job_retention_s: int = 0, concurrency: int = 1, poll_s: float = 0.5,
+                 heartbeat_s: float = 30.0) -> None:
         self._store = store
         self._job_root = Path(job_root)
         self._validate = validate
@@ -54,6 +55,7 @@ class VmJobDispatcher:
         self._retention_s = max(0, int(job_retention_s))
         self._concurrency = max(1, concurrency)
         self._poll_s = poll_s
+        self._heartbeat_s = max(1.0, float(heartbeat_s))
         self._stop = threading.Event()
 
     def _job_dir(self, job: Job) -> Path:
@@ -87,6 +89,27 @@ class VmJobDispatcher:
             logger.warning("vm_dispatch: could not write metadata.json for %s (result routes may "
                            "404)", job.job_id, exc_info=True)
 
+    def _validate_with_heartbeat(self, job: Job, in_path: Path) -> tuple[dict | None, bool]:
+        """Run ``validate()`` while a daemon thread refreshes the job's ``started_at`` every
+        ``heartbeat_s``. A VM validation can legitimately outrun a peer's warm-recovery cutoff
+        (``worker_timeout_s + grace``); without the heartbeat that sweep would FAIL the still-running
+        job as abandoned and delete its input before our terminal CAS. The refresh is CAS-fenced on
+        our claim, so it no-ops harmlessly if the job was reclaimed."""
+        beat = threading.Event()
+
+        def _pump() -> None:
+            while not beat.wait(self._heartbeat_s):
+                self._store.update_if_status(job.job_id, JobStatus.RUNNING,
+                                             expect_claim_id=job.claim_id, started_at=time.time())
+
+        hb = threading.Thread(target=_pump, name=f"vmhb-{job.job_id[:8]}", daemon=True)
+        hb.start()
+        try:
+            return self._validate(in_path)
+        finally:
+            beat.set()
+            hb.join(timeout=2)
+
     def _claim_is_ours(self, job: Job) -> bool:
         """True if we should run this claimed job. ``claim_next(engine=)`` already filters at the
         store, so this is a DEFENSIVE fallback: if a store ignored the filter and handed us another
@@ -113,7 +136,7 @@ class VmJobDispatcher:
         try:
             if not in_path.exists():
                 raise FileNotFoundError(f"spooled input missing: {in_path}")
-            summary, ok = self._validate(in_path)
+            summary, ok = self._validate_with_heartbeat(job, in_path)
             finished = time.time()
             # CAS on (status, claim_id) so a stale owner can't clobber a job that was reclaimed
             # (RUNNING->QUEUED->RUNNING under another dispatcher). The return value is OUR ownership.

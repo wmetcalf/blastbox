@@ -94,10 +94,27 @@ def rotate(candidate: str, *, live_disk: str, backup_dir: str, keep_n: int = 5,
     # nothing) instead of advancing the disk golden while the boot mirror stays stale.
     for dest in dests:
         _checked(["cp", "--reflink=auto", candidate, dest + ".new"], "stage candidate")
-    # Only once ALL targets are staged, SWAP them into place (rename is ~atomic; the gap between the
-    # two renames is a single syscall apart, far tighter than a full cp between them).
+    # Move the current targets aside first (so a mid-sequence swap failure can be ROLLED BACK to a
+    # consistent pair), then swap the staged copies into place. If any promote fails, restore every
+    # target from its stash — never leave live_disk advanced while the RAM mirror stays stale.
+    stashed = []
     for dest in dests:
-        _checked(["mv", dest + ".new", dest], "promote")
+        if runner([*pfx, "test", "-e", dest], capture_output=True, text=True).returncode == 0:
+            _checked(["mv", dest, dest + ".rollback"], "stash current")
+            stashed.append(dest)
+    try:
+        for dest in dests:
+            _checked(["mv", dest + ".new", dest], "promote")
+    except Exception:
+        logger.error("golden rotate: promote failed — rolling back to the previous consistent pair")
+        for dest in dests:
+            runner([*pfx, "rm", "-f", dest + ".new"], capture_output=True, text=True)  # drop partial new
+            if dest in stashed:                                                          # restore old
+                runner([*pfx, "rm", "-f", dest], capture_output=True, text=True)
+                runner([*pfx, "mv", dest + ".rollback", dest], capture_output=True, text=True)
+        raise
+    for dest in stashed:  # success — drop the stashes
+        runner([*pfx, "rm", "-f", dest + ".rollback"], capture_output=True, text=True)
     runner([*pfx, "chmod", "644", live_disk, *([live_shm] if live_shm else [])], capture_output=True, text=True)
     prune_backups(backup_dir, keep_n, sudo=sudo, runner=runner)
 

@@ -236,6 +236,9 @@ class VmWorkerSpec:
             except Exception:
                 if had_golden:   # restore the previous working golden — a failed rebuild is non-destructive
                     _run(["mv", prev, img.golden])
+                else:            # FIRST build: delete the partial golden/flat so a later build_image(
+                    # force=False) doesn't mistake a half-provisioned image for a valid golden.
+                    _run(["rm", "-f", img.golden, img.golden + ".flat"])
                 raise
             if had_golden:
                 _run(["rm", "-f", prev])

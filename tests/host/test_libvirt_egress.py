@@ -450,11 +450,12 @@ def test_tor_redirect_deletes_sweeps_only_target_worker():
         "-A PREROUTING -s 192.168.122.5/32 -p tcp -j REDIRECT --to-ports 9040",         # other worker
         "-A PREROUTING -s 192.168.122.50/32 -p udp --dport 53 -j REDIRECT --to-ports 9053",  # DNS, not TCP
     ])
-    dels = _tor_redirect_deletes("192.168.122.50", 9040, dump)
-    assert len(dels) == 2                                  # both .50 TCP redirects, not .5, not DNS
+    dels = _tor_redirect_deletes("192.168.122.50", 9040, 9053, dump)
+    assert len(dels) == 3                # both .50 TransPort redirects + the .50 DNS redirect, not .5
     assert all(d[:4] == ["iptables", "-t", "nat", "-D"] for d in dels)
     assert all("192.168.122.50/32" in " ".join(d) for d in dels)
     assert all(d[4] == "PREROUTING" for d in dels)
+    assert any("9053" in " ".join(d) for d in dels)       # the DNS→DNSPort redirect is swept too
 
 
 def test_direct_egress_is_not_tunnel_scoped():
@@ -481,11 +482,11 @@ def test_routing_teardown_inverts():
 def test_routing_next_hop_shared_router_mode():
     R = ExitRouting(gateway="10.99.0.2", leg="br-routers", gateway_table_base=200)
     cmds = _flat(routing_commands("192.168.122.5", "openvpn", R))
-    # per-gateway table default via the router VM on the leg
-    assert any("route replace default via 10.99.0.2 dev br-routers table 202" in c for c in cmds)
+    # per-gateway table default via the router VM on the leg (table id = base + low-24-bits of gw IP)
+    assert any("route replace default via 10.99.0.2 dev br-routers table 6488266" in c for c in cmds)
     # local exemption + select the per-gateway table
     assert any("rule add from 192.168.122.5 to 192.168.122.0/24 lookup main" in c for c in cmds)
-    assert any("rule add from 192.168.122.5 lookup 202" in c for c in cmds)
+    assert any("rule add from 192.168.122.5 lookup 6488266" in c for c in cmds)
     # SNAT onto the leg so the router replies to this host
     assert any("POSTROUTING -s 192.168.122.5 -o br-routers -j MASQUERADE" in c for c in cmds)
 
@@ -501,23 +502,22 @@ def test_routing_local_exemption_uses_worker_cidr_override():
     assert any("to 192.168.122.0/24 lookup main" in c for c in flat2)
 
 
-def test_routing_next_hop_table_id_avoids_cross_subnet_collision():
-    # gateways differing only in the 3rd octet must NOT share a route table (last-octet-only keying
-    # collided 10.99.0.2 and 10.99.1.2 → both table 202, corrupting isolation).
+def test_routing_next_hop_table_id_avoids_collisions():
+    # gateways must NOT share a route table across the 2nd/3rd octets: last-octet-only collided
+    # 10.99.0.2 / 10.99.1.2; 16-bit keying collided 10.98.0.2 / 10.99.0.2. The 24-bit key separates all.
     def _table(gw):
         cmds = _flat(routing_commands("192.168.122.5", "openvpn",
                                       ExitRouting(gateway=gw, leg="br-routers", gateway_table_base=200)))
         return next(c.split("table ")[1] for c in cmds if "route replace default" in c)
-    assert _table("10.99.0.2") == "202"          # base + 0*256 + 2
-    assert _table("10.99.1.2") == "458"          # base + 1*256 + 2 — distinct, no collision
-    assert _table("10.99.0.2") != _table("10.99.1.2")
+    tables = {_table(gw) for gw in ("10.99.0.2", "10.99.1.2", "10.98.0.2", "10.99.0.3")}
+    assert len(tables) == 4                       # all distinct — no cross-/24 or cross-/16 collision
 
 
 def test_routing_next_hop_no_masquerade():
     R = ExitRouting(gateway="10.99.0.3", leg="br-routers", gateway_masquerade=False)
     cmds = _flat(routing_commands("192.168.122.5", "wireguard", R))
     assert not any("MASQUERADE" in c for c in cmds)
-    assert any("route replace default via 10.99.0.3 dev br-routers table 203" in c for c in cmds)
+    assert any("route replace default via 10.99.0.3 dev br-routers table 6488267" in c for c in cmds)
 
 
 def test_routing_next_hop_teardown_keeps_shared_route():
@@ -526,5 +526,5 @@ def test_routing_next_hop_teardown_keeps_shared_route():
     # the shared per-gateway route must NOT be torn down (other workers/hosts use it)
     assert not any(c.startswith("ip route") for c in rm)
     # but the per-worker rules + masquerade are removed
-    assert any("rule del from 192.168.122.5 lookup 202" in c for c in rm)
+    assert any("rule del from 192.168.122.5 lookup 6488266" in c for c in rm)
     assert any("POSTROUTING -s 192.168.122.5 -o br-routers -j MASQUERADE" in c and "-D" in c for c in rm)

@@ -150,9 +150,35 @@ def test_rotate_stages_all_targets_before_swapping(tmp_path):
     golden.rotate(str(tmp_path / "cand.qcow2"), live_disk=str(live), live_shm=str(shm),
                   backup_dir=str(tmp_path / "b"), ts="T", sudo=False, runner=rec)
     stage = [i for i, c in enumerate(rec.cmds) if c[0] == "cp" and c[-1].endswith(".new")]
-    swap = [i for i, c in enumerate(rec.cmds) if c[0] == "mv"]
-    assert len(stage) == 2 and len(swap) == 2
-    assert max(stage) < min(swap)          # stage disk+shm, THEN swap both
+    promote = [i for i, c in enumerate(rec.cmds) if c[0] == "mv" and c[1].endswith(".new")]
+    assert len(stage) == 2 and len(promote) == 2   # both .new staged, both promoted
+    assert max(stage) < min(promote)        # stage disk+shm, THEN swap both into place
+
+
+def test_rotate_rolls_back_split_promotion(tmp_path):
+    # if the SHM mirror promote fails after the disk was already swapped, both must be rolled back to
+    # the previous consistent pair (never leave live_disk advanced + mirror stale).
+    live = tmp_path / "g.qcow2"
+    live.write_text("cur")
+    shm = tmp_path / "shm.qcow2"
+    shm.write_text("curshm")
+
+    class _R:
+        def __init__(self):
+            self.cmds = []
+
+        def __call__(self, argv, **k):
+            self.cmds.append(argv)
+            rc = 1 if (argv[:1] == ["mv"] and argv[1].endswith("shm.qcow2.new")) else 0  # fail SHM promote
+            return type("C", (), {"returncode": rc, "stdout": "", "stderr": "boom"})()
+
+    r = _R()
+    with pytest.raises(RuntimeError, match="promote"):
+        golden.rotate(str(tmp_path / "cand.qcow2"), live_disk=str(live), live_shm=str(shm),
+                      backup_dir=str(tmp_path / "b"), ts="T", sudo=False, runner=r)
+    flat = [" ".join(c) for c in r.cmds]
+    assert any(f"mv {live}.rollback {live}" in c for c in flat)    # disk restored from its stash
+    assert any(f"mv {shm}.rollback {shm}" in c for c in flat)      # mirror restored too
 
 
 def test_promote_if_valid_rejects_when_factory_raises(tmp_path):
