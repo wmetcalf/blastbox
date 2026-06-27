@@ -49,7 +49,15 @@ def validate_golden(qcow2: str, *, runtime_factory: Callable[[str], object],
         logger.warning("golden gate: check raised for %s", qcow2, exc_info=True)
         return False
     finally:
-        rt.reap(slot)  # type: ignore[attr-defined]
+        # Cleanup must NOT change the gate result: reap() now RAISES if it can't dispose the worker
+        # (e.g. virsh destroy failed). Letting that escape the finally would turn a check()==False
+        # rejection into an exception (skipping promote_if_valid's on_reject) or block a passing
+        # candidate from rotating. Swallow+log teardown failures so the True/False verdict stands.
+        try:
+            rt.reap(slot)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            logger.warning("golden gate: throwaway worker reap failed for %s (manual cleanup may be "
+                           "needed); gate verdict unaffected", qcow2, exc_info=True)
 
 
 def rotate(candidate: str, *, live_disk: str, backup_dir: str, keep_n: int = 5,

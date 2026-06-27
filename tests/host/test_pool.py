@@ -120,6 +120,26 @@ def test_promote_warming_evicts_slot_reaped_during_finalize() -> None:
     assert set(rt.reaped) == ids         # and they were reaped
 
 
+class _FinalizeReapRaisesRuntime(_FakeRuntime):
+    """is_ready() RAISES (e.g. finalize's reap couldn't `virsh destroy` the VM — it may still run)."""
+
+    def is_ready(self, slot: Slot) -> bool:
+        slot.state = SlotState.DRAINING
+        raise RuntimeError("destroy failed during finalize; VM may still be running")
+
+
+def test_promote_warming_quarantines_slot_when_is_ready_raises() -> None:
+    # if is_ready RAISES (reap couldn't dispose the VM), the slot must NOT be popped — leave it
+    # quarantined/tracked, not evicted like a cleanly-reaped husk (which would orphan a live VM).
+    rt = _FinalizeReapRaisesRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=4)
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots))
+    pool._promote_warming()
+    assert sid in pool._slots                                # NOT evicted — quarantined
+    assert pool._slots[sid].state == SlotState.DRAINING
+
+
 # ---------------------------------------------------------------------------
 # Fake clock (injectable)
 # ---------------------------------------------------------------------------

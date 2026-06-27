@@ -56,12 +56,16 @@ class VmJobDispatcher:
         self._poll_s = poll_s
         self._stop = threading.Event()
 
+    def _job_dir(self, job: Job) -> Path:
+        # The ingress canonical layout is <job_root>/<id>/{input,output}/ (job.result_dir points at
+        # the OUTPUT subdir, NOT this parent — don't derive paths from it). Everything hangs off here.
+        return self._job_root / job.job_id
+
     def _input_path(self, job: Job) -> Path:
-        # ingress spools to <result_dir>/input/<filename>; result_dir falls back to job_root/<id>.
-        # Path(...).name strips any directory components a non-ingress producer left in `filename`,
-        # so the join (and the finally-block unlink) can never escape the job's own input/ dir.
-        root = Path(job.result_dir) if job.result_dir else (self._job_root / job.job_id)
-        return root / "input" / Path(job.filename).name
+        # ingress spools the sample to <job_root>/<id>/input/<filename>. Path(...).name strips any
+        # directory components a non-ingress producer left in `filename`, so the join (and the
+        # finally-block unlink) can never escape the job's own input/ dir.
+        return self._job_dir(job) / "input" / Path(job.filename).name
 
     def _expiry(self, finished_at: float) -> float | None:
         return finished_at + self._retention_s if self._retention_s > 0 else None
@@ -73,8 +77,7 @@ class VmJobDispatcher:
         validator didn't already produce one (don't clobber a real one) — otherwise those routes 404
         on a job that looks done. Best-effort: a write hiccup must not fail an otherwise-valid job
         (the authoritative result is the stored ``result_summary``)."""
-        root = Path(job.result_dir) if job.result_dir else (self._job_root / job.job_id)
-        meta = root / "output" / "metadata.json"
+        meta = self._job_dir(job) / "output" / "metadata.json"
         if meta.exists():
             return
         try:
@@ -98,17 +101,19 @@ class VmJobDispatcher:
     def _process(self, job: Job) -> None:
         # Mark the in-flight job as a warm worker BEFORE the (possibly long) validate, so a peer's
         # requeue_orphaned_jobs sweep — which treats a RUNNING job with worker_runtime != "warm" as a
-        # dead COLD Docker job and requeues it — doesn't re-detonate it under us. CAS-fenced; best-effort.
-        self._store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
-                                     worker_runtime="warm", worker_tier=self._worker_tier)
+        # dead COLD Docker job and requeues it — doesn't re-detonate it under us. The CAS is also our
+        # OWNERSHIP fence: if it returns False the job was reclaimed since we claimed it, so STOP here
+        # (don't validate someone else's job / write output another owner now controls).
+        if not self._store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
+                                            worker_runtime="warm", worker_tier=self._worker_tier):
+            logger.info("vm_dispatch: job %s reclaimed before validate; skipping", job.job_id)
+            return
         in_path = self._input_path(job)
         owned = False
         try:
             if not in_path.exists():
                 raise FileNotFoundError(f"spooled input missing: {in_path}")
             summary, ok = self._validate(in_path)
-            if ok:  # DONE ⇒ the ingress result routes require output/metadata.json to exist
-                self._ensure_metadata(job, summary)
             finished = time.time()
             # CAS on (status, claim_id) so a stale owner can't clobber a job that was reclaimed
             # (RUNNING->QUEUED->RUNNING under another dispatcher). The return value is OUR ownership.
@@ -116,6 +121,11 @@ class VmJobDispatcher:
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                 status=JobStatus.DONE if ok else JobStatus.FAILED,
                 finished_at=finished, result_summary=summary, expires_at=self._expiry(finished))
+            # Materialize metadata.json ONLY after WE win the terminal CAS — else a stale owner could
+            # write it and the real owner's _ensure_metadata would skip (meta.exists()), serving stale
+            # metadata for a different validation. DONE ⇒ the ingress result routes need it to exist.
+            if owned and ok:
+                self._ensure_metadata(job, summary)
         except Exception as exc:  # noqa: BLE001 — one bad job must not sink the dispatcher
             logger.warning("vm_dispatch: job %s failed: %s", job.job_id, exc, exc_info=True)
             finished = time.time()

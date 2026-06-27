@@ -508,23 +508,25 @@ class WarmPool:
 
         newly_idle: list[str] = []
         for slot in warming:
+            raised = False
             try:
                 ready = self._runtime.is_ready(slot)
             except Exception:
                 logger.exception("pool.is_ready_error slot_id=%s", slot.slot_id)
                 ready = False
+                raised = True
             if ready:
                 with self._lock:
                     # Only promote if still WARMING (concurrent stop could clear it)
                     if slot.slot_id in self._slots and slot.state == SlotState.WARMING:
                         slot.state = SlotState.IDLE
                         newly_idle.append(slot.slot_id)
-            elif slot.state == SlotState.DRAINING:
-                # A runtime whose finalize fails closed (e.g. libvirt egress/snapshot error) reaps the
-                # VM *inside* is_ready() and returns False, leaving the slot DRAINING. If we leave it
-                # in _slots it still counts against concurrent_ceiling headroom, so repeated finalize
-                # failures pile up dead husks and eventually stop new spawns. The runtime already
-                # reaped it, so just evict the record (count it) — don't reap again.
+            elif slot.state == SlotState.DRAINING and not raised:
+                # is_ready returned False AND the runtime moved the slot to DRAINING => its finalize
+                # failed closed and it reaped the VM ITSELF (destroy SUCCEEDED). Evict the dead husk so
+                # it doesn't eat concurrent_ceiling headroom (the runtime already reaped — don't redo).
+                # NB: if is_ready RAISED, reap() could NOT dispose the VM (it may still be running), so
+                # we must NOT pop it — leave it tracked/quarantined, exactly like release() does.
                 with self._lock:
                     if self._slots.pop(slot.slot_id, None) is not None:
                         record_slot_reaped()

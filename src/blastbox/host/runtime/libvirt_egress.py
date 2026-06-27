@@ -368,21 +368,25 @@ def input_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | Non
     return r
 
 
-def _ip_rule_priorities(worker_ip: str, ip_rule_dump: str) -> list[str]:
-    """From ``ip rule show`` output, the priorities of EVERY rule selecting ``from <worker_ip>``.
+def _ip_rule_deletes(worker_ip: str, ip_rule_dump: str) -> list[list[str]]:
+    """From ``ip rule show`` output, the ``ip rule del`` argv for EVERY rule selecting ``from
+    <worker_ip>`` — by its FULL selector, not bare priority.
 
-    The per-driver teardown only deletes the exact ``ip rule`` argv generated from the CURRENT
-    ExitRouting, so if a reused DHCP IP's prior worker used a different vpn_table / next-hop gateway /
-    worker_cidr, the stale ``ip rule from <worker_ip> lookup <old-table>`` survives at the same
-    priority and keeps steering this worker through the old table. Enumerate every ``from
-    <worker_ip>`` rule by priority so remove() can delete them all regardless of the old config."""
-    prios: list[str] = []
+    The per-driver teardown only deletes the exact argv generated from the CURRENT ExitRouting, so a
+    reused DHCP IP whose prior worker used a different vpn_table / next-hop gateway / worker_cidr
+    leaves a stale ``ip rule from <worker_ip> lookup <old-table>``. Deleting by bare ``priority``
+    would be wrong: adjacent workers share priorities (worker .6's local-main rule can sit at the same
+    priority as worker .5's tunnel rule), so ``ip rule del priority <p>`` could remove a SIBLING's
+    route. Reconstruct the full selector (``from <ip> [to ..] lookup ..``) + its priority so each
+    delete matches exactly this worker's own rule."""
+    out: list[list[str]] = []
     for line in ip_rule_dump.splitlines():
-        # e.g. "32237:\tfrom 192.168.122.5 lookup vpn"  → priority "32237", selector "from <ip> ..."
+        # e.g. "32237:\tfrom 192.168.122.5 lookup vpn" → prio 32237, selector "from <ip> lookup vpn"
         toks = line.replace(":", " ", 1).split()
         if len(toks) >= 3 and toks[0].isdigit() and toks[1] == "from" and toks[2] == worker_ip:
-            prios.append(toks[0])
-    return prios
+            prio, selector = toks[0], toks[1:]
+            out.append(["ip", "rule", "del", *selector, "priority", prio])
+    return out
 
 
 def _fakenet_dnat_deletes(worker_ip: str, prerouting_dump: str) -> list[list[str]]:
@@ -612,8 +616,8 @@ class LibvirtEgress:
         cp = self._priv(["ip", "rule", "show"])
         if cp.returncode != 0:
             return
-        for prio in _ip_rule_priorities(worker_ip, cp.stdout):
-            self._priv(["ip", "rule", "del", "priority", prio])
+        for argv in _ip_rule_deletes(worker_ip, cp.stdout):
+            self._priv(argv)
 
     def _sweep_fakenet_dnat(self, worker_ip: str) -> None:
         """Delete EVERY live nat-PREROUTING DNAT this worker has, so an orphan from a prior inetsim

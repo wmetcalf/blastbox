@@ -209,7 +209,11 @@ class LibvirtVmRuntime:
             if self._sh(["qemu-img", "create", "-f", "qcow2", "-b", self.cfg.golden_base,
                          "-F", "qcow2", overlay], sudo_tool="qemu-img").returncode != 0:
                 raise RuntimeError(f"{name}: qemu-img create overlay off {self.cfg.golden_base} failed")
-            self._sh(["chmod", "644", overlay])
+            # 600, NOT 644: the overlay (default in world-readable /dev/shm) accumulates the submitted
+            # sample + guest-side state, so a world-readable mode leaks detonation inputs to any local
+            # user. libvirt's dynamic DAC ownership chowns the disk to the qemu user on domain start
+            # and restores it on stop, so owner-only is sufficient for qemu to read it.
+            self._sh(["chmod", "600", overlay])
             # Private 0600 tempfile (random name) for the domain XML, NOT a predictable /tmp/<name>.xml:
             # on a multi-user host another local user could race a predictable path and swap in
             # attacker-controlled XML before `sudo virsh define` reads it (defining a hostile domain

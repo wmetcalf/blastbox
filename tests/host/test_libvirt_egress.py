@@ -13,7 +13,7 @@ from blastbox.host.runtime.libvirt_egress import (
     VmEgressPolicy,
     _chain_name,
     _fakenet_dnat_deletes,
-    _ip_rule_priorities,
+    _ip_rule_deletes,
     _rule_priority,
     _tor_redirect_deletes,
     forward_chain_rules,
@@ -32,7 +32,7 @@ def test_rule_priority_stays_below_main():
     assert len(prios) == 256
 
 
-def test_ip_rule_priorities_match_only_target_worker():
+def test_ip_rule_deletes_use_full_selector_for_target_worker():
     dump = "\n".join([
         "0:\tfrom all lookup local",
         "32237:\tfrom 192.168.122.5 lookup vpn",
@@ -40,8 +40,14 @@ def test_ip_rule_priorities_match_only_target_worker():
         "1500:\tfrom 192.168.122.50 lookup vpn",        # different worker (.50, not .5)
         "32766:\tfrom all lookup main",
     ])
-    prios = _ip_rule_priorities("192.168.122.5", dump)
-    assert sorted(prios) == ["32236", "32237"]          # both .5 rules, not .50, not from-all
+    dels = _ip_rule_deletes("192.168.122.5", dump)
+    # only .5's two rules, deleted by FULL selector + priority (not bare priority, which could hit a
+    # sibling worker sharing a priority).
+    assert dels == [
+        ["ip", "rule", "del", "from", "192.168.122.5", "lookup", "vpn", "priority", "32237"],
+        ["ip", "rule", "del", "from", "192.168.122.5", "to", "192.168.122.0/24", "lookup", "main",
+         "priority", "32236"],
+    ]
 
 
 def _flat(rules):

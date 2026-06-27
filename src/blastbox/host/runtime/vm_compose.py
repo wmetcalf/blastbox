@@ -213,17 +213,32 @@ class VmWorkerSpec:
             # Create the golden as a fresh overlay backed by the base, so provisioners boot a ready
             # disk instead of each reimplementing overlay creation. (Provisioners do the OS-specific
             # install/config + guest shutdown against this disk.)
-            _run(["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", img.base_qcow2,
-                  img.golden], check=True)
-            for cmd in img.provisioners:
-                _run_provisioner(cmd)
-            if not img.exists():
-                raise RuntimeError(f"{self.name}: provisioners ran but {img.golden} was not produced")
-            # Flatten: collapse the backing chain into a standalone qcow2 so the golden carries no
-            # dependency on base_qcow2 (a worker copy with a dangling backing file won't boot).
-            flat = img.golden + ".flat"
-            _run(["qemu-img", "convert", "-O", "qcow2", img.golden, flat], check=True)
-            _run(["mv", flat, img.golden], check=True)
+            # Protect an existing golden on a forced rebuild: qemu-img create overwrites img.golden in
+            # place, and the provisioners target that path, so a later provisioner/convert failure
+            # would otherwise destroy the previous WORKING golden with no recovery. Move it aside
+            # first and restore it if the rebuild fails; only drop the backup once the new one is in.
+            prev = img.golden + ".prev"
+            had_golden = img.exists()
+            if had_golden:
+                _run(["mv", img.golden, prev], check=True)
+            try:
+                _run(["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", img.base_qcow2,
+                      img.golden], check=True)
+                for cmd in img.provisioners:
+                    _run_provisioner(cmd)
+                if not img.exists():
+                    raise RuntimeError(f"{self.name}: provisioners ran but {img.golden} was not produced")
+                # Flatten: collapse the backing chain into a standalone qcow2 so the golden carries no
+                # dependency on base_qcow2 (a worker copy with a dangling backing file won't boot).
+                flat = img.golden + ".flat"
+                _run(["qemu-img", "convert", "-O", "qcow2", img.golden, flat], check=True)
+                _run(["mv", flat, img.golden], check=True)
+            except Exception:
+                if had_golden:   # restore the previous working golden — a failed rebuild is non-destructive
+                    _run(["mv", prev, img.golden])
+                raise
+            if had_golden:
+                _run(["rm", "-f", prev])
             return img.golden
         raise ValueError(f"{self.name}: unknown builder {img.builder!r}")
 
@@ -245,9 +260,11 @@ def _truthy(v: object) -> bool:
 
 def _ports(v: object) -> tuple[int, ...] | None:
     # Normalize whatever YAML produced (int / str / list) to a string, then hand it to the ONE
-    # validated parser shared with the container path. That range-checks (1-65535), dedups, and
-    # fails closed on nothing-valid — so a compose typo like `egress_ports: [80, 70000]` drops the
-    # bad token instead of emitting a broken `--dports` that reaps every worker for the spec.
+    # validated parser shared with the container path (range-checks 1-65535, dedups).
+    # OMITTED (None / bool) → None = "no allowlist" (direct accepts all; tunneled accepts all over the
+    # tunnel). But a PROVIDED value that parses to nothing (e.g. `egress_ports: [70000]`) must FAIL
+    # CLOSED — returning None there would silently WIDEN a web-only policy to unrestricted egress —
+    # so it collapses to an empty tuple (), which downstream means "drop everything", not "allow all".
     if v is None or isinstance(v, bool):  # bool is an int subclass; a YAML bool is not a port list
         return None
     if isinstance(v, int):                # a single port, e.g. `egress_ports: 443`
@@ -258,7 +275,7 @@ def _ports(v: object) -> tuple[int, ...] | None:
         raw = " ".join(str(x) for x in v)
     else:
         return None
-    return parse_egress_ports(raw)
+    return parse_egress_ports(raw) or ()   # provided-but-all-invalid → () (closed), never None (open)
 
 
 def _run(args: list[str], check: bool = False) -> subprocess.CompletedProcess:
