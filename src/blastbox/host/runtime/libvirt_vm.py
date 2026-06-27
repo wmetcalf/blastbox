@@ -221,7 +221,12 @@ class LibvirtVmRuntime:
             # sample + guest-side state, so a world-readable mode leaks detonation inputs to any local
             # user. libvirt's dynamic DAC ownership chowns the disk to the qemu user on domain start
             # and restores it on stop, so owner-only is sufficient for qemu to read it.
-            self._sh(["chmod", "600", overlay])
+            # CHECK the chmod: it's the only step making the overlay private. If it fails (denied,
+            # unsupported fs, timeout) the VM must NOT start with a possibly world-readable overlay in
+            # /dev/shm — raise so the spawn try/except reaps + re-raises before virsh define.
+            if self._sh(["chmod", "600", overlay]).returncode != 0:
+                raise RuntimeError(f"{name}: chmod 600 overlay failed — refusing to start a VM with a "
+                                   "possibly world-readable overlay (would leak the sample)")
             # Private 0600 tempfile (random name) for the domain XML, NOT a predictable /tmp/<name>.xml:
             # on a multi-user host another local user could race a predictable path and swap in
             # attacker-controlled XML before `sudo virsh define` reads it (defining a hostile domain
@@ -378,7 +383,12 @@ class LibvirtVmRuntime:
             LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing).remove(
                 slot.ip, self.cfg.egress_policy.exit_driver, mac=slot.mac,
                 egress_ports=self.cfg.egress_policy.egress_ports)  # unhook AFTER the guest is gone
-        self._sh(["rm", "-f", slot.overlay])
+        # CHECK the overlay rm: a failed remove (perm/busy/immutable/timeout) leaves a stale qcow2
+        # holding the sample under /dev/shm, leaking it + consuming tmpfs while replacements spawn.
+        # Raise so the pool QUARANTINES the slot (keeps it tracked) and the leaked overlay surfaces.
+        if self._sh(["rm", "-f", slot.overlay]).returncode != 0:
+            raise RuntimeError(f"{slot.domain}: overlay {slot.overlay} could not be removed — leaked "
+                               "qcow2 holds the sample + consumes tmpfs; slot quarantined")
 
     # ---- snapshot-recycle extension -----------------------------------------
     def recycle(self, slot: VmSlot, ready_timeout_s: float = 60.0) -> None:

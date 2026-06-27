@@ -114,10 +114,16 @@ class VmWorkerSpec:
                 egress_ports=_ports(eg.get("egress_ports")),
                 block_internal=_truthy(eg.get("block_internal", False)),
             )
-            routing = ExitRouting(**{k: eg[k] for k in (
+            routing_kw = {k: eg[k] for k in (
                 "vpn_table", "vpn_tun", "tor_trans_port", "tor_dns_port", "fakenet_addr",
-                "gateway", "leg", "gateway_table_base", "gateway_masquerade",
-                "worker_cidr") if k in eg})  # worker_cidr: non-/24 nets need it for the local exemption
+                "gateway", "leg", "gateway_table_base",
+                "worker_cidr") if k in eg}  # worker_cidr: non-/24 nets need it for the local exemption
+            if "gateway_masquerade" in eg:
+                # Coerce with the SAME boolean parser as block_internal: a quoted YAML scalar like
+                # `gateway_masquerade: "false"` is a non-empty (truthy) string otherwise, so routing
+                # would still install MASQUERADE and silently collapse a disable-SNAT policy.
+                routing_kw["gateway_masquerade"] = _truthy(eg["gateway_masquerade"])
+            routing = ExitRouting(**routing_kw)
         known = {f for f in cls.__dataclass_fields__ if f not in ("name", "image", "egress", "routing")}
         return cls(name=name, image=image, egress=egress, routing=routing,
                    **{k: v for k, v in d.items() if k in known})
@@ -283,8 +289,10 @@ def _ports(v: object) -> tuple[int, ...] | None:
     # tunnel). But a PROVIDED value that parses to nothing (e.g. `egress_ports: [70000]`) must FAIL
     # CLOSED — returning None there would silently WIDEN a web-only policy to unrestricted egress —
     # so it collapses to an empty tuple (), which downstream means "drop everything", not "allow all".
-    if v is None or isinstance(v, bool):  # bool is an int subclass; a YAML bool is not a port list
+    if v is None:                         # OMITTED → None (no allowlist)
         return None
+    if isinstance(v, bool):               # bool is an int subclass; a YAML bool is not a port list —
+        return ()                         # a PROVIDED bool is malformed → fail CLOSED, not None (open)
     if isinstance(v, int):                # a single port, e.g. `egress_ports: 443`
         raw: str = str(v)
     elif isinstance(v, str):

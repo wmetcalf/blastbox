@@ -94,6 +94,16 @@ def test_build_image_packer_requires_golden(monkeypatch, tmp_path):
         spec.build_image()
 
 
+def test_from_dict_coerces_quoted_gateway_masquerade():
+    # a quoted YAML scalar "false" must disable SNAT, not stay a truthy string that installs MASQUERADE.
+    spec = VmWorkerSpec.from_dict("auth", {
+        "image": "/g.qcow2",
+        "egress": {"exit": "openvpn", "gateway": "10.99.0.2", "leg": "br-r",
+                   "gateway_masquerade": "false"},
+    })
+    assert spec.routing is not None and spec.routing.gateway_masquerade is False
+
+
 def test_from_dict_threads_worker_cidr_into_routing():
     # non-/24 nets need ExitRouting.worker_cidr; the compose egress allowlist must not drop it.
     spec = VmWorkerSpec.from_dict("auth", {
@@ -151,8 +161,9 @@ def test_ports_accepts_single_int_and_rejects_bool():
     assert _ports(443) == (443,)            # a single port
     assert _ports("80,443") == (80, 443)
     assert _ports([80, 443]) == (80, 443)
-    assert _ports(True) is None             # YAML bool is not a port list (omitted → no allowlist)
-    assert _ports(None) is None             # omitted → None (no allowlist)
+    assert _ports(None) is None             # OMITTED → None (no allowlist)
+    assert _ports(True) == ()               # a PROVIDED bool is malformed → fail closed, not open
+    assert _ports(False) == ()
     # out-of-range tokens are range-filtered; a partially-valid list keeps the valid ones.
     assert _ports([80, 70000, 443]) == (80, 443)
     # PROVIDED but ALL-invalid must FAIL CLOSED to () (drop everything), NOT None (which would widen

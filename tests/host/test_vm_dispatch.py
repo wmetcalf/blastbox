@@ -144,14 +144,18 @@ def test_claim_next_engine_set_keeps_vm_jobs_off_cold_dispatcher():
     assert vm is not None and vm.engine == "authenticode"
 
 
+def _claim_as_vm(store, job, *, started_at, worker_runtime="warm", worker_tier="libvirt-vm"):
+    claimed = store.claim_next()
+    store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=claimed.claim_id,
+                           started_at=started_at, worker_runtime=worker_runtime, worker_tier=worker_tier)
+
+
 def test_maintenance_recovers_orphaned_running_job(tmp_path):
-    # a RUNNING job whose heartbeat went stale (claiming dispatcher crashed) is FAILED by maintenance
-    # and its input dropped — not left RUNNING forever.
+    # a VM-owned RUNNING job whose heartbeat went stale (claiming dispatcher crashed) is FAILED by
+    # maintenance and its input dropped — not left RUNNING forever.
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
-    claimed = store.claim_next()                         # RUNNING + claim_id
-    store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=claimed.claim_id,
-                           started_at=1.0)               # ancient started_at (no heartbeat)
+    _claim_as_vm(store, job, started_at=1.0)             # ancient started_at, marked warm/our-tier
     d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), orphan_timeout_s=10.0)
     d._run_maintenance()
     got = store.get(job.job_id)
@@ -163,12 +167,22 @@ def test_maintenance_leaves_fresh_running_job_alone(tmp_path):
     import time as _t
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
-    claimed = store.claim_next()
-    store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=claimed.claim_id,
-                           started_at=_t.time())          # freshly heartbeated
+    _claim_as_vm(store, job, started_at=_t.time())        # freshly heartbeated
     d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), orphan_timeout_s=600.0)
     d._run_maintenance()
     assert store.get(job.job_id).status is JobStatus.RUNNING   # still alive, untouched
+
+
+def test_maintenance_does_not_recover_a_cold_job(tmp_path):
+    # a stale-but-not-ours job (a cold/container job, worker_runtime != "warm") must NOT be failed —
+    # its Docker worker may still be running; failing + deleting input would be a cross-tier clobber.
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    _claim_as_vm(store, job, started_at=1.0, worker_runtime="runc", worker_tier=None)
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), orphan_timeout_s=10.0)
+    d._run_maintenance()
+    assert store.get(job.job_id).status is JobStatus.RUNNING        # left for the cold dispatcher
+    assert (tmp_path / job.job_id / "input" / "evil.dll").exists()  # input NOT deleted
 
 
 def test_maintenance_expires_terminal_job_dir(tmp_path):

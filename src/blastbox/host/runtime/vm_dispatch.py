@@ -213,6 +213,12 @@ class VmJobDispatcher:
             for job in self._store.list(status=JobStatus.RUNNING):
                 if self._engine is not None and job.engine != self._engine:
                     continue
+                # Recover ONLY jobs a VM dispatcher of OUR tier owns (worker_runtime="warm" +
+                # matching worker_tier, both set by _process). In a shared store a long COLD/container
+                # job for the same engine has worker_runtime=None/"runc" — its Docker worker may still
+                # be running, so failing it + deleting its input here would be a cross-tier clobber.
+                if job.worker_runtime != "warm" or job.worker_tier != self._worker_tier:
+                    continue
                 if job.started_at is None or job.started_at >= cutoff:
                     continue  # fresh (heartbeat-refreshed) → still alive
                 now = time.time()
