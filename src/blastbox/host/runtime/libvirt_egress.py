@@ -540,6 +540,12 @@ class LibvirtEgress:
                               "!", "-s", worker_ip, "-j", "DROP", check=True)
                 self._ipt_run("-I", "INPUT", "1", "-s", worker_ip, "-m", "mac",
                               "!", "--mac-source", mac, "-j", "DROP", check=True)  # sibling-spoof drop
+                # DHCP renewal/rebind (after lease expiry or a snapshot revert) is sent from 0.0.0.0
+                # with the worker MAC — it has the MAC but NOT the IP, so it matches the anti-spoof
+                # `! -s worker_ip` DROP above and the guest can never re-lease. Exempt the worker's
+                # DHCP-client→server (udp 67) ABOVE the spoof drops. Scoped to the worker MAC.
+                self._ipt_run("-I", "INPUT", "1", "-m", "mac", "--mac-source", mac, "-p", "udp",
+                              "--dport", "67", "-j", "ACCEPT", check=True)
             # (exit routing was installed at the TOP of this try, before the FORWARD jump — see L460.)
             # IPv6 fail-closed: the filter/routing above is IPv4-only, so drop ALL forwarded v6 from
             # the worker (matched on its MAC) — a v6-capable guest must not egress around the policy.
@@ -581,6 +587,8 @@ class LibvirtEgress:
                         "!", "--mac-source", mac, "-j", "DROP"])  # sibling-spoof teardown (FORWARD)
             self._priv(["iptables", "-D", "INPUT", "-s", worker_ip, "-m", "mac",
                         "!", "--mac-source", mac, "-j", "DROP"])  # sibling-spoof teardown (INPUT)
+            self._priv(["iptables", "-D", "INPUT", "-m", "mac", "--mac-source", mac, "-p", "udp",
+                        "--dport", "67", "-j", "ACCEPT"])  # DHCP-exempt teardown (INPUT)
         # Sweep any spoof DROPs left by a PRIOR mac on this IP (reuse after crash/partial cleanup) —
         # the per-mac deletes above only cover the current mac. Runs even when mac is None.
         self._sweep_spoof_drops(worker_ip)

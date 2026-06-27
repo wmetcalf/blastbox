@@ -349,6 +349,27 @@ def test_apply_installs_routing_before_forward_jump(monkeypatch):
     assert dnat < jump   # sink DNAT installed before the FORWARD jump → no clearnet window
 
 
+def test_apply_exempts_dhcp_above_input_antispoof(monkeypatch):
+    # DHCP renewal from 0.0.0.0 (worker MAC, no IP) must be ACCEPTed ABOVE the INPUT anti-spoof DROP,
+    # else the guest can never re-lease after a lease expiry / snapshot revert.
+    eg = LibvirtEgress(sudo=False)
+    issued = []
+
+    def fake_ipt(*a, **k):
+        issued.append(" ".join(a))
+        return subprocess.CompletedProcess(list(a), 1 if "-D" in a else 0, "", "")
+
+    monkeypatch.setattr(eg, "_ipt_run", fake_ipt)
+    monkeypatch.setattr(eg, "_priv", lambda argv, **k: subprocess.CompletedProcess(argv, 0, "", ""))
+    eg.apply("192.168.122.5", VmEgressPolicy(exit_driver="direct"), gateway="192.168.122.1",
+             mac="52:54:00:aa:bb:cc")
+    dhcp = next(i for i, s in enumerate(issued)
+                if "INPUT 1 -m mac --mac-source 52:54:00:aa:bb:cc -p udp --dport 67 -j ACCEPT" in s)
+    anti = next(i for i, s in enumerate(issued)
+                if "INPUT 1 -m mac --mac-source 52:54:00:aa:bb:cc ! -s 192.168.122.5 -j DROP" in s)
+    assert dhcp > anti   # inserted LATER at pos 1 → ends up ABOVE the anti-spoof in the chain
+
+
 def test_apply_installs_sibling_spoof_complement(monkeypatch):
     eg = LibvirtEgress(sudo=False)  # routing=None → direct exit, no routing commands
     issued = []

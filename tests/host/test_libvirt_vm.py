@@ -48,6 +48,13 @@ def test_domain_xml_reflects_config(kw, needle):
     assert xml.startswith("<domain type='kvm'>") and xml.endswith("</domain>")
 
 
+def test_domain_xml_omits_emulator_by_default():
+    # default omits <emulator> so libvirt picks its capabilities default (portable across distros that
+    # package qemu outside /usr/bin); an explicit path is emitted when pinned.
+    assert "<emulator>" not in _rt()._domain_xml("bbvm-x", "/o.qcow2")
+    assert "<emulator>/opt/q</emulator>" in _rt(emulator="/opt/q")._domain_xml("bbvm-x", "/o.qcow2")
+
+
 def test_domain_xml_pins_mac_ip_via_nwfilter():
     # clean-traffic nwfilter pins MAC+IP at the ebtables layer so a root guest can't spoof both to
     # escape the IP/MAC-keyed host policy.

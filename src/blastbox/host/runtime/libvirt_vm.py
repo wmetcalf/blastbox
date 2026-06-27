@@ -81,6 +81,10 @@ class LibvirtVmConfig:
     """libvirt network the worker NIC attaches to."""
 
     machine: str = "pc"
+    emulator: str = ""
+    """QEMU binary path for the domain. Default "" OMITS <emulator> so libvirt picks its capabilities
+    default — portable across distros (e.g. RHEL/CentOS package qemu-kvm outside /usr/bin). Set an
+    explicit path only to pin a specific binary."""
     disk_bus: str = "sata"
     nic_model: str = "e1000"
     nwfilter: str = "clean-traffic"
@@ -549,7 +553,9 @@ class LibvirtVmRuntime:
             "<clock offset='localtime'><timer name='rtc' tickpolicy='catchup'/>"
             "<timer name='pit' tickpolicy='delay'/><timer name='hpet' present='no'/></clock>"
             "<on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash>"
-            "<devices><emulator>/usr/bin/qemu-system-x86_64</emulator>"
+            # Omit <emulator> by default so libvirt uses its capabilities default (portable across
+            # distros that package qemu outside /usr/bin); emit it only when explicitly pinned.
+            f"<devices>{f'<emulator>{c.emulator}</emulator>' if c.emulator else ''}"
             "<disk type='file' device='disk'><driver name='qemu' type='qcow2' cache='none' io='native' discard='unmap'/>"
             f"<source file='{overlay}'/><target dev='{_dev}' bus='{c.disk_bus}'/></disk>"
             f"{_ctrl}"
