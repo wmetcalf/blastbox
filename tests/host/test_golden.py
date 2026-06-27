@@ -93,6 +93,28 @@ def test_prune_keeps_newest_n(tmp_path):
     assert all("2026010" in c[-1] for c in rms)
 
 
+def test_prune_backups_enumerates_with_privileged_runner():
+    # under sudo, backup enumeration must go through the runner (find), not unprivileged Path.glob —
+    # a root-only image dir would otherwise raise/see-nothing AFTER the promote and fail rotate().
+    listing = "\n".join(f"/root/img/golden-base.2026010{i}-000000.qcow2" for i in range(5))
+
+    class _R:
+        def __init__(self):
+            self.rm = []
+
+        def __call__(self, argv, **k):
+            if "find" in argv:
+                return type("C", (), {"returncode": 0, "stdout": listing, "stderr": ""})()
+            if "rm" in argv:
+                self.rm.append(argv)
+            return type("C", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    r = _R()
+    golden.prune_backups("/root/img", 2, sudo=True, runner=r)
+    assert len(r.rm) == 3                                   # 3 oldest of the 5 found are pruned
+    assert all("2026010" in a[-1] for a in r.rm)
+
+
 def test_validate_golden_pass_and_reaps():
     rt = _FakeRT("SLOT")
     assert golden.validate_golden("/c.qcow2", runtime_factory=lambda q: rt,

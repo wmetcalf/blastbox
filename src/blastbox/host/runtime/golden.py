@@ -100,11 +100,19 @@ def prune_backups(backup_dir: str, keep_n: int, *, sudo: bool = True,
     for the ``%Y%m%d-%H%M%S`` names). ``keep_n <= 0`` keeps everything."""
     if keep_n <= 0:
         return
-    baks = sorted(Path(backup_dir).glob("golden-base.*.qcow2"))
     pfx = ["sudo"] if sudo else []
+    # Enumerate via the SAME privilege model as the rm/cp/mv: a root-only libvirt image tree would
+    # make an unprivileged Path.glob() raise or see nothing — which, since prune runs AFTER the
+    # promote, would fail rotate() over an already-promoted golden and leave retention ineffective.
+    if sudo:
+        cp = runner([*pfx, "find", backup_dir, "-maxdepth", "1", "-type", "f",
+                     "-name", "golden-base.*.qcow2"], capture_output=True, text=True)
+        baks = sorted(ln for ln in (getattr(cp, "stdout", "") or "").splitlines() if ln.strip())
+    else:
+        baks = sorted(str(p) for p in Path(backup_dir).glob("golden-base.*.qcow2"))
     for b in baks[:-keep_n]:
-        logger.info("pruning old golden backup %s", b.name)
-        runner([*pfx, "rm", "-f", str(b)], capture_output=True, text=True)
+        logger.info("pruning old golden backup %s", b.rsplit("/", 1)[-1])
+        runner([*pfx, "rm", "-f", b], capture_output=True, text=True)
 
 
 def promote_if_valid(candidate: str, *, runtime_factory: Callable[[str], object],

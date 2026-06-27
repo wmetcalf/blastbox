@@ -4,10 +4,13 @@ from __future__ import annotations
 import pytest
 
 from blastbox.host.netpolicy import Personality
+import subprocess
+
 from blastbox.host.runtime.libvirt_egress import (
     LibvirtEgress,
     VmEgressPolicy,
     _chain_name,
+    _fakenet_dnat_deletes,
     _tor_redirect_deletes,
     forward_chain_rules,
     input_chain_rules,
@@ -218,6 +221,79 @@ def test_vpn_killswitch_scopes_egress_to_tunnel():
                  VmEgressPolicy(exit_driver="openvpn", egress_ports=(80, 443)), "192.168.122.1",
                  egress_if="tun0"))
     assert any("multiport --dports 80,443 -o tun0 -j ACCEPT" in r for r in fwd2)
+
+
+def test_routing_tor_dns_redirect_gated_on_allowlist():
+    rt = ExitRouting()
+    # 53 omitted from the allowlist => NO DNS redirect into tor (unredirected DNS falls to FORWARD drop)
+    flat = [" ".join(c) for c in routing_commands("192.168.122.5", "tor", rt, egress_ports=(80, 443))]
+    assert not any("--dport 53 -j REDIRECT" in f for f in flat)
+    # 53 present => DNS resolves via tor's DNSPort
+    flat2 = [" ".join(c) for c in routing_commands("192.168.122.5", "tor", rt, egress_ports=(53, 80))]
+    assert any("udp --dport 53 -j REDIRECT" in f for f in flat2)
+    # unset allowlist => DNS via tor (unchanged default)
+    flat3 = [" ".join(c) for c in routing_commands("192.168.122.5", "tor", rt)]
+    assert any("udp --dport 53 -j REDIRECT" in f for f in flat3)
+
+
+def test_input_chain_tor_dnsport_gated_on_allowlist():
+    rt = ExitRouting(tor_trans_port=9040, tor_dns_port=9053)
+    # 53 omitted => no DNSPort accept (the redirect isn't installed either); TransPort still accepted
+    flat = _flat(input_chain_rules("192.168.122.9", VmEgressPolicy(exit_driver="tor", egress_ports=(80, 443)),
+                                   gateway="192.168.122.1", routing=rt))
+    assert not any("--dport 9053 -j ACCEPT" in f for f in flat)
+    assert any("--dport 9040 -j ACCEPT" in f for f in flat)
+
+
+def test_fakenet_dnat_deletes_sweeps_only_target_worker():
+    dump = "\n".join([
+        "-A PREROUTING -s 192.168.122.50/32 -p udp --dport 53 -j DNAT --to-destination 172.28.100.1:53",
+        "-A PREROUTING -s 192.168.122.50/32 -j DNAT --to-destination 172.28.100.1",         # catch-all
+        "-A PREROUTING -s 192.168.122.5/32 -j DNAT --to-destination 10.0.0.1",               # other worker
+        "-A PREROUTING -s 192.168.122.50/32 -p tcp -j REDIRECT --to-ports 9040",             # not a DNAT
+    ])
+    dels = _fakenet_dnat_deletes("192.168.122.50", dump)
+    assert len(dels) == 2                                  # both .50 DNATs, not .5, not the REDIRECT
+    assert all(d[:4] == ["iptables", "-t", "nat", "-D"] for d in dels)
+    assert all("192.168.122.50/32" in " ".join(d) for d in dels)
+
+
+def test_v6_drop_raises_on_missing_mac_match_extension(monkeypatch):
+    # ip6tables present but the `mac` match is unavailable: the drop wouldn't install while the guest
+    # may have working IPv6 → must FAIL CLOSED (raise), not be tolerated as "no v6 stack".
+    eg = LibvirtEgress(sudo=False)
+    monkeypatch.setattr(eg, "_priv", lambda argv, **k: subprocess.CompletedProcess(
+        argv, 1, "", "ip6tables: Couldn't load match `mac':No such file or directory"))
+    with pytest.raises(RuntimeError, match="v6 fail-closed"):
+        eg._v6_drop("FORWARD", "52:54:00:aa:bb:cc")
+
+
+def test_preboot_block_installs_v4_required_and_v6_besteffort(monkeypatch):
+    eg = LibvirtEgress(sudo=False)
+    calls = []
+    monkeypatch.setattr(eg, "_ipt_run",
+                        lambda *a, **k: calls.append(("ipt", " ".join(a))) or subprocess.CompletedProcess(list(a), 0, "", ""))
+    monkeypatch.setattr(eg, "_priv",
+                        lambda argv, **k: calls.append(("priv", " ".join(argv))) or subprocess.CompletedProcess(argv, 0, "", ""))
+    eg.preboot_block("52:54:00:aa:bb:cc")
+    ipt = [c[1] for c in calls if c[0] == "ipt"]   # v4 FORWARD+INPUT, checked
+    priv = [c[1] for c in calls if c[0] == "priv"]  # v6 FORWARD+INPUT, best-effort
+    assert len(ipt) == 2 and all("-m mac --mac-source 52:54:00:aa:bb:cc -j DROP" in s for s in ipt)
+    assert len(priv) == 2 and all(s.startswith("ip6tables") for s in priv)
+
+
+def test_apply_installs_sibling_spoof_complement(monkeypatch):
+    eg = LibvirtEgress(sudo=False)  # routing=None → direct exit, no routing commands
+    issued = []
+    monkeypatch.setattr(eg, "_ipt_run",
+                        lambda *a, **k: issued.append(" ".join(a)) or subprocess.CompletedProcess(list(a), 0, "", ""))
+    monkeypatch.setattr(eg, "_priv",
+                        lambda argv, **k: issued.append(" ".join(argv)) or subprocess.CompletedProcess(argv, 0, "", ""))
+    eg.apply("192.168.122.5", VmEgressPolicy(exit_driver="direct"), gateway="192.168.122.1",
+             mac="52:54:00:aa:bb:cc")
+    # a sibling VM spoofing worker_ip from a DIFFERENT mac is dropped on both FORWARD and INPUT
+    assert any("FORWARD 1 -s 192.168.122.5 -m mac ! --mac-source 52:54:00:aa:bb:cc -j DROP" in s for s in issued)
+    assert any("INPUT 1 -s 192.168.122.5 -m mac ! --mac-source 52:54:00:aa:bb:cc -j DROP" in s for s in issued)
 
 
 def test_v6_drop_raises_on_real_rejection(monkeypatch):

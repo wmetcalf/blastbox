@@ -214,6 +214,9 @@ class _RecEgress:
     def remove(self, *a, **k):
         _RecEgress.events.append("egress-remove")
 
+    def preboot_unblock(self, *a, **k):
+        _RecEgress.events.append("preboot-unblock")
+
 
 def _reap_rt(monkeypatch, *, destroyed: bool):
     rt = _rt(egress_policy=VmEgressPolicy(exit_driver="direct"))
@@ -232,7 +235,7 @@ def test_reap_destroys_guest_before_removing_egress(monkeypatch):
     rt.reap(slot)
     # destroy the guest FIRST (while egress is up), THEN unhook egress, THEN free the overlay.
     assert order == ["destroy", "rm-overlay"]
-    assert _RecEgress.events == ["egress-remove"]
+    assert _RecEgress.events == ["egress-remove", "preboot-unblock"]  # policy unhooked + boot-block lifted
     assert order.index("destroy") < order.index("rm-overlay")
 
 

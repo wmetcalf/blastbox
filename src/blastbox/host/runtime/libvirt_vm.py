@@ -215,9 +215,14 @@ class LibvirtVmRuntime:
                     raise RuntimeError(f"{name}: virsh define failed")
             finally:
                 Path(xml_path).unlink(missing_ok=True)  # don't leave per-spawn XML in /tmp
+            # MAC is known once defined (domiflist reads the persisted config). Install a blanket
+            # by-MAC egress block BEFORE start, so the guest can't establish any flow during boot —
+            # before is_ready() installs the real IP-keyed policy. finalize/reap lift it.
+            slot.mac = self._domain_mac(name)
+            if self.cfg.egress_policy is not None and slot.mac:
+                LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing).preboot_block(slot.mac)
             if self._virsh("start", name).returncode != 0:
                 raise RuntimeError(f"{name}: virsh start failed")
-            slot.mac = self._domain_mac(name)
             slot.state = SlotState.WARMING
             return slot
         except Exception:
@@ -247,8 +252,11 @@ class LibvirtVmRuntime:
                     raise RuntimeError(
                         f"{slot.domain}: egress requires the worker MAC for anti-spoof/v6 rules but "
                         "domiflist returned none — refusing to finalize an under-firewalled guest")
-                LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing).apply(
-                    ip, self.cfg.egress_policy, self.cfg.resolved_gateway, mac=slot.mac)
+                eg = LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing)
+                eg.apply(ip, self.cfg.egress_policy, self.cfg.resolved_gateway, mac=slot.mac)
+                # real IP-keyed policy is now in place — lift the pre-boot blanket MAC block so it
+                # doesn't shadow the policy (the policy keeps its own anti-spoof + v6 MAC drops).
+                eg.preboot_unblock(slot.mac)
             # Correct the clock before the worker is smoked + snapshotted — a fresh golden boot can
             # carry a stale/wrong clock (observed ~7h off), and for a cert validator the clock IS the
             # trust decision, so the baseline must be time-correct. PRIMARY = the libvirt-native
@@ -341,10 +349,14 @@ class LibvirtVmRuntime:
             logger.error("%s: destroy failed — leaving egress rules + overlay in place so the "
                          "possibly-live guest stays contained (manual cleanup needed)", slot.domain)
             return
-        if self.cfg.egress_policy is not None and slot.ip is not None:
-            LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing).remove(
-                slot.ip, self.cfg.egress_policy.exit_driver, mac=slot.mac,
-                egress_ports=self.cfg.egress_policy.egress_ports)  # unhook AFTER the guest is gone
+        if self.cfg.egress_policy is not None and slot.mac:
+            eg = LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing)
+            if slot.ip is not None:
+                eg.remove(slot.ip, self.cfg.egress_policy.exit_driver, mac=slot.mac,
+                          egress_ports=self.cfg.egress_policy.egress_ports)  # unhook AFTER guest gone
+            # lift the pre-boot blanket block too, in case finalize never ran (reaped mid-boot) so it
+            # doesn't outlive the worker and block a future MAC reuse.
+            eg.preboot_unblock(slot.mac)
         self._sh(["rm", "-f", slot.overlay])
 
     # ---- snapshot-recycle extension -----------------------------------------

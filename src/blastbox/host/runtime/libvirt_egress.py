@@ -166,16 +166,22 @@ def routing_commands(worker_ip: str, exit_driver: str, routing: ExitRouting,
              "-o", routing.vpn_tun, "-j", "MASQUERADE"],
         ]
     if exit_driver == "tor":
-        cmds = [
-            # DNS FIRST (udp+tcp 53), BEFORE the local-subnet RETURN — otherwise DNS to the bridge
-            # resolver (192.168.122.1:53) matches the RETURN and resolves OUTSIDE tor (a deanon leak).
-            # Redirect it to tor's DNSPort so name resolution goes through tor too.
-            ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip,
-             "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", str(routing.tor_dns_port)],
-            ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip,
-             "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-ports", str(routing.tor_dns_port)],
-            ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip, "-d", local, "-j", "RETURN"],
-        ]
+        cmds = []
+        # DNS redirect is gated on the allowlist (parity with the container leak guard + the direct/
+        # INPUT DNS gate): an explicit egress_ports that omits 53 means "no DNS", so we DON'T redirect
+        # it into tor — unredirected DNS (udp 53 / non-allowlisted tcp 53) then falls through to the
+        # FORWARD chain and is dropped. Unset allowlist or one including 53 ⇒ resolve via tor's DNSPort.
+        if egress_ports is None or 53 in egress_ports:
+            cmds += [
+                # DNS FIRST (udp+tcp 53), BEFORE the local-subnet RETURN — otherwise DNS to the bridge
+                # resolver (192.168.122.1:53) matches the RETURN and resolves OUTSIDE tor (a deanon leak).
+                ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip,
+                 "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", str(routing.tor_dns_port)],
+                ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip,
+                 "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-ports", str(routing.tor_dns_port)],
+            ]
+        cmds.append(
+            ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip, "-d", local, "-j", "RETURN"])
         if block_internal:
             # RETURN RFC1918-destined TCP from nat (after the local /24 RETURN above) so it is NOT
             # transparently proxied to tor — it falls through to FORWARD where block_internal DROPs
@@ -332,8 +338,11 @@ def input_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | Non
     elif drv == "tor" and routing is not None:
         # tor REDIRECTs the guest's DNS(53) and all TCP onto the host's tor ports; post-NAT that
         # traffic is host-destined, so accept exactly those local ports (nothing else reaches clearnet).
-        r.append(["-A", c, "-p", "udp", "--dport", str(routing.tor_dns_port), "-j", "ACCEPT"])
-        r.append(["-A", c, "-p", "tcp", "--dport", str(routing.tor_dns_port), "-j", "ACCEPT"])
+        # The DNSPort accept is gated on the allowlist to match the routing-side gate: if 53 isn't
+        # allowed, no DNS redirect is installed, so accepting the DNSPort would be dead anyway.
+        if policy.egress_ports is None or 53 in policy.egress_ports:
+            r.append(["-A", c, "-p", "udp", "--dport", str(routing.tor_dns_port), "-j", "ACCEPT"])
+            r.append(["-A", c, "-p", "tcp", "--dport", str(routing.tor_dns_port), "-j", "ACCEPT"])
         r.append(["-A", c, "-p", "tcp", "--dport", str(routing.tor_trans_port), "-j", "ACCEPT"])
     elif drv == "inetsim" and routing is not None and routing.fakenet_addr:
         # inetsim DNATs DNS + everything to the FakeNet listener (a host-local addr → INPUT). The
@@ -349,6 +358,21 @@ def input_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | Non
               "--log-prefix", "bbvm-host-drop ", "--log-level", "4"])
     r.append(["-A", c, "-j", "DROP"])
     return r
+
+
+def _fakenet_dnat_deletes(worker_ip: str, prerouting_dump: str) -> list[list[str]]:
+    """From ``iptables -t nat -S PREROUTING``, the ``-D`` argv for EVERY DNAT this worker has —
+    whatever sink address installed it. del-by-match teardown only removes DNATs for the CURRENT
+    ``fakenet_addr``, so a reused DHCP IP whose prior inetsim worker DNATed to a now-changed sink
+    would leave an orphan catch-all DNAT ahead of the new rules, silently sending its traffic to the
+    OLD sink. Enumerate and delete all of the worker's DNATs regardless of target."""
+    src = f"-s {worker_ip}/32"
+    out: list[list[str]] = []
+    for line in prerouting_dump.splitlines():
+        toks = line.split()
+        if toks[:2] == ["-A", "PREROUTING"] and src in line and "-j DNAT" in line:
+            out.append(["iptables", "-t", "nat", "-D", *toks[1:]])
+    return out
 
 
 def _tor_redirect_deletes(worker_ip: str, tor_trans_port: int, prerouting_dump: str) -> list[list[str]]:
@@ -440,6 +464,11 @@ class LibvirtEgress:
             if mac:
                 self._ipt_run("-I", "FORWARD", "1", "-m", "mac", "--mac-source", mac,
                               "!", "-s", worker_ip, "-j", "DROP", check=True)
+                # COMPLEMENT: a co-resident VM with a DIFFERENT mac that spoofs worker_ip would
+                # otherwise match the `-s worker_ip` jump + the `ip rule from worker_ip` and borrow
+                # this worker's VPN/tor/direct policy. Drop worker_ip sourced from a non-matching MAC.
+                self._ipt_run("-I", "FORWARD", "1", "-s", worker_ip, "-m", "mac",
+                              "!", "--mac-source", mac, "-j", "DROP", check=True)
             # host-INPUT chain: traffic the guest sends to a host-local addr (bridge resolver, tor/
             # FakeNet redirect targets) is delivered via INPUT and bypasses the FORWARD filter above;
             # this governs it with the same dedicated-chain + single -s jump model (see
@@ -452,6 +481,8 @@ class LibvirtEgress:
             if mac:
                 self._ipt_run("-I", "INPUT", "1", "-m", "mac", "--mac-source", mac,
                               "!", "-s", worker_ip, "-j", "DROP", check=True)
+                self._ipt_run("-I", "INPUT", "1", "-s", worker_ip, "-m", "mac",
+                              "!", "--mac-source", mac, "-j", "DROP", check=True)  # sibling-spoof drop
             # rooter-style exit routing (policy-route / REDIRECT / DNAT), single-NIC
             if self._routing is not None:
                 for cmd in routing_commands(worker_ip, policy.exit_driver, self._routing,
@@ -481,6 +512,7 @@ class LibvirtEgress:
                                                      block_internal=True):
                     self._priv(cmd)  # best-effort: del-by-match, ignore "not found"
             self._sweep_tor_tcp_redirects(worker_ip)  # orphan REDIRECTs left by a prior port set
+            self._sweep_fakenet_dnat(worker_ip)       # orphan DNATs left by a changed sink address
         if mac:
             self._priv(["ip6tables", "-D", "FORWARD", "-m", "mac", "--mac-source", mac, "-j", "DROP"])
             self._priv(["ip6tables", "-D", "INPUT", "-m", "mac", "--mac-source", mac, "-j", "DROP"])
@@ -488,6 +520,10 @@ class LibvirtEgress:
                         "!", "-s", worker_ip, "-j", "DROP"])  # anti-spoof teardown (FORWARD)
             self._priv(["iptables", "-D", "INPUT", "-m", "mac", "--mac-source", mac,
                         "!", "-s", worker_ip, "-j", "DROP"])  # anti-spoof teardown (INPUT)
+            self._priv(["iptables", "-D", "FORWARD", "-s", worker_ip, "-m", "mac",
+                        "!", "--mac-source", mac, "-j", "DROP"])  # sibling-spoof teardown (FORWARD)
+            self._priv(["iptables", "-D", "INPUT", "-s", worker_ip, "-m", "mac",
+                        "!", "--mac-source", mac, "-j", "DROP"])  # sibling-spoof teardown (INPUT)
         chain = _chain_name(worker_ip)
         while self._ipt_run("-D", "FORWARD", "-s", worker_ip, "-j", chain).returncode == 0:
             pass
@@ -498,6 +534,24 @@ class LibvirtEgress:
             pass
         self._ipt_run("-F", in_chain)
         self._ipt_run("-X", in_chain)
+
+    def preboot_block(self, mac: str) -> None:
+        """Blanket-DROP all of a worker's forwarded + host-bound traffic by MAC, installed BEFORE the
+        domain is started — so a boot-time updater/telemetry or a compromised golden can't establish
+        egress flows in the window before the real (IP-keyed) policy goes on in finalize (and the
+        later ESTABLISHED accept can't then preserve such a flow). The IPv4 FORWARD+INPUT drops are
+        required (fail closed — the egress model already needs the `mac` match); the IPv6 ones are
+        best-effort (worker nets are v4-only by design). finalize/reap call :meth:`preboot_unblock`."""
+        for chain in ("FORWARD", "INPUT"):
+            self._ipt_run("-I", chain, "1", "-m", "mac", "--mac-source", mac, "-j", "DROP", check=True)
+            self._priv(["ip6tables", "-I", chain, "1", "-m", "mac", "--mac-source", mac, "-j", "DROP"])
+
+    def preboot_unblock(self, mac: str) -> None:
+        """Remove the :meth:`preboot_block` blanket drops once the real policy is installed (finalize)
+        or the worker is reaped. Best-effort del-by-match — a no-op if they were never installed."""
+        for chain in ("FORWARD", "INPUT"):
+            self._priv(["iptables", "-D", chain, "-m", "mac", "--mac-source", mac, "-j", "DROP"])
+            self._priv(["ip6tables", "-D", chain, "-m", "mac", "--mac-source", mac, "-j", "DROP"])
 
     def _v6_drop(self, chain: str, mac: str) -> None:
         """Install the IPv6 fail-closed DROP for this worker's MAC at the head of ``chain``.
@@ -511,10 +565,11 @@ class LibvirtEgress:
         if cp.returncode == 0:
             return
         err = (cp.stderr or "").lower()
-        # benign: the host has no usable IPv6 filter stack (module/table absent) — there is no v6
-        # path to bypass, so don't reap every worker over it.
-        benign = ("table does not exist", "no such file", "not supported", "can't initialize",
-                  "address family not supported", "no chain/target/match")
+        # benign ONLY when the host has no usable IPv6 filter TABLE/stack — there is no v6 path to
+        # bypass, so don't reap every worker over it. A narrow list: a missing `mac` MATCH extension
+        # ("couldn't load match `mac`: no such file...") must NOT be tolerated — the v6 drop wouldn't
+        # install while the guest may still have working IPv6, so that case raises (fail closed).
+        benign = ("table does not exist", "can't initialize", "address family not supported")
         if not any(b in err for b in benign):
             raise RuntimeError(f"ip6tables {chain} v6 fail-closed DROP failed (rc={cp.returncode}): "
                                f"{(cp.stderr or '').strip()[:160]}")
@@ -532,6 +587,18 @@ class LibvirtEgress:
         if cp.returncode != 0:
             return
         for argv in _tor_redirect_deletes(worker_ip, self._routing.tor_trans_port, cp.stdout):
+            self._priv(argv)
+
+    def _sweep_fakenet_dnat(self, worker_ip: str) -> None:
+        """Delete EVERY live nat-PREROUTING DNAT this worker has, so an orphan from a prior inetsim
+        incarnation whose sink address has since changed can't survive a reused DHCP IP and keep
+        sending traffic to the old FakeNet sink. Best-effort; no-op without routing or on a dump fail."""
+        if self._routing is None:
+            return
+        cp = self._ipt_run("-t", "nat", "-S", "PREROUTING")
+        if cp.returncode != 0:
+            return
+        for argv in _fakenet_dnat_deletes(worker_ip, cp.stdout):
             self._priv(argv)
 
     def installed(self, worker_ip: str) -> bool:
