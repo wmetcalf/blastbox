@@ -85,28 +85,30 @@ class VmJobDispatcher:
     def _expiry(self, finished_at: float) -> float | None:
         return finished_at + self._retention_s if self._retention_s > 0 else None
 
-    def _ensure_metadata(self, job: Job, summary: dict | None) -> None:
-        """The ingress ``/metadata``, ``/artifacts/{id}``, ``/result`` routes all require
-        ``<output>/metadata.json`` to exist once a job is DONE. A VM ``validate()`` returns a result
-        summary, not necessarily a sealed output dir, so write a metadata.json from the summary if the
-        validator didn't already produce one (don't clobber a real one) — otherwise those routes 404
-        on a job that looks done. Best-effort: a write hiccup must not fail an otherwise-valid job
-        (the authoritative result is the stored ``result_summary``).
+    def _ensure_metadata(self, job: Job, summary: dict | None) -> bool:
+        """Write ``<output>/metadata.json`` from the validate() summary. Called BEFORE the terminal
+        CAS so DONE is never observable without it (the ingress ``/metadata``/``/artifacts``/
+        ``/result`` routes gate on DONE then require the file). ATOMIC (tmp + replace) and OVERWRITES,
+        so a reclaim race resolves to the LAST validation's metadata — the DONE-winner wrote its own
+        before winning, and a stale loser's file is replaced by the next owner. Returns whether it
+        wrote (False on an I/O hiccup — the authoritative result is the stored ``result_summary``).
 
         SECURITY: force ``artifacts: []``. The ingress treats metadata.json's artifact list as
         dispatcher-VALIDATED (re-hashed by the host trust gate), and drives ``/artifacts``/``/result``
         file serving off it. A VM ``validate()`` summary is NOT that — it never went through the trust
         gate — so an ``artifacts`` list in it (guest-influenced) must never make unsealed output files
         downloadable. We surface the summary as the metadata body but neuter its artifact manifest."""
-        meta = self._job_dir(job) / "output" / "metadata.json"
-        if meta.exists():
-            return
+        out = self._job_dir(job) / "output"
         try:
-            meta.parent.mkdir(parents=True, exist_ok=True)
-            meta.write_text(json.dumps({**(summary or {}), "artifacts": []}))
+            out.mkdir(parents=True, exist_ok=True)
+            tmp = out / "metadata.json.tmp"
+            tmp.write_text(json.dumps({**(summary or {}), "artifacts": []}))
+            tmp.replace(out / "metadata.json")   # atomic publish
+            return True
         except OSError:
             logger.warning("vm_dispatch: could not write metadata.json for %s (result routes may "
                            "404)", job.job_id, exc_info=True)
+            return False
 
     def _validate_with_heartbeat(self, job: Job, in_path: Path) -> tuple[dict | None, bool]:
         """Run ``validate()`` while a daemon thread refreshes the job's ``started_at`` every
@@ -156,6 +158,12 @@ class VmJobDispatcher:
             if not in_path.exists():
                 raise FileNotFoundError(f"spooled input missing: {in_path}")
             summary, ok = self._validate_with_heartbeat(job, in_path)
+            # Materialize metadata.json BEFORE the DONE CAS: the ingress result routes gate on DONE and
+            # then require the file, so DONE must never be observable (by a poller, or after a crash in
+            # this window) without it. The write is atomic + overwriting, so a reclaim race resolves to
+            # the last validation's metadata (the DONE-winner wrote its own just before winning).
+            if ok:
+                self._ensure_metadata(job, summary)
             finished = time.time()
             # CAS on (status, claim_id) so a stale owner can't clobber a job that was reclaimed
             # (RUNNING->QUEUED->RUNNING under another dispatcher). The return value is OUR ownership.
@@ -163,11 +171,6 @@ class VmJobDispatcher:
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                 status=JobStatus.DONE if ok else JobStatus.FAILED,
                 finished_at=finished, result_summary=summary, expires_at=self._expiry(finished))
-            # Materialize metadata.json ONLY after WE win the terminal CAS — else a stale owner could
-            # write it and the real owner's _ensure_metadata would skip (meta.exists()), serving stale
-            # metadata for a different validation. DONE ⇒ the ingress result routes need it to exist.
-            if owned and ok:
-                self._ensure_metadata(job, summary)
         except Exception as exc:  # noqa: BLE001 — one bad job must not sink the dispatcher
             logger.warning("vm_dispatch: job %s failed: %s", job.job_id, exc, exc_info=True)
             finished = time.time()

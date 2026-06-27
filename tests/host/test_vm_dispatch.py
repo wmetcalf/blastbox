@@ -52,6 +52,23 @@ def test_dispatch_writes_metadata_json_on_done(tmp_path):
     assert json.loads(meta.read_text())["verdict"]["status"] == "Valid"
 
 
+def test_dispatch_metadata_overwrites_stale_and_neuters_artifacts(tmp_path):
+    # metadata.json is overwritten (not skip-if-exists) so a reclaim race resolves to OUR validation,
+    # and the guest-supplied artifacts list is neutered to [] (never served as trusted output).
+    import json
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    out = tmp_path / job.job_id / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_text('{"stale": true, "artifacts": [{"id": "x", "path": "../etc"}]}')
+    d = VmJobDispatcher(store, str(tmp_path),
+                        lambda p: ({"verdict": "ok", "artifacts": [{"id": "y", "path": "z"}]}, True))
+    d._process(store.claim_next())
+    meta = json.loads((out / "metadata.json").read_text())
+    assert meta.get("verdict") == "ok" and "stale" not in meta   # overwritten with our result
+    assert meta["artifacts"] == []                               # guest artifacts neutered (security)
+
+
 def test_dispatch_does_not_write_metadata_on_failure(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
