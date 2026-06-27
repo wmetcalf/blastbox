@@ -285,8 +285,14 @@ def test_preboot_block_installs_v4_required_and_v6_besteffort(monkeypatch):
 def test_apply_installs_sibling_spoof_complement(monkeypatch):
     eg = LibvirtEgress(sudo=False)  # routing=None → direct exit, no routing commands
     issued = []
-    monkeypatch.setattr(eg, "_ipt_run",
-                        lambda *a, **k: issued.append(" ".join(a)) or subprocess.CompletedProcess(list(a), 0, "", ""))
+
+    def fake_ipt(*a, **k):
+        issued.append(" ".join(a))
+        # `-D` is delete-by-match: remove()'s `while ...returncode == 0` jump-deletion loop must see a
+        # nonzero ("rule not found") to terminate — return rc 1 for deletes, rc 0 for -N/-A/-I/-F/-X.
+        return subprocess.CompletedProcess(list(a), 1 if "-D" in a else 0, "", "")
+
+    monkeypatch.setattr(eg, "_ipt_run", fake_ipt)
     monkeypatch.setattr(eg, "_priv",
                         lambda argv, **k: issued.append(" ".join(argv)) or subprocess.CompletedProcess(argv, 0, "", ""))
     eg.apply("192.168.122.5", VmEgressPolicy(exit_driver="direct"), gateway="192.168.122.1",
