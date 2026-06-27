@@ -268,10 +268,13 @@ def forward_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | N
     r: list[list[str]] = [
         ["-A", c, *oif, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
     ]
-    if gateway and policy.exit_driver not in ("none", "drop", "tor"):
+    if (gateway and policy.exit_driver not in ("none", "drop", "tor")
+            and (policy.egress_ports is None or 53 in policy.egress_ports)):
         # DNS to the bridge resolver only (not arbitrary internal hosts). Skipped for none/drop —
         # a no-egress policy must not leak even DNS — and for tor, whose DNS is fully REDIRECTed to
-        # the DNSPort in PREROUTING (so no FORWARD exemption is needed or wanted).
+        # the DNSPort in PREROUTING (so no FORWARD exemption is needed or wanted). Also gated on the
+        # allowlist (parity with the INPUT chain): an explicit egress_ports omitting 53 means "no DNS",
+        # so a forwarded/custom gateway resolver can't bypass a no-DNS policy.
         r.append(["-A", c, "-d", gateway, "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
         r.append(["-A", c, "-d", gateway, "-p", "tcp", "--dport", "53", "-j", "ACCEPT"])
     if policy.block_internal:
@@ -372,6 +375,25 @@ def input_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | Non
               "--log-prefix", "bbvm-host-drop ", "--log-level", "4"])
     r.append(["-A", c, "-j", "DROP"])
     return r
+
+
+def _spoof_drop_deletes(worker_ip: str, chain: str, chain_dump: str) -> list[list[str]]:
+    """From ``iptables -S <chain>`` output, the ``-D`` argv for EVERY MAC-matched DROP referencing
+    this worker IP — the anti-spoof (``-m mac --mac-source <mac> ! -s <ip>``) and sibling-spoof
+    (``-s <ip> -m mac ! --mac-source <mac>``) rules, for ANY mac.
+
+    The per-mac teardown only deletes the CURRENT mac's rules, so an IP reused with a DIFFERENT mac
+    (after a crash / partial cleanup) leaves a stale ``-s <ip> ! --mac-source <old-mac> DROP`` ahead
+    of the new jump — the new VM's mac != old-mac, so it matches the drop and is blackholed during
+    readiness. Sweep all of them regardless of mac."""
+    needle = f"{worker_ip}/32"   # appears as `-s <ip>/32` or `! -s <ip>/32`; /32 avoids .5↔.50
+    out: list[list[str]] = []
+    for line in chain_dump.splitlines():
+        toks = line.split()
+        if (toks[:2] == ["-A", chain] and needle in line and "-m mac" in line
+                and toks[-2:] == ["-j", "DROP"]):
+            out.append(["iptables", "-D", *toks[1:]])
+    return out
 
 
 def _ip_rule_deletes(worker_ip: str, ip_rule_dump: str) -> list[list[str]]:
@@ -569,6 +591,9 @@ class LibvirtEgress:
                         "!", "--mac-source", mac, "-j", "DROP"])  # sibling-spoof teardown (FORWARD)
             self._priv(["iptables", "-D", "INPUT", "-s", worker_ip, "-m", "mac",
                         "!", "--mac-source", mac, "-j", "DROP"])  # sibling-spoof teardown (INPUT)
+        # Sweep any spoof DROPs left by a PRIOR mac on this IP (reuse after crash/partial cleanup) —
+        # the per-mac deletes above only cover the current mac. Runs even when mac is None.
+        self._sweep_spoof_drops(worker_ip)
         chain = _chain_name(worker_ip)
         while self._ipt_run("-D", "FORWARD", "-s", worker_ip, "-j", chain).returncode == 0:
             pass
@@ -628,6 +653,17 @@ class LibvirtEgress:
             return
         for argv in _ip_rule_deletes(worker_ip, cp.stdout):
             self._priv(argv)
+
+    def _sweep_spoof_drops(self, worker_ip: str) -> None:
+        """Delete EVERY live MAC-matched spoof DROP referencing this worker IP on FORWARD + INPUT,
+        whatever mac installed it — so a stale rule from a prior incarnation (IP reused with a new
+        mac) can't blackhole the new VM. Best-effort; no-op on a dump fail."""
+        for chain in ("FORWARD", "INPUT"):
+            cp = self._ipt_run("-S", chain)
+            if cp.returncode != 0:
+                continue
+            for argv in _spoof_drop_deletes(worker_ip, chain, cp.stdout):
+                self._priv(argv)
 
     def _sweep_fakenet_dnat(self, worker_ip: str) -> None:
         """Delete EVERY live nat-PREROUTING DNAT this worker has, so an orphan from a prior inetsim

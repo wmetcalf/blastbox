@@ -31,6 +31,29 @@ def test_build_image_qemu_removes_partial_first_build(monkeypatch, tmp_path):
     assert ["rm", "-f", str(g), str(g) + ".flat"] in calls       # partial first-build golden removed
 
 
+def test_build_image_packer_restores_golden_on_failed_forced_rebuild(monkeypatch, tmp_path):
+    # a forced packer rebuild that fails must restore the previous working golden, not destroy it.
+    import blastbox.host.runtime.vm_compose as mod
+    g = tmp_path / "g.qcow2"
+    g.write_text("old-working")            # existing golden → force rebuild
+    calls = []
+
+    def fake_run(args, check=False):
+        calls.append(args)
+        if args[:2] == ["packer", "build"]:
+            raise RuntimeError("packer failed")
+        return type("C", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(mod, "_run", fake_run)
+    spec = VmWorkerSpec.from_dict("auth", {
+        "image": {"golden": str(g), "builder": "packer", "packer_template": "/t.pkr.hcl"},
+    })
+    with pytest.raises(RuntimeError):
+        spec.build_image(force=True)
+    assert ["mv", str(g), str(g) + ".prev"] in calls       # moved aside before the build
+    assert ["mv", str(g) + ".prev", str(g)] in calls       # restored after the failure
+
+
 def test_build_image_packer_requires_golden(monkeypatch, tmp_path):
     # parity with the qemu branch: a packer template that exits 0 but doesn't produce image.golden
     # must fail at build time, not return a missing/stale path that the pool trips over later.

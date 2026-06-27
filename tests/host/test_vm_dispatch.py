@@ -129,6 +129,21 @@ def test_claim_is_ours_accepts_matching_and_unscoped(tmp_path):
                            engine="authenticode")._claim_is_ours(claimed) is True
 
 
+def test_claim_next_engine_set_keeps_vm_jobs_off_cold_dispatcher():
+    # a cold dispatcher claiming with the SET of engines it handles must leave a VM-only engine's job
+    # for the VM dispatcher, not grab it first and fail it "unknown engine".
+    store = InMemoryJobStore()
+    for eng in ("clippyshot", "authenticode", "redtusk"):
+        store.create(Job.new(engine=eng, filename="f"))
+    cold_engines = {"clippyshot", "redtusk"}
+    seen = set()
+    while (j := store.claim_next(engine=cold_engines)) is not None:
+        seen.add(j.engine)
+    assert seen == cold_engines                                   # never claimed authenticode
+    vm = store.claim_next(engine="authenticode")                  # left for the VM dispatcher
+    assert vm is not None and vm.engine == "authenticode"
+
+
 def test_libvirt_vm_is_a_routable_tier():
     # operators must be able to target_tier=libvirt-vm so VM-only jobs aren't claimed+failed by the
     # cold dispatcher in a shared store (ingress validates target_tier against VALID_TIERS).

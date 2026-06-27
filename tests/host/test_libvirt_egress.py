@@ -15,6 +15,7 @@ from blastbox.host.runtime.libvirt_egress import (
     _fakenet_dnat_deletes,
     _ip_rule_deletes,
     _rule_priority,
+    _spoof_drop_deletes,
     _tor_redirect_deletes,
     forward_chain_rules,
     input_chain_rules,
@@ -364,6 +365,33 @@ def test_v6_drop_ok_is_silent(monkeypatch):
     eg = LibvirtEgress(sudo=False)
     monkeypatch.setattr(eg, "_priv", lambda argv, **k: subprocess.CompletedProcess(argv, 0, "", ""))
     eg._v6_drop("INPUT", "52:54:00:aa:bb:cc")
+
+
+def test_forward_gateway_dns_gated_on_allowlist():
+    # an explicit egress_ports omitting 53 must withhold the gateway-DNS exemption too — a forwarded
+    # /custom resolver can't bypass a no-DNS policy (parity with the INPUT chain).
+    flat = _flat(forward_chain_rules("192.168.122.5",
+                                     VmEgressPolicy(exit_driver="direct", egress_ports=(80, 443)),
+                                     gateway="10.0.0.53"))
+    assert not any("--dport 53 -j ACCEPT" in f for f in flat)
+    # 53 in the allowlist (or unset) → gateway DNS accepted
+    flat2 = _flat(forward_chain_rules("192.168.122.5",
+                                      VmEgressPolicy(exit_driver="direct", egress_ports=(53, 80)),
+                                      gateway="10.0.0.53"))
+    assert any("-d 10.0.0.53 -p udp --dport 53 -j ACCEPT" in f for f in flat2)
+
+
+def test_spoof_drop_deletes_sweep_all_macs():
+    dump = "\n".join([
+        "-A FORWARD -m mac --mac-source 52:54:00:aa:bb:cc ! -s 192.168.122.5/32 -j DROP",   # anti-spoof
+        "-A FORWARD -s 192.168.122.5/32 -m mac ! --mac-source 52:54:00:de:ad:00 -j DROP",   # STALE sibling
+        "-A FORWARD -s 192.168.122.50/32 -m mac ! --mac-source 52:54:00:11:22:33 -j DROP",  # other worker
+        "-A FORWARD -s 192.168.122.5/32 -j BBVM_192_168_122_5",                              # the jump (no mac)
+    ])
+    dels = _spoof_drop_deletes("192.168.122.5", "FORWARD", dump)
+    assert len(dels) == 2                          # both .5 spoof DROPs (any mac), not .50, not the jump
+    assert all(d[:2] == ["iptables", "-D"] for d in dels)
+    assert all("192.168.122.5/32" in " ".join(d) for d in dels)
 
 
 def test_forward_inetsim_block_internal_exempts_sink():

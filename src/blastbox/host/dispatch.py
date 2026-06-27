@@ -313,7 +313,11 @@ class Dispatcher:
         # dispatcher has no cold path, so it must not claim work it can't immediately serve.
         if self._warm_only and (self._pool is None or self._pool.idle_count <= 0):
             return False
-        job = self._job_store.claim_next(claimant_tier=self._tier)
+        # Claim ONLY jobs for engines this dispatcher actually handles: in a shared store beside a
+        # VM/other-engine dispatcher, claiming an unknown-engine job here would just fail it
+        # "unknown engine" before its real dispatcher sees it. Engine-scoping leaves it for them; a
+        # genuinely-unknown engine (ingress open-allowlist typo) stays queued for the stale reaper.
+        job = self._job_store.claim_next(claimant_tier=self._tier, engine=frozenset(self._engines))
         if job is None:
             return False
         self._dispatch_claimed_job(job)

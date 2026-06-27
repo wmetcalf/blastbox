@@ -200,12 +200,25 @@ class VmWorkerSpec:
         if img.builder == "packer":
             if not img.packer_template:
                 raise ValueError(f"{self.name}: builder=packer needs packer_template")
-            _run(["packer", "build", img.packer_template], check=True)
-            # Verify the template actually wrote image.golden (parity with the qemu branch): a
-            # template that exits 0 but emits its artifact elsewhere — or, with force=True, leaves the
-            # old golden in place — would otherwise return a missing/stale path that fails in the pool.
-            if not img.exists():
-                raise RuntimeError(f"{self.name}: packer build ran but {img.golden} was not produced")
+            # On a forced rebuild over an existing golden, a plain `img.exists()` after the build
+            # can't tell whether packer actually replaced it — a template that exits 0 while writing
+            # elsewhere (or leaving the old file) would return the STALE golden as a successful
+            # rebuild. Move the old golden aside first so "exists after build" proves packer produced
+            # a fresh one; restore it if the build fails, so a failed rebuild is non-destructive.
+            prev = img.golden + ".prev"
+            had_golden = img.exists()
+            if had_golden:
+                _run(["mv", img.golden, prev], check=True)
+            try:
+                _run(["packer", "build", img.packer_template], check=True)
+                if not img.exists():
+                    raise RuntimeError(f"{self.name}: packer build ran but {img.golden} was not produced")
+            except Exception:
+                if had_golden:   # restore the previous working golden
+                    _run(["mv", prev, img.golden])
+                raise
+            if had_golden:
+                _run(["rm", "-f", prev])
             return img.golden
         if img.builder == "qemu":
             if not img.base_qcow2:

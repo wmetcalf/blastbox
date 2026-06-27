@@ -23,8 +23,16 @@ warm-restore reset. The guest transport (how a job is sent to ``slot.endpoint``)
 engine's concern; this runtime only owns slot lifecycle, readiness, and snapshot-recycle.
 
 Prereqs: ``virsh`` (libvirt), ``qemu-img``, a golden qcow2, and a guest that brings up the
-agent on ``agent_port`` at boot. Egress policy for the worker's tap/IP is applied separately
-(netd libvirt mode); see the network primitive.
+agent on ``agent_port`` at boot. Egress policy for the worker's IP/MAC is applied separately by
+the host-side rooter (``libvirt_egress``): per-worker FORWARD/INPUT chains + tor/vpn/inetsim/
+fakenet exit steering.
+
+NOT WIRED for the VM tier (container/netns-only today, via ``netd``/``capture``/the cold
+dispatcher labels): per-job **pcap capture** and **TLS keydump** (``SSLKEYLOGFILE`` →
+GoGoRoboCap decrypt). A VM has no per-worker netns to tcpdump or inject env into; wiring it
+would need a netd "tap mode" (capture on the worker's ``vnet*``/bridge filtered by its MAC/IP)
+plus guest-side keylog extraction over the agent, or routing the VM through the sslproxy MITM
+gateway for gateway-side keys. See the network primitive.
 """
 from __future__ import annotations
 
