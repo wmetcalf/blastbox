@@ -97,12 +97,15 @@ def rotate(candidate: str, *, live_disk: str, backup_dir: str, keep_n: int = 5,
     # Move the current targets aside first (so a mid-sequence swap failure can be ROLLED BACK to a
     # consistent pair), then swap the staged copies into place. If any promote fails, restore every
     # target from its stash — never leave live_disk advanced while the RAM mirror stays stale.
-    stashed = []
-    for dest in dests:
-        if runner([*pfx, "test", "-e", dest], capture_output=True, text=True).returncode == 0:
-            _checked(["mv", dest, dest + ".rollback"], "stash current")
-            stashed.append(dest)
+    stashed: list[str] = []
     try:
+        # Stash (move current aside) AND promote inside ONE try: a failure stashing a LATER target
+        # (after an earlier one was already moved to .rollback) must roll back too, else the earlier
+        # target's live golden is left missing at .rollback.
+        for dest in dests:
+            if runner([*pfx, "test", "-e", dest], capture_output=True, text=True).returncode == 0:
+                _checked(["mv", dest, dest + ".rollback"], "stash current")
+                stashed.append(dest)
         for dest in dests:
             _checked(["mv", dest + ".new", dest], "promote")
     except Exception:

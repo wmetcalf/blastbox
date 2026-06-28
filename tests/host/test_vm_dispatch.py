@@ -69,6 +69,49 @@ def test_dispatch_metadata_overwrites_stale_and_neuters_artifacts(tmp_path):
     assert meta["artifacts"] == []                               # guest artifacts neutered (security)
 
 
+def test_dispatch_bounds_oversized_summary(tmp_path):
+    # a compromised VM agent's huge summary must not be stored verbatim (balloons DB + every response)
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    big = {"blob": "A" * (300 * 1024)}
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: (big, True), max_summary_bytes=256 * 1024)
+    d._process(store.claim_next())
+    got = store.get(job.job_id)
+    assert got.status is JobStatus.DONE
+    assert got.result_summary["error"] == "summary_too_large"
+
+
+def test_dispatch_times_out_a_hung_validate(tmp_path):
+    import time as _t
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: _t.sleep(5),
+                        validate_timeout_s=0.3, heartbeat_s=0.1)
+    d._process(store.claim_next())
+    got = store.get(job.job_id)
+    assert got.status is JobStatus.FAILED and got.error == "TimeoutError"   # claim thread freed
+
+
+def test_stage_publish_discard_metadata(tmp_path):
+    import json
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    claimed = store.claim_next()                      # gives job a claim_id for the staged name
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True))
+    out = tmp_path / job.job_id / "output"
+    # stage: written to a confined staging file, NOT published
+    staged = d._stage_metadata(claimed, {"v": 1, "artifacts": [{"id": "x"}]})
+    assert (out / staged).exists() and not (out / "metadata.json").exists()
+    # discard (lost claim): staged removed, nothing published
+    d._publish_or_discard_metadata(claimed, staged, publish=False)
+    assert not (out / staged).exists() and not (out / "metadata.json").exists()
+    # publish (won claim): atomic rename into metadata.json, artifacts neutered
+    s2 = d._stage_metadata(claimed, {"v": 2, "artifacts": [{"id": "y"}]})
+    d._publish_or_discard_metadata(claimed, s2, publish=True)
+    meta = json.loads((out / "metadata.json").read_text())
+    assert meta["v"] == 2 and meta["artifacts"] == []
+
+
 def test_dispatch_does_not_write_metadata_on_failure(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)

@@ -181,6 +181,33 @@ def test_rotate_rolls_back_split_promotion(tmp_path):
     assert any(f"mv {shm}.rollback {shm}" in c for c in flat)      # mirror restored too
 
 
+def test_rotate_rolls_back_when_a_later_stash_fails(tmp_path):
+    # if stashing the SHM mirror fails AFTER the live disk was already moved to .rollback, the disk
+    # must be restored (not left missing at .rollback).
+    live = tmp_path / "g.qcow2"
+    live.write_text("disk")
+    shm = tmp_path / "shm.qcow2"
+    shm.write_text("mirror")
+
+    class _R:
+        def __init__(self):
+            self.cmds = []
+
+        def __call__(self, argv, **k):
+            self.cmds.append(argv)
+            # both targets exist (test -e rc0); fail the SHM stash (mv shm shm.rollback)
+            rc = 1 if (argv[:1] == ["mv"] and argv[1].endswith("shm.qcow2")
+                       and argv[2].endswith(".rollback")) else 0
+            return type("C", (), {"returncode": rc, "stdout": "", "stderr": "busy"})()
+
+    r = _R()
+    with pytest.raises(RuntimeError):
+        golden.rotate(str(tmp_path / "cand.qcow2"), live_disk=str(live), live_shm=str(shm),
+                      backup_dir=str(tmp_path / "b"), ts="T", sudo=False, runner=r)
+    flat = [" ".join(c) for c in r.cmds]
+    assert any(f"mv {live}.rollback {live}" in c for c in flat)   # already-stashed disk restored
+
+
 def test_rotate_removes_half_promoted_target_on_first_rotation(tmp_path):
     # FIRST rotation (no prior live files → nothing stashed): if live_disk promotes but the shm mirror
     # promote fails, rollback must REMOVE the already-promoted disk (not leave a half-promoted pair).

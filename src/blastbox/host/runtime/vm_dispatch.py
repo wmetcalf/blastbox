@@ -20,14 +20,21 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from blastbox.contract.envelope import atomic_write_confined
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.jobs.retention import JobRetentionSweeper
+
+# Cap a VM validate() summary before it's stored as result_summary / written to metadata.json — a
+# compromised/buggy VM agent could otherwise return a huge nested blob that balloons the DB/Redis
+# value and every status/list response for the job.
+_MAX_SUMMARY_BYTES = 256 * 1024
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +55,9 @@ class VmJobDispatcher:
                  engine: str | None = None, worker_tier: str = "libvirt-vm",
                  job_retention_s: int = 0, concurrency: int = 1, poll_s: float = 0.5,
                  heartbeat_s: float = 30.0, maintenance_interval_s: float = 60.0,
-                 orphan_timeout_s: float = 600.0, sole_owner: bool = False) -> None:
+                 orphan_timeout_s: float = 600.0, sole_owner: bool = False,
+                 validate_timeout_s: float = 1800.0,
+                 max_summary_bytes: int = _MAX_SUMMARY_BYTES) -> None:
         self._store = store
         self._job_root = Path(job_root)
         self._validate = validate
@@ -68,6 +77,10 @@ class VmJobDispatcher:
         # crashed BEFORE _process stamped worker_runtime="warm" — there's no cold job to mistake it
         # for. Default False keeps recovery scoped to our own warm-stamped claims (shared-store safe).
         self._sole_owner = bool(sole_owner)
+        # Bound a hung validate() so a dead VM agent can't occupy a claim thread forever (heartbeat
+        # would keep the job looking fresh, so the orphan sweep never recovers it).
+        self._validate_timeout_s = max(self._heartbeat_s, float(validate_timeout_s))
+        self._max_summary_bytes = max(1024, int(max_summary_bytes))
         self._retention = JobRetentionSweeper(self._job_root)
         self._stop = threading.Event()
 
@@ -85,37 +98,75 @@ class VmJobDispatcher:
     def _expiry(self, finished_at: float) -> float | None:
         return finished_at + self._retention_s if self._retention_s > 0 else None
 
-    def _ensure_metadata(self, job: Job, summary: dict | None) -> bool:
-        """Write ``<output>/metadata.json`` from the validate() summary. Called BEFORE the terminal
-        CAS so DONE is never observable without it (the ingress ``/metadata``/``/artifacts``/
-        ``/result`` routes gate on DONE then require the file). ATOMIC (tmp + replace) and OVERWRITES,
-        so a reclaim race resolves to the LAST validation's metadata — the DONE-winner wrote its own
-        before winning, and a stale loser's file is replaced by the next owner. Returns whether it
-        wrote (False on an I/O hiccup — the authoritative result is the stored ``result_summary``).
+    def _bounded_summary(self, summary: dict | None) -> dict | None:
+        """Cap an untrusted VM summary so it can't balloon the store / every status response. Returns
+        a small marker if it's unserializable or exceeds ``max_summary_bytes``."""
+        if summary is None:
+            return None
+        try:
+            n = len(json.dumps(summary))
+        except (TypeError, ValueError):
+            return {"error": "unserializable_summary"}
+        if n > self._max_summary_bytes:
+            return {"error": "summary_too_large", "summary_bytes": n}
+        return summary
 
-        SECURITY: force ``artifacts: []``. The ingress treats metadata.json's artifact list as
-        dispatcher-VALIDATED (re-hashed by the host trust gate), and drives ``/artifacts``/``/result``
-        file serving off it. A VM ``validate()`` summary is NOT that — it never went through the trust
-        gate — so an ``artifacts`` list in it (guest-influenced) must never make unsealed output files
-        downloadable. We surface the summary as the metadata body but neuter its artifact manifest."""
+    def _stage_metadata(self, job: Job, summary: dict | None) -> str | None:
+        """Write metadata to a confined, claim-specific STAGING file (not yet published). Confined +
+        symlink-safe (atomic_write_confined: random O_EXCL|O_NOFOLLOW temp under a dir fd), so a
+        prior untrusted attempt's planted symlink in output/ can't redirect the host write. Returns
+        the staged file's name, or None on failure.
+
+        SECURITY: force ``artifacts: []`` — the ingress treats metadata.json's artifact list as
+        host-trust-gate-validated and serves files off it; a VM summary's (guest-influenced) artifact
+        list never went through the gate, so it must never make unsealed output downloadable."""
         out = self._job_dir(job) / "output"
+        name = f".metadata.{job.claim_id or 'x'}.staged"
         try:
             out.mkdir(parents=True, exist_ok=True)
-            tmp = out / "metadata.json.tmp"
-            tmp.write_text(json.dumps({**(summary or {}), "artifacts": []}))
-            tmp.replace(out / "metadata.json")   # atomic publish
-            return True
+            data = json.dumps({**(summary or {}), "artifacts": []}).encode()
+            atomic_write_confined(out, name, data, mode=0o644)
+            return name
         except OSError:
-            logger.warning("vm_dispatch: could not write metadata.json for %s (result routes may "
-                           "404)", job.job_id, exc_info=True)
-            return False
+            logger.warning("vm_dispatch: could not stage metadata.json for %s", job.job_id,
+                           exc_info=True)
+            return None
+
+    def _publish_or_discard_metadata(self, job: Job, staged: str, *, publish: bool) -> None:
+        """Atomically rename the staged metadata into ``metadata.json`` (ONLY when our terminal CAS
+        won — so a stale loser never overwrites the DONE-winner's file), else discard it. The rename
+        is confined (renameat under the output dir fd) and clobbers any planted ``metadata.json``
+        symlink at the destination."""
+        out = self._job_dir(job) / "output"
+        try:
+            dir_fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError:
+            return
+        try:
+            if publish:
+                os.replace(staged, "metadata.json", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            else:
+                try:
+                    os.unlink(staged, dir_fd=dir_fd)
+                except OSError:
+                    pass
+        except OSError:
+            logger.warning("vm_dispatch: could not %s metadata for %s",
+                           "publish" if publish else "discard", job.job_id, exc_info=True)
+        finally:
+            os.close(dir_fd)
 
     def _validate_with_heartbeat(self, job: Job, in_path: Path) -> tuple[dict | None, bool]:
         """Run ``validate()`` while a daemon thread refreshes the job's ``started_at`` every
         ``heartbeat_s``. A VM validation can legitimately outrun a peer's warm-recovery cutoff
         (``worker_timeout_s + grace``); without the heartbeat that sweep would FAIL the still-running
         job as abandoned and delete its input before our terminal CAS. The refresh is CAS-fenced on
-        our claim, so it no-ops harmlessly if the job was reclaimed."""
+        our claim, so it no-ops harmlessly if the job was reclaimed.
+
+        Bounded by ``validate_timeout_s``: validate() runs in a daemon thread; if it hangs (dead agent
+        / stuck network read) past the deadline we raise TimeoutError (→ the job FAILs) and stop
+        beating, freeing this claim thread. The hung daemon thread is abandoned (Python can't kill a
+        thread) — the engine's validate() should also use its own socket timeouts."""
         beat = threading.Event()
 
         def _pump() -> None:
@@ -123,10 +174,26 @@ class VmJobDispatcher:
                 self._store.update_if_status(job.job_id, JobStatus.RUNNING,
                                              expect_claim_id=job.claim_id, started_at=time.time())
 
+        result: dict[str, object] = {}
+
+        def _run() -> None:
+            try:
+                result["v"] = self._validate(in_path)
+            except BaseException as exc:  # noqa: BLE001 — surfaced to the caller below
+                result["e"] = exc
+
         hb = threading.Thread(target=_pump, name=f"vmhb-{job.job_id[:8]}", daemon=True)
+        vt = threading.Thread(target=_run, name=f"vmval-{job.job_id[:8]}", daemon=True)
         hb.start()
+        vt.start()
         try:
-            return self._validate(in_path)
+            vt.join(timeout=self._validate_timeout_s)
+            if vt.is_alive():
+                raise TimeoutError(f"validate() exceeded {self._validate_timeout_s:.0f}s "
+                                   "(hung VM agent?)")
+            if "e" in result:
+                raise result["e"]  # type: ignore[misc]
+            return result["v"]  # type: ignore[return-value]
         finally:
             beat.set()
             hb.join(timeout=2)
@@ -158,12 +225,13 @@ class VmJobDispatcher:
             if not in_path.exists():
                 raise FileNotFoundError(f"spooled input missing: {in_path}")
             summary, ok = self._validate_with_heartbeat(job, in_path)
-            # Materialize metadata.json BEFORE the DONE CAS: the ingress result routes gate on DONE and
-            # then require the file, so DONE must never be observable (by a poller, or after a crash in
-            # this window) without it. The write is atomic + overwriting, so a reclaim race resolves to
-            # the last validation's metadata (the DONE-winner wrote its own just before winning).
-            if ok:
-                self._ensure_metadata(job, summary)
+            summary = self._bounded_summary(summary)   # cap untrusted summary before store/metadata
+            # STAGE metadata.json (confined) before the CAS so its bytes are ready, then PUBLISH it
+            # only if WE win the terminal CAS — satisfies both "DONE must imply metadata exists" (the
+            # publish is a single renameat right after the winning CAS) and "only the winning claim's
+            # metadata is served" (a stale loser discards its staged file, never overwriting the
+            # winner's). A loser's CAS fails below and we discard.
+            staged = self._stage_metadata(job, summary) if ok else None
             finished = time.time()
             # CAS on (status, claim_id) so a stale owner can't clobber a job that was reclaimed
             # (RUNNING->QUEUED->RUNNING under another dispatcher). The return value is OUR ownership.
@@ -171,6 +239,8 @@ class VmJobDispatcher:
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                 status=JobStatus.DONE if ok else JobStatus.FAILED,
                 finished_at=finished, result_summary=summary, expires_at=self._expiry(finished))
+            if staged is not None:
+                self._publish_or_discard_metadata(job, staged, publish=owned)
         except Exception as exc:  # noqa: BLE001 — one bad job must not sink the dispatcher
             logger.warning("vm_dispatch: job %s failed: %s", job.job_id, exc, exc_info=True)
             finished = time.time()
