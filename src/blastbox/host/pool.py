@@ -244,21 +244,21 @@ class WarmPool:
         # (e.g. a libvirt VM whose `virsh destroy` failed during a rolling restart), KEEP it tracked —
         # else the still-running domain (with its overlay + egress rules) is forgotten outside pool
         # accounting and never retried. Quarantined entries stay in _slots for surfacing/manual cleanup.
+        # Flip EVERY slot to DRAINING under the lock BEFORE releasing it to reap: claim()/promotion
+        # only hand out IDLE/WARMING slots, so a dispatcher that races claim() in the window between
+        # snapshotting to_reap and reaping must not be handed a slot stop() is about to dispose. After
+        # this, reap failures simply leave the (already-DRAINING) husk tracked for manual cleanup.
         with self._lock:
             to_reap = list(self._slots.values())
+            for slot in to_reap:
+                slot.state = SlotState.DRAINING
 
         for slot in to_reap:
             try:
                 self._reap_and_count(slot)
             except Exception:
-                logger.exception("pool.reap_error_on_stop slot_id=%s — quarantining", slot.slot_id)
-                # Mark the retained (un-reaped) slot DRAINING so it can NEVER be handed out again:
-                # claim()/promotion only touch IDLE/WARMING, so if this WarmPool object is restarted or
-                # a dispatcher races claim() after stop() began, a still-IDLE husk for a VM whose
-                # disposal FAILED must not be reused while it may still be running.
-                with self._lock:
-                    if slot.slot_id in self._slots:
-                        slot.state = SlotState.DRAINING
+                logger.exception("pool.reap_error_on_stop slot_id=%s — quarantining (still DRAINING, "
+                                 "never claimable)", slot.slot_id)
             else:
                 with self._lock:
                     self._slots.pop(slot.slot_id, None)

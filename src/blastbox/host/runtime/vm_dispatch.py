@@ -176,7 +176,17 @@ class VmJobDispatcher:
                 raise TimeoutError(f"validate() exceeded {self._validate_timeout_s:.0f}s "
                                    "(hung VM agent?)")
             if "e" in result:
-                raise result["e"]  # type: ignore[misc]
+                exc = result["e"]
+                # _run captures BaseException so a validate() that raises SystemExit/GeneratorExit
+                # (e.g. a sample-triggered sys.exit in the engine) can't silently kill the daemon
+                # thread. But _process/_worker_loop only catch Exception, so re-raising a bare
+                # BaseException would skip the FAILED write and leave the job RUNNING until orphan
+                # recovery. Normalize a non-Exception BaseException into a RuntimeError so the
+                # documented raising→FAILED path runs. (KeyboardInterrupt isn't delivered to this
+                # daemon thread by the signal machinery, so there's no interactive shutdown to lose.)
+                if isinstance(exc, Exception):
+                    raise exc
+                raise RuntimeError(f"validate() raised {type(exc).__name__}: {exc}")  # type: ignore[union-attr]
             return result["v"]  # type: ignore[return-value]
         finally:
             beat.set()

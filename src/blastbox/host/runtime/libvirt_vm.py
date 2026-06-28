@@ -60,6 +60,11 @@ def _run(args: list[str], timeout: float = 120) -> subprocess.CompletedProcess:
         return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(args, 124, "", "timeout")
+    except OSError as exc:
+        # The helper binary isn't installed (e.g. `sudo` missing with the default config, or `virsh`
+        # missing when sudo=False). available() probes through here and must FAIL CLOSED (return a
+        # nonzero result → available()=False), not crash runtime selection with a raw FileNotFoundError.
+        return subprocess.CompletedProcess(args, 127, "", str(exc))
 
 
 @dataclass(frozen=True)

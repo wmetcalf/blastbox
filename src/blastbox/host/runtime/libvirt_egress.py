@@ -661,7 +661,13 @@ class LibvirtEgress:
         Best-effort; per-chain no-op on a dump fail."""
         pre = self._ipt_run("-t", "nat", "-S", "PREROUTING")
         if pre.returncode == 0:
-            for argv in _nat_chain_deletes(worker_ip, "PREROUTING", ("REDIRECT", "DNAT"), pre.stdout):
+            # RETURN too, not just REDIRECT/DNAT: tor/inetsim install ``-s <ip> -d <internal> -j
+            # RETURN`` bypass rules AHEAD of the DNS REDIRECT/DNAT. When this IP is reused under a
+            # policy whose exact teardown can't reach them (no/!changed ExitRouting or worker_cidr),
+            # a leftover RETURN short-circuits PREROUTING and DNS to the bridge/local nets escapes
+            # tor/FakeNet on the next incarnation. Sweep them by source IP too.
+            for argv in _nat_chain_deletes(worker_ip, "PREROUTING",
+                                           ("REDIRECT", "DNAT", "RETURN"), pre.stdout):
                 self._priv(argv)
         post = self._ipt_run("-t", "nat", "-S", "POSTROUTING")
         if post.returncode == 0:

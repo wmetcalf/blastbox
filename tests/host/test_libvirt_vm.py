@@ -91,6 +91,19 @@ def test_available_fail_closed_without_golden():
         LibvirtVmConfig(golden_base="/no/such/golden.qcow2", sudo=False)).available() is False
 
 
+def test_available_fails_closed_when_helper_binary_missing(monkeypatch):
+    # sudo/virsh not installed → subprocess.run raises FileNotFoundError; available() must return
+    # False (fail closed), not crash runtime selection with a raw OSError.
+    import blastbox.host.runtime.libvirt_vm as mod
+
+    def no_binary(args, **k):
+        raise FileNotFoundError(2, "No such file or directory", args[0] if args else "?")
+
+    monkeypatch.setattr(mod.subprocess, "run", no_binary)
+    assert mod.LibvirtVmRuntime(
+        mod.LibvirtVmConfig(golden_base="/g.qcow2", sudo=True)).available() is False
+
+
 def test_alloc_overlay_name_uses_64_bits_and_unique_path(monkeypatch):
     # 16 hex (64 bits), not 8 — a 32-bit space birthday-collides in a long-lived pool, and a collision
     # is destructive (spawn destroys+overwrites the sibling's domain/overlay).

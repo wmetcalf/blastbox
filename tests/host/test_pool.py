@@ -452,6 +452,30 @@ def test_stop_retains_slot_whose_reap_fails() -> None:
     assert pool._slots[sid].state == SlotState.DRAINING  # ...is now unclaimable (claim() picks IDLE)
 
 
+def test_stop_marks_slots_draining_before_reaping() -> None:
+    # stop() must flip every slot to DRAINING UNDER THE LOCK before reaping, so a dispatcher racing
+    # claim() in the window between snapshotting to_reap and the reap can never be handed a slot stop()
+    # is about to dispose. Observe the slot's state AT reap time.
+    class _RecordStateAtReap(_FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.state_at_reap: dict[str, SlotState] = {}
+
+        def reap(self, slot: Slot) -> None:
+            self.state_at_reap[slot.slot_id] = slot.state
+            super().reap(slot)
+
+    rt = _RecordStateAtReap()
+    pool = WarmPool(runtime=rt, warm_size=2)
+    pool._spawn_to_deficit(ready=True)
+    for s in pool._slots.values():
+        s.state = SlotState.IDLE                   # claimable before stop
+    ids = set(pool._slots.keys())
+    pool.stop()
+    assert set(rt.state_at_reap.keys()) == ids
+    assert all(st == SlotState.DRAINING for st in rt.state_at_reap.values())  # never IDLE at reap
+
+
 # ---------------------------------------------------------------------------
 # Test 10: burst scaling — effective_target rises to warm_size + burst_size
 #          after sustained misses for burst_trigger_s; drains after burst_drain_s

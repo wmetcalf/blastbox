@@ -317,6 +317,20 @@ def test_nat_chain_deletes_sweep_target_worker_by_source_ip():
     assert len(md) == 1 and "br-r" in " ".join(md[0])
 
 
+def test_nat_chain_deletes_sweeps_return_bypass_rules():
+    # tor/inetsim install `-s <ip> -d <internal> -j RETURN` bypasses AHEAD of the DNS REDIRECT; on IP
+    # reuse a leftover RETURN short-circuits PREROUTING and DNS escapes tor/FakeNet. Must be swept too.
+    pre = "\n".join([
+        "-A PREROUTING -s 192.168.122.50/32 -d 192.168.122.0/24 -j RETURN",   # local-net bypass
+        "-A PREROUTING -s 192.168.122.50/32 -d 10.0.0.0/8 -j RETURN",          # RFC1918 bypass
+        "-A PREROUTING -s 192.168.122.50/32 -p tcp -j REDIRECT --to-ports 9040",
+        "-A PREROUTING -s 192.168.122.5/32 -d 10.0.0.0/8 -j RETURN",           # other worker — untouched
+    ])
+    dels = _nat_chain_deletes("192.168.122.50", "PREROUTING", ("REDIRECT", "DNAT", "RETURN"), pre)
+    assert sum("-j RETURN" in " ".join(d) for d in dels) == 2     # both .50 RETURNs swept, not .5's
+    assert all("192.168.122.50/32" in " ".join(d) for d in dels)
+
+
 def test_v6_drop_raises_on_permission_denied(monkeypatch):
     # legacy iptables reports a privilege problem as "can't initialize ... Permission denied" — that
     # is NOT a benign "no v6 table" case: the drop didn't install while v6 may work → fail closed.

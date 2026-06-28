@@ -352,6 +352,22 @@ def test_dispatch_marks_failed_on_raise(tmp_path):
     assert got.error == "RuntimeError"
 
 
+def test_dispatch_marks_failed_when_validate_raises_baseexception(tmp_path):
+    # a validate() that raises a non-Exception BaseException (e.g. a sample-triggered sys.exit) must
+    # still FAIL the job, not slip past _process's `except Exception` and leave it RUNNING forever.
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+
+    def sys_exit(p):
+        raise SystemExit(2)
+
+    d = VmJobDispatcher(store, str(tmp_path), sys_exit)
+    d._process(store.claim_next())
+    got = store.get(job.job_id)
+    assert got.status is JobStatus.FAILED              # normalized to a failure, not a stuck RUNNING
+    assert got.error == "RuntimeError"                 # wrapped (SystemExit → RuntimeError)
+
+
 def test_dispatch_missing_input_is_failed(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
