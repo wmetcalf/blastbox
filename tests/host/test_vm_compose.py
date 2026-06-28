@@ -101,6 +101,14 @@ def test_from_dict_rejects_malformed_block_internal():
                                      "egress": {"exit": "direct", "block_internal": "treu"}})
 
 
+@pytest.mark.parametrize("badkey", ["exitt", "block_internl", "egress_port", "fakenet_address"])
+def test_from_dict_rejects_unknown_egress_key(badkey):
+    # a misspelled egress key must be REJECTED, not silently ignored → defaulting to direct/unblocked.
+    with pytest.raises(ValueError, match="unknown egress key"):
+        VmWorkerSpec.from_dict("w", {"image": "/g.qcow2",
+                                     "egress": {"exit": "tor", badkey: "x"}})
+
+
 @pytest.mark.parametrize("bad", [[], {}, ["x"]])
 def test_from_dict_rejects_non_scalar_block_internal(bad):
     # a non-scalar YAML value (block_internal: [] / {}) must be REJECTED, not coerced via bool([])

@@ -174,6 +174,23 @@ def test_from_personality_blank_ports_stays_unrestricted():
     assert VmEgressPolicy.from_personality(p).egress_ports is None
 
 
+def test_from_personality_rejects_malformed_block_internal():
+    # a typoed security knob (block_internal=treu) must be REJECTED, not read as False — else the VM
+    # is provisioned without the RFC1918/internal-destination drops the operator intended.
+    p = Personality(name="w", exit_driver="direct", config={"block_internal": "treu"})
+    with pytest.raises(ValueError, match="boolean"):
+        VmEgressPolicy.from_personality(p)
+
+
+def test_from_personality_block_internal_valid_values():
+    assert VmEgressPolicy.from_personality(
+        Personality(name="w", exit_driver="direct", config={"block_internal": "true"})).block_internal is True
+    assert VmEgressPolicy.from_personality(
+        Personality(name="w", exit_driver="direct", config={"block_internal": "false"})).block_internal is False
+    assert VmEgressPolicy.from_personality(
+        Personality(name="w", exit_driver="direct", config={})).block_internal is False  # omitted → off
+
+
 # --- exit routing (rooter model: policy-route / REDIRECT / DNAT) -------------------
 from blastbox.host.runtime.libvirt_egress import (  # noqa: E402
     routing_commands,

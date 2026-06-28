@@ -20,6 +20,7 @@ from blastbox.host.netwire import (
     leak_guard_rules_v6,
     leakguard_from_inspect,
     parse_egress_ports,
+    parse_strict_bool,
     socks_proxy_url,
     socks_resolv_conf,
     transproxy_redirect_rules,
@@ -269,6 +270,20 @@ def test_leak_guard_rules_v6_fails_closed():
 #   block_internal=1        → drop RFC1918 + link-local/metadata destinations (no SSRF/lateral).
 # Proven live (toolz3, 2026-06-20): worker egressed via PIA on 53/80/443 only; non-web + internal
 # blocked. These build the worker-netns OUTPUT rules that express exactly that.
+
+
+def test_parse_strict_bool_maps_words_and_rejects_typos():
+    for t in ("1", "true", "TRUE", "yes", "on"):
+        assert parse_strict_bool(t) is True
+    for f in ("0", "false", "no", "off"):
+        assert parse_strict_bool(f) is False
+    assert parse_strict_bool(None) is False                 # omitted → default
+    assert parse_strict_bool(None, default=True) is True
+    assert parse_strict_bool("") is False                   # blank → default
+    assert parse_strict_bool("", default=True) is True
+    for bad in ("treu", "enable", "maybe", "2"):
+        with pytest.raises(ValueError, match="boolean"):
+            parse_strict_bool(bad)                           # a typo must NOT silently read False
 
 
 def test_parse_egress_ports_accepts_comma_or_whitespace():

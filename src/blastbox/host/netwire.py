@@ -309,6 +309,22 @@ def egress_filter_from_inspect(
 _INTERNAL_NETS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16")
 
 
+def parse_strict_bool(raw: str | None, *, default: bool = False) -> bool:
+    """Parse a SECURITY-knob boolean string fail-closed. ``None``/blank → ``default``; the usual
+    truthy/falsey words map as expected; anything else (a typo like ``"treu"``) RAISES rather than
+    silently coercing to a permissive value — a security control must not be disabled by a typo."""
+    if raw is None:
+        return default
+    s = str(raw).strip().lower()
+    if s == "":
+        return default
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"malformed boolean value {raw!r} (use true/false)")
+
+
 def parse_egress_ports(raw: str | None) -> tuple[int, ...] | None:
     """Parse an ``egress_ports`` value (comma- or whitespace-separated port numbers) into a validated
     tuple, or ``None`` if nothing valid survives. Non-numeric / out-of-range (not 1-65535) tokens are

@@ -383,6 +383,40 @@ def test_accepts_job_whose_net_policy_matches_fixed(tmp_path):
     assert store.get(job.job_id).status is JobStatus.DONE
 
 
+def test_rejects_job_when_engine_default_policy_mismatches_fixed(tmp_path):
+    # no per-job override (job.net_policy=None), but the ENGINE default is "tor" while the pool is
+    # provisioned "fakenet": the cold path would apply tor, so the VM tier must reject rather than
+    # detonate under the wrong fixed egress.
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)                         # job.net_policy is None
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
+                        fixed_net_policy="fakenet", engine_net_policy="tor")
+    d._process(store.claim_next())
+    got = store.get(job.job_id)
+    assert got.status is JobStatus.FAILED
+    assert "tor" in (got.error or "") and "engine-default" in got.error
+
+
+def test_accepts_job_when_engine_default_matches_fixed(tmp_path):
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
+                        fixed_net_policy="fakenet", engine_net_policy="fakenet")
+    d._process(store.claim_next())
+    assert store.get(job.job_id).status is JobStatus.DONE
+
+
+def test_per_job_override_takes_precedence_over_engine_default(tmp_path):
+    # an explicit override wins over the engine default for the effective-policy comparison.
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    job.net_policy = "fakenet"                                # override matches the pool
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
+                        fixed_net_policy="fakenet", engine_net_policy="tor")
+    d._process(store.claim_next())
+    assert store.get(job.job_id).status is JobStatus.DONE     # override (fakenet) honored, not the default
+
+
 def test_dispatch_marks_failed_when_validate_raises_baseexception(tmp_path):
     # a validate() that raises a non-Exception BaseException (e.g. a sample-triggered sys.exit) must
     # still FAIL the job, not slip past _process's `except Exception` and leave it RUNNING forever.

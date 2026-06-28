@@ -57,6 +57,7 @@ class VmJobDispatcher:
                  orphan_timeout_s: float = 600.0, sole_owner: bool = False,
                  validate_timeout_s: float = 1800.0,
                  fixed_net_policy: str | None = None,
+                 engine_net_policy: str | None = None,
                  max_summary_bytes: int = _MAX_SUMMARY_BYTES) -> None:
         self._store = store
         self._job_root = Path(job_root)
@@ -84,6 +85,11 @@ class VmJobDispatcher:
         # has a FIXED egress applied at spawn; it can't re-steer per job like the cold container path.
         # A job requesting a different policy is rejected fail-closed in _process (see there).
         self._fixed_net_policy = fixed_net_policy
+        # The engine's DEFAULT net_policy (EngineSpec.net_policy / BLASTBOX_ENGINE_<NAME>_NETPOLICY),
+        # applied by the cold path when a job carries no per-job override. The EFFECTIVE policy is the
+        # per-job override if present, else this default — _process compares the effective policy
+        # against the pool's fixed egress so an engine-default mismatch is caught too, not just overrides.
+        self._engine_net_policy = engine_net_policy
         self._max_summary_bytes = max(1024, int(max_summary_bytes))
         self._retention = JobRetentionSweeper(self._job_root)
         self._stop = threading.Event()
@@ -209,25 +215,29 @@ class VmJobDispatcher:
         return False
 
     def _process(self, job: Job) -> None:
-        # Fail closed on a per-job net_policy this warm tier can't honor — BEFORE detonation. The
-        # ingress only sets job.net_policy when BLASTBOX_ALLOW_NETPOLICY_OVERRIDE is on; the cold
-        # container path resolves+applies it per launch, but a warm VM's egress is FIXED at spawn and
-        # can't be re-steered per job. Running the sample under the pool's (different) policy while the
-        # record claims another would silently break the isolation/attribution contract — reject it.
-        if job.net_policy and job.net_policy != self._fixed_net_policy:
+        # Fail closed on an EFFECTIVE net_policy this warm tier can't honor — BEFORE detonation. A
+        # warm VM's egress is FIXED at spawn and can't be re-steered per job like the cold container
+        # path. The effective policy is the per-job override (ingress sets job.net_policy only when
+        # BLASTBOX_ALLOW_NETPOLICY_OVERRIDE is on) if present, ELSE the engine default — the cold path
+        # resolves+applies that default, so a VM pool fixed to a DIFFERENT policy would otherwise
+        # detonate under the wrong egress while the record implies another. Reject the mismatch.
+        effective_policy = job.net_policy or self._engine_net_policy
+        if effective_policy and effective_policy != self._fixed_net_policy:
+            kind = "override" if job.net_policy else "engine-default"
             finished = time.time()
             if self._store.update_if_status(
                     job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                     status=JobStatus.FAILED, finished_at=finished,
-                    error=f"net_policy {job.net_policy!r} not honored by {self._worker_tier} tier "
-                          f"(fixed egress {self._fixed_net_policy!r})",
+                    error=f"net_policy {effective_policy!r} ({kind}) not honored by {self._worker_tier} "
+                          f"tier (fixed egress {self._fixed_net_policy!r})",
                     expires_at=self._expiry(finished)):
                 try:  # we owned the terminal write → drop the spooled input
                     self._input_path(job).unlink()
                 except OSError:
                     pass
-            logger.warning("vm_dispatch: rejecting job %s — net_policy %r not honored by %s (fixed %r)",
-                           job.job_id, job.net_policy, self._worker_tier, self._fixed_net_policy)
+            logger.warning("vm_dispatch: rejecting job %s — net_policy %r (%s) not honored by %s "
+                           "(fixed %r)", job.job_id, effective_policy, kind, self._worker_tier,
+                           self._fixed_net_policy)
             return
         # Mark the in-flight job as a warm worker BEFORE the (possibly long) validate, so a peer's
         # requeue_orphaned_jobs sweep — which treats a RUNNING job with worker_runtime != "warm" as a

@@ -115,6 +115,19 @@ class VmWorkerSpec:
             raise ValueError(f"{name}: 'egress' must be a mapping (e.g. {{exit: drop}}), got "
                              f"{type(eg).__name__}")
         if isinstance(eg, dict):
+            # Reject UNKNOWN keys before applying permissive defaults: a typoed key (`exitt: tor`,
+            # `block_internl: true`) would otherwise be ignored and the VM provisioned with the
+            # default exit_driver="direct" / block_internal=False — clearnet or unblocked internal
+            # egress instead of the intended policy. Fail closed like the malformed-value paths.
+            _ALLOWED_EGRESS_KEYS = {
+                "exit", "egress_ports", "block_internal", "gateway_masquerade",
+                "vpn_table", "vpn_tun", "tor_trans_port", "tor_dns_port", "fakenet_addr",
+                "gateway", "leg", "gateway_table_base", "worker_cidr",
+            }
+            unknown = set(eg) - _ALLOWED_EGRESS_KEYS
+            if unknown:
+                raise ValueError(f"{name}: unknown egress key(s) {sorted(unknown)} "
+                                 f"(did you mean one of {sorted(_ALLOWED_EGRESS_KEYS)}?)")
             egress = VmEgressPolicy(
                 exit_driver=eg.get("exit", "direct"),
                 egress_ports=_ports(eg.get("egress_ports")),

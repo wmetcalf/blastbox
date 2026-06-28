@@ -21,7 +21,7 @@ import subprocess
 from dataclasses import dataclass
 
 from blastbox.host.netpolicy import Personality
-from blastbox.host.netwire import _INTERNAL_NETS, parse_egress_ports
+from blastbox.host.netwire import _INTERNAL_NETS, parse_egress_ports, parse_strict_bool
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,10 @@ class VmEgressPolicy:
     @classmethod
     def from_personality(cls, p: Personality) -> "VmEgressPolicy":
         cfg = p.config
-        block = cfg.get("block_internal", "").strip().lower() in ("1", "true", "yes", "on")
+        # Fail closed on a typo: a malformed block_internal (e.g. "treu") must be REJECTED, not read
+        # as False — that would silently provision the VM without the RFC1918/internal-destination
+        # drops the operator intended (same posture as the compose parser).
+        block = parse_strict_bool(cfg.get("block_internal"), default=False)
         raw_ports = cfg.get("egress_ports")
         ports = parse_egress_ports(raw_ports)
         # Fail closed on a typo. parse_egress_ports() returns None for BOTH an omitted allowlist
