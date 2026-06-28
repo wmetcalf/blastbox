@@ -243,3 +243,39 @@ def test_concurrent_claim_many_jobs():
 
     assert len(claimed_ids) == len(set(claimed_ids)), "no duplicate claims"
     assert len(claimed_ids) == n, "all jobs claimed"
+
+
+def test_claim_filters_by_engine():
+    # claim_next(engine=...) must never return a foreign-engine job (initial-scan predicate).
+    store = _make_store()
+    store.create(_make_job(engine="other", filename="foreign.docx"))
+    assert store.claim_next(engine="mine") is None
+    mine = _make_job(engine="mine", filename="ours.docx")
+    store.create(mine)
+    claimed = store.claim_next(engine="mine")
+    assert claimed is not None and claimed.job_id == mine.job_id
+
+
+def test_claim_rechecks_engine_inside_watch(monkeypatch):
+    # If a candidate's engine is reassigned AFTER the scan selects it but BEFORE the watched re-read,
+    # the watched section must re-validate the engine predicate and NOT claim the now-foreign job.
+    import blastbox.host.jobs.redis_store as rs
+    store = _make_store()
+    job = _make_job(engine="mine", filename="ours.docx")
+    store.create(job)
+
+    real_decode = rs._decode_job
+    calls = {"n": 0}
+
+    def flaky_decode(raw):
+        j = real_decode(raw)
+        calls["n"] += 1
+        if j is not None and calls["n"] >= 2:   # first decode (scan) matches; later (watch re-read) drifts
+            j.engine = "other"
+        return j
+
+    monkeypatch.setattr(rs, "_decode_job", flaky_decode)
+    # scan selects it (engine "mine"), watched re-read sees "other" → skip; rescan now also sees
+    # "other" → no candidate → None. Without the watched engine re-check this would claim a foreign job.
+    assert store.claim_next(engine="mine") is None
+    assert store.get(job.job_id).status is JobStatus.QUEUED   # never claimed

@@ -62,6 +62,19 @@ class Engine(Protocol):
     formats: frozenset[str]
     """Set of format labels this engine handles (or ``frozenset({"*"})``)."""
 
+    # Optional, read via getattr — default 1 (reset every job) when omitted.
+    #
+    #   jobs_per_recycle: int
+    #
+    # The engine author's RISK × COST call, surfaced to the warm pool. It says "how many jobs may a
+    # warm worker serve before it must be reset", and is only honoured on tiers whose runtime can
+    # reset a worker in place (``recycle()``); the cheap-reset container/microVM tiers stay
+    # disposable-per-job regardless. Raise it when exploitation threat is LOW *and* recycle is
+    # EXPENSIVE (e.g. a parse-only validator on a full-VM tier where reset = a multi-second
+    # snapshot-revert). Leave it at 1 — the safe default — for anything that renders or executes
+    # untrusted input, where every job needs a pristine worker. Generic to any engine; not a
+    # special case.
+
     def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
         """Run the detonation.
 

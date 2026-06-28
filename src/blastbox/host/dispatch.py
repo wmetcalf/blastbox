@@ -262,6 +262,13 @@ class Dispatcher:
         # not by silently mislabeling warm jobs as cold here. Inert until an operator enables
         # routing at the API (BLASTBOX_ALLOW_TIER_ROUTING) — existing jobs have no target.
         self._tier = tier
+        # OPT-IN engine scoping for SHARED multi-dispatcher stores: when set, claim only jobs for
+        # engines this dispatcher handles, so it can't grab (and fail "unknown engine") a job that a
+        # co-resident VM/other-engine dispatcher owns. Default OFF preserves the single-dispatcher
+        # contract — claim anything + FAIL a genuinely-unknown engine fast (an open-allowlist typo
+        # would otherwise sit QUEUED forever). Enable this only when peers handle the other engines.
+        self._engine_scoped = os.environ.get(
+            "BLASTBOX_DISPATCHER_ENGINE_SCOPED", "").strip().lower() in ("1", "true", "yes", "on")
 
         # Personality registry built ONCE from the operator env (does not change per job).
         from blastbox.host.netpolicy import parse_personalities
@@ -313,7 +320,15 @@ class Dispatcher:
         # dispatcher has no cold path, so it must not claim work it can't immediately serve.
         if self._warm_only and (self._pool is None or self._pool.idle_count <= 0):
             return False
-        job = self._job_store.claim_next(claimant_tier=self._tier)
+        # Engine scoping is OPT-IN (shared multi-dispatcher stores): scoped → leave another
+        # dispatcher's engine's jobs for it; unscoped (default) → claim anything, and the
+        # _dispatch_claimed_job path FAILs a genuinely-unknown engine fast. Only pass engine= when
+        # scoping is on, so the default path keeps the original claim_next(*, claimant_tier=) shape an
+        # injected/legacy JobStore double may implement (no new keyword forced on it).
+        if self._engine_scoped:
+            job = self._job_store.claim_next(claimant_tier=self._tier, engine=frozenset(self._engines))
+        else:
+            job = self._job_store.claim_next(claimant_tier=self._tier)
         if job is None:
             return False
         self._dispatch_claimed_job(job)
@@ -564,6 +579,18 @@ class Dispatcher:
         except ValueError:
             _log.warning("httpproxy proxy= %r has a bad port; not injecting proxy env", proxy[:80])
             return {}
+        # Strip any inline user:pass@ — the upstream provider's credentials must NOT cross into the
+        # untrusted worker env (the documented design is a creds-holding chaining sidecar that the
+        # worker reaches credential-free). A creds-bearing proxy= is an operator misconfiguration;
+        # drop the userinfo (and warn) so it can't leak to a sample via HTTP_PROXY.
+        if parsed.username or parsed.password:
+            _log.warning("httpproxy proxy= carries inline credentials; stripping userinfo before "
+                         "injecting into the worker env (use a creds-holding sidecar instead)")
+            host = parsed.hostname or ""
+            if ":" in host:        # IPv6 literal: parsed.hostname drops the brackets — restore them,
+                host = f"[{host}]"  # else "2001:db8::1:8080" is an invalid host/port to URL parsers.
+            netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
+            proxy = urllib.parse.urlunparse(parsed._replace(netloc=netloc))
         return {k: proxy for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}
 
     def _resolve_personality(self, job: Job):
@@ -718,6 +745,9 @@ class Dispatcher:
         materialize_fn = getattr(runtime, "materialize_warm_output", None)
 
         slot_input_copy: Path | None = None
+        warm_clean = False  # set True ONLY on the clean DONE path; every _fail_job/timeout/error path
+        #                     leaves it False so the slot is released DIRTY (force-recycled, never
+        #                     returned to IDLE with a wedged/contaminated worker for the next job).
         try:
             # ------------------------------------------------------------------
             # Step 1: Engine lookup (security: engine spec is operator-configured)
@@ -940,6 +970,7 @@ class Dispatcher:
             else:
                 # DONE applied + still ours: index per-page perceptual hashes for /similar.
                 self._index_page_hashes(job.job_id, envelope)
+                warm_clean = True   # clean run → the warm slot is safe to reuse without a forced reset
 
         finally:
             # Security: release the slot on EVERY terminal path (success, trust-fail,
@@ -951,7 +982,8 @@ class Dispatcher:
                     slot_input_copy.unlink(missing_ok=True)
                 except OSError:
                     pass
-            self._pool.release(slot)  # type: ignore[union-attr]  # pool is non-None here
+            # dirty=not warm_clean → a failed run force-recycles the slot before reuse.
+            self._pool.release(slot, dirty=not warm_clean)  # type: ignore[union-attr]  # non-None here
 
     def _dispatch_inner(
         self, job: Job, input_path: Path, output_dir: Path
@@ -991,6 +1023,11 @@ class Dispatcher:
             docker_network_args,
             inspect_routes_via_gateway,
             worker_resolv_conf,
+        )
+        from blastbox.host.netwire import (
+            BLOCK_INTERNAL_LABEL,
+            EGRESS_PORTS_LABEL,
+            parse_egress_ports,
         )
         personality = resolve_net_policy(
             job_net_policy=job.net_policy,
@@ -1037,6 +1074,35 @@ class Dispatcher:
                 f"netpolicy {personality.name!r} (exit={personality.exit_driver}) is a gateway-routed "
                 f"tier but declares no gateway=; the worker can't be told which route to wait for, so "
                 f"egress would race netd. Add gateway=<netd gateway IP> to the personality.",
+            )
+            return
+        # Egress-hardening knobs (egress_ports / block_internal) are only enforceable on the
+        # gateway-routed, netd-gated tiers (tor/openvpn/wireguard): there the worker's OWN netns OUTPUT
+        # carries the real destination IP:port (so a port/destination filter is meaningful) AND egress
+        # is fail-closed until netd installs the leak guard (the knobs ride it as a precondition). On a
+        # SOCKS/httpproxy proxy hop the OUTPUT is the proxy connection (the filter would drop the
+        # tunnel); on a plain bridge (direct/inetsim) it fails OPEN under runsc / before netd wires.
+        raw_egress_ports = personality.config.get("egress_ports")
+        wants_egress_filter = bool(raw_egress_ports and raw_egress_ports.strip()) or (
+            personality.config.get("block_internal", "").strip().lower() in ("1", "true", "yes", "on")
+        )
+        if wants_egress_filter and personality.exit_driver not in ("tor", "openvpn", "wireguard"):
+            self._fail_job(
+                job,
+                f"netpolicy {personality.name!r} (exit={personality.exit_driver}) declares "
+                f"egress_ports or block_internal, which are only enforceable on the netd-gated tiers "
+                f"tor, openvpn, or wireguard (the worker's OUTPUT carries the real destination there "
+                f"and egress is fail-closed until the leak guard installs). A proxy hop (socks or "
+                f"httpproxy) would drop its own tunnel; a plain bridge (direct or inetsim) fails open. "
+                f"Use tor, openvpn, or wireguard, or drop the knob.",
+            )
+            return
+        if (raw_egress_ports and raw_egress_ports.strip()
+                and parse_egress_ports(raw_egress_ports) is None):
+            self._fail_job(
+                job,
+                f"netpolicy {personality.name!r}: egress_ports={raw_egress_ports!r} has no valid port "
+                f"(1-65535) — refusing rather than widen egress.",
             )
             return
         network_args = docker_network_args(personality)
@@ -1102,6 +1168,19 @@ class Dispatcher:
             worker_labels["blastbox.net.leakguard"] = "dns"
         elif personality.exit_driver in ("socks", "httpproxy"):
             worker_labels["blastbox.net.leakguard"] = "strict"
+
+        # Egress-filter labels for the gateway-routed tiers (already gated to tor/openvpn/wireguard +
+        # validated above). netd folds these into the in-netns leak guard, which is a PRECONDITION for
+        # wiring → fail-closed. tor already carries 'dns' (TCP+DNS only) from the block above; the
+        # all-IP vpn tiers get 'allip' so block_internal keeps non-internal UDP/ICMP.
+        if wants_egress_filter:
+            egress_ports = parse_egress_ports(personality.config.get("egress_ports"))
+            if egress_ports is not None:
+                worker_labels[EGRESS_PORTS_LABEL] = ",".join(str(p) for p in egress_ports)
+            if personality.config.get("block_internal", "").strip().lower() in (
+                    "1", "true", "yes", "on"):
+                worker_labels[BLOCK_INTERNAL_LABEL] = "1"
+            worker_labels.setdefault("blastbox.net.leakguard", "allip")
 
         container_name = f"blastbox-worker-{job.job_id[:12]}"
         argv = build_worker_docker_run_argv(

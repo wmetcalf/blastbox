@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
+
 import copy
 import dataclasses
 import threading
 import time
 import uuid
 
-from blastbox.host.jobs.base import Job, JobStatus, filter_sort_window
+from blastbox.host.jobs.base import Job, JobStatus, filter_sort_window, normalize_engine_filter
 
 # Allowlist of Job fields that update() may set — mirrors RedisJobStore._JOB_FIELDS and
 # SqlJobStore._COLUMNS so all three backends fail closed identically on an unknown field
@@ -115,17 +117,21 @@ class InMemoryJobStore:
             jobs = [j for j in jobs if ql in (j.filename or "").lower()]
         return len(jobs)
 
-    def claim_next(self, *, claimant_tier: str | None = None) -> Job | None:
+    def claim_next(self, *, claimant_tier: str | None = None,
+                   engine: "str | Collection[str] | None" = None) -> Job | None:
         """Atomically claim the oldest QUEUED job and flip it to RUNNING.
 
         ``claimant_tier`` routes: a job with ``target_tier`` set is claimable only by a
-        claimant whose tier matches; an untargeted job (the default) by anyone.
+        claimant whose tier matches; an untargeted job (the default) by anyone. ``engine`` (a name
+        or the set of engines this claimant handles) restricts the claim (shared multi-engine stores).
         """
+        engines = normalize_engine_filter(engine)
         with self._lock:
             queued = [
                 job for job in self._jobs.values()
                 if job.status == JobStatus.QUEUED
                 and (job.target_tier is None or job.target_tier == claimant_tier)
+                and (engines is None or job.engine in engines)
             ]
             if not queued:
                 return None

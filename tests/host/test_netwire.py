@@ -9,13 +9,18 @@ from __future__ import annotations
 import pytest
 
 from blastbox.host.netwire import (
+    BLOCK_INTERNAL_LABEL,
+    EGRESS_PORTS_LABEL,
     TUN_ADDR,
     TUN_DEV,
     WireTarget,
+    egress_filter_from_inspect,
     gateway_route_commands,
     leak_guard_rules,
     leak_guard_rules_v6,
     leakguard_from_inspect,
+    parse_egress_ports,
+    parse_strict_bool,
     socks_proxy_url,
     socks_resolv_conf,
     transproxy_redirect_rules,
@@ -218,9 +223,11 @@ def _lg(mode="strict", pid=77):
     }
 
 
-def test_leakguard_from_inspect_strict_and_dns():
-    assert leakguard_from_inspect(_lg("strict", 5)) == (5, False)
-    assert leakguard_from_inspect(_lg("dns", 9)) == (9, True)
+def test_leakguard_from_inspect_modes():
+    # (pid, allow_udp_dns, drop_non_tcp)
+    assert leakguard_from_inspect(_lg("strict", 5)) == (5, False, True)
+    assert leakguard_from_inspect(_lg("dns", 9)) == (9, True, True)
+    assert leakguard_from_inspect(_lg("allip", 7)) == (7, False, False)  # all-IP tier: keep non-TCP
 
 
 def test_leakguard_from_inspect_none_without_label_or_pid():
@@ -255,6 +262,163 @@ def test_leak_guard_rules_v6_fails_closed():
     # no udp:53 carve-out even for the tor/dns case (tor's DNSPort REDIRECT is v4)
     assert not any("--dport" in r for r in rules)
     assert any("LOG" in r and "blastbox-leak-drop6 " in r for r in rules)
+
+
+# ------------------------------------------------------------ egress port allowlist + internal block
+# Two composable personality knobs that harden ANY egress tier:
+#   egress_ports=53 80 443  → web-only L4 allowlist (DNS/HTTP/HTTPS), drop everything else.
+#   block_internal=1        → drop RFC1918 + link-local/metadata destinations (no SSRF/lateral).
+# Proven live (toolz3, 2026-06-20): worker egressed via PIA on 53/80/443 only; non-web + internal
+# blocked. These build the worker-netns OUTPUT rules that express exactly that.
+
+
+def test_parse_strict_bool_maps_words_and_rejects_typos():
+    for t in ("1", "true", "TRUE", "yes", "on"):
+        assert parse_strict_bool(t) is True
+    for f in ("0", "false", "no", "off"):
+        assert parse_strict_bool(f) is False
+    assert parse_strict_bool(None) is False                 # omitted → default
+    assert parse_strict_bool(None, default=True) is True
+    assert parse_strict_bool("") is False                   # blank → default
+    assert parse_strict_bool("", default=True) is True
+    for bad in ("treu", "enable", "maybe", "2"):
+        with pytest.raises(ValueError, match="boolean"):
+            parse_strict_bool(bad)                           # a typo must NOT silently read False
+
+
+def test_parse_egress_ports_accepts_comma_or_whitespace():
+    assert parse_egress_ports("53,80,443") == (53, 80, 443)
+    assert parse_egress_ports("53 80 443") == (53, 80, 443)
+    assert parse_egress_ports("53, 80   443") == (53, 80, 443)
+
+
+def test_parse_egress_ports_skips_invalid_and_out_of_range():
+    # a typo'd / non-numeric / out-of-range token is dropped, not fatal.
+    assert parse_egress_ports("53 nope 80 0 70000 443") == (53, 80, 443)
+
+
+def test_parse_egress_ports_empty_is_none():
+    assert parse_egress_ports("") is None
+    assert parse_egress_ports("   ") is None
+    assert parse_egress_ports(None) is None
+    assert parse_egress_ports("bogus 99999") is None  # nothing valid survives
+
+
+def test_leak_guard_rules_web_only_allowlist():
+    rules = leak_guard_rules(allow_udp_dns=True, allowed_ports=(53, 80, 443))
+    # DNS over UDP allowed; TCP restricted to the allowlist via multiport.
+    assert ["iptables", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", "ACCEPT"] in rules
+    assert ["iptables", "-A", "OUTPUT", "-p", "tcp", "-m", "multiport",
+            "--dports", "53,80,443", "-j", "ACCEPT"] in rules
+    # NO blanket "ACCEPT -p tcp" (that would defeat the allowlist).
+    assert ["iptables", "-A", "OUTPUT", "-p", "tcp", "-j", "ACCEPT"] not in rules
+
+
+def test_leak_guard_rules_web_only_drops_everything_unlisted():
+    # Web-only ends in a CATCH-ALL drop (not the legacy "! -p tcp"): a non-allowed TCP port AND any
+    # non-TCP both fall through to DROP. The audit LOG immediately precedes it.
+    rules = leak_guard_rules(allow_udp_dns=True, allowed_ports=(80, 443))
+    assert rules[-1] == ["iptables", "-A", "OUTPUT", "-j", "DROP"]
+    assert rules[-2] == ["iptables", "-A", "OUTPUT", "-m", "limit", "--limit", "10/min",
+                         "-j", "LOG", "--log-prefix", "blastbox-leak-drop ", "--log-level", "4"]
+    # the legacy non-tcp-only DROP must NOT be present in web-only mode.
+    assert ["iptables", "-A", "OUTPUT", "!", "-p", "tcp", "-j", "DROP"] not in rules
+
+
+def test_leak_guard_rules_block_internal_drops_rfc1918_before_accepts():
+    rules = leak_guard_rules(allow_udp_dns=True, allowed_ports=(80, 443), block_internal=True)
+    for net in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"):
+        assert ["iptables", "-A", "OUTPUT", "-d", net, "-j", "DROP"] in rules
+    # every internal DROP must precede the first non-loopback ACCEPT (internal :443 dropped, not allowed).
+    first_accept = next(i for i, r in enumerate(rules) if "ACCEPT" in r and "lo" not in r)
+    last_block = max(i for i, r in enumerate(rules) if "-d" in r and "DROP" in r)
+    assert last_block < first_accept
+
+
+def test_leak_guard_rules_block_internal_composes_with_legacy_tcp_tier():
+    # block_internal with NO allowed_ports → legacy TCP-only tier PLUS the internal drops.
+    rules = leak_guard_rules(allow_udp_dns=False, block_internal=True)
+    assert ["iptables", "-A", "OUTPUT", "-d", "192.168.0.0/16", "-j", "DROP"] in rules
+    assert ["iptables", "-A", "OUTPUT", "-p", "tcp", "-j", "ACCEPT"] in rules   # still TCP-only tier
+    assert rules[-1] == ["iptables", "-A", "OUTPUT", "!", "-p", "tcp", "-j", "DROP"]
+
+
+def test_leak_guard_rules_legacy_unchanged_when_no_new_knobs():
+    # Regression: the existing callers pass neither knob → byte-identical to the historical output.
+    assert leak_guard_rules(allow_udp_dns=False) == [
+        ["iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"],
+        ["iptables", "-A", "OUTPUT", "-p", "tcp", "-j", "ACCEPT"],
+        ["iptables", "-A", "OUTPUT", "!", "-p", "tcp", "-m", "limit", "--limit", "10/min",
+         "-j", "LOG", "--log-prefix", "blastbox-leak-drop ", "--log-level", "4"],
+        ["iptables", "-A", "OUTPUT", "!", "-p", "tcp", "-j", "DROP"],
+    ]
+
+
+def _egress_inspect(*, ports=None, block=None):
+    labels = {"blastbox.job_id": "J"}
+    if ports is not None:
+        labels[EGRESS_PORTS_LABEL] = ports
+    if block is not None:
+        labels[BLOCK_INTERNAL_LABEL] = block
+    return {"Config": {"Labels": labels}, "State": {"Pid": 7, "Running": True}}
+
+
+def test_egress_filter_from_inspect_reads_labels():
+    assert egress_filter_from_inspect(_egress_inspect(ports="53,80,443", block="1")) == \
+        ((53, 80, 443), True)
+
+
+def test_egress_filter_from_inspect_absent_is_none_false():
+    assert egress_filter_from_inspect(_egress_inspect()) == (None, False)
+    assert egress_filter_from_inspect({"Config": {"Labels": {}}}) == (None, False)
+    assert egress_filter_from_inspect({}) == (None, False)
+
+
+def test_egress_filter_from_inspect_block_internal_falsey():
+    assert egress_filter_from_inspect(_egress_inspect(block="0")) == (None, False)
+
+
+def test_parse_egress_ports_dedups_preserving_order():
+    # Duplicate ports waste multiport slots (which are capped at 15) — dedup, keep first-seen order.
+    assert parse_egress_ports("80,443,80,53,443") == (80, 443, 53)
+
+
+def test_leak_guard_rules_web_only_chunks_over_multiport_limit():
+    # iptables multiport caps at 15 ports per rule; >15 ports must split into multiple ACCEPT rules
+    # (else iptables rejects the rule and the worker fails closed with no egress).
+    ports = tuple(range(1000, 1020))  # 20 ports
+    rules = leak_guard_rules(allow_udp_dns=False, allowed_ports=ports)
+    multiport = [r for r in rules if "multiport" in r]
+    assert len(multiport) == 2
+    for r in multiport:
+        assert 1 <= len(r[r.index("--dports") + 1].split(",")) <= 15
+    covered = [int(p) for r in multiport for p in r[r.index("--dports") + 1].split(",")]
+    assert covered == list(ports)  # every port covered, order preserved
+
+
+def test_leak_guard_rules_web_only_dns_only_when_53_listed():
+    # UDP/53 is allowed iff 53 is in the allowlist — an explicit list that omits 53 must not get DNS.
+    assert any("udp" in r for r in leak_guard_rules(allow_udp_dns=True, allowed_ports=(53, 80, 443)))
+    assert not any("udp" in r for r in leak_guard_rules(allow_udp_dns=True, allowed_ports=(80, 443)))
+
+
+def test_leak_guard_rules_block_internal_only_allip_preserves_non_tcp():
+    # An all-IP tier (drop_non_tcp=False) that only blocks internal must keep non-internal UDP/ICMP:
+    # just loopback ACCEPT + the internal DROPs, no protocol match at all.
+    rules = leak_guard_rules(allow_udp_dns=False, block_internal=True, drop_non_tcp=False)
+    assert rules[0] == ["iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"]
+    assert ["iptables", "-A", "OUTPUT", "-d", "10.0.0.0/8", "-j", "DROP"] in rules
+    assert ["iptables", "-A", "OUTPUT", "!", "-p", "tcp", "-j", "DROP"] not in rules
+    assert ["iptables", "-A", "OUTPUT", "-j", "DROP"] not in rules  # no catch-all
+    assert not any("-p" in r for r in rules)  # nothing matched/dropped by protocol
+
+
+def test_egress_filter_from_inspect_tolerates_none_label_values():
+    # Labels come from `docker inspect` (Mapping[str, object]) — a present-but-None value must not
+    # crash or be mis-parsed as the string "None".
+    inspect = {"Config": {"Labels": {
+        EGRESS_PORTS_LABEL: None, BLOCK_INTERNAL_LABEL: None, "blastbox.job_id": "J"}}}
+    assert egress_filter_from_inspect(inspect) == (None, False)
 
 
 def test_transproxy_rules_reject_bad_port():

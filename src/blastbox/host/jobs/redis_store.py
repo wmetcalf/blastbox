@@ -7,6 +7,8 @@ works on large key spaces without blocking.  Every ``set`` includes a TTL.
 
 from __future__ import annotations
 
+from collections.abc import Collection
+
 import dataclasses
 import json
 import logging
@@ -15,7 +17,7 @@ import uuid
 
 from redis.exceptions import WatchError
 
-from blastbox.host.jobs.base import Job, JobStatus, filter_sort_window
+from blastbox.host.jobs.base import Job, JobStatus, filter_sort_window, normalize_engine_filter
 
 _log = logging.getLogger("blastbox.host.jobs.redis_store")
 
@@ -191,7 +193,8 @@ class RedisJobStore:
             n += 1
         return n
 
-    def claim_next(self, *, claimant_tier: str | None = None) -> Job | None:
+    def claim_next(self, *, claimant_tier: str | None = None,
+                   engine: "str | Collection[str] | None" = None) -> Job | None:
         """Atomically claim the oldest QUEUED job.
 
         Scans all keys with the store prefix, picks the oldest QUEUED job,
@@ -200,8 +203,10 @@ class RedisJobStore:
 
         ``claimant_tier`` routes: a job with ``target_tier`` set is claimable only by a
         claimant whose tier matches; the scan already decodes every job, so the filter is
-        free here (the claim stays O(N)-scan as before).
+        free here (the claim stays O(N)-scan as before). ``engine`` (a name or the set of engines
+        this claimant handles) restricts the claim (shared multi-engine stores).
         """
+        engines = normalize_engine_filter(engine)
         while True:
             candidates: list[tuple[float, str, str]] = []
             for k in self._r.scan_iter(match=_PREFIX + "*", count=200):
@@ -212,6 +217,8 @@ class RedisJobStore:
                 if job is None:
                     continue
                 if job.target_tier is not None and job.target_tier != claimant_tier:
+                    continue
+                if engines is not None and job.engine not in engines:
                     continue
                 if job.status == JobStatus.QUEUED:
                     # Decode key to str for comparison; fakeredis may return bytes
@@ -233,10 +240,14 @@ class RedisJobStore:
                     if job.status != JobStatus.QUEUED:
                         # Another claimer won the race; retry from the scan.
                         continue
-                    # Re-check the tier predicate inside the WATCH too (target_tier is write-once
-                    # today, so this can't currently change between scan and claim — but keep the
-                    # atomic re-validation symmetric with the SQL/memory backends).
+                    # Re-check the tier AND engine predicates inside the WATCH too: the watched re-read
+                    # must re-validate every predicate the scan advertised, else a job mutated under the
+                    # same key between scan-select and here (e.g. engine reassigned) could be claimed by
+                    # an engine-scoped dispatcher it no longer matches. WATCH aborts the EXEC on any such
+                    # write, but re-checking keeps the guard correct even when the value is re-read here.
                     if job.target_tier is not None and job.target_tier != claimant_tier:
+                        continue
+                    if engines is not None and job.engine not in engines:
                         continue
                     job.status = JobStatus.RUNNING
                     job.started_at = time.time()

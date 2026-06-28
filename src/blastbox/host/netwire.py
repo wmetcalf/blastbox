@@ -247,13 +247,17 @@ def transproxy_redirect_rules(
 #   strict → drop ALL non-TCP egress (the SOCKS/httpproxy tiers carry only TCP).
 #   dns    → also ACCEPT UDP:53 (the tor tier needs it to reach the host DNSPort REDIRECT).
 LEAKGUARD_LABEL = "blastbox.net.leakguard"
-_LEAKGUARD_MODES = frozenset({"strict", "dns"})
+# strict → TCP-only, no UDP DNS.  dns → TCP-only + UDP:53 (tor / socks-udp-dns).
+# allip  → all protocols allowed (``drop_non_tcp=False``) — for an all-IP tier (openvpn/wireguard)
+#          that only layers a destination/port filter and must keep non-internal UDP/ICMP/raw.
+_LEAKGUARD_MODES = frozenset({"strict", "dns", "allip"})
 
 
-def leakguard_from_inspect(inspect: Mapping[str, object]) -> tuple[int, bool] | None:
-    """``(pid, allow_udp_dns)`` if the container is labeled ``blastbox.net.leakguard=strict|dns`` and
-    exposes a host-visible ``State.Pid`` (runc/FC), else ``None``. ``allow_udp_dns`` is True for the
-    ``dns`` mode (tor tier)."""
+def leakguard_from_inspect(inspect: Mapping[str, object]) -> tuple[int, bool, bool] | None:
+    """``(pid, allow_udp_dns, drop_non_tcp)`` if the container is labeled
+    ``blastbox.net.leakguard=strict|dns|allip`` and exposes a host-visible ``State.Pid`` (runc/FC),
+    else ``None``. ``allow_udp_dns`` is True for ``dns``; ``drop_non_tcp`` is False only for ``allip``
+    (an all-IP tier keeps non-internal UDP/ICMP/raw)."""
     config = inspect.get("Config") or {}
     labels = config.get("Labels") if isinstance(config, Mapping) else None
     if not isinstance(labels, Mapping):
@@ -265,20 +269,135 @@ def leakguard_from_inspect(inspect: Mapping[str, object]) -> tuple[int, bool] | 
     pid = state.get("Pid") if isinstance(state, Mapping) else None
     if not isinstance(pid, int) or pid <= 0:
         return None
-    return (pid, mode == "dns")
+    return (pid, mode == "dns", mode != "allip")
 
 
-def leak_guard_rules(*, allow_udp_dns: bool) -> list[list[str]]:
-    """The WORKER-netns ``OUTPUT`` firewall that makes a TCP-only proxy tier leak-proof: ACCEPT
-    loopback + TCP (+ UDP:53 for the tor tier), LOG (rate-limited) then DROP everything else —
-    so a sample's UDP/ICMP/raw can NEVER leave the worker netns, independent of the internal-bridge
-    / tun2socks containment. The LOG (``blastbox-leak-drop`` prefix → kernel log) is the audit trail
-    of attempted non-TCP egress. Run via ``nsenter`` into the worker netns; OUTPUT is empty there
-    (the worker has no CAP_NET_ADMIN), so appended rules apply in order."""
-    rules = [
-        ["iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"],
-        ["iptables", "-A", "OUTPUT", "-p", "tcp", "-j", "ACCEPT"],
-    ]
+# Two composable egress-hardening knobs, set by the dispatcher from the personality config and read
+# here so netd can fold them into the worker-netns OUTPUT firewall:
+#   blastbox.net.egress-ports = "53,80,443"  → an L4 allowlist (web-only: DNS/HTTP/HTTPS). Drop the
+#                                              rest — other TCP ports AND all non-TCP.
+#   blastbox.net.block-internal = "1"         → drop RFC1918 + link-local/metadata destinations.
+# Both apply to ANY egress tier (they ride the same leak-guard wiring). Proven live on toolz3.
+EGRESS_PORTS_LABEL = "blastbox.net.egress-ports"
+BLOCK_INTERNAL_LABEL = "blastbox.net.block-internal"
+
+
+def egress_filter_from_inspect(
+    inspect: Mapping[str, object],
+) -> tuple[tuple[int, ...] | None, bool]:
+    """``(allowed_ports, block_internal)`` read from a container's labels. ``allowed_ports`` is the
+    parsed :data:`EGRESS_PORTS_LABEL` allowlist (``None`` if unset/empty/all-invalid);
+    ``block_internal`` is the :data:`BLOCK_INTERNAL_LABEL` flag. Returns ``(None, False)`` when a
+    worker opted into neither — a no-op for every existing personality."""
+    config = inspect.get("Config") or {}
+    labels = config.get("Labels") if isinstance(config, Mapping) else None
+    if not isinstance(labels, Mapping):
+        return (None, False)
+    # Label values are typed ``object`` (from ``docker inspect``) — only a real string is meaningful;
+    # a present-but-None / non-str value is ignored, not coerced to the string "None".
+    raw_ports = labels.get(EGRESS_PORTS_LABEL)
+    allowed_ports = parse_egress_ports(raw_ports if isinstance(raw_ports, str) else None)
+    raw_block = labels.get(BLOCK_INTERNAL_LABEL)
+    block_internal = isinstance(raw_block, str) and raw_block.strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    return (allowed_ports, block_internal)
+
+
+# RFC1918 + link-local/cloud-metadata destinations a hardened egress worker must never reach: no
+# SSRF into the host LAN, no 169.254.169.254 metadata, no lateral movement to sibling workers.
+_INTERNAL_NETS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16")
+
+
+def parse_strict_bool(raw: str | None, *, default: bool = False) -> bool:
+    """Parse a SECURITY-knob boolean string fail-closed. ``None``/blank → ``default``; the usual
+    truthy/falsey words map as expected; anything else (a typo like ``"treu"``) RAISES rather than
+    silently coercing to a permissive value — a security control must not be disabled by a typo."""
+    if raw is None:
+        return default
+    s = str(raw).strip().lower()
+    if s == "":
+        return default
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"malformed boolean value {raw!r} (use true/false)")
+
+
+def parse_egress_ports(raw: str | None) -> tuple[int, ...] | None:
+    """Parse an ``egress_ports`` value (comma- or whitespace-separated port numbers) into a validated
+    tuple, or ``None`` if nothing valid survives. Non-numeric / out-of-range (not 1-65535) tokens are
+    skipped — a typo must neither widen the allowlist nor write a broken ``--dports``."""
+    if not raw:
+        return None
+    ports: list[int] = []
+    for tok in re.split(r"[,\s]+", raw.strip()):
+        if not tok:
+            continue
+        try:
+            p = int(tok)
+        except ValueError:
+            continue
+        if 1 <= p <= 65535:
+            ports.append(p)
+    # Dedup (keep first-seen order): duplicates waste the capped multiport slots downstream.
+    return tuple(dict.fromkeys(ports)) or None
+
+
+def leak_guard_rules(
+    *,
+    allow_udp_dns: bool,
+    allowed_ports: tuple[int, ...] | None = None,
+    block_internal: bool = False,
+    drop_non_tcp: bool = True,
+) -> list[list[str]]:
+    """The WORKER-netns ``OUTPUT`` firewall. Run via ``nsenter`` into the worker netns; OUTPUT is
+    empty there (the worker has no CAP_NET_ADMIN), so appended rules apply in order. The LOG
+    (``blastbox-leak-drop`` prefix → kernel log) is the audit trail of dropped egress.
+
+    Default (no ``allowed_ports``/``block_internal``, ``drop_non_tcp=True``) is the historical
+    TCP-only leak guard: ACCEPT loopback + TCP (+ UDP:53 when ``allow_udp_dns``), LOG+DROP everything
+    else — so a sample's UDP/ICMP/raw can NEVER leave the netns.
+
+    ``block_internal`` prepends a DROP for every :data:`_INTERNAL_NETS` destination (RFC1918 +
+    link-local/metadata), before any ACCEPT, so internal egress is denied regardless of port/proto.
+
+    ``allowed_ports`` switches to **web-only** mode: ACCEPT the TCP port allowlist (+ UDP:53 only when
+    53 is itself in the allowlist), then a CATCH-ALL LOG+DROP — so a non-allowed TCP port *and* any
+    non-TCP both fall closed.
+
+    ``drop_non_tcp=False`` is the **all-IP** path (openvpn/wireguard with only ``block_internal``): keep
+    loopback + the internal block and let every non-internal protocol flow — no TCP-only downgrade."""
+    rules: list[list[str]] = [["iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"]]
+    if block_internal:
+        rules += [["iptables", "-A", "OUTPUT", "-d", net, "-j", "DROP"] for net in _INTERNAL_NETS]
+
+    if allowed_ports is not None:
+        # WEB-ONLY: explicit allowlist, then drop EVERYTHING unmatched (other ports + all non-TCP).
+        # DNS (UDP:53) only when 53 is itself allowed — never widen an explicit list to permit DNS.
+        if 53 in allowed_ports:
+            rules.append(["iptables", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
+        # iptables ``multiport`` accepts at most 15 ports per rule → chunk, so a >15-port allowlist
+        # produces several ACCEPT rules instead of one rejected rule (which would fail the worker closed).
+        for i in range(0, len(allowed_ports), 15):
+            rules.append([
+                "iptables", "-A", "OUTPUT", "-p", "tcp", "-m", "multiport",
+                "--dports", ",".join(_port(p) for p in allowed_ports[i:i + 15]), "-j", "ACCEPT",
+            ])
+        rules += [
+            ["iptables", "-A", "OUTPUT", "-m", "limit", "--limit", "10/min",
+             "-j", "LOG", "--log-prefix", "blastbox-leak-drop ", "--log-level", "4"],
+            ["iptables", "-A", "OUTPUT", "-j", "DROP"],
+        ]
+        return rules
+
+    if not drop_non_tcp:
+        # ALL-IP tier: loopback + the internal block only; every non-internal protocol flows.
+        return rules
+
+    # LEGACY TCP-only tier — byte-identical to the historical output when block_internal is unset.
+    rules.append(["iptables", "-A", "OUTPUT", "-p", "tcp", "-j", "ACCEPT"])
     if allow_udp_dns:
         rules.append(["iptables", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
     rules += [

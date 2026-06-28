@@ -627,6 +627,35 @@ def test_leakguard_installs_in_netns_output_drop(tmp_path):
     assert (4321, ["ip6tables", "-A", "OUTPUT", "-j", "DROP"]) in runs
 
 
+def test_leakguard_web_only_egress_ports_and_block_internal(tmp_path):
+    # A worker labeled with egress-ports + block-internal gets the WEB-ONLY leak guard: the TCP
+    # allowlist + RFC1918 drops + a catch-all DROP (not the legacy "! -p tcp" drop).
+    runs: list = []
+    d = CaptureDaemon(
+        job_root=str(tmp_path),
+        inspect_fn=lambda cid: {
+            "Config": {"Labels": {
+                "blastbox.net.leakguard": "dns",
+                "blastbox.net.egress-ports": "53,80,443",
+                "blastbox.net.block-internal": "1",
+                "blastbox.job_id": "W1",
+            }},
+            "State": {"Pid": 4321, "Running": True},
+        },
+        network_iface_fn=lambda: {},
+        spawn_fn=lambda *a, **k: None,
+        nsenter_run_fn=lambda pid, argv: runs.append((pid, argv)) or 0,
+    )
+    d.handle_start("w1")
+    assert "w1" in d.leakguarded
+    argvs = [argv for _, argv in runs]
+    assert ["iptables", "-A", "OUTPUT", "-p", "tcp", "-m", "multiport",
+            "--dports", "53,80,443", "-j", "ACCEPT"] in argvs
+    assert ["iptables", "-A", "OUTPUT", "-d", "192.168.0.0/16", "-j", "DROP"] in argvs
+    assert ["iptables", "-A", "OUTPUT", "-j", "DROP"] in argvs          # catch-all
+    assert ["iptables", "-A", "OUTPUT", "!", "-p", "tcp", "-j", "DROP"] not in argvs  # not legacy
+
+
 def _leakguard_only_daemon(tmp_path, nsenter_run, job_id="L3"):
     return CaptureDaemon(
         job_root=str(tmp_path),

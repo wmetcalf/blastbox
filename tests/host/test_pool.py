@@ -76,6 +76,108 @@ class _FakeRuntime:
             self.reaped.append(slot.slot_id)
 
 
+class _ReapFailRuntime(_FakeRuntime):
+    """Models a runtime whose reap() RAISES because it couldn't dispose the worker (e.g. a libvirt VM
+    whose `virsh destroy` failed and may still be running)."""
+
+    def reap(self, slot: Slot) -> None:
+        raise RuntimeError("destroy failed; worker may still be running")
+
+
+def test_release_quarantines_slot_when_reap_fails() -> None:
+    # a reap that RAISES (worker not disposed) must NOT pop the slot — keep it tracked/quarantined so
+    # it counts against the ceiling and surfaces, instead of orphaning a live worker off the books.
+    rt = _ReapFailRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    slot.state = SlotState.ASSIGNED
+    pool.release(slot)
+    assert slot.slot_id in pool._slots                       # NOT popped — quarantined
+    assert pool._slots[slot.slot_id].state == SlotState.DRAINING
+
+
+class _FinalizeFailRuntime(_FakeRuntime):
+    """Models a runtime (e.g. libvirt) whose finalize fails closed: it reaps the VM INSIDE is_ready()
+    — flipping the slot to DRAINING — and returns False."""
+
+    def is_ready(self, slot: Slot) -> bool:
+        slot.state = SlotState.DRAINING
+        self.reap(slot)
+        return False
+
+
+def test_promote_warming_evicts_slot_reaped_during_finalize() -> None:
+    # a slot the runtime reaped internally (DRAINING, is_ready False) must be EVICTED from the pool,
+    # not left as a husk that eats concurrent_ceiling headroom and eventually stops new spawns.
+    rt = _FinalizeFailRuntime()
+    pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=4)
+    pool._spawn_to_deficit(ready=True)
+    ids = set(pool._slots.keys())
+    assert len(ids) == 2
+    pool._promote_warming()
+    assert pool.slot_count == 0          # both dead husks removed (not stuck DRAINING)
+    assert set(rt.reaped) == ids         # and they were reaped
+
+
+class _ExternallyDrainedReapFails(_FakeRuntime):
+    """is_ready() finds the slot DRAINING (set EXTERNALLY, e.g. a racing stop()) and returns False
+    WITHOUT reaping — and reap() then RAISES (the VM may still be running)."""
+
+    def is_ready(self, slot: Slot) -> bool:
+        slot.state = SlotState.DRAINING   # external drain — NOT a runtime-internal reap
+        return False
+
+    def reap(self, slot: Slot) -> None:
+        raise RuntimeError("destroy failed; VM may still be running")
+
+
+def test_promote_warming_quarantines_externally_drained_slot_when_reap_fails() -> None:
+    # a slot marked DRAINING externally while finalize is still in flight must NOT be blindly popped
+    # on is_ready=False — the pool must reap it, and if that reap FAILS (VM possibly still running)
+    # keep it tracked/quarantined rather than orphaning a live worker off the books.
+    rt = _ExternallyDrainedReapFails()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2)
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots.keys()))
+    pool._promote_warming()
+    assert sid in pool._slots            # reap raised → NOT popped, quarantined (still tracked)
+
+
+def test_health_check_quarantines_slot_when_reap_fails() -> None:
+    # a dead IDLE slot whose reap RAISES (destroy failed → VM may still run) must stay quarantined in
+    # _slots (not popped), so the health sweep can't orphan a live worker off pool accounting.
+    rt = _ReapFailRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=4)
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots))
+    pool._slots[sid].state = SlotState.IDLE
+    rt.set_alive(sid, False)            # mark it dead so _health_check tries to evict it
+    pool._health_check()
+    assert sid in pool._slots           # NOT popped — quarantined
+    assert pool._slots[sid].state == SlotState.DRAINING
+
+
+class _FinalizeReapRaisesRuntime(_FakeRuntime):
+    """is_ready() RAISES (e.g. finalize's reap couldn't `virsh destroy` the VM — it may still run)."""
+
+    def is_ready(self, slot: Slot) -> bool:
+        slot.state = SlotState.DRAINING
+        raise RuntimeError("destroy failed during finalize; VM may still be running")
+
+
+def test_promote_warming_quarantines_slot_when_is_ready_raises() -> None:
+    # if is_ready RAISES (reap couldn't dispose the VM), the slot must NOT be popped — leave it
+    # quarantined/tracked, not evicted like a cleanly-reaped husk (which would orphan a live VM).
+    rt = _FinalizeReapRaisesRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=4)
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots))
+    pool._promote_warming()
+    assert sid in pool._slots                                # NOT evicted — quarantined
+    assert pool._slots[sid].state == SlotState.DRAINING
+
+
 # ---------------------------------------------------------------------------
 # Fake clock (injectable)
 # ---------------------------------------------------------------------------
@@ -357,6 +459,45 @@ def test_9_stop_reaps_all() -> None:
         f"  Expected: {sorted(all_ids)}\n"
         f"  Reaped:   {sorted(rt.reaped)}"
     )
+
+
+def test_stop_retains_slot_whose_reap_fails() -> None:
+    # stop() must NOT drop a slot whose reap RAISES (e.g. virsh destroy failed → the VM may still be
+    # running): popping it would orphan a live worker off the books. Keep it tracked/quarantined so it
+    # surfaces for manual cleanup instead of leaking silently. AND mark it DRAINING so a pool
+    # restart/reuse (or a claim() racing stop()) can never hand the still-undisposed husk back out.
+    rt = _ReapFailRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1)
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots.keys()))
+    pool._slots[sid].state = SlotState.IDLE       # an IDLE slot at stop time...
+    pool.stop()
+    assert sid in pool._slots                      # NOT popped — quarantined for manual cleanup
+    assert pool._slots[sid].state == SlotState.DRAINING  # ...is now unclaimable (claim() picks IDLE)
+
+
+def test_stop_marks_slots_draining_before_reaping() -> None:
+    # stop() must flip every slot to DRAINING UNDER THE LOCK before reaping, so a dispatcher racing
+    # claim() in the window between snapshotting to_reap and the reap can never be handed a slot stop()
+    # is about to dispose. Observe the slot's state AT reap time.
+    class _RecordStateAtReap(_FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.state_at_reap: dict[str, SlotState] = {}
+
+        def reap(self, slot: Slot) -> None:
+            self.state_at_reap[slot.slot_id] = slot.state
+            super().reap(slot)
+
+    rt = _RecordStateAtReap()
+    pool = WarmPool(runtime=rt, warm_size=2)
+    pool._spawn_to_deficit(ready=True)
+    for s in pool._slots.values():
+        s.state = SlotState.IDLE                   # claimable before stop
+    ids = set(pool._slots.keys())
+    pool.stop()
+    assert set(rt.state_at_reap.keys()) == ids
+    assert all(st == SlotState.DRAINING for st in rt.state_at_reap.values())  # never IDLE at reap
 
 
 # ---------------------------------------------------------------------------
@@ -701,3 +842,122 @@ def test_burst_suppressed_while_warm_tier_building() -> None:
     assert pool.burst_active is False
     assert pool.effective_target == 1  # warm_size only, NOT warm_size + burst_size
     assert pool.slot_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Reuse mode (jobs_per_recycle / max_jobs_per_slot) — opt-in for recycle-capable runtimes
+# ---------------------------------------------------------------------------
+
+
+class _RecycleRuntime(_FakeRuntime):
+    """A SlotRuntime that supports in-place reset (e.g. a VM snapshot-revert)."""
+
+    def __init__(self, recycle_raises: bool = False) -> None:
+        super().__init__()
+        self.recycled: list[str] = []
+        self._recycle_raises = recycle_raises
+
+    def recycle(self, slot: Slot) -> None:
+        if self._recycle_raises:
+            raise RuntimeError("snapshot-revert failed")
+        self.recycled.append(slot.slot_id)
+
+
+def _warm_one(pool: WarmPool) -> None:
+    pool.tick()  # spawn
+    pool.tick()  # promote to IDLE
+
+
+def test_release_does_not_republish_slot_drained_during_recycle() -> None:
+    # If a concurrent stop() flips the slot to DRAINING WHILE the (seconds-long) recycle runs,
+    # release() must NOT republish it to IDLE — that would hand a caller a slot stop() is reaping.
+    # It must leave DRAINING alone and fall through to reap (fail-safe).
+    class _DrainDuringRecycle(_RecycleRuntime):
+        def recycle(self, slot: Slot) -> None:
+            super().recycle(slot)
+            slot.state = SlotState.DRAINING   # simulate stop() winning the race mid-recycle
+
+    rt = _DrainDuringRecycle()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=1)
+    _warm_one(pool)
+    s1 = pool.claim(timeout_s=1.0)
+    assert s1 is not None
+    pool.release(s1)                          # recycle drains it → must reap, NOT return to IDLE
+    assert rt.reaped == [s1.slot_id]          # fell through to the reap fail-safe
+    assert pool.claim(timeout_s=0.2) is None  # never republished as claimable
+
+
+def test_reuse_returns_slot_to_idle_and_recycles_on_cadence() -> None:
+    rt = _RecycleRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=2)
+    _warm_one(pool)
+    s1 = pool.claim(timeout_s=1.0)
+    assert s1 is not None
+    pool.release(s1)  # job 1: 1 % 2 != 0 → reuse without reset
+    assert rt.reaped == [] and rt.recycled == []
+    s2 = pool.claim(timeout_s=1.0)
+    assert s2 is not None and s2.slot_id == s1.slot_id  # SAME slot reused
+    pool.release(s2)  # job 2: 2 % 2 == 0 → recycle (reset) then back to IDLE
+    assert rt.recycled == [s1.slot_id] and rt.reaped == []
+    pool.stop()
+
+
+def test_reuse_reaps_at_max_jobs_per_slot() -> None:
+    rt = _RecycleRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0,
+                    jobs_per_recycle=1, max_jobs_per_slot=2)
+    _warm_one(pool)
+    s1 = pool.claim(timeout_s=1.0)
+    pool.release(s1)  # job 1: reset (1%1==0), reused
+    assert rt.recycled == [s1.slot_id] and rt.reaped == []
+    s2 = pool.claim(timeout_s=1.0)
+    assert s2.slot_id == s1.slot_id
+    pool.release(s2)  # job 2: jobs == max_jobs_per_slot → reap+respawn (no reuse)
+    assert rt.reaped == [s1.slot_id]
+    pool.stop()
+
+
+def test_no_recycle_method_always_reaps_even_with_jobs_per_recycle() -> None:
+    rt = _FakeRuntime()  # no recycle() → never reused, regardless of config
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=5)
+    _warm_one(pool)
+    s1 = pool.claim(timeout_s=1.0)
+    pool.release(s1)
+    assert rt.reaped == [s1.slot_id]  # disposable-per-job, byte-identical to before
+    pool.stop()
+
+
+def test_recycle_failure_falls_back_to_reap() -> None:
+    rt = _RecycleRuntime(recycle_raises=True)
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=1)
+    _warm_one(pool)
+    s1 = pool.claim(timeout_s=1.0)
+    pool.release(s1)  # recycle raises → must reap, never return a broken slot to IDLE
+    assert rt.reaped == [s1.slot_id]
+    pool.stop()
+
+
+def test_dirty_release_force_recycles_off_cadence() -> None:
+    # A failed run (dirty=True) must reset the slot BEFORE reuse even on a non-boundary job, so the
+    # next job never inherits a wedged/contaminated warm worker.
+    rt = _RecycleRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=10)
+    _warm_one(pool)
+    s1 = pool.claim(timeout_s=1.0)
+    assert s1 is not None
+    pool.release(s1, dirty=True)  # job 1: 1 % 10 != 0 but DIRTY → force recycle, then back to IDLE
+    assert rt.recycled == [s1.slot_id] and rt.reaped == []
+    s2 = pool.claim(timeout_s=1.0)
+    assert s2 is not None and s2.slot_id == s1.slot_id  # reset-in-place, same slot reused
+    pool.stop()
+
+
+def test_dirty_release_reaps_when_no_recycle_method() -> None:
+    # Non-reuse runtime: a dirty release is reaped (a full reset) exactly like a clean one.
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=5)
+    _warm_one(pool)
+    s1 = pool.claim(timeout_s=1.0)
+    pool.release(s1, dirty=True)
+    assert rt.reaped == [s1.slot_id]
+    pool.stop()

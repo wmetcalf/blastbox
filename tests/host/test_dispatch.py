@@ -439,7 +439,8 @@ def test_trust_failure_fails_job_input_gone(tmp_path):
 
 
 def test_unknown_engine_fails_job_no_subprocess_input_gone(tmp_path):
-    """Job with unknown engine → FAILED immediately, no subprocess, input gone."""
+    """DEFAULT (engine scoping OFF): a job with an unknown engine → FAILED fast, no subprocess, input
+    gone. The single-dispatcher contract — so an open-allowlist typo can't sit QUEUED forever."""
     store = InMemoryJobStore()
     job = _make_job(engine="no-such-engine")
     job.input_sha256 = _INPUT_SHA
@@ -462,6 +463,37 @@ def test_unknown_engine_fails_job_no_subprocess_input_gone(tmp_path):
     assert subprocess_calls == [], "subprocess must NOT be launched for unknown engine"
     assert not input_path.exists()
     assert not input_path.parent.exists()
+
+
+def test_default_claim_keeps_legacy_store_signature(tmp_path):
+    # default (scoping OFF): claim_next must be called WITHOUT engine= so a store implementing only
+    # the original claim_next(*, claimant_tier=) shape doesn't raise TypeError.
+    store = InMemoryJobStore()
+    orig = store.claim_next
+
+    def legacy(*, claimant_tier=None):    # NO engine kwarg (pre-engine-scoping protocol)
+        return orig(claimant_tier=claimant_tier)
+
+    store.claim_next = legacy  # type: ignore[method-assign]
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    assert dispatcher.dispatch_once() is False    # no TypeError; just an empty queue
+
+
+def test_engine_scoped_dispatcher_leaves_foreign_engine_jobs(tmp_path, monkeypatch):
+    """OPT-IN (BLASTBOX_DISPATCHER_ENGINE_SCOPED=1): a job for an engine this dispatcher doesn't
+    handle is LEFT UNCLAIMED for its real (e.g. VM) dispatcher — not stolen + failed."""
+    monkeypatch.setenv("BLASTBOX_DISPATCHER_ENGINE_SCOPED", "1")
+    store = InMemoryJobStore()
+    job = _make_job(engine="no-such-engine")          # not in this dispatcher's {test-engine}
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    input_path = _setup_job_dirs(tmp_path, job)
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    assert dispatcher.dispatch_once() is False         # nothing claimable for our engine
+    final_job = store.get(job.job_id)
+    assert final_job is not None and final_job.status == JobStatus.QUEUED  # left, not failed
+    assert input_path.exists()                          # input preserved
 
 
 # ---------------------------------------------------------------------------
@@ -884,9 +916,9 @@ def test_dispatcher_passes_its_tier_to_claim_next(tmp_path):
     seen = {}
     orig = store.claim_next
 
-    def spy(*, claimant_tier=None):
+    def spy(*, claimant_tier=None, engine=None):
         seen["tier"] = claimant_tier
-        return orig(claimant_tier=claimant_tier)
+        return orig(claimant_tier=claimant_tier, engine=engine)
 
     store.claim_next = spy  # type: ignore[method-assign]
     dispatcher = _make_dispatcher(store, job_root=tmp_path)
@@ -1456,6 +1488,80 @@ def test_socks_dns_tcp_off_uses_dns_leakguard(tmp_path, monkeypatch):
     assert "blastbox.net.leakguard=strict" not in argv
 
 
+def test_egress_filter_labels_set_on_vpn_tier(tmp_path, monkeypatch):
+    """egress_ports + block_internal on a gateway-routed all-IP tier (openvpn) → the worker carries the
+    egress-filter labels AND the 'allip' leakguard (all-IP: keep non-internal UDP/ICMP). The decl uses
+    whitespace for multi-value (',' is the KV separator)."""
+    monkeypatch.setenv(
+        "BLASTBOX_NETPOLICY_WEBVPN",
+        "exit=openvpn,gateway=10.8.0.1,egress_ports=53 80 443,block_internal=1",
+    )
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    launched: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="webvpn")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
+                                  subprocess_runner=fake_runner)
+    assert dispatcher.dispatch_once() is True
+    argv = next(a for a in launched if a[:2] == ["docker", "run"])
+    assert "blastbox.net.egress-ports=53,80,443" in argv
+    assert "blastbox.net.block-internal=1" in argv
+    assert "blastbox.net.leakguard=allip" in argv   # all-IP tier keeps non-internal UDP/ICMP
+
+
+@pytest.mark.parametrize("decl,driver", [
+    ("exit=socks,proxy=socks5://172.30.0.40:9050,egress_ports=53 80 443", "socks"),
+    ("exit=direct,block_internal=1", "direct"),
+    ("exit=inetsim,egress_ports=80 443", "inetsim"),
+])
+def test_egress_filter_refused_on_unsupported_tier(tmp_path, monkeypatch, decl, driver):
+    """egress_ports/block_internal are only sound on tor/openvpn/wireguard (the worker's OUTPUT carries
+    the real dst:port AND egress is fail-closed until netd wires). On a proxy hop (socks/httpproxy) the
+    filter would drop the tunnel; on a plain bridge (direct/inetsim) it fails open. Refuse, fail-closed."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_BAD", decl)
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="bad")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng})
+    assert dispatcher.dispatch_once() is True
+    final = store.get(job.job_id)
+    assert final.status == JobStatus.FAILED
+    assert "tor, openvpn, or wireguard" in (final.error or "")
+
+
+def test_egress_ports_invalid_value_refused(tmp_path, monkeypatch):
+    """A non-empty but all-invalid egress_ports (typo) must FAIL the job, not silently widen egress."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_TYPO", "exit=openvpn,gateway=10.8.0.1,egress_ports=htts")
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="typo")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng})
+    assert dispatcher.dispatch_once() is True
+    final = store.get(job.job_id)
+    assert final.status == JobStatus.FAILED
+    assert "egress_ports" in (final.error or "")
+
+
 def test_httpproxy_env_validates_proxy_url(tmp_path):
     """The httpproxy proxy= URL is validated before injection — a malformed value injects no proxy
     env (fail closed), matching the socks tier's validation."""
@@ -1470,6 +1576,16 @@ def test_httpproxy_env_validates_proxy_url(tmp_path):
         assert d._httpproxy_env(p) == {}
     # non-httpproxy driver → never injects proxy env
     assert d._httpproxy_env(Personality(name="d", exit_driver="direct", config={})) == {}
+    # inline user:pass@ is STRIPPED before reaching the worker env (creds stay in the sidecar)
+    creds = Personality(name="brd", exit_driver="httpproxy",
+                        config={"proxy": "http://user:s3cr3t@172.30.0.30:8888"})
+    env = d._httpproxy_env(creds)
+    assert env["HTTP_PROXY"] == "http://172.30.0.30:8888"  # host:port kept, userinfo dropped
+    assert all("s3cr3t" not in v and "user" not in v for v in env.values())
+    # IPv6 literal: brackets must be preserved when rebuilding the credential-stripped netloc
+    v6 = Personality(name="brd", exit_driver="httpproxy",
+                     config={"proxy": "http://u:p@[2001:db8::1]:8080"})
+    assert d._httpproxy_env(v6)["HTTP_PROXY"] == "http://[2001:db8::1]:8080"
 
 
 def test_decrypt_seal_refuses_symlinked_output(tmp_path, monkeypatch):
