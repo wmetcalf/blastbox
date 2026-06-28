@@ -211,7 +211,13 @@ class LibvirtVmRuntime:
         # report this tier unavailable on a perfectly usable layout.
         if self._sh(["test", "-e", self.cfg.golden_base]).returncode != 0:
             return False
-        return _run(self._virsh_argv("version"), timeout=15).returncode == 0
+        if _run(self._virsh_argv("version"), timeout=15).returncode != 0:
+            return False
+        # qemu-img is a hard prerequisite used BEFORE the domain is defined (spawn() creates the COW
+        # overlay with `qemu-img create`). Probe it with the same privilege model, else the pool could
+        # select this tier on a host that has virsh but not qemu-img and every spawn would fail
+        # immediately at overlay creation. Fail closed instead of accepting an unusable tier.
+        return self._sh(["qemu-img", "--version"], sudo_tool="qemu-img").returncode == 0
 
     def _alloc_overlay_name(self) -> tuple[str, str, str]:
         """Allocate a unique ``(sid, domain, overlay_path)`` for a new VM slot.

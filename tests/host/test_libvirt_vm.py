@@ -91,6 +91,31 @@ def test_available_fail_closed_without_golden():
         LibvirtVmConfig(golden_base="/no/such/golden.qcow2", sudo=False)).available() is False
 
 
+def test_available_fails_closed_without_qemu_img(monkeypatch):
+    # golden present + virsh OK, but qemu-img missing → spawn would fail at overlay creation, so the
+    # tier must report unavailable rather than be selected and fail every job.
+    import blastbox.host.runtime.libvirt_vm as mod
+    rt = _rt()
+
+    def fake_sh(args, **k):
+        ok = not (args and args[0] == "qemu-img")        # everything passes EXCEPT qemu-img
+        return type("C", (), {"returncode": 0 if ok else 1, "stdout": ""})()
+
+    monkeypatch.setattr(rt, "_sh", fake_sh)
+    monkeypatch.setattr(mod, "_run", lambda *a, **k: _OK())   # virsh version → rc0
+    assert rt.available() is False
+
+
+def test_available_probes_qemu_img_when_present(monkeypatch):
+    import blastbox.host.runtime.libvirt_vm as mod
+    rt = _rt()
+    calls = []
+    monkeypatch.setattr(rt, "_sh", lambda args, **k: calls.append(args[0]) or _OK())
+    monkeypatch.setattr(mod, "_run", lambda *a, **k: _OK())
+    assert rt.available() is True
+    assert "qemu-img" in calls
+
+
 def test_available_fails_closed_when_helper_binary_missing(monkeypatch):
     # sudo/virsh not installed → subprocess.run raises FileNotFoundError; available() must return
     # False (fail closed), not crash runtime selection with a raw OSError.

@@ -844,6 +844,25 @@ def _warm_one(pool: WarmPool) -> None:
     pool.tick()  # promote to IDLE
 
 
+def test_release_does_not_republish_slot_drained_during_recycle() -> None:
+    # If a concurrent stop() flips the slot to DRAINING WHILE the (seconds-long) recycle runs,
+    # release() must NOT republish it to IDLE — that would hand a caller a slot stop() is reaping.
+    # It must leave DRAINING alone and fall through to reap (fail-safe).
+    class _DrainDuringRecycle(_RecycleRuntime):
+        def recycle(self, slot: Slot) -> None:
+            super().recycle(slot)
+            slot.state = SlotState.DRAINING   # simulate stop() winning the race mid-recycle
+
+    rt = _DrainDuringRecycle()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=1)
+    _warm_one(pool)
+    s1 = pool.claim(timeout_s=1.0)
+    assert s1 is not None
+    pool.release(s1)                          # recycle drains it → must reap, NOT return to IDLE
+    assert rt.reaped == [s1.slot_id]          # fell through to the reap fail-safe
+    assert pool.claim(timeout_s=0.2) is None  # never republished as claimable
+
+
 def test_reuse_returns_slot_to_idle_and_recycles_on_cadence() -> None:
     rt = _RecycleRuntime()
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=2)

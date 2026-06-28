@@ -208,16 +208,25 @@ def test_routing_tor_redirects_tcp_and_dns_keeps_local():
 
 def test_routing_fakenet_dnats_when_addr_set():
     assert routing_commands("192.168.122.9", "inetsim", ExitRouting()) == []  # no addr -> disabled
+    # No gateway known → NOTHING is exempted from the FakeNet DNAT (fail-closed): no subnet RETURN, so
+    # a guest can't reach sibling VMs on the bridge — everything is sunk.
     cmds = _flat(routing_commands("192.168.122.9", "inetsim", ExitRouting(fakenet_addr="172.28.100.2")))
-    # DNS redirected to FakeNet (so C2 domains resolve to the sinkhole, not NXDOMAIN at dnsmasq)
     assert any("--dport 53 -j DNAT --to-destination 172.28.100.2:53" in c for c in cmds)
-    # catch-all DNAT for everything else, host/agent control path stays local
     assert any(c.endswith("-j DNAT --to-destination 172.28.100.2") for c in cmds)
-    assert any("-d 192.168.122.0/24 -j RETURN" in c for c in cmds)
-    # DNS rules must precede the local RETURN so DNS to the bridge resolver is still caught
-    flat = cmds
-    assert flat.index(next(c for c in flat if "--dport 53" in c)) < \
-        flat.index(next(c for c in flat if "RETURN" in c))
+    assert not any("RETURN" in c for c in cmds)                      # no subnet-wide exemption
+    assert not any("192.168.122.0/24" in c for c in cmds)
+
+
+def test_routing_fakenet_exempts_only_gateway_not_subnet():
+    # With a gateway, ONLY the bridge host is RETURNed (guest↔host control stays local); sibling VMs on
+    # the subnet are NOT exempted — they get DNATed into FakeNet, blocking lateral movement.
+    cmds = _flat(routing_commands("192.168.122.9", "inetsim",
+                                  ExitRouting(fakenet_addr="172.28.100.2"), gateway="192.168.122.1"))
+    assert any("-d 192.168.122.1 -j RETURN" in c for c in cmds)      # host/gateway exempt
+    assert not any("192.168.122.0/24" in c for c in cmds)            # but NOT the whole subnet
+    # DNS rules must precede the gateway RETURN so DNS to the bridge resolver is still sunk
+    assert cmds.index(next(c for c in cmds if "--dport 53" in c)) < \
+        cmds.index(next(c for c in cmds if "RETURN" in c))
 
 
 def test_tor_all_tcp_without_egress_ports():

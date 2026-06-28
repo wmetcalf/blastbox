@@ -327,7 +327,11 @@ class WarmPool:
                     self._recycle(slot)  # e.g. VM snapshot-revert (seconds-long)
                 if self._runtime.is_alive(slot):
                     with self._lock:
-                        if slot.slot_id in self._slots:
+                        # Only publish to IDLE if the slot is STILL the ASSIGNED one we're recycling.
+                        # A concurrent stop() flips slots to DRAINING under the lock before reaping; if
+                        # it won the race, republishing to IDLE here would hand a caller a slot stop()
+                        # is about to dispose. Leave DRAINING alone and fall through to reap (fail-safe).
+                        if slot.slot_id in self._slots and slot.state == SlotState.ASSIGNED:
                             slot.state = SlotState.IDLE
                             self._last_idle_at = self._clock()
                             self._idle_event.set()

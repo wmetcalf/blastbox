@@ -147,7 +147,8 @@ def _tor_tcp_redirects(worker_ip: str, routing: ExitRouting,
 
 def routing_commands(worker_ip: str, exit_driver: str, routing: ExitRouting,
                      egress_ports: tuple[int, ...] | None = None,
-                     block_internal: bool = False) -> list[list[str]]:
+                     block_internal: bool = False,
+                     gateway: str | None = None) -> list[list[str]]:
     """The privileged argv (``ip``/``iptables`` nat) that *steer* the worker's external egress for
     its exit driver — the rooter half, separate from the FORWARD *filter*. ``direct``/``none``/
     ``drop`` need none (direct = main-table default; none/drop are filter-dropped). Each command is
@@ -232,17 +233,24 @@ def routing_commands(worker_ip: str, exit_driver: str, routing: ExitRouting,
             return []
         fn = routing.fakenet_addr
         # DNS FIRST (even to the local bridge resolver) → FakeNet, so attacker C2 domains resolve to
-        # the sinkhole instead of NXDOMAIN'ing at dnsmasq. Then keep other host/agent control traffic
-        # local, and DNAT everything else (preserving dport) to the FakeNet-NG listener.
-        return [
+        # the sinkhole instead of NXDOMAIN'ing at dnsmasq. Then keep guest↔HOST control traffic local,
+        # and DNAT everything else (preserving dport) to the FakeNet-NG listener.
+        rules = [
             ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip,
              "-p", "udp", "--dport", "53", "-j", "DNAT", "--to-destination", fn + ":53"],
             ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip,
              "-p", "tcp", "--dport", "53", "-j", "DNAT", "--to-destination", fn + ":53"],
-            ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip, "-d", local, "-j", "RETURN"],
-            ["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip,
-             "-j", "DNAT", "--to-destination", fn],
         ]
+        # Exempt ONLY the bridge host/gateway from the FakeNet DNAT, NOT the whole worker subnet: a
+        # subnet-wide RETURN would let a compromised guest reach SIBLING VMs on the libvirt bridge
+        # (lateral movement) instead of being sunk into FakeNet. With no gateway known, exempt nothing
+        # (everything — incl. host-bound traffic — is sunk), which is the fail-closed choice.
+        if gateway:
+            rules.append(["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip,
+                          "-d", gateway, "-j", "RETURN"])
+        rules.append(["iptables", "-t", "nat", "-A", "PREROUTING", "-s", worker_ip,
+                      "-j", "DNAT", "--to-destination", fn])
+        return rules
     return []
 
 
@@ -522,7 +530,8 @@ class LibvirtEgress:
             # decides WHAT's allowed — wiring the destination first leaves no clearnet window.
             if self._routing is not None:
                 for cmd in routing_commands(worker_ip, policy.exit_driver, self._routing,
-                                            policy.egress_ports, policy.block_internal):
+                                            policy.egress_ports, policy.block_internal,
+                                            gateway=gateway):
                     self._priv(cmd, check=True)
             self._ipt_run("-N", chain, check=True)
             # Kill-switch interface for a tunneled exit: the local tun for an on-host VPN, or the leg
