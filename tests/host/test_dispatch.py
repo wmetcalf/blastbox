@@ -439,7 +439,8 @@ def test_trust_failure_fails_job_input_gone(tmp_path):
 
 
 def test_unknown_engine_fails_job_no_subprocess_input_gone(tmp_path):
-    """Job with unknown engine → FAILED immediately, no subprocess, input gone."""
+    """DEFAULT (engine scoping OFF): a job with an unknown engine → FAILED fast, no subprocess, input
+    gone. The single-dispatcher contract — so an open-allowlist typo can't sit QUEUED forever."""
     store = InMemoryJobStore()
     job = _make_job(engine="no-such-engine")
     job.input_sha256 = _INPUT_SHA
@@ -462,6 +463,37 @@ def test_unknown_engine_fails_job_no_subprocess_input_gone(tmp_path):
     assert subprocess_calls == [], "subprocess must NOT be launched for unknown engine"
     assert not input_path.exists()
     assert not input_path.parent.exists()
+
+
+def test_default_claim_keeps_legacy_store_signature(tmp_path):
+    # default (scoping OFF): claim_next must be called WITHOUT engine= so a store implementing only
+    # the original claim_next(*, claimant_tier=) shape doesn't raise TypeError.
+    store = InMemoryJobStore()
+    orig = store.claim_next
+
+    def legacy(*, claimant_tier=None):    # NO engine kwarg (pre-engine-scoping protocol)
+        return orig(claimant_tier=claimant_tier)
+
+    store.claim_next = legacy  # type: ignore[method-assign]
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    assert dispatcher.dispatch_once() is False    # no TypeError; just an empty queue
+
+
+def test_engine_scoped_dispatcher_leaves_foreign_engine_jobs(tmp_path, monkeypatch):
+    """OPT-IN (BLASTBOX_DISPATCHER_ENGINE_SCOPED=1): a job for an engine this dispatcher doesn't
+    handle is LEFT UNCLAIMED for its real (e.g. VM) dispatcher — not stolen + failed."""
+    monkeypatch.setenv("BLASTBOX_DISPATCHER_ENGINE_SCOPED", "1")
+    store = InMemoryJobStore()
+    job = _make_job(engine="no-such-engine")          # not in this dispatcher's {test-engine}
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    input_path = _setup_job_dirs(tmp_path, job)
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    assert dispatcher.dispatch_once() is False         # nothing claimable for our engine
+    final_job = store.get(job.job_id)
+    assert final_job is not None and final_job.status == JobStatus.QUEUED  # left, not failed
+    assert input_path.exists()                          # input preserved
 
 
 # ---------------------------------------------------------------------------
@@ -884,9 +916,9 @@ def test_dispatcher_passes_its_tier_to_claim_next(tmp_path):
     seen = {}
     orig = store.claim_next
 
-    def spy(*, claimant_tier=None):
+    def spy(*, claimant_tier=None, engine=None):
         seen["tier"] = claimant_tier
-        return orig(claimant_tier=claimant_tier)
+        return orig(claimant_tier=claimant_tier, engine=engine)
 
     store.claim_next = spy  # type: ignore[method-assign]
     dispatcher = _make_dispatcher(store, job_root=tmp_path)
@@ -1544,6 +1576,16 @@ def test_httpproxy_env_validates_proxy_url(tmp_path):
         assert d._httpproxy_env(p) == {}
     # non-httpproxy driver → never injects proxy env
     assert d._httpproxy_env(Personality(name="d", exit_driver="direct", config={})) == {}
+    # inline user:pass@ is STRIPPED before reaching the worker env (creds stay in the sidecar)
+    creds = Personality(name="brd", exit_driver="httpproxy",
+                        config={"proxy": "http://user:s3cr3t@172.30.0.30:8888"})
+    env = d._httpproxy_env(creds)
+    assert env["HTTP_PROXY"] == "http://172.30.0.30:8888"  # host:port kept, userinfo dropped
+    assert all("s3cr3t" not in v and "user" not in v for v in env.values())
+    # IPv6 literal: brackets must be preserved when rebuilding the credential-stripped netloc
+    v6 = Personality(name="brd", exit_driver="httpproxy",
+                     config={"proxy": "http://u:p@[2001:db8::1]:8080"})
+    assert d._httpproxy_env(v6)["HTTP_PROXY"] == "http://[2001:db8::1]:8080"
 
 
 def test_decrypt_seal_refuses_symlinked_output(tmp_path, monkeypatch):

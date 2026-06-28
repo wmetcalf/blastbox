@@ -6,6 +6,7 @@ import enum
 import time
 import uuid
 from builtins import list as _list  # explicit ref: JobStore.list shadows the builtin
+from collections.abc import Collection
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -136,8 +137,19 @@ class Job:
 # Canonical dispatcher tier names. A warm sidecar's tier is its BLASTBOX_POOL_RUNTIME
 # (one of WARM_TIERS); the cold dispatcher is "cold". A job's target_tier (when set) and a
 # claimant's tier are matched against this vocabulary.
-WARM_TIERS = ("firecracker", "gvisor")
+WARM_TIERS = ("firecracker", "gvisor", "libvirt-vm")
 VALID_TIERS = ("cold", *WARM_TIERS)
+
+
+def normalize_engine_filter(engine: "str | Collection[str] | None") -> tuple[str, ...] | None:
+    """Normalize a ``claim_next`` engine filter to a tuple of engine names, or None for "any engine".
+    Accepts a single engine name or a collection (the set of engines a claimant handles). An empty
+    collection normalizes to None (no filter) — callers pass the engines they handle, or None."""
+    if engine is None:
+        return None
+    if isinstance(engine, str):
+        return (engine,)
+    return tuple(engine) or None
 
 
 # Whitelist of fields ``list(sort=...)`` accepts. A whitelist (not a free column
@@ -242,7 +254,15 @@ class JobStore(Protocol):
         """
         ...
 
-    def claim_next(self, *, claimant_tier: str | None = None) -> Job | None: ...
+    def claim_next(self, *, claimant_tier: str | None = None,
+                   engine: str | Collection[str] | None = None) -> Job | None:
+        """Atomically claim the oldest eligible QUEUED job → RUNNING. ``claimant_tier`` routes by
+        ``target_tier``; ``engine`` (when set) restricts the claim to jobs for that engine — a single
+        name OR the SET of engines this claimant handles. So a VM dispatcher (``engine="authenticode"``)
+        and a cold dispatcher (``engine=set(self._engines)``) sharing one store each claim only their
+        own jobs, instead of the cold one grabbing a VM-engine job first and failing it ``unknown
+        engine``. ``engine=None`` = any engine (default; unchanged behaviour)."""
+        ...
     def delete(self, job_id: str) -> None: ...
 
 

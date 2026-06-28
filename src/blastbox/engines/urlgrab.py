@@ -102,6 +102,18 @@ class _CappedRedirect(urllib.request.HTTPRedirectHandler):
     max_repeats = _DEFAULT_MAX_REDIRECTS
     max_redirections = _DEFAULT_MAX_REDIRECTS
 
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Keep the fetcher a bounded HTTP(S) client across the WHOLE redirect chain, not just the
+        # initial URL: a malicious server can 30x to file:// (or ftp://, etc.), and build_opener's
+        # default FileHandler/FTPHandler would happily service it — reading a worker-local file into
+        # the sealed `body` artifact (SSRF / local-file read). Reject any non-HTTP(S) redirect target.
+        # Raise URLError (NOT HTTPError): _default_fetch treats an HTTPError as a real 4xx/5xx
+        # *response* (it would record fetched=True, status=302, final_url=the unsafe URL), whereas a
+        # URLError is a transport failure → FetchError → the result correctly reads fetch_failed.
+        if urlparse(newurl).scheme not in ("http", "https"):
+            raise urllib.error.URLError(f"blocked redirect to non-HTTP(S) scheme: {newurl[:80]}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
 
 def _default_fetch(
     url: str, *, timeout: float, max_bytes: int, max_redirects: int, verify_tls: bool = True
@@ -136,7 +148,14 @@ def _default_fetch(
     req = urllib.request.Request(url, headers={"User-Agent": _DEFAULT_UA}, method="GET")
     try:
         resp = opener.open(req, timeout=timeout)
-    except urllib.error.HTTPError as e:  # 4xx/5xx are responses, not transport failures
+    except urllib.error.HTTPError as e:  # 4xx/5xx are responses, not transport failures —
+        # EXCEPT a redirect to a scheme urllib itself refuses (file://, gopher://): HTTPRedirectHandler
+        # raises HTTPError directly (before our redirect_request hook runs) with e.url = the blocked
+        # target. That's NOT a real fetched 302 — treat it as a fetch FAILURE, not a response, so the
+        # result isn't mislabeled fetched=True with final_url pointing at the blocked URL.
+        if urlparse(getattr(e, "url", "") or url).scheme not in ("http", "https"):
+            raise FetchError(f"blocked redirect to non-HTTP(S) scheme: "
+                             f"{(getattr(e, 'url', '') or '')[:80]}") from e
         resp = e
     except (urllib.error.URLError, socket.timeout, OSError, ValueError) as e:
         raise FetchError(str(e)) from e

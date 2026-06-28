@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
+
 import json
 import sqlite3
 import threading
@@ -13,7 +15,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from blastbox.contract import Envelope, Page, find_by_type, phash_hex_to_int8
-from blastbox.host.jobs.base import LISTABLE_SORT_FIELDS, Job, JobStatus
+from blastbox.host.jobs.base import LISTABLE_SORT_FIELDS, Job, JobStatus, normalize_engine_filter
 
 
 # Allowlist of column names in the ``jobs`` table.  ``update()`` validates
@@ -489,20 +491,34 @@ class SqlJobStore:
             params.append(f"%{esc}%")
         return where, params
 
-    def claim_next(self, *, claimant_tier: str | None = None) -> Job | None:
-        if self._driver == "sqlite":
-            return self._claim_next_sqlite(claimant_tier)
-        return self._claim_next_postgres(claimant_tier)
+    def _engine_clause(self, engines: tuple[str, ...] | None) -> tuple[str, _list[str]]:
+        """SQL fragment + params for the engine filter: ``AND engine IN (?,?,..)`` for a set of
+        engines this claimant handles, or empty (no filter) when None."""
+        if not engines:
+            return "", []
+        placeholders = ",".join([self._param] * len(engines))
+        return f"AND engine IN ({placeholders}) ", list(engines)
 
-    def _claim_next_sqlite(self, claimant_tier: str | None = None) -> Job | None:
+    def claim_next(self, *, claimant_tier: str | None = None,
+                   engine: "str | Collection[str] | None" = None) -> Job | None:
+        engines = normalize_engine_filter(engine)
+        if self._driver == "sqlite":
+            return self._claim_next_sqlite(claimant_tier, engines)
+        return self._claim_next_postgres(claimant_tier, engines)
+
+    def _claim_next_sqlite(self, claimant_tier: str | None = None,
+                           engines: tuple[str, ...] | None = None) -> Job | None:
         # target_tier routing: claim a job only if it has no target, or its target matches
         # this claimant's tier. Binding claimant_tier=None makes `target_tier = NULL` (never
         # true in SQL), so the predicate collapses to `target_tier IS NULL` — an untiered
         # claimant takes only untargeted jobs. Existing rows are NULL → unchanged behaviour.
+        # `engines`: when set, restrict to `engine IN (...)`; absent = no engine filter.
+        eng_clause, eng_params = self._engine_clause(engines)
         select_sql = (
             f"SELECT {', '.join(_COLUMNS)} FROM jobs "
             f"WHERE status = {self._param} "
             f"AND (target_tier IS NULL OR target_tier = {self._param}) "
+            f"{eng_clause}"
             f"ORDER BY created_at ASC, job_id ASC LIMIT 1"
         )
         # The UPDATE is a compare-and-swap: it only fires if the row is STILL
@@ -519,7 +535,7 @@ class SqlJobStore:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                select_sql, (JobStatus.QUEUED.value, claimant_tier)
+                select_sql, (JobStatus.QUEUED.value, claimant_tier, *eng_params)
             ).fetchone()
             if row is None:
                 return None
@@ -546,16 +562,20 @@ class SqlJobStore:
             job.claim_id = claim_id
             return job
 
-    def _claim_next_postgres(self, claimant_tier: str | None = None) -> Job | None:
+    def _claim_next_postgres(self, claimant_tier: str | None = None,
+                             engines: tuple[str, ...] | None = None) -> Job | None:
         cols_jobs = ", ".join(f"jobs.{col}" for col in _COLUMNS)
         # target_tier routing (see _claim_next_sqlite): only rows with no target or a target
         # matching this claimant are eligible; claimant_tier=None ⇒ target_tier IS NULL only.
+        # `engines`: when set, restrict to `engine IN (...)`; absent = no engine filter.
+        eng_clause, eng_params = self._engine_clause(engines)
         sql = f"""
         WITH next_job AS (
             SELECT job_id
             FROM jobs
             WHERE status = {self._param}
             AND (target_tier IS NULL OR target_tier = {self._param})
+            {eng_clause}
             ORDER BY created_at ASC, job_id ASC
             FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -569,6 +589,7 @@ class SqlJobStore:
         params = (
             JobStatus.QUEUED.value,
             claimant_tier,
+            *eng_params,
             JobStatus.RUNNING.value,
             time.time(),
             uuid.uuid4().hex,  # fresh ownership token per claim

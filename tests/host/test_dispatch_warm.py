@@ -158,6 +158,7 @@ class FakeWarmPool:
     def __init__(self, slot: Slot | None, runtime: object | None = None) -> None:
         self._slot = slot
         self.release_calls: list[Slot] = []
+        self.release_dirty: list[bool] = []  # parallel to release_calls: the dirty flag per release
         # Default: a file-based warm runtime that deliberately lacks the vsock
         # warm-path seam (stage_warm_input / host_warm_control /
         # materialize_warm_output), so the dispatcher falls back to the
@@ -178,8 +179,9 @@ class FakeWarmPool:
     def claim(self, *, timeout_s: float) -> Slot | None:
         return self._slot
 
-    def release(self, slot: Slot) -> None:
+    def release(self, slot: Slot, *, dirty: bool = False) -> None:
         self.release_calls.append(slot)
+        self.release_dirty.append(dirty)
 
 
 # ---------------------------------------------------------------------------
@@ -460,9 +462,10 @@ def test_1_warm_happy_path(tmp_path):
     assert final_job.result_summary["artifact_count"] == 1
     assert final_job.worker_runtime == "warm"
 
-    # pool.release must have been called exactly once with our slot
+    # pool.release must have been called exactly once with our slot, CLEAN (the run succeeded)
     assert len(pool.release_calls) == 1
     assert pool.release_calls[0] is slot
+    assert pool.release_dirty == [False]  # clean DONE → slot safe to reuse without a forced reset
 
     # staged input must be gone (job_root/job_id/input/<filename>)
     staged_input = tmp_path / "jobs" / job.job_id / "input" / Path(job.filename).name
@@ -593,9 +596,10 @@ def test_2_warm_trust_failure(tmp_path):
     assert final_job.status == JobStatus.FAILED
     assert final_job.error is not None
 
-    # Slot released exactly once
+    # Slot released exactly once, DIRTY (trust failure → force-reset before reuse)
     assert len(pool.release_calls) == 1
     assert pool.release_calls[0] is slot
+    assert pool.release_dirty == [True]
 
     # Input gone
     staged_input = tmp_path / "jobs" / job.job_id / "input" / Path(job.filename).name
@@ -638,9 +642,10 @@ def test_3_warm_timeout(tmp_path):
     assert final_job.error is not None
     assert "timed out" in final_job.error.lower() or "timeout" in final_job.error.lower()
 
-    # Slot released exactly once
+    # Slot released exactly once, DIRTY (timeout → force-reset before reuse)
     assert len(pool.release_calls) == 1
     assert pool.release_calls[0] is slot
+    assert pool.release_dirty == [True]
 
     # Input gone
     staged_input = tmp_path / "jobs" / job.job_id / "input" / Path(job.filename).name
