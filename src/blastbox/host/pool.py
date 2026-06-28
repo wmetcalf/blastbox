@@ -362,6 +362,29 @@ class WarmPool:
                 if reaped:
                     self._slots.pop(slot.slot_id, None)
 
+    def retire(self, slot: Slot) -> None:
+        """Permanently dispose ``slot`` WITHOUT recycling it — for a worker that may STILL be in use
+        by an abandoned/hung thread (e.g. a validate that timed out). Unlike ``release(dirty=True)``,
+        which on a recycle-capable runtime snapshot-reverts and returns the SAME endpoint to IDLE
+        (letting the hung thread keep talking to it and corrupt a later job), retire REAPS (destroys)
+        the worker — severing the hung interaction — and removes the slot. On a reap failure the slot
+        is quarantined (kept tracked/DRAINING, never reused). The replacement spawns on the next tick.
+        """
+        with self._lock:
+            if slot.slot_id not in self._slots:
+                return  # already removed/reaped concurrently — don't double-reap
+            slot.state = SlotState.DRAINING  # unclaimable from here, even if the reap is slow
+        reaped = False
+        try:
+            self._reap_and_count(slot)
+            reaped = True
+        except Exception:
+            logger.exception("pool.retire_reap_error slot_id=%s — quarantining (worker may persist)",
+                             slot.slot_id)
+        with self._lock:
+            if reaped:
+                self._slots.pop(slot.slot_id, None)
+
     def tick(self) -> None:
         """One maintenance step: promote WARMING→IDLE, health-check, burst, spawn to deficit.
 

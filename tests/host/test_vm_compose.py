@@ -26,6 +26,7 @@ class _FakePool:
         self._slot = slot if slot is not None else _FakeSlot()
         self.claimed = 0
         self.released: list[bool] = []   # dirty flag per release
+        self.retired: list[str] = []     # slot_ids force-retired (hung path)
 
     def claim(self, *, timeout_s):
         self.claimed += 1
@@ -33,6 +34,9 @@ class _FakePool:
 
     def release(self, slot, *, dirty=False):
         self.released.append(dirty)
+
+    def retire(self, slot):
+        self.retired.append(slot.slot_id)
 
 
 def test_slot_bound_validate_clean_run_releases_clean():
@@ -74,7 +78,9 @@ def test_slot_bound_validate_hung_run_reclaims_slot():
     v = slot_bound_validate(pool, hang, work_timeout_s=0.2)
     with pytest.raises(TimeoutError, match="exceeded"):
         v("/in")
-    assert pool.released == [True]                          # hung → slot reclaimed DIRTY, not leaked
+    # hung thread still alive → slot must be RETIRED (VM destroyed), NOT recycled+reused (which would
+    # let the abandoned thread corrupt a later job's worker).
+    assert pool.retired == [pool._slot.slot_id] and pool.released == []
     gate.set()                                              # let the abandoned daemon thread finish
 
 
@@ -187,6 +193,14 @@ def test_from_dict_accepts_all_exit_routing_fields():
         "exit": "openvpn", "rule_priority_base": 5000, "vpn_table": "vpn", "vpn_tun": "tun7"}})
     assert spec.routing.rule_priority_base == 5000
     assert spec.routing.vpn_table == "vpn" and spec.routing.vpn_tun == "tun7"
+
+
+@pytest.mark.parametrize("badkey", ["egres", "rooting", "warmsize", "mem_md"])
+def test_from_dict_rejects_unknown_top_level_key(badkey):
+    # a misspelled SECURITY-critical top-level key (e.g. `egres:` instead of `egress:`) must be
+    # REJECTED, not silently dropped → egress=None → VM on the unrestricted libvirt network.
+    with pytest.raises(ValueError, match="unknown top-level key"):
+        VmWorkerSpec.from_dict("w", {"image": "/g.qcow2", badkey: "x"})
 
 
 @pytest.mark.parametrize("badkey", ["exitt", "block_internl", "egress_port", "fakenet_address"])

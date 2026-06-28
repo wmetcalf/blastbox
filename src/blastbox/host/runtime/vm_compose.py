@@ -147,6 +147,16 @@ class VmWorkerSpec:
                 routing_kw["gateway_masquerade"] = _truthy(eg["gateway_masquerade"])
             routing = ExitRouting(**routing_kw)
         known = {f for f in cls.__dataclass_fields__ if f not in ("name", "image", "egress", "routing")}
+        # Reject UNKNOWN top-level keys (mirroring the nested egress-key check): a misspelled
+        # security-critical key — e.g. `egres:` instead of `egress:` — would otherwise be silently
+        # dropped, leaving egress=None and starting the VM with NO per-worker rooter on the
+        # unrestricted libvirt network. `image`/`egress` are consumed above; everything else must be a
+        # known spec field. Fail closed so the typo surfaces.
+        allowed_top = known | {"image", "egress"}
+        unknown_top = set(d) - allowed_top
+        if unknown_top:
+            raise ValueError(f"{name}: unknown top-level key(s) {sorted(unknown_top)} "
+                             f"(did you mean one of {sorted(allowed_top)}?)")
         return cls(name=name, image=image, egress=egress, routing=routing,
                    **{k: v for k, v in d.items() if k in known})
 
@@ -342,15 +352,21 @@ def slot_bound_validate(
                 raise result["e"]  # type: ignore[misc]
             return result["v"]  # type: ignore[return-value]
         finally:
-            # Release on EVERY path. dirty=True unless run() returned ok=True: a hung (still-alive
-            # thread), errored, or ok=False run leaves the worker possibly contaminated, so force a
-            # recycle rather than reuse it. A clean ok=True run reuses per the pool's recycle policy.
-            v = result.get("v")
-            clean = bool(isinstance(v, tuple) and len(v) == 2 and v[1])
+            # Always return the slot. If the work thread is STILL ALIVE (the work_timeout path), it
+            # may keep talking to this VM — do NOT recycle (a snapshot-revert + reuse would let the
+            # abandoned thread corrupt a later job's worker). RETIRE it: destroy the VM, severing the
+            # hung interaction, so it's never reused. A finished thread releases normally: dirty=True
+            # unless run() returned ok=True cleanly (errored/ok=False → force-recycle a possibly
+            # contaminated worker; clean → reuse per the pool's recycle policy).
             try:
-                pool.release(slot, dirty=not clean)
-            except Exception:  # noqa: BLE001 — release must never mask the validate result/exception
-                _log.exception("slot_bound_validate: release failed for slot %s", slot.slot_id)
+                if t.is_alive():
+                    pool.retire(slot)
+                else:
+                    v = result.get("v")
+                    clean = bool(isinstance(v, tuple) and len(v) == 2 and v[1])
+                    pool.release(slot, dirty=not clean)
+            except Exception:  # noqa: BLE001 — slot return must never mask the validate result/error
+                _log.exception("slot_bound_validate: slot return failed for slot %s", slot.slot_id)
     return _validate
 
 

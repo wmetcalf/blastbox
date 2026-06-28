@@ -354,7 +354,8 @@ def test_dispatch_marks_failed_on_raise(tmp_path):
 
 def test_rejects_job_with_unhonored_net_policy(tmp_path):
     # a warm VM has fixed egress; a per-job net_policy it can't honor must FAIL before detonation,
-    # never run under the pool's (different) policy while the record claims another.
+    # never run under the pool's (different) policy while the record claims another. Enforcement is
+    # opt-in: the pool here is DECLARED no-network ("none"), so a "tor" override is rejected.
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     job.net_policy = "tor"   # InMemoryJobStore holds the job by reference; claim_next snapshots it
@@ -364,13 +365,25 @@ def test_rejects_job_with_unhonored_net_policy(tmp_path):
         detonated["ran"] = True
         return ({}, True)
 
-    d = VmJobDispatcher(store, str(tmp_path), validate)        # fixed_net_policy=None → reject any
+    d = VmJobDispatcher(store, str(tmp_path), validate, fixed_net_policy="none")  # declared no-network
     d._process(store.claim_next())
     got = store.get(job.job_id)
     assert got.status is JobStatus.FAILED
     assert "net_policy" in (got.error or "") and "tor" in got.error
     assert detonated["ran"] is False                          # rejected BEFORE validate
     assert not (tmp_path / job.job_id / "input" / job.filename).exists()  # input dropped
+
+
+def test_net_policy_enforcement_opt_in_skips_when_undeclared(tmp_path):
+    # fixed_net_policy unset → enforcement OFF. We must NOT assume the pool is no-network ("none") —
+    # a libvirt VM with egress_policy=None is on the (unrestricted) libvirt net, not --network=none —
+    # so a job with a policy still runs (operator owns routing when they don't declare the pool egress).
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    job.net_policy = "tor"
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True))  # fixed_net_policy=None → opt-out
+    d._process(store.claim_next())
+    assert store.get(job.job_id).status is JobStatus.DONE
 
 
 def test_accepts_job_whose_net_policy_matches_fixed(tmp_path):
@@ -452,6 +465,29 @@ def test_no_policy_anywhere_runs_on_unconfigured_pool(tmp_path):
     d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), engine="authenticode")
     d._process(store.claim_next())
     assert store.get(job.job_id).status is JobStatus.DONE
+
+
+def test_does_not_write_metadata_when_claim_lost_during_validate(tmp_path):
+    # if a long validate outlives its claim and a peer reclaims the job, the stale owner must NOT
+    # write output/metadata.json (a filesystem op the terminal CAS can't fence) — that would clobber
+    # the new owner's metadata for the now-DONE job.
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    claimed = store.claim_next()
+
+    def validate(p):
+        # simulate a peer reclaiming the job mid-validate: rotate the stored claim_id out from under us
+        store._jobs[job.job_id].claim_id = "peer-now-owns-it"
+        return ({"ok": 1}, True)
+
+    d = VmJobDispatcher(store, str(tmp_path), validate)
+    d._process(claimed)
+    # we bailed before publishing: no metadata.json written, and we did NOT CAS the job to DONE
+    assert not (tmp_path / job.job_id / "output" / "metadata.json").exists()
+    got = store.get(job.job_id)
+    assert got.status is JobStatus.RUNNING and got.claim_id == "peer-now-owns-it"  # peer still owns it
+    # and the shared input is left for the new owner (we didn't unlink it)
+    assert (tmp_path / job.job_id / "input" / job.filename).exists()
 
 
 def test_dispatch_marks_failed_when_validate_raises_baseexception(tmp_path):

@@ -108,6 +108,17 @@ class VmJobDispatcher:
         raw = os.environ.get(f"BLASTBOX_ENGINE_{name}_NETPOLICY")
         return raw.strip().lower() if raw and raw.strip() else "none"
 
+    def _claim_is_still_ours(self, job: Job) -> bool:
+        """Whether we still own the claim: the stored job is RUNNING with OUR claim_id. A best-effort
+        TOCTOU narrowing for the metadata write (the store CAS fences the status update; this fences
+        the unfenceable filesystem write so a reclaimed job's new owner isn't clobbered). A store read
+        error is treated as "not ours" — fail closed, don't write."""
+        try:
+            cur = self._store.get(job.job_id)
+        except Exception:  # noqa: BLE001 — a transient store error → don't risk a clobbering write
+            return False
+        return cur is not None and cur.status == JobStatus.RUNNING and cur.claim_id == job.claim_id
+
     def _job_dir(self, job: Job) -> Path:
         # The ingress canonical layout is <job_root>/<id>/{input,output}/ (job.result_dir points at
         # the OUTPUT subdir, NOT this parent — don't derive paths from it). Everything hangs off here.
@@ -231,15 +242,18 @@ class VmJobDispatcher:
     def _process(self, job: Job) -> None:
         # Fail closed on an EFFECTIVE net_policy this warm tier can't honor — BEFORE detonation. A
         # warm VM's egress is FIXED at spawn and can't be re-steered per job like the cold container
-        # path. The effective policy mirrors resolve_net_policy: per-job override (ingress sets
-        # job.net_policy only when BLASTBOX_ALLOW_NETPOLICY_OVERRIDE is on) → engine default → "none".
-        # It is compared for EQUALITY against the pool's fixed egress (both default to "none"). "none"/
-        # "drop" mean --network=none (NO egress, the fail-closed default), so this is NOT skippable: a
-        # job whose effective policy is "none" must not run on a pool that has network (a LEAK), and a
-        # tor/fakenet/vpn policy must not run on a differently-fixed pool. Any mismatch is rejected.
-        effective_policy = (job.net_policy or self._engine_default_policy(job.engine)
-                            or "none").strip().lower()
-        fixed_policy = (self._fixed_net_policy or "none").strip().lower()
+        # path. Enforcement is OPT-IN via fixed_net_policy (the egress this pool is PROVISIONED with):
+        # we must NOT assume an undeclared pool is "none"/no-network, because a libvirt VM with
+        # egress_policy=None is left on the (unrestricted) libvirt network, NOT --network=none — so
+        # defaulting to "none" would falsely pass no-egress jobs onto a networked VM. When declared,
+        # the effective policy (override → engine default → "none", mirroring resolve_net_policy) must
+        # EQUAL it; "none"/"drop" (=--network=none) are enforced like any other, no skipping.
+        if self._fixed_net_policy is not None:
+            effective_policy = (job.net_policy or self._engine_default_policy(job.engine)
+                                or "none").strip().lower()
+            fixed_policy = self._fixed_net_policy.strip().lower()
+        else:
+            effective_policy = fixed_policy = ""  # enforcement opt-out: operator owns routing
         if effective_policy != fixed_policy:
             kind = "override" if job.net_policy else "engine-default"
             finished = time.time()
@@ -275,7 +289,15 @@ class VmJobDispatcher:
             err: str | None = None
             # Publish metadata.json BEFORE the DONE CAS so DONE never implies a 404 on /metadata,
             # /artifacts, /result. If the write fails, FAIL the job (recoverable) rather than mark it
-            # DONE-without-metadata.
+            # DONE-without-metadata. But re-check OWNERSHIP first: if a long validation outlived its
+            # claim and a peer reclaimed+completed the job, the terminal CAS below would no-op — yet
+            # the metadata WRITE is a filesystem op the CAS can't fence, so a stale owner could clobber
+            # the new owner's metadata.json (served for the now-DONE job). If we no longer own the
+            # claim, bail before writing — don't touch a job another dispatcher controls.
+            if ok and not self._claim_is_still_ours(job):
+                logger.info("vm_dispatch: job %s reclaimed during validate; not publishing metadata "
+                            "or CAS (peer owns it now)", job.job_id)
+                return
             if ok and not self._ensure_metadata(job, summary):
                 ok, err = False, "metadata_write_failed"
             finished = time.time()
