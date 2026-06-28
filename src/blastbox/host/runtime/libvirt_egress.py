@@ -32,6 +32,14 @@ def _run(args: list[str], timeout: float = 20) -> subprocess.CompletedProcess:
     except subprocess.TimeoutExpired:
         # a hung iptables/ip call must not abort apply/remove mid-rule with an uncaught exception
         return subprocess.CompletedProcess(args, 124, "", "timeout")
+    except OSError as exc:
+        # The binary isn't installed (e.g. ip6tables on an IPv4-only/minimal host) or some other
+        # OS-level spawn failure. A best-effort teardown delete must NOT raise here: remove() issues
+        # the v6 deletes BEFORE the IPv4 spoof-drop/jump/chain/conntrack cleanup, so an uncaught
+        # FileNotFoundError would abort teardown and leak the IPv4 rules. Return a nonzero result
+        # (mirrors the conntrack missing-binary handling) — check=False deletes no-op, check=True
+        # callers in apply() still surface a clean RuntimeError + roll back.
+        return subprocess.CompletedProcess(args, 127, "", str(exc))
 
 
 @dataclass(frozen=True)
@@ -46,9 +54,19 @@ class VmEgressPolicy:
     def from_personality(cls, p: Personality) -> "VmEgressPolicy":
         cfg = p.config
         block = cfg.get("block_internal", "").strip().lower() in ("1", "true", "yes", "on")
+        raw_ports = cfg.get("egress_ports")
+        ports = parse_egress_ports(raw_ports)
+        # Fail closed on a typo. parse_egress_ports() returns None for BOTH an omitted allowlist
+        # (→ unrestricted, the intended default) AND a provided-but-all-invalid one (e.g. "70000").
+        # For direct/VPN exits None means unrestricted egress, so a typoed egress_ports would silently
+        # widen a web-only policy to wide-open. Distinguish them: a non-blank value that parsed to
+        # nothing becomes an EMPTY allowlist (deny-all + trailing DROP), not None — matching the
+        # compose parser's fail-closed posture.
+        if ports is None and raw_ports and raw_ports.strip():
+            ports = ()
         return cls(
             exit_driver=p.exit_driver,
-            egress_ports=parse_egress_ports(cfg.get("egress_ports")),
+            egress_ports=ports,
             block_internal=block,
         )
 

@@ -252,6 +252,13 @@ class WarmPool:
                 self._reap_and_count(slot)
             except Exception:
                 logger.exception("pool.reap_error_on_stop slot_id=%s — quarantining", slot.slot_id)
+                # Mark the retained (un-reaped) slot DRAINING so it can NEVER be handed out again:
+                # claim()/promotion only touch IDLE/WARMING, so if this WarmPool object is restarted or
+                # a dispatcher races claim() after stop() began, a still-IDLE husk for a VM whose
+                # disposal FAILED must not be reused while it may still be running.
+                with self._lock:
+                    if slot.slot_id in self._slots:
+                        slot.state = SlotState.DRAINING
             else:
                 with self._lock:
                     self._slots.pop(slot.slot_id, None)

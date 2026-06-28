@@ -91,6 +91,39 @@ def test_available_fail_closed_without_golden():
         LibvirtVmConfig(golden_base="/no/such/golden.qcow2", sudo=False)).available() is False
 
 
+def test_alloc_overlay_name_uses_64_bits_and_unique_path(monkeypatch):
+    # 16 hex (64 bits), not 8 — a 32-bit space birthday-collides in a long-lived pool, and a collision
+    # is destructive (spawn destroys+overwrites the sibling's domain/overlay).
+    rt = _rt()
+    monkeypatch.setattr(rt, "_sh", lambda args, **k: type("C", (), {"returncode": 1})())  # nothing exists
+    sid, name, overlay = rt._alloc_overlay_name()
+    assert len(sid) == 16 and name == f"bbvm-{sid}"
+    assert overlay.endswith(f"{name}.qcow2")
+
+
+def test_alloc_overlay_name_rerolls_past_existing_overlay(monkeypatch):
+    # if the first candidate overlay already exists (a live sibling), re-roll instead of returning a
+    # name spawn() would destroy+overwrite.
+    rt = _rt()
+    seen: list[str] = []
+
+    def fake_sh(args, **k):
+        overlay = args[-1]
+        seen.append(overlay)
+        return type("C", (), {"returncode": 0 if len(seen) == 1 else 1})()  # 1st exists, 2nd free
+
+    monkeypatch.setattr(rt, "_sh", fake_sh)
+    sid, name, overlay = rt._alloc_overlay_name()
+    assert len(seen) == 2 and overlay == seen[1] and overlay != seen[0]  # re-rolled past the collision
+
+
+def test_alloc_overlay_name_raises_when_no_free_name(monkeypatch):
+    rt = _rt()
+    monkeypatch.setattr(rt, "_sh", lambda args, **k: type("C", (), {"returncode": 0})())  # all "exist"
+    with pytest.raises(RuntimeError, match="unique VM overlay name"):
+        rt._alloc_overlay_name()
+
+
 def test_destroy_domain_command_not_found_is_a_failed_destroy(monkeypatch):
     # `sudo virsh` with virsh missing from root's PATH → "virsh: command not found": NOT a benign
     # absent-domain case (no destroy happened), so reap() must treat it as failed (→ quarantine).

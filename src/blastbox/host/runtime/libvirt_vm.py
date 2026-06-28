@@ -208,15 +208,33 @@ class LibvirtVmRuntime:
             return False
         return _run(self._virsh_argv("version"), timeout=15).returncode == 0
 
+    def _alloc_overlay_name(self) -> tuple[str, str, str]:
+        """Allocate a unique ``(sid, domain, overlay_path)`` for a new VM slot.
+
+        16 hex (64 bits), not 8 (32 bits): in a long-running warm pool that reprovisions many slots a
+        32-bit name space has a realistic birthday collision, and a collision is DESTRUCTIVE — spawn()
+        unconditionally ``_destroy_domain(name)`` + rm's the overlay, so a duplicate ``bbvm-<sid>``
+        would tear down a LIVE sibling VM and clobber its pool entry. 64 bits makes that astronomically
+        unlikely; the existence re-roll makes the destructive case impossible."""
+        overlay_dir = Path(self.cfg.overlay_dir)
+        for _ in range(8):
+            sid = uuid.uuid4().hex[:16]
+            name = f"bbvm-{sid}"
+            overlay = str(overlay_dir / f"{name}.qcow2")
+            # An existing overlay at this name means a live sibling already owns it — re-roll rather
+            # than destroy+overwrite it. (test -e via the privileged runner: the overlay dir may be
+            # root-only, so an unprivileged exists() could miss a sibling and falsely accept the name.)
+            if self._sh(["test", "-e", overlay]).returncode != 0:
+                return sid, name, overlay
+        raise RuntimeError("could not allocate a unique VM overlay name after 8 attempts")
+
     # ---- SlotRuntime ---------------------------------------------------------
     def spawn(self) -> VmSlot:
         """Provision a COW overlay off the golden, define+start the domain, and return a WARMING
         slot IMMEDIATELY. Readiness (agent up) and the one-time finalize (egress + clean snapshot)
         happen in ``is_ready()`` so the ~60s guest boot never blocks the pool's tick loop —
         matching the async-spawn contract of the FC/gVisor runtimes."""
-        sid = uuid.uuid4().hex[:8]
-        name = f"bbvm-{sid}"
-        overlay = str(Path(self.cfg.overlay_dir) / f"{name}.qcow2")
+        sid, name, overlay = self._alloc_overlay_name()
         slot = VmSlot(slot_id=sid, domain=name, overlay=overlay,
                       agent_port=self.cfg.agent_port, spawned_at=time.time())
 

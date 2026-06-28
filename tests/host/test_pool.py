@@ -440,13 +440,16 @@ def test_9_stop_reaps_all() -> None:
 def test_stop_retains_slot_whose_reap_fails() -> None:
     # stop() must NOT drop a slot whose reap RAISES (e.g. virsh destroy failed → the VM may still be
     # running): popping it would orphan a live worker off the books. Keep it tracked/quarantined so it
-    # surfaces for manual cleanup instead of leaking silently.
+    # surfaces for manual cleanup instead of leaking silently. AND mark it DRAINING so a pool
+    # restart/reuse (or a claim() racing stop()) can never hand the still-undisposed husk back out.
     rt = _ReapFailRuntime()
     pool = WarmPool(runtime=rt, warm_size=1)
     pool._spawn_to_deficit(ready=True)
     sid = next(iter(pool._slots.keys()))
+    pool._slots[sid].state = SlotState.IDLE       # an IDLE slot at stop time...
     pool.stop()
-    assert sid in pool._slots          # NOT popped — quarantined for manual cleanup
+    assert sid in pool._slots                      # NOT popped — quarantined for manual cleanup
+    assert pool._slots[sid].state == SlotState.DRAINING  # ...is now unclaimable (claim() picks IDLE)
 
 
 # ---------------------------------------------------------------------------

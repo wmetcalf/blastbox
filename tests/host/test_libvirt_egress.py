@@ -156,6 +156,24 @@ def test_from_personality_defaults_off():
     assert pol.egress_ports is None and pol.block_internal is False
 
 
+def test_from_personality_fails_closed_on_invalid_ports():
+    # a provided-but-all-invalid egress_ports (typo) must NOT collapse to None (= unrestricted egress
+    # for direct/VPN); it becomes an EMPTY allowlist (deny-all + trailing DROP), failing closed.
+    p = Personality(name="w", exit_driver="direct", config={"egress_ports": "70000 nope"})
+    pol = VmEgressPolicy.from_personality(p)
+    assert pol.egress_ports == ()        # deny-all, NOT None
+    # and the FORWARD filter for direct then emits a trailing DROP instead of a bare ACCEPT-all
+    flat = _flat(forward_chain_rules("192.168.122.7", pol, gateway="192.168.122.1"))
+    assert any(f.endswith("-j DROP") for f in flat)
+    assert not any(f == "-A BBVM_192_168_122_7 -j ACCEPT" for f in flat)
+
+
+def test_from_personality_blank_ports_stays_unrestricted():
+    # an omitted / whitespace-only value is "no allowlist" (None), distinct from a typo — unchanged.
+    p = Personality(name="w", exit_driver="direct", config={"egress_ports": "   "})
+    assert VmEgressPolicy.from_personality(p).egress_ports is None
+
+
 # --- exit routing (rooter model: policy-route / REDIRECT / DNAT) -------------------
 from blastbox.host.runtime.libvirt_egress import (  # noqa: E402
     routing_commands,
@@ -472,6 +490,39 @@ def test_flush_conntrack_tolerates_missing_binary(monkeypatch):
 
     monkeypatch.setattr(eg, "_priv", boom)
     eg._flush_conntrack("192.168.122.5")   # conntrack(8) absent → best-effort, must not raise
+
+
+def test_run_tolerates_missing_binary(monkeypatch):
+    # _run must turn a missing binary (e.g. ip6tables on an IPv4-only host) into a nonzero result, not
+    # an uncaught FileNotFoundError — else remove()'s v6 deletes (issued BEFORE the IPv4 cleanup) would
+    # abort teardown and leak the IPv4 rules.
+    import blastbox.host.runtime.libvirt_egress as eg_mod
+
+    def no_binary(args, **k):
+        raise FileNotFoundError(2, "No such file or directory", args[0])
+
+    monkeypatch.setattr(eg_mod.subprocess, "run", no_binary)
+    cp = eg_mod._run(["ip6tables", "-D", "FORWARD", "-j", "DROP"])
+    assert cp.returncode == 127        # nonzero → check=False deletes no-op, teardown continues
+
+
+def test_remove_continues_to_ipv4_cleanup_when_ip6tables_absent(monkeypatch):
+    # End-to-end through the REAL _run: with ip6tables absent, remove() must still issue the IPv4
+    # anti-spoof/chain deletes (the v6 deletes are emitted first and must not abort teardown).
+    import blastbox.host.runtime.libvirt_egress as eg_mod
+    eg = LibvirtEgress(sudo=False)               # no sudo prefix → args[0] is the binary
+    seen: list[list[str]] = []
+
+    def fake_subprocess_run(args, **k):
+        seen.append(args)
+        if args and args[0] == "ip6tables":
+            raise FileNotFoundError(2, "No such file or directory", "ip6tables")
+        return subprocess.CompletedProcess(args, 1, "", "")   # IPv4 deletes: "not found" no-op
+
+    monkeypatch.setattr(eg_mod.subprocess, "run", fake_subprocess_run)
+    eg.remove("192.168.122.8", mac="52:54:00:aa:bb:cc")       # must NOT raise
+    assert any(a[0] == "ip6tables" for a in seen)             # v6 delete was attempted (and tolerated)
+    assert any(a[0] == "iptables" and "-D" in a for a in seen)  # IPv4 cleanup STILL ran afterwards
 
 
 def test_forward_inetsim_block_internal_exempts_sink():
