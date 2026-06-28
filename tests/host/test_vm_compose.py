@@ -5,7 +5,86 @@ import pytest
 
 from blastbox.host.pool import SlotRuntime
 from blastbox.host.runtime.libvirt_vm import LibvirtVmRuntime
-from blastbox.host.runtime.vm_compose import VmImageSpec, VmWorkerSpec, _ports, _run_provisioner
+from blastbox.host.runtime.vm_compose import (
+    VmImageSpec,
+    VmWorkerSpec,
+    _ports,
+    _run_provisioner,
+    slot_bound_validate,
+)
+
+
+class _FakeSlot:
+    def __init__(self, sid: str = "slot-abcdef12") -> None:
+        self.slot_id = sid
+
+
+class _FakePool:
+    """Minimal WarmPool double: records claim/release calls + the dirty flag."""
+
+    def __init__(self, slot=None) -> None:
+        self._slot = slot if slot is not None else _FakeSlot()
+        self.claimed = 0
+        self.released: list[bool] = []   # dirty flag per release
+
+    def claim(self, *, timeout_s):
+        self.claimed += 1
+        return self._slot
+
+    def release(self, slot, *, dirty=False):
+        self.released.append(dirty)
+
+
+def test_slot_bound_validate_clean_run_releases_clean():
+    pool = _FakePool()
+    v = slot_bound_validate(pool, lambda slot, p: ({"k": 1}, True))
+    summary, ok = v("/in")
+    assert (summary, ok) == ({"k": 1}, True)
+    assert pool.claimed == 1 and pool.released == [False]   # clean → reuse (not dirty)
+
+
+def test_slot_bound_validate_ok_false_releases_dirty():
+    pool = _FakePool()
+    v = slot_bound_validate(pool, lambda slot, p: ({}, False))
+    assert v("/in") == ({}, False)
+    assert pool.released == [True]                          # ok=False → force-recycle
+
+
+def test_slot_bound_validate_run_raises_releases_dirty():
+    pool = _FakePool()
+
+    def boom(slot, p):
+        raise RuntimeError("agent died")
+
+    v = slot_bound_validate(pool, boom)
+    with pytest.raises(RuntimeError, match="agent died"):
+        v("/in")
+    assert pool.released == [True]                          # raised → force-recycle, slot returned
+
+
+def test_slot_bound_validate_hung_run_reclaims_slot():
+    import threading
+    pool = _FakePool()
+    gate = threading.Event()
+
+    def hang(slot, p):
+        gate.wait(timeout=10)        # blocks past the tiny work_timeout below
+        return ({}, True)
+
+    v = slot_bound_validate(pool, hang, work_timeout_s=0.2)
+    with pytest.raises(TimeoutError, match="exceeded"):
+        v("/in")
+    assert pool.released == [True]                          # hung → slot reclaimed DIRTY, not leaked
+    gate.set()                                              # let the abandoned daemon thread finish
+
+
+def test_slot_bound_validate_no_slot_raises():
+    pool = _FakePool(slot=None)
+    pool._slot = None                                       # claim returns None
+    v = slot_bound_validate(pool, lambda slot, p: ({}, True), claim_timeout_s=0.1)
+    with pytest.raises(RuntimeError, match="no warm VM slot"):
+        v("/in")
+    assert pool.released == []                              # nothing claimed → nothing to release
 
 
 def test_build_image_qemu_removes_partial_first_build(monkeypatch, tmp_path):

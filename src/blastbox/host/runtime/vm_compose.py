@@ -25,14 +25,19 @@ provisioner scripts stay with the engine (e.g. the win-validator golden).
 """
 from __future__ import annotations
 
+import logging
 import subprocess
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from blastbox.host.netwire import parse_egress_ports
-from blastbox.host.pool import WarmPool
+from blastbox.host.pool import Slot, WarmPool
 from blastbox.host.runtime.libvirt_egress import ExitRouting, VmEgressPolicy
 from blastbox.host.runtime.libvirt_vm import LibvirtVmConfig, LibvirtVmRuntime
+
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +294,64 @@ def load_compose(path: str) -> dict[str, VmWorkerSpec]:
     import yaml  # type: ignore[import-untyped]  # lazy: only needed when loading a file
     doc = yaml.safe_load(Path(path).read_text()) or {}
     return {name: VmWorkerSpec.from_dict(name, d) for name, d in (doc.get("workers") or {}).items()}
+
+
+def slot_bound_validate(
+    pool: WarmPool,
+    run: Callable[[Slot, Path], tuple[dict | None, bool]],
+    *,
+    claim_timeout_s: float = 30.0,
+    work_timeout_s: float = 1500.0,
+) -> Callable[[Path], tuple[dict | None, bool]]:
+    """Wrap an engine's per-slot work into a :class:`VmJobDispatcher` ``validate`` callable that
+    ALWAYS returns its warm VM slot — the fix for a hung/failed validate leaking pool capacity.
+
+    ``run(slot, in_path)`` is the engine's "talk to the claimed warm VM and decide (summary, ok)".
+    The wrapper:
+
+    * claims a slot (up to ``claim_timeout_s``; raises if none is free),
+    * runs ``run`` in a bounded daemon thread (``work_timeout_s``) so a hung VM agent can't pin the
+      slot forever — set ``work_timeout_s`` BELOW the dispatcher's ``validate_timeout_s`` so this
+      reclaim fires first (Python can't kill the abandoned thread, but the slot is freed),
+    * releases the slot in a ``finally`` on EVERY exit — ``dirty=True`` unless ``run`` returned
+      ``ok=True`` cleanly — so a hung, errored, or contaminated worker is force-recycled (snapshot
+      reverted), not handed to the next job.
+
+    Returns ``(summary, ok)`` like any ``validate``; re-raises ``run``'s exception (and ``TimeoutError``
+    on a work-timeout) so the dispatcher records the job ``FAILED``."""
+    def _validate(in_path: Path) -> tuple[dict | None, bool]:
+        slot = pool.claim(timeout_s=claim_timeout_s)
+        if slot is None:
+            raise RuntimeError(f"no warm VM slot available within {claim_timeout_s}s")
+        result: dict[str, object] = {}
+
+        def _work() -> None:
+            try:
+                result["v"] = run(slot, in_path)
+            except BaseException as exc:  # noqa: BLE001 — surfaced to the caller after the join
+                result["e"] = exc
+
+        t = threading.Thread(target=_work, name=f"vm-slot-work-{slot.slot_id[:8]}", daemon=True)
+        t.start()
+        t.join(timeout=work_timeout_s)
+        try:
+            if t.is_alive():
+                raise TimeoutError(f"VM work exceeded {work_timeout_s}s — reclaiming slot "
+                                   f"{slot.slot_id} (hung VM agent?)")
+            if "e" in result:
+                raise result["e"]  # type: ignore[misc]
+            return result["v"]  # type: ignore[return-value]
+        finally:
+            # Release on EVERY path. dirty=True unless run() returned ok=True: a hung (still-alive
+            # thread), errored, or ok=False run leaves the worker possibly contaminated, so force a
+            # recycle rather than reuse it. A clean ok=True run reuses per the pool's recycle policy.
+            v = result.get("v")
+            clean = bool(isinstance(v, tuple) and len(v) == 2 and v[1])
+            try:
+                pool.release(slot, dirty=not clean)
+            except Exception:  # noqa: BLE001 — release must never mask the validate result/exception
+                _log.exception("slot_bound_validate: release failed for slot %s", slot.slot_id)
+    return _validate
 
 
 def _truthy(v: object) -> bool:
