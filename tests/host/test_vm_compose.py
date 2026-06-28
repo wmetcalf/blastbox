@@ -101,6 +101,15 @@ def test_from_dict_rejects_malformed_block_internal():
                                      "egress": {"exit": "direct", "block_internal": "treu"}})
 
 
+def test_from_dict_accepts_all_exit_routing_fields():
+    # the unknown-key allowlist is DERIVED from ExitRouting's fields, so every valid routing knob
+    # (incl. rule_priority_base, previously omitted) parses and threads through.
+    spec = VmWorkerSpec.from_dict("w", {"image": "/g.qcow2", "egress": {
+        "exit": "openvpn", "rule_priority_base": 5000, "vpn_table": "vpn", "vpn_tun": "tun7"}})
+    assert spec.routing.rule_priority_base == 5000
+    assert spec.routing.vpn_table == "vpn" and spec.routing.vpn_tun == "tun7"
+
+
 @pytest.mark.parametrize("badkey", ["exitt", "block_internl", "egress_port", "fakenet_address"])
 def test_from_dict_rejects_unknown_egress_key(badkey):
     # a misspelled egress key must be REJECTED, not silently ignored → defaulting to direct/unblocked.

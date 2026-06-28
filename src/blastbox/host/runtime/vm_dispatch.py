@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -89,6 +90,14 @@ class VmJobDispatcher:
         # applied by the cold path when a job carries no per-job override. The EFFECTIVE policy is the
         # per-job override if present, else this default — _process compares the effective policy
         # against the pool's fixed egress so an engine-default mismatch is caught too, not just overrides.
+        # DERIVE it from the same env var the cold path reads when not passed explicitly, so the guard
+        # isn't silently skipped just because a caller didn't thread it: a routed engine default
+        # (e.g. =tor) on a pool fixed to something else is then still rejected. Unset env → None
+        # (engine default "none"/direct → no routed mismatch to catch), which is the benign case.
+        if engine_net_policy is None and engine:
+            env_name = engine.upper().replace("-", "_")
+            raw = os.environ.get(f"BLASTBOX_ENGINE_{env_name}_NETPOLICY")
+            engine_net_policy = raw.strip().lower() if raw and raw.strip() else None
         self._engine_net_policy = engine_net_policy
         self._max_summary_bytes = max(1024, int(max_summary_bytes))
         self._retention = JobRetentionSweeper(self._job_root)
@@ -222,6 +231,12 @@ class VmJobDispatcher:
         # resolves+applies that default, so a VM pool fixed to a DIFFERENT policy would otherwise
         # detonate under the wrong egress while the record implies another. Reject the mismatch.
         effective_policy = job.net_policy or self._engine_net_policy
+        # "none" (the canonical default: BLASTBOX_NETPOLICY_NONE = exit=direct) is not a routed policy
+        # to enforce — any pool's baseline can serve it, and the only risky direction is a CONTAINED
+        # policy (tor/fakenet/vpn) being requested but NOT applied (a leak), which a non-"none"
+        # effective still catches. Treat it like no policy so we don't reject benign over-containment.
+        if effective_policy in ("none", ""):
+            effective_policy = None
         if effective_policy and effective_policy != self._fixed_net_policy:
             kind = "override" if job.net_policy else "engine-default"
             finished = time.time()

@@ -119,11 +119,10 @@ class VmWorkerSpec:
             # `block_internl: true`) would otherwise be ignored and the VM provisioned with the
             # default exit_driver="direct" / block_internal=False — clearnet or unblocked internal
             # egress instead of the intended policy. Fail closed like the malformed-value paths.
-            _ALLOWED_EGRESS_KEYS = {
-                "exit", "egress_ports", "block_internal", "gateway_masquerade",
-                "vpn_table", "vpn_tun", "tor_trans_port", "tor_dns_port", "fakenet_addr",
-                "gateway", "leg", "gateway_table_base", "worker_cidr",
-            }
+            # DERIVE the routing keys from ExitRouting's fields so the allowlist + passthrough can
+            # never drift out of sync with the dataclass (e.g. rule_priority_base was missed before).
+            _ROUTING_KEYS = set(ExitRouting.__dataclass_fields__)
+            _ALLOWED_EGRESS_KEYS = {"exit", "egress_ports", "block_internal"} | _ROUTING_KEYS
             unknown = set(eg) - _ALLOWED_EGRESS_KEYS
             if unknown:
                 raise ValueError(f"{name}: unknown egress key(s) {sorted(unknown)} "
@@ -133,10 +132,9 @@ class VmWorkerSpec:
                 egress_ports=_ports(eg.get("egress_ports")),
                 block_internal=_truthy(eg.get("block_internal", False)),
             )
-            routing_kw = {k: eg[k] for k in (
-                "vpn_table", "vpn_tun", "tor_trans_port", "tor_dns_port", "fakenet_addr",
-                "gateway", "leg", "gateway_table_base",
-                "worker_cidr") if k in eg}  # worker_cidr: non-/24 nets need it for the local exemption
+            # gateway_masquerade needs bool coercion (handled below); every other ExitRouting field
+            # passes through as-is (ints/strings land on the dataclass directly).
+            routing_kw = {k: eg[k] for k in _ROUTING_KEYS if k in eg and k != "gateway_masquerade"}
             if "gateway_masquerade" in eg:
                 # Coerce with the SAME boolean parser as block_internal: a quoted YAML scalar like
                 # `gateway_masquerade: "false"` is a non-empty (truthy) string otherwise, so routing

@@ -520,6 +520,16 @@ class LibvirtEgress:
             raise ValueError(
                 f"exit_driver {policy.exit_driver!r} is not supported by the VM rooter "
                 "(no routing path) — refusing to apply a permissive filter")
+        if (policy.exit_driver in ("openvpn", "wireguard") and self._routing is not None
+                and bool(self._routing.gateway) != bool(self._routing.leg)):
+            # Shared-router (next-hop) mode needs BOTH gateway + leg. With exactly one set,
+            # routing_commands silently falls back to LOCAL-TUN mode and the kill-switch scopes to
+            # vpn_tun instead of the router leg — so a missing-leg typo would detonate via the host's
+            # default VPN table/tun0 rather than the intended next-hop router. Fail closed.
+            raise ValueError(
+                f"exit_driver {policy.exit_driver!r} shared-router mode needs BOTH gateway and leg "
+                f"(got gateway={self._routing.gateway!r}, leg={self._routing.leg!r}); refusing to "
+                "silently fall back to local-tun (would egress via the host default VPN/tun)")
         chain = _chain_name(worker_ip)
         # clear any prior incarnation; pass this policy's ports so a prior port-scoped tor's per-port
         # REDIRECTs are swept (deployments are homogeneous).

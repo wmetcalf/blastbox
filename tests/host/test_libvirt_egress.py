@@ -81,6 +81,34 @@ def test_apply_rejects_unsupported_exit_driver():
                      mac="52:54:00:aa:bb:cc")
 
 
+@pytest.mark.parametrize("routing", [
+    ExitRouting(gateway="192.168.50.1"),                 # gateway set, leg missing
+    ExitRouting(leg="br-vpn1"),                           # leg set, gateway missing
+])
+@pytest.mark.parametrize("drv", ["openvpn", "wireguard"])
+def test_apply_fails_closed_on_partial_shared_router_config(routing, drv):
+    # shared-router (next-hop) mode needs BOTH gateway + leg; exactly one set must FAIL closed, not
+    # silently fall back to local-tun (which would egress via the host default VPN/tun0).
+    eg = LibvirtEgress(sudo=False, routing=routing)
+    with pytest.raises(ValueError, match="gateway and leg"):
+        eg.apply("192.168.122.5", VmEgressPolicy(exit_driver=drv), "192.168.122.1",
+                 mac="52:54:00:aa:bb:cc")
+
+
+def test_apply_allows_complete_shared_router_config(monkeypatch):
+    # both gateway + leg set → passes the XOR gate. We make privileged ops FAIL (rc1) so the first
+    # check=True install raises RuntimeError right AFTER the gate (and the -D delete loop in remove()
+    # terminates) — proving the gate let a complete config through (it would otherwise be a ValueError).
+    import blastbox.host.runtime.libvirt_egress as eg_mod
+    fail = type("C", (), {"returncode": 1, "stdout": "", "stderr": "denied"})
+    monkeypatch.setattr(eg_mod, "_run", lambda *a, **k: fail())
+    eg = LibvirtEgress(sudo=False, routing=ExitRouting(gateway="192.168.50.1", leg="br-vpn1"))
+    with pytest.raises(Exception) as ei:
+        eg.apply("192.168.122.5", VmEgressPolicy(exit_driver="openvpn"), "192.168.122.1",
+                 mac="52:54:00:aa:bb:cc")
+    assert "gateway and leg" not in str(ei.value)   # passed the XOR gate; failed later on the rc1 op
+
+
 def test_drop_policy_has_no_dns_exemption():
     # exit=none/drop must not leak even gateway DNS.
     rules = _flat(forward_chain_rules("192.168.122.5", VmEgressPolicy(exit_driver="drop"),

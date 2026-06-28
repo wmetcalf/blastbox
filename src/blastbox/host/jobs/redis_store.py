@@ -240,10 +240,14 @@ class RedisJobStore:
                     if job.status != JobStatus.QUEUED:
                         # Another claimer won the race; retry from the scan.
                         continue
-                    # Re-check the tier predicate inside the WATCH too (target_tier is write-once
-                    # today, so this can't currently change between scan and claim — but keep the
-                    # atomic re-validation symmetric with the SQL/memory backends).
+                    # Re-check the tier AND engine predicates inside the WATCH too: the watched re-read
+                    # must re-validate every predicate the scan advertised, else a job mutated under the
+                    # same key between scan-select and here (e.g. engine reassigned) could be claimed by
+                    # an engine-scoped dispatcher it no longer matches. WATCH aborts the EXEC on any such
+                    # write, but re-checking keeps the guard correct even when the value is re-read here.
                     if job.target_tier is not None and job.target_tier != claimant_tier:
+                        continue
+                    if engines is not None and job.engine not in engines:
                         continue
                     job.status = JobStatus.RUNNING
                     job.started_at = time.time()

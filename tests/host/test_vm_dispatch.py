@@ -417,6 +417,31 @@ def test_per_job_override_takes_precedence_over_engine_default(tmp_path):
     assert store.get(job.job_id).status is JobStatus.DONE     # override (fakenet) honored, not the default
 
 
+def test_engine_net_policy_derived_from_env_when_not_passed(tmp_path, monkeypatch):
+    # if the dispatcher isn't given engine_net_policy, derive it from the same env var the cold path
+    # reads, so a routed engine default isn't silently skipped just because a caller didn't thread it.
+    monkeypatch.setenv("BLASTBOX_ENGINE_AUTHENTICODE_NETPOLICY", "tor")
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)                         # no per-job override
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
+                        engine="authenticode", fixed_net_policy="fakenet")  # engine_net_policy NOT passed
+    d._process(store.claim_next())
+    got = store.get(job.job_id)
+    assert got.status is JobStatus.FAILED and "tor" in (got.error or "")
+
+
+def test_none_engine_default_is_not_enforced(tmp_path, monkeypatch):
+    # "none" (the canonical direct/no-egress default) is benign over-containment, not a leak — don't
+    # reject a no-override job just because the engine default resolves to "none".
+    monkeypatch.setenv("BLASTBOX_ENGINE_AUTHENTICODE_NETPOLICY", "none")
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
+                        engine="authenticode", fixed_net_policy="fakenet")
+    d._process(store.claim_next())
+    assert store.get(job.job_id).status is JobStatus.DONE     # "none" default → no enforcement
+
+
 def test_dispatch_marks_failed_when_validate_raises_baseexception(tmp_path):
     # a validate() that raises a non-Exception BaseException (e.g. a sample-triggered sys.exit) must
     # still FAIL the job, not slip past _process's `except Exception` and leave it RUNNING forever.
