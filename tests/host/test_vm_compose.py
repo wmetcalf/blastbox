@@ -101,6 +101,15 @@ def test_from_dict_rejects_malformed_block_internal():
                                      "egress": {"exit": "direct", "block_internal": "treu"}})
 
 
+@pytest.mark.parametrize("bad", [[], {}, ["x"]])
+def test_from_dict_rejects_non_scalar_block_internal(bad):
+    # a non-scalar YAML value (block_internal: [] / {}) must be REJECTED, not coerced via bool([])
+    # =False — that would SILENTLY DISABLE the RFC1918/internal-destination block.
+    with pytest.raises(ValueError, match="boolean"):
+        VmWorkerSpec.from_dict("w", {"image": "/g.qcow2",
+                                     "egress": {"exit": "direct", "block_internal": bad}})
+
+
 def test_from_dict_rejects_non_mapping_egress():
     # a malformed egress block must NOT silently disable the per-worker firewall (egress=None).
     for bad in ("drop", ["drop"], 5):

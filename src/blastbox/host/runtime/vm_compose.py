@@ -296,7 +296,10 @@ def _truthy(v: object) -> bool:
         if s in ("", "0", "false", "no", "off"):
             return False
         raise ValueError(f"malformed boolean value {v!r} (use true/false)")
-    return bool(v)
+    # Anything non-scalar (a YAML list/dict/null, e.g. a typo `block_internal: []`) must NOT fall
+    # through to Python truthiness — `bool([])` is False, which would SILENTLY DISABLE the security
+    # knob. Reject it, same fail-closed posture as a malformed string.
+    raise ValueError(f"unsupported boolean value {v!r} (use true/false)")
 
 
 def _ports(v: object) -> tuple[int, ...] | None:

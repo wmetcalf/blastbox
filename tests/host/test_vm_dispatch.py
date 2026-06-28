@@ -352,6 +352,37 @@ def test_dispatch_marks_failed_on_raise(tmp_path):
     assert got.error == "RuntimeError"
 
 
+def test_rejects_job_with_unhonored_net_policy(tmp_path):
+    # a warm VM has fixed egress; a per-job net_policy it can't honor must FAIL before detonation,
+    # never run under the pool's (different) policy while the record claims another.
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    job.net_policy = "tor"   # InMemoryJobStore holds the job by reference; claim_next snapshots it
+    detonated = {"ran": False}
+
+    def validate(p):
+        detonated["ran"] = True
+        return ({}, True)
+
+    d = VmJobDispatcher(store, str(tmp_path), validate)        # fixed_net_policy=None → reject any
+    d._process(store.claim_next())
+    got = store.get(job.job_id)
+    assert got.status is JobStatus.FAILED
+    assert "net_policy" in (got.error or "") and "tor" in got.error
+    assert detonated["ran"] is False                          # rejected BEFORE validate
+    assert not (tmp_path / job.job_id / "input" / job.filename).exists()  # input dropped
+
+
+def test_accepts_job_whose_net_policy_matches_fixed(tmp_path):
+    # when the pool IS provisioned for the requested policy, the job runs normally.
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    job.net_policy = "fakenet"
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), fixed_net_policy="fakenet")
+    d._process(store.claim_next())
+    assert store.get(job.job_id).status is JobStatus.DONE
+
+
 def test_dispatch_marks_failed_when_validate_raises_baseexception(tmp_path):
     # a validate() that raises a non-Exception BaseException (e.g. a sample-triggered sys.exit) must
     # still FAIL the job, not slip past _process's `except Exception` and leave it RUNNING forever.

@@ -56,6 +56,7 @@ class VmJobDispatcher:
                  heartbeat_s: float = 30.0, maintenance_interval_s: float = 60.0,
                  orphan_timeout_s: float = 600.0, sole_owner: bool = False,
                  validate_timeout_s: float = 1800.0,
+                 fixed_net_policy: str | None = None,
                  max_summary_bytes: int = _MAX_SUMMARY_BYTES) -> None:
         self._store = store
         self._job_root = Path(job_root)
@@ -79,6 +80,10 @@ class VmJobDispatcher:
         # Bound a hung validate() so a dead VM agent can't occupy a claim thread forever (heartbeat
         # would keep the job looking fresh, so the orphan sweep never recovers it).
         self._validate_timeout_s = max(self._heartbeat_s, float(validate_timeout_s))
+        # The net_policy (egress personality) this pool's VMs are PROVISIONED with, or None. A warm VM
+        # has a FIXED egress applied at spawn; it can't re-steer per job like the cold container path.
+        # A job requesting a different policy is rejected fail-closed in _process (see there).
+        self._fixed_net_policy = fixed_net_policy
         self._max_summary_bytes = max(1024, int(max_summary_bytes))
         self._retention = JobRetentionSweeper(self._job_root)
         self._stop = threading.Event()
@@ -204,6 +209,26 @@ class VmJobDispatcher:
         return False
 
     def _process(self, job: Job) -> None:
+        # Fail closed on a per-job net_policy this warm tier can't honor — BEFORE detonation. The
+        # ingress only sets job.net_policy when BLASTBOX_ALLOW_NETPOLICY_OVERRIDE is on; the cold
+        # container path resolves+applies it per launch, but a warm VM's egress is FIXED at spawn and
+        # can't be re-steered per job. Running the sample under the pool's (different) policy while the
+        # record claims another would silently break the isolation/attribution contract — reject it.
+        if job.net_policy and job.net_policy != self._fixed_net_policy:
+            finished = time.time()
+            if self._store.update_if_status(
+                    job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
+                    status=JobStatus.FAILED, finished_at=finished,
+                    error=f"net_policy {job.net_policy!r} not honored by {self._worker_tier} tier "
+                          f"(fixed egress {self._fixed_net_policy!r})",
+                    expires_at=self._expiry(finished)):
+                try:  # we owned the terminal write → drop the spooled input
+                    self._input_path(job).unlink()
+                except OSError:
+                    pass
+            logger.warning("vm_dispatch: rejecting job %s — net_policy %r not honored by %s (fixed %r)",
+                           job.job_id, job.net_policy, self._worker_tier, self._fixed_net_policy)
+            return
         # Mark the in-flight job as a warm worker BEFORE the (possibly long) validate, so a peer's
         # requeue_orphaned_jobs sweep — which treats a RUNNING job with worker_runtime != "warm" as a
         # dead COLD Docker job and requeues it — doesn't re-detonate it under us. The CAS is also our
