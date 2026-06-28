@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 import time
 from collections.abc import Callable
@@ -111,50 +110,29 @@ class VmJobDispatcher:
             return {"error": "summary_too_large", "summary_bytes": n}
         return summary
 
-    def _stage_metadata(self, job: Job, summary: dict | None) -> str | None:
-        """Write metadata to a confined, claim-specific STAGING file (not yet published). Confined +
-        symlink-safe (atomic_write_confined: random O_EXCL|O_NOFOLLOW temp under a dir fd), so a
-        prior untrusted attempt's planted symlink in output/ can't redirect the host write. Returns
-        the staged file's name, or None on failure.
+    def _ensure_metadata(self, job: Job, summary: dict | None) -> bool:
+        """Write+publish ``<output>/metadata.json`` from the summary, atomically and CONFINED
+        (atomic_write_confined: a random O_EXCL|O_NOFOLLOW temp under the output dir fd, then renameat
+        — a prior untrusted attempt's planted symlink in output/ can't redirect the host write, and a
+        planted metadata.json symlink at the destination is clobbered, not followed). Returns whether
+        it succeeded; the caller writes metadata BEFORE the DONE CAS and FAILs the job if this returns
+        False, so DONE is never observable without the file. (A VM job is never requeued mid-validate
+        — orphan recovery FAILs it and the cold requeue skips worker_runtime="warm" — so there's no
+        concurrent owner whose metadata could race/overwrite this one.)
 
         SECURITY: force ``artifacts: []`` — the ingress treats metadata.json's artifact list as
         host-trust-gate-validated and serves files off it; a VM summary's (guest-influenced) artifact
         list never went through the gate, so it must never make unsealed output downloadable."""
         out = self._job_dir(job) / "output"
-        name = f".metadata.{job.claim_id or 'x'}.staged"
         try:
             out.mkdir(parents=True, exist_ok=True)
             data = json.dumps({**(summary or {}), "artifacts": []}).encode()
-            atomic_write_confined(out, name, data, mode=0o644)
-            return name
+            atomic_write_confined(out, "metadata.json", data, mode=0o644)
+            return True
         except OSError:
-            logger.warning("vm_dispatch: could not stage metadata.json for %s", job.job_id,
+            logger.warning("vm_dispatch: could not write metadata.json for %s", job.job_id,
                            exc_info=True)
-            return None
-
-    def _publish_or_discard_metadata(self, job: Job, staged: str, *, publish: bool) -> None:
-        """Atomically rename the staged metadata into ``metadata.json`` (ONLY when our terminal CAS
-        won — so a stale loser never overwrites the DONE-winner's file), else discard it. The rename
-        is confined (renameat under the output dir fd) and clobbers any planted ``metadata.json``
-        symlink at the destination."""
-        out = self._job_dir(job) / "output"
-        try:
-            dir_fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY)
-        except OSError:
-            return
-        try:
-            if publish:
-                os.replace(staged, "metadata.json", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-            else:
-                try:
-                    os.unlink(staged, dir_fd=dir_fd)
-                except OSError:
-                    pass
-        except OSError:
-            logger.warning("vm_dispatch: could not %s metadata for %s",
-                           "publish" if publish else "discard", job.job_id, exc_info=True)
-        finally:
-            os.close(dir_fd)
+            return False
 
     def _validate_with_heartbeat(self, job: Job, in_path: Path) -> tuple[dict | None, bool]:
         """Run ``validate()`` while a daemon thread refreshes the job's ``started_at`` every
@@ -226,21 +204,20 @@ class VmJobDispatcher:
                 raise FileNotFoundError(f"spooled input missing: {in_path}")
             summary, ok = self._validate_with_heartbeat(job, in_path)
             summary = self._bounded_summary(summary)   # cap untrusted summary before store/metadata
-            # STAGE metadata.json (confined) before the CAS so its bytes are ready, then PUBLISH it
-            # only if WE win the terminal CAS — satisfies both "DONE must imply metadata exists" (the
-            # publish is a single renameat right after the winning CAS) and "only the winning claim's
-            # metadata is served" (a stale loser discards its staged file, never overwriting the
-            # winner's). A loser's CAS fails below and we discard.
-            staged = self._stage_metadata(job, summary) if ok else None
+            err: str | None = None
+            # Publish metadata.json BEFORE the DONE CAS so DONE never implies a 404 on /metadata,
+            # /artifacts, /result. If the write fails, FAIL the job (recoverable) rather than mark it
+            # DONE-without-metadata.
+            if ok and not self._ensure_metadata(job, summary):
+                ok, err = False, "metadata_write_failed"
             finished = time.time()
             # CAS on (status, claim_id) so a stale owner can't clobber a job that was reclaimed
             # (RUNNING->QUEUED->RUNNING under another dispatcher). The return value is OUR ownership.
             owned = self._store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                 status=JobStatus.DONE if ok else JobStatus.FAILED,
-                finished_at=finished, result_summary=summary, expires_at=self._expiry(finished))
-            if staged is not None:
-                self._publish_or_discard_metadata(job, staged, publish=owned)
+                finished_at=finished, result_summary=summary, error=err,
+                expires_at=self._expiry(finished))
         except Exception as exc:  # noqa: BLE001 — one bad job must not sink the dispatcher
             logger.warning("vm_dispatch: job %s failed: %s", job.job_id, exc, exc_info=True)
             finished = time.time()

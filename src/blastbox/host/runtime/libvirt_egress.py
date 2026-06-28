@@ -305,6 +305,11 @@ def forward_chain_rules(worker_ip: str, policy: VmEgressPolicy, gateway: str | N
     # packets fall back to the host's default route — they hit the catch-all DROP instead of leaking
     # out the host's WAN with the worker's traffic. ``direct`` has no egress_if (egress via host is
     # the intent), so it ACCEPTs unscoped.
+    # inetsim sinks ALL ports to FakeNet by design (the DNAT rewrote dest → sink_addr), so exempt the
+    # sink from the port allowlist — else non-web malware ports never reach it. (Belt-and-suspenders
+    # with the block_internal sink exemption above, which only fires when block_internal is set.)
+    if sink_addr:
+        r.append(["-A", c, "-d", sink_addr, "-j", "ACCEPT"])
     if policy.egress_ports is not None:  # oif computed at the top of this function
         if 53 in policy.egress_ports:
             r.append(["-A", c, "-p", "udp", "--dport", "53", *oif, "-j", "ACCEPT"])
@@ -592,6 +597,7 @@ class LibvirtEgress:
         # Sweep any spoof DROPs left by a PRIOR mac on this IP (reuse after crash/partial cleanup) —
         # the per-mac deletes above only cover the current mac. Runs even when mac is None.
         self._sweep_spoof_drops(worker_ip)
+        self._flush_conntrack(worker_ip)
         chain = _chain_name(worker_ip)
         while self._ipt_run("-D", "FORWARD", "-s", worker_ip, "-j", chain).returncode == 0:
             pass
@@ -653,6 +659,17 @@ class LibvirtEgress:
             return
         for argv in _ip_rule_deletes(worker_ip, cp.stdout):
             self._priv(argv)
+
+    def _flush_conntrack(self, worker_ip: str) -> None:
+        """Drop conntrack state for this IP (both directions). The per-worker chain ACCEPTs
+        ESTABLISHED,RELATED first, so a NEW VM reusing this DHCP IP + the same UDP 5-tuple could be
+        classified ESTABLISHED off the PRIOR VM's lingering conntrack and bypass the new policy until
+        it expires. Best-effort — conntrack(8) is optional; tolerate it being absent."""
+        for direction in ("-s", "-d"):
+            try:
+                self._priv(["conntrack", "-D", direction, worker_ip])
+            except OSError:  # conntrack binary not installed — nothing to flush by this tool
+                return
 
     def _sweep_spoof_drops(self, worker_ip: str) -> None:
         """Delete EVERY live MAC-matched spoof DROP referencing this worker IP on FORWARD + INPUT,

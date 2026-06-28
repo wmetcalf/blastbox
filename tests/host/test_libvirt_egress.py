@@ -443,6 +443,37 @@ def test_spoof_drop_deletes_sweep_all_macs():
     assert all("192.168.122.5/32" in " ".join(d) for d in dels)
 
 
+def test_forward_inetsim_sink_exempt_from_port_allowlist():
+    # inetsim sinks ALL ports to FakeNet — the sink dest must be ACCEPTed regardless of egress_ports,
+    # else non-web malware ports (DNATed to the sink) hit the allowlist DROP and never reach FakeNet.
+    pol = VmEgressPolicy(exit_driver="inetsim", egress_ports=(80, 443))
+    flat = _flat(forward_chain_rules("192.168.122.5", pol, gateway="192.168.122.1",
+                                     sink_addr="172.28.100.1"))
+    assert any("-d 172.28.100.1 -j ACCEPT" in f for f in flat)
+    sink_i = next(i for i, f in enumerate(flat) if "-d 172.28.100.1 -j ACCEPT" in f)
+    assert sink_i < len(flat) - 1 and flat[-1].endswith("-j DROP")   # before the catch-all drop
+
+
+def test_flush_conntrack_both_directions(monkeypatch):
+    eg = LibvirtEgress(sudo=False)
+    calls = []
+    monkeypatch.setattr(eg, "_priv",
+                        lambda argv, **k: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""))
+    eg._flush_conntrack("192.168.122.5")
+    assert ["conntrack", "-D", "-s", "192.168.122.5"] in calls
+    assert ["conntrack", "-D", "-d", "192.168.122.5"] in calls
+
+
+def test_flush_conntrack_tolerates_missing_binary(monkeypatch):
+    eg = LibvirtEgress(sudo=False)
+
+    def boom(argv, **k):
+        raise FileNotFoundError("conntrack")
+
+    monkeypatch.setattr(eg, "_priv", boom)
+    eg._flush_conntrack("192.168.122.5")   # conntrack(8) absent → best-effort, must not raise
+
+
 def test_forward_inetsim_block_internal_exempts_sink():
     # inetsim DNATs everything to the RFC1918 FakeNet sink; without the exemption block_internal would
     # DROP the very traffic it's meant to sink. The sink ACCEPT must precede the internal DROPs.

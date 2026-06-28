@@ -181,6 +181,21 @@ def test_rotate_rolls_back_split_promotion(tmp_path):
     assert any(f"mv {shm}.rollback {shm}" in c for c in flat)      # mirror restored too
 
 
+def test_rotate_raises_on_failed_readability_chmod(tmp_path):
+    # a failed final chmod (golden stuck 0600, qemu can't read it) is a FAILED rotation, not success.
+    live = tmp_path / "g.qcow2"
+    live.write_text("cur")
+
+    class _R:
+        def __call__(self, argv, **k):
+            rc = 1 if (argv[:1] == ["chmod"] and "644" in argv) else 0
+            return type("C", (), {"returncode": rc, "stdout": "", "stderr": "denied"})()
+
+    with pytest.raises(RuntimeError, match="chmod golden readable"):
+        golden.rotate(str(tmp_path / "cand.qcow2"), live_disk=str(live), backup_dir=str(tmp_path / "b"),
+                      ts="T", sudo=False, runner=_R())
+
+
 def test_rotate_rolls_back_when_a_later_stash_fails(tmp_path):
     # if stashing the SHM mirror fails AFTER the live disk was already moved to .rollback, the disk
     # must be restored (not left missing at .rollback).

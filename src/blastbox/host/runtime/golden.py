@@ -121,7 +121,9 @@ def rotate(candidate: str, *, live_disk: str, backup_dir: str, keep_n: int = 5,
         raise
     for dest in stashed:  # success — drop the stashes
         runner([*pfx, "rm", "-f", dest + ".rollback"], capture_output=True, text=True)
-    runner([*pfx, "chmod", "644", live_disk, *([live_shm] if live_shm else [])], capture_output=True, text=True)
+    # CHECK the readability chmod: if the candidate kept a restrictive mode (e.g. 0600), a failed
+    # chmod leaves a golden qemu can't read for overlay/boot — that's a failed rotation, not a success.
+    _checked(["chmod", "644", live_disk, *([live_shm] if live_shm else [])], "chmod golden readable")
     prune_backups(backup_dir, keep_n, sudo=sudo, runner=runner)
 
 

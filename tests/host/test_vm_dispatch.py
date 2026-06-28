@@ -92,24 +92,16 @@ def test_dispatch_times_out_a_hung_validate(tmp_path):
     assert got.status is JobStatus.FAILED and got.error == "TimeoutError"   # claim thread freed
 
 
-def test_stage_publish_discard_metadata(tmp_path):
-    import json
+def test_dispatch_fails_job_when_metadata_unwritable(tmp_path):
+    # metadata is a precondition for DONE: if it can't be written, the job FAILs (never DONE with a
+    # 404'ing /metadata).
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
-    claimed = store.claim_next()                      # gives job a claim_id for the staged name
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True))
-    out = tmp_path / job.job_id / "output"
-    # stage: written to a confined staging file, NOT published
-    staged = d._stage_metadata(claimed, {"v": 1, "artifacts": [{"id": "x"}]})
-    assert (out / staged).exists() and not (out / "metadata.json").exists()
-    # discard (lost claim): staged removed, nothing published
-    d._publish_or_discard_metadata(claimed, staged, publish=False)
-    assert not (out / staged).exists() and not (out / "metadata.json").exists()
-    # publish (won claim): atomic rename into metadata.json, artifacts neutered
-    s2 = d._stage_metadata(claimed, {"v": 2, "artifacts": [{"id": "y"}]})
-    d._publish_or_discard_metadata(claimed, s2, publish=True)
-    meta = json.loads((out / "metadata.json").read_text())
-    assert meta["v"] == 2 and meta["artifacts"] == []
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"v": 1}, True))
+    d._ensure_metadata = lambda *a, **k: False   # simulate a write failure  # type: ignore[method-assign]
+    d._process(store.claim_next())
+    got = store.get(job.job_id)
+    assert got.status is JobStatus.FAILED and got.error == "metadata_write_failed"
 
 
 def test_dispatch_does_not_write_metadata_on_failure(tmp_path):
