@@ -108,8 +108,12 @@ def rotate(candidate: str, *, live_disk: str, backup_dir: str, keep_n: int = 5,
                 stashed.append(dest)
         for dest in dests:
             _checked(["mv", dest + ".new", dest], "promote")
+        # The readability chmod is INSIDE the try (the stashes are still intact): if the candidate
+        # kept a restrictive mode (e.g. 0600), a failed chmod leaves a golden qemu can't read — that's
+        # a failed rotation, and the rollback below must restore the previous golden.
+        _checked(["chmod", "644", live_disk, *([live_shm] if live_shm else [])], "chmod golden readable")
     except Exception:
-        logger.error("golden rotate: promote failed — rolling back to the previous consistent pair")
+        logger.error("golden rotate: promote/chmod failed — rolling back to the previous consistent pair")
         for dest in dests:
             runner([*pfx, "rm", "-f", dest + ".new"], capture_output=True, text=True)  # drop partial new
             # Always clear any already-promoted new file at dest, THEN restore the stash if there was
@@ -119,11 +123,8 @@ def rotate(candidate: str, *, live_disk: str, backup_dir: str, keep_n: int = 5,
             if dest in stashed:                                                          # restore old
                 runner([*pfx, "mv", dest + ".rollback", dest], capture_output=True, text=True)
         raise
-    for dest in stashed:  # success — drop the stashes
+    for dest in stashed:  # success (incl. chmod) — drop the stashes
         runner([*pfx, "rm", "-f", dest + ".rollback"], capture_output=True, text=True)
-    # CHECK the readability chmod: if the candidate kept a restrictive mode (e.g. 0600), a failed
-    # chmod leaves a golden qemu can't read for overlay/boot — that's a failed rotation, not a success.
-    _checked(["chmod", "644", live_disk, *([live_shm] if live_shm else [])], "chmod golden readable")
     prune_backups(backup_dir, keep_n, sudo=sudo, runner=runner)
 
 

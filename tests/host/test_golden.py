@@ -182,18 +182,25 @@ def test_rotate_rolls_back_split_promotion(tmp_path):
 
 
 def test_rotate_raises_on_failed_readability_chmod(tmp_path):
-    # a failed final chmod (golden stuck 0600, qemu can't read it) is a FAILED rotation, not success.
+    # a failed chmod (golden stuck 0600, qemu can't read it) is a FAILED rotation, not success — AND
+    # because the chmod now runs INSIDE the try (before the stashes are dropped), the failure must
+    # ALSO roll back: the previous golden is restored from its .rollback stash, not left chmod-failed.
     live = tmp_path / "g.qcow2"
     live.write_text("cur")
 
+    cmds: list[str] = []
+
     class _R:
         def __call__(self, argv, **k):
+            cmds.append(" ".join(argv))
             rc = 1 if (argv[:1] == ["chmod"] and "644" in argv) else 0
             return type("C", (), {"returncode": rc, "stdout": "", "stderr": "denied"})()
 
     with pytest.raises(RuntimeError, match="chmod golden readable"):
         golden.rotate(str(tmp_path / "cand.qcow2"), live_disk=str(live), backup_dir=str(tmp_path / "b"),
                       ts="T", sudo=False, runner=_R())
+    # rollback restored the previous golden from its stash (not left at .rollback / chmod-failed)
+    assert any(c == f"mv {live}.rollback {live}" for c in cmds)
 
 
 def test_rotate_rolls_back_when_a_later_stash_fails(tmp_path):

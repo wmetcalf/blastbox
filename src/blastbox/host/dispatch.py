@@ -745,6 +745,9 @@ class Dispatcher:
         materialize_fn = getattr(runtime, "materialize_warm_output", None)
 
         slot_input_copy: Path | None = None
+        warm_clean = False  # set True ONLY on the clean DONE path; every _fail_job/timeout/error path
+        #                     leaves it False so the slot is released DIRTY (force-recycled, never
+        #                     returned to IDLE with a wedged/contaminated worker for the next job).
         try:
             # ------------------------------------------------------------------
             # Step 1: Engine lookup (security: engine spec is operator-configured)
@@ -967,6 +970,7 @@ class Dispatcher:
             else:
                 # DONE applied + still ours: index per-page perceptual hashes for /similar.
                 self._index_page_hashes(job.job_id, envelope)
+                warm_clean = True   # clean run → the warm slot is safe to reuse without a forced reset
 
         finally:
             # Security: release the slot on EVERY terminal path (success, trust-fail,
@@ -978,7 +982,8 @@ class Dispatcher:
                     slot_input_copy.unlink(missing_ok=True)
                 except OSError:
                     pass
-            self._pool.release(slot)  # type: ignore[union-attr]  # pool is non-None here
+            # dirty=not warm_clean → a failed run force-recycles the slot before reuse.
+            self._pool.release(slot, dirty=not warm_clean)  # type: ignore[union-attr]  # non-None here
 
     def _dispatch_inner(
         self, job: Job, input_path: Path, output_dir: Path

@@ -136,6 +136,48 @@ def test_heartbeat_refreshes_started_at_during_validate(tmp_path):
     assert got.started_at > t0                # started_at was refreshed past claim time
 
 
+def test_heartbeat_survives_transient_store_error(tmp_path):
+    # a transient store error in the heartbeat must NOT kill the heartbeat thread: if started_at
+    # stopped refreshing, the orphan sweep would FAIL this still-running job and delete its input.
+    # The pump swallows+logs the error and keeps beating; the job still completes.
+    import time as _t
+
+    class _FlakyHeartbeatStore(InMemoryJobStore):
+        heartbeat_raises = 0
+
+        def update_if_status(self, job_id, expect_status, *, expect_claim_id=None, **fields):
+            # The heartbeat is the ONLY caller that refreshes started_at with no status change; the
+            # terminal CAS sets status= and the warm-mark sets worker_runtime/worker_tier.
+            if "started_at" in fields and "status" not in fields and self.heartbeat_raises > 0:
+                self.heartbeat_raises -= 1
+                raise RuntimeError("transient store blip")
+            return super().update_if_status(job_id, expect_status,
+                                            expect_claim_id=expect_claim_id, **fields)
+
+    store = _FlakyHeartbeatStore()
+    store.heartbeat_raises = 2          # first two heartbeats blow up, then recover
+    job = _queue_job(store, tmp_path)
+    claimed = store.claim_next()
+    t0 = store.get(job.job_id).started_at
+
+    def slow_validate(p):
+        # the heartbeat interval floors at 1s; 2 injected failures push the first SURVIVING beat to
+        # ~3s, so give it generous headroom (this asserts recovery, not latency).
+        deadline = _t.time() + 8.0
+        while _t.time() < deadline:     # wait until a heartbeat survives the blips and bumps started_at
+            if (store.get(job.job_id).started_at or 0) > t0:
+                return ({}, True)
+            _t.sleep(0.02)
+        return ({}, False)
+
+    d = VmJobDispatcher(store, str(tmp_path), slow_validate, heartbeat_s=0.05)
+    d._process(claimed)
+    got = store.get(job.job_id)
+    assert got.status is JobStatus.DONE        # heartbeat recovered + job completed despite the blips
+    assert got.started_at > t0                 # started_at was still refreshed (sweep won't orphan it)
+    assert store.heartbeat_raises == 0         # both injected errors were actually exercised
+
+
 def test_dispatch_sets_retention_expiry(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)

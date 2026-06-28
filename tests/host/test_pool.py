@@ -437,6 +437,18 @@ def test_9_stop_reaps_all() -> None:
     )
 
 
+def test_stop_retains_slot_whose_reap_fails() -> None:
+    # stop() must NOT drop a slot whose reap RAISES (e.g. virsh destroy failed → the VM may still be
+    # running): popping it would orphan a live worker off the books. Keep it tracked/quarantined so it
+    # surfaces for manual cleanup instead of leaking silently.
+    rt = _ReapFailRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1)
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots.keys()))
+    pool.stop()
+    assert sid in pool._slots          # NOT popped — quarantined for manual cleanup
+
+
 # ---------------------------------------------------------------------------
 # Test 10: burst scaling — effective_target rises to warm_size + burst_size
 #          after sustained misses for burst_trigger_s; drains after burst_drain_s
@@ -851,5 +863,31 @@ def test_recycle_failure_falls_back_to_reap() -> None:
     _warm_one(pool)
     s1 = pool.claim(timeout_s=1.0)
     pool.release(s1)  # recycle raises → must reap, never return a broken slot to IDLE
+    assert rt.reaped == [s1.slot_id]
+    pool.stop()
+
+
+def test_dirty_release_force_recycles_off_cadence() -> None:
+    # A failed run (dirty=True) must reset the slot BEFORE reuse even on a non-boundary job, so the
+    # next job never inherits a wedged/contaminated warm worker.
+    rt = _RecycleRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=10)
+    _warm_one(pool)
+    s1 = pool.claim(timeout_s=1.0)
+    assert s1 is not None
+    pool.release(s1, dirty=True)  # job 1: 1 % 10 != 0 but DIRTY → force recycle, then back to IDLE
+    assert rt.recycled == [s1.slot_id] and rt.reaped == []
+    s2 = pool.claim(timeout_s=1.0)
+    assert s2 is not None and s2.slot_id == s1.slot_id  # reset-in-place, same slot reused
+    pool.stop()
+
+
+def test_dirty_release_reaps_when_no_recycle_method() -> None:
+    # Non-reuse runtime: a dirty release is reaped (a full reset) exactly like a clean one.
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=5)
+    _warm_one(pool)
+    s1 = pool.claim(timeout_s=1.0)
+    pool.release(s1, dirty=True)
     assert rt.reaped == [s1.slot_id]
     pool.stop()

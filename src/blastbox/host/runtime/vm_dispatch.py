@@ -149,8 +149,14 @@ class VmJobDispatcher:
 
         def _pump() -> None:
             while not beat.wait(self._heartbeat_s):
-                self._store.update_if_status(job.job_id, JobStatus.RUNNING,
-                                             expect_claim_id=job.claim_id, started_at=time.time())
+                try:
+                    self._store.update_if_status(job.job_id, JobStatus.RUNNING,
+                                                 expect_claim_id=job.claim_id, started_at=time.time())
+                except Exception:  # noqa: BLE001 — a transient store error must NOT kill the heartbeat:
+                    # if started_at stops refreshing, the orphan sweep would fail this still-running
+                    # job and delete its input. Log and keep beating; the next tick retries.
+                    logger.warning("vm_dispatch: heartbeat store update failed for %s (will retry)",
+                                   job.job_id, exc_info=True)
 
         result: dict[str, object] = {}
 

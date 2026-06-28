@@ -240,16 +240,21 @@ class WarmPool:
             self._thread.join(timeout=10.0)
             self._thread = None
 
-        # Reap every slot regardless of state
+        # Reap every slot regardless of state. Pop each ONLY after a successful reap: if reap RAISES
+        # (e.g. a libvirt VM whose `virsh destroy` failed during a rolling restart), KEEP it tracked —
+        # else the still-running domain (with its overlay + egress rules) is forgotten outside pool
+        # accounting and never retried. Quarantined entries stay in _slots for surfacing/manual cleanup.
         with self._lock:
             to_reap = list(self._slots.values())
-            self._slots.clear()
 
         for slot in to_reap:
             try:
                 self._reap_and_count(slot)
             except Exception:
-                logger.exception("pool.reap_error_on_stop slot_id=%s", slot.slot_id)
+                logger.exception("pool.reap_error_on_stop slot_id=%s — quarantining", slot.slot_id)
+            else:
+                with self._lock:
+                    self._slots.pop(slot.slot_id, None)
 
     # ------------------------------------------------------------------
     # Public interface
@@ -282,7 +287,7 @@ class WarmPool:
             if self._clock() >= deadline:
                 return None
 
-    def release(self, slot: Slot) -> None:
+    def release(self, slot: Slot, *, dirty: bool = False) -> None:
         """Finish a job on ``slot``.
 
         Default (no ``recycle`` on the runtime): ASSIGNED → DRAINING → reap (warm ≠ reuse); the
@@ -290,6 +295,12 @@ class WarmPool:
         slot is reset every ``jobs_per_recycle`` jobs and returned to IDLE, until it reaches
         ``max_jobs_per_slot`` (then reaped+respawned). On any recycle failure or a dead slot it
         falls back to reap, so a broken slot is never returned to IDLE.
+
+        ``dirty=True`` marks the just-finished run as a failure (timeout/trust-fail/engine error/
+        crash). A dirty slot is force-reset BEFORE reuse: it recycles unconditionally (not just on
+        the ``jobs_per_recycle`` boundary) in REUSE mode, so the next job never inherits a wedged or
+        contaminated warm worker. In non-reuse mode the slot is reaped anyway, which is already a
+        full reset.
         """
         with self._lock:
             slot.jobs += 1
@@ -300,7 +311,7 @@ class WarmPool:
             self._max_jobs_per_slot and jobs >= self._max_jobs_per_slot
         ):
             try:
-                if jobs % self._jobs_per_recycle == 0:
+                if dirty or jobs % self._jobs_per_recycle == 0:
                     # Reset in place while the slot stays ASSIGNED. ASSIGNED is counted as active
                     # (state != DRAINING) so _spawn_to_deficit won't spawn a spurious replacement,
                     # AND it is neither claimable (claim() picks IDLE) nor promotable
