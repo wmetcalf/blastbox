@@ -430,16 +430,28 @@ def test_engine_net_policy_derived_from_env_when_not_passed(tmp_path, monkeypatc
     assert got.status is JobStatus.FAILED and "tor" in (got.error or "")
 
 
-def test_none_engine_default_is_not_enforced(tmp_path, monkeypatch):
-    # "none" (the canonical direct/no-egress default) is benign over-containment, not a leak — don't
-    # reject a no-override job just because the engine default resolves to "none".
+def test_none_policy_job_rejected_on_networked_pool(tmp_path, monkeypatch):
+    # "none"/"drop" mean --network=none (NO egress, the fail-closed default). A job whose effective
+    # policy is "none" must NOT run on a pool that HAS network (fakenet/tor/direct) — that's a LEAK,
+    # not benign over-containment. Reject the mismatch.
     monkeypatch.setenv("BLASTBOX_ENGINE_AUTHENTICODE_NETPOLICY", "none")
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
                         engine="authenticode", fixed_net_policy="fakenet")
     d._process(store.claim_next())
-    assert store.get(job.job_id).status is JobStatus.DONE     # "none" default → no enforcement
+    got = store.get(job.job_id)
+    assert got.status is JobStatus.FAILED and "none" in (got.error or "")
+
+
+def test_no_policy_anywhere_runs_on_unconfigured_pool(tmp_path):
+    # the common case: no per-job override, no engine default (env unset), pool egress undeclared.
+    # effective="none" == fixed="none" → run normally (the equality model doesn't break the default).
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), engine="authenticode")
+    d._process(store.claim_next())
+    assert store.get(job.job_id).status is JobStatus.DONE
 
 
 def test_dispatch_marks_failed_when_validate_raises_baseexception(tmp_path):

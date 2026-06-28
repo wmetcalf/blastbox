@@ -86,22 +86,27 @@ class VmJobDispatcher:
         # has a FIXED egress applied at spawn; it can't re-steer per job like the cold container path.
         # A job requesting a different policy is rejected fail-closed in _process (see there).
         self._fixed_net_policy = fixed_net_policy
-        # The engine's DEFAULT net_policy (EngineSpec.net_policy / BLASTBOX_ENGINE_<NAME>_NETPOLICY),
-        # applied by the cold path when a job carries no per-job override. The EFFECTIVE policy is the
-        # per-job override if present, else this default — _process compares the effective policy
-        # against the pool's fixed egress so an engine-default mismatch is caught too, not just overrides.
-        # DERIVE it from the same env var the cold path reads when not passed explicitly, so the guard
-        # isn't silently skipped just because a caller didn't thread it: a routed engine default
-        # (e.g. =tor) on a pool fixed to something else is then still rejected. Unset env → None
-        # (engine default "none"/direct → no routed mismatch to catch), which is the benign case.
-        if engine_net_policy is None and engine:
-            env_name = engine.upper().replace("-", "_")
-            raw = os.environ.get(f"BLASTBOX_ENGINE_{env_name}_NETPOLICY")
-            engine_net_policy = raw.strip().lower() if raw and raw.strip() else None
+        # Explicit per-dispatcher engine-default override. When None (the usual case), the engine
+        # default is derived PER JOB from BLASTBOX_ENGINE_<job.engine>_NETPOLICY in _engine_default_policy
+        # — so an UNSCOPED dispatcher (engine=None, the documented single-engine default) still resolves
+        # each job's engine default instead of silently skipping the check.
         self._engine_net_policy = engine_net_policy
         self._max_summary_bytes = max(1024, int(max_summary_bytes))
         self._retention = JobRetentionSweeper(self._job_root)
         self._stop = threading.Event()
+
+    def _engine_default_policy(self, engine: str | None) -> str:
+        """The engine's DEFAULT net_policy name, mirroring the cold path's ``engine.net_policy``. An
+        explicit ``engine_net_policy`` ctor value wins; otherwise it's derived PER JOB from
+        ``BLASTBOX_ENGINE_<engine>_NETPOLICY`` (so an unscoped dispatcher resolves each job's engine),
+        defaulting to ``"none"`` (the fail-closed no-egress default) — never silently skipped."""
+        if self._engine_net_policy is not None:
+            return self._engine_net_policy
+        name = (engine or "").upper().replace("-", "_")
+        if not name:
+            return "none"
+        raw = os.environ.get(f"BLASTBOX_ENGINE_{name}_NETPOLICY")
+        return raw.strip().lower() if raw and raw.strip() else "none"
 
     def _job_dir(self, job: Job) -> Path:
         # The ingress canonical layout is <job_root>/<id>/{input,output}/ (job.result_dir points at
@@ -226,33 +231,30 @@ class VmJobDispatcher:
     def _process(self, job: Job) -> None:
         # Fail closed on an EFFECTIVE net_policy this warm tier can't honor — BEFORE detonation. A
         # warm VM's egress is FIXED at spawn and can't be re-steered per job like the cold container
-        # path. The effective policy is the per-job override (ingress sets job.net_policy only when
-        # BLASTBOX_ALLOW_NETPOLICY_OVERRIDE is on) if present, ELSE the engine default — the cold path
-        # resolves+applies that default, so a VM pool fixed to a DIFFERENT policy would otherwise
-        # detonate under the wrong egress while the record implies another. Reject the mismatch.
-        effective_policy = job.net_policy or self._engine_net_policy
-        # "none" (the canonical default: BLASTBOX_NETPOLICY_NONE = exit=direct) is not a routed policy
-        # to enforce — any pool's baseline can serve it, and the only risky direction is a CONTAINED
-        # policy (tor/fakenet/vpn) being requested but NOT applied (a leak), which a non-"none"
-        # effective still catches. Treat it like no policy so we don't reject benign over-containment.
-        if effective_policy in ("none", ""):
-            effective_policy = None
-        if effective_policy and effective_policy != self._fixed_net_policy:
+        # path. The effective policy mirrors resolve_net_policy: per-job override (ingress sets
+        # job.net_policy only when BLASTBOX_ALLOW_NETPOLICY_OVERRIDE is on) → engine default → "none".
+        # It is compared for EQUALITY against the pool's fixed egress (both default to "none"). "none"/
+        # "drop" mean --network=none (NO egress, the fail-closed default), so this is NOT skippable: a
+        # job whose effective policy is "none" must not run on a pool that has network (a LEAK), and a
+        # tor/fakenet/vpn policy must not run on a differently-fixed pool. Any mismatch is rejected.
+        effective_policy = (job.net_policy or self._engine_default_policy(job.engine)
+                            or "none").strip().lower()
+        fixed_policy = (self._fixed_net_policy or "none").strip().lower()
+        if effective_policy != fixed_policy:
             kind = "override" if job.net_policy else "engine-default"
             finished = time.time()
             if self._store.update_if_status(
                     job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                     status=JobStatus.FAILED, finished_at=finished,
                     error=f"net_policy {effective_policy!r} ({kind}) not honored by {self._worker_tier} "
-                          f"tier (fixed egress {self._fixed_net_policy!r})",
+                          f"tier (fixed egress {fixed_policy!r})",
                     expires_at=self._expiry(finished)):
                 try:  # we owned the terminal write → drop the spooled input
                     self._input_path(job).unlink()
                 except OSError:
                     pass
-            logger.warning("vm_dispatch: rejecting job %s — net_policy %r (%s) not honored by %s "
-                           "(fixed %r)", job.job_id, effective_policy, kind, self._worker_tier,
-                           self._fixed_net_policy)
+            logger.warning("vm_dispatch: rejecting job %s — net_policy %r (%s) != fixed egress %r on %s",
+                           job.job_id, effective_policy, kind, fixed_policy, self._worker_tier)
             return
         # Mark the in-flight job as a warm worker BEFORE the (possibly long) validate, so a peer's
         # requeue_orphaned_jobs sweep — which treats a RUNNING job with worker_runtime != "warm" as a

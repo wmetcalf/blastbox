@@ -120,6 +120,30 @@ def test_promote_warming_evicts_slot_reaped_during_finalize() -> None:
     assert set(rt.reaped) == ids         # and they were reaped
 
 
+class _ExternallyDrainedReapFails(_FakeRuntime):
+    """is_ready() finds the slot DRAINING (set EXTERNALLY, e.g. a racing stop()) and returns False
+    WITHOUT reaping — and reap() then RAISES (the VM may still be running)."""
+
+    def is_ready(self, slot: Slot) -> bool:
+        slot.state = SlotState.DRAINING   # external drain — NOT a runtime-internal reap
+        return False
+
+    def reap(self, slot: Slot) -> None:
+        raise RuntimeError("destroy failed; VM may still be running")
+
+
+def test_promote_warming_quarantines_externally_drained_slot_when_reap_fails() -> None:
+    # a slot marked DRAINING externally while finalize is still in flight must NOT be blindly popped
+    # on is_ready=False — the pool must reap it, and if that reap FAILS (VM possibly still running)
+    # keep it tracked/quarantined rather than orphaning a live worker off the books.
+    rt = _ExternallyDrainedReapFails()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2)
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots.keys()))
+    pool._promote_warming()
+    assert sid in pool._slots            # reap raised → NOT popped, quarantined (still tracked)
+
+
 def test_health_check_quarantines_slot_when_reap_fails() -> None:
     # a dead IDLE slot whose reap RAISES (destroy failed → VM may still run) must stay quarantined in
     # _slots (not popped), so the health sweep can't orphan a live worker off pool accounting.

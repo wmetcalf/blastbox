@@ -550,14 +550,23 @@ class WarmPool:
                         slot.state = SlotState.IDLE
                         newly_idle.append(slot.slot_id)
             elif slot.state == SlotState.DRAINING and not raised:
-                # is_ready returned False AND the runtime moved the slot to DRAINING => its finalize
-                # failed closed and it reaped the VM ITSELF (destroy SUCCEEDED). Evict the dead husk so
-                # it doesn't eat concurrent_ceiling headroom (the runtime already reaped — don't redo).
-                # NB: if is_ready RAISED, reap() could NOT dispose the VM (it may still be running), so
-                # we must NOT pop it — leave it tracked/quarantined, exactly like release() does.
+                # is_ready returned False AND the slot is DRAINING. Usually the runtime's finalize
+                # failed closed and reaped the VM ITSELF; but DRAINING can ALSO be set EXTERNALLY (a
+                # concurrent stop() flips every slot to DRAINING before reaping) while a slow finalize
+                # is still in flight. We can't tell which, so DON'T blindly pop on the assumption the
+                # VM is gone: reap() it ourselves (idempotent — a second destroy is a benign "not
+                # found") and pop ONLY on a successful reap; on a reap failure the VM may still be
+                # running, so keep it tracked/quarantined instead of orphaning it off the books.
+                # (If is_ready RAISED, we never enter here — same quarantine intent.)
+                reaped = False
+                try:
+                    self._reap_and_count(slot)
+                    reaped = True
+                except Exception:
+                    logger.exception("pool.promote_reap_error slot_id=%s — quarantining", slot.slot_id)
                 with self._lock:
-                    if self._slots.pop(slot.slot_id, None) is not None:
-                        record_slot_reaped()
+                    if reaped:
+                        self._slots.pop(slot.slot_id, None)
 
         if newly_idle:
             with self._lock:
