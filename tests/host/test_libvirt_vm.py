@@ -57,12 +57,20 @@ def test_domain_xml_omits_emulator_by_default():
 
 def test_domain_xml_pins_mac_ip_via_nwfilter():
     # clean-traffic nwfilter pins MAC+IP at the ebtables layer so a root guest can't spoof both to
-    # escape the IP/MAC-keyed host policy.
+    # escape the IP/MAC-keyed host policy. Default emits CTRL_IP_LEARNING=dhcp so no-ip-spoofing
+    # learns the worker IP from DHCP (the libvirt "any" default is racy and black-holes some guests).
     xml = _rt()._domain_xml("bbvm-x", "/o.qcow2")
-    assert "<filterref filter='clean-traffic'/>" in xml
+    assert "filter='clean-traffic'" in xml
+    assert "<parameter name='CTRL_IP_LEARNING' value='dhcp'/>" in xml
+    assert "<filterref filter='clean-traffic'/>" not in xml          # wrapped, not self-closing
     # configurable / disable-able
     assert "filterref" not in _rt(nwfilter="")._domain_xml("bbvm-x", "/o.qcow2")
     assert "filter='custom-nf'" in _rt(nwfilter="custom-nf")._domain_xml("bbvm-x", "/o.qcow2")
+    # learning mode tunable; "" omits the parameter (libvirt default), back to a bare filterref
+    anyx = _rt(nwfilter_ip_learning="any")._domain_xml("bbvm-x", "/o.qcow2")
+    assert "<parameter name='CTRL_IP_LEARNING' value='any'/>" in anyx
+    barex = _rt(nwfilter_ip_learning="")._domain_xml("bbvm-x", "/o.qcow2")
+    assert "<filterref filter='clean-traffic'/>" in barex and "CTRL_IP_LEARNING" not in barex
 
 
 def test_domain_xml_virtio_disk_omits_invalid_controller():

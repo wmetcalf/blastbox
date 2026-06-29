@@ -97,6 +97,13 @@ class LibvirtVmConfig:
     The host egress policy keys on the worker's IP + MAC; a guest with root could change BOTH to dodge
     the per-IP jump + MAC anti-spoof and follow the bridge default route. This pins them at the
     libvirt/ebtables layer so they can't. Set to "" to disable (e.g. a host pinning MAC elsewhere)."""
+    nwfilter_ip_learning: str = "dhcp"
+    """``CTRL_IP_LEARNING`` for the nwfilter's ``no-ip-spoofing`` (only emitted when ``nwfilter`` is
+    set). ``dhcp`` snoops the DHCP exchange to learn the worker IP — RELIABLE for DHCP guests. The
+    libvirt default (``any``, learn from the first IP packet) is racy and silently FAILS for some
+    guests (e.g. Windows): it then learns no IP, so ``no-ip-spoofing`` black-holes ALL unicast and the
+    worker never becomes reachable. Set ``any`` for first-packet learning, or "" to omit the parameter
+    (libvirt default). Workers use the libvirt network's DHCP, so ``dhcp`` is the correct default."""
     subnet_prefix: str = "192.168.122."
     """DHCP subnet of ``network``; used to resolve the worker IP via the host neigh table."""
 
@@ -571,6 +578,16 @@ class LibvirtVmRuntime:
         # emit a controller for the bus types that have one. virtio disks target vd*, the rest sd*.
         _ctrl = "" if c.disk_bus in ("virtio", "ide") else f"<controller type='{c.disk_bus}' index='0'/>"
         _dev = "vda" if c.disk_bus == "virtio" else "sda"
+        # nwfilter on the worker NIC. When set, emit CTRL_IP_LEARNING (default "dhcp") so no-ip-spoofing
+        # learns the worker IP from the DHCP exchange rather than libvirt's racy "any" default.
+        if c.nwfilter and c.nwfilter_ip_learning:
+            _filterref = (f"<filterref filter='{c.nwfilter}'>"
+                          f"<parameter name='CTRL_IP_LEARNING' value='{c.nwfilter_ip_learning}'/>"
+                          "</filterref>")
+        elif c.nwfilter:
+            _filterref = f"<filterref filter='{c.nwfilter}'/>"
+        else:
+            _filterref = ""
         return (
             "<domain type='kvm'>"
             f"<name>{name}</name>"
@@ -591,7 +608,10 @@ class LibvirtVmRuntime:
             f"<interface type='network'><source network='{c.network}'/><model type='{c.nic_model}'/>"
             # clean-traffic nwfilter: pin MAC + IP (no-mac/no-ip/no-arp-spoofing) at the libvirt
             # ebtables layer so a root guest can't change them to escape the IP/MAC-keyed host policy.
-            f"{f'''<filterref filter='{c.nwfilter}'/>''' if c.nwfilter else ''}</interface>"
+            # CTRL_IP_LEARNING=dhcp: snoop DHCP to learn the worker IP reliably — without it (libvirt's
+            # racy "any" default) no-ip-spoofing can learn NO IP and black-hole all unicast (the worker
+            # then never becomes reachable; seen with Windows guests).
+            f"{_filterref}</interface>"
             "<serial type='pty'><target type='isa-serial' port='0'/></serial><console type='pty'/>"
             # QEMU guest-agent channel — enables `virsh domtime --sync` (post-revert clock sync) +
             # in-guest exec; needs qemu-ga running in the golden.

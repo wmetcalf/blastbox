@@ -78,6 +78,8 @@ class VmWorkerSpec:
     network: str = "default"
     disk_bus: str = "sata"
     nic_model: str = "e1000"
+    nwfilter: str = "clean-traffic"
+    nwfilter_ip_learning: str = "dhcp"  # CTRL_IP_LEARNING: snoop DHCP to learn the worker IP reliably
     overlay_dir: str = "/dev/shm"
     subnet_prefix: str = "192.168.122."
 
@@ -173,6 +175,8 @@ class VmWorkerSpec:
             network=self.network,
             disk_bus=self.disk_bus,
             nic_model=self.nic_model,
+            nwfilter=self.nwfilter,
+            nwfilter_ip_learning=self.nwfilter_ip_learning,
             subnet_prefix=self.subnet_prefix,
             sudo=self.sudo,
             egress_policy=self.egress,
