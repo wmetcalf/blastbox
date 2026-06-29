@@ -186,6 +186,22 @@ def test_from_dict_rejects_malformed_block_internal():
                                      "egress": {"exit": "direct", "block_internal": "treu"}})
 
 
+@pytest.mark.parametrize("bad", [None, False, True, 0, ["clean-traffic"]])
+def test_from_dict_rejects_non_string_nwfilter(bad):
+    # `nwfilter:` (None) or `nwfilter: false` (bool) must be REJECTED, not read as falsy and silently
+    # drop the <filterref> — that disables the anti-spoofing a root guest is held back by.
+    with pytest.raises(ValueError, match="must be a string"):
+        VmWorkerSpec.from_dict("w", {"image": "/g.qcow2", "nwfilter": bad})
+    with pytest.raises(ValueError, match="must be a string"):
+        VmWorkerSpec.from_dict("w", {"image": "/g.qcow2", "nwfilter_ip_learning": bad})
+
+
+def test_from_dict_accepts_empty_string_nwfilter_as_disable():
+    # the ONE disable sentinel is an explicit "" (not None/false)
+    spec = VmWorkerSpec.from_dict("w", {"image": "/g.qcow2", "nwfilter": ""})
+    assert spec.nwfilter == ""
+
+
 def test_nwfilter_threads_through_spec_to_vm_config():
     # the nwfilter + its IP-learning mode are configurable on the spec and flow to LibvirtVmConfig,
     # so a vmcompose deployment can tune/disable the anti-spoof filter (closes the config gap).

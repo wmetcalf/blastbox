@@ -579,8 +579,14 @@ class LibvirtVmRuntime:
         _ctrl = "" if c.disk_bus in ("virtio", "ide") else f"<controller type='{c.disk_bus}' index='0'/>"
         _dev = "vda" if c.disk_bus == "virtio" else "sda"
         # nwfilter on the worker NIC. When set, emit CTRL_IP_LEARNING (default "dhcp") so no-ip-spoofing
-        # learns the worker IP from the DHCP exchange rather than libvirt's racy "any" default.
+        # learns the worker IP from the DHCP exchange rather than libvirt's racy "any" default. Validate
+        # the value up front (libvirt only accepts dhcp/any/none) so a typo fails fast with a clear
+        # error here instead of a cryptic libvirt XML-validation error at `virsh define`.
         if c.nwfilter and c.nwfilter_ip_learning:
+            if c.nwfilter_ip_learning not in ("dhcp", "any", "none"):
+                raise ValueError(
+                    f"Invalid nwfilter_ip_learning {c.nwfilter_ip_learning!r}; "
+                    "must be 'dhcp', 'any', 'none', or '' (omit)")
             _filterref = (f"<filterref filter='{c.nwfilter}'>"
                           f"<parameter name='CTRL_IP_LEARNING' value='{c.nwfilter_ip_learning}'/>"
                           "</filterref>")

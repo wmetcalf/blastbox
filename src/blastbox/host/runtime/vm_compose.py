@@ -159,6 +159,15 @@ class VmWorkerSpec:
         if unknown_top:
             raise ValueError(f"{name}: unknown top-level key(s) {sorted(unknown_top)} "
                              f"(did you mean one of {sorted(allowed_top)}?)")
+        # The nwfilter knobs are SECURITY controls (a root guest re-IPing around the host egress
+        # policy is exactly what they prevent). A malformed YAML scalar — `nwfilter:` (→ None) or
+        # `nwfilter: false` (→ bool) — would otherwise be passed through and read as falsy by
+        # _domain_xml, SILENTLY dropping the <filterref>. Require a string; the only disable sentinel
+        # is an explicit "". (bool is checked before str since bool is an int, not str — but be explicit.)
+        for _k in ("nwfilter", "nwfilter_ip_learning"):
+            if _k in d and not isinstance(d[_k], str):
+                raise ValueError(f"{name}: {_k} must be a string (use \"\" to disable), got "
+                                 f"{type(d[_k]).__name__}")
         return cls(name=name, image=image, egress=egress, routing=routing,
                    **{k: v for k, v in d.items() if k in known})
 

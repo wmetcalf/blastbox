@@ -71,6 +71,9 @@ def test_domain_xml_pins_mac_ip_via_nwfilter():
     assert "<parameter name='CTRL_IP_LEARNING' value='any'/>" in anyx
     barex = _rt(nwfilter_ip_learning="")._domain_xml("bbvm-x", "/o.qcow2")
     assert "<filterref filter='clean-traffic'/>" in barex and "CTRL_IP_LEARNING" not in barex
+    # a typo'd learning mode fails fast with a clear error (not a cryptic libvirt XML error later)
+    with pytest.raises(ValueError, match="Invalid nwfilter_ip_learning"):
+        _rt(nwfilter_ip_learning="dhpc")._domain_xml("bbvm-x", "/o.qcow2")
 
 
 def test_domain_xml_virtio_disk_omits_invalid_controller():
