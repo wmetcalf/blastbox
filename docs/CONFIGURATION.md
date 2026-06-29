@@ -39,7 +39,8 @@ and the tier-capability matrix.
 |---|---|---|
 | `BLASTBOX_DISPATCH_CONCURRENCY` | `1` | Dispatch-loop worker threads. **On a warm tier this MUST equal the warm pool size** — the warm path blocks until the job finishes, so N threads are needed to keep N slots busy (default 1 starves the pool). |
 | `BLASTBOX_DISPATCH_WARM_ONLY` | `""` (off) | Claim-gate primitive: only claim jobs when a warm slot is free, and **never cold-fall-back** — overflow stays queued for the cold dispatcher. This is what makes a process a *warm sidecar*. |
-| `BLASTBOX_MAX_QUEUED_AGE_S` | `0` (off) | TTL after which a job still QUEUED is FAILed and its (untrusted) input deleted — bounds the `target_tier` footgun (a job pinned to a tier no dispatcher serves). Honored by **both** the cold `Dispatcher` **and** the network-endpoint (static/AWS/cascade) dispatcher. |
+| `BLASTBOX_MAX_QUEUED_AGE_S` | `0` (off) | Opt-in **stale-queued reaper**: TTL after which a job still QUEUED is FAILed and its (untrusted) input deleted — bounds the `target_tier` footgun (a job pinned to a tier no dispatcher serves) and a >1k batch backlog. Honored by **every** dispatcher variant: the cold container `Dispatcher` and the network-endpoint `VmJobDispatcher` (libvirt-VM / static / AWS / cascade). `0` ⇒ never reap on age (correct for huge legitimate batches). |
+| `BLASTBOX_ALLOW_TIER_ROUTING` | `0` | Allow a job to **request a specific warm backend** via a `target_tier` field at submit (claim-predicate honored by every store: memory / sql / redis). **Off (default) ⇒ `target_tier` is silently ignored** (like a per-job override that isn't permitted). The `worker_tier` label (e.g. `firecracker` / `gvisor` / `libvirt-vm`) is what a warm sidecar advertises and what UIs show. Gate this *with* `BLASTBOX_MAX_QUEUED_AGE_S` — a job pinned to a tier whose dispatcher is down would otherwise queue forever. |
 | `BLASTBOX_DISPATCH_SOLE_OWNER` | `0` | Network-endpoint dispatcher only. `1` ⇒ this is the **only** dispatcher on the store, so orphan recovery may also reclaim a claim that crashed before the `worker_runtime="warm"` stamp. Leave `0` on a **shared** store (a cold dispatcher for the same engine) — it would otherwise FAIL that peer's live jobs. |
 
 ## Runtime selection (docker: runc / runsc)
@@ -299,9 +300,31 @@ blastbox pki show-ca                           # the public CA cert -> bake into
 Bake `ca.crt` into worker images (public trust anchor); keep `ca.key` on the dispatcher only. For
 disposable workers, mint the server cert per-spawn (SAN = the instance IP) rather than baking a key.
 
+## Runtime: libvirt VM (full-OS engines)
+
+Unlike the FC/gVisor warm tiers — selected by `BLASTBOX_POOL_RUNTIME` and configured by
+`BLASTBOX_*` env — the **libvirt/KVM VM-worker tier is a library primitive, not an env-selected
+runtime.** A consuming app (e.g. win-validator) builds a `VmWorkerSpec` (`host/runtime/vm_compose.py`)
+and drives it through the generic `WarmPool` + `VmJobDispatcher`. So these knobs are **spec fields the
+consumer sets** (often mapped from its *own* env, e.g. win-validator's `AUTHENTICODE_IP_POOL`), not
+`BLASTBOX_*` vars. They are listed here because their **security semantics** are blastbox's.
+
+| `VmWorkerSpec` field | Default | Notes |
+|---|---|---|
+| `image` (`VmImageSpec`) | — | The golden qcow2. A **string** ⇒ the path (e.g. `image: /dev/shm/golden-base.qcow2`); a **mapping** ⇒ a build recipe (`image.golden` = where to bake it, plus `base_qcow2`/provisioner). Each job gets a disposable overlay. *(The field is `image`, not `golden` — a top-level `golden:` key raises `ValueError` at `VmWorkerSpec.from_dict`.)* Golden **rotation is not automatic** — it's a separate helper the consuming app schedules (build a fresh golden, then flip the spec). |
+| `warm_size` / `concurrent_ceiling` / `jobs_per_recycle` / `max_jobs_per_slot` | `2` / `16` / `1` / `0` | Warm slots / max concurrent / jobs a slot serves before `recycle()` **reverts it to the clean snapshot in place and reuses it** / total jobs before it's reaped+respawned (`0` = unlimited). Safety comes from the per-job snapshot revert, not a fresh VM; for **true destroy-and-respawn per document** (no slot reuse at all) set `max_jobs_per_slot=1`. |
+| `worker_ip_pool` | `""` | **Assign+enforce.** `"START-END"` within a single /16 (size it for the **peak concurrent** worker count — the pool bursts from `warm_size` toward `concurrent_ceiling` under load, so `≥ concurrent_ceiling` avoids exhaustion) ⇒ blastbox reserves a DHCP host entry and **pins an explicit IP** per worker (`CTRL_IP_LEARNING=none` + nwfilter `IP=`), with a deterministic MAC derived from the IP. A root-compromised guest then **can't re-IP** around the egress rooter. **`""` ⇒ DHCP-learning** (`clean-traffic` `CTRL_IP_LEARNING=dhcp`) — convenient, but a long-idle warm worker's learned pin lapses with the lease, so assign-enforce is the **snapshot-robust / secure** mode. |
+| `nwfilter` | `clean-traffic` | libvirt nwfilter bound to the worker NIC (`no-mac-spoofing` + `no-ip-spoofing` + `allow-dhcp-server`). `""` ⇒ no filterref (no L2 anti-spoof — only do this behind another boundary). |
+| `nwfilter_ip_learning` | `dhcp` | `CTRL_IP_LEARNING` for the DHCP-learning path (`dhcp` or `any`; `none` is rejected here because it needs `worker_ip_pool`). Unused once `worker_ip_pool` is set. |
+| `dhcp_server` | `""` | `clean-traffic` `DHCPSERVER` parameter — the **trusted** dnsmasq a worker may accept leases from, so it can't rogue-DHCP itself a different one. `""` ⇒ derived as `subnet_prefix` + `.1`. |
+| `mac_prefix` | `52:54:00:bb` | OUI for assign-enforce MACs; the last 2 octets are the IP's 3rd+4th, giving a 1:1 MAC↔IP map within the /16. |
+| `subnet_prefix` | `192.168.122.` | The libvirt network's subnet, used for the `DHCPSERVER` default and pool sanity. |
+| `egress` (`VmEgressPolicy`) / `routing` (`ExitRouting`) | `None` | Optional per-worker egress through `LibvirtEgress` (a CAPE-style per-IP `iptables` `BBVM_<ip>` chain + `FORWARD` jump): exit driver, port allowlist, `block_internal`, VPN/SOCKS routing. `None` ⇒ no egress wired. |
+
 ## Per-engine params (engine ↔ host boundary)
 
 | Var | Default | Notes |
 |---|---|---|
 | `BLASTBOX_ENGINE_<NAME>_PARAM_KEYS` | unset | **Allowlist** of `job.params` keys forwardable to that engine's worker as env. **Unset** ⇒ legacy shape+denylist only (a hostile job's params could reach engine knobs — so set this on **every** tier that runs the engine). **Set** (even to an empty value) ⇒ strict allowlist: only the listed keys pass, and an empty value blocks **all** params. e.g. `BLASTBOX_ENGINE_CLIPPYSHOT_PARAM_KEYS=CLIPPYSHOT_OCR,CLIPPYSHOT_QR,…`. |
 | `BLASTBOX_ENGINE_<NAME>_DEFAULT_PARAMS` | `""` | **Operator default params**: `KEY=VAL,KEY2=VAL2` applied for any key a job does **not** set (the per-job value always wins). Makes an enablement default — e.g. a scanner toggle — a **runtime** decision in the dispatcher env instead of a value hardcoded in the engine: flip it + restart the dispatcher, no image/snapshot rebuild, and it reaches **cold and warm** tiers alike. Each defaulted key must itself be forwardable (in `_PARAM_KEYS`) and non-reserved — it passes the same gate as a client param, so the default reaches the worker only where a client param with that key would have. Set on **every** tier that runs the engine (it's read where params are forwarded). e.g. `BLASTBOX_ENGINE_REDTUSK_DEFAULT_PARAMS=REDTUSK_ENABLE_QR=1,REDTUSK_ENABLE_OCR=0`. |
+| `BLASTBOX_ENGINE_<NAME>_RESERVED_KEYS` | unset | Extra param keys **dropped unconditionally** (cold **and** warm), unioned into the engine's built-in `reserved_param_keys` floor. For knobs that must *never* be client/job-settable because they're RCE-adjacent — a JVM engine's `JAVA_BIN`/`JAVA_OPTS`/`WORKER_JAR`, a sandbox-downgrade switch. Keys are upper-cased and stripped **before** the `_PARAM_KEYS` allowlist is applied, so a reserved key can't be re-admitted by also listing it. The framework core carries **no** hardcoded `CLIPPYSHOT_*`/engine-specific reserved keys — each engine declares its own floor (via `EngineSpec.reserved_param_keys`) and the operator extends it here. e.g. `BLASTBOX_ENGINE_REDTUSK_RESERVED_KEYS=JAVA_BIN,JAVA_OPTS,WORKER_JAR`. |
