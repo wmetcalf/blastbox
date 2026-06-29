@@ -144,6 +144,12 @@ class LibvirtVmConfig:
     mac_prefix: str = "52:54:00:bb"
     """4-octet OUI prefix for assign+enforce MACs; the last 2 octets are derived from the assigned IP's
     3rd+4th octets (1:1 within a /16), so MAC↔IP is deterministic — no separate MAC bookkeeping."""
+    dhcp_server: str = ""
+    """Trusted DHCP server IP for the clean-traffic ``DHCPSERVER`` parameter — constrains the guest's
+    DHCP to the bridge's dnsmasq so a compromised worker can't run a rogue DHCP server and make
+    ``no-ip-spoofing`` learn an attacker-supplied lease (DHCP-learning mode), nor disturb a sibling's
+    learning. "" auto-derives ``subnet_prefix + "1"`` (the libvirt default bridge/dnsmasq IP); set
+    explicitly for a non-standard network gateway. Only emitted for the ``clean-traffic`` nwfilter."""
     subnet_prefix: str = "192.168.122."
     """DHCP subnet of ``network``; used to resolve the worker IP via the host neigh table."""
 
@@ -722,6 +728,14 @@ class LibvirtVmRuntime:
         _ctrl = "" if c.disk_bus in ("virtio", "ide") else f"<controller type='{c.disk_bus}' index='0'/>"
         _dev = "vda" if c.disk_bus == "virtio" else "sda"
         _macref = f"<mac address='{mac}'/>" if mac else ""   # assign-enforce: pin the worker MAC
+        # DHCPSERVER (clean-traffic only): restrict the guest's DHCP to the trusted bridge dnsmasq so a
+        # compromised worker can't rogue-DHCP itself a different lease (which DHCP-learning would then
+        # pin) or poison a sibling's learning. Derived from subnet_prefix when not set explicitly.
+        _dhcpsrv = ""
+        if c.nwfilter == "clean-traffic":
+            _server = c.dhcp_server or (c.subnet_prefix + "1" if c.subnet_prefix else "")
+            if _server:
+                _dhcpsrv = f"<parameter name='DHCPSERVER' value='{_server}'/>"
         # nwfilter on the worker NIC. ASSIGN-ENFORCE (assigned_ip): pin the IP EXPLICITLY in
         # no-ip-spoofing (CTRL_IP_LEARNING=none + IP=<assigned>) — nothing to learn, so no rogue-DHCP
         # poisoning and no lease to expire. DHCP-LEARNING (no assigned_ip): emit CTRL_IP_LEARNING
@@ -731,7 +745,7 @@ class LibvirtVmRuntime:
         if c.nwfilter and assigned_ip:
             _filterref = (f"<filterref filter='{c.nwfilter}'>"
                           "<parameter name='CTRL_IP_LEARNING' value='none'/>"
-                          f"<parameter name='IP' value='{assigned_ip}'/></filterref>")
+                          f"<parameter name='IP' value='{assigned_ip}'/>{_dhcpsrv}</filterref>")
         elif c.nwfilter and c.nwfilter_ip_learning:
             # DHCP-learning path (no assigned IP). 'none' is only valid WITH an explicit IP (the
             # assign-enforce branch above supplies it) — emitting CTRL_IP_LEARNING=none here, where
@@ -742,7 +756,7 @@ class LibvirtVmRuntime:
                     "must be 'dhcp', 'any', or '' (omit). 'none' needs an assigned IP (worker_ip_pool).")
             _filterref = (f"<filterref filter='{c.nwfilter}'>"
                           f"<parameter name='CTRL_IP_LEARNING' value='{c.nwfilter_ip_learning}'/>"
-                          "</filterref>")
+                          f"{_dhcpsrv}</filterref>")
         elif c.nwfilter:
             _filterref = f"<filterref filter='{c.nwfilter}'/>"
         else:

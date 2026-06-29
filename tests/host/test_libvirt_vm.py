@@ -150,6 +150,21 @@ def test_ip_pool_parse_and_mac_derivation():
         _parse_ip_pool("10.0.0.1-10.1.0.1")         # spans 2 /16s → MACs would collide
 
 
+def test_dhcpserver_restricts_clean_traffic_dhcp_source(monkeypatch):
+    # clean-traffic emits DHCPSERVER (trusted dnsmasq) so a rogue worker can't DHCP itself a different
+    # lease that DHCP-learning would then pin. Derived from subnet_prefix; overridable; clean-traffic only.
+    x = _rt()._domain_xml("bbvm-x", "/o.qcow2")                       # learning default
+    assert "<parameter name='DHCPSERVER' value='192.168.122.1'/>" in x
+    x2 = _rt(dhcp_server="10.9.0.1")._domain_xml("bbvm-x", "/o.qcow2")
+    assert "<parameter name='DHCPSERVER' value='10.9.0.1'/>" in x2
+    # assign-enforce branch carries it too (alongside the explicit IP pin)
+    rt = _pooled_rt(monkeypatch, "192.168.122.200-192.168.122.201")
+    xp = rt._domain_xml("bbvm-x", "/o.qcow2", mac="52:54:00:bb:7a:c8", assigned_ip="192.168.122.200")
+    assert "DHCPSERVER" in xp and "<parameter name='IP' value='192.168.122.200'/>" in xp
+    # a custom (non clean-traffic) filter does NOT get the clean-traffic-specific parameter
+    assert "DHCPSERVER" not in _rt(nwfilter="custom-nf")._domain_xml("bbvm-x", "/o.qcow2")
+
+
 def test_learning_none_without_pool_rejected():
     # CTRL_IP_LEARNING=none needs an explicit IP (assign-enforce); without worker_ip_pool there is
     # none, and libvirt rejects 'none' on a referenced no-ip-spoofing — fail fast with a clear error.

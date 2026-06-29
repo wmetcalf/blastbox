@@ -82,6 +82,7 @@ class VmWorkerSpec:
     nwfilter_ip_learning: str = "dhcp"  # CTRL_IP_LEARNING (DHCP-learning mode; unused when worker_ip_pool set)
     worker_ip_pool: str = ""            # "START-END" → assign+enforce: reserve+pin a fixed IP per worker
     mac_prefix: str = "52:54:00:bb"     # OUI for assign-enforce MACs (last 2 octets derived from the IP)
+    dhcp_server: str = ""               # clean-traffic DHCPSERVER (trusted dnsmasq); "" → subnet+".1"
     overlay_dir: str = "/dev/shm"
     subnet_prefix: str = "192.168.122."
 
@@ -166,7 +167,7 @@ class VmWorkerSpec:
         # `nwfilter: false` (→ bool) — would otherwise be passed through and read as falsy by
         # _domain_xml, SILENTLY dropping the <filterref>. Require a string; the only disable sentinel
         # is an explicit "". (bool is checked before str since bool is an int, not str — but be explicit.)
-        for _k in ("nwfilter", "nwfilter_ip_learning", "worker_ip_pool", "mac_prefix"):
+        for _k in ("nwfilter", "nwfilter_ip_learning", "worker_ip_pool", "mac_prefix", "dhcp_server"):
             if _k in d and not isinstance(d[_k], str):
                 raise ValueError(f"{name}: {_k} must be a string (use \"\" to disable), got "
                                  f"{type(d[_k]).__name__}")
@@ -190,6 +191,7 @@ class VmWorkerSpec:
             nwfilter_ip_learning=self.nwfilter_ip_learning,
             worker_ip_pool=self.worker_ip_pool,
             mac_prefix=self.mac_prefix,
+            dhcp_server=self.dhcp_server,
             subnet_prefix=self.subnet_prefix,
             sudo=self.sudo,
             egress_policy=self.egress,

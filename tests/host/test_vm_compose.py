@@ -224,6 +224,9 @@ def test_assign_enforce_pool_threads_to_vm_config():
     assert cfg.worker_ip_pool == "192.168.122.200-192.168.122.250" and cfg.mac_prefix == "52:54:00:cc"
     # default: no pool (DHCP-learning mode)
     assert VmWorkerSpec.from_dict("w", {"image": "/g.qcow2"}).to_vm_config().worker_ip_pool == ""
+    # dhcp_server threads through too
+    cfg2 = VmWorkerSpec.from_dict("w", {"image": "/g.qcow2", "dhcp_server": "10.0.0.1"}).to_vm_config()
+    assert cfg2.dhcp_server == "10.0.0.1"
 
 
 def test_from_dict_accepts_all_exit_routing_fields():
