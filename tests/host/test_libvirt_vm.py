@@ -16,6 +16,15 @@ def _rt(**kw) -> LibvirtVmRuntime:
     return LibvirtVmRuntime(LibvirtVmConfig(golden_base="/dev/shm/golden.qcow2", **kw))
 
 
+def _pooled_rt(monkeypatch, pool: str = "192.168.122.200-192.168.122.201", **kw) -> LibvirtVmRuntime:
+    # A pooled runtime's __init__ calls _reconcile_reservations() which shells to virsh. Mock the
+    # module runner BEFORE construction so a unit test can NEVER delete real DHCP reservations from
+    # the dev/CI host's libvirt network (net-dumpxml returns nothing → nothing reconciled).
+    import blastbox.host.runtime.libvirt_vm as mod
+    monkeypatch.setattr(mod, "_run", lambda *a, **k: type("C", (), {"returncode": 0, "stdout": ""})())
+    return _rt(worker_ip_pool=pool, **kw)
+
+
 def test_slotruntime_protocol_conformance():
     assert isinstance(_rt(), SlotRuntime)
     assert hasattr(_rt(), "recycle")  # the snapshot-restore extension
@@ -137,10 +146,19 @@ def test_ip_pool_parse_and_mac_derivation():
         _parse_ip_pool("192.168.122.200")           # no '-'
     with pytest.raises(ValueError):
         _parse_ip_pool("192.168.122.250-192.168.122.200")  # END < START
+    with pytest.raises(ValueError, match="one /16"):
+        _parse_ip_pool("10.0.0.1-10.1.0.1")         # spans 2 /16s → MACs would collide
 
 
-def test_ip_allocator_hands_out_distinct_and_frees():
-    rt = _rt(worker_ip_pool="192.168.122.200-192.168.122.201")
+def test_learning_none_without_pool_rejected():
+    # CTRL_IP_LEARNING=none needs an explicit IP (assign-enforce); without worker_ip_pool there is
+    # none, and libvirt rejects 'none' on a referenced no-ip-spoofing — fail fast with a clear error.
+    with pytest.raises(ValueError, match="needs an assigned IP"):
+        _rt(nwfilter_ip_learning="none")._domain_xml("bbvm-x", "/o.qcow2")
+
+
+def test_ip_allocator_hands_out_distinct_and_frees(monkeypatch):
+    rt = _pooled_rt(monkeypatch, "192.168.122.200-192.168.122.201")
     ip1, mac1 = rt._alloc_ip_mac()
     ip2, mac2 = rt._alloc_ip_mac()
     assert {ip1, ip2} == {"192.168.122.200", "192.168.122.201"} and mac1 != mac2
@@ -150,10 +168,10 @@ def test_ip_allocator_hands_out_distinct_and_frees():
     assert rt._alloc_ip_mac()[0] == ip1             # freed IP is handed back out
 
 
-def test_domain_xml_assign_enforce_pins_explicit_mac_and_ip():
+def test_domain_xml_assign_enforce_pins_explicit_mac_and_ip(monkeypatch):
     # assign-enforce: explicit <mac> + no-ip-spoofing pinned to OUR ip (CTRL_IP_LEARNING=none), so a
     # root guest can neither spoof a different IP nor poison DHCP learning (there is none).
-    rt = _rt(worker_ip_pool="192.168.122.200-192.168.122.250")
+    rt = _pooled_rt(monkeypatch, "192.168.122.200-192.168.122.250")
     x = rt._domain_xml("bbvm-x", "/o.qcow2", mac="52:54:00:bb:7a:f0", assigned_ip="192.168.122.240")
     assert "<mac address='52:54:00:bb:7a:f0'/>" in x
     assert "<parameter name='CTRL_IP_LEARNING' value='none'/>" in x
@@ -171,7 +189,7 @@ def _sh_ok_free_name(args, **k):
 def test_spawn_reserves_and_assigns_then_reap_unreserves(monkeypatch):
     # spawn() in assign-enforce mode adds a DHCP reservation + assigns slot.ip/mac upfront; reap()
     # removes the reservation + returns the IP to the pool.
-    rt = _rt(worker_ip_pool="192.168.122.200-192.168.122.201")
+    rt = _pooled_rt(monkeypatch, "192.168.122.200-192.168.122.201")
     calls: list[list[str]] = []
     monkeypatch.setattr(rt, "_virsh", lambda *a, **k: calls.append(list(a)) or _OK())
     monkeypatch.setattr(rt, "_sh", _sh_ok_free_name)
@@ -189,7 +207,7 @@ def test_spawn_reserves_and_assigns_then_reap_unreserves(monkeypatch):
 def test_spawn_reserve_failure_does_not_delete_others_reservation(monkeypatch):
     # if our _reserve() fails (IP already reserved by another live runtime), the except->reap path
     # must NOT delete that other reservation — only free our own allocation back to the pool.
-    rt = _rt(worker_ip_pool="192.168.122.200-192.168.122.201")
+    rt = _pooled_rt(monkeypatch, "192.168.122.200-192.168.122.201")
     calls: list[list[str]] = []
 
     def fake_virsh(*a, **k):

@@ -71,14 +71,21 @@ def _run(args: list[str], timeout: float = 120) -> subprocess.CompletedProcess:
 
 
 def _parse_ip_pool(spec: str) -> list[str]:
-    """Parse an inclusive IPv4 range ``"A.B.C.D-A.B.C.E"`` into its list of addresses (in order)."""
+    """Parse an inclusive IPv4 range ``"A.B.C.D-A.B.C.E"`` into its list of addresses (in order).
+    The range MUST fit in a single /16: the MAC is derived from the IP's 3rd+4th octets only, so two
+    IPs that differ in octets 1/2 would collapse to the same MAC (duplicate MACs → libvirt/bridge
+    conflicts). Reject a multi-/16 pool rather than hand out colliding MACs."""
     start, _, end = spec.partition("-")
     if not end:
         raise ValueError(f"worker_ip_pool must be 'START-END', got {spec!r}")
-    lo = int(ipaddress.IPv4Address(start.strip()))
-    hi = int(ipaddress.IPv4Address(end.strip()))
+    s, e = start.strip(), end.strip()
+    lo = int(ipaddress.IPv4Address(s))
+    hi = int(ipaddress.IPv4Address(e))
     if hi < lo:
         raise ValueError(f"worker_ip_pool END < START: {spec!r}")
+    if s.split(".")[:2] != e.split(".")[:2]:
+        raise ValueError(f"worker_ip_pool must fit in one /16 (MAC derives from octets 3+4), got "
+                         f"{spec!r}")
     return [str(ipaddress.IPv4Address(i)) for i in range(lo, hi + 1)]
 
 
@@ -284,11 +291,14 @@ class LibvirtVmRuntime:
         if r.returncode != 0:
             raise RuntimeError(f"DHCP reservation add failed for {mac}/{ip}: {(r.stderr or '').strip()}")
 
-    def _unreserve(self, mac: str | None, ip: str | None) -> None:
+    def _unreserve(self, mac: str | None, ip: str | None) -> bool:
+        """Delete a DHCP reservation. Returns whether it's GONE — callers must not reuse the IP until
+        the delete actually succeeds, else a stale reservation makes the next _reserve() of that IP
+        fail (wedging a small pool)."""
         if not (mac and ip):
-            return
-        self._virsh("net-update", self.cfg.network, "delete", "ip-dhcp-host",
-                    self._reservation_xml(mac, ip), "--live", "--config")  # best-effort on teardown
+            return True
+        return self._virsh("net-update", self.cfg.network, "delete", "ip-dhcp-host",
+                           self._reservation_xml(mac, ip), "--live", "--config").returncode == 0
 
     def _reconcile_reservations(self) -> None:
         """Reconcile our DHCP reservations with RUNNING domains at startup so the pool never hands a
@@ -302,15 +312,19 @@ class LibvirtVmRuntime:
             for tok in (self._virsh("domiflist", dom).stdout or "").split():
                 if tok.lower().startswith(self.cfg.mac_prefix.lower() + ":"):
                     running_macs.add(tok.lower())
+        pool = set(self._ip_pool)
         xml = self._virsh("net-dumpxml", self.cfg.network).stdout or ""
         for mac, ip in re.findall(rf"<host mac='({re.escape(self.cfg.mac_prefix)}:[0-9a-fA-F:]+)' "
                                   r"ip='([0-9.]+)'", xml):
-            if mac.lower() in running_macs:
-                with self._ip_lock:            # live worker owns it → keep reserved, don't hand it out
+            if ip not in pool:
+                continue                        # NOT ours — another tier / hand-managed entry that just
+                #                                 happens to share the MAC prefix; never touch it.
+            if mac.lower() in running_macs or not self._unreserve(mac, ip):
+                # live worker owns it (keep reserved), OR the stale delete FAILED (reservation persists)
+                # — either way don't hand this IP out, or the next _reserve() would fail on a dup.
+                with self._ip_lock:
                     if ip in self._ip_free:
                         self._ip_free.remove(ip)
-            else:
-                self._unreserve(mac, ip)        # no domain owns it → truly stale, free the reservation
 
     # ---- prereq check (fail-closed selection) --------------------------------
     def available(self) -> bool:
@@ -554,9 +568,11 @@ class LibvirtVmRuntime:
         # (it came from our allocator). (Only reached on a SUCCESSFUL destroy; a failed destroy raises
         # above + keeps everything in place so a still-running guest's address can't be reused.)
         if self._ip_pool and slot.ip in self._ip_pool:
-            if slot.reserved:
-                self._unreserve(slot.mac, slot.ip)
-            self._free_ip(slot.ip)
+            # Free the IP for reuse ONLY once its reservation is confirmed gone — a failed delete
+            # leaves the reservation, so reusing the IP would make the next _reserve() fail. A
+            # not-reserved slot (our _reserve never succeeded) has nothing to delete → free it back.
+            if not slot.reserved or self._unreserve(slot.mac, slot.ip):
+                self._free_ip(slot.ip)
         # CHECK the overlay rm: a failed remove (perm/busy/immutable/timeout) leaves a stale qcow2
         # holding the sample under /dev/shm, leaking it + consuming tmpfs while replacements spawn.
         # Raise so the pool QUARANTINES the slot (keeps it tracked) and the leaked overlay surfaces.
@@ -717,10 +733,13 @@ class LibvirtVmRuntime:
                           "<parameter name='CTRL_IP_LEARNING' value='none'/>"
                           f"<parameter name='IP' value='{assigned_ip}'/></filterref>")
         elif c.nwfilter and c.nwfilter_ip_learning:
-            if c.nwfilter_ip_learning not in ("dhcp", "any", "none"):
+            # DHCP-learning path (no assigned IP). 'none' is only valid WITH an explicit IP (the
+            # assign-enforce branch above supplies it) — emitting CTRL_IP_LEARNING=none here, where
+            # no-ip-spoofing has no IP, is a libvirt define error. Only dhcp/any learn an IP.
+            if c.nwfilter_ip_learning not in ("dhcp", "any"):
                 raise ValueError(
-                    f"Invalid nwfilter_ip_learning {c.nwfilter_ip_learning!r}; "
-                    "must be 'dhcp', 'any', 'none', or '' (omit)")
+                    f"Invalid nwfilter_ip_learning {c.nwfilter_ip_learning!r} without worker_ip_pool; "
+                    "must be 'dhcp', 'any', or '' (omit). 'none' needs an assigned IP (worker_ip_pool).")
             _filterref = (f"<filterref filter='{c.nwfilter}'>"
                           f"<parameter name='CTRL_IP_LEARNING' value='{c.nwfilter_ip_learning}'/>"
                           "</filterref>")
