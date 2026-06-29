@@ -163,6 +163,9 @@ def test_dhcpserver_restricts_clean_traffic_dhcp_source(monkeypatch):
     assert "DHCPSERVER" in xp and "<parameter name='IP' value='192.168.122.200'/>" in xp
     # a custom (non clean-traffic) filter does NOT get the clean-traffic-specific parameter
     assert "DHCPSERVER" not in _rt(nwfilter="custom-nf")._domain_xml("bbvm-x", "/o.qcow2")
+    # subnet_prefix without a trailing dot still derives a VALID IP (not "192.168.1221")
+    x3 = _rt(subnet_prefix="192.168.122")._domain_xml("bbvm-x", "/o.qcow2")
+    assert "<parameter name='DHCPSERVER' value='192.168.122.1'/>" in x3
 
 
 def test_learning_none_without_pool_rejected():

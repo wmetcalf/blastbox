@@ -733,7 +733,11 @@ class LibvirtVmRuntime:
         # pin) or poison a sibling's learning. Derived from subnet_prefix when not set explicitly.
         _dhcpsrv = ""
         if c.nwfilter == "clean-traffic":
-            _server = c.dhcp_server or (c.subnet_prefix + "1" if c.subnet_prefix else "")
+            # Derive the bridge dnsmasq IP from subnet_prefix, tolerating a missing trailing dot
+            # ("192.168.122" → "192.168.122.1", not "192.168.1221") so a typo doesn't emit an invalid
+            # IP that fails `virsh define`.
+            _pfx = (c.subnet_prefix or "").rstrip(".")
+            _server = c.dhcp_server or (f"{_pfx}.1" if _pfx else "")
             if _server:
                 _dhcpsrv = f"<parameter name='DHCPSERVER' value='{_server}'/>"
         # nwfilter on the worker NIC. ASSIGN-ENFORCE (assigned_ip): pin the IP EXPLICITLY in
