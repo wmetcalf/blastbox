@@ -127,6 +127,78 @@ def test_available_probes_qemu_img_when_present(monkeypatch):
     assert "qemu-img" in calls
 
 
+def test_ip_pool_parse_and_mac_derivation():
+    from blastbox.host.runtime.libvirt_vm import _mac_for_ip, _parse_ip_pool
+    assert _parse_ip_pool("192.168.122.200-192.168.122.203") == [
+        "192.168.122.200", "192.168.122.201", "192.168.122.202", "192.168.122.203"]
+    assert _mac_for_ip("52:54:00:bb", "192.168.122.240") == "52:54:00:bb:7a:f0"   # 122->7a, 240->f0
+    assert _mac_for_ip("52:54:00:bb", "10.1.2.3") == "52:54:00:bb:02:03"
+    with pytest.raises(ValueError):
+        _parse_ip_pool("192.168.122.200")           # no '-'
+    with pytest.raises(ValueError):
+        _parse_ip_pool("192.168.122.250-192.168.122.200")  # END < START
+
+
+def test_ip_allocator_hands_out_distinct_and_frees():
+    rt = _rt(worker_ip_pool="192.168.122.200-192.168.122.201")
+    ip1, mac1 = rt._alloc_ip_mac()
+    ip2, mac2 = rt._alloc_ip_mac()
+    assert {ip1, ip2} == {"192.168.122.200", "192.168.122.201"} and mac1 != mac2
+    with pytest.raises(RuntimeError, match="exhausted"):
+        rt._alloc_ip_mac()                          # pool of 2 is empty
+    rt._free_ip(ip1)
+    assert rt._alloc_ip_mac()[0] == ip1             # freed IP is handed back out
+
+
+def test_domain_xml_assign_enforce_pins_explicit_mac_and_ip():
+    # assign-enforce: explicit <mac> + no-ip-spoofing pinned to OUR ip (CTRL_IP_LEARNING=none), so a
+    # root guest can neither spoof a different IP nor poison DHCP learning (there is none).
+    rt = _rt(worker_ip_pool="192.168.122.200-192.168.122.250")
+    x = rt._domain_xml("bbvm-x", "/o.qcow2", mac="52:54:00:bb:7a:f0", assigned_ip="192.168.122.240")
+    assert "<mac address='52:54:00:bb:7a:f0'/>" in x
+    assert "<parameter name='CTRL_IP_LEARNING' value='none'/>" in x
+    assert "<parameter name='IP' value='192.168.122.240'/>" in x
+    assert "value='dhcp'" not in x                  # NOT learning mode
+
+
+def _sh_ok_free_name(args, **k):
+    # `test -e <overlay>` -> rc1 (name free); everything else (qemu-img/chmod/rm) -> rc0
+    if args[:1] == ["test"]:
+        return type("C", (), {"returncode": 1, "stdout": ""})()
+    return _OK()
+
+
+def test_spawn_reserves_and_assigns_then_reap_unreserves(monkeypatch):
+    # spawn() in assign-enforce mode adds a DHCP reservation + assigns slot.ip/mac upfront; reap()
+    # removes the reservation + returns the IP to the pool.
+    rt = _rt(worker_ip_pool="192.168.122.200-192.168.122.201")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(rt, "_virsh", lambda *a, **k: calls.append(list(a)) or _OK())
+    monkeypatch.setattr(rt, "_sh", _sh_ok_free_name)
+    monkeypatch.setattr(rt, "_destroy_domain", lambda *a, **k: True)
+    slot = rt.spawn()
+    assert slot.ip in ("192.168.122.200", "192.168.122.201") and slot.mac
+    assert any(a[:3] == ["net-update", "default", "add"] and slot.ip in " ".join(a) for a in calls)
+    held = slot.ip
+    calls.clear()
+    rt.reap(slot)
+    assert any(a[:3] == ["net-update", "default", "delete"] and held in " ".join(a) for a in calls)
+    assert held in rt._ip_free                       # IP returned to the pool after reap
+
+
+def test_dhcp_learning_mode_no_reservation(monkeypatch):
+    # without a pool, spawn() does NOT touch DHCP reservations (DHCP-learning mode); MAC is read back.
+    rt = _rt()  # no worker_ip_pool
+    calls: list[list[str]] = []
+    monkeypatch.setattr(rt, "_virsh", lambda *a, **k: calls.append(list(a)) or _OK())
+    monkeypatch.setattr(rt, "_sh", _sh_ok_free_name)
+    monkeypatch.setattr(rt, "_destroy_domain", lambda *a, **k: True)
+    monkeypatch.setattr(rt, "_domain_mac", lambda name: "52:54:00:aa:bb:cc")
+    slot = rt.spawn()
+    assert slot.ip is None and slot.mac == "52:54:00:aa:bb:cc"   # learned later via DHCP/neigh
+    assert not any("net-update" in a for a in calls)
+
+
 def test_available_fails_closed_when_helper_binary_missing(monkeypatch):
     # sudo/virsh not installed → subprocess.run raises FileNotFoundError; available() must return
     # False (fail closed), not crash runtime selection with a raw OSError.

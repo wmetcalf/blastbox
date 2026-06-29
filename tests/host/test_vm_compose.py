@@ -215,6 +215,17 @@ def test_nwfilter_threads_through_spec_to_vm_config():
     assert dflt.nwfilter == "clean-traffic" and dflt.nwfilter_ip_learning == "dhcp"
 
 
+def test_assign_enforce_pool_threads_to_vm_config():
+    # worker_ip_pool + mac_prefix flow from the spec to LibvirtVmConfig (opt-in assign+enforce).
+    spec = VmWorkerSpec.from_dict("w", {"image": "/g.qcow2",
+                                        "worker_ip_pool": "192.168.122.200-192.168.122.250",
+                                        "mac_prefix": "52:54:00:cc"})
+    cfg = spec.to_vm_config()
+    assert cfg.worker_ip_pool == "192.168.122.200-192.168.122.250" and cfg.mac_prefix == "52:54:00:cc"
+    # default: no pool (DHCP-learning mode)
+    assert VmWorkerSpec.from_dict("w", {"image": "/g.qcow2"}).to_vm_config().worker_ip_pool == ""
+
+
 def test_from_dict_accepts_all_exit_routing_fields():
     # the unknown-key allowlist is DERIVED from ExitRouting's fields, so every valid routing knob
     # (incl. rule_priority_base, previously omitted) parses and threads through.

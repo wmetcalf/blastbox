@@ -79,7 +79,9 @@ class VmWorkerSpec:
     disk_bus: str = "sata"
     nic_model: str = "e1000"
     nwfilter: str = "clean-traffic"
-    nwfilter_ip_learning: str = "dhcp"  # CTRL_IP_LEARNING: snoop DHCP to learn the worker IP reliably
+    nwfilter_ip_learning: str = "dhcp"  # CTRL_IP_LEARNING (DHCP-learning mode; unused when worker_ip_pool set)
+    worker_ip_pool: str = ""            # "START-END" → assign+enforce: reserve+pin a fixed IP per worker
+    mac_prefix: str = "52:54:00:bb"     # OUI for assign-enforce MACs (last 2 octets derived from the IP)
     overlay_dir: str = "/dev/shm"
     subnet_prefix: str = "192.168.122."
 
@@ -186,6 +188,8 @@ class VmWorkerSpec:
             nic_model=self.nic_model,
             nwfilter=self.nwfilter,
             nwfilter_ip_learning=self.nwfilter_ip_learning,
+            worker_ip_pool=self.worker_ip_pool,
+            mac_prefix=self.mac_prefix,
             subnet_prefix=self.subnet_prefix,
             sudo=self.sudo,
             egress_policy=self.egress,

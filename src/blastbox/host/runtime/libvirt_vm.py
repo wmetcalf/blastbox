@@ -36,11 +36,14 @@ gateway for gateway-side keys. See the network primitive.
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
+import re
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -65,6 +68,24 @@ def _run(args: list[str], timeout: float = 120) -> subprocess.CompletedProcess:
         # missing when sudo=False). available() probes through here and must FAIL CLOSED (return a
         # nonzero result → available()=False), not crash runtime selection with a raw FileNotFoundError.
         return subprocess.CompletedProcess(args, 127, "", str(exc))
+
+
+def _parse_ip_pool(spec: str) -> list[str]:
+    """Parse an inclusive IPv4 range ``"A.B.C.D-A.B.C.E"`` into its list of addresses (in order)."""
+    start, _, end = spec.partition("-")
+    if not end:
+        raise ValueError(f"worker_ip_pool must be 'START-END', got {spec!r}")
+    lo = int(ipaddress.IPv4Address(start.strip()))
+    hi = int(ipaddress.IPv4Address(end.strip()))
+    if hi < lo:
+        raise ValueError(f"worker_ip_pool END < START: {spec!r}")
+    return [str(ipaddress.IPv4Address(i)) for i in range(lo, hi + 1)]
+
+
+def _mac_for_ip(prefix: str, ip: str) -> str:
+    """Deterministic MAC from the IP's 3rd+4th octets (1:1 within a /16) → no MAC bookkeeping."""
+    o = ip.split(".")
+    return f"{prefix}:{int(o[2]):02x}:{int(o[3]):02x}"
 
 
 @dataclass(frozen=True)
@@ -99,11 +120,23 @@ class LibvirtVmConfig:
     libvirt/ebtables layer so they can't. Set to "" to disable (e.g. a host pinning MAC elsewhere)."""
     nwfilter_ip_learning: str = "dhcp"
     """``CTRL_IP_LEARNING`` for the nwfilter's ``no-ip-spoofing`` (only emitted when ``nwfilter`` is
-    set). ``dhcp`` snoops the DHCP exchange to learn the worker IP — RELIABLE for DHCP guests. The
-    libvirt default (``any``, learn from the first IP packet) is racy and silently FAILS for some
-    guests (e.g. Windows): it then learns no IP, so ``no-ip-spoofing`` black-holes ALL unicast and the
-    worker never becomes reachable. Set ``any`` for first-packet learning, or "" to omit the parameter
-    (libvirt default). Workers use the libvirt network's DHCP, so ``dhcp`` is the correct default."""
+    set AND ``worker_ip_pool`` is unset — assign+enforce pins the IP explicitly instead of learning).
+    ``dhcp`` snoops the DHCP exchange to learn the worker IP — RELIABLE for DHCP guests. The libvirt
+    default (``any``, learn from the first IP packet) is racy and silently FAILS for some guests (e.g.
+    Windows): it learns no IP, so ``no-ip-spoofing`` black-holes ALL unicast and the worker never
+    becomes reachable. Set ``any`` for first-packet learning, or "" to omit (libvirt default)."""
+    worker_ip_pool: str = ""
+    """Opt-in ASSIGN+ENFORCE mode: an inclusive IPv4 range ``"START-END"`` (within ``network``'s DHCP
+    range) from which blastbox hands each worker a fixed IP. When set, blastbox: assigns the worker a
+    deterministic ``(MAC, IP)``, adds a per-worker libvirt DHCP **reservation** (so the guest gets
+    exactly that IP), and pins the IP **explicitly** in ``no-ip-spoofing`` (``CTRL_IP_LEARNING=none`` +
+    ``IP=<assigned>``) — no DHCP learning. Stronger than learning: nothing to poison via a rogue DHCP
+    reply, and no DHCP lease to expire under snapshot/restore. The reservation is removed + the IP
+    freed on reap. Empty ⇒ DHCP-learning mode (above). Each worker gets a distinct IP, so it autoscales
+    up to the pool size; size the pool ≥ the engine's ``concurrent_ceiling``."""
+    mac_prefix: str = "52:54:00:bb"
+    """4-octet OUI prefix for assign+enforce MACs; the last 2 octets are derived from the assigned IP's
+    3rd+4th octets (1:1 within a /16), so MAC↔IP is deterministic — no separate MAC bookkeeping."""
     subnet_prefix: str = "192.168.122."
     """DHCP subnet of ``network``; used to resolve the worker IP via the host neigh table."""
 
@@ -210,6 +243,59 @@ class LibvirtVmRuntime:
     def __init__(self, config: LibvirtVmConfig) -> None:
         self.cfg = config
         self._bridge_name: str | None = None  # resolved lazily from cfg.network (cached)
+        # Assign+enforce IP allocator (opt-in via worker_ip_pool). In-memory free-list + lock; the
+        # MAC is derived from the IP (1:1) so there's no separate MAC pool. Stale reservations from a
+        # prior (crashed) run are cleared at startup so the pool can't leak across restarts.
+        self._ip_pool: list[str] = _parse_ip_pool(config.worker_ip_pool) if config.worker_ip_pool else []
+        self._ip_free: list[str] = list(self._ip_pool)
+        self._ip_lock = threading.Lock()
+        if self._ip_pool:
+            self._clear_stale_reservations()
+
+    @property
+    def assigns_ip(self) -> bool:
+        return bool(self._ip_pool)
+
+    def _alloc_ip_mac(self) -> tuple[str, str]:
+        with self._ip_lock:
+            if not self._ip_free:
+                raise RuntimeError(f"worker_ip_pool exhausted ({len(self._ip_pool)} addrs); raise the "
+                                   "range or lower concurrent_ceiling")
+            ip = self._ip_free.pop(0)
+        return ip, _mac_for_ip(self.cfg.mac_prefix, ip)
+
+    def _free_ip(self, ip: str | None) -> None:
+        if not ip:
+            return
+        with self._ip_lock:
+            if ip in self._ip_pool and ip not in self._ip_free:
+                self._ip_free.append(ip)
+
+    def _reservation_xml(self, mac: str, ip: str) -> str:
+        return f"<host mac='{mac}' ip='{ip}'/>"
+
+    def _reserve(self, mac: str, ip: str) -> None:
+        """Add a per-worker libvirt DHCP reservation so the guest gets exactly ``ip``. Fail closed:
+        a failed reservation must abort the spawn (else the worker DHCPs a different IP and no-ip-
+        spoofing, pinned to ``ip``, would black-hole it)."""
+        r = self._virsh("net-update", self.cfg.network, "add", "ip-dhcp-host",
+                        self._reservation_xml(mac, ip), "--live", "--config")
+        if r.returncode != 0:
+            raise RuntimeError(f"DHCP reservation add failed for {mac}/{ip}: {(r.stderr or '').strip()}")
+
+    def _unreserve(self, mac: str | None, ip: str | None) -> None:
+        if not (mac and ip):
+            return
+        self._virsh("net-update", self.cfg.network, "delete", "ip-dhcp-host",
+                    self._reservation_xml(mac, ip), "--live", "--config")  # best-effort on teardown
+
+    def _clear_stale_reservations(self) -> None:
+        """Remove any ip-dhcp-host entries with OUR mac_prefix left by a prior crashed run, so the
+        pool's addresses are free to re-reserve. Best-effort."""
+        xml = self._virsh("net-dumpxml", self.cfg.network).stdout or ""
+        for mac, ip in re.findall(rf"<host mac='({re.escape(self.cfg.mac_prefix)}:[0-9a-fA-F:]+)' "
+                                  r"ip='([0-9.]+)'", xml):
+            self._unreserve(mac, ip)
 
     # ---- prereq check (fail-closed selection) --------------------------------
     def available(self) -> bool:
@@ -253,8 +339,16 @@ class LibvirtVmRuntime:
         happen in ``is_ready()`` so the ~60s guest boot never blocks the pool's tick loop —
         matching the async-spawn contract of the FC/gVisor runtimes."""
         sid, name, overlay = self._alloc_overlay_name()
+        # Assign+enforce: hand this worker a fixed (MAC, IP) and pin it. Allocated BEFORE the try so a
+        # pool-exhaustion error doesn't leave a half-built domain; the reservation + explicit pin go in
+        # below. slot.ip/mac are known UPFRONT (no DHCP-learn / neigh-resolution race).
+        assigned_mac = assigned_ip = None
+        if self._ip_pool:
+            assigned_ip, assigned_mac = self._alloc_ip_mac()
         slot = VmSlot(slot_id=sid, domain=name, overlay=overlay,
                       agent_port=self.cfg.agent_port, spawned_at=time.time())
+        if assigned_ip:
+            slot.ip, slot.mac = assigned_ip, assigned_mac
 
         self._destroy_domain(name)
         self._sh(["rm", "-f", overlay])
@@ -277,17 +371,23 @@ class LibvirtVmRuntime:
             # attacker-controlled XML before `sudo virsh define` reads it (defining a hostile domain
             # with the dispatcher's libvirt privileges). mkstemp gives an unguessable name + 0600;
             # root (virsh) can still read it.
+            # Reserve the worker's IP (so it DHCPs exactly that) BEFORE start. Fail-closed: a failed
+            # reservation aborts the spawn, since the explicit no-ip-spoofing pin would otherwise
+            # black-hole a different DHCP-assigned IP.
+            if assigned_ip and assigned_mac:
+                self._reserve(assigned_mac, assigned_ip)
             fd, xml_path = tempfile.mkstemp(suffix=".xml", prefix=f"{name}-")
             try:
                 with os.fdopen(fd, "w") as fh:
-                    fh.write(self._domain_xml(name, overlay))
+                    fh.write(self._domain_xml(name, overlay, mac=assigned_mac, assigned_ip=assigned_ip))
                 if self._virsh("define", xml_path).returncode != 0:
                     raise RuntimeError(f"{name}: virsh define failed")
             finally:
                 Path(xml_path).unlink(missing_ok=True)  # don't leave per-spawn XML behind
             if self._virsh("start", name).returncode != 0:
                 raise RuntimeError(f"{name}: virsh start failed")
-            slot.mac = self._domain_mac(name)
+            if not assigned_mac:        # assign-enforce already set slot.mac; else read libvirt's auto MAC
+                slot.mac = self._domain_mac(name)
             # NOTE (boot-window residual risk): the guest is on the libvirt network from `start` until
             # is_ready() installs the IP-keyed egress policy (it needs the DHCP-assigned IP first). A
             # pre-boot blanket block was tried and reverted — it had to permit DHCP (else the guest
@@ -431,6 +531,12 @@ class LibvirtVmRuntime:
             LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing).remove(
                 slot.ip, self.cfg.egress_policy.exit_driver, mac=slot.mac,
                 egress_ports=self.cfg.egress_policy.egress_ports)  # unhook AFTER the guest is gone
+        # Assign-enforce: the guest is GONE, so drop its DHCP reservation + return the IP to the pool.
+        # (Only reached on a SUCCESSFUL destroy; a failed destroy raises above + keeps the IP reserved
+        # so a still-running guest can't have its address reused.)
+        if self._ip_pool and slot.ip in self._ip_pool:
+            self._unreserve(slot.mac, slot.ip)
+            self._free_ip(slot.ip)
         # CHECK the overlay rm: a failed remove (perm/busy/immutable/timeout) leaves a stale qcow2
         # holding the sample under /dev/shm, leaking it + consuming tmpfs while replacements spawn.
         # Raise so the pool QUARANTINES the slot (keeps it tracked) and the leaked overlay surfaces.
@@ -570,7 +676,8 @@ class LibvirtVmRuntime:
         except OSError:
             return False
 
-    def _domain_xml(self, name: str, overlay: str) -> str:
+    def _domain_xml(self, name: str, overlay: str, *,
+                    mac: str | None = None, assigned_ip: str | None = None) -> str:
         c = self.cfg
         # virtio-blk attaches directly to the PCI root and has NO controller element — libvirt has no
         # `<controller type='virtio'>` type, so emitting one makes `virsh define` reject the XML and
@@ -578,11 +685,18 @@ class LibvirtVmRuntime:
         # emit a controller for the bus types that have one. virtio disks target vd*, the rest sd*.
         _ctrl = "" if c.disk_bus in ("virtio", "ide") else f"<controller type='{c.disk_bus}' index='0'/>"
         _dev = "vda" if c.disk_bus == "virtio" else "sda"
-        # nwfilter on the worker NIC. When set, emit CTRL_IP_LEARNING (default "dhcp") so no-ip-spoofing
-        # learns the worker IP from the DHCP exchange rather than libvirt's racy "any" default. Validate
-        # the value up front (libvirt only accepts dhcp/any/none) so a typo fails fast with a clear
-        # error here instead of a cryptic libvirt XML-validation error at `virsh define`.
-        if c.nwfilter and c.nwfilter_ip_learning:
+        _macref = f"<mac address='{mac}'/>" if mac else ""   # assign-enforce: pin the worker MAC
+        # nwfilter on the worker NIC. ASSIGN-ENFORCE (assigned_ip): pin the IP EXPLICITLY in
+        # no-ip-spoofing (CTRL_IP_LEARNING=none + IP=<assigned>) — nothing to learn, so no rogue-DHCP
+        # poisoning and no lease to expire. DHCP-LEARNING (no assigned_ip): emit CTRL_IP_LEARNING
+        # (default "dhcp") so no-ip-spoofing learns the IP from the DHCP exchange (libvirt's "any"
+        # default is racy and black-holes some guests). libvirt only accepts dhcp/any/none — validate
+        # up front so a typo fails fast here, not as a cryptic XML-validation error at `virsh define`.
+        if c.nwfilter and assigned_ip:
+            _filterref = (f"<filterref filter='{c.nwfilter}'>"
+                          "<parameter name='CTRL_IP_LEARNING' value='none'/>"
+                          f"<parameter name='IP' value='{assigned_ip}'/></filterref>")
+        elif c.nwfilter and c.nwfilter_ip_learning:
             if c.nwfilter_ip_learning not in ("dhcp", "any", "none"):
                 raise ValueError(
                     f"Invalid nwfilter_ip_learning {c.nwfilter_ip_learning!r}; "
@@ -611,7 +725,7 @@ class LibvirtVmRuntime:
             "<disk type='file' device='disk'><driver name='qemu' type='qcow2' cache='none' io='native' discard='unmap'/>"
             f"<source file='{overlay}'/><target dev='{_dev}' bus='{c.disk_bus}'/></disk>"
             f"{_ctrl}"
-            f"<interface type='network'><source network='{c.network}'/><model type='{c.nic_model}'/>"
+            f"<interface type='network'>{_macref}<source network='{c.network}'/><model type='{c.nic_model}'/>"
             # clean-traffic nwfilter: pin MAC + IP (no-mac/no-ip/no-arp-spoofing) at the libvirt
             # ebtables layer so a root guest can't change them to escape the IP/MAC-keyed host policy.
             # CTRL_IP_LEARNING=dhcp: snoop DHCP to learn the worker IP reliably — without it (libvirt's
