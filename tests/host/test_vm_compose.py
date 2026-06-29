@@ -186,6 +186,46 @@ def test_from_dict_rejects_malformed_block_internal():
                                      "egress": {"exit": "direct", "block_internal": "treu"}})
 
 
+@pytest.mark.parametrize("key", ["nwfilter", "nwfilter_ip_learning", "worker_ip_pool", "mac_prefix"])
+@pytest.mark.parametrize("bad", [None, False, True, 0, ["clean-traffic"]])
+def test_from_dict_rejects_non_string_security_knob(key, bad):
+    # `key:` (None) or `key: false` (bool) must be REJECTED, not read as falsy — a malformed
+    # worker_ip_pool silently falls back to DHCP-learning (disables assign+enforce); a malformed
+    # nwfilter drops the <filterref>. Fail closed on these security-sensitive fields.
+    with pytest.raises(ValueError, match="must be a string"):
+        VmWorkerSpec.from_dict("w", {"image": "/g.qcow2", key: bad})
+
+
+def test_from_dict_accepts_empty_string_nwfilter_as_disable():
+    # the ONE disable sentinel is an explicit "" (not None/false)
+    spec = VmWorkerSpec.from_dict("w", {"image": "/g.qcow2", "nwfilter": ""})
+    assert spec.nwfilter == ""
+
+
+def test_nwfilter_threads_through_spec_to_vm_config():
+    # the nwfilter + its IP-learning mode are configurable on the spec and flow to LibvirtVmConfig,
+    # so a vmcompose deployment can tune/disable the anti-spoof filter (closes the config gap).
+    spec = VmWorkerSpec.from_dict("w", {"image": "/g.qcow2",
+                                        "nwfilter": "no-mac-spoofing", "nwfilter_ip_learning": "any"})
+    assert spec.nwfilter == "no-mac-spoofing" and spec.nwfilter_ip_learning == "any"
+    cfg = spec.to_vm_config()
+    assert cfg.nwfilter == "no-mac-spoofing" and cfg.nwfilter_ip_learning == "any"
+    # defaults: clean-traffic + dhcp learning
+    dflt = VmWorkerSpec.from_dict("w", {"image": "/g.qcow2"}).to_vm_config()
+    assert dflt.nwfilter == "clean-traffic" and dflt.nwfilter_ip_learning == "dhcp"
+
+
+def test_assign_enforce_pool_threads_to_vm_config():
+    # worker_ip_pool + mac_prefix flow from the spec to LibvirtVmConfig (opt-in assign+enforce).
+    spec = VmWorkerSpec.from_dict("w", {"image": "/g.qcow2",
+                                        "worker_ip_pool": "192.168.122.200-192.168.122.250",
+                                        "mac_prefix": "52:54:00:cc"})
+    cfg = spec.to_vm_config()
+    assert cfg.worker_ip_pool == "192.168.122.200-192.168.122.250" and cfg.mac_prefix == "52:54:00:cc"
+    # default: no pool (DHCP-learning mode)
+    assert VmWorkerSpec.from_dict("w", {"image": "/g.qcow2"}).to_vm_config().worker_ip_pool == ""
+
+
 def test_from_dict_accepts_all_exit_routing_fields():
     # the unknown-key allowlist is DERIVED from ExitRouting's fields, so every valid routing knob
     # (incl. rule_priority_base, previously omitted) parses and threads through.
