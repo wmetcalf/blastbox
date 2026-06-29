@@ -227,6 +227,7 @@ class VmSlot:
     jobs: int = 0
     recycles: int = 0
     spawned_at: float = 0.0
+    reserved: bool = False  # assign-enforce: THIS spawn created the DHCP reservation (gate teardown)
 
     @property
     def endpoint(self) -> tuple[str, int] | None:
@@ -250,7 +251,7 @@ class LibvirtVmRuntime:
         self._ip_free: list[str] = list(self._ip_pool)
         self._ip_lock = threading.Lock()
         if self._ip_pool:
-            self._clear_stale_reservations()
+            self._reconcile_reservations()
 
     @property
     def assigns_ip(self) -> bool:
@@ -289,13 +290,27 @@ class LibvirtVmRuntime:
         self._virsh("net-update", self.cfg.network, "delete", "ip-dhcp-host",
                     self._reservation_xml(mac, ip), "--live", "--config")  # best-effort on teardown
 
-    def _clear_stale_reservations(self) -> None:
-        """Remove any ip-dhcp-host entries with OUR mac_prefix left by a prior crashed run, so the
-        pool's addresses are free to re-reserve. Best-effort."""
+    def _reconcile_reservations(self) -> None:
+        """Reconcile our DHCP reservations with RUNNING domains at startup so the pool never hands a
+        new worker an IP a still-running old worker (from a crashed manager) already owns — that would
+        put a duplicate MAC/IP on the bridge and let readiness/jobs talk to the wrong, possibly
+        contaminated VM. A reservation whose domain is STILL RUNNING is kept and its IP marked in-use
+        (removed from the free-list); a reservation with NO running domain is truly stale → deleted.
+        Best-effort (a missing virsh just leaves the pool fully free)."""
+        running_macs = set()
+        for dom in (self._virsh("list", "--name").stdout or "").split():
+            for tok in (self._virsh("domiflist", dom).stdout or "").split():
+                if tok.lower().startswith(self.cfg.mac_prefix.lower() + ":"):
+                    running_macs.add(tok.lower())
         xml = self._virsh("net-dumpxml", self.cfg.network).stdout or ""
         for mac, ip in re.findall(rf"<host mac='({re.escape(self.cfg.mac_prefix)}:[0-9a-fA-F:]+)' "
                                   r"ip='([0-9.]+)'", xml):
-            self._unreserve(mac, ip)
+            if mac.lower() in running_macs:
+                with self._ip_lock:            # live worker owns it → keep reserved, don't hand it out
+                    if ip in self._ip_free:
+                        self._ip_free.remove(ip)
+            else:
+                self._unreserve(mac, ip)        # no domain owns it → truly stale, free the reservation
 
     # ---- prereq check (fail-closed selection) --------------------------------
     def available(self) -> bool:
@@ -376,6 +391,7 @@ class LibvirtVmRuntime:
             # black-hole a different DHCP-assigned IP.
             if assigned_ip and assigned_mac:
                 self._reserve(assigned_mac, assigned_ip)
+                slot.reserved = True   # only WE may delete this reservation (see reap)
             fd, xml_path = tempfile.mkstemp(suffix=".xml", prefix=f"{name}-")
             try:
                 with os.fdopen(fd, "w") as fh:
@@ -531,11 +547,15 @@ class LibvirtVmRuntime:
             LibvirtEgress(sudo=self.cfg.sudo, routing=self.cfg.exit_routing).remove(
                 slot.ip, self.cfg.egress_policy.exit_driver, mac=slot.mac,
                 egress_ports=self.cfg.egress_policy.egress_ports)  # unhook AFTER the guest is gone
-        # Assign-enforce: the guest is GONE, so drop its DHCP reservation + return the IP to the pool.
-        # (Only reached on a SUCCESSFUL destroy; a failed destroy raises above + keeps the IP reserved
-        # so a still-running guest can't have its address reused.)
+        # Assign-enforce: the guest is GONE, so drop ITS DHCP reservation + return the IP to the pool.
+        # Only delete the reservation if THIS slot created it (slot.reserved) — a spawn whose own
+        # _reserve() FAILED (e.g. the IP was already reserved by another live runtime) must NOT delete
+        # that other reservation on the except→reap path. The IP is still ours to return to the pool
+        # (it came from our allocator). (Only reached on a SUCCESSFUL destroy; a failed destroy raises
+        # above + keeps everything in place so a still-running guest's address can't be reused.)
         if self._ip_pool and slot.ip in self._ip_pool:
-            self._unreserve(slot.mac, slot.ip)
+            if slot.reserved:
+                self._unreserve(slot.mac, slot.ip)
             self._free_ip(slot.ip)
         # CHECK the overlay rm: a failed remove (perm/busy/immutable/timeout) leaves a stale qcow2
         # holding the sample under /dev/shm, leaking it + consuming tmpfs while replacements spawn.

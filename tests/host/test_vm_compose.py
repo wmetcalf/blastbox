@@ -186,14 +186,14 @@ def test_from_dict_rejects_malformed_block_internal():
                                      "egress": {"exit": "direct", "block_internal": "treu"}})
 
 
+@pytest.mark.parametrize("key", ["nwfilter", "nwfilter_ip_learning", "worker_ip_pool", "mac_prefix"])
 @pytest.mark.parametrize("bad", [None, False, True, 0, ["clean-traffic"]])
-def test_from_dict_rejects_non_string_nwfilter(bad):
-    # `nwfilter:` (None) or `nwfilter: false` (bool) must be REJECTED, not read as falsy and silently
-    # drop the <filterref> — that disables the anti-spoofing a root guest is held back by.
+def test_from_dict_rejects_non_string_security_knob(key, bad):
+    # `key:` (None) or `key: false` (bool) must be REJECTED, not read as falsy — a malformed
+    # worker_ip_pool silently falls back to DHCP-learning (disables assign+enforce); a malformed
+    # nwfilter drops the <filterref>. Fail closed on these security-sensitive fields.
     with pytest.raises(ValueError, match="must be a string"):
-        VmWorkerSpec.from_dict("w", {"image": "/g.qcow2", "nwfilter": bad})
-    with pytest.raises(ValueError, match="must be a string"):
-        VmWorkerSpec.from_dict("w", {"image": "/g.qcow2", "nwfilter_ip_learning": bad})
+        VmWorkerSpec.from_dict("w", {"image": "/g.qcow2", key: bad})
 
 
 def test_from_dict_accepts_empty_string_nwfilter_as_disable():

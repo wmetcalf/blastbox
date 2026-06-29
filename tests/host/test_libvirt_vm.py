@@ -186,6 +186,59 @@ def test_spawn_reserves_and_assigns_then_reap_unreserves(monkeypatch):
     assert held in rt._ip_free                       # IP returned to the pool after reap
 
 
+def test_spawn_reserve_failure_does_not_delete_others_reservation(monkeypatch):
+    # if our _reserve() fails (IP already reserved by another live runtime), the except->reap path
+    # must NOT delete that other reservation — only free our own allocation back to the pool.
+    rt = _rt(worker_ip_pool="192.168.122.200-192.168.122.201")
+    calls: list[list[str]] = []
+
+    def fake_virsh(*a, **k):
+        calls.append(list(a))
+        if a[:3] == ("net-update", "default", "add"):
+            return type("C", (), {"returncode": 1, "stdout": "", "stderr": "already in use"})()
+        return _OK()
+
+    monkeypatch.setattr(rt, "_virsh", fake_virsh)
+    monkeypatch.setattr(rt, "_sh", _sh_ok_free_name)
+    monkeypatch.setattr(rt, "_destroy_domain", lambda *a, **k: True)
+    with pytest.raises(RuntimeError, match="reservation add failed"):
+        rt.spawn()
+    # the failed spawn's reap must NOT have issued a net-update delete (it never owned the reservation)
+    assert not any(a[:3] == ["net-update", "default", "delete"] for a in calls)
+    # but our allocated IP is returned to the pool (no leak)
+    assert len(rt._ip_free) == 2
+
+
+def test_reconcile_keeps_running_workers_ip_and_clears_stale(monkeypatch):
+    # startup reconcile: an IP whose domain is STILL RUNNING (crashed manager) is marked in-use; a
+    # reservation with no live domain is deleted as stale.
+    import blastbox.host.runtime.libvirt_vm as mod
+    deletes: list[str] = []
+
+    def fake_run(args, **k):
+        s = " ".join(args)
+        if "list --name" in s:
+            return type("C", (), {"returncode": 0, "stdout": "bbvm-live\n"})()
+        if "domiflist bbvm-live" in s:
+            return type("C", (), {"returncode": 0,
+                "stdout": " vnet9  network  default  e1000  52:54:00:bb:7a:c8\n"})()  # .200 live
+        if "net-dumpxml" in s:
+            return type("C", (), {"returncode": 0, "stdout":
+                "<host mac='52:54:00:bb:7a:c8' ip='192.168.122.200'/>"     # running -> keep
+                "<host mac='52:54:00:bb:7a:c9' ip='192.168.122.201'/>"}    # stale   -> delete
+                )()
+        if "net-update" in s and "delete" in s:
+            deletes.append(s)
+        return type("C", (), {"returncode": 0, "stdout": ""})()
+
+    monkeypatch.setattr(mod, "_run", fake_run)
+    rt = mod.LibvirtVmRuntime(mod.LibvirtVmConfig(
+        golden_base="/g.qcow2", worker_ip_pool="192.168.122.200-192.168.122.201"))
+    assert "192.168.122.200" not in rt._ip_free        # live worker's IP not handed out
+    assert "192.168.122.201" in rt._ip_free            # stale IP freed for reuse
+    assert any("192.168.122.201" in d for d in deletes) and not any("192.168.122.200" in d for d in deletes)
+
+
 def test_dhcp_learning_mode_no_reservation(monkeypatch):
     # without a pool, spawn() does NOT touch DHCP reservations (DHCP-learning mode); MAC is read back.
     rt = _rt()  # no worker_ip_pool
