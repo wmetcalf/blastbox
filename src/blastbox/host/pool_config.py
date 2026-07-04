@@ -117,11 +117,13 @@ def build_warm_pool(
         elif cfg.runtime == RUNTIME_AWS_LAMBDA_MICROVM:
             from blastbox.host.runtime.aws_worker import select_lambda_microvm_runtime
 
-            runtime = select_lambda_microvm_runtime(require_available=True)
+            # network-endpoint slot (AwsWorkerSlot) diverges from the SlotRuntime Protocol's Slot,
+            # like libvirt's VmSlot -- WarmPool drives it fine (touches only the common fields).
+            runtime = select_lambda_microvm_runtime(require_available=True)  # type: ignore[assignment]
         elif cfg.runtime == RUNTIME_AWS_EC2:
             from blastbox.host.runtime.aws_worker import select_disposable_ec2_runtime
 
-            runtime = select_disposable_ec2_runtime(require_available=True)
+            runtime = select_disposable_ec2_runtime(require_available=True)  # type: ignore[assignment]
         else:
             raise ValueError(f"unknown pool runtime: {cfg.runtime!r}")
 
