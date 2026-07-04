@@ -78,7 +78,7 @@ and the tier-capability matrix.
 
 | Var | Default | Notes |
 |---|---|---|
-| `BLASTBOX_POOL_RUNTIME` | runtime default | Warm backend: `firecracker`, `gvisor`, `aws-lambda-microvm`, `aws-ec2`, or `static`. |
+| `BLASTBOX_POOL_RUNTIME` | runtime default | Warm backend: `firecracker`, `gvisor`, `aws-lambda-microvm`, `aws-ec2`, `static`, or `cascade` (tiered local→overflow). |
 | `BLASTBOX_POOL_WARM_SIZE` | — | Number of pre-warmed slots. |
 | `BLASTBOX_POOL_CEILING` | — | Max concurrent slots (warm + burst). |
 | `BLASTBOX_POOL_BURST_SIZE` | — | Extra cold-burst slots above the warm set under load. |
@@ -174,6 +174,33 @@ The fleet is finite, so **size the pool to it**: keep `BLASTBOX_POOL_CEILING <= 
 (a claim beyond the fleet raises `StaticPoolExhausted`). Set `BLASTBOX_DISPATCH_CONCURRENCY` to the fleet
 size too. This is the "bare-metal worker pool" shape — the same warm-pool scaler + generic agent as the
 cloud tiers, just pointed at machines you already own.
+
+## Runtime: cascade (local + overflow tiers) (`cascade`)
+
+**"Run X workers locally, then burst up to Y on other hardware / AWS"** as a single warm pool. A
+priority-ordered list of tiers — each an existing backend + a capacity — where `spawn` fills tier 1,
+then overflows to tier 2, and so on; `reap` frees the slot on whichever tier owns it. The WarmPool on
+top is unchanged (it still sees one runtime); each tier reads its own backend config.
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_POOL_TIERS` | — | **Required.** Ordered `backend:capacity` list, e.g. `gvisor:4,aws-ec2:16` — 4 warm local + up to 16 overflow on AWS. Backends: `gvisor`, `firecracker`, `static`, `aws-ec2`, `aws-lambda-microvm`. |
+
+The **primary** (first) tier must be available at startup (fail-closed); an **overflow** tier that isn't
+available is logged and skipped, so local capacity still comes up if the cloud/remote tier is
+misconfigured. Set `BLASTBOX_POOL_WARM_SIZE` to the local tier's capacity (keep those warm),
+`BLASTBOX_POOL_CEILING` to the sum (local + overflow), and `BLASTBOX_DISPATCH_CONCURRENCY` to the ceiling.
+
+Example — 4 warm gVisor locally, overflow to a rack of other boxes, then AWS:
+```
+BLASTBOX_POOL_RUNTIME=cascade
+BLASTBOX_POOL_TIERS=gvisor:4,static:8,aws-ec2:16
+BLASTBOX_STATIC_WORKERS=box1:8765,box2:8765,box3:8765,box4:8765
+BLASTBOX_EC2_AMI=ami-...            # (+ BLASTBOX_EC2_* placement)
+BLASTBOX_POOL_WARM_SIZE=4
+BLASTBOX_POOL_CEILING=28
+BLASTBOX_DISPATCH_CONCURRENCY=28
+```
 
 ## Per-engine params (engine ↔ host boundary)
 

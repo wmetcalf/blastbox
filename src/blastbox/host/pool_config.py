@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Any
 from dataclasses import dataclass
 
 from blastbox.host.pool import SlotRuntime, WarmPool
@@ -22,6 +23,7 @@ RUNTIME_GVISOR = "gvisor"
 RUNTIME_AWS_LAMBDA_MICROVM = "aws-lambda-microvm"
 RUNTIME_AWS_EC2 = "aws-ec2"
 RUNTIME_STATIC = "static"
+RUNTIME_CASCADE = "cascade"
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,40 @@ class PoolConfig:
         return cfg
 
 
+def select_runtime_by_name(
+    name: str, *, warm_snapshot: bool = False, require_available: bool = True
+) -> Any:
+    """Build one SlotRuntime for a backend name. Shared by ``build_warm_pool`` and the cascade tier
+    builder. Network-endpoint tiers (aws/static) return slots that structurally diverge from the
+    ``SlotRuntime`` Protocol's ``Slot`` -- WarmPool drives them fine (it touches only common fields),
+    so this returns ``Any`` rather than sprinkling per-call ``type: ignore``."""
+    if name == RUNTIME_FIRECRACKER:
+        if warm_snapshot:
+            from blastbox.host.runtime.fc_snapshot_runtime import select_snapshot_runtime
+
+            return select_snapshot_runtime(require_available=require_available)
+        from blastbox.host.runtime.firecracker import select_fc_runtime
+
+        return select_fc_runtime(require_available=require_available)
+    if name == RUNTIME_GVISOR:
+        from blastbox.host.runtime.gvisor_snapshot_runtime import select_gvisor_snapshot_runtime
+
+        return select_gvisor_snapshot_runtime(require_available=require_available)
+    if name == RUNTIME_AWS_LAMBDA_MICROVM:
+        from blastbox.host.runtime.aws_worker import select_lambda_microvm_runtime
+
+        return select_lambda_microvm_runtime(require_available=require_available)
+    if name == RUNTIME_AWS_EC2:
+        from blastbox.host.runtime.aws_worker import select_disposable_ec2_runtime
+
+        return select_disposable_ec2_runtime(require_available=require_available)
+    if name == RUNTIME_STATIC:
+        from blastbox.host.runtime.static_pool import select_static_pool_runtime
+
+        return select_static_pool_runtime(require_available=require_available)
+    raise ValueError(f"unknown pool runtime: {name!r}")
+
+
 def build_warm_pool(
     cfg: PoolConfig | None = None,
     *,
@@ -98,39 +134,12 @@ def build_warm_pool(
     if runtime is None:
         if cfg.runtime == RUNTIME_NONE:
             return None
-        if cfg.runtime == RUNTIME_FIRECRACKER:
-            if cfg.warm_snapshot:
-                from blastbox.host.runtime.fc_snapshot_runtime import (
-                    select_snapshot_runtime,
-                )
+        if cfg.runtime == RUNTIME_CASCADE:
+            from blastbox.host.runtime.cascade import build_cascade_runtime
 
-                runtime = select_snapshot_runtime(require_available=True)
-            else:
-                from blastbox.host.runtime.firecracker import select_fc_runtime
-
-                runtime = select_fc_runtime(require_available=True)
-        elif cfg.runtime == RUNTIME_GVISOR:
-            from blastbox.host.runtime.gvisor_snapshot_runtime import (
-                select_gvisor_snapshot_runtime,
-            )
-
-            runtime = select_gvisor_snapshot_runtime(require_available=True)
-        elif cfg.runtime == RUNTIME_AWS_LAMBDA_MICROVM:
-            from blastbox.host.runtime.aws_worker import select_lambda_microvm_runtime
-
-            # network-endpoint slot (AwsWorkerSlot) diverges from the SlotRuntime Protocol's Slot,
-            # like libvirt's VmSlot -- WarmPool drives it fine (touches only the common fields).
-            runtime = select_lambda_microvm_runtime(require_available=True)  # type: ignore[assignment]
-        elif cfg.runtime == RUNTIME_AWS_EC2:
-            from blastbox.host.runtime.aws_worker import select_disposable_ec2_runtime
-
-            runtime = select_disposable_ec2_runtime(require_available=True)  # type: ignore[assignment]
-        elif cfg.runtime == RUNTIME_STATIC:
-            from blastbox.host.runtime.static_pool import select_static_pool_runtime
-
-            runtime = select_static_pool_runtime(require_available=True)  # type: ignore[assignment]
+            runtime = build_cascade_runtime(warm_snapshot=cfg.warm_snapshot)
         else:
-            raise ValueError(f"unknown pool runtime: {cfg.runtime!r}")
+            runtime = select_runtime_by_name(cfg.runtime, warm_snapshot=cfg.warm_snapshot)
 
     assert runtime is not None  # narrowed: every branch above returned/raised/assigned
     pool = WarmPool(
