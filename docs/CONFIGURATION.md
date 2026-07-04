@@ -78,7 +78,7 @@ and the tier-capability matrix.
 
 | Var | Default | Notes |
 |---|---|---|
-| `BLASTBOX_POOL_RUNTIME` | runtime default | Warm backend: `firecracker` or `gvisor`. |
+| `BLASTBOX_POOL_RUNTIME` | runtime default | Warm backend: `firecracker`, `gvisor`, `aws-lambda-microvm`, or `aws-ec2`. |
 | `BLASTBOX_POOL_WARM_SIZE` | — | Number of pre-warmed slots. |
 | `BLASTBOX_POOL_CEILING` | — | Max concurrent slots (warm + burst). |
 | `BLASTBOX_POOL_BURST_SIZE` | — | Extra cold-burst slots above the warm set under load. |
@@ -118,6 +118,41 @@ and the tier-capability matrix.
 | `BLASTBOX_CRAC_JAVA_BIN` | `java` | JVM used for the CRaC warmup. |
 | `BLASTBOX_CRAC_JCMD_BIN` | `jcmd` | `jcmd` for triggering the checkpoint. |
 | `BLASTBOX_CRAC_ENGINE_ARGV` | `""` | The JVM engine's launch argv (JSON list). |
+
+## Runtime: AWS disposable workers (Lambda MicroVM / disposable EC2)
+
+A **family** of managed-cloud backends behind the same warm-pool seam (`SlotRuntime`), for running
+workers on AWS with no host infra. Selected by `BLASTBOX_POOL_RUNTIME=aws-lambda-microvm` or
+`aws-ec2`. Both are **network-endpoint, disposable** tiers (one job per worker, then terminate — no
+reuse), driven by `VmJobDispatcher` with a transport (the generic `remote_http` HTTP+tar transport, or
+an engine-supplied one). They shell the `aws` CLI (no boto3 dep) and are **fail-closed**: a tier is
+refused at selection unless `sts get-caller-identity` and a read-only service probe both pass. Only
+**sealed-Linux** engines fit (ARM64 worker image running `python -m blastbox.worker.http_agent`;
+win-validator stays libvirt — no Windows/nested-virt on either).
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_AWS_REGION` | `AWS_REGION` or `us-east-1` | Region for all AWS calls. |
+| `BLASTBOX_AWS_PROFILE` | — | Named CLI profile (else default cred chain). |
+| `BLASTBOX_AWS_AGENT_PORT` | `8765` | Port the in-worker HTTP agent listens on. |
+| `BLASTBOX_AWS_MAX_DURATION_S` | `3600` | Hard lifetime cap requested of the worker (belt-and-braces reap). |
+| **Lambda MicroVM** (`aws-lambda-microvm`) | | transport = per-VM HTTPS URL + JWE token |
+| `BLASTBOX_LAMBDA_IMAGE` | — | **Required.** MicroVM image identifier/ARN (from `create-microvm-image`). |
+| `BLASTBOX_LAMBDA_EXEC_ROLE_ARN` | — | Execution role for `run-microvm`. |
+| `BLASTBOX_LAMBDA_EGRESS_CONNECTORS` | `""` | Comma-list of VPC egress-connector ids; **empty ⇒ sealed (no outbound)**. |
+| `BLASTBOX_LAMBDA_NO_INGRESS` | `0` | `1` ⇒ `NO_INGRESS` (no public URL). |
+| **Disposable EC2** (`aws-ec2`) | | transport = instance IP:port (private by default) |
+| `BLASTBOX_EC2_AMI` | — | **Required.** Worker AMI (agent brought up via user-data). |
+| `BLASTBOX_EC2_INSTANCE_TYPE` | `m7g.large` | ARM64 default (matches the sealed-Linux ARM image); override for x86. |
+| `BLASTBOX_EC2_SUBNET_ID` / `BLASTBOX_EC2_SECURITY_GROUPS` | — | VPC placement + SGs (comma-list). |
+| `BLASTBOX_EC2_IAM_PROFILE` / `BLASTBOX_EC2_KEY_NAME` | — | Instance profile name / SSH key name. |
+| `BLASTBOX_EC2_PUBLIC_IP` | `0` | `1` ⇒ talk to the public IP (default: private, host in-VPC). |
+| `BLASTBOX_EC2_USER_DATA_B64` | — | base64 cloud-init that starts the worker agent on `AGENT_PORT`. |
+
+The **generic worker agent** (`python -m blastbox.worker.http_agent`, `BLASTBOX_ENGINE=module:Class`)
+serves any engine over `GET /healthz` + `POST /detonate`; bake it + the engine + its deps into the
+worker image. `BLASTBOX_WORKER_AGENT_PORT` / `BLASTBOX_WORKER_AGENT_TOKEN` / `BLASTBOX_WORKER_AGENT_MAX_BYTES`
+tune it.
 
 ## Per-engine params (engine ↔ host boundary)
 
