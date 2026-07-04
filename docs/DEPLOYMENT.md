@@ -35,6 +35,12 @@ redundant, and (for nono) Landlock isn't even available under runsc (below).
 > tier with a weak outer boundary) and **the FC guest**. gVisor relies on its Sentry, which is
 > itself a syscall sandbox, so nono adds nothing there — they're *substitutes, not layers*.
 
+> **Network-endpoint tiers are a different axis.** `static` (other hardware), `aws-ec2` /
+> `aws-lambda-microvm` (cloud), and `cascade` (local + overflow) decide **where the worker runs**, not
+> how it's isolated — each remote worker runs the same hardened worker image and provides its own
+> boundary (typically runsc). The host drives them over the generic HTTP+tar transport (`remote_http`,
+> the same sealed-envelope contract as a local sandbox). See *Which tier* below + deployment shape 3.
+
 ## Which tier do I want?
 
 - **Bare-metal host, no KVM, no gVisor** → `runc` + an inner namespace sandbox. Prefer
@@ -51,6 +57,15 @@ redundant, and (for nono) Landlock isn't even available under runsc (below).
   Add the **warm-UNO snapshot** tier for LibreOffice to hide the ~750 ms soffice boot.
 - **Throughput-sensitive** → a **warm pool** (FC snapshot or gVisor C/R), sized so
   `BLASTBOX_DISPATCH_CONCURRENCY == BLASTBOX_POOL_WARM_SIZE`.
+- **Other physical machines you already own** → `static` — point the pool at a fixed fleet of
+  always-on boxes each running `python -m blastbox.worker.http_agent` (`BLASTBOX_STATIC_WORKERS`).
+  Spawn claims a free box, reap returns it — nothing boots/terminates; each box provides its own
+  isolation (run the worker image under runsc there).
+- **Cloud burst** → `aws-ec2` (throwaway EC2 per job) or `aws-lambda-microvm` (Lambda MicroVM + JWE) —
+  disposable, one job then terminate; fail-closed on creds/entitlement (`BLASTBOX_EC2_*` / `BLASTBOX_LAMBDA_*`).
+- **X local + burst to Y elsewhere** → `cascade` — an ordered `BLASTBOX_POOL_TIERS` list, e.g.
+  `gvisor:4,static:8,aws-ec2:16`: fills local first, overflows to other hardware, then cloud. Set
+  `BLASTBOX_POOL_WARM_SIZE`=the local tier's capacity and `BLASTBOX_POOL_CEILING`=the sum.
 
 Defense-in-depth on the weak tier: enable **`BLASTBOX_WORKER_NONO_WRAP=1`** on the **runc**
 cold path to Landlock-confine the whole worker (write-confinement + network block) on top of
@@ -93,6 +108,35 @@ Tier-specific gotchas, captured here so they aren't re-discovered:
   dir on startup; do **not** set `BLASTBOX_WORKER_NONO_WRAP` (Landlock ENOSYS).
 - FC sidecar: `BLASTBOX_FC_VCPU=1` (pinned), guest output via virtio-blk ext4 (read by
   `debugfs`), no guest NIC. Landlock *is* available in the guest, so inner-nono works there.
+
+### 3. Network-endpoint workers — other hardware, cloud, or a cascade
+
+Run the worker **off-box** instead of launching a local container per job. Bake
+`python -m blastbox.worker.http_agent` (`BLASTBOX_ENGINE=<module:Class>`) + the engine into an image;
+the host POSTs each job's input and gets the sealed output tar back over the generic `remote_http`
+transport (same sealed-envelope contract as a local sandbox; auth via a shared bearer token or the
+Lambda JWE). All wiring is env — no code changes to add/resize/retarget a tier.
+
+```sh
+# (a) a fleet of boxes you own — claims a free box, returns it; nothing boots/terminates
+BLASTBOX_POOL_RUNTIME=static
+BLASTBOX_STATIC_WORKERS=box1:8765,box2:8765,box3:8765     # +BLASTBOX_STATIC_WORKER_TOKEN
+
+# (b) disposable cloud workers (one job -> terminate; fail-closed on creds)
+BLASTBOX_POOL_RUNTIME=aws-ec2                             # or aws-lambda-microvm
+BLASTBOX_EC2_AMI=ami-...                                  # +BLASTBOX_EC2_* placement
+
+# (c) X local + overflow to other hardware then cloud — a single pool
+BLASTBOX_POOL_RUNTIME=cascade
+BLASTBOX_POOL_TIERS=gvisor:4,static:8,aws-ec2:16          # local -> other boxes -> AWS
+BLASTBOX_POOL_WARM_SIZE=4                                 # keep the 4 local warm
+BLASTBOX_POOL_CEILING=28                                  # 4 + 8 + 16
+BLASTBOX_DISPATCH_CONCURRENCY=28
+```
+
+In the cascade the **primary (local) tier is fail-closed**; an overflow tier that isn't available at
+startup is logged and **skipped**, so local capacity still comes up if the cloud/remote tier is
+misconfigured. Full knob tables: the *Runtime: static / AWS / cascade* sections of CONFIGURATION.md.
 
 ## Generating a sandbox policy (optional, advanced)
 
