@@ -16,6 +16,7 @@ import logging
 import os
 import shutil
 import tarfile
+import tempfile
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
@@ -50,12 +51,13 @@ def slot_base_url(slot: _Slot) -> str:
     raise ValueError("slot has no reachable endpoint (no url and no ip)")
 
 
-def _safe_extract_tar(tar_bytes: bytes, dest: Path) -> list[str]:
-    """Extract regular files from ``tar_bytes`` into ``dest``, rejecting path traversal. Returns the
-    relative paths written."""
+def _safe_extract_tar(tar_source: bytes | Any, dest: Path) -> list[str]:
+    """Extract regular files from a tar (bytes or a seekable fileobj) into ``dest``, rejecting path
+    traversal. Returns the relative paths written."""
     dest = dest.resolve()
+    fileobj = io.BytesIO(tar_source) if isinstance(tar_source, (bytes, bytearray)) else tar_source
     written: list[str] = []
-    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r") as tf:
+    with tarfile.open(fileobj=fileobj, mode="r") as tf:
         for m in tf.getmembers():
             if not m.isfile():
                 continue
@@ -92,10 +94,13 @@ def detonate_remote(
         headers["X-aws-proxy-auth"] = token
         headers["X-aws-proxy-port"] = str(agent_port)
     req = urllib.request.Request(url, data=input_path.read_bytes(), method="POST", headers=headers)
-    with opener(req, timeout) as resp:
-        tar_bytes = resp.read()
     output_dir.mkdir(parents=True, exist_ok=True)
-    _safe_extract_tar(tar_bytes, output_dir)
+    # stream the response tar to a spooled temp file (spills to disk past 64MB) rather than holding the
+    # whole thing in memory -- artifact tars can be large.
+    with opener(req, timeout) as resp, tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:
+        shutil.copyfileobj(resp, spool)
+        spool.seek(0)
+        _safe_extract_tar(spool, output_dir)
     meta = output_dir / "metadata.json"
     if meta.exists():
         return json.loads(meta.read_text())

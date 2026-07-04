@@ -29,10 +29,10 @@ def _tar(files: dict[str, bytes]) -> bytes:
 
 class _Resp:
     def __init__(self, data: bytes) -> None:
-        self._d = data
+        self._bio = io.BytesIO(data)
 
-    def read(self) -> bytes:
-        return self._d
+    def read(self, n: int = -1) -> bytes:
+        return self._bio.read(n)
 
     def __enter__(self):
         return self

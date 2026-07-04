@@ -25,6 +25,7 @@ Optional bearer auth: set `BLASTBOX_WORKER_AGENT_TOKEN`; the agent then requires
 
 from __future__ import annotations
 
+import hmac
 import io
 import json
 import logging
@@ -53,13 +54,8 @@ def _safe_name(raw: str | None) -> str:
     return keep or "input.bin"
 
 
-def _const_eq(a: str, b: str) -> bool:
-    if len(a) != len(b):
-        return False
-    r = 0
-    for x, y in zip(a, b):
-        r |= ord(x) ^ ord(y)
-    return r == 0
+class _TruncatedBody(Exception):
+    """The client sent fewer bytes than Content-Length declared."""
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -86,7 +82,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not got:
             auth = self.headers.get("Authorization", "")
             got = auth[7:] if auth.startswith("Bearer ") else ""
-        return _const_eq(got, self.token)
+        return hmac.compare_digest(got, self.token)
 
     def do_GET(self) -> None:
         if urlparse(self.path).path == "/healthz":
@@ -102,7 +98,11 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._authed():
             self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "bad_content_length"})
+            return
         if length <= 0:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "empty_body"})
             return
@@ -112,6 +112,9 @@ class _Handler(BaseHTTPRequestHandler):
         name = _safe_name(parse_qs(parsed.query).get("name", [None])[0])
         try:
             tar_bytes = self._run_job(name, length)
+        except _TruncatedBody:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "truncated_body"})
+            return
         except Exception as exc:  # noqa: BLE001 -- a job crash must not kill the agent
             _log.warning("http_agent: detonate failed: %s", exc)
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "engine_error"})
@@ -136,6 +139,8 @@ class _Handler(BaseHTTPRequestHandler):
                         break
                     fh.write(chunk)
                     remaining -= len(chunk)
+            if remaining > 0:
+                raise _TruncatedBody
             # SAME core the cold/FC/gVisor workers use: runs the engine + seals metadata.json in out_dir
             run_detonation(self.engine, input_path=in_path, output_dir=out_dir, limits=Limits.from_env())
             # tar the sealed output dir (metadata.json + artifacts) for the host to extract
@@ -149,10 +154,9 @@ class _Handler(BaseHTTPRequestHandler):
 
 def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
           token: str | None = None, max_bytes: int = _DEFAULT_MAX_BYTES) -> ThreadingHTTPServer:
-    _Handler.engine = engine
-    _Handler.token = token
-    _Handler.max_bytes = max_bytes
-    httpd = ThreadingHTTPServer((bind, port), _Handler)
+    handler = type("_BoundHandler", (_Handler,),
+                   {"engine": engine, "token": token, "max_bytes": max_bytes})
+    httpd = ThreadingHTTPServer((bind, port), handler)
     _log.info("http_agent: serving engine=%s on %s:%d", engine.name, bind, port)
     return httpd
 

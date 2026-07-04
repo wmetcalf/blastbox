@@ -57,6 +57,7 @@ def test_healthz():
             assert body["ok"] is True and body["engine"] == "test-noop"
     finally:
         httpd.shutdown()
+        httpd.server_close()
 
 
 def test_end_to_end_detonate_roundtrip(tmp_path):
@@ -75,6 +76,7 @@ def test_end_to_end_detonate_roundtrip(tmp_path):
         assert meta.get("status") == "ok"
     finally:
         httpd.shutdown()
+        httpd.server_close()
 
 
 def test_auth_required_when_token_set(tmp_path):
@@ -89,6 +91,7 @@ def test_auth_required_when_token_set(tmp_path):
         assert r.status == 200
     finally:
         httpd.shutdown()
+        httpd.server_close()
 
 
 def test_size_cap(tmp_path):
@@ -99,6 +102,7 @@ def test_size_cap(tmp_path):
         assert ei.value.code == 413
     finally:
         httpd.shutdown()
+        httpd.server_close()
 
 
 def test_unknown_paths_404():
@@ -109,3 +113,4 @@ def test_unknown_paths_404():
         assert ei.value.code == 404
     finally:
         httpd.shutdown()
+        httpd.server_close()
