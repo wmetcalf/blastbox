@@ -21,6 +21,7 @@ RUNTIME_FIRECRACKER = "firecracker"
 RUNTIME_GVISOR = "gvisor"
 RUNTIME_AWS_LAMBDA_MICROVM = "aws-lambda-microvm"
 RUNTIME_AWS_EC2 = "aws-ec2"
+RUNTIME_STATIC = "static"
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,10 @@ def build_warm_pool(
             from blastbox.host.runtime.aws_worker import select_disposable_ec2_runtime
 
             runtime = select_disposable_ec2_runtime(require_available=True)  # type: ignore[assignment]
+        elif cfg.runtime == RUNTIME_STATIC:
+            from blastbox.host.runtime.static_pool import select_static_pool_runtime
+
+            runtime = select_static_pool_runtime(require_available=True)  # type: ignore[assignment]
         else:
             raise ValueError(f"unknown pool runtime: {cfg.runtime!r}")
 

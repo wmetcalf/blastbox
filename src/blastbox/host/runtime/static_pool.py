@@ -1,0 +1,230 @@
+"""Static worker-pool runtime (SlotRuntime) for pre-provisioned, always-on workers.
+
+The AWS/FC/gVisor tiers *create* a worker per slot (spawn -> boot -> terminate). This backend is the
+opposite: a **fixed fleet of long-lived boxes** (bare-metal or VMs) that each already run the generic
+``blastbox.worker.http_agent``. "Spawning" a slot just **claims a free box** from the registered list;
+"reaping" it **returns the box to the pool** -- nothing is booted or torn down. Same network-endpoint
+slot shape as :class:`~blastbox.host.runtime.aws_worker.AwsWorkerSlot`, so the ``remote_http`` transport
+and ``VmJobDispatcher`` drive it unchanged.
+
+Selected by ``BLASTBOX_POOL_RUNTIME=static``; the fleet is declared in ``BLASTBOX_STATIC_WORKERS`` (a
+comma-list of ``host:port`` or ``http://host:port`` endpoints). Because the fleet is finite, size the pool
+to it: keep ``BLASTBOX_POOL_CEILING <= len(workers)`` (a spawn beyond the fleet raises ``StaticPoolExhausted``).
+
+Fail-closed: ``available()`` returns False unless at least one configured box answers ``/healthz``.
+"""
+
+from __future__ import annotations
+
+import itertools
+import logging
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+from blastbox.host.pool import SlotState
+from blastbox.host.runtime.aws_worker import HttpProbe, _default_http_probe
+
+_log = logging.getLogger("blastbox.host.runtime.static_pool")
+
+
+class StaticPoolExhausted(RuntimeError):
+    """All registered workers are already claimed (pool ceiling exceeds the fleet size)."""
+
+
+class StaticPoolUnavailable(RuntimeError):
+    """No worker is configured / reachable -- the tier must not be selected."""
+
+
+def _env(get: Callable[[str], str | None], key: str, default: str | None = None) -> str | None:
+    v = get(key)
+    return v if (v is not None and v != "") else default
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class StaticWorker:
+    """One registered always-on worker. ``url`` (a full base URL) wins over ``host``/``port``."""
+
+    host: str | None = None
+    port: int = 8765
+    url: str | None = None
+    token: str | None = None
+
+    @classmethod
+    def parse(cls, spec: str, *, default_port: int, default_token: str | None) -> StaticWorker:
+        """Parse one ``BLASTBOX_STATIC_WORKERS`` item: ``http://h:p``, ``h:p``, or ``h``."""
+        spec = spec.strip()
+        if spec.startswith(("http://", "https://")):
+            return cls(url=spec.rstrip("/"), token=default_token)
+        host, _, port = spec.partition(":")
+        return cls(host=host, port=int(port) if port else default_port, token=default_token)
+
+
+@dataclass(frozen=True)
+class StaticPoolConfig:
+    workers: tuple[StaticWorker, ...] = ()
+    health_path: str = "/healthz"
+    probe_timeout_s: float = 5.0
+
+    @classmethod
+    def from_env(cls, get: Callable[[str], str | None], **overrides: Any) -> StaticPoolConfig:
+        default_port = int(_env(get, "BLASTBOX_STATIC_AGENT_PORT", "8765") or "8765")
+        token = _env(get, "BLASTBOX_STATIC_WORKER_TOKEN")
+        raw = _env(get, "BLASTBOX_STATIC_WORKERS") or ""
+        workers = tuple(
+            StaticWorker.parse(item, default_port=default_port, default_token=token)
+            for item in raw.split(",")
+            if item.strip()
+        )
+        return cls(
+            workers=workers,
+            health_path=_env(get, "BLASTBOX_STATIC_HEALTH_PATH", "/healthz") or "/healthz",
+            probe_timeout_s=float(_env(get, "BLASTBOX_STATIC_PROBE_TIMEOUT_S", "5") or "5"),
+            **overrides,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Slot handle (network-endpoint flavored, like AwsWorkerSlot)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StaticWorkerSlot:
+    slot_id: str
+    worker_index: int                    # which registered box this slot holds (reap -> free)
+    ip: str | None = None
+    url: str | None = None
+    auth_token: str | None = None
+    agent_port: int = 8765
+    state: SlotState = SlotState.SPAWNING
+    jobs: int = 0
+    spawned_at: float = 0.0
+    reserved: bool = False
+
+    @property
+    def endpoint(self) -> tuple[str, int] | None:
+        if self.ip is not None:
+            return (self.ip, self.agent_port)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _Counter:
+    _seq: Any = field(default_factory=lambda: itertools.count(1))
+
+    def next(self) -> int:
+        return next(self._seq)
+
+
+class StaticPoolRuntime:
+    """SlotRuntime over a fixed fleet of always-on http_agent workers. ``spawn`` claims a free box;
+    ``reap`` returns it (never boots/terminates). No ``recycle`` -> WarmPool treats each claim as one
+    job then returns the box (the worker itself is stateless per the sealed-envelope contract)."""
+
+    kind = "static"
+
+    def __init__(
+        self,
+        cfg: StaticPoolConfig,
+        *,
+        http_probe: HttpProbe | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        self.cfg = cfg
+        self._probe = http_probe or _default_http_probe
+        self._clock = clock or time.monotonic
+        self._lock = threading.Lock()
+        self._free: list[int] = list(range(len(cfg.workers)))
+        self._ids = _Counter()
+
+    # -- helpers ------------------------------------------------------------
+    def _base_url(self, w: StaticWorker) -> str:
+        if w.url:
+            return w.url.rstrip("/")
+        return f"http://{w.host}:{w.port}"
+
+    def _health_ok(self, w: StaticWorker) -> bool:
+        url = self._base_url(w) + self.cfg.health_path
+        headers = {"X-aws-proxy-auth": w.token} if w.token else {}
+        try:
+            return bool(self._probe(url, headers, self.cfg.probe_timeout_s))
+        except OSError as exc:
+            _log.debug("static: health probe %s failed: %s", url, exc)
+            return False
+
+    # -- fail-closed availability ------------------------------------------
+    def available(self) -> bool:
+        """True iff at least one registered worker answers /healthz (fail-closed)."""
+        return any(self._health_ok(w) for w in self.cfg.workers)
+
+    # -- SlotRuntime protocol ----------------------------------------------
+    def spawn(self) -> StaticWorkerSlot:
+        with self._lock:
+            if not self._free:
+                raise StaticPoolExhausted(
+                    f"all {len(self.cfg.workers)} static workers claimed "
+                    "(set BLASTBOX_POOL_CEILING <= fleet size)"
+                )
+            idx = self._free.pop(0)
+        w = self.cfg.workers[idx]
+        slot = StaticWorkerSlot(
+            slot_id=f"static-{self._ids.next()}",
+            worker_index=idx,
+            ip=w.host,
+            url=w.url,
+            auth_token=w.token,
+            agent_port=w.port,
+            state=SlotState.WARMING,
+            spawned_at=self._clock(),
+        )
+        _log.info("static: claimed worker[%d] %s for slot=%s", idx, self._base_url(w), slot.slot_id)
+        return slot
+
+    def is_ready(self, slot: StaticWorkerSlot) -> bool:
+        return self._health_ok(self.cfg.workers[slot.worker_index])
+
+    def is_alive(self, slot: StaticWorkerSlot) -> bool:
+        # always-on boxes: "alive" == reachable
+        return self._health_ok(self.cfg.workers[slot.worker_index])
+
+    def reap(self, slot: StaticWorkerSlot) -> None:
+        """Return the box to the free pool (nothing is torn down)."""
+        with self._lock:
+            if slot.worker_index not in self._free:
+                self._free.append(slot.worker_index)
+        _log.info("static: released worker[%d] from slot=%s", slot.worker_index, slot.slot_id)
+
+
+# ---------------------------------------------------------------------------
+# Selection
+# ---------------------------------------------------------------------------
+
+def select_static_pool_runtime(
+    get: Callable[[str], str | None] | None = None,
+    *,
+    require_available: bool = False,
+    http_probe: HttpProbe | None = None,
+) -> StaticPoolRuntime:
+    """Build a StaticPoolRuntime from the environment. With ``require_available``, raise
+    ``StaticPoolUnavailable`` unless the fleet is non-empty AND at least one box answers /healthz."""
+    import os
+
+    cfg = StaticPoolConfig.from_env(get or os.environ.get)
+    if not cfg.workers:
+        if require_available:
+            raise StaticPoolUnavailable("BLASTBOX_STATIC_WORKERS is empty")
+        _log.warning("static: no BLASTBOX_STATIC_WORKERS configured")
+    rt = StaticPoolRuntime(cfg, http_probe=http_probe)
+    if require_available and not rt.available():
+        raise StaticPoolUnavailable("no configured static worker answered /healthz")
+    return rt

@@ -78,7 +78,7 @@ and the tier-capability matrix.
 
 | Var | Default | Notes |
 |---|---|---|
-| `BLASTBOX_POOL_RUNTIME` | runtime default | Warm backend: `firecracker`, `gvisor`, `aws-lambda-microvm`, or `aws-ec2`. |
+| `BLASTBOX_POOL_RUNTIME` | runtime default | Warm backend: `firecracker`, `gvisor`, `aws-lambda-microvm`, `aws-ec2`, or `static`. |
 | `BLASTBOX_POOL_WARM_SIZE` | — | Number of pre-warmed slots. |
 | `BLASTBOX_POOL_CEILING` | — | Max concurrent slots (warm + burst). |
 | `BLASTBOX_POOL_BURST_SIZE` | — | Extra cold-burst slots above the warm set under load. |
@@ -153,6 +153,27 @@ The **generic worker agent** (`python -m blastbox.worker.http_agent`, `BLASTBOX_
 serves any engine over `GET /healthz` + `POST /detonate`; bake it + the engine + its deps into the
 worker image. `BLASTBOX_WORKER_AGENT_PORT` / `BLASTBOX_WORKER_AGENT_TOKEN` / `BLASTBOX_WORKER_AGENT_MAX_BYTES`
 tune it.
+
+## Runtime: static worker pool (`static`)
+
+For a **fixed fleet of always-on workers** — bare-metal boxes or long-lived VMs that each already run
+`python -m blastbox.worker.http_agent`. Unlike every other tier this backend **creates nothing**: a slot
+"spawn" just **claims a free box** from the registered list, and "reap" **returns it** — no boot, no
+terminate. Same network-endpoint slot as the AWS tiers, so the `remote_http` transport drives it unchanged.
+Selected by `BLASTBOX_POOL_RUNTIME=static`. Fail-closed: refused unless at least one box answers `/healthz`.
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_STATIC_WORKERS` | — | **Required.** Comma-list of worker endpoints: `host:port`, bare `host`, or a full `http(s)://host:port` URL. |
+| `BLASTBOX_STATIC_AGENT_PORT` | `8765` | Default port for `host` / `host:` entries that omit one. |
+| `BLASTBOX_STATIC_WORKER_TOKEN` | — | Shared bearer token sent as `X-aws-proxy-auth` to every box (the agent's `BLASTBOX_WORKER_AGENT_TOKEN`). |
+| `BLASTBOX_STATIC_HEALTH_PATH` | `/healthz` | Health-probe path. |
+| `BLASTBOX_STATIC_PROBE_TIMEOUT_S` | `5` | Per-probe HTTP timeout. |
+
+The fleet is finite, so **size the pool to it**: keep `BLASTBOX_POOL_CEILING <= len(BLASTBOX_STATIC_WORKERS)`
+(a claim beyond the fleet raises `StaticPoolExhausted`). Set `BLASTBOX_DISPATCH_CONCURRENCY` to the fleet
+size too. This is the "bare-metal worker pool" shape — the same warm-pool scaler + generic agent as the
+cloud tiers, just pointed at machines you already own.
 
 ## Per-engine params (engine ↔ host boundary)
 
