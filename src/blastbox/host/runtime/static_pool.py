@@ -127,9 +127,16 @@ class _Counter:
 
 
 class StaticPoolRuntime:
-    """SlotRuntime over a fixed fleet of always-on http_agent workers. ``spawn`` claims a free box;
-    ``reap`` returns it (never boots/terminates). No ``recycle`` -> WarmPool treats each claim as one
-    job then returns the box (the worker itself is stateless per the sealed-envelope contract)."""
+    """SlotRuntime over a fixed fleet of always-on http_agent workers. ``spawn`` claims a free box
+    (skipping any that fail ``/healthz``); ``reap`` returns it (never boots/terminates). No ``recycle``
+    -> WarmPool treats each claim as one-job-then-return; that reuse needs no reset because the
+    http_agent runs every job in a fresh temp dir and re-seals its own output (stateless per the
+    sealed-envelope contract).
+
+    The free-set is **in-process**: a single dispatcher process is assumed to own the pool (as every
+    warm tier does -- ``BLASTBOX_DISPATCH_CONCURRENCY`` threads in one process). Running multiple
+    dispatcher processes against the same fleet would double-claim boxes; that would need an external
+    coordinator (out of scope)."""
 
     kind = "static"
 
@@ -170,25 +177,36 @@ class StaticPoolRuntime:
     # -- SlotRuntime protocol ----------------------------------------------
     def spawn(self) -> StaticWorkerSlot:
         with self._lock:
-            if not self._free:
-                raise StaticPoolExhausted(
-                    f"all {len(self.cfg.workers)} static workers claimed "
-                    "(set BLASTBOX_POOL_CEILING <= fleet size)"
-                )
-            idx = self._free.pop(0)
-        w = self.cfg.workers[idx]
-        slot = StaticWorkerSlot(
-            slot_id=f"static-{self._ids.next()}",
-            worker_index=idx,
-            ip=w.host,
-            url=w.url,
-            auth_token=w.token,
-            agent_port=w.port,
-            state=SlotState.WARMING,
-            spawned_at=self._clock(),
-        )
-        _log.info("static: claimed worker[%d] %s for slot=%s", idx, self._base_url(w), slot.slot_id)
-        return slot
+            candidates = list(self._free)
+        if not candidates:
+            raise StaticPoolExhausted(
+                f"all {len(self.cfg.workers)} static workers claimed "
+                "(set BLASTBOX_POOL_CEILING <= fleet size)"
+            )
+        # claim the first free box that actually answers /healthz -- don't hand out a dead one
+        # (probe outside the lock; re-check under it in case another thread claimed it meanwhile).
+        for idx in candidates:
+            if not self._health_ok(self.cfg.workers[idx]):
+                _log.warning("static: worker[%d] unhealthy, skipping for this claim", idx)
+                continue
+            with self._lock:
+                if idx not in self._free:
+                    continue
+                self._free.remove(idx)
+            w = self.cfg.workers[idx]
+            slot = StaticWorkerSlot(
+                slot_id=f"static-{self._ids.next()}",
+                worker_index=idx,
+                ip=w.host,
+                url=w.url,
+                auth_token=w.token,
+                agent_port=w.port,
+                state=SlotState.WARMING,
+                spawned_at=self._clock(),
+            )
+            _log.info("static: claimed worker[%d] %s for slot=%s", idx, self._base_url(w), slot.slot_id)
+            return slot
+        raise StaticPoolExhausted("no free static worker is currently healthy")
 
     def is_ready(self, slot: StaticWorkerSlot) -> bool:
         return self._health_ok(self.cfg.workers[slot.worker_index])

@@ -107,6 +107,27 @@ def test_detonate_remote_sends_jwe_header_when_token(tmp_path):
     assert cap[0].headers.get("X-aws-proxy-port") == "8765"
 
 
+def _header_ci(req, name: str):
+    return next((v for k, v in req.headers.items() if k.lower() == name.lower()), None)
+
+
+def test_detonate_remote_forwards_params(tmp_path):
+    (tmp_path / "in.bin").write_bytes(b"z")
+    cap: list = []
+    detonate_remote("http://h:8765", tmp_path / "in.bin", tmp_path / "o",
+                    params={"CLIPPYSHOT_OCR": "1", "CLIPPYSHOT_OCR_ALL": "1"},
+                    http_open=_opener(_tar({"metadata.json": b"{}"}), cap))
+    assert json.loads(_header_ci(cap[0], "X-Blastbox-Params")) == {"CLIPPYSHOT_OCR": "1", "CLIPPYSHOT_OCR_ALL": "1"}
+
+
+def test_detonate_remote_no_params_header_when_none(tmp_path):
+    (tmp_path / "in.bin").write_bytes(b"z")
+    cap: list = []
+    detonate_remote("http://h:8765", tmp_path / "in.bin", tmp_path / "o",
+                    http_open=_opener(_tar({"metadata.json": b"{}"}), cap))
+    assert _header_ci(cap[0], "X-Blastbox-Params") is None
+
+
 # --------------------------------------------------------------------- make_remote_validate
 
 def test_make_remote_validate_happy(tmp_path):

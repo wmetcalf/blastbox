@@ -84,15 +84,20 @@ def detonate_remote(
     agent_port: int = 8765,
     timeout: float = 600.0,
     http_open: HttpOpen | None = None,
+    params: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """POST ``input_path`` to the remote agent's ``/detonate``; extract the returned sealed output tar
-    into ``output_dir``; return the parsed ``metadata.json`` (empty dict if the worker produced none)."""
+    into ``output_dir``; return the parsed ``metadata.json`` (empty dict if the worker produced none).
+    ``params`` is a dict of already-host-allowlisted per-job env overrides (OCR/QR toggles, etc.)
+    forwarded so remote workers honor per-job params the same as local ones."""
     opener = http_open or _default_open
     url = base_url.rstrip("/") + "/detonate?name=" + quote(input_path.name)
     headers = {"Content-Type": "application/octet-stream"}
     if token:
         headers["X-aws-proxy-auth"] = token
         headers["X-aws-proxy-port"] = str(agent_port)
+    if params:
+        headers["X-Blastbox-Params"] = json.dumps(params)
     req = urllib.request.Request(url, data=input_path.read_bytes(), method="POST", headers=headers)
     output_dir.mkdir(parents=True, exist_ok=True)
     # stream the response tar to a spooled temp file (spills to disk past 64MB) rather than holding the
@@ -115,13 +120,15 @@ def make_remote_validate(
     token: str | None = None,
     timeout: float = 600.0,
     http_open: HttpOpen | None = None,
+    params_for: Callable[[Path], dict[str, str]] | None = None,
 ) -> Callable[[Path], tuple[dict[str, Any] | None, bool]]:
     """Build a ``validate(input_path) -> (metadata, ok)`` for a network-endpoint dispatcher.
 
     ``claim``/``release`` manage a warm slot from the pool (AWS or VM); ``output_dir_for(input_path)``
-    gives the job's output dir the sealed artifacts land in. The worker's own JWE (``slot.auth_token``)
-    is preferred over the static ``token``. A transport/agent failure returns ``(None, False)`` so the
-    dispatcher fails the job rather than emitting a bogus verdict.
+    gives the job's output dir the sealed artifacts land in. ``params_for(input_path)`` resolves the
+    job's allowlisted per-job params (OCR/QR toggles, etc.) forwarded to the remote worker. The worker's
+    own JWE (``slot.auth_token``) is preferred over the static ``token``. A transport/agent failure
+    returns ``(None, False)`` so the dispatcher fails the job rather than emitting a bogus verdict.
     """
 
     def validate(input_path: Path) -> tuple[dict[str, Any] | None, bool]:
@@ -133,6 +140,7 @@ def make_remote_validate(
                 token=getattr(slot, "auth_token", None) or token,
                 agent_port=getattr(slot, "agent_port", 8765),
                 timeout=timeout, http_open=http_open,
+                params=params_for(input_path) if params_for else None,
             )
             return meta, True
         except Exception as exc:  # noqa: BLE001

@@ -25,6 +25,7 @@ Optional bearer auth: set `BLASTBOX_WORKER_AGENT_TOKEN`; the agent then requires
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import io
 import json
@@ -32,6 +33,8 @@ import logging
 import os
 import tarfile
 import tempfile
+import threading
+from collections.abc import Iterator
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -45,6 +48,39 @@ from blastbox.worker.load import load_engine
 _log = logging.getLogger("blastbox.worker.http_agent")
 
 _DEFAULT_MAX_BYTES = 512 * 1024 * 1024
+
+# Per-job env (forwarded params) is applied to os.environ around run_detonation, which the threaded
+# server would race on -- serialize detonations behind this lock. A warm slot handles one job at a
+# time anyway (the pool assigns one box per job), so this costs nothing in the intended topology.
+_JOB_LOCK = threading.Lock()
+
+
+def _parse_params(raw: str | None) -> dict[str, str]:
+    """Parse the ``X-Blastbox-Params`` header (a JSON object of already-allowlisted env overrides)."""
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return {str(k): str(v) for k, v in obj.items()} if isinstance(obj, dict) else {}
+
+
+@contextlib.contextmanager
+def _job_env(params: dict[str, str]) -> Iterator[None]:
+    """Apply ``params`` to os.environ for the duration of one detonation, then restore. Held under
+    ``_JOB_LOCK`` so concurrent requests can't observe each other's env."""
+    with _JOB_LOCK:
+        saved = {k: os.environ.get(k) for k in params}
+        os.environ.update(params)
+        try:
+            yield
+        finally:
+            for k, old in saved.items():
+                if old is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = old
 
 
 def _safe_name(raw: str | None) -> str:
@@ -110,8 +146,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "too_large", "max_bytes": self.max_bytes})
             return
         name = _safe_name(parse_qs(parsed.query).get("name", [None])[0])
+        params = _parse_params(self.headers.get("X-Blastbox-Params"))
         try:
-            tar_bytes = self._run_job(name, length)
+            tar_bytes = self._run_job(name, length, params)
         except _TruncatedBody:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "truncated_body"})
             return
@@ -125,7 +162,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(tar_bytes)
 
-    def _run_job(self, name: str, length: int) -> bytes:
+    def _run_job(self, name: str, length: int, params: dict[str, str]) -> bytes:
         with tempfile.TemporaryDirectory(prefix="bbagent-") as tmp:
             tmp_p = Path(tmp)
             in_path = tmp_p / name
@@ -141,8 +178,14 @@ class _Handler(BaseHTTPRequestHandler):
                     remaining -= len(chunk)
             if remaining > 0:
                 raise _TruncatedBody
-            # SAME core the cold/FC/gVisor workers use: runs the engine + seals metadata.json in out_dir
-            run_detonation(self.engine, input_path=in_path, output_dir=out_dir, limits=Limits.from_env())
+            # SAME core the cold/FC/gVisor workers use: runs the engine + seals metadata.json in out_dir.
+            # Per-job params (already host-allowlisted) are applied to env just for this detonation.
+            with _job_env(params):
+                rc = run_detonation(self.engine, input_path=in_path, output_dir=out_dir,
+                                    limits=Limits.from_env())
+            if rc != 0:
+                # harness could not seal metadata.json -- surface as a job failure, not a silent 200
+                raise RuntimeError(f"harness failed (rc={rc}); metadata.json not sealed")
             # tar the sealed output dir (metadata.json + artifacts) for the host to extract
             buf = io.BytesIO()
             with tarfile.open(fileobj=buf, mode="w") as tf:

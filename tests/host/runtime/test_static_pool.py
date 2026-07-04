@@ -108,6 +108,19 @@ def test_spawn_exhausts_then_reap_frees():
     assert {s2.worker_index, s3.worker_index} == {0, 1}
 
 
+def test_spawn_skips_unhealthy_worker():
+    # box "dead" fails /healthz -> the claim must skip it and hand out "live"
+    rt = StaticPoolRuntime(_cfg("dead:8765", "live:8765"), http_probe=FakeProbe(healthy={"live"}))
+    slot = rt.spawn()
+    assert slot.ip == "live"
+
+
+def test_spawn_raises_when_no_free_worker_healthy():
+    rt = StaticPoolRuntime(_cfg("a:8765", "b:8765"), http_probe=FakeProbe(healthy=set()))
+    with pytest.raises(StaticPoolExhausted):
+        rt.spawn()
+
+
 def test_spawn_distributes_across_distinct_boxes():
     rt = StaticPoolRuntime(_cfg("a:8765", "b:8765", "c:8765"), http_probe=FakeProbe(all_ok=True))
     idxs = {rt.spawn().worker_index for _ in range(3)}

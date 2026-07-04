@@ -114,3 +114,53 @@ def test_unknown_paths_404():
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+class _EnvEchoEngine:
+    """Reflects the TEST_PARAM env var into the detection label -- to prove per-job params reach here."""
+
+    name = "env-echo"
+    formats = frozenset({"*"})
+
+    def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
+        import os
+        (outdir / "p.png").write_bytes(b"\x89PNG")
+        return DetonationResult(
+            payload=Page(index=0, dims=Dimensions(width=1.0, height=1.0, unit="px"),
+                         image=ArtifactRef(id="a0")),
+            artifacts=[DeclaredArtifact(id="a0", path="p.png", kind="image")],
+            detected=Detection(label=os.environ.get("TEST_PARAM", "<unset>"),
+                               mime="application/octet-stream", confidence=1.0, source="test"),
+        )
+
+
+def test_forwards_params_and_restores_env(tmp_path):
+    import os
+    httpd = serve(_EnvEchoEngine(), bind="127.0.0.1", port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    inp = tmp_path / "in.bin"
+    inp.write_bytes(b"z")
+    try:
+        meta = detonate_remote(f"http://127.0.0.1:{port}", inp, tmp_path / "o1",
+                               params={"TEST_PARAM": "forwarded"})
+        assert meta["detected"]["label"] == "forwarded"        # param reached the engine
+        meta2 = detonate_remote(f"http://127.0.0.1:{port}", inp, tmp_path / "o2")
+        assert meta2["detected"]["label"] == "<unset>"          # no leak between jobs
+        assert "TEST_PARAM" not in os.environ                   # env restored on the server side
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_harness_failure_returns_500(tmp_path, monkeypatch):
+    # a non-zero run_detonation (e.g. metadata.json couldn't be sealed) must be a job failure, not 200
+    monkeypatch.setattr("blastbox.worker.http_agent.run_detonation", lambda *a, **k: 1)
+    httpd, port = _running_agent()
+    try:
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post(f"http://127.0.0.1:{port}/detonate?name=x.bin", b"data")
+        assert ei.value.code == 500
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
