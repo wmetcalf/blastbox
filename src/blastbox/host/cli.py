@@ -263,6 +263,34 @@ def _version_cmd(_: argparse.Namespace) -> int:
     return 0
 
 
+def _pki_cmd(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from blastbox.host.pki import ensure_ca
+
+    pki_dir = Path(args.dir)
+    ca = ensure_ca(pki_dir)  # generate-or-load the CA
+    if args.pki_action == "init":
+        crt, key = ca.issue_client("dispatcher", days=args.days).write(pki_dir, "dispatcher")
+        print(f"CA ready in {pki_dir}")
+        print(f"  ca.crt         (public trust anchor -> bake into worker images) : {pki_dir / 'ca.crt'}")
+        print(f"  dispatcher.crt / dispatcher.key  (host mTLS client cert)        : {crt} / {key}")
+        return 0
+    if args.pki_action == "issue-server":
+        name = args.name or (args.san[0] if args.san else "server")
+        crt, key = ca.issue_server(args.san, cn=args.cn, days=args.days).write(pki_dir, name)
+        print(f"server cert (SAN={args.san}, {args.days}d) -> {crt} / {key}")
+        return 0
+    if args.pki_action == "issue-client":
+        crt, key = ca.issue_client(args.cn, days=args.days).write(pki_dir, args.cn)
+        print(f"client cert (cn={args.cn}, {args.days}d) -> {crt} / {key}")
+        return 0
+    if args.pki_action == "show-ca":
+        print((pki_dir / "ca.crt").read_text(), end="")
+        return 0
+    return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="blastbox")
     sub = p.add_subparsers(dest="command", required=True)
@@ -302,6 +330,24 @@ def build_parser() -> argparse.ArgumentParser:
     pb.add_argument("--json", default=None, help="write the JSON report to this path")
     pb.add_argument("--compare", default=None, help="(reserved) baseline JSON to diff")
     pb.set_defaults(func=_bench_cmd)
+
+    # pki -- worker-mTLS certificate authority
+    pk = sub.add_parser("pki", help="worker-mTLS certificate authority (generate + issue certs)")
+    pk.add_argument("--dir", default=os.environ.get("BLASTBOX_PKI_DIR", "/var/lib/blastbox/pki"),
+                    help="CA/cert state dir (BLASTBOX_PKI_DIR)")
+    pks = pk.add_subparsers(dest="pki_action", required=True)
+    pk_init = pks.add_parser("init", help="create the CA + a dispatcher client cert")
+    pk_init.add_argument("--days", type=int, default=365)
+    pk_srv = pks.add_parser("issue-server", help="mint a worker server cert (SAN-pinned)")
+    pk_srv.add_argument("--san", action="append", required=True, help="IP or DNS name (repeatable)")
+    pk_srv.add_argument("--cn", default=None)
+    pk_srv.add_argument("--name", default=None, help="output filename stem (default: first SAN)")
+    pk_srv.add_argument("--days", type=int, default=30)
+    pk_cli = pks.add_parser("issue-client", help="mint a client cert")
+    pk_cli.add_argument("--cn", default="dispatcher")
+    pk_cli.add_argument("--days", type=int, default=365)
+    pks.add_parser("show-ca", help="print the CA cert (public trust anchor)")
+    pk.set_defaults(func=_pki_cmd)
 
     # version
     pv = sub.add_parser("version", help="print version and exit")

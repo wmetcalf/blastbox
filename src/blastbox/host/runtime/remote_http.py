@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import shutil
+import ssl
 import tarfile
 import tempfile
 import urllib.request
@@ -26,11 +27,24 @@ from urllib.parse import quote
 _log = logging.getLogger("blastbox.host.runtime.remote_http")
 
 # Injectable HTTP seam (tests pass a fake returning canned tar bytes; default hits the network).
-HttpOpen = Callable[[urllib.request.Request, float], Any]
+# ``context`` carries the client SSL/mTLS context for https:// workers (None for http/tests).
+HttpOpen = Callable[..., Any]
 
 
-def _default_open(req: urllib.request.Request, timeout: float) -> Any:
-    return urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 (url is host-built)
+def _default_open(req: urllib.request.Request, timeout: float, context: ssl.SSLContext | None = None) -> Any:
+    return urllib.request.urlopen(req, timeout=timeout, context=context)  # noqa: S310 (url is host-built)
+
+
+def dispatch_ssl_context_from_env(get: Callable[[str], str | None] = os.environ.get) -> ssl.SSLContext | None:
+    """Build the dispatcher's client (m)TLS context from env, or None if no CA is configured:
+    ``BLASTBOX_DISPATCH_TLS_CA`` (verify workers) + optional ``_CERT``/``_KEY`` (present the client cert
+    for mTLS). Pass the result as ``ssl_context`` to ``make_remote_validate`` / ``detonate_remote``."""
+    ca = get("BLASTBOX_DISPATCH_TLS_CA")
+    if not ca:
+        return None
+    from blastbox.tls import client_ssl_context
+    return client_ssl_context(ca, cert_file=get("BLASTBOX_DISPATCH_TLS_CERT"),
+                              key_file=get("BLASTBOX_DISPATCH_TLS_KEY"))
 
 
 class _Slot(Protocol):
@@ -85,11 +99,13 @@ def detonate_remote(
     timeout: float = 600.0,
     http_open: HttpOpen | None = None,
     params: dict[str, str] | None = None,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> dict[str, Any]:
     """POST ``input_path`` to the remote agent's ``/detonate``; extract the returned sealed output tar
     into ``output_dir``; return the parsed ``metadata.json`` (empty dict if the worker produced none).
     ``params`` is a dict of already-host-allowlisted per-job env overrides (OCR/QR toggles, etc.)
-    forwarded so remote workers honor per-job params the same as local ones."""
+    forwarded so remote workers honor per-job params the same as local ones. ``ssl_context`` verifies
+    the worker's server cert + presents the dispatcher's client cert (mTLS) for ``https://`` workers."""
     opener = http_open or _default_open
     url = base_url.rstrip("/") + "/detonate?name=" + quote(input_path.name)
     headers = {"Content-Type": "application/octet-stream"}
@@ -102,7 +118,8 @@ def detonate_remote(
     output_dir.mkdir(parents=True, exist_ok=True)
     # stream the response tar to a spooled temp file (spills to disk past 64MB) rather than holding the
     # whole thing in memory -- artifact tars can be large.
-    with opener(req, timeout) as resp, tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:
+    with opener(req, timeout, context=ssl_context) as resp, \
+            tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:
         shutil.copyfileobj(resp, spool)
         spool.seek(0)
         _safe_extract_tar(spool, output_dir)
@@ -121,6 +138,7 @@ def make_remote_validate(
     timeout: float = 600.0,
     http_open: HttpOpen | None = None,
     params_for: Callable[[Path], dict[str, str]] | None = None,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> Callable[[Path], tuple[dict[str, Any] | None, bool]]:
     """Build a ``validate(input_path) -> (metadata, ok)`` for a network-endpoint dispatcher.
 
@@ -141,6 +159,7 @@ def make_remote_validate(
                 agent_port=getattr(slot, "agent_port", 8765),
                 timeout=timeout, http_open=http_open,
                 params=params_for(input_path) if params_for else None,
+                ssl_context=ssl_context,
             )
             return meta, True
         except Exception as exc:  # noqa: BLE001

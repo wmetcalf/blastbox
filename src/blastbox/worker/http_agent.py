@@ -28,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import hmac
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -98,10 +99,21 @@ class _Handler(BaseHTTPRequestHandler):
     engine: Engine = None  # type: ignore[assignment]  # set on the server
     token: str | None = None
     max_bytes: int = _DEFAULT_MAX_BYTES
+    allow_nets: list = []  # peer-IP allowlist (empty = allow any; mTLS is the stronger gate)
 
     # quieter logging (per-request lines go to our logger at debug)
     def log_message(self, fmt: str, *args: object) -> None:
         _log.debug("http_agent: " + fmt, *args)
+
+    def _caller_allowed(self) -> bool:
+        """True if the peer IP is in the configured allowlist (or no allowlist is set)."""
+        if not self.allow_nets:
+            return True
+        try:
+            peer = ipaddress.ip_address(self.client_address[0])
+        except (ValueError, IndexError):
+            return False
+        return any(peer in net for net in self.allow_nets)
 
     def _json(self, status: HTTPStatus, obj: dict) -> None:
         body = json.dumps(obj).encode()
@@ -130,6 +142,9 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path != "/detonate":
             self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        if not self._caller_allowed():
+            self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
             return
         if not self._authed():
             self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
@@ -195,12 +210,31 @@ class _Handler(BaseHTTPRequestHandler):
             return buf.getvalue()
 
 
+def _parse_cidrs(raw: str | None) -> list:
+    nets = []
+    for c in (raw or "").split(","):
+        c = c.strip()
+        if c:
+            nets.append(ipaddress.ip_network(c, strict=False))
+    return nets
+
+
 def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
-          token: str | None = None, max_bytes: int = _DEFAULT_MAX_BYTES) -> ThreadingHTTPServer:
+          token: str | None = None, max_bytes: int = _DEFAULT_MAX_BYTES,
+          tls_cert: str | None = None, tls_key: str | None = None,
+          client_ca: str | None = None, allow_cidrs: str | None = None) -> ThreadingHTTPServer:
+    """Serve the engine. ``tls_cert``/``tls_key`` enable HTTPS; adding ``client_ca`` requires a
+    CA-signed **client** cert (mTLS). ``allow_cidrs`` restricts which peer IPs may POST /detonate."""
     handler = type("_BoundHandler", (_Handler,),
-                   {"engine": engine, "token": token, "max_bytes": max_bytes})
+                   {"engine": engine, "token": token, "max_bytes": max_bytes,
+                    "allow_nets": _parse_cidrs(allow_cidrs)})
     httpd = ThreadingHTTPServer((bind, port), handler)
-    _log.info("http_agent: serving engine=%s on %s:%d", engine.name, bind, port)
+    if tls_cert and tls_key:
+        from blastbox.tls import server_ssl_context
+        ctx = server_ssl_context(tls_cert, tls_key, client_ca_file=client_ca)
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    _log.info("http_agent: serving engine=%s on %s:%d (tls=%s mtls=%s allowlist=%s)",
+              engine.name, bind, port, bool(tls_cert), bool(client_ca), bool(allow_cidrs))
     return httpd
 
 
@@ -216,9 +250,20 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001 -- warmup is best-effort (fail-open to cold)
             _log.warning("http_agent: warmup failed (continuing cold): %s", exc)
     port = int(os.environ.get("BLASTBOX_WORKER_AGENT_PORT", "8765"))
+    bind = os.environ.get("BLASTBOX_WORKER_AGENT_BIND", "0.0.0.0")
     token = os.environ.get("BLASTBOX_WORKER_AGENT_TOKEN") or None
     max_bytes = int(os.environ.get("BLASTBOX_WORKER_AGENT_MAX_BYTES", str(_DEFAULT_MAX_BYTES)))
-    httpd = serve(engine, port=port, token=token, max_bytes=max_bytes)
+    tls_cert = os.environ.get("BLASTBOX_WORKER_AGENT_TLS_CERT") or None
+    tls_key = os.environ.get("BLASTBOX_WORKER_AGENT_TLS_KEY") or None
+    client_ca = os.environ.get("BLASTBOX_WORKER_AGENT_CLIENT_CA") or None
+    allow_cidrs = os.environ.get("BLASTBOX_WORKER_AGENT_ALLOW_CIDRS") or None
+    # fail-loud when exposed with no controls: a non-loopback bind with no mTLS, no token, no allowlist
+    if bind not in ("127.0.0.1", "localhost", "::1") and not (client_ca or token or allow_cidrs):
+        _log.warning("http_agent: bound to %s with NO mTLS / token / IP allowlist -- anyone who can "
+                     "reach :%d can submit jobs. Set BLASTBOX_WORKER_AGENT_CLIENT_CA (mTLS) or "
+                     "_ALLOW_CIDRS / _TOKEN.", bind, port)
+    httpd = serve(engine, bind=bind, port=port, token=token, max_bytes=max_bytes,
+                  tls_cert=tls_cert, tls_key=tls_key, client_ca=client_ca, allow_cidrs=allow_cidrs)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

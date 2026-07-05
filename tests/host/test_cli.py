@@ -113,3 +113,23 @@ def test_engine_net_policy_from_env(monkeypatch):
     monkeypatch.setenv("BLASTBOX_ENGINE_REDTUSK_NETPOLICY", "fakenet")
     engines = _parse_engine_specs("redtusk=img:tag")
     assert engines["redtusk"].net_policy == "fakenet"
+
+
+class TestPkiCli:
+    def test_init_creates_ca_and_dispatcher_cert(self, tmp_path):
+        assert main(["pki", "--dir", str(tmp_path), "init"]) == 0
+        assert (tmp_path / "ca.crt").exists()
+        assert (tmp_path / "dispatcher.crt").exists() and (tmp_path / "dispatcher.key").exists()
+
+    def test_issue_server_is_ca_signed(self, tmp_path):
+        main(["pki", "--dir", str(tmp_path), "init"])
+        assert main(["pki", "--dir", str(tmp_path), "issue-server", "--san", "10.0.0.5"]) == 0
+        from cryptography import x509
+        ca = x509.load_pem_x509_certificate((tmp_path / "ca.crt").read_bytes())
+        srv = x509.load_pem_x509_certificate((tmp_path / "10.0.0.5.crt").read_bytes())
+        assert srv.issuer == ca.subject
+
+    def test_show_ca_prints_pem(self, tmp_path, capsys):
+        main(["pki", "--dir", str(tmp_path), "init"])
+        main(["pki", "--dir", str(tmp_path), "show-ca"])
+        assert "BEGIN CERTIFICATE" in capsys.readouterr().out

@@ -42,7 +42,7 @@ class _Resp:
 
 
 def _opener(tar_bytes: bytes, capture: list | None = None):
-    def op(req, timeout):
+    def op(req, timeout, context=None):
         if capture is not None:
             capture.append(req)
         return _Resp(tar_bytes)
@@ -128,6 +128,21 @@ def test_detonate_remote_no_params_header_when_none(tmp_path):
     assert _header_ci(cap[0], "X-Blastbox-Params") is None
 
 
+def test_dispatch_ssl_context_from_env_none_without_ca():
+    from blastbox.host.runtime.remote_http import dispatch_ssl_context_from_env
+    assert dispatch_ssl_context_from_env({}.get) is None
+
+
+def test_dispatch_ssl_context_from_env_builds(tmp_path):
+    import ssl
+
+    from blastbox.host.pki import ensure_ca
+    from blastbox.host.runtime.remote_http import dispatch_ssl_context_from_env
+    ensure_ca(tmp_path)     # writes tmp_path/ca.crt
+    ctx = dispatch_ssl_context_from_env({"BLASTBOX_DISPATCH_TLS_CA": str(tmp_path / "ca.crt")}.get)
+    assert isinstance(ctx, ssl.SSLContext)
+
+
 # --------------------------------------------------------------------- make_remote_validate
 
 def test_make_remote_validate_happy(tmp_path):
@@ -150,7 +165,7 @@ def test_make_remote_validate_failure_releases_slot(tmp_path):
     slot = SimpleNamespace(url=None, ip="10.0.1.4", auth_token=None, agent_port=8765)
     released = []
 
-    def boom(req, timeout):
+    def boom(req, timeout, context=None):
         raise OSError("connection refused")
 
     validate = make_remote_validate(

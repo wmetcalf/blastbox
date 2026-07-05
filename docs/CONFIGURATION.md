@@ -202,6 +202,39 @@ BLASTBOX_POOL_CEILING=28
 BLASTBOX_DISPATCH_CONCURRENCY=28
 ```
 
+## Worker HTTP agent + mTLS (network-endpoint tiers)
+
+The `static` / `aws-*` / `cascade` tiers run the worker as `python -m blastbox.worker.http_agent`. These
+knobs configure it; **default it to loopback + mTLS** for anything off-box (the transport is otherwise
+plain HTTP for a *trusted private VPC* — do not expose it to the public internet in the clear).
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_WORKER_AGENT_PORT` | `8765` | Listen port. |
+| `BLASTBOX_WORKER_AGENT_BIND` | `0.0.0.0` | Bind address. A non-loopback bind with **no** mTLS/token/allowlist logs a loud warning. |
+| `BLASTBOX_WORKER_AGENT_TOKEN` | — | Bearer token required on `/detonate` (`X-aws-proxy-auth` / `Authorization: Bearer`). |
+| `BLASTBOX_WORKER_AGENT_MAX_BYTES` | `512MiB` | Max request body. |
+| `BLASTBOX_WORKER_AGENT_TLS_CERT` / `_TLS_KEY` | — | Serve **HTTPS** with this server cert/key (mint via `blastbox pki issue-server`). |
+| `BLASTBOX_WORKER_AGENT_CLIENT_CA` | — | Require a **client** cert signed by this CA (**mTLS**) — the cryptographic allowed-caller gate. |
+| `BLASTBOX_WORKER_AGENT_ALLOW_CIDRS` | — | Comma-list of CIDRs allowed to POST `/detonate` (peer-IP allowlist; 403 otherwise). Defense-in-depth with mTLS + the SG. |
+
+**Dispatcher (client) side** — build the mTLS context the transport presents:
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_DISPATCH_TLS_CA` | — | CA that signed the workers' server certs (verify them). Setting it turns on `https://`. |
+| `BLASTBOX_DISPATCH_TLS_CERT` / `_TLS_KEY` | — | The dispatcher's client cert/key (mTLS; `blastbox pki init` mints `dispatcher.{crt,key}`). |
+
+**PKI / cert generation** — `BLASTBOX_PKI_DIR` (default `/var/lib/blastbox/pki`) holds the CA. The
+`blastbox pki` CLI generates + issues everything (pure `cryptography`, no openssl):
+```
+blastbox pki init                              # CA (ca.crt/ca.key) + dispatcher client cert
+blastbox pki issue-server --san 10.0.0.5       # a worker's server cert, SAN-pinned (short-lived)
+blastbox pki show-ca                           # the public CA cert -> bake into worker images
+```
+Bake `ca.crt` into worker images (public trust anchor); keep `ca.key` on the dispatcher only. For
+disposable workers, mint the server cert per-spawn (SAN = the instance IP) rather than baking a key.
+
 ## Per-engine params (engine ↔ host boundary)
 
 | Var | Default | Notes |

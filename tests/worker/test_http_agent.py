@@ -164,3 +164,43 @@ def test_harness_failure_returns_500(tmp_path, monkeypatch):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_ip_allowlist_blocks_disallowed_peer():
+    httpd, port = _running_agent(allow_cidrs="10.0.0.0/8")   # 127.0.0.1 is not in it
+    try:
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post(f"http://127.0.0.1:{port}/detonate?name=x.bin", b"data")
+        assert ei.value.code == 403
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_mtls_end_to_end_and_rejects_uncertified_caller(tmp_path):
+    from blastbox.host.pki import ensure_ca
+    from blastbox.tls import client_ssl_context
+
+    ca = ensure_ca(tmp_path / "pki")
+    scrt, skey = ca.issue_server(["127.0.0.1"]).write(tmp_path, "server")
+    (tmp_path / "ca.crt").write_bytes(ca.cert_pem)
+    ccrt, ckey = ca.issue_client("dispatcher").write(tmp_path, "client")
+
+    httpd = serve(_NoopEngine(), bind="127.0.0.1", port=0,
+                  tls_cert=str(scrt), tls_key=str(skey), client_ca=str(tmp_path / "ca.crt"))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    inp = tmp_path / "in.bin"
+    inp.write_bytes(b"z")
+    try:
+        # dispatcher presents its CA-signed client cert -> allowed
+        cctx = client_ssl_context(str(tmp_path / "ca.crt"), cert_file=str(ccrt), key_file=str(ckey))
+        meta = detonate_remote(f"https://127.0.0.1:{port}", inp, tmp_path / "o", ssl_context=cctx)
+        assert meta["detected"]["label"] == "docx"
+        # no client cert (server-verify only) -> mTLS gate rejects the caller
+        noclient = client_ssl_context(str(tmp_path / "ca.crt"))
+        with pytest.raises(Exception):
+            detonate_remote(f"https://127.0.0.1:{port}", inp, tmp_path / "o2", ssl_context=noclient)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
