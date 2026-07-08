@@ -146,10 +146,15 @@ class StaticPoolRuntime:
         *,
         http_probe: HttpProbe | None = None,
         clock: Callable[[], float] | None = None,
+        ssl_context: Any = None,
     ) -> None:
         self.cfg = cfg
         self._probe = http_probe or _default_http_probe
         self._clock = clock or time.monotonic
+        # client (m)TLS context for https workers -- the dispatcher hands this to make_remote_validate
+        # so the transport verifies the worker + presents its client cert.
+        self.ssl_context = ssl_context
+        self._tls = bool(ssl_context)
         self._lock = threading.Lock()
         self._free: list[int] = list(range(len(cfg.workers)))
         self._ids = _Counter()
@@ -158,7 +163,8 @@ class StaticPoolRuntime:
     def _base_url(self, w: StaticWorker) -> str:
         if w.url:
             return w.url.rstrip("/")
-        return f"http://{w.host}:{w.port}"
+        scheme = "https" if self._tls else "http"  # host:port workers follow the pool's TLS mode
+        return f"{scheme}://{w.host}:{w.port}"
 
     def _health_ok(self, w: StaticWorker) -> bool:
         url = self._base_url(w) + self.cfg.health_path
@@ -198,7 +204,7 @@ class StaticPoolRuntime:
                 slot_id=f"static-{self._ids.next()}",
                 worker_index=idx,
                 ip=w.host,
-                url=w.url,
+                url=self._base_url(w),   # carries the scheme (https when TLS) for the transport
                 auth_token=w.token,
                 agent_port=w.port,
                 state=SlotState.WARMING,
@@ -237,12 +243,19 @@ def select_static_pool_runtime(
     ``StaticPoolUnavailable`` unless the fleet is non-empty AND at least one box answers /healthz."""
     import os
 
-    cfg = StaticPoolConfig.from_env(get or os.environ.get)
+    from blastbox.host.runtime.remote_http import dispatch_ssl_context_from_env, make_tls_probe
+
+    getter = get or os.environ.get
+    cfg = StaticPoolConfig.from_env(getter)
     if not cfg.workers:
         if require_available:
             raise StaticPoolUnavailable("BLASTBOX_STATIC_WORKERS is empty")
         _log.warning("static: no BLASTBOX_STATIC_WORKERS configured")
-    rt = StaticPoolRuntime(cfg, http_probe=http_probe)
+    # if BLASTBOX_DISPATCH_TLS_CA is set, probe workers over https+mTLS and hand the context to the
+    # transport via runtime.ssl_context (workers should be https:// or the pool runs in TLS mode).
+    ctx = dispatch_ssl_context_from_env(getter)
+    probe = http_probe or (make_tls_probe(ctx) if ctx else None)
+    rt = StaticPoolRuntime(cfg, http_probe=probe, ssl_context=ctx)
     if require_available and not rt.available():
         raise StaticPoolUnavailable("no configured static worker answered /healthz")
     return rt

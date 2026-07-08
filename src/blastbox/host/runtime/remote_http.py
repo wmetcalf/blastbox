@@ -18,6 +18,7 @@ import shutil
 import ssl
 import tarfile
 import tempfile
+import urllib.error
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
@@ -45,6 +46,19 @@ def dispatch_ssl_context_from_env(get: Callable[[str], str | None] = os.environ.
     from blastbox.tls import client_ssl_context
     return client_ssl_context(ca, cert_file=get("BLASTBOX_DISPATCH_TLS_CERT"),
                               key_file=get("BLASTBOX_DISPATCH_TLS_KEY"))
+
+
+def make_tls_probe(ssl_context: ssl.SSLContext | None) -> Callable[[str, dict, float], bool]:
+    """A health-probe (``(url, headers, timeout) -> bool``) that carries the client (m)TLS context, so a
+    pool's ``/healthz`` check works against ``https://`` workers. Matches the ``HttpProbe`` seam shape."""
+    def probe(url: str, headers: dict, timeout: float) -> bool:
+        req = urllib.request.Request(url, headers=headers, method="GET")  # noqa: S310 (host-built url)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=ssl_context) as resp:  # noqa: S310
+                return 200 <= resp.status < 300
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            return False
+    return probe
 
 
 class _Slot(Protocol):

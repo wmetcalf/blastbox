@@ -154,6 +154,25 @@ def test_satisfies_slotruntime_protocol():
     assert isinstance(rt, SlotRuntime)
 
 
+def test_tls_mode_uses_https_scheme(tmp_path):
+    from blastbox.host.pki import ensure_ca
+    from blastbox.tls import client_ssl_context
+    ensure_ca(tmp_path)  # writes ca.crt
+    ctx = client_ssl_context(str(tmp_path / "ca.crt"))
+    rt = StaticPoolRuntime(_cfg("10.0.0.9:8765"), http_probe=FakeProbe(all_ok=True), ssl_context=ctx)
+    assert rt.ssl_context is ctx
+    assert slot_base_url(rt.spawn()) == "https://10.0.0.9:8765"   # host:port -> https in TLS mode
+
+
+def test_select_builds_ssl_context_from_dispatch_tls_env(tmp_path):
+    from blastbox.host.pki import ensure_ca
+    ensure_ca(tmp_path)
+    env = {"BLASTBOX_STATIC_WORKERS": "10.0.0.1:8765",
+           "BLASTBOX_DISPATCH_TLS_CA": str(tmp_path / "ca.crt")}
+    rt = select_static_pool_runtime(env.get, require_available=False)
+    assert rt.ssl_context is not None
+
+
 def test_token_forwarded_as_auth_header():
     probe = FakeProbe(all_ok=True)
     rt = StaticPoolRuntime(_cfg("a:8765", token="jwe.tok"), http_probe=probe)

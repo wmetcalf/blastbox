@@ -175,6 +175,11 @@ The fleet is finite, so **size the pool to it**: keep `BLASTBOX_POOL_CEILING <= 
 size too. This is the "bare-metal worker pool" shape — the same warm-pool scaler + generic agent as the
 cloud tiers, just pointed at machines you already own.
 
+**mTLS:** when `BLASTBOX_DISPATCH_TLS_CA` is set (see *Worker HTTP agent + mTLS*), the pool automatically
+probes `/healthz` and drives the transport over **https + client-cert mTLS** — declare workers as
+`https://host:port` (bare `host:port` entries are upgraded to `https` in TLS mode). The pool exposes the
+client context on `runtime.ssl_context` for the dispatcher's `make_remote_validate`.
+
 ## Runtime: cascade (local + overflow tiers) (`cascade`)
 
 **"Run X workers locally, then burst up to Y on other hardware / AWS"** as a single warm pool. A
