@@ -285,6 +285,12 @@ def _pki_cmd(args: argparse.Namespace) -> int:
         crt, key = ca.issue_client(args.cn, days=args.days).write(pki_dir, args.cn)
         print(f"client cert (cn={args.cn}, {args.days}d) -> {crt} / {key}")
         return 0
+    if args.pki_action == "sign-csr":
+        cert_pem = ca.sign_csr(Path(args.csr).read_bytes(), days=args.days)
+        out = Path(args.out) if args.out else Path(args.csr).with_suffix(".crt")
+        out.write_bytes(cert_pem)
+        print(f"signed server cert ({args.days}d) -> {out}")
+        return 0
     if args.pki_action == "show-ca":
         print((pki_dir / "ca.crt").read_text(), end="")
         return 0
@@ -346,6 +352,10 @@ def build_parser() -> argparse.ArgumentParser:
     pk_cli = pks.add_parser("issue-client", help="mint a client cert")
     pk_cli.add_argument("--cn", default="dispatcher")
     pk_cli.add_argument("--days", type=int, default=365)
+    pk_csr = pks.add_parser("sign-csr", help="sign a worker-generated CSR -> server cert (key stays on the box)")
+    pk_csr.add_argument("--csr", required=True, help="path to the CSR PEM")
+    pk_csr.add_argument("--out", default=None, help="output cert path (default: <csr>.crt)")
+    pk_csr.add_argument("--days", type=int, default=30)
     pks.add_parser("show-ca", help="print the CA cert (public trust anchor)")
     pk.set_defaults(func=_pki_cmd)
 

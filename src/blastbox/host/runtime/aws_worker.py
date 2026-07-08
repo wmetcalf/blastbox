@@ -203,11 +203,15 @@ class AwsDisposableRuntime:
         aws_runner: AwsRunner | None = None,
         http_probe: HttpProbe | None = None,
         clock: Callable[[], float] | None = None,
+        ssl_context: Any = None,
     ) -> None:
         self.cfg = cfg
         self._run_aws = aws_runner or _default_aws_runner
         self._probe = http_probe or _default_http_probe
         self._clock = clock or time.monotonic
+        # client (m)TLS context for https workers -- exposed for make_remote_validate; when set, the
+        # health probe defaults to the TLS-aware one (see the select_* helpers).
+        self.ssl_context = ssl_context
 
     # -- aws cli seam -------------------------------------------------------
     def _aws(self, service: str, op: str, *args: str) -> dict[str, Any]:
@@ -352,13 +356,27 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
         self._aws("lambda-microvms", "terminate-microvm", "--microvm-id", str(slot.resource_id))
 
 
+def _inject_tls(getter: Callable[[str], str | None], kw: dict[str, Any]) -> dict[str, Any]:
+    """If BLASTBOX_DISPATCH_TLS_CA is set (and not already overridden), add the client (m)TLS context +
+    a TLS-aware health probe so an https worker agent is probed + talked to over mTLS."""
+    if "ssl_context" in kw:
+        return kw
+    from blastbox.host.runtime.remote_http import dispatch_ssl_context_from_env, make_tls_probe
+    ctx = dispatch_ssl_context_from_env(getter)
+    if ctx is not None:
+        kw = {**kw, "ssl_context": ctx}
+        kw.setdefault("http_probe", make_tls_probe(ctx))
+    return kw
+
+
 def select_lambda_microvm_runtime(
     *, cfg: LambdaMicroVmConfig | None = None, get_env: Callable[[str], str | None] | None = None,
     require_available: bool = False, **kw: Any,
 ) -> LambdaMicroVmRuntime:
     import os
-    cfg = cfg or LambdaMicroVmConfig.from_env(get_env or os.environ.get)
-    rt = LambdaMicroVmRuntime(cfg, **kw)
+    getter = get_env or os.environ.get
+    cfg = cfg or LambdaMicroVmConfig.from_env(getter)
+    rt = LambdaMicroVmRuntime(cfg, **_inject_tls(getter, kw))
     if require_available and not rt.available():
         raise AwsUnavailable("aws-lambda-microvm tier unavailable (creds/entitlement/service probe failed)")
     return rt
@@ -442,8 +460,9 @@ def select_disposable_ec2_runtime(
     require_available: bool = False, **kw: Any,
 ) -> DisposableEc2Runtime:
     import os
-    cfg = cfg or Ec2Config.from_env(get_env or os.environ.get)
-    rt = DisposableEc2Runtime(cfg, **kw)
+    getter = get_env or os.environ.get
+    cfg = cfg or Ec2Config.from_env(getter)
+    rt = DisposableEc2Runtime(cfg, **_inject_tls(getter, kw))
     if require_available and not rt.available():
         raise AwsUnavailable("aws-ec2 tier unavailable (creds/service probe failed)")
     return rt

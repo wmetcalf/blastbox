@@ -247,3 +247,16 @@ def test_build_warm_pool_recognizes_aws_runtimes(monkeypatch):
     cfg = pool_config.PoolConfig.from_env()
     pool = pool_config.build_warm_pool(cfg)
     assert pool is not None
+
+
+def test_select_injects_dispatch_tls_context(tmp_path):
+    from blastbox.host.pki import ensure_ca
+    ensure_ca(tmp_path)  # writes ca.crt
+    env = {"BLASTBOX_DISPATCH_TLS_CA": str(tmp_path / "ca.crt"), "BLASTBOX_LAMBDA_IMAGE": "img-x"}
+    rt = select_lambda_microvm_runtime(get_env=env.get, require_available=False)
+    assert rt.ssl_context is not None   # BLASTBOX_DISPATCH_TLS_CA -> the tier talks mTLS
+
+
+def test_select_no_tls_context_without_ca():
+    rt = select_lambda_microvm_runtime(get_env={"BLASTBOX_LAMBDA_IMAGE": "img-x"}.get, require_available=False)
+    assert rt.ssl_context is None

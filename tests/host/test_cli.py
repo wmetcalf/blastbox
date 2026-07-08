@@ -133,3 +133,19 @@ class TestPkiCli:
         main(["pki", "--dir", str(tmp_path), "init"])
         main(["pki", "--dir", str(tmp_path), "show-ca"])
         assert "BEGIN CERTIFICATE" in capsys.readouterr().out
+
+    def test_sign_csr(self, tmp_path):
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+        main(["pki", "--dir", str(tmp_path), "init"])
+        key = ec.generate_private_key(ec.SECP256R1())
+        csr = (x509.CertificateSigningRequestBuilder()
+               .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "w1")]))
+               .sign(key, hashes.SHA256()))
+        (tmp_path / "w.csr").write_bytes(csr.public_bytes(serialization.Encoding.PEM))
+        assert main(["pki", "--dir", str(tmp_path), "sign-csr", "--csr", str(tmp_path / "w.csr")]) == 0
+        crt = x509.load_pem_x509_certificate((tmp_path / "w.crt").read_bytes())
+        ca = x509.load_pem_x509_certificate((tmp_path / "ca.crt").read_bytes())
+        assert crt.issuer == ca.subject   # worker's key never left the box; dispatcher signed the CSR
