@@ -284,4 +284,17 @@ def test_lambda_cli_arg_shapes_match_live_api():
     tok = next(a for k, a in fake.calls if k == "lambda-microvms create-microvm-auth-token")
     assert "--microvm-identifier" in tok
     assert tok[tok.index("--expiration-in-minutes") + 1] == "25"
-    assert tok[tok.index("--allowed-ports") + 1] == "8765"
+    assert tok[tok.index("--allowed-ports") + 1] == "port=8765"   # tagged-union list shorthand
+
+
+def test_lambda_endpoint_resolves_to_https():
+    # live: get-microvm returns `endpoint` (bare host) + create-microvm-auth-token returns `authToken`
+    rt, _ = _lambda_rt({
+        "lambda-microvms run-microvm": {"microvmId": "mv-1"},
+        "lambda-microvms get-microvm": {"state": "running", "endpoint": "abc.lambda-microvm.us-east-1.on.aws"},
+        "lambda-microvms create-microvm-auth-token": {"authToken": "jwe.x"},
+    })
+    slot = rt.spawn()
+    assert rt.is_ready(slot) is True
+    assert slot.url == "https://abc.lambda-microvm.us-east-1.on.aws"
+    assert slot.auth_token == "jwe.x"

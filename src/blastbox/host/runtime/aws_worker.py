@@ -107,8 +107,10 @@ class LambdaMicroVmConfig(AwsWorkerConfig):
     image_identifier: str = ""
     execution_role_arn: str | None = None
     # run-microvm --{egress,ingress}-network-connectors are (list) args -> passed as separate tokens.
-    egress_connector_ids: tuple[str, ...] = ()   # () => sealed (no outbound)
-    ingress_connector_ids: tuple[str, ...] = ()  # () => no ingress connectors configured
+    # NOTE (live): omitting them DEFAULTS to INTERNET_EGRESS + HTTP_INGRESS -- NOT sealed. To restrict,
+    # pass explicit connector ARNs (a no-internet egress connector to seal outbound).
+    egress_connector_ids: tuple[str, ...] = ()
+    ingress_connector_ids: tuple[str, ...] = ()
     auth_token_ttl_min: int = 15                 # create-microvm-auth-token --expiration-in-minutes
 
     @classmethod
@@ -344,8 +346,8 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
         resp = self._aws("lambda-microvms", "create-microvm-auth-token",
                          "--microvm-identifier", str(slot.resource_id),
                          "--expiration-in-minutes", str(self.cfg.auth_token_ttl_min),
-                         "--allowed-ports", str(self.cfg.agent_port))
-        tok = resp.get("token") or resp.get("authToken") or resp.get("Token")
+                         "--allowed-ports", f"port={self.cfg.agent_port}")  # tagged-union list shorthand
+        tok = resp.get("authToken") or resp.get("token") or resp.get("Token")
         if not tok:
             raise AwsWorkerError("create-microvm-auth-token: no token in response")
         return str(tok)
@@ -356,9 +358,11 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
             desc = self._describe(slot)
             if str(desc.get("state", "")).lower() not in ("running", "active", "ready"):
                 return False
-            slot.url = desc.get("url") or desc.get("endpointUrl") or desc.get("Url")
-            if slot.url is None:
+            # live: get-microvm returns the per-VM host under `endpoint` (a bare hostname, no scheme)
+            ep = desc.get("endpoint") or desc.get("url") or desc.get("endpointUrl")
+            if not ep:
                 return False
+            slot.url = str(ep) if str(ep).startswith("http") else f"https://{ep}"
         token = self._mint_token(slot)
         slot.auth_token = token
         url = slot.url.rstrip("/") + self.cfg.agent_health_path

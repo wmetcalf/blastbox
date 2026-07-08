@@ -139,7 +139,7 @@ win-validator stays libvirt — no Windows/nested-virt on either).
 | **Lambda MicroVM** (`aws-lambda-microvm`) | | transport = per-VM HTTPS URL + JWE token |
 | `BLASTBOX_LAMBDA_IMAGE` | — | **Required.** An **in-account** MicroVM image ARN built via `create-microvm-image` (the managed base `…:aws:microvm-image:al2023-1` is **not** directly runnable — verified live). |
 | `BLASTBOX_LAMBDA_EXEC_ROLE_ARN` | — | Execution role for `run-microvm`. |
-| `BLASTBOX_LAMBDA_EGRESS_CONNECTORS` | `""` | Comma-list of egress-connector ids (passed to `run-microvm` as a list); **empty ⇒ sealed (no outbound)**. |
+| `BLASTBOX_LAMBDA_EGRESS_CONNECTORS` | `""` | Comma-list of egress-connector ids (list arg). **Empty ⇒ AWS default `INTERNET_EGRESS` (not sealed)** — pass a no-internet connector to seal outbound. |
 | `BLASTBOX_LAMBDA_INGRESS_CONNECTORS` | `""` | Comma-list of ingress-connector ids (empty ⇒ none configured). |
 | `BLASTBOX_LAMBDA_AUTH_TTL_MIN` | `15` | JWE lifetime for `create-microvm-auth-token` (`--expiration-in-minutes`); token is minted fresh at probe time + scoped to the agent port. |
 | **Disposable EC2** (`aws-ec2`) | | transport = instance IP:port (private by default) |
