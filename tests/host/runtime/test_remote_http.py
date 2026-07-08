@@ -149,6 +149,33 @@ def test_dispatch_ssl_context_from_env_builds(tmp_path):
     assert isinstance(ctx, ssl.SSLContext)
 
 
+def test_dispatch_ssl_context_partial_fails_closed():
+    from blastbox.host.runtime.remote_http import dispatch_ssl_context_from_env
+    with pytest.raises(RuntimeError):
+        dispatch_ssl_context_from_env({"BLASTBOX_DISPATCH_TLS_CERT": "c"}.get)   # cert, no CA -> not plaintext
+
+
+def test_detonate_remote_caps_output(tmp_path):
+    from blastbox.host.runtime.remote_http import RemoteOutputTooLarge
+    (tmp_path / "in.bin").write_bytes(b"z")
+    big = _tar({"metadata.json": b"{}", "blob.bin": b"x" * 5000})
+    with pytest.raises(RemoteOutputTooLarge):
+        detonate_remote("http://h:8765", tmp_path / "in.bin", tmp_path / "o",
+                        http_open=_opener(big), max_output_bytes=1000)
+
+
+def test_make_remote_validate_fails_on_engine_error(tmp_path):
+    (tmp_path / "in.docx").write_bytes(b"z")
+    slot = SimpleNamespace(url=None, ip="10.0.1.4", auth_token=None, agent_port=8765)
+    validate = make_remote_validate(
+        claim=lambda: slot, release=lambda s: None,
+        output_dir_for=lambda p: tmp_path / "out",
+        http_open=_opener(_tar({"metadata.json": json.dumps({"status": "engine_error"}).encode()})),
+    )
+    _, ok = validate(tmp_path / "in.docx")
+    assert ok is False   # a sealed engine_error envelope is not a successful job
+
+
 # --------------------------------------------------------------------- make_remote_validate
 
 def test_make_remote_validate_happy(tmp_path):

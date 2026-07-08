@@ -14,7 +14,6 @@ import io
 import json
 import logging
 import os
-import shutil
 import ssl
 import tarfile
 import tempfile
@@ -36,16 +35,41 @@ def _default_open(req: urllib.request.Request, timeout: float, context: ssl.SSLC
     return urllib.request.urlopen(req, timeout=timeout, context=context)  # noqa: S310 (url is host-built)
 
 
+class RemoteOutputTooLarge(RuntimeError):
+    """A remote worker returned more output than the configured cap allows (DoS guard)."""
+
+
+def _bounded_copy(src: Any, dst: Any, limit: int | None) -> int:
+    """copyfileobj that aborts once ``limit`` bytes have been read (None = unbounded)."""
+    total = 0
+    while True:
+        chunk = src.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if limit is not None and total > limit:
+            raise RemoteOutputTooLarge(f"remote output exceeded {limit} bytes")
+        dst.write(chunk)
+    return total
+
+
 def dispatch_ssl_context_from_env(get: Callable[[str], str | None] = os.environ.get) -> ssl.SSLContext | None:
     """Build the dispatcher's client (m)TLS context from env, or None if no CA is configured:
     ``BLASTBOX_DISPATCH_TLS_CA`` (verify workers) + optional ``_CERT``/``_KEY`` (present the client cert
     for mTLS). Pass the result as ``ssl_context`` to ``make_remote_validate`` / ``detonate_remote``."""
     ca = get("BLASTBOX_DISPATCH_TLS_CA")
+    cert = get("BLASTBOX_DISPATCH_TLS_CERT") or None
+    key = get("BLASTBOX_DISPATCH_TLS_KEY") or None
+    # fail closed on a partial config -- don't silently fall back to plaintext (would send the bearer
+    # token + sample bytes in the clear).
     if not ca:
+        if cert or key:
+            raise RuntimeError("partial dispatcher TLS: BLASTBOX_DISPATCH_TLS_CERT/KEY set but _CA missing")
         return None
+    if bool(cert) != bool(key):
+        raise RuntimeError("BLASTBOX_DISPATCH_TLS_CERT and _TLS_KEY must be set together")
     from blastbox.tls import client_ssl_context
-    return client_ssl_context(ca, cert_file=get("BLASTBOX_DISPATCH_TLS_CERT"),
-                              key_file=get("BLASTBOX_DISPATCH_TLS_KEY"))
+    return client_ssl_context(ca, cert_file=cert, key_file=key)
 
 
 def make_tls_probe(ssl_context: ssl.SSLContext | None) -> Callable[[str, dict, float], bool]:
@@ -81,12 +105,13 @@ def slot_base_url(slot: _Slot, *, tls: bool = False) -> str:
     raise ValueError("slot has no reachable endpoint (no url and no ip)")
 
 
-def _safe_extract_tar(tar_source: bytes | Any, dest: Path) -> list[str]:
+def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: int | None = None) -> list[str]:
     """Extract regular files from a tar (bytes or a seekable fileobj) into ``dest``, rejecting path
-    traversal. Returns the relative paths written."""
+    traversal and capping the total extracted bytes. Returns the relative paths written."""
     dest = dest.resolve()
     fileobj = io.BytesIO(tar_source) if isinstance(tar_source, (bytes, bytearray)) else tar_source
     written: list[str] = []
+    total = 0
     with tarfile.open(fileobj=fileobj, mode="r") as tf:
         for m in tf.getmembers():
             if not m.isfile():
@@ -100,7 +125,8 @@ def _safe_extract_tar(tar_source: bytes | Any, dest: Path) -> list[str]:
             if src is None:
                 continue
             with src, target.open("wb") as out:
-                shutil.copyfileobj(src, out)
+                remaining = None if max_total_bytes is None else max_total_bytes - total
+                total += _bounded_copy(src, out, remaining)
             written.append(str(target.relative_to(dest)))
     return written
 
@@ -116,6 +142,7 @@ def detonate_remote(
     http_open: HttpOpen | None = None,
     params: dict[str, str] | None = None,
     ssl_context: ssl.SSLContext | None = None,
+    max_output_bytes: int | None = None,
 ) -> dict[str, Any]:
     """POST ``input_path`` to the remote agent's ``/detonate``; extract the returned sealed output tar
     into ``output_dir``; return the parsed ``metadata.json`` (empty dict if the worker produced none).
@@ -133,12 +160,13 @@ def detonate_remote(
     req = urllib.request.Request(url, data=input_path.read_bytes(), method="POST", headers=headers)
     output_dir.mkdir(parents=True, exist_ok=True)
     # stream the response tar to a spooled temp file (spills to disk past 64MB) rather than holding the
-    # whole thing in memory -- artifact tars can be large.
+    # whole thing in memory -- artifact tars can be large. CAP the stream + the extracted total so a
+    # buggy/compromised worker can't fill the dispatcher's disk.
     with opener(req, timeout, context=ssl_context) as resp, \
             tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:
-        shutil.copyfileobj(resp, spool)
+        _bounded_copy(resp, spool, max_output_bytes)
         spool.seek(0)
-        _safe_extract_tar(spool, output_dir)
+        _safe_extract_tar(spool, output_dir, max_total_bytes=max_output_bytes)
     meta = output_dir / "metadata.json"
     if meta.exists():
         return json.loads(meta.read_text())
@@ -155,6 +183,7 @@ def make_remote_validate(
     http_open: HttpOpen | None = None,
     params_for: Callable[[Path], dict[str, str]] | None = None,
     ssl_context: ssl.SSLContext | None = None,
+    max_output_bytes: int | None = None,
 ) -> Callable[[Path], tuple[dict[str, Any] | None, bool]]:
     """Build a ``validate(input_path) -> (metadata, ok)`` for a network-endpoint dispatcher.
 
@@ -176,7 +205,13 @@ def make_remote_validate(
                 timeout=timeout, http_open=http_open,
                 params=params_for(input_path) if params_for else None,
                 ssl_context=ssl_context,
+                max_output_bytes=max_output_bytes,
             )
+            # a sealed envelope whose engine failed is NOT a successful job -- gate like the local
+            # dispatcher paths do (missing/invalid metadata or engine_error => fail).
+            if not meta or meta.get("status") == "engine_error":
+                _log.warning("remote_http: remote job not ok (status=%s)", (meta or {}).get("status"))
+                return meta or None, False
             return meta, True
         except Exception as exc:  # noqa: BLE001
             _log.warning("remote_http: validate failed: %s", exc)

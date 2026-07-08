@@ -251,15 +251,25 @@ def test_build_warm_pool_recognizes_aws_runtimes(monkeypatch):
     assert pool is not None
 
 
-def test_select_injects_dispatch_tls_context(tmp_path):
+def test_ec2_select_injects_dispatch_tls_context(tmp_path):
     from blastbox.host.pki import ensure_ca
+    from blastbox.host.runtime.aws_worker import select_disposable_ec2_runtime
     ensure_ca(tmp_path)  # writes ca.crt
+    env = {"BLASTBOX_DISPATCH_TLS_CA": str(tmp_path / "ca.crt"), "BLASTBOX_EC2_AMI": "ami-x"}
+    rt = select_disposable_ec2_runtime(get_env=env.get, require_available=False)
+    assert rt.ssl_context is not None   # self-hosted EC2 agent -> worker mTLS applies
+
+
+def test_lambda_select_does_not_pin_worker_ca(tmp_path):
+    # Lambda talks to AWS's public https endpoint + JWE -> must NOT get the private worker CA
+    from blastbox.host.pki import ensure_ca
+    ensure_ca(tmp_path)
     env = {"BLASTBOX_DISPATCH_TLS_CA": str(tmp_path / "ca.crt"), "BLASTBOX_LAMBDA_IMAGE": "img-x"}
     rt = select_lambda_microvm_runtime(get_env=env.get, require_available=False)
-    assert rt.ssl_context is not None   # BLASTBOX_DISPATCH_TLS_CA -> the tier talks mTLS
+    assert rt.ssl_context is None
 
 
-def test_select_no_tls_context_without_ca():
+def test_lambda_select_no_tls_context():
     rt = select_lambda_microvm_runtime(get_env={"BLASTBOX_LAMBDA_IMAGE": "img-x"}.get, require_available=False)
     assert rt.ssl_context is None
 

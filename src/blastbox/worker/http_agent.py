@@ -134,6 +134,11 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if urlparse(self.path).path == "/healthz":
+            # when a token is set, gate /healthz too -- otherwise a token-misconfigured dispatcher
+            # marks the worker ready and only discovers the 401 at /detonate (every job fails).
+            if not self._authed():
+                self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                return
             self._json(HTTPStatus.OK, {"ok": True, "engine": self.engine.name})
         else:
             self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})

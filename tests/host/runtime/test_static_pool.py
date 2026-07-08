@@ -164,6 +164,15 @@ def test_tls_mode_uses_https_scheme(tmp_path):
     assert slot_base_url(rt.spawn()) == "https://10.0.0.9:8765"   # host:port -> https in TLS mode
 
 
+def test_tls_forces_https_on_plaintext_url_worker(tmp_path):
+    from blastbox.host.pki import ensure_ca
+    from blastbox.tls import client_ssl_context
+    ensure_ca(tmp_path)
+    ctx = client_ssl_context(str(tmp_path / "ca.crt"))
+    rt = StaticPoolRuntime(_cfg("http://w.internal:8443"), http_probe=FakeProbe(all_ok=True), ssl_context=ctx)
+    assert slot_base_url(rt.spawn()) == "https://w.internal:8443"   # never plaintext under mTLS
+
+
 def test_select_builds_ssl_context_from_dispatch_tls_env(tmp_path):
     from blastbox.host.pki import ensure_ca
     ensure_ca(tmp_path)

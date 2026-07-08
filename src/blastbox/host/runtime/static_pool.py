@@ -162,7 +162,12 @@ class StaticPoolRuntime:
     # -- helpers ------------------------------------------------------------
     def _base_url(self, w: StaticWorker) -> str:
         if w.url:
-            return w.url.rstrip("/")
+            url = w.url.rstrip("/")
+            if self._tls and url.startswith("http://"):
+                # never send tokens/samples in the clear when the pool has an mTLS context
+                _log.warning("static: forcing https on plaintext worker %s (dispatcher TLS is on)", url)
+                url = "https://" + url[len("http://"):]
+            return url
         scheme = "https" if self._tls else "http"  # host:port workers follow the pool's TLS mode
         return f"{scheme}://{w.host}:{w.port}"
 

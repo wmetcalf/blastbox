@@ -185,6 +185,20 @@ def test_input_named_out_does_not_collide_with_output_dir():
         httpd.server_close()
 
 
+def test_healthz_requires_token_when_set():
+    httpd, port = _running_agent(token="s3cr3t")
+    try:
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=10)
+        assert ei.value.code == 401                       # misconfigured token -> not "healthy"
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/healthz", headers={"X-aws-proxy-auth": "s3cr3t"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            assert r.status == 200
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_ip_allowlist_blocks_disallowed_peer():
     httpd, port = _running_agent(allow_cidrs="10.0.0.0/8")   # 127.0.0.1 is not in it
     try:

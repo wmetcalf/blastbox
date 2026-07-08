@@ -393,7 +393,10 @@ def select_lambda_microvm_runtime(
     import os
     getter = get_env or os.environ.get
     cfg = cfg or LambdaMicroVmConfig.from_env(getter)
-    rt = LambdaMicroVmRuntime(cfg, **_inject_tls(getter, kw))
+    # NOTE: no _inject_tls here -- the Lambda tier talks to AWS's per-VM PUBLIC https endpoint + a JWE,
+    # so it must use the public trust roots (default context), NOT the private worker-mTLS CA (which is
+    # only for self-hosted EC2/static agents). Pinning the worker CA here would break AWS TLS.
+    rt = LambdaMicroVmRuntime(cfg, **kw)
     if require_available and not rt.available():
         raise AwsUnavailable("aws-lambda-microvm tier unavailable (creds/entitlement/service probe failed)")
     return rt
