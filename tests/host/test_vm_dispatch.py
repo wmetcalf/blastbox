@@ -69,6 +69,23 @@ def test_dispatch_metadata_overwrites_stale_and_neuters_artifacts(tmp_path):
     assert meta["artifacts"] == []                               # guest artifacts neutered (security)
 
 
+def test_dispatch_trust_output_metadata_preserves_sealed_artifacts(tmp_path):
+    # remote_http path: the transport already sealed output/metadata.json (with the real, host-extracted
+    # artifact list) -> preserve it instead of clobbering to artifacts:[].
+    import json
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    out = tmp_path / job.job_id / "output"
+    out.mkdir(parents=True)
+    sealed = {"status": "ok", "artifacts": [{"id": "p1", "path": "page.png", "sha256": "ab", "bytes": 3}]}
+    (out / "metadata.json").write_text(json.dumps(sealed))
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: (sealed, True), trust_output_metadata=True)
+    d._process(store.claim_next())
+    meta = json.loads((out / "metadata.json").read_text())
+    assert meta["status"] == "ok"
+    assert meta["artifacts"][0]["id"] == "p1"   # preserved, NOT neutered
+
+
 def test_dispatch_bounds_oversized_summary(tmp_path):
     # a compromised VM agent's huge summary must not be stored verbatim (balloons DB + every response)
     store = InMemoryJobStore()

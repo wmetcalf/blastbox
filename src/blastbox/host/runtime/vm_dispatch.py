@@ -59,10 +59,17 @@ class VmJobDispatcher:
                  validate_timeout_s: float = 1800.0,
                  fixed_net_policy: str | None = None,
                  engine_net_policy: str | None = None,
+                 trust_output_metadata: bool = False,
                  max_summary_bytes: int = _MAX_SUMMARY_BYTES) -> None:
         self._store = store
         self._job_root = Path(job_root)
         self._validate = validate
+        # When the transport itself sealed + wrote output/metadata.json (the remote_http path: the
+        # http_agent runs run_detonation which re-hashes artifacts from disk, and the HOST extracts the
+        # tar traversal-safe), that file is a trustworthy sealed envelope -- preserve it (with its
+        # artifact list) instead of clobbering it to artifacts:[]. False = the libvirt-VM path, where the
+        # summary is guest-influenced and artifacts MUST be forced empty.
+        self._trust_output_metadata = trust_output_metadata
         self._engine = engine
         self._worker_tier = worker_tier
         self._retention_s = max(0, int(job_retention_s))
@@ -162,6 +169,10 @@ class VmJobDispatcher:
         out = self._job_dir(job) / "output"
         try:
             out.mkdir(parents=True, exist_ok=True)
+            # Remote path: the transport already sealed + wrote a trustworthy metadata.json (with the
+            # real artifact list) into output/. Preserve it rather than overwriting with artifacts:[].
+            if self._trust_output_metadata and (out / "metadata.json").is_file():
+                return True
             data = json.dumps({**(summary or {}), "artifacts": []}).encode()
             atomic_write_confined(out, "metadata.json", data, mode=0o644)
             return True

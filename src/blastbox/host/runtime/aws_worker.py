@@ -144,6 +144,7 @@ class Ec2Config(AwsWorkerConfig):
     key_name: str | None = None
     use_public_ip: bool = False        # talk to the public IP (default: private IP, host in-VPC)
     user_data_b64: str | None = None   # base64 cloud-init that brings up the worker agent on agent_port
+    agent_token: str | None = None     # BLASTBOX_WORKER_AGENT_TOKEN baked into the AMI -> forwarded here
 
     @classmethod
     def from_env(cls, get: Callable[[str], str | None], **overrides: Any) -> Ec2Config:
@@ -154,6 +155,7 @@ class Ec2Config(AwsWorkerConfig):
             profile=_env(get, "BLASTBOX_AWS_PROFILE"),
             agent_port=int(_env(get, "BLASTBOX_AWS_AGENT_PORT", "8765") or "8765"),
             image_id=_env(get, "BLASTBOX_EC2_AMI") or "",
+            agent_token=_env(get, "BLASTBOX_EC2_AGENT_TOKEN"),
             instance_type=_env(get, "BLASTBOX_EC2_INSTANCE_TYPE", "m7g.large") or "m7g.large",
             subnet_id=_env(get, "BLASTBOX_EC2_SUBNET_ID"),
             security_group_ids=tuple(s.strip() for s in (sgs or "").split(",") if s.strip()),
@@ -443,11 +445,17 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
             # our stored base64) or it would double-encode and the agent would never start.
             import base64
             args += ["--user-data", base64.b64decode(c.user_data_b64).decode("utf-8", errors="replace")]
+        if c.max_duration_s and not c.user_data_b64:
+            _log.warning("aws-ec2: MAX_DURATION_S is set but --instance-initiated-shutdown-behavior only "
+                         "reaps if the guest shuts itself down; bake a self-terminate TTL into the AMI/"
+                         "user-data so a crashed dispatcher can't leak a running instance")
         resp = self._aws("ec2", "run-instances", *args)
         insts = resp.get("Instances") or []
         if not insts or not insts[0].get("InstanceId"):
             raise AwsWorkerError("run-instances: no instance id in response")
-        return AwsWorkerSlot(slot_id=sid, resource_id=str(insts[0]["InstanceId"]), state=SlotState.WARMING)
+        slot = AwsWorkerSlot(slot_id=sid, resource_id=str(insts[0]["InstanceId"]), state=SlotState.WARMING)
+        slot.auth_token = c.agent_token   # forwarded to /healthz + /detonate by the transport
+        return slot
 
     def _describe(self, slot: AwsWorkerSlot) -> dict[str, Any]:
         resp = self._aws("ec2", "describe-instances", "--instance-ids", str(slot.resource_id))
@@ -470,7 +478,8 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
                 return False
         scheme = "https" if self.ssl_context else "http"
         url = f"{scheme}://{slot.ip}:{self.cfg.agent_port}{self.cfg.agent_health_path}"
-        return self._probe(url, {}, self.cfg.probe_timeout_s)
+        headers = {"X-aws-proxy-auth": self.cfg.agent_token} if self.cfg.agent_token else {}
+        return self._probe(url, headers, self.cfg.probe_timeout_s)
 
     def _terminate(self, slot: AwsWorkerSlot) -> None:
         self._aws("ec2", "terminate-instances", "--instance-ids", str(slot.resource_id))

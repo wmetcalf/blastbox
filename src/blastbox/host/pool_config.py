@@ -35,6 +35,10 @@ class PoolConfig:
     concurrent_ceiling: int = 16
     spawn_rate_limit: float = 4.0
     burst_size: int = 4
+    # Max seconds a slot may sit WARMING before it's evicted. The 120s default is fine for FC/gVisor;
+    # raise it for cloud tiers (aws-ec2 first-boot can take minutes) so healthy-but-slow slots aren't
+    # churned -- matches the AWS ready_timeout budget.
+    warming_timeout_s: float = 120.0
     # Warm-snapshot tier (firecracker only): spawn = restore-from-warm-snapshot
     # instead of cold-boot. Opt-in; default OFF (cold FC boot per slot).
     warm_snapshot: bool = False
@@ -71,6 +75,7 @@ class PoolConfig:
             "concurrent_ceiling": _int("BLASTBOX_POOL_CEILING", cls.concurrent_ceiling),
             "spawn_rate_limit": _float("BLASTBOX_POOL_SPAWN_RATE", cls.spawn_rate_limit),
             "burst_size": _int("BLASTBOX_POOL_BURST_SIZE", cls.burst_size),
+            "warming_timeout_s": _float("BLASTBOX_POOL_WARMING_TIMEOUT_S", cls.warming_timeout_s),
             "warm_snapshot": _bool("BLASTBOX_POOL_WARM_SNAPSHOT", cls.warm_snapshot),
         }
         values.update(overrides)
@@ -145,6 +150,7 @@ def build_warm_pool(
     pool = WarmPool(
         runtime=runtime,
         warm_size=cfg.warm_size,
+        warming_timeout_s=cfg.warming_timeout_s,
         concurrent_ceiling=cfg.concurrent_ceiling,
         spawn_rate_limit=cfg.spawn_rate_limit,
         burst_size=cfg.burst_size,

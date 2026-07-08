@@ -308,3 +308,18 @@ def test_lambda_endpoint_resolves_to_https():
     assert rt.is_ready(slot) is True
     assert slot.url == "https://abc.lambda-microvm.us-east-1.on.aws"
     assert slot.auth_token == "jwe.x"
+
+
+def test_ec2_forwards_agent_token():
+    cfg = Ec2Config(region="us-east-1", image_id="ami-x", agent_token="tok123")
+    seen: list = []
+    fake = FakeAws({**_IDENT,
+                    "ec2 run-instances": {"Instances": [{"InstanceId": "i-1"}]},
+                    "ec2 describe-instances": {"Reservations": [{"Instances": [
+                        {"InstanceId": "i-1", "State": {"Name": "running"}, "PrivateIpAddress": "10.0.0.5"}]}]}})
+    rt = DisposableEc2Runtime(cfg, aws_runner=fake,
+                              http_probe=lambda u, h, t: (seen.append(h) or True), clock=lambda: 1.0)
+    slot = rt.spawn()
+    assert slot.auth_token == "tok123"                     # forwarded to the /detonate transport
+    assert rt.is_ready(slot) is True
+    assert seen[-1].get("X-aws-proxy-auth") == "tok123"    # and sent in the readiness probe

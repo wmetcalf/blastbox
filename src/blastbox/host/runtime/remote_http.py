@@ -175,7 +175,7 @@ def detonate_remote(
 
 def make_remote_validate(
     claim: Callable[[], _Slot],
-    release: Callable[[_Slot], None],
+    release: Callable[..., None],
     output_dir_for: Callable[[Path], Path],
     *,
     token: str | None = None,
@@ -196,6 +196,7 @@ def make_remote_validate(
 
     def validate(input_path: Path) -> tuple[dict[str, Any] | None, bool]:
         slot = claim()
+        dirty = True  # only a clean, successful round-trip releases the slot as reusable
         try:
             base = slot_base_url(slot, tls=ssl_context is not None)
             meta = detonate_remote(
@@ -212,11 +213,17 @@ def make_remote_validate(
             if not meta or meta.get("status") == "engine_error":
                 _log.warning("remote_http: remote job not ok (status=%s)", (meta or {}).get("status"))
                 return meta or None, False
+            dirty = False
             return meta, True
         except Exception as exc:  # noqa: BLE001
+            # transport error after the request may have reached the worker -> the box could still be
+            # busy; keep dirty=True so the pool retires/recycles it instead of re-offering immediately.
             _log.warning("remote_http: validate failed: %s", exc)
             return None, False
         finally:
-            release(slot)
+            try:
+                release(slot, dirty=dirty)
+            except TypeError:            # release seam that doesn't accept dirty (legacy callers/tests)
+                release(slot)
 
     return validate

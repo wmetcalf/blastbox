@@ -164,6 +164,35 @@ def test_detonate_remote_caps_output(tmp_path):
                         http_open=_opener(big), max_output_bytes=1000)
 
 
+def test_make_remote_validate_releases_dirty_on_failure(tmp_path):
+    (tmp_path / "in.docx").write_bytes(b"z")
+    slot = SimpleNamespace(url=None, ip="10.0.1.4", auth_token=None, agent_port=8765)
+    seen = []
+
+    def boom(req, timeout, context=None):
+        raise OSError("connection refused")
+
+    validate = make_remote_validate(
+        claim=lambda: slot, release=lambda s, dirty=False: seen.append(dirty),
+        output_dir_for=lambda p: tmp_path / "out", http_open=boom,
+    )
+    validate(tmp_path / "in.docx")
+    assert seen == [True]   # transport failure -> retire the slot dirty
+
+
+def test_make_remote_validate_releases_clean_on_success(tmp_path):
+    (tmp_path / "in.docx").write_bytes(b"z")
+    slot = SimpleNamespace(url=None, ip="10.0.1.4", auth_token=None, agent_port=8765)
+    seen = []
+    validate = make_remote_validate(
+        claim=lambda: slot, release=lambda s, dirty=False: seen.append(dirty),
+        output_dir_for=lambda p: tmp_path / "out",
+        http_open=_opener(_tar({"metadata.json": json.dumps({"status": "ok"}).encode()})),
+    )
+    validate(tmp_path / "in.docx")
+    assert seen == [False]   # clean success -> reusable
+
+
 def test_make_remote_validate_fails_on_engine_error(tmp_path):
     (tmp_path / "in.docx").write_bytes(b"z")
     slot = SimpleNamespace(url=None, ip="10.0.1.4", auth_token=None, agent_port=8765)

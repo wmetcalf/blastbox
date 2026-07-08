@@ -83,6 +83,7 @@ and the tier-capability matrix.
 | `BLASTBOX_POOL_CEILING` | — | Max concurrent slots (warm + burst). |
 | `BLASTBOX_POOL_BURST_SIZE` | — | Extra cold-burst slots above the warm set under load. |
 | `BLASTBOX_POOL_SPAWN_RATE` | — | Slot replenish rate. |
+| `BLASTBOX_POOL_WARMING_TIMEOUT_S` | `120` | Max seconds a slot may sit WARMING before eviction. **Raise for cloud tiers** (`aws-ec2` first-boot can exceed 120s) or healthy-but-slow slots get churned. |
 | `BLASTBOX_POOL_WARM_SNAPSHOT` | `0` | FC only: restore from a memory snapshot (warm-UNO) instead of cold-booting the guest. |
 
 ## Runtime: Firecracker
@@ -148,7 +149,8 @@ win-validator stays libvirt — no Windows/nested-virt on either).
 | `BLASTBOX_EC2_SUBNET_ID` / `BLASTBOX_EC2_SECURITY_GROUPS` | — | VPC placement + SGs (comma-list). |
 | `BLASTBOX_EC2_IAM_PROFILE` / `BLASTBOX_EC2_KEY_NAME` | — | Instance profile name / SSH key name. |
 | `BLASTBOX_EC2_PUBLIC_IP` | `0` | `1` ⇒ talk to the public IP (default: private, host in-VPC). |
-| `BLASTBOX_EC2_USER_DATA_B64` | — | base64 cloud-init that starts the worker agent on `AGENT_PORT`. |
+| `BLASTBOX_EC2_USER_DATA_B64` | — | base64 cloud-init that starts the worker agent on `AGENT_PORT`. **Bake a self-terminate TTL** (`shutdown` after `MAX_DURATION_S`) so a crashed dispatcher can't leak a running instance — `--instance-initiated-shutdown-behavior terminate` only fires if the guest shuts itself down. |
+| `BLASTBOX_EC2_AGENT_TOKEN` | — | Bearer token the AMI's agent expects (`BLASTBOX_WORKER_AGENT_TOKEN`); forwarded on both the readiness probe and `/detonate`. |
 
 The **generic worker agent** (`python -m blastbox.worker.http_agent`, `BLASTBOX_ENGINE=module:Class`)
 serves any engine over `GET /healthz` + `POST /detonate`; bake it + the engine + its deps into the

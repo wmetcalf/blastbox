@@ -190,6 +190,18 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     else:
         tier = "cold"
 
+    # Network-endpoint tiers (aws / static / cascade) drive workers over the http_agent + remote_http
+    # transport via VmJobDispatcher -- NOT the file-handshake Dispatcher (whose slots need input_dir).
+    from blastbox.host.jobs.base import NETWORK_ENDPOINT_TIERS
+
+    if pool is not None and tier in NETWORK_ENDPOINT_TIERS:
+        vm_disp = _network_endpoint_dispatcher(store, job_root, pool, tier, engines, limits)
+        try:
+            vm_disp.run()
+        finally:
+            pool.stop()
+        return 0
+
     dispatcher = Dispatcher(
         job_store=store,
         engines=engines,
@@ -256,6 +268,41 @@ def _bench_cmd(args: argparse.Namespace) -> int:
         with open(args.json, "w", encoding="utf-8") as fh:
             json.dump(res.report.to_json(), fh, indent=2)
     return 0
+
+
+def _network_endpoint_dispatcher(store, job_root, pool, tier, engines, limits):  # noqa: ANN001
+    """Build a VmJobDispatcher that drives a network-endpoint warm pool (aws/static/cascade) over the
+    remote_http transport: claim a slot, POST the job to its http_agent, extract the sealed output."""
+    from blastbox.host.runtime.remote_http import make_remote_validate
+    from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
+
+    # the runtime carries the client (m)TLS context (set for ec2/static, None for lambda's public TLS)
+    ssl_context = getattr(getattr(pool, "_runtime", None), "ssl_context", None)
+    claim_timeout = float(os.environ.get("BLASTBOX_WORKER_TIMEOUT_S") or "300")
+
+    def _claim():  # noqa: ANN202
+        slot = pool.claim(timeout_s=claim_timeout)
+        if slot is None:
+            raise RuntimeError("no warm slot available within claim timeout")
+        return slot
+
+    def _release(slot, dirty: bool = False) -> None:  # noqa: ANN001
+        pool.release(slot, dirty=dirty)
+
+    validate = make_remote_validate(
+        _claim, _release,
+        output_dir_for=lambda in_path: in_path.parent.parent / "output",
+        ssl_context=ssl_context,
+        max_output_bytes=limits.max_total_artifact_bytes,
+    )
+    return VmJobDispatcher(
+        store, str(job_root), validate,
+        engine=(next(iter(engines)) if len(engines) == 1 else None),
+        worker_tier=tier,
+        trust_output_metadata=True,   # the transport sealed + wrote output/metadata.json (real artifacts)
+        concurrency=int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1"),
+        job_retention_s=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"),
+    )
 
 
 def _version_cmd(_: argparse.Namespace) -> int:
