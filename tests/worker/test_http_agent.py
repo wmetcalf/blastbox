@@ -166,6 +166,25 @@ def test_harness_failure_returns_500(tmp_path, monkeypatch):
         httpd.server_close()
 
 
+def test_tls_env_fails_closed_on_partial_config():
+    from blastbox.worker.http_agent import _tls_env
+    with pytest.raises(SystemExit):
+        _tls_env({"BLASTBOX_WORKER_AGENT_TLS_CERT": "c"}.get)     # cert without key
+    with pytest.raises(SystemExit):
+        _tls_env({"BLASTBOX_WORKER_AGENT_CLIENT_CA": "ca"}.get)   # mTLS without TLS
+    assert _tls_env({}.get) == (None, None, None)
+
+
+def test_input_named_out_does_not_collide_with_output_dir():
+    httpd, port = _running_agent()
+    try:
+        r = _post(f"http://127.0.0.1:{port}/detonate?name=out", b"data")
+        assert r.status == 200        # a client filename of "out" no longer clashes with out_dir
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_ip_allowlist_blocks_disallowed_peer():
     httpd, port = _running_agent(allow_cidrs="10.0.0.0/8")   # 127.0.0.1 is not in it
     try:

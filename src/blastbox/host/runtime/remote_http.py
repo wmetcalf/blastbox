@@ -69,13 +69,15 @@ class _Slot(Protocol):
     agent_port: int
 
 
-def slot_base_url(slot: _Slot) -> str:
-    """Resolve the worker's base URL: a Lambda-MicroVM `url`, else `http://<ip>:<port>` (EC2/VM)."""
+def slot_base_url(slot: _Slot, *, tls: bool = False) -> str:
+    """Resolve the worker's base URL: a Lambda-MicroVM `url`, else `http(s)://<ip>:<port>` (EC2/VM).
+    ``tls`` selects the scheme for ip-based slots (https under mTLS)."""
     if getattr(slot, "url", None):
         return str(slot.url).rstrip("/")
     ip = getattr(slot, "ip", None)
     if ip:
-        return f"http://{ip}:{getattr(slot, 'agent_port', 8765)}"
+        scheme = "https" if tls else "http"
+        return f"{scheme}://{ip}:{getattr(slot, 'agent_port', 8765)}"
     raise ValueError("slot has no reachable endpoint (no url and no ip)")
 
 
@@ -166,7 +168,7 @@ def make_remote_validate(
     def validate(input_path: Path) -> tuple[dict[str, Any] | None, bool]:
         slot = claim()
         try:
-            base = slot_base_url(slot)
+            base = slot_base_url(slot, tls=ssl_context is not None)
             meta = detonate_remote(
                 base, input_path, output_dir_for(input_path),
                 token=getattr(slot, "auth_token", None) or token,

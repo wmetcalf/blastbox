@@ -61,6 +61,12 @@ def test_slot_base_url_ec2_ip_port():
     assert slot_base_url(slot) == "http://10.0.1.9:8765"
 
 
+def test_slot_base_url_tls_scheme():
+    slot = SimpleNamespace(url=None, ip="10.0.0.4", agent_port=8765)
+    assert slot_base_url(slot, tls=True) == "https://10.0.0.4:8765"
+    assert slot_base_url(slot, tls=False) == "http://10.0.0.4:8765"
+
+
 def test_slot_base_url_no_endpoint_raises():
     with pytest.raises(ValueError):
         slot_base_url(SimpleNamespace(url=None, ip=None, agent_port=8765))

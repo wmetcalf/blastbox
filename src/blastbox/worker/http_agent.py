@@ -180,7 +180,9 @@ class _Handler(BaseHTTPRequestHandler):
     def _run_job(self, name: str, length: int, params: dict[str, str]) -> bytes:
         with tempfile.TemporaryDirectory(prefix="bbagent-") as tmp:
             tmp_p = Path(tmp)
-            in_path = tmp_p / name
+            in_dir = tmp_p / "in"
+            in_dir.mkdir()
+            in_path = in_dir / name           # own subdir: a client name of "out" can't collide with out_dir
             out_dir = tmp_p / "out"
             # stream the body to disk (bounded)
             remaining = length
@@ -208,6 +210,18 @@ class _Handler(BaseHTTPRequestHandler):
                     if f.is_file():
                         tf.add(f, arcname=str(f.relative_to(out_dir)))
             return buf.getvalue()
+
+
+def _tls_env(get) -> tuple[str | None, str | None, str | None]:
+    """Read the agent TLS/mTLS env, failing closed on a partial config (never downgrade to plaintext)."""
+    cert = get("BLASTBOX_WORKER_AGENT_TLS_CERT") or None
+    key = get("BLASTBOX_WORKER_AGENT_TLS_KEY") or None
+    ca = get("BLASTBOX_WORKER_AGENT_CLIENT_CA") or None
+    if bool(cert) != bool(key):
+        raise SystemExit("BLASTBOX_WORKER_AGENT_TLS_CERT and _TLS_KEY must be set together")
+    if ca and not cert:
+        raise SystemExit("BLASTBOX_WORKER_AGENT_CLIENT_CA (mTLS) requires _TLS_CERT/_TLS_KEY")
+    return cert, key, ca
 
 
 def _parse_cidrs(raw: str | None) -> list:
@@ -253,9 +267,7 @@ def main(argv: list[str] | None = None) -> int:
     bind = os.environ.get("BLASTBOX_WORKER_AGENT_BIND", "0.0.0.0")
     token = os.environ.get("BLASTBOX_WORKER_AGENT_TOKEN") or None
     max_bytes = int(os.environ.get("BLASTBOX_WORKER_AGENT_MAX_BYTES", str(_DEFAULT_MAX_BYTES)))
-    tls_cert = os.environ.get("BLASTBOX_WORKER_AGENT_TLS_CERT") or None
-    tls_key = os.environ.get("BLASTBOX_WORKER_AGENT_TLS_KEY") or None
-    client_ca = os.environ.get("BLASTBOX_WORKER_AGENT_CLIENT_CA") or None
+    tls_cert, tls_key, client_ca = _tls_env(os.environ.get)
     allow_cidrs = os.environ.get("BLASTBOX_WORKER_AGENT_ALLOW_CIDRS") or None
     # fail-loud when exposed with no controls: a non-loopback bind with no mTLS, no token, no allowlist
     if bind not in ("127.0.0.1", "localhost", "::1") and not (client_ca or token or allow_cidrs):

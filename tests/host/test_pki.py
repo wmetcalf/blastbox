@@ -31,6 +31,18 @@ def test_ensure_ca_generates_then_reloads_same(tmp_path):
     assert ca1.cert_pem == ca2.cert_pem
 
 
+def test_ensure_ca_refuses_partial_state(tmp_path):
+    ensure_ca(tmp_path)
+    (tmp_path / "ca.key").unlink()                 # crt present, key gone -> partial
+    with pytest.raises(RuntimeError):
+        ensure_ca(tmp_path)                         # must NOT silently rotate the CA
+
+
+def test_issued_private_key_is_0600(tmp_path):
+    _, key = _generate_ca().issue_client("d").write(tmp_path, "d")
+    assert oct(key.stat().st_mode)[-3:] == "600"
+
+
 def test_ca_is_a_ca_cert():
     ca = _generate_ca()
     cert = x509.load_pem_x509_certificate(ca.cert_pem)

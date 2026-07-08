@@ -45,6 +45,13 @@ def _san_list(sans: list[str]) -> list[x509.GeneralName]:
     return out
 
 
+def _write_private(path: Path, data: bytes) -> None:
+    """Write a private key, created 0600 from the start (no world-readable window before a chmod)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+
+
 @dataclass
 class IssuedCert:
     """A leaf cert + its private key, both PEM. ``write`` drops them next to each other."""
@@ -57,8 +64,7 @@ class IssuedCert:
         dir.mkdir(parents=True, exist_ok=True)
         crt, key = dir / f"{name}.crt", dir / f"{name}.key"
         crt.write_bytes(self.cert_pem)
-        key.write_bytes(self.key_pem)
-        os.chmod(key, 0o600)
+        _write_private(key, self.key_pem)
         return crt, key
 
 
@@ -179,15 +185,22 @@ def load_ca(pki_dir: Path) -> CertAuthority:
 
 
 def ensure_ca(pki_dir: Path) -> CertAuthority:
-    """Load the CA from ``pki_dir`` (``ca.crt`` + ``ca.key``) or generate + persist a new one (key 0600)."""
+    """Load the CA from ``pki_dir`` (``ca.crt`` + ``ca.key``) or generate + persist a new one (key 0600).
+    Refuses a **partial** state (only one of the two present) rather than silently rotating the CA --
+    a fresh CA would invalidate every cert it already signed."""
     pki_dir = Path(pki_dir)
-    if (pki_dir / "ca.crt").exists() and (pki_dir / "ca.key").exists():
+    crt, key = pki_dir / "ca.crt", pki_dir / "ca.key"
+    if crt.exists() and key.exists():
         return load_ca(pki_dir)
+    if crt.exists() or key.exists():
+        raise RuntimeError(
+            f"partial CA state in {pki_dir} (have {'ca.crt' if crt.exists() else 'ca.key'}, "
+            "missing the other) -- refusing to rotate the CA; restore or clear both files"
+        )
     pki_dir.mkdir(parents=True, exist_ok=True)
     ca = _generate_ca()
-    (pki_dir / "ca.crt").write_bytes(ca.cert_pem)
-    (pki_dir / "ca.key").write_bytes(ca.key_pem)
-    os.chmod(pki_dir / "ca.key", 0o600)
+    crt.write_bytes(ca.cert_pem)
+    _write_private(key, ca.key_pem)
     return ca
 
 

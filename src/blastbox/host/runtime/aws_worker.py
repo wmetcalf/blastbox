@@ -448,7 +448,8 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
             slot.ip = inst.get("PublicIpAddress") if self.cfg.use_public_ip else inst.get("PrivateIpAddress")
             if slot.ip is None:
                 return False
-        url = f"http://{slot.ip}:{self.cfg.agent_port}{self.cfg.agent_health_path}"
+        scheme = "https" if self.ssl_context else "http"
+        url = f"{scheme}://{slot.ip}:{self.cfg.agent_port}{self.cfg.agent_health_path}"
         return self._probe(url, {}, self.cfg.probe_timeout_s)
 
     def _terminate(self, slot: AwsWorkerSlot) -> None:
