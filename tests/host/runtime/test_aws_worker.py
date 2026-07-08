@@ -212,14 +212,16 @@ def test_lambda_config_from_env():
         "BLASTBOX_AWS_PROFILE": "detonate",
         "BLASTBOX_LAMBDA_IMAGE": "arn:img",
         "BLASTBOX_LAMBDA_EGRESS_CONNECTORS": "conn-1,conn-2",
-        "BLASTBOX_LAMBDA_NO_INGRESS": "1",
+        "BLASTBOX_LAMBDA_INGRESS_CONNECTORS": "ing-1",
+        "BLASTBOX_LAMBDA_AUTH_TTL_MIN": "20",
     }
     cfg = LambdaMicroVmConfig.from_env(env.get)
     assert cfg.region == "us-west-2"
     assert cfg.profile == "detonate"
     assert cfg.image_identifier == "arn:img"
     assert cfg.egress_connector_ids == ("conn-1", "conn-2")
-    assert cfg.ingress is False
+    assert cfg.ingress_connector_ids == ("ing-1",)
+    assert cfg.auth_token_ttl_min == 20
     assert cfg.aws_argv("lambda-microvms", "list-microvms")[:6] == [
         "aws", "lambda-microvms", "list-microvms", "--region", "us-west-2", "--output",
     ]
@@ -260,3 +262,26 @@ def test_select_injects_dispatch_tls_context(tmp_path):
 def test_select_no_tls_context_without_ca():
     rt = select_lambda_microvm_runtime(get_env={"BLASTBOX_LAMBDA_IMAGE": "img-x"}.get, require_available=False)
     assert rt.ssl_context is None
+
+
+def test_lambda_cli_arg_shapes_match_live_api():
+    # locked in from the live spike: connectors are (list) tokens (NOT comma-joined), and the auth
+    # token needs --microvm-identifier + --expiration-in-minutes + --allowed-ports.
+    cfg = LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:img",
+                              egress_connector_ids=("e-1", "e-2"), ingress_connector_ids=("i-1",),
+                              auth_token_ttl_min=25, agent_port=8765)
+    fake = FakeAws({**_IDENT,
+                    "lambda-microvms run-microvm": {"microvmId": "mv-1"},
+                    "lambda-microvms create-microvm-auth-token": {"token": "jwe"}})
+    rt = LambdaMicroVmRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True, clock=lambda: 1.0)
+    slot = rt.spawn()
+    run_argv = next(a for k, a in fake.calls if k == "lambda-microvms run-microvm")
+    i = run_argv.index("--egress-network-connectors")
+    assert run_argv[i + 1:i + 3] == ["e-1", "e-2"]          # separate tokens, not "e-1,e-2"
+    assert "e-1,e-2" not in run_argv
+    assert "--ingress-network-connectors" in run_argv and "i-1" in run_argv
+    rt._mint_token(slot)
+    tok = next(a for k, a in fake.calls if k == "lambda-microvms create-microvm-auth-token")
+    assert "--microvm-identifier" in tok
+    assert tok[tok.index("--expiration-in-minutes") + 1] == "25"
+    assert tok[tok.index("--allowed-ports") + 1] == "8765"

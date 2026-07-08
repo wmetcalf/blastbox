@@ -101,23 +101,32 @@ class AwsWorkerConfig:
 
 @dataclass(frozen=True)
 class LambdaMicroVmConfig(AwsWorkerConfig):
-    image_identifier: str = ""         # microvm image ARN/id from create-microvm-image
+    # NOTE: image_identifier MUST be an in-account image ARN built via `create-microvm-image` (the
+    # managed base arn:...:aws:microvm-image:al2023-1 is NOT directly runnable -- verified live:
+    # "Image ARN must contain a valid customer account ID"). Build one from the base + a code artifact.
+    image_identifier: str = ""
     execution_role_arn: str | None = None
-    egress_connector_ids: tuple[str, ...] = ()   # () => no egress connector == sealed (no outbound)
-    ingress: bool = True               # False => NO_INGRESS (no public URL)
+    # run-microvm --{egress,ingress}-network-connectors are (list) args -> passed as separate tokens.
+    egress_connector_ids: tuple[str, ...] = ()   # () => sealed (no outbound)
+    ingress_connector_ids: tuple[str, ...] = ()  # () => no ingress connectors configured
+    auth_token_ttl_min: int = 15                 # create-microvm-auth-token --expiration-in-minutes
 
     @classmethod
     def from_env(cls, get: Callable[[str], str | None], **overrides: Any) -> LambdaMicroVmConfig:
         region = _env(get, "BLASTBOX_AWS_REGION") or _env(get, "AWS_REGION") or "us-east-1"
-        conns = _env(get, "BLASTBOX_LAMBDA_EGRESS_CONNECTORS")
+
+        def _idlist(key: str) -> tuple[str, ...]:
+            return tuple(c.strip() for c in (_env(get, key) or "").split(",") if c.strip())
+
         return cls(
             region=region,
             profile=_env(get, "BLASTBOX_AWS_PROFILE"),
             agent_port=int(_env(get, "BLASTBOX_AWS_AGENT_PORT", "8765") or "8765"),
             image_identifier=_env(get, "BLASTBOX_LAMBDA_IMAGE") or "",
             execution_role_arn=_env(get, "BLASTBOX_LAMBDA_EXEC_ROLE_ARN"),
-            egress_connector_ids=tuple(c.strip() for c in (conns or "").split(",") if c.strip()),
-            ingress=(_env(get, "BLASTBOX_LAMBDA_NO_INGRESS") or "0") != "1",
+            egress_connector_ids=_idlist("BLASTBOX_LAMBDA_EGRESS_CONNECTORS"),
+            ingress_connector_ids=_idlist("BLASTBOX_LAMBDA_INGRESS_CONNECTORS"),
+            auth_token_ttl_min=int(_env(get, "BLASTBOX_LAMBDA_AUTH_TTL_MIN", "15") or "15"),
             max_duration_s=int(_env(get, "BLASTBOX_AWS_MAX_DURATION_S", "3600") or "3600"),
             **overrides,
         )
@@ -313,9 +322,9 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
         if self.cfg.execution_role_arn:
             args += ["--execution-role-arn", self.cfg.execution_role_arn]
         if self.cfg.egress_connector_ids:
-            args += ["--egress-network-connectors", ",".join(self.cfg.egress_connector_ids)]
-        if not self.cfg.ingress:
-            args += ["--ingress-network-connectors", "NO_INGRESS"]
+            args += ["--egress-network-connectors", *self.cfg.egress_connector_ids]
+        if self.cfg.ingress_connector_ids:
+            args += ["--ingress-network-connectors", *self.cfg.ingress_connector_ids]
         resp = self._aws("lambda-microvms", "run-microvm", *args)
         rid = resp.get("microvmId") or resp.get("MicrovmId") or resp.get("id")
         if not rid:
@@ -323,15 +332,19 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
         return AwsWorkerSlot(slot_id=sid, resource_id=str(rid), state=SlotState.WARMING)
 
     def _describe(self, slot: AwsWorkerSlot) -> dict[str, Any]:
-        return self._aws("lambda-microvms", "get-microvm", "--microvm-id", str(slot.resource_id))
+        return self._aws("lambda-microvms", "get-microvm", "--microvm-identifier", str(slot.resource_id))
 
     def _running(self, slot: AwsWorkerSlot) -> bool:
         st = str(self._describe(slot).get("state", "")).lower()
         return st in ("running", "active", "ready")
 
     def _mint_token(self, slot: AwsWorkerSlot) -> str:
+        # minted fresh at probe/detonation time with a short TTL + scoped to the agent port (both
+        # required by the API) -- a token minted at spawn could expire before a warm slot's job.
         resp = self._aws("lambda-microvms", "create-microvm-auth-token",
-                         "--microvm-id", str(slot.resource_id))
+                         "--microvm-identifier", str(slot.resource_id),
+                         "--expiration-in-minutes", str(self.cfg.auth_token_ttl_min),
+                         "--allowed-ports", str(self.cfg.agent_port))
         tok = resp.get("token") or resp.get("authToken") or resp.get("Token")
         if not tok:
             raise AwsWorkerError("create-microvm-auth-token: no token in response")
@@ -353,7 +366,7 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
         return self._probe(url, headers, self.cfg.probe_timeout_s)
 
     def _terminate(self, slot: AwsWorkerSlot) -> None:
-        self._aws("lambda-microvms", "terminate-microvm", "--microvm-id", str(slot.resource_id))
+        self._aws("lambda-microvms", "terminate-microvm", "--microvm-identifier", str(slot.resource_id))
 
 
 def _inject_tls(getter: Callable[[str], str | None], kw: dict[str, Any]) -> dict[str, Any]:
