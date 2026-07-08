@@ -86,6 +86,38 @@ def test_dispatch_trust_output_metadata_preserves_sealed_artifacts(tmp_path):
     assert meta["artifacts"][0]["id"] == "p1"   # preserved, NOT neutered
 
 
+def test_dispatch_forwards_sanitized_params_to_validate(tmp_path):
+    # per-job params reach a params-aware validate() (the remote_http seam), gated by the sanitize hook
+    store = InMemoryJobStore()
+    job = Job.new(engine="clippyshot", filename="f.docx")
+    job.params = {"CLIPPYSHOT_OCR": "1", "bad key": "x"}
+    root = tmp_path / job.job_id
+    (root / "input").mkdir(parents=True)
+    (root / "input" / "f.docx").write_bytes(b"z")
+    job.result_dir = str(root)
+    store.create(job)
+    seen = {}
+
+    def validate(path, *, params=None):
+        seen["params"] = params
+        return ({"status": "ok"}, True)
+
+    d = VmJobDispatcher(store, str(tmp_path), validate,
+                        sanitize_params=lambda p: {k: v for k, v in p.items() if k == "CLIPPYSHOT_OCR"})
+    d._process(store.claim_next())
+    assert seen["params"] == {"CLIPPYSHOT_OCR": "1"}   # allowlisted key forwarded; "bad key" dropped
+
+
+def test_dispatch_legacy_validate_without_params_kwarg(tmp_path):
+    # a validate() that doesn't accept params (the libvirt-vm seam) must still work unchanged
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"verdict": "ok"}, True),
+                        sanitize_params=lambda p: p)
+    d._process(store.claim_next())
+    assert store.get(job.job_id).status is JobStatus.DONE
+
+
 def test_dispatch_bounds_oversized_summary(tmp_path):
     # a compromised VM agent's huge summary must not be stored verbatim (balloons DB + every response)
     store = InMemoryJobStore()

@@ -145,6 +145,7 @@ class Ec2Config(AwsWorkerConfig):
     use_public_ip: bool = False        # talk to the public IP (default: private IP, host in-VPC)
     user_data_b64: str | None = None   # base64 cloud-init that brings up the worker agent on agent_port
     agent_token: str | None = None     # BLASTBOX_WORKER_AGENT_TOKEN baked into the AMI -> forwarded here
+    self_terminate: bool = True        # inject a guest self-shutdown TTL so a leaked instance dies
 
     @classmethod
     def from_env(cls, get: Callable[[str], str | None], **overrides: Any) -> Ec2Config:
@@ -163,9 +164,27 @@ class Ec2Config(AwsWorkerConfig):
             key_name=_env(get, "BLASTBOX_EC2_KEY_NAME"),
             use_public_ip=(_env(get, "BLASTBOX_EC2_PUBLIC_IP") or "0") == "1",
             user_data_b64=_env(get, "BLASTBOX_EC2_USER_DATA_B64"),
+            self_terminate=(_env(get, "BLASTBOX_EC2_SELF_TERMINATE", "1") or "1") not in ("0", "false", "no"),
             max_duration_s=int(_env(get, "BLASTBOX_AWS_MAX_DURATION_S", "3600") or "3600"),
             **overrides,
         )
+
+
+def _userdata_with_self_terminate(raw: str | None, max_duration_s: int) -> str:
+    """Wrap the operator's user-data (any cloud-init format) + a self-terminate part as MIME multipart,
+    so a crashed dispatcher can't leak a running instance (needs shutdown-behavior=terminate, which the
+    EC2 launch sets). The operator's part keeps its own cloud-init type; the TTL is an x-shellscript that
+    schedules ``shutdown`` after the duration."""
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    minutes = max(1, max_duration_s // 60)
+    msg = MIMEMultipart()
+    if raw and raw.strip():
+        subtype = "cloud-config" if raw.lstrip().startswith("#cloud-config") else "x-shellscript"
+        msg.attach(MIMEText(raw, subtype))
+    msg.attach(MIMEText(f"#!/bin/sh\nshutdown -h +{minutes}\n", "x-shellscript"))
+    return msg.as_string()
 
 
 # ---------------------------------------------------------------------------
@@ -440,15 +459,18 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
             args += ["--iam-instance-profile", f"Name={c.iam_instance_profile}"]
         if c.key_name:
             args += ["--key-name", c.key_name]
+        # The aws CLI base64-encodes --user-data itself, so hand it the RAW text (decoded from our
+        # stored base64) or it would double-encode and the agent would never start.
+        user_data = None
         if c.user_data_b64:
-            # The aws CLI base64-encodes --user-data itself, so hand it the RAW script (decoded from
-            # our stored base64) or it would double-encode and the agent would never start.
             import base64
-            args += ["--user-data", base64.b64decode(c.user_data_b64).decode("utf-8", errors="replace")]
-        if c.max_duration_s and not c.user_data_b64:
-            _log.warning("aws-ec2: MAX_DURATION_S is set but --instance-initiated-shutdown-behavior only "
-                         "reaps if the guest shuts itself down; bake a self-terminate TTL into the AMI/"
-                         "user-data so a crashed dispatcher can't leak a running instance")
+            user_data = base64.b64decode(c.user_data_b64).decode("utf-8", errors="replace")
+        if c.self_terminate and c.max_duration_s:
+            # backstop reap: guest schedules its own shutdown -> shutdown-behavior=terminate kills it,
+            # so a crashed dispatcher can't leak a running instance past MAX_DURATION_S.
+            user_data = _userdata_with_self_terminate(user_data, c.max_duration_s)
+        if user_data:
+            args += ["--user-data", user_data]
         resp = self._aws("ec2", "run-instances", *args)
         insts = resp.get("Instances") or []
         if not insts or not insts[0].get("InstanceId"):

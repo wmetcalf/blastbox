@@ -60,6 +60,7 @@ class VmJobDispatcher:
                  fixed_net_policy: str | None = None,
                  engine_net_policy: str | None = None,
                  trust_output_metadata: bool = False,
+                 sanitize_params: Callable[[dict[str, str]], dict[str, str]] | None = None,
                  max_summary_bytes: int = _MAX_SUMMARY_BYTES) -> None:
         self._store = store
         self._job_root = Path(job_root)
@@ -70,6 +71,15 @@ class VmJobDispatcher:
         # artifact list) instead of clobbering it to artifacts:[]. False = the libvirt-VM path, where the
         # summary is guest-influenced and artifacts MUST be forced empty.
         self._trust_output_metadata = trust_output_metadata
+        # Optional per-job param gate (built from the engine's allowlist by the caller): the sanitized
+        # subset is passed to a validate() that accepts a `params` kwarg (the remote_http seam), so a
+        # network-endpoint job honors per-job toggles (OCR/QR) just like the local worker.
+        self._sanitize = sanitize_params
+        try:
+            import inspect
+            self._validate_takes_params = "params" in inspect.signature(validate).parameters
+        except (TypeError, ValueError):
+            self._validate_takes_params = False
         self._engine = engine
         self._worker_tier = worker_tier
         self._retention_s = max(0, int(job_retention_s))
@@ -206,10 +216,14 @@ class VmJobDispatcher:
                                    job.job_id, exc_info=True)
 
         result: dict[str, object] = {}
+        params = self._sanitize(dict(job.params)) if (self._sanitize and job.params) else None
 
         def _run() -> None:
             try:
-                result["v"] = self._validate(in_path)
+                if self._validate_takes_params:
+                    result["v"] = self._validate(in_path, params=params)  # type: ignore[call-arg]
+                else:
+                    result["v"] = self._validate(in_path)
             except BaseException as exc:  # noqa: BLE001 — surfaced to the caller below
                 result["e"] = exc
 

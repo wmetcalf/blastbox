@@ -323,3 +323,29 @@ def test_ec2_forwards_agent_token():
     assert slot.auth_token == "tok123"                     # forwarded to the /detonate transport
     assert rt.is_ready(slot) is True
     assert seen[-1].get("X-aws-proxy-auth") == "tok123"    # and sent in the readiness probe
+
+
+def test_ec2_self_terminate_ttl_injected():
+    import base64
+
+    from blastbox.host.runtime.aws_worker import _userdata_with_self_terminate
+    wrapped = _userdata_with_self_terminate("#!/bin/bash\necho hi\n", 600)
+    assert "shutdown -h +10" in wrapped and "echo hi" in wrapped   # 600s -> 10min; operator part kept
+
+    ud = base64.b64encode(b"#!/bin/bash\nstart-agent\n").decode()
+    cfg = Ec2Config(region="us-east-1", image_id="ami-x", user_data_b64=ud, max_duration_s=1800)
+    fake = FakeAws({**_IDENT, "ec2 run-instances": {"Instances": [{"InstanceId": "i-1"}]}})
+    rt = DisposableEc2Runtime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True, clock=lambda: 1.0)
+    rt.spawn()
+    argv = next(a for k, a in fake.calls if k == "ec2 run-instances")
+    ud_arg = argv[argv.index("--user-data") + 1]
+    assert "shutdown -h +30" in ud_arg and "start-agent" in ud_arg   # crashed dispatcher can't leak it
+
+
+def test_ec2_self_terminate_can_be_disabled():
+    cfg = Ec2Config(region="us-east-1", image_id="ami-x", max_duration_s=1800, self_terminate=False)
+    fake = FakeAws({**_IDENT, "ec2 run-instances": {"Instances": [{"InstanceId": "i-1"}]}})
+    rt = DisposableEc2Runtime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True, clock=lambda: 1.0)
+    rt.spawn()
+    argv = next(a for k, a in fake.calls if k == "ec2 run-instances")
+    assert "--user-data" not in argv   # opted out -> no injected TTL, no user-data

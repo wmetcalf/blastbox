@@ -149,7 +149,8 @@ win-validator stays libvirt — no Windows/nested-virt on either).
 | `BLASTBOX_EC2_SUBNET_ID` / `BLASTBOX_EC2_SECURITY_GROUPS` | — | VPC placement + SGs (comma-list). |
 | `BLASTBOX_EC2_IAM_PROFILE` / `BLASTBOX_EC2_KEY_NAME` | — | Instance profile name / SSH key name. |
 | `BLASTBOX_EC2_PUBLIC_IP` | `0` | `1` ⇒ talk to the public IP (default: private, host in-VPC). |
-| `BLASTBOX_EC2_USER_DATA_B64` | — | base64 cloud-init that starts the worker agent on `AGENT_PORT`. **Bake a self-terminate TTL** (`shutdown` after `MAX_DURATION_S`) so a crashed dispatcher can't leak a running instance — `--instance-initiated-shutdown-behavior terminate` only fires if the guest shuts itself down. |
+| `BLASTBOX_EC2_USER_DATA_B64` | — | base64 cloud-init that starts the worker agent on `AGENT_PORT` (any format — merged into MIME-multipart with the auto TTL). |
+| `BLASTBOX_EC2_SELF_TERMINATE` | `1` | Inject a guest self-shutdown after `MAX_DURATION_S` (MIME-multipart, on top of your user-data) so a **crashed dispatcher can't leak a running instance** — `--instance-initiated-shutdown-behavior terminate` then reaps it. Set `0` if the AMI handles its own TTL. |
 | `BLASTBOX_EC2_AGENT_TOKEN` | — | Bearer token the AMI's agent expects (`BLASTBOX_WORKER_AGENT_TOKEN`); forwarded on both the readiness probe and `/detonate`. |
 
 The **generic worker agent** (`python -m blastbox.worker.http_agent`, `BLASTBOX_ENGINE=module:Class`)

@@ -194,9 +194,11 @@ def make_remote_validate(
     returns ``(None, False)`` so the dispatcher fails the job rather than emitting a bogus verdict.
     """
 
-    def validate(input_path: Path) -> tuple[dict[str, Any] | None, bool]:
+    def validate(input_path: Path, *, params: dict[str, str] | None = None) -> tuple[dict[str, Any] | None, bool]:
         slot = claim()
         dirty = True  # only a clean, successful round-trip releases the slot as reusable
+        # per-job params from the dispatcher (already allowlist-gated) win; else the params_for hook.
+        job_params = params if params is not None else (params_for(input_path) if params_for else None)
         try:
             base = slot_base_url(slot, tls=ssl_context is not None)
             meta = detonate_remote(
@@ -204,7 +206,7 @@ def make_remote_validate(
                 token=getattr(slot, "auth_token", None) or token,
                 agent_port=getattr(slot, "agent_port", 8765),
                 timeout=timeout, http_open=http_open,
-                params=params_for(input_path) if params_for else None,
+                params=job_params,
                 ssl_context=ssl_context,
                 max_output_bytes=max_output_bytes,
             )

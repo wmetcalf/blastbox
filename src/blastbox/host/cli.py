@@ -295,11 +295,23 @@ def _network_endpoint_dispatcher(store, job_root, pool, tier, engines, limits): 
         ssl_context=ssl_context,
         max_output_bytes=limits.max_total_artifact_bytes,
     )
+    # per-job params: gate job.params through the (single) engine's allowlist, same as the cold path,
+    # and forward the sanitized subset to the remote worker (OCR/QR toggles honored end-to-end).
+    sanitize = None
+    if len(engines) == 1:
+        from blastbox.host.dispatch import Dispatcher
+        spec = next(iter(engines.values()))
+
+        def sanitize(p):  # noqa: ANN001,ANN202
+            return Dispatcher._sanitize_params(p, spec.allowed_param_keys, spec.reserved_param_keys,
+                                               getattr(spec, "default_params", None))
+
     return VmJobDispatcher(
         store, str(job_root), validate,
         engine=(next(iter(engines)) if len(engines) == 1 else None),
         worker_tier=tier,
         trust_output_metadata=True,   # the transport sealed + wrote output/metadata.json (real artifacts)
+        sanitize_params=sanitize,
         concurrency=int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1"),
         job_retention_s=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"),
     )
