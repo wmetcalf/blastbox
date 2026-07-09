@@ -348,6 +348,28 @@ def test_ec2_self_terminate_ttl_injected():
     assert "shutdown -h +30" in ud_arg and "start-agent" in ud_arg   # crashed dispatcher can't leak it
 
 
+def test_ec2_self_terminate_preserves_multipart_userdata():
+    # if the operator user-data is ALREADY MIME multipart cloud-init, the TTL is APPENDED as a part,
+    # not nested (which would make cloud-init treat the whole document as one opaque script).
+    from email import message_from_string
+
+    from blastbox.host.runtime.aws_worker import _userdata_with_self_terminate
+    multipart = (
+        "Content-Type: multipart/mixed; boundary=\"BOUND\"\n"
+        "MIME-Version: 1.0\n\n"
+        "--BOUND\n"
+        "Content-Type: text/cloud-config\n\n"
+        "#cloud-config\nruncmd:\n  - echo original\n\n"
+        "--BOUND--\n"
+    )
+    wrapped = _userdata_with_self_terminate(multipart, 600)
+    msg = message_from_string(wrapped)
+    payloads = [p.get_payload() for p in msg.get_payload()] if msg.is_multipart() else []
+    assert msg.is_multipart()
+    assert any("echo original" in p for p in payloads)          # operator part preserved as its own part
+    assert any("shutdown -h +10" in p for p in payloads)        # TTL appended alongside, not nesting it
+
+
 def test_ec2_self_terminate_can_be_disabled():
     cfg = Ec2Config(region="us-east-1", image_id="ami-x", max_duration_s=1800, self_terminate=False)
     fake = FakeAws({**_IDENT, "ec2 run-instances": {"Instances": [{"InstanceId": "i-1"}]}})

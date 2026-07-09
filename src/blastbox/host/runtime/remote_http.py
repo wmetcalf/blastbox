@@ -105,29 +105,50 @@ def slot_base_url(slot: _Slot, *, tls: bool = False) -> str:
     raise ValueError("slot has no reachable endpoint (no url and no ip)")
 
 
-def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: int | None = None) -> list[str]:
+def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: int | None = None,
+                      max_members: int | None = None) -> list[str]:
     """Extract regular files from a tar (bytes or a seekable fileobj) into ``dest``, rejecting path
-    traversal and capping the total extracted bytes. Returns the relative paths written."""
+    traversal and capping the total extracted bytes AND the regular-file member count (an inode-
+    exhaustion guard: a buggy/compromised agent could pack hundreds of thousands of tiny files that
+    stay under the byte budget). Writes never follow symlinks (``O_NOFOLLOW``) so a stale worker-
+    controlled symlink left in ``dest`` from a prior attempt can't redirect a write out of the tree.
+    Returns the relative paths written."""
     dest = dest.resolve()
     fileobj = io.BytesIO(tar_source) if isinstance(tar_source, (bytes, bytearray)) else tar_source
     written: list[str] = []
     total = 0
+    files = 0
     with tarfile.open(fileobj=fileobj, mode="r") as tf:
         for m in tf.getmembers():
             if not m.isfile():
                 continue
-            target = (dest / m.name).resolve()
-            if target != dest and not str(target).startswith(str(dest) + os.sep):
+            files += 1
+            if max_members is not None and files > max_members:
+                raise RemoteOutputTooLarge(f"remote output exceeded {max_members} files")
+            raw = dest / m.name
+            # bounds check on the FULLY-RESOLVED path (catches leaf + intermediate-dir symlink escapes).
+            resolved = raw.resolve()
+            if resolved != dest and not str(resolved).startswith(str(dest) + os.sep):
                 _log.warning("remote_http: dropping traversal member %r", m.name)
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
+            raw.parent.mkdir(parents=True, exist_ok=True)
             src = tf.extractfile(m)
             if src is None:
                 continue
-            with src, target.open("wb") as out:
+            # open the UNRESOLVED leaf with O_NOFOLLOW: if that leaf is a symlink (left over from a
+            # prior/requeued attempt, or swapped in after the bounds check), the open fails ELOOP and we
+            # skip the member rather than writing THROUGH the symlink. Opening the resolved path instead
+            # would silently follow it.
+            try:
+                fd = os.open(raw, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            except OSError as exc:
+                src.close()
+                _log.warning("remote_http: refusing to write member %r (%s)", m.name, exc)
+                continue
+            with src, os.fdopen(fd, "wb") as out:
                 remaining = None if max_total_bytes is None else max_total_bytes - total
                 total += _bounded_copy(src, out, remaining)
-            written.append(str(target.relative_to(dest)))
+            written.append(str(resolved.relative_to(dest)))
     return written
 
 
@@ -143,6 +164,8 @@ def detonate_remote(
     params: dict[str, str] | None = None,
     ssl_context: ssl.SSLContext | None = None,
     max_output_bytes: int | None = None,
+    max_members: int | None = None,
+    max_metadata_bytes: int | None = None,
 ) -> dict[str, Any]:
     """POST ``input_path`` to the remote agent's ``/detonate``; extract the returned sealed output tar
     into ``output_dir``; return the parsed ``metadata.json`` (empty dict if the worker produced none).
@@ -170,9 +193,15 @@ def detonate_remote(
             tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:
         _bounded_copy(resp, spool, stream_cap)
         spool.seek(0)
-        _safe_extract_tar(spool, output_dir, max_total_bytes=max_output_bytes)
+        _safe_extract_tar(spool, output_dir, max_total_bytes=max_output_bytes, max_members=max_members)
     meta = output_dir / "metadata.json"
     if meta.exists():
+        # bound the metadata BEFORE parsing -- a worker can put an under-artifact-budget-but-huge
+        # metadata.json in the tar; parsing a multi-hundred-MB JSON here (before the host trust gate
+        # enforces max_metadata_bytes) is a CPU/memory DoS.
+        if max_metadata_bytes is not None and meta.stat().st_size > max_metadata_bytes:
+            raise RemoteOutputTooLarge(
+                f"remote metadata.json is {meta.stat().st_size} bytes (> {max_metadata_bytes})")
         return json.loads(meta.read_text())
     return {}
 
@@ -188,7 +217,9 @@ def make_remote_validate(
     params_for: Callable[[Path], dict[str, str]] | None = None,
     ssl_context: ssl.SSLContext | None = None,
     max_output_bytes: int | None = None,
-    output_trust: Callable[[Path, Path], None] | None = None,
+    max_members: int | None = None,
+    max_metadata_bytes: int | None = None,
+    output_trust: Callable[[Path, Path, str | None], None] | None = None,
 ) -> Callable[[Path], tuple[dict[str, Any] | None, bool]]:
     """Build a ``validate(input_path) -> (metadata, ok)`` for a network-endpoint dispatcher.
 
@@ -199,7 +230,8 @@ def make_remote_validate(
     returns ``(None, False)`` so the dispatcher fails the job rather than emitting a bogus verdict.
     """
 
-    def validate(input_path: Path, *, params: dict[str, str] | None = None) -> tuple[dict[str, Any] | None, bool]:
+    def validate(input_path: Path, *, params: dict[str, str] | None = None,
+                 input_sha256: str | None = None) -> tuple[dict[str, Any] | None, bool]:
         slot = claim()
         dirty = True  # only a clean, successful round-trip releases the slot as reusable
         # per-job params from the dispatcher (already allowlist-gated) win; else the params_for hook.
@@ -215,6 +247,8 @@ def make_remote_validate(
                 params=job_params,
                 ssl_context=ssl_context,
                 max_output_bytes=max_output_bytes,
+                max_members=max_members,
+                max_metadata_bytes=max_metadata_bytes,
             )
             # a sealed envelope whose engine failed is NOT a successful job -- gate like the local
             # dispatcher paths do (missing/invalid metadata or engine_error => fail).
@@ -225,7 +259,9 @@ def make_remote_validate(
             # host validation (re-sealed hashes / engine / input_sha / caps) stays dirty and is retired
             # rather than re-offered. It re-writes the host-sealed metadata.json in out_dir; re-read it.
             if output_trust is not None:
-                output_trust(input_path, out_dir)   # raises on trust failure -> caught below, dirty stays True
+                # pass the authoritative ingress SHA (if the dispatcher supplied one) so trust compares
+                # against it, not a recompute of the staged file. Raises on failure -> dirty stays True.
+                output_trust(input_path, out_dir, input_sha256)
                 sealed = out_dir / "metadata.json"
                 if sealed.exists():
                     meta = json.loads(sealed.read_text())

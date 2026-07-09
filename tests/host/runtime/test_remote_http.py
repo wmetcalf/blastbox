@@ -88,6 +88,38 @@ def test_safe_extract_rejects_traversal(tmp_path):
     assert not (tmp_path / "escape.bin").exists()   # traversal dropped
 
 
+def test_safe_extract_caps_member_count(tmp_path):
+    from blastbox.host.runtime.remote_http import RemoteOutputTooLarge
+    tar = _tar({f"f{i}.bin": b"x" for i in range(10)})
+    with pytest.raises(RemoteOutputTooLarge):
+        _safe_extract_tar(tar, tmp_path, max_members=5)   # inode-exhaustion guard
+
+
+def test_safe_extract_refuses_symlink_leaf(tmp_path):
+    # a stale symlink at the member's leaf (even one that resolves IN-bounds) must not be written
+    # THROUGH: O_NOFOLLOW makes the open fail ELOOP and the member is skipped.
+    import os
+    dest = tmp_path / "out"
+    dest.mkdir()
+    inside = dest / "inside.txt"
+    inside.write_text("original")
+    os.symlink(inside, dest / "p0.png")   # dest/p0.png -> dest/inside.txt (in-bounds, passes bounds check)
+    _safe_extract_tar(_tar({"p0.png": b"overwrite"}), dest)
+    assert inside.read_text() == "original"   # not written through the symlink
+
+
+def test_safe_extract_symlink_escape_blocked(tmp_path):
+    # a symlink whose target is OUTSIDE dest is dropped by the resolve()+bounds check.
+    import os
+    dest = tmp_path / "out"
+    dest.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("original")
+    os.symlink(secret, dest / "p0.png")   # dest/p0.png -> ../secret.txt (out of bounds)
+    _safe_extract_tar(_tar({"p0.png": b"overwrite"}), dest)
+    assert secret.read_text() == "original"
+
+
 # --------------------------------------------------------------------- detonate_remote
 
 def test_detonate_remote_extracts_and_returns_meta(tmp_path):
@@ -164,6 +196,43 @@ def test_detonate_remote_caps_output(tmp_path):
                         http_open=_opener(big), max_output_bytes=1000)
 
 
+def test_detonate_remote_caps_member_count(tmp_path):
+    from blastbox.host.runtime.remote_http import RemoteOutputTooLarge
+    (tmp_path / "in.bin").write_bytes(b"z")
+    many = _tar({"metadata.json": b"{}", **{f"f{i}.bin": b"x" for i in range(20)}})
+    with pytest.raises(RemoteOutputTooLarge):
+        detonate_remote("http://h:8765", tmp_path / "in.bin", tmp_path / "o",
+                        http_open=_opener(many), max_members=5)
+
+
+def test_detonate_remote_caps_metadata_size(tmp_path):
+    from blastbox.host.runtime.remote_http import RemoteOutputTooLarge
+    (tmp_path / "in.bin").write_bytes(b"z")
+    huge_meta = _tar({"metadata.json": b'{"x":"' + b"a" * 10000 + b'"}'})
+    with pytest.raises(RemoteOutputTooLarge):
+        detonate_remote("http://h:8765", tmp_path / "in.bin", tmp_path / "o",
+                        http_open=_opener(huge_meta), max_metadata_bytes=1000)
+
+
+def test_make_remote_validate_forwards_input_sha_to_trust(tmp_path):
+    # the dispatcher-supplied authoritative ingress SHA reaches output_trust (not a recompute).
+    (tmp_path / "in.docx").write_bytes(b"z")
+    slot = SimpleNamespace(url=None, ip="10.0.1.4", auth_token=None, agent_port=8765)
+    got = {}
+
+    def trust(_in_path, _out_dir, sha):
+        got["sha"] = sha
+
+    validate = make_remote_validate(
+        claim=lambda: slot, release=lambda s, dirty=False: None,
+        output_dir_for=lambda p: tmp_path / "out",
+        http_open=_opener(_tar({"metadata.json": json.dumps({"status": "ok"}).encode()})),
+        output_trust=trust,
+    )
+    validate(tmp_path / "in.docx", input_sha256="deadbeef")
+    assert got["sha"] == "deadbeef"
+
+
 def test_make_remote_validate_releases_dirty_on_failure(tmp_path):
     (tmp_path / "in.docx").write_bytes(b"z")
     slot = SimpleNamespace(url=None, ip="10.0.1.4", auth_token=None, agent_port=8765)
@@ -212,7 +281,7 @@ def test_make_remote_validate_trust_failure_keeps_slot_dirty(tmp_path):
     slot = SimpleNamespace(url=None, ip="10.0.1.4", auth_token=None, agent_port=8765)
     seen = []
 
-    def bad_trust(_in_path, _out_dir):
+    def bad_trust(_in_path, _out_dir, _sha):
         raise RuntimeError("hash mismatch")
 
     validate = make_remote_validate(
@@ -231,7 +300,7 @@ def test_make_remote_validate_trust_ok_rereads_sealed_metadata(tmp_path):
     slot = SimpleNamespace(url=None, ip="10.0.1.4", auth_token=None, agent_port=8765)
     out = tmp_path / "out"
 
-    def reseal(_in_path, out_dir):
+    def reseal(_in_path, out_dir, _sha):
         (out_dir / "metadata.json").write_text(json.dumps({"status": "ok", "sealed": True}))
 
     validate = make_remote_validate(

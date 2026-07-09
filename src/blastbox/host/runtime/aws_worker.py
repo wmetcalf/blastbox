@@ -175,15 +175,29 @@ def _userdata_with_self_terminate(raw: str | None, max_duration_s: int) -> str:
     so a crashed dispatcher can't leak a running instance (needs shutdown-behavior=terminate, which the
     EC2 launch sets). The operator's part keeps its own cloud-init type; the TTL is an x-shellscript that
     schedules ``shutdown`` after the duration."""
+    from email import message_from_string
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
 
     minutes = max(1, max_duration_s // 60)
-    msg = MIMEMultipart()
+    ttl = MIMEText(f"#!/bin/sh\nshutdown -h +{minutes}\n", "x-shellscript")
     if raw and raw.strip():
+        head = raw[:400].lower()
+        # If the operator's user-data is ALREADY a MIME multipart cloud-init document, append the TTL
+        # part to it -- wrapping the whole document as a single x-shellscript part (the old behavior)
+        # would make cloud-init run it as one opaque script and lose its constituent parts.
+        if not raw.lstrip().startswith("#") and ("mime-version:" in head or "multipart/" in head):
+            outer = message_from_string(raw)
+            if outer.is_multipart():
+                outer.attach(ttl)
+                return outer.as_string()
         subtype = "cloud-config" if raw.lstrip().startswith("#cloud-config") else "x-shellscript"
+        msg = MIMEMultipart()
         msg.attach(MIMEText(raw, subtype))
-    msg.attach(MIMEText(f"#!/bin/sh\nshutdown -h +{minutes}\n", "x-shellscript"))
+        msg.attach(ttl)
+        return msg.as_string()
+    msg = MIMEMultipart()
+    msg.attach(ttl)
     return msg.as_string()
 
 

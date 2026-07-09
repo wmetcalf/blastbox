@@ -83,9 +83,14 @@ class VmJobDispatcher:
         self._output_validator = output_validator
         try:
             import inspect
-            self._validate_takes_params = "params" in inspect.signature(validate).parameters
+            _params = inspect.signature(validate).parameters
+            self._validate_takes_params = "params" in _params
+            # the remote transport's trust gate compares against the AUTHORITATIVE ingress-recorded
+            # input SHA (not a recompute of the staged file) -> pass job.input_sha256 when accepted.
+            self._validate_takes_input_sha = "input_sha256" in _params
         except (TypeError, ValueError):
             self._validate_takes_params = False
+            self._validate_takes_input_sha = False
         self._engine = engine
         self._worker_tier = worker_tier
         self._retention_s = max(0, int(job_retention_s))
@@ -228,10 +233,12 @@ class VmJobDispatcher:
 
         def _run() -> None:
             try:
+                kw: dict[str, object] = {}
                 if self._validate_takes_params:
-                    result["v"] = self._validate(in_path, params=params)  # type: ignore[call-arg]
-                else:
-                    result["v"] = self._validate(in_path)
+                    kw["params"] = params
+                if self._validate_takes_input_sha:
+                    kw["input_sha256"] = job.input_sha256   # authoritative ingress SHA for the trust gate
+                result["v"] = self._validate(in_path, **kw)  # type: ignore[call-arg]
             except BaseException as exc:  # noqa: BLE001 — surfaced to the caller below
                 result["e"] = exc
 
@@ -475,6 +482,12 @@ def build_remote_vm_dispatcher(
 
     ssl_context = getattr(pool.runtime, "ssl_context", None)
     max_output_bytes = getattr(limits, "max_total_artifact_bytes", None)
+    # DoS backstops for the untrusted worker tar, BEFORE the host trust gate parses/validates it:
+    # a member (inode) cap ~ the artifact ceiling (+slack for metadata.json/control files), and a
+    # metadata.json size cap so a huge JSON isn't parsed before max_metadata_bytes is enforced.
+    _max_artifacts = getattr(limits, "max_artifacts", None)
+    max_members = (_max_artifacts + 16) if _max_artifacts is not None else None
+    max_metadata_bytes = getattr(limits, "max_metadata_bytes", None)
 
     def _claim() -> Any:
         slot = pool.claim(timeout_s=worker_timeout_s)
@@ -500,17 +513,22 @@ def build_remote_vm_dispatcher(
     # It runs INSIDE the transport (make_remote_validate) BEFORE the slot is released clean, so a worker
     # that fails trust keeps its slot dirty and is retired instead of re-offered. The transport hands it
     # (input_path, out_dir); recompute the input SHA from the bytes actually POSTed (== job.input_sha256).
-    output_trust: Callable[[Path, Path], None] | None = None
+    output_trust: Callable[[Path, Path, str | None], None] | None = None
     if limits is not None:
-        def output_trust(input_path: Path, out_dir: Path) -> None:
-            import hashlib
-
+        def output_trust(input_path: Path, out_dir: Path, expected_sha: str | None) -> None:
             from blastbox.host.trust import OutputTrustError, validate_worker_output
-            h = hashlib.sha256()
-            with open(input_path, "rb") as fh:
-                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-                    h.update(chunk)
-            env = validate_worker_output(output_dir=out_dir, input_sha256=h.hexdigest(),
+            # Compare the worker's sealed envelope against the AUTHORITATIVE ingress-recorded input SHA
+            # (job.input_sha256), matching the cold/file-warm paths -- so a staged input that was
+            # corrupted/replaced after submission is caught (the worker hashed different bytes). Fall
+            # back to hashing the POSTed file only if the dispatcher didn't supply one.
+            if not expected_sha:
+                import hashlib
+                h = hashlib.sha256()
+                with open(input_path, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                        h.update(chunk)
+                expected_sha = h.hexdigest()
+            env = validate_worker_output(output_dir=out_dir, input_sha256=expected_sha,
                                          engine=engine or "", limits=limits)
             if env.status == "engine_error":
                 detail = env.warnings[0].message if env.warnings else "engine_error"
@@ -523,6 +541,8 @@ def build_remote_vm_dispatcher(
         output_dir_for=lambda in_path: in_path.parent.parent / "output",
         ssl_context=ssl_context,
         max_output_bytes=max_output_bytes,
+        max_members=max_members,
+        max_metadata_bytes=max_metadata_bytes,
         output_trust=output_trust,   # trust gate runs pre-release so a failed slot stays dirty
         timeout=worker_timeout_s,   # bound the transport by the operator's worker timeout, not the 600s default
     )
@@ -533,9 +553,12 @@ def build_remote_vm_dispatcher(
         sanitize_params=sanitize,
         fixed_net_policy=getattr(engine_spec, "net_policy", None),   # enforce egress personality
         validate_timeout_s=worker_timeout_s,
-        # this is the ONLY dispatcher for its single engine's remote pool -> recover a claim that was
-        # marked RUNNING but crashed before _process stamped worker_runtime="warm" (else it hangs).
-        sole_owner=True,
+        # sole_owner recovers a claim that crashed in the tiny window BETWEEN claim and the
+        # worker_runtime="warm" stamp -- but it makes maintenance FAIL any stale RUNNING job for this
+        # engine, which would clobber a COLD dispatcher's live jobs if one shares the store. Default OFF
+        # (shared-store safe); opt in with BLASTBOX_DISPATCH_SOLE_OWNER=1 ONLY for a network-ONLY store.
+        sole_owner=(os.environ.get("BLASTBOX_DISPATCH_SOLE_OWNER") or "").strip().lower()
+                   in ("1", "true", "yes"),
         concurrency=concurrency,
         job_retention_s=job_retention_s,
     )
