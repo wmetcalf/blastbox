@@ -67,13 +67,18 @@ class CascadingRuntime:
 
     @property
     def ssl_context(self) -> Any:
-        """The client (m)TLS context for the network tiers (they share the env-built one) -- so the
-        remote transport verifies workers + presents the client cert through the cascade wrapper."""
-        for t in self.tiers:
-            ctx = getattr(t.runtime, "ssl_context", None)
-            if ctx is not None:
-                return ctx
-        return None
+        """The client (m)TLS context for the network tiers. Worker-mTLS tiers (static/ec2) carry a
+        private-CA context; Lambda uses AWS PUBLIC TLS (no context). Those can't share one transport
+        context, so a cascade mixing them is a misconfig (fail-fast, like dispatch_style)."""
+        ctxs = [getattr(t.runtime, "ssl_context", None) for t in self.tiers
+                if getattr(t.runtime, "dispatch_style", "file") == "network"]
+        has_ctx = [c is not None for c in ctxs]
+        if any(has_ctx) and not all(has_ctx):
+            raise CascadeMisconfigured(
+                "cascade mixes worker-mTLS tiers (static/ec2, private CA) with public-TLS tiers "
+                "(aws-lambda-microvm) -- one transport context can't verify both; use separate pools"
+            )
+        return next((c for c in ctxs if c is not None), None)
 
     def __init__(self, tiers: list[Tier]) -> None:
         if not tiers:
@@ -124,14 +129,16 @@ class CascadingRuntime:
 
     def reap(self, slot: Any) -> None:
         with self._lock:
-            i = self._owner.pop(slot.slot_id, None)
+            i = self._owner.get(slot.slot_id)
         if i is None:
             return
-        try:
-            self.tiers[i].runtime.reap(slot)
-        finally:
-            with self._lock:
-                self._counts[i] = max(0, self._counts[i] - 1)
+        # reap FIRST; only drop ownership + decrement on success, so a failing inner reap keeps the
+        # slot->tier mapping (a later stop()/retry can terminate it) and doesn't undercount capacity
+        # while the worker is still live.
+        self.tiers[i].runtime.reap(slot)
+        with self._lock:
+            self._owner.pop(slot.slot_id, None)
+            self._counts[i] = max(0, self._counts[i] - 1)
 
     def available(self) -> bool:
         return bool(self.tiers)   # built only with tiers that came up

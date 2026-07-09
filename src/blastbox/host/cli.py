@@ -169,9 +169,8 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     # Opt-in warm pool (BLASTBOX_POOL_RUNTIME; default "none" → cold path only).
     from blastbox.host.pool_config import build_warm_pool
 
-    pool = build_warm_pool()
-    if pool is not None:
-        pool.start()
+    pool = build_warm_pool()   # built, NOT started -- start only after all validation below, so a
+    # config error (mixed cascade / multi-engine) can't leak already-spawned cloud slots.
 
     # Tier identity, derived ALONGSIDE the pool so a misconfig fails fast HERE rather than the
     # dispatcher silently mislabeling/misrouting warm jobs as "cold". A built warm pool MUST
@@ -210,6 +209,7 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
             concurrency=int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1"),
             job_retention_s=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"),
         )
+        pool.start()   # validation passed -> now spawn/warm slots (nothing to leak on an earlier raise)
         try:
             vm.run()
         except BaseException:
@@ -219,6 +219,8 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
             pool.stop()
         return 0
 
+    if pool is not None:
+        pool.start()   # file-handshake warm path: start after tier-identity validation
     dispatcher = Dispatcher(
         job_store=store,
         engines=engines,

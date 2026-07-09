@@ -130,12 +130,26 @@ def test_cascade_dispatch_style_mixed_raises():
 
 def test_cascade_exposes_inner_ssl_context():
     a = FakeRuntime("a")
+    a.dispatch_style = "network"                           # type: ignore[attr-defined]
     a.ssl_context = "CTX"                                  # type: ignore[attr-defined]
     assert CascadingRuntime([Tier("a", a, 1)]).ssl_context == "CTX"
 
 
 def test_cascade_ssl_context_none_when_absent():
     assert CascadingRuntime([Tier("a", FakeRuntime("a"), 1)]).ssl_context is None
+
+
+def test_cascade_ssl_context_mixed_mtls_and_public_tls_raises():
+    # a worker-mTLS tier (private CA context) + a public-TLS Lambda tier (no context) can't share
+    # one transport context -- fail fast rather than silently verifying one and not the other.
+    mtls = FakeRuntime("static")
+    mtls.dispatch_style = "network"                        # type: ignore[attr-defined]
+    mtls.ssl_context = "CTX"                               # type: ignore[attr-defined]
+    lam = FakeRuntime("lambda")
+    lam.dispatch_style = "network"                         # type: ignore[attr-defined]
+    lam.ssl_context = None                                 # type: ignore[attr-defined]
+    with pytest.raises(CascadeMisconfigured):
+        _ = CascadingRuntime([Tier("static", mtls, 1), Tier("lambda", lam, 1)]).ssl_context
 
 
 def test_empty_tiers_rejected():

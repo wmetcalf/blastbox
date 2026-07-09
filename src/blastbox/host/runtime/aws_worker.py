@@ -229,6 +229,7 @@ class AwsDisposableRuntime:
 
     kind = "aws"
     dispatch_style = "network"   # driven over http_agent + remote_http (VmJobDispatcher), not file-handshake
+    _liveness_cache_s = 5.0      # cache is_alive() so a 0.1s pool tick doesn't spam the AWS describe API
 
     def __init__(
         self,
@@ -246,6 +247,7 @@ class AwsDisposableRuntime:
         # client (m)TLS context for https workers -- exposed for make_remote_validate; when set, the
         # health probe defaults to the TLS-aware one (see the select_* helpers).
         self.ssl_context = ssl_context
+        self._live_cache: dict[str, tuple[float, bool]] = {}
 
     # -- aws cli seam -------------------------------------------------------
     def _aws(self, service: str, op: str, *args: str) -> dict[str, Any]:
@@ -294,12 +296,21 @@ class AwsDisposableRuntime:
             return False
 
     def is_alive(self, slot: AwsWorkerSlot) -> bool:
+        # cache for _liveness_cache_s so the pool's fast tick (~0.1s) doesn't issue an AWS describe per
+        # tick per slot (throttling / cost / dispatcher CPU). Real liveness changes are seconds-scale.
+        now = self._clock()
+        cached = self._live_cache.get(slot.slot_id)
+        if cached is not None and (now - cached[0]) < self._liveness_cache_s:
+            return cached[1]
         try:
-            return self._running(slot)
+            alive = self._running(slot)
         except (AwsWorkerError, OSError):
-            return False
+            alive = False
+        self._live_cache[slot.slot_id] = (now, alive)
+        return alive
 
     def reap(self, slot: AwsWorkerSlot) -> None:
+        self._live_cache.pop(slot.slot_id, None)
         if slot.resource_id is None:
             return
         self._terminate(slot)

@@ -497,13 +497,21 @@ def build_remote_vm_dispatcher(
 
     # host trust gate: re-seal the extracted output + verify engine/input-SHA/caps, then overwrite
     # metadata.json with the host-sealed envelope (recomputed hashes). Same gate the cold path runs.
-    output_validator: Callable[[Job, Path], None] | None = None
+    # It runs INSIDE the transport (make_remote_validate) BEFORE the slot is released clean, so a worker
+    # that fails trust keeps its slot dirty and is retired instead of re-offered. The transport hands it
+    # (input_path, out_dir); recompute the input SHA from the bytes actually POSTed (== job.input_sha256).
+    output_trust: Callable[[Path, Path], None] | None = None
     if limits is not None:
-        def output_validator(job: Job, out_dir: Path) -> None:
-            from blastbox.contract.envelope import atomic_write_confined
+        def output_trust(input_path: Path, out_dir: Path) -> None:
+            import hashlib
+
             from blastbox.host.trust import OutputTrustError, validate_worker_output
-            env = validate_worker_output(output_dir=out_dir, input_sha256=job.input_sha256 or "",
-                                         engine=job.engine, limits=limits)
+            h = hashlib.sha256()
+            with open(input_path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(chunk)
+            env = validate_worker_output(output_dir=out_dir, input_sha256=h.hexdigest(),
+                                         engine=engine or "", limits=limits)
             if env.status == "engine_error":
                 detail = env.warnings[0].message if env.warnings else "engine_error"
                 raise OutputTrustError(f"engine_error: {detail}")
@@ -515,6 +523,7 @@ def build_remote_vm_dispatcher(
         output_dir_for=lambda in_path: in_path.parent.parent / "output",
         ssl_context=ssl_context,
         max_output_bytes=max_output_bytes,
+        output_trust=output_trust,   # trust gate runs pre-release so a failed slot stays dirty
         timeout=worker_timeout_s,   # bound the transport by the operator's worker timeout, not the 600s default
     )
     return VmJobDispatcher(
@@ -522,9 +531,11 @@ def build_remote_vm_dispatcher(
         engine=engine, worker_tier=tier,
         trust_output_metadata=True,   # preserve the host-sealed metadata.json the validator wrote
         sanitize_params=sanitize,
-        output_validator=output_validator,
         fixed_net_policy=getattr(engine_spec, "net_policy", None),   # enforce egress personality
         validate_timeout_s=worker_timeout_s,
+        # this is the ONLY dispatcher for its single engine's remote pool -> recover a claim that was
+        # marked RUNNING but crashed before _process stamped worker_runtime="warm" (else it hangs).
+        sole_owner=True,
         concurrency=concurrency,
         job_retention_s=job_retention_s,
     )

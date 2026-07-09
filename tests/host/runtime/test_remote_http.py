@@ -205,6 +205,45 @@ def test_make_remote_validate_fails_on_engine_error(tmp_path):
     assert ok is False   # a sealed engine_error envelope is not a successful job
 
 
+def test_make_remote_validate_trust_failure_keeps_slot_dirty(tmp_path):
+    # host trust gate runs BEFORE the slot is released: a transport-ok job that FAILS host validation
+    # must fail AND retire the slot dirty (not re-offer a worker that produced untrusted output).
+    (tmp_path / "in.docx").write_bytes(b"z")
+    slot = SimpleNamespace(url=None, ip="10.0.1.4", auth_token=None, agent_port=8765)
+    seen = []
+
+    def bad_trust(_in_path, _out_dir):
+        raise RuntimeError("hash mismatch")
+
+    validate = make_remote_validate(
+        claim=lambda: slot, release=lambda s, dirty=False: seen.append(dirty),
+        output_dir_for=lambda p: tmp_path / "out",
+        http_open=_opener(_tar({"metadata.json": json.dumps({"status": "ok"}).encode()})),
+        output_trust=bad_trust,
+    )
+    _, ok = validate(tmp_path / "in.docx")
+    assert ok is False and seen == [True]   # trust failed -> job fails, slot retired dirty
+
+
+def test_make_remote_validate_trust_ok_rereads_sealed_metadata(tmp_path):
+    # a passing trust gate re-writes metadata.json (host-sealed) -> validate returns the re-read version.
+    (tmp_path / "in.docx").write_bytes(b"z")
+    slot = SimpleNamespace(url=None, ip="10.0.1.4", auth_token=None, agent_port=8765)
+    out = tmp_path / "out"
+
+    def reseal(_in_path, out_dir):
+        (out_dir / "metadata.json").write_text(json.dumps({"status": "ok", "sealed": True}))
+
+    validate = make_remote_validate(
+        claim=lambda: slot, release=lambda s, dirty=False: None,
+        output_dir_for=lambda p: out,
+        http_open=_opener(_tar({"metadata.json": json.dumps({"status": "ok"}).encode()})),
+        output_trust=reseal,
+    )
+    meta, ok = validate(tmp_path / "in.docx")
+    assert ok is True and meta.get("sealed") is True   # returns the host-sealed metadata, not the worker's
+
+
 # --------------------------------------------------------------------- make_remote_validate
 
 def test_make_remote_validate_happy(tmp_path):

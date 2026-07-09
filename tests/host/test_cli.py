@@ -93,6 +93,24 @@ class TestDispatchArgparse:
             ret = main(["dispatch"])
         assert ret == 1
 
+    def test_dispatch_network_multi_engine_does_not_start_pool(self):
+        """A network-endpoint pool + >1 engine must fail validation BEFORE pool.start(), so a config
+        error can't leak already-spawned cloud slots (Codex #1/#6)."""
+        import os
+
+        pool = MagicMock()
+        pool.runtime.dispatch_style = "network"
+        env = {
+            "BLASTBOX_ENGINES": "clippyshot=img1:latest,redtusk=img2:latest",
+            "BLASTBOX_POOL_RUNTIME": "aws-ec2",   # a network-endpoint warm tier
+        }
+        with patch.dict(os.environ, env, clear=True), \
+                patch("blastbox.host.pool_config.build_warm_pool", return_value=pool), \
+                patch("blastbox.host.jobs.factory.build_job_store_from_env", return_value=MagicMock()):
+            with pytest.raises(ValueError, match="single engine"):
+                main(["dispatch"])
+        pool.start.assert_not_called()   # validation raised first -> nothing spawned to leak
+
 
 class TestCliParser:
     def test_no_command_raises_systemexit(self):

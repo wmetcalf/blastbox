@@ -196,19 +196,25 @@ top is unchanged (it still sees one runtime); each tier reads its own backend co
 | `BLASTBOX_POOL_TIERS` | — | **Required.** Ordered `backend:capacity` list, e.g. `gvisor:4,aws-ec2:16` — 4 warm local + up to 16 overflow on AWS. Backends: `gvisor`, `firecracker`, `static`, `aws-ec2`, `aws-lambda-microvm`. |
 
 The **primary** (first) tier must be available at startup (fail-closed); an **overflow** tier that isn't
-available is logged and skipped, so local capacity still comes up if the cloud/remote tier is
-misconfigured. Set `BLASTBOX_POOL_WARM_SIZE` to the local tier's capacity (keep those warm),
-`BLASTBOX_POOL_CEILING` to the sum (local + overflow), and `BLASTBOX_DISPATCH_CONCURRENCY` to the ceiling.
+available is logged and skipped, so capacity still comes up if the cloud/remote tier is misconfigured.
+Set `BLASTBOX_POOL_WARM_SIZE` to the primary tier's capacity (keep those warm), `BLASTBOX_POOL_CEILING` to
+the sum, and `BLASTBOX_DISPATCH_CONCURRENCY` to the ceiling.
 
-Example — 4 warm gVisor locally, overflow to a rack of other boxes, then AWS:
+> **All tiers must share a dispatch style.** Every tier is either **network-endpoint** (`static`,
+> `aws-ec2`, `aws-lambda-microvm` — driven over `remote_http`) or **file-handshake** (`gvisor`,
+> `firecracker`). You can't mix them in one cascade (a job can't use both transports) — the dispatcher
+> **fails fast** at startup if you do. So "local + remote overflow" means a network-endpoint local tier
+> (`static` boxes you own), not `gvisor`/`firecracker`.
+
+Example — 8 warm workers on a rack of boxes you own, overflow to AWS:
 ```
 BLASTBOX_POOL_RUNTIME=cascade
-BLASTBOX_POOL_TIERS=gvisor:4,static:8,aws-ec2:16
-BLASTBOX_STATIC_WORKERS=box1:8765,box2:8765,box3:8765,box4:8765
+BLASTBOX_POOL_TIERS=static:8,aws-ec2:16       # all network-endpoint
+BLASTBOX_STATIC_WORKERS=box1:8765,box2:8765,box3:8765,box4:8765,box5:8765,box6:8765,box7:8765,box8:8765
 BLASTBOX_EC2_AMI=ami-...            # (+ BLASTBOX_EC2_* placement)
-BLASTBOX_POOL_WARM_SIZE=4
-BLASTBOX_POOL_CEILING=28
-BLASTBOX_DISPATCH_CONCURRENCY=28
+BLASTBOX_POOL_WARM_SIZE=8
+BLASTBOX_POOL_CEILING=24
+BLASTBOX_DISPATCH_CONCURRENCY=24
 ```
 
 ## Worker HTTP agent + mTLS (network-endpoint tiers)

@@ -188,6 +188,7 @@ def make_remote_validate(
     params_for: Callable[[Path], dict[str, str]] | None = None,
     ssl_context: ssl.SSLContext | None = None,
     max_output_bytes: int | None = None,
+    output_trust: Callable[[Path, Path], None] | None = None,
 ) -> Callable[[Path], tuple[dict[str, Any] | None, bool]]:
     """Build a ``validate(input_path) -> (metadata, ok)`` for a network-endpoint dispatcher.
 
@@ -205,8 +206,9 @@ def make_remote_validate(
         job_params = params if params is not None else (params_for(input_path) if params_for else None)
         try:
             base = slot_base_url(slot, tls=ssl_context is not None)
+            out_dir = output_dir_for(input_path)
             meta = detonate_remote(
-                base, input_path, output_dir_for(input_path),
+                base, input_path, out_dir,
                 token=getattr(slot, "auth_token", None) or token,
                 agent_port=getattr(slot, "agent_port", 8765),
                 timeout=timeout, http_open=http_open,
@@ -219,6 +221,14 @@ def make_remote_validate(
             if not meta or meta.get("status") == "engine_error":
                 _log.warning("remote_http: remote job not ok (status=%s)", (meta or {}).get("status"))
                 return meta or None, False
+            # HOST TRUST GATE -- runs BEFORE the slot is released clean, so a worker whose output fails
+            # host validation (re-sealed hashes / engine / input_sha / caps) stays dirty and is retired
+            # rather than re-offered. It re-writes the host-sealed metadata.json in out_dir; re-read it.
+            if output_trust is not None:
+                output_trust(input_path, out_dir)   # raises on trust failure -> caught below, dirty stays True
+                sealed = out_dir / "metadata.json"
+                if sealed.exists():
+                    meta = json.loads(sealed.read_text())
             dirty = False
             return meta, True
         except Exception as exc:  # noqa: BLE001

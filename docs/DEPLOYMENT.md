@@ -63,9 +63,10 @@ redundant, and (for nono) Landlock isn't even available under runsc (below).
   isolation (run the worker image under runsc there).
 - **Cloud burst** → `aws-ec2` (throwaway EC2 per job) or `aws-lambda-microvm` (Lambda MicroVM + JWE) —
   disposable, one job then terminate; fail-closed on creds/entitlement (`BLASTBOX_EC2_*` / `BLASTBOX_LAMBDA_*`).
-- **X local + burst to Y elsewhere** → `cascade` — an ordered `BLASTBOX_POOL_TIERS` list, e.g.
-  `gvisor:4,static:8,aws-ec2:16`: fills local first, overflows to other hardware, then cloud. Set
-  `BLASTBOX_POOL_WARM_SIZE`=the local tier's capacity and `BLASTBOX_POOL_CEILING`=the sum.
+- **X primary + burst to Y elsewhere** → `cascade` — an ordered `BLASTBOX_POOL_TIERS` list, e.g.
+  `static:8,aws-ec2:16`: fills the primary first, overflows to the next tier. **All tiers must share a
+  dispatch style** (all network-endpoint `static`/`aws-*`, or all file-handshake `gvisor`/`firecracker`
+  — a mix fails fast at startup). Set `BLASTBOX_POOL_WARM_SIZE`=the primary's capacity, `_CEILING`=the sum.
 
 Defense-in-depth on the weak tier: enable **`BLASTBOX_WORKER_NONO_WRAP=1`** on the **runc**
 cold path to Landlock-confine the whole worker (write-confinement + network block) on top of
@@ -126,12 +127,12 @@ BLASTBOX_STATIC_WORKERS=box1:8765,box2:8765,box3:8765     # +BLASTBOX_STATIC_WOR
 BLASTBOX_POOL_RUNTIME=aws-ec2                             # or aws-lambda-microvm
 BLASTBOX_EC2_AMI=ami-...                                  # +BLASTBOX_EC2_* placement
 
-# (c) X local + overflow to other hardware then cloud — a single pool
+# (c) fixed fleet + overflow to cloud — a single pool (all tiers network-endpoint; can't mix with gvisor/fc)
 BLASTBOX_POOL_RUNTIME=cascade
-BLASTBOX_POOL_TIERS=gvisor:4,static:8,aws-ec2:16          # local -> other boxes -> AWS
-BLASTBOX_POOL_WARM_SIZE=4                                 # keep the 4 local warm
-BLASTBOX_POOL_CEILING=28                                  # 4 + 8 + 16
-BLASTBOX_DISPATCH_CONCURRENCY=28
+BLASTBOX_POOL_TIERS=static:8,aws-ec2:16                   # your boxes -> AWS
+BLASTBOX_POOL_WARM_SIZE=8                                 # keep the 8 static warm
+BLASTBOX_POOL_CEILING=24                                  # 8 + 16
+BLASTBOX_DISPATCH_CONCURRENCY=24
 ```
 
 In the cascade the **primary (local) tier is fail-closed**; an overflow tier that isn't available at
