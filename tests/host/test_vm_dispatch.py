@@ -118,6 +118,31 @@ def test_dispatch_legacy_validate_without_params_kwarg(tmp_path):
     assert store.get(job.job_id).status is JobStatus.DONE
 
 
+def test_output_validator_failure_fails_job(tmp_path):
+    # the remote trust gate: a validator that raises (engine/input-sha/hash mismatch) FAILs the job
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+
+    def boom(job, out_dir):  # noqa: ANN001
+        raise RuntimeError("hash mismatch")
+
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"status": "ok"}, True), output_validator=boom)
+    d._process(store.claim_next())
+    got = store.get(job.job_id)
+    assert got.status is JobStatus.FAILED
+    assert "trust validation failed" in (got.error or "")
+
+
+def test_output_validator_success_marks_done(tmp_path):
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    called = {}
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"status": "ok"}, True),
+                        output_validator=lambda j, o: called.setdefault("ok", True))
+    d._process(store.claim_next())
+    assert store.get(job.job_id).status is JobStatus.DONE and called["ok"]
+
+
 def test_build_remote_vm_dispatcher_constructs(tmp_path):
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
 

@@ -196,18 +196,25 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     if pool is not None and getattr(pool.runtime, "dispatch_style", "file") == "network":
         from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
 
-        single = len(engines) == 1
+        # a network-endpoint pool serves ONE worker image/agent (BLASTBOX_ENGINE); a multi-engine
+        # dispatcher here would send other engines' jobs to the wrong agent -- require exactly one.
+        if len(engines) != 1:
+            raise ValueError("network-endpoint tiers (aws/static/cascade) serve a single engine image; "
+                             "configure one engine or run separately-scoped remote pools")
         vm = build_remote_vm_dispatcher(
             store, job_root, pool, tier=tier,
-            engine=(next(iter(engines)) if single else None),
-            engine_spec=(next(iter(engines.values())) if single else None),
-            max_output_bytes=limits.max_total_artifact_bytes,
-            claim_timeout_s=float(os.environ.get("BLASTBOX_WORKER_TIMEOUT_S") or "300"),
+            engine=next(iter(engines)),
+            engine_spec=next(iter(engines.values())),
+            limits=limits,
+            worker_timeout_s=float(os.environ.get("BLASTBOX_WORKER_TIMEOUT_S") or "300"),
             concurrency=int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1"),
             job_retention_s=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"),
         )
         try:
             vm.run()
+        except BaseException:
+            vm.stop()   # release the executor's worker loops so the finally's pool.stop() can reap
+            raise
         finally:
             pool.stop()
         return 0

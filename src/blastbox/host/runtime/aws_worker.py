@@ -207,6 +207,7 @@ class AwsWorkerSlot:
     jobs: int = 0
     spawned_at: float = 0.0
     reserved: bool = False
+    token_minted_at: float = 0.0         # for TTL-based JWE refresh (lambda)
 
     @property
     def endpoint(self) -> tuple[str, int] | None:
@@ -387,9 +388,24 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
             slot.url = str(ep) if str(ep).startswith("http") else f"https://{ep}"
         token = self._mint_token(slot)
         slot.auth_token = token
+        slot.token_minted_at = self._clock()
         url = slot.url.rstrip("/") + self.cfg.agent_health_path
         headers = {"X-aws-proxy-auth": token, "X-aws-proxy-port": str(self.cfg.agent_port)}
         return self._probe(url, headers, self.cfg.probe_timeout_s)
+
+    def is_alive(self, slot: AwsWorkerSlot) -> bool:
+        """Refresh the JWE past half its TTL so an IDLE warm slot's token can't expire before its job
+        (the transport reuses ``slot.auth_token`` for /detonate without re-minting)."""
+        alive = super().is_alive(slot)
+        if alive and slot.auth_token:
+            half_ttl = self.cfg.auth_token_ttl_min * 60 * 0.5
+            if (self._clock() - slot.token_minted_at) > half_ttl:
+                try:
+                    slot.auth_token = self._mint_token(slot)
+                    slot.token_minted_at = self._clock()
+                except (AwsWorkerError, OSError):
+                    pass   # best-effort; a real failure surfaces at readiness/detonate
+        return alive
 
     def _terminate(self, slot: AwsWorkerSlot) -> None:
         self._aws("lambda-microvms", "terminate-microvm", "--microvm-identifier", str(slot.resource_id))

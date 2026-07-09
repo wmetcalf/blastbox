@@ -199,6 +199,27 @@ def test_healthz_requires_token_when_set():
         httpd.server_close()
 
 
+def test_zero_byte_input_accepted():
+    httpd, port = _running_agent()
+    try:
+        r = _post(f"http://127.0.0.1:{port}/detonate?name=empty.bin", b"")
+        assert r.status == 200        # a zero-byte sample is valid (the local harness runs it too)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_healthz_honors_cidr_allowlist():
+    httpd, port = _running_agent(allow_cidrs="10.0.0.0/8")   # 127.0.0.1 excluded
+    try:
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=10)
+        assert ei.value.code == 403   # readiness gated same as /detonate -> no false "healthy"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_ip_allowlist_blocks_disallowed_peer():
     httpd, port = _running_agent(allow_cidrs="10.0.0.0/8")   # 127.0.0.1 is not in it
     try:

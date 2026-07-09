@@ -70,6 +70,24 @@ def test_issue_client_has_client_eku():
     assert cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value == "dispatcher"
 
 
+def test_sign_csr_rejects_missing_san():
+    ca = _generate_ca()
+    key = ec.generate_private_key(ec.SECP256R1())
+    csr = (x509.CertificateSigningRequestBuilder()
+           .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "w")]))
+           .sign(key, hashes.SHA256()))
+    with pytest.raises(ValueError):
+        ca.sign_csr(csr.public_bytes(serialization.Encoding.PEM))   # SAN-less server cert refused
+
+
+def test_load_ca_rejects_key_cert_mismatch(tmp_path):
+    from blastbox.host.pki import load_ca
+    ensure_ca(tmp_path)
+    (tmp_path / "ca.key").write_bytes(_generate_ca().key_pem)       # a different CA's key
+    with pytest.raises(RuntimeError):
+        load_ca(tmp_path)
+
+
 def test_sign_csr_signs_and_rejects_bad(tmp_path):
     ca = _generate_ca()
     key = ec.generate_private_key(ec.SECP256R1())

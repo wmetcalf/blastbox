@@ -62,6 +62,7 @@ class VmJobDispatcher:
                  engine_net_policy: str | None = None,
                  trust_output_metadata: bool = False,
                  sanitize_params: Callable[[dict[str, str]], dict[str, str]] | None = None,
+                 output_validator: Callable[[Job, Path], None] | None = None,
                  max_summary_bytes: int = _MAX_SUMMARY_BYTES) -> None:
         self._store = store
         self._job_root = Path(job_root)
@@ -76,6 +77,10 @@ class VmJobDispatcher:
         # subset is passed to a validate() that accepts a `params` kwarg (the remote_http seam), so a
         # network-endpoint job honors per-job toggles (OCR/QR) just like the local worker.
         self._sanitize = sanitize_params
+        # Host trust gate for output already on disk (remote_http path): re-seal + verify engine, input
+        # SHA, artifact hashes, caps before DONE. Raises to fail the job. None = no gate (libvirt-vm
+        # returns an in-memory summary, not on-disk artifacts, so the summary-neuter is the control).
+        self._output_validator = output_validator
         try:
             import inspect
             self._validate_takes_params = "params" in inspect.signature(validate).parameters
@@ -217,7 +222,9 @@ class VmJobDispatcher:
                                    job.job_id, exc_info=True)
 
         result: dict[str, object] = {}
-        params = self._sanitize(dict(job.params)) if (self._sanitize and job.params) else None
+        # run the sanitizer whenever it exists (even with empty job.params) so operator default_params
+        # still reach the worker, matching the cold/file-warm paths.
+        params = self._sanitize(dict(job.params)) if self._sanitize else None
 
         def _run() -> None:
             try:
@@ -313,6 +320,15 @@ class VmJobDispatcher:
             summary, ok = self._validate_with_heartbeat(job, in_path)
             summary = self._bounded_summary(summary)   # cap untrusted summary before store/metadata
             err: str | None = None
+            # Host trust gate on the extracted output BEFORE DONE: verify engine + input SHA, re-seal
+            # artifact hashes from disk, enforce caps. A compromised/stale remote agent can't get a
+            # wrong-input or unsealed result marked DONE.
+            if ok and self._output_validator is not None:
+                try:
+                    self._output_validator(job, self._job_dir(job) / "output")
+                except Exception as exc:  # noqa: BLE001 -- trust failure => FAIL, don't mark DONE
+                    ok, err = False, f"output trust validation failed: {exc}"
+                    logger.warning("vm_dispatch: job %s failed trust gate: %s", job.job_id, exc)
             # Publish metadata.json BEFORE the DONE CAS so DONE never implies a 404 on /metadata,
             # /artifacts, /result. If the write fails, FAIL the job (recoverable) rather than mark it
             # DONE-without-metadata. But re-check OWNERSHIP first: if a long validation outlived its
@@ -444,23 +460,24 @@ def build_remote_vm_dispatcher(
     tier: str,
     engine: str | None = None,
     engine_spec: Any = None,
-    max_output_bytes: int | None = None,
-    claim_timeout_s: float = 300.0,
+    limits: Any = None,
+    worker_timeout_s: float = 300.0,
     concurrency: int = 1,
     job_retention_s: int = 0,
 ) -> "VmJobDispatcher":
     """Assemble a VmJobDispatcher that drives a NETWORK-ENDPOINT warm pool (aws/static/cascade) over the
-    remote_http transport: claim a warm slot -> POST the job to its http_agent -> extract the sealed
-    output. The runtime's client (m)TLS context flows through; per-job params are gated through the
-    engine's allowlist and forwarded so OCR/QR toggles work end-to-end. This is the single typed seam
-    the CLI uses for network-endpoint tiers -- selection is capability-based (``runtime.dispatch_style``),
-    not tier-name matching."""
+    remote_http transport: claim a warm slot -> POST the job to its http_agent -> HOST-TRUST-GATE the
+    extracted output (re-seal + verify engine/input-SHA/caps) -> DONE. The runtime's client (m)TLS
+    context flows through; per-job params are gated through the engine's allowlist and forwarded; the
+    engine's egress personality is enforced fail-closed. Selection is capability-based
+    (``runtime.dispatch_style``), not tier-name matching -- this is the single typed CLI seam."""
     from blastbox.host.runtime.remote_http import make_remote_validate
 
     ssl_context = getattr(pool.runtime, "ssl_context", None)
+    max_output_bytes = getattr(limits, "max_total_artifact_bytes", None)
 
     def _claim() -> Any:
-        slot = pool.claim(timeout_s=claim_timeout_s)
+        slot = pool.claim(timeout_s=worker_timeout_s)
         if slot is None:
             raise RuntimeError("no warm slot available within claim timeout")
         return slot
@@ -478,17 +495,36 @@ def build_remote_vm_dispatcher(
                 getattr(engine_spec, "default_params", None),
             )
 
+    # host trust gate: re-seal the extracted output + verify engine/input-SHA/caps, then overwrite
+    # metadata.json with the host-sealed envelope (recomputed hashes). Same gate the cold path runs.
+    output_validator: Callable[[Job, Path], None] | None = None
+    if limits is not None:
+        def output_validator(job: Job, out_dir: Path) -> None:
+            from blastbox.contract.envelope import atomic_write_confined
+            from blastbox.host.trust import OutputTrustError, validate_worker_output
+            env = validate_worker_output(output_dir=out_dir, input_sha256=job.input_sha256 or "",
+                                         engine=job.engine, limits=limits)
+            if env.status == "engine_error":
+                detail = env.warnings[0].message if env.warnings else "engine_error"
+                raise OutputTrustError(f"engine_error: {detail}")
+            atomic_write_confined(out_dir, "metadata.json",
+                                  env.model_dump_json(by_alias=True).encode("utf-8"), mode=0o644)
+
     validate = make_remote_validate(
         _claim, _release,
         output_dir_for=lambda in_path: in_path.parent.parent / "output",
         ssl_context=ssl_context,
         max_output_bytes=max_output_bytes,
+        timeout=worker_timeout_s,   # bound the transport by the operator's worker timeout, not the 600s default
     )
     return VmJobDispatcher(
         store, str(job_root), validate,
         engine=engine, worker_tier=tier,
-        trust_output_metadata=True,   # the transport sealed + wrote output/metadata.json (real artifacts)
+        trust_output_metadata=True,   # preserve the host-sealed metadata.json the validator wrote
         sanitize_params=sanitize,
+        output_validator=output_validator,
+        fixed_net_policy=getattr(engine_spec, "net_policy", None),   # enforce egress personality
+        validate_timeout_s=worker_timeout_s,
         concurrency=concurrency,
         job_retention_s=job_retention_s,
     )

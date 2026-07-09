@@ -134,8 +134,11 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if urlparse(self.path).path == "/healthz":
-            # when a token is set, gate /healthz too -- otherwise a token-misconfigured dispatcher
-            # marks the worker ready and only discovers the 401 at /detonate (every job fails).
+            # gate readiness with the SAME controls as /detonate -- else a caller outside the CIDR
+            # allowlist or with a wrong token is marked "ready" and only fails later on every job.
+            if not self._caller_allowed():
+                self._json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
             if not self._authed():
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return
@@ -159,9 +162,10 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "bad_content_length"})
             return
-        if length <= 0:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "empty_body"})
+        if length < 0:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "bad_content_length"})
             return
+        # length == 0 is allowed: a zero-byte sample is a valid input the local harness also runs.
         if length > self.max_bytes:
             self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "too_large", "max_bytes": self.max_bytes})
             return

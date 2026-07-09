@@ -162,9 +162,13 @@ def detonate_remote(
     # stream the response tar to a spooled temp file (spills to disk past 64MB) rather than holding the
     # whole thing in memory -- artifact tars can be large. CAP the stream + the extracted total so a
     # buggy/compromised worker can't fill the dispatcher's disk.
+    # The tar stream is larger than the files (headers/padding/metadata.json), so cap the STREAM with
+    # headroom and enforce the real artifact budget during EXTRACTION -- else a valid output near the
+    # budget is rejected purely on archive overhead.
+    stream_cap = None if max_output_bytes is None else int(max_output_bytes * 1.1) + 65536
     with opener(req, timeout, context=ssl_context) as resp, \
             tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:
-        _bounded_copy(resp, spool, max_output_bytes)
+        _bounded_copy(resp, spool, stream_cap)
         spool.seek(0)
         _safe_extract_tar(spool, output_dir, max_total_bytes=max_output_bytes)
     meta = output_dir / "metadata.json"

@@ -46,9 +46,11 @@ def _san_list(sans: list[str]) -> list[x509.GeneralName]:
 
 
 def _write_private(path: Path, data: bytes) -> None:
-    """Write a private key, created 0600 from the start (no world-readable window before a chmod)."""
+    """Write a private key at 0600 -- enforced via fchmod so an EXISTING (possibly looser-perm) file
+    being overwritten is also tightened (the O_CREAT mode only applies on creation)."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as fh:
+    with os.fdopen(fd, "wb") as fh:   # closes fd on any error below
+        os.fchmod(fd, 0o600)
         fh.write(data)
 
 
@@ -139,6 +141,10 @@ class CertAuthority:
             sans = [str(g.value) for g in ext.value]
         except x509.ExtensionNotFound:
             pass
+        if not sans:
+            # a SAN-less server cert passes signing but fails TLS hostname/IP verification later --
+            # reject at signing time (workers are reached by IP/URL through client_ssl_context).
+            raise ValueError("server CSR has no SubjectAlternativeName; refusing to issue a SAN-less server cert")
         cert = self._sign(cn, csr.public_key(), sans, server=True, client=False, days=days)
         return cert.public_bytes(serialization.Encoding.PEM)
 
@@ -181,6 +187,11 @@ def load_ca(pki_dir: Path) -> CertAuthority:
     cert = x509.load_pem_x509_certificate((pki_dir / "ca.crt").read_bytes())
     key = serialization.load_pem_private_key((pki_dir / "ca.key").read_bytes(), password=None)
     assert isinstance(key, ec.EllipticCurvePrivateKey)
+    # guard against a partial restore / interrupted rotation: a key that doesn't match ca.crt would mint
+    # leaf certs signed by the wrong CA (fail TLS against the published ca.crt).
+    spki = serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    if key.public_key().public_bytes(*spki) != cert.public_key().public_bytes(*spki):
+        raise RuntimeError(f"CA key does not match ca.crt in {pki_dir} (partial/mismatched CA state)")
     return CertAuthority(cert, key)
 
 

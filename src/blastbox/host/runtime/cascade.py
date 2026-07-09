@@ -65,6 +65,16 @@ class CascadingRuntime:
             )
         return next(iter(styles), "file")
 
+    @property
+    def ssl_context(self) -> Any:
+        """The client (m)TLS context for the network tiers (they share the env-built one) -- so the
+        remote transport verifies workers + presents the client cert through the cascade wrapper."""
+        for t in self.tiers:
+            ctx = getattr(t.runtime, "ssl_context", None)
+            if ctx is not None:
+                return ctx
+        return None
+
     def __init__(self, tiers: list[Tier]) -> None:
         if not tiers:
             raise CascadeMisconfigured("cascade needs at least one tier")

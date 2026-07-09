@@ -140,9 +140,12 @@ class TestPkiCli:
         from cryptography.hazmat.primitives.asymmetric import ec
         from cryptography.x509.oid import NameOID
         main(["pki", "--dir", str(tmp_path), "init"])
+        import ipaddress
         key = ec.generate_private_key(ec.SECP256R1())
         csr = (x509.CertificateSigningRequestBuilder()
                .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "w1")]))
+               .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("10.0.0.9"))]),
+                              critical=False)
                .sign(key, hashes.SHA256()))
         (tmp_path / "w.csr").write_bytes(csr.public_bytes(serialization.Encoding.PEM))
         assert main(["pki", "--dir", str(tmp_path), "sign-csr", "--csr", str(tmp_path / "w.csr")]) == 0

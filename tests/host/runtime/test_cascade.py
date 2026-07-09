@@ -128,6 +128,16 @@ def test_cascade_dispatch_style_mixed_raises():
         _ = rt.dispatch_style   # can't mix transports in one job
 
 
+def test_cascade_exposes_inner_ssl_context():
+    a = FakeRuntime("a")
+    a.ssl_context = "CTX"                                  # type: ignore[attr-defined]
+    assert CascadingRuntime([Tier("a", a, 1)]).ssl_context == "CTX"
+
+
+def test_cascade_ssl_context_none_when_absent():
+    assert CascadingRuntime([Tier("a", FakeRuntime("a"), 1)]).ssl_context is None
+
+
 def test_empty_tiers_rejected():
     with pytest.raises(CascadeMisconfigured):
         CascadingRuntime([])
