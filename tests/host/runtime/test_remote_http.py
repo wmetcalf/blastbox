@@ -196,6 +196,27 @@ def test_detonate_remote_caps_output(tmp_path):
                         http_open=_opener(big), max_output_bytes=1000)
 
 
+def test_detonate_remote_clears_stale_output(tmp_path):
+    # a prior/requeued attempt's leftover file must be removed before extraction, so the trust gate
+    # re-seals ONLY this attempt's output.
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "stale.png").write_bytes(b"old")
+    (tmp_path / "in.bin").write_bytes(b"z")
+    tar = _tar({"metadata.json": json.dumps({"status": "ok"}).encode(), "page-001.png": b"new"})
+    detonate_remote("http://h:8765", tmp_path / "in.bin", out, http_open=_opener(tar))
+    assert not (out / "stale.png").exists()          # stale file dropped
+    assert (out / "page-001.png").read_bytes() == b"new"
+
+
+def test_extracted_artifacts_are_group_readable(tmp_path):
+    # 0644 so a serve process on a different UID can read the artifacts (serve+dispatch split).
+    import stat
+    _safe_extract_tar(_tar({"p0.png": b"x"}), tmp_path)
+    mode = stat.S_IMODE((tmp_path / "p0.png").stat().st_mode)
+    assert mode & 0o044   # world/group readable
+
+
 def test_detonate_remote_caps_member_count(tmp_path):
     from blastbox.host.runtime.remote_http import RemoteOutputTooLarge
     (tmp_path / "in.bin").write_bytes(b"z")

@@ -209,6 +209,46 @@ def test_zero_byte_input_accepted():
         httpd.server_close()
 
 
+def test_concurrent_detonate_returns_409_busy():
+    """A warm box serves one job at a time: a request landing while another is in flight gets a fast
+    409 (so the dispatcher fails+retires that slot) instead of queueing behind the busy job."""
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingEngine(_NoopEngine):
+        def detonate(self, input: Path, outdir: Path, limits):
+            started.set()
+            release.wait(timeout=10)
+            return super().detonate(input, outdir, limits)
+
+    httpd = serve(_BlockingEngine(), bind="127.0.0.1", port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    url = f"http://127.0.0.1:{port}/detonate?name=a.bin"
+    r1: dict = {}
+
+    def _job1():
+        try:
+            r1["r"] = _post(url, b"x")
+        except Exception as exc:  # noqa: BLE001
+            r1["e"] = exc
+
+    try:
+        th = threading.Thread(target=_job1, daemon=True)
+        th.start()
+        assert started.wait(timeout=10)                 # job 1 is inside the engine, holding the lock
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post(url, b"y")                            # job 2 lands while busy
+        assert ei.value.code == 409
+        release.set()                                   # let job 1 finish
+        th.join(timeout=10)
+        assert r1.get("r") is not None and r1["r"].status == 200   # job 1 completed cleanly
+    finally:
+        release.set()
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_healthz_honors_cidr_allowlist():
     httpd, port = _running_agent(allow_cidrs="10.0.0.0/8")   # 127.0.0.1 excluded
     try:

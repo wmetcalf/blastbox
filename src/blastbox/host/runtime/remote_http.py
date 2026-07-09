@@ -105,6 +105,21 @@ def slot_base_url(slot: _Slot, *, tls: bool = False) -> str:
     raise ValueError("slot has no reachable endpoint (no url and no ip)")
 
 
+def _empty_dir(d: Path) -> None:
+    """Remove everything under ``d`` (files, symlinks-as-links, subtrees) without following symlinks
+    out of it, leaving ``d`` itself. Used to drop a prior/requeued attempt's output before extracting
+    a fresh one, so the host trust gate re-seals ONLY this attempt's artifacts."""
+    import shutil
+    for child in d.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            try:
+                child.unlink()   # removes a file OR a symlink (never the symlink's target)
+            except OSError:
+                pass
+
+
 def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: int | None = None,
                       max_members: int | None = None) -> list[str]:
     """Extract regular files from a tar (bytes or a seekable fileobj) into ``dest``, rejecting path
@@ -119,7 +134,10 @@ def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: i
     total = 0
     files = 0
     with tarfile.open(fileobj=fileobj, mode="r") as tf:
-        for m in tf.getmembers():
+        # iterate LAZILY (not getmembers(), which reads every header into a list first) so the member
+        # cap short-circuits before a tar of hundreds of thousands of tiny entries materializes all
+        # their TarInfo objects in memory.
+        for m in tf:
             if not m.isfile():
                 continue
             files += 1
@@ -140,7 +158,9 @@ def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: i
             # skip the member rather than writing THROUGH the symlink. Opening the resolved path instead
             # would silently follow it.
             try:
-                fd = os.open(raw, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+                # 0644: the API process in a serve+dispatch split may run as a different UID and must
+                # be able to read the artifacts + the host-sealed metadata.json (matches the re-seal mode).
+                fd = os.open(raw, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
             except OSError as exc:
                 src.close()
                 _log.warning("remote_http: refusing to write member %r (%s)", m.name, exc)
@@ -182,6 +202,7 @@ def detonate_remote(
         headers["X-Blastbox-Params"] = json.dumps(params)
     req = urllib.request.Request(url, data=input_path.read_bytes(), method="POST", headers=headers)
     output_dir.mkdir(parents=True, exist_ok=True)
+    _empty_dir(output_dir)   # drop any stale files from a prior/requeued attempt before extracting
     # stream the response tar to a spooled temp file (spills to disk past 64MB) rather than holding the
     # whole thing in memory -- artifact tars can be large. CAP the stream + the extracted total so a
     # buggy/compromised worker can't fill the dispatcher's disk.

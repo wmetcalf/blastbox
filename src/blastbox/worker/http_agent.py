@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import contextlib
 import hmac
-import io
 import ipaddress
 import json
 import logging
@@ -69,19 +68,19 @@ def _parse_params(raw: str | None) -> dict[str, str]:
 
 @contextlib.contextmanager
 def _job_env(params: dict[str, str]) -> Iterator[None]:
-    """Apply ``params`` to os.environ for the duration of one detonation, then restore. Held under
-    ``_JOB_LOCK`` so concurrent requests can't observe each other's env."""
-    with _JOB_LOCK:
-        saved = {k: os.environ.get(k) for k in params}
-        os.environ.update(params)
-        try:
-            yield
-        finally:
-            for k, old in saved.items():
-                if old is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = old
+    """Apply ``params`` to os.environ for the duration of one detonation, then restore. The caller
+    holds ``_JOB_LOCK`` (do_POST acquires it non-blocking, one job at a time), so concurrent requests
+    can't observe each other's env."""
+    saved = {k: os.environ.get(k) for k in params}
+    os.environ.update(params)
+    try:
+        yield
+    finally:
+        for k, old in saved.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
 
 
 def _safe_name(raw: str | None) -> str:
@@ -171,8 +170,15 @@ class _Handler(BaseHTTPRequestHandler):
             return
         name = _safe_name(parse_qs(parsed.query).get("name", [None])[0])
         params = _parse_params(self.headers.get("X-Blastbox-Params"))
+        # Single-flight: a warm box serves ONE job at a time (the pool assigns one box per job). Acquire
+        # NON-BLOCKING so a request that lands on a box still finishing a prior (e.g. host-timed-out) job
+        # gets a fast 409 -- the dispatcher fails that job + retires the slot dirty -- instead of queueing
+        # behind the stale job and cascading into more timeouts / overlapping detonations.
+        if not _JOB_LOCK.acquire(blocking=False):
+            self._json(HTTPStatus.CONFLICT, {"error": "busy"})
+            return
         try:
-            tar_bytes = self._run_job(name, length, params)
+            tar = self._run_job(name, length, params)
         except _TruncatedBody:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "truncated_body"})
             return
@@ -180,13 +186,21 @@ class _Handler(BaseHTTPRequestHandler):
             _log.warning("http_agent: detonate failed: %s", exc)
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "engine_error"})
             return
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "application/x-tar")
-        self.send_header("Content-Length", str(len(tar_bytes)))
-        self.end_headers()
-        self.wfile.write(tar_bytes)
+        finally:
+            _JOB_LOCK.release()
+        try:
+            import shutil
+            size = tar.seek(0, os.SEEK_END)
+            tar.seek(0)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/x-tar")
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            shutil.copyfileobj(tar, self.wfile)   # stream from the spool, don't hold it all in memory
+        finally:
+            tar.close()
 
-    def _run_job(self, name: str, length: int, params: dict[str, str]) -> bytes:
+    def _run_job(self, name: str, length: int, params: dict[str, str]) -> tempfile.SpooledTemporaryFile:
         with tempfile.TemporaryDirectory(prefix="bbagent-") as tmp:
             tmp_p = Path(tmp)
             in_dir = tmp_p / "in"
@@ -206,19 +220,32 @@ class _Handler(BaseHTTPRequestHandler):
                 raise _TruncatedBody
             # SAME core the cold/FC/gVisor workers use: runs the engine + seals metadata.json in out_dir.
             # Per-job params (already host-allowlisted) are applied to env just for this detonation.
+            limits = Limits.from_env()
             with _job_env(params):
                 rc = run_detonation(self.engine, input_path=in_path, output_dir=out_dir,
-                                    limits=Limits.from_env())
+                                    limits=limits)
             if rc != 0:
                 # harness could not seal metadata.json -- surface as a job failure, not a silent 200
                 raise RuntimeError(f"harness failed (rc={rc}); metadata.json not sealed")
-            # tar the sealed output dir (metadata.json + artifacts) for the host to extract
-            buf = io.BytesIO()
-            with tarfile.open(fileobj=buf, mode="w") as tf:
+            # tar the sealed output dir (metadata.json + artifacts) into a SPOOLED file (spills to disk
+            # past 64MB) rather than a full in-memory BytesIO, and CAP the total so a buggy engine that
+            # leaves huge undeclared files in out_dir can't OOM the agent. The host re-enforces its own
+            # caps on extraction; this is the worker's self-protection.
+            cap = getattr(limits, "max_total_artifact_bytes", None)
+            spool: tempfile.SpooledTemporaryFile = tempfile.SpooledTemporaryFile(
+                max_size=64 * 1024 * 1024, prefix="bbagent-tar-")
+            total = 0
+            with tarfile.open(fileobj=spool, mode="w") as tf:
                 for f in sorted(out_dir.rglob("*")):
-                    if f.is_file():
-                        tf.add(f, arcname=str(f.relative_to(out_dir)))
-            return buf.getvalue()
+                    if not f.is_file():
+                        continue
+                    total += f.stat().st_size
+                    if cap is not None and total > cap:
+                        spool.close()
+                        raise RuntimeError(f"output exceeds {cap} bytes")
+                    tf.add(f, arcname=str(f.relative_to(out_dir)))
+            spool.seek(0)
+            return spool
 
 
 def _tls_env(get) -> tuple[str | None, str | None, str | None]:

@@ -93,6 +93,30 @@ def test_build_pool_unknown_runtime_raises():
         build_warm_pool(cfg)
 
 
+def test_build_pool_bumps_warming_timeout_from_runtime_readiness(monkeypatch):
+    """A slow-booting runtime (e.g. aws-ec2, readiness 300s) raises the pool warming timeout when the
+    operator didn't set BLASTBOX_POOL_WARMING_TIMEOUT_S, so a healthy-but-slow slot isn't churned."""
+    monkeypatch.delenv("BLASTBOX_POOL_WARMING_TIMEOUT_S", raising=False)
+
+    class _SlowRuntime(_FakeRuntime):
+        readiness_timeout_s = 300.0
+
+    cfg = PoolConfig(runtime=RUNTIME_FIRECRACKER, warm_size=1, concurrent_ceiling=1)  # default warming 120
+    pool = build_warm_pool(cfg, runtime=_SlowRuntime())
+    assert pool._warming_timeout_s == 300.0
+
+
+def test_build_pool_explicit_warming_timeout_wins(monkeypatch):
+    monkeypatch.setenv("BLASTBOX_POOL_WARMING_TIMEOUT_S", "90")
+
+    class _SlowRuntime(_FakeRuntime):
+        readiness_timeout_s = 300.0
+
+    cfg = PoolConfig.from_env(runtime=RUNTIME_FIRECRACKER, warm_size=1, concurrent_ceiling=1)
+    pool = build_warm_pool(cfg, runtime=_SlowRuntime())
+    assert pool._warming_timeout_s == 90.0   # operator override is NOT overridden by the runtime budget
+
+
 # --- warm-snapshot gate ----------------------------------------------------
 
 

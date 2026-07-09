@@ -263,6 +263,12 @@ class AwsDisposableRuntime:
         self.ssl_context = ssl_context
         self._live_cache: dict[str, tuple[float, bool]] = {}
 
+    @property
+    def readiness_timeout_s(self) -> float:
+        """The budget a slot needs to become ready (EC2 first boot often >2min). The warm pool reads
+        this to size its warming timeout so a healthy-but-slow cloud slot isn't evicted + churned."""
+        return float(self.cfg.ready_timeout_s)
+
     # -- aws cli seam -------------------------------------------------------
     def _aws(self, service: str, op: str, *args: str) -> dict[str, Any]:
         argv = self.cfg.aws_argv(service, op, *args)

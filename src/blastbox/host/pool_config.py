@@ -147,10 +147,16 @@ def build_warm_pool(
             runtime = select_runtime_by_name(cfg.runtime, warm_snapshot=cfg.warm_snapshot)
 
     assert runtime is not None  # narrowed: every branch above returned/raised/assigned
+    # A slow-booting runtime (aws-ec2 first boot commonly >120s) declares its own readiness budget.
+    # If the operator DIDN'T explicitly set the pool warming timeout, raise it to that budget so a
+    # healthy-but-slow cloud slot isn't evicted + churned. An explicit env value always wins.
+    warming_timeout_s = cfg.warming_timeout_s
+    if os.environ.get("BLASTBOX_POOL_WARMING_TIMEOUT_S") is None:
+        warming_timeout_s = max(warming_timeout_s, float(getattr(runtime, "readiness_timeout_s", 0.0)))
     pool = WarmPool(
         runtime=runtime,
         warm_size=cfg.warm_size,
-        warming_timeout_s=cfg.warming_timeout_s,
+        warming_timeout_s=warming_timeout_s,
         concurrent_ceiling=cfg.concurrent_ceiling,
         spawn_rate_limit=cfg.spawn_rate_limit,
         burst_size=cfg.burst_size,

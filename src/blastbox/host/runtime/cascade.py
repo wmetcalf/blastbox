@@ -80,6 +80,13 @@ class CascadingRuntime:
             )
         return next((c for c in ctxs if c is not None), None)
 
+    @property
+    def readiness_timeout_s(self) -> float:
+        """The MAX readiness budget across tiers, so the warm pool's warming timeout covers the slowest
+        tier (e.g. an aws-ec2 overflow tier that boots slower than a local one)."""
+        return max((float(getattr(t.runtime, "readiness_timeout_s", 0.0)) for t in self.tiers),
+                   default=0.0)
+
     def __init__(self, tiers: list[Tier]) -> None:
         if not tiers:
             raise CascadeMisconfigured("cascade needs at least one tier")
@@ -142,6 +149,33 @@ class CascadingRuntime:
 
     def available(self) -> bool:
         return bool(self.tiers)   # built only with tiers that came up
+
+    # -- file-handshake warm-path hooks ------------------------------------
+    # An ALL-FILE cascade (e.g. gvisor:4,firecracker:4) is driven by the file Dispatcher, which reads
+    # these hooks off the pool runtime (getattr) to decide how input/output move for a slot. The cascade
+    # must delegate them to the slot's OWNING tier -- otherwise gVisor jobs get host paths in go.json
+    # instead of /in//out and FC jobs miss the vsock path. (Network cascades never reach this path; they
+    # run through VmJobDispatcher, so exposing these here is inert for them.)
+    def _delegate(self, slot: Any, name: str) -> Any:
+        tier = self._tier_of(slot)
+        if tier is None:
+            raise CascadeExhausted(f"cascade: no owning tier for slot {getattr(slot, 'slot_id', slot)!r}")
+        fn = getattr(tier.runtime, name, None)
+        if fn is None:
+            raise CascadeMisconfigured(
+                f"cascade tier {tier.name!r} does not implement the warm hook {name!r} -- a file "
+                "cascade needs file-handshake warm tiers (gvisor/firecracker) on every tier"
+            )
+        return fn
+
+    def host_warm_control(self, slot: Any) -> Any:
+        return self._delegate(slot, "host_warm_control")(slot)
+
+    def stage_warm_input(self, slot: Any, staged_input_path: Any) -> Any:
+        return self._delegate(slot, "stage_warm_input")(slot, staged_input_path)
+
+    def materialize_warm_output(self, slot: Any) -> None:
+        self._delegate(slot, "materialize_warm_output")(slot)
 
 
 # ---------------------------------------------------------------------------

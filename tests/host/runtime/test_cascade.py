@@ -50,6 +50,41 @@ class FakeRuntime:
         self.reaped.append(slot.slot_id)
 
 
+class WarmFileRuntime(FakeRuntime):
+    """A file-handshake warm runtime that also implements the warm-transport hooks (like gvisor/fc)."""
+
+    def host_warm_control(self, slot):
+        return f"control:{slot.slot_id}"
+
+    def stage_warm_input(self, slot, path):
+        return f"staged:{path}"
+
+    def materialize_warm_output(self, slot):
+        self.materialized = slot.slot_id
+
+
+def test_cascade_delegates_warm_hooks_to_owning_tier():
+    # an all-file cascade must route host_warm_control/stage_warm_input/materialize_warm_output to the
+    # tier that owns the slot -- else gVisor/FC jobs get the wrong input/output transport.
+    a, b = WarmFileRuntime("gvisor"), WarmFileRuntime("fc")
+    rt = CascadingRuntime([Tier("gvisor", a, 1), Tier("fc", b, 1)])
+    s_a = rt.spawn()   # owned by tier gvisor
+    s_b = rt.spawn()   # owned by tier fc
+    assert rt.host_warm_control(s_a) == f"control:{s_a.slot_id}"
+    assert rt.stage_warm_input(s_b, "/in/x") == "staged:/in/x"
+    rt.materialize_warm_output(s_b)
+    assert b.materialized == s_b.slot_id
+
+
+def test_cascade_warm_hook_missing_on_tier_raises():
+    # a file cascade whose tier can't do the warm handshake fails fast rather than silently mis-routing.
+    plain = FakeRuntime("plain")   # no host_warm_control
+    rt = CascadingRuntime([Tier("plain", plain, 1)])
+    slot = rt.spawn()
+    with pytest.raises(CascadeMisconfigured):
+        rt.host_warm_control(slot)
+
+
 # --------------------------------------------------------------- routing
 
 def test_spawn_fills_primary_then_overflows():
