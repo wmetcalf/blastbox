@@ -227,6 +227,7 @@ class AwsDisposableRuntime:
     ``recycle`` -> one job per slot)."""
 
     kind = "aws"
+    dispatch_style = "network"   # driven over http_agent + remote_http (VmJobDispatcher), not file-handshake
 
     def __init__(
         self,

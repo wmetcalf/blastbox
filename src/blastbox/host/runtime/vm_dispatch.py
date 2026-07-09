@@ -26,6 +26,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 from blastbox.contract.envelope import atomic_write_confined
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
@@ -433,3 +434,61 @@ class VmJobDispatcher:
 
     def stop(self, *_: object) -> None:
         self._stop.set()
+
+
+def build_remote_vm_dispatcher(
+    store: JobStore,
+    job_root: str | Path,
+    pool: Any,
+    *,
+    tier: str,
+    engine: str | None = None,
+    engine_spec: Any = None,
+    max_output_bytes: int | None = None,
+    claim_timeout_s: float = 300.0,
+    concurrency: int = 1,
+    job_retention_s: int = 0,
+) -> "VmJobDispatcher":
+    """Assemble a VmJobDispatcher that drives a NETWORK-ENDPOINT warm pool (aws/static/cascade) over the
+    remote_http transport: claim a warm slot -> POST the job to its http_agent -> extract the sealed
+    output. The runtime's client (m)TLS context flows through; per-job params are gated through the
+    engine's allowlist and forwarded so OCR/QR toggles work end-to-end. This is the single typed seam
+    the CLI uses for network-endpoint tiers -- selection is capability-based (``runtime.dispatch_style``),
+    not tier-name matching."""
+    from blastbox.host.runtime.remote_http import make_remote_validate
+
+    ssl_context = getattr(pool.runtime, "ssl_context", None)
+
+    def _claim() -> Any:
+        slot = pool.claim(timeout_s=claim_timeout_s)
+        if slot is None:
+            raise RuntimeError("no warm slot available within claim timeout")
+        return slot
+
+    def _release(slot: Any, dirty: bool = False) -> None:
+        pool.release(slot, dirty=dirty)
+
+    sanitize: Callable[[dict[str, str]], dict[str, str]] | None = None
+    if engine_spec is not None:
+        from blastbox.host.dispatch import Dispatcher   # lazy: dispatch<->vm_dispatch are independent
+
+        def sanitize(p: dict[str, str]) -> dict[str, str]:
+            return Dispatcher._sanitize_params(
+                p, engine_spec.allowed_param_keys, engine_spec.reserved_param_keys,
+                getattr(engine_spec, "default_params", None),
+            )
+
+    validate = make_remote_validate(
+        _claim, _release,
+        output_dir_for=lambda in_path: in_path.parent.parent / "output",
+        ssl_context=ssl_context,
+        max_output_bytes=max_output_bytes,
+    )
+    return VmJobDispatcher(
+        store, str(job_root), validate,
+        engine=engine, worker_tier=tier,
+        trust_output_metadata=True,   # the transport sealed + wrote output/metadata.json (real artifacts)
+        sanitize_params=sanitize,
+        concurrency=concurrency,
+        job_retention_s=job_retention_s,
+    )

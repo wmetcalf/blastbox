@@ -310,6 +310,12 @@ def test_lambda_endpoint_resolves_to_https():
     assert slot.auth_token == "jwe.x"
 
 
+def test_aws_runtimes_declare_network_dispatch_style():
+    lam, _ = _lambda_rt({})
+    ec2, _ = _ec2_rt({})
+    assert lam.dispatch_style == "network" and ec2.dispatch_style == "network"
+
+
 def test_ec2_forwards_agent_token():
     cfg = Ec2Config(region="us-east-1", image_id="ami-x", agent_token="tok123")
     seen: list = []

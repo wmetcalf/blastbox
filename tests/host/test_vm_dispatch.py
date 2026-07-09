@@ -118,6 +118,25 @@ def test_dispatch_legacy_validate_without_params_kwarg(tmp_path):
     assert store.get(job.job_id).status is JobStatus.DONE
 
 
+def test_build_remote_vm_dispatcher_constructs(tmp_path):
+    from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+
+    class _FakePool:
+        runtime = type("R", (), {"ssl_context": None})()
+
+        def claim(self, *, timeout_s):  # noqa: ANN001, ANN202
+            return None
+
+        def release(self, slot, *, dirty=False):  # noqa: ANN001
+            pass
+
+    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
+                                    tier="static", engine="clippyshot")
+    assert isinstance(vm, VmJobDispatcher)
+    assert vm._trust_output_metadata is True        # the remote path preserves the sealed metadata
+    assert vm._validate_takes_params is True         # the remote_http validate accepts params
+
+
 def test_dispatch_bounds_oversized_summary(tmp_path):
     # a compromised VM agent's huge summary must not be stored verbatim (balloons DB + every response)
     store = InMemoryJobStore()

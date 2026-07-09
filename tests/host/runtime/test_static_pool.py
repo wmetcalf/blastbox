@@ -154,6 +154,11 @@ def test_satisfies_slotruntime_protocol():
     assert isinstance(rt, SlotRuntime)
 
 
+def test_static_dispatch_style_is_network():
+    rt = StaticPoolRuntime(_cfg("a:8765"), http_probe=FakeProbe(all_ok=True))
+    assert rt.dispatch_style == "network"   # capability-based routing -> VmJobDispatcher
+
+
 def test_tls_mode_uses_https_scheme(tmp_path):
     from blastbox.host.pki import ensure_ca
     from blastbox.tls import client_ssl_context

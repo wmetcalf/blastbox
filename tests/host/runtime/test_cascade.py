@@ -109,6 +109,25 @@ def test_satisfies_slotruntime_protocol():
     assert isinstance(rt, SlotRuntime)
 
 
+def test_cascade_dispatch_style_homogeneous():
+    a, b = FakeRuntime("a"), FakeRuntime("b")
+    a.dispatch_style = b.dispatch_style = "network"        # type: ignore[attr-defined]
+    assert CascadingRuntime([Tier("a", a, 1), Tier("b", b, 1)]).dispatch_style == "network"
+
+
+def test_cascade_dispatch_style_defaults_file():
+    # a runtime without dispatch_style (fc/gvisor) is "file"
+    assert CascadingRuntime([Tier("a", FakeRuntime("a"), 1)]).dispatch_style == "file"
+
+
+def test_cascade_dispatch_style_mixed_raises():
+    net = FakeRuntime("net")
+    net.dispatch_style = "network"                         # type: ignore[attr-defined]
+    rt = CascadingRuntime([Tier("net", net, 1), Tier("file", FakeRuntime("file"), 1)])
+    with pytest.raises(CascadeMisconfigured):
+        _ = rt.dispatch_style   # can't mix transports in one job
+
+
 def test_empty_tiers_rejected():
     with pytest.raises(CascadeMisconfigured):
         CascadingRuntime([])

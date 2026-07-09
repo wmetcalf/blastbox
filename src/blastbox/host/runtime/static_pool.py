@@ -139,6 +139,7 @@ class StaticPoolRuntime:
     coordinator (out of scope)."""
 
     kind = "static"
+    dispatch_style = "network"   # driven over http_agent + remote_http (VmJobDispatcher)
 
     def __init__(
         self,

@@ -53,6 +53,18 @@ class CascadingRuntime:
 
     kind = "cascade"
 
+    @property
+    def dispatch_style(self) -> str:
+        """The common dispatch style of the tiers. A job can't use two transports, so a cascade that
+        mixes network-endpoint (aws/static) and file-handshake (fc/gvisor) tiers is a misconfig."""
+        styles = {getattr(t.runtime, "dispatch_style", "file") for t in self.tiers}
+        if len(styles) > 1:
+            raise CascadeMisconfigured(
+                f"cascade tiers mix dispatch styles {sorted(styles)} -- all must be the same "
+                "(all network-endpoint aws/static, or all file-handshake fc/gvisor)"
+            )
+        return next(iter(styles), "file")
+
     def __init__(self, tiers: list[Tier]) -> None:
         if not tiers:
             raise CascadeMisconfigured("cascade needs at least one tier")
