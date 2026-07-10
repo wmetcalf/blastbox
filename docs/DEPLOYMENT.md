@@ -139,6 +139,13 @@ In the cascade the **primary (local) tier is fail-closed**; an overflow tier tha
 startup is logged and **skipped**, so local capacity still comes up if the cloud/remote tier is
 misconfigured. Full knob tables: the *Runtime: static / AWS / cascade* sections of CONFIGURATION.md.
 
+**Per-engine profiles.** The tier config above is engine-agnostic; the engine-specific slice
+(`BLASTBOX_ENGINE`, param allowlist/reserved keys, egress policy, resource caps, worker env) lives in
+ready-to-source examples under `deploy/remote/` — `clippyshot.env.example` and `redtusk.env.example`.
+Source one, add a tier slice, done. The only non-config difference between engines is the prebaked
+worker image (ClippyShot bakes LibreOffice+PDFium; RedTusk bakes JDK+the Tika jar). Both are
+live-proven on the `aws-ec2` disposable tier.
+
 ## Generating a sandbox policy (optional, advanced)
 
 `blastbox.profile` traces an engine over a corpus and emits candidate seccomp/Landlock
