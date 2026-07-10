@@ -241,7 +241,7 @@ def test_make_remote_validate_forwards_input_sha_to_trust(tmp_path):
     slot = SimpleNamespace(url=None, ip="10.0.1.4", auth_token=None, agent_port=8765)
     got = {}
 
-    def trust(_in_path, _out_dir, sha):
+    def trust(_in_path, _out_dir, sha, _owns=None):
         got["sha"] = sha
 
     validate = make_remote_validate(
@@ -252,6 +252,37 @@ def test_make_remote_validate_forwards_input_sha_to_trust(tmp_path):
     )
     validate(tmp_path / "in.docx", input_sha256="deadbeef")
     assert got["sha"] == "deadbeef"
+
+
+def test_make_remote_validate_forwards_owns_to_trust(tmp_path):
+    # the ownership predicate reaches output_trust so it can fence the metadata write.
+    (tmp_path / "in.docx").write_bytes(b"z")
+    slot = SimpleNamespace(url=None, ip="10.0.1.4", auth_token=None, agent_port=8765)
+    got = {}
+
+    def trust(_in_path, _out_dir, _sha, owns=None):
+        got["owns"] = owns() if owns else None
+
+    validate = make_remote_validate(
+        claim=lambda: slot, release=lambda s, dirty=False: None,
+        output_dir_for=lambda p: tmp_path / "out",
+        http_open=_opener(_tar({"metadata.json": json.dumps({"status": "ok"}).encode()})),
+        output_trust=trust,
+    )
+    validate(tmp_path / "in.docx", owns=lambda: False)
+    assert got["owns"] is False   # predicate threaded through
+
+
+def test_detonate_remote_streams_input_with_content_length(tmp_path):
+    # the input is streamed (open file handle + Content-Length), not read fully into memory.
+    inp = tmp_path / "in.bin"
+    inp.write_bytes(b"x" * 1234)
+    cap: list = []
+    tar = _tar({"metadata.json": json.dumps({"status": "ok"}).encode()})
+    detonate_remote("http://h:8765", inp, tmp_path / "out", http_open=_opener(tar, cap))
+    req = cap[0]
+    assert req.get_header("Content-length") == "1234"      # explicit length -> streamed body
+    assert hasattr(req.data, "read")                        # data is a file object, not bytes
 
 
 def test_make_remote_validate_releases_dirty_on_failure(tmp_path):
@@ -302,7 +333,7 @@ def test_make_remote_validate_trust_failure_keeps_slot_dirty(tmp_path):
     slot = SimpleNamespace(url=None, ip="10.0.1.4", auth_token=None, agent_port=8765)
     seen = []
 
-    def bad_trust(_in_path, _out_dir, _sha):
+    def bad_trust(_in_path, _out_dir, _sha, _owns=None):
         raise RuntimeError("hash mismatch")
 
     validate = make_remote_validate(
@@ -321,7 +352,7 @@ def test_make_remote_validate_trust_ok_rereads_sealed_metadata(tmp_path):
     slot = SimpleNamespace(url=None, ip="10.0.1.4", auth_token=None, agent_port=8765)
     out = tmp_path / "out"
 
-    def reseal(_in_path, out_dir, _sha):
+    def reseal(_in_path, out_dir, _sha, _owns=None):
         (out_dir / "metadata.json").write_text(json.dumps({"status": "ok", "sealed": True}))
 
     validate = make_remote_validate(

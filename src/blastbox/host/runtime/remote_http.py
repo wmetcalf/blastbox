@@ -217,7 +217,11 @@ def detonate_remote(
         headers["X-aws-proxy-port"] = str(agent_port)
     if params:
         headers["X-Blastbox-Params"] = json.dumps(params)
-    req = urllib.request.Request(url, data=input_path.read_bytes(), method="POST", headers=headers)
+    # STREAM the input as the request body (open file handle + explicit Content-Length) instead of
+    # read_bytes() -- otherwise the dispatcher holds the whole sample in RAM per concurrent claim
+    # thread, so a burst of large-but-valid uploads (raised BLASTBOX_MAX_INPUT) can OOM it before any
+    # worker-side limit runs. urllib streams a file-like `data` when Content-Length is set.
+    headers["Content-Length"] = str(input_path.stat().st_size)
     output_dir.mkdir(parents=True, exist_ok=True)
     _empty_dir(output_dir)   # drop any stale files from a prior/requeued attempt before extracting
     # stream the response tar to a spooled temp file (spills to disk past 64MB) rather than holding the
@@ -227,11 +231,13 @@ def detonate_remote(
     # headroom and enforce the real artifact budget during EXTRACTION -- else a valid output near the
     # budget is rejected purely on archive overhead.
     stream_cap = None if max_output_bytes is None else int(max_output_bytes * 1.1) + 65536
-    with opener(req, timeout, context=ssl_context) as resp, \
-            tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:
-        _bounded_copy(resp, spool, stream_cap)
-        spool.seek(0)
-        _safe_extract_tar(spool, output_dir, max_total_bytes=max_output_bytes, max_members=max_members)
+    with input_path.open("rb") as body:
+        req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+        with opener(req, timeout, context=ssl_context) as resp, \
+                tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:
+            _bounded_copy(resp, spool, stream_cap)
+            spool.seek(0)
+            _safe_extract_tar(spool, output_dir, max_total_bytes=max_output_bytes, max_members=max_members)
     meta = output_dir / "metadata.json"
     if meta.exists():
         # bound the metadata BEFORE parsing -- a worker can put an under-artifact-budget-but-huge
@@ -257,8 +263,8 @@ def make_remote_validate(
     max_output_bytes: int | None = None,
     max_members: int | None = None,
     max_metadata_bytes: int | None = None,
-    output_trust: Callable[[Path, Path, str | None], None] | None = None,
-) -> Callable[[Path], tuple[dict[str, Any] | None, bool]]:
+    output_trust: Callable[..., None] | None = None,
+) -> Callable[..., tuple[dict[str, Any] | None, bool]]:
     """Build a ``validate(input_path) -> (metadata, ok)`` for a network-endpoint dispatcher.
 
     ``claim``/``release`` manage a warm slot from the pool (AWS or VM); ``output_dir_for(input_path)``
@@ -269,7 +275,8 @@ def make_remote_validate(
     """
 
     def validate(input_path: Path, *, params: dict[str, str] | None = None,
-                 input_sha256: str | None = None) -> tuple[dict[str, Any] | None, bool]:
+                 input_sha256: str | None = None,
+                 owns: Callable[[], bool] | None = None) -> tuple[dict[str, Any] | None, bool]:
         slot = claim()
         dirty = True  # only a clean, successful round-trip releases the slot as reusable
         # per-job params from the dispatcher (already allowlist-gated) win; else the params_for hook.
@@ -298,8 +305,9 @@ def make_remote_validate(
             # rather than re-offered. It re-writes the host-sealed metadata.json in out_dir; re-read it.
             if output_trust is not None:
                 # pass the authoritative ingress SHA (if the dispatcher supplied one) so trust compares
-                # against it, not a recompute of the staged file. Raises on failure -> dirty stays True.
-                output_trust(input_path, out_dir, input_sha256)
+                # against it, not a recompute of the staged file, plus the ownership predicate so the
+                # host metadata write is fenced by claim ownership. Raises on failure -> dirty stays True.
+                output_trust(input_path, out_dir, input_sha256, owns)
                 sealed = out_dir / "metadata.json"
                 if sealed.exists():
                     meta = json.loads(sealed.read_text())

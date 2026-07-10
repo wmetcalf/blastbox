@@ -89,9 +89,12 @@ class VmJobDispatcher:
             # the remote transport's trust gate compares against the AUTHORITATIVE ingress-recorded
             # input SHA (not a recompute of the staged file) -> pass job.input_sha256 when accepted.
             self._validate_takes_input_sha = "input_sha256" in _params
+            # ownership predicate so the transport can fence its metadata write by our still-held claim.
+            self._validate_takes_owns = "owns" in _params
         except (TypeError, ValueError):
             self._validate_takes_params = False
             self._validate_takes_input_sha = False
+            self._validate_takes_owns = False
         self._engine = engine
         self._worker_tier = worker_tier
         self._retention_s = max(0, int(job_retention_s))
@@ -244,6 +247,8 @@ class VmJobDispatcher:
                     kw["params"] = params
                 if self._validate_takes_input_sha:
                     kw["input_sha256"] = job.input_sha256   # authoritative ingress SHA for the trust gate
+                if self._validate_takes_owns:
+                    kw["owns"] = lambda: self._claim_is_still_ours(job)   # fence the metadata write
                 result["v"] = self._validate(in_path, **kw)  # type: ignore[call-arg]
             except BaseException as exc:  # noqa: BLE001 — surfaced to the caller below
                 result["e"] = exc
@@ -538,21 +543,36 @@ def build_remote_vm_dispatcher(
     sanitize: Callable[[dict[str, str]], dict[str, str]] | None = None
     if engine_spec is not None:
         from blastbox.host.dispatch import Dispatcher   # lazy: dispatch<->vm_dispatch are independent
+        from blastbox.host.netpolicy import parse_personalities, resolve_net_policy
+
+        # The remote tier's egress is FIXED at the engine's provisioned personality (the dispatcher
+        # already FAILs jobs whose effective policy != this). Tell the remote worker's inner sandbox
+        # whether that personality grants egress by injecting BLASTBOX_NET_EGRESS -- the SAME dispatcher-
+        # owned env the cold path sets. Without it a bwrap/nsjail/nono inner sandbox on the remote box
+        # keeps the image default (sealed) and fails closed even on an egress-provisioned tier.
+        _registry = parse_personalities(os.environ)
+        _personality = resolve_net_policy(
+            job_net_policy=None, engine_default=(getattr(engine_spec, "net_policy", None) or "none"),
+            registry=_registry, allow_override=False,
+        )
+        _net_env = {"BLASTBOX_NET_EGRESS": "1" if _personality.exit_driver not in ("none", "drop") else "0"}
 
         def sanitize(p: dict[str, str]) -> dict[str, str]:
-            return Dispatcher._sanitize_params(
+            out = Dispatcher._sanitize_params(
                 p, engine_spec.allowed_param_keys, engine_spec.reserved_param_keys,
                 getattr(engine_spec, "default_params", None),
             )
+            return {**out, **_net_env}   # dispatcher-owned, merged LAST so a job param can't flip it
 
     # host trust gate: re-seal the extracted output + verify engine/input-SHA/caps, then overwrite
     # metadata.json with the host-sealed envelope (recomputed hashes). Same gate the cold path runs.
     # It runs INSIDE the transport (make_remote_validate) BEFORE the slot is released clean, so a worker
     # that fails trust keeps its slot dirty and is retired instead of re-offered. The transport hands it
     # (input_path, out_dir); recompute the input SHA from the bytes actually POSTed (== job.input_sha256).
-    output_trust: Callable[[Path, Path, str | None], None] | None = None
+    output_trust: Callable[..., None] | None = None
     if limits is not None:
-        def output_trust(input_path: Path, out_dir: Path, expected_sha: str | None) -> None:
+        def output_trust(input_path: Path, out_dir: Path, expected_sha: str | None,
+                         owns: Callable[[], bool] | None = None) -> None:
             from blastbox.host.trust import OutputTrustError, validate_worker_output
             # Compare the worker's sealed envelope against the AUTHORITATIVE ingress-recorded input SHA
             # (job.input_sha256), matching the cold/file-warm paths -- so a staged input that was
@@ -570,6 +590,12 @@ def build_remote_vm_dispatcher(
             if env.status == "engine_error":
                 detail = env.warnings[0].message if env.warnings else "engine_error"
                 raise OutputTrustError(f"engine_error: {detail}")
+            # Fence the metadata WRITE by claim ownership: if this (possibly long) remote attempt
+            # outlived its claim and a peer recovered the job, DON'T overwrite the new owner's
+            # metadata.json in the shared output dir. Raise -> job fails for this stale attempt, slot
+            # retired dirty. Checked immediately before the write to shrink the TOCTOU to ~nothing.
+            if owns is not None and not owns():
+                raise OutputTrustError("claim lost before host metadata write (peer recovered the job)")
             atomic_write_confined(out_dir, "metadata.json",
                                   env.model_dump_json(by_alias=True).encode("utf-8"), mode=0o644)
 

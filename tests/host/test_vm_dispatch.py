@@ -187,6 +187,40 @@ def test_build_remote_vm_dispatcher_constructs(tmp_path):
     assert isinstance(vm, VmJobDispatcher)
     assert vm._trust_output_metadata is True        # the remote path preserves the sealed metadata
     assert vm._validate_takes_params is True         # the remote_http validate accepts params
+    assert vm._validate_takes_owns is True           # ...and the ownership predicate (metadata fence)
+
+
+class _FakePool:
+    runtime = type("R", (), {"ssl_context": None})()
+
+    def claim(self, *, timeout_s):  # noqa: ANN001, ANN202
+        return None
+
+    def release(self, slot, *, dirty=False):  # noqa: ANN001
+        pass
+
+
+def test_remote_injects_net_egress_sealed_by_default(tmp_path):
+    # a no-egress ('none') engine personality -> the remote worker is told BLASTBOX_NET_EGRESS=0
+    from blastbox.host.dispatch import EngineSpec
+    from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+    spec = EngineSpec(name="clippyshot", image="img", worker_argv=[], net_policy="none")
+    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
+                                    tier="static", engine="clippyshot", engine_spec=spec)
+    assert vm._sanitize({})["BLASTBOX_NET_EGRESS"] == "0"
+
+
+def test_remote_injects_net_egress_open_for_egress_personality(tmp_path, monkeypatch):
+    # an egress personality (exit != none/drop) -> BLASTBOX_NET_EGRESS=1 reaches the remote worker
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_INSPECT", "exit=direct")
+    from blastbox.host.dispatch import EngineSpec
+    from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+    spec = EngineSpec(name="clippyshot", image="img", worker_argv=[], net_policy="inspect")
+    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
+                                    tier="static", engine="clippyshot", engine_spec=spec)
+    assert vm._sanitize({})["BLASTBOX_NET_EGRESS"] == "1"   # dispatcher-owned, merged last
+    # a hostile job param cannot flip it back
+    assert vm._sanitize({"BLASTBOX_NET_EGRESS": "0"})["BLASTBOX_NET_EGRESS"] == "1"
 
 
 def test_dispatch_bounds_oversized_summary(tmp_path):
