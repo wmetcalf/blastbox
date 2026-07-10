@@ -15,11 +15,16 @@ import pytest
 from blastbox.host.pool import SlotRuntime, SlotState
 from blastbox.host.runtime.aws_worker import (
     AwsUnavailable,
+    AwsWorkerError,
+    AwsWorkerSlot,
     DisposableEc2Runtime,
     Ec2Config,
     LambdaMicroVmConfig,
     LambdaMicroVmRuntime,
+    LambdaSnapStartConfig,
+    LambdaSnapStartRuntime,
     select_lambda_microvm_runtime,
+    select_lambda_snapstart_runtime,
 )
 
 
@@ -65,6 +70,205 @@ def _ec2_rt(responses, probe=lambda url, hdrs, to: True, **kw):  # noqa: ANN001
     cfg = Ec2Config(region="us-east-1", image_id="ami-0abc")
     fake = FakeAws({**_IDENT, **responses})
     return DisposableEc2Runtime(cfg, aws_runner=fake, http_probe=probe, clock=lambda: 100.0, **kw), fake
+
+
+def _snapstart_rt(responses, probe=lambda url, hdrs, to: True, clock=lambda: 100.0, **cfgkw):  # noqa: ANN001
+    cfg = LambdaSnapStartConfig(region="us-east-1", image_identifier="arn:img",
+                                allow_default_egress=True, resume_poll_s=0.0, **cfgkw)
+    fake = FakeAws({**_IDENT, **responses})
+    return LambdaSnapStartRuntime(cfg, aws_runner=fake, http_probe=probe, clock=clock), fake
+
+
+# --------------------------------------------------------------------------- SnapStart (warm) tier
+
+def test_snapstart_launch_sets_idle_policy():
+    rt, fake = _snapstart_rt({"lambda-microvms run-microvm": {"microvmId": "mv-1"}},
+                             max_idle_duration_s=90, suspended_duration_s=1800)
+    rt.spawn()
+    argv = next(a for k, a in fake.calls if k == "lambda-microvms run-microvm")
+    policy = json.loads(argv[argv.index("--idle-policy") + 1])
+    assert policy == {"maxIdleDurationSeconds": 90, "suspendedDurationSeconds": 1800, "autoResumeEnabled": True}
+
+
+def test_snapstart_running_counts_suspended_as_alive():
+    # a PARKED (suspended) slot must report alive, or the pool health-check reaps it every tick.
+    for state in ("suspended", "suspending", "pending", "running"):
+        rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": state}})
+        slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+        assert rt._running(slot) is True, state
+
+
+def test_snapstart_running_dead_states():
+    for state in ("terminating", "terminated"):
+        rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": state}})
+        slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+        assert rt._running(slot) is False, state
+
+
+def test_snapstart_is_alive_true_for_suspended_slot():
+    # end-to-end through is_alive (which the pool health-check calls on IDLE slots) -> parked stays warm.
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "suspended"},
+                           "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}})
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    assert rt.is_alive(slot) is True
+
+
+def test_snapstart_is_alive_does_not_mint_token_on_parked_slot():
+    # regression: the base is_alive JWE-refresh mints a token every idle tick, which FAILS on a SUSPENDED
+    # slot (mint needs RUNNING) forever -> control-plane storm. SnapStart's is_alive must NOT mint.
+    rt, fake = _snapstart_rt({"lambda-microvms get-microvm": {"state": "suspended"},
+                             "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                            clock=lambda: 100000.0)   # far past any token half-TTL
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    slot.auth_token, slot.token_minted_at = "aged", 0.0   # a stale token that base is_alive would try to refresh
+    for _ in range(5):
+        rt.is_alive(slot)
+    assert "lambda-microvms create-microvm-auth-token" not in [k for k, _ in fake.calls]   # no mint storm
+
+
+def test_snapstart_running_empty_or_unknown_state_not_alive():
+    # fail-CLOSED: an empty/unrecognized get-microvm state must NOT read as alive (else a broken slot
+    # lingers IDLE and is handed out).
+    for resp in ({}, {"state": "weird-future-state"}):
+        rt, _ = _snapstart_rt({"lambda-microvms get-microvm": resp})
+        assert rt._running(AwsWorkerSlot(slot_id='s', resource_id='mv-1')) is False
+
+
+def test_snapstart_readiness_describe_is_cached_during_warming():
+    # is_ready (WARMING promotion, ~10Hz) must NOT issue a get-microvm per tick before the URL resolves.
+    # With no endpoint in the describe, url never resolves; the describe must still be cache-throttled.
+    rt, fake = _snapstart_rt({"lambda-microvms get-microvm": {"state": "pending"}},   # no endpoint yet
+                            probe=lambda u, h, t: False, clock=lambda: 500.0)   # constant clock -> within TTL
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    for _ in range(10):
+        rt.is_ready(slot)
+    n_desc = sum(1 for k, _ in fake.calls if k == "lambda-microvms get-microvm")
+    assert n_desc == 1   # 10 readiness ticks within the cache window -> a single control-plane describe
+
+
+def test_snapstart_resume_wakes_and_refreshes():
+    # a PARKED slot: the endpoint probe fails first (VM suspended/unreachable) -> resume() issues
+    # resume-microvm, then the probe succeeds. Readiness is probe-decided, not state-decided.
+    n = {"probes": 0}
+
+    def probe(u, h, t):
+        n["probes"] += 1
+        return n["probes"] > 1        # first probe fails, second (post-resume) succeeds
+
+    rt, fake = _snapstart_rt({
+        "lambda-microvms get-microvm": {"state": "suspended", "endpoint": "vm.example"},
+        "lambda-microvms resume-microvm": {},
+        "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"},
+    }, probe=probe)
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    slot.auth_token = "STALE"           # a token minted while parked must be discarded
+    rt.resume(slot)
+    ops = [k for k, _ in fake.calls]
+    assert "lambda-microvms resume-microvm" in ops        # nudged the parked slot awake after the probe failed
+    assert slot.url == "https://vm.example"               # stable endpoint resolved
+    assert slot.auth_token == "jwe"                       # fresh token, not STALE
+
+
+def test_snapstart_resume_skips_resume_when_already_reachable():
+    # if the very first probe succeeds (slot already RUNNING+reachable), no resume-microvm is issued.
+    rt, fake = _snapstart_rt({
+        "lambda-microvms get-microvm": {"state": "running", "endpoint": "vm.example"},
+        "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"},
+    })
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    rt.resume(slot)
+    assert "lambda-microvms resume-microvm" not in [k for k, _ in fake.calls]   # probe-first, already reachable
+
+
+def test_snapstart_resume_wakes_stale_running_state_when_auto_resume_off():
+    # the hard case: auto_resume off + get-microvm lies 'running' but the VM is actually parked. Probe
+    # fails, so resume() must STILL issue resume-microvm (not trust the eventually-consistent state).
+    n = {"probes": 0}
+
+    def probe(u, h, t):
+        n["probes"] += 1
+        return n["probes"] > 1
+
+    rt, fake = _snapstart_rt({
+        "lambda-microvms get-microvm": {"state": "running", "endpoint": "vm.example"},   # stale/lying
+        "lambda-microvms resume-microvm": {},
+        "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"},
+    }, probe=probe, auto_resume=False)
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    rt.resume(slot)
+    assert "lambda-microvms resume-microvm" in [k for k, _ in fake.calls]   # woke despite 'running' state
+
+
+def test_snapstart_resume_raises_on_dead_slot():
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "terminated"}})
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    with pytest.raises(AwsWorkerError, match="cannot resume"):
+        rt.resume(slot)
+
+
+def test_snapstart_resume_times_out_when_never_healthy():
+    # health probe never succeeds -> resume raises after the budget instead of hanging forever. A clock
+    # that advances on each call guarantees the deadline is crossed (no wall-clock sleep).
+    ticks = [0.0]
+
+    def clock():
+        ticks[0] += 1.0
+        return ticks[0]
+
+    rt, _ = _snapstart_rt(
+        {"lambda-microvms get-microvm": {"state": "running", "endpoint": "vm.example"},
+         "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+        probe=lambda u, h, t: False, clock=clock, resume_timeout_s=5.0,
+    )
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    with pytest.raises(AwsWorkerError, match="not ready"):
+        rt.resume(slot)
+
+
+def test_snapstart_config_from_env():
+    env = {
+        "BLASTBOX_LAMBDA_IMAGE": "arn:img",
+        "BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS": "1",
+        "BLASTBOX_LAMBDA_SNAPSTART_IDLE_S": "90",
+        "BLASTBOX_LAMBDA_SNAPSTART_SUSPENDED_TTL_S": "1200",
+        "BLASTBOX_LAMBDA_SNAPSTART_AUTO_RESUME": "0",
+        "BLASTBOX_LAMBDA_SNAPSTART_RESUME_TIMEOUT_S": "30",
+    }
+    cfg = LambdaSnapStartConfig.from_env(env.get)
+    assert cfg.image_identifier == "arn:img" and cfg.allow_default_egress is True   # inherited fields
+    assert cfg.max_idle_duration_s == 90 and cfg.suspended_duration_s == 1200
+    assert cfg.auto_resume is False and cfg.resume_timeout_s == 30.0
+
+
+def test_snapstart_config_clamps_to_aws_bounds():
+    # maxIdleDurationSeconds min is 60; maximum-duration ceiling is 28800 (8h). A sub-60 / over-8h value
+    # must be clamped, not passed through to a per-spawn AWS reject (silent fail-never-warm).
+    cfg = LambdaSnapStartConfig(region="us-east-1", image_identifier="img", allow_default_egress=True,
+                                max_idle_duration_s=30, suspended_duration_s=-5, max_duration_s=999999)
+    assert cfg.max_idle_duration_s == 60
+    assert cfg.suspended_duration_s == 0
+    assert cfg.max_duration_s == 28800
+
+
+def test_snapstart_from_env_override_applies_without_collision():
+    # the inherited **overrides contract must work (regression: dict-merge, not duplicate kwargs).
+    cfg = LambdaSnapStartConfig.from_env(
+        {"BLASTBOX_LAMBDA_IMAGE": "img", "BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS": "1"}.get,
+        resume_timeout_s=99.0, region="us-west-2")
+    assert cfg.resume_timeout_s == 99.0 and cfg.region == "us-west-2"   # base + new fields overridable
+
+
+def test_snapstart_inherits_egress_failclosed():
+    with pytest.raises(AwsUnavailable, match="egress"):
+        LambdaSnapStartRuntime(LambdaSnapStartConfig(region="us-east-1", image_identifier="img"))
+
+
+def test_snapstart_select_and_dispatch_style():
+    rt = select_lambda_snapstart_runtime(
+        get_env={"BLASTBOX_LAMBDA_IMAGE": "img", "BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS": "1"}.get)
+    assert rt.kind == "aws-lambda-snapstart"
+    assert rt.dispatch_style == "network"
+    assert rt.ssl_context is None       # AWS public TLS + JWE, NOT the private worker CA
 
 
 # --------------------------------------------------------------------------- protocol conformance
@@ -275,6 +479,21 @@ def test_build_warm_pool_recognizes_aws_runtimes(monkeypatch):
     cfg = pool_config.PoolConfig.from_env()
     pool = pool_config.build_warm_pool(cfg)
     assert pool is not None
+
+
+def test_snapstart_runtime_satisfies_slotruntime_protocol():
+    rt, _ = _snapstart_rt({})
+    assert isinstance(rt, SlotRuntime)
+    assert callable(getattr(rt, "resume", None))   # the warm-claim seam the dispatcher detects
+
+
+def test_pool_config_registers_snapstart(monkeypatch):
+    from blastbox.host import pool_config
+    ss, _ = _snapstart_rt({})
+    monkeypatch.setattr("blastbox.host.runtime.aws_worker.select_lambda_snapstart_runtime",
+                        lambda **kw: ss)
+    got = pool_config.select_runtime_by_name("aws-lambda-snapstart", require_available=False)
+    assert got is ss and got.dispatch_style == "network"
 
 
 def test_ec2_select_injects_dispatch_tls_context(tmp_path):

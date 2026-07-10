@@ -511,6 +511,25 @@ class VmJobDispatcher:
         self._stop.set()
 
 
+def _resume_on_claim(pool: Any, slot: Any) -> None:
+    """Optional per-claim resume seam (aws-lambda-snapstart): wake a parked/suspended warm slot and
+    block until its agent answers BEFORE the transport POSTs (which has no retry). The runtime
+    repopulates slot.url/auth_token in place; slot_base_url + the POST read them dynamically after claim,
+    so no transport change is needed. On resume failure release the slot DIRTY (retire the un-resumable
+    worker) rather than leak it, then re-raise so the job fails. A runtime without resume() is a no-op."""
+    resume = getattr(getattr(pool, "runtime", None), "resume", None)
+    if not callable(resume):
+        return
+    try:
+        resume(slot)
+    except Exception:
+        try:
+            pool.release(slot, dirty=True)
+        except Exception:   # noqa: BLE001 -- release failure must not mask the resume error
+            logger.warning("vm_dispatch: releasing un-resumable slot failed", exc_info=True)
+        raise
+
+
 def build_remote_vm_dispatcher(
     store: JobStore,
     job_root: str | Path,
@@ -534,6 +553,15 @@ def build_remote_vm_dispatcher(
 
     ssl_context = getattr(pool.runtime, "ssl_context", None)
     max_output_bytes = getattr(limits, "max_total_artifact_bytes", None)
+    # A resume seam (snapstart) runs INSIDE the claim, before the transport's timeout guard -- if its
+    # budget outlasts the per-job budget a slow wake can abandon the claim thread with a live billing
+    # slot. Warn (don't fail) if the operator sized them backwards.
+    _resume_to = getattr(getattr(pool.runtime, "cfg", None), "resume_timeout_s", None)
+    if _resume_to is not None and float(_resume_to) >= worker_timeout_s:
+        logger.warning("vm_dispatch: resume_timeout_s=%.0f >= worker_timeout_s=%.0f -- lower "
+                       "BLASTBOX_LAMBDA_SNAPSTART_RESUME_TIMEOUT_S below BLASTBOX_WORKER_TIMEOUT_S so a "
+                       "slow resume can't outlast the job budget and leak a live slot", float(_resume_to),
+                       worker_timeout_s)
     # DoS backstops for the untrusted worker tar, BEFORE the host trust gate parses/validates it:
     # a member (inode) cap ~ the artifact ceiling (+slack for metadata.json/control files), and a
     # metadata.json size cap so a huge JSON isn't parsed before max_metadata_bytes is enforced.
@@ -542,10 +570,28 @@ def build_remote_vm_dispatcher(
     max_metadata_bytes = getattr(limits, "max_metadata_bytes", None)
 
     def _claim() -> Any:
-        slot = pool.claim(timeout_s=worker_timeout_s)
-        if slot is None:
-            raise RuntimeError("no warm slot available within claim timeout")
-        return slot
+        # Claim + (optionally) resume within one worker-timeout budget. If a claimed slot can't be
+        # resumed (snapstart: e.g. the platform auto-terminated a parked slot within the liveness-cache
+        # window), _resume_on_claim already released it dirty -> try ANOTHER slot instead of failing the
+        # job on one dead-on-arrival slot. For non-resume runtimes _resume_on_claim never raises, so this
+        # returns on the first claim exactly as before.
+        deadline = time.monotonic() + worker_timeout_s
+        last_exc: Exception | None = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            slot = pool.claim(timeout_s=remaining)
+            if slot is None:
+                break
+            try:
+                _resume_on_claim(pool, slot)
+                return slot
+            except Exception as exc:  # noqa: BLE001 -- slot already retired dirty; try the next one
+                last_exc = exc
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("no warm slot available within claim timeout")
 
     def _release(slot: Any, dirty: bool = False) -> None:
         pool.release(slot, dirty=dirty)

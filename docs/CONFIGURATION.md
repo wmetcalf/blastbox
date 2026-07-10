@@ -80,7 +80,7 @@ and the tier-capability matrix.
 
 | Var | Default | Notes |
 |---|---|---|
-| `BLASTBOX_POOL_RUNTIME` | runtime default | Warm backend: `firecracker`, `gvisor`, `aws-lambda-microvm`, `aws-ec2`, `static`, or `cascade` (tiered local→overflow). |
+| `BLASTBOX_POOL_RUNTIME` | runtime default | Warm backend: `firecracker`, `gvisor`, `aws-lambda-microvm`, `aws-lambda-snapstart` (warm AWS — suspend/resume), `aws-ec2`, `static`, or `cascade` (tiered local→overflow). |
 | `BLASTBOX_POOL_WARM_SIZE` | — | Number of pre-warmed slots. |
 | `BLASTBOX_POOL_CEILING` | — | Max concurrent slots (warm + burst). |
 | `BLASTBOX_POOL_BURST_SIZE` | — | Extra cold-burst slots above the warm set under load. |
@@ -146,6 +146,13 @@ win-validator stays libvirt — no Windows/nested-virt on either).
 | `BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS` | `0` | `1` ⇒ explicitly accept AWS's default **public internet** egress when no egress connector is set (otherwise the tier fail-closes). Use only when internet egress is intended; set the engine's `net_policy` accordingly. |
 | `BLASTBOX_LAMBDA_INGRESS_CONNECTORS` | `""` | Comma-list of ingress-connector ids (empty ⇒ none configured). |
 | `BLASTBOX_LAMBDA_AUTH_TTL_MIN` | `15` | JWE lifetime for `create-microvm-auth-token` (`--expiration-in-minutes`); minted fresh at probe time, scoped to the agent port, and **reused across readiness ticks within half its TTL** (no per-tick control-plane call). |
+| **Lambda MicroVM WARM / SnapStart** (`aws-lambda-snapstart`) | | the WARM AWS tier — per-microvm suspend/resume |
+| _(reuses all `BLASTBOX_LAMBDA_*` + `BLASTBOX_AWS_*` above)_ | | Same image/egress/token config as `aws-lambda-microvm`. |
+| `BLASTBOX_LAMBDA_SNAPSTART_IDLE_S` | `120` | `idlePolicy.maxIdleDurationSeconds` — idle time (running, billing) before AWS auto-suspends a warm slot. Lower = cheaper park, more resume churn. |
+| `BLASTBOX_LAMBDA_SNAPSTART_SUSPENDED_TTL_S` | `3600` | `idlePolicy.suspendedDurationSeconds` — how long a PARKED slot persists before AWS auto-terminates it (then the pool replenishes). |
+| `BLASTBOX_LAMBDA_SNAPSTART_AUTO_RESUME` | `1` | `idlePolicy.autoResumeEnabled` — wake on inbound traffic (belt-and-braces with the dispatcher's explicit `resume-microvm` on claim). |
+| `BLASTBOX_LAMBDA_SNAPSTART_RESUME_TIMEOUT_S` | `60` | Budget for `resume-microvm` + `/healthz` to answer when a job claims a parked slot (the transport POSTs with no retry). |
+| `BLASTBOX_LAMBDA_SNAPSTART_RESUME_POLL_S` | `1` | Health re-probe interval while a resumed slot settles. |
 | **Disposable EC2** (`aws-ec2`) | | transport = instance IP:port (private by default) |
 | `BLASTBOX_EC2_AMI` | — | **Required.** Worker AMI (agent brought up via user-data). |
 | `BLASTBOX_EC2_INSTANCE_TYPE` | `m7g.large` | ARM64 default (matches the sealed-Linux ARM image); override for x86. |
@@ -159,7 +166,18 @@ win-validator stays libvirt — no Windows/nested-virt on either).
 The **generic worker agent** (`python -m blastbox.worker.http_agent`, `BLASTBOX_ENGINE=module:Class`)
 serves any engine over `GET /healthz` + `POST /detonate`; bake it + the engine + its deps into the
 worker image. `BLASTBOX_WORKER_AGENT_PORT` / `BLASTBOX_WORKER_AGENT_TOKEN` / `BLASTBOX_WORKER_AGENT_MAX_BYTES`
-tune it.
+tune it. The agent runs `engine.warmup()` **before** it binds, so a MicroVM whose `/healthz` answers is
+already warm (JVM booted / soffice UNO up) — which is what makes the SnapStart tier's parked slots warm.
+
+**`aws-lambda-snapstart` — the WARM AWS tier.** AWS exposes `suspend-microvm`/`resume-microvm` (per-VM
+live state; endpoint stable across the cycle) but **no snapshot-template/fan-out**, so each pool slot is
+individually boot+warmed then parked. The tier: (1) `run-microvm`s each slot with an `--idle-policy` so
+AWS auto-suspends it once warm+idle (full mem+disk preserved); (2) the dispatcher `resume-microvm`s the
+claimed slot and health-gates it **before** the job POSTs (sub-second — JVM/soffice already warm);
+(3) **terminates** it after one untrusted job (disposable-warm, never reused across inputs). The
+boot + warmup cost is paid off the critical path during background replenishment. Same fail-closed
+egress + JWE + public-AWS-TLS model as `aws-lambda-microvm`; size `BLASTBOX_POOL_WARM_SIZE` to the
+warm depth you want parked.
 
 ## Runtime: static worker pool (`static`)
 

@@ -21,6 +21,7 @@ RUNTIME_NONE = "none"
 RUNTIME_FIRECRACKER = "firecracker"
 RUNTIME_GVISOR = "gvisor"
 RUNTIME_AWS_LAMBDA_MICROVM = "aws-lambda-microvm"
+RUNTIME_AWS_LAMBDA_SNAPSTART = "aws-lambda-snapstart"
 RUNTIME_AWS_EC2 = "aws-ec2"
 RUNTIME_STATIC = "static"
 RUNTIME_CASCADE = "cascade"
@@ -108,6 +109,10 @@ def select_runtime_by_name(
         from blastbox.host.runtime.aws_worker import select_lambda_microvm_runtime
 
         return select_lambda_microvm_runtime(require_available=require_available)
+    if name == RUNTIME_AWS_LAMBDA_SNAPSTART:
+        from blastbox.host.runtime.aws_worker import select_lambda_snapstart_runtime
+
+        return select_lambda_snapstart_runtime(require_available=require_available)
     if name == RUNTIME_AWS_EC2:
         from blastbox.host.runtime.aws_worker import select_disposable_ec2_runtime
 

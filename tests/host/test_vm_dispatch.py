@@ -195,6 +195,48 @@ def test_output_validator_success_marks_done(tmp_path):
     assert store.get(job.job_id).status is JobStatus.DONE and called["ok"]
 
 
+def test_resume_on_claim_calls_runtime_resume():
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.vm_dispatch import _resume_on_claim
+    seen = {}
+    slot = SimpleNamespace(slot_id="s1")
+    pool = SimpleNamespace(
+        runtime=SimpleNamespace(resume=lambda s: seen.setdefault("resumed", s)),
+        release=lambda s, dirty=False: seen.setdefault("released", dirty),
+    )
+    _resume_on_claim(pool, slot)
+    assert seen["resumed"] is slot and "released" not in seen   # resumed, not released
+
+
+def test_resume_on_claim_releases_dirty_on_failure():
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.vm_dispatch import _resume_on_claim
+    seen = {}
+
+    def boom(_s):
+        raise RuntimeError("resume failed")
+
+    slot = SimpleNamespace(slot_id="s1")
+    pool = SimpleNamespace(
+        runtime=SimpleNamespace(resume=boom),
+        release=lambda s, dirty=False: seen.setdefault("released_dirty", dirty),
+    )
+    with pytest.raises(RuntimeError, match="resume failed"):
+        _resume_on_claim(pool, slot)
+    assert seen["released_dirty"] is True   # un-resumable slot retired dirty, not leaked
+
+
+def test_resume_on_claim_noop_without_resume():
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.vm_dispatch import _resume_on_claim
+    # a runtime without a resume() method (disposable ec2/static/etc.) is a no-op
+    pool = SimpleNamespace(runtime=SimpleNamespace(), release=lambda *a, **k: None)
+    _resume_on_claim(pool, SimpleNamespace(slot_id="s1"))   # must not raise
+
+
 def test_build_remote_vm_dispatcher_constructs(tmp_path):
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
 

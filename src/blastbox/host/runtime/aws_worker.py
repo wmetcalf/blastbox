@@ -396,11 +396,16 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
             args += ["--egress-network-connectors", *self.cfg.egress_connector_ids]
         if self.cfg.ingress_connector_ids:
             args += ["--ingress-network-connectors", *self.cfg.ingress_connector_ids]
+        args += self._extra_run_args()   # subclass hook (e.g. SnapStart --idle-policy)
         resp = self._aws("lambda-microvms", "run-microvm", *args)
         rid = resp.get("microvmId") or resp.get("MicrovmId") or resp.get("id")
         if not rid:
             raise AwsWorkerError("run-microvm: no microvm id in response")
         return AwsWorkerSlot(slot_id=sid, resource_id=str(rid), state=SlotState.WARMING)
+
+    def _extra_run_args(self) -> list[str]:
+        """Extra `run-microvm` args a subclass appends (base: none). SnapStart adds `--idle-policy`."""
+        return []
 
     def _describe(self, slot: AwsWorkerSlot) -> dict[str, Any]:
         return self._aws("lambda-microvms", "get-microvm", "--microvm-identifier", str(slot.resource_id))
@@ -489,6 +494,192 @@ def select_lambda_microvm_runtime(
     rt = LambdaMicroVmRuntime(cfg, **kw)
     if require_available and not rt.available():
         raise AwsUnavailable("aws-lambda-microvm tier unavailable (creds/entitlement/service probe failed)")
+    return rt
+
+
+# ---------------------------------------------------------------------------
+# Lambda MicroVM WARM (SnapStart) tier — suspend/resume, per-microvm
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class LambdaSnapStartConfig(LambdaMicroVmConfig):
+    # AWS lambda-microvms has NO snapshot-template/fan-out -- only per-microvm suspend/resume. So each
+    # warm slot is individually booted+warmed (the agent runs engine.warmup() before serving /healthz,
+    # so a healthy endpoint == warm) then PARKED by the platform idle-policy, resumed per job, and
+    # TERMINATED after one (untrusted) job. The idle-policy is the platform-native warm controller.
+    max_idle_duration_s: int = 120       # idle time (running, billing) before AWS auto-suspends a warm slot
+    suspended_duration_s: int = 3600     # how long a PARKED slot persists before AWS auto-terminates it
+    auto_resume: bool = True             # wake on inbound traffic (belt-and-braces with explicit resume)
+    resume_timeout_s: float = 60.0       # budget for resume-microvm + /healthz to answer on claim
+    resume_poll_s: float = 1.0           # health re-probe interval while a resumed slot settles
+
+    def __post_init__(self) -> None:
+        # Clamp to the AWS run-microvm --idle-policy / --maximum-duration bounds so a mistyped env value
+        # can't turn every spawn into an opaque per-slot AWS reject (silent fail-never-warm). AWS:
+        # maxIdleDurationSeconds >= 60, suspendedDurationSeconds >= 0, maximum-duration <= 28800 (8h).
+        idle = max(60, int(self.max_idle_duration_s))
+        susp = max(0, int(self.suspended_duration_s))
+        dur = min(28800, max(1, int(self.max_duration_s)))
+        if (idle, susp, dur) != (self.max_idle_duration_s, self.suspended_duration_s, self.max_duration_s):
+            _log.warning("snapstart: clamped idle-policy to AWS bounds (idle=%ds suspended=%ds max_duration=%ds)",
+                         idle, susp, dur)
+        object.__setattr__(self, "max_idle_duration_s", idle)
+        object.__setattr__(self, "suspended_duration_s", susp)
+        object.__setattr__(self, "max_duration_s", dur)
+
+    @classmethod
+    def from_env(cls, get: Callable[[str], str | None], **overrides: Any) -> LambdaSnapStartConfig:
+        import dataclasses
+        base = LambdaMicroVmConfig.from_env(get)
+        fields = {f.name: getattr(base, f.name) for f in dataclasses.fields(LambdaMicroVmConfig)}
+        fields.update(
+            max_idle_duration_s=int(_env(get, "BLASTBOX_LAMBDA_SNAPSTART_IDLE_S", "120") or "120"),
+            suspended_duration_s=int(_env(get, "BLASTBOX_LAMBDA_SNAPSTART_SUSPENDED_TTL_S", "3600") or "3600"),
+            auto_resume=(_env(get, "BLASTBOX_LAMBDA_SNAPSTART_AUTO_RESUME", "1") or "1").strip().lower()
+                        not in ("0", "false", "no"),
+            resume_timeout_s=float(_env(get, "BLASTBOX_LAMBDA_SNAPSTART_RESUME_TIMEOUT_S", "60") or "60"),
+            resume_poll_s=float(_env(get, "BLASTBOX_LAMBDA_SNAPSTART_RESUME_POLL_S", "1") or "1"),
+        )
+        fields.update(overrides)   # caller overrides win last, no duplicate-keyword collision
+        return cls(**fields)
+
+
+class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
+    """WARM Lambda MicroVM tier: pay the boot + engine warmup ONCE per slot in the background, let the
+    platform park it (idle-policy suspend), then RESUME it per job (sub-second, JVM/soffice already warm)
+    and TERMINATE after one untrusted job. Disposable-warm — never reuses a slot across jobs.
+
+    vs the disposable ``aws-lambda-microvm`` tier this only: (1) runs each microVM with an ``--idle-policy``
+    so AWS auto-suspends idle warm slots + auto-resumes on traffic; (2) treats SUSPENDED/SUSPENDING/PENDING
+    as ALIVE (else the pool health-check reaps parked slots); (3) exposes a ``resume(slot)`` hook the
+    dispatcher calls on claim to wake + re-token + health-gate the slot BEFORE the job POSTs (the transport
+    POSTs with no retry, so a not-yet-awake endpoint would lose the job). Everything else inherits."""
+
+    kind = "aws-lambda-snapstart"
+    _DEAD_STATES = ("terminating", "terminated")
+    # WHITELIST of states that count as alive (fail-CLOSED on empty/unknown/future states -- liveness
+    # must be probe-decided, and an unrecognized get-microvm state should reap, not linger IDLE).
+    _ALIVE_STATES = ("pending", "running", "suspending", "suspended")
+
+    def __init__(self, cfg: LambdaSnapStartConfig, **kw: Any) -> None:
+        super().__init__(cfg, **kw)   # inherits the image-required + fail-closed egress guards
+        self.cfg: LambdaSnapStartConfig = cfg
+        # Cache the readiness get-microvm during WARMING so the ~0.1s pool promotion tick doesn't spam
+        # the control plane (mirrors the is_alive _liveness_cache). resume()/_state stay UNCACHED (they
+        # need the current state to decide waking).
+        self._desc_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+    def _extra_run_args(self) -> list[str]:
+        import json
+        policy = {
+            "maxIdleDurationSeconds": self.cfg.max_idle_duration_s,
+            "suspendedDurationSeconds": self.cfg.suspended_duration_s,
+            "autoResumeEnabled": self.cfg.auto_resume,
+        }
+        return ["--idle-policy", json.dumps(policy)]
+
+    def _describe_cached(self, slot: AwsWorkerSlot, ttl: float) -> dict[str, Any]:
+        now = self._clock()
+        cached = self._desc_cache.get(slot.slot_id)
+        if cached is not None and (now - cached[0]) < ttl:
+            return cached[1]
+        desc = self._describe(slot)
+        self._desc_cache[slot.slot_id] = (now, desc)
+        return desc
+
+    def _state(self, slot: AwsWorkerSlot) -> str:
+        return str(self._describe(slot).get("state", "")).lower()   # UNCACHED: resume needs current state
+
+    def _resolve_url(self, slot: AwsWorkerSlot) -> None:
+        """Populate slot.url from get-microvm's endpoint if not already set. Unlike the base _health_ok
+        (which only reads the endpoint when RUNNING), the microVM endpoint is a STABLE property available
+        at any state -- so a parked/suspended slot can still be addressed once resumed. Uses the readiness
+        describe cache so the warming poll doesn't issue a get-microvm per tick."""
+        if slot.url is not None:
+            return
+        desc = self._describe_cached(slot, self._liveness_cache_s)
+        ep = desc.get("endpoint") or desc.get("url") or desc.get("endpointUrl")
+        if ep:
+            slot.url = str(ep) if str(ep).startswith("http") else f"https://{ep}"
+
+    def _running(self, slot: AwsWorkerSlot) -> bool:
+        # A PARKED (suspended) warm slot is ALIVE -- the base _running (running/active/ready only) would
+        # make is_alive() False for a suspended slot and the pool's per-tick health-check would reap every
+        # parked slot. WHITELIST the known-alive states (empty/unknown -> not alive -> reaped). A
+        # get-microvm error (microvm gone) still raises -> is_alive() catches -> False -> reaped.
+        return self._state(slot) in self._ALIVE_STATES
+
+    def _health_ok(self, slot: AwsWorkerSlot) -> bool:
+        # SnapStart-specific: resolve the STABLE endpoint independent of state (a parked slot is
+        # addressable) via the cached describe, then mint+probe. The base _health_ok gates URL resolution
+        # on state==running and does an UNCACHED get-microvm per call -- both wrong for a parked warm slot.
+        self._resolve_url(slot)
+        if slot.url is None:
+            return False
+        token = self._ensure_token(slot)
+        url = slot.url.rstrip("/") + self.cfg.agent_health_path
+        headers = {"X-aws-proxy-auth": token, "X-aws-proxy-port": str(self.cfg.agent_port)}
+        return self._probe(url, headers, self.cfg.probe_timeout_s)
+
+    def is_alive(self, slot: AwsWorkerSlot) -> bool:
+        # Skip the LambdaMicroVmRuntime JWE-refresh: minting a token requires RUNNING, so it would fail
+        # every idle tick on a PARKED (suspended) slot -- silently, forever -- an AWS control-plane storm
+        # that never achieves the refresh. resume() force-mints a fresh JWE on claim, so the idle refresh
+        # is unnecessary here. Use the base liveness (cached _running) directly.
+        return AwsDisposableRuntime.is_alive(self, slot)
+
+    def reap(self, slot: AwsWorkerSlot) -> None:
+        self._desc_cache.pop(slot.slot_id, None)
+        super().reap(slot)
+
+    def resume(self, slot: AwsWorkerSlot) -> None:
+        """Wake a (possibly parked) slot and block until its agent answers, BEFORE the job POSTs. Called
+        by the dispatcher's claim seam. Raises on failure so the claim retires the slot dirty.
+
+        Readiness is decided by the ENDPOINT PROBE (the get-microvm state field is eventually consistent).
+        Whenever the probe is still failing and the slot isn't confirmed dead, (re)issue resume-microvm --
+        it is tolerant of a wrong-state target (already running / stale state), so a genuinely-parked slot
+        that get-microvm still misreports is actually woken even with autoResumeEnabled=false."""
+        import time
+        self._resolve_url(slot)     # stable endpoint, addressable even while transitioning
+        slot.auth_token = None      # a JWE minted while suspended is invalid; force a fresh mint once awake
+        deadline = self._clock() + self.cfg.resume_timeout_s
+        last_exc: Exception | None = None
+        while self._clock() < deadline:
+            try:
+                if self._health_ok(slot):
+                    return
+            except (AwsWorkerError, OSError) as exc:
+                last_exc = exc      # not-yet-RUNNING mint/probe failures -> keep trying to wake it
+            # probe failed -> the slot isn't serving. Confirm it's not dead, then nudge it awake.
+            try:
+                cur = self._state(slot)
+            except (AwsWorkerError, OSError) as exc:
+                last_exc, cur = exc, ""
+            if cur in self._DEAD_STATES:
+                raise AwsWorkerError(f"snapstart slot {slot.slot_id} is {cur!r}; cannot resume")
+            try:
+                self._aws("lambda-microvms", "resume-microvm",
+                          "--microvm-identifier", str(slot.resource_id))
+            except AwsWorkerError as exc:
+                last_exc = exc      # already-running / eventual-consistency wrong-state -> fine, probe is the gate
+            time.sleep(self.cfg.resume_poll_s)
+        raise AwsWorkerError(
+            f"snapstart slot {slot.slot_id} not ready within {self.cfg.resume_timeout_s:.0f}s: {last_exc}")
+
+
+def select_lambda_snapstart_runtime(
+    *, cfg: LambdaSnapStartConfig | None = None, get_env: Callable[[str], str | None] | None = None,
+    require_available: bool = False, **kw: Any,
+) -> LambdaSnapStartRuntime:
+    import os
+    getter = get_env or os.environ.get
+    cfg = cfg or LambdaSnapStartConfig.from_env(getter)
+    # Like the disposable Lambda tier: AWS-managed PUBLIC https endpoint + JWE, so NO _inject_tls (public
+    # trust roots, not the private worker CA).
+    rt = LambdaSnapStartRuntime(cfg, **kw)
+    if require_available and not rt.available():
+        raise AwsUnavailable("aws-lambda-snapstart tier unavailable (creds/entitlement/service probe failed)")
     return rt
 
 

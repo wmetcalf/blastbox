@@ -17,14 +17,15 @@ small, well-bounded slice, captured in the profiles here:
 The **only thing that isn't config** is the worker image: it bakes the engine + its runtime deps, so
 you build one image per engine. Everything else is env.
 
-> **These tiers are COLD (disposable), not warm-snapshot.** `aws-ec2` / `aws-lambda-microvm` boot a
-> fresh worker per job and terminate it — there is no checkpoint/restore. The warm-**snapshot** tiers
-> (FC microVM snapshot, gVisor C/R, CRaC) are a *separate, local* family (file-handshake, needs
-> `/dev/kvm` or `runsc` on your own box) — see `docs/DEPLOYMENT.md` shape 2. The `*-cold-worker` image
-> is the shared substrate: those warm tiers build *from* it (FC stages a rootfs from it; gVisor
-> checkpoints a running instance of it), but on the AWS tiers it runs literally cold. A warm
-> Lambda-SnapStart pool (`resume-microvm`) is possible but **not implemented** — the current Lambda
-> runtime is one-job-then-terminate.
+> **Cold vs warm AWS tiers.** `aws-ec2` / `aws-lambda-microvm` are COLD/disposable — a fresh worker
+> boots per job and terminates. `aws-lambda-snapstart` is the **WARM** AWS tier: it runs each MicroVM
+> with an idle-policy so AWS auto-suspends idle warm slots (full mem+disk preserved — JVM/soffice stay
+> booted) and the dispatcher `resume-microvm`s one per job (sub-second), then terminates it after one
+> untrusted job. The boot + `engine.warmup()` cost is paid **off the critical path** during background
+> pool replenishment. It is still disposable-per-job (never reuses a slot across untrusted inputs).
+> The separate **local** warm-snapshot family (FC microVM snapshot, gVisor C/R, CRaC — file-handshake,
+> needs `/dev/kvm` or `runsc`) is `docs/DEPLOYMENT.md` shape 2. All AWS tiers share the `*-cold-worker`
+> image (its agent runs `engine.warmup()` before serving, so a healthy endpoint means warm).
 
 ## Usage
 
