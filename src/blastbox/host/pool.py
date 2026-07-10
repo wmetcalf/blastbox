@@ -176,6 +176,15 @@ class WarmPool:
         max_jobs_per_slot: int = 0,
     ) -> None:
         self._runtime = runtime
+        # Some runtimes (static pool) reuse a long-lived box on reap and care whether the just-finished
+        # job was DIRTY (timeout/trust-fail) so they can quarantine it instead of re-offering it while a
+        # stale request may still be running. Pass `dirty` to reap() only if it accepts the kwarg
+        # (backward-compatible: disposable runtimes reap the whole worker regardless).
+        try:
+            import inspect
+            self._reap_takes_dirty = "dirty" in inspect.signature(runtime.reap).parameters
+        except (TypeError, ValueError):
+            self._reap_takes_dirty = False
         # Reuse mode (only active when the runtime implements recycle()): serve N jobs, reset every
         # ``jobs_per_recycle`` via runtime.recycle(), reap+respawn after ``max_jobs_per_slot`` (0 =
         # unlimited reuse with periodic resets). Cheap-reset runtimes have no recycle() → disposable.
@@ -348,7 +357,7 @@ class WarmPool:
         # The replacement will be spawned by the next tick() call.
         reaped = False
         try:
-            self._reap_and_count(slot)
+            self._reap_and_count(slot, dirty=dirty)   # forward dirty so a reusing runtime can quarantine
             reaped = True
         except Exception:
             # reap() raises when it could NOT dispose the worker (e.g. a libvirt VM whose `virsh
@@ -410,10 +419,14 @@ class WarmPool:
             return bool(prepare())
         return True
 
-    def _reap_and_count(self, slot: "Slot") -> None:
-        """Reap a slot via the runtime and count the disposal (metrics)."""
+    def _reap_and_count(self, slot: "Slot", *, dirty: bool = False) -> None:
+        """Reap a slot via the runtime and count the disposal (metrics). ``dirty`` (from a failed
+        release) is forwarded to a reap() that accepts it, so a reusing runtime can quarantine."""
         try:
-            self._runtime.reap(slot)
+            if self._reap_takes_dirty:
+                self._runtime.reap(slot, dirty=dirty)  # type: ignore[call-arg]
+            else:
+                self._runtime.reap(slot)
         finally:
             record_slot_reaped()
 

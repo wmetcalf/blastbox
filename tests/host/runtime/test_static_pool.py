@@ -127,6 +127,30 @@ def test_spawn_distributes_across_distinct_boxes():
     assert idxs == {0, 1, 2}  # each claim a distinct box
 
 
+def test_dirty_reap_quarantines_box_until_cooldown():
+    # a DIRTY release (timeout/trust-fail) must NOT be re-offered until the cooldown expires, so a
+    # stale request still running in the long-lived agent has time to drain.
+    now = [1000.0]
+    cfg = _cfg("a:8765", dirty_cooldown_s=30.0)
+    rt = StaticPoolRuntime(cfg, http_probe=FakeProbe(all_ok=True), clock=lambda: now[0])
+    s1 = rt.spawn()
+    rt.reap(s1, dirty=True)                       # box goes into cooldown
+    with pytest.raises(StaticPoolExhausted):
+        rt.spawn()                                # still cooling -> not claimable
+    now[0] += 31.0                                # cooldown expires
+    s2 = rt.spawn()
+    assert s2.worker_index == s1.worker_index     # reclaimed after cooldown
+
+
+def test_clean_reap_has_no_cooldown():
+    now = [1000.0]
+    cfg = _cfg("a:8765", dirty_cooldown_s=30.0)
+    rt = StaticPoolRuntime(cfg, http_probe=FakeProbe(all_ok=True), clock=lambda: now[0])
+    s1 = rt.spawn()
+    rt.reap(s1, dirty=False)                       # clean -> immediately reusable
+    assert rt.spawn().worker_index == s1.worker_index
+
+
 def test_reap_is_idempotent():
     rt = StaticPoolRuntime(_cfg("a:8765"), http_probe=FakeProbe(all_ok=True))
     slot = rt.spawn()

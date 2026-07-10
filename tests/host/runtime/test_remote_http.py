@@ -226,6 +226,16 @@ def test_detonate_remote_caps_member_count(tmp_path):
                         http_open=_opener(many), max_members=5)
 
 
+def test_extract_excludes_metadata_from_artifact_budget(tmp_path):
+    # a job whose ARTIFACTS fit the budget but whose metadata.json would tip the byte total over must
+    # NOT be rejected -- metadata is a control file with its own cap (matches the cold trust gate).
+    big_meta = b'{"x":"' + b"a" * 900 + b'"}'      # ~910 bytes of metadata
+    tar = _tar({"metadata.json": big_meta, "p0.png": b"x" * 200})
+    # artifact budget 500: p0.png (200) fits; if metadata counted, 200+910 > 500 would (wrongly) fail.
+    written = _safe_extract_tar(tar, tmp_path, max_total_bytes=500)
+    assert set(written) == {"metadata.json", "p0.png"}
+
+
 def test_detonate_remote_caps_metadata_size(tmp_path):
     from blastbox.host.runtime.remote_http import RemoteOutputTooLarge
     (tmp_path / "in.bin").write_bytes(b"z")
@@ -395,5 +405,6 @@ def test_make_remote_validate_failure_releases_slot(tmp_path):
         output_dir_for=lambda p: tmp_path / "out", http_open=boom,
     )
     meta, ok = validate(tmp_path / "in.docx")
-    assert ok is False and meta is None
+    assert ok is False
+    assert meta == {"error": "remote worker transport error"}   # sanitized reason surfaced
     assert released == [slot]   # released even on failure

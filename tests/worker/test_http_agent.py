@@ -153,6 +153,42 @@ def test_forwards_params_and_restores_env(tmp_path):
         httpd.server_close()
 
 
+class _EgressEchoEngine:
+    """Reflects limits.net_egress into the detection label -- proves forwarded BLASTBOX_NET_EGRESS
+    reaches Limits (built AFTER the params env is installed)."""
+
+    name = "egress-echo"
+    formats = frozenset({"*"})
+
+    def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
+        (outdir / "p.png").write_bytes(b"\x89PNG")
+        return DetonationResult(
+            payload=Page(index=0, dims=Dimensions(width=1.0, height=1.0, unit="px"),
+                         image=ArtifactRef(id="a0")),
+            artifacts=[DeclaredArtifact(id="a0", path="p.png", kind="image")],
+            detected=Detection(label=("egress" if limits.net_egress else "sealed"),
+                               mime="application/octet-stream", confidence=1.0, source="test"),
+        )
+
+
+def test_forwarded_net_egress_reaches_limits(tmp_path):
+    # J1: Limits must be built INSIDE the forwarded-params env, so BLASTBOX_NET_EGRESS actually applies.
+    httpd = serve(_EgressEchoEngine(), bind="127.0.0.1", port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    inp = tmp_path / "in.bin"
+    inp.write_bytes(b"z")
+    try:
+        meta = detonate_remote(f"http://127.0.0.1:{port}", inp, tmp_path / "o1",
+                               params={"BLASTBOX_NET_EGRESS": "1"})
+        assert meta["detected"]["label"] == "egress"        # forwarded param took effect on Limits
+        meta2 = detonate_remote(f"http://127.0.0.1:{port}", inp, tmp_path / "o2")
+        assert meta2["detected"]["label"] == "sealed"        # default is fail-closed, no leak
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_harness_failure_returns_500(tmp_path, monkeypatch):
     # a non-zero run_detonation (e.g. metadata.json couldn't be sealed) must be a job failure, not 200
     monkeypatch.setattr("blastbox.worker.http_agent.run_detonation", lambda *a, **k: 1)

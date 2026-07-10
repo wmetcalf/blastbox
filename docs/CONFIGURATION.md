@@ -176,6 +176,7 @@ Selected by `BLASTBOX_POOL_RUNTIME=static`. Fail-closed: refused unless at least
 | `BLASTBOX_STATIC_WORKER_TOKEN` | — | Shared bearer token sent as `X-aws-proxy-auth` to every box (the agent's `BLASTBOX_WORKER_AGENT_TOKEN`). |
 | `BLASTBOX_STATIC_HEALTH_PATH` | `/healthz` | Health-probe path. |
 | `BLASTBOX_STATIC_PROBE_TIMEOUT_S` | `5` | Per-probe HTTP timeout. |
+| `BLASTBOX_STATIC_DIRTY_COOLDOWN_S` | `60` | After a **dirty** release (timeout/trust-fail/agent error) a box is held out of the free set this long, so a stale request still running in the long-lived agent can drain before the box is re-offered. |
 
 The fleet is finite, so **size the pool to it**: keep `BLASTBOX_POOL_CEILING <= len(BLASTBOX_STATIC_WORKERS)`
 (a claim beyond the fleet raises `StaticPoolExhausted`). Set `BLASTBOX_DISPATCH_CONCURRENCY` to the fleet

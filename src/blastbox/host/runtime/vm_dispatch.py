@@ -338,6 +338,12 @@ class VmJobDispatcher:
             summary, ok = self._validate_with_heartbeat(job, in_path)
             summary = self._bounded_summary(summary)   # cap untrusted summary before store/metadata
             err: str | None = None
+            if not ok and isinstance(summary, dict):
+                # a failing validate carries a coarse sanitized reason (remote transport/trust/engine)
+                # so the FAILED job has an actionable error instead of a bare None.
+                _e = summary.get("error")
+                if isinstance(_e, str):
+                    err = _e
             # Host trust gate on the extracted output BEFORE DONE: verify engine + input SHA, re-seal
             # artifact hashes from disk, enforce caps. A compromised/stale remote agent can't get a
             # wrong-input or unsealed result marked DONE.
@@ -461,7 +467,11 @@ class VmJobDispatcher:
         cutoff = time.time() - self._max_queued_age_s
         try:
             for job in self._store.list(status=JobStatus.QUEUED):
-                if self._engine is not None and job.engine != self._engine:
+                # Normally scope the sweep to OUR engine (a peer dispatcher owns the others). But when
+                # sole_owner (no other dispatcher on this store), also fail jobs for engines NOBODY
+                # serves -- a typo'd/mismatched engine would otherwise keep its untrusted input forever
+                # despite the TTL. Only sole_owner may safely reach across engines.
+                if not self._sole_owner and self._engine is not None and job.engine != self._engine:
                     continue
                 if job.created_at > cutoff:
                     continue

@@ -71,6 +71,9 @@ class StaticPoolConfig:
     workers: tuple[StaticWorker, ...] = ()
     health_path: str = "/healthz"
     probe_timeout_s: float = 5.0
+    # after a DIRTY release (timeout/trust-fail/agent error) a box is held out of the free set this
+    # long, so a stale request still executing in the long-lived agent has time to drain before reuse.
+    dirty_cooldown_s: float = 60.0
 
     @classmethod
     def from_env(cls, get: Callable[[str], str | None], **overrides: Any) -> StaticPoolConfig:
@@ -86,6 +89,7 @@ class StaticPoolConfig:
             workers=workers,
             health_path=_env(get, "BLASTBOX_STATIC_HEALTH_PATH", "/healthz") or "/healthz",
             probe_timeout_s=float(_env(get, "BLASTBOX_STATIC_PROBE_TIMEOUT_S", "5") or "5"),
+            dirty_cooldown_s=float(_env(get, "BLASTBOX_STATIC_DIRTY_COOLDOWN_S", "60") or "60"),
             **overrides,
         )
 
@@ -159,6 +163,10 @@ class StaticPoolRuntime:
         self._lock = threading.Lock()
         self._free: list[int] = list(range(len(cfg.workers)))
         self._ids = _Counter()
+        # worker_index -> monotonic time until which a DIRTY-released box stays quarantined (a stale,
+        # possibly-still-running request must be given time to drain before the box is re-offered).
+        self._cooldown_until: dict[int, float] = {}
+        self._dirty_cooldown_s = cfg.dirty_cooldown_s
 
     # -- helpers ------------------------------------------------------------
     def _base_url(self, w: StaticWorker) -> str:
@@ -197,7 +205,14 @@ class StaticPoolRuntime:
             )
         # claim the first free box that actually answers /healthz -- don't hand out a dead one
         # (probe outside the lock; re-check under it in case another thread claimed it meanwhile).
+        now = self._clock()
         for idx in candidates:
+            with self._lock:
+                cool = self._cooldown_until.get(idx, 0.0)
+            if cool > now:
+                _log.info("static: worker[%d] cooling down (%.0fs left), skipping for this claim",
+                          idx, cool - now)
+                continue
             if not self._health_ok(self.cfg.workers[idx]):
                 _log.warning("static: worker[%d] unhealthy, skipping for this claim", idx)
                 continue
@@ -227,12 +242,21 @@ class StaticPoolRuntime:
         # always-on boxes: "alive" == reachable
         return self._health_ok(self.cfg.workers[slot.worker_index])
 
-    def reap(self, slot: StaticWorkerSlot) -> None:
-        """Return the box to the free pool (nothing is torn down)."""
+    def reap(self, slot: StaticWorkerSlot, dirty: bool = False) -> None:
+        """Return the box to the free pool (nothing is torn down). On a DIRTY release (timeout/trust-
+        fail/agent error) QUARANTINE it for ``dirty_cooldown_s`` first -- a stale request may still be
+        running in the long-lived agent, and re-offering the box immediately would let the next claim
+        hit the agent's busy-409 or race the in-flight (untrusted-output) job. The box is still
+        appended to free, but spawn() skips it until the cooldown expires."""
         with self._lock:
+            if dirty and self._dirty_cooldown_s > 0:
+                self._cooldown_until[slot.worker_index] = self._clock() + self._dirty_cooldown_s
+            else:
+                self._cooldown_until.pop(slot.worker_index, None)   # clean release clears any cooldown
             if slot.worker_index not in self._free:
                 self._free.append(slot.worker_index)
-        _log.info("static: released worker[%d] from slot=%s", slot.worker_index, slot.slot_id)
+        _log.info("static: released worker[%d] from slot=%s (dirty=%s)",
+                  slot.worker_index, slot.slot_id, dirty)
 
 
 # ---------------------------------------------------------------------------

@@ -220,8 +220,11 @@ class _Handler(BaseHTTPRequestHandler):
                 raise _TruncatedBody
             # SAME core the cold/FC/gVisor workers use: runs the engine + seals metadata.json in out_dir.
             # Per-job params (already host-allowlisted) are applied to env just for this detonation.
-            limits = Limits.from_env()
             with _job_env(params):
+                # build Limits INSIDE the params env so dispatcher-owned overrides (BLASTBOX_NET_EGRESS,
+                # render tunables, ...) forwarded via X-Blastbox-Params actually take effect -- reading
+                # them before _job_env would pin Limits to the worker-image defaults (sealed egress).
+                limits = Limits.from_env()
                 rc = run_detonation(self.engine, input_path=in_path, output_dir=out_dir,
                                     limits=limits)
             if rc != 0:
@@ -248,10 +251,13 @@ class _Handler(BaseHTTPRequestHandler):
                     if file_cap is not None and files > file_cap:
                         spool.close()
                         raise RuntimeError(f"output exceeds {file_cap} files")
-                    total += f.stat().st_size
-                    if cap is not None and total > cap:
-                        spool.close()
-                        raise RuntimeError(f"output exceeds {cap} bytes")
+                    # metadata.json is a control file, not a declared artifact -- don't count it toward
+                    # the artifact byte budget (matches the cold trust gate + the host extractor).
+                    if f.name != "metadata.json" or f.parent != out_dir:
+                        total += f.stat().st_size
+                        if cap is not None and total > cap:
+                            spool.close()
+                            raise RuntimeError(f"output exceeds {cap} bytes")
                     tf.add(f, arcname=str(f.relative_to(out_dir)))
             spool.seek(0)
             return spool

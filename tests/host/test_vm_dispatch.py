@@ -56,6 +56,31 @@ def test_fail_stale_queued_jobs(tmp_path):
     assert store.get(fresh.job_id).status is JobStatus.QUEUED             # fresh job untouched
 
 
+def test_fail_stale_queued_sweeps_other_engines_when_sole_owner(tmp_path):
+    import time
+    store = InMemoryJobStore()
+    other = _queue_job(store, tmp_path, filename="orphan.bin")
+    other.engine = "some-unserved-engine"       # an engine THIS dispatcher doesn't serve
+    other.created_at = time.time() - 10_000
+    # sole_owner => no peer dispatcher, so a job for an engine nobody serves must still be swept.
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
+                        engine="authenticode", max_queued_age_s=1.0, sole_owner=True)
+    d._fail_stale_queued_jobs()
+    assert store.get(other.job_id).status is JobStatus.FAILED
+
+
+def test_fail_stale_queued_scopes_to_engine_when_not_sole_owner(tmp_path):
+    import time
+    store = InMemoryJobStore()
+    other = _queue_job(store, tmp_path, filename="orphan.bin")
+    other.engine = "some-other-engine"
+    other.created_at = time.time() - 10_000
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
+                        engine="authenticode", max_queued_age_s=1.0)  # sole_owner False (default)
+    d._fail_stale_queued_jobs()
+    assert store.get(other.job_id).status is JobStatus.QUEUED   # a peer owns that engine -> left alone
+
+
 def test_fail_stale_queued_disabled_by_default(tmp_path):
     import time
     store = InMemoryJobStore()

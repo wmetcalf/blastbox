@@ -134,15 +134,19 @@ class CascadingRuntime:
         tier = self._tier_of(slot)
         return tier is not None and tier.runtime.is_alive(slot)
 
-    def reap(self, slot: Any) -> None:
+    def reap(self, slot: Any, dirty: bool = False) -> None:
         with self._lock:
             i = self._owner.get(slot.slot_id)
         if i is None:
             return
         # reap FIRST; only drop ownership + decrement on success, so a failing inner reap keeps the
         # slot->tier mapping (a later stop()/retry can terminate it) and doesn't undercount capacity
-        # while the worker is still live.
-        self.tiers[i].runtime.reap(slot)
+        # while the worker is still live. Forward `dirty` to a tier reap that accepts it (static
+        # quarantine); tiers whose reap ignores it (disposable) just dispose the whole worker.
+        try:
+            self.tiers[i].runtime.reap(slot, dirty=dirty)
+        except TypeError:
+            self.tiers[i].runtime.reap(slot)
         with self._lock:
             self._owner.pop(slot.slot_id, None)
             self._counts[i] = max(0, self._counts[i] - 1)

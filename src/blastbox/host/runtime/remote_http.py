@@ -39,6 +39,22 @@ class RemoteOutputTooLarge(RuntimeError):
     """A remote worker returned more output than the configured cap allows (DoS guard)."""
 
 
+def _sanitized_failure(exc: Exception) -> str:
+    """Map a transport/trust exception to a COARSE, non-sensitive reason for the job's error field
+    (never the raw message -- it can carry hosts/paths/tokens)."""
+    import ssl as _ssl
+    import urllib.error as _ue
+    if isinstance(exc, RemoteOutputTooLarge):
+        return "remote output exceeded configured limits"
+    if type(exc).__name__ == "OutputTrustError":
+        return "remote output failed host trust validation"
+    if isinstance(exc, (_ssl.SSLError,)):
+        return "remote worker TLS error"
+    if isinstance(exc, (_ue.URLError, TimeoutError, ConnectionError, OSError)):
+        return "remote worker transport error"
+    return "remote job failed"
+
+
 def _bounded_copy(src: Any, dst: Any, limit: int | None) -> int:
     """copyfileobj that aborts once ``limit`` bytes have been read (None = unbounded)."""
     total = 0
@@ -138,7 +154,7 @@ def _empty_dir(d: Path) -> None:
 
 
 def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: int | None = None,
-                      max_members: int | None = None) -> list[str]:
+                      max_members: int | None = None, max_metadata_bytes: int | None = None) -> list[str]:
     """Extract regular files from a tar (bytes or a seekable fileobj) into ``dest``, rejecting path
     traversal and capping the total extracted bytes AND the regular-file member count (an inode-
     exhaustion guard: a buggy/compromised agent could pack hundreds of thousands of tiny files that
@@ -183,8 +199,15 @@ def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: i
                 _log.warning("remote_http: refusing to write member %r (%s)", m.name, exc)
                 continue
             with src, os.fdopen(fd, "wb") as out:
-                remaining = None if max_total_bytes is None else max_total_bytes - total
-                total += _bounded_copy(src, out, remaining)
+                # metadata.json is a CONTROL file, not a declared artifact -- bound it by its OWN cap and
+                # DON'T count it toward the artifact byte total, so the remote tier matches the cold trust
+                # gate (which caps metadata separately). Otherwise a job whose artifacts fit the budget but
+                # whose metadata tips the sum over would be failed only on the remote path.
+                if m.name == "metadata.json":
+                    _bounded_copy(src, out, max_metadata_bytes)
+                else:
+                    remaining = None if max_total_bytes is None else max_total_bytes - total
+                    total += _bounded_copy(src, out, remaining)
             written.append(str(resolved.relative_to(dest)))
     return written
 
@@ -237,7 +260,8 @@ def detonate_remote(
                 tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:
             _bounded_copy(resp, spool, stream_cap)
             spool.seek(0)
-            _safe_extract_tar(spool, output_dir, max_total_bytes=max_output_bytes, max_members=max_members)
+            _safe_extract_tar(spool, output_dir, max_total_bytes=max_output_bytes,
+                              max_members=max_members, max_metadata_bytes=max_metadata_bytes)
     meta = output_dir / "metadata.json"
     if meta.exists():
         # bound the metadata BEFORE parsing -- a worker can put an under-artifact-budget-but-huge
@@ -299,7 +323,8 @@ def make_remote_validate(
             # dispatcher paths do (missing/invalid metadata or engine_error => fail).
             if not meta or meta.get("status") == "engine_error":
                 _log.warning("remote_http: remote job not ok (status=%s)", (meta or {}).get("status"))
-                return meta or None, False
+                reason = "remote engine error" if meta else "remote worker returned no metadata"
+                return {"error": reason}, False
             # HOST TRUST GATE -- runs BEFORE the slot is released clean, so a worker whose output fails
             # host validation (re-sealed hashes / engine / input_sha / caps) stays dirty and is retired
             # rather than re-offered. It re-writes the host-sealed metadata.json in out_dir; re-read it.
@@ -317,7 +342,9 @@ def make_remote_validate(
             # transport error after the request may have reached the worker -> the box could still be
             # busy; keep dirty=True so the pool retires/recycles it instead of re-offering immediately.
             _log.warning("remote_http: validate failed: %s", exc)
-            return None, False
+            # surface a COARSE, sanitized reason (exception CLASS, not its message) so a failed remote
+            # job carries an actionable error the API can show -- without leaking hosts/paths/internals.
+            return {"error": _sanitized_failure(exc)}, False
         finally:
             try:
                 release(slot, dirty=dirty)
