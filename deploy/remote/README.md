@@ -17,6 +17,15 @@ small, well-bounded slice, captured in the profiles here:
 The **only thing that isn't config** is the worker image: it bakes the engine + its runtime deps, so
 you build one image per engine. Everything else is env.
 
+> **These tiers are COLD (disposable), not warm-snapshot.** `aws-ec2` / `aws-lambda-microvm` boot a
+> fresh worker per job and terminate it — there is no checkpoint/restore. The warm-**snapshot** tiers
+> (FC microVM snapshot, gVisor C/R, CRaC) are a *separate, local* family (file-handshake, needs
+> `/dev/kvm` or `runsc` on your own box) — see `docs/DEPLOYMENT.md` shape 2. The `*-cold-worker` image
+> is the shared substrate: those warm tiers build *from* it (FC stages a rootfs from it; gVisor
+> checkpoints a running instance of it), but on the AWS tiers it runs literally cold. A warm
+> Lambda-SnapStart pool (`resume-microvm`) is possible but **not implemented** — the current Lambda
+> runtime is one-job-then-terminate.
+
 ## Usage
 
 Pick a **tier** and pick an **engine profile**. Source the engine profile, then set the tier knobs
