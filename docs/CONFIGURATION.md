@@ -39,6 +39,8 @@ and the tier-capability matrix.
 |---|---|---|
 | `BLASTBOX_DISPATCH_CONCURRENCY` | `1` | Dispatch-loop worker threads. **On a warm tier this MUST equal the warm pool size** — the warm path blocks until the job finishes, so N threads are needed to keep N slots busy (default 1 starves the pool). |
 | `BLASTBOX_DISPATCH_WARM_ONLY` | `""` (off) | Claim-gate primitive: only claim jobs when a warm slot is free, and **never cold-fall-back** — overflow stays queued for the cold dispatcher. This is what makes a process a *warm sidecar*. |
+| `BLASTBOX_MAX_QUEUED_AGE_S` | `0` (off) | TTL after which a job still QUEUED is FAILed and its (untrusted) input deleted — bounds the `target_tier` footgun (a job pinned to a tier no dispatcher serves). Honored by **both** the cold `Dispatcher` **and** the network-endpoint (static/AWS/cascade) dispatcher. |
+| `BLASTBOX_DISPATCH_SOLE_OWNER` | `0` | Network-endpoint dispatcher only. `1` ⇒ this is the **only** dispatcher on the store, so orphan recovery may also reclaim a claim that crashed before the `worker_runtime="warm"` stamp. Leave `0` on a **shared** store (a cold dispatcher for the same engine) — it would otherwise FAIL that peer's live jobs. |
 
 ## Runtime selection (docker: runc / runsc)
 
@@ -140,9 +142,10 @@ win-validator stays libvirt — no Windows/nested-virt on either).
 | **Lambda MicroVM** (`aws-lambda-microvm`) | | transport = per-VM HTTPS URL + JWE token |
 | `BLASTBOX_LAMBDA_IMAGE` | — | **Required.** An **in-account** MicroVM image ARN built via `create-microvm-image` (the managed base `…:aws:microvm-image:al2023-1` is **not** directly runnable — verified live). |
 | `BLASTBOX_LAMBDA_EXEC_ROLE_ARN` | — | Execution role for `run-microvm`. |
-| `BLASTBOX_LAMBDA_EGRESS_CONNECTORS` | `""` | Comma-list of egress-connector ids (list arg). **Empty ⇒ AWS default `INTERNET_EGRESS` (not sealed)** — pass a no-internet connector to seal outbound. |
+| `BLASTBOX_LAMBDA_EGRESS_CONNECTORS` | `""` | Comma-list of egress-connector ids (list arg). **Empty ⇒ AWS default `INTERNET_EGRESS` (not sealed).** Pass a no-internet connector to seal outbound. **Without one the tier refuses to start** (fail-closed — see `ALLOW_DEFAULT_EGRESS`) because default internet egress silently contradicts a `net_policy='none'` engine. |
+| `BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS` | `0` | `1` ⇒ explicitly accept AWS's default **public internet** egress when no egress connector is set (otherwise the tier fail-closes). Use only when internet egress is intended; set the engine's `net_policy` accordingly. |
 | `BLASTBOX_LAMBDA_INGRESS_CONNECTORS` | `""` | Comma-list of ingress-connector ids (empty ⇒ none configured). |
-| `BLASTBOX_LAMBDA_AUTH_TTL_MIN` | `15` | JWE lifetime for `create-microvm-auth-token` (`--expiration-in-minutes`); token is minted fresh at probe time + scoped to the agent port. |
+| `BLASTBOX_LAMBDA_AUTH_TTL_MIN` | `15` | JWE lifetime for `create-microvm-auth-token` (`--expiration-in-minutes`); minted fresh at probe time, scoped to the agent port, and **reused across readiness ticks within half its TTL** (no per-tick control-plane call). |
 | **Disposable EC2** (`aws-ec2`) | | transport = instance IP:port (private by default) |
 | `BLASTBOX_EC2_AMI` | — | **Required.** Worker AMI (agent brought up via user-data). |
 | `BLASTBOX_EC2_INSTANCE_TYPE` | `m7g.large` | ARM64 default (matches the sealed-Linux ARM image); override for x86. |
