@@ -139,7 +139,8 @@ class Job:
 # claimant's tier are matched against this vocabulary.
 # NETWORK_ENDPOINT_TIERS drive workers over HTTP (the generic http_agent + remote_http transport)
 # via VmJobDispatcher, rather than the file-handshake path fc/gvisor use.
-NETWORK_ENDPOINT_TIERS = ("aws-ec2", "aws-lambda-microvm", "aws-lambda-snapstart", "static", "cascade")
+NETWORK_ENDPOINT_TIERS = ("aws-ec2", "aws-ec2-hibernate", "aws-lambda-microvm", "aws-lambda-snapstart",
+                          "static", "cascade")
 WARM_TIERS = ("firecracker", "gvisor", "libvirt-vm", *NETWORK_ENDPOINT_TIERS)
 VALID_TIERS = ("cold", *WARM_TIERS)
 

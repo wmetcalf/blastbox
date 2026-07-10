@@ -23,6 +23,7 @@ RUNTIME_GVISOR = "gvisor"
 RUNTIME_AWS_LAMBDA_MICROVM = "aws-lambda-microvm"
 RUNTIME_AWS_LAMBDA_SNAPSTART = "aws-lambda-snapstart"
 RUNTIME_AWS_EC2 = "aws-ec2"
+RUNTIME_AWS_EC2_HIBERNATE = "aws-ec2-hibernate"
 RUNTIME_STATIC = "static"
 RUNTIME_CASCADE = "cascade"
 
@@ -117,6 +118,10 @@ def select_runtime_by_name(
         from blastbox.host.runtime.aws_worker import select_disposable_ec2_runtime
 
         return select_disposable_ec2_runtime(require_available=require_available)
+    if name == RUNTIME_AWS_EC2_HIBERNATE:
+        from blastbox.host.runtime.aws_worker import select_ec2_hibernate_runtime
+
+        return select_ec2_hibernate_runtime(require_available=require_available)
     if name == RUNTIME_STATIC:
         from blastbox.host.runtime.static_pool import select_static_pool_runtime
 

@@ -719,6 +719,7 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
             args += ["--iam-instance-profile", f"Name={c.iam_instance_profile}"]
         if c.key_name:
             args += ["--key-name", c.key_name]
+        args += self._extra_launch_args()   # subclass hook (e.g. hibernate: --hibernation-options + EBS)
         # The aws CLI base64-encodes --user-data itself, so hand it the RAW text (decoded from our
         # stored base64) or it would double-encode and the agent would never start.
         user_data = None
@@ -763,6 +764,11 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
         headers = {"X-aws-proxy-auth": self.cfg.agent_token} if self.cfg.agent_token else {}
         return self._probe(url, headers, self.cfg.probe_timeout_s)
 
+    def _extra_launch_args(self) -> list[str]:
+        """Extra `run-instances` args a subclass appends (base: none). The hibernate tier adds
+        --hibernation-options + an encrypted root EBS volume."""
+        return []
+
     def _terminate(self, slot: AwsWorkerSlot) -> None:
         self._aws("ec2", "terminate-instances", "--instance-ids", str(slot.resource_id))
 
@@ -777,4 +783,235 @@ def select_disposable_ec2_runtime(
     rt = DisposableEc2Runtime(cfg, **_inject_tls(getter, kw))
     if require_available and not rt.available():
         raise AwsUnavailable("aws-ec2 tier unavailable (creds/service probe failed)")
+    return rt
+
+
+# ---------------------------------------------------------------------------
+# EC2 WARM (hibernate C/R) tier — stop-hibernate / start, per-instance
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Ec2HibernateConfig(Ec2Config):
+    # EC2 Hibernate = the warm C/R primitive: stop-instances --hibernate saves the instance's RAM to the
+    # (encrypted) root EBS and start-instances restores it -- the warmed process (JVM/soffice) survives.
+    # Unlike Lambda's platform idle-policy, EC2 has NO auto-hibernate, so the RUNTIME parks a warmed slot
+    # itself (boot -> warm -> stop --hibernate -> parked) and starts it on claim. The private IP is
+    # retained across stop/start, so the endpoint is stable. Requires an encrypted root volume + a
+    # hibernation-capable instance type (e.g. t4g/m6g/c6g, RAM <= 150 GB) + a hibernation-enabled AMI.
+    # the guest self-terminate shutdown timer conflicts with parking (on resume a wall-clock jump can
+    # fire it immediately) -- default it OFF here regardless of construction path.
+    self_terminate: bool = False
+    root_device_name: str = "/dev/xvda"   # AL2023 ARM64 root device
+    root_volume_gb: int = 30              # >= RAM + OS; the EBS must hold the saved RAM image
+    # the pool's WARMING eviction budget must cover boot + engine.warmup + the ec2-hibinit reserve wait
+    # + stop --hibernate -> stopped (all in is_ready) -- much longer than a fresh-boot readiness.
+    ready_timeout_s: float = 600.0
+    resume_timeout_s: float = 180.0       # < worker_timeout (300) so a slow start leaves budget for the job
+    resume_poll_s: float = 5.0
+    hibernate_timeout_s: float = 300.0    # per-slot budget for stop --hibernate -> stopped before re-driving
+
+    @classmethod
+    def from_env(cls, get: Callable[[str], str | None], **overrides: Any) -> Ec2HibernateConfig:
+        import dataclasses
+        base = Ec2Config.from_env(get)
+        fields = {f.name: getattr(base, f.name) for f in dataclasses.fields(Ec2Config)}
+        fields["self_terminate"] = (get("BLASTBOX_EC2_SELF_TERMINATE") or "0").strip().lower() in ("1", "true", "yes")
+        fields.update(
+            root_device_name=_env(get, "BLASTBOX_EC2_ROOT_DEVICE", "/dev/xvda") or "/dev/xvda",
+            root_volume_gb=int(_env(get, "BLASTBOX_EC2_ROOT_VOLUME_GB", "30") or "30"),
+            ready_timeout_s=float(_env(get, "BLASTBOX_EC2_HIBERNATE_READY_TIMEOUT_S", "600") or "600"),
+            resume_timeout_s=float(_env(get, "BLASTBOX_EC2_HIBERNATE_RESUME_TIMEOUT_S", "180") or "180"),
+            resume_poll_s=float(_env(get, "BLASTBOX_EC2_HIBERNATE_RESUME_POLL_S", "5") or "5"),
+            hibernate_timeout_s=float(_env(get, "BLASTBOX_EC2_HIBERNATE_TIMEOUT_S", "300") or "300"),
+        )
+        fields.update(overrides)
+        return cls(**fields)
+
+
+class Ec2HibernateRuntime(DisposableEc2Runtime):
+    """WARM EC2 tier via hibernate C/R. spawn boots+warms an instance in the background; is_ready drives
+    a per-slot state machine (warm -> stop --hibernate -> parked STOPPED); resume(slot) start-instances +
+    health-gates it on claim (private IP retained -> stable endpoint); reap terminates it after ONE
+    untrusted job (disposable-warm, never reused across inputs). The warmed process survives the
+    hibernate/start because EC2 saves+restores RAM."""
+
+    kind = "aws-ec2-hibernate"
+    _ALIVE_STATES = ("pending", "running", "stopping", "stopped")
+    _DEAD_STATES = ("shutting-down", "terminated")
+
+    def __init__(self, cfg: Ec2HibernateConfig, **kw: Any) -> None:
+        super().__init__(cfg, **kw)
+        self.cfg: Ec2HibernateConfig = cfg
+        self._phase: dict[str, str] = {}   # slot_id -> "warming" | "hibernating" | "parked"
+        self._desc_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._hib_attempt: dict[str, float] = {}   # slot_id -> last stop --hibernate attempt (throttle)
+        self._hib_started: dict[str, float] = {}   # slot_id -> when it entered the hibernating phase
+
+    def _service_available(self) -> bool:
+        # fail LOUD (once, at pool build) on a hibernation-incapable config instead of churning
+        # launch->warm->stop-fails->reap->respawn forever. Verify the instance type supports hibernation
+        # and the root volume can hold the RAM image.
+        super()._service_available()   # describe-instances probe
+        d = self._aws("ec2", "describe-instance-types", "--instance-types", self.cfg.instance_type)
+        its = d.get("InstanceTypes", [])
+        if not its or not its[0].get("HibernationSupported"):
+            raise AwsWorkerError(
+                f"aws-ec2-hibernate: instance type {self.cfg.instance_type!r} does not support hibernation "
+                "(pick a hibernation-capable type, e.g. t4g/m6g/m7g)")
+        ram_mib = int(its[0].get("MemoryInfo", {}).get("SizeInMiB", 0))
+        if ram_mib and self.cfg.root_volume_gb * 1024 < ram_mib:
+            raise AwsWorkerError(
+                f"aws-ec2-hibernate: root_volume_gb={self.cfg.root_volume_gb} is smaller than the "
+                f"instance RAM ({ram_mib} MiB) -- hibernation saves RAM to the root EBS; raise "
+                "BLASTBOX_EC2_ROOT_VOLUME_GB")
+        return True
+
+    def _extra_launch_args(self) -> list[str]:
+        import json
+        ebs = [{"DeviceName": self.cfg.root_device_name,
+                "Ebs": {"Encrypted": True, "VolumeSize": self.cfg.root_volume_gb,
+                        "DeleteOnTermination": True}}]
+        # hibernation requires an ENCRYPTED root volume large enough to hold the saved RAM image.
+        return ["--hibernation-options", "Configured=true", "--block-device-mappings", json.dumps(ebs)]
+
+    def _describe_cached(self, slot: AwsWorkerSlot, ttl: float) -> dict[str, Any]:
+        now = self._clock()
+        cached = self._desc_cache.get(slot.slot_id)
+        if cached is not None and (now - cached[0]) < ttl:
+            return cached[1]
+        desc = self._describe(slot)
+        self._desc_cache[slot.slot_id] = (now, desc)
+        return desc
+
+    def _state(self, slot: AwsWorkerSlot) -> str:
+        return str(self._describe(slot).get("State", {}).get("Name", "")).lower()   # UNCACHED
+
+    def _running(self, slot: AwsWorkerSlot) -> bool:
+        # a PARKED (stopped/hibernated) warm slot is ALIVE -- whitelist so the pool health-check doesn't
+        # reap parked slots; empty/unknown/dead -> not alive -> reaped.
+        return self._state(slot) in self._ALIVE_STATES
+
+    def _resolve_ip(self, slot: AwsWorkerSlot, *, refresh: bool = False) -> None:
+        if slot.ip is not None and not refresh:
+            return
+        if refresh:
+            # a resumed instance gets a NEW public IP (private IP is retained). Bypass the describe cache
+            # and drop the stale IP so we never probe/POST the token to the pre-hibernate (reassigned) IP.
+            self._desc_cache.pop(slot.slot_id, None)
+            if self.cfg.use_public_ip:
+                slot.ip = None
+        inst = self._describe_cached(slot, 0.0 if refresh else self._liveness_cache_s)
+        ip = inst.get("PublicIpAddress") if self.cfg.use_public_ip else inst.get("PrivateIpAddress")
+        if ip:
+            slot.ip = str(ip)
+
+    def _agent_healthy(self, slot: AwsWorkerSlot) -> bool:
+        self._resolve_ip(slot)
+        if slot.ip is None:
+            return False
+        scheme = "https" if self.ssl_context else "http"
+        url = f"{scheme}://{slot.ip}:{self.cfg.agent_port}{self.cfg.agent_health_path}"
+        headers = {"X-aws-proxy-auth": self.cfg.agent_token} if self.cfg.agent_token else {}
+        return self._probe(url, headers, self.cfg.probe_timeout_s)
+
+    def is_ready(self, slot: AwsWorkerSlot) -> bool:
+        # Per-slot state machine, polled by the pool during WARMING: boot -> warm -> hibernate -> parked.
+        try:
+            now = self._clock()
+            phase = self._phase.get(slot.slot_id, "warming")
+            if phase == "warming":
+                if str(self._describe_cached(slot, self._liveness_cache_s)
+                       .get("State", {}).get("Name", "")).lower() != "running":
+                    return False
+                if not self._agent_healthy(slot):
+                    return False
+                # Warmed -> PARK it: stop --hibernate. THROTTLE the attempt (the pool polls is_ready at
+                # ~10Hz) -- and TOLERATE "not ready to hibernate yet" (the ec2-hibinit-agent needs ~1-2min
+                # after boot to lay down the hibernation reserve). On a failed/throttled attempt we stay
+                # in "warming" and retry on a later tick; only a SUCCESSFUL stop advances to "hibernating".
+                if now - self._hib_attempt.get(slot.slot_id, 0.0) < self._liveness_cache_s:
+                    return False
+                self._hib_attempt[slot.slot_id] = now
+                try:
+                    self._aws("ec2", "stop-instances", "--instance-ids", str(slot.resource_id), "--hibernate")
+                except AwsWorkerError as exc:
+                    _log.info("ec2-hibernate: stop --hibernate %s not ready yet (%s); will retry",
+                              slot.slot_id, str(exc)[:120])
+                    return False
+                self._desc_cache.pop(slot.slot_id, None)   # force a fresh describe next poll
+                self._phase[slot.slot_id] = "hibernating"
+                self._hib_started[slot.slot_id] = now
+                return False
+            if phase == "hibernating":
+                st = str(self._describe_cached(slot, self._liveness_cache_s)
+                         .get("State", {}).get("Name", "")).lower()
+                if st == "stopped":
+                    self._phase[slot.slot_id] = "parked"
+                    return True
+                # RECOVERY: hibernate can be ACCEPTED then fail async (instance lands back 'running'), or
+                # hang. Don't sit in 'hibernating' forever spinning until warming_timeout -- re-drive from
+                # 'warming' (the stop is re-issued, throttled) if it came back running or blew the budget.
+                started = self._hib_started.get(slot.slot_id, now)
+                if st in self._DEAD_STATES:
+                    return False   # is_alive/_health_check will reap it
+                if st == "running" or (now - started) > self.cfg.hibernate_timeout_s:
+                    _log.info("ec2-hibernate: %s hibernate did not take (state=%s, %.0fs) -- re-driving",
+                              slot.slot_id, st, now - started)
+                    self._phase[slot.slot_id] = "warming"
+                return False
+            return True   # parked -- claimable; resume() wakes it on claim
+        except (AwsWorkerError, OSError) as exc:
+            _log.debug("ec2-hibernate: is_ready(%s) error: %s", slot.slot_id, exc)
+            return False
+
+    def resume(self, slot: AwsWorkerSlot) -> None:
+        """Start a hibernated slot and block until its agent answers, BEFORE the job POSTs. Called by the
+        dispatcher's claim seam. Raises on failure so the claim retires the slot dirty."""
+        import time
+        st = self._state(slot)
+        if st in self._DEAD_STATES:
+            raise AwsWorkerError(f"ec2-hibernate slot {slot.slot_id} is {st!r}; cannot resume")
+        if st == "stopped":
+            self._aws("ec2", "start-instances", "--instance-ids", str(slot.resource_id))
+        self._resolve_ip(slot, refresh=True)   # private IP is retained, but re-describe to be safe
+        deadline = self._clock() + self.cfg.resume_timeout_s
+        last_exc: Exception | None = None
+        while self._clock() < deadline:
+            try:
+                if self._agent_healthy(slot):
+                    return
+            except (AwsWorkerError, OSError) as exc:
+                last_exc = exc
+            try:
+                cur = self._state(slot)
+            except (AwsWorkerError, OSError) as exc:
+                last_exc, cur = exc, ""
+            if cur in self._DEAD_STATES:
+                raise AwsWorkerError(f"ec2-hibernate slot {slot.slot_id} is {cur!r}; cannot resume")
+            if cur == "stopped":   # not yet starting (or slid back) -> (re)issue start
+                try:
+                    self._aws("ec2", "start-instances", "--instance-ids", str(slot.resource_id))
+                except AwsWorkerError as exc:
+                    last_exc = exc
+            self._resolve_ip(slot, refresh=True)
+            time.sleep(self.cfg.resume_poll_s)
+        raise AwsWorkerError(
+            f"ec2-hibernate slot {slot.slot_id} not ready within {self.cfg.resume_timeout_s:.0f}s: {last_exc}")
+
+    def reap(self, slot: AwsWorkerSlot) -> None:
+        for d in (self._phase, self._desc_cache, self._hib_attempt, self._hib_started):
+            d.pop(slot.slot_id, None)
+        super().reap(slot)   # terminate-instances (disposable after one untrusted job)
+
+
+def select_ec2_hibernate_runtime(
+    *, cfg: Ec2HibernateConfig | None = None, get_env: Callable[[str], str | None] | None = None,
+    require_available: bool = False, **kw: Any,
+) -> Ec2HibernateRuntime:
+    import os
+    getter = get_env or os.environ.get
+    cfg = cfg or Ec2HibernateConfig.from_env(getter)
+    rt = Ec2HibernateRuntime(cfg, **_inject_tls(getter, kw))   # self-hosted EC2 agent -> worker mTLS applies
+    if require_available and not rt.available():
+        raise AwsUnavailable("aws-ec2-hibernate tier unavailable (creds/service probe failed)")
     return rt

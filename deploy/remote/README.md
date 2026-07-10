@@ -18,7 +18,10 @@ The **only thing that isn't config** is the worker image: it bakes the engine + 
 you build one image per engine. Everything else is env.
 
 > **Cold vs warm AWS tiers.** `aws-ec2` / `aws-lambda-microvm` are COLD/disposable — a fresh worker
-> boots per job and terminates. `aws-lambda-snapstart` is the **WARM** AWS tier: it runs each MicroVM
+> boots per job and terminates. Two **WARM** AWS tiers pay the boot+warmup once and park:
+> **`aws-ec2-hibernate`** (`stop --hibernate`/`start` C/R — RAM saved to encrypted EBS) and
+> **`aws-lambda-snapstart`** (suspend/resume). Both are disposable-per-job and live-proven (the same
+> warmed PID served the pre-park and post-resume jobs). `aws-lambda-snapstart` runs each MicroVM
 > with an idle-policy so AWS auto-suspends idle warm slots (full mem+disk preserved — JVM/soffice stay
 > booted) and the dispatcher `resume-microvm`s one per job (sub-second), then terminates it after one
 > untrusted job. The boot + `engine.warmup()` cost is paid **off the critical path** during background

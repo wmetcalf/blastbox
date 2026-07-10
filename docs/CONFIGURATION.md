@@ -80,7 +80,7 @@ and the tier-capability matrix.
 
 | Var | Default | Notes |
 |---|---|---|
-| `BLASTBOX_POOL_RUNTIME` | runtime default | Warm backend: `firecracker`, `gvisor`, `aws-lambda-microvm`, `aws-lambda-snapstart` (warm AWS — suspend/resume), `aws-ec2`, `static`, or `cascade` (tiered local→overflow). |
+| `BLASTBOX_POOL_RUNTIME` | runtime default | Warm backend: `firecracker`, `gvisor`, `aws-lambda-microvm`, `aws-lambda-snapstart` (warm AWS — suspend/resume), `aws-ec2`, `aws-ec2-hibernate` (warm AWS — hibernate C/R), `static`, or `cascade` (tiered local→overflow). |
 | `BLASTBOX_POOL_WARM_SIZE` | — | Number of pre-warmed slots. |
 | `BLASTBOX_POOL_CEILING` | — | Max concurrent slots (warm + burst). |
 | `BLASTBOX_POOL_BURST_SIZE` | — | Extra cold-burst slots above the warm set under load. |
@@ -162,6 +162,14 @@ win-validator stays libvirt — no Windows/nested-virt on either).
 | `BLASTBOX_EC2_USER_DATA_B64` | — | base64 cloud-init that starts the worker agent on `AGENT_PORT` (any format — merged into MIME-multipart with the auto TTL). |
 | `BLASTBOX_EC2_SELF_TERMINATE` | `1` | Inject a guest self-shutdown after `MAX_DURATION_S` (MIME-multipart, on top of your user-data) so a **crashed dispatcher can't leak a running instance** — `--instance-initiated-shutdown-behavior terminate` then reaps it. Set `0` if the AMI handles its own TTL. |
 | `BLASTBOX_EC2_AGENT_TOKEN` | — | Bearer token the AMI's agent expects (`BLASTBOX_WORKER_AGENT_TOKEN`); forwarded on both the readiness probe and `/detonate`. |
+| **EC2 WARM / Hibernate** (`aws-ec2-hibernate`) | | the WARM EC2 tier — `stop --hibernate` / `start` C/R |
+| _(reuses all `BLASTBOX_EC2_*` + `BLASTBOX_AWS_*` above)_ | | Same AMI/subnet/SG/agent-token config as `aws-ec2`, PLUS: needs a **hibernation-capable** instance type (t4g/m6g/m7g/…, RAM ≤ 150 GB) and an AMI that supports hibernation (AL2023 does). Fail-closed preflight refuses an incapable type or an undersized root volume. |
+| `BLASTBOX_EC2_ROOT_VOLUME_GB` | `30` | Encrypted root EBS size — must be **≥ the instance RAM** (hibernation saves RAM to it). Raise for large-memory types. |
+| `BLASTBOX_EC2_ROOT_DEVICE` | `/dev/xvda` | Root device name (AL2023 ARM64). |
+| `BLASTBOX_EC2_HIBERNATE_READY_TIMEOUT_S` | `600` | Warming budget — must cover boot + `engine.warmup()` + the `ec2-hibinit` reserve wait + `stop --hibernate` → stopped (all in `is_ready`). |
+| `BLASTBOX_EC2_HIBERNATE_RESUME_TIMEOUT_S` | `180` | Budget for `start-instances` + `/healthz` on claim (kept below the job timeout). |
+| `BLASTBOX_EC2_HIBERNATE_TIMEOUT_S` | `300` | Per-slot budget for `stop --hibernate` → `stopped`; if hibernation doesn't take (instance lands back `running`) the slot re-drives. |
+| `BLASTBOX_EC2_SELF_TERMINATE` | `0` (off) | The guest shutdown-TTL is **off** by default here (it would fire on resume after a wall-clock jump and kill the parked slot). |
 
 The **generic worker agent** (`python -m blastbox.worker.http_agent`, `BLASTBOX_ENGINE=module:Class`)
 serves any engine over `GET /healthz` + `POST /detonate`; bake it + the engine + its deps into the
@@ -178,6 +186,18 @@ claimed slot and health-gates it **before** the job POSTs (sub-second — JVM/so
 boot + warmup cost is paid off the critical path during background replenishment. Same fail-closed
 egress + JWE + public-AWS-TLS model as `aws-lambda-microvm`; size `BLASTBOX_POOL_WARM_SIZE` to the
 warm depth you want parked.
+
+**`aws-ec2-hibernate` — the WARM EC2 tier.** EC2's warm C/R primitive is **Hibernate**: `stop-instances
+--hibernate` saves the instance RAM to the encrypted root EBS (→ `stopped`) and `start-instances`
+restores it (→ `running`), so the warmed process (JVM/soffice) survives. Unlike Lambda's platform
+idle-policy, EC2 has no auto-hibernate, so the runtime parks a warmed slot itself: `is_ready` drives a
+per-slot state machine (wait `running` + agent `/healthz` → `stop --hibernate` → wait `stopped` →
+parked), and the `resume` seam `start-instances` + health-gates it on claim (the **private IP is
+retained** across stop/start, so the endpoint is stable). Terminated after one untrusted job
+(disposable-warm). The `ec2-hibinit` agent needs ~1–2 min after boot before `stop --hibernate` is
+accepted ("not ready to hibernate yet") — the state machine throttles + retries that automatically.
+Both warm-survival cycles are **live-proven on real AWS** (the same warmed PID served the pre-hibernate
+and post-resume jobs). Self-hosted agent → worker mTLS applies (unlike the AWS-fronted Lambda tiers).
 
 ## Runtime: static worker pool (`static`)
 

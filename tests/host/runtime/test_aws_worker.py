@@ -19,11 +19,14 @@ from blastbox.host.runtime.aws_worker import (
     AwsWorkerSlot,
     DisposableEc2Runtime,
     Ec2Config,
+    Ec2HibernateConfig,
+    Ec2HibernateRuntime,
     LambdaMicroVmConfig,
     LambdaMicroVmRuntime,
     LambdaSnapStartConfig,
     LambdaSnapStartRuntime,
     select_lambda_microvm_runtime,
+    select_ec2_hibernate_runtime,
     select_lambda_snapstart_runtime,
 )
 
@@ -577,6 +580,193 @@ def test_ec2_forwards_agent_token():
     assert slot.auth_token == "tok123"                     # forwarded to the /detonate transport
     assert rt.is_ready(slot) is True
     assert seen[-1].get("X-aws-proxy-auth") == "tok123"    # and sent in the readiness probe
+
+
+# --------------------------------------------------------------------------- EC2 hibernate (warm) tier
+
+def _hibernate_rt(*, state, healthy, clock=lambda: 100.0, **cfgkw):  # noqa: ANN001
+    """state=[str] and healthy=[bool] are 1-elem lists the test mutates to drive the state machine."""
+    cfg = Ec2HibernateConfig(region="us-east-1", image_id="ami-x", instance_type="t4g.nano",
+                             resume_poll_s=0.0, **cfgkw)
+
+    def describe(argv):  # noqa: ANN001 -- callable response reads the CURRENT state each call
+        return _cp(stdout=json.dumps({"Reservations": [{"Instances": [
+            {"InstanceId": "i-1", "State": {"Name": state[0]}, "PrivateIpAddress": "10.0.0.5"}]}]}))
+
+    fake = FakeAws({
+        **_IDENT,
+        "ec2 run-instances": {"Instances": [{"InstanceId": "i-1"}]},
+        "ec2 describe-instances": describe,
+        "ec2 stop-instances": {},
+        "ec2 start-instances": {},
+    })
+    rt = Ec2HibernateRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: healthy[0], clock=clock)
+    return rt, fake
+
+
+def test_ec2_hibernate_launch_adds_hibernation_and_encrypted_ebs():
+    rt, fake = _hibernate_rt(state=["running"], healthy=[False])
+    rt._launch()
+    argv = next(a for k, a in fake.calls if k == "ec2 run-instances")
+    assert "--hibernation-options" in argv and "Configured=true" in argv
+    joined = " ".join(argv)
+    assert '"Encrypted": true' in joined or '"Encrypted":true' in joined   # encrypted root volume
+
+
+def test_ec2_hibernate_state_machine_parks_a_warmed_slot():
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    state, healthy = ["running"], [False]
+    rt, fake = _hibernate_rt(state=state, healthy=healthy)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    assert rt.is_ready(slot) is False                       # running but agent not up
+    healthy[0] = True
+    assert rt.is_ready(slot) is False                       # agent up -> issues stop --hibernate
+    assert any(k == "ec2 stop-instances" and "--hibernate" in a for k, a in fake.calls)
+    n_hib = sum(1 for k, a in fake.calls if k == "ec2 stop-instances")
+    state[0] = "stopped"
+    assert rt.is_ready(slot) is True                        # hibernated -> parked -> claimable
+    rt.is_ready(slot)                                       # parked stays ready, no more hibernate calls
+    assert sum(1 for k, a in fake.calls if k == "ec2 stop-instances") == n_hib   # issued exactly once
+
+
+def test_ec2_hibernate_tolerates_not_ready_and_throttles():
+    # stop --hibernate can fail "not ready to hibernate yet" for ~1-2min after boot (ec2-hibinit-agent
+    # lays down the reserve). is_ready must STAY warming + retry (throttled), never falsely advance.
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    state, healthy, ticks, hib_ok = ["running"], [True], [1000.0], [False]
+    rt, fake = _hibernate_rt(state=state, healthy=healthy, clock=lambda: ticks[0])
+
+    def stop(argv):  # noqa: ANN001
+        if not hib_ok[0]:
+            return _cp(rc=254, stderr="An error occurred (UnsupportedOperation): not ready to hibernate yet")
+        return _cp(stdout="{}")
+
+    fake.responses["ec2 stop-instances"] = stop
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    assert rt.is_ready(slot) is False                                   # attempts hibernate, not-ready -> warming
+    assert sum(1 for k, a in fake.calls if k == "ec2 stop-instances") == 1
+    assert rt.is_ready(slot) is False                                   # immediate retry THROTTLED
+    assert sum(1 for k, a in fake.calls if k == "ec2 stop-instances") == 1   # no new attempt
+    ticks[0] += 10.0
+    hib_ok[0] = True
+    assert rt.is_ready(slot) is False                                   # past cooldown -> retries -> succeeds
+    assert sum(1 for k, a in fake.calls if k == "ec2 stop-instances") == 2
+    state[0] = "stopped"
+    assert rt.is_ready(slot) is True                                    # now parked
+
+
+def test_ec2_hibernate_running_whitelist():
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    for st in ("pending", "running", "stopping", "stopped"):
+        rt, _ = _hibernate_rt(state=[st], healthy=[False])
+        assert rt._running(slot) is True, st                # parked (stopped) counts alive
+    for st in ("shutting-down", "terminated", ""):
+        rt, _ = _hibernate_rt(state=[st], healthy=[False])
+        assert rt._running(slot) is False, st               # dead/unknown -> reaped
+
+
+def test_ec2_hibernate_resume_starts_and_health_gates():
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    state, healthy = ["stopped"], [True]                    # already reachable-after-start in this fake
+    rt, fake = _hibernate_rt(state=state, healthy=healthy)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt.resume(slot)
+    assert any(k == "ec2 start-instances" for k, a in fake.calls)   # woke the hibernated instance
+    assert slot.ip == "10.0.0.5"                            # private IP resolved
+
+
+def test_ec2_hibernate_resume_raises_on_terminated():
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    rt, _ = _hibernate_rt(state=["terminated"], healthy=[False])
+    with pytest.raises(AwsWorkerError, match="cannot resume"):
+        rt.resume(AwsWorkerSlot(slot_id="s", resource_id="i-1"))
+
+
+def test_ec2_hibernate_resume_times_out():
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    ticks = [0.0]
+
+    def clock():
+        ticks[0] += 1.0
+        return ticks[0]
+
+    rt, _ = _hibernate_rt(state=["stopped"], healthy=[False], clock=clock, resume_timeout_s=5.0)
+    with pytest.raises(AwsWorkerError, match="not ready"):
+        rt.resume(AwsWorkerSlot(slot_id="s", resource_id="i-1"))
+
+
+def test_ec2_hibernate_config_defaults_self_terminate_off():
+    # the guest self-terminate timer conflicts with parking -> OFF by default for the hibernate tier,
+    # on BOTH the direct-construct and from_env paths (field default, not just from_env).
+    assert Ec2HibernateConfig(region="us-east-1", image_id="a").self_terminate is False
+    cfg = Ec2HibernateConfig.from_env({"BLASTBOX_EC2_AMI": "ami-x"}.get)
+    assert cfg.self_terminate is False
+    assert cfg.root_volume_gb == 30 and cfg.root_device_name == "/dev/xvda"
+    assert cfg.ready_timeout_s == 600.0 and cfg.resume_timeout_s == 180.0   # covers boot+warm+hibernate; < worker budget
+
+
+def test_ec2_hibernate_preflight_rejects_incapable_type():
+    # fail LOUD at pool build on a hibernation-incapable type instead of churning launch->stuck->reap.
+    rt, fake = _hibernate_rt(state=["running"], healthy=[False])
+    fake.responses["ec2 describe-instance-types"] = {"InstanceTypes": [{"HibernationSupported": False,
+                                                                        "MemoryInfo": {"SizeInMiB": 2048}}]}
+    fake.responses["ec2 describe-instances"] = {"Reservations": []}   # available()'s probe
+    assert rt.available() is False   # _service_available raises -> available() fail-closed
+
+
+def test_ec2_hibernate_preflight_rejects_undersized_root_volume():
+    rt, fake = _hibernate_rt(state=["running"], healthy=[False], root_volume_gb=1)   # 1GB < 2GB RAM
+    fake.responses["ec2 describe-instance-types"] = {"InstanceTypes": [{"HibernationSupported": True,
+                                                                        "MemoryInfo": {"SizeInMiB": 2048}}]}
+    fake.responses["ec2 describe-instances"] = {"Reservations": []}
+    assert rt.available() is False   # root volume can't hold RAM -> refused
+
+
+def test_ec2_hibernate_redrives_when_hibernate_does_not_take():
+    # stop --hibernate accepted, but the instance lands back 'running' (async hibernate failure) -> the
+    # hibernating phase must re-drive from 'warming' (re-issue stop), not sit stuck until warming_timeout.
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    state, healthy, ticks = ["running"], [True], [1000.0]
+    rt, fake = _hibernate_rt(state=state, healthy=healthy, clock=lambda: ticks[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt.is_ready(slot)                       # warming -> stop --hibernate -> hibernating
+    assert rt._phase["s"] == "hibernating"
+    # instance came back running (hibernate didn't take) -> is_ready re-drives to warming
+    ticks[0] += 10.0
+    assert rt.is_ready(slot) is False
+    assert rt._phase["s"] == "warming"      # recovered instead of stuck
+
+
+def test_ec2_hibernate_resume_refreshes_public_ip_uncached():
+    # a resumed instance gets a NEW public IP; resume must re-describe uncached (not the stale cached IP).
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    ip = {"v": "1.1.1.1"}
+
+    def describe(argv):  # noqa: ANN001
+        return _cp(stdout=json.dumps({"Reservations": [{"Instances": [
+            {"InstanceId": "i-1", "State": {"Name": "running"}, "PublicIpAddress": ip["v"]}]}]}))
+
+    cfg = Ec2HibernateConfig(region="us-east-1", image_id="ami-x", use_public_ip=True, resume_poll_s=0.0)
+    fake = FakeAws({**_IDENT, "ec2 describe-instances": describe, "ec2 start-instances": {},
+                   "ec2 stop-instances": {}})
+    rt = Ec2HibernateRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: "2.2.2.2" in u, clock=lambda: 100.0)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    slot.ip = "1.1.1.1"          # stale pre-hibernate public IP
+    ip["v"] = "2.2.2.2"          # AWS assigned a new one on start
+    rt.resume(slot)             # must pick up 2.2.2.2 (probe only passes on the new IP)
+    assert slot.ip == "2.2.2.2"
+
+
+def test_ec2_hibernate_select_and_registration():
+    from blastbox.host import pool_config
+    rt = select_ec2_hibernate_runtime(get_env={"BLASTBOX_EC2_AMI": "ami-x"}.get)
+    assert rt.kind == "aws-ec2-hibernate" and rt.dispatch_style == "network"
+    hib, _ = _hibernate_rt(state=["running"], healthy=[False])
+    import unittest.mock as m
+    with m.patch("blastbox.host.runtime.aws_worker.select_ec2_hibernate_runtime", lambda **kw: hib):
+        got = pool_config.select_runtime_by_name("aws-ec2-hibernate", require_available=False)
+    assert got is hib
 
 
 def test_ec2_self_terminate_ttl_injected():
