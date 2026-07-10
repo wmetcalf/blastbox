@@ -105,6 +105,23 @@ def slot_base_url(slot: _Slot, *, tls: bool = False) -> str:
     raise ValueError("slot has no reachable endpoint (no url and no ip)")
 
 
+def _make_traversable(dir_path: Path, root: Path) -> None:
+    """mkdir ``dir_path`` (parents) and chmod every component from ``root`` down to 0755, so the API
+    process in a serve+dispatch UID split can traverse into nested artifact dirs (e.g. ``pages/``).
+    mkdir honors the dispatcher umask (a restrictive 077 would leave 0700), so chmod explicitly. These
+    are untrusted-output artifact dirs, not sensitive, so world-traversable is fine."""
+    dir_path.mkdir(parents=True, exist_ok=True)
+    p = dir_path
+    while True:
+        try:
+            p.chmod(0o755)
+        except OSError:
+            pass
+        if p == root or root not in p.parents:
+            break
+        p = p.parent
+
+
 def _empty_dir(d: Path) -> None:
     """Remove everything under ``d`` (files, symlinks-as-links, subtrees) without following symlinks
     out of it, leaving ``d`` itself. Used to drop a prior/requeued attempt's output before extracting
@@ -149,7 +166,7 @@ def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: i
             if resolved != dest and not str(resolved).startswith(str(dest) + os.sep):
                 _log.warning("remote_http: dropping traversal member %r", m.name)
                 continue
-            raw.parent.mkdir(parents=True, exist_ok=True)
+            _make_traversable(raw.parent, dest)   # 0755 intermediates so a different API UID can read
             src = tf.extractfile(m)
             if src is None:
                 continue

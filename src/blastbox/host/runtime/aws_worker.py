@@ -112,6 +112,10 @@ class LambdaMicroVmConfig(AwsWorkerConfig):
     egress_connector_ids: tuple[str, ...] = ()
     ingress_connector_ids: tuple[str, ...] = ()
     auth_token_ttl_min: int = 15                 # create-microvm-auth-token --expiration-in-minutes
+    # A Lambda MicroVM with NO egress connector gets DEFAULT public internet egress -- which silently
+    # contradicts the engine's default net_policy='none'. Fail closed: refuse such a pool unless the
+    # operator either supplies a (no-internet) egress connector or explicitly opts into internet here.
+    allow_default_egress: bool = False
 
     @classmethod
     def from_env(cls, get: Callable[[str], str | None], **overrides: Any) -> LambdaMicroVmConfig:
@@ -128,6 +132,8 @@ class LambdaMicroVmConfig(AwsWorkerConfig):
             execution_role_arn=_env(get, "BLASTBOX_LAMBDA_EXEC_ROLE_ARN"),
             egress_connector_ids=_idlist("BLASTBOX_LAMBDA_EGRESS_CONNECTORS"),
             ingress_connector_ids=_idlist("BLASTBOX_LAMBDA_INGRESS_CONNECTORS"),
+            allow_default_egress=(_env(get, "BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS") or "").strip().lower()
+                                 in ("1", "true", "yes"),
             auth_token_ttl_min=int(_env(get, "BLASTBOX_LAMBDA_AUTH_TTL_MIN", "15") or "15"),
             max_duration_s=int(_env(get, "BLASTBOX_AWS_MAX_DURATION_S", "3600") or "3600"),
             **overrides,
@@ -362,6 +368,15 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
     def __init__(self, cfg: LambdaMicroVmConfig, **kw: Any) -> None:
         if not cfg.image_identifier:
             raise AwsUnavailable("LambdaMicroVmRuntime: BLASTBOX_LAMBDA_IMAGE (image identifier) is required")
+        # Fail closed on the fail-OPEN default: no egress connector => AWS gives the MicroVM public
+        # internet, but the dispatcher treats the pool as honoring the engine's net_policy (often
+        # 'none'). Refuse unless a connector seals egress OR the operator explicitly accepts internet.
+        if not cfg.egress_connector_ids and not cfg.allow_default_egress:
+            raise AwsUnavailable(
+                "aws-lambda-microvm has NO egress connector -> AWS defaults to public internet egress, "
+                "which contradicts a no-egress net_policy. Set BLASTBOX_LAMBDA_EGRESS_CONNECTORS to a "
+                "no-internet connector, or BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS=1 to accept internet egress."
+            )
         super().__init__(cfg, **kw)
         self.cfg: LambdaMicroVmConfig = cfg
 
@@ -406,6 +421,17 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
             raise AwsWorkerError("create-microvm-auth-token: no token in response")
         return str(tok)
 
+    def _ensure_token(self, slot: AwsWorkerSlot) -> str:
+        """Reuse the slot's JWE while it's younger than half its TTL; mint a fresh one only when it's
+        missing or aging. WarmPool polls is_ready()/is_alive() every ~0.1s -- minting per tick would
+        spam create-microvm-auth-token and throttle the AWS control plane before the slot warms."""
+        half_ttl = self.cfg.auth_token_ttl_min * 60 * 0.5
+        if slot.auth_token and (self._clock() - slot.token_minted_at) <= half_ttl:
+            return slot.auth_token
+        slot.auth_token = self._mint_token(slot)
+        slot.token_minted_at = self._clock()
+        return slot.auth_token
+
     def _health_ok(self, slot: AwsWorkerSlot) -> bool:
         # Resolve the per-VM URL once the microVM is running, then probe the agent with a fresh JWE.
         if slot.url is None:
@@ -417,9 +443,7 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
             if not ep:
                 return False
             slot.url = str(ep) if str(ep).startswith("http") else f"https://{ep}"
-        token = self._mint_token(slot)
-        slot.auth_token = token
-        slot.token_minted_at = self._clock()
+        token = self._ensure_token(slot)   # reuse a fresh token across rapid readiness ticks
         url = slot.url.rstrip("/") + self.cfg.agent_health_path
         headers = {"X-aws-proxy-auth": token, "X-aws-proxy-port": str(self.cfg.agent_port)}
         return self._probe(url, headers, self.cfg.probe_timeout_s)
@@ -429,13 +453,10 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
         (the transport reuses ``slot.auth_token`` for /detonate without re-minting)."""
         alive = super().is_alive(slot)
         if alive and slot.auth_token:
-            half_ttl = self.cfg.auth_token_ttl_min * 60 * 0.5
-            if (self._clock() - slot.token_minted_at) > half_ttl:
-                try:
-                    slot.auth_token = self._mint_token(slot)
-                    slot.token_minted_at = self._clock()
-                except (AwsWorkerError, OSError):
-                    pass   # best-effort; a real failure surfaces at readiness/detonate
+            try:
+                self._ensure_token(slot)   # refresh only past half-TTL (cached otherwise)
+            except (AwsWorkerError, OSError):
+                pass   # best-effort; a real failure surfaces at readiness/detonate
         return alive
 
     def _terminate(self, slot: AwsWorkerSlot) -> None:

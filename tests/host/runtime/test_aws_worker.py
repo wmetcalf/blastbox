@@ -55,7 +55,8 @@ _IDENT = {"sts get-caller-identity": {"Account": "380038281108", "Arn": "arn:aws
 
 
 def _lambda_rt(responses, probe=lambda url, hdrs, to: True, **kw):  # noqa: ANN001
-    cfg = LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1")
+    cfg = LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+                              allow_default_egress=True)
     fake = FakeAws({**_IDENT, **responses})
     return LambdaMicroVmRuntime(cfg, aws_runner=fake, http_probe=probe, clock=lambda: 100.0, **kw), fake
 
@@ -182,13 +183,38 @@ def test_available_true_when_creds_and_service_ok():
 
 
 def test_available_false_when_no_account():
-    cfg = LambdaMicroVmConfig(region="us-east-1", image_identifier="img")
+    cfg = LambdaMicroVmConfig(region="us-east-1", image_identifier="img", allow_default_egress=True)
     fake = FakeAws({"sts get-caller-identity": {}})   # no Account
     rt = LambdaMicroVmRuntime(cfg, aws_runner=fake)
     assert rt.available() is False
 
 
-def test_available_false_when_service_denied():
+def test_lambda_refuses_default_egress_without_optin():
+    # no egress connector + no explicit opt-in => AWS default is public internet, which would fail OPEN
+    # against a no-egress net_policy. The tier must refuse to build.
+    with pytest.raises(AwsUnavailable, match="egress"):
+        LambdaMicroVmRuntime(LambdaMicroVmConfig(region="us-east-1", image_identifier="img"))
+
+
+def test_lambda_default_egress_ok_with_connector():
+    # a sealing egress connector makes it safe -> builds fine
+    LambdaMicroVmRuntime(LambdaMicroVmConfig(region="us-east-1", image_identifier="img",
+                                             egress_connector_ids=("e-noinet",)))
+
+
+def test_lambda_readiness_token_is_cached_across_ticks():
+    # is_ready() polled every ~0.1s must NOT mint a fresh JWE each tick (control-plane throttle):
+    # within the token's half-TTL the slot reuses its cached token.
+    rt, fake = _lambda_rt(
+        {"lambda-microvms run-microvm": {"microvmId": "mv-1"},
+         "lambda-microvms get-microvm": {"state": "running", "endpoint": "vm.example"},
+         "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+    )
+    slot = rt._launch()
+    for _ in range(20):
+        rt.is_ready(slot)
+    mints = sum(1 for k, _ in fake.calls if k == "lambda-microvms create-microvm-auth-token")
+    assert mints == 1            # minted once, then reused
     cfg = Ec2Config(region="us-east-1", image_id="ami-0")
     fake = FakeAws({**_IDENT, "ec2 describe-instances": _cp(rc=254, stderr="AccessDenied")})
     rt = DisposableEc2Runtime(cfg, aws_runner=fake)
@@ -199,7 +225,7 @@ def test_select_requires_available_raises():
     fake = FakeAws({"sts get-caller-identity": {}})
     with pytest.raises(AwsUnavailable):
         select_lambda_microvm_runtime(
-            cfg=LambdaMicroVmConfig(region="us-east-1", image_identifier="img"),
+            cfg=LambdaMicroVmConfig(region="us-east-1", image_identifier="img", allow_default_egress=True),
             require_available=True, aws_runner=fake,
         )
 
@@ -264,13 +290,16 @@ def test_lambda_select_does_not_pin_worker_ca(tmp_path):
     # Lambda talks to AWS's public https endpoint + JWE -> must NOT get the private worker CA
     from blastbox.host.pki import ensure_ca
     ensure_ca(tmp_path)
-    env = {"BLASTBOX_DISPATCH_TLS_CA": str(tmp_path / "ca.crt"), "BLASTBOX_LAMBDA_IMAGE": "img-x"}
+    env = {"BLASTBOX_DISPATCH_TLS_CA": str(tmp_path / "ca.crt"), "BLASTBOX_LAMBDA_IMAGE": "img-x",
+           "BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS": "1"}
     rt = select_lambda_microvm_runtime(get_env=env.get, require_available=False)
     assert rt.ssl_context is None
 
 
 def test_lambda_select_no_tls_context():
-    rt = select_lambda_microvm_runtime(get_env={"BLASTBOX_LAMBDA_IMAGE": "img-x"}.get, require_available=False)
+    rt = select_lambda_microvm_runtime(
+        get_env={"BLASTBOX_LAMBDA_IMAGE": "img-x", "BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS": "1"}.get,
+        require_available=False)
     assert rt.ssl_context is None
 
 

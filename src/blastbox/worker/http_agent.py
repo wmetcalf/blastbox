@@ -232,13 +232,22 @@ class _Handler(BaseHTTPRequestHandler):
             # leaves huge undeclared files in out_dir can't OOM the agent. The host re-enforces its own
             # caps on extraction; this is the worker's self-protection.
             cap = getattr(limits, "max_total_artifact_bytes", None)
+            # member cap too: zero-byte/tiny files never advance the byte cap, so an engine that leaves
+            # hundreds of thousands of them could still emit a huge tar header stream + burn CPU/inodes.
+            max_files = getattr(limits, "max_artifacts", None)
+            file_cap = (max_files + 16) if max_files is not None else None
             spool: tempfile.SpooledTemporaryFile = tempfile.SpooledTemporaryFile(
                 max_size=64 * 1024 * 1024, prefix="bbagent-tar-")
             total = 0
+            files = 0
             with tarfile.open(fileobj=spool, mode="w") as tf:
                 for f in sorted(out_dir.rglob("*")):
                     if not f.is_file():
                         continue
+                    files += 1
+                    if file_cap is not None and files > file_cap:
+                        spool.close()
+                        raise RuntimeError(f"output exceeds {file_cap} files")
                     total += f.stat().st_size
                     if cap is not None and total > cap:
                         spool.close()

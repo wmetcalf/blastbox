@@ -39,6 +39,33 @@ def test_dispatch_marks_done_with_summary_and_unlinks_input(tmp_path):
     assert got.worker_tier == "libvirt-vm"
 
 
+def test_fail_stale_queued_jobs(tmp_path):
+    import time
+    store = InMemoryJobStore()
+    old = _queue_job(store, tmp_path, filename="stale.dll")
+    old.created_at = time.time() - 10_000        # far past the TTL
+    fresh = _queue_job(store, tmp_path, filename="fresh.dll")
+
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
+                        engine="authenticode", max_queued_age_s=1.0)
+    d._fail_stale_queued_jobs()
+
+    assert store.get(old.job_id).status is JobStatus.FAILED
+    assert "max queued age" in (store.get(old.job_id).error or "")
+    assert not (tmp_path / old.job_id / "input" / "stale.dll").exists()   # untrusted input deleted
+    assert store.get(fresh.job_id).status is JobStatus.QUEUED             # fresh job untouched
+
+
+def test_fail_stale_queued_disabled_by_default(tmp_path):
+    import time
+    store = InMemoryJobStore()
+    old = _queue_job(store, tmp_path, filename="stale.dll")
+    old.created_at = time.time() - 10_000
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), engine="authenticode")  # TTL 0 = off
+    d._fail_stale_queued_jobs()
+    assert store.get(old.job_id).status is JobStatus.QUEUED   # no TTL configured -> no-op
+
+
 def test_dispatch_writes_metadata_json_on_done(tmp_path):
     # ingress /metadata, /artifacts, /result require <output>/metadata.json once a job is DONE; the
     # dispatcher materializes it from the summary so those routes don't 404 on a VM job.

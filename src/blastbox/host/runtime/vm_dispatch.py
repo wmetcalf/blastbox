@@ -63,6 +63,7 @@ class VmJobDispatcher:
                  trust_output_metadata: bool = False,
                  sanitize_params: Callable[[dict[str, str]], dict[str, str]] | None = None,
                  output_validator: Callable[[Job, Path], None] | None = None,
+                 max_queued_age_s: float = 0.0,
                  max_summary_bytes: int = _MAX_SUMMARY_BYTES) -> None:
         self._store = store
         self._job_root = Path(job_root)
@@ -107,6 +108,11 @@ class VmJobDispatcher:
         # crashed BEFORE _process stamped worker_runtime="warm" — there's no cold job to mistake it
         # for. Default False keeps recovery scoped to our own warm-stamped claims (shared-store safe).
         self._sole_owner = bool(sole_owner)
+        # Opt-in ceiling (0 = off) on how long a job may sit QUEUED before this dispatcher's maintenance
+        # FAILs it + deletes its input. In a remote-only (static/AWS) deployment there is NO cold
+        # Dispatcher to run this sweep, so a job pinned to a target_tier nobody serves (or for an engine
+        # this single-engine dispatcher can't claim) would otherwise keep its untrusted input forever.
+        self._max_queued_age_s = max(0.0, float(max_queued_age_s))
         # Bound a hung validate() so a dead VM agent can't occupy a claim thread forever (heartbeat
         # would keep the job looking fresh, so the orphan sweep never recovers it).
         self._validate_timeout_s = max(self._heartbeat_s, float(validate_timeout_s))
@@ -437,6 +443,37 @@ class VmJobDispatcher:
                         pass
         except Exception:  # noqa: BLE001
             logger.warning("vm_dispatch: orphan recovery failed", exc_info=True)
+        self._fail_stale_queued_jobs()
+
+    def _fail_stale_queued_jobs(self) -> None:
+        """FAIL jobs stuck QUEUED past ``max_queued_age_s`` and delete their untrusted input (opt-in;
+        0 = off). The network-endpoint path bypasses the cold ``Dispatcher`` (the only other place this
+        runs), so without this a job pinned to a target_tier nobody serves — or for an engine this
+        single-engine dispatcher can't claim — would sit QUEUED with its input on disk forever. CAS on
+        QUEUED so a job claimed since the list() snapshot (→ RUNNING) is left to its claimer."""
+        if self._max_queued_age_s <= 0:
+            return
+        cutoff = time.time() - self._max_queued_age_s
+        try:
+            for job in self._store.list(status=JobStatus.QUEUED):
+                if self._engine is not None and job.engine != self._engine:
+                    continue
+                if job.created_at > cutoff:
+                    continue
+                now = time.time()
+                if self._store.update_if_status(
+                        job.job_id, JobStatus.QUEUED,
+                        status=JobStatus.FAILED, finished_at=now,
+                        error=f"job exceeded the max queued age ({self._max_queued_age_s:.0f}s) without "
+                              f"being claimed (no dispatcher for target_tier={job.target_tier!r}?)",
+                        expires_at=self._expiry(now)):
+                    logger.info("vm_dispatch: failed stale-queued job %s", job.job_id)
+                    try:
+                        self._input_path(job).unlink()
+                    except OSError:
+                        pass
+        except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
+            logger.warning("vm_dispatch: stale-queued sweep failed", exc_info=True)
 
     def _maintenance_loop(self) -> None:
         while not self._stop.wait(self._maintenance_interval_s):
@@ -559,6 +596,9 @@ def build_remote_vm_dispatcher(
         # (shared-store safe); opt in with BLASTBOX_DISPATCH_SOLE_OWNER=1 ONLY for a network-ONLY store.
         sole_owner=(os.environ.get("BLASTBOX_DISPATCH_SOLE_OWNER") or "").strip().lower()
                    in ("1", "true", "yes"),
+        # same stale-queued TTL the cold Dispatcher honors -- bounds a job pinned to a tier no remote
+        # dispatcher serves (else its untrusted input lingers forever in a remote-only deployment).
+        max_queued_age_s=float(os.environ.get("BLASTBOX_MAX_QUEUED_AGE_S") or "0"),
         concurrency=concurrency,
         job_retention_s=job_retention_s,
     )
