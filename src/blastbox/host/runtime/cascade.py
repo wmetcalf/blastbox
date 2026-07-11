@@ -102,6 +102,15 @@ class CascadingRuntime:
             with self._lock:
                 if self._counts[i] >= tier.capacity:
                     continue
+            # SKIP a tier still building its base snapshot (prepare() False) -- don't reserve/spawn on it
+            # (would block the tick thread in spawn().build()); a ready tier later in the order can still
+            # be filled. Its build was already kicked by prepare() and it becomes spawnable once ready.
+            p = getattr(tier.runtime, "prepare", None)
+            if callable(p) and not p():
+                continue
+            with self._lock:
+                if self._counts[i] >= tier.capacity:   # re-check under the lock (raced a concurrent spawn)
+                    continue
                 self._counts[i] += 1          # reserve before the (slow) spawn
             try:
                 slot = tier.runtime.spawn()
@@ -154,16 +163,17 @@ class CascadingRuntime:
     def prepare(self) -> bool:
         """Delegate the async-build/readiness gate to the tiers. A snapshot tier (gvisor/fc with
         BLASTBOX_POOL_WARM_SNAPSHOT) relies on prepare() so WarmPool kicks its slow base-snapshot build
-        OFF the tick thread and doesn't spawn until it's built. Without this the pool would treat the
-        cascade as always-ready and block the single tick thread inside the inner spawn().build(). Kick
-        EVERY tier's prepare (so all builds start) and report ready only when all are ready; a tier
-        without prepare() is always ready."""
-        ready = True
+        OFF the tick thread. Kick EVERY tier's prepare (so all builds start) but report ready if ANY tier
+        is ready -- so a slow overflow snapshot build doesn't starve an already-ready primary tier
+        (spawn() itself skips the still-building tiers). A tier without prepare() is always ready."""
+        any_ready = False
         for t in self.tiers:
             p = getattr(t.runtime, "prepare", None)
-            if callable(p) and not p():
-                ready = False
-        return ready
+            if p is None:
+                any_ready = True
+            elif p():        # kicks the async build + reports readiness
+                any_ready = True
+        return any_ready
 
     def available(self) -> bool:
         return bool(self.tiers)   # built only with tiers that came up

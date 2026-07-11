@@ -558,8 +558,10 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
     kind = "aws-lambda-snapstart"
     _DEAD_STATES = ("terminating", "terminated")
     # WHITELIST of states that count as alive (fail-CLOSED on empty/unknown/future states -- liveness
-    # must be probe-decided, and an unrecognized get-microvm state should reap, not linger IDLE).
-    _ALIVE_STATES = ("pending", "running", "suspending", "suspended")
+    # must be probe-decided, and an unrecognized get-microvm state should reap, not linger IDLE). Include
+    # the base Lambda runtime's running aliases (active/ready) so a MicroVM the base considers alive
+    # isn't reaped by the SnapStart health check, plus the parked (suspended) states.
+    _ALIVE_STATES = ("pending", "running", "active", "ready", "suspending", "suspended")
 
     def __init__(self, cfg: LambdaSnapStartConfig, **kw: Any) -> None:
         super().__init__(cfg, **kw)   # inherits the image-required + fail-closed egress guards

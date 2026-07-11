@@ -63,30 +63,47 @@ class WarmFileRuntime(FakeRuntime):
         self.materialized = slot.slot_id
 
 
-def test_cascade_prepare_delegates_and_aggregates():
-    # a snapshot tier (gvisor/fc warm-snapshot) relies on prepare() for its async base build; the cascade
-    # must delegate + kick EVERY tier and report ready only when ALL are ready (else the tick thread
-    # blocks in the inner spawn().build()).
-    class PrepRuntime(FakeRuntime):
-        def __init__(self, name, ready):
-            super().__init__(name)
-            self._ready, self.prepped = ready, 0
+class _PrepRuntime(FakeRuntime):
+    def __init__(self, name, ready):
+        super().__init__(name)
+        self._ready, self.prepped = ready, 0
 
-        def prepare(self):
-            self.prepped += 1
-            return self._ready
+    def prepare(self):
+        self.prepped += 1
+        return self._ready
 
-    a, b = PrepRuntime("a", True), PrepRuntime("b", False)
+
+def test_cascade_prepare_ready_if_any_tier_ready():
+    # a slow overflow snapshot build must NOT starve a ready primary -> prepare() is True if ANY tier is
+    # ready, but EVERY tier's build is still kicked.
+    a, b = _PrepRuntime("a", True), _PrepRuntime("b", False)
     rt = CascadingRuntime([Tier("a", a, 1), Tier("b", b, 1)])
-    assert rt.prepare() is False              # b not ready -> cascade not ready
-    assert a.prepped == 1 and b.prepped == 1  # BOTH kicked (all async builds start)
-    b._ready = True
-    assert rt.prepare() is True               # all tiers ready
+    assert rt.prepare() is True                # a ready -> cascade can spawn (on a)
+    assert a.prepped == 1 and b.prepped == 1   # BOTH kicked (all async builds start)
+
+
+def test_cascade_prepare_false_when_no_tier_ready():
+    a, b = _PrepRuntime("a", False), _PrepRuntime("b", False)
+    rt = CascadingRuntime([Tier("a", a, 1), Tier("b", b, 1)])
+    assert rt.prepare() is False
 
 
 def test_cascade_prepare_true_without_prepare_tiers():
     rt = CascadingRuntime([Tier("a", FakeRuntime("a"), 1)])   # no prepare() -> always ready
     assert rt.prepare() is True
+
+
+def test_cascade_spawn_skips_still_building_tier():
+    # spawn must skip a tier whose prepare() is still False (building) and fill a ready tier instead of
+    # blocking on the inner spawn().build().
+    building, ready = _PrepRuntime("fc", False), _PrepRuntime("static", True)
+    rt = CascadingRuntime([Tier("fc", building, 4), Tier("static", ready, 4)])
+    slot = rt.spawn()
+    assert slot.slot_id.startswith("static")   # routed to the ready tier, not the building primary
+    assert building.spawned == []              # the building tier's spawn was never called
+    building._ready = True
+    # once fc is built it becomes spawnable (primary preference resumes on the next spawn)
+    assert rt.spawn().slot_id.startswith("fc")
 
 
 def test_cascade_resume_delegates_to_owning_tier():
