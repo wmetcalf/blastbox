@@ -775,6 +775,9 @@ def test_ec2_self_terminate_ttl_injected():
     from blastbox.host.runtime.aws_worker import _userdata_with_self_terminate
     wrapped = _userdata_with_self_terminate("#!/bin/bash\necho hi\n", 600)
     assert "shutdown -h +10" in wrapped and "echo hi" in wrapped   # 600s -> 10min; operator part kept
+    # CEILING, not floor: a non-minute budget must never schedule the shutdown BEFORE max_duration_s.
+    assert "shutdown -h +2" in _userdata_with_self_terminate(None, 119)   # 119s -> 2min (not 1)
+    assert "shutdown -h +1" in _userdata_with_self_terminate(None, 60)    # exact minute stays 1
 
     ud = base64.b64encode(b"#!/bin/bash\nstart-agent\n").decode()
     cfg = Ec2Config(region="us-east-1", image_id="ami-x", user_data_b64=ud, max_duration_s=1800)

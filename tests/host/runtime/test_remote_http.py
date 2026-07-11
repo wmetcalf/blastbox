@@ -236,6 +236,17 @@ def test_extract_excludes_metadata_from_artifact_budget(tmp_path):
     assert set(written) == {"metadata.json", "p0.png"}
 
 
+def test_detonate_remote_stream_cap_covers_metadata_budget(tmp_path):
+    # a result whose ARTIFACTS fit max_output_bytes but whose (separately-capped) metadata is large must
+    # NOT be rejected by the pre-extraction stream cap -- the stream cap must include the metadata budget.
+    (tmp_path / "in.bin").write_bytes(b"z")
+    big_meta = b'{"status":"ok","pad":"' + b"a" * 100_000 + b'"}'      # 100KB metadata (within its cap)
+    tar = _tar({"metadata.json": big_meta, "p0.png": b"x" * 200})       # tiny artifact (within 1000)
+    meta = detonate_remote("http://h:8765", tmp_path / "in.bin", tmp_path / "o",
+                           http_open=_opener(tar), max_output_bytes=1000, max_metadata_bytes=4_000_000)
+    assert meta.get("status") == "ok"   # not rejected: stream cap = artifact + metadata budgets + overhead
+
+
 def test_detonate_remote_caps_metadata_size(tmp_path):
     from blastbox.host.runtime.remote_http import RemoteOutputTooLarge
     (tmp_path / "in.bin").write_bytes(b"z")

@@ -195,6 +195,43 @@ def test_output_validator_success_marks_done(tmp_path):
     assert store.get(job.job_id).status is JobStatus.DONE and called["ok"]
 
 
+def test_vm_dispatch_indexes_page_hashes_when_store_supports_it(tmp_path):
+    from blastbox.contract import ArtifactRef, Detection, Dimensions, Page
+    from blastbox.contract.envelope import Envelope
+
+    calls = []
+
+    class HashStore(InMemoryJobStore):
+        def supports_hash_search(self):
+            return True
+
+        def index_page_hashes(self, jid, env):
+            calls.append((jid, type(env).__name__))
+            return 1
+
+    store = HashStore()
+    job = _queue_job(store, tmp_path)
+    out = tmp_path / job.job_id / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    env = Envelope(engine="authenticode", input_sha256="ab" * 32,
+                   detected=Detection(label="dll", mime="application/octet-stream", confidence=1.0, source="t"),
+                   payload=Page(index=0, dims=Dimensions(width=1.0, height=1.0, unit="px"),
+                                image=ArtifactRef(id="a0")))
+    (out / "metadata.json").write_text(env.model_dump_json(by_alias=True))
+
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"status": "ok"}, True), engine="authenticode")
+    d._index_page_hashes(job)
+    assert calls == [(job.job_id, "Envelope")]   # sealed metadata.json fed through the indexer
+
+
+def test_vm_dispatch_skips_indexing_when_unsupported(tmp_path):
+    # a store without hash-search support (memory/redis) -> no-op, never raises
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"status": "ok"}, True))
+    d._index_page_hashes(job)   # must not raise (no metadata.json either)
+
+
 def test_resume_on_claim_calls_runtime_resume():
     from types import SimpleNamespace
 

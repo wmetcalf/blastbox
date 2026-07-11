@@ -185,7 +185,7 @@ def _userdata_with_self_terminate(raw: str | None, max_duration_s: int) -> str:
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
 
-    minutes = max(1, max_duration_s // 60)
+    minutes = max(1, -(-max_duration_s // 60))   # ceiling: never schedule the backstop BEFORE max_duration_s
     ttl = MIMEText(f"#!/bin/sh\nshutdown -h +{minutes}\n", "x-shellscript")
     if raw and raw.strip():
         head = raw[:400].lower()

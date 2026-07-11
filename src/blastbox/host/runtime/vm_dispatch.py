@@ -374,6 +374,10 @@ class VmJobDispatcher:
                 status=JobStatus.DONE if ok else JobStatus.FAILED,
                 finished_at=finished, result_summary=summary, error=err,
                 expires_at=self._expiry(finished))
+            if ok and owned:
+                # index per-page perceptual hashes for /v1/similar, same as the cold/file-warm paths --
+                # else a network-endpoint (static/AWS) page-hash job is DONE but invisible to search.
+                self._index_page_hashes(job)
         except Exception as exc:  # noqa: BLE001 — one bad job must not sink the dispatcher
             logger.warning("vm_dispatch: job %s failed: %s", job.job_id, exc, exc_info=True)
             finished = time.time()
@@ -389,6 +393,25 @@ class VmJobDispatcher:
                     in_path.unlink()
                 except OSError:
                     pass
+
+    def _index_page_hashes(self, job: Job) -> None:
+        """Best-effort: index the job's per-page perceptual hashes (phash/colorhash/sha256) for
+        ``/v1/similar``, same as the cold/file-warm paths -- else a network-endpoint page-hash job is
+        DONE with sealed artifacts but invisible to search. Postgres+pg_bktree only, so gate on
+        ``supports_hash_search()``. Reads the HOST-SEALED metadata.json (the Envelope the trust gate
+        wrote). An indexing failure NEVER fails an otherwise-DONE job."""
+        supports = getattr(self._store, "supports_hash_search", None)
+        indexer = getattr(self._store, "index_page_hashes", None)
+        if supports is None or indexer is None or not supports():
+            return
+        meta = self._job_dir(job) / "output" / "metadata.json"
+        if not meta.exists():
+            return
+        try:
+            from blastbox.contract.envelope import Envelope
+            indexer(job.job_id, Envelope.model_validate_json(meta.read_text()))
+        except Exception:  # noqa: BLE001 -- indexing is best-effort; never fail a DONE job on it
+            logger.exception("vm_dispatch: page-hash indexing failed for %s; continuing", job.job_id)
 
     def _worker_loop(self) -> None:
         while not self._stop.is_set():

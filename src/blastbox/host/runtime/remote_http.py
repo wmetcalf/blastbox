@@ -250,10 +250,14 @@ def detonate_remote(
     # stream the response tar to a spooled temp file (spills to disk past 64MB) rather than holding the
     # whole thing in memory -- artifact tars can be large. CAP the stream + the extracted total so a
     # buggy/compromised worker can't fill the dispatcher's disk.
-    # The tar stream is larger than the files (headers/padding/metadata.json), so cap the STREAM with
-    # headroom and enforce the real artifact budget during EXTRACTION -- else a valid output near the
-    # budget is rejected purely on archive overhead.
-    stream_cap = None if max_output_bytes is None else int(max_output_bytes * 1.1) + 65536
+    # The tar stream is larger than the ARTIFACT files: it also carries metadata.json (capped SEPARATELY
+    # by max_metadata_bytes during extraction, NOT counted in the artifact budget) plus per-member tar
+    # headers/padding. Size the stream cap to cover all three (artifact budget + metadata budget + 10%
+    # header/padding headroom) -- else a valid output whose artifacts fit the budget but whose metadata
+    # (or many tiny members' headers) push the raw stream over is rejected before extraction can apply
+    # the real per-cap budgets.
+    stream_cap = None if max_output_bytes is None else (
+        int(max_output_bytes * 1.1) + (max_metadata_bytes or 0) + 65536)
     with input_path.open("rb") as body:
         req = urllib.request.Request(url, data=body, method="POST", headers=headers)
         with opener(req, timeout, context=ssl_context) as resp, \
