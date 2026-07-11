@@ -84,6 +84,17 @@ class _ReapFailRuntime(_FakeRuntime):
         raise RuntimeError("destroy failed; worker may still be running")
 
 
+def test_spawn_completing_after_stop_is_reaped_not_leaked() -> None:
+    # a slow spawn (AWS run-instances/run-microvm, up to 120s) can finish AFTER stop() snapshotted
+    # _slots. Publishing it then would leak a live cloud instance -> reap it instead.
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool._stop_event.set()                 # shutdown already in progress
+    pool._spawn_to_deficit(ready=True)     # a spawn completes while stopping
+    assert len(rt.reaped) == 1             # the just-created slot was reaped...
+    assert not pool._slots                 # ...and never published (no leak)
+
+
 def test_release_quarantines_slot_when_reap_fails() -> None:
     # a reap that RAISES (worker not disposed) must NOT pop the slot — keep it tracked/quarantined so
     # it counts against the ceiling and surfaces, instead of orphaning a live worker off the books.

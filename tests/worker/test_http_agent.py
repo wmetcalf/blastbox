@@ -245,6 +245,20 @@ def test_zero_byte_input_accepted():
         httpd.server_close()
 
 
+def test_agent_caps_oversized_metadata_before_archiving(monkeypatch):
+    # a metadata.json over its OWN cap must fail the job BEFORE it's archived, so a buggy engine can't
+    # fill the worker disk (a 2nd copy would land in the spooled tar) before the host rejects it.
+    monkeypatch.setenv("BLASTBOX_MAX_METADATA", "50")   # any real sealed metadata.json exceeds 50 bytes
+    httpd, port = _running_agent()
+    try:
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post(f"http://127.0.0.1:{port}/detonate?name=x.bin", b"data")
+        assert ei.value.code == 500   # over the metadata cap -> job fails, not a huge disk write
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_concurrent_detonate_returns_409_busy():
     """A warm box serves one job at a time: a request landing while another is in flight gets a fast
     409 (so the dispatcher fails+retires that slot) instead of queueing behind the busy job."""

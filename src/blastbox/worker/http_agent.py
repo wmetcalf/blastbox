@@ -235,6 +235,7 @@ class _Handler(BaseHTTPRequestHandler):
             # leaves huge undeclared files in out_dir can't OOM the agent. The host re-enforces its own
             # caps on extraction; this is the worker's self-protection.
             cap = getattr(limits, "max_total_artifact_bytes", None)
+            meta_cap = getattr(limits, "max_metadata_bytes", None)
             # member cap too: zero-byte/tiny files never advance the byte cap, so an engine that leaves
             # hundreds of thousands of them could still emit a huge tar header stream + burn CPU/inodes.
             max_files = getattr(limits, "max_artifacts", None)
@@ -252,8 +253,14 @@ class _Handler(BaseHTTPRequestHandler):
                         spool.close()
                         raise RuntimeError(f"output exceeds {file_cap} files")
                     # metadata.json is a control file, not a declared artifact -- don't count it toward
-                    # the artifact byte budget (matches the cold trust gate + the host extractor).
-                    if f.name != "metadata.json" or f.parent != out_dir:
+                    # the artifact byte budget (matches the cold trust gate + the host extractor), but DO
+                    # cap it by its OWN budget BEFORE archiving so a buggy engine's huge metadata can't
+                    # fill the worker disk (a second copy lands in the spooled tar) before the host rejects it.
+                    if f.name == "metadata.json" and f.parent == out_dir:
+                        if meta_cap is not None and f.stat().st_size > meta_cap:
+                            spool.close()
+                            raise RuntimeError(f"metadata.json is {f.stat().st_size} bytes (> {meta_cap})")
+                    else:
                         total += f.stat().st_size
                         if cap is not None and total > cap:
                             spool.close()

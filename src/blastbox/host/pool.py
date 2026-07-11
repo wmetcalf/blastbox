@@ -643,8 +643,21 @@ class WarmPool:
                 logger.exception("pool.spawn_failed")
                 continue
 
+            # Publish under the lock, BUT only if shutdown hasn't begun. A slow spawn (e.g. AWS
+            # run-instances / run-microvm blocks up to cli_timeout_s=120s, far past stop()'s 10s
+            # thread-join) can complete AFTER stop() snapshotted _slots -- publishing then would leak a
+            # live EC2 instance / MicroVM (never reaped until its TTL). Checking _stop_event under the
+            # same lock stop() flips slots to DRAINING under closes the race either way.
             with self._lock:
-                self._slots[slot.slot_id] = slot
+                stopping = self._stop_event.is_set()
+                if not stopping:
+                    self._slots[slot.slot_id] = slot
+            if stopping:
+                try:
+                    self._reap_and_count(slot)   # reap the just-created (untracked) slot ourselves
+                except Exception:
+                    logger.exception("pool.reap_after_stop_failed slot_id=%s", slot.slot_id)
+                break
 
     def _effective_target_unlocked(self) -> int:
         """Compute current target (must be called under _lock or read-only context).
