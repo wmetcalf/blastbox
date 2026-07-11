@@ -89,6 +89,37 @@ def test_cascade_prepare_true_without_prepare_tiers():
     assert rt.prepare() is True
 
 
+def test_cascade_resume_delegates_to_owning_tier():
+    # a resume-based tier (aws-ec2-hibernate / snapstart) in a cascade must be woken on claim via the
+    # owning tier's resume(); a tier without resume() is a no-op.
+    class ResumeRuntime(FakeRuntime):
+        def __init__(self, name):
+            super().__init__(name)
+            self.resumed = []
+
+        def resume(self, slot):
+            self.resumed.append(slot.slot_id)
+
+    r, plain = ResumeRuntime("hib"), FakeRuntime("fc")
+    rt = CascadingRuntime([Tier("hib", r, 1), Tier("fc", plain, 1)])
+    s_r = rt.spawn()      # owned by the resume tier
+    s_p = rt.spawn()      # owned by the plain tier
+    rt.resume(s_r)
+    assert r.resumed == [s_r.slot_id]        # delegated to the owning tier's resume
+    rt.resume(s_p)                            # plain tier has no resume() -> no-op (must not raise)
+
+
+def test_cascade_resume_propagates_owner_failure():
+    class BoomResume(FakeRuntime):
+        def resume(self, slot):
+            raise RuntimeError("cannot wake")
+
+    rt = CascadingRuntime([Tier("hib", BoomResume("hib"), 1)])
+    slot = rt.spawn()
+    with pytest.raises(RuntimeError, match="cannot wake"):
+        rt.resume(slot)   # so _resume_on_claim retires the slot dirty
+
+
 def test_cascade_delegates_warm_hooks_to_owning_tier():
     # an all-file cascade must route host_warm_control/stage_warm_input/materialize_warm_output to the
     # tier that owns the slot -- else gVisor/FC jobs get the wrong input/output transport.

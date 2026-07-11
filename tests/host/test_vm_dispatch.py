@@ -265,12 +265,6 @@ def test_remote_no_slot_requeues_not_fails(tmp_path):
     assert (tmp_path / job.job_id / "input" / "evil.dll").exists()   # input preserved for the retry
 
 
-def test_vm_dispatch_slot_available_gate_stored():
-    store = InMemoryJobStore()
-    d = VmJobDispatcher(store, "/x", lambda p: ({}, True), slot_available=lambda: False)
-    assert d._slot_available is not None and d._slot_available() is False
-
-
 def test_vm_dispatch_skips_indexing_when_unsupported(tmp_path):
     # a store without hash-search support (memory/redis) -> no-op, never raises
     store = InMemoryJobStore()

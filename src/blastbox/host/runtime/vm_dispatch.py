@@ -70,7 +70,6 @@ class VmJobDispatcher:
                  sanitize_params: Callable[[dict[str, str]], dict[str, str]] | None = None,
                  output_validator: Callable[[Job, Path], None] | None = None,
                  max_queued_age_s: float = 0.0,
-                 slot_available: Callable[[], bool] | None = None,
                  max_summary_bytes: int = _MAX_SUMMARY_BYTES) -> None:
         self._store = store
         self._job_root = Path(job_root)
@@ -123,10 +122,6 @@ class VmJobDispatcher:
         # Dispatcher to run this sweep, so a job pinned to a target_tier nobody serves (or for an engine
         # this single-engine dispatcher can't claim) would otherwise keep its untrusted input forever.
         self._max_queued_age_s = max(0.0, float(max_queued_age_s))
-        # Optional "is a warm slot free?" predicate (network-endpoint pools). When set, the worker loop
-        # doesn't claim a queued job unless a slot is available -- so a job stays QUEUED (for a later slot
-        # or another dispatcher) instead of being claimed and then FAILed for lack of capacity.
-        self._slot_available = slot_available
         # Bound a hung validate() so a dead VM agent can't occupy a claim thread forever (heartbeat
         # would keep the job looking fresh, so the orphan sweep never recovers it).
         self._validate_timeout_s = max(self._heartbeat_s, float(validate_timeout_s))
@@ -453,12 +448,6 @@ class VmJobDispatcher:
 
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
-            # Don't claim a queued job unless a warm slot is free -- else we'd mark it RUNNING and then
-            # spend its whole budget waiting for capacity (and FAIL it if none frees). Leaving it QUEUED
-            # keeps it available for the next slot or another dispatcher. (No predicate -> claim as before.)
-            if self._slot_available is not None and not self._slot_available():
-                self._stop.wait(self._poll_s)
-                continue
             try:
                 # Engine-scoped + tier-scoped claim: the store filters to our engine (so we never
                 # claim+requeue another engine's head job and HOL-block our own work) AND honours
@@ -748,9 +737,6 @@ def build_remote_vm_dispatcher(
         # same stale-queued TTL the cold Dispatcher honors -- bounds a job pinned to a tier no remote
         # dispatcher serves (else its untrusted input lingers forever in a remote-only deployment).
         max_queued_age_s=float(os.environ.get("BLASTBOX_MAX_QUEUED_AGE_S") or "0"),
-        # keep a queued job QUEUED until a warm slot is free (else it's claimed then FAILed on capacity
-        # pressure). idle_count-1 accounts for the slot THIS claim will consume.
-        slot_available=lambda: getattr(pool, "idle_count", 1) > 0,
         concurrency=concurrency,
         job_retention_s=job_retention_s,
     )

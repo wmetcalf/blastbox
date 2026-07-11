@@ -195,6 +195,20 @@ class CascadingRuntime:
     def materialize_warm_output(self, slot: Any) -> None:
         self._delegate(slot, "materialize_warm_output")(slot)
 
+    def resume(self, slot: Any) -> None:
+        """Delegate the OPTIONAL per-claim resume seam (aws-ec2-hibernate / aws-lambda-snapstart) to the
+        slot's OWNING tier. Unlike the file-handshake warm hooks above, resume is optional -- a tier
+        without it (file/disposable) is a NO-OP, so a mixed or all-non-resume cascade is unaffected.
+        Without this delegate `_resume_on_claim` only sees CascadingRuntime (no resume) and would POST to
+        a still-parked (stopped/suspended) endpoint. A resume failure propagates so the claim retires the
+        slot dirty."""
+        tier = self._tier_of(slot)
+        if tier is None:
+            raise CascadeExhausted(f"cascade: no owning tier for slot {getattr(slot, 'slot_id', slot)!r}")
+        fn = getattr(tier.runtime, "resume", None)
+        if callable(fn):
+            fn(slot)
+
 
 # ---------------------------------------------------------------------------
 # Build from env
