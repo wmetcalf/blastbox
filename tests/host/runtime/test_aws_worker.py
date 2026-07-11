@@ -422,6 +422,20 @@ def test_lambda_readiness_token_is_cached_across_ticks():
         rt.is_ready(slot)
     mints = sum(1 for k, _ in fake.calls if k == "lambda-microvms create-microvm-auth-token")
     assert mints == 1            # minted once, then reused
+
+
+def test_lambda_health_describe_is_cached_across_warming_ticks():
+    # while the microVM is still coming up (url unresolved), the ~10Hz readiness poll must throttle the
+    # get-microvm describe to _liveness_cache_s -- otherwise every tick hits the AWS control plane.
+    rt, fake = _lambda_rt(
+        {"lambda-microvms run-microvm": {"microvmId": "mv-1"},
+         "lambda-microvms get-microvm": {"state": "pending"}},   # never resolves -> url stays None
+    )
+    slot = rt._launch()
+    for _ in range(10):
+        assert rt.is_ready(slot) is False        # not running yet
+    describes = sum(1 for k, _ in fake.calls if k == "lambda-microvms get-microvm")
+    assert describes == 1        # cached across ticks (constant clock, within the 5s TTL)
     cfg = Ec2Config(region="us-east-1", image_id="ami-0")
     fake = FakeAws({**_IDENT, "ec2 describe-instances": _cp(rc=254, stderr="AccessDenied")})
     rt = DisposableEc2Runtime(cfg, aws_runner=fake)
@@ -465,6 +479,20 @@ def test_ec2_config_from_env_defaults_arm():
     assert cfg.image_id == "ami-x"
     assert cfg.instance_type == "m7g.large"   # ARM64 default
     assert cfg.region == "us-east-1"
+
+
+def test_lambda_config_clamps_to_aws_bounds():
+    # AWS rejects max-duration > 28800s and auth-token TTL > 60min; the config clamps at construction
+    # so an over-large operator value can't 400 every run-microvm / create-auth-token call.
+    hi = LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:img",
+                             max_duration_s=999999, auth_token_ttl_min=120)
+    assert hi.max_duration_s == 28800 and hi.auth_token_ttl_min == 60
+    lo = LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:img",
+                             max_duration_s=0, auth_token_ttl_min=0)
+    assert lo.max_duration_s == 1 and lo.auth_token_ttl_min == 1
+    # SnapStart chains the same clamp via super().__post_init__()
+    snap = LambdaSnapStartConfig(region="us-east-1", image_identifier="arn:img", max_duration_s=999999)
+    assert snap.max_duration_s == 28800
 
 
 # --------------------------------------------------------------------------- pool_config registration

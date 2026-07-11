@@ -60,6 +60,17 @@ def test_healthz():
         httpd.server_close()
 
 
+def test_serve_applies_socket_read_timeout():
+    # a stalled/slowloris request body would otherwise hold the single-flight job lock forever; serve()
+    # must stamp the timeout onto the handler so StreamRequestHandler.setup() enforces it per request.
+    httpd, _ = _running_agent(timeout_s=42.0)
+    try:
+        assert httpd.RequestHandlerClass.timeout == 42.0
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_end_to_end_detonate_roundtrip(tmp_path):
     """Real agent + real client: input bytes -> engine runs + seals -> tar -> extracted into out/."""
     httpd, port = _running_agent()

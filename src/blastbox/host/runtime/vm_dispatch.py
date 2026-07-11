@@ -31,6 +31,11 @@ from typing import Any
 from blastbox.contract.envelope import atomic_write_confined
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.jobs.retention import JobRetentionSweeper
+from blastbox.observability.metrics import (
+    observe_job_duration,
+    record_job_dispatched,
+    record_warm_claim,
+)
 
 # Cap a VM validate() summary before it's stored as result_summary / written to metadata.json — a
 # compromised/buggy VM agent could otherwise return a huge nested blob that balloons the DB/Redis
@@ -338,6 +343,7 @@ class VmJobDispatcher:
             return
         in_path = self._input_path(job)
         owned = False
+        t0 = time.monotonic()   # for the job-duration metric (parity with the cold dispatcher)
         try:
             if not in_path.exists():
                 raise FileNotFoundError(f"spooled input missing: {in_path}")
@@ -397,6 +403,7 @@ class VmJobDispatcher:
         except NoWarmSlot:
             # capacity pressure, not a job failure -- the job NEVER ran. REQUEUE it (CAS back to QUEUED,
             # clear our claim + warm stamp) so it waits for a slot / another dispatcher instead of FAILing.
+            record_warm_claim(hit=False)   # warm-pool miss (parity with the cold dispatcher's metric)
             logger.info("vm_dispatch: no warm slot for %s; requeuing (not failing)", job.job_id)
             owned = self._store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
@@ -418,6 +425,18 @@ class VmJobDispatcher:
                     in_path.unlink()
                 except OSError:
                     pass
+            # Metric parity with the cold dispatcher: count the terminal outcome + wall time.
+            # Requeued (NoWarmSlot) jobs never reached a terminal state here, so they are skipped
+            # -- they'll be counted when they actually run. Read the final status from the store so
+            # a crash mid-dispatch still counts as 'failed'.
+            final = self._store.get(job.job_id)
+            if final is not None and final.status in (JobStatus.DONE, JobStatus.FAILED):
+                record_warm_claim(hit=True)   # a slot was claimed to produce this terminal outcome
+                record_job_dispatched(
+                    path=self._worker_tier,
+                    outcome="done" if final.status == JobStatus.DONE else "failed",
+                )
+                observe_job_duration(path=self._worker_tier, seconds=time.monotonic() - t0)
 
     def _sealed_envelope(self, job: Job) -> Any:
         """Parse the HOST-SEALED metadata.json (the Envelope the trust gate wrote) for the remote path,
@@ -612,7 +631,11 @@ def build_remote_vm_dispatcher(
     # A resume seam (snapstart) runs INSIDE the claim, before the transport's timeout guard -- if its
     # budget outlasts the per-job budget a slow wake can abandon the claim thread with a live billing
     # slot. Warn (don't fail) if the operator sized them backwards.
+    # A tier's cfg carries it directly; a CascadingRuntime aggregates it across its wrapped tiers and
+    # exposes the max as a plain attribute (it has no single cfg), so honor both.
     _resume_to = getattr(getattr(pool.runtime, "cfg", None), "resume_timeout_s", None)
+    if _resume_to is None:
+        _resume_to = getattr(pool.runtime, "resume_timeout_s", None)
     if _resume_to is not None and float(_resume_to) >= worker_timeout_s:
         logger.warning("vm_dispatch: resume_timeout_s=%.0f >= worker_timeout_s=%.0f -- lower "
                        "BLASTBOX_LAMBDA_SNAPSTART_RESUME_TIMEOUT_S below BLASTBOX_WORKER_TIMEOUT_S so a "

@@ -108,6 +108,31 @@ def test_release_quarantines_slot_when_reap_fails() -> None:
     assert pool._slots[slot.slot_id].state == SlotState.DRAINING
 
 
+def test_reap_and_count_skips_concurrent_double_dispose() -> None:
+    # stop()'s bounded thread-join can expire while the background tick is still mid-reap of a slow AWS
+    # terminate; both paths must NOT run a SECOND concurrent terminate on the same live cloud resource.
+    # The _reaping guard makes EXACTLY ONE path dispose a slot that is already being reaped.
+    entered, release = threading.Event(), threading.Event()
+
+    class _BlockingReapRuntime(_FakeRuntime):
+        def reap(self, slot: Slot) -> None:
+            entered.set()
+            release.wait(timeout=5)
+            super().reap(slot)
+
+    rt = _BlockingReapRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    slot = rt.spawn()
+    t = threading.Thread(target=pool._reap_and_count, args=(slot,), daemon=True)
+    t.start()
+    assert entered.wait(timeout=5)     # first reap in-flight -> slot in _reaping
+    pool._reap_and_count(slot)         # concurrent second dispose must be a no-op (returns immediately)
+    assert rt.reaped == []             # second call did NOT invoke a real reap (first still blocked)
+    release.set()
+    t.join(timeout=5)
+    assert rt.reaped == [slot.slot_id]  # exactly ONE real disposal
+
+
 class _FinalizeFailRuntime(_FakeRuntime):
     """Models a runtime (e.g. libvirt) whose finalize fails closed: it reaps the VM INSIDE is_ready()
     — flipping the slot to DRAINING — and returns False."""

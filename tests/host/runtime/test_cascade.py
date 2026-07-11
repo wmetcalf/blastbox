@@ -137,6 +137,32 @@ def test_cascade_resume_propagates_owner_failure():
         rt.resume(slot)   # so _resume_on_claim retires the slot dirty
 
 
+def test_cascade_resume_timeout_s_aggregates_max_across_tiers():
+    # a cascade has no single cfg; it exposes the MAX in-claim resume budget so the dispatcher factory
+    # can still warn when a wrapped tier's resume budget outlasts the per-job budget. Reads cfg.* AND a
+    # plain resume_timeout_s attr; None when no tier resumes on claim.
+    class _Cfg:
+        def __init__(self, v):
+            self.resume_timeout_s = v
+
+    class CfgRuntime(FakeRuntime):
+        def __init__(self, name, v):
+            super().__init__(name)
+            self.cfg = _Cfg(v)
+
+    class AttrRuntime(FakeRuntime):
+        resume_timeout_s = 45.0
+
+    plain = FakeRuntime("fc")
+    assert CascadingRuntime([Tier("fc", plain, 1)]).resume_timeout_s is None   # no resume tier
+    rt = CascadingRuntime([
+        Tier("hib", CfgRuntime("hib", 120.0), 1),
+        Tier("snap", AttrRuntime("snap"), 1),
+        Tier("fc", plain, 1),
+    ])
+    assert rt.resume_timeout_s == 120.0   # max(120 via cfg, 45 via attr)
+
+
 def test_cascade_delegates_warm_hooks_to_owning_tier():
     # an all-file cascade must route host_warm_control/stage_warm_input/materialize_warm_output to the
     # tier that owns the slot -- else gVisor/FC jobs get the wrong input/output transport.

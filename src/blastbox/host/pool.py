@@ -213,6 +213,7 @@ class WarmPool:
 
         # Background thread
         self._stop_event = threading.Event()
+        self._reaping: set[str] = set()   # slot_ids currently being disposed (dedupe concurrent reaps)
         self._thread: threading.Thread | None = None
 
         # Burst demand tracking — all access under _lock
@@ -421,7 +422,16 @@ class WarmPool:
 
     def _reap_and_count(self, slot: "Slot", *, dirty: bool = False) -> None:
         """Reap a slot via the runtime and count the disposal (metrics). ``dirty`` (from a failed
-        release) is forwarded to a reap() that accepts it, so a reusing runtime can quarantine."""
+        release) is forwarded to a reap() that accepts it, so a reusing runtime can quarantine.
+
+        Guarded so EXACTLY ONE path disposes a given slot even under concurrency: stop() (whose 10s
+        thread-join can expire while the background tick is still mid-reap of a slow AWS terminate,
+        up to cli_timeout_s) must not run a SECOND concurrent terminate on the same real cloud resource
+        (double control-plane call + double metric/count). A slot already being reaped is skipped."""
+        with self._lock:
+            if slot.slot_id in self._reaping:
+                return
+            self._reaping.add(slot.slot_id)
         try:
             if self._reap_takes_dirty:
                 self._runtime.reap(slot, dirty=dirty)  # type: ignore[call-arg]
@@ -429,6 +439,8 @@ class WarmPool:
                 self._runtime.reap(slot)
         finally:
             record_slot_reaped()
+            with self._lock:
+                self._reaping.discard(slot.slot_id)
 
     def _sample_metrics(self) -> None:
         """Publish a snapshot of slot-state counts + target to Prometheus gauges."""

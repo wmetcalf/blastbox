@@ -247,6 +247,20 @@ def test_detonate_remote_stream_cap_covers_metadata_budget(tmp_path):
     assert meta.get("status") == "ok"   # not rejected: stream cap = artifact + metadata budgets + overhead
 
 
+def test_detonate_remote_stream_cap_covers_member_headroom(tmp_path):
+    # many tiny artifacts whose CONTENT fits max_output_bytes but whose per-member tar headers (512B each)
+    # push the raw stream past artifact+metadata budgets. The stream cap must add per-member headroom
+    # (~max_members*1KB) or a legitimate many-page result is (wrongly) rejected before extraction.
+    (tmp_path / "in.bin").write_bytes(b"z")
+    files = {"metadata.json": b'{"status":"ok"}'}
+    files.update({f"p{i}.png": b"x" * 10 for i in range(200)})   # 2KB of content across 200 members
+    tar = _tar(files)   # ~206KB stream (200 x 1KB tar blocks) -- exceeds 5000*1.1 + 2000 + 64KB naive cap
+    meta = detonate_remote("http://h:8765", tmp_path / "in.bin", tmp_path / "o",
+                           http_open=_opener(tar), max_output_bytes=5000, max_metadata_bytes=2000,
+                           max_members=300)
+    assert meta.get("status") == "ok"   # not rejected: stream cap includes max_members*1024 header headroom
+
+
 def test_detonate_remote_caps_metadata_size(tmp_path):
     from blastbox.host.runtime.remote_http import RemoteOutputTooLarge
     (tmp_path / "in.bin").write_bytes(b"z")

@@ -256,8 +256,11 @@ def detonate_remote(
     # header/padding headroom) -- else a valid output whose artifacts fit the budget but whose metadata
     # (or many tiny members' headers) push the raw stream over is rejected before extraction can apply
     # the real per-cap budgets.
+    # header/padding headroom must track the MEMBER count, not just bytes: many tiny files (each a
+    # 512B tar header + padding, all within the byte budget) can make the raw stream exceed a byte-only
+    # headroom. Add ~1KiB per allowed member so a valid max-member tar isn't rejected pre-extraction.
     stream_cap = None if max_output_bytes is None else (
-        int(max_output_bytes * 1.1) + (max_metadata_bytes or 0) + 65536)
+        int(max_output_bytes * 1.1) + (max_metadata_bytes or 0) + (max_members or 0) * 1024 + 65536)
     with input_path.open("rb") as body:
         req = urllib.request.Request(url, data=body, method="POST", headers=headers)
         with opener(req, timeout, context=ssl_context) as resp, \

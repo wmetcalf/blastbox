@@ -99,6 +99,10 @@ class _Handler(BaseHTTPRequestHandler):
     token: str | None = None
     max_bytes: int = _DEFAULT_MAX_BYTES
     allow_nets: list = []  # peer-IP allowlist (empty = allow any; mTLS is the stronger gate)
+    # Socket read timeout (StreamRequestHandler.setup() applies it): a stalled/slowloris request body
+    # would otherwise hold the single-flight _JOB_LOCK forever and wedge the whole worker. Overridable
+    # via BLASTBOX_WORKER_AGENT_TIMEOUT_S; must exceed the largest legitimate upload's transfer time.
+    timeout = 300.0   # ClassVar (matches StreamRequestHandler.timeout); no annotation -> no override clash
 
     # quieter logging (per-request lines go to our logger at debug)
     def log_message(self, fmt: str, *args: object) -> None:
@@ -294,12 +298,14 @@ def _parse_cidrs(raw: str | None) -> list:
 def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
           token: str | None = None, max_bytes: int = _DEFAULT_MAX_BYTES,
           tls_cert: str | None = None, tls_key: str | None = None,
-          client_ca: str | None = None, allow_cidrs: str | None = None) -> ThreadingHTTPServer:
+          client_ca: str | None = None, allow_cidrs: str | None = None,
+          timeout_s: float = 300.0) -> ThreadingHTTPServer:
     """Serve the engine. ``tls_cert``/``tls_key`` enable HTTPS; adding ``client_ca`` requires a
-    CA-signed **client** cert (mTLS). ``allow_cidrs`` restricts which peer IPs may POST /detonate."""
+    CA-signed **client** cert (mTLS). ``allow_cidrs`` restricts which peer IPs may POST /detonate.
+    ``timeout_s`` bounds a request's socket reads so a slowloris body can't hold the job lock forever."""
     handler = type("_BoundHandler", (_Handler,),
                    {"engine": engine, "token": token, "max_bytes": max_bytes,
-                    "allow_nets": _parse_cidrs(allow_cidrs)})
+                    "allow_nets": _parse_cidrs(allow_cidrs), "timeout": timeout_s})
     httpd = ThreadingHTTPServer((bind, port), handler)
     if tls_cert and tls_key:
         from blastbox.tls import server_ssl_context
@@ -332,8 +338,10 @@ def main(argv: list[str] | None = None) -> int:
         _log.warning("http_agent: bound to %s with NO mTLS / token / IP allowlist -- anyone who can "
                      "reach :%d can submit jobs. Set BLASTBOX_WORKER_AGENT_CLIENT_CA (mTLS) or "
                      "_ALLOW_CIDRS / _TOKEN.", bind, port)
+    timeout_s = float(os.environ.get("BLASTBOX_WORKER_AGENT_TIMEOUT_S") or "300")
     httpd = serve(engine, bind=bind, port=port, token=token, max_bytes=max_bytes,
-                  tls_cert=tls_cert, tls_key=tls_key, client_ca=client_ca, allow_cidrs=allow_cidrs)
+                  tls_cert=tls_cert, tls_key=tls_key, client_ca=client_ca, allow_cidrs=allow_cidrs,
+                  timeout_s=timeout_s)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

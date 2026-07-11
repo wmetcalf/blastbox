@@ -117,6 +117,18 @@ class LambdaMicroVmConfig(AwsWorkerConfig):
     # operator either supplies a (no-internet) egress connector or explicitly opts into internet here.
     allow_default_egress: bool = False
 
+    def __post_init__(self) -> None:
+        # Clamp to the AWS bounds so a mistyped env can't turn every call into an opaque reject:
+        # run-microvm --maximum-duration-in-seconds <= 28800 (8h); create-microvm-auth-token
+        # --expiration-in-minutes in [1, 60]. (SnapStart's __post_init__ chains to this via super().)
+        dur = min(28800, max(1, int(self.max_duration_s)))
+        ttl = min(60, max(1, int(self.auth_token_ttl_min)))
+        if (dur, ttl) != (self.max_duration_s, self.auth_token_ttl_min):
+            _log.warning("lambda-microvm: clamped max_duration_s=%d auth_token_ttl_min=%d to AWS bounds",
+                         dur, ttl)
+        object.__setattr__(self, "max_duration_s", dur)
+        object.__setattr__(self, "auth_token_ttl_min", ttl)
+
     @classmethod
     def from_env(cls, get: Callable[[str], str | None], **overrides: Any) -> LambdaMicroVmConfig:
         region = _env(get, "BLASTBOX_AWS_REGION") or _env(get, "AWS_REGION") or "us-east-1"
@@ -268,6 +280,21 @@ class AwsDisposableRuntime:
         # health probe defaults to the TLS-aware one (see the select_* helpers).
         self.ssl_context = ssl_context
         self._live_cache: dict[str, tuple[float, bool]] = {}
+        # cache the READINESS get-microvm/describe-instances too (is_ready is polled ~10Hz during WARMING,
+        # and its endpoint-resolution describe is uncached) so a booting slot doesn't spam the control plane.
+        self._desc_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+    def _describe_cached(self, slot: "AwsWorkerSlot", ttl: float) -> dict[str, Any]:
+        now = self._clock()
+        cached = self._desc_cache.get(slot.slot_id)
+        if cached is not None and (now - cached[0]) < ttl:
+            return cached[1]
+        desc = self._describe(slot)
+        self._desc_cache[slot.slot_id] = (now, desc)
+        return desc
+
+    def _describe(self, slot: "AwsWorkerSlot") -> dict[str, Any]:   # concrete tiers override
+        raise NotImplementedError
 
     @property
     def readiness_timeout_s(self) -> float:
@@ -337,6 +364,7 @@ class AwsDisposableRuntime:
 
     def reap(self, slot: AwsWorkerSlot) -> None:
         self._live_cache.pop(slot.slot_id, None)
+        self._desc_cache.pop(slot.slot_id, None)
         if slot.resource_id is None:
             return
         self._terminate(slot)
@@ -440,7 +468,7 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
     def _health_ok(self, slot: AwsWorkerSlot) -> bool:
         # Resolve the per-VM URL once the microVM is running, then probe the agent with a fresh JWE.
         if slot.url is None:
-            desc = self._describe(slot)
+            desc = self._describe_cached(slot, self._liveness_cache_s)   # throttle the ~10Hz warming poll
             if str(desc.get("state", "")).lower() not in ("running", "active", "ready"):
                 return False
             # live: get-microvm returns the per-VM host under `endpoint` (a bare hostname, no scheme)
@@ -514,18 +542,16 @@ class LambdaSnapStartConfig(LambdaMicroVmConfig):
     resume_poll_s: float = 1.0           # health re-probe interval while a resumed slot settles
 
     def __post_init__(self) -> None:
-        # Clamp to the AWS run-microvm --idle-policy / --maximum-duration bounds so a mistyped env value
-        # can't turn every spawn into an opaque per-slot AWS reject (silent fail-never-warm). AWS:
-        # maxIdleDurationSeconds >= 60, suspendedDurationSeconds >= 0, maximum-duration <= 28800 (8h).
+        super().__post_init__()   # base clamps max_duration_s + auth_token_ttl_min
+        # Clamp the AWS run-microvm --idle-policy bounds so a mistyped env value can't turn every spawn
+        # into an opaque per-slot AWS reject (silent fail-never-warm): maxIdleDurationSeconds >= 60,
+        # suspendedDurationSeconds >= 0.
         idle = max(60, int(self.max_idle_duration_s))
         susp = max(0, int(self.suspended_duration_s))
-        dur = min(28800, max(1, int(self.max_duration_s)))
-        if (idle, susp, dur) != (self.max_idle_duration_s, self.suspended_duration_s, self.max_duration_s):
-            _log.warning("snapstart: clamped idle-policy to AWS bounds (idle=%ds suspended=%ds max_duration=%ds)",
-                         idle, susp, dur)
+        if (idle, susp) != (self.max_idle_duration_s, self.suspended_duration_s):
+            _log.warning("snapstart: clamped idle-policy to AWS bounds (idle=%ds suspended=%ds)", idle, susp)
         object.__setattr__(self, "max_idle_duration_s", idle)
         object.__setattr__(self, "suspended_duration_s", susp)
-        object.__setattr__(self, "max_duration_s", dur)
 
     @classmethod
     def from_env(cls, get: Callable[[str], str | None], **overrides: Any) -> LambdaSnapStartConfig:
@@ -564,12 +590,8 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
     _ALIVE_STATES = ("pending", "running", "active", "ready", "suspending", "suspended")
 
     def __init__(self, cfg: LambdaSnapStartConfig, **kw: Any) -> None:
-        super().__init__(cfg, **kw)   # inherits the image-required + fail-closed egress guards
+        super().__init__(cfg, **kw)   # inherits the image-required + fail-closed egress guards + _desc_cache
         self.cfg: LambdaSnapStartConfig = cfg
-        # Cache the readiness get-microvm during WARMING so the ~0.1s pool promotion tick doesn't spam
-        # the control plane (mirrors the is_alive _liveness_cache). resume()/_state stay UNCACHED (they
-        # need the current state to decide waking).
-        self._desc_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     def _extra_run_args(self) -> list[str]:
         import json
@@ -579,15 +601,6 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
             "autoResumeEnabled": self.cfg.auto_resume,
         }
         return ["--idle-policy", json.dumps(policy)]
-
-    def _describe_cached(self, slot: AwsWorkerSlot, ttl: float) -> dict[str, Any]:
-        now = self._clock()
-        cached = self._desc_cache.get(slot.slot_id)
-        if cached is not None and (now - cached[0]) < ttl:
-            return cached[1]
-        desc = self._describe(slot)
-        self._desc_cache[slot.slot_id] = (now, desc)
-        return desc
 
     def _state(self, slot: AwsWorkerSlot) -> str:
         return str(self._describe(slot).get("state", "")).lower()   # UNCACHED: resume needs current state
@@ -755,7 +768,7 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
 
     def _health_ok(self, slot: AwsWorkerSlot) -> bool:
         if slot.ip is None:
-            inst = self._describe(slot)
+            inst = self._describe_cached(slot, self._liveness_cache_s)   # throttle the ~10Hz warming poll
             if str(inst.get("State", {}).get("Name", "")) != "running":
                 return False
             slot.ip = inst.get("PublicIpAddress") if self.cfg.use_public_ip else inst.get("PrivateIpAddress")
@@ -842,10 +855,9 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
     _DEAD_STATES = ("shutting-down", "terminated")
 
     def __init__(self, cfg: Ec2HibernateConfig, **kw: Any) -> None:
-        super().__init__(cfg, **kw)
+        super().__init__(cfg, **kw)   # base provides _desc_cache + _describe_cached
         self.cfg: Ec2HibernateConfig = cfg
         self._phase: dict[str, str] = {}   # slot_id -> "warming" | "hibernating" | "parked"
-        self._desc_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._hib_attempt: dict[str, float] = {}   # slot_id -> last stop --hibernate attempt (throttle)
         self._hib_started: dict[str, float] = {}   # slot_id -> when it entered the hibernating phase
 
@@ -875,15 +887,6 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                         "DeleteOnTermination": True}}]
         # hibernation requires an ENCRYPTED root volume large enough to hold the saved RAM image.
         return ["--hibernation-options", "Configured=true", "--block-device-mappings", json.dumps(ebs)]
-
-    def _describe_cached(self, slot: AwsWorkerSlot, ttl: float) -> dict[str, Any]:
-        now = self._clock()
-        cached = self._desc_cache.get(slot.slot_id)
-        if cached is not None and (now - cached[0]) < ttl:
-            return cached[1]
-        desc = self._describe(slot)
-        self._desc_cache[slot.slot_id] = (now, desc)
-        return desc
 
     def _state(self, slot: AwsWorkerSlot) -> str:
         return str(self._describe(slot).get("State", {}).get("Name", "")).lower()   # UNCACHED

@@ -265,6 +265,40 @@ def test_remote_no_slot_requeues_not_fails(tmp_path):
     assert (tmp_path / job.job_id / "input" / "evil.dll").exists()   # input preserved for the retry
 
 
+def test_dispatch_records_terminal_metrics(tmp_path):
+    # parity with the cold dispatcher: a terminal job bumps dispatched(path,outcome) + a warm-claim HIT.
+    import blastbox.observability.metrics as m
+    store = InMemoryJobStore()
+    _queue_job(store, tmp_path)
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"status": "ok"}, True),
+                        worker_tier="aws-ec2-hibernate")
+    bd = m.JOBS_DISPATCHED_TOTAL.labels(path="aws-ec2-hibernate", outcome="done")._value.get()
+    bh = m.WARM_CLAIMS_TOTAL.labels(result="hit")._value.get()
+    bc = m.JOB_DURATION_SECONDS.labels(path="aws-ec2-hibernate")._sum.get()
+    d._process(store.claim_next())
+    assert m.JOBS_DISPATCHED_TOTAL.labels(path="aws-ec2-hibernate", outcome="done")._value.get() == bd + 1
+    assert m.WARM_CLAIMS_TOTAL.labels(result="hit")._value.get() == bh + 1
+    assert m.JOB_DURATION_SECONDS.labels(path="aws-ec2-hibernate")._sum.get() >= bc   # duration observed
+
+
+def test_requeue_records_warm_claim_miss(tmp_path):
+    # a NoWarmSlot requeue is a warm-pool MISS, and must NOT count as a dispatched/hit (the job never ran).
+    import blastbox.observability.metrics as m
+    from blastbox.host.runtime.vm_dispatch import NoWarmSlot
+    store = InMemoryJobStore()
+    _queue_job(store, tmp_path)
+
+    def validate(path):
+        raise NoWarmSlot("no warm slot available within claim timeout")
+
+    d = VmJobDispatcher(store, str(tmp_path), validate, engine="authenticode", worker_tier="aws-ec2")
+    bmiss = m.WARM_CLAIMS_TOTAL.labels(result="miss")._value.get()
+    bhit = m.WARM_CLAIMS_TOTAL.labels(result="hit")._value.get()
+    d._process(store.claim_next())
+    assert m.WARM_CLAIMS_TOTAL.labels(result="miss")._value.get() == bmiss + 1
+    assert m.WARM_CLAIMS_TOTAL.labels(result="hit")._value.get() == bhit       # no false hit for a requeue
+
+
 def test_vm_dispatch_skips_indexing_when_unsupported(tmp_path):
     # a store without hash-search support (memory/redis) -> no-op, never raises
     store = InMemoryJobStore()

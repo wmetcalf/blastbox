@@ -87,6 +87,18 @@ class CascadingRuntime:
         return max((float(getattr(t.runtime, "readiness_timeout_s", 0.0)) for t in self.tiers),
                    default=0.0)
 
+    @property
+    def resume_timeout_s(self) -> float | None:
+        """The MAX in-claim resume budget across wrapped tiers (a snapstart/hibernate seam carries one on
+        its cfg), or None if no tier resumes on claim. A cascade has no single cfg, so the dispatcher
+        factory reads this to still warn when a tier's resume budget outlasts the per-job budget."""
+        vals = [
+            float(rt) for t in self.tiers
+            if (rt := getattr(getattr(t.runtime, "cfg", None), "resume_timeout_s", None)
+                or getattr(t.runtime, "resume_timeout_s", None)) is not None
+        ]
+        return max(vals) if vals else None
+
     def __init__(self, tiers: list[Tier]) -> None:
         if not tiers:
             raise CascadeMisconfigured("cascade needs at least one tier")
