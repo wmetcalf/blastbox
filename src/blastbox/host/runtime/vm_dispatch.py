@@ -631,6 +631,19 @@ def build_remote_vm_dispatcher(
     (``runtime.dispatch_style``), not tier-name matching -- this is the single typed CLI seam."""
     from blastbox.host.runtime.remote_http import make_remote_validate
 
+    # FAIL CLOSED on an unsafe trust configuration. This path sets trust_output_metadata=True (it PRESERVES
+    # the worker-supplied metadata.json + artifact list), which is only safe when the host trust gate re-
+    # seals/hashes/caps that output first. The gate needs BOTH: `limits` (without it output_trust is never
+    # installed -> a compromised worker's untrusted artifacts get marked DONE unvalidated) and `engine`
+    # (validate_worker_output requires an exact engine match -> engine=None validates against "" and every
+    # real envelope deterministically fails). The CLI always supplies both; a direct caller must too.
+    if limits is None:
+        raise ValueError("build_remote_vm_dispatcher requires limits: the trust-gated remote path preserves "
+                         "worker metadata and MUST re-validate it (caps/hashes). Pass Limits.")
+    if not engine:
+        raise ValueError("build_remote_vm_dispatcher requires engine: the host trust gate validates each "
+                         "worker envelope against an exact engine. Pass the tier's engine name.")
+
     ssl_context = getattr(pool.runtime, "ssl_context", None)
     max_output_bytes = getattr(limits, "max_total_artifact_bytes", None)
     # A resume seam (snapstart) runs INSIDE the claim, before the transport's timeout guard -- if its
@@ -714,35 +727,35 @@ def build_remote_vm_dispatcher(
     # It runs INSIDE the transport (make_remote_validate) BEFORE the slot is released clean, so a worker
     # that fails trust keeps its slot dirty and is retired instead of re-offered. The transport hands it
     # (input_path, out_dir); recompute the input SHA from the bytes actually POSTed (== job.input_sha256).
-    output_trust: Callable[..., None] | None = None
-    if limits is not None:
-        def output_trust(input_path: Path, out_dir: Path, expected_sha: str | None,
-                         owns: Callable[[], bool] | None = None) -> None:
-            from blastbox.host.trust import OutputTrustError, validate_worker_output
-            # Compare the worker's sealed envelope against the AUTHORITATIVE ingress-recorded input SHA
-            # (job.input_sha256), matching the cold/file-warm paths -- so a staged input that was
-            # corrupted/replaced after submission is caught (the worker hashed different bytes). Fall
-            # back to hashing the POSTed file only if the dispatcher didn't supply one.
-            if not expected_sha:
-                import hashlib
-                h = hashlib.sha256()
-                with open(input_path, "rb") as fh:
-                    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-                        h.update(chunk)
-                expected_sha = h.hexdigest()
-            env = validate_worker_output(output_dir=out_dir, input_sha256=expected_sha,
-                                         engine=engine or "", limits=limits)
-            if env.status == "engine_error":
-                detail = env.warnings[0].message if env.warnings else "engine_error"
-                raise OutputTrustError(f"engine_error: {detail}")
-            # Fence the metadata WRITE by claim ownership: if this (possibly long) remote attempt
-            # outlived its claim and a peer recovered the job, DON'T overwrite the new owner's
-            # metadata.json in the shared output dir. Raise -> job fails for this stale attempt, slot
-            # retired dirty. Checked immediately before the write to shrink the TOCTOU to ~nothing.
-            if owns is not None and not owns():
-                raise OutputTrustError("claim lost before host metadata write (peer recovered the job)")
-            atomic_write_confined(out_dir, "metadata.json",
-                                  env.model_dump_json(by_alias=True).encode("utf-8"), mode=0o644)
+    # limits + engine are guaranteed non-None (fail-closed guard at the top), so the trust gate is ALWAYS
+    # installed on this path -- trust_output_metadata=True is never set without it.
+    def output_trust(input_path: Path, out_dir: Path, expected_sha: str | None,
+                     owns: Callable[[], bool] | None = None) -> None:
+        from blastbox.host.trust import OutputTrustError, validate_worker_output
+        # Compare the worker's sealed envelope against the AUTHORITATIVE ingress-recorded input SHA
+        # (job.input_sha256), matching the cold/file-warm paths -- so a staged input that was
+        # corrupted/replaced after submission is caught (the worker hashed different bytes). Fall
+        # back to hashing the POSTed file only if the dispatcher didn't supply one.
+        if not expected_sha:
+            import hashlib
+            h = hashlib.sha256()
+            with open(input_path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(chunk)
+            expected_sha = h.hexdigest()
+        env = validate_worker_output(output_dir=out_dir, input_sha256=expected_sha,
+                                     engine=engine, limits=limits)
+        if env.status == "engine_error":
+            detail = env.warnings[0].message if env.warnings else "engine_error"
+            raise OutputTrustError(f"engine_error: {detail}")
+        # Fence the metadata WRITE by claim ownership: if this (possibly long) remote attempt
+        # outlived its claim and a peer recovered the job, DON'T overwrite the new owner's
+        # metadata.json in the shared output dir. Raise -> job fails for this stale attempt, slot
+        # retired dirty. Checked immediately before the write to shrink the TOCTOU to ~nothing.
+        if owns is not None and not owns():
+            raise OutputTrustError("claim lost before host metadata write (peer recovered the job)")
+        atomic_write_confined(out_dir, "metadata.json",
+                              env.model_dump_json(by_alias=True).encode("utf-8"), mode=0o644)
 
     validate = make_remote_validate(
         _claim, _release,
@@ -760,9 +773,12 @@ def build_remote_vm_dispatcher(
         trust_output_metadata=True,   # preserve the host-sealed metadata.json the validator wrote
         sanitize_params=sanitize,
         fixed_net_policy=getattr(engine_spec, "net_policy", None),   # enforce egress personality
-        # the parent heartbeat watchdog must cover the bounded claim WAIT plus the full detonation budget,
-        # so a slot claimed late (near warm_claim_timeout_s) still gets its whole worker_timeout_s to run.
-        validate_timeout_s=warm_claim_timeout_s + worker_timeout_s,
+        # the parent heartbeat watchdog must cover the bounded claim WAIT + the in-claim RESUME (snapstart/
+        # hibernate wake, up to the tier's resume_timeout_s) + the full detonation budget, so a slot claimed
+        # late and slow to wake still gets its whole worker_timeout_s to run instead of being killed mid-run.
+        validate_timeout_s=(warm_claim_timeout_s
+                            + (float(_resume_to) if _resume_to is not None else 0.0)
+                            + worker_timeout_s),
         # sole_owner recovers a claim that crashed in the tiny window BETWEEN claim and the
         # worker_runtime="warm" stamp -- but it makes maintenance FAIL any stale RUNNING job for this
         # engine, which would clobber a COLD dispatcher's live jobs if one shares the store. Default OFF

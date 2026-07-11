@@ -303,10 +303,12 @@ def _guard_exposure(bind: str, port: int, *, token, client_ca, allow_cidrs, allo
     (mTLS / bearer token / IP allowlist): anyone who can reach the port could submit arbitrary jobs and
     consume the worker's egress + sandbox boundary. A gated deployment (AWS microVM JWE proxy, a security
     group, a private worker network) can opt back in with BLASTBOX_WORKER_AGENT_ALLOW_INSECURE=1."""
-    # Parse the CIDR list the SAME way serve()/_caller_allowed does: a whitespace/comma-only value (e.g.
-    # a typo `" , "`) parses to an EMPTY list, which _caller_allowed treats as allow-ANY -- so it is NOT a
-    # gate. Only a non-empty parsed allowlist counts; otherwise this would wave through a wide-open agent.
-    has_cidr_gate = bool(_parse_cidrs(allow_cidrs))
+    # Parse the CIDR list the SAME way serve()/_caller_allowed does. Two ways it is NOT actually a gate,
+    # both of which _caller_allowed treats as allow-ANY: (1) a whitespace/comma-only value (e.g. a typo
+    # `" , "`) parses to an EMPTY list; (2) a catch-all network (`0.0.0.0/0` / `::/0`, prefixlen 0) matches
+    # every peer. Count the allowlist as a gate ONLY if it is non-empty AND has no catch-all entry.
+    _cidrs = _parse_cidrs(allow_cidrs)
+    has_cidr_gate = bool(_cidrs) and not any(n.prefixlen == 0 for n in _cidrs)
     exposed = bind not in _LOOPBACK_BINDS
     if not exposed or client_ca or token or has_cidr_gate:
         return

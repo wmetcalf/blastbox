@@ -1,11 +1,17 @@
 """Unit tests for the libvirt pool job dispatcher (in-memory store; validate stubbed)."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from blastbox.host.jobs.base import Job, JobStatus
 from blastbox.host.jobs.memory import InMemoryJobStore
 from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
+
+# the trust-gated remote factory requires limits (uses getattr(...,None) for caps); an empty ns suffices
+# for construction tests that never actually run the trust gate.
+_FAKE_LIMITS = SimpleNamespace(max_total_artifact_bytes=None, max_artifacts=None, max_metadata_bytes=None)
 
 
 def _queue_job(store, tmp_path, filename="evil.dll", body=b"MZ"):
@@ -386,7 +392,7 @@ def test_build_remote_vm_dispatcher_constructs(tmp_path):
             pass
 
     vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
-                                    tier="static", engine="clippyshot")
+                                    tier="static", engine="clippyshot", limits=_FAKE_LIMITS)
     assert isinstance(vm, VmJobDispatcher)
     assert vm._trust_output_metadata is True        # the remote path preserves the sealed metadata
     assert vm._validate_takes_params is True         # the remote_http validate accepts params
@@ -411,12 +417,41 @@ def test_remote_claim_budget_is_bounded_and_reserves_detonation_time(tmp_path):
             pass
 
     vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _NeverYieldsPool(),
-                                    tier="aws-ec2", engine="clippyshot",
+                                    tier="aws-ec2", engine="clippyshot", limits=_FAKE_LIMITS,
                                     worker_timeout_s=300.0, warm_claim_timeout_s=0.05)
     assert vm._validate_timeout_s == pytest.approx(300.05)   # watchdog = claim budget + detonate budget
     with pytest.raises(NoWarmSlot):
         vm._validate(tmp_path / "in.bin")                    # no slot within the claim budget -> requeue
     assert seen["claim_timeout"] <= 0.05                     # bounded by warm_claim_timeout_s, not 300s
+
+
+def test_remote_watchdog_includes_resume_budget(tmp_path):
+    # G5: for a resume-based tier the in-claim wake (resume_timeout_s) runs BEFORE detonation, so the
+    # watchdog must cover claim + resume + detonate -- else a late+slow resume eats the detonation budget
+    # and the job is killed mid-run. Here resume_timeout_s=180 (EC2-hibernate default).
+    from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+    pool = SimpleNamespace(
+        runtime=SimpleNamespace(ssl_context=None, cfg=SimpleNamespace(resume_timeout_s=180.0)),
+        claim=lambda *, timeout_s: None, release=lambda s, dirty=False: None,
+    )
+    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
+                                    tier="aws-ec2-hibernate", engine="clippyshot", limits=_FAKE_LIMITS,
+                                    worker_timeout_s=300.0, warm_claim_timeout_s=60.0)
+    assert vm._validate_timeout_s == pytest.approx(540.0)   # 60 claim + 180 resume + 300 detonate
+
+
+def test_remote_factory_requires_limits_and_engine(tmp_path):
+    # G1/G2: the trust-gated remote path PRESERVES worker metadata, so it must fail closed without the
+    # host trust gate's inputs -- limits (caps/hashes) and an exact engine to match the envelope against.
+    from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+    pool = SimpleNamespace(runtime=SimpleNamespace(ssl_context=None),
+                           claim=lambda *, timeout_s: None, release=lambda s, dirty=False: None)
+    with pytest.raises(ValueError, match="requires limits"):
+        build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
+                                   tier="static", engine="clippyshot", limits=None)
+    with pytest.raises(ValueError, match="requires engine"):
+        build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
+                                   tier="static", engine=None, limits=_FAKE_LIMITS)
 
 
 class _FakePool:
@@ -435,7 +470,7 @@ def test_remote_injects_net_egress_sealed_by_default(tmp_path):
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
     spec = EngineSpec(name="clippyshot", image="img", worker_argv=[], net_policy="none")
     vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
-                                    tier="static", engine="clippyshot", engine_spec=spec)
+                                    tier="static", engine="clippyshot", engine_spec=spec, limits=_FAKE_LIMITS)
     assert vm._sanitize({})["BLASTBOX_NET_EGRESS"] == "0"
 
 
@@ -446,7 +481,7 @@ def test_remote_injects_net_egress_open_for_egress_personality(tmp_path, monkeyp
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
     spec = EngineSpec(name="clippyshot", image="img", worker_argv=[], net_policy="inspect")
     vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
-                                    tier="static", engine="clippyshot", engine_spec=spec)
+                                    tier="static", engine="clippyshot", engine_spec=spec, limits=_FAKE_LIMITS)
     assert vm._sanitize({})["BLASTBOX_NET_EGRESS"] == "1"   # dispatcher-owned, merged last
     # a hostile job param cannot flip it back
     assert vm._sanitize({"BLASTBOX_NET_EGRESS": "0"})["BLASTBOX_NET_EGRESS"] == "1"

@@ -75,6 +75,11 @@ def test_guard_exposure_rejects_empty_cidr_allowlist():
         with pytest.raises(SystemExit, match="refusing to serve"):
             _guard_exposure("0.0.0.0", 8765, token=None, client_ca=None, allow_cidrs=junk,
                             allow_insecure=False)
+    # a catch-all network parses non-empty but matches EVERY peer -> also not a gate (fail closed)
+    for catchall in ("0.0.0.0/0", "::/0", "10.0.0.0/8,0.0.0.0/0"):
+        with pytest.raises(SystemExit, match="refusing to serve"):
+            _guard_exposure("0.0.0.0", 8765, token=None, client_ca=None, allow_cidrs=catchall,
+                            allow_insecure=False)
 
 
 def test_guard_exposure_allows_gated_or_optin():

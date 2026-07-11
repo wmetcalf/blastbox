@@ -95,6 +95,19 @@ def test_spawn_completing_after_stop_is_reaped_not_leaked() -> None:
     assert not pool._slots                 # ...and never published (no leak)
 
 
+def test_after_stop_spawn_tracks_slot_when_reap_fails() -> None:
+    # G4: a slow spawn (AWS run-instances/run-microvm) can finish AFTER stop() flipped _stop_event; the
+    # slot is reaped while still untracked. If that terminate RAISES (the cloud resource may persist), the
+    # husk must be TRACKED as DRAINING for accounting/manual cleanup -- not silently leaked off the books,
+    # matching every other reap-failure path (release/health/stop).
+    rt = _ReapFailRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool._stop_event.set()                 # shutdown already in progress
+    pool._spawn_to_deficit(ready=True)     # a spawn completes while stopping; its reap raises
+    assert len(pool._slots) == 1           # tracked, not leaked
+    assert next(iter(pool._slots.values())).state == SlotState.DRAINING   # quarantined husk
+
+
 def test_release_quarantines_slot_when_reap_fails() -> None:
     # a reap that RAISES (worker not disposed) must NOT pop the slot — keep it tracked/quarantined so
     # it counts against the ceiling and surfaces, instead of orphaning a live worker off the books.

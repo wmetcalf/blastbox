@@ -670,10 +670,19 @@ class WarmPool:
                 if not stopping:
                     self._slots[slot.slot_id] = slot
             if stopping:
+                reaped = False
                 try:
-                    self._reap_and_count(slot)   # reap the just-created (untracked) slot ourselves
+                    reaped = self._reap_and_count(slot)   # reap the just-created (untracked) slot ourselves
                 except Exception:
-                    logger.exception("pool.reap_after_stop_failed slot_id=%s", slot.slot_id)
+                    logger.exception("pool.reap_after_stop_failed slot_id=%s — quarantining (worker may "
+                                     "persist)", slot.slot_id)
+                if not reaped:
+                    # the terminate raised (the EC2/MicroVM may still be running): TRACK the husk as
+                    # DRAINING so it's accounted/surfaced for manual cleanup instead of silently leaked
+                    # off the books -- matching every other reap-failure path (release/health/stop).
+                    slot.state = SlotState.DRAINING
+                    with self._lock:
+                        self._slots[slot.slot_id] = slot
                 break
 
     def _effective_target_unlocked(self) -> int:
