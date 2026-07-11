@@ -261,6 +261,33 @@ def test_detonate_remote_stream_cap_covers_member_headroom(tmp_path):
     assert meta.get("status") == "ok"   # not rejected: stream cap includes max_members*1024 header headroom
 
 
+def test_safe_extract_metadata_cap_applies_to_normalized_path(tmp_path):
+    # F7 (security): a worker disguising the control file as "./metadata.json" still lands at
+    # output/metadata.json, so it must get the METADATA cap -- not the (much larger) artifact byte budget.
+    from blastbox.host.runtime.remote_http import RemoteOutputTooLarge
+    tar = _tar({"./metadata.json": b'{"x":"' + b"a" * 5000 + b'"}'})   # ~5KB "metadata"
+    with pytest.raises(RemoteOutputTooLarge):
+        _safe_extract_tar(tar, tmp_path, max_total_bytes=1_000_000, max_metadata_bytes=1000)
+
+
+def test_make_remote_validate_params_for_raise_releases_dirty(tmp_path):
+    # F2: a raising params_for hook must NOT leak the claimed slot -- it is released DIRTY (retired) and
+    # the caller gets the sanitized (error, False) contract, not an exception out of validate().
+    from blastbox.host.runtime.remote_http import make_remote_validate
+    released = []
+    slot = SimpleNamespace(slot_id="s1", auth_token=None, agent_port=8765)
+
+    def boom(_p):
+        raise ValueError("bad hook")
+
+    validate = make_remote_validate(
+        lambda: slot, lambda s, dirty=False: released.append((s.slot_id, dirty)),
+        output_dir_for=lambda p: tmp_path, params_for=boom)
+    meta, ok = validate(tmp_path / "in.bin")
+    assert ok is False and "error" in meta       # sanitized failure, not a raise
+    assert released == [("s1", True)]            # claimed slot released DIRTY, not leaked ASSIGNED
+
+
 def test_detonate_remote_caps_metadata_size(tmp_path):
     from blastbox.host.runtime.remote_http import RemoteOutputTooLarge
     (tmp_path / "in.bin").write_bytes(b"z")

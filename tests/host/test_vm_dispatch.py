@@ -440,6 +440,30 @@ def test_remote_watchdog_includes_resume_budget(tmp_path):
     assert vm._validate_timeout_s == pytest.approx(540.0)   # 60 claim + 180 resume + 300 detonate
 
 
+def test_remote_all_stale_resume_slots_requeues_not_fails(tmp_path):
+    # F3: if every slot in the claim window is un-resumable (AWS auto-terminated parked slots in a batch),
+    # _claim must raise NoWarmSlot (-> the job REQUEUES, input preserved), NOT the resume exception (which
+    # _process would treat as a job failure and delete the input, though the job never ran).
+    from blastbox.host.runtime.vm_dispatch import NoWarmSlot, build_remote_vm_dispatcher
+    slot = SimpleNamespace(slot_id="s1", url="http://x", auth_token=None, agent_port=8765)
+    calls = {"n": 0}
+
+    def claim(*, timeout_s):
+        calls["n"] += 1
+        return slot if calls["n"] == 1 else None   # one stale slot, then the window is empty
+
+    def resume(s):
+        raise RuntimeError("snapstart slot 's1' is 'terminated'; cannot resume")
+
+    pool = SimpleNamespace(runtime=SimpleNamespace(ssl_context=None, resume=resume),
+                           claim=claim, release=lambda s, dirty=False: None)
+    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
+                                    tier="aws-lambda-snapstart", engine="clippyshot", limits=_FAKE_LIMITS,
+                                    warm_claim_timeout_s=5.0)
+    with pytest.raises(NoWarmSlot):
+        vm._validate(tmp_path / "in.bin")          # resume-failure window -> requeue, not fail
+
+
 def test_remote_factory_requires_limits_and_engine(tmp_path):
     # G1/G2: the trust-gated remote path PRESERVES worker metadata, so it must fail closed without the
     # host trust gate's inputs -- limits (caps/hashes) and an exact engine to match the envelope against.

@@ -137,6 +137,33 @@ def test_cascade_resume_propagates_owner_failure():
         rt.resume(slot)   # so _resume_on_claim retires the slot dirty
 
 
+def test_cascade_is_alive_for_claim_delegates_fresh_hook():
+    # a cascade wrapping an AWS tier must route the claim-time FRESH liveness to the owning tier's
+    # is_alive_for_claim (cache-bypassing) -- else the pool falls back to the cascade's CACHED is_alive and
+    # can hand out a slot AWS terminated between the health tick and the claim.
+    class _FreshTier(FakeRuntime):
+        def __init__(self, name):
+            super().__init__(name)
+            self.claim_checks = 0
+
+        def is_alive(self, slot):        # cached / background-tick view: still alive
+            return True
+
+        def is_alive_for_claim(self, slot):
+            self.claim_checks += 1
+            return False                 # fresh view: terminated since the last tick
+
+    aws = _FreshTier("aws")
+    rt = CascadingRuntime([Tier("aws", aws, 1)])
+    slot = rt.spawn()
+    assert rt.is_alive(slot) is True             # cached delegate
+    assert rt.is_alive_for_claim(slot) is False  # FRESH delegate reached the tier's hook
+    assert aws.claim_checks == 1
+    # a tier WITHOUT the hook (file/libvirt) falls back to its is_alive (already fresh)
+    rt2 = CascadingRuntime([Tier("fc", FakeRuntime("fc"), 1)])
+    assert rt2.is_alive_for_claim(rt2.spawn()) is True
+
+
 def test_cascade_resume_timeout_s_aggregates_max_across_tiers():
     # a cascade has no single cfg; it exposes the MAX in-claim resume budget so the dispatcher factory
     # can still warn when a wrapped tier's resume budget outlasts the per-job budget. Reads cfg.* AND a

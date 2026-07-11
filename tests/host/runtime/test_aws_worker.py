@@ -436,6 +436,28 @@ def test_lambda_mint_token_accepts_string_and_map():
     assert rt_m._mint_token(slot) == "jwe-in-map"
 
 
+def test_lambda_is_alive_for_claim_refreshes_token():
+    # F6: the fresh claim path bypasses is_alive() (where the JWE is refreshed), so it must re-mint the
+    # token past half-TTL itself -- else a slot the background tick hasn't refreshed is handed out with an
+    # aged/expired token and /detonate 403s a healthy worker.
+    clock = {"t": 100.0}
+    cfg = LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:img",
+                              allow_default_egress=True, auth_token_ttl_min=10)   # half-TTL = 300s
+    fake = FakeAws({**_IDENT,
+                    "lambda-microvms run-microvm": {"microvmId": "mv-1"},
+                    "lambda-microvms get-microvm": {"state": "running", "endpoint": "vm.example"},
+                    "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}})
+    rt = LambdaMicroVmRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True,
+                              clock=lambda: clock["t"])
+    slot = rt._launch()
+    rt.is_ready(slot)                                  # mints the token @ t=100
+    mints0 = sum(1 for k, _ in fake.calls if k == "lambda-microvms create-microvm-auth-token")
+    clock["t"] = 100.0 + 10 * 60 * 0.5 + 1             # advance just past half-TTL
+    assert rt.is_alive_for_claim(slot) is True         # fresh describe -> running
+    mints1 = sum(1 for k, _ in fake.calls if k == "lambda-microvms create-microvm-auth-token")
+    assert mints1 == mints0 + 1                         # re-minted at hand-out
+
+
 def test_is_alive_for_claim_bypasses_liveness_cache():
     # a slot cached-alive by a background tick but terminated by AWS since must read DEAD at claim time,
     # so the pool drops it instead of handing a dead worker to a user job.

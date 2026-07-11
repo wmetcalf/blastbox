@@ -691,8 +691,12 @@ def build_remote_vm_dispatcher(
                 return slot
             except Exception as exc:  # noqa: BLE001 -- slot already retired dirty; try the next one
                 last_exc = exc
+        # Exhausting the claim window on un-resumable slots is the SAME "no usable warm slot; the job never
+        # ran" condition as a plain capacity miss -- resume only wakes the SLOT, it never touched the job's
+        # input/content. So REQUEUE (NoWarmSlot), don't FAIL+delete-input: AWS auto-terminates parked slots
+        # in correlated batches, so a whole claim window can be stale at once and that must not fail jobs.
         if last_exc is not None:
-            raise last_exc   # a real resume failure (dead slots) -> FAIL the job
+            raise NoWarmSlot("no resumable warm slot within claim timeout") from last_exc
         raise NoWarmSlot("no warm slot available within claim timeout")   # capacity -> REQUEUE the job
 
     def _release(slot: Any, dirty: bool = False) -> None:

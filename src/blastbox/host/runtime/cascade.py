@@ -8,8 +8,9 @@ whichever tier owns it. The WarmPool above it is unchanged -- it just sees one S
 
 Wiring (env):
   BLASTBOX_POOL_RUNTIME=cascade
-  BLASTBOX_POOL_TIERS=gvisor:4,aws-ec2:16     # 4 warm local + up to 16 overflow on AWS
+  BLASTBOX_POOL_TIERS=static:4,aws-ec2:16     # 4 warm local + up to 16 overflow on AWS
   BLASTBOX_POOL_WARM_SIZE=4                    # keep the 4 local slots warm
+  BLASTBOX_POOL_BURST_SIZE=16                  # so the pool can burst 4 -> 20 into the overflow tier
   BLASTBOX_POOL_CEILING=20                     # 4 local + 16 overflow
   BLASTBOX_DISPATCH_CONCURRENCY=20
 
@@ -155,6 +156,17 @@ class CascadingRuntime:
         tier = self._tier_of(slot)
         return tier is not None and tier.runtime.is_alive(slot)
 
+    def is_alive_for_claim(self, slot: Any) -> bool:
+        """Claim-time FRESH liveness, delegated to the owning tier's cache-bypassing hook when it has one
+        (AWS tiers) -- else the tier's is_alive (file/libvirt, already fresh). Without this the pool's
+        getattr(runtime, "is_alive_for_claim") finds nothing on the cascade and falls back to the cascade's
+        CACHED is_alive, so a cascade-wrapped AWS slot terminated between tick and claim would be handed out."""
+        tier = self._tier_of(slot)
+        if tier is None:
+            return False
+        fresh = getattr(tier.runtime, "is_alive_for_claim", None)
+        return fresh(slot) if callable(fresh) else tier.runtime.is_alive(slot)
+
     def reap(self, slot: Any, dirty: bool = False) -> None:
         with self._lock:
             i = self._owner.get(slot.slot_id)
@@ -237,7 +249,7 @@ class CascadingRuntime:
 # ---------------------------------------------------------------------------
 
 def _parse_tiers(spec: str) -> list[tuple[str, int]]:
-    """Parse ``gvisor:4,aws-ec2:16`` -> [('gvisor', 4), ('aws-ec2', 16)]."""
+    """Parse ``static:4,aws-ec2:16`` -> [('static', 4), ('aws-ec2', 16)]."""
     out: list[tuple[str, int]] = []
     for item in spec.split(","):
         item = item.strip()
@@ -273,7 +285,7 @@ def build_cascade_runtime(
     spec = get("BLASTBOX_POOL_TIERS") or ""
     parsed = _parse_tiers(spec)
     if not parsed:
-        raise CascadeMisconfigured("BLASTBOX_POOL_TIERS is empty (need e.g. 'gvisor:4,aws-ec2:16')")
+        raise CascadeMisconfigured("BLASTBOX_POOL_TIERS is empty (need e.g. 'static:4,aws-ec2:16')")
 
     tiers: list[Tier] = []
     for pos, (name, capacity) in enumerate(parsed):

@@ -198,17 +198,21 @@ def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: i
                 src.close()
                 _log.warning("remote_http: refusing to write member %r (%s)", m.name, exc)
                 continue
+            rel = str(resolved.relative_to(dest))
             with src, os.fdopen(fd, "wb") as out:
                 # metadata.json is a CONTROL file, not a declared artifact -- bound it by its OWN cap and
                 # DON'T count it toward the artifact byte total, so the remote tier matches the cold trust
                 # gate (which caps metadata separately). Otherwise a job whose artifacts fit the budget but
-                # whose metadata tips the sum over would be failed only on the remote path.
-                if m.name == "metadata.json":
+                # whose metadata tips the sum over would be failed only on the remote path. Key the cap on
+                # the RESOLVED relative path, not the raw member name: a worker sending "./metadata.json"
+                # (or "foo/../metadata.json") still lands at output/metadata.json and must get the metadata
+                # cap, not the (larger) artifact budget.
+                if rel == "metadata.json":
                     _bounded_copy(src, out, max_metadata_bytes)
                 else:
                     remaining = None if max_total_bytes is None else max_total_bytes - total
                     total += _bounded_copy(src, out, remaining)
-            written.append(str(resolved.relative_to(dest)))
+            written.append(rel)
     return written
 
 
@@ -310,9 +314,11 @@ def make_remote_validate(
                  owns: Callable[[], bool] | None = None) -> tuple[dict[str, Any] | None, bool]:
         slot = claim()
         dirty = True  # only a clean, successful round-trip releases the slot as reusable
-        # per-job params from the dispatcher (already allowlist-gated) win; else the params_for hook.
-        job_params = params if params is not None else (params_for(input_path) if params_for else None)
         try:
+            # per-job params from the dispatcher (already allowlist-gated) win; else the params_for hook.
+            # Derived INSIDE the try so a raising params_for still hits the finally -> the claimed slot is
+            # released dirty (retired/recycled) instead of leaking ASSIGNED until process shutdown.
+            job_params = params if params is not None else (params_for(input_path) if params_for else None)
             base = slot_base_url(slot, tls=ssl_context is not None)
             out_dir = output_dir_for(input_path)
             meta = detonate_remote(

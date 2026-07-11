@@ -515,6 +515,19 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
                 pass   # best-effort; a real failure surfaces at readiness/detonate
         return alive
 
+    def is_alive_for_claim(self, slot: AwsWorkerSlot) -> bool:
+        """The claim-time fresh check bypasses is_alive(), which is where the JWE is refreshed -- so also
+        re-mint here past half-TTL, else a slot the background tick hasn't refreshed recently (scheduler/
+        process pause, long tick gap) is handed out with a near/already-expired token and /detonate 403s a
+        healthy worker. Refreshing at hand-out guarantees >= half-TTL remaining for the job about to run."""
+        alive = super().is_alive_for_claim(slot)
+        if alive and slot.auth_token:
+            try:
+                self._ensure_token(slot)
+            except (AwsWorkerError, OSError):
+                pass   # best-effort; a real failure surfaces at detonate
+        return alive
+
     def _terminate(self, slot: AwsWorkerSlot) -> None:
         self._aws("lambda-microvms", "terminate-microvm", "--microvm-identifier", str(slot.resource_id))
 
