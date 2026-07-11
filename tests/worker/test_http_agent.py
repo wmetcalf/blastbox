@@ -60,6 +60,24 @@ def test_healthz():
         httpd.server_close()
 
 
+def test_guard_exposure_fails_closed_when_wide_open():
+    from blastbox.worker.http_agent import _guard_exposure
+    # non-loopback bind with NO mTLS / token / allowlist and no insecure opt-in -> refuse to start
+    with pytest.raises(SystemExit, match="refusing to serve"):
+        _guard_exposure("0.0.0.0", 8765, token=None, client_ca=None, allow_cidrs=None, allow_insecure=False)
+
+
+def test_guard_exposure_allows_gated_or_optin():
+    from blastbox.worker.http_agent import _guard_exposure
+    # each of these must NOT raise: loopback bind, a token, mTLS, an IP allowlist, or the insecure opt-in.
+    _guard_exposure("127.0.0.1", 8765, token=None, client_ca=None, allow_cidrs=None, allow_insecure=False)
+    _guard_exposure("::1", 8765, token=None, client_ca=None, allow_cidrs=None, allow_insecure=False)
+    _guard_exposure("0.0.0.0", 8765, token="s3cret", client_ca=None, allow_cidrs=None, allow_insecure=False)
+    _guard_exposure("0.0.0.0", 8765, token=None, client_ca="/ca.pem", allow_cidrs=None, allow_insecure=False)
+    _guard_exposure("0.0.0.0", 8765, token=None, client_ca=None, allow_cidrs="10.0.0.0/8", allow_insecure=False)
+    _guard_exposure("0.0.0.0", 8765, token=None, client_ca=None, allow_cidrs=None, allow_insecure=True)
+
+
 def test_serve_applies_socket_read_timeout():
     # a stalled/slowloris request body would otherwise hold the single-flight job lock forever; serve()
     # must stamp the timeout onto the handler so StreamRequestHandler.setup() enforces it per request.

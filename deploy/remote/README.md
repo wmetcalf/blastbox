@@ -59,3 +59,10 @@ The same engine profile works across **all** network-endpoint tiers — swap onl
 > box's own image (run it under runsc there). For `aws-ec2` the AMI's user-data starts the agent; for
 > `aws-lambda-microvm` the MicroVM image ARN is built from the engine image. The profiles below assume
 > that image exists — they configure the **dispatcher's** view of the engine, not the image build.
+>
+> **The agent fails closed on a wide-open bind.** Serving on a non-loopback address with no mTLS / token
+> / IP allowlist now **refuses to start** — each tier must give the agent a gate in its image env:
+> `static` / `aws-ec2` / `aws-ec2-hibernate` bake `BLASTBOX_WORKER_AGENT_TOKEN` (matching the
+> dispatcher's `BLASTBOX_STATIC_WORKER_TOKEN` / `BLASTBOX_EC2_AGENT_TOKEN`) or mTLS; the Lambda tiers
+> (`aws-lambda-microvm` / `aws-lambda-snapstart`) sit behind the AWS MicroVM JWE proxy, so their image
+> sets `BLASTBOX_WORKER_AGENT_ALLOW_INSECURE=1` to accept that external gate explicitly.

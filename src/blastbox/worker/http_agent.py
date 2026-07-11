@@ -295,6 +295,30 @@ def _parse_cidrs(raw: str | None) -> list:
     return nets
 
 
+_LOOPBACK_BINDS = ("127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1")
+
+
+def _guard_exposure(bind: str, port: int, *, token, client_ca, allow_cidrs, allow_insecure: bool) -> None:
+    """FAIL CLOSED when the agent would listen on a non-loopback address with NO request gate
+    (mTLS / bearer token / IP allowlist): anyone who can reach the port could submit arbitrary jobs and
+    consume the worker's egress + sandbox boundary. A gated deployment (AWS microVM JWE proxy, a security
+    group, a private worker network) can opt back in with BLASTBOX_WORKER_AGENT_ALLOW_INSECURE=1."""
+    exposed = bind not in _LOOPBACK_BINDS
+    if not exposed or client_ca or token or allow_cidrs:
+        return
+    where = f"{bind}:{port}"
+    if not allow_insecure:
+        raise SystemExit(
+            f"http_agent: refusing to serve on {where} with NO mTLS / token / IP allowlist -- anyone who "
+            "can reach it could submit arbitrary jobs. Set BLASTBOX_WORKER_AGENT_CLIENT_CA (mTLS), "
+            "_TOKEN or _ALLOW_CIDRS; bind BLASTBOX_WORKER_AGENT_BIND to loopback; or, if an external gate "
+            "(AWS microVM proxy / security group / private network) already fences the port, set "
+            "BLASTBOX_WORKER_AGENT_ALLOW_INSECURE=1 to accept the risk explicitly.")
+    _log.warning("http_agent: serving on %s with NO mTLS / token / IP allowlist -- relying on an EXTERNAL "
+                 "gate (BLASTBOX_WORKER_AGENT_ALLOW_INSECURE=1). Anyone who can reach it can submit jobs.",
+                 where)
+
+
 def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
           token: str | None = None, max_bytes: int = _DEFAULT_MAX_BYTES,
           tls_cert: str | None = None, tls_key: str | None = None,
@@ -333,11 +357,12 @@ def main(argv: list[str] | None = None) -> int:
     max_bytes = int(os.environ.get("BLASTBOX_WORKER_AGENT_MAX_BYTES", str(_DEFAULT_MAX_BYTES)))
     tls_cert, tls_key, client_ca = _tls_env(os.environ.get)
     allow_cidrs = os.environ.get("BLASTBOX_WORKER_AGENT_ALLOW_CIDRS") or None
-    # fail-loud when exposed with no controls: a non-loopback bind with no mTLS, no token, no allowlist
-    if bind not in ("127.0.0.1", "localhost", "::1") and not (client_ca or token or allow_cidrs):
-        _log.warning("http_agent: bound to %s with NO mTLS / token / IP allowlist -- anyone who can "
-                     "reach :%d can submit jobs. Set BLASTBOX_WORKER_AGENT_CLIENT_CA (mTLS) or "
-                     "_ALLOW_CIDRS / _TOKEN.", bind, port)
+    # fail CLOSED when exposed with no controls (non-loopback bind + no mTLS / token / allowlist), unless
+    # an external gate is opted into via BLASTBOX_WORKER_AGENT_ALLOW_INSECURE=1.
+    allow_insecure = (os.environ.get("BLASTBOX_WORKER_AGENT_ALLOW_INSECURE") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+    _guard_exposure(bind, port, token=token, client_ca=client_ca, allow_cidrs=allow_cidrs,
+                    allow_insecure=allow_insecure)
     timeout_s = float(os.environ.get("BLASTBOX_WORKER_AGENT_TIMEOUT_S") or "300")
     httpd = serve(engine, bind=bind, port=port, token=token, max_bytes=max_bytes,
                   tls_cert=tls_cert, tls_key=tls_key, client_ca=client_ca, allow_cidrs=allow_cidrs,

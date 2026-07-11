@@ -268,7 +268,8 @@ plain HTTP for a *trusted private VPC* — do not expose it to the public intern
 | Var | Default | Notes |
 |---|---|---|
 | `BLASTBOX_WORKER_AGENT_PORT` | `8765` | Listen port. |
-| `BLASTBOX_WORKER_AGENT_BIND` | `0.0.0.0` | Bind address. A non-loopback bind with **no** mTLS/token/allowlist logs a loud warning. |
+| `BLASTBOX_WORKER_AGENT_BIND` | `0.0.0.0` | Bind address. A non-loopback bind with **no** mTLS/token/allowlist **fails closed** (the agent refuses to start) unless `BLASTBOX_WORKER_AGENT_ALLOW_INSECURE=1`. |
+| `BLASTBOX_WORKER_AGENT_ALLOW_INSECURE` | `0` | Opt back into serving on a non-loopback address with **no** request gate — only when an **external** gate already fences the port (AWS microVM JWE proxy, a security group, a private worker network). Proxy-gated tiers (e.g. `aws-lambda-microvm`) that don't bake in a token must set this in the worker image env. |
 | `BLASTBOX_WORKER_AGENT_TOKEN` | — | Bearer token required on `/detonate` (`X-aws-proxy-auth` / `Authorization: Bearer`). |
 | `BLASTBOX_WORKER_AGENT_MAX_BYTES` | `512MiB` | Max request body. |
 | `BLASTBOX_WORKER_AGENT_TLS_CERT` / `_TLS_KEY` | — | Serve **HTTPS** with this server cert/key (mint via `blastbox pki issue-server`). |
