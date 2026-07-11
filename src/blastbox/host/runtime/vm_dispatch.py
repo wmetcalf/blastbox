@@ -40,6 +40,12 @@ _MAX_SUMMARY_BYTES = 256 * 1024
 logger = logging.getLogger(__name__)
 
 
+class NoWarmSlot(RuntimeError):
+    """No warm slot was available to run a claimed job. The dispatcher REQUEUES the job (it never ran)
+    instead of FAILing it, so it waits for a slot / another dispatcher rather than burning a job on
+    transient capacity pressure."""
+
+
 class VmJobDispatcher:
     """Drive queued jobs through an engine's warm VM pool. ``validate`` is the engine seam.
 
@@ -64,6 +70,7 @@ class VmJobDispatcher:
                  sanitize_params: Callable[[dict[str, str]], dict[str, str]] | None = None,
                  output_validator: Callable[[Job, Path], None] | None = None,
                  max_queued_age_s: float = 0.0,
+                 slot_available: Callable[[], bool] | None = None,
                  max_summary_bytes: int = _MAX_SUMMARY_BYTES) -> None:
         self._store = store
         self._job_root = Path(job_root)
@@ -116,6 +123,10 @@ class VmJobDispatcher:
         # Dispatcher to run this sweep, so a job pinned to a target_tier nobody serves (or for an engine
         # this single-engine dispatcher can't claim) would otherwise keep its untrusted input forever.
         self._max_queued_age_s = max(0.0, float(max_queued_age_s))
+        # Optional "is a warm slot free?" predicate (network-endpoint pools). When set, the worker loop
+        # doesn't claim a queued job unless a slot is available -- so a job stays QUEUED (for a later slot
+        # or another dispatcher) instead of being claimed and then FAILed for lack of capacity.
+        self._slot_available = slot_available
         # Bound a hung validate() so a dead VM agent can't occupy a claim thread forever (heartbeat
         # would keep the job looking fresh, so the orphan sweep never recovers it).
         self._validate_timeout_s = max(self._heartbeat_s, float(validate_timeout_s))
@@ -338,6 +349,16 @@ class VmJobDispatcher:
             summary, ok = self._validate_with_heartbeat(job, in_path)
             summary = self._bounded_summary(summary)   # cap untrusted summary before store/metadata
             err: str | None = None
+            sealed_env: Any = None
+            if ok and self._trust_output_metadata:
+                # Remote path: the transport returns the FULL sealed metadata dict. Persist a COMPACT
+                # result_summary (like the cold dispatcher) so list/status responses don't carry the
+                # whole payload/artifacts (up to 256 KiB/job) -- the full envelope stays in metadata.json
+                # for /metadata. Parse the envelope ONCE here and reuse it for page-hash indexing.
+                sealed_env = self._sealed_envelope(job)
+                if sealed_env is not None:
+                    from blastbox.host.dispatch import _build_result_summary
+                    summary = _build_result_summary(sealed_env)
             if not ok and isinstance(summary, dict):
                 # a failing validate carries a coarse sanitized reason (remote transport/trust/engine)
                 # so the FAILED job has an actionable error instead of a bare None.
@@ -377,7 +398,16 @@ class VmJobDispatcher:
             if ok and owned:
                 # index per-page perceptual hashes for /v1/similar, same as the cold/file-warm paths --
                 # else a network-endpoint (static/AWS) page-hash job is DONE but invisible to search.
-                self._index_page_hashes(job)
+                self._index_page_hashes(job, sealed_env)
+        except NoWarmSlot:
+            # capacity pressure, not a job failure -- the job NEVER ran. REQUEUE it (CAS back to QUEUED,
+            # clear our claim + warm stamp) so it waits for a slot / another dispatcher instead of FAILing.
+            logger.info("vm_dispatch: no warm slot for %s; requeuing (not failing)", job.job_id)
+            owned = self._store.update_if_status(
+                job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
+                status=JobStatus.QUEUED, claim_id=None, started_at=None,
+                worker_runtime=None, worker_tier=None)
+            owned = False   # requeued, not terminal -> don't delete the input in the finally
         except Exception as exc:  # noqa: BLE001 — one bad job must not sink the dispatcher
             logger.warning("vm_dispatch: job %s failed: %s", job.job_id, exc, exc_info=True)
             finished = time.time()
@@ -394,27 +424,41 @@ class VmJobDispatcher:
                 except OSError:
                     pass
 
-    def _index_page_hashes(self, job: Job) -> None:
+    def _sealed_envelope(self, job: Job) -> Any:
+        """Parse the HOST-SEALED metadata.json (the Envelope the trust gate wrote) for the remote path,
+        or None if absent/unparseable. Used to build a COMPACT result_summary + index page hashes."""
+        meta = self._job_dir(job) / "output" / "metadata.json"
+        if not meta.exists():
+            return None
+        try:
+            from blastbox.contract.envelope import Envelope
+            return Envelope.model_validate_json(meta.read_text())
+        except Exception:  # noqa: BLE001
+            logger.warning("vm_dispatch: could not parse sealed metadata for %s", job.job_id, exc_info=True)
+            return None
+
+    def _index_page_hashes(self, job: Job, envelope: Any) -> None:
         """Best-effort: index the job's per-page perceptual hashes (phash/colorhash/sha256) for
         ``/v1/similar``, same as the cold/file-warm paths -- else a network-endpoint page-hash job is
         DONE with sealed artifacts but invisible to search. Postgres+pg_bktree only, so gate on
-        ``supports_hash_search()``. Reads the HOST-SEALED metadata.json (the Envelope the trust gate
-        wrote). An indexing failure NEVER fails an otherwise-DONE job."""
+        ``supports_hash_search()``. An indexing failure NEVER fails an otherwise-DONE job."""
         supports = getattr(self._store, "supports_hash_search", None)
         indexer = getattr(self._store, "index_page_hashes", None)
-        if supports is None or indexer is None or not supports():
-            return
-        meta = self._job_dir(job) / "output" / "metadata.json"
-        if not meta.exists():
+        if supports is None or indexer is None or not supports() or envelope is None:
             return
         try:
-            from blastbox.contract.envelope import Envelope
-            indexer(job.job_id, Envelope.model_validate_json(meta.read_text()))
+            indexer(job.job_id, envelope)
         except Exception:  # noqa: BLE001 -- indexing is best-effort; never fail a DONE job on it
             logger.exception("vm_dispatch: page-hash indexing failed for %s; continuing", job.job_id)
 
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
+            # Don't claim a queued job unless a warm slot is free -- else we'd mark it RUNNING and then
+            # spend its whole budget waiting for capacity (and FAIL it if none frees). Leaving it QUEUED
+            # keeps it available for the next slot or another dispatcher. (No predicate -> claim as before.)
+            if self._slot_available is not None and not self._slot_available():
+                self._stop.wait(self._poll_s)
+                continue
             try:
                 # Engine-scoped + tier-scoped claim: the store filters to our engine (so we never
                 # claim+requeue another engine's head job and HOL-block our own work) AND honours
@@ -613,8 +657,8 @@ def build_remote_vm_dispatcher(
             except Exception as exc:  # noqa: BLE001 -- slot already retired dirty; try the next one
                 last_exc = exc
         if last_exc is not None:
-            raise last_exc
-        raise RuntimeError("no warm slot available within claim timeout")
+            raise last_exc   # a real resume failure (dead slots) -> FAIL the job
+        raise NoWarmSlot("no warm slot available within claim timeout")   # capacity -> REQUEUE the job
 
     def _release(slot: Any, dirty: bool = False) -> None:
         pool.release(slot, dirty=dirty)
@@ -704,6 +748,9 @@ def build_remote_vm_dispatcher(
         # same stale-queued TTL the cold Dispatcher honors -- bounds a job pinned to a tier no remote
         # dispatcher serves (else its untrusted input lingers forever in a remote-only deployment).
         max_queued_age_s=float(os.environ.get("BLASTBOX_MAX_QUEUED_AGE_S") or "0"),
+        # keep a queued job QUEUED until a warm slot is free (else it's claimed then FAILed on capacity
+        # pressure). idle_count-1 accounts for the slot THIS claim will consume.
+        slot_available=lambda: getattr(pool, "idle_count", 1) > 0,
         concurrency=concurrency,
         job_retention_s=job_retention_s,
     )

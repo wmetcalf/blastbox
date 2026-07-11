@@ -63,6 +63,32 @@ class WarmFileRuntime(FakeRuntime):
         self.materialized = slot.slot_id
 
 
+def test_cascade_prepare_delegates_and_aggregates():
+    # a snapshot tier (gvisor/fc warm-snapshot) relies on prepare() for its async base build; the cascade
+    # must delegate + kick EVERY tier and report ready only when ALL are ready (else the tick thread
+    # blocks in the inner spawn().build()).
+    class PrepRuntime(FakeRuntime):
+        def __init__(self, name, ready):
+            super().__init__(name)
+            self._ready, self.prepped = ready, 0
+
+        def prepare(self):
+            self.prepped += 1
+            return self._ready
+
+    a, b = PrepRuntime("a", True), PrepRuntime("b", False)
+    rt = CascadingRuntime([Tier("a", a, 1), Tier("b", b, 1)])
+    assert rt.prepare() is False              # b not ready -> cascade not ready
+    assert a.prepped == 1 and b.prepped == 1  # BOTH kicked (all async builds start)
+    b._ready = True
+    assert rt.prepare() is True               # all tiers ready
+
+
+def test_cascade_prepare_true_without_prepare_tiers():
+    rt = CascadingRuntime([Tier("a", FakeRuntime("a"), 1)])   # no prepare() -> always ready
+    assert rt.prepare() is True
+
+
 def test_cascade_delegates_warm_hooks_to_owning_tier():
     # an all-file cascade must route host_warm_control/stage_warm_input/materialize_warm_output to the
     # tier that owns the slot -- else gVisor/FC jobs get the wrong input/output transport.

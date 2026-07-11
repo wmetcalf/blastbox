@@ -220,8 +220,55 @@ def test_vm_dispatch_indexes_page_hashes_when_store_supports_it(tmp_path):
     (out / "metadata.json").write_text(env.model_dump_json(by_alias=True))
 
     d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"status": "ok"}, True), engine="authenticode")
-    d._index_page_hashes(job)
+    env_parsed = d._sealed_envelope(job)                 # parses the sealed metadata.json -> Envelope
+    assert type(env_parsed).__name__ == "Envelope"
+    d._index_page_hashes(job, env_parsed)
     assert calls == [(job.job_id, "Envelope")]   # sealed metadata.json fed through the indexer
+
+
+def test_remote_done_stores_compact_summary(tmp_path):
+    # trust_output_metadata (remote path): result_summary must be the COMPACT derivative (like cold),
+    # NOT the full sealed metadata dict -- the full envelope stays in metadata.json for /metadata.
+    from blastbox.contract import ArtifactRef, Detection, Dimensions, Page
+    from blastbox.contract.envelope import Envelope
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+    out = tmp_path / job.job_id / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    env = Envelope(engine="authenticode", input_sha256="ab" * 32,
+                   detected=Detection(label="dll", mime="application/octet-stream", confidence=1.0, source="t"),
+                   payload=Page(index=0, dims=Dimensions(width=1.0, height=1.0, unit="px"),
+                                image=ArtifactRef(id="a0")))
+    (out / "metadata.json").write_text(env.model_dump_json(by_alias=True))
+    fat = {"status": "ok", "payload": {"blob": "y" * 5000}, "artifacts": [1, 2, 3]}   # what the transport returns
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: (fat, True), engine="authenticode",
+                        trust_output_metadata=True)
+    d._process(store.claim_next())
+    got = store.get(job.job_id)
+    assert got.status is JobStatus.DONE
+    assert got.result_summary.get("detected") == "dll" and "artifact_count" in got.result_summary
+    assert "payload" not in got.result_summary   # the fat payload was NOT persisted on the job
+
+
+def test_remote_no_slot_requeues_not_fails(tmp_path):
+    from blastbox.host.runtime.vm_dispatch import NoWarmSlot
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path)
+
+    def validate(path):
+        raise NoWarmSlot("no warm slot available within claim timeout")
+
+    d = VmJobDispatcher(store, str(tmp_path), validate, engine="authenticode")
+    d._process(store.claim_next())
+    got = store.get(job.job_id)
+    assert got.status is JobStatus.QUEUED and got.claim_id is None   # requeued (never ran), NOT failed
+    assert (tmp_path / job.job_id / "input" / "evil.dll").exists()   # input preserved for the retry
+
+
+def test_vm_dispatch_slot_available_gate_stored():
+    store = InMemoryJobStore()
+    d = VmJobDispatcher(store, "/x", lambda p: ({}, True), slot_available=lambda: False)
+    assert d._slot_available is not None and d._slot_available() is False
 
 
 def test_vm_dispatch_skips_indexing_when_unsupported(tmp_path):
@@ -229,7 +276,7 @@ def test_vm_dispatch_skips_indexing_when_unsupported(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"status": "ok"}, True))
-    d._index_page_hashes(job)   # must not raise (no metadata.json either)
+    d._index_page_hashes(job, None)   # must not raise
 
 
 def test_resume_on_claim_calls_runtime_resume():

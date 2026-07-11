@@ -151,6 +151,20 @@ class CascadingRuntime:
             self._owner.pop(slot.slot_id, None)
             self._counts[i] = max(0, self._counts[i] - 1)
 
+    def prepare(self) -> bool:
+        """Delegate the async-build/readiness gate to the tiers. A snapshot tier (gvisor/fc with
+        BLASTBOX_POOL_WARM_SNAPSHOT) relies on prepare() so WarmPool kicks its slow base-snapshot build
+        OFF the tick thread and doesn't spawn until it's built. Without this the pool would treat the
+        cascade as always-ready and block the single tick thread inside the inner spawn().build(). Kick
+        EVERY tier's prepare (so all builds start) and report ready only when all are ready; a tier
+        without prepare() is always ready."""
+        ready = True
+        for t in self.tiers:
+            p = getattr(t.runtime, "prepare", None)
+            if callable(p) and not p():
+                ready = False
+        return ready
+
     def available(self) -> bool:
         return bool(self.tiers)   # built only with tiers that came up
 
