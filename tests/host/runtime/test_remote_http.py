@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tarfile
 from types import SimpleNamespace
 
@@ -268,6 +269,55 @@ def test_safe_extract_metadata_cap_applies_to_normalized_path(tmp_path):
     tar = _tar({"./metadata.json": b'{"x":"' + b"a" * 5000 + b'"}'})   # ~5KB "metadata"
     with pytest.raises(RemoteOutputTooLarge):
         _safe_extract_tar(tar, tmp_path, max_total_bytes=1_000_000, max_metadata_bytes=1000)
+
+
+def test_default_open_does_not_follow_worker_redirects():
+    # G2 (security): a worker's 3xx must NOT be followed -- urllib would rewrite POST->GET and re-send
+    # X-aws-proxy-auth / X-Blastbox-Params to the Location, leaking the token + doing an SSRF GET.
+    import http.server
+    import threading
+    import urllib.error
+    import urllib.request
+    from blastbox.host.runtime.remote_http import _default_open
+    leaked = {}
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(302)
+            self.send_header("Location", "/steal")
+            self.end_headers()
+
+        def do_GET(self):                       # the redirect target -- must NEVER be reached
+            leaked["auth"] = self.headers.get("X-aws-proxy-auth")
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{srv.server_address[1]}/detonate", data=b"x",
+                                     method="POST", headers={"X-aws-proxy-auth": "SECRET-JWE"})
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _default_open(req, timeout=5)
+        assert ei.value.code in (301, 302, 303, 307, 308)   # redirect surfaced (fail-closed), not followed
+        assert "auth" not in leaked                          # /steal never hit -> token not leaked
+    finally:
+        srv.shutdown()
+
+
+def test_extracted_artifacts_forced_0644_under_restrictive_umask(tmp_path):
+    # G5: a restrictive process umask (e.g. 077) must not mask extracted artifacts to 0600 -- the API
+    # process (a different UID in a serve+dispatch split) has to read them. fchmod forces the exact mode.
+    old = os.umask(0o077)
+    try:
+        written = _safe_extract_tar(_tar({"metadata.json": b'{"ok":1}', "p0.png": b"x" * 10}), tmp_path)
+        for name in written:
+            assert (os.stat(tmp_path / name).st_mode & 0o777) == 0o644, name
+    finally:
+        os.umask(old)
 
 
 def test_make_remote_validate_params_for_raise_releases_dirty(tmp_path):

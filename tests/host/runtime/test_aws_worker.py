@@ -8,6 +8,7 @@ fail-closed availability probe, config from_env, and pool_config registration.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 
 import pytest
@@ -521,6 +522,18 @@ def test_lambda_config_from_env():
     ]
 
 
+def test_ec2_self_terminate_bool_spellings():
+    # G4: non-canonical falsy spellings must disable the backstop (were treated as ENABLED before the
+    # strip/lower fix); default (unset) + truthy spellings stay ON.
+    for val in ("False", "FALSE", "NO", "No", "off", "Off", " false ", "0", "no"):
+        cfg = Ec2Config.from_env({"BLASTBOX_EC2_SELF_TERMINATE": val, "BLASTBOX_EC2_AMI": "ami-x"}.get)
+        assert cfg.self_terminate is False, val
+    for val in ("1", "true", "yes", "on", ""):   # "" -> _env default "1"; unset also defaults ON
+        cfg = Ec2Config.from_env({"BLASTBOX_EC2_SELF_TERMINATE": val, "BLASTBOX_EC2_AMI": "ami-x"}.get)
+        assert cfg.self_terminate is True, val
+    assert Ec2Config.from_env({"BLASTBOX_EC2_AMI": "ami-x"}.get).self_terminate is True   # unset -> ON
+
+
 def test_ec2_config_from_env_defaults_arm():
     cfg = Ec2Config.from_env({"BLASTBOX_EC2_AMI": "ami-x"}.get)
     assert cfg.image_id == "ami-x"
@@ -856,12 +869,25 @@ def test_ec2_self_terminate_ttl_injected():
 
     ud = base64.b64encode(b"#!/bin/bash\nstart-agent\n").decode()
     cfg = Ec2Config(region="us-east-1", image_id="ami-x", user_data_b64=ud, max_duration_s=1800)
-    fake = FakeAws({**_IDENT, "ec2 run-instances": {"Instances": [{"InstanceId": "i-1"}]}})
+    captured = {}
+
+    def _run(argv):   # user-data is passed as a 0600 file:// (out of argv) -> read it DURING the call
+        val = argv[argv.index("--user-data") + 1]
+        assert val.startswith("file://")                       # secret is NOT a raw argv element
+        path = val[len("file://"):]
+        assert (os.stat(path).st_mode & 0o777) == 0o600        # created 0600 (O_EXCL)
+        with open(path) as fh:
+            captured["ud"] = fh.read()
+        return _cp(stdout=json.dumps({"Instances": [{"InstanceId": "i-1"}]}))
+
+    fake = FakeAws({**_IDENT, "ec2 run-instances": _run})
     rt = DisposableEc2Runtime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True, clock=lambda: 1.0)
     rt.spawn()
     argv = next(a for k, a in fake.calls if k == "ec2 run-instances")
-    ud_arg = argv[argv.index("--user-data") + 1]
-    assert "shutdown -h +30" in ud_arg and "start-agent" in ud_arg   # crashed dispatcher can't leak it
+    assert not any("start-agent" in str(a) for a in argv)      # the bootstrap secret never hits argv (/proc)
+    assert "shutdown -h +30" in captured["ud"] and "start-agent" in captured["ud"]  # ...but is in the file
+    ud_path = argv[argv.index("--user-data") + 1][len("file://"):]
+    assert not os.path.exists(ud_path)                          # temp file unlinked after the call
 
 
 def test_ec2_self_terminate_preserves_multipart_userdata():

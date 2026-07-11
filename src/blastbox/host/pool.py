@@ -243,11 +243,28 @@ class WarmPool:
         )
         self._thread.start()
 
-    def stop(self) -> None:
-        """Stop the background loop and reap ALL slots (no orphans)."""
+    def stop(self, stop_timeout_s: float = 150.0) -> None:
+        """Stop the background loop and reap ALL slots (no orphans).
+
+        Waits (BOUNDED) for the daemon to finish an in-flight tick so its OWN post-spawn reap disposes a
+        slot spawned during shutdown: a slow AWS ``run-instances``/``run-microvm`` racing stop() isn't yet
+        in ``_slots``, so stop()'s reap loop can't see it -- and if the process exits right after stop()
+        returns (the CLI does), the daemon is killed before its terminate call runs, leaking a live cloud
+        worker. The wait is capped at ``stop_timeout_s`` (>= a runtime's per-call CLI timeout) so a wedged
+        spawn can't hang shutdown forever; past it we log and proceed (the slot's self-terminate TTL, where
+        enabled, is the last backstop). A clean shutdown with no in-flight spawn returns within one poll."""
         self._stop_event.set()
         if self._thread is not None:
-            self._thread.join(timeout=10.0)
+            # Fast path returns immediately when the daemon has already exited (no spawn in flight).
+            self._thread.join(timeout=min(10.0, stop_timeout_s))
+            waited = min(10.0, stop_timeout_s)
+            while self._thread.is_alive() and waited < stop_timeout_s:
+                step = min(1.0, stop_timeout_s - waited)
+                self._thread.join(timeout=step)   # let the in-flight tick finish + run its post-spawn reap
+                waited += step
+            if self._thread.is_alive():
+                logger.warning("pool.stop: background thread still running after %.0fs (wedged spawn?) — "
+                               "proceeding; an in-flight cloud slot may leak until its TTL", stop_timeout_s)
             self._thread = None
 
         # Reap every slot regardless of state. Pop each ONLY after a successful reap: if reap RAISES

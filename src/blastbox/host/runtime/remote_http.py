@@ -31,8 +31,24 @@ _log = logging.getLogger("blastbox.host.runtime.remote_http")
 HttpOpen = Callable[..., Any]
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Worker transports MUST NOT follow a worker-chosen 3xx. urllib's default handler rewrites the
+    /detonate POST to a GET and re-sends every header (bar content-*) to the Location -- so a compromised
+    worker answering 302 would make the dispatcher leak ``X-aws-proxy-auth`` (the JWE) + ``X-Blastbox-
+    Params`` to an attacker URL AND perform an SSRF GET from the host net, defeating the worker's no-egress
+    containment. Returning None makes urllib raise HTTPError (fail-closed) instead of following."""
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
 def _default_open(req: urllib.request.Request, timeout: float, context: ssl.SSLContext | None = None) -> Any:
-    return urllib.request.urlopen(req, timeout=timeout, context=context)  # noqa: S310 (url is host-built)
+    # build a fresh opener with redirects DISABLED (+ the caller's mTLS context for https workers) rather
+    # than urlopen's default opener, which would auto-follow a worker's redirect and leak the auth headers.
+    handlers: list[Any] = [_NoRedirect()]
+    if context is not None:
+        handlers.append(urllib.request.HTTPSHandler(context=context))
+    return urllib.request.build_opener(*handlers).open(req, timeout=timeout)  # noqa: S310 (url is host-built)
 
 
 class RemoteOutputTooLarge(RuntimeError):
@@ -200,6 +216,10 @@ def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: i
                 continue
             rel = str(resolved.relative_to(dest))
             with src, os.fdopen(fd, "wb") as out:
+                # force the exact 0644 regardless of the process umask (a restrictive umask like 077 would
+                # otherwise land 0600, unreadable to the API process in a serve+dispatch UID split) --
+                # matches the dir chmod above and the host-sealed metadata writer.
+                os.fchmod(fd, 0o644)
                 # metadata.json is a CONTROL file, not a declared artifact -- bound it by its OWN cap and
                 # DON'T count it toward the artifact byte total, so the remote tier matches the cold trust
                 # gate (which caps metadata separately). Otherwise a job whose artifacts fit the budget but

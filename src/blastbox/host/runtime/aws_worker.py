@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -182,7 +184,8 @@ class Ec2Config(AwsWorkerConfig):
             key_name=_env(get, "BLASTBOX_EC2_KEY_NAME"),
             use_public_ip=(_env(get, "BLASTBOX_EC2_PUBLIC_IP") or "0") == "1",
             user_data_b64=_env(get, "BLASTBOX_EC2_USER_DATA_B64"),
-            self_terminate=(_env(get, "BLASTBOX_EC2_SELF_TERMINATE", "1") or "1") not in ("0", "false", "no"),
+            self_terminate=(_env(get, "BLASTBOX_EC2_SELF_TERMINATE", "1") or "1").strip().lower()
+            not in ("0", "false", "no", "off"),   # strip/lower so False/NO/Off actually disable the backstop
             max_duration_s=int(_env(get, "BLASTBOX_AWS_MAX_DURATION_S", "3600") or "3600"),
             **overrides,
         )
@@ -782,8 +785,23 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
             # so a crashed dispatcher can't leak a running instance past MAX_DURATION_S.
             user_data = _userdata_with_self_terminate(user_data, c.max_duration_s)
         if user_data:
-            args += ["--user-data", user_data]
-        resp = self._aws("ec2", "run-instances", *args)
+            # Keep user-data OUT of the aws process argv: cloud-init that bootstraps the agent may carry a
+            # bearer token / TLS private key, and argv is visible via /proc + `ps` to local users / process
+            # logging. Hand the CLI a 0600 file:// instead -- it base64-encodes the file's TEXT content
+            # exactly as it would a raw --user-data string, so the launched instance is byte-identical.
+            fd, ud_path = tempfile.mkstemp(prefix="bb-ec2-ud-", suffix=".txt")   # mode 0600, O_EXCL
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(user_data)
+                args += ["--user-data", f"file://{ud_path}"]
+                resp = self._aws("ec2", "run-instances", *args)
+            finally:
+                try:
+                    os.unlink(ud_path)
+                except OSError:
+                    pass
+        else:
+            resp = self._aws("ec2", "run-instances", *args)
         insts = resp.get("Instances") or []
         if not insts or not insts[0].get("InstanceId"):
             raise AwsWorkerError("run-instances: no instance id in response")

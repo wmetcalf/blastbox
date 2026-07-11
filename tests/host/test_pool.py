@@ -119,6 +119,64 @@ def test_claim_prefers_fresh_liveness_when_runtime_provides_it() -> None:
     assert rt.claim_checks == 1               # used the FRESH hand-out check, not is_alive
 
 
+def test_stop_waits_for_inflight_spawn_then_reaps() -> None:
+    # G1: a spawn racing stop() (not yet in _slots) must be disposed by the daemon's post-spawn reap
+    # BEFORE stop() returns -- else the CLII's sys.exit() right after stop() kills the daemon and leaks the
+    # live cloud instance. So stop() blocks (bounded) on the in-flight tick.
+    entered, release = threading.Event(), threading.Event()
+
+    class _SlowSpawn(_FakeRuntime):
+        def spawn(self) -> Slot:
+            entered.set()
+            release.wait(timeout=5)
+            return super().spawn()
+
+    rt = _SlowSpawn()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool.start()
+    assert entered.wait(timeout=5)                 # daemon is inside spawn() (in-flight, not yet published)
+    st = threading.Thread(target=lambda: pool.stop(stop_timeout_s=10.0))
+    st.start()
+    time.sleep(0.3)
+    assert st.is_alive()                           # stop() is WAITING for the in-flight spawn, not returning
+    release.set()                                  # let spawn finish -> daemon's post-spawn reap runs
+    st.join(timeout=5)
+    assert not st.is_alive()
+    assert len(rt.reaped) == 1                      # the raced slot was reaped, not leaked
+    assert not pool._slots
+
+
+def test_stop_fast_path_returns_promptly() -> None:
+    # G1: a clean shutdown (no spawn in flight) must NOT wait the stop_timeout_s ceiling.
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool.start()
+    time.sleep(0.3)
+    t0 = time.monotonic()
+    pool.stop(stop_timeout_s=100.0)
+    assert time.monotonic() - t0 < 5.0             # returned fast, didn't burn the 100s ceiling
+
+
+def test_stop_is_bounded_when_spawn_wedged() -> None:
+    # G1: a spawn that never returns must not hang shutdown -- stop() gives up after ~stop_timeout_s.
+    entered, never = threading.Event(), threading.Event()
+
+    class _WedgedSpawn(_FakeRuntime):
+        def spawn(self) -> Slot:
+            entered.set()
+            never.wait(timeout=10)                 # not released by the test; daemon exits after 10s
+            return super().spawn()
+
+    rt = _WedgedSpawn()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool.start()
+    assert entered.wait(timeout=5)
+    t0 = time.monotonic()
+    pool.stop(stop_timeout_s=1.0)
+    dt = time.monotonic() - t0
+    assert 0.8 < dt < 5.0                           # gave up ~1s (the ceiling), did NOT hang for 10s
+
+
 def test_after_stop_spawn_tracks_slot_when_reap_fails() -> None:
     # G4: a slow spawn (AWS run-instances/run-microvm) can finish AFTER stop() flipped _stop_event; the
     # slot is reaped while still untracked. If that terminate RAISES (the cloud resource may persist), the
