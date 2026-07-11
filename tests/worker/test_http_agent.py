@@ -67,6 +67,16 @@ def test_guard_exposure_fails_closed_when_wide_open():
         _guard_exposure("0.0.0.0", 8765, token=None, client_ca=None, allow_cidrs=None, allow_insecure=False)
 
 
+def test_guard_exposure_rejects_empty_cidr_allowlist():
+    from blastbox.worker.http_agent import _guard_exposure
+    # a whitespace/comma-only ALLOW_CIDRS parses to [] which _caller_allowed treats as allow-ANY -- it is
+    # NOT a gate, so the guard must still fail closed (a typo like `" , "` must not open the agent wide).
+    for junk in (" , ", "   ", ",,"):
+        with pytest.raises(SystemExit, match="refusing to serve"):
+            _guard_exposure("0.0.0.0", 8765, token=None, client_ca=None, allow_cidrs=junk,
+                            allow_insecure=False)
+
+
 def test_guard_exposure_allows_gated_or_optin():
     from blastbox.worker.http_agent import _guard_exposure
     # each of these must NOT raise: loopback bind, a token, mTLS, an IP allowlist, or the insecure opt-in.

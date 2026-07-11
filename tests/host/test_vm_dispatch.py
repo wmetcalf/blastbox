@@ -299,6 +299,30 @@ def test_requeue_records_warm_claim_miss(tmp_path):
     assert m.WARM_CLAIMS_TOTAL.labels(result="hit")._value.get() == bhit       # no false hit for a requeue
 
 
+def test_requeue_ignores_peer_finish_for_metrics(tmp_path, monkeypatch):
+    # F4 race: after THIS attempt requeues on NoWarmSlot (owned=False), a PEER can claim + finish the job
+    # so the store reports DONE by the time our finally runs. The terminal metric must gate on this
+    # attempt's own winning CAS, NOT the store's current state -- else a tier that only recorded a
+    # warm-claim MISS would also record a hit + 'done' it never earned (double-count / wrong attribution).
+    from types import SimpleNamespace
+    import blastbox.observability.metrics as m
+    from blastbox.host.runtime.vm_dispatch import NoWarmSlot
+    store = InMemoryJobStore()
+    _queue_job(store, tmp_path)
+
+    def validate(path):
+        raise NoWarmSlot("no warm slot available within claim timeout")
+
+    d = VmJobDispatcher(store, str(tmp_path), validate, engine="authenticode", worker_tier="aws-ec2")
+    j = store.claim_next()
+    monkeypatch.setattr(store, "get", lambda jid: SimpleNamespace(status=JobStatus.DONE))  # peer "finished" it
+    bhit = m.WARM_CLAIMS_TOTAL.labels(result="hit")._value.get()
+    bdone = m.JOBS_DISPATCHED_TOTAL.labels(path="aws-ec2", outcome="done")._value.get()
+    d._process(j)
+    assert m.WARM_CLAIMS_TOTAL.labels(result="hit")._value.get() == bhit             # no false hit
+    assert m.JOBS_DISPATCHED_TOTAL.labels(path="aws-ec2", outcome="done")._value.get() == bdone  # no false 'done'
+
+
 def test_vm_dispatch_skips_indexing_when_unsupported(tmp_path):
     # a store without hash-search support (memory/redis) -> no-op, never raises
     store = InMemoryJobStore()
@@ -367,6 +391,32 @@ def test_build_remote_vm_dispatcher_constructs(tmp_path):
     assert vm._trust_output_metadata is True        # the remote path preserves the sealed metadata
     assert vm._validate_takes_params is True         # the remote_http validate accepts params
     assert vm._validate_takes_owns is True           # ...and the ownership predicate (metadata fence)
+
+
+def test_remote_claim_budget_is_bounded_and_reserves_detonation_time(tmp_path):
+    # F3: the claim WAIT and the detonation must not share one budget. The claim is bounded by
+    # warm_claim_timeout_s (NOT worker_timeout_s), and the heartbeat watchdog covers claim + detonate so
+    # a slot claimed late still gets the full worker_timeout_s to run instead of being watchdog-killed.
+    from blastbox.host.runtime.vm_dispatch import NoWarmSlot, build_remote_vm_dispatcher
+    seen = {}
+
+    class _NeverYieldsPool:
+        runtime = type("R", (), {"ssl_context": None})()
+
+        def claim(self, *, timeout_s):  # noqa: ANN001, ANN202
+            seen["claim_timeout"] = timeout_s
+            return None
+
+        def release(self, slot, *, dirty=False):  # noqa: ANN001
+            pass
+
+    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _NeverYieldsPool(),
+                                    tier="aws-ec2", engine="clippyshot",
+                                    worker_timeout_s=300.0, warm_claim_timeout_s=0.05)
+    assert vm._validate_timeout_s == pytest.approx(300.05)   # watchdog = claim budget + detonate budget
+    with pytest.raises(NoWarmSlot):
+        vm._validate(tmp_path / "in.bin")                    # no slot within the claim budget -> requeue
+    assert seen["claim_timeout"] <= 0.05                     # bounded by warm_claim_timeout_s, not 300s
 
 
 class _FakePool:

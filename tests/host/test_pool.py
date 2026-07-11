@@ -123,14 +123,31 @@ def test_reap_and_count_skips_concurrent_double_dispose() -> None:
     rt = _BlockingReapRuntime()
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
     slot = rt.spawn()
-    t = threading.Thread(target=pool._reap_and_count, args=(slot,), daemon=True)
+    owner_ret: list[bool] = []
+    t = threading.Thread(target=lambda: owner_ret.append(pool._reap_and_count(slot)), daemon=True)
     t.start()
     assert entered.wait(timeout=5)     # first reap in-flight -> slot in _reaping
-    pool._reap_and_count(slot)         # concurrent second dispose must be a no-op (returns immediately)
+    # concurrent second dispose must be a no-op that reports it did NOT dispose (False) -- so the caller
+    # leaves the slot tracked instead of popping a slot whose real terminate might still fail.
+    assert pool._reap_and_count(slot) is False
     assert rt.reaped == []             # second call did NOT invoke a real reap (first still blocked)
     release.set()
     t.join(timeout=5)
     assert rt.reaped == [slot.slot_id]  # exactly ONE real disposal
+    assert owner_ret == [True]          # the owning call reports it DID dispose
+
+
+def test_caller_keeps_slot_tracked_when_reap_skipped() -> None:
+    # when _reap_and_count reports it SKIPPED (False -- another thread owns the reap), a caller must NOT
+    # pop the slot: the owning thread disposes it (or quarantines on failure). Popping here could untrack
+    # a slot whose real terminate later fails, orphaning a live worker off the books.
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    pool._reap_and_count = lambda s, **kw: False   # type: ignore[assignment]  # simulate a concurrent skip
+    pool.retire(slot)
+    assert slot.slot_id in pool._slots   # left tracked for the owning thread, not popped
 
 
 class _FinalizeFailRuntime(_FakeRuntime):

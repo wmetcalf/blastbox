@@ -343,6 +343,7 @@ class VmJobDispatcher:
             return
         in_path = self._input_path(job)
         owned = False
+        terminal_status: JobStatus | None = None   # the terminal state THIS attempt CAS-won (for metrics)
         t0 = time.monotonic()   # for the job-duration metric (parity with the cold dispatcher)
         try:
             if not in_path.exists():
@@ -391,9 +392,10 @@ class VmJobDispatcher:
             finished = time.time()
             # CAS on (status, claim_id) so a stale owner can't clobber a job that was reclaimed
             # (RUNNING->QUEUED->RUNNING under another dispatcher). The return value is OUR ownership.
+            terminal_status = JobStatus.DONE if ok else JobStatus.FAILED
             owned = self._store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
-                status=JobStatus.DONE if ok else JobStatus.FAILED,
+                status=terminal_status,
                 finished_at=finished, result_summary=summary, error=err,
                 expires_at=self._expiry(finished))
             if ok and owned:
@@ -413,6 +415,7 @@ class VmJobDispatcher:
         except Exception as exc:  # noqa: BLE001 — one bad job must not sink the dispatcher
             logger.warning("vm_dispatch: job %s failed: %s", job.job_id, exc, exc_info=True)
             finished = time.time()
+            terminal_status = JobStatus.FAILED
             owned = self._store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                 status=JobStatus.FAILED, finished_at=finished, error=type(exc).__name__,
@@ -425,16 +428,17 @@ class VmJobDispatcher:
                     in_path.unlink()
                 except OSError:
                     pass
-            # Metric parity with the cold dispatcher: count the terminal outcome + wall time.
-            # Requeued (NoWarmSlot) jobs never reached a terminal state here, so they are skipped
-            # -- they'll be counted when they actually run. Read the final status from the store so
-            # a crash mid-dispatch still counts as 'failed'.
-            final = self._store.get(job.job_id)
-            if final is not None and final.status in (JobStatus.DONE, JobStatus.FAILED):
+            # Metric parity with the cold dispatcher: count the terminal outcome + wall time -- but ONLY
+            # for THIS attempt's own winning CAS (owned + the status we wrote). Requeued (NoWarmSlot)
+            # attempts set owned=False, and a reclaimed attempt loses the CAS -> both are skipped. Gating
+            # on a store re-read instead would double-count: after a requeue, a PEER dispatcher can claim
+            # and finish the same job before this finally runs, so we'd record a hit + terminal outcome
+            # for a tier that only recorded a miss and never ran the job.
+            if owned and terminal_status is not None:
                 record_warm_claim(hit=True)   # a slot was claimed to produce this terminal outcome
                 record_job_dispatched(
                     path=self._worker_tier,
-                    outcome="done" if final.status == JobStatus.DONE else "failed",
+                    outcome="done" if terminal_status is JobStatus.DONE else "failed",
                 )
                 observe_job_duration(path=self._worker_tier, seconds=time.monotonic() - t0)
 
@@ -615,6 +619,7 @@ def build_remote_vm_dispatcher(
     engine_spec: Any = None,
     limits: Any = None,
     worker_timeout_s: float = 300.0,
+    warm_claim_timeout_s: float = 60.0,
     concurrency: int = 1,
     job_retention_s: int = 0,
 ) -> "VmJobDispatcher":
@@ -649,12 +654,17 @@ def build_remote_vm_dispatcher(
     max_metadata_bytes = getattr(limits, "max_metadata_bytes", None)
 
     def _claim() -> Any:
-        # Claim + (optionally) resume within one worker-timeout budget. If a claimed slot can't be
-        # resumed (snapstart: e.g. the platform auto-terminated a parked slot within the liveness-cache
-        # window), _resume_on_claim already released it dirty -> try ANOTHER slot instead of failing the
-        # job on one dead-on-arrival slot. For non-resume runtimes _resume_on_claim never raises, so this
-        # returns on the first claim exactly as before.
-        deadline = time.monotonic() + worker_timeout_s
+        # Claim + (optionally) resume within a BOUNDED claim budget -- NOT the whole worker_timeout_s.
+        # The claim wait and the detonation must not share one budget: if the wait could burn all of
+        # worker_timeout_s, a slot appearing near the deadline would start detonating just as the parent
+        # heartbeat watchdog (validate_timeout_s) fired, marking the job failed + deleting its input while
+        # the daemon keeps a LIVE claimed slot. Capping the wait at warm_claim_timeout_s reserves the full
+        # worker_timeout_s for the detonation (validate_timeout_s = claim + detonate). No slot in that
+        # window -> NoWarmSlot -> requeue (capacity pressure, not a failure). If a claimed slot can't be
+        # resumed (snapstart: the platform auto-terminated a parked slot within the liveness-cache window),
+        # _resume_on_claim already released it dirty -> try ANOTHER slot. For non-resume runtimes
+        # _resume_on_claim never raises, so this returns on the first claim exactly as before.
+        deadline = time.monotonic() + warm_claim_timeout_s
         last_exc: Exception | None = None
         while True:
             remaining = deadline - time.monotonic()
@@ -750,7 +760,9 @@ def build_remote_vm_dispatcher(
         trust_output_metadata=True,   # preserve the host-sealed metadata.json the validator wrote
         sanitize_params=sanitize,
         fixed_net_policy=getattr(engine_spec, "net_policy", None),   # enforce egress personality
-        validate_timeout_s=worker_timeout_s,
+        # the parent heartbeat watchdog must cover the bounded claim WAIT plus the full detonation budget,
+        # so a slot claimed late (near warm_claim_timeout_s) still gets its whole worker_timeout_s to run.
+        validate_timeout_s=warm_claim_timeout_s + worker_timeout_s,
         # sole_owner recovers a claim that crashed in the tiny window BETWEEN claim and the
         # worker_runtime="warm" stamp -- but it makes maintenance FAIL any stale RUNNING job for this
         # engine, which would clobber a COLD dispatcher's live jobs if one shares the store. Default OFF

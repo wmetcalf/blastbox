@@ -62,6 +62,7 @@ and the tier-capability matrix.
 | `BLASTBOX_WORKER_CPUS` | `1.0` | `--cpus`. |
 | `BLASTBOX_WORKER_NOFILE` | `4096` | `--ulimit nofile`. |
 | `BLASTBOX_WORKER_TIMEOUT_S` | engine | Per-job wall-clock budget. |
+| `BLASTBOX_WARM_CLAIM_TIMEOUT_S` | `60` | *(network-endpoint tiers)* Max seconds a job waits for a warm slot before requeuing (capacity pressure ≠ failure). Bounded **separately** from `WORKER_TIMEOUT_S` so a late claim can't eat the detonation budget; the heartbeat watchdog covers `claim + detonate`. |
 
 ## Worker in-process sandbox + nono
 
