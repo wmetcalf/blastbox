@@ -362,6 +362,23 @@ class AwsDisposableRuntime:
         self._live_cache[slot.slot_id] = (now, alive)
         return alive
 
+    def is_alive_for_claim(self, slot: AwsWorkerSlot) -> bool:
+        """Claim-time hand-out check: BYPASS the liveness cache. A slot seen alive by a background health
+        tick may have been terminated by AWS since (SnapStart idle-policy auto-terminate, spot reclaim,
+        hibernate expiry), and the cached ``is_alive()`` would still hand it to a user job -- whose remote
+        POST then FAILS the job instead of the pool dropping the dead slot + trying another/requeuing.
+        Force a fresh describe here (dropping the describe cache too, since a tier's ``_running`` may read
+        it); the ~5s cache still throttles the background ~10Hz poll. The pool calls this at claim iff the
+        runtime provides it (optional protocol method; file/libvirt tiers fall back to ``is_alive``)."""
+        now = self._clock()
+        self._desc_cache.pop(slot.slot_id, None)   # force a fresh get-instance/get-microvm this call
+        try:
+            alive = self._running(slot)
+        except (AwsWorkerError, OSError):
+            alive = False
+        self._live_cache[slot.slot_id] = (now, alive)   # keep the background-tick cache coherent
+        return alive
+
     def reap(self, slot: AwsWorkerSlot) -> None:
         self._live_cache.pop(slot.slot_id, None)
         self._desc_cache.pop(slot.slot_id, None)
@@ -450,9 +467,15 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
                          "--expiration-in-minutes", str(self.cfg.auth_token_ttl_min),
                          "--allowed-ports", f"port={self.cfg.agent_port}")  # tagged-union list shorthand
         tok = resp.get("authToken") or resp.get("token") or resp.get("Token")
-        if not tok:
-            raise AwsWorkerError("create-microvm-auth-token: no token in response")
-        return str(tok)
+        # The live `aws` CLI returned a bare JWE string (validated end-to-end: /healthz 200 with this as
+        # the X-aws-proxy-auth header). The API reference models authToken as a header-name -> value MAP,
+        # so also handle that shape -- extract the X-aws-proxy-auth value (fall back to the sole value) --
+        # rather than str()-ing a dict into a "{...}" header that would 403 every Lambda slot.
+        if isinstance(tok, dict):
+            tok = tok.get("X-aws-proxy-auth") or (next(iter(tok.values())) if len(tok) == 1 else None)
+        if not isinstance(tok, str) or not tok:
+            raise AwsWorkerError("create-microvm-auth-token: no usable token in response")
+        return tok
 
     def _ensure_token(self, slot: AwsWorkerSlot) -> str:
         """Reuse the slot's JWE while it's younger than half its TTL; mint a fresh one only when it's

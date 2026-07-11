@@ -95,6 +95,30 @@ def test_spawn_completing_after_stop_is_reaped_not_leaked() -> None:
     assert not pool._slots                 # ...and never published (no leak)
 
 
+def test_claim_prefers_fresh_liveness_when_runtime_provides_it() -> None:
+    # H2: at hand-out the pool must prefer is_alive_for_claim (a FRESH check) over the possibly-cached
+    # is_alive, so a slot the cached is_alive still reports alive -- but which AWS terminated since -- is
+    # dropped+replaced instead of assigned to a user job.
+    class _FreshRuntime(_FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.claim_checks = 0
+
+        def is_alive(self, slot: Slot) -> bool:
+            return True                       # background/tick view: still (cached) alive
+
+        def is_alive_for_claim(self, slot: Slot) -> bool:
+            self.claim_checks += 1
+            return False                      # fresh view: terminated since the last tick
+
+    rt = _FreshRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    next(iter(pool._slots.values())).state = SlotState.IDLE   # make it claimable
+    assert pool._try_claim_one() is None      # dead-at-claim slot dropped, nothing handed out
+    assert rt.claim_checks == 1               # used the FRESH hand-out check, not is_alive
+
+
 def test_after_stop_spawn_tracks_slot_when_reap_fails() -> None:
     # G4: a slow spawn (AWS run-instances/run-microvm) can finish AFTER stop() flipped _stop_event; the
     # slot is reaped while still untracked. If that terminate RAISES (the cloud resource may persist), the

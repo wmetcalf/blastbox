@@ -552,10 +552,17 @@ class WarmPool:
                 # Flip to ASSIGNED immediately to block concurrent claimers
                 candidate.state = SlotState.ASSIGNED
 
-            # Check liveness OUTSIDE the lock (may be slow)
+            # Check liveness OUTSIDE the lock (may be slow). Prefer a FRESH hand-out check
+            # (is_alive_for_claim) when the runtime provides one: the per-tick is_alive() may be cached
+            # (AWS throttles the control-plane describe), so a slot terminated since the last tick could
+            # otherwise be handed out and fail the user's job. Falls back to is_alive() for file/libvirt
+            # tiers whose is_alive() is already a fresh check.
+            claim_check = getattr(self._runtime, "is_alive_for_claim", None)
+            if not callable(claim_check):
+                claim_check = self._runtime.is_alive
             alive = False
             try:
-                alive = self._runtime.is_alive(candidate)
+                alive = claim_check(candidate)
             except Exception:
                 logger.exception("pool.is_alive_error slot_id=%s", candidate.slot_id)
 

@@ -424,6 +424,31 @@ def test_lambda_readiness_token_is_cached_across_ticks():
     assert mints == 1            # minted once, then reused
 
 
+def test_lambda_mint_token_accepts_string_and_map():
+    # the live CLI returned authToken as a bare JWE string (proven: /healthz 200 with it as the header);
+    # the API reference models it as a header-name -> value MAP. _mint_token must yield a usable string
+    # for BOTH -- never str() a dict into a "{...}" header that would 403 every Lambda slot.
+    slot = AwsWorkerSlot(slot_id="s1", resource_id="mv-1", state=SlotState.WARMING)
+    rt_s, _ = _lambda_rt({"lambda-microvms create-microvm-auth-token": {"authToken": "jwe-string"}})
+    assert rt_s._mint_token(slot) == "jwe-string"
+    rt_m, _ = _lambda_rt({"lambda-microvms create-microvm-auth-token":
+                          {"authToken": {"X-aws-proxy-auth": "jwe-in-map"}}})
+    assert rt_m._mint_token(slot) == "jwe-in-map"
+
+
+def test_is_alive_for_claim_bypasses_liveness_cache():
+    # a slot cached-alive by a background tick but terminated by AWS since must read DEAD at claim time,
+    # so the pool drops it instead of handing a dead worker to a user job.
+    state = {"v": "running"}
+    rt, _ = _lambda_rt({"lambda-microvms run-microvm": {"microvmId": "mv-1"},
+                        "lambda-microvms get-microvm": lambda argv: _cp(stdout=json.dumps({"state": state["v"]}))})
+    slot = rt._launch()
+    assert rt.is_alive(slot) is True             # cached: running
+    state["v"] = "terminated"
+    assert rt.is_alive(slot) is True             # STILL cached True (constant clock, within the 5s TTL)
+    assert rt.is_alive_for_claim(slot) is False  # fresh describe -> dead
+
+
 def test_lambda_health_describe_is_cached_across_warming_ticks():
     # while the microVM is still coming up (url unresolved), the ~10Hz readiness poll must throttle the
     # get-microvm describe to _liveness_cache_s -- otherwise every tick hits the AWS control plane.
