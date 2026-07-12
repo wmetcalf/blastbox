@@ -6,8 +6,10 @@ default was dead glue (no such command) that harness.main would argparse-reject.
 """
 from __future__ import annotations
 
+import pytest
+
 from blastbox.host.cli import _parse_engine_specs
-from blastbox.host.dispatch import Dispatcher, EngineSpec
+from blastbox.host.dispatch import Dispatcher, EngineSpec, enforce_allowed_runtimes
 
 
 def test_parse_single_engine_default_argv_is_empty():
@@ -77,6 +79,47 @@ def test_reserved_param_keys_from_env(monkeypatch):
     assert specs["foo"].reserved_param_keys == frozenset(
         {"FOO_JAVA_BIN", "FOO_SANDBOX", "FOO_OPTS"}
     )
+
+
+def test_allowed_runtimes_default_none_when_unset():
+    # UNSET -> None (no tier restriction; the engine may run on any dispatcher tier).
+    specs = _parse_engine_specs("clippyshot=img:t")
+    assert specs["clippyshot"].allowed_runtimes is None
+
+
+def test_allowed_runtimes_from_env_normalized(monkeypatch):
+    # Comma-list, stripped + lowercased, into a frozenset of canonical tier names.
+    monkeypatch.setenv("BLASTBOX_ENGINE_CLIPPYSHOT_ALLOWED_RUNTIMES", "cold, Firecracker ,GVISOR")
+    specs = _parse_engine_specs("clippyshot=img:t")
+    assert specs["clippyshot"].allowed_runtimes == frozenset({"cold", "firecracker", "gvisor"})
+
+
+def test_allowed_runtimes_unknown_tier_raises(monkeypatch):
+    # A typo'd/unknown tier name is a config error, not a silently-dropped entry (dropping could
+    # leave the set permitting an unintended tier). Fail loudly at parse time.
+    monkeypatch.setenv("BLASTBOX_ENGINE_CLIPPYSHOT_ALLOWED_RUNTIMES", "cold,aws-ec3")
+    with pytest.raises(ValueError, match="unknown tier"):
+        _parse_engine_specs("clippyshot=img:t")
+
+
+def test_enforce_allowed_runtimes_allows_listed_tier_and_unrestricted():
+    engines = {
+        "restricted": EngineSpec("restricted", "img:t", [], allowed_runtimes=frozenset({"cold", "gvisor"})),
+        "any": EngineSpec("any", "img:t", []),  # allowed_runtimes=None -> no restriction
+    }
+    enforce_allowed_runtimes(engines, "cold")     # both permitted
+    enforce_allowed_runtimes(engines, "gvisor")   # both permitted
+
+
+def test_enforce_allowed_runtimes_refuses_disallowed_tier():
+    engines = {
+        "clippyshot": EngineSpec(
+            "clippyshot", "img:t", [], allowed_runtimes=frozenset({"cold", "firecracker", "gvisor"})
+        ),
+    }
+    # A BLASTBOX_POOL_RUNTIME drift onto a public-AWS tier the engine wasn't cleared for must fail closed.
+    with pytest.raises(ValueError, match="not permitted on the 'aws-ec2' tier"):
+        enforce_allowed_runtimes(engines, "aws-ec2")
 
 
 def test_param_keys_env_name_and_keys_are_normalized(monkeypatch):

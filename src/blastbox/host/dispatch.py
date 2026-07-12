@@ -175,6 +175,32 @@ class EngineSpec:
     # (see netpolicy.resolve_net_policy). Runtime-configurable like default_params: flip the
     # env + restart the dispatcher, no rebuild. This task only carries it; applying it is later.
     net_policy: str = "none"
+    # Operator allowlist of dispatcher TIERS this engine may run on (BLASTBOX_ENGINE_<NAME>_ALLOWED_RUNTIMES),
+    # matched against the canonical tier vocabulary (jobs.base.VALID_TIERS: "cold" + the warm tiers
+    # firecracker/gvisor/libvirt-vm/aws-*/static/cascade). None (default) ⇒ no restriction (any tier).
+    # A frozenset ⇒ ONLY those tiers; a dispatcher whose tier is not in the set REFUSES TO START for
+    # this engine (checked before the pool spawns, so no cloud slot leaks) — so an operator can pin a
+    # locally-vetted engine to secure local tiers and a BLASTBOX_POOL_RUNTIME drift can't silently route
+    # it onto a public-AWS/remote worker with a different egress posture. Fail-closed like the param
+    # allowlist: the set must list EVERY tier the engine is intended to run on.
+    allowed_runtimes: frozenset[str] | None = None
+
+
+def enforce_allowed_runtimes(engines: Mapping[str, "EngineSpec"], tier: str) -> None:
+    """Fail-closed guard: refuse a dispatcher whose ``tier`` is not in a served engine's
+    ``allowed_runtimes``. Called at startup BEFORE the pool spawns any (cloud) slot, so a
+    ``BLASTBOX_POOL_RUNTIME`` drift that would route a locally-vetted engine onto a disallowed
+    tier is caught loudly instead of silently detonating on the wrong worker. Engines with
+    ``allowed_runtimes is None`` impose no restriction."""
+    for name, spec in engines.items():
+        allowed = spec.allowed_runtimes
+        if allowed is not None and tier not in allowed:
+            raise ValueError(
+                f"engine {name!r} is not permitted on the {tier!r} tier "
+                f"(allowed_runtimes={sorted(allowed)}); refusing to start — set "
+                f"BLASTBOX_ENGINE_{name.upper()}_ALLOWED_RUNTIMES to include {tier!r} "
+                f"if this dispatcher should run it, or point BLASTBOX_POOL_RUNTIME at an allowed tier"
+            )
 
 
 class Dispatcher:

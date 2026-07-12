@@ -4,19 +4,26 @@ This module is the *application* side of the netpolicy layer: given a fully-reso
 :class:`~blastbox.host.netpolicy.Personality` (returned by ``resolve_net_policy``), return
 the list of ``--network``-related flags to splice into the worker ``docker run`` argv.
 
-Plan 2 implements the docker-native exit drivers only:
+Two kinds of exit reach the ``docker run`` argv:
 
-* ``none`` / ``drop``  → ``["--network=none"]``   (no egress, default/safe)
-* ``direct``           → ``["--network", "bb-net0"]``
-* ``inetsim``          → ``["--network", "bb-fakenet"]``
+* **Docker-native, self-contained** — no sidecar needed:
+  * ``none`` / ``drop``  → ``["--network=none"]``   (no egress, default/safe)
+  * ``direct``           → ``["--network", "bb-net0"]``
+  * ``inetsim``          → ``["--network", "bb-fakenet"]``
+* **Sidecar-wired** — ``socks`` / ``tor`` / ``httpproxy`` → the INTERNAL ``bb-socks`` bridge,
+  ``openvpn`` / ``wireguard`` → the INTERNAL ``bb-vpn`` bridge (see ``_BRIDGE_NETWORKS``). An
+  internal bridge has **no direct egress** on its own; ``blastbox-netd`` wires the real exit
+  (a netns TUN + tun2socks, a host REDIRECT → tor, or a default route to the VPN/NAT gateway).
+  This IS the fail-closed property: if netd never wires it, the worker sits on the internal
+  bridge with **no route out** — the operator is never silently granted unexpected egress.
 
-Exit drivers that require a sidecar (``socks``, ``wireguard``, ``openvpn``) are NOT yet
-wired on the docker path.  They fall back FAIL-CLOSED to ``--network=none`` and log a
-warning — the operator must not be silently granted unexpected egress.
+So ``--network=none`` is emitted only for ``none`` / ``drop`` (and an unrecognized driver, or
+``inspect`` on a non-routable one); the sidecar drivers fail closed via "internal bridge, no
+route", not by literally being downgraded to ``none``.
 
-Operators are responsible for pre-creating ``bb-net0`` / ``bb-fakenet`` docker networks on
-the host before launching the dispatcher.  This module only names them in the argv; it
-never creates or inspects them.
+Operators are responsible for pre-creating the ``bb-*`` docker networks on the host before
+launching the dispatcher.  This module only names them in the argv; it never creates or
+inspects them.
 """
 from __future__ import annotations
 

@@ -140,11 +140,31 @@ def _parse_engine_specs(engines_raw: str) -> dict:
             net_policy = (
                 os.environ.get(f"BLASTBOX_ENGINE_{env_name}_NETPOLICY") or "none"
             ).strip().lower()
+            # Optional per-engine dispatcher-TIER allowlist (BLASTBOX_ENGINE_<NAME>_ALLOWED_RUNTIMES):
+            #   BLASTBOX_ENGINE_<NAME>_ALLOWED_RUNTIMES='cold,firecracker,gvisor'
+            # Unset ⇒ None (any tier). Set ⇒ only those tiers; enforced fail-closed at startup
+            # (enforce_allowed_runtimes) so a BLASTBOX_POOL_RUNTIME drift can't route the engine onto
+            # a tier it wasn't cleared for. An unknown tier name is a config typo — raise, don't
+            # silently drop it (a dropped entry could leave the set permitting an unintended tier).
+            from blastbox.host.jobs.base import VALID_TIERS
+
+            runtimes_raw = os.environ.get(f"BLASTBOX_ENGINE_{env_name}_ALLOWED_RUNTIMES")
+            allowed_runtimes: frozenset[str] | None = None
+            if runtimes_raw is not None:
+                parsed = frozenset(t.strip().lower() for t in runtimes_raw.split(",") if t.strip())
+                unknown = parsed - set(VALID_TIERS)
+                if unknown:
+                    raise ValueError(
+                        f"BLASTBOX_ENGINE_{env_name}_ALLOWED_RUNTIMES has unknown tier(s) "
+                        f"{sorted(unknown)}; valid tiers: {'/'.join(VALID_TIERS)}"
+                    )
+                allowed_runtimes = parsed
             engines[name] = EngineSpec(
                 name=name, image=image, worker_argv=[],
                 allowed_param_keys=allowed, reserved_param_keys=reserved,
                 default_params=default_params,
                 net_policy=net_policy,
+                allowed_runtimes=allowed_runtimes,
             )
     return engines
 
@@ -188,6 +208,13 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         tier = _pool_rt
     else:
         tier = "cold"
+
+    # Fail-closed BEFORE pool.start(): refuse to run an engine on a tier its operator-configured
+    # allowlist excludes, so a BLASTBOX_POOL_RUNTIME drift can't route a locally-vetted engine onto
+    # a public-AWS/remote worker with a different egress posture (and no cloud slot spawns on a raise).
+    from blastbox.host.dispatch import enforce_allowed_runtimes
+
+    enforce_allowed_runtimes(engines, tier)
 
     # Capability-based routing: the runtime declares its dispatch_style. A network-endpoint pool
     # (aws / static / cascade) drives workers over http_agent + remote_http via VmJobDispatcher; every
