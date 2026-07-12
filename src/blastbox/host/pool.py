@@ -243,16 +243,30 @@ class WarmPool:
         )
         self._thread.start()
 
-    def stop(self, stop_timeout_s: float = 150.0) -> None:
+    def _default_stop_budget(self) -> float:
+        """Shutdown budget covering an in-flight spawn (up to the runtime's per-call CLI timeout) PLUS its
+        post-spawn terminate (another CLI timeout), + margin -- else a slow AWS spawn racing stop() eats the
+        budget and the process exits mid-terminate, leaking the just-created worker. Floors at 150s; a
+        runtime with no cli_timeout_s (file/libvirt) uses the floor."""
+        cli = (getattr(getattr(self._runtime, "cfg", None), "cli_timeout_s", None)
+               or getattr(self._runtime, "cli_timeout_s", None) or 0.0)
+        return max(150.0, 2.0 * float(cli) + 30.0)
+
+    def stop(self, stop_timeout_s: float | None = None) -> None:
         """Stop the background loop and reap ALL slots (no orphans).
 
         Waits (BOUNDED) for the daemon to finish an in-flight tick so its OWN post-spawn reap disposes a
         slot spawned during shutdown: a slow AWS ``run-instances``/``run-microvm`` racing stop() isn't yet
         in ``_slots``, so stop()'s reap loop can't see it -- and if the process exits right after stop()
         returns (the CLI does), the daemon is killed before its terminate call runs, leaking a live cloud
-        worker. The wait is capped at ``stop_timeout_s`` (>= a runtime's per-call CLI timeout) so a wedged
-        spawn can't hang shutdown forever; past it we log and proceed (the slot's self-terminate TTL, where
-        enabled, is the last backstop). A clean shutdown with no in-flight spawn returns within one poll."""
+        worker. The budget must cover the in-flight spawn (up to a runtime's per-call CLI timeout) PLUS its
+        post-spawn terminate (another CLI timeout), so the default is derived from the runtime's
+        ``cli_timeout_s`` (2× + margin) when unset -- else a slow spawn eats the budget and the process
+        exits mid-terminate. A wedged spawn can't hang shutdown forever; past the budget we log and proceed
+        (the slot's self-terminate TTL, where enabled, is the last backstop). A clean shutdown with no
+        in-flight spawn returns within one poll."""
+        if stop_timeout_s is None:
+            stop_timeout_s = self._default_stop_budget()
         self._stop_event.set()
         if self._thread is not None:
             # Fast path returns immediately when the daemon has already exited (no spawn in flight).

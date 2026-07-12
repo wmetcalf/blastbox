@@ -119,6 +119,17 @@ def test_claim_prefers_fresh_liveness_when_runtime_provides_it() -> None:
     assert rt.claim_checks == 1               # used the FRESH hand-out check, not is_alive
 
 
+def test_stop_budget_covers_spawn_plus_reap() -> None:
+    # #2: the default shutdown budget must cover an in-flight spawn (cli_timeout_s) PLUS its terminate
+    # (another cli_timeout_s) + margin -- else a slow AWS spawn racing stop() leaves too little for the
+    # terminate and the process exits mid-reap, leaking the worker.
+    class _CfgRt(_FakeRuntime):
+        cfg = type("C", (), {"cli_timeout_s": 120.0})()
+
+    assert WarmPool(runtime=_CfgRt(), warm_size=1)._default_stop_budget() == 270.0   # 2*120 + 30
+    assert WarmPool(runtime=_FakeRuntime(), warm_size=1)._default_stop_budget() == 150.0   # floor (no cli)
+
+
 def test_stop_waits_for_inflight_spawn_then_reaps() -> None:
     # G1: a spawn racing stop() (not yet in _slots) must be disposed by the daemon's post-spawn reap
     # BEFORE stop() returns -- else the CLII's sys.exit() right after stop() kills the daemon and leaks the

@@ -609,6 +609,22 @@ def test_snapstart_auto_resume_off_disables():
     assert LambdaSnapStartConfig.from_env({"BLASTBOX_LAMBDA_IMAGE": "arn:img"}.get).auto_resume is True
 
 
+def test_ec2_public_ip_requests_associate_flag():
+    # #1: public-endpoint mode must request a public IP (a nondefault subnet defaults auto-assign off, so
+    # without --associate-public-ip-address the instance gets no public address and the slot churns).
+    fake = FakeAws({**_IDENT, "ec2 run-instances": {"Instances": [{"InstanceId": "i-1"}]}})
+    rt = DisposableEc2Runtime(
+        Ec2Config(region="us-east-1", image_id="ami-x", use_public_ip=True, allow_plaintext_public=True),
+        aws_runner=fake, http_probe=lambda u, h, t: True, clock=lambda: 1.0)
+    rt.spawn()
+    assert "--associate-public-ip-address" in next(a for k, a in fake.calls if k == "ec2 run-instances")
+    fake2 = FakeAws({**_IDENT, "ec2 run-instances": {"Instances": [{"InstanceId": "i-2"}]}})
+    rt2 = DisposableEc2Runtime(Ec2Config(region="us-east-1", image_id="ami-x"),   # private-IP default
+                               aws_runner=fake2, http_probe=lambda u, h, t: True, clock=lambda: 1.0)
+    rt2.spawn()
+    assert "--associate-public-ip-address" not in next(a for k, a in fake2.calls if k == "ec2 run-instances")
+
+
 def test_ec2_public_ip_without_tls_fails_closed():
     # J3 (security): a public IP with no dispatcher TLS would send X-aws-proxy-auth + samples in cleartext
     # over the public endpoint -> fail closed at construction, unless the operator explicitly opts in.

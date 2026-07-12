@@ -825,6 +825,11 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
                 "--instance-initiated-shutdown-behavior", "terminate"]
         if c.subnet_id:
             args += ["--subnet-id", c.subnet_id]
+        if c.use_public_ip:
+            # a NONDEFAULT subnet defaults auto-assign-public-IP to FALSE, so without this the instance
+            # gets no public address, _health_ok never sees a PublicIpAddress, and the slot churns until
+            # the warming timeout. Explicitly request one for public-endpoint mode.
+            args += ["--associate-public-ip-address"]
         if c.security_group_ids:
             args += ["--security-group-ids", *c.security_group_ids]
         if c.iam_instance_profile:
