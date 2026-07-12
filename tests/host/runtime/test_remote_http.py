@@ -565,6 +565,65 @@ def test_worker_busy_409_requeues_not_fails(tmp_path):
     assert released == [True]   # busy box released dirty (cooldown); the job requeues
 
 
+def test_open_bounded_deadline():
+    # N2: the opener (connect/send/headers) phase must be bounded by a total wall-clock deadline, not just
+    # urllib's per-op socket timeout -- else a worker trickling the request/headers pins the claimed slot.
+    import threading
+    import time as _time
+    from blastbox.host.runtime.remote_http import RemoteReadTimeout, _open_bounded
+    blocked = threading.Event()
+
+    def slow_opener(req, timeout, context=None):
+        blocked.wait(5)          # blocks well past the deadline
+        return "late"
+
+    with pytest.raises(RemoteReadTimeout):
+        _open_bounded(slow_opener, object(), timeout=5, context=None, deadline=_time.monotonic() + 0.2)
+    blocked.set()
+    assert _open_bounded(lambda r, t, context=None: "ok", object(), 5, None,
+                         _time.monotonic() + 5) == "ok"   # a fast opener returns its value
+
+
+def test_engine_error_releases_slot_clean(tmp_path):
+    # N3: a SEALED engine_error is a clean completion (agent healthy, lock free) -> release the slot CLEAN,
+    # so a client feeding malformed samples can't quarantine the static fleet into cooldown.
+    (tmp_path / "in.docx").write_bytes(b"z")
+    slot = SimpleNamespace(url="http://x", ip=None, auth_token=None, agent_port=8765)
+    released = []
+    validate = make_remote_validate(
+        claim=lambda: slot, release=lambda s, dirty=False: released.append(dirty),
+        output_dir_for=lambda p: tmp_path / "out",
+        http_open=_opener(_tar({"metadata.json": json.dumps({"status": "engine_error"}).encode()})))
+    meta, ok = validate(tmp_path / "in.docx")
+    assert ok is False and released == [False]   # job fails, slot released CLEAN
+
+
+def test_missing_metadata_releases_slot_dirty(tmp_path):
+    # ...but genuinely abnormal worker output (no sealed metadata) stays dirty -> retire it.
+    (tmp_path / "in.docx").write_bytes(b"z")
+    slot = SimpleNamespace(url="http://x", ip=None, auth_token=None, agent_port=8765)
+    released = []
+    validate = make_remote_validate(
+        claim=lambda: slot, release=lambda s, dirty=False: released.append(dirty),
+        output_dir_for=lambda p: tmp_path / "out", http_open=_opener(_tar({})))   # no metadata.json
+    meta, ok = validate(tmp_path / "in.docx")
+    assert ok is False and released == [True]
+
+
+def test_safe_extract_counts_non_regular_members(tmp_path):
+    # N5: a tar dominated by non-regular headers (dirs/symlinks) must still trip max_members -- they were
+    # skipped BEFORE counting, so a header-count DoS slipped the cap.
+    from blastbox.host.runtime.remote_http import RemoteOutputTooLarge
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for i in range(10):
+            ti = tarfile.TarInfo(f"d{i}")
+            ti.type = tarfile.DIRTYPE
+            tf.addfile(ti)
+    with pytest.raises(RemoteOutputTooLarge):
+        _safe_extract_tar(buf.getvalue(), tmp_path, max_members=5)   # 10 dir headers > 5
+
+
 def test_detonate_remote_streams_input_with_content_length(tmp_path):
     # the input is streamed (open file handle + Content-Length), not read fully into memory.
     inp = tmp_path / "in.bin"

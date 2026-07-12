@@ -7,6 +7,7 @@ output dir (metadata.json + the artifact) comes back in the tar. No real AWS / n
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import urllib.error
@@ -146,6 +147,32 @@ def test_auth_required_when_token_set(tmp_path):
         # with the token (as the Lambda-style header) -> 200
         r = _post(url, b"data", {"X-aws-proxy-auth": "s3cr3t"})
         assert r.status == 200
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_slow_body_returns_408():
+    # N1: a client that trickles the request body (a byte before each idle timeout) past the total budget
+    # while holding _JOB_LOCK must get 408 -- one slow uploader can't take the worker out of service.
+    import socket
+    import time as _time
+    httpd, port = _running_agent(timeout_s=0.5)
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+        s.sendall(b"POST /detonate?name=x.bin HTTP/1.1\r\nHost: x\r\nContent-Length: 1000000\r\n\r\n")
+        for _ in range(6):                 # trickle: byte every 0.3s, no idle gap > 0.5s, total > 0.5s budget
+            try:
+                s.sendall(b"x")
+            except OSError:
+                break                      # server closed after responding
+            _time.sleep(0.3)
+        s.settimeout(3)
+        resp = b""
+        with contextlib.suppress(OSError):
+            resp = s.recv(4096)
+        s.close()
+        assert b" 408 " in resp            # slow_body -> REQUEST_TIMEOUT, not held open forever
     finally:
         httpd.shutdown()
         httpd.server_close()

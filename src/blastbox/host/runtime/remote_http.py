@@ -10,6 +10,7 @@ Plugs into `VmJobDispatcher(validate=...)` (or a pool_manager-style claim loop) 
 
 from __future__ import annotations
 
+import concurrent.futures
 import io
 import json
 import logging
@@ -107,6 +108,23 @@ def _check_params_header_size(params: dict[str, str] | None) -> None:
         raise ParamsTooLargeForRemote(
             f"forwarded params serialize to {line} header bytes (> 65536); reduce the allowlisted "
             "per-job params for the remote tier")
+
+
+def _open_bounded(opener: Any, req: Any, timeout: float, context: Any, deadline: float) -> Any:
+    """Run ``opener()`` (connect + send the request body + read the response status/headers) under a TOTAL
+    wall-clock ``deadline``, not just urllib's PER-OP socket timeout. A worker that slowly reads our request
+    or trickles response headers would otherwise keep opener() blocked past the job budget while the daemon
+    validate thread pins the claimed slot (the watchdog can fail the job but can't retire the slot). On
+    timeout raise RemoteReadTimeout so the caller's finally frees the slot; the abandoned opener thread
+    lingers until its per-op socket timeout reaps it, but the scarce SLOT is freed promptly. HTTPError from
+    opener (e.g. 409) is re-raised through fut.result so the caller's existing handling still fires."""
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="bb-open")
+    fut = ex.submit(opener, req, timeout, context=context)
+    ex.shutdown(wait=False)   # don't block on a possibly-stuck opener thread
+    try:
+        return fut.result(timeout=max(0.0, deadline - time.monotonic()))
+    except concurrent.futures.TimeoutError as exc:
+        raise RemoteReadTimeout("remote opener (connect/send/headers) exceeded the wall-clock deadline") from exc
 
 
 def _cap_read_timeout(src: Any, remaining: float) -> None:
@@ -255,11 +273,15 @@ def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: i
         # cap short-circuits before a tar of hundreds of thousands of tiny entries materializes all
         # their TarInfo objects in memory.
         for m in tf:
-            if not m.isfile():
-                continue
+            # count EVERY header against the cap, BEFORE the non-regular skip: a tar dominated by
+            # directories/symlinks/other non-file headers would otherwise never trip max_members and could
+            # burn CPU parsing up to the raw stream cap. (max_members = max_artifacts + slack, so a few
+            # legit dirs are absorbed.)
             files += 1
             if max_members is not None and files > max_members:
-                raise RemoteOutputTooLarge(f"remote output exceeded {max_members} files")
+                raise RemoteOutputTooLarge(f"remote output exceeded {max_members} members")
+            if not m.isfile():
+                continue
             raw = dest / m.name
             # bounds check on the FULLY-RESOLVED path (catches leaf + intermediate-dir symlink escapes).
             resolved = raw.resolve()
@@ -366,7 +388,7 @@ def detonate_remote(
     with input_path.open("rb") as body:
         req = urllib.request.Request(url, data=body, method="POST", headers=headers)
         try:
-            resp_cm = opener(req, timeout, context=ssl_context)
+            resp_cm = _open_bounded(opener, req, timeout, ssl_context, read_deadline)
         except urllib.error.HTTPError as exc:
             # 409 = the worker's single-flight job lock is held (a stale detonation still running on a
             # re-offered static box). Capacity pressure, NOT a job failure -> requeue like NoWarmSlot.
@@ -451,6 +473,12 @@ def make_remote_validate(
             if not meta or meta.get("status") == "engine_error":
                 _log.warning("remote_http: remote job not ok (status=%s)", (meta or {}).get("status"))
                 reason = "remote engine error" if meta else "remote worker returned no metadata"
+                # A SEALED engine_error is a CLEAN completion -- the agent responded, sealed its output, and
+                # its job lock is free -- so release the slot CLEAN (dirty=False): a client feeding malformed
+                # samples that reliably engine_error must NOT be able to quarantine the static fleet into
+                # cooldown. Missing metadata (not meta) IS abnormal worker output -> stay dirty/retire.
+                if meta:
+                    dirty = False
                 return {"error": reason}, False
             # HOST TRUST GATE -- runs BEFORE the slot is released clean, so a worker whose output fails
             # host validation (re-sealed hashes / engine / input_sha / caps) stays dirty and is retired

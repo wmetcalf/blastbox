@@ -34,6 +34,7 @@ import os
 import tarfile
 import tempfile
 import threading
+import time
 from collections.abc import Iterator
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -92,6 +93,11 @@ def _safe_name(raw: str | None) -> str:
 
 class _TruncatedBody(Exception):
     """The client sent fewer bytes than Content-Length declared."""
+
+
+class _SlowBody(Exception):
+    """The client trickled the request body past the total wall-clock budget while holding the single-
+    flight job lock -- one slow uploader must not take the worker out of service (every other job 409s)."""
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -186,6 +192,9 @@ class _Handler(BaseHTTPRequestHandler):
         except _TruncatedBody:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "truncated_body"})
             return
+        except _SlowBody:
+            self._json(HTTPStatus.REQUEST_TIMEOUT, {"error": "slow_body"})
+            return
         except Exception as exc:  # noqa: BLE001 -- a job crash must not kill the agent
             _log.warning("http_agent: detonate failed: %s", exc)
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "engine_error"})
@@ -211,15 +220,35 @@ class _Handler(BaseHTTPRequestHandler):
             in_dir.mkdir()
             in_path = in_dir / name           # own subdir: a client name of "out" can't collide with out_dir
             out_dir = tmp_p / "out"
-            # stream the body to disk (bounded)
+            # stream the body to disk (bounded by size AND a TOTAL wall-clock deadline). The socket timeout
+            # only caps idle GAPS, so a client trickling the body (a byte before each timeout) would hold
+            # _JOB_LOCK far past the budget and 409 every real job. Cap each recv to the remaining budget so
+            # the deadline is enforced during a blocking read too (a single read() can buffer + block).
             remaining = length
-            with in_path.open("wb") as fh:
-                while remaining > 0:
-                    chunk = self.rfile.read(min(remaining, 1024 * 1024))
-                    if not chunk:
-                        break
-                    fh.write(chunk)
-                    remaining -= len(chunk)
+            deadline = time.monotonic() + self.timeout
+            read = getattr(self.rfile, "read1", self.rfile.read)
+            try:
+                with in_path.open("wb") as fh:
+                    while remaining > 0:
+                        budget = deadline - time.monotonic()
+                        if budget <= 0:
+                            raise _SlowBody
+                        with contextlib.suppress(OSError):
+                            self.connection.settimeout(budget)
+                        try:
+                            chunk = read(min(remaining, 1024 * 1024))
+                        except (TimeoutError, OSError) as exc:
+                            if time.monotonic() >= deadline:
+                                raise _SlowBody from exc
+                            raise
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        remaining -= len(chunk)
+            finally:
+                # restore the per-recv timeout so the shrunk read budget doesn't leak into the response write
+                with contextlib.suppress(OSError):
+                    self.connection.settimeout(self.timeout)
             if remaining > 0:
                 raise _TruncatedBody
             # SAME core the cold/FC/gVisor workers use: runs the engine + seals metadata.json in out_dir.
@@ -247,15 +276,20 @@ class _Handler(BaseHTTPRequestHandler):
             spool: tempfile.SpooledTemporaryFile = tempfile.SpooledTemporaryFile(
                 max_size=64 * 1024 * 1024, prefix="bbagent-tar-")
             total = 0
-            files = 0
             with tarfile.open(fileobj=spool, mode="w") as tf:
-                for f in sorted(out_dir.rglob("*")):
+                # Enforce the member cap DURING a LAZY walk, BEFORE sorting: sorted(out_dir.rglob("*"))
+                # materializes + sorts the ENTIRE tree, so a job leaving hundreds of thousands of entries
+                # burns worker memory/CPU before file_cap could fire. Collect regular files lazily, stop at
+                # the cap, then sort the bounded set for a deterministic tar layout.
+                candidates: list = []
+                for f in out_dir.rglob("*"):
                     if not f.is_file():
                         continue
-                    files += 1
-                    if file_cap is not None and files > file_cap:
+                    candidates.append(f)
+                    if file_cap is not None and len(candidates) > file_cap:
                         spool.close()
                         raise RuntimeError(f"output exceeds {file_cap} files")
+                for f in sorted(candidates):
                     # metadata.json is a control file, not a declared artifact -- don't count it toward
                     # the artifact byte budget (matches the cold trust gate + the host extractor), but DO
                     # cap it by its OWN budget BEFORE archiving so a buggy engine's huge metadata can't
