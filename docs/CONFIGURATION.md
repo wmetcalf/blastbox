@@ -39,6 +39,8 @@ and the tier-capability matrix.
 |---|---|---|
 | `BLASTBOX_DISPATCH_CONCURRENCY` | `1` | Dispatch-loop worker threads. **On a warm tier this MUST equal the warm pool size** — the warm path blocks until the job finishes, so N threads are needed to keep N slots busy (default 1 starves the pool). |
 | `BLASTBOX_DISPATCH_WARM_ONLY` | `""` (off) | Claim-gate primitive: only claim jobs when a warm slot is free, and **never cold-fall-back** — overflow stays queued for the cold dispatcher. This is what makes a process a *warm sidecar*. |
+| `BLASTBOX_MAX_QUEUED_AGE_S` | `0` (off) | TTL after which a job still QUEUED is FAILed and its (untrusted) input deleted — bounds the `target_tier` footgun (a job pinned to a tier no dispatcher serves). Honored by **both** the cold `Dispatcher` **and** the network-endpoint (static/AWS/cascade) dispatcher. |
+| `BLASTBOX_DISPATCH_SOLE_OWNER` | `0` | Network-endpoint dispatcher only. `1` ⇒ this is the **only** dispatcher on the store, so orphan recovery may also reclaim a claim that crashed before the `worker_runtime="warm"` stamp. Leave `0` on a **shared** store (a cold dispatcher for the same engine) — it would otherwise FAIL that peer's live jobs. |
 
 ## Runtime selection (docker: runc / runsc)
 
@@ -60,6 +62,7 @@ and the tier-capability matrix.
 | `BLASTBOX_WORKER_CPUS` | `1.0` | `--cpus`. |
 | `BLASTBOX_WORKER_NOFILE` | `4096` | `--ulimit nofile`. |
 | `BLASTBOX_WORKER_TIMEOUT_S` | engine | Per-job wall-clock budget. |
+| `BLASTBOX_WARM_CLAIM_TIMEOUT_S` | `60` | *(network-endpoint tiers)* Max seconds a job waits for a warm slot before requeuing (capacity pressure ≠ failure). Bounded **separately** from `WORKER_TIMEOUT_S` so a late claim can't eat the detonation budget; the heartbeat watchdog covers `claim + detonate`. |
 
 ## Worker in-process sandbox + nono
 
@@ -78,11 +81,12 @@ and the tier-capability matrix.
 
 | Var | Default | Notes |
 |---|---|---|
-| `BLASTBOX_POOL_RUNTIME` | runtime default | Warm backend: `firecracker` or `gvisor`. |
+| `BLASTBOX_POOL_RUNTIME` | runtime default | Warm backend: `firecracker`, `gvisor`, `aws-lambda-microvm`, `aws-lambda-snapstart` (warm AWS — suspend/resume), `aws-ec2`, `aws-ec2-hibernate` (warm AWS — hibernate C/R), `static`, or `cascade` (tiered local→overflow). |
 | `BLASTBOX_POOL_WARM_SIZE` | — | Number of pre-warmed slots. |
 | `BLASTBOX_POOL_CEILING` | — | Max concurrent slots (warm + burst). |
 | `BLASTBOX_POOL_BURST_SIZE` | — | Extra cold-burst slots above the warm set under load. |
 | `BLASTBOX_POOL_SPAWN_RATE` | — | Slot replenish rate. |
+| `BLASTBOX_POOL_WARMING_TIMEOUT_S` | `120` | Max seconds a slot may sit WARMING before eviction. **Raise for cloud tiers** (`aws-ec2` first-boot can exceed 120s) or healthy-but-slow slots get churned. |
 | `BLASTBOX_POOL_WARM_SNAPSHOT` | `0` | FC only: restore from a memory snapshot (warm-UNO) instead of cold-booting the guest. |
 
 ## Runtime: Firecracker
@@ -118,6 +122,182 @@ and the tier-capability matrix.
 | `BLASTBOX_CRAC_JAVA_BIN` | `java` | JVM used for the CRaC warmup. |
 | `BLASTBOX_CRAC_JCMD_BIN` | `jcmd` | `jcmd` for triggering the checkpoint. |
 | `BLASTBOX_CRAC_ENGINE_ARGV` | `""` | The JVM engine's launch argv (JSON list). |
+
+## Runtime: AWS disposable workers (Lambda MicroVM / disposable EC2)
+
+A **family** of managed-cloud backends behind the same warm-pool seam (`SlotRuntime`), for running
+workers on AWS with no host infra. Selected by `BLASTBOX_POOL_RUNTIME=aws-lambda-microvm` or
+`aws-ec2`. Both are **network-endpoint, disposable** tiers (one job per worker, then terminate — no
+reuse), driven by `VmJobDispatcher` with a transport (the generic `remote_http` HTTP+tar transport, or
+an engine-supplied one). They shell the `aws` CLI (no boto3 dep) and are **fail-closed**: a tier is
+refused at selection unless `sts get-caller-identity` and a read-only service probe both pass. Only
+**sealed-Linux** engines fit (ARM64 worker image running `python -m blastbox.worker.http_agent`;
+win-validator stays libvirt — no Windows/nested-virt on either).
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_AWS_REGION` | `AWS_REGION` or `us-east-1` | Region for all AWS calls. |
+| `BLASTBOX_AWS_PROFILE` | — | Named CLI profile (else default cred chain). |
+| `BLASTBOX_AWS_AGENT_PORT` | `8765` | Port the in-worker HTTP agent listens on. |
+| `BLASTBOX_AWS_MAX_DURATION_S` | `3600` | Hard lifetime cap requested of the worker (belt-and-braces reap). |
+| **Lambda MicroVM** (`aws-lambda-microvm`) | | transport = per-VM HTTPS URL + JWE token |
+| `BLASTBOX_LAMBDA_IMAGE` | — | **Required.** An **in-account** MicroVM image ARN built via `create-microvm-image` (the managed base `…:aws:microvm-image:al2023-1` is **not** directly runnable — verified live). |
+| `BLASTBOX_LAMBDA_EXEC_ROLE_ARN` | — | Execution role for `run-microvm`. |
+| `BLASTBOX_LAMBDA_EGRESS_CONNECTORS` | `""` | Comma-list of egress-connector ids (list arg). **Empty ⇒ AWS default `INTERNET_EGRESS` (not sealed).** Pass a no-internet connector to seal outbound. **Without one the tier refuses to start** (fail-closed — see `ALLOW_DEFAULT_EGRESS`) because default internet egress silently contradicts a `net_policy='none'` engine. |
+| `BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS` | `0` | `1` ⇒ explicitly accept AWS's default **public internet** egress when no egress connector is set (otherwise the tier fail-closes). Use only when internet egress is intended; set the engine's `net_policy` accordingly. |
+| `BLASTBOX_LAMBDA_INGRESS_CONNECTORS` | `""` | Comma-list of ingress-connector ids (empty ⇒ none configured). |
+| `BLASTBOX_LAMBDA_AUTH_TTL_MIN` | `15` | JWE lifetime for `create-microvm-auth-token` (`--expiration-in-minutes`); minted fresh at probe time, scoped to the agent port, and **reused across readiness ticks within half its TTL** (no per-tick control-plane call). |
+| **Lambda MicroVM WARM / SnapStart** (`aws-lambda-snapstart`) | | the WARM AWS tier — per-microvm suspend/resume |
+| _(reuses all `BLASTBOX_LAMBDA_*` + `BLASTBOX_AWS_*` above)_ | | Same image/egress/token config as `aws-lambda-microvm`. |
+| `BLASTBOX_LAMBDA_SNAPSTART_IDLE_S` | `120` | `idlePolicy.maxIdleDurationSeconds` — idle time (running, billing) before AWS auto-suspends a warm slot. Lower = cheaper park, more resume churn. |
+| `BLASTBOX_LAMBDA_SNAPSTART_SUSPENDED_TTL_S` | `3600` | `idlePolicy.suspendedDurationSeconds` — how long a PARKED slot persists before AWS auto-terminates it (then the pool replenishes). |
+| `BLASTBOX_LAMBDA_SNAPSTART_AUTO_RESUME` | `1` | `idlePolicy.autoResumeEnabled` — wake on inbound traffic (belt-and-braces with the dispatcher's explicit `resume-microvm` on claim). |
+| `BLASTBOX_LAMBDA_SNAPSTART_RESUME_TIMEOUT_S` | `60` | Budget for `resume-microvm` + `/healthz` to answer when a job claims a parked slot (the transport POSTs with no retry). |
+| `BLASTBOX_LAMBDA_SNAPSTART_RESUME_POLL_S` | `1` | Health re-probe interval while a resumed slot settles. |
+| **Disposable EC2** (`aws-ec2`) | | transport = instance IP:port (private by default) |
+| `BLASTBOX_EC2_AMI` | — | **Required.** Worker AMI (agent brought up via user-data). |
+| `BLASTBOX_EC2_INSTANCE_TYPE` | `m7g.large` | ARM64 default (matches the sealed-Linux ARM image); override for x86. |
+| `BLASTBOX_EC2_SUBNET_ID` / `BLASTBOX_EC2_SECURITY_GROUPS` | — | VPC placement + SGs (comma-list). |
+| `BLASTBOX_EC2_IAM_PROFILE` / `BLASTBOX_EC2_KEY_NAME` | — | Instance profile name / SSH key name. |
+| `BLASTBOX_EC2_PUBLIC_IP` | `0` | `1` ⇒ talk to the public IP (default: private, host in-VPC). Requires dispatcher TLS (`BLASTBOX_DISPATCH_TLS_CA`) — the runtime **fails closed** on public-IP-without-TLS (the token + samples would cross the public internet in cleartext). |
+| `BLASTBOX_EC2_ALLOW_PLAINTEXT_PUBLIC` | `0` | `1` ⇒ explicitly accept a public-IP worker with **no** TLS (opt out of the fail-closed guard above). Only for a trusted/private-fronted public endpoint. |
+| `BLASTBOX_EC2_USER_DATA_B64` | — | base64 cloud-init that starts the worker agent on `AGENT_PORT` (any format — merged into MIME-multipart with the auto TTL). |
+| `BLASTBOX_EC2_SELF_TERMINATE` | `1` | Inject a guest self-shutdown after `MAX_DURATION_S` (MIME-multipart, on top of your user-data) so a **crashed dispatcher can't leak a running instance** — `--instance-initiated-shutdown-behavior terminate` then reaps it. Set `0` if the AMI handles its own TTL. |
+| `BLASTBOX_EC2_AGENT_TOKEN` | — | Bearer token the AMI's agent expects (`BLASTBOX_WORKER_AGENT_TOKEN`); forwarded on both the readiness probe and `/detonate`. |
+| **EC2 WARM / Hibernate** (`aws-ec2-hibernate`) | | the WARM EC2 tier — `stop --hibernate` / `start` C/R |
+| _(reuses all `BLASTBOX_EC2_*` + `BLASTBOX_AWS_*` above)_ | | Same AMI/subnet/SG/agent-token config as `aws-ec2`, PLUS: needs a **hibernation-capable** instance type (t4g/m6g/m7g/…, RAM ≤ 150 GB) and an AMI that supports hibernation (AL2023 does). Fail-closed preflight refuses an incapable type or an undersized root volume. |
+| `BLASTBOX_EC2_ROOT_VOLUME_GB` | `30` | Encrypted root EBS size — must be **≥ the instance RAM** (hibernation saves RAM to it). Raise for large-memory types. |
+| `BLASTBOX_EC2_ROOT_DEVICE` | `/dev/xvda` | Root device name (AL2023 ARM64). |
+| `BLASTBOX_EC2_HIBERNATE_READY_TIMEOUT_S` | `600` | Warming budget — must cover boot + `engine.warmup()` + the `ec2-hibinit` reserve wait + `stop --hibernate` → stopped (all in `is_ready`). |
+| `BLASTBOX_EC2_HIBERNATE_RESUME_TIMEOUT_S` | `180` | Budget for `start-instances` + `/healthz` on claim (kept below the job timeout). |
+| `BLASTBOX_EC2_HIBERNATE_TIMEOUT_S` | `300` | Per-slot budget for `stop --hibernate` → `stopped`; if hibernation doesn't take (instance lands back `running`) the slot re-drives. |
+| `BLASTBOX_EC2_SELF_TERMINATE` | `0` (off) | The guest shutdown-TTL is **off** by default here (it would fire on resume after a wall-clock jump and kill the parked slot). |
+
+The **generic worker agent** (`python -m blastbox.worker.http_agent`, `BLASTBOX_ENGINE=module:Class`)
+serves any engine over `GET /healthz` + `POST /detonate`; bake it + the engine + its deps into the
+worker image. `BLASTBOX_WORKER_AGENT_PORT` / `BLASTBOX_WORKER_AGENT_TOKEN` / `BLASTBOX_WORKER_AGENT_MAX_BYTES`
+tune it. The agent runs `engine.warmup()` **before** it binds, so a MicroVM whose `/healthz` answers is
+already warm (JVM booted / soffice UNO up) — which is what makes the SnapStart tier's parked slots warm.
+
+**`aws-lambda-snapstart` — the WARM AWS tier.** AWS exposes `suspend-microvm`/`resume-microvm` (per-VM
+live state; endpoint stable across the cycle) but **no snapshot-template/fan-out**, so each pool slot is
+individually boot+warmed then parked. The tier: (1) `run-microvm`s each slot with an `--idle-policy` so
+AWS auto-suspends it once warm+idle (full mem+disk preserved); (2) the dispatcher `resume-microvm`s the
+claimed slot and health-gates it **before** the job POSTs (sub-second — JVM/soffice already warm);
+(3) **terminates** it after one untrusted job (disposable-warm, never reused across inputs). The
+boot + warmup cost is paid off the critical path during background replenishment. Same fail-closed
+egress + JWE + public-AWS-TLS model as `aws-lambda-microvm`; size `BLASTBOX_POOL_WARM_SIZE` to the
+warm depth you want parked.
+
+**`aws-ec2-hibernate` — the WARM EC2 tier.** EC2's warm C/R primitive is **Hibernate**: `stop-instances
+--hibernate` saves the instance RAM to the encrypted root EBS (→ `stopped`) and `start-instances`
+restores it (→ `running`), so the warmed process (JVM/soffice) survives. Unlike Lambda's platform
+idle-policy, EC2 has no auto-hibernate, so the runtime parks a warmed slot itself: `is_ready` drives a
+per-slot state machine (wait `running` + agent `/healthz` → `stop --hibernate` → wait `stopped` →
+parked), and the `resume` seam `start-instances` + health-gates it on claim (the **private IP is
+retained** across stop/start, so the endpoint is stable). Terminated after one untrusted job
+(disposable-warm). The `ec2-hibinit` agent needs ~1–2 min after boot before `stop --hibernate` is
+accepted ("not ready to hibernate yet") — the state machine throttles + retries that automatically.
+Both warm-survival cycles are **live-proven on real AWS** (the same warmed PID served the pre-hibernate
+and post-resume jobs). Self-hosted agent → worker mTLS applies (unlike the AWS-fronted Lambda tiers).
+
+## Runtime: static worker pool (`static`)
+
+For a **fixed fleet of always-on workers** — bare-metal boxes or long-lived VMs that each already run
+`python -m blastbox.worker.http_agent`. Unlike every other tier this backend **creates nothing**: a slot
+"spawn" just **claims a free box** from the registered list, and "reap" **returns it** — no boot, no
+terminate. Same network-endpoint slot as the AWS tiers, so the `remote_http` transport drives it unchanged.
+Selected by `BLASTBOX_POOL_RUNTIME=static`. Fail-closed: refused unless at least one box answers `/healthz`.
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_STATIC_WORKERS` | — | **Required.** Comma-list of worker endpoints: `host:port`, bare `host`, or a full `http(s)://host:port` URL. |
+| `BLASTBOX_STATIC_AGENT_PORT` | `8765` | Default port for `host` / `host:` entries that omit one. |
+| `BLASTBOX_STATIC_WORKER_TOKEN` | — | Shared bearer token sent as `X-aws-proxy-auth` to every box (the agent's `BLASTBOX_WORKER_AGENT_TOKEN`). |
+| `BLASTBOX_STATIC_HEALTH_PATH` | `/healthz` | Health-probe path. |
+| `BLASTBOX_STATIC_PROBE_TIMEOUT_S` | `5` | Per-probe HTTP timeout. |
+| `BLASTBOX_STATIC_DIRTY_COOLDOWN_S` | `60` | After a **dirty** release (timeout/trust-fail/agent error) a box is held out of the free set this long, so a stale request still running in the long-lived agent can drain before the box is re-offered. |
+
+The fleet is finite, so **size the pool to it**: keep `BLASTBOX_POOL_CEILING <= len(BLASTBOX_STATIC_WORKERS)`
+(a claim beyond the fleet raises `StaticPoolExhausted`). Set `BLASTBOX_DISPATCH_CONCURRENCY` to the fleet
+size too. This is the "bare-metal worker pool" shape — the same warm-pool scaler + generic agent as the
+cloud tiers, just pointed at machines you already own.
+
+**mTLS:** when `BLASTBOX_DISPATCH_TLS_CA` is set (see *Worker HTTP agent + mTLS*), the pool automatically
+probes `/healthz` and drives the transport over **https + client-cert mTLS** — declare workers as
+`https://host:port` (bare `host:port` entries are upgraded to `https` in TLS mode). The pool exposes the
+client context on `runtime.ssl_context` for the dispatcher's `make_remote_validate`.
+
+## Runtime: cascade (local + overflow tiers) (`cascade`)
+
+**"Run X workers locally, then burst up to Y on other hardware / AWS"** as a single warm pool. A
+priority-ordered list of tiers — each an existing backend + a capacity — where `spawn` fills tier 1,
+then overflows to tier 2, and so on; `reap` frees the slot on whichever tier owns it. The WarmPool on
+top is unchanged (it still sees one runtime); each tier reads its own backend config.
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_POOL_TIERS` | — | **Required.** Ordered `backend:capacity` list, e.g. `static:4,aws-ec2:16` — 4 warm local + up to 16 overflow on AWS. Backends: `gvisor`, `firecracker`, `static`, `aws-ec2`, `aws-lambda-microvm`. **All tiers must share a dispatch style** (see below) — don't mix file-handshake (`gvisor`/`firecracker`) with network-endpoint (`static`/`aws-*`). |
+
+The **primary** (first) tier must be available at startup (fail-closed); an **overflow** tier that isn't
+available is logged and skipped, so capacity still comes up if the cloud/remote tier is misconfigured.
+Set `BLASTBOX_POOL_WARM_SIZE` to the primary tier's capacity (keep those warm), `BLASTBOX_POOL_CEILING` to
+the sum, `BLASTBOX_DISPATCH_CONCURRENCY` to the ceiling, and `BLASTBOX_POOL_BURST_SIZE` to the overflow
+capacity — the pool only raises its target to `WARM_SIZE + BURST_SIZE` (default burst **4**), so without
+this it never spawns into the overflow tier no matter how high the ceiling.
+
+> **All tiers must share a dispatch style.** Every tier is either **network-endpoint** (`static`,
+> `aws-ec2`, `aws-lambda-microvm` — driven over `remote_http`) or **file-handshake** (`gvisor`,
+> `firecracker`). You can't mix them in one cascade (a job can't use both transports) — the dispatcher
+> **fails fast** at startup if you do. So "local + remote overflow" means a network-endpoint local tier
+> (`static` boxes you own), not `gvisor`/`firecracker`.
+
+Example — 8 warm workers on a rack of boxes you own, overflow to AWS:
+```
+BLASTBOX_POOL_RUNTIME=cascade
+BLASTBOX_POOL_TIERS=static:8,aws-ec2:16       # all network-endpoint
+BLASTBOX_STATIC_WORKERS=box1:8765,box2:8765,box3:8765,box4:8765,box5:8765,box6:8765,box7:8765,box8:8765
+BLASTBOX_EC2_AMI=ami-...            # (+ BLASTBOX_EC2_* placement)
+BLASTBOX_POOL_WARM_SIZE=8
+BLASTBOX_POOL_BURST_SIZE=16         # so the pool can burst 8 warm -> 24 (into the 16 AWS overflow slots)
+BLASTBOX_POOL_CEILING=24
+BLASTBOX_DISPATCH_CONCURRENCY=24
+```
+
+## Worker HTTP agent + mTLS (network-endpoint tiers)
+
+The `static` / `aws-*` / `cascade` tiers run the worker as `python -m blastbox.worker.http_agent`. These
+knobs configure it; **default it to loopback + mTLS** for anything off-box (the transport is otherwise
+plain HTTP for a *trusted private VPC* — do not expose it to the public internet in the clear).
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_WORKER_AGENT_PORT` | `8765` | Listen port. |
+| `BLASTBOX_WORKER_AGENT_BIND` | `0.0.0.0` | Bind address. A non-loopback bind with **no** mTLS/token/allowlist **fails closed** (the agent refuses to start) unless `BLASTBOX_WORKER_AGENT_ALLOW_INSECURE=1`. |
+| `BLASTBOX_WORKER_AGENT_ALLOW_INSECURE` | `0` | Opt back into serving on a non-loopback address with **no** request gate — only when an **external** gate already fences the port (AWS microVM JWE proxy, a security group, a private worker network). Proxy-gated tiers (e.g. `aws-lambda-microvm`) that don't bake in a token must set this in the worker image env. |
+| `BLASTBOX_WORKER_AGENT_TOKEN` | — | Bearer token required on `/detonate` (`X-aws-proxy-auth` / `Authorization: Bearer`). |
+| `BLASTBOX_WORKER_AGENT_MAX_BYTES` | `512MiB` | Max request body. |
+| `BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S` | `2×timeout+30` | Hard ceiling for one detonation; a hung engine that blows past it **retires the worker** (`os._exit`, the supervisor/pool replaces the box) so it can't hold the single-flight lock forever. Defaults to twice the per-job `timeout_s` + 30s (never trips a normal job); `0` disables. |
+| `BLASTBOX_WORKER_AGENT_TLS_CERT` / `_TLS_KEY` | — | Serve **HTTPS** with this server cert/key (mint via `blastbox pki issue-server`). |
+| `BLASTBOX_WORKER_AGENT_CLIENT_CA` | — | Require a **client** cert signed by this CA (**mTLS**) — the cryptographic allowed-caller gate. |
+| `BLASTBOX_WORKER_AGENT_ALLOW_CIDRS` | — | Comma-list of CIDRs allowed to POST `/detonate` (peer-IP allowlist; 403 otherwise). Defense-in-depth with mTLS + the SG. |
+
+**Dispatcher (client) side** — build the mTLS context the transport presents:
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_DISPATCH_TLS_CA` | — | CA that signed the workers' server certs (verify them). Setting it turns on `https://`. |
+| `BLASTBOX_DISPATCH_TLS_CERT` / `_TLS_KEY` | — | The dispatcher's client cert/key (mTLS; `blastbox pki init` mints `dispatcher.{crt,key}`). |
+
+**PKI / cert generation** — `BLASTBOX_PKI_DIR` (default `/var/lib/blastbox/pki`) holds the CA. The
+`blastbox pki` CLI generates + issues everything (pure `cryptography`, no openssl):
+```
+blastbox pki init                              # CA (ca.crt/ca.key) + dispatcher client cert
+blastbox pki issue-server --san 10.0.0.5       # a worker's server cert, SAN-pinned (short-lived)
+blastbox pki show-ca                           # the public CA cert -> bake into worker images
+```
+Bake `ca.crt` into worker images (public trust anchor); keep `ca.key` on the dispatcher only. For
+disposable workers, mint the server cert per-spawn (SAN = the instance IP) rather than baking a key.
 
 ## Per-engine params (engine ↔ host boundary)
 

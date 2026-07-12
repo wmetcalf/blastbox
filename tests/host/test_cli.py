@@ -93,6 +93,24 @@ class TestDispatchArgparse:
             ret = main(["dispatch"])
         assert ret == 1
 
+    def test_dispatch_network_multi_engine_does_not_start_pool(self):
+        """A network-endpoint pool + >1 engine must fail validation BEFORE pool.start(), so a config
+        error can't leak already-spawned cloud slots (Codex #1/#6)."""
+        import os
+
+        pool = MagicMock()
+        pool.runtime.dispatch_style = "network"
+        env = {
+            "BLASTBOX_ENGINES": "clippyshot=img1:latest,redtusk=img2:latest",
+            "BLASTBOX_POOL_RUNTIME": "aws-ec2",   # a network-endpoint warm tier
+        }
+        with patch.dict(os.environ, env, clear=True), \
+                patch("blastbox.host.pool_config.build_warm_pool", return_value=pool), \
+                patch("blastbox.host.jobs.factory.build_job_store_from_env", return_value=MagicMock()):
+            with pytest.raises(ValueError, match="single engine"):
+                main(["dispatch"])
+        pool.start.assert_not_called()   # validation raised first -> nothing spawned to leak
+
 
 class TestCliParser:
     def test_no_command_raises_systemexit(self):
@@ -113,3 +131,42 @@ def test_engine_net_policy_from_env(monkeypatch):
     monkeypatch.setenv("BLASTBOX_ENGINE_REDTUSK_NETPOLICY", "fakenet")
     engines = _parse_engine_specs("redtusk=img:tag")
     assert engines["redtusk"].net_policy == "fakenet"
+
+
+class TestPkiCli:
+    def test_init_creates_ca_and_dispatcher_cert(self, tmp_path):
+        assert main(["pki", "--dir", str(tmp_path), "init"]) == 0
+        assert (tmp_path / "ca.crt").exists()
+        assert (tmp_path / "dispatcher.crt").exists() and (tmp_path / "dispatcher.key").exists()
+
+    def test_issue_server_is_ca_signed(self, tmp_path):
+        main(["pki", "--dir", str(tmp_path), "init"])
+        assert main(["pki", "--dir", str(tmp_path), "issue-server", "--san", "10.0.0.5"]) == 0
+        from cryptography import x509
+        ca = x509.load_pem_x509_certificate((tmp_path / "ca.crt").read_bytes())
+        srv = x509.load_pem_x509_certificate((tmp_path / "10.0.0.5.crt").read_bytes())
+        assert srv.issuer == ca.subject
+
+    def test_show_ca_prints_pem(self, tmp_path, capsys):
+        main(["pki", "--dir", str(tmp_path), "init"])
+        main(["pki", "--dir", str(tmp_path), "show-ca"])
+        assert "BEGIN CERTIFICATE" in capsys.readouterr().out
+
+    def test_sign_csr(self, tmp_path):
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+        main(["pki", "--dir", str(tmp_path), "init"])
+        import ipaddress
+        key = ec.generate_private_key(ec.SECP256R1())
+        csr = (x509.CertificateSigningRequestBuilder()
+               .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "w1")]))
+               .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("10.0.0.9"))]),
+                              critical=False)
+               .sign(key, hashes.SHA256()))
+        (tmp_path / "w.csr").write_bytes(csr.public_bytes(serialization.Encoding.PEM))
+        assert main(["pki", "--dir", str(tmp_path), "sign-csr", "--csr", str(tmp_path / "w.csr")]) == 0
+        crt = x509.load_pem_x509_certificate((tmp_path / "w.crt").read_bytes())
+        ca = x509.load_pem_x509_certificate((tmp_path / "ca.crt").read_bytes())
+        assert crt.issuer == ca.subject   # worker's key never left the box; dispatcher signed the CSR

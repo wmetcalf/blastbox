@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Any
 from dataclasses import dataclass
 
 from blastbox.host.pool import SlotRuntime, WarmPool
@@ -19,6 +20,12 @@ _log = logging.getLogger("blastbox.host.pool_config")
 RUNTIME_NONE = "none"
 RUNTIME_FIRECRACKER = "firecracker"
 RUNTIME_GVISOR = "gvisor"
+RUNTIME_AWS_LAMBDA_MICROVM = "aws-lambda-microvm"
+RUNTIME_AWS_LAMBDA_SNAPSTART = "aws-lambda-snapstart"
+RUNTIME_AWS_EC2 = "aws-ec2"
+RUNTIME_AWS_EC2_HIBERNATE = "aws-ec2-hibernate"
+RUNTIME_STATIC = "static"
+RUNTIME_CASCADE = "cascade"
 
 
 @dataclass(frozen=True)
@@ -30,6 +37,10 @@ class PoolConfig:
     concurrent_ceiling: int = 16
     spawn_rate_limit: float = 4.0
     burst_size: int = 4
+    # Max seconds a slot may sit WARMING before it's evicted. The 120s default is fine for FC/gVisor;
+    # raise it for cloud tiers (aws-ec2 first-boot can take minutes) so healthy-but-slow slots aren't
+    # churned -- matches the AWS ready_timeout budget.
+    warming_timeout_s: float = 120.0
     # Warm-snapshot tier (firecracker only): spawn = restore-from-warm-snapshot
     # instead of cold-boot. Opt-in; default OFF (cold FC boot per slot).
     warm_snapshot: bool = False
@@ -58,7 +69,7 @@ class PoolConfig:
             raw = os.environ.get(key, "").strip().lower()
             if not raw:
                 return default
-            return raw not in ("0", "false", "no")
+            return raw not in ("0", "false", "no", "off")
 
         values: dict[str, object] = {
             "runtime": os.environ.get("BLASTBOX_POOL_RUNTIME", cls.runtime).strip().lower(),
@@ -66,6 +77,7 @@ class PoolConfig:
             "concurrent_ceiling": _int("BLASTBOX_POOL_CEILING", cls.concurrent_ceiling),
             "spawn_rate_limit": _float("BLASTBOX_POOL_SPAWN_RATE", cls.spawn_rate_limit),
             "burst_size": _int("BLASTBOX_POOL_BURST_SIZE", cls.burst_size),
+            "warming_timeout_s": _float("BLASTBOX_POOL_WARMING_TIMEOUT_S", cls.warming_timeout_s),
             "warm_snapshot": _bool("BLASTBOX_POOL_WARM_SNAPSHOT", cls.warm_snapshot),
         }
         values.update(overrides)
@@ -73,6 +85,48 @@ class PoolConfig:
         if cfg.warm_size < 0 or cfg.concurrent_ceiling < 1:
             raise ValueError("warm_size must be >= 0 and concurrent_ceiling >= 1")
         return cfg
+
+
+def select_runtime_by_name(
+    name: str, *, warm_snapshot: bool = False, require_available: bool = True
+) -> Any:
+    """Build one SlotRuntime for a backend name. Shared by ``build_warm_pool`` and the cascade tier
+    builder. Network-endpoint tiers (aws/static) return slots that structurally diverge from the
+    ``SlotRuntime`` Protocol's ``Slot`` -- WarmPool drives them fine (it touches only common fields),
+    so this returns ``Any`` rather than sprinkling per-call ``type: ignore``."""
+    if name == RUNTIME_FIRECRACKER:
+        if warm_snapshot:
+            from blastbox.host.runtime.fc_snapshot_runtime import select_snapshot_runtime
+
+            return select_snapshot_runtime(require_available=require_available)
+        from blastbox.host.runtime.firecracker import select_fc_runtime
+
+        return select_fc_runtime(require_available=require_available)
+    if name == RUNTIME_GVISOR:
+        from blastbox.host.runtime.gvisor_snapshot_runtime import select_gvisor_snapshot_runtime
+
+        return select_gvisor_snapshot_runtime(require_available=require_available)
+    if name == RUNTIME_AWS_LAMBDA_MICROVM:
+        from blastbox.host.runtime.aws_worker import select_lambda_microvm_runtime
+
+        return select_lambda_microvm_runtime(require_available=require_available)
+    if name == RUNTIME_AWS_LAMBDA_SNAPSTART:
+        from blastbox.host.runtime.aws_worker import select_lambda_snapstart_runtime
+
+        return select_lambda_snapstart_runtime(require_available=require_available)
+    if name == RUNTIME_AWS_EC2:
+        from blastbox.host.runtime.aws_worker import select_disposable_ec2_runtime
+
+        return select_disposable_ec2_runtime(require_available=require_available)
+    if name == RUNTIME_AWS_EC2_HIBERNATE:
+        from blastbox.host.runtime.aws_worker import select_ec2_hibernate_runtime
+
+        return select_ec2_hibernate_runtime(require_available=require_available)
+    if name == RUNTIME_STATIC:
+        from blastbox.host.runtime.static_pool import select_static_pool_runtime
+
+        return select_static_pool_runtime(require_available=require_available)
+    raise ValueError(f"unknown pool runtime: {name!r}")
 
 
 def build_warm_pool(
@@ -95,30 +149,24 @@ def build_warm_pool(
     if runtime is None:
         if cfg.runtime == RUNTIME_NONE:
             return None
-        if cfg.runtime == RUNTIME_FIRECRACKER:
-            if cfg.warm_snapshot:
-                from blastbox.host.runtime.fc_snapshot_runtime import (
-                    select_snapshot_runtime,
-                )
+        if cfg.runtime == RUNTIME_CASCADE:
+            from blastbox.host.runtime.cascade import build_cascade_runtime
 
-                runtime = select_snapshot_runtime(require_available=True)
-            else:
-                from blastbox.host.runtime.firecracker import select_fc_runtime
-
-                runtime = select_fc_runtime(require_available=True)
-        elif cfg.runtime == RUNTIME_GVISOR:
-            from blastbox.host.runtime.gvisor_snapshot_runtime import (
-                select_gvisor_snapshot_runtime,
-            )
-
-            runtime = select_gvisor_snapshot_runtime(require_available=True)
+            runtime = build_cascade_runtime(warm_snapshot=cfg.warm_snapshot)
         else:
-            raise ValueError(f"unknown pool runtime: {cfg.runtime!r}")
+            runtime = select_runtime_by_name(cfg.runtime, warm_snapshot=cfg.warm_snapshot)
 
     assert runtime is not None  # narrowed: every branch above returned/raised/assigned
+    # A slow-booting runtime (aws-ec2 first boot commonly >120s) declares its own readiness budget.
+    # If the operator DIDN'T explicitly set the pool warming timeout, raise it to that budget so a
+    # healthy-but-slow cloud slot isn't evicted + churned. An explicit env value always wins.
+    warming_timeout_s = cfg.warming_timeout_s
+    if os.environ.get("BLASTBOX_POOL_WARMING_TIMEOUT_S") is None:
+        warming_timeout_s = max(warming_timeout_s, float(getattr(runtime, "readiness_timeout_s", 0.0)))
     pool = WarmPool(
         runtime=runtime,
         warm_size=cfg.warm_size,
+        warming_timeout_s=warming_timeout_s,
         concurrent_ceiling=cfg.concurrent_ceiling,
         spawn_rate_limit=cfg.spawn_rate_limit,
         burst_size=cfg.burst_size,

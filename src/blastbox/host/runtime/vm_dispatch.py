@@ -26,10 +26,17 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 from blastbox.contract.envelope import atomic_write_confined
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.jobs.retention import JobRetentionSweeper
+from blastbox.host.runtime.remote_http import WorkerBusy   # 409 from a busy worker -> requeue, not fail
+from blastbox.observability.metrics import (
+    observe_job_duration,
+    record_job_dispatched,
+    record_warm_claim,
+)
 
 # Cap a VM validate() summary before it's stored as result_summary / written to metadata.json — a
 # compromised/buggy VM agent could otherwise return a huge nested blob that balloons the DB/Redis
@@ -37,6 +44,12 @@ from blastbox.host.jobs.retention import JobRetentionSweeper
 _MAX_SUMMARY_BYTES = 256 * 1024
 
 logger = logging.getLogger(__name__)
+
+
+class NoWarmSlot(RuntimeError):
+    """No warm slot was available to run a claimed job. The dispatcher REQUEUES the job (it never ran)
+    instead of FAILing it, so it waits for a slot / another dispatcher rather than burning a job on
+    transient capacity pressure."""
 
 
 class VmJobDispatcher:
@@ -59,10 +72,41 @@ class VmJobDispatcher:
                  validate_timeout_s: float = 1800.0,
                  fixed_net_policy: str | None = None,
                  engine_net_policy: str | None = None,
+                 trust_output_metadata: bool = False,
+                 sanitize_params: Callable[[dict[str, str]], dict[str, str]] | None = None,
+                 output_validator: Callable[[Job, Path], None] | None = None,
+                 max_queued_age_s: float = 0.0,
                  max_summary_bytes: int = _MAX_SUMMARY_BYTES) -> None:
         self._store = store
         self._job_root = Path(job_root)
         self._validate = validate
+        # When the transport itself sealed + wrote output/metadata.json (the remote_http path: the
+        # http_agent runs run_detonation which re-hashes artifacts from disk, and the HOST extracts the
+        # tar traversal-safe), that file is a trustworthy sealed envelope -- preserve it (with its
+        # artifact list) instead of clobbering it to artifacts:[]. False = the libvirt-VM path, where the
+        # summary is guest-influenced and artifacts MUST be forced empty.
+        self._trust_output_metadata = trust_output_metadata
+        # Optional per-job param gate (built from the engine's allowlist by the caller): the sanitized
+        # subset is passed to a validate() that accepts a `params` kwarg (the remote_http seam), so a
+        # network-endpoint job honors per-job toggles (OCR/QR) just like the local worker.
+        self._sanitize = sanitize_params
+        # Host trust gate for output already on disk (remote_http path): re-seal + verify engine, input
+        # SHA, artifact hashes, caps before DONE. Raises to fail the job. None = no gate (libvirt-vm
+        # returns an in-memory summary, not on-disk artifacts, so the summary-neuter is the control).
+        self._output_validator = output_validator
+        try:
+            import inspect
+            _params = inspect.signature(validate).parameters
+            self._validate_takes_params = "params" in _params
+            # the remote transport's trust gate compares against the AUTHORITATIVE ingress-recorded
+            # input SHA (not a recompute of the staged file) -> pass job.input_sha256 when accepted.
+            self._validate_takes_input_sha = "input_sha256" in _params
+            # ownership predicate so the transport can fence its metadata write by our still-held claim.
+            self._validate_takes_owns = "owns" in _params
+        except (TypeError, ValueError):
+            self._validate_takes_params = False
+            self._validate_takes_input_sha = False
+            self._validate_takes_owns = False
         self._engine = engine
         self._worker_tier = worker_tier
         self._retention_s = max(0, int(job_retention_s))
@@ -79,6 +123,11 @@ class VmJobDispatcher:
         # crashed BEFORE _process stamped worker_runtime="warm" — there's no cold job to mistake it
         # for. Default False keeps recovery scoped to our own warm-stamped claims (shared-store safe).
         self._sole_owner = bool(sole_owner)
+        # Opt-in ceiling (0 = off) on how long a job may sit QUEUED before this dispatcher's maintenance
+        # FAILs it + deletes its input. In a remote-only (static/AWS) deployment there is NO cold
+        # Dispatcher to run this sweep, so a job pinned to a target_tier nobody serves (or for an engine
+        # this single-engine dispatcher can't claim) would otherwise keep its untrusted input forever.
+        self._max_queued_age_s = max(0.0, float(max_queued_age_s))
         # Bound a hung validate() so a dead VM agent can't occupy a claim thread forever (heartbeat
         # would keep the job looking fresh, so the orphan sweep never recovers it).
         self._validate_timeout_s = max(self._heartbeat_s, float(validate_timeout_s))
@@ -162,6 +211,10 @@ class VmJobDispatcher:
         out = self._job_dir(job) / "output"
         try:
             out.mkdir(parents=True, exist_ok=True)
+            # Remote path: the transport already sealed + wrote a trustworthy metadata.json (with the
+            # real artifact list) into output/. Preserve it rather than overwriting with artifacts:[].
+            if self._trust_output_metadata and (out / "metadata.json").is_file():
+                return True
             data = json.dumps({**(summary or {}), "artifacts": []}).encode()
             atomic_write_confined(out, "metadata.json", data, mode=0o644)
             return True
@@ -195,10 +248,20 @@ class VmJobDispatcher:
                                    job.job_id, exc_info=True)
 
         result: dict[str, object] = {}
+        # run the sanitizer whenever it exists (even with empty job.params) so operator default_params
+        # still reach the worker, matching the cold/file-warm paths.
+        params = self._sanitize(dict(job.params)) if self._sanitize else None
 
         def _run() -> None:
             try:
-                result["v"] = self._validate(in_path)
+                kw: dict[str, object] = {}
+                if self._validate_takes_params:
+                    kw["params"] = params
+                if self._validate_takes_input_sha:
+                    kw["input_sha256"] = job.input_sha256   # authoritative ingress SHA for the trust gate
+                if self._validate_takes_owns:
+                    kw["owns"] = lambda: self._claim_is_still_ours(job)   # fence the metadata write
+                result["v"] = self._validate(in_path, **kw)  # type: ignore[call-arg]
             except BaseException as exc:  # noqa: BLE001 — surfaced to the caller below
                 result["e"] = exc
 
@@ -281,12 +344,39 @@ class VmJobDispatcher:
             return
         in_path = self._input_path(job)
         owned = False
+        terminal_status: JobStatus | None = None   # the terminal state THIS attempt CAS-won (for metrics)
+        t0 = time.monotonic()   # for the job-duration metric (parity with the cold dispatcher)
         try:
             if not in_path.exists():
                 raise FileNotFoundError(f"spooled input missing: {in_path}")
             summary, ok = self._validate_with_heartbeat(job, in_path)
             summary = self._bounded_summary(summary)   # cap untrusted summary before store/metadata
             err: str | None = None
+            sealed_env: Any = None
+            if ok and self._trust_output_metadata:
+                # Remote path: the transport returns the FULL sealed metadata dict. Persist a COMPACT
+                # result_summary (like the cold dispatcher) so list/status responses don't carry the
+                # whole payload/artifacts (up to 256 KiB/job) -- the full envelope stays in metadata.json
+                # for /metadata. Parse the envelope ONCE here and reuse it for page-hash indexing.
+                sealed_env = self._sealed_envelope(job)
+                if sealed_env is not None:
+                    from blastbox.host.dispatch import _build_result_summary
+                    summary = _build_result_summary(sealed_env)
+            if not ok and isinstance(summary, dict):
+                # a failing validate carries a coarse sanitized reason (remote transport/trust/engine)
+                # so the FAILED job has an actionable error instead of a bare None.
+                _e = summary.get("error")
+                if isinstance(_e, str):
+                    err = _e
+            # Host trust gate on the extracted output BEFORE DONE: verify engine + input SHA, re-seal
+            # artifact hashes from disk, enforce caps. A compromised/stale remote agent can't get a
+            # wrong-input or unsealed result marked DONE.
+            if ok and self._output_validator is not None:
+                try:
+                    self._output_validator(job, self._job_dir(job) / "output")
+                except Exception as exc:  # noqa: BLE001 -- trust failure => FAIL, don't mark DONE
+                    ok, err = False, f"output trust validation failed: {exc}"
+                    logger.warning("vm_dispatch: job %s failed trust gate: %s", job.job_id, exc)
             # Publish metadata.json BEFORE the DONE CAS so DONE never implies a 404 on /metadata,
             # /artifacts, /result. If the write fails, FAIL the job (recoverable) rather than mark it
             # DONE-without-metadata. But re-check OWNERSHIP first: if a long validation outlived its
@@ -303,14 +393,31 @@ class VmJobDispatcher:
             finished = time.time()
             # CAS on (status, claim_id) so a stale owner can't clobber a job that was reclaimed
             # (RUNNING->QUEUED->RUNNING under another dispatcher). The return value is OUR ownership.
+            terminal_status = JobStatus.DONE if ok else JobStatus.FAILED
             owned = self._store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
-                status=JobStatus.DONE if ok else JobStatus.FAILED,
+                status=terminal_status,
                 finished_at=finished, result_summary=summary, error=err,
                 expires_at=self._expiry(finished))
+            if ok and owned:
+                # index per-page perceptual hashes for /v1/similar, same as the cold/file-warm paths --
+                # else a network-endpoint (static/AWS) page-hash job is DONE but invisible to search.
+                self._index_page_hashes(job, sealed_env)
+        except (NoWarmSlot, WorkerBusy):
+            # capacity pressure, not a job failure -- the job NEVER ran (no slot, or the claimed worker's
+            # single-flight lock was held by a stale detonation -> 409). REQUEUE it (CAS back to QUEUED,
+            # clear our claim + warm stamp) so it waits for a slot / another dispatcher instead of FAILing.
+            record_warm_claim(hit=False)   # warm-pool miss (parity with the cold dispatcher's metric)
+            logger.info("vm_dispatch: no usable warm slot for %s; requeuing (not failing)", job.job_id)
+            owned = self._store.update_if_status(
+                job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
+                status=JobStatus.QUEUED, claim_id=None, started_at=None,
+                worker_runtime=None, worker_tier=None)
+            owned = False   # requeued, not terminal -> don't delete the input in the finally
         except Exception as exc:  # noqa: BLE001 — one bad job must not sink the dispatcher
             logger.warning("vm_dispatch: job %s failed: %s", job.job_id, exc, exc_info=True)
             finished = time.time()
+            terminal_status = JobStatus.FAILED
             owned = self._store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                 status=JobStatus.FAILED, finished_at=finished, error=type(exc).__name__,
@@ -323,6 +430,46 @@ class VmJobDispatcher:
                     in_path.unlink()
                 except OSError:
                     pass
+            # Metric parity with the cold dispatcher: count the terminal outcome + wall time -- but ONLY
+            # for THIS attempt's own winning CAS (owned + the status we wrote). Requeued (NoWarmSlot)
+            # attempts set owned=False, and a reclaimed attempt loses the CAS -> both are skipped. Gating
+            # on a store re-read instead would double-count: after a requeue, a PEER dispatcher can claim
+            # and finish the same job before this finally runs, so we'd record a hit + terminal outcome
+            # for a tier that only recorded a miss and never ran the job.
+            if owned and terminal_status is not None:
+                record_warm_claim(hit=True)   # a slot was claimed to produce this terminal outcome
+                record_job_dispatched(
+                    path=self._worker_tier,
+                    outcome="done" if terminal_status is JobStatus.DONE else "failed",
+                )
+                observe_job_duration(path=self._worker_tier, seconds=time.monotonic() - t0)
+
+    def _sealed_envelope(self, job: Job) -> Any:
+        """Parse the HOST-SEALED metadata.json (the Envelope the trust gate wrote) for the remote path,
+        or None if absent/unparseable. Used to build a COMPACT result_summary + index page hashes."""
+        meta = self._job_dir(job) / "output" / "metadata.json"
+        if not meta.exists():
+            return None
+        try:
+            from blastbox.contract.envelope import Envelope
+            return Envelope.model_validate_json(meta.read_text())
+        except Exception:  # noqa: BLE001
+            logger.warning("vm_dispatch: could not parse sealed metadata for %s", job.job_id, exc_info=True)
+            return None
+
+    def _index_page_hashes(self, job: Job, envelope: Any) -> None:
+        """Best-effort: index the job's per-page perceptual hashes (phash/colorhash/sha256) for
+        ``/v1/similar``, same as the cold/file-warm paths -- else a network-endpoint page-hash job is
+        DONE with sealed artifacts but invisible to search. Postgres+pg_bktree only, so gate on
+        ``supports_hash_search()``. An indexing failure NEVER fails an otherwise-DONE job."""
+        supports = getattr(self._store, "supports_hash_search", None)
+        indexer = getattr(self._store, "index_page_hashes", None)
+        if supports is None or indexer is None or not supports() or envelope is None:
+            return
+        try:
+            indexer(job.job_id, envelope)
+        except Exception:  # noqa: BLE001 -- indexing is best-effort; never fail a DONE job on it
+            logger.exception("vm_dispatch: page-hash indexing failed for %s; continuing", job.job_id)
 
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
@@ -388,6 +535,41 @@ class VmJobDispatcher:
                         pass
         except Exception:  # noqa: BLE001
             logger.warning("vm_dispatch: orphan recovery failed", exc_info=True)
+        self._fail_stale_queued_jobs()
+
+    def _fail_stale_queued_jobs(self) -> None:
+        """FAIL jobs stuck QUEUED past ``max_queued_age_s`` and delete their untrusted input (opt-in;
+        0 = off). The network-endpoint path bypasses the cold ``Dispatcher`` (the only other place this
+        runs), so without this a job pinned to a target_tier nobody serves — or for an engine this
+        single-engine dispatcher can't claim — would sit QUEUED with its input on disk forever. CAS on
+        QUEUED so a job claimed since the list() snapshot (→ RUNNING) is left to its claimer."""
+        if self._max_queued_age_s <= 0:
+            return
+        cutoff = time.time() - self._max_queued_age_s
+        try:
+            for job in self._store.list(status=JobStatus.QUEUED):
+                # Normally scope the sweep to OUR engine (a peer dispatcher owns the others). But when
+                # sole_owner (no other dispatcher on this store), also fail jobs for engines NOBODY
+                # serves -- a typo'd/mismatched engine would otherwise keep its untrusted input forever
+                # despite the TTL. Only sole_owner may safely reach across engines.
+                if not self._sole_owner and self._engine is not None and job.engine != self._engine:
+                    continue
+                if job.created_at > cutoff:
+                    continue
+                now = time.time()
+                if self._store.update_if_status(
+                        job.job_id, JobStatus.QUEUED,
+                        status=JobStatus.FAILED, finished_at=now,
+                        error=f"job exceeded the max queued age ({self._max_queued_age_s:.0f}s) without "
+                              f"being claimed (no dispatcher for target_tier={job.target_tier!r}?)",
+                        expires_at=self._expiry(now)):
+                    logger.info("vm_dispatch: failed stale-queued job %s", job.job_id)
+                    try:
+                        self._input_path(job).unlink()
+                    except OSError:
+                        pass
+        except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
+            logger.warning("vm_dispatch: stale-queued sweep failed", exc_info=True)
 
     def _maintenance_loop(self) -> None:
         while not self._stop.wait(self._maintenance_interval_s):
@@ -404,7 +586,280 @@ class VmJobDispatcher:
                 ex.submit(self._worker_loop)
             if self._maintenance_interval_s > 0:
                 ex.submit(self._maintenance_loop)
-            self._stop.wait()
+            try:
+                self._stop.wait()
+            finally:
+                # Release the worker/maintenance loops BEFORE the ThreadPoolExecutor's __exit__ joins them.
+                # A KeyboardInterrupt out of _stop.wait() would otherwise deadlock: __exit__ waits for the
+                # loops, but the loops only exit once _stop is set -- which the caller's `except` can't do
+                # until run() returns. Setting it here (idempotent on a normal stop()) breaks that cycle,
+                # so the interrupt propagates to the CLI where vm.stop()/pool.stop() reap live cloud slots.
+                self._stop.set()
 
     def stop(self, *_: object) -> None:
         self._stop.set()
+
+
+def _resume_on_claim(pool: Any, slot: Any) -> None:
+    """Optional per-claim resume seam (aws-lambda-snapstart): wake a parked/suspended warm slot and
+    block until its agent answers BEFORE the transport POSTs (which has no retry). The runtime
+    repopulates slot.url/auth_token in place; slot_base_url + the POST read them dynamically after claim,
+    so no transport change is needed. On resume failure release the slot DIRTY (retire the un-resumable
+    worker) rather than leak it, then re-raise so the job fails. A runtime without resume() is a no-op."""
+    resume = getattr(getattr(pool, "runtime", None), "resume", None)
+    if not callable(resume):
+        return
+    try:
+        resume(slot)
+    except Exception:
+        try:
+            pool.release(slot, dirty=True)
+        except Exception:   # noqa: BLE001 -- release failure must not mask the resume error
+            logger.warning("vm_dispatch: releasing un-resumable slot failed", exc_info=True)
+        raise
+
+
+def build_remote_vm_dispatcher(
+    store: JobStore,
+    job_root: str | Path,
+    pool: Any,
+    *,
+    tier: str,
+    engine: str | None = None,
+    engine_spec: Any = None,
+    limits: Any = None,
+    worker_timeout_s: float = 300.0,
+    warm_claim_timeout_s: float = 60.0,
+    concurrency: int = 1,
+    job_retention_s: int = 0,
+) -> "VmJobDispatcher":
+    """Assemble a VmJobDispatcher that drives a NETWORK-ENDPOINT warm pool (aws/static/cascade) over the
+    remote_http transport: claim a warm slot -> POST the job to its http_agent -> HOST-TRUST-GATE the
+    extracted output (re-seal + verify engine/input-SHA/caps) -> DONE. The runtime's client (m)TLS
+    context flows through; per-job params are gated through the engine's allowlist and forwarded; the
+    engine's egress personality is enforced fail-closed. Selection is capability-based
+    (``runtime.dispatch_style``), not tier-name matching -- this is the single typed CLI seam."""
+    from blastbox.host.runtime.remote_http import make_remote_validate
+
+    # FAIL CLOSED on an unsafe trust configuration. This path sets trust_output_metadata=True (it PRESERVES
+    # the worker-supplied metadata.json + artifact list), which is only safe when the host trust gate re-
+    # seals/hashes/caps that output first. The gate needs BOTH: `limits` (without it output_trust is never
+    # installed -> a compromised worker's untrusted artifacts get marked DONE unvalidated) and `engine`
+    # (validate_worker_output requires an exact engine match -> engine=None validates against "" and every
+    # real envelope deterministically fails). The CLI always supplies both; a direct caller must too.
+    if limits is None:
+        raise ValueError("build_remote_vm_dispatcher requires limits: the trust-gated remote path preserves "
+                         "worker metadata and MUST re-validate it (caps/hashes). Pass Limits.")
+    if not engine:
+        raise ValueError("build_remote_vm_dispatcher requires engine: the host trust gate validates each "
+                         "worker envelope against an exact engine. Pass the tier's engine name.")
+
+    ssl_context = getattr(pool.runtime, "ssl_context", None)
+    max_output_bytes = getattr(limits, "max_total_artifact_bytes", None)
+    # A resume seam (snapstart) runs INSIDE the claim, before the transport's timeout guard -- if its
+    # budget outlasts the per-job budget a slow wake can abandon the claim thread with a live billing
+    # slot. Warn (don't fail) if the operator sized them backwards.
+    # A tier's cfg carries it directly; a CascadingRuntime aggregates it across its wrapped tiers and
+    # exposes the max as a plain attribute (it has no single cfg), so honor both.
+    _resume_to = getattr(getattr(pool.runtime, "cfg", None), "resume_timeout_s", None)
+    if _resume_to is None:
+        _resume_to = getattr(pool.runtime, "resume_timeout_s", None)
+    if _resume_to is not None and float(_resume_to) >= worker_timeout_s:
+        logger.warning("vm_dispatch: resume_timeout_s=%.0f >= worker_timeout_s=%.0f -- lower "
+                       "BLASTBOX_LAMBDA_SNAPSTART_RESUME_TIMEOUT_S below BLASTBOX_WORKER_TIMEOUT_S so a "
+                       "slow resume can't outlast the job budget and leak a live slot", float(_resume_to),
+                       worker_timeout_s)
+    # Disposable AWS tiers have no recycle(), so make_remote_validate's finally release() runs a
+    # SYNCHRONOUS terminate-instances/terminate-microvm (bounded by the aws-cli timeout) BEFORE validate()
+    # returns -- i.e. INSIDE the heartbeat watchdog. Budget that cleanup too, else a job that used most of
+    # worker_timeout_s gets watchdog-killed (marked FAILED) while terminating, after its output was already
+    # received + trusted.
+    # honor a tier's cfg directly; a CascadingRuntime has no single cfg but aggregates the max across its
+    # wrapped tiers as a plain attribute (mirrors the resume_timeout_s fallback above).
+    _cleanup_to = getattr(getattr(pool.runtime, "cfg", None), "cli_timeout_s", None)
+    if _cleanup_to is None:
+        _cleanup_to = getattr(pool.runtime, "cli_timeout_s", None)
+    _cleanup_budget = float(_cleanup_to) if _cleanup_to is not None else 0.0
+    # Post-read HOST sealing runs INSIDE the watchdog AFTER detonate_remote's network read may have
+    # consumed the whole worker_timeout_s: _safe_extract_tar (write up to max_total_artifact_bytes) +
+    # output_trust re-SHA-256 of every artifact + validate_envelope. It's CPU/disk-bound and scales with
+    # the artifact cap; it must NOT borrow from _cleanup_budget (sized for the terminate; 0 on recycle-only
+    # VM/static tiers), else a slow-but-VALID job is watchdog-FAILED during sealing. Base covers parse +
+    # small-file overhead; ~50MB/s floor covers the extract-write + hash-read passes. Cap may be None
+    # (unbounded) -> base only. This is purely additive; the transport still bounds the network read.
+    _seal_slack = 30.0 + (max_output_bytes or 0) / (50 * 1024 * 1024)
+    # DoS backstops for the untrusted worker tar, BEFORE the host trust gate parses/validates it:
+    # a member (inode) cap ~ the artifact ceiling (+slack for metadata.json/control files), and a
+    # metadata.json size cap so a huge JSON isn't parsed before max_metadata_bytes is enforced.
+    _max_artifacts = getattr(limits, "max_artifacts", None)
+    max_members = (_max_artifacts + 16) if _max_artifacts is not None else None
+    max_metadata_bytes = getattr(limits, "max_metadata_bytes", None)
+
+    def _claim() -> Any:
+        # Claim + (optionally) resume within a BOUNDED claim budget -- NOT the whole worker_timeout_s.
+        # The claim wait and the detonation must not share one budget: if the wait could burn all of
+        # worker_timeout_s, a slot appearing near the deadline would start detonating just as the parent
+        # heartbeat watchdog (validate_timeout_s) fired, marking the job failed + deleting its input while
+        # the daemon keeps a LIVE claimed slot. Capping the wait at warm_claim_timeout_s reserves the full
+        # worker_timeout_s for the detonation (validate_timeout_s = claim + detonate). No slot in that
+        # window -> NoWarmSlot -> requeue (capacity pressure, not a failure). If a claimed slot can't be
+        # resumed (snapstart: the platform auto-terminated a parked slot within the liveness-cache window),
+        # _resume_on_claim already released it dirty -> try ANOTHER slot. For non-resume runtimes
+        # _resume_on_claim never raises, so this returns on the first claim exactly as before.
+        deadline = time.monotonic() + warm_claim_timeout_s
+        last_exc: Exception | None = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            slot = pool.claim(timeout_s=remaining)
+            if slot is None:
+                break
+            try:
+                _resume_on_claim(pool, slot)
+                return slot
+            except Exception as exc:  # noqa: BLE001 -- slot already retired dirty; try the next one
+                last_exc = exc
+        # Exhausting the claim window on un-resumable slots is the SAME "no usable warm slot; the job never
+        # ran" condition as a plain capacity miss -- resume only wakes the SLOT, it never touched the job's
+        # input/content. So REQUEUE (NoWarmSlot), don't FAIL+delete-input: AWS auto-terminates parked slots
+        # in correlated batches, so a whole claim window can be stale at once and that must not fail jobs.
+        if last_exc is not None:
+            raise NoWarmSlot("no resumable warm slot within claim timeout") from last_exc
+        raise NoWarmSlot("no warm slot available within claim timeout")   # capacity -> REQUEUE the job
+
+    def _release(slot: Any, dirty: bool = False) -> None:
+        pool.release(slot, dirty=dirty)
+
+    sanitize: Callable[[dict[str, str]], dict[str, str]] | None = None
+    # the RESOLVED policy the worker's egress is actually provisioned to (None = enforcement opt-out, i.e.
+    # engine declared no policy). Set from _personality below so a malformed/missing BLASTBOX_NETPOLICY_*
+    # -- which resolve_net_policy fails-closed to 'none' -- is what _process compares against, not the raw
+    # spec name (else a job matching the raw name runs on a sealed worker instead of being rejected).
+    _resolved_net_policy: str | None = None
+    if engine_spec is not None:
+        from blastbox.host.dispatch import Dispatcher   # lazy: dispatch<->vm_dispatch are independent
+        from blastbox.host.netpolicy import parse_personalities, resolve_net_policy
+
+        # The remote tier's egress is FIXED at the engine's provisioned personality (the dispatcher
+        # already FAILs jobs whose effective policy != this). Tell the remote worker's inner sandbox
+        # whether that personality grants egress by injecting BLASTBOX_NET_EGRESS -- the SAME dispatcher-
+        # owned env the cold path sets. Without it a bwrap/nsjail/nono inner sandbox on the remote box
+        # keeps the image default (sealed) and fails closed even on an egress-provisioned tier.
+        _registry = parse_personalities(os.environ)
+        _personality = resolve_net_policy(
+            job_net_policy=None, engine_default=(getattr(engine_spec, "net_policy", None) or "none"),
+            registry=_registry, allow_override=False,
+        )
+        # resolved name to enforce against -- but ONLY when the engine actually declared a policy, so an
+        # UNdeclared engine (net_policy None) stays enforcement-opt-out exactly as before.
+        _resolved_net_policy = _personality.name if getattr(engine_spec, "net_policy", None) else None
+        _net_env = {"BLASTBOX_NET_EGRESS": "1" if _personality.exit_driver not in ("none", "drop") else "0"}
+        # For an httpproxy personality, inject the SAME validated HTTP_PROXY/HTTPS_PROXY the cold dispatcher
+        # sets (Dispatcher._httpproxy_env) into the worker env -- else the inner sandbox is opened for egress
+        # but proxy-aware clients get no proxy and go direct / fail, silently differing from the cold tier.
+        # (Returns {} for non-httpproxy personalities, so it's a no-op for none/direct/inetsim.)
+        _net_env.update(Dispatcher._httpproxy_env(_personality))
+        # Forward the HOST-owned output caps to the worker. http_agent builds Limits.from_env() PER JOB and
+        # rejects a result over ITS OWN metadata/artifact-bytes/file caps (HTTP 500) BEFORE returning the
+        # tar -- so a cap the operator raised only on the DISPATCHER (for the host trust gate + extractor)
+        # would still 500 at the agent unless it's also raised in the worker image. Forwarding closes that
+        # drift: these are dispatcher-owned (merged LAST, a job param can't flip them).
+        for _env_key, _cap in (("BLASTBOX_MAX_METADATA", max_metadata_bytes),
+                               ("BLASTBOX_MAX_TOTAL_ARTIFACTS", max_output_bytes),
+                               ("BLASTBOX_MAX_ARTIFACTS", getattr(limits, "max_artifacts", None)),
+                               # per-artifact cap too: engines (detonate/urlgrab) read max_artifact_bytes
+                               # during detonation, so an unforwarded raise silently TRUNCATES on the worker.
+                               ("BLASTBOX_MAX_ARTIFACT", getattr(limits, "max_artifact_bytes", None))):
+            if _cap is not None:
+                _net_env[_env_key] = str(_cap)
+
+        def sanitize(p: dict[str, str]) -> dict[str, str]:
+            out = Dispatcher._sanitize_params(
+                p, engine_spec.allowed_param_keys, engine_spec.reserved_param_keys,
+                getattr(engine_spec, "default_params", None),
+            )
+            return {**out, **_net_env}   # dispatcher-owned, merged LAST so a job param can't flip it
+
+    # host trust gate: re-seal the extracted output + verify engine/input-SHA/caps, then overwrite
+    # metadata.json with the host-sealed envelope (recomputed hashes). Same gate the cold path runs.
+    # It runs INSIDE the transport (make_remote_validate) BEFORE the slot is released clean, so a worker
+    # that fails trust keeps its slot dirty and is retired instead of re-offered. The transport hands it
+    # (input_path, out_dir); recompute the input SHA from the bytes actually POSTed (== job.input_sha256).
+    # limits + engine are guaranteed non-None (fail-closed guard at the top), so the trust gate is ALWAYS
+    # installed on this path -- trust_output_metadata=True is never set without it.
+    def output_trust(input_path: Path, out_dir: Path, expected_sha: str | None,
+                     owns: Callable[[], bool] | None = None) -> None:
+        from blastbox.errors import EngineErrorEnvelope
+        from blastbox.host.trust import OutputTrustError, validate_worker_output
+        # Compare the worker's sealed envelope against the AUTHORITATIVE ingress-recorded input SHA
+        # (job.input_sha256), matching the cold/file-warm paths -- so a staged input that was
+        # corrupted/replaced after submission is caught (the worker hashed different bytes). Fall
+        # back to hashing the POSTed file only if the dispatcher didn't supply one.
+        if not expected_sha:
+            import hashlib
+            h = hashlib.sha256()
+            with open(input_path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(chunk)
+            expected_sha = h.hexdigest()
+        env = validate_worker_output(output_dir=out_dir, input_sha256=expected_sha,
+                                     engine=engine, limits=limits)
+        if env.status == "engine_error":
+            # the envelope VALIDATED (structure/hashes/input-sha) -> a healthy worker, a failed SAMPLE.
+            # Distinct exception so the transport can release the slot clean (a malformed/unvalidatable
+            # envelope raised a plain OutputTrustError above and stays dirty).
+            detail = env.warnings[0].message if env.warnings else "engine_error"
+            raise EngineErrorEnvelope(f"engine_error: {detail}")
+        # Fence the metadata WRITE by claim ownership: if this (possibly long) remote attempt
+        # outlived its claim and a peer recovered the job, DON'T overwrite the new owner's
+        # metadata.json in the shared output dir. Raise -> job fails for this stale attempt, slot
+        # retired dirty. Checked immediately before the write to shrink the TOCTOU to ~nothing.
+        if owns is not None and not owns():
+            raise OutputTrustError("claim lost before host metadata write (peer recovered the job)")
+        atomic_write_confined(out_dir, "metadata.json",
+                              env.model_dump_json(by_alias=True).encode("utf-8"), mode=0o644)
+
+    validate = make_remote_validate(
+        _claim, _release,
+        output_dir_for=lambda in_path: in_path.parent.parent / "output",
+        ssl_context=ssl_context,
+        max_output_bytes=max_output_bytes,
+        max_members=max_members,
+        max_metadata_bytes=max_metadata_bytes,
+        output_trust=output_trust,   # trust gate runs pre-release so a failed slot stays dirty
+        timeout=worker_timeout_s,   # bound the transport by the operator's worker timeout, not the 600s default
+    )
+    return VmJobDispatcher(
+        store, str(job_root), validate,
+        engine=engine, worker_tier=tier,
+        trust_output_metadata=True,   # preserve the host-sealed metadata.json the validator wrote
+        sanitize_params=sanitize,
+        fixed_net_policy=_resolved_net_policy,   # enforce against the RESOLVED (fail-closed) egress, not raw
+        # the job's DEFAULT policy must ALSO be the RESOLVED name, matching fixed_net_policy + the worker's
+        # actual egress: a malformed/undeclared BLASTBOX_NETPOLICY_* fails closed to "none" (worker sealed),
+        # so an untargeted job should run SEALED (effective "none" == fixed "none"), as resolve_net_policy
+        # intends -- NOT be rejected (raw "inspect" != "none"). In the normal case resolved == raw.
+        engine_net_policy=_resolved_net_policy,
+        # the parent heartbeat watchdog must cover the bounded claim WAIT + the in-claim RESUME (snapstart/
+        # hibernate wake, up to the tier's resume_timeout_s) + the full detonation budget + the synchronous
+        # post-job cleanup terminate (disposable AWS tiers, up to cli_timeout_s), so a slot claimed late,
+        # slow to wake, or slow to terminate still gets its whole worker_timeout_s to run without a
+        # post-success watchdog kill.
+        validate_timeout_s=(warm_claim_timeout_s
+                            + (float(_resume_to) if _resume_to is not None else 0.0)
+                            + worker_timeout_s
+                            + _seal_slack
+                            + _cleanup_budget),
+        # sole_owner recovers a claim that crashed in the tiny window BETWEEN claim and the
+        # worker_runtime="warm" stamp -- but it makes maintenance FAIL any stale RUNNING job for this
+        # engine, which would clobber a COLD dispatcher's live jobs if one shares the store. Default OFF
+        # (shared-store safe); opt in with BLASTBOX_DISPATCH_SOLE_OWNER=1 ONLY for a network-ONLY store.
+        sole_owner=(os.environ.get("BLASTBOX_DISPATCH_SOLE_OWNER") or "").strip().lower()
+                   in ("1", "true", "yes", "on"),
+        # same stale-queued TTL the cold Dispatcher honors -- bounds a job pinned to a tier no remote
+        # dispatcher serves (else its untrusted input lingers forever in a remote-only deployment).
+        max_queued_age_s=float(os.environ.get("BLASTBOX_MAX_QUEUED_AGE_S") or "0"),
+        concurrency=concurrency,
+        job_retention_s=job_retention_s,
+    )

@@ -1,0 +1,1123 @@
+"""Unit tests for the AWS disposable-worker runtime family (no real AWS).
+
+The AWS CLI and the HTTP health probe are injected as fakes, so spawn/is_ready/is_alive/reap are
+exercised end-to-end against canned responses. Also checks SlotRuntime protocol conformance, the
+fail-closed availability probe, config from_env, and pool_config registration.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+
+import pytest
+
+from blastbox.host.pool import SlotRuntime, SlotState
+from blastbox.host.runtime.aws_worker import (
+    AwsUnavailable,
+    AwsWorkerError,
+    AwsWorkerSlot,
+    DisposableEc2Runtime,
+    Ec2Config,
+    Ec2HibernateConfig,
+    Ec2HibernateRuntime,
+    LambdaMicroVmConfig,
+    LambdaMicroVmRuntime,
+    LambdaSnapStartConfig,
+    LambdaSnapStartRuntime,
+    select_lambda_microvm_runtime,
+    select_ec2_hibernate_runtime,
+    select_lambda_snapstart_runtime,
+)
+
+
+def _cp(rc: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(args=["aws"], returncode=rc, stdout=stdout, stderr=stderr)
+
+
+class FakeAws:
+    """Maps ``"<service> <op>"`` -> dict (JSON'd) | CompletedProcess | callable(argv)->CompletedProcess."""
+
+    def __init__(self, responses: dict) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def __call__(self, argv, timeout):  # noqa: ANN001
+        argv = list(argv)
+        key = f"{argv[1]} {argv[2]}"
+        self.calls.append((key, argv))
+        r = self.responses.get(key)
+        if r is None:
+            return _cp(rc=254, stderr=f"no fake for {key}")
+        if callable(r):
+            return r(argv)
+        if isinstance(r, subprocess.CompletedProcess):
+            return r
+        return _cp(stdout=json.dumps(r))
+
+    def ops(self) -> list[str]:
+        return [k for k, _ in self.calls]
+
+
+_IDENT = {"sts get-caller-identity": {"Account": "380038281108", "Arn": "arn:aws:iam::x:user/y"}}
+
+
+def _lambda_rt(responses, probe=lambda url, hdrs, to: True, **kw):  # noqa: ANN001
+    cfg = LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+                              allow_default_egress=True)
+    fake = FakeAws({**_IDENT, **responses})
+    return LambdaMicroVmRuntime(cfg, aws_runner=fake, http_probe=probe, clock=lambda: 100.0, **kw), fake
+
+
+def _ec2_rt(responses, probe=lambda url, hdrs, to: True, **kw):  # noqa: ANN001
+    cfg = Ec2Config(region="us-east-1", image_id="ami-0abc")
+    fake = FakeAws({**_IDENT, **responses})
+    return DisposableEc2Runtime(cfg, aws_runner=fake, http_probe=probe, clock=lambda: 100.0, **kw), fake
+
+
+def _snapstart_rt(responses, probe=lambda url, hdrs, to: True, clock=lambda: 100.0, **cfgkw):  # noqa: ANN001
+    cfg = LambdaSnapStartConfig(region="us-east-1", image_identifier="arn:img",
+                                allow_default_egress=True, resume_poll_s=0.0, **cfgkw)
+    fake = FakeAws({**_IDENT, **responses})
+    return LambdaSnapStartRuntime(cfg, aws_runner=fake, http_probe=probe, clock=clock), fake
+
+
+# --------------------------------------------------------------------------- SnapStart (warm) tier
+
+def test_snapstart_launch_sets_idle_policy():
+    rt, fake = _snapstart_rt({"lambda-microvms run-microvm": {"microvmId": "mv-1"}},
+                             max_idle_duration_s=90, suspended_duration_s=1800)
+    rt.spawn()
+    argv = next(a for k, a in fake.calls if k == "lambda-microvms run-microvm")
+    policy = json.loads(argv[argv.index("--idle-policy") + 1])
+    assert policy == {"maxIdleDurationSeconds": 90, "suspendedDurationSeconds": 1800, "autoResumeEnabled": True}
+
+
+def test_snapstart_running_counts_suspended_as_alive():
+    # a PARKED (suspended) slot must report alive, or the pool health-check reaps it every tick.
+    for state in ("suspended", "suspending", "pending", "running"):
+        rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": state}})
+        slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+        assert rt._running(slot) is True, state
+
+
+def test_snapstart_running_dead_states():
+    for state in ("terminating", "terminated"):
+        rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": state}})
+        slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+        assert rt._running(slot) is False, state
+
+
+def test_snapstart_is_alive_true_for_suspended_slot():
+    # end-to-end through is_alive (which the pool health-check calls on IDLE slots) -> parked stays warm.
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "suspended"},
+                           "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}})
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    assert rt.is_alive(slot) is True
+
+
+def test_snapstart_is_alive_does_not_mint_token_on_parked_slot():
+    # regression: the base is_alive JWE-refresh mints a token every idle tick, which FAILS on a SUSPENDED
+    # slot (mint needs RUNNING) forever -> control-plane storm. SnapStart's is_alive must NOT mint.
+    rt, fake = _snapstart_rt({"lambda-microvms get-microvm": {"state": "suspended"},
+                             "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                            clock=lambda: 100000.0)   # far past any token half-TTL
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    slot.auth_token, slot.token_minted_at = "aged", 0.0   # a stale token that base is_alive would try to refresh
+    for _ in range(5):
+        rt.is_alive(slot)
+    assert "lambda-microvms create-microvm-auth-token" not in [k for k, _ in fake.calls]   # no mint storm
+
+
+def test_snapstart_running_empty_or_unknown_state_not_alive():
+    # fail-CLOSED: an empty/unrecognized get-microvm state must NOT read as alive (else a broken slot
+    # lingers IDLE and is handed out).
+    for resp in ({}, {"state": "weird-future-state"}):
+        rt, _ = _snapstart_rt({"lambda-microvms get-microvm": resp})
+        assert rt._running(AwsWorkerSlot(slot_id='s', resource_id='mv-1')) is False
+
+
+def test_snapstart_readiness_describe_is_cached_during_warming():
+    # is_ready (WARMING promotion, ~10Hz) must NOT issue a get-microvm per tick before the URL resolves.
+    # With no endpoint in the describe, url never resolves; the describe must still be cache-throttled.
+    rt, fake = _snapstart_rt({"lambda-microvms get-microvm": {"state": "pending"}},   # no endpoint yet
+                            probe=lambda u, h, t: False, clock=lambda: 500.0)   # constant clock -> within TTL
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    for _ in range(10):
+        rt.is_ready(slot)
+    n_desc = sum(1 for k, _ in fake.calls if k == "lambda-microvms get-microvm")
+    assert n_desc == 1   # 10 readiness ticks within the cache window -> a single control-plane describe
+
+
+def test_snapstart_resume_wakes_and_refreshes():
+    # a PARKED slot: the endpoint probe fails first (VM suspended/unreachable) -> resume() issues
+    # resume-microvm, then the probe succeeds. Readiness is probe-decided, not state-decided.
+    n = {"probes": 0}
+
+    def probe(u, h, t):
+        n["probes"] += 1
+        return n["probes"] > 1        # first probe fails, second (post-resume) succeeds
+
+    rt, fake = _snapstart_rt({
+        "lambda-microvms get-microvm": {"state": "suspended", "endpoint": "vm.example"},
+        "lambda-microvms resume-microvm": {},
+        "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"},
+    }, probe=probe)
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    slot.auth_token = "STALE"           # a token minted while parked must be discarded
+    rt.resume(slot)
+    ops = [k for k, _ in fake.calls]
+    assert "lambda-microvms resume-microvm" in ops        # nudged the parked slot awake after the probe failed
+    assert slot.url == "https://vm.example"               # stable endpoint resolved
+    assert slot.auth_token == "jwe"                       # fresh token, not STALE
+
+
+def test_snapstart_warmup_throttles_failing_token_mint():
+    # M2: AWS can surface the stable endpoint while a SnapStart slot is still pending, but minting needs a
+    # RUNNING VM -> it fails. The ~10Hz readiness poll must NOT re-mint (and fail) every tick -- throttle it.
+    clk = {"t": 100.0}
+    rt, fake = _snapstart_rt({
+        "lambda-microvms get-microvm": {"state": "pending", "endpoint": "vm.example"},   # endpoint pre-running
+        "lambda-microvms create-microvm-auth-token": _cp(rc=254, stderr="microvm not running"),
+    }, probe=lambda u, h, t: True, clock=lambda: clk["t"])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="mv-1")
+    for _ in range(10):                    # 10 ticks 0.1s apart (~1s); throttle window = max(poll,1.0)=1.0
+        assert rt.is_ready(slot) is False  # mint fails (pending) -> not ready
+        clk["t"] += 0.1
+    mints = sum(1 for k, _ in fake.calls if k == "lambda-microvms create-microvm-auth-token")
+    assert mints <= 2   # throttled to ~1 per window, NOT one per readiness tick (10)
+
+
+def test_snapstart_throttles_failing_refresh_with_cached_token():
+    # #3: the mint throttle must apply even when a STALE cached token exists -- an aged token re-minted
+    # past half-TTL on a never-ready/suspended slot rejects, and without this it storms the mint API every
+    # tick (the first fix only covered tokenless first mints).
+    clk = {"t": 100.0}
+    rt, fake = _snapstart_rt({
+        "lambda-microvms get-microvm": {"state": "pending", "endpoint": "vm.example"},
+        "lambda-microvms create-microvm-auth-token": _cp(rc=254, stderr="microvm not running"),
+    }, probe=lambda u, h, t: True, clock=lambda: clk["t"], auth_token_ttl_min=10)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="mv-1")
+    slot.auth_token = "AGED"          # a cached token...
+    slot.token_minted_at = -1e9       # ...far past half-TTL, so _ensure_token always tries to re-mint
+    for _ in range(10):
+        assert rt.is_ready(slot) is False
+        clk["t"] += 0.1
+    mints = sum(1 for k, _ in fake.calls if k == "lambda-microvms create-microvm-auth-token")
+    assert mints <= 2   # throttled DESPITE the cached token (was 10 -- one per tick -- before the fix)
+
+
+def test_snapstart_resume_remints_token_after_wake():
+    # I4: a JWE minted while the slot is PARKED is invalid; after resume-microvm the next probe must
+    # re-mint an awake token. Model: 1st mint 'jwe-parked' (probe rejects), post-resume mint 'jwe-awake'
+    # (probe accepts). Without the post-resume token clear the parked token is cached+reused -> the probe
+    # never passes -> resume() would time out.
+    minted = {"n": 0}
+
+    def mint(argv):
+        minted["n"] += 1
+        return _cp(stdout=json.dumps({"authToken": "jwe-parked" if minted["n"] == 1 else "jwe-awake"}))
+
+    def probe(u, h, t):
+        return h.get("X-aws-proxy-auth") == "jwe-awake"     # only an awake-minted token is accepted
+
+    clk = {"t": 100.0}
+
+    def clock():
+        clk["t"] += 0.5                                     # advancing so a stuck loop RAISES, never hangs
+        return clk["t"]
+
+    rt, _ = _snapstart_rt({
+        "lambda-microvms get-microvm": {"state": "suspended", "endpoint": "vm.example"},
+        "lambda-microvms resume-microvm": {},
+        "lambda-microvms create-microvm-auth-token": mint,
+    }, probe=probe, clock=clock)
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    rt.resume(slot)                          # must NOT raise -> the post-resume re-mint let the probe pass
+    assert slot.auth_token == "jwe-awake"    # the awake token survived, not the parked one
+    assert minted["n"] >= 2                  # re-minted after the wake instead of reusing the parked JWE
+
+
+def test_snapstart_resume_skips_resume_when_already_reachable():
+    # if the very first probe succeeds (slot already RUNNING+reachable), no resume-microvm is issued.
+    rt, fake = _snapstart_rt({
+        "lambda-microvms get-microvm": {"state": "running", "endpoint": "vm.example"},
+        "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"},
+    })
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    rt.resume(slot)
+    assert "lambda-microvms resume-microvm" not in [k for k, _ in fake.calls]   # probe-first, already reachable
+
+
+def test_snapstart_resume_wakes_stale_running_state_when_auto_resume_off():
+    # the hard case: auto_resume off + get-microvm lies 'running' but the VM is actually parked. Probe
+    # fails, so resume() must STILL issue resume-microvm (not trust the eventually-consistent state).
+    n = {"probes": 0}
+
+    def probe(u, h, t):
+        n["probes"] += 1
+        return n["probes"] > 1
+
+    rt, fake = _snapstart_rt({
+        "lambda-microvms get-microvm": {"state": "running", "endpoint": "vm.example"},   # stale/lying
+        "lambda-microvms resume-microvm": {},
+        "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"},
+    }, probe=probe, auto_resume=False)
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    rt.resume(slot)
+    assert "lambda-microvms resume-microvm" in [k for k, _ in fake.calls]   # woke despite 'running' state
+
+
+def test_snapstart_resume_raises_on_dead_slot():
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "terminated"}})
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    with pytest.raises(AwsWorkerError, match="cannot resume"):
+        rt.resume(slot)
+
+
+def test_snapstart_resume_times_out_when_never_healthy():
+    # health probe never succeeds -> resume raises after the budget instead of hanging forever. A clock
+    # that advances on each call guarantees the deadline is crossed (no wall-clock sleep).
+    ticks = [0.0]
+
+    def clock():
+        ticks[0] += 1.0
+        return ticks[0]
+
+    rt, _ = _snapstart_rt(
+        {"lambda-microvms get-microvm": {"state": "running", "endpoint": "vm.example"},
+         "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+        probe=lambda u, h, t: False, clock=clock, resume_timeout_s=5.0,
+    )
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    with pytest.raises(AwsWorkerError, match="not ready"):
+        rt.resume(slot)
+
+
+def test_snapstart_config_from_env():
+    env = {
+        "BLASTBOX_LAMBDA_IMAGE": "arn:img",
+        "BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS": "1",
+        "BLASTBOX_LAMBDA_SNAPSTART_IDLE_S": "90",
+        "BLASTBOX_LAMBDA_SNAPSTART_SUSPENDED_TTL_S": "1200",
+        "BLASTBOX_LAMBDA_SNAPSTART_AUTO_RESUME": "0",
+        "BLASTBOX_LAMBDA_SNAPSTART_RESUME_TIMEOUT_S": "30",
+    }
+    cfg = LambdaSnapStartConfig.from_env(env.get)
+    assert cfg.image_identifier == "arn:img" and cfg.allow_default_egress is True   # inherited fields
+    assert cfg.max_idle_duration_s == 90 and cfg.suspended_duration_s == 1200
+    assert cfg.auto_resume is False and cfg.resume_timeout_s == 30.0
+
+
+def test_snapstart_config_clamps_to_aws_bounds():
+    # maxIdleDurationSeconds min is 60; maximum-duration ceiling is 28800 (8h). A sub-60 / over-8h value
+    # must be clamped, not passed through to a per-spawn AWS reject (silent fail-never-warm).
+    cfg = LambdaSnapStartConfig(region="us-east-1", image_identifier="img", allow_default_egress=True,
+                                max_idle_duration_s=30, suspended_duration_s=-5, max_duration_s=999999)
+    assert cfg.max_idle_duration_s == 60
+    assert cfg.suspended_duration_s == 0
+    assert cfg.max_duration_s == 28800
+
+
+def test_snapstart_from_env_override_applies_without_collision():
+    # the inherited **overrides contract must work (regression: dict-merge, not duplicate kwargs).
+    cfg = LambdaSnapStartConfig.from_env(
+        {"BLASTBOX_LAMBDA_IMAGE": "img", "BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS": "1"}.get,
+        resume_timeout_s=99.0, region="us-west-2")
+    assert cfg.resume_timeout_s == 99.0 and cfg.region == "us-west-2"   # base + new fields overridable
+
+
+def test_snapstart_inherits_egress_failclosed():
+    with pytest.raises(AwsUnavailable, match="egress"):
+        LambdaSnapStartRuntime(LambdaSnapStartConfig(region="us-east-1", image_identifier="img"))
+
+
+def test_snapstart_select_and_dispatch_style():
+    rt = select_lambda_snapstart_runtime(
+        get_env={"BLASTBOX_LAMBDA_IMAGE": "img", "BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS": "1"}.get)
+    assert rt.kind == "aws-lambda-snapstart"
+    assert rt.dispatch_style == "network"
+    assert rt.ssl_context is None       # AWS public TLS + JWE, NOT the private worker CA
+
+
+# --------------------------------------------------------------------------- protocol conformance
+
+def test_both_runtimes_satisfy_slotruntime_protocol():
+    lam, _ = _lambda_rt({})
+    ec2, _ = _ec2_rt({})
+    assert isinstance(lam, SlotRuntime)
+    assert isinstance(ec2, SlotRuntime)
+    # disposable: neither exposes recycle (never reuse a detonation worker)
+    assert not hasattr(lam, "recycle")
+    assert not hasattr(ec2, "recycle")
+
+
+# --------------------------------------------------------------------------- lambda-microvm lifecycle
+
+def test_lambda_spawn_ready_reap():
+    rt, fake = _lambda_rt({
+        "lambda-microvms run-microvm": {"microvmId": "mv-123"},
+        "lambda-microvms get-microvm": {"state": "running", "url": "https://mv-123.lambda-url.aws/"},
+        "lambda-microvms create-microvm-auth-token": {"token": "jwe.abc.def"},
+        "lambda-microvms terminate-microvm": {},
+    })
+    slot = rt.spawn()
+    assert slot.resource_id == "mv-123"
+    assert slot.state == SlotState.WARMING
+    assert slot.spawned_at == 100.0
+    assert rt.is_ready(slot) is True
+    assert slot.url == "https://mv-123.lambda-url.aws/"
+    assert slot.auth_token == "jwe.abc.def"          # a fresh JWE was minted for the probe
+    assert rt.is_alive(slot) is True
+    rt.reap(slot)
+    assert "lambda-microvms terminate-microvm" in fake.ops()
+
+
+def test_lambda_not_ready_until_running():
+    rt, _ = _lambda_rt({
+        "lambda-microvms run-microvm": {"microvmId": "mv-9"},
+        "lambda-microvms get-microvm": {"state": "pending"},   # not running yet
+    })
+    slot = rt.spawn()
+    assert rt.is_ready(slot) is False
+    assert slot.url is None
+
+
+def test_lambda_ready_false_when_agent_probe_fails():
+    rt, _ = _lambda_rt(
+        {
+            "lambda-microvms run-microvm": {"microvmId": "mv-7"},
+            "lambda-microvms get-microvm": {"state": "running", "url": "https://x/"},
+            "lambda-microvms create-microvm-auth-token": {"token": "t"},
+        },
+        probe=lambda url, hdrs, to: False,   # microVM up but agent not answering
+    )
+    slot = rt.spawn()
+    assert rt.is_ready(slot) is False
+
+
+def test_lambda_requires_image_identifier():
+    with pytest.raises(AwsUnavailable):
+        LambdaMicroVmRuntime(LambdaMicroVmConfig(region="us-east-1", image_identifier=""))
+
+
+def test_lambda_reap_is_noop_without_resource():
+    rt, fake = _lambda_rt({})
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+
+    rt.reap(AwsWorkerSlot(slot_id="s", resource_id=None))
+    assert "lambda-microvms terminate-microvm" not in fake.ops()
+
+
+# --------------------------------------------------------------------------- ec2 lifecycle
+
+def test_ec2_spawn_ready_reap():
+    rt, fake = _ec2_rt({
+        "ec2 run-instances": {"Instances": [{"InstanceId": "i-abc"}]},
+        "ec2 describe-instances": {
+            "Reservations": [{"Instances": [{
+                "InstanceId": "i-abc", "State": {"Name": "running"}, "PrivateIpAddress": "10.0.1.5",
+            }]}]
+        },
+        "ec2 terminate-instances": {},
+    })
+    slot = rt.spawn()
+    assert slot.resource_id == "i-abc"
+    assert rt.is_ready(slot) is True
+    assert slot.ip == "10.0.1.5"
+    assert slot.endpoint == ("10.0.1.5", 8765)
+    assert rt.is_alive(slot) is True
+    rt.reap(slot)
+    assert "ec2 terminate-instances" in fake.ops()
+
+
+def test_ec2_not_ready_until_running():
+    rt, _ = _ec2_rt({
+        "ec2 run-instances": {"Instances": [{"InstanceId": "i-9"}]},
+        "ec2 describe-instances": {
+            "Reservations": [{"Instances": [{"InstanceId": "i-9", "State": {"Name": "pending"}}]}]
+        },
+    })
+    slot = rt.spawn()
+    assert rt.is_ready(slot) is False
+    assert slot.ip is None
+
+
+def test_ec2_requires_ami():
+    with pytest.raises(AwsUnavailable):
+        DisposableEc2Runtime(Ec2Config(region="us-east-1", image_id=""))
+
+
+# --------------------------------------------------------------------------- fail-closed availability
+
+def test_available_true_when_creds_and_service_ok():
+    rt, _ = _lambda_rt({"lambda-microvms list-microvms": {"items": []}})
+    assert rt.available() is True
+
+
+def test_available_false_when_no_account():
+    cfg = LambdaMicroVmConfig(region="us-east-1", image_identifier="img", allow_default_egress=True)
+    fake = FakeAws({"sts get-caller-identity": {}})   # no Account
+    rt = LambdaMicroVmRuntime(cfg, aws_runner=fake)
+    assert rt.available() is False
+
+
+def test_lambda_refuses_default_egress_without_optin():
+    # no egress connector + no explicit opt-in => AWS default is public internet, which would fail OPEN
+    # against a no-egress net_policy. The tier must refuse to build.
+    with pytest.raises(AwsUnavailable, match="egress"):
+        LambdaMicroVmRuntime(LambdaMicroVmConfig(region="us-east-1", image_identifier="img"))
+
+
+def test_lambda_default_egress_ok_with_connector():
+    # a sealing egress connector makes it safe -> builds fine
+    LambdaMicroVmRuntime(LambdaMicroVmConfig(region="us-east-1", image_identifier="img",
+                                             egress_connector_ids=("e-noinet",)))
+
+
+def test_lambda_readiness_token_is_cached_across_ticks():
+    # is_ready() polled every ~0.1s must NOT mint a fresh JWE each tick (control-plane throttle):
+    # within the token's half-TTL the slot reuses its cached token.
+    rt, fake = _lambda_rt(
+        {"lambda-microvms run-microvm": {"microvmId": "mv-1"},
+         "lambda-microvms get-microvm": {"state": "running", "endpoint": "vm.example"},
+         "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+    )
+    slot = rt._launch()
+    for _ in range(20):
+        rt.is_ready(slot)
+    mints = sum(1 for k, _ in fake.calls if k == "lambda-microvms create-microvm-auth-token")
+    assert mints == 1            # minted once, then reused
+
+
+def test_lambda_mint_token_accepts_string_and_map():
+    # the live CLI returned authToken as a bare JWE string (proven: /healthz 200 with it as the header);
+    # the API reference models it as a header-name -> value MAP. _mint_token must yield a usable string
+    # for BOTH -- never str() a dict into a "{...}" header that would 403 every Lambda slot.
+    slot = AwsWorkerSlot(slot_id="s1", resource_id="mv-1", state=SlotState.WARMING)
+    rt_s, _ = _lambda_rt({"lambda-microvms create-microvm-auth-token": {"authToken": "jwe-string"}})
+    assert rt_s._mint_token(slot) == "jwe-string"
+    rt_m, _ = _lambda_rt({"lambda-microvms create-microvm-auth-token":
+                          {"authToken": {"X-aws-proxy-auth": "jwe-in-map"}}})
+    assert rt_m._mint_token(slot) == "jwe-in-map"
+
+
+def test_lambda_is_alive_for_claim_refreshes_token():
+    # F6: the fresh claim path bypasses is_alive() (where the JWE is refreshed), so it must re-mint the
+    # token past half-TTL itself -- else a slot the background tick hasn't refreshed is handed out with an
+    # aged/expired token and /detonate 403s a healthy worker.
+    clock = {"t": 100.0}
+    cfg = LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:img",
+                              allow_default_egress=True, auth_token_ttl_min=10)   # half-TTL = 300s
+    fake = FakeAws({**_IDENT,
+                    "lambda-microvms run-microvm": {"microvmId": "mv-1"},
+                    "lambda-microvms get-microvm": {"state": "running", "endpoint": "vm.example"},
+                    "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}})
+    rt = LambdaMicroVmRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True,
+                              clock=lambda: clock["t"])
+    slot = rt._launch()
+    rt.is_ready(slot)                                  # mints the token @ t=100
+    mints0 = sum(1 for k, _ in fake.calls if k == "lambda-microvms create-microvm-auth-token")
+    clock["t"] = 100.0 + 10 * 60 * 0.5 + 1             # advance just past half-TTL
+    assert rt.is_alive_for_claim(slot) is True         # fresh describe -> running
+    mints1 = sum(1 for k, _ in fake.calls if k == "lambda-microvms create-microvm-auth-token")
+    assert mints1 == mints0 + 1                         # re-minted at hand-out
+
+
+def test_lambda_claim_fails_when_token_unrefreshable():
+    # O2: at CLAIM time an un-refreshable JWE means /detonate would 403 -> the claim check must FAIL so the
+    # pool drops the slot, rather than hand out a known-bad credential (unlike the best-effort background poll).
+    rt, _ = _lambda_rt({"lambda-microvms run-microvm": {"microvmId": "mv-1"},
+                        "lambda-microvms get-microvm": {"state": "running", "endpoint": "vm.example"},
+                        "lambda-microvms create-microvm-auth-token": _cp(rc=254, stderr="mint failed")})
+    slot = rt._launch()
+    slot.auth_token = "AGED"
+    slot.token_minted_at = -1e9        # far past half-TTL -> _ensure_token re-mints (and fails)
+    assert rt.is_alive_for_claim(slot) is False   # un-refreshable token -> unusable slot
+
+
+def test_snapstart_claim_does_not_fail_on_parked_token():
+    # O2: SnapStart parked slots can't mint (needs RUNNING) and resume() re-mints on wake -> claim must NOT
+    # fail them on a mint error (the base override would), which would reap every parked slot before resume.
+    rt, fake = _snapstart_rt({
+        "lambda-microvms get-microvm": {"state": "suspended"},   # parked -> alive via the base whitelist
+        "lambda-microvms create-microvm-auth-token": _cp(rc=254, stderr="not running"),
+    }, probe=lambda u, h, t: True)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="mv-1")
+    slot.auth_token = "STALE"
+    assert rt.is_alive_for_claim(slot) is True   # base check (suspended alive), no token touch
+    assert sum(1 for k, _ in fake.calls if k == "lambda-microvms create-microvm-auth-token") == 0  # no doomed mint
+
+
+def test_default_aws_runner_disables_pager(monkeypatch):
+    # O3: AWS_PAGER="" must be set (with os.environ spread so creds survive) so noninteractive JSON never
+    # routes through a pager -> no spawn/reap hang or non-JSON parse.
+    import blastbox.host.runtime.aws_worker as awm
+    captured = {}
+
+    def fake_run(argv, **kw):  # noqa: ANN001
+        captured["env"] = kw.get("env")
+        return _cp(stdout="{}")
+
+    monkeypatch.setattr(awm.subprocess, "run", fake_run)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "sentinel")
+    awm._default_aws_runner(["aws", "sts", "get-caller-identity"], 5.0)
+    assert captured["env"]["AWS_PAGER"] == ""                    # pager disabled
+    assert captured["env"]["AWS_ACCESS_KEY_ID"] == "sentinel"    # creds preserved (os.environ spread)
+
+
+def test_is_alive_for_claim_bypasses_liveness_cache():
+    # a slot cached-alive by a background tick but terminated by AWS since must read DEAD at claim time,
+    # so the pool drops it instead of handing a dead worker to a user job.
+    state = {"v": "running"}
+    rt, _ = _lambda_rt({"lambda-microvms run-microvm": {"microvmId": "mv-1"},
+                        "lambda-microvms get-microvm": lambda argv: _cp(stdout=json.dumps({"state": state["v"]}))})
+    slot = rt._launch()
+    assert rt.is_alive(slot) is True             # cached: running
+    state["v"] = "terminated"
+    assert rt.is_alive(slot) is True             # STILL cached True (constant clock, within the 5s TTL)
+    assert rt.is_alive_for_claim(slot) is False  # fresh describe -> dead
+
+
+def test_lambda_health_describe_is_cached_across_warming_ticks():
+    # while the microVM is still coming up (url unresolved), the ~10Hz readiness poll must throttle the
+    # get-microvm describe to _liveness_cache_s -- otherwise every tick hits the AWS control plane.
+    rt, fake = _lambda_rt(
+        {"lambda-microvms run-microvm": {"microvmId": "mv-1"},
+         "lambda-microvms get-microvm": {"state": "pending"}},   # never resolves -> url stays None
+    )
+    slot = rt._launch()
+    for _ in range(10):
+        assert rt.is_ready(slot) is False        # not running yet
+    describes = sum(1 for k, _ in fake.calls if k == "lambda-microvms get-microvm")
+    assert describes == 1        # cached across ticks (constant clock, within the 5s TTL)
+    cfg = Ec2Config(region="us-east-1", image_id="ami-0")
+    fake = FakeAws({**_IDENT, "ec2 describe-instances": _cp(rc=254, stderr="AccessDenied")})
+    rt = DisposableEc2Runtime(cfg, aws_runner=fake)
+    assert rt.available() is False
+
+
+def test_select_requires_available_raises():
+    fake = FakeAws({"sts get-caller-identity": {}})
+    with pytest.raises(AwsUnavailable):
+        select_lambda_microvm_runtime(
+            cfg=LambdaMicroVmConfig(region="us-east-1", image_identifier="img", allow_default_egress=True),
+            require_available=True, aws_runner=fake,
+        )
+
+
+# --------------------------------------------------------------------------- config from_env
+
+def test_lambda_config_from_env():
+    env = {
+        "BLASTBOX_AWS_REGION": "us-west-2",
+        "BLASTBOX_AWS_PROFILE": "detonate",
+        "BLASTBOX_LAMBDA_IMAGE": "arn:img",
+        "BLASTBOX_LAMBDA_EGRESS_CONNECTORS": "conn-1,conn-2",
+        "BLASTBOX_LAMBDA_INGRESS_CONNECTORS": "ing-1",
+        "BLASTBOX_LAMBDA_AUTH_TTL_MIN": "20",
+    }
+    cfg = LambdaMicroVmConfig.from_env(env.get)
+    assert cfg.region == "us-west-2"
+    assert cfg.profile == "detonate"
+    assert cfg.image_identifier == "arn:img"
+    assert cfg.egress_connector_ids == ("conn-1", "conn-2")
+    assert cfg.ingress_connector_ids == ("ing-1",)
+    assert cfg.auth_token_ttl_min == 20
+    assert cfg.aws_argv("lambda-microvms", "list-microvms")[:6] == [
+        "aws", "lambda-microvms", "list-microvms", "--region", "us-west-2", "--output",
+    ]
+
+
+def test_ec2_self_terminate_bool_spellings():
+    # G4: non-canonical falsy spellings must disable the backstop (were treated as ENABLED before the
+    # strip/lower fix); default (unset) + truthy spellings stay ON.
+    for val in ("False", "FALSE", "NO", "No", "off", "Off", " false ", "0", "no"):
+        cfg = Ec2Config.from_env({"BLASTBOX_EC2_SELF_TERMINATE": val, "BLASTBOX_EC2_AMI": "ami-x"}.get)
+        assert cfg.self_terminate is False, val
+    for val in ("1", "true", "yes", "on", ""):   # "" -> _env default "1"; unset also defaults ON
+        cfg = Ec2Config.from_env({"BLASTBOX_EC2_SELF_TERMINATE": val, "BLASTBOX_EC2_AMI": "ami-x"}.get)
+        assert cfg.self_terminate is True, val
+    assert Ec2Config.from_env({"BLASTBOX_EC2_AMI": "ami-x"}.get).self_terminate is True   # unset -> ON
+
+
+def test_snapstart_auto_resume_off_disables():
+    # H4: "off"/"Off"/"OFF" must disable AWS platform auto-resume (parity with self_terminate); default ON.
+    for val in ("off", " Off ", "OFF"):
+        cfg = LambdaSnapStartConfig.from_env({"BLASTBOX_LAMBDA_SNAPSTART_AUTO_RESUME": val,
+                                              "BLASTBOX_LAMBDA_IMAGE": "arn:img"}.get)
+        assert cfg.auto_resume is False, val
+    assert LambdaSnapStartConfig.from_env({"BLASTBOX_LAMBDA_IMAGE": "arn:img"}.get).auto_resume is True
+
+
+def test_ec2_public_ip_requests_associate_flag():
+    # #1: public-endpoint mode must request a public IP (a nondefault subnet defaults auto-assign off, so
+    # without --associate-public-ip-address the instance gets no public address and the slot churns).
+    fake = FakeAws({**_IDENT, "ec2 run-instances": {"Instances": [{"InstanceId": "i-1"}]}})
+    rt = DisposableEc2Runtime(
+        Ec2Config(region="us-east-1", image_id="ami-x", use_public_ip=True, allow_plaintext_public=True),
+        aws_runner=fake, http_probe=lambda u, h, t: True, clock=lambda: 1.0)
+    rt.spawn()
+    assert "--associate-public-ip-address" in next(a for k, a in fake.calls if k == "ec2 run-instances")
+    fake2 = FakeAws({**_IDENT, "ec2 run-instances": {"Instances": [{"InstanceId": "i-2"}]}})
+    rt2 = DisposableEc2Runtime(Ec2Config(region="us-east-1", image_id="ami-x"),   # private-IP default
+                               aws_runner=fake2, http_probe=lambda u, h, t: True, clock=lambda: 1.0)
+    rt2.spawn()
+    assert "--associate-public-ip-address" not in next(a for k, a in fake2.calls if k == "ec2 run-instances")
+
+
+def test_ec2_public_ip_without_tls_fails_closed():
+    # J3 (security): a public IP with no dispatcher TLS would send X-aws-proxy-auth + samples in cleartext
+    # over the public endpoint -> fail closed at construction, unless the operator explicitly opts in.
+    import ssl
+    fake = FakeAws({**_IDENT})
+    with pytest.raises(AwsUnavailable, match="cleartext"):
+        DisposableEc2Runtime(Ec2Config(region="us-east-1", image_id="ami-x", use_public_ip=True),
+                             aws_runner=fake)
+    with pytest.raises(AwsUnavailable, match="cleartext"):   # hibernate tier too (shared __init__)
+        Ec2HibernateRuntime(Ec2HibernateConfig(region="us-east-1", image_id="ami-x", use_public_ip=True),
+                            aws_runner=fake)
+    # explicit opt-out accepts plaintext:
+    DisposableEc2Runtime(Ec2Config(region="us-east-1", image_id="ami-x", use_public_ip=True,
+                                   allow_plaintext_public=True), aws_runner=fake)
+    # a dispatcher TLS context also satisfies it (probes + /detonate go https):
+    DisposableEc2Runtime(Ec2Config(region="us-east-1", image_id="ami-x", use_public_ip=True),
+                         aws_runner=fake, ssl_context=ssl.create_default_context())
+    # the default private-IP path never trips the guard:
+    DisposableEc2Runtime(Ec2Config(region="us-east-1", image_id="ami-x"), aws_runner=fake)
+
+
+def test_inject_tls_installs_mtls_probe_for_explicit_context():
+    # K1: an explicit ssl_context must also get a MATCHING mTLS probe, else _health_ok probes the https
+    # worker with the non-mTLS default probe (no client cert) and it never readies.
+    import ssl
+    from blastbox.host.runtime.aws_worker import _inject_tls
+    ctx = ssl.create_default_context()
+    kw = _inject_tls({}.get, {"ssl_context": ctx})
+    assert kw["ssl_context"] is ctx and callable(kw.get("http_probe"))   # TLS-aware probe installed
+
+    def sentinel(u, h, t):
+        return True
+
+    kw2 = _inject_tls({}.get, {"ssl_context": ctx, "http_probe": sentinel})
+    assert kw2["http_probe"] is sentinel                                 # explicit probe preserved
+    assert "http_probe" not in _inject_tls({}.get, {"ssl_context": None})  # None stays http (no probe)
+
+
+def test_ec2_public_ip_bool_spellings():
+    # sweep: BLASTBOX_EC2_PUBLIC_IP / _ALLOW_PLAINTEXT_PUBLIC accept the same 1/true/yes/on set (were bare ==)
+    for val in ("true", "YES", "On", " 1 "):
+        assert Ec2Config.from_env({"BLASTBOX_EC2_PUBLIC_IP": val, "BLASTBOX_EC2_AMI": "ami-x"}.get).use_public_ip
+    for val in ("0", "false", "off", ""):
+        assert not Ec2Config.from_env({"BLASTBOX_EC2_PUBLIC_IP": val, "BLASTBOX_EC2_AMI": "ami-x"}.get).use_public_ip
+
+
+def test_ec2_config_from_env_defaults_arm():
+    cfg = Ec2Config.from_env({"BLASTBOX_EC2_AMI": "ami-x"}.get)
+    assert cfg.image_id == "ami-x"
+    assert cfg.instance_type == "m7g.large"   # ARM64 default
+    assert cfg.region == "us-east-1"
+
+
+def test_lambda_config_clamps_to_aws_bounds():
+    # AWS rejects max-duration > 28800s and auth-token TTL > 60min; the config clamps at construction
+    # so an over-large operator value can't 400 every run-microvm / create-auth-token call.
+    hi = LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:img",
+                             max_duration_s=999999, auth_token_ttl_min=120)
+    assert hi.max_duration_s == 28800 and hi.auth_token_ttl_min == 60
+    lo = LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:img",
+                             max_duration_s=0, auth_token_ttl_min=0)
+    assert lo.max_duration_s == 1 and lo.auth_token_ttl_min == 1
+    # SnapStart chains the same clamp via super().__post_init__()
+    snap = LambdaSnapStartConfig(region="us-east-1", image_identifier="arn:img", max_duration_s=999999)
+    assert snap.max_duration_s == 28800
+
+
+# --------------------------------------------------------------------------- pool_config registration
+
+def test_build_warm_pool_recognizes_aws_runtimes(monkeypatch):
+    from blastbox.host import pool_config
+
+    ec2, _ = _ec2_rt({})
+    monkeypatch.setattr(
+        "blastbox.host.runtime.aws_worker.select_disposable_ec2_runtime",
+        lambda **kw: ec2,
+    )
+    monkeypatch.setenv("BLASTBOX_POOL_RUNTIME", "aws-ec2")
+    monkeypatch.setenv("BLASTBOX_POOL_WARM_SIZE", "1")
+    cfg = pool_config.PoolConfig.from_env()
+    pool = pool_config.build_warm_pool(cfg)
+    assert pool is not None
+
+
+def test_snapstart_runtime_satisfies_slotruntime_protocol():
+    rt, _ = _snapstart_rt({})
+    assert isinstance(rt, SlotRuntime)
+    assert callable(getattr(rt, "resume", None))   # the warm-claim seam the dispatcher detects
+
+
+def test_pool_config_registers_snapstart(monkeypatch):
+    from blastbox.host import pool_config
+    ss, _ = _snapstart_rt({})
+    monkeypatch.setattr("blastbox.host.runtime.aws_worker.select_lambda_snapstart_runtime",
+                        lambda **kw: ss)
+    got = pool_config.select_runtime_by_name("aws-lambda-snapstart", require_available=False)
+    assert got is ss and got.dispatch_style == "network"
+
+
+def test_ec2_select_injects_dispatch_tls_context(tmp_path):
+    from blastbox.host.pki import ensure_ca
+    from blastbox.host.runtime.aws_worker import select_disposable_ec2_runtime
+    ensure_ca(tmp_path)  # writes ca.crt
+    env = {"BLASTBOX_DISPATCH_TLS_CA": str(tmp_path / "ca.crt"), "BLASTBOX_EC2_AMI": "ami-x"}
+    rt = select_disposable_ec2_runtime(get_env=env.get, require_available=False)
+    assert rt.ssl_context is not None   # self-hosted EC2 agent -> worker mTLS applies
+
+
+def test_lambda_select_does_not_pin_worker_ca(tmp_path):
+    # Lambda talks to AWS's public https endpoint + JWE -> must NOT get the private worker CA
+    from blastbox.host.pki import ensure_ca
+    ensure_ca(tmp_path)
+    env = {"BLASTBOX_DISPATCH_TLS_CA": str(tmp_path / "ca.crt"), "BLASTBOX_LAMBDA_IMAGE": "img-x",
+           "BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS": "1"}
+    rt = select_lambda_microvm_runtime(get_env=env.get, require_available=False)
+    assert rt.ssl_context is None
+
+
+def test_lambda_select_no_tls_context():
+    rt = select_lambda_microvm_runtime(
+        get_env={"BLASTBOX_LAMBDA_IMAGE": "img-x", "BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS": "1"}.get,
+        require_available=False)
+    assert rt.ssl_context is None
+
+
+def test_lambda_cli_arg_shapes_match_live_api():
+    # locked in from the live spike: connectors are (list) tokens (NOT comma-joined), and the auth
+    # token needs --microvm-identifier + --expiration-in-minutes + --allowed-ports.
+    cfg = LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:img",
+                              egress_connector_ids=("e-1", "e-2"), ingress_connector_ids=("i-1",),
+                              auth_token_ttl_min=25, agent_port=8765)
+    fake = FakeAws({**_IDENT,
+                    "lambda-microvms run-microvm": {"microvmId": "mv-1"},
+                    "lambda-microvms create-microvm-auth-token": {"token": "jwe"}})
+    rt = LambdaMicroVmRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True, clock=lambda: 1.0)
+    slot = rt.spawn()
+    run_argv = next(a for k, a in fake.calls if k == "lambda-microvms run-microvm")
+    i = run_argv.index("--egress-network-connectors")
+    assert run_argv[i + 1:i + 3] == ["e-1", "e-2"]          # separate tokens, not "e-1,e-2"
+    assert "e-1,e-2" not in run_argv
+    assert "--ingress-network-connectors" in run_argv and "i-1" in run_argv
+    rt._mint_token(slot)
+    tok = next(a for k, a in fake.calls if k == "lambda-microvms create-microvm-auth-token")
+    assert "--microvm-identifier" in tok
+    assert tok[tok.index("--expiration-in-minutes") + 1] == "25"
+    assert tok[tok.index("--allowed-ports") + 1] == "port=8765"   # tagged-union list shorthand
+
+
+def test_lambda_endpoint_resolves_to_https():
+    # live: get-microvm returns `endpoint` (bare host) + create-microvm-auth-token returns `authToken`
+    rt, _ = _lambda_rt({
+        "lambda-microvms run-microvm": {"microvmId": "mv-1"},
+        "lambda-microvms get-microvm": {"state": "running", "endpoint": "abc.lambda-microvm.us-east-1.on.aws"},
+        "lambda-microvms create-microvm-auth-token": {"authToken": "jwe.x"},
+    })
+    slot = rt.spawn()
+    assert rt.is_ready(slot) is True
+    assert slot.url == "https://abc.lambda-microvm.us-east-1.on.aws"
+    assert slot.auth_token == "jwe.x"
+
+
+def test_aws_runtimes_declare_network_dispatch_style():
+    lam, _ = _lambda_rt({})
+    ec2, _ = _ec2_rt({})
+    assert lam.dispatch_style == "network" and ec2.dispatch_style == "network"
+
+
+def test_ec2_forwards_agent_token():
+    cfg = Ec2Config(region="us-east-1", image_id="ami-x", agent_token="tok123")
+    seen: list = []
+    fake = FakeAws({**_IDENT,
+                    "ec2 run-instances": {"Instances": [{"InstanceId": "i-1"}]},
+                    "ec2 describe-instances": {"Reservations": [{"Instances": [
+                        {"InstanceId": "i-1", "State": {"Name": "running"}, "PrivateIpAddress": "10.0.0.5"}]}]}})
+    rt = DisposableEc2Runtime(cfg, aws_runner=fake,
+                              http_probe=lambda u, h, t: (seen.append(h) or True), clock=lambda: 1.0)
+    slot = rt.spawn()
+    assert slot.auth_token == "tok123"                     # forwarded to the /detonate transport
+    assert rt.is_ready(slot) is True
+    assert seen[-1].get("X-aws-proxy-auth") == "tok123"    # and sent in the readiness probe
+
+
+# --------------------------------------------------------------------------- EC2 hibernate (warm) tier
+
+def _hibernate_rt(*, state, healthy, clock=lambda: 100.0, **cfgkw):  # noqa: ANN001
+    """state=[str] and healthy=[bool] are 1-elem lists the test mutates to drive the state machine."""
+    cfg = Ec2HibernateConfig(region="us-east-1", image_id="ami-x", instance_type="t4g.nano",
+                             resume_poll_s=0.0, **cfgkw)
+
+    def describe(argv):  # noqa: ANN001 -- callable response reads the CURRENT state each call
+        return _cp(stdout=json.dumps({"Reservations": [{"Instances": [
+            {"InstanceId": "i-1", "State": {"Name": state[0]}, "PrivateIpAddress": "10.0.0.5"}]}]}))
+
+    fake = FakeAws({
+        **_IDENT,
+        "ec2 run-instances": {"Instances": [{"InstanceId": "i-1"}]},
+        "ec2 describe-instances": describe,
+        "ec2 stop-instances": {},
+        "ec2 start-instances": {},
+    })
+    rt = Ec2HibernateRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: healthy[0], clock=clock)
+    return rt, fake
+
+
+def test_ec2_hibernate_launch_adds_hibernation_and_encrypted_ebs():
+    rt, fake = _hibernate_rt(state=["running"], healthy=[False])
+    rt._launch()
+    argv = next(a for k, a in fake.calls if k == "ec2 run-instances")
+    assert "--hibernation-options" in argv and "Configured=true" in argv
+    joined = " ".join(argv)
+    assert '"Encrypted": true' in joined or '"Encrypted":true' in joined   # encrypted root volume
+
+
+def test_ec2_hibernate_state_machine_parks_a_warmed_slot():
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    state, healthy = ["running"], [False]
+    rt, fake = _hibernate_rt(state=state, healthy=healthy)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    assert rt.is_ready(slot) is False                       # running but agent not up
+    healthy[0] = True
+    assert rt.is_ready(slot) is False                       # agent up -> issues stop --hibernate
+    assert any(k == "ec2 stop-instances" and "--hibernate" in a for k, a in fake.calls)
+    n_hib = sum(1 for k, a in fake.calls if k == "ec2 stop-instances")
+    state[0] = "stopped"
+    assert rt.is_ready(slot) is True                        # hibernated -> parked -> claimable
+    rt.is_ready(slot)                                       # parked stays ready, no more hibernate calls
+    assert sum(1 for k, a in fake.calls if k == "ec2 stop-instances") == n_hib   # issued exactly once
+
+
+def test_ec2_hibernate_tolerates_not_ready_and_throttles():
+    # stop --hibernate can fail "not ready to hibernate yet" for ~1-2min after boot (ec2-hibinit-agent
+    # lays down the reserve). is_ready must STAY warming + retry (throttled), never falsely advance.
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    state, healthy, ticks, hib_ok = ["running"], [True], [1000.0], [False]
+    rt, fake = _hibernate_rt(state=state, healthy=healthy, clock=lambda: ticks[0])
+
+    def stop(argv):  # noqa: ANN001
+        if not hib_ok[0]:
+            return _cp(rc=254, stderr="An error occurred (UnsupportedOperation): not ready to hibernate yet")
+        return _cp(stdout="{}")
+
+    fake.responses["ec2 stop-instances"] = stop
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    assert rt.is_ready(slot) is False                                   # attempts hibernate, not-ready -> warming
+    assert sum(1 for k, a in fake.calls if k == "ec2 stop-instances") == 1
+    assert rt.is_ready(slot) is False                                   # immediate retry THROTTLED
+    assert sum(1 for k, a in fake.calls if k == "ec2 stop-instances") == 1   # no new attempt
+    ticks[0] += 10.0
+    hib_ok[0] = True
+    assert rt.is_ready(slot) is False                                   # past cooldown -> retries -> succeeds
+    assert sum(1 for k, a in fake.calls if k == "ec2 stop-instances") == 2
+    state[0] = "stopped"
+    assert rt.is_ready(slot) is True                                    # now parked
+
+
+def test_ec2_hibernate_running_whitelist():
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    for st in ("pending", "running", "stopping", "stopped"):
+        rt, _ = _hibernate_rt(state=[st], healthy=[False])
+        assert rt._running(slot) is True, st                # parked (stopped) counts alive
+    for st in ("shutting-down", "terminated", ""):
+        rt, _ = _hibernate_rt(state=[st], healthy=[False])
+        assert rt._running(slot) is False, st               # dead/unknown -> reaped
+
+
+def test_ec2_hibernate_resume_starts_and_health_gates():
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    state, healthy = ["stopped"], [True]                    # already reachable-after-start in this fake
+    rt, fake = _hibernate_rt(state=state, healthy=healthy)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt.resume(slot)
+    assert any(k == "ec2 start-instances" for k, a in fake.calls)   # woke the hibernated instance
+    assert slot.ip == "10.0.0.5"                            # private IP resolved
+
+
+def test_ec2_hibernate_resume_raises_on_terminated():
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    rt, _ = _hibernate_rt(state=["terminated"], healthy=[False])
+    with pytest.raises(AwsWorkerError, match="cannot resume"):
+        rt.resume(AwsWorkerSlot(slot_id="s", resource_id="i-1"))
+
+
+def test_ec2_hibernate_resume_times_out():
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    ticks = [0.0]
+
+    def clock():
+        ticks[0] += 1.0
+        return ticks[0]
+
+    rt, _ = _hibernate_rt(state=["stopped"], healthy=[False], clock=clock, resume_timeout_s=5.0)
+    with pytest.raises(AwsWorkerError, match="not ready"):
+        rt.resume(AwsWorkerSlot(slot_id="s", resource_id="i-1"))
+
+
+def test_ec2_hibernate_config_defaults_self_terminate_off():
+    # the guest self-terminate timer conflicts with parking -> OFF by default for the hibernate tier,
+    # on BOTH the direct-construct and from_env paths (field default, not just from_env).
+    assert Ec2HibernateConfig(region="us-east-1", image_id="a").self_terminate is False
+    cfg = Ec2HibernateConfig.from_env({"BLASTBOX_EC2_AMI": "ami-x"}.get)
+    assert cfg.self_terminate is False
+    assert cfg.root_volume_gb == 30 and cfg.root_device_name == "/dev/xvda"
+    assert cfg.ready_timeout_s == 600.0 and cfg.resume_timeout_s == 180.0   # covers boot+warm+hibernate; < worker budget
+
+
+def test_ec2_hibernate_preflight_rejects_incapable_type():
+    # fail LOUD at pool build on a hibernation-incapable type instead of churning launch->stuck->reap.
+    rt, fake = _hibernate_rt(state=["running"], healthy=[False])
+    fake.responses["ec2 describe-instance-types"] = {"InstanceTypes": [{"HibernationSupported": False,
+                                                                        "MemoryInfo": {"SizeInMiB": 2048}}]}
+    fake.responses["ec2 describe-instances"] = {"Reservations": []}   # available()'s probe
+    assert rt.available() is False   # _service_available raises -> available() fail-closed
+
+
+def test_ec2_hibernate_preflight_rejects_undersized_root_volume():
+    rt, fake = _hibernate_rt(state=["running"], healthy=[False], root_volume_gb=1)   # 1GB < 2GB RAM
+    fake.responses["ec2 describe-instance-types"] = {"InstanceTypes": [{"HibernationSupported": True,
+                                                                        "MemoryInfo": {"SizeInMiB": 2048}}]}
+    fake.responses["ec2 describe-instances"] = {"Reservations": []}
+    assert rt.available() is False   # root volume can't hold RAM -> refused
+
+
+def test_ec2_hibernate_redrives_when_hibernate_does_not_take():
+    # stop --hibernate accepted, but the instance lands back 'running' (async hibernate failure) -> the
+    # hibernating phase must re-drive from 'warming' (re-issue stop), not sit stuck until warming_timeout.
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    state, healthy, ticks = ["running"], [True], [1000.0]
+    rt, fake = _hibernate_rt(state=state, healthy=healthy, clock=lambda: ticks[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt.is_ready(slot)                       # warming -> stop --hibernate -> hibernating
+    assert rt._phase["s"] == "hibernating"
+    # instance came back running (hibernate didn't take) -> is_ready re-drives to warming
+    ticks[0] += 10.0
+    assert rt.is_ready(slot) is False
+    assert rt._phase["s"] == "warming"      # recovered instead of stuck
+
+
+def test_ec2_hibernate_resume_refreshes_public_ip_uncached():
+    # a resumed instance gets a NEW public IP; resume must re-describe uncached (not the stale cached IP).
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    ip = {"v": "1.1.1.1"}
+
+    def describe(argv):  # noqa: ANN001
+        return _cp(stdout=json.dumps({"Reservations": [{"Instances": [
+            {"InstanceId": "i-1", "State": {"Name": "running"}, "PublicIpAddress": ip["v"]}]}]}))
+
+    cfg = Ec2HibernateConfig(region="us-east-1", image_id="ami-x", use_public_ip=True, resume_poll_s=0.0,
+                             allow_plaintext_public=True)   # this test exercises IP refresh, not the TLS guard
+    fake = FakeAws({**_IDENT, "ec2 describe-instances": describe, "ec2 start-instances": {},
+                   "ec2 stop-instances": {}})
+    rt = Ec2HibernateRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: "2.2.2.2" in u, clock=lambda: 100.0)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    slot.ip = "1.1.1.1"          # stale pre-hibernate public IP
+    ip["v"] = "2.2.2.2"          # AWS assigned a new one on start
+    rt.resume(slot)             # must pick up 2.2.2.2 (probe only passes on the new IP)
+    assert slot.ip == "2.2.2.2"
+
+
+def test_ec2_hibernate_select_and_registration():
+    from blastbox.host import pool_config
+    rt = select_ec2_hibernate_runtime(get_env={"BLASTBOX_EC2_AMI": "ami-x"}.get)
+    assert rt.kind == "aws-ec2-hibernate" and rt.dispatch_style == "network"
+    hib, _ = _hibernate_rt(state=["running"], healthy=[False])
+    import unittest.mock as m
+    with m.patch("blastbox.host.runtime.aws_worker.select_ec2_hibernate_runtime", lambda **kw: hib):
+        got = pool_config.select_runtime_by_name("aws-ec2-hibernate", require_available=False)
+    assert got is hib
+
+
+def test_ec2_self_terminate_ttl_injected():
+    import base64
+
+    from blastbox.host.runtime.aws_worker import _userdata_with_self_terminate
+    wrapped = _userdata_with_self_terminate("#!/bin/bash\necho hi\n", 600)
+    assert "shutdown -h +10" in wrapped and "echo hi" in wrapped   # 600s -> 10min; operator part kept
+    # CEILING, not floor: a non-minute budget must never schedule the shutdown BEFORE max_duration_s.
+    assert "shutdown -h +2" in _userdata_with_self_terminate(None, 119)   # 119s -> 2min (not 1)
+    assert "shutdown -h +1" in _userdata_with_self_terminate(None, 60)    # exact minute stays 1
+
+    ud = base64.b64encode(b"#!/bin/bash\nstart-agent\n").decode()
+    cfg = Ec2Config(region="us-east-1", image_id="ami-x", user_data_b64=ud, max_duration_s=1800)
+    captured = {}
+
+    def _run(argv):   # user-data is passed as a 0600 file:// (out of argv) -> read it DURING the call
+        val = argv[argv.index("--user-data") + 1]
+        assert val.startswith("file://")                       # secret is NOT a raw argv element
+        path = val[len("file://"):]
+        assert (os.stat(path).st_mode & 0o777) == 0o600        # created 0600 (O_EXCL)
+        with open(path) as fh:
+            captured["ud"] = fh.read()
+        return _cp(stdout=json.dumps({"Instances": [{"InstanceId": "i-1"}]}))
+
+    fake = FakeAws({**_IDENT, "ec2 run-instances": _run})
+    rt = DisposableEc2Runtime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True, clock=lambda: 1.0)
+    rt.spawn()
+    argv = next(a for k, a in fake.calls if k == "ec2 run-instances")
+    assert not any("start-agent" in str(a) for a in argv)      # the bootstrap secret never hits argv (/proc)
+    assert "shutdown -h +30" in captured["ud"] and "start-agent" in captured["ud"]  # ...but is in the file
+    ud_path = argv[argv.index("--user-data") + 1][len("file://"):]
+    assert not os.path.exists(ud_path)                          # temp file unlinked after the call
+
+
+def test_userdata_preserves_cloudinit_part_types():
+    # L3: a single-part cloud-init payload keeps its own format (docstring promise) -- #cloud-boothook /
+    # #include / #part-handler must NOT be wrapped as x-shellscript (cloud-init would mis-run them and the
+    # worker agent never starts). #!shebang + #cloud-config stay as they were.
+    from email import message_from_string
+
+    from blastbox.host.runtime.aws_worker import _userdata_with_self_terminate
+    cases = [
+        ("#cloud-boothook\nfoo\n", "text/cloud-boothook"),
+        ("#include\nhttp://x/y\n", "text/x-include-url"),
+        ("#include-once\nhttp://x/y\n", "text/x-include-once-url"),
+        ("#part-handler\ndef list_types():\n    pass\n", "text/part-handler"),
+        ("#!/bin/bash\necho hi\n", "text/x-shellscript"),          # shebang default unchanged
+        ("#cloud-config\nruncmd:\n  - x\n", "text/cloud-config"),  # cloud-config unchanged
+    ]
+    for raw, expected in cases:
+        parts = message_from_string(_userdata_with_self_terminate(raw, 600)).get_payload()
+        assert parts[0].get_content_type() == expected, raw          # operator part keeps its type
+        assert parts[1].get_content_type() == "text/x-shellscript"   # TTL part stays a shell script
+        assert "shutdown -h +10" in parts[1].get_payload()
+
+
+def test_ec2_self_terminate_preserves_multipart_userdata():
+    # if the operator user-data is ALREADY MIME multipart cloud-init, the TTL is APPENDED as a part,
+    # not nested (which would make cloud-init treat the whole document as one opaque script).
+    from email import message_from_string
+
+    from blastbox.host.runtime.aws_worker import _userdata_with_self_terminate
+    multipart = (
+        "Content-Type: multipart/mixed; boundary=\"BOUND\"\n"
+        "MIME-Version: 1.0\n\n"
+        "--BOUND\n"
+        "Content-Type: text/cloud-config\n\n"
+        "#cloud-config\nruncmd:\n  - echo original\n\n"
+        "--BOUND--\n"
+    )
+    wrapped = _userdata_with_self_terminate(multipart, 600)
+    msg = message_from_string(wrapped)
+    payloads = [p.get_payload() for p in msg.get_payload()] if msg.is_multipart() else []
+    assert msg.is_multipart()
+    assert any("echo original" in p for p in payloads)          # operator part preserved as its own part
+    assert any("shutdown -h +10" in p for p in payloads)        # TTL appended alongside, not nesting it
+
+
+def test_ec2_self_terminate_can_be_disabled():
+    cfg = Ec2Config(region="us-east-1", image_id="ami-x", max_duration_s=1800, self_terminate=False)
+    fake = FakeAws({**_IDENT, "ec2 run-instances": {"Instances": [{"InstanceId": "i-1"}]}})
+    rt = DisposableEc2Runtime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True, clock=lambda: 1.0)
+    rt.spawn()
+    argv = next(a for k, a in fake.calls if k == "ec2 run-instances")
+    assert "--user-data" not in argv   # opted out -> no injected TTL, no user-data

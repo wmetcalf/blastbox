@@ -211,9 +211,15 @@ does *not* render or execute) is the example consumer used to demonstrate the ov
 Core framework complete and adversarially tested: contract + full host orchestrator + worker SDK
 (harness, sandbox self-check, warm protocol) + warm pool (burst + health loops) + warm dispatch.
 
-**Two runtime backends**, selected fail-closed: hardened `docker run` (runc/runsc) and a **Firecracker
-microVM per slot** (AF_VSOCK warm protocol — *the engine* defines what "warmup" means, so the tier is
-engine-agnostic). **Four in-process sandbox backends**, auto-selected (`nsjail` → `bwrap` → `nono` →
+**A family of runtime backends** behind one `SlotRuntime` seam, all fail-closed and config-selected
+(`BLASTBOX_POOL_RUNTIME`, no code changes to switch): **local** — hardened `docker run` (runc/runsc), a
+**Firecracker microVM per slot** (AF_VSOCK warm protocol — *the engine* defines what "warmup" means, so
+the tier is engine-agnostic), and **gVisor checkpoint/restore**; and **network-endpoint** — a fixed fleet
+of boxes you own (`static`) or disposable cloud workers (`aws-ec2` / `aws-lambda-microvm`), where any
+engine runs off-box via `python -m blastbox.worker.http_agent` over a generic HTTP+tar transport (same
+sealed-envelope contract). A **`cascade`** composes same-transport tiers into one pool — e.g. *X warm on
+your own hardware, overflow to AWS* (`BLASTBOX_POOL_TIERS=static:8,aws-ec2:16`); all tiers must share one
+dispatch style (all network-endpoint, or all file-handshake — a mix fails fast). **Four in-process sandbox backends**, auto-selected (`nsjail` → `bwrap` → `nono` →
 `container`; `container` inside an OCI host) with a `BLASTBOX_SANDBOX` override. `nono` is a **Landlock**
 capability sandbox — filesystem + network containment **without user namespaces**, for hosts where
 `bwrap`/`nsjail` can't run (restricted-userns / no `CAP_SYS_ADMIN`); it's `secure=False` (no

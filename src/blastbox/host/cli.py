@@ -169,9 +169,8 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     # Opt-in warm pool (BLASTBOX_POOL_RUNTIME; default "none" → cold path only).
     from blastbox.host.pool_config import build_warm_pool
 
-    pool = build_warm_pool()
-    if pool is not None:
-        pool.start()
+    pool = build_warm_pool()   # built, NOT started -- start only after all validation below, so a
+    # config error (mixed cascade / multi-engine) can't leak already-spawned cloud slots.
 
     # Tier identity, derived ALONGSIDE the pool so a misconfig fails fast HERE rather than the
     # dispatcher silently mislabeling/misrouting warm jobs as "cold". A built warm pool MUST
@@ -190,6 +189,39 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     else:
         tier = "cold"
 
+    # Capability-based routing: the runtime declares its dispatch_style. A network-endpoint pool
+    # (aws / static / cascade) drives workers over http_agent + remote_http via VmJobDispatcher; every
+    # other runtime uses the file-handshake Dispatcher below. A cascade mixing styles raises here.
+    if pool is not None and getattr(pool.runtime, "dispatch_style", "file") == "network":
+        from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+
+        # a network-endpoint pool serves ONE worker image/agent (BLASTBOX_ENGINE); a multi-engine
+        # dispatcher here would send other engines' jobs to the wrong agent -- require exactly one.
+        if len(engines) != 1:
+            raise ValueError("network-endpoint tiers (aws/static/cascade) serve a single engine image; "
+                             "configure one engine or run separately-scoped remote pools")
+        vm = build_remote_vm_dispatcher(
+            store, job_root, pool, tier=tier,
+            engine=next(iter(engines)),
+            engine_spec=next(iter(engines.values())),
+            limits=limits,
+            worker_timeout_s=float(os.environ.get("BLASTBOX_WORKER_TIMEOUT_S") or "300"),
+            warm_claim_timeout_s=float(os.environ.get("BLASTBOX_WARM_CLAIM_TIMEOUT_S") or "60"),
+            concurrency=int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1"),
+            job_retention_s=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"),
+        )
+        pool.start()   # validation passed -> now spawn/warm slots (nothing to leak on an earlier raise)
+        try:
+            vm.run()
+        except BaseException:
+            vm.stop()   # release the executor's worker loops so the finally's pool.stop() can reap
+            raise
+        finally:
+            pool.stop()
+        return 0
+
+    if pool is not None:
+        pool.start()   # file-handshake warm path: start after tier-identity validation
     dispatcher = Dispatcher(
         job_store=store,
         engines=engines,
@@ -263,6 +295,40 @@ def _version_cmd(_: argparse.Namespace) -> int:
     return 0
 
 
+def _pki_cmd(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from blastbox.host.pki import ensure_ca
+
+    pki_dir = Path(args.dir)
+    ca = ensure_ca(pki_dir)  # generate-or-load the CA
+    if args.pki_action == "init":
+        crt, key = ca.issue_client("dispatcher", days=args.days).write(pki_dir, "dispatcher")
+        print(f"CA ready in {pki_dir}")
+        print(f"  ca.crt         (public trust anchor -> bake into worker images) : {pki_dir / 'ca.crt'}")
+        print(f"  dispatcher.crt / dispatcher.key  (host mTLS client cert)        : {crt} / {key}")
+        return 0
+    if args.pki_action == "issue-server":
+        name = args.name or (args.san[0] if args.san else "server")
+        crt, key = ca.issue_server(args.san, cn=args.cn, days=args.days).write(pki_dir, name)
+        print(f"server cert (SAN={args.san}, {args.days}d) -> {crt} / {key}")
+        return 0
+    if args.pki_action == "issue-client":
+        crt, key = ca.issue_client(args.cn, days=args.days).write(pki_dir, args.cn)
+        print(f"client cert (cn={args.cn}, {args.days}d) -> {crt} / {key}")
+        return 0
+    if args.pki_action == "sign-csr":
+        cert_pem = ca.sign_csr(Path(args.csr).read_bytes(), days=args.days)
+        out = Path(args.out) if args.out else Path(args.csr).with_suffix(".crt")
+        out.write_bytes(cert_pem)
+        print(f"signed server cert ({args.days}d) -> {out}")
+        return 0
+    if args.pki_action == "show-ca":
+        print((pki_dir / "ca.crt").read_text(), end="")
+        return 0
+    return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="blastbox")
     sub = p.add_subparsers(dest="command", required=True)
@@ -302,6 +368,28 @@ def build_parser() -> argparse.ArgumentParser:
     pb.add_argument("--json", default=None, help="write the JSON report to this path")
     pb.add_argument("--compare", default=None, help="(reserved) baseline JSON to diff")
     pb.set_defaults(func=_bench_cmd)
+
+    # pki -- worker-mTLS certificate authority
+    pk = sub.add_parser("pki", help="worker-mTLS certificate authority (generate + issue certs)")
+    pk.add_argument("--dir", default=os.environ.get("BLASTBOX_PKI_DIR", "/var/lib/blastbox/pki"),
+                    help="CA/cert state dir (BLASTBOX_PKI_DIR)")
+    pks = pk.add_subparsers(dest="pki_action", required=True)
+    pk_init = pks.add_parser("init", help="create the CA + a dispatcher client cert")
+    pk_init.add_argument("--days", type=int, default=365)
+    pk_srv = pks.add_parser("issue-server", help="mint a worker server cert (SAN-pinned)")
+    pk_srv.add_argument("--san", action="append", required=True, help="IP or DNS name (repeatable)")
+    pk_srv.add_argument("--cn", default=None)
+    pk_srv.add_argument("--name", default=None, help="output filename stem (default: first SAN)")
+    pk_srv.add_argument("--days", type=int, default=30)
+    pk_cli = pks.add_parser("issue-client", help="mint a client cert")
+    pk_cli.add_argument("--cn", default="dispatcher")
+    pk_cli.add_argument("--days", type=int, default=365)
+    pk_csr = pks.add_parser("sign-csr", help="sign a worker-generated CSR -> server cert (key stays on the box)")
+    pk_csr.add_argument("--csr", required=True, help="path to the CSR PEM")
+    pk_csr.add_argument("--out", default=None, help="output cert path (default: <csr>.crt)")
+    pk_csr.add_argument("--days", type=int, default=30)
+    pks.add_parser("show-ca", help="print the CA cert (public trust anchor)")
+    pk.set_defaults(func=_pki_cmd)
 
     # version
     pv = sub.add_parser("version", help="print version and exit")

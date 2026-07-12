@@ -176,6 +176,15 @@ class WarmPool:
         max_jobs_per_slot: int = 0,
     ) -> None:
         self._runtime = runtime
+        # Some runtimes (static pool) reuse a long-lived box on reap and care whether the just-finished
+        # job was DIRTY (timeout/trust-fail) so they can quarantine it instead of re-offering it while a
+        # stale request may still be running. Pass `dirty` to reap() only if it accepts the kwarg
+        # (backward-compatible: disposable runtimes reap the whole worker regardless).
+        try:
+            import inspect
+            self._reap_takes_dirty = "dirty" in inspect.signature(runtime.reap).parameters
+        except (TypeError, ValueError):
+            self._reap_takes_dirty = False
         # Reuse mode (only active when the runtime implements recycle()): serve N jobs, reset every
         # ``jobs_per_recycle`` via runtime.recycle(), reap+respawn after ``max_jobs_per_slot`` (0 =
         # unlimited reuse with periodic resets). Cheap-reset runtimes have no recycle() → disposable.
@@ -204,6 +213,7 @@ class WarmPool:
 
         # Background thread
         self._stop_event = threading.Event()
+        self._reaping: set[str] = set()   # slot_ids currently being disposed (dedupe concurrent reaps)
         self._thread: threading.Thread | None = None
 
         # Burst demand tracking — all access under _lock
@@ -233,11 +243,42 @@ class WarmPool:
         )
         self._thread.start()
 
-    def stop(self) -> None:
-        """Stop the background loop and reap ALL slots (no orphans)."""
+    def _default_stop_budget(self) -> float:
+        """Shutdown budget covering an in-flight spawn (up to the runtime's per-call CLI timeout) PLUS its
+        post-spawn terminate (another CLI timeout), + margin -- else a slow AWS spawn racing stop() eats the
+        budget and the process exits mid-terminate, leaking the just-created worker. Floors at 150s; a
+        runtime with no cli_timeout_s (file/libvirt) uses the floor."""
+        cli = (getattr(getattr(self._runtime, "cfg", None), "cli_timeout_s", None)
+               or getattr(self._runtime, "cli_timeout_s", None) or 0.0)
+        return max(150.0, 2.0 * float(cli) + 30.0)
+
+    def stop(self, stop_timeout_s: float | None = None) -> None:
+        """Stop the background loop and reap ALL slots (no orphans).
+
+        Waits (BOUNDED) for the daemon to finish an in-flight tick so its OWN post-spawn reap disposes a
+        slot spawned during shutdown: a slow AWS ``run-instances``/``run-microvm`` racing stop() isn't yet
+        in ``_slots``, so stop()'s reap loop can't see it -- and if the process exits right after stop()
+        returns (the CLI does), the daemon is killed before its terminate call runs, leaking a live cloud
+        worker. The budget must cover the in-flight spawn (up to a runtime's per-call CLI timeout) PLUS its
+        post-spawn terminate (another CLI timeout), so the default is derived from the runtime's
+        ``cli_timeout_s`` (2× + margin) when unset -- else a slow spawn eats the budget and the process
+        exits mid-terminate. A wedged spawn can't hang shutdown forever; past the budget we log and proceed
+        (the slot's self-terminate TTL, where enabled, is the last backstop). A clean shutdown with no
+        in-flight spawn returns within one poll."""
+        if stop_timeout_s is None:
+            stop_timeout_s = self._default_stop_budget()
         self._stop_event.set()
         if self._thread is not None:
-            self._thread.join(timeout=10.0)
+            # Fast path returns immediately when the daemon has already exited (no spawn in flight).
+            self._thread.join(timeout=min(10.0, stop_timeout_s))
+            waited = min(10.0, stop_timeout_s)
+            while self._thread.is_alive() and waited < stop_timeout_s:
+                step = min(1.0, stop_timeout_s - waited)
+                self._thread.join(timeout=step)   # let the in-flight tick finish + run its post-spawn reap
+                waited += step
+            if self._thread.is_alive():
+                logger.warning("pool.stop: background thread still running after %.0fs (wedged spawn?) — "
+                               "proceeding; an in-flight cloud slot may leak until its TTL", stop_timeout_s)
             self._thread = None
 
         # Reap every slot regardless of state. Pop each ONLY after a successful reap: if reap RAISES
@@ -255,13 +296,14 @@ class WarmPool:
 
         for slot in to_reap:
             try:
-                self._reap_and_count(slot)
+                disposed = self._reap_and_count(slot)
             except Exception:
                 logger.exception("pool.reap_error_on_stop slot_id=%s — quarantining (still DRAINING, "
                                  "never claimable)", slot.slot_id)
             else:
-                with self._lock:
-                    self._slots.pop(slot.slot_id, None)
+                if disposed:   # skip-because-another-thread-owns-it (False) -> leave it for that thread
+                    with self._lock:
+                        self._slots.pop(slot.slot_id, None)
 
     # ------------------------------------------------------------------
     # Public interface
@@ -348,8 +390,8 @@ class WarmPool:
         # The replacement will be spawned by the next tick() call.
         reaped = False
         try:
-            self._reap_and_count(slot)
-            reaped = True
+            # forward dirty so a reusing runtime can quarantine; False = another thread owns the reap
+            reaped = self._reap_and_count(slot, dirty=dirty)
         except Exception:
             # reap() raises when it could NOT dispose the worker (e.g. a libvirt VM whose `virsh
             # destroy` failed and may still be running). Do NOT pop the slot: keep it tracked
@@ -376,8 +418,7 @@ class WarmPool:
             slot.state = SlotState.DRAINING  # unclaimable from here, even if the reap is slow
         reaped = False
         try:
-            self._reap_and_count(slot)
-            reaped = True
+            reaped = self._reap_and_count(slot)   # False = another thread owns the reap -> don't pop
         except Exception:
             logger.exception("pool.retire_reap_error slot_id=%s — quarantining (worker may persist)",
                              slot.slot_id)
@@ -410,12 +451,34 @@ class WarmPool:
             return bool(prepare())
         return True
 
-    def _reap_and_count(self, slot: "Slot") -> None:
-        """Reap a slot via the runtime and count the disposal (metrics)."""
+    def _reap_and_count(self, slot: "Slot", *, dirty: bool = False) -> bool:
+        """Reap a slot via the runtime and count the disposal (metrics). ``dirty`` (from a failed
+        release) is forwarded to a reap() that accepts it, so a reusing runtime can quarantine.
+
+        Guarded so EXACTLY ONE path disposes a given slot even under concurrency: stop() (whose 10s
+        thread-join can expire while the background tick is still mid-reap of a slow AWS terminate,
+        up to cli_timeout_s) must not run a SECOND concurrent terminate on the same real cloud resource
+        (double control-plane call + double metric/count).
+
+        Returns ``True`` iff THIS call actually disposed the slot. Returns ``False`` when it SKIPPED
+        because another thread already owns the reap -- the caller MUST NOT then treat the slot as gone
+        (don't pop it from ``_slots``): leave it tracked so the owning thread pops it on success or
+        keeps it quarantined if its reap raises. A silent early-return that read as success could let a
+        second path untrack a slot whose real terminate later fails, orphaning a live cloud resource."""
+        with self._lock:
+            if slot.slot_id in self._reaping:
+                return False
+            self._reaping.add(slot.slot_id)
         try:
-            self._runtime.reap(slot)
+            if self._reap_takes_dirty:
+                self._runtime.reap(slot, dirty=dirty)  # type: ignore[call-arg]
+            else:
+                self._runtime.reap(slot)
         finally:
             record_slot_reaped()
+            with self._lock:
+                self._reaping.discard(slot.slot_id)
+        return True
 
     def _sample_metrics(self) -> None:
         """Publish a snapshot of slot-state counts + target to Prometheus gauges."""
@@ -520,10 +583,17 @@ class WarmPool:
                 # Flip to ASSIGNED immediately to block concurrent claimers
                 candidate.state = SlotState.ASSIGNED
 
-            # Check liveness OUTSIDE the lock (may be slow)
+            # Check liveness OUTSIDE the lock (may be slow). Prefer a FRESH hand-out check
+            # (is_alive_for_claim) when the runtime provides one: the per-tick is_alive() may be cached
+            # (AWS throttles the control-plane describe), so a slot terminated since the last tick could
+            # otherwise be handed out and fail the user's job. Falls back to is_alive() for file/libvirt
+            # tiers whose is_alive() is already a fresh check.
+            claim_check = getattr(self._runtime, "is_alive_for_claim", None)
+            if not callable(claim_check):
+                claim_check = self._runtime.is_alive
             alive = False
             try:
-                alive = self._runtime.is_alive(candidate)
+                alive = claim_check(candidate)
             except Exception:
                 logger.exception("pool.is_alive_error slot_id=%s", candidate.slot_id)
 
@@ -541,8 +611,7 @@ class WarmPool:
             # off the books while a replacement spawns.
             reaped = False
             try:
-                self._reap_and_count(candidate)
-                reaped = True
+                reaped = self._reap_and_count(candidate)   # False = another thread owns it -> don't pop
             except Exception:
                 logger.exception("pool.reap_dead_slot_error slot_id=%s — quarantining", candidate.slot_id)
             finally:
@@ -583,8 +652,7 @@ class WarmPool:
                 # (If is_ready RAISED, we never enter here — same quarantine intent.)
                 reaped = False
                 try:
-                    self._reap_and_count(slot)
-                    reaped = True
+                    reaped = self._reap_and_count(slot)   # False = another thread owns it -> don't pop
                 except Exception:
                     logger.exception("pool.promote_reap_error slot_id=%s — quarantining", slot.slot_id)
                 with self._lock:
@@ -630,8 +698,30 @@ class WarmPool:
                 logger.exception("pool.spawn_failed")
                 continue
 
+            # Publish under the lock, BUT only if shutdown hasn't begun. A slow spawn (e.g. AWS
+            # run-instances / run-microvm blocks up to cli_timeout_s=120s, far past stop()'s 10s
+            # thread-join) can complete AFTER stop() snapshotted _slots -- publishing then would leak a
+            # live EC2 instance / MicroVM (never reaped until its TTL). Checking _stop_event under the
+            # same lock stop() flips slots to DRAINING under closes the race either way.
             with self._lock:
-                self._slots[slot.slot_id] = slot
+                stopping = self._stop_event.is_set()
+                if not stopping:
+                    self._slots[slot.slot_id] = slot
+            if stopping:
+                reaped = False
+                try:
+                    reaped = self._reap_and_count(slot)   # reap the just-created (untracked) slot ourselves
+                except Exception:
+                    logger.exception("pool.reap_after_stop_failed slot_id=%s — quarantining (worker may "
+                                     "persist)", slot.slot_id)
+                if not reaped:
+                    # the terminate raised (the EC2/MicroVM may still be running): TRACK the husk as
+                    # DRAINING so it's accounted/surfaced for manual cleanup instead of silently leaked
+                    # off the books -- matching every other reap-failure path (release/health/stop).
+                    slot.state = SlotState.DRAINING
+                    with self._lock:
+                        self._slots[slot.slot_id] = slot
+                break
 
     def _effective_target_unlocked(self) -> int:
         """Compute current target (must be called under _lock or read-only context).
@@ -730,8 +820,7 @@ class WarmPool:
             logger.warning("pool.health_evicted_dead_slot slot_id=%s", slot.slot_id)
             reaped = False
             try:
-                self._reap_and_count(slot)
-                reaped = True
+                reaped = self._reap_and_count(slot)   # False = another thread owns it -> don't pop
             except Exception:
                 # reap raised (worker not disposed — may still run): quarantine, don't pop (like
                 # release()), so a live worker isn't orphaned off pool accounting.
