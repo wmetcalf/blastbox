@@ -69,7 +69,7 @@ class PoolConfig:
             raw = os.environ.get(key, "").strip().lower()
             if not raw:
                 return default
-            return raw not in ("0", "false", "no")
+            return raw not in ("0", "false", "no", "off")
 
         values: dict[str, object] = {
             "runtime": os.environ.get("BLASTBOX_POOL_RUNTIME", cls.runtime).strip().lower(),

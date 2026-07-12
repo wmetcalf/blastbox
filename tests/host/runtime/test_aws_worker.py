@@ -595,6 +595,31 @@ def test_ec2_public_ip_without_tls_fails_closed():
     DisposableEc2Runtime(Ec2Config(region="us-east-1", image_id="ami-x"), aws_runner=fake)
 
 
+def test_inject_tls_installs_mtls_probe_for_explicit_context():
+    # K1: an explicit ssl_context must also get a MATCHING mTLS probe, else _health_ok probes the https
+    # worker with the non-mTLS default probe (no client cert) and it never readies.
+    import ssl
+    from blastbox.host.runtime.aws_worker import _inject_tls
+    ctx = ssl.create_default_context()
+    kw = _inject_tls({}.get, {"ssl_context": ctx})
+    assert kw["ssl_context"] is ctx and callable(kw.get("http_probe"))   # TLS-aware probe installed
+
+    def sentinel(u, h, t):
+        return True
+
+    kw2 = _inject_tls({}.get, {"ssl_context": ctx, "http_probe": sentinel})
+    assert kw2["http_probe"] is sentinel                                 # explicit probe preserved
+    assert "http_probe" not in _inject_tls({}.get, {"ssl_context": None})  # None stays http (no probe)
+
+
+def test_ec2_public_ip_bool_spellings():
+    # sweep: BLASTBOX_EC2_PUBLIC_IP / _ALLOW_PLAINTEXT_PUBLIC accept the same 1/true/yes/on set (were bare ==)
+    for val in ("true", "YES", "On", " 1 "):
+        assert Ec2Config.from_env({"BLASTBOX_EC2_PUBLIC_IP": val, "BLASTBOX_EC2_AMI": "ami-x"}.get).use_public_ip
+    for val in ("0", "false", "off", ""):
+        assert not Ec2Config.from_env({"BLASTBOX_EC2_PUBLIC_IP": val, "BLASTBOX_EC2_AMI": "ami-x"}.get).use_public_ip
+
+
 def test_ec2_config_from_env_defaults_arm():
     cfg = Ec2Config.from_env({"BLASTBOX_EC2_AMI": "ami-x"}.get)
     assert cfg.image_id == "ami-x"

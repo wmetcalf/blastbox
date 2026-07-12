@@ -151,7 +151,7 @@ class LambdaMicroVmConfig(AwsWorkerConfig):
             egress_connector_ids=_idlist("BLASTBOX_LAMBDA_EGRESS_CONNECTORS"),
             ingress_connector_ids=_idlist("BLASTBOX_LAMBDA_INGRESS_CONNECTORS"),
             allow_default_egress=(_env(get, "BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS") or "").strip().lower()
-                                 in ("1", "true", "yes"),
+                                 in ("1", "true", "yes", "on"),
             auth_token_ttl_min=int(_env(get, "BLASTBOX_LAMBDA_AUTH_TTL_MIN", "15") or "15"),
             max_duration_s=int(_env(get, "BLASTBOX_AWS_MAX_DURATION_S", "3600") or "3600"),
             **overrides,
@@ -187,8 +187,10 @@ class Ec2Config(AwsWorkerConfig):
             security_group_ids=tuple(s.strip() for s in (sgs or "").split(",") if s.strip()),
             iam_instance_profile=_env(get, "BLASTBOX_EC2_IAM_PROFILE"),
             key_name=_env(get, "BLASTBOX_EC2_KEY_NAME"),
-            use_public_ip=(_env(get, "BLASTBOX_EC2_PUBLIC_IP") or "0") == "1",
-            allow_plaintext_public=(_env(get, "BLASTBOX_EC2_ALLOW_PLAINTEXT_PUBLIC") or "0") == "1",
+            use_public_ip=(_env(get, "BLASTBOX_EC2_PUBLIC_IP") or "").strip().lower()
+            in ("1", "true", "yes", "on"),
+            allow_plaintext_public=(_env(get, "BLASTBOX_EC2_ALLOW_PLAINTEXT_PUBLIC") or "").strip().lower()
+            in ("1", "true", "yes", "on"),
             user_data_b64=_env(get, "BLASTBOX_EC2_USER_DATA_B64"),
             self_terminate=(_env(get, "BLASTBOX_EC2_SELF_TERMINATE", "1") or "1").strip().lower()
             not in ("0", "false", "no", "off"),   # strip/lower so False/NO/Off actually disable the backstop
@@ -544,9 +546,13 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
 def _inject_tls(getter: Callable[[str], str | None], kw: dict[str, Any]) -> dict[str, Any]:
     """If BLASTBOX_DISPATCH_TLS_CA is set (and not already overridden), add the client (m)TLS context +
     a TLS-aware health probe so an https worker agent is probed + talked to over mTLS."""
-    if "ssl_context" in kw:
-        return kw
     from blastbox.host.runtime.remote_http import dispatch_ssl_context_from_env, make_tls_probe
+    if "ssl_context" in kw:
+        # a caller-supplied context still needs a MATCHING mTLS probe, else _health_ok probes the https
+        # worker with the non-mTLS _default_http_probe (no client cert / private CA) and it never readies.
+        if kw["ssl_context"] is not None:
+            kw.setdefault("http_probe", make_tls_probe(kw["ssl_context"]))
+        return kw
     ctx = dispatch_ssl_context_from_env(getter)
     if ctx is not None:
         kw = {**kw, "ssl_context": ctx}
@@ -904,7 +910,7 @@ class Ec2HibernateConfig(Ec2Config):
         import dataclasses
         base = Ec2Config.from_env(get)
         fields = {f.name: getattr(base, f.name) for f in dataclasses.fields(Ec2Config)}
-        fields["self_terminate"] = (get("BLASTBOX_EC2_SELF_TERMINATE") or "0").strip().lower() in ("1", "true", "yes")
+        fields["self_terminate"] = (get("BLASTBOX_EC2_SELF_TERMINATE") or "0").strip().lower() in ("1", "true", "yes", "on")
         fields.update(
             root_device_name=_env(get, "BLASTBOX_EC2_ROOT_DEVICE", "/dev/xvda") or "/dev/xvda",
             root_volume_gb=int(_env(get, "BLASTBOX_EC2_ROOT_VOLUME_GB", "30") or "30"),

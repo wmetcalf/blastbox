@@ -60,6 +60,19 @@ def test_healthz():
         httpd.server_close()
 
 
+def test_serve_fails_closed_on_wide_open_bind():
+    # K4: serve() itself (not just main()) must fail closed, so a programmatic embedder can't listen wide
+    # open on the 0.0.0.0 default with no token/mTLS/allowlist.
+    with pytest.raises(SystemExit, match="refusing to serve"):
+        serve(_NoopEngine(), bind="0.0.0.0", port=0)
+
+
+def test_serve_allows_wide_open_with_insecure_optin(monkeypatch):
+    monkeypatch.setenv("BLASTBOX_WORKER_AGENT_ALLOW_INSECURE", "1")
+    httpd = serve(_NoopEngine(), bind="0.0.0.0", port=0)   # explicit opt-in -> warns + serves
+    httpd.server_close()
+
+
 def test_guard_exposure_fails_closed_when_wide_open():
     from blastbox.worker.http_agent import _guard_exposure
     # non-loopback bind with NO mTLS / token / allowlist and no insecure opt-in -> refuse to start

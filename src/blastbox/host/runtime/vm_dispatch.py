@@ -737,6 +737,11 @@ def build_remote_vm_dispatcher(
             registry=_registry, allow_override=False,
         )
         _net_env = {"BLASTBOX_NET_EGRESS": "1" if _personality.exit_driver not in ("none", "drop") else "0"}
+        # For an httpproxy personality, inject the SAME validated HTTP_PROXY/HTTPS_PROXY the cold dispatcher
+        # sets (Dispatcher._httpproxy_env) into the worker env -- else the inner sandbox is opened for egress
+        # but proxy-aware clients get no proxy and go direct / fail, silently differing from the cold tier.
+        # (Returns {} for non-httpproxy personalities, so it's a no-op for none/direct/inetsim.)
+        _net_env.update(Dispatcher._httpproxy_env(_personality))
         # Forward the HOST-owned output caps to the worker. http_agent builds Limits.from_env() PER JOB and
         # rejects a result over ITS OWN metadata/artifact-bytes/file caps (HTTP 500) BEFORE returning the
         # tar -- so a cap the operator raised only on the DISPATCHER (for the host trust gate + extractor)
@@ -827,7 +832,7 @@ def build_remote_vm_dispatcher(
         # engine, which would clobber a COLD dispatcher's live jobs if one shares the store. Default OFF
         # (shared-store safe); opt in with BLASTBOX_DISPATCH_SOLE_OWNER=1 ONLY for a network-ONLY store.
         sole_owner=(os.environ.get("BLASTBOX_DISPATCH_SOLE_OWNER") or "").strip().lower()
-                   in ("1", "true", "yes"),
+                   in ("1", "true", "yes", "on"),
         # same stale-queued TTL the cold Dispatcher honors -- bounds a job pinned to a tier no remote
         # dispatcher serves (else its untrusted input lingers forever in a remote-only deployment).
         max_queued_age_s=float(os.environ.get("BLASTBOX_MAX_QUEUED_AGE_S") or "0"),

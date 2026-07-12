@@ -546,6 +546,21 @@ def test_remote_factory_forwards_output_caps_to_worker(tmp_path):
     assert out["BLASTBOX_MAX_ARTIFACT"] == "209715200"   # per-artifact cap too (engines read it)
 
 
+def test_remote_factory_forwards_httpproxy_env(tmp_path, monkeypatch):
+    # K2: an httpproxy personality must inject the validated HTTP_PROXY/HTTPS_PROXY into the worker env
+    # (like the cold dispatcher) -- else the inner sandbox opens for egress but proxy-aware clients go direct.
+    from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_PROXYTEST", "exit=httpproxy,proxy=http://p.example:3128")
+    spec = SimpleNamespace(net_policy="proxytest", allowed_param_keys=frozenset(),
+                           reserved_param_keys=frozenset(), default_params=None)
+    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
+                                    tier="static", engine="clippyshot", engine_spec=spec, limits=_FAKE_LIMITS)
+    out = vm._sanitize({})
+    assert out["BLASTBOX_NET_EGRESS"] == "1"
+    assert out["HTTP_PROXY"] == "http://p.example:3128"
+    assert out["HTTPS_PROXY"] == "http://p.example:3128"
+
+
 def test_remote_factory_requires_limits_and_engine(tmp_path):
     # G1/G2: the trust-gated remote path PRESERVES worker metadata, so it must fail closed without the
     # host trust gate's inputs -- limits (caps/hashes) and an exact engine to match the envelope against.

@@ -333,6 +333,12 @@ def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
     """Serve the engine. ``tls_cert``/``tls_key`` enable HTTPS; adding ``client_ca`` requires a
     CA-signed **client** cert (mTLS). ``allow_cidrs`` restricts which peer IPs may POST /detonate.
     ``timeout_s`` bounds a request's socket reads so a slowloris body can't hold the job lock forever."""
+    # fail CLOSED here (not just in main()) so a programmatic embedder that calls serve() directly can't
+    # listen wide open on the 0.0.0.0 default with no token/mTLS/allowlist. Idempotent with main()'s check.
+    allow_insecure = (os.environ.get("BLASTBOX_WORKER_AGENT_ALLOW_INSECURE") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+    _guard_exposure(bind, port, token=token, client_ca=client_ca, allow_cidrs=allow_cidrs,
+                    allow_insecure=allow_insecure)
     handler = type("_BoundHandler", (_Handler,),
                    {"engine": engine, "token": token, "max_bytes": max_bytes,
                     "allow_nets": _parse_cidrs(allow_cidrs), "timeout": timeout_s})
@@ -360,15 +366,14 @@ def main(argv: list[str] | None = None) -> int:
     port = int(os.environ.get("BLASTBOX_WORKER_AGENT_PORT", "8765"))
     bind = os.environ.get("BLASTBOX_WORKER_AGENT_BIND", "0.0.0.0")
     token = os.environ.get("BLASTBOX_WORKER_AGENT_TOKEN") or None
-    max_bytes = int(os.environ.get("BLASTBOX_WORKER_AGENT_MAX_BYTES", str(_DEFAULT_MAX_BYTES)))
+    # request-body cap: honor an explicit override, else derive from the operator input cap so a raised
+    # BLASTBOX_MAX_INPUT actually lifts the agent's Content-Length gate on the network tiers (per-job param
+    # forwarding can't -- the gate runs before params apply). max() keeps the historic 512 MiB floor so an
+    # agent box without BLASTBOX_MAX_INPUT never regresses below today's default.
+    _explicit_max = os.environ.get("BLASTBOX_WORKER_AGENT_MAX_BYTES")
+    max_bytes = int(_explicit_max) if _explicit_max else max(_DEFAULT_MAX_BYTES, Limits.from_env().max_input_bytes)
     tls_cert, tls_key, client_ca = _tls_env(os.environ.get)
     allow_cidrs = os.environ.get("BLASTBOX_WORKER_AGENT_ALLOW_CIDRS") or None
-    # fail CLOSED when exposed with no controls (non-loopback bind + no mTLS / token / allowlist), unless
-    # an external gate is opted into via BLASTBOX_WORKER_AGENT_ALLOW_INSECURE=1.
-    allow_insecure = (os.environ.get("BLASTBOX_WORKER_AGENT_ALLOW_INSECURE") or "").strip().lower() in (
-        "1", "true", "yes", "on")
-    _guard_exposure(bind, port, token=token, client_ca=client_ca, allow_cidrs=allow_cidrs,
-                    allow_insecure=allow_insecure)
     timeout_s = float(os.environ.get("BLASTBOX_WORKER_AGENT_TIMEOUT_S") or "300")
     httpd = serve(engine, bind=bind, port=port, token=token, max_bytes=max_bytes,
                   tls_cert=tls_cert, tls_key=tls_key, client_ca=client_ca, allow_cidrs=allow_cidrs,
