@@ -131,6 +131,20 @@ def test_net_egress_from_env_fail_closed(monkeypatch):
         assert Limits.from_env().net_egress is False, bad
 
 
+def test_disclose_security_internals_defaults_off():
+    assert Limits().disclose_security_internals is False
+
+
+def test_disclose_security_internals_fail_closed(monkeypatch):
+    # A security flag (True = MORE disclosure) must fail closed: only an explicit truthy token enables it.
+    for good in ("1", "true", "YES", " on "):
+        monkeypatch.setenv("BLASTBOX_DISCLOSE_SECURITY_INTERNALS", good)
+        assert Limits.from_env().disclose_security_internals is True, good
+    for bad in ("0", "false", "no", "off", "", "garbage", "2"):
+        monkeypatch.setenv("BLASTBOX_DISCLOSE_SECURITY_INTERNALS", bad)
+        assert Limits.from_env().disclose_security_internals is False, bad
+
+
 def test_from_env_non_numeric_names_var(monkeypatch):
     """A non-numeric env value must raise ValueError naming the variable."""
     monkeypatch.setenv("BLASTBOX_TIMEOUT", "notanumber")
