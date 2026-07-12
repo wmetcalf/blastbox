@@ -419,7 +419,7 @@ def test_remote_claim_budget_is_bounded_and_reserves_detonation_time(tmp_path):
     vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _NeverYieldsPool(),
                                     tier="aws-ec2", engine="clippyshot", limits=_FAKE_LIMITS,
                                     worker_timeout_s=300.0, warm_claim_timeout_s=0.05)
-    assert vm._validate_timeout_s == pytest.approx(300.05)   # watchdog = claim budget + detonate budget
+    assert vm._validate_timeout_s == pytest.approx(330.05)   # 0.05 claim + 300 detonate + 30 seal-slack
     with pytest.raises(NoWarmSlot):
         vm._validate(tmp_path / "in.bin")                    # no slot within the claim budget -> requeue
     assert seen["claim_timeout"] <= 0.05                     # bounded by warm_claim_timeout_s, not 300s
@@ -437,7 +437,7 @@ def test_remote_watchdog_includes_resume_budget(tmp_path):
     vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
                                     tier="aws-ec2-hibernate", engine="clippyshot", limits=_FAKE_LIMITS,
                                     worker_timeout_s=300.0, warm_claim_timeout_s=60.0)
-    assert vm._validate_timeout_s == pytest.approx(540.0)   # 60 claim + 180 resume + 300 detonate
+    assert vm._validate_timeout_s == pytest.approx(570.0)   # 60 claim + 180 resume + 300 detonate + 30 seal
 
 
 def test_remote_all_stale_resume_slots_requeues_not_fails(tmp_path):
@@ -497,7 +497,7 @@ def test_remote_watchdog_includes_cleanup_budget(tmp_path):
                                     tier="aws-lambda-snapstart", engine="clippyshot", limits=_FAKE_LIMITS,
                                     worker_timeout_s=300.0, warm_claim_timeout_s=60.0)
     # 60 claim + 180 resume + 300 detonate + 120 cleanup
-    assert vm._validate_timeout_s == pytest.approx(660.0)
+    assert vm._validate_timeout_s == pytest.approx(690.0)   # +30 seal-slack
 
 
 def test_remote_watchdog_cleanup_budget_from_cascade_attr(tmp_path):
@@ -510,7 +510,26 @@ def test_remote_watchdog_cleanup_budget_from_cascade_attr(tmp_path):
     vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
                                     tier="cascade", engine="clippyshot", limits=_FAKE_LIMITS,
                                     worker_timeout_s=300.0, warm_claim_timeout_s=60.0)
-    assert vm._validate_timeout_s == pytest.approx(660.0)   # 60 + 180 resume + 300 + 120 cleanup (attr)
+    assert vm._validate_timeout_s == pytest.approx(690.0)   # 60 + 180 resume + 300 + 120 cleanup + 30 seal
+
+
+def test_remote_watchdog_seal_slack_scales_with_artifact_cap(tmp_path):
+    # O1: the watchdog reserves post-read sealing time (tar-extract + re-hash every artifact) derived from
+    # the artifact cap -- present even with no cleanup budget, and scaling with BLASTBOX_MAX_TOTAL_ARTIFACTS.
+    from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+
+    def budget(cap):
+        limits = SimpleNamespace(max_total_artifact_bytes=cap, max_artifacts=None, max_metadata_bytes=None)
+        pool = SimpleNamespace(runtime=SimpleNamespace(ssl_context=None),   # no cli_timeout_s / resume
+                               claim=lambda *, timeout_s: None, release=lambda s, dirty=False: None)
+        return build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool, tier="static",
+                                          engine="clippyshot", limits=limits, worker_timeout_s=300.0,
+                                          warm_claim_timeout_s=0.0)._validate_timeout_s
+
+    b_small = budget(50 * 1024 * 1024)     # 50 MB -> +1s slack over the 30s base
+    b_large = budget(500 * 1024 * 1024)    # 500 MB -> +10s
+    assert b_small == pytest.approx(300.0 + 30.0 + 1.0)                    # worker + base + 50MB/50MBps
+    assert b_large - b_small == pytest.approx((450 * 1024 * 1024) / (50 * 1024 * 1024))   # scales with cap
 
 
 def test_remote_factory_threads_engine_net_policy(tmp_path, monkeypatch):

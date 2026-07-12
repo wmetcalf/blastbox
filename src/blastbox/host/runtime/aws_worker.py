@@ -58,7 +58,11 @@ class AwsUnavailable(RuntimeError):
 
 
 def _default_aws_runner(argv: Sequence[str], timeout: float) -> subprocess.CompletedProcess:
-    return subprocess.run(list(argv), capture_output=True, text=True, timeout=timeout)  # noqa: S603
+    # AWS_PAGER="" disables the CLI client-side pager for EVERY runtime call (higher precedence than a
+    # profile `cli_pager`), so noninteractive JSON never routes through less/more -> no spawn/reap hang or
+    # non-JSON parse. Spread os.environ so AWS creds / PATH / AWS_* still resolve.
+    env = {**os.environ, "AWS_PAGER": ""}
+    return subprocess.run(list(argv), capture_output=True, text=True, timeout=timeout, env=env)  # noqa: S603
 
 
 def _default_http_probe(url: str, headers: dict[str, str], timeout: float) -> bool:
@@ -548,13 +552,17 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
         """The claim-time fresh check bypasses is_alive(), which is where the JWE is refreshed -- so also
         re-mint here past half-TTL, else a slot the background tick hasn't refreshed recently (scheduler/
         process pause, long tick gap) is handed out with a near/already-expired token and /detonate 403s a
-        healthy worker. Refreshing at hand-out guarantees >= half-TTL remaining for the job about to run."""
+        healthy worker. Refreshing at hand-out guarantees >= half-TTL remaining for the job about to run.
+
+        Unlike the background is_alive() (best-effort refresh, don't reap a healthy IDLE slot on a transient
+        mint blip), a CLAIM-time mint failure means we'd hand /detonate a token we KNOW can't be refreshed
+        -> guaranteed 403 -> FAIL the check so the pool drops this slot and tries another / requeues."""
         alive = super().is_alive_for_claim(slot)
         if alive and slot.auth_token:
             try:
                 self._ensure_token(slot)
             except (AwsWorkerError, OSError):
-                pass   # best-effort; a real failure surfaces at detonate
+                return False   # un-refreshable token at hand-out -> unusable slot (not a silent 403)
         return alive
 
     def _terminate(self, slot: AwsWorkerSlot) -> None:
@@ -725,6 +733,13 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # that never achieves the refresh. resume() force-mints a fresh JWE on claim, so the idle refresh
         # is unnecessary here. Use the base liveness (cached _running) directly.
         return AwsDisposableRuntime.is_alive(self, slot)
+
+    def is_alive_for_claim(self, slot: AwsWorkerSlot) -> bool:
+        # Also skip the base Lambda claim-time refresh: a claimed slot is usually PARKED (mint needs
+        # RUNNING -> always fails), and resume() force-mints a fresh JWE on wake AFTER the claim. Failing
+        # the claim on a mint error (the base override) would reap EVERY parked warm slot before resume()
+        # could wake it -> destroys the tier. Use the base liveness (fresh describe, no token touch).
+        return AwsDisposableRuntime.is_alive_for_claim(self, slot)
 
     def reap(self, slot: AwsWorkerSlot) -> None:
         self._desc_cache.pop(slot.slot_id, None)

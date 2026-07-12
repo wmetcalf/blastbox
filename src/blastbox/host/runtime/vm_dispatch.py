@@ -680,6 +680,14 @@ def build_remote_vm_dispatcher(
     if _cleanup_to is None:
         _cleanup_to = getattr(pool.runtime, "cli_timeout_s", None)
     _cleanup_budget = float(_cleanup_to) if _cleanup_to is not None else 0.0
+    # Post-read HOST sealing runs INSIDE the watchdog AFTER detonate_remote's network read may have
+    # consumed the whole worker_timeout_s: _safe_extract_tar (write up to max_total_artifact_bytes) +
+    # output_trust re-SHA-256 of every artifact + validate_envelope. It's CPU/disk-bound and scales with
+    # the artifact cap; it must NOT borrow from _cleanup_budget (sized for the terminate; 0 on recycle-only
+    # VM/static tiers), else a slow-but-VALID job is watchdog-FAILED during sealing. Base covers parse +
+    # small-file overhead; ~50MB/s floor covers the extract-write + hash-read passes. Cap may be None
+    # (unbounded) -> base only. This is purely additive; the transport still bounds the network read.
+    _seal_slack = 30.0 + (max_output_bytes or 0) / (50 * 1024 * 1024)
     # DoS backstops for the untrusted worker tar, BEFORE the host trust gate parses/validates it:
     # a member (inode) cap ~ the artifact ceiling (+slack for metadata.json/control files), and a
     # metadata.json size cap so a huge JSON isn't parsed before max_metadata_bytes is enforced.
@@ -841,6 +849,7 @@ def build_remote_vm_dispatcher(
         validate_timeout_s=(warm_claim_timeout_s
                             + (float(_resume_to) if _resume_to is not None else 0.0)
                             + worker_timeout_s
+                            + _seal_slack
                             + _cleanup_budget),
         # sole_owner recovers a claim that crashed in the tiny window BETWEEN claim and the
         # worker_runtime="warm" stamp -- but it makes maintenance FAIL any stale RUNNING job for this

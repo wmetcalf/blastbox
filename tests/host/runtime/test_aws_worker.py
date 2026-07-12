@@ -525,6 +525,48 @@ def test_lambda_is_alive_for_claim_refreshes_token():
     assert mints1 == mints0 + 1                         # re-minted at hand-out
 
 
+def test_lambda_claim_fails_when_token_unrefreshable():
+    # O2: at CLAIM time an un-refreshable JWE means /detonate would 403 -> the claim check must FAIL so the
+    # pool drops the slot, rather than hand out a known-bad credential (unlike the best-effort background poll).
+    rt, _ = _lambda_rt({"lambda-microvms run-microvm": {"microvmId": "mv-1"},
+                        "lambda-microvms get-microvm": {"state": "running", "endpoint": "vm.example"},
+                        "lambda-microvms create-microvm-auth-token": _cp(rc=254, stderr="mint failed")})
+    slot = rt._launch()
+    slot.auth_token = "AGED"
+    slot.token_minted_at = -1e9        # far past half-TTL -> _ensure_token re-mints (and fails)
+    assert rt.is_alive_for_claim(slot) is False   # un-refreshable token -> unusable slot
+
+
+def test_snapstart_claim_does_not_fail_on_parked_token():
+    # O2: SnapStart parked slots can't mint (needs RUNNING) and resume() re-mints on wake -> claim must NOT
+    # fail them on a mint error (the base override would), which would reap every parked slot before resume.
+    rt, fake = _snapstart_rt({
+        "lambda-microvms get-microvm": {"state": "suspended"},   # parked -> alive via the base whitelist
+        "lambda-microvms create-microvm-auth-token": _cp(rc=254, stderr="not running"),
+    }, probe=lambda u, h, t: True)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="mv-1")
+    slot.auth_token = "STALE"
+    assert rt.is_alive_for_claim(slot) is True   # base check (suspended alive), no token touch
+    assert sum(1 for k, _ in fake.calls if k == "lambda-microvms create-microvm-auth-token") == 0  # no doomed mint
+
+
+def test_default_aws_runner_disables_pager(monkeypatch):
+    # O3: AWS_PAGER="" must be set (with os.environ spread so creds survive) so noninteractive JSON never
+    # routes through a pager -> no spawn/reap hang or non-JSON parse.
+    import blastbox.host.runtime.aws_worker as awm
+    captured = {}
+
+    def fake_run(argv, **kw):  # noqa: ANN001
+        captured["env"] = kw.get("env")
+        return _cp(stdout="{}")
+
+    monkeypatch.setattr(awm.subprocess, "run", fake_run)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "sentinel")
+    awm._default_aws_runner(["aws", "sts", "get-caller-identity"], 5.0)
+    assert captured["env"]["AWS_PAGER"] == ""                    # pager disabled
+    assert captured["env"]["AWS_ACCESS_KEY_ID"] == "sentinel"    # creds preserved (os.environ spread)
+
+
 def test_is_alive_for_claim_bypasses_liveness_cache():
     # a slot cached-alive by a background tick but terminated by AWS since must read DEAD at claim time,
     # so the pool drops it instead of handing a dead worker to a user job.
