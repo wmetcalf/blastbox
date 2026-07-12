@@ -308,6 +308,41 @@ def test_default_open_does_not_follow_worker_redirects():
         srv.shutdown()
 
 
+def test_health_probes_do_not_follow_worker_redirects():
+    # H1 (security): BOTH health-probe paths (aws_worker._default_http_probe + remote_http.make_tls_probe)
+    # must fail closed on a worker's /healthz 3xx, like /detonate -- else they re-send X-aws-proxy-auth
+    # (the shared EC2/static agent_token or a Lambda JWE) to the Location and a 2xx there falsely = READY.
+    import http.server
+    import threading
+    from blastbox.host.runtime.aws_worker import _default_http_probe
+    from blastbox.host.runtime.remote_http import make_tls_probe
+    leaked = {}
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/steal":                       # the redirect target -- must never be reached
+                leaked["auth"] = self.headers.get("X-aws-proxy-auth")
+                self.send_response(200)
+            else:
+                self.send_response(302)
+                self.send_header("Location", "/steal")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_address[1]}/healthz"
+        for probe in (_default_http_probe, make_tls_probe(None)):
+            leaked.clear()
+            assert probe(url, {"X-aws-proxy-auth": "SECRET"}, 5.0) is False   # redirect -> not ready
+            assert "auth" not in leaked                                        # token NOT leaked to /steal
+    finally:
+        srv.shutdown()
+
+
 def test_extracted_artifacts_forced_0644_under_restrictive_umask(tmp_path):
     # G5: a restrictive process umask (e.g. 077) must not mask extracted artifacts to 0600 -- the API
     # process (a different UID in a serve+dispatch split) has to read them. fchmod forces the exact mode.

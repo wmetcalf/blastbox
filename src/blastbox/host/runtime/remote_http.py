@@ -110,7 +110,10 @@ def make_tls_probe(ssl_context: ssl.SSLContext | None) -> Callable[[str, dict, f
     def probe(url: str, headers: dict, timeout: float) -> bool:
         req = urllib.request.Request(url, headers=headers, method="GET")  # noqa: S310 (host-built url)
         try:
-            with urllib.request.urlopen(req, timeout=timeout, context=ssl_context) as resp:  # noqa: S310
+            # no-redirect opener: a worker answering /healthz with a 3xx must NOT be followed (it would
+            # re-send X-aws-proxy-auth to the Location -- and on a downgrade to http:// the mTLS context
+            # wouldn't apply, so the token would go out in the clear). A 3xx -> HTTPError -> False below.
+            with _default_open(req, timeout, context=ssl_context) as resp:
                 return 200 <= resp.status < 300
         except (urllib.error.URLError, TimeoutError, OSError, ValueError):
             return False

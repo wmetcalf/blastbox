@@ -584,7 +584,15 @@ class VmJobDispatcher:
                 ex.submit(self._worker_loop)
             if self._maintenance_interval_s > 0:
                 ex.submit(self._maintenance_loop)
-            self._stop.wait()
+            try:
+                self._stop.wait()
+            finally:
+                # Release the worker/maintenance loops BEFORE the ThreadPoolExecutor's __exit__ joins them.
+                # A KeyboardInterrupt out of _stop.wait() would otherwise deadlock: __exit__ waits for the
+                # loops, but the loops only exit once _stop is set -- which the caller's `except` can't do
+                # until run() returns. Setting it here (idempotent on a normal stop()) breaks that cycle,
+                # so the interrupt propagates to the CLI where vm.stop()/pool.stop() reap live cloud slots.
+                self._stop.set()
 
     def stop(self, *_: object) -> None:
         self._stop.set()
@@ -659,6 +667,13 @@ def build_remote_vm_dispatcher(
                        "BLASTBOX_LAMBDA_SNAPSTART_RESUME_TIMEOUT_S below BLASTBOX_WORKER_TIMEOUT_S so a "
                        "slow resume can't outlast the job budget and leak a live slot", float(_resume_to),
                        worker_timeout_s)
+    # Disposable AWS tiers have no recycle(), so make_remote_validate's finally release() runs a
+    # SYNCHRONOUS terminate-instances/terminate-microvm (bounded by the aws-cli timeout) BEFORE validate()
+    # returns -- i.e. INSIDE the heartbeat watchdog. Budget that cleanup too, else a job that used most of
+    # worker_timeout_s gets watchdog-killed (marked FAILED) while terminating, after its output was already
+    # received + trusted.
+    _cleanup_to = getattr(getattr(pool.runtime, "cfg", None), "cli_timeout_s", None)
+    _cleanup_budget = float(_cleanup_to) if _cleanup_to is not None else 0.0
     # DoS backstops for the untrusted worker tar, BEFORE the host trust gate parses/validates it:
     # a member (inode) cap ~ the artifact ceiling (+slack for metadata.json/control files), and a
     # metadata.json size cap so a huge JSON isn't parsed before max_metadata_bytes is enforced.
@@ -778,11 +793,14 @@ def build_remote_vm_dispatcher(
         sanitize_params=sanitize,
         fixed_net_policy=getattr(engine_spec, "net_policy", None),   # enforce egress personality
         # the parent heartbeat watchdog must cover the bounded claim WAIT + the in-claim RESUME (snapstart/
-        # hibernate wake, up to the tier's resume_timeout_s) + the full detonation budget, so a slot claimed
-        # late and slow to wake still gets its whole worker_timeout_s to run instead of being killed mid-run.
+        # hibernate wake, up to the tier's resume_timeout_s) + the full detonation budget + the synchronous
+        # post-job cleanup terminate (disposable AWS tiers, up to cli_timeout_s), so a slot claimed late,
+        # slow to wake, or slow to terminate still gets its whole worker_timeout_s to run without a
+        # post-success watchdog kill.
         validate_timeout_s=(warm_claim_timeout_s
                             + (float(_resume_to) if _resume_to is not None else 0.0)
-                            + worker_timeout_s),
+                            + worker_timeout_s
+                            + _cleanup_budget),
         # sole_owner recovers a claim that crashed in the tiny window BETWEEN claim and the
         # worker_runtime="warm" stamp -- but it makes maintenance FAIL any stale RUNNING job for this
         # engine, which would clobber a COLD dispatcher's live jobs if one shares the store. Default OFF

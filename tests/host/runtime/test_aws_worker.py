@@ -534,6 +534,15 @@ def test_ec2_self_terminate_bool_spellings():
     assert Ec2Config.from_env({"BLASTBOX_EC2_AMI": "ami-x"}.get).self_terminate is True   # unset -> ON
 
 
+def test_snapstart_auto_resume_off_disables():
+    # H4: "off"/"Off"/"OFF" must disable AWS platform auto-resume (parity with self_terminate); default ON.
+    for val in ("off", " Off ", "OFF"):
+        cfg = LambdaSnapStartConfig.from_env({"BLASTBOX_LAMBDA_SNAPSTART_AUTO_RESUME": val,
+                                              "BLASTBOX_LAMBDA_IMAGE": "arn:img"}.get)
+        assert cfg.auto_resume is False, val
+    assert LambdaSnapStartConfig.from_env({"BLASTBOX_LAMBDA_IMAGE": "arn:img"}.get).auto_resume is True
+
+
 def test_ec2_config_from_env_defaults_arm():
     cfg = Ec2Config.from_env({"BLASTBOX_EC2_AMI": "ami-x"}.get)
     assert cfg.image_id == "ami-x"

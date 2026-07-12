@@ -63,9 +63,13 @@ def _default_aws_runner(argv: Sequence[str], timeout: float) -> subprocess.Compl
 
 def _default_http_probe(url: str, headers: dict[str, str], timeout: float) -> bool:
     """GET ``url`` with ``headers``; True iff a 2xx comes back within ``timeout``."""
+    from blastbox.host.runtime.remote_http import _default_open   # no-redirect opener (no import cycle)
     req = urllib.request.Request(url, headers=headers, method="GET")  # noqa: S310 (url is host-built)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        # NEVER follow a worker-chosen 3xx on /healthz: it would re-send X-aws-proxy-auth (the shared
+        # EC2/static agent_token, or a Lambda JWE) to the Location + SSRF-GET, and a 2xx there would
+        # falsely mark the slot READY. A redirect -> HTTPError -> not-ready (False) below.
+        with _default_open(req, timeout) as resp:
             return 200 <= resp.status < 300
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
         return False
@@ -601,7 +605,7 @@ class LambdaSnapStartConfig(LambdaMicroVmConfig):
             max_idle_duration_s=int(_env(get, "BLASTBOX_LAMBDA_SNAPSTART_IDLE_S", "120") or "120"),
             suspended_duration_s=int(_env(get, "BLASTBOX_LAMBDA_SNAPSTART_SUSPENDED_TTL_S", "3600") or "3600"),
             auto_resume=(_env(get, "BLASTBOX_LAMBDA_SNAPSTART_AUTO_RESUME", "1") or "1").strip().lower()
-                        not in ("0", "false", "no"),
+                        not in ("0", "false", "no", "off"),   # "off" must disable too (parity w/ self_terminate)
             resume_timeout_s=float(_env(get, "BLASTBOX_LAMBDA_SNAPSTART_RESUME_TIMEOUT_S", "60") or "60"),
             resume_poll_s=float(_env(get, "BLASTBOX_LAMBDA_SNAPSTART_RESUME_POLL_S", "1") or "1"),
         )

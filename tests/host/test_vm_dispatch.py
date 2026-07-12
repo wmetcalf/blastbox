@@ -464,6 +464,42 @@ def test_remote_all_stale_resume_slots_requeues_not_fails(tmp_path):
         vm._validate(tmp_path / "in.bin")          # resume-failure window -> requeue, not fail
 
 
+def test_run_sets_stop_on_interrupt_so_executor_can_join(tmp_path):
+    # H2: a KeyboardInterrupt out of run()'s _stop.wait() must set _stop in a finally BEFORE the
+    # ThreadPoolExecutor joins the worker loops -- else the loops (which spin on _stop) never exit and the
+    # join deadlocks, so the CLI's vm.stop()/pool.stop() never reap live cloud slots. Assert _stop ends up
+    # set and run() returns (doesn't hang).
+    store = InMemoryJobStore()
+    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), engine="authenticode", concurrency=1)
+    orig_wait = d._stop.wait
+
+    def fake_wait(timeout=None):
+        if timeout is None:            # the run() main-thread block == the interrupt point
+            raise KeyboardInterrupt
+        return orig_wait(timeout)      # worker/maintenance loop backoffs
+
+    d._stop.wait = fake_wait           # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        d.run()
+    assert d._stop.is_set()            # set in the finally -> loops exit, executor joins, no deadlock
+
+
+def test_remote_watchdog_includes_cleanup_budget(tmp_path):
+    # H3: the watchdog must also cover the SYNCHRONOUS post-job terminate (disposable tiers release() in
+    # make_remote_validate's finally, bounded by cli_timeout_s), else a job that used most of
+    # worker_timeout_s is watchdog-killed while terminating -- after its output was received + trusted.
+    from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+    pool = SimpleNamespace(
+        runtime=SimpleNamespace(ssl_context=None,
+                                cfg=SimpleNamespace(resume_timeout_s=180.0, cli_timeout_s=120.0)),
+        claim=lambda *, timeout_s: None, release=lambda s, dirty=False: None)
+    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
+                                    tier="aws-lambda-snapstart", engine="clippyshot", limits=_FAKE_LIMITS,
+                                    worker_timeout_s=300.0, warm_claim_timeout_s=60.0)
+    # 60 claim + 180 resume + 300 detonate + 120 cleanup
+    assert vm._validate_timeout_s == pytest.approx(660.0)
+
+
 def test_remote_factory_requires_limits_and_engine(tmp_path):
     # G1/G2: the trust-gated remote path PRESERVES worker metadata, so it must fail closed without the
     # host trust gate's inputs -- limits (caps/hashes) and an exact engine to match the envelope against.
