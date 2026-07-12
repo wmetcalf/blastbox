@@ -1067,6 +1067,11 @@ def test_ec2_self_terminate_ttl_injected():
     # CEILING, not floor: a non-minute budget must never schedule the shutdown BEFORE max_duration_s.
     assert "shutdown -h +2" in _userdata_with_self_terminate(None, 119)   # 119s -> 2min (not 1)
     assert "shutdown -h +1" in _userdata_with_self_terminate(None, 60)    # exact minute stays 1
+    # A misconfigured <=0 duration must still ARM a backstop (never emit an invalid negative timer that
+    # silently fails to fire) -- both branches clamp to a positive minimum.
+    assert "systemd-run --on-active=1s" in _userdata_with_self_terminate(None, -5, uptime=True)
+    assert "systemd-run --on-active=1s" in _userdata_with_self_terminate(None, 0, uptime=True)
+    assert "shutdown -h +1" in _userdata_with_self_terminate(None, -5)
 
     ud = base64.b64encode(b"#!/bin/bash\nstart-agent\n").decode()
     cfg = Ec2Config(region="us-east-1", image_id="ami-x", user_data_b64=ud, max_duration_s=1800)

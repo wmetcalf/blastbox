@@ -219,7 +219,8 @@ def _userdata_with_self_terminate(raw: str | None, max_duration_s: int, *, uptim
     from email.mime.text import MIMEText
 
     if uptime:
-        ttl_body = f"#!/bin/sh\nsystemd-run --on-active={int(max_duration_s)}s /sbin/shutdown -h now\n"
+        seconds = max(1, int(max_duration_s))   # clamp: a misconfigured <=0 must still ARM the backstop,
+        ttl_body = f"#!/bin/sh\nsystemd-run --on-active={seconds}s /sbin/shutdown -h now\n"
     else:
         minutes = max(1, -(-max_duration_s // 60))   # ceiling: never schedule the backstop BEFORE the budget
         ttl_body = f"#!/bin/sh\nshutdown -h +{minutes}\n"
