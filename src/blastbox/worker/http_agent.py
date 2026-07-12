@@ -100,6 +100,32 @@ class _SlowBody(Exception):
     flight job lock -- one slow uploader must not take the worker out of service (every other job 409s)."""
 
 
+_HARD_EXIT = os._exit   # injectable seam: tests override this to avoid killing the test runner
+
+
+def _hard_deadline_s(limits: Limits) -> float:
+    """Hard wall-clock ceiling for ONE detonation, strictly > the engine's own ``timeout_s`` so a normal
+    job never trips it. An explicit ``BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S`` wins (0/negative disables the
+    watchdog); else 2x the per-job timeout + 30s slack."""
+    override = os.environ.get("BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S")
+    if override is not None:
+        return max(0.0, float(override))
+    return float(limits.timeout_s) * 2.0 + 30.0
+
+
+def _on_hard_deadline(hard_s: float) -> None:
+    # A hung engine (in-process infinite loop / a child ignoring its own timeout) holds _JOB_LOCK forever:
+    # /healthz stays 200 but every /detonate 409s -- a black hole on a reused static/warm box. A Python
+    # thread can't be killed and a per-job subprocess would forfeit engine warmth, so RETIRE the whole
+    # worker; the supervisor / warm pool replaces the box (its /healthz stops answering -> fail-closed).
+    _log.critical("http_agent: detonation exceeded the %.0fs hard deadline -- retiring the worker (a hung "
+                  "engine can't be killed in-thread); the supervisor/pool will replace it", hard_s)
+    with contextlib.suppress(Exception):
+        import faulthandler
+        faulthandler.dump_traceback()
+    _HARD_EXIT(75)
+
+
 class _Handler(BaseHTTPRequestHandler):
     engine: Engine = None  # type: ignore[assignment]  # set on the server
     token: str | None = None
@@ -258,8 +284,20 @@ class _Handler(BaseHTTPRequestHandler):
                 # render tunables, ...) forwarded via X-Blastbox-Params actually take effect -- reading
                 # them before _job_env would pin Limits to the worker-image defaults (sealed egress).
                 limits = Limits.from_env()
-                rc = run_detonation(self.engine, input_path=in_path, output_dir=out_dir,
-                                    limits=limits)
+                # AGENT-side hard-deadline backstop, armed ONLY around the detonation (the body is already
+                # read, so a slow uploader -- handled by _SlowBody -- can't trip it): a hung engine would
+                # otherwise pin _JOB_LOCK forever. The deadline is strictly > the engine's own timeout, so
+                # a normal job cancels the timer well before it fires and _HARD_EXIT is never called.
+                _hard_s = _hard_deadline_s(limits)
+                _wd = threading.Timer(_hard_s, _on_hard_deadline, args=(_hard_s,)) if _hard_s > 0 else None
+                if _wd is not None:
+                    _wd.daemon = True
+                    _wd.start()
+                try:
+                    rc = run_detonation(self.engine, input_path=in_path, output_dir=out_dir, limits=limits)
+                finally:
+                    if _wd is not None:
+                        _wd.cancel()
             if rc != 0:
                 # harness could not seal metadata.json -- surface as a job failure, not a silent 200
                 raise RuntimeError(f"harness failed (rc={rc}); metadata.json not sealed")
@@ -282,13 +320,19 @@ class _Handler(BaseHTTPRequestHandler):
                 # burns worker memory/CPU before file_cap could fire. Collect regular files lazily, stop at
                 # the cap, then sort the bounded set for a deterministic tar layout.
                 candidates: list = []
+                entries = 0
                 for f in out_dir.rglob("*"):
+                    # count EVERY entry (dirs/symlinks/non-files too) BEFORE the non-file skip, so a
+                    # directory-bomb out_dir (many empty dirs, few files) can't walk the whole tree under
+                    # _JOB_LOCK without tripping the cap -- mirrors the extraction-side header count. file_cap
+                    # = max_artifacts + 16, so a handful of legit subdirs are absorbed by the slack.
+                    entries += 1
+                    if file_cap is not None and entries > file_cap:
+                        spool.close()
+                        raise RuntimeError(f"output exceeds {file_cap} entries")
                     if not f.is_file():
                         continue
                     candidates.append(f)
-                    if file_cap is not None and len(candidates) > file_cap:
-                        spool.close()
-                        raise RuntimeError(f"output exceeds {file_cap} files")
                 for f in sorted(candidates):
                     # metadata.json is a control file, not a declared artifact -- don't count it toward
                     # the artifact byte budget (matches the cold trust gate + the host extractor), but DO
@@ -367,6 +411,14 @@ def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
     """Serve the engine. ``tls_cert``/``tls_key`` enable HTTPS; adding ``client_ca`` requires a
     CA-signed **client** cert (mTLS). ``allow_cidrs`` restricts which peer IPs may POST /detonate.
     ``timeout_s`` bounds a request's socket reads so a slowloris body can't hold the job lock forever."""
+    # Reject a PARTIAL TLS config here too (not just via main()'s _tls_env), so a direct serve() embedder
+    # can't pass client_ca WITHOUT a server cert/key: the ssl wrap below (`if tls_cert and tls_key`) would
+    # then be skipped and the agent would listen PLAINTEXT -- but _guard_exposure counts client_ca as an
+    # mTLS gate and would wave it through wide open. After this, a truthy client_ca implies real mTLS.
+    if bool(tls_cert) != bool(tls_key):
+        raise SystemExit("serve(): BLASTBOX_WORKER_AGENT_TLS_CERT and _TLS_KEY must be set together")
+    if client_ca and not tls_cert:
+        raise SystemExit("serve(): client_ca (mTLS) requires TLS_CERT/_TLS_KEY -- refusing to serve plaintext")
     # fail CLOSED here (not just in main()) so a programmatic embedder that calls serve() directly can't
     # listen wide open on the 0.0.0.0 default with no token/mTLS/allowlist. Idempotent with main()'s check.
     allow_insecure = (os.environ.get("BLASTBOX_WORKER_AGENT_ALLOW_INSECURE") or "").strip().lower() in (

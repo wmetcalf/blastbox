@@ -277,6 +277,7 @@ plain HTTP for a *trusted private VPC* — do not expose it to the public intern
 | `BLASTBOX_WORKER_AGENT_ALLOW_INSECURE` | `0` | Opt back into serving on a non-loopback address with **no** request gate — only when an **external** gate already fences the port (AWS microVM JWE proxy, a security group, a private worker network). Proxy-gated tiers (e.g. `aws-lambda-microvm`) that don't bake in a token must set this in the worker image env. |
 | `BLASTBOX_WORKER_AGENT_TOKEN` | — | Bearer token required on `/detonate` (`X-aws-proxy-auth` / `Authorization: Bearer`). |
 | `BLASTBOX_WORKER_AGENT_MAX_BYTES` | `512MiB` | Max request body. |
+| `BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S` | `2×timeout+30` | Hard ceiling for one detonation; a hung engine that blows past it **retires the worker** (`os._exit`, the supervisor/pool replaces the box) so it can't hold the single-flight lock forever. Defaults to twice the per-job `timeout_s` + 30s (never trips a normal job); `0` disables. |
 | `BLASTBOX_WORKER_AGENT_TLS_CERT` / `_TLS_KEY` | — | Serve **HTTPS** with this server cert/key (mint via `blastbox pki issue-server`). |
 | `BLASTBOX_WORKER_AGENT_CLIENT_CA` | — | Require a **client** cert signed by this CA (**mTLS**) — the cryptographic allowed-caller gate. |
 | `BLASTBOX_WORKER_AGENT_ALLOW_CIDRS` | — | Comma-list of CIDRs allowed to POST `/detonate` (peer-IP allowlist; 403 otherwise). Defense-in-depth with mTLS + the SG. |

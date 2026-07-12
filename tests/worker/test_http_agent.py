@@ -61,6 +61,62 @@ def test_healthz():
         httpd.server_close()
 
 
+def test_serve_rejects_partial_tls():
+    # P1: client_ca without a server cert/key would skip the TLS wrap and listen PLAINTEXT, yet the
+    # exposure guard counts client_ca as an mTLS gate -> wide open. Reject the partial config.
+    with pytest.raises(SystemExit, match="requires TLS"):
+        serve(_NoopEngine(), bind="0.0.0.0", port=0, client_ca="/ca.pem")
+    with pytest.raises(SystemExit, match="set together"):
+        serve(_NoopEngine(), bind="0.0.0.0", port=0, tls_cert="/c.pem")   # cert without key
+
+
+def test_hard_deadline_s_derivation(monkeypatch):
+    # P3: hard deadline = override if set (0 disables), else 2*timeout_s + 30 (strictly > the engine budget).
+    from blastbox.worker.http_agent import _hard_deadline_s
+    monkeypatch.delenv("BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S", raising=False)
+    assert _hard_deadline_s(Limits(timeout_s=120)) == 270.0
+    monkeypatch.setenv("BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S", "45")
+    assert _hard_deadline_s(Limits(timeout_s=120)) == 45.0
+    monkeypatch.setenv("BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S", "0")
+    assert _hard_deadline_s(Limits(timeout_s=120)) == 0.0   # disabled
+
+
+def test_hard_deadline_retires_hung_engine(monkeypatch):
+    # P3: a hung engine holding _JOB_LOCK must trip the watchdog -> the exit seam fires (os._exit in prod,
+    # retiring the box). A normal (fast) job never trips it (covered by every other passing test).
+    import blastbox.worker.http_agent as hag
+    fired = threading.Event()
+    release = threading.Event()   # the test releases the "hang" so _JOB_LOCK (module-global!) is freed
+    monkeypatch.setattr(hag, "_HARD_EXIT", lambda code: fired.set())
+    monkeypatch.setenv("BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S", "0.3")
+
+    class _Hang:
+        name = "hang"
+        formats = frozenset({"*"})
+
+        def detonate(self, input, outdir, limits):
+            release.wait(5)                 # hold the lock (simulate the hang) until the test releases
+            raise RuntimeError("released")  # then error -> 500 -> do_POST frees _JOB_LOCK
+
+    httpd = hag.serve(_Hang(), bind="127.0.0.1", port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+
+    def _do_post():
+        with contextlib.suppress(Exception):
+            _post(f"http://127.0.0.1:{port}/detonate?name=x.bin", b"MZ")   # hangs in the detonation
+
+    t = threading.Thread(target=_do_post, daemon=True)
+    t.start()
+    try:
+        assert fired.wait(3)   # the watchdog fired within the deadline (os._exit seam invoked)
+    finally:
+        release.set()          # free the hung detonation so it releases the module-global _JOB_LOCK
+        t.join(timeout=3)      # ...and wait for that unwind before other tests run
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_serve_fails_closed_on_wide_open_bind():
     # K4: serve() itself (not just main()) must fail closed, so a programmatic embedder can't listen wide
     # open on the 0.0.0.0 default with no token/mTLS/allowlist.
@@ -173,6 +229,37 @@ def test_slow_body_returns_408():
             resp = s.recv(4096)
         s.close()
         assert b" 408 " in resp            # slow_body -> REQUEST_TIMEOUT, not held open forever
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_dir_bomb_trips_entry_cap(monkeypatch):
+    # P2: a directory bomb (many empty dirs, few files) must trip the entry cap -- the tar-build walk
+    # counts EVERY entry, so it can't enumerate the whole tree under _JOB_LOCK past the cap.
+    monkeypatch.setenv("BLASTBOX_MAX_ARTIFACTS", "3")   # file_cap = 3 + 16 = 19
+
+    class _DirBomb:
+        name = "bomb"
+        formats = frozenset({"*"})
+
+        def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
+            for i in range(50):
+                (outdir / f"d{i:02d}").mkdir()          # 50 empty dirs -> > 19 entries
+            (outdir / "page-001.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 56)
+            return DetonationResult(
+                payload=Page(index=0, dims=Dimensions(width=1.0, height=1.0, unit="px"),
+                             image=ArtifactRef(id="a0")),
+                artifacts=[DeclaredArtifact(id="a0", path="page-001.png", kind="image")],
+                detected=Detection(label="docx", mime="x", confidence=0.9, source="test"))
+
+    httpd = serve(_DirBomb(), bind="127.0.0.1", port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    try:
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post(f"http://127.0.0.1:{port}/detonate?name=x.bin", b"MZ")
+        assert ei.value.code == 500   # entry cap tripped -> job fails (500), agent stays up
     finally:
         httpd.shutdown()
         httpd.server_close()
