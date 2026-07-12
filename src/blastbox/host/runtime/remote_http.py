@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import ssl
+import time
 import tarfile
 import tempfile
 import urllib.error
@@ -64,6 +65,21 @@ class ClaimLost(RuntimeError):
     so we don't clobber the new owner's result in the shared output dir."""
 
 
+class WorkerBusy(RuntimeError):
+    """The worker agent answered /detonate with 409 (its single-flight job lock is held). Capacity
+    pressure, NOT a job failure -- the dispatcher requeues (like NoWarmSlot) instead of FAILing the job."""
+
+
+class ParamsTooLargeForRemote(RuntimeError):
+    """The forwarded per-job params serialize to a header larger than the stdlib HTTP line limit, so the
+    worker would reject the request before parsing them. Fail fast with an actionable error."""
+
+
+class RemoteReadTimeout(RuntimeError):
+    """Reading the worker's response tar exceeded the total wall-clock deadline (a trickling/broken worker
+    kept the stream open). Abort so the validate finally can release the slot instead of pinning it."""
+
+
 def _sanitized_failure(exc: Exception) -> str:
     """Map a transport/trust exception to a COARSE, non-sensitive reason for the job's error field
     (never the raw message -- it can carry hosts/paths/tokens)."""
@@ -80,11 +96,18 @@ def _sanitized_failure(exc: Exception) -> str:
     return "remote job failed"
 
 
-def _bounded_copy(src: Any, dst: Any, limit: int | None) -> int:
-    """copyfileobj that aborts once ``limit`` bytes have been read (None = unbounded)."""
+def _bounded_copy(src: Any, dst: Any, limit: int | None, deadline: float | None = None) -> int:
+    """copyfileobj that aborts once ``limit`` bytes have been read (None = unbounded). When ``deadline``
+    (a ``time.monotonic()`` value) is given, also aborts if the TOTAL wall-clock read exceeds it -- the
+    urllib socket timeout only bounds idle gaps, so a worker trickling >=1 byte per window could otherwise
+    read forever past the job budget while the abandoned validate thread pins the pool slot. Reads via
+    ``read1`` (one recv per call) when available so the deadline is re-checked promptly under a trickle."""
     total = 0
+    read = getattr(src, "read1", None) or src.read
     while True:
-        chunk = src.read(1024 * 1024)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise RemoteReadTimeout(f"remote output read exceeded the {deadline:.0f}s wall-clock deadline")
+        chunk = read(1024 * 1024)
         if not chunk:
             break
         total += len(chunk)
@@ -276,7 +299,16 @@ def detonate_remote(
         headers["X-aws-proxy-auth"] = token
         headers["X-aws-proxy-port"] = str(agent_port)
     if params:
-        headers["X-Blastbox-Params"] = json.dumps(params)
+        _encoded = json.dumps(params)
+        # a single header line has a hard stdlib limit (http.client _MAXLINE = 65536); a params set that
+        # serializes past it would be rejected by the worker's HTTP parser BEFORE _parse_params runs, an
+        # opaque failure the cold/file paths (env-passed params) don't have. Fail fast with a clear reason.
+        _line = len(b"X-Blastbox-Params: ") + len(_encoded.encode("utf-8", "surrogatepass")) + 2
+        if _line > 65536:
+            raise ParamsTooLargeForRemote(
+                f"forwarded params serialize to {_line} header bytes (> 65536); reduce the allowlisted "
+                "per-job params for the remote tier")
+        headers["X-Blastbox-Params"] = _encoded
     # STREAM the input as the request body (open file handle + explicit Content-Length) instead of
     # read_bytes() -- otherwise the dispatcher holds the whole sample in RAM per concurrent claim
     # thread, so a burst of large-but-valid uploads (raised BLASTBOX_MAX_INPUT) can OOM it before any
@@ -305,11 +337,20 @@ def detonate_remote(
     # headroom. Add ~1KiB per allowed member so a valid max-member tar isn't rejected pre-extraction.
     stream_cap = None if max_output_bytes is None else (
         int(max_output_bytes * 1.1) + (max_metadata_bytes or 0) + (max_members or 0) * 1024 + 65536)
+    read_deadline = time.monotonic() + timeout   # TOTAL wall-clock budget for the response read
     with input_path.open("rb") as body:
         req = urllib.request.Request(url, data=body, method="POST", headers=headers)
-        with opener(req, timeout, context=ssl_context) as resp, \
-                tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:
-            _bounded_copy(resp, spool, stream_cap)
+        try:
+            resp_cm = opener(req, timeout, context=ssl_context)
+        except urllib.error.HTTPError as exc:
+            # 409 = the worker's single-flight job lock is held (a stale detonation still running on a
+            # re-offered static box). Capacity pressure, NOT a job failure -> requeue like NoWarmSlot.
+            # Other 4xx/5xx are real failures and propagate.
+            if exc.code == 409:
+                raise WorkerBusy(f"worker busy (409) at {url}") from exc
+            raise
+        with resp_cm as resp, tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:
+            _bounded_copy(resp, spool, stream_cap, deadline=read_deadline)
             spool.seek(0)
             if owns is not None and not owns():   # a peer may have reclaimed during the round-trip
                 raise ClaimLost("claim lost before output extract (peer recovered the job)")
@@ -394,6 +435,10 @@ def make_remote_validate(
                     meta = json.loads(sealed.read_text())
             dirty = False
             return meta, True
+        except WorkerBusy:
+            # NOT a job failure -- the worker's lock is held by a stale detonation. Propagate so the
+            # dispatcher requeues the job (like NoWarmSlot); the finally releases this slot dirty (cooldown).
+            raise
         except Exception as exc:  # noqa: BLE001
             # transport error after the request may have reached the worker -> the box could still be
             # busy; keep dirty=True so the pool retires/recycles it instead of re-offering immediately.

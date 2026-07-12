@@ -307,6 +307,7 @@ class AwsDisposableRuntime:
         # health probe defaults to the TLS-aware one (see the select_* helpers).
         self.ssl_context = ssl_context
         self._live_cache: dict[str, tuple[float, bool]] = {}
+        self._mint_fail_at: dict[str, float] = {}   # slot_id -> last failed-token-mint time (throttle)
         # cache the READINESS get-microvm/describe-instances too (is_ready is polled ~10Hz during WARMING,
         # and its endpoint-resolution describe is uncached) so a booting slot doesn't spam the control plane.
         self._desc_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -409,6 +410,7 @@ class AwsDisposableRuntime:
     def reap(self, slot: AwsWorkerSlot) -> None:
         self._live_cache.pop(slot.slot_id, None)
         self._desc_cache.pop(slot.slot_id, None)
+        self._mint_fail_at.pop(slot.slot_id, None)
         if slot.resource_id is None:
             return
         self._terminate(slot)
@@ -698,7 +700,18 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         self._resolve_url(slot)
         if slot.url is None:
             return False
-        token = self._ensure_token(slot)
+        # THROTTLE re-minting after a failed mint: AWS can surface the stable endpoint while the microVM is
+        # still pending, but create-microvm-auth-token needs a RUNNING VM -> it fails. Without this the
+        # ~10Hz WARMING readiness poll would re-mint (and fail) every tick, storming the control plane. Skip
+        # a re-mint within one throttle window of the last failure; the probe stays the readiness gate.
+        throttle = max(self.cfg.resume_poll_s, 1.0)
+        if slot.auth_token is None and (self._clock() - self._mint_fail_at.get(slot.slot_id, -1e18)) < throttle:
+            return False
+        try:
+            token = self._ensure_token(slot)
+        except (AwsWorkerError, OSError):
+            self._mint_fail_at[slot.slot_id] = self._clock()   # not runnable yet -> back off the mint API
+            return False
         url = slot.url.rstrip("/") + self.cfg.agent_health_path
         headers = {"X-aws-proxy-auth": token, "X-aws-proxy-port": str(self.cfg.agent_port)}
         return self._probe(url, headers, self.cfg.probe_timeout_s)

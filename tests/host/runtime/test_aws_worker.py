@@ -173,6 +173,22 @@ def test_snapstart_resume_wakes_and_refreshes():
     assert slot.auth_token == "jwe"                       # fresh token, not STALE
 
 
+def test_snapstart_warmup_throttles_failing_token_mint():
+    # M2: AWS can surface the stable endpoint while a SnapStart slot is still pending, but minting needs a
+    # RUNNING VM -> it fails. The ~10Hz readiness poll must NOT re-mint (and fail) every tick -- throttle it.
+    clk = {"t": 100.0}
+    rt, fake = _snapstart_rt({
+        "lambda-microvms get-microvm": {"state": "pending", "endpoint": "vm.example"},   # endpoint pre-running
+        "lambda-microvms create-microvm-auth-token": _cp(rc=254, stderr="microvm not running"),
+    }, probe=lambda u, h, t: True, clock=lambda: clk["t"])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="mv-1")
+    for _ in range(10):                    # 10 ticks 0.1s apart (~1s); throttle window = max(poll,1.0)=1.0
+        assert rt.is_ready(slot) is False  # mint fails (pending) -> not ready
+        clk["t"] += 0.1
+    mints = sum(1 for k, _ in fake.calls if k == "lambda-microvms create-microvm-auth-token")
+    assert mints <= 2   # throttled to ~1 per window, NOT one per readiness tick (10)
+
+
 def test_snapstart_resume_remints_token_after_wake():
     # I4: a JWE minted while the slot is PARKED is invalid; after resume-microvm the next probe must
     # re-mint an awake token. Model: 1st mint 'jwe-parked' (probe rejects), post-resume mint 'jwe-awake'

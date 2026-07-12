@@ -464,6 +464,74 @@ def test_detonate_remote_fences_destructive_ops_on_lost_claim(tmp_path):
     assert (out / "peer.png").read_bytes() == b"peer artifact"   # NOT wiped / clobbered
 
 
+def test_detonate_remote_read_deadline_aborts_trickle(tmp_path, monkeypatch):
+    # M1: a worker trickling the response past the timeout must ABORT (RemoteReadTimeout), not hang -- else
+    # the abandoned validate thread pins the pool slot forever (availability DoS).
+    from blastbox.host.runtime.remote_http import RemoteReadTimeout
+    (tmp_path / "in.bin").write_bytes(b"z")
+
+    class _Trickle:
+        def read(self, n=-1):
+            return b"x"                    # never EOFs
+        read1 = read
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr("blastbox.host.runtime.remote_http.time.monotonic", lambda: clock["t"])
+
+    def opener(req, timeout, context=None):
+        clock["t"] = timeout + 1           # jump past the read deadline before the first chunk check
+        return _Trickle()
+
+    with pytest.raises(RemoteReadTimeout):
+        detonate_remote("http://h:8765", tmp_path / "in.bin", tmp_path / "out",
+                        http_open=opener, timeout=5, max_output_bytes=1000)
+
+
+def test_detonate_remote_rejects_oversized_params(tmp_path):
+    # M3: a params set that serializes past the stdlib header-line limit must fail fast BEFORE the round-trip
+    # (else the worker rejects the request opaquely at the HTTP parser).
+    from blastbox.host.runtime.remote_http import ParamsTooLargeForRemote
+    (tmp_path / "in.bin").write_bytes(b"z")
+    big = {f"K{i:03d}": "A" * 4000 for i in range(20)}   # ~80 KB > 65536
+    called = {"n": 0}
+
+    def opener(req, timeout, context=None):
+        called["n"] += 1
+        return _Resp(b"")
+
+    with pytest.raises(ParamsTooLargeForRemote):
+        detonate_remote("http://h:8765", tmp_path / "in.bin", tmp_path / "out",
+                        http_open=opener, params=big, max_output_bytes=1000)
+    assert called["n"] == 0   # rejected before any network round-trip
+
+
+def test_worker_busy_409_requeues_not_fails(tmp_path):
+    # M4: a 409 (worker's single-flight lock held by a stale detonation) is capacity pressure -> WorkerBusy
+    # propagates (dispatcher requeues) and the slot is released DIRTY, not treated as a job failure.
+    import io
+    import urllib.error
+    from blastbox.host.runtime.remote_http import WorkerBusy, make_remote_validate
+    (tmp_path / "in.docx").write_bytes(b"z")
+    slot = SimpleNamespace(url="http://x", ip=None, auth_token=None, agent_port=8765)
+    released = []
+
+    def opener(req, timeout, context=None):
+        raise urllib.error.HTTPError(req.full_url, 409, "busy", {}, io.BytesIO(b'{"error":"busy"}'))
+
+    validate = make_remote_validate(
+        claim=lambda: slot, release=lambda s, dirty=False: released.append(dirty),
+        output_dir_for=lambda p: tmp_path / "out", http_open=opener)
+    with pytest.raises(WorkerBusy):
+        validate(tmp_path / "in.docx")
+    assert released == [True]   # busy box released dirty (cooldown); the job requeues
+
+
 def test_detonate_remote_streams_input_with_content_length(tmp_path):
     # the input is streamed (open file handle + Content-Length), not read fully into memory.
     inp = tmp_path / "in.bin"
