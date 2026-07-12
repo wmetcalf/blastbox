@@ -195,10 +195,12 @@ def enforce_allowed_runtimes(engines: Mapping[str, "EngineSpec"], tier: str) -> 
     for name, spec in engines.items():
         allowed = spec.allowed_runtimes
         if allowed is not None and tier not in allowed:
+            # env-var form normalizes name like _parse_engine_specs (upper + hyphen→underscore)
+            env_name = name.upper().replace("-", "_")
             raise ValueError(
                 f"engine {name!r} is not permitted on the {tier!r} tier "
                 f"(allowed_runtimes={sorted(allowed)}); refusing to start — set "
-                f"BLASTBOX_ENGINE_{name.upper()}_ALLOWED_RUNTIMES to include {tier!r} "
+                f"BLASTBOX_ENGINE_{env_name}_ALLOWED_RUNTIMES to include {tier!r} "
                 f"if this dispatcher should run it, or point BLASTBOX_POOL_RUNTIME at an allowed tier"
             )
 

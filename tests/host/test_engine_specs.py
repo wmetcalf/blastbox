@@ -94,6 +94,22 @@ def test_allowed_runtimes_from_env_normalized(monkeypatch):
     assert specs["clippyshot"].allowed_runtimes == frozenset({"cold", "firecracker", "gvisor"})
 
 
+def test_allowed_runtimes_set_but_empty_is_unset(monkeypatch):
+    # SET-but-empty (the `${VAR:-}` compose idiom) -> None (any tier), NOT an empty set that would
+    # make the engine unrunnable on every tier. Differs deliberately from allowed_param_keys.
+    for empty in ("", "   ", ",  ,"):
+        monkeypatch.setenv("BLASTBOX_ENGINE_CLIPPYSHOT_ALLOWED_RUNTIMES", empty)
+        specs = _parse_engine_specs("clippyshot=img:t")
+        assert specs["clippyshot"].allowed_runtimes is None, repr(empty)
+
+
+def test_enforce_allowed_runtimes_error_names_normalized_env_var():
+    # Hyphenated engine name -> the suggested env var must normalize '-' to '_' (a shell-valid name).
+    engines = {"test-engine": EngineSpec("test-engine", "img:t", [], allowed_runtimes=frozenset({"cold"}))}
+    with pytest.raises(ValueError, match="BLASTBOX_ENGINE_TEST_ENGINE_ALLOWED_RUNTIMES"):
+        enforce_allowed_runtimes(engines, "gvisor")
+
+
 def test_allowed_runtimes_unknown_tier_raises(monkeypatch):
     # A typo'd/unknown tier name is a config error, not a silently-dropped entry (dropping could
     # leave the set permitting an unintended tier). Fail loudly at parse time.
