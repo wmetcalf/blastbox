@@ -27,10 +27,10 @@ _ENV_MAP = {
 
 # Fields that need non-int coercion from env strings.
 _ENV_COERCE: dict[str, Callable[[str], object]] = {
-    "disclose_security_internals": lambda s: s.strip().lower() not in ("0", "false", "no", "off"),
-    # net_egress is FAIL-CLOSED: only an explicit truthy token opens egress, so a typo or an
-    # unexpected value can never silently net-share an untrusted worker (unlike the permissive
-    # not-in-falsey style above).
+    # Both are SECURITY flags, so both are FAIL-CLOSED: only an explicit truthy token turns them on,
+    # so a typo / whitespace / unexpected value can never silently disclose security internals nor
+    # net-share an untrusted worker. (disclose_security_internals: True = MORE disclosure.)
+    "disclose_security_internals": lambda s: s.strip().lower() in ("1", "true", "yes", "on"),
     "net_egress": lambda s: s.strip().lower() in ("1", "true", "yes", "on"),
 }
 
