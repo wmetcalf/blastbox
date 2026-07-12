@@ -782,6 +782,7 @@ def build_remote_vm_dispatcher(
     # installed on this path -- trust_output_metadata=True is never set without it.
     def output_trust(input_path: Path, out_dir: Path, expected_sha: str | None,
                      owns: Callable[[], bool] | None = None) -> None:
+        from blastbox.errors import EngineErrorEnvelope
         from blastbox.host.trust import OutputTrustError, validate_worker_output
         # Compare the worker's sealed envelope against the AUTHORITATIVE ingress-recorded input SHA
         # (job.input_sha256), matching the cold/file-warm paths -- so a staged input that was
@@ -797,8 +798,11 @@ def build_remote_vm_dispatcher(
         env = validate_worker_output(output_dir=out_dir, input_sha256=expected_sha,
                                      engine=engine, limits=limits)
         if env.status == "engine_error":
+            # the envelope VALIDATED (structure/hashes/input-sha) -> a healthy worker, a failed SAMPLE.
+            # Distinct exception so the transport can release the slot clean (a malformed/unvalidatable
+            # envelope raised a plain OutputTrustError above and stays dirty).
             detail = env.warnings[0].message if env.warnings else "engine_error"
-            raise OutputTrustError(f"engine_error: {detail}")
+            raise EngineErrorEnvelope(f"engine_error: {detail}")
         # Fence the metadata WRITE by claim ownership: if this (possibly long) remote attempt
         # outlived its claim and a peer recovered the job, DON'T overwrite the new owner's
         # metadata.json in the shared output dir. Raise -> job fails for this stale attempt, slot
@@ -824,10 +828,11 @@ def build_remote_vm_dispatcher(
         trust_output_metadata=True,   # preserve the host-sealed metadata.json the validator wrote
         sanitize_params=sanitize,
         fixed_net_policy=_resolved_net_policy,   # enforce against the RESOLVED (fail-closed) egress, not raw
-        # source the job's DEFAULT policy from the SAME spec, not just the env: else a programmatic caller
-        # that sets engine_spec.net_policy without also exporting BLASTBOX_ENGINE_<NAME>_NETPOLICY gets a
-        # fixed policy the per-job default ("none") never matches -> every untargeted job is rejected.
-        engine_net_policy=getattr(engine_spec, "net_policy", None),
+        # the job's DEFAULT policy must ALSO be the RESOLVED name, matching fixed_net_policy + the worker's
+        # actual egress: a malformed/undeclared BLASTBOX_NETPOLICY_* fails closed to "none" (worker sealed),
+        # so an untargeted job should run SEALED (effective "none" == fixed "none"), as resolve_net_policy
+        # intends -- NOT be rejected (raw "inspect" != "none"). In the normal case resolved == raw.
+        engine_net_policy=_resolved_net_policy,
         # the parent heartbeat watchdog must cover the bounded claim WAIT + the in-claim RESUME (snapstart/
         # hibernate wake, up to the tier's resume_timeout_s) + the full detonation budget + the synchronous
         # post-job cleanup terminate (disposable AWS tiers, up to cli_timeout_s), so a slot claimed late,

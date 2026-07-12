@@ -584,18 +584,66 @@ def test_open_bounded_deadline():
                          _time.monotonic() + 5) == "ok"   # a fast opener returns its value
 
 
-def test_engine_error_releases_slot_clean(tmp_path):
-    # N3: a SEALED engine_error is a clean completion (agent healthy, lock free) -> release the slot CLEAN,
-    # so a client feeding malformed samples can't quarantine the static fleet into cooldown.
+def test_open_bounded_timeout_thread_is_daemon():
+    # #3: a timed-out opener must run in a DAEMON thread so it never blocks process exit (a non-daemon
+    # executor thread abandoned with wait=False would).
+    import threading
+    import time as _time
+    from blastbox.host.runtime.remote_http import RemoteReadTimeout, _open_bounded
+    before = set(threading.enumerate())
+    ev = threading.Event()
+
+    def slow(req, timeout, context=None):
+        ev.wait(2)
+        return "late"
+
+    try:
+        with pytest.raises(RemoteReadTimeout):
+            _open_bounded(slow, object(), 2, None, _time.monotonic() + 0.1)
+        leaked = [t for t in threading.enumerate() if t not in before and t.name == "bb-open"]
+        assert leaked and all(t.daemon for t in leaked)   # abandoned opener thread is a daemon
+    finally:
+        ev.set()
+
+
+def test_validated_engine_error_releases_slot_clean(tmp_path):
+    # N3+#2: a VALIDATED engine_error (trust gate verified the envelope/hash -> healthy worker, bad sample)
+    # releases the slot CLEAN, so a client feeding malformed samples can't quarantine the static fleet.
+    from blastbox.errors import EngineErrorEnvelope
     (tmp_path / "in.docx").write_bytes(b"z")
     slot = SimpleNamespace(url="http://x", ip=None, auth_token=None, agent_port=8765)
     released = []
+
+    def trust(_in, _out, _sha, owns=None):
+        raise EngineErrorEnvelope("engine_error: sample failed")   # envelope VALIDATED, status engine_error
+
     validate = make_remote_validate(
         claim=lambda: slot, release=lambda s, dirty=False: released.append(dirty),
         output_dir_for=lambda p: tmp_path / "out",
-        http_open=_opener(_tar({"metadata.json": json.dumps({"status": "engine_error"}).encode()})))
+        http_open=_opener(_tar({"metadata.json": json.dumps({"status": "engine_error"}).encode()})),
+        output_trust=trust)
     meta, ok = validate(tmp_path / "in.docx")
-    assert ok is False and released == [False]   # job fails, slot released CLEAN
+    assert ok is False and released == [False]   # validated engine_error -> clean release
+
+
+def test_fake_engine_error_stays_dirty(tmp_path):
+    # #2: a worker returning {"status":"engine_error"} that does NOT validate (bad hash / malformed) must
+    # stay DIRTY -- a compromised/broken worker can't dodge cooldown by faking engine_error.
+    from blastbox.errors import OutputTrustError
+    (tmp_path / "in.docx").write_bytes(b"z")
+    slot = SimpleNamespace(url="http://x", ip=None, auth_token=None, agent_port=8765)
+    released = []
+
+    def trust(_in, _out, _sha, owns=None):
+        raise OutputTrustError("hash mismatch / malformed envelope")   # NOT a validated engine_error
+
+    validate = make_remote_validate(
+        claim=lambda: slot, release=lambda s, dirty=False: released.append(dirty),
+        output_dir_for=lambda p: tmp_path / "out",
+        http_open=_opener(_tar({"metadata.json": json.dumps({"status": "engine_error"}).encode()})),
+        output_trust=trust)
+    meta, ok = validate(tmp_path / "in.docx")
+    assert ok is False and released == [True]    # unvalidatable -> retire the worker dirty
 
 
 def test_missing_metadata_releases_slot_dirty(tmp_path):

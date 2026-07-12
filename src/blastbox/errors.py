@@ -84,6 +84,12 @@ class OutputTrustError(BlastboxError):
     """Worker output failed the host-side trust validation."""
 
 
+class EngineErrorEnvelope(OutputTrustError):
+    """The worker returned a VALIDATED sealed envelope whose status is ``engine_error`` (structure/hashes/
+    input-sha all checked out -- the box is healthy, the SAMPLE failed). The job fails, but the slot may be
+    released CLEAN, unlike a malformed/unvalidatable envelope (a plain OutputTrustError -> retire dirty)."""
+
+
 class WarmTimeout(BlastboxError):
     """No job arrived within the idle-timeout window for a warm worker slot."""
 

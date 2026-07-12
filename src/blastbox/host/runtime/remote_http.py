@@ -10,12 +10,12 @@ Plugs into `VmJobDispatcher(validate=...)` (or a pool_manager-style claim loop) 
 
 from __future__ import annotations
 
-import concurrent.futures
 import io
 import json
 import logging
 import os
 import ssl
+import threading
 import time
 import tarfile
 import tempfile
@@ -25,6 +25,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
+
+from blastbox.errors import EngineErrorEnvelope
 
 _log = logging.getLogger("blastbox.host.runtime.remote_http")
 
@@ -115,16 +117,26 @@ def _open_bounded(opener: Any, req: Any, timeout: float, context: Any, deadline:
     wall-clock ``deadline``, not just urllib's PER-OP socket timeout. A worker that slowly reads our request
     or trickles response headers would otherwise keep opener() blocked past the job budget while the daemon
     validate thread pins the claimed slot (the watchdog can fail the job but can't retire the slot). On
-    timeout raise RemoteReadTimeout so the caller's finally frees the slot; the abandoned opener thread
-    lingers until its per-op socket timeout reaps it, but the scarce SLOT is freed promptly. HTTPError from
-    opener (e.g. 409) is re-raised through fut.result so the caller's existing handling still fires."""
-    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="bb-open")
-    fut = ex.submit(opener, req, timeout, context=context)
-    ex.shutdown(wait=False)   # don't block on a possibly-stuck opener thread
-    try:
-        return fut.result(timeout=max(0.0, deadline - time.monotonic()))
-    except concurrent.futures.TimeoutError as exc:
-        raise RemoteReadTimeout("remote opener (connect/send/headers) exceeded the wall-clock deadline") from exc
+    timeout raise RemoteReadTimeout so the caller's finally frees the slot promptly. The stuck opener runs
+    in a DAEMON thread so it never blocks process exit (a non-daemon executor thread with wait=False would)
+    and reaps on its own per-op socket timeout. HTTPError from opener (e.g. 409) is re-raised so the caller's
+    existing handling still fires."""
+    box: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            box["resp"] = opener(req, timeout, context=context)
+        except BaseException as exc:   # noqa: BLE001 -- surfaced to the caller below
+            box["exc"] = exc
+
+    t = threading.Thread(target=_run, name="bb-open", daemon=True)
+    t.start()
+    t.join(timeout=max(0.0, deadline - time.monotonic()))
+    if t.is_alive():
+        raise RemoteReadTimeout("remote opener (connect/send/headers) exceeded the wall-clock deadline")
+    if "exc" in box:
+        raise box["exc"]
+    return box["resp"]
 
 
 def _cap_read_timeout(src: Any, remaining: float) -> None:
@@ -468,18 +480,10 @@ def make_remote_validate(
                 max_metadata_bytes=max_metadata_bytes,
                 owns=owns,   # fence the destructive clear/extract by claim ownership (reclaim race)
             )
-            # a sealed envelope whose engine failed is NOT a successful job -- gate like the local
-            # dispatcher paths do (missing/invalid metadata or engine_error => fail).
-            if not meta or meta.get("status") == "engine_error":
-                _log.warning("remote_http: remote job not ok (status=%s)", (meta or {}).get("status"))
-                reason = "remote engine error" if meta else "remote worker returned no metadata"
-                # A SEALED engine_error is a CLEAN completion -- the agent responded, sealed its output, and
-                # its job lock is free -- so release the slot CLEAN (dirty=False): a client feeding malformed
-                # samples that reliably engine_error must NOT be able to quarantine the static fleet into
-                # cooldown. Missing metadata (not meta) IS abnormal worker output -> stay dirty/retire.
-                if meta:
-                    dirty = False
-                return {"error": reason}, False
+            # No metadata at all is abnormal worker output -> fail the job AND retire the slot (dirty).
+            if not meta:
+                _log.warning("remote_http: remote worker returned no metadata")
+                return {"error": "remote worker returned no metadata"}, False
             # HOST TRUST GATE -- runs BEFORE the slot is released clean, so a worker whose output fails
             # host validation (re-sealed hashes / engine / input_sha / caps) stays dirty and is retired
             # rather than re-offered. It re-writes the host-sealed metadata.json in out_dir; re-read it.
@@ -487,10 +491,22 @@ def make_remote_validate(
                 # pass the authoritative ingress SHA (if the dispatcher supplied one) so trust compares
                 # against it, not a recompute of the staged file, plus the ownership predicate so the
                 # host metadata write is fenced by claim ownership. Raises on failure -> dirty stays True.
-                output_trust(input_path, out_dir, input_sha256, owns)
+                try:
+                    output_trust(input_path, out_dir, input_sha256, owns)
+                except EngineErrorEnvelope:
+                    # a VALIDATED engine_error (structure/hashes/input-sha checked out): the box is HEALTHY,
+                    # the SAMPLE failed -> fail the job but release the slot CLEAN, so a client feeding
+                    # malformed samples can't quarantine the static fleet. A FAKE/malformed engine_error
+                    # would have raised a plain OutputTrustError above -> falls to the generic except (dirty).
+                    dirty = False
+                    return {"error": "remote engine error"}, False
                 sealed = out_dir / "metadata.json"
                 if sealed.exists():
                     meta = json.loads(sealed.read_text())
+            elif meta.get("status") == "engine_error":
+                # no trust gate to validate the envelope (direct callers / tests) -> can't tell a genuine
+                # engine_error from a faked one, so fail CONSERVATIVELY (dirty).
+                return {"error": "remote engine error"}, False
             dirty = False
             return meta, True
         except WorkerBusy:

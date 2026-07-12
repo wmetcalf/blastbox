@@ -557,11 +557,13 @@ def test_remote_factory_fixed_policy_is_resolved_not_raw(tmp_path, monkeypatch):
     vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
                                     tier="static", engine="clippyshot", engine_spec=spec, limits=_FAKE_LIMITS)
     assert vm._fixed_net_policy == "none"        # RESOLVED (fail-closed), NOT the raw "inspect"
-    assert vm._engine_net_policy == "inspect"    # job default stays the engine INTENT -> mismatch -> reject
+    assert vm._engine_net_policy == "none"       # job DEFAULT also resolved -> untargeted jobs run SEALED
+    #                                              (effective "none" == fixed "none"), not rejected
     monkeypatch.setenv("BLASTBOX_NETPOLICY_INSPECT", "exit=direct")   # now properly declared
     vm2 = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
                                      tier="static", engine="clippyshot", engine_spec=spec, limits=_FAKE_LIMITS)
     assert vm2._fixed_net_policy == "inspect"    # declared -> resolves to its own name (normal case unchanged)
+    assert vm2._engine_net_policy == "inspect"
 
 
 def test_remote_factory_forwards_httpproxy_env(tmp_path, monkeypatch):
