@@ -140,11 +140,35 @@ def _parse_engine_specs(engines_raw: str) -> dict:
             net_policy = (
                 os.environ.get(f"BLASTBOX_ENGINE_{env_name}_NETPOLICY") or "none"
             ).strip().lower()
+            # Optional per-engine dispatcher-TIER allowlist (BLASTBOX_ENGINE_<NAME>_ALLOWED_RUNTIMES):
+            #   BLASTBOX_ENGINE_<NAME>_ALLOWED_RUNTIMES='cold,firecracker,gvisor'
+            # Unset OR set-but-empty ⇒ None (any tier) — an empty value is the common `${VAR:-}` compose
+            # idiom for "use the default", and unlike the param allowlist an empty set here would be a
+            # footgun (an engine permitted on NO tier can never run). Set ⇒ only those tiers; enforced
+            # fail-closed at startup (enforce_allowed_runtimes) so a BLASTBOX_POOL_RUNTIME drift can't
+            # route the engine onto a tier it wasn't cleared for. An unknown tier name is a config typo —
+            # raise, don't silently drop it (a dropped entry could leave the set permitting an unintended tier).
+            from blastbox.host.jobs.base import VALID_TIERS
+
+            runtimes_raw = os.environ.get(f"BLASTBOX_ENGINE_{env_name}_ALLOWED_RUNTIMES")
+            allowed_runtimes: frozenset[str] | None = None
+            if runtimes_raw and runtimes_raw.strip():
+                parsed = frozenset(t.strip().lower() for t in runtimes_raw.split(",") if t.strip())
+                unknown = parsed - set(VALID_TIERS)
+                if unknown:
+                    raise ValueError(
+                        f"BLASTBOX_ENGINE_{env_name}_ALLOWED_RUNTIMES has unknown tier(s) "
+                        f"{sorted(unknown)}; valid tiers: {'/'.join(VALID_TIERS)}"
+                    )
+                # A value that parses to zero tiers (e.g. ",  ,") is treated as unset (any tier), not
+                # an empty "run nowhere" set — same footgun avoidance as the set-but-empty case above.
+                allowed_runtimes = parsed or None
             engines[name] = EngineSpec(
                 name=name, image=image, worker_argv=[],
                 allowed_param_keys=allowed, reserved_param_keys=reserved,
                 default_params=default_params,
                 net_policy=net_policy,
+                allowed_runtimes=allowed_runtimes,
             )
     return engines
 
@@ -188,6 +212,17 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         tier = _pool_rt
     else:
         tier = "cold"
+
+    warm_only = (os.environ.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower()
+                 in ("1", "true", "yes", "on"))
+
+    # Fail-closed BEFORE pool.start(): refuse to run an engine on ANY tier this dispatcher can execute
+    # it on — the advertised tier PLUS the cold-fallback/egress-bypass ("cold") and cascade overflow
+    # tiers (reachable_tiers) — so a BLASTBOX_POOL_RUNTIME/_TIERS drift can't route a locally-vetted
+    # engine onto a public-AWS/remote worker with a different egress posture (no slot spawns on a raise).
+    from blastbox.host.dispatch import enforce_allowed_runtimes, reachable_tiers
+
+    enforce_allowed_runtimes(engines, reachable_tiers(pool, tier, warm_only))
 
     # Capability-based routing: the runtime declares its dispatch_style. A network-endpoint pool
     # (aws / static / cascade) drives workers over http_agent + remote_http via VmJobDispatcher; every
@@ -241,9 +276,9 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         tier=tier,
         # Warm-ONLY sidecar (socket-less gVisor C/R or FC warm dispatcher): on a warm-pool
         # miss, REQUEUE the job for the cold dispatcher instead of cold-falling-back (which
-        # would fail closed here — no docker socket). Inert without a pool.
-        warm_only=(os.environ.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower()
-                   in ("1", "true", "yes", "on")),
+        # would fail closed here — no docker socket). Inert without a pool. (Parsed above for
+        # reachable_tiers; reused here so the gate and the dispatcher agree on cold-fallback.)
+        warm_only=warm_only,
     )
     try:
         dispatcher.run_forever(
