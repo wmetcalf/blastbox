@@ -203,17 +203,27 @@ class Ec2Config(AwsWorkerConfig):
         )
 
 
-def _userdata_with_self_terminate(raw: str | None, max_duration_s: int) -> str:
+def _userdata_with_self_terminate(raw: str | None, max_duration_s: int, *, uptime: bool = False) -> str:
     """Wrap the operator's user-data (any cloud-init format) + a self-terminate part as MIME multipart,
     so a crashed dispatcher can't leak a running instance (needs shutdown-behavior=terminate, which the
-    EC2 launch sets). The operator's part keeps its own cloud-init type; the TTL is an x-shellscript that
-    schedules ``shutdown`` after the duration."""
+    EC2 launch sets). The operator's part keeps its own cloud-init type.
+
+    ``uptime=False`` (disposable EC2): schedule ``shutdown -h +minutes`` -- a WALL-CLOCK deadline, correct
+    for an instance that never hibernates. ``uptime=True`` (ec2-hibernate): a wall-clock deadline would fire
+    on RESUME after the clock jumped past it and kill a healthy warm slot; instead arm a ``systemd-run
+    --on-active`` transient timer, whose CLOCK_MONOTONIC deadline does NOT advance while the instance is
+    hibernated -- so it bounds cumulative RUNNING time (a leaked RUNNING instance self-terminates; a parked
+    one never accrues the budget). It survives cloud-init exit (systemd owns the timer)."""
     from email import message_from_string
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
 
-    minutes = max(1, -(-max_duration_s // 60))   # ceiling: never schedule the backstop BEFORE max_duration_s
-    ttl = MIMEText(f"#!/bin/sh\nshutdown -h +{minutes}\n", "x-shellscript")
+    if uptime:
+        ttl_body = f"#!/bin/sh\nsystemd-run --on-active={int(max_duration_s)}s /sbin/shutdown -h now\n"
+    else:
+        minutes = max(1, -(-max_duration_s // 60))   # ceiling: never schedule the backstop BEFORE the budget
+        ttl_body = f"#!/bin/sh\nshutdown -h +{minutes}\n"
+    ttl = MIMEText(ttl_body, "x-shellscript")
     if raw and raw.strip():
         head = raw[:400].lower()
         # If the operator's user-data is ALREADY a MIME multipart cloud-init document, append the TTL
@@ -809,6 +819,7 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
     default). Agent is brought up by the AMI's user-data; instance is terminated after one job."""
 
     kind = "aws-ec2"
+    _uptime_backstop = False   # disposable instances never hibernate -> a wall-clock shutdown TTL is fine
 
     def __init__(self, cfg: Ec2Config, **kw: Any) -> None:
         if not cfg.image_id:
@@ -860,8 +871,10 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
             user_data = base64.b64decode(c.user_data_b64).decode("utf-8", errors="replace")
         if c.self_terminate and c.max_duration_s:
             # backstop reap: guest schedules its own shutdown -> shutdown-behavior=terminate kills it,
-            # so a crashed dispatcher can't leak a running instance past MAX_DURATION_S.
-            user_data = _userdata_with_self_terminate(user_data, c.max_duration_s)
+            # so a crashed dispatcher can't leak a running instance past MAX_DURATION_S. The hibernate tier
+            # uses an UPTIME timer (see _uptime_backstop) so it can't fire on resume.
+            user_data = _userdata_with_self_terminate(user_data, c.max_duration_s,
+                                                      uptime=self._uptime_backstop)
         if user_data:
             # Keep user-data OUT of the aws process argv: cloud-init that bootstraps the agent may carry a
             # bearer token / TLS private key, and argv is visible via /proc + `ps` to local users / process
@@ -945,9 +958,13 @@ class Ec2HibernateConfig(Ec2Config):
     # itself (boot -> warm -> stop --hibernate -> parked) and starts it on claim. The private IP is
     # retained across stop/start, so the endpoint is stable. Requires an encrypted root volume + a
     # hibernation-capable instance type (e.g. t4g/m6g/c6g, RAM <= 150 GB) + a hibernation-enabled AMI.
-    # the guest self-terminate shutdown timer conflicts with parking (on resume a wall-clock jump can
-    # fire it immediately) -- default it OFF here regardless of construction path.
-    self_terminate: bool = False
+    # DEFAULT-ON crash backstop: the runtime uses an UPTIME timer (systemd-run --on-active, see
+    # Ec2HibernateRuntime._uptime_backstop) whose monotonic deadline doesn't advance while hibernated, so
+    # unlike a wall-clock `shutdown -h +minutes` it can't fire on resume -- a leaked RUNNING instance
+    # (crashed dispatcher) self-terminates after MAX_DURATION_S of cumulative running time, a parked one
+    # never accrues it. (A stopped/hibernated leak from a crashed dispatcher is EBS-cost only and not bounded
+    # by a guest timer -- an external tag sweep is the follow-up for that.)
+    self_terminate: bool = True
     root_device_name: str = "/dev/xvda"   # AL2023 ARM64 root device
     root_volume_gb: int = 30              # >= RAM + OS; the EBS must hold the saved RAM image
     # the pool's WARMING eviction budget must cover boot + engine.warmup + the ec2-hibinit reserve wait
@@ -962,7 +979,7 @@ class Ec2HibernateConfig(Ec2Config):
         import dataclasses
         base = Ec2Config.from_env(get)
         fields = {f.name: getattr(base, f.name) for f in dataclasses.fields(Ec2Config)}
-        fields["self_terminate"] = (get("BLASTBOX_EC2_SELF_TERMINATE") or "0").strip().lower() in ("1", "true", "yes", "on")
+        fields["self_terminate"] = (get("BLASTBOX_EC2_SELF_TERMINATE") or "1").strip().lower() not in ("0", "false", "no", "off")
         fields.update(
             root_device_name=_env(get, "BLASTBOX_EC2_ROOT_DEVICE", "/dev/xvda") or "/dev/xvda",
             root_volume_gb=int(_env(get, "BLASTBOX_EC2_ROOT_VOLUME_GB", "30") or "30"),
@@ -985,6 +1002,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
     kind = "aws-ec2-hibernate"
     _ALIVE_STATES = ("pending", "running", "stopping", "stopped")
     _DEAD_STATES = ("shutting-down", "terminated")
+    _uptime_backstop = True   # a wall-clock shutdown TTL would fire on resume; use a monotonic uptime timer
 
     def __init__(self, cfg: Ec2HibernateConfig, **kw: Any) -> None:
         super().__init__(cfg, **kw)   # base provides _desc_cache + _describe_cached

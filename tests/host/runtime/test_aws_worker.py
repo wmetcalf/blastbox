@@ -963,14 +963,35 @@ def test_ec2_hibernate_resume_times_out():
         rt.resume(AwsWorkerSlot(slot_id="s", resource_id="i-1"))
 
 
-def test_ec2_hibernate_config_defaults_self_terminate_off():
-    # the guest self-terminate timer conflicts with parking -> OFF by default for the hibernate tier,
-    # on BOTH the direct-construct and from_env paths (field default, not just from_env).
-    assert Ec2HibernateConfig(region="us-east-1", image_id="a").self_terminate is False
+def test_ec2_hibernate_config_defaults_self_terminate_on():
+    # the crash backstop is now DEFAULT-ON for the hibernate tier (uptime-based, so it can't fire on
+    # resume), on BOTH the direct-construct and from_env paths; explicitly disable-able.
+    assert Ec2HibernateConfig(region="us-east-1", image_id="a").self_terminate is True
     cfg = Ec2HibernateConfig.from_env({"BLASTBOX_EC2_AMI": "ami-x"}.get)
-    assert cfg.self_terminate is False
+    assert cfg.self_terminate is True
+    off = Ec2HibernateConfig.from_env({"BLASTBOX_EC2_AMI": "ami-x", "BLASTBOX_EC2_SELF_TERMINATE": "0"}.get)
+    assert off.self_terminate is False
     assert cfg.root_volume_gb == 30 and cfg.root_device_name == "/dev/xvda"
     assert cfg.ready_timeout_s == 600.0 and cfg.resume_timeout_s == 180.0   # covers boot+warm+hibernate; < worker budget
+
+
+def test_ec2_hibernate_backstop_is_uptime_based():
+    # a wall-clock `shutdown -h +minutes` would fire on RESUME after the clock jumped; the hibernate tier
+    # must arm a MONOTONIC uptime timer (systemd-run --on-active) instead, so a parked slot isn't killed.
+    captured = {}
+
+    def _run(argv):   # user-data is a 0600 file:// -> read it during the call
+        val = argv[argv.index("--user-data") + 1]
+        with open(val[len("file://"):]) as fh:
+            captured["ud"] = fh.read()
+        return _cp(stdout=json.dumps({"Instances": [{"InstanceId": "i-1"}]}))
+
+    fake = FakeAws({**_IDENT, "ec2 run-instances": _run})
+    rt = Ec2HibernateRuntime(Ec2HibernateConfig(region="us-east-1", image_id="ami-x", max_duration_s=3600),
+                             aws_runner=fake, http_probe=lambda u, h, t: True, clock=lambda: 1.0)
+    rt._launch()
+    assert "systemd-run --on-active=3600s /sbin/shutdown -h now" in captured["ud"]   # uptime timer
+    assert "shutdown -h +" not in captured["ud"]                                      # NOT wall-clock
 
 
 def test_ec2_hibernate_preflight_rejects_incapable_type():

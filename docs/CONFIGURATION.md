@@ -171,7 +171,7 @@ win-validator stays libvirt — no Windows/nested-virt on either).
 | `BLASTBOX_EC2_HIBERNATE_READY_TIMEOUT_S` | `600` | Warming budget — must cover boot + `engine.warmup()` + the `ec2-hibinit` reserve wait + `stop --hibernate` → stopped (all in `is_ready`). |
 | `BLASTBOX_EC2_HIBERNATE_RESUME_TIMEOUT_S` | `180` | Budget for `start-instances` + `/healthz` on claim (kept below the job timeout). |
 | `BLASTBOX_EC2_HIBERNATE_TIMEOUT_S` | `300` | Per-slot budget for `stop --hibernate` → `stopped`; if hibernation doesn't take (instance lands back `running`) the slot re-drives. |
-| `BLASTBOX_EC2_SELF_TERMINATE` | `0` (off) | The guest shutdown-TTL is **off** by default here (it would fire on resume after a wall-clock jump and kill the parked slot). |
+| `BLASTBOX_EC2_SELF_TERMINATE` | `1` (on) | Crash backstop, **default-on** here too but **uptime-based** (`systemd-run --on-active`, a monotonic timer that doesn't advance while hibernated) — so unlike the disposable tier's wall-clock TTL it **can't fire on resume**. A leaked *running* instance self-terminates after `MAX_DURATION_S` of cumulative running time; a parked one never accrues it. Set `0` to disable. *(A stopped/hibernated leak from a crashed dispatcher is EBS-cost only and not bounded by a guest timer — a tag-based sweep is the follow-up.)* |
 
 The **generic worker agent** (`python -m blastbox.worker.http_agent`, `BLASTBOX_ENGINE=module:Class`)
 serves any engine over `GET /healthz` + `POST /detonate`; bake it + the engine + its deps into the
