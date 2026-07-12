@@ -719,6 +719,10 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
             try:
                 self._aws("lambda-microvms", "resume-microvm",
                           "--microvm-identifier", str(slot.resource_id))
+                # discard any JWE minted while the slot was still suspended (invalid): the NEXT probe must
+                # re-mint an awake token, else an AUTO_RESUME=off slot woken here keeps probing/detonating
+                # with the pre-resume token until the deadline. On success the awake-minted token survives.
+                slot.auth_token = None
             except AwsWorkerError as exc:
                 last_exc = exc      # already-running / eventual-consistency wrong-state -> fine, probe is the gate
             time.sleep(self.cfg.resume_poll_s)

@@ -500,6 +500,51 @@ def test_remote_watchdog_includes_cleanup_budget(tmp_path):
     assert vm._validate_timeout_s == pytest.approx(660.0)
 
 
+def test_remote_watchdog_cleanup_budget_from_cascade_attr(tmp_path):
+    # I1: a cascade has no cfg, so the cleanup budget must come from its aggregated cli_timeout_s ATTR
+    # (same fallback the resume budget uses) -- else a cascaded AWS job is watchdog-killed during terminate.
+    from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+    pool = SimpleNamespace(
+        runtime=SimpleNamespace(ssl_context=None, resume_timeout_s=180.0, cli_timeout_s=120.0),  # no cfg
+        claim=lambda *, timeout_s: None, release=lambda s, dirty=False: None)
+    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
+                                    tier="cascade", engine="clippyshot", limits=_FAKE_LIMITS,
+                                    worker_timeout_s=300.0, warm_claim_timeout_s=60.0)
+    assert vm._validate_timeout_s == pytest.approx(660.0)   # 60 + 180 resume + 300 + 120 cleanup (attr)
+
+
+def test_remote_factory_threads_engine_net_policy(tmp_path, monkeypatch):
+    # I2: a programmatic caller with engine_spec.net_policy but no BLASTBOX_ENGINE_<NAME>_NETPOLICY export
+    # must source the job DEFAULT from the same spec as the fixed policy -- else every untargeted job is
+    # rejected ('none' default != 'inspect' fixed).
+    from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_INSPECT", "exit=direct")
+    monkeypatch.delenv("BLASTBOX_ENGINE_CLIPPYSHOT_NETPOLICY", raising=False)
+    spec = SimpleNamespace(net_policy="inspect", allowed_param_keys=frozenset(),
+                           reserved_param_keys=frozenset(), default_params=None)
+    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
+                                    tier="static", engine="clippyshot", engine_spec=spec, limits=_FAKE_LIMITS)
+    assert vm._engine_net_policy == "inspect"   # job default now sourced from the spec, matching fixed
+    assert vm._fixed_net_policy == "inspect"
+
+
+def test_remote_factory_forwards_output_caps_to_worker(tmp_path):
+    # I3: the host-owned metadata/artifact/file caps must reach the worker (which enforces its OWN
+    # Limits.from_env caps + HTTP 500s an over-cap result BEFORE returning the tar), so a dispatcher-raised
+    # cap doesn't fail at the agent. They ride the dispatcher-owned _net_env (merged last).
+    from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+    spec = SimpleNamespace(net_policy="none", allowed_param_keys=frozenset(),
+                           reserved_param_keys=frozenset(), default_params=None)
+    limits = SimpleNamespace(max_metadata_bytes=104857600, max_total_artifact_bytes=500_000_000,
+                             max_artifacts=2000)
+    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
+                                    tier="static", engine="clippyshot", engine_spec=spec, limits=limits)
+    out = vm._sanitize({})
+    assert out["BLASTBOX_MAX_METADATA"] == "104857600"
+    assert out["BLASTBOX_MAX_TOTAL_ARTIFACTS"] == "500000000"
+    assert out["BLASTBOX_MAX_ARTIFACTS"] == "2000"
+
+
 def test_remote_factory_requires_limits_and_engine(tmp_path):
     # G1/G2: the trust-gated remote path PRESERVES worker metadata, so it must fail closed without the
     # host trust gate's inputs -- limits (caps/hashes) and an exact engine to match the envelope against.

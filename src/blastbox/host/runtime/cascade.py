@@ -100,6 +100,20 @@ class CascadingRuntime:
         ]
         return max(vals) if vals else None
 
+    @property
+    def cli_timeout_s(self) -> float | None:
+        """The MAX per-CLI-call timeout across wrapped tiers (an AWS tier's synchronous terminate on
+        release runs up to this), or None if no tier carries one. A cascade has no single cfg, so the
+        dispatcher factory reads this to budget the post-job cleanup terminate in the watchdog -- exactly
+        as it reads resume_timeout_s -- else a cascaded AWS job that used most of its budget is watchdog-
+        killed during the post-success terminate."""
+        vals = [
+            float(ct) for t in self.tiers
+            if (ct := getattr(getattr(t.runtime, "cfg", None), "cli_timeout_s", None)
+                or getattr(t.runtime, "cli_timeout_s", None)) is not None
+        ]
+        return max(vals) if vals else None
+
     def __init__(self, tiers: list[Tier]) -> None:
         if not tiers:
             raise CascadeMisconfigured("cascade needs at least one tier")

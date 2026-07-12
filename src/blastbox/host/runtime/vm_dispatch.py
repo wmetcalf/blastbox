@@ -672,7 +672,11 @@ def build_remote_vm_dispatcher(
     # returns -- i.e. INSIDE the heartbeat watchdog. Budget that cleanup too, else a job that used most of
     # worker_timeout_s gets watchdog-killed (marked FAILED) while terminating, after its output was already
     # received + trusted.
+    # honor a tier's cfg directly; a CascadingRuntime has no single cfg but aggregates the max across its
+    # wrapped tiers as a plain attribute (mirrors the resume_timeout_s fallback above).
     _cleanup_to = getattr(getattr(pool.runtime, "cfg", None), "cli_timeout_s", None)
+    if _cleanup_to is None:
+        _cleanup_to = getattr(pool.runtime, "cli_timeout_s", None)
     _cleanup_budget = float(_cleanup_to) if _cleanup_to is not None else 0.0
     # DoS backstops for the untrusted worker tar, BEFORE the host trust gate parses/validates it:
     # a member (inode) cap ~ the artifact ceiling (+slack for metadata.json/control files), and a
@@ -733,6 +737,16 @@ def build_remote_vm_dispatcher(
             registry=_registry, allow_override=False,
         )
         _net_env = {"BLASTBOX_NET_EGRESS": "1" if _personality.exit_driver not in ("none", "drop") else "0"}
+        # Forward the HOST-owned output caps to the worker. http_agent builds Limits.from_env() PER JOB and
+        # rejects a result over ITS OWN metadata/artifact-bytes/file caps (HTTP 500) BEFORE returning the
+        # tar -- so a cap the operator raised only on the DISPATCHER (for the host trust gate + extractor)
+        # would still 500 at the agent unless it's also raised in the worker image. Forwarding closes that
+        # drift: these are dispatcher-owned (merged LAST, a job param can't flip them).
+        for _env_key, _cap in (("BLASTBOX_MAX_METADATA", max_metadata_bytes),
+                               ("BLASTBOX_MAX_TOTAL_ARTIFACTS", max_output_bytes),
+                               ("BLASTBOX_MAX_ARTIFACTS", getattr(limits, "max_artifacts", None))):
+            if _cap is not None:
+                _net_env[_env_key] = str(_cap)
 
         def sanitize(p: dict[str, str]) -> dict[str, str]:
             out = Dispatcher._sanitize_params(
@@ -792,6 +806,10 @@ def build_remote_vm_dispatcher(
         trust_output_metadata=True,   # preserve the host-sealed metadata.json the validator wrote
         sanitize_params=sanitize,
         fixed_net_policy=getattr(engine_spec, "net_policy", None),   # enforce egress personality
+        # source the job's DEFAULT policy from the SAME spec, not just the env: else a programmatic caller
+        # that sets engine_spec.net_policy without also exporting BLASTBOX_ENGINE_<NAME>_NETPOLICY gets a
+        # fixed policy the per-job default ("none") never matches -> every untargeted job is rejected.
+        engine_net_policy=getattr(engine_spec, "net_policy", None),
         # the parent heartbeat watchdog must cover the bounded claim WAIT + the in-claim RESUME (snapstart/
         # hibernate wake, up to the tier's resume_timeout_s) + the full detonation budget + the synchronous
         # post-job cleanup terminate (disposable AWS tiers, up to cli_timeout_s), so a slot claimed late,

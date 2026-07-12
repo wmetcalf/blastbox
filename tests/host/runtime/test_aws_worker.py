@@ -173,6 +173,37 @@ def test_snapstart_resume_wakes_and_refreshes():
     assert slot.auth_token == "jwe"                       # fresh token, not STALE
 
 
+def test_snapstart_resume_remints_token_after_wake():
+    # I4: a JWE minted while the slot is PARKED is invalid; after resume-microvm the next probe must
+    # re-mint an awake token. Model: 1st mint 'jwe-parked' (probe rejects), post-resume mint 'jwe-awake'
+    # (probe accepts). Without the post-resume token clear the parked token is cached+reused -> the probe
+    # never passes -> resume() would time out.
+    minted = {"n": 0}
+
+    def mint(argv):
+        minted["n"] += 1
+        return _cp(stdout=json.dumps({"authToken": "jwe-parked" if minted["n"] == 1 else "jwe-awake"}))
+
+    def probe(u, h, t):
+        return h.get("X-aws-proxy-auth") == "jwe-awake"     # only an awake-minted token is accepted
+
+    clk = {"t": 100.0}
+
+    def clock():
+        clk["t"] += 0.5                                     # advancing so a stuck loop RAISES, never hangs
+        return clk["t"]
+
+    rt, _ = _snapstart_rt({
+        "lambda-microvms get-microvm": {"state": "suspended", "endpoint": "vm.example"},
+        "lambda-microvms resume-microvm": {},
+        "lambda-microvms create-microvm-auth-token": mint,
+    }, probe=probe, clock=clock)
+    slot = AwsWorkerSlot(slot_id='s', resource_id='mv-1')
+    rt.resume(slot)                          # must NOT raise -> the post-resume re-mint let the probe pass
+    assert slot.auth_token == "jwe-awake"    # the awake token survived, not the parked one
+    assert minted["n"] >= 2                  # re-minted after the wake instead of reusing the parked JWE
+
+
 def test_snapstart_resume_skips_resume_when_already_reachable():
     # if the very first probe succeeds (slot already RUNNING+reachable), no resume-microvm is issued.
     rt, fake = _snapstart_rt({

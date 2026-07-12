@@ -164,6 +164,31 @@ def test_cascade_is_alive_for_claim_delegates_fresh_hook():
     assert rt2.is_alive_for_claim(rt2.spawn()) is True
 
 
+def test_cascade_cli_timeout_s_aggregates_max_across_tiers():
+    # I1: a cascade has no single cfg; it exposes the MAX per-CLI-call timeout across wrapped tiers so the
+    # dispatcher factory can budget the post-job terminate for cascaded AWS tiers (mirrors resume_timeout_s).
+    class _Cfg:
+        def __init__(self, v):
+            self.cli_timeout_s = v
+
+    class CfgRuntime(FakeRuntime):
+        def __init__(self, name, v):
+            super().__init__(name)
+            self.cfg = _Cfg(v)
+
+    class AttrRuntime(FakeRuntime):
+        cli_timeout_s = 90.0
+
+    plain = FakeRuntime("fc")
+    assert CascadingRuntime([Tier("fc", plain, 1)]).cli_timeout_s is None   # no AWS tier -> None
+    rt = CascadingRuntime([
+        Tier("ec2", CfgRuntime("ec2", 120.0), 1),
+        Tier("snap", AttrRuntime("snap"), 1),
+        Tier("fc", plain, 1),
+    ])
+    assert rt.cli_timeout_s == 120.0   # max(120 via cfg, 90 via attr)
+
+
 def test_cascade_resume_timeout_s_aggregates_max_across_tiers():
     # a cascade has no single cfg; it exposes the MAX in-claim resume budget so the dispatcher factory
     # can still warn when a wrapped tier's resume budget outlasts the per-job budget. Reads cfg.* AND a
