@@ -977,6 +977,28 @@ def test_ec2_self_terminate_ttl_injected():
     assert not os.path.exists(ud_path)                          # temp file unlinked after the call
 
 
+def test_userdata_preserves_cloudinit_part_types():
+    # L3: a single-part cloud-init payload keeps its own format (docstring promise) -- #cloud-boothook /
+    # #include / #part-handler must NOT be wrapped as x-shellscript (cloud-init would mis-run them and the
+    # worker agent never starts). #!shebang + #cloud-config stay as they were.
+    from email import message_from_string
+
+    from blastbox.host.runtime.aws_worker import _userdata_with_self_terminate
+    cases = [
+        ("#cloud-boothook\nfoo\n", "text/cloud-boothook"),
+        ("#include\nhttp://x/y\n", "text/x-include-url"),
+        ("#include-once\nhttp://x/y\n", "text/x-include-once-url"),
+        ("#part-handler\ndef list_types():\n    pass\n", "text/part-handler"),
+        ("#!/bin/bash\necho hi\n", "text/x-shellscript"),          # shebang default unchanged
+        ("#cloud-config\nruncmd:\n  - x\n", "text/cloud-config"),  # cloud-config unchanged
+    ]
+    for raw, expected in cases:
+        parts = message_from_string(_userdata_with_self_terminate(raw, 600)).get_payload()
+        assert parts[0].get_content_type() == expected, raw          # operator part keeps its type
+        assert parts[1].get_content_type() == "text/x-shellscript"   # TTL part stays a shell script
+        assert "shutdown -h +10" in parts[1].get_payload()
+
+
 def test_ec2_self_terminate_preserves_multipart_userdata():
     # if the operator user-data is ALREADY MIME multipart cloud-init, the TTL is APPENDED as a part,
     # not nested (which would make cloud-init treat the whole document as one opaque script).

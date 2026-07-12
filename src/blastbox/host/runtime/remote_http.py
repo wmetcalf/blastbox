@@ -59,6 +59,11 @@ class RemoteOutputTooLarge(RuntimeError):
     """A remote worker returned more output than the configured cap allows (DoS guard)."""
 
 
+class ClaimLost(RuntimeError):
+    """This attempt outlived its claim (a peer reclaimed the job) before a destructive output op -- abort
+    so we don't clobber the new owner's result in the shared output dir."""
+
+
 def _sanitized_failure(exc: Exception) -> str:
     """Map a transport/trust exception to a COARSE, non-sensitive reason for the job's error field
     (never the raw message -- it can carry hosts/paths/tokens)."""
@@ -257,6 +262,7 @@ def detonate_remote(
     max_output_bytes: int | None = None,
     max_members: int | None = None,
     max_metadata_bytes: int | None = None,
+    owns: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """POST ``input_path`` to the remote agent's ``/detonate``; extract the returned sealed output tar
     into ``output_dir``; return the parsed ``metadata.json`` (empty dict if the worker produced none).
@@ -277,6 +283,13 @@ def detonate_remote(
     # worker-side limit runs. urllib streams a file-like `data` when Content-Length is set.
     headers["Content-Length"] = str(input_path.stat().st_size)
     output_dir.mkdir(parents=True, exist_ok=True)
+    # FENCE the DESTRUCTIVE ops by claim ownership: if this (possibly long) attempt outlived its claim and
+    # a peer reclaimed+completed the job, emptying/extracting into the SHARED output dir would clobber the
+    # new owner's sealed result. Check before the wipe (peer-already-done ordering) AND again after the
+    # network round-trip before extracting (reclaim landed mid-flight). The final metadata write is fenced
+    # separately in output_trust; this protects the earlier filesystem mutations it can't.
+    if owns is not None and not owns():
+        raise ClaimLost("claim lost before output clear (peer recovered the job)")
     _empty_dir(output_dir)   # drop any stale files from a prior/requeued attempt before extracting
     # stream the response tar to a spooled temp file (spills to disk past 64MB) rather than holding the
     # whole thing in memory -- artifact tars can be large. CAP the stream + the extracted total so a
@@ -298,6 +311,8 @@ def detonate_remote(
                 tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:
             _bounded_copy(resp, spool, stream_cap)
             spool.seek(0)
+            if owns is not None and not owns():   # a peer may have reclaimed during the round-trip
+                raise ClaimLost("claim lost before output extract (peer recovered the job)")
             _safe_extract_tar(spool, output_dir, max_total_bytes=max_output_bytes,
                               max_members=max_members, max_metadata_bytes=max_metadata_bytes)
     meta = output_dir / "metadata.json"
@@ -358,6 +373,7 @@ def make_remote_validate(
                 max_output_bytes=max_output_bytes,
                 max_members=max_members,
                 max_metadata_bytes=max_metadata_bytes,
+                owns=owns,   # fence the destructive clear/extract by claim ownership (reclaim race)
             )
             # a sealed envelope whose engine failed is NOT a successful job -- gate like the local
             # dispatcher paths do (missing/invalid metadata or engine_error => fail).

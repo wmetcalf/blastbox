@@ -220,7 +220,23 @@ def _userdata_with_self_terminate(raw: str | None, max_duration_s: int) -> str:
             if outer.is_multipart():
                 outer.attach(ttl)
                 return outer.as_string()
-        subtype = "cloud-config" if raw.lstrip().startswith("#cloud-config") else "x-shellscript"
+        # Preserve the operator part's cloud-init FORMAT (docstring's promise): map its leading header to
+        # the right MIME subtype (cloud-init's INCLUSION_TYPES_MAP), most-specific prefix first. A bare
+        # #!shebang or an unrecognized payload defaults to x-shellscript (today's behavior). Wrapping a
+        # #cloud-boothook/#include/#part-handler as x-shellscript would make cloud-init mis-run it, so the
+        # AMI's bootstrap never starts the agent and the slot never readies.
+        _lead = raw.lstrip()
+        _ci_types = (
+            ("#include-once", "x-include-once-url"),
+            ("#include", "x-include-url"),
+            ("#cloud-config-archive", "cloud-config-archive"),
+            ("#cloud-config-jsonp", "cloud-config-jsonp"),
+            ("#cloud-config", "cloud-config"),
+            ("#cloud-boothook", "cloud-boothook"),
+            ("#part-handler", "part-handler"),
+            ("#upstart-job", "upstart-job"),
+        )
+        subtype = next((st for pfx, st in _ci_types if _lead.startswith(pfx)), "x-shellscript")
         msg = MIMEMultipart()
         msg.attach(MIMEText(raw, subtype))
         msg.attach(ttl)

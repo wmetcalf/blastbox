@@ -546,6 +546,24 @@ def test_remote_factory_forwards_output_caps_to_worker(tmp_path):
     assert out["BLASTBOX_MAX_ARTIFACT"] == "209715200"   # per-artifact cap too (engines read it)
 
 
+def test_remote_factory_fixed_policy_is_resolved_not_raw(tmp_path, monkeypatch):
+    # L2: a malformed/missing BLASTBOX_NETPOLICY_* resolves fail-closed to 'none' (worker sealed). The
+    # fixed policy must be that RESOLVED name, not the raw spec -- else a job matching the raw name runs on
+    # a sealed worker instead of being rejected.
+    from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+    monkeypatch.delenv("BLASTBOX_NETPOLICY_INSPECT", raising=False)   # personality NOT declared
+    spec = SimpleNamespace(net_policy="inspect", allowed_param_keys=frozenset(),
+                           reserved_param_keys=frozenset(), default_params=None)
+    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
+                                    tier="static", engine="clippyshot", engine_spec=spec, limits=_FAKE_LIMITS)
+    assert vm._fixed_net_policy == "none"        # RESOLVED (fail-closed), NOT the raw "inspect"
+    assert vm._engine_net_policy == "inspect"    # job default stays the engine INTENT -> mismatch -> reject
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_INSPECT", "exit=direct")   # now properly declared
+    vm2 = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
+                                     tier="static", engine="clippyshot", engine_spec=spec, limits=_FAKE_LIMITS)
+    assert vm2._fixed_net_policy == "inspect"    # declared -> resolves to its own name (normal case unchanged)
+
+
 def test_remote_factory_forwards_httpproxy_env(tmp_path, monkeypatch):
     # K2: an httpproxy personality must inject the validated HTTP_PROXY/HTTPS_PROXY into the worker env
     # (like the cold dispatcher) -- else the inner sandbox opens for egress but proxy-aware clients go direct.

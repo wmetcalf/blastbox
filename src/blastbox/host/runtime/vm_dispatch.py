@@ -722,6 +722,11 @@ def build_remote_vm_dispatcher(
         pool.release(slot, dirty=dirty)
 
     sanitize: Callable[[dict[str, str]], dict[str, str]] | None = None
+    # the RESOLVED policy the worker's egress is actually provisioned to (None = enforcement opt-out, i.e.
+    # engine declared no policy). Set from _personality below so a malformed/missing BLASTBOX_NETPOLICY_*
+    # -- which resolve_net_policy fails-closed to 'none' -- is what _process compares against, not the raw
+    # spec name (else a job matching the raw name runs on a sealed worker instead of being rejected).
+    _resolved_net_policy: str | None = None
     if engine_spec is not None:
         from blastbox.host.dispatch import Dispatcher   # lazy: dispatch<->vm_dispatch are independent
         from blastbox.host.netpolicy import parse_personalities, resolve_net_policy
@@ -736,6 +741,9 @@ def build_remote_vm_dispatcher(
             job_net_policy=None, engine_default=(getattr(engine_spec, "net_policy", None) or "none"),
             registry=_registry, allow_override=False,
         )
+        # resolved name to enforce against -- but ONLY when the engine actually declared a policy, so an
+        # UNdeclared engine (net_policy None) stays enforcement-opt-out exactly as before.
+        _resolved_net_policy = _personality.name if getattr(engine_spec, "net_policy", None) else None
         _net_env = {"BLASTBOX_NET_EGRESS": "1" if _personality.exit_driver not in ("none", "drop") else "0"}
         # For an httpproxy personality, inject the SAME validated HTTP_PROXY/HTTPS_PROXY the cold dispatcher
         # sets (Dispatcher._httpproxy_env) into the worker env -- else the inner sandbox is opened for egress
@@ -813,7 +821,7 @@ def build_remote_vm_dispatcher(
         engine=engine, worker_tier=tier,
         trust_output_metadata=True,   # preserve the host-sealed metadata.json the validator wrote
         sanitize_params=sanitize,
-        fixed_net_policy=getattr(engine_spec, "net_policy", None),   # enforce egress personality
+        fixed_net_policy=_resolved_net_policy,   # enforce against the RESOLVED (fail-closed) egress, not raw
         # source the job's DEFAULT policy from the SAME spec, not just the env: else a programmatic caller
         # that sets engine_spec.net_policy without also exporting BLASTBOX_ENGINE_<NAME>_NETPOLICY gets a
         # fixed policy the per-job default ("none") never matches -> every untargeted job is rejected.

@@ -446,8 +446,22 @@ def test_make_remote_validate_forwards_owns_to_trust(tmp_path):
         http_open=_opener(_tar({"metadata.json": json.dumps({"status": "ok"}).encode()})),
         output_trust=trust,
     )
-    validate(tmp_path / "in.docx", owns=lambda: False)
-    assert got["owns"] is False   # predicate threaded through
+    validate(tmp_path / "in.docx", owns=lambda: True)   # True -> detonate proceeds to the trust gate
+    assert got["owns"] is True   # predicate threaded through to output_trust
+
+
+def test_detonate_remote_fences_destructive_ops_on_lost_claim(tmp_path):
+    # L1: if the claim was lost (a peer reclaimed+completed the job), detonate_remote must NOT empty/extract
+    # into the SHARED output dir -- that would clobber the new owner's sealed result. It aborts (ClaimLost).
+    from blastbox.host.runtime.remote_http import ClaimLost
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "peer.png").write_bytes(b"peer artifact")   # the peer owner's result already in the shared dir
+    (tmp_path / "in.bin").write_bytes(b"z")
+    with pytest.raises(ClaimLost):
+        detonate_remote("http://h:8765", tmp_path / "in.bin", out,
+                        http_open=_opener(_tar({"metadata.json": b"{}"})), owns=lambda: False)
+    assert (out / "peer.png").read_bytes() == b"peer artifact"   # NOT wiped / clobbered
 
 
 def test_detonate_remote_streams_input_with_content_length(tmp_path):
