@@ -234,35 +234,71 @@ def test_slow_body_returns_408():
         httpd.server_close()
 
 
+def _serve_engine_and_post(engine, body=b"MZ"):
+    """Serve one engine on loopback, POST /detonate, return the HTTPError (or None on 200)."""
+    httpd = serve(engine, bind="127.0.0.1", port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    try:
+        try:
+            _post(f"http://127.0.0.1:{port}/detonate?name=x.bin", body)
+            return None
+        except urllib.error.HTTPError as exc:
+            return exc
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def _one_png_result(outdir, name="page-001.png"):
+    (outdir / name).write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 56)
+    return DetonationResult(
+        payload=Page(index=0, dims=Dimensions(width=1.0, height=1.0, unit="px"), image=ArtifactRef(id="a0")),
+        artifacts=[DeclaredArtifact(id="a0", path=name, kind="image")],
+        detected=Detection(label="docx", mime="x", confidence=0.9, source="test"))
+
+
 def test_dir_bomb_trips_entry_cap(monkeypatch):
-    # P2: a directory bomb (many empty dirs, few files) must trip the entry cap -- the tar-build walk
-    # counts EVERY entry, so it can't enumerate the whole tree under _JOB_LOCK past the cap.
-    monkeypatch.setenv("BLASTBOX_MAX_ARTIFACTS", "3")   # file_cap = 3 + 16 = 19
+    # P2: a directory BOMB (many empty dirs, few files) must trip the generous total-entry cap so it can't
+    # enumerate the whole tree under _JOB_LOCK. entry_cap = 4*file_cap + 64 = 4*19+64 = 140.
+    monkeypatch.setenv("BLASTBOX_MAX_ARTIFACTS", "3")   # file_cap = 19 -> entry_cap = 140
 
     class _DirBomb:
         name = "bomb"
         formats = frozenset({"*"})
 
         def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
-            for i in range(50):
-                (outdir / f"d{i:02d}").mkdir()          # 50 empty dirs -> > 19 entries
-            (outdir / "page-001.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 56)
+            for i in range(300):                 # 300 empty dirs -> > 140 entries -> bomb tripped
+                (outdir / f"d{i:03d}").mkdir()
+            return _one_png_result(outdir)
+
+    exc = _serve_engine_and_post(_DirBomb())
+    assert exc is not None and exc.code == 500   # entry cap tripped -> 500, agent stays up
+
+
+def test_nested_artifact_layout_passes(monkeypatch):
+    # follow-on: a VALID nested layout (one subdir per artifact ~ 2x entries) up to max_artifacts must NOT
+    # be rejected -- charging dirs to file_cap wrongly 500'd it; the separate generous entry_cap fixes it.
+    monkeypatch.setenv("BLASTBOX_MAX_ARTIFACTS", "20")   # file_cap = 36 -> entry_cap = 4*36+64 = 208
+
+    class _Nested:
+        name = "nested"
+        formats = frozenset({"*"})
+
+        def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
+            arts = []
+            for i in range(20):                  # 20 artifacts in per-page subdirs -> ~41 entries < 208
+                d = outdir / f"page-{i:03d}"
+                d.mkdir()
+                (d / "img.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 56)
+                arts.append(DeclaredArtifact(id=f"a{i}", path=f"page-{i:03d}/img.png", kind="image"))
             return DetonationResult(
                 payload=Page(index=0, dims=Dimensions(width=1.0, height=1.0, unit="px"),
                              image=ArtifactRef(id="a0")),
-                artifacts=[DeclaredArtifact(id="a0", path="page-001.png", kind="image")],
+                artifacts=arts,
                 detected=Detection(label="docx", mime="x", confidence=0.9, source="test"))
 
-    httpd = serve(_DirBomb(), bind="127.0.0.1", port=0)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    port = httpd.server_address[1]
-    try:
-        with pytest.raises(urllib.error.HTTPError) as ei:
-            _post(f"http://127.0.0.1:{port}/detonate?name=x.bin", b"MZ")
-        assert ei.value.code == 500   # entry cap tripped -> job fails (500), agent stays up
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
+    assert _serve_engine_and_post(_Nested()) is None   # 200 -- valid nested output archived, not 500
 
 
 def test_size_cap(tmp_path):

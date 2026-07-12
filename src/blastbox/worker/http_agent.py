@@ -319,20 +319,25 @@ class _Handler(BaseHTTPRequestHandler):
                 # materializes + sorts the ENTIRE tree, so a job leaving hundreds of thousands of entries
                 # burns worker memory/CPU before file_cap could fire. Collect regular files lazily, stop at
                 # the cap, then sort the bounded set for a deterministic tar layout.
+                # Two SEPARATE caps: file_cap bounds the ARTIFACT count (files only, = max_artifacts + 16);
+                # a more generous entry_cap bounds the TOTAL walk (dirs/symlinks included) so a directory
+                # bomb can't enumerate an unbounded tree under _JOB_LOCK -- WITHOUT rejecting a valid nested
+                # layout (one subdir per artifact ~ 2x entries; allow generous nesting), which charging dirs
+                # to file_cap wrongly did.
+                entry_cap = None if file_cap is None else (4 * file_cap + 64)
                 candidates: list = []
                 entries = 0
                 for f in out_dir.rglob("*"):
-                    # count EVERY entry (dirs/symlinks/non-files too) BEFORE the non-file skip, so a
-                    # directory-bomb out_dir (many empty dirs, few files) can't walk the whole tree under
-                    # _JOB_LOCK without tripping the cap -- mirrors the extraction-side header count. file_cap
-                    # = max_artifacts + 16, so a handful of legit subdirs are absorbed by the slack.
                     entries += 1
-                    if file_cap is not None and entries > file_cap:
+                    if entry_cap is not None and entries > entry_cap:
                         spool.close()
-                        raise RuntimeError(f"output exceeds {file_cap} entries")
+                        raise RuntimeError(f"output exceeds {entry_cap} entries (directory bomb?)")
                     if not f.is_file():
                         continue
                     candidates.append(f)
+                    if file_cap is not None and len(candidates) > file_cap:
+                        spool.close()
+                        raise RuntimeError(f"output exceeds {file_cap} files")
                 for f in sorted(candidates):
                     # metadata.json is a control file, not a declared artifact -- don't count it toward
                     # the artifact byte budget (matches the cold trust gate + the host extractor), but DO
