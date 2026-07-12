@@ -9,7 +9,31 @@ from __future__ import annotations
 import pytest
 
 from blastbox.host.cli import _parse_engine_specs
-from blastbox.host.dispatch import Dispatcher, EngineSpec, enforce_allowed_runtimes
+from blastbox.host.dispatch import (
+    Dispatcher,
+    EngineSpec,
+    enforce_allowed_runtimes,
+    reachable_tiers,
+)
+
+
+class _FakeTier:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeRuntime:
+    def __init__(self, dispatch_style="file", kind=None, tiers=None) -> None:
+        self.dispatch_style = dispatch_style
+        if kind is not None:
+            self.kind = kind
+        if tiers is not None:
+            self.tiers = tiers
+
+
+class _FakePool:
+    def __init__(self, runtime) -> None:
+        self.runtime = runtime
 
 
 def test_parse_single_engine_default_argv_is_empty():
@@ -118,13 +142,13 @@ def test_allowed_runtimes_unknown_tier_raises(monkeypatch):
         _parse_engine_specs("clippyshot=img:t")
 
 
-def test_enforce_allowed_runtimes_allows_listed_tier_and_unrestricted():
+def test_enforce_allowed_runtimes_allows_covered_and_unrestricted():
     engines = {
         "restricted": EngineSpec("restricted", "img:t", [], allowed_runtimes=frozenset({"cold", "gvisor"})),
         "any": EngineSpec("any", "img:t", []),  # allowed_runtimes=None -> no restriction
     }
-    enforce_allowed_runtimes(engines, "cold")     # both permitted
-    enforce_allowed_runtimes(engines, "gvisor")   # both permitted
+    enforce_allowed_runtimes(engines, {"cold"})            # both permitted
+    enforce_allowed_runtimes(engines, {"cold", "gvisor"})  # reachable set fully covered
 
 
 def test_enforce_allowed_runtimes_refuses_disallowed_tier():
@@ -134,8 +158,48 @@ def test_enforce_allowed_runtimes_refuses_disallowed_tier():
         ),
     }
     # A BLASTBOX_POOL_RUNTIME drift onto a public-AWS tier the engine wasn't cleared for must fail closed.
-    with pytest.raises(ValueError, match="not permitted on the 'aws-ec2' tier"):
-        enforce_allowed_runtimes(engines, "aws-ec2")
+    with pytest.raises(ValueError, match="not permitted on tier.*aws-ec2"):
+        enforce_allowed_runtimes(engines, {"aws-ec2"})
+
+
+def test_enforce_refuses_cold_fallback_tier_not_in_allowlist():
+    # Codex P1: a firecracker+cold-fallback dispatcher can run on "cold"; an engine cleared only for
+    # firecracker must fail closed because reachable_tiers folds "cold" into the reachable set.
+    engines = {"clippyshot": EngineSpec("clippyshot", "img:t", [], allowed_runtimes=frozenset({"firecracker"}))}
+    reach = reachable_tiers(_FakePool(_FakeRuntime("file")), "firecracker", warm_only=False)
+    with pytest.raises(ValueError, match="not permitted on tier.*cold"):
+        enforce_allowed_runtimes(engines, reach)
+
+
+def test_enforce_refuses_cascade_overflow_tier():
+    # Codex P1: BLASTBOX_POOL_RUNTIME=cascade with static:+aws-ec2: reaches BOTH members; an engine
+    # cleared only for static must fail closed on the aws-ec2 overflow tier.
+    engines = {"eng": EngineSpec("eng", "img:t", [], allowed_runtimes=frozenset({"static"}))}
+    casc = _FakeRuntime("network", kind="cascade", tiers=[_FakeTier("static"), _FakeTier("aws-ec2")])
+    reach = reachable_tiers(_FakePool(casc), "cascade", warm_only=True)
+    with pytest.raises(ValueError, match="not permitted on tier.*aws-ec2"):
+        enforce_allowed_runtimes(engines, reach)
+
+
+def test_reachable_tiers_paths():
+    # No pool -> cold dispatcher.
+    assert reachable_tiers(None, "cold", warm_only=False) == frozenset({"cold"})
+    # File-handshake warm dispatcher cold-falls-back unless warm-only.
+    assert reachable_tiers(_FakePool(_FakeRuntime("file")), "firecracker", warm_only=False) == frozenset(
+        {"firecracker", "cold"}
+    )
+    assert reachable_tiers(_FakePool(_FakeRuntime("file")), "firecracker", warm_only=True) == frozenset(
+        {"firecracker"}
+    )
+    # Network-endpoint tiers requeue -> no cold fallback.
+    assert reachable_tiers(_FakePool(_FakeRuntime("network")), "aws-ec2", warm_only=False) == frozenset(
+        {"aws-ec2"}
+    )
+    # Cascade -> concrete member tiers (+ cold when file-handshake + not warm-only).
+    file_casc = _FakeRuntime("file", kind="cascade", tiers=[_FakeTier("firecracker"), _FakeTier("gvisor")])
+    assert reachable_tiers(_FakePool(file_casc), "cascade", warm_only=False) == frozenset(
+        {"firecracker", "gvisor", "cold"}
+    )
 
 
 def test_param_keys_env_name_and_keys_are_normalized(monkeypatch):

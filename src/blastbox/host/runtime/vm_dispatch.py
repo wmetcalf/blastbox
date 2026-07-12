@@ -654,6 +654,15 @@ def build_remote_vm_dispatcher(
         raise ValueError("build_remote_vm_dispatcher requires engine: the host trust gate validates each "
                          "worker envelope against an exact engine. Pass the tier's engine name.")
 
+    # Fail-closed per-engine tier gate, applied here so the network-endpoint/cascade path — and any
+    # embedder calling this factory directly — can't route the engine onto a tier its allowed_runtimes
+    # excludes. Network tiers requeue rather than cold-fall-back, so reachable_tiers folds in only the
+    # concrete cascade members here (no "cold"). Runs before the CLI's pool.start().
+    if engine_spec is not None:
+        from blastbox.host.dispatch import enforce_allowed_runtimes, reachable_tiers
+
+        enforce_allowed_runtimes({engine: engine_spec}, reachable_tiers(pool, tier, warm_only=True))
+
     ssl_context = getattr(pool.runtime, "ssl_context", None)
     max_output_bytes = getattr(limits, "max_total_artifact_bytes", None)
     # A resume seam (snapstart) runs INSIDE the claim, before the transport's timeout guard -- if its

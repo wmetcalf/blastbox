@@ -213,12 +213,16 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     else:
         tier = "cold"
 
-    # Fail-closed BEFORE pool.start(): refuse to run an engine on a tier its operator-configured
-    # allowlist excludes, so a BLASTBOX_POOL_RUNTIME drift can't route a locally-vetted engine onto
-    # a public-AWS/remote worker with a different egress posture (and no cloud slot spawns on a raise).
-    from blastbox.host.dispatch import enforce_allowed_runtimes
+    warm_only = (os.environ.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower()
+                 in ("1", "true", "yes", "on"))
 
-    enforce_allowed_runtimes(engines, tier)
+    # Fail-closed BEFORE pool.start(): refuse to run an engine on ANY tier this dispatcher can execute
+    # it on — the advertised tier PLUS the cold-fallback/egress-bypass ("cold") and cascade overflow
+    # tiers (reachable_tiers) — so a BLASTBOX_POOL_RUNTIME/_TIERS drift can't route a locally-vetted
+    # engine onto a public-AWS/remote worker with a different egress posture (no slot spawns on a raise).
+    from blastbox.host.dispatch import enforce_allowed_runtimes, reachable_tiers
+
+    enforce_allowed_runtimes(engines, reachable_tiers(pool, tier, warm_only))
 
     # Capability-based routing: the runtime declares its dispatch_style. A network-endpoint pool
     # (aws / static / cascade) drives workers over http_agent + remote_http via VmJobDispatcher; every
@@ -272,9 +276,9 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         tier=tier,
         # Warm-ONLY sidecar (socket-less gVisor C/R or FC warm dispatcher): on a warm-pool
         # miss, REQUEUE the job for the cold dispatcher instead of cold-falling-back (which
-        # would fail closed here — no docker socket). Inert without a pool.
-        warm_only=(os.environ.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower()
-                   in ("1", "true", "yes", "on")),
+        # would fail closed here — no docker socket). Inert without a pool. (Parsed above for
+        # reachable_tiers; reused here so the gate and the dispatcher agree on cold-fallback.)
+        warm_only=warm_only,
     )
     try:
         dispatcher.run_forever(

@@ -31,7 +31,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping
 
 from blastbox.contract.envelope import (
     Artifact,
@@ -186,22 +186,52 @@ class EngineSpec:
     allowed_runtimes: frozenset[str] | None = None
 
 
-def enforce_allowed_runtimes(engines: Mapping[str, "EngineSpec"], tier: str) -> None:
-    """Fail-closed guard: refuse a dispatcher whose ``tier`` is not in a served engine's
-    ``allowed_runtimes``. Called at startup BEFORE the pool spawns any (cloud) slot, so a
-    ``BLASTBOX_POOL_RUNTIME`` drift that would route a locally-vetted engine onto a disallowed
-    tier is caught loudly instead of silently detonating on the wrong worker. Engines with
-    ``allowed_runtimes is None`` impose no restriction."""
+def reachable_tiers(pool: Any, tier: str, warm_only: bool) -> frozenset[str]:
+    """The full set of tiers a dispatcher can actually EXECUTE a job on — not just its advertised
+    ``tier``. A file-handshake warm dispatcher **cold-falls-back** to the local Docker path on a pool
+    miss or an egress job (unless ``warm_only``), so ``"cold"`` is reachable; a **cascade** routes each
+    spawn to any of its concrete member tiers. ``allowed_runtimes`` is enforced against ALL of these so
+    the gate can't be escaped via cold-fall-back, an egress job, or a cascade overflow."""
+    if pool is None:
+        return frozenset({"cold"})
+    rt = getattr(pool, "runtime", None)
+    members = getattr(rt, "tiers", None)
+    if getattr(rt, "kind", None) == "cascade" and members:
+        tiers = {t.name for t in members}   # the concrete BLASTBOX_POOL_TIERS entries spawn routes to
+    else:
+        tiers = {tier}
+    # Only the file-handshake Dispatcher cold-falls-back; network-endpoint tiers requeue (no cold path).
+    if not warm_only and getattr(rt, "dispatch_style", "file") == "file":
+        tiers.add("cold")
+    return frozenset(tiers)
+
+
+def enforce_allowed_runtimes(engines: Mapping[str, "EngineSpec"], reachable: Collection[str]) -> None:
+    """Fail-closed guard: refuse a dispatcher that can execute an engine on a tier its operator-
+    configured ``allowed_runtimes`` excludes. ``reachable`` is EVERY tier this dispatcher can run a job
+    on (see :func:`reachable_tiers`) — including the ``"cold"`` fallback and each ``cascade`` member — so
+    the gate isn't bypassable via cold-fall-back, an egress job, or a cascade overflow. Enforced in the
+    dispatcher constructors/factory (so embedders are covered, not just the CLI) and again in the CLI
+    before the pool spawns any (cloud) slot. Engines with ``allowed_runtimes is None`` impose no
+    restriction, so this is a no-op for the default config."""
+    reachable = frozenset(reachable)
     for name, spec in engines.items():
-        allowed = spec.allowed_runtimes
-        if allowed is not None and tier not in allowed:
+        # getattr default: a real EngineSpec always has the field; a duck-typed spec (embedder/tests)
+        # without it just imposes no restriction (same as None).
+        allowed = getattr(spec, "allowed_runtimes", None)
+        if allowed is None:
+            continue
+        disallowed = reachable - allowed
+        if disallowed:
             # env-var form normalizes name like _parse_engine_specs (upper + hyphen→underscore)
             env_name = name.upper().replace("-", "_")
             raise ValueError(
-                f"engine {name!r} is not permitted on the {tier!r} tier "
-                f"(allowed_runtimes={sorted(allowed)}); refusing to start — set "
-                f"BLASTBOX_ENGINE_{env_name}_ALLOWED_RUNTIMES to include {tier!r} "
-                f"if this dispatcher should run it, or point BLASTBOX_POOL_RUNTIME at an allowed tier"
+                f"engine {name!r} is not permitted on tier(s) {sorted(disallowed)} that this "
+                f"dispatcher can execute jobs on (reachable={sorted(reachable)}, "
+                f"allowed_runtimes={sorted(allowed)}); refusing to start — add them to "
+                f"BLASTBOX_ENGINE_{env_name}_ALLOWED_RUNTIMES, or reconfigure the pool "
+                f"(BLASTBOX_POOL_RUNTIME / BLASTBOX_POOL_TIERS / BLASTBOX_DISPATCH_WARM_ONLY) "
+                f"so it can't reach them"
             )
 
 
@@ -290,6 +320,13 @@ class Dispatcher:
         # not by silently mislabeling warm jobs as cold here. Inert until an operator enables
         # routing at the API (BLASTBOX_ALLOW_TIER_ROUTING) — existing jobs have no target.
         self._tier = tier
+        # Fail-closed per-engine tier gate, in the CONSTRUCTOR (not just the CLI) so embedders are
+        # covered: refuse if THIS dispatcher can execute an engine on a tier its allowed_runtimes
+        # excludes — reachable_tiers folds in the cold-fallback + egress-bypass ("cold") and cascade
+        # overflow paths, so the gate isn't escapable at dispatch time.
+        enforce_allowed_runtimes(
+            self._engines, reachable_tiers(self._pool, self._tier, self._warm_only)
+        )
         # OPT-IN engine scoping for SHARED multi-dispatcher stores: when set, claim only jobs for
         # engines this dispatcher handles, so it can't grab (and fail "unknown engine") a job that a
         # co-resident VM/other-engine dispatcher owns. Default OFF preserves the single-dispatcher
