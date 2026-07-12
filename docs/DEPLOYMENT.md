@@ -27,6 +27,12 @@ redundant, and (for nono) Landlock isn't even available under runsc (below).
 | **runsc** (cold) | gVisor Sentry (strong) | container | ❌ **Sentry returns ENOSYS** | — |
 | **gVisor C/R** (warm) | gVisor Sentry | container | ❌ ENOSYS | runsc checkpoint/restore |
 | **firecracker** (warm/cold) | hardware KVM microVM (strongest) | container (+ nono in-guest) | ✅ guest kernel ships `landlock_*` | FC mem snapshot (warm-UNO) |
+| **libvirt VM** (warm/cold) | full KVM guest OS per job | the guest OS itself (N/A) | N/A (full guest) | libvirt warm pool (golden overlay; snapshot-revert recycle) |
+
+> The **libvirt VM tier** is for engines whose analysis *is* a full OS (e.g. validating Windows
+> code signatures inside real Windows) — not an in-process sandbox model. It's a **library primitive**
+> (`vm_compose` + `VmJobDispatcher`), wired by the consuming app, **not** selected by
+> `BLASTBOX_POOL_RUNTIME`. See *Which tier* and CONFIGURATION's *Runtime: libvirt VM*.
 
 > **The Landlock footgun.** nono needs the `landlock_*` syscalls. The **gVisor Sentry does
 > not implement them** (verified: `landlock_create_ruleset` → ENOSYS) — so the inner-nono
@@ -63,10 +69,17 @@ redundant, and (for nono) Landlock isn't even available under runsc (below).
   isolation (run the worker image under runsc there).
 - **Cloud burst** → `aws-ec2` (throwaway EC2 per job) or `aws-lambda-microvm` (Lambda MicroVM + JWE) —
   disposable, one job then terminate; fail-closed on creds/entitlement (`BLASTBOX_EC2_*` / `BLASTBOX_LAMBDA_*`).
+  Add the **warm** cloud tiers — `aws-lambda-snapstart` (per-microvm suspend/resume) or
+  `aws-ec2-hibernate` (`stop --hibernate`/`start`) — to keep pre-warmed slots parked between jobs.
 - **X primary + burst to Y elsewhere** → `cascade` — an ordered `BLASTBOX_POOL_TIERS` list, e.g.
   `static:8,aws-ec2:16`: fills the primary first, overflows to the next tier. **All tiers must share a
   dispatch style** (all network-endpoint `static`/`aws-*`, or all file-handshake `gvisor`/`firecracker`
   — a mix fails fast at startup). Set `BLASTBOX_POOL_WARM_SIZE`=the primary's capacity, `_CEILING`=the sum.
+- **The analysis *is* a full OS** (Windows code-sign validation, an engine that needs a real
+  desktop) → the **libvirt/KVM VM tier**: a whole disposable guest per job. Library-wired via a
+  `VmWorkerSpec` (`vm_compose`), not `BLASTBOX_POOL_RUNTIME`. **Pin worker IPs** with
+  `worker_ip_pool` (assign-enforce) so a root-compromised guest can't re-IP around the egress
+  rooter — see *Egress enforcement on the VM tier* below.
 
 Defense-in-depth on the weak tier: enable **`BLASTBOX_WORKER_NONO_WRAP=1`** on the **runc**
 cold path to Landlock-confine the whole worker (write-confinement + network block) on top of
@@ -80,6 +93,27 @@ the container. It is a no-op/skip under runsc.
   ⇒ the dispatcher refuses the job early (`InsecureRuntimeRefused`).
 - Per-engine param **allowlist** is default-deny — set `BLASTBOX_ENGINE_<NAME>_PARAM_KEYS` on
   every tier that runs the engine (cold dispatcher **and** every warm sidecar).
+
+### Egress enforcement on the VM tier
+
+A container/microVM worker has **no `CAP_NET_ADMIN`** and a host-managed netns/veth, so it
+*cannot* re-IP itself — its egress rooter keys safely on the worker's address. A **full libvirt
+VM worker is root in its own guest**, so it *can*. Two layers close that:
+
+- **Assign+enforce IP** (`worker_ip_pool`): blastbox reserves a deterministic MAC+IP per worker and
+  pins it with a libvirt `clean-traffic` nwfilter (`CTRL_IP_LEARNING=none` + `IP=`). The guest can
+  set whatever address it likes internally; the host **drops spoofed source IPs at L2**, so the
+  `LibvirtEgress` per-IP `iptables` chain (`BBVM_<ip>`) stays authoritative. This is the
+  **recommended** mode for any VM worker with egress.
+- **DHCP-learning** (`worker_ip_pool=""`, the zero-config default) learns the worker's IP from its
+  DHCP lease and restricts `DHCPSERVER` to the trusted bridge. It's convenient but the learned pin
+  **lapses with the lease** on a long-idle warm worker — so it's not snapshot-robust. Prefer
+  assign-enforce when egress is enabled.
+
+> **toolz3 gotcha:** with `net.bridge.bridge-nf-call-iptables=0`, bridged traffic bypasses the host
+> `FORWARD` chain, so `physdev`-keyed rules silently don't match. The `LibvirtEgress` rooter keys on
+> the **source IP** (which assign-enforce makes unspoofable) rather than the bridge port, sidestepping
+> that sysctl entirely.
 
 ## Deployment shapes
 

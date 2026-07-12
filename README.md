@@ -34,6 +34,8 @@ blastbox/
 │   │               OR a Firecracker microVM per slot (AF_VSOCK warm protocol; the
 │   │               engine defines warmup — a JVM engine via CRaC, with guest-console
 │   │               CPU-feature-mismatch detect + a probe; a non-JVM engine without)
+│   │               OR a disposable libvirt/KVM VM per job (full-OS engines; vm_compose
+│   │               spec, assign-enforce IP via nwfilter, per-IP egress rooter)
 │   ├── pool        warm slot pool (one-doc-per-slot, never-reuse; burst + health loops)
 │   ├── trust       output-trust validator — re-seals worker output from disk
 │   ├── netpolicy   opt-in egress OVERLAY: personality → exit driver, fail-closed to `none`
@@ -235,6 +237,20 @@ Proven end-to-end — live on a Firecracker host — with two real, language-div
 **FC warm-pool tier**: a **JVM + Tika** recursive extractor (CRaC warm-restore) and a **Python +
 LibreOffice** rasterizer (warm-UNO snapshot/restore, or cold-boot; `deploy/firecracker/Dockerfile.clippyshot`).
 The LibreOffice engine also runs standalone on the **docker + sandbox** tier (runc/runsc).
+
+**Disposable libvirt/KVM VM tier — for full-OS engines.** Beyond the two auto-selected
+container/microVM runtimes, blastbox ships a **libvirt VM-worker primitive**
+(`host/runtime/libvirt_vm.py` + `vm_compose` + `VmJobDispatcher`) for engines that need a *whole
+guest OS* per job — e.g. a Windows code-signature validator that detonates inside a real Windows VM.
+Unlike the FC/gVisor warm tiers (selected by `BLASTBOX_POOL_RUNTIME`), this tier is **library-wired**:
+a consuming app builds a `VmWorkerSpec` (golden image, warm size, agent port, egress) and gets
+warm-pooling and per-job disposability for free (golden **rotation** is a separate helper the app
+schedules — bake a fresh golden, then flip the spec). Workers are
+**IP-assigned-and-enforced** — a deterministic MAC+IP is reserved per worker and pinned via a libvirt
+`clean-traffic` nwfilter (`worker_ip_pool`), so a root-compromised guest **can't re-IP around** the
+per-worker egress rooter (`LibvirtEgress`, a CAPE-style per-IP `iptables` `BBVM_<ip>` chain). The
+DHCP-learning fallback restricts `DHCPSERVER` to the trusted bridge so a worker can't rogue-DHCP a
+different lease. Proven live with the win-validator Authenticode engine.
 
 **Warm-UNO via FC snapshot/restore — shipped.** A microVM with a running, idle in-guest `unoserver`
 (soffice `--accept` on a local UDS) is captured in a Firecracker memory snapshot built *first-boot on the

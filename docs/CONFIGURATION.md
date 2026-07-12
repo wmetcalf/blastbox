@@ -32,6 +32,10 @@ and the tier-capability matrix.
 | `BLASTBOX_METRICS_PUBLIC` | `true` | Serve `/metrics` without auth. |
 | `BLASTBOX_INGRESS_EXTENSION` | `""` | Optional ingress extension entry point. |
 | `BLASTBOX_ZIP_PASSWORD` | `infected` | Password tried for password-protected sample archives (the malware-corpus convention). |
+| `BLASTBOX_EXPOSE_DOCS` | `0` (off) | Truthy (`1/true/yes/on`) publishes `/docs`, `/redoc`, `/openapi.json`; otherwise all three are disabled. A malware-processing service withholds its API surface by default. |
+| `BLASTBOX_CSP` | *(strict default, below)* | Overrides the `Content-Security-Policy` header. Set to an **empty string** to drop the CSP header entirely. Only the CSP is env-configurable — `x-frame-options: DENY`, `x-content-type-options: nosniff`, and `referrer-policy: no-referrer` are always sent unconditionally. |
+
+The default CSP (`middleware.DEFAULT_CSP`) is `default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'`.
 
 ## Dispatch
 
@@ -39,7 +43,8 @@ and the tier-capability matrix.
 |---|---|---|
 | `BLASTBOX_DISPATCH_CONCURRENCY` | `1` | Dispatch-loop worker threads. **On a warm tier this MUST equal the warm pool size** — the warm path blocks until the job finishes, so N threads are needed to keep N slots busy (default 1 starves the pool). |
 | `BLASTBOX_DISPATCH_WARM_ONLY` | `""` (off) | Claim-gate primitive: only claim jobs when a warm slot is free, and **never cold-fall-back** — overflow stays queued for the cold dispatcher. This is what makes a process a *warm sidecar*. |
-| `BLASTBOX_MAX_QUEUED_AGE_S` | `0` (off) | TTL after which a job still QUEUED is FAILed and its (untrusted) input deleted — bounds the `target_tier` footgun (a job pinned to a tier no dispatcher serves). Honored by **both** the cold `Dispatcher` **and** the network-endpoint (static/AWS/cascade) dispatcher. |
+| `BLASTBOX_MAX_QUEUED_AGE_S` | `0` (off) | Opt-in **stale-queued reaper**: TTL after which a job still QUEUED is FAILed and its (untrusted) input deleted — bounds the `target_tier` footgun (a job pinned to a tier no dispatcher serves) and a >1k batch backlog. Honored by **every** dispatcher variant: the cold container `Dispatcher` and the network-endpoint `VmJobDispatcher` (libvirt-VM / static / AWS / cascade). `0` ⇒ never reap on age (correct for huge legitimate batches). |
+| `BLASTBOX_ALLOW_TIER_ROUTING` | `0` | Allow a job to **request a specific warm backend** via a `target_tier` field at submit (claim-predicate honored by every store: memory / sql / redis). **Off (default) ⇒ `target_tier` is silently ignored** (like a per-job override that isn't permitted). The `worker_tier` label (e.g. `firecracker` / `gvisor` / `libvirt-vm`) is what a warm sidecar advertises and what UIs show. Gate this *with* `BLASTBOX_MAX_QUEUED_AGE_S` — a job pinned to a tier whose dispatcher is down would otherwise queue forever. |
 | `BLASTBOX_DISPATCH_SOLE_OWNER` | `0` | Network-endpoint dispatcher only. `1` ⇒ this is the **only** dispatcher on the store, so orphan recovery may also reclaim a claim that crashed before the `worker_runtime="warm"` stamp. Leave `0` on a **shared** store (a cold dispatcher for the same engine) — it would otherwise FAIL that peer's live jobs. |
 
 ## Runtime selection (docker: runc / runsc)
@@ -63,6 +68,16 @@ and the tier-capability matrix.
 | `BLASTBOX_WORKER_NOFILE` | `4096` | `--ulimit nofile`. |
 | `BLASTBOX_WORKER_TIMEOUT_S` | engine | Per-job wall-clock budget. |
 | `BLASTBOX_WARM_CLAIM_TIMEOUT_S` | `60` | *(network-endpoint tiers)* Max seconds a job waits for a warm slot before requeuing (capacity pressure ≠ failure). Bounded **separately** from `WORKER_TIMEOUT_S` so a late claim can't eat the detonation budget; the heartbeat watchdog covers `claim + detonate`. |
+
+**Output-trust / extraction-DoS caps** (`Limits.from_env`) — strict-by-default bounds on what an untrusted worker may read in and write back. Each must be a positive integer in `[1, ceiling]` (byte ceiling 256 GiB, count ceiling 65536); `0` / negative / unparseable raises a `ValueError` naming the offending var.
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_MAX_INPUT` | `104857600` (100 MiB) | Max accepted input-file size (also enforced pre-spool by the ingress 413 body guard). |
+| `BLASTBOX_MAX_METADATA` | `4194304` (4 MiB) | Max size of the worker's `metadata.json`. |
+| `BLASTBOX_MAX_ARTIFACT` | `52428800` (50 MiB) | Max size of a **single** output artifact. |
+| `BLASTBOX_MAX_TOTAL_ARTIFACTS` | `524288000` (500 MiB) | Max **total bytes** across all artifacts (a byte cap, despite the name — not a count). |
+| `BLASTBOX_MAX_ARTIFACTS` | `1000` | Max **number** of artifacts. |
 
 ## Worker in-process sandbox + nono
 
@@ -299,9 +314,54 @@ blastbox pki show-ca                           # the public CA cert -> bake into
 Bake `ca.crt` into worker images (public trust anchor); keep `ca.key` on the dispatcher only. For
 disposable workers, mint the server cert per-spawn (SAN = the instance IP) rather than baking a key.
 
+## Runtime: libvirt VM (full-OS engines)
+
+Unlike the FC/gVisor warm tiers — selected by `BLASTBOX_POOL_RUNTIME` and configured by
+`BLASTBOX_*` env — the **libvirt/KVM VM-worker tier is a library primitive, not an env-selected
+runtime.** A consuming app (e.g. win-validator) builds a `VmWorkerSpec` (`host/runtime/vm_compose.py`)
+and drives it through the generic `WarmPool` + `VmJobDispatcher`. So these knobs are **spec fields the
+consumer sets** (often mapped from its *own* env, e.g. win-validator's `AUTHENTICODE_IP_POOL`), not
+`BLASTBOX_*` vars. They are listed here because their **security semantics** are blastbox's.
+
+| `VmWorkerSpec` field | Default | Notes |
+|---|---|---|
+| `image` (`VmImageSpec`) | — | The golden qcow2. A **string** ⇒ the path (e.g. `image: /dev/shm/golden-base.qcow2`); a **mapping** ⇒ a build recipe (`image.golden` = where to bake it, plus `base_qcow2`/provisioner). Each job gets a disposable overlay. *(The field is `image`, not `golden` — a top-level `golden:` key raises `ValueError` at `VmWorkerSpec.from_dict`.)* Golden **rotation is not automatic** — it's a separate helper the consuming app schedules (build a fresh golden, then flip the spec). |
+| `warm_size` / `concurrent_ceiling` / `jobs_per_recycle` / `max_jobs_per_slot` | `2` / `16` / `1` / `0` | Warm slots / max concurrent / jobs a slot serves before `recycle()` **reverts it to the clean snapshot in place and reuses it** / total jobs before it's reaped+respawned (`0` = unlimited). Safety comes from the per-job snapshot revert, not a fresh VM; for **true destroy-and-respawn per document** (no slot reuse at all) set `max_jobs_per_slot=1`. |
+| `worker_ip_pool` | `""` | **Assign+enforce.** `"START-END"` within a single /16 (size it for the **peak concurrent** worker count — the pool bursts from `warm_size` toward `concurrent_ceiling` under load, so `≥ concurrent_ceiling` avoids exhaustion) ⇒ blastbox reserves a DHCP host entry and **pins an explicit IP** per worker (`CTRL_IP_LEARNING=none` + nwfilter `IP=`), with a deterministic MAC derived from the IP. A root-compromised guest then **can't re-IP** around the egress rooter. **`""` ⇒ DHCP-learning** (`clean-traffic` `CTRL_IP_LEARNING=dhcp`) — convenient, but a long-idle warm worker's learned pin lapses with the lease, so assign-enforce is the **snapshot-robust / secure** mode. |
+| `nwfilter` | `clean-traffic` | libvirt nwfilter bound to the worker NIC (`no-mac-spoofing` + `no-ip-spoofing` + `allow-dhcp-server`). `""` ⇒ no filterref (no L2 anti-spoof — only do this behind another boundary). |
+| `nwfilter_ip_learning` | `dhcp` | `CTRL_IP_LEARNING` for the DHCP-learning path (`dhcp` or `any`; `none` is rejected here because it needs `worker_ip_pool`). Unused once `worker_ip_pool` is set. |
+| `dhcp_server` | `""` | `clean-traffic` `DHCPSERVER` parameter — the **trusted** dnsmasq a worker may accept leases from, so it can't rogue-DHCP itself a different one. `""` ⇒ derived as `subnet_prefix` + `.1`. |
+| `mac_prefix` | `52:54:00:bb` | OUI for assign-enforce MACs; the last 2 octets are the IP's 3rd+4th, giving a 1:1 MAC↔IP map within the /16. |
+| `subnet_prefix` | `192.168.122.` | The libvirt network's subnet, used for the `DHCPSERVER` default and pool sanity. |
+| `egress` (`VmEgressPolicy`) / `routing` (`ExitRouting`) | `None` | Optional per-worker egress through `LibvirtEgress` (a CAPE-style per-IP `iptables` `BBVM_<ip>` chain + `FORWARD` jump): exit driver, port allowlist, `block_internal`, VPN/SOCKS routing. `None` ⇒ no egress wired. |
+
 ## Per-engine params (engine ↔ host boundary)
 
 | Var | Default | Notes |
 |---|---|---|
 | `BLASTBOX_ENGINE_<NAME>_PARAM_KEYS` | unset | **Allowlist** of `job.params` keys forwardable to that engine's worker as env. **Unset** ⇒ legacy shape+denylist only (a hostile job's params could reach engine knobs — so set this on **every** tier that runs the engine). **Set** (even to an empty value) ⇒ strict allowlist: only the listed keys pass, and an empty value blocks **all** params. e.g. `BLASTBOX_ENGINE_CLIPPYSHOT_PARAM_KEYS=CLIPPYSHOT_OCR,CLIPPYSHOT_QR,…`. |
 | `BLASTBOX_ENGINE_<NAME>_DEFAULT_PARAMS` | `""` | **Operator default params**: `KEY=VAL,KEY2=VAL2` applied for any key a job does **not** set (the per-job value always wins). Makes an enablement default — e.g. a scanner toggle — a **runtime** decision in the dispatcher env instead of a value hardcoded in the engine: flip it + restart the dispatcher, no image/snapshot rebuild, and it reaches **cold and warm** tiers alike. Each defaulted key must itself be forwardable (in `_PARAM_KEYS`) and non-reserved — it passes the same gate as a client param, so the default reaches the worker only where a client param with that key would have. Set on **every** tier that runs the engine (it's read where params are forwarded). e.g. `BLASTBOX_ENGINE_REDTUSK_DEFAULT_PARAMS=REDTUSK_ENABLE_QR=1,REDTUSK_ENABLE_OCR=0`. |
+| `BLASTBOX_ENGINE_<NAME>_RESERVED_KEYS` | unset | Extra param keys **dropped unconditionally** (cold **and** warm), unioned into the engine's built-in `reserved_param_keys` floor. For knobs that must *never* be client/job-settable because they're RCE-adjacent — a JVM engine's `JAVA_BIN`/`JAVA_OPTS`/`WORKER_JAR`, a sandbox-downgrade switch. Keys are upper-cased and stripped **before** the `_PARAM_KEYS` allowlist is applied, so a reserved key can't be re-admitted by also listing it. The framework core carries **no** hardcoded `CLIPPYSHOT_*`/engine-specific reserved keys — each engine declares its own floor (via `EngineSpec.reserved_param_keys`) and the operator extends it here. e.g. `BLASTBOX_ENGINE_REDTUSK_RESERVED_KEYS=JAVA_BIN,JAVA_OPTS,WORKER_JAR`. |
+
+## Network policy / egress overlay (netpolicy)
+
+Egress control has two layers: the **dispatcher** resolves a per-job *personality* (a named egress policy) and picks the worker's Docker `--network`; the privileged **`blastbox-netd`** helper (a host systemd unit, out-of-band from the cap-dropped dispatcher) wires the actual exit — netns TUN + tun2socks, host REDIRECT → tor, a VPN gateway route, or an MITM inspect gateway. Everything is **fail-closed**: unset/malformed knobs leave the worker with **no route out**, and the whole feature is inert until an operator declares a personality.
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_NETPOLICY_<NAME>` | (only `none`) | Operator personality registry — one env var per named policy; value is `exit=<driver>,k=v,…`. `exit=` drivers: `none`, `drop`, `direct`, `inetsim`, `tor`, `socks`, `httpproxy`, `wireguard`, `openvpn` (unknown/missing `exit` ⇒ warned + not selectable). `inspect=1` routes through the MITM gateway. `BLASTBOX_NETPOLICY_NONE` is reserved (the fail-closed default) and ignored with a warning. |
+| `BLASTBOX_ALLOW_NETPOLICY_OVERRIDE` | `0` (off) | Truthy ⇒ a job may pick a *declared* personality by name; otherwise the per-engine default (else `none`) is forced. An undeclared name always collapses to `none`. |
+| `BLASTBOX_NET_CAPTURE` | `0` (off) | Truthy ⇒ egress workers are labelled for `blastbox-netd` to capture a host-side pcap, sealed into the result envelope as a trusted artifact. Needs netd running; the dispatcher stays cap-drop=ALL. |
+| `BLASTBOX_NET_CAPTURE_WAIT_S` | `5` | Seconds the dispatcher waits for netd's `<pcap>.done` sentinel before sealing (so the capture isn't copied mid-write). Clamped `[0, 60]`. |
+| `BLASTBOX_NET_DECRYPT` | `0` (off) | Truthy **and** a TLS keylog present in the job's capture dir ⇒ run GoGoRoboCap to seal `decrypted.pcap` + `mixed.pcap`. Best-effort: a missing/hostile keylog is a silent no-op, never fails the job. |
+| `BLASTBOX_NET_DECRYPT_KEYLOG_WAIT_S` | `8` | Seconds the dispatcher polls for the per-job keylog (`sslkeys.log`) before decrypt (netd drops it on the worker DIE event, which races the seal). Clamped `[0, 60]`. |
+| `BLASTBOX_GOGOROBOCAP_BIN` | `gogorobocap` | Path/name of the GoGoRoboCap TLS-replay binary used by `BLASTBOX_NET_DECRYPT`. |
+| `BLASTBOX_NETD_SOCKS_PROXY` | `""` (disabled) | **netd:** SOCKS5 URL (`socks5://[user:pass@]host:port`) for the `socks` tier — enables netns TUN + tun2socks for workers labelled `blastbox.net.wire=socks`. |
+| `BLASTBOX_NETD_VPN_GATEWAY` | `""` (disabled) | **netd:** VPN+NAT gateway sidecar IP for the `vpn`/`openvpn`/`wireguard` tier; default-routes labelled workers through it. |
+| `BLASTBOX_NETD_INSPECT_GATEWAY` | `""` (disabled) | **netd:** sslproxy/MITM gateway IP for the `inspect` tier; default-routes inspected workers through it. |
+| `BLASTBOX_NETD_INSPECT_KEYLOG` | `""` (disabled) | **netd:** host path to the sslproxy gateway's `SSLKEYLOGFILE`, snapshotted into each inspect job's capture dir as `sslkeys.log` so the dispatcher can decrypt. |
+| `BLASTBOX_NETD_TRANSPROXY_GATEWAY` | `""` (disabled) | **netd:** host bridge gateway IP that `tor` (CAPE-transparent) workers default-route through before the host REDIRECTs their TCP/DNS to tor. |
+| `BLASTBOX_NETD_TRANSPROXY_TRANS_PORT` | `9040` | **netd:** tor `TransPort` the host REDIRECTs worker TCP to. |
+| `BLASTBOX_NETD_TRANSPROXY_DNS_PORT` | `5353` | **netd:** tor `DNSPort` the host REDIRECTs worker `:53` to. |
+
+**Wired vs. fail-closed on the Docker path.** Only `direct` (bridge `bb-net0`) and `inetsim` (`bb-fakenet`) are self-contained docker-native exits (operator pre-creates the bridge). `socks`/`tor`/`httpproxy` attach to an internal `bb-socks` bridge and `openvpn`/`wireguard` to `bb-vpn` — neither has direct egress on its own; the real exit is wired by `blastbox-netd`. So **without netd running and the matching `BLASTBOX_NETD_*` knob set, those workers sit on an internal bridge with no route** — fail-closed, but by "internal bridge, no egress" rather than literally `--network=none` (used only for `none`/`drop`/unknown drivers). `BLASTBOX_NET_EGRESS` (a `Limits` field) is set **per-job by the dispatcher** (`1` for a personality with a real exit, else `0`, merged last so a hostile `job.param` can't flip it) and only decides whether an inner namespace sandbox net-*shares* the worker netns — operators don't normally hand-set it.
