@@ -574,6 +574,27 @@ def test_snapstart_auto_resume_off_disables():
     assert LambdaSnapStartConfig.from_env({"BLASTBOX_LAMBDA_IMAGE": "arn:img"}.get).auto_resume is True
 
 
+def test_ec2_public_ip_without_tls_fails_closed():
+    # J3 (security): a public IP with no dispatcher TLS would send X-aws-proxy-auth + samples in cleartext
+    # over the public endpoint -> fail closed at construction, unless the operator explicitly opts in.
+    import ssl
+    fake = FakeAws({**_IDENT})
+    with pytest.raises(AwsUnavailable, match="cleartext"):
+        DisposableEc2Runtime(Ec2Config(region="us-east-1", image_id="ami-x", use_public_ip=True),
+                             aws_runner=fake)
+    with pytest.raises(AwsUnavailable, match="cleartext"):   # hibernate tier too (shared __init__)
+        Ec2HibernateRuntime(Ec2HibernateConfig(region="us-east-1", image_id="ami-x", use_public_ip=True),
+                            aws_runner=fake)
+    # explicit opt-out accepts plaintext:
+    DisposableEc2Runtime(Ec2Config(region="us-east-1", image_id="ami-x", use_public_ip=True,
+                                   allow_plaintext_public=True), aws_runner=fake)
+    # a dispatcher TLS context also satisfies it (probes + /detonate go https):
+    DisposableEc2Runtime(Ec2Config(region="us-east-1", image_id="ami-x", use_public_ip=True),
+                         aws_runner=fake, ssl_context=ssl.create_default_context())
+    # the default private-IP path never trips the guard:
+    DisposableEc2Runtime(Ec2Config(region="us-east-1", image_id="ami-x"), aws_runner=fake)
+
+
 def test_ec2_config_from_env_defaults_arm():
     cfg = Ec2Config.from_env({"BLASTBOX_EC2_AMI": "ami-x"}.get)
     assert cfg.image_id == "ami-x"
@@ -875,7 +896,8 @@ def test_ec2_hibernate_resume_refreshes_public_ip_uncached():
         return _cp(stdout=json.dumps({"Reservations": [{"Instances": [
             {"InstanceId": "i-1", "State": {"Name": "running"}, "PublicIpAddress": ip["v"]}]}]}))
 
-    cfg = Ec2HibernateConfig(region="us-east-1", image_id="ami-x", use_public_ip=True, resume_poll_s=0.0)
+    cfg = Ec2HibernateConfig(region="us-east-1", image_id="ami-x", use_public_ip=True, resume_poll_s=0.0,
+                             allow_plaintext_public=True)   # this test exercises IP refresh, not the TLS guard
     fake = FakeAws({**_IDENT, "ec2 describe-instances": describe, "ec2 start-instances": {},
                    "ec2 stop-instances": {}})
     rt = Ec2HibernateRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: "2.2.2.2" in u, clock=lambda: 100.0)

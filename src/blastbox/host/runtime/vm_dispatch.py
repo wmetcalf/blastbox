@@ -744,7 +744,10 @@ def build_remote_vm_dispatcher(
         # drift: these are dispatcher-owned (merged LAST, a job param can't flip them).
         for _env_key, _cap in (("BLASTBOX_MAX_METADATA", max_metadata_bytes),
                                ("BLASTBOX_MAX_TOTAL_ARTIFACTS", max_output_bytes),
-                               ("BLASTBOX_MAX_ARTIFACTS", getattr(limits, "max_artifacts", None))):
+                               ("BLASTBOX_MAX_ARTIFACTS", getattr(limits, "max_artifacts", None)),
+                               # per-artifact cap too: engines (detonate/urlgrab) read max_artifact_bytes
+                               # during detonation, so an unforwarded raise silently TRUNCATES on the worker.
+                               ("BLASTBOX_MAX_ARTIFACT", getattr(limits, "max_artifact_bytes", None))):
             if _cap is not None:
                 _net_env[_env_key] = str(_cap)
 

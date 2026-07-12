@@ -536,13 +536,14 @@ def test_remote_factory_forwards_output_caps_to_worker(tmp_path):
     spec = SimpleNamespace(net_policy="none", allowed_param_keys=frozenset(),
                            reserved_param_keys=frozenset(), default_params=None)
     limits = SimpleNamespace(max_metadata_bytes=104857600, max_total_artifact_bytes=500_000_000,
-                             max_artifacts=2000)
+                             max_artifacts=2000, max_artifact_bytes=209715200)
     vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
                                     tier="static", engine="clippyshot", engine_spec=spec, limits=limits)
     out = vm._sanitize({})
     assert out["BLASTBOX_MAX_METADATA"] == "104857600"
     assert out["BLASTBOX_MAX_TOTAL_ARTIFACTS"] == "500000000"
     assert out["BLASTBOX_MAX_ARTIFACTS"] == "2000"
+    assert out["BLASTBOX_MAX_ARTIFACT"] == "209715200"   # per-artifact cap too (engines read it)
 
 
 def test_remote_factory_requires_limits_and_engine(tmp_path):

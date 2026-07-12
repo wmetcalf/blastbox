@@ -343,6 +343,36 @@ def test_health_probes_do_not_follow_worker_redirects():
         srv.shutdown()
 
 
+def test_default_open_ignores_ambient_proxy(monkeypatch):
+    # J2: worker transport must IGNORE HTTP_PROXY/HTTPS_PROXY -- else the /detonate body + X-aws-proxy-auth
+    # route through the proxy (cleartext for http workers). With a DEAD proxy set, a direct request to a
+    # live local worker must still SUCCEED, proving the proxy was bypassed.
+    import http.server
+    import threading
+    import urllib.request
+    from blastbox.host.runtime.remote_http import _default_open
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")    # dead proxy port
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+        req = urllib.request.Request(f"http://127.0.0.1:{srv.server_address[1]}/healthz")
+        with _default_open(req, timeout=5) as resp:
+            assert resp.status == 200        # reached the worker DIRECTLY (a used proxy would refuse:1)
+    finally:
+        srv.shutdown()
+
+
 def test_extracted_artifacts_forced_0644_under_restrictive_umask(tmp_path):
     # G5: a restrictive process umask (e.g. 077) must not mask extracted artifacts to 0600 -- the API
     # process (a different UID in a serve+dispatch split) has to read them. fchmod forces the exact mode.

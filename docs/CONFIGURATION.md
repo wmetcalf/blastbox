@@ -159,7 +159,8 @@ win-validator stays libvirt — no Windows/nested-virt on either).
 | `BLASTBOX_EC2_INSTANCE_TYPE` | `m7g.large` | ARM64 default (matches the sealed-Linux ARM image); override for x86. |
 | `BLASTBOX_EC2_SUBNET_ID` / `BLASTBOX_EC2_SECURITY_GROUPS` | — | VPC placement + SGs (comma-list). |
 | `BLASTBOX_EC2_IAM_PROFILE` / `BLASTBOX_EC2_KEY_NAME` | — | Instance profile name / SSH key name. |
-| `BLASTBOX_EC2_PUBLIC_IP` | `0` | `1` ⇒ talk to the public IP (default: private, host in-VPC). |
+| `BLASTBOX_EC2_PUBLIC_IP` | `0` | `1` ⇒ talk to the public IP (default: private, host in-VPC). Requires dispatcher TLS (`BLASTBOX_DISPATCH_TLS_CA`) — the runtime **fails closed** on public-IP-without-TLS (the token + samples would cross the public internet in cleartext). |
+| `BLASTBOX_EC2_ALLOW_PLAINTEXT_PUBLIC` | `0` | `1` ⇒ explicitly accept a public-IP worker with **no** TLS (opt out of the fail-closed guard above). Only for a trusted/private-fronted public endpoint. |
 | `BLASTBOX_EC2_USER_DATA_B64` | — | base64 cloud-init that starts the worker agent on `AGENT_PORT` (any format — merged into MIME-multipart with the auto TTL). |
 | `BLASTBOX_EC2_SELF_TERMINATE` | `1` | Inject a guest self-shutdown after `MAX_DURATION_S` (MIME-multipart, on top of your user-data) so a **crashed dispatcher can't leak a running instance** — `--instance-initiated-shutdown-behavior terminate` then reaps it. Set `0` if the AMI handles its own TTL. |
 | `BLASTBOX_EC2_AGENT_TOKEN` | — | Bearer token the AMI's agent expects (`BLASTBOX_WORKER_AGENT_TOKEN`); forwarded on both the readiness probe and `/detonate`. |

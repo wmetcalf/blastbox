@@ -167,6 +167,7 @@ class Ec2Config(AwsWorkerConfig):
     iam_instance_profile: str | None = None
     key_name: str | None = None
     use_public_ip: bool = False        # talk to the public IP (default: private IP, host in-VPC)
+    allow_plaintext_public: bool = False   # opt out of the public-IP-requires-TLS fail-closed guard
     user_data_b64: str | None = None   # base64 cloud-init that brings up the worker agent on agent_port
     agent_token: str | None = None     # BLASTBOX_WORKER_AGENT_TOKEN baked into the AMI -> forwarded here
     self_terminate: bool = True        # inject a guest self-shutdown TTL so a leaked instance dies
@@ -187,6 +188,7 @@ class Ec2Config(AwsWorkerConfig):
             iam_instance_profile=_env(get, "BLASTBOX_EC2_IAM_PROFILE"),
             key_name=_env(get, "BLASTBOX_EC2_KEY_NAME"),
             use_public_ip=(_env(get, "BLASTBOX_EC2_PUBLIC_IP") or "0") == "1",
+            allow_plaintext_public=(_env(get, "BLASTBOX_EC2_ALLOW_PLAINTEXT_PUBLIC") or "0") == "1",
             user_data_b64=_env(get, "BLASTBOX_EC2_USER_DATA_B64"),
             self_terminate=(_env(get, "BLASTBOX_EC2_SELF_TERMINATE", "1") or "1").strip().lower()
             not in ("0", "false", "no", "off"),   # strip/lower so False/NO/Off actually disable the backstop
@@ -758,7 +760,17 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
     def __init__(self, cfg: Ec2Config, **kw: Any) -> None:
         if not cfg.image_id:
             raise AwsUnavailable("DisposableEc2Runtime: BLASTBOX_EC2_AMI is required")
-        super().__init__(cfg, **kw)
+        super().__init__(cfg, **kw)   # sets self.ssl_context from the injected/kw context
+        # FAIL CLOSED on public IP without TLS: both the readiness probe and /detonate would then talk
+        # http:// to the PUBLIC EC2 endpoint, sending X-aws-proxy-auth (the shared agent_token) + the
+        # sample bytes across the public internet in cleartext. Covers the hibernate tier too (it chains
+        # through this __init__). Private-IP deploys (the default, use_public_ip=False) never trip it.
+        if cfg.use_public_ip and self.ssl_context is None and not cfg.allow_plaintext_public:
+            raise AwsUnavailable(
+                "EC2 worker over a PUBLIC IP without dispatcher TLS: the bearer token + sample bytes would "
+                "cross the public internet in cleartext. Set BLASTBOX_DISPATCH_TLS_CA (+ _CERT/_KEY for "
+                "mTLS to the agent), or BLASTBOX_EC2_ALLOW_PLAINTEXT_PUBLIC=1 to explicitly accept plaintext."
+            )
         self.cfg: Ec2Config = cfg
 
     def _service_available(self) -> bool:

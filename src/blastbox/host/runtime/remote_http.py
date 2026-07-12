@@ -45,7 +45,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 def _default_open(req: urllib.request.Request, timeout: float, context: ssl.SSLContext | None = None) -> Any:
     # build a fresh opener with redirects DISABLED (+ the caller's mTLS context for https workers) rather
     # than urlopen's default opener, which would auto-follow a worker's redirect and leak the auth headers.
-    handlers: list[Any] = [_NoRedirect()]
+    # Also pin an EMPTY ProxyHandler so worker transport IGNORES ambient HTTP_PROXY/HTTPS_PROXY: workers are
+    # private/direct-reach, and routing the /detonate body + X-aws-proxy-auth through an env proxy would
+    # leak them in cleartext for http:// workers. (Worker EGRESS proxying is the netpolicy httpproxy driver
+    # injected into the WORKER's env -- independent of this dispatcher-side transport opener.)
+    handlers: list[Any] = [_NoRedirect(), urllib.request.ProxyHandler({})]
     if context is not None:
         handlers.append(urllib.request.HTTPSHandler(context=context))
     return urllib.request.build_opener(*handlers).open(req, timeout=timeout)  # noqa: S310 (url is host-built)
