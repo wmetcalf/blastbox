@@ -385,22 +385,55 @@ def test_extracted_artifacts_forced_0644_under_restrictive_umask(tmp_path):
         os.umask(old)
 
 
-def test_make_remote_validate_params_for_raise_releases_dirty(tmp_path):
-    # F2: a raising params_for hook must NOT leak the claimed slot -- it is released DIRTY (retired) and
-    # the caller gets the sanitized (error, False) contract, not an exception out of validate().
+def test_cap_read_timeout_best_effort():
+    # #1: _cap_read_timeout shrinks the socket read timeout to the remaining budget (so a chunk-then-stall
+    # can't block the full original socket timeout past the deadline), and is a graceful no-op with no sock.
+    from blastbox.host.runtime.remote_http import _cap_read_timeout
+
+    class _Sock:
+        t = None
+
+        def settimeout(self, v):
+            self.t = v
+
+    resp = SimpleNamespace(fp=SimpleNamespace(raw=SimpleNamespace(_sock=_Sock())))
+    _cap_read_timeout(resp, 3.5)
+    assert resp.fp.raw._sock.t == 3.5            # capped to the remaining budget
+    _cap_read_timeout(SimpleNamespace(), 2.0)    # no reachable socket -> no-op, no raise
+
+
+def test_oversized_params_rejected_before_claim(tmp_path):
+    # #2: oversized params (ingress-valid but past the header limit) must be rejected BEFORE claiming a
+    # slot -- else a client could quarantine static boxes / burn AWS slots without running a job.
     from blastbox.host.runtime.remote_http import make_remote_validate
-    released = []
+    claimed = []
+    slot = SimpleNamespace(slot_id="s1", auth_token=None, agent_port=8765)
+    big = {f"K{i:03d}": "A" * 4000 for i in range(20)}   # ~80 KB > 65536
+
+    validate = make_remote_validate(
+        lambda: (claimed.append(1), slot)[1], lambda s, dirty=False: None,
+        output_dir_for=lambda p: tmp_path)
+    meta, ok = validate(tmp_path / "in.bin", params=big)
+    assert ok is False and "error" in meta
+    assert claimed == []   # rejected WITHOUT claiming a slot
+
+
+def test_make_remote_validate_params_for_raise_fails_before_claim(tmp_path):
+    # F2 + #2: a raising params_for is a LOCAL failure -- it must NOT claim a slot at all (deriving params
+    # before claim() means no worker is claimed+dirtied), returning the sanitized (error, False) contract.
+    from blastbox.host.runtime.remote_http import make_remote_validate
+    claimed, released = [], []
     slot = SimpleNamespace(slot_id="s1", auth_token=None, agent_port=8765)
 
     def boom(_p):
         raise ValueError("bad hook")
 
     validate = make_remote_validate(
-        lambda: slot, lambda s, dirty=False: released.append((s.slot_id, dirty)),
+        lambda: (claimed.append(1), slot)[1], lambda s, dirty=False: released.append((s.slot_id, dirty)),
         output_dir_for=lambda p: tmp_path, params_for=boom)
     meta, ok = validate(tmp_path / "in.bin")
     assert ok is False and "error" in meta       # sanitized failure, not a raise
-    assert released == [("s1", True)]            # claimed slot released DIRTY, not leaked ASSIGNED
+    assert claimed == [] and released == []      # no slot claimed -> none to leak or dirty
 
 
 def test_detonate_remote_caps_metadata_size(tmp_path):

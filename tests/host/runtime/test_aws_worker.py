@@ -189,6 +189,25 @@ def test_snapstart_warmup_throttles_failing_token_mint():
     assert mints <= 2   # throttled to ~1 per window, NOT one per readiness tick (10)
 
 
+def test_snapstart_throttles_failing_refresh_with_cached_token():
+    # #3: the mint throttle must apply even when a STALE cached token exists -- an aged token re-minted
+    # past half-TTL on a never-ready/suspended slot rejects, and without this it storms the mint API every
+    # tick (the first fix only covered tokenless first mints).
+    clk = {"t": 100.0}
+    rt, fake = _snapstart_rt({
+        "lambda-microvms get-microvm": {"state": "pending", "endpoint": "vm.example"},
+        "lambda-microvms create-microvm-auth-token": _cp(rc=254, stderr="microvm not running"),
+    }, probe=lambda u, h, t: True, clock=lambda: clk["t"], auth_token_ttl_min=10)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="mv-1")
+    slot.auth_token = "AGED"          # a cached token...
+    slot.token_minted_at = -1e9       # ...far past half-TTL, so _ensure_token always tries to re-mint
+    for _ in range(10):
+        assert rt.is_ready(slot) is False
+        clk["t"] += 0.1
+    mints = sum(1 for k, _ in fake.calls if k == "lambda-microvms create-microvm-auth-token")
+    assert mints <= 2   # throttled DESPITE the cached token (was 10 -- one per tick -- before the fix)
+
+
 def test_snapstart_resume_remints_token_after_wake():
     # I4: a JWE minted while the slot is PARKED is invalid; after resume-microvm the next probe must
     # re-mint an awake token. Model: 1st mint 'jwe-parked' (probe rejects), post-resume mint 'jwe-awake'

@@ -96,18 +96,51 @@ def _sanitized_failure(exc: Exception) -> str:
     return "remote job failed"
 
 
+def _check_params_header_size(params: dict[str, str] | None) -> None:
+    """Raise ParamsTooLargeForRemote if the forwarded params serialize past the stdlib HTTP header-line
+    limit (http.client._MAXLINE = 65536). The worker's HTTP parser would reject the request BEFORE
+    _parse_params runs -- an opaque failure the cold/file paths (env-passed params) don't have."""
+    if not params:
+        return
+    line = len(b"X-Blastbox-Params: ") + len(json.dumps(params).encode("utf-8", "surrogatepass")) + 2
+    if line > 65536:
+        raise ParamsTooLargeForRemote(
+            f"forwarded params serialize to {line} header bytes (> 65536); reduce the allowlisted "
+            "per-job params for the remote tier")
+
+
+def _cap_read_timeout(src: Any, remaining: float) -> None:
+    """Best-effort: shrink the NEXT socket read's timeout to the REMAINING wall-clock budget, so a worker
+    that sends a chunk just before the deadline and then STALLS can't block for the full original urllib
+    socket timeout (another ~worker_timeout_s) past the budget. No-op when the socket isn't reachable (a
+    custom opener / test double) -- the per-chunk deadline check still bounds a steady trickle."""
+    try:
+        src.fp.raw._sock.settimeout(max(0.001, remaining))
+    except (AttributeError, OSError):
+        pass
+
+
 def _bounded_copy(src: Any, dst: Any, limit: int | None, deadline: float | None = None) -> int:
     """copyfileobj that aborts once ``limit`` bytes have been read (None = unbounded). When ``deadline``
     (a ``time.monotonic()`` value) is given, also aborts if the TOTAL wall-clock read exceeds it -- the
-    urllib socket timeout only bounds idle gaps, so a worker trickling >=1 byte per window could otherwise
-    read forever past the job budget while the abandoned validate thread pins the pool slot. Reads via
-    ``read1`` (one recv per call) when available so the deadline is re-checked promptly under a trickle."""
+    urllib socket timeout only bounds idle gaps, so a worker trickling (or chunk-then-stalling) could
+    otherwise read past the job budget while the abandoned validate thread pins the pool slot. Reads via
+    ``read1`` (one recv per call) when available AND caps each read to the remaining budget, so the deadline
+    is enforced both between AND during a blocking read."""
     total = 0
     read = getattr(src, "read1", None) or src.read
     while True:
-        if deadline is not None and time.monotonic() >= deadline:
-            raise RemoteReadTimeout(f"remote output read exceeded the {deadline:.0f}s wall-clock deadline")
-        chunk = read(1024 * 1024)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RemoteReadTimeout(f"remote output read exceeded the {deadline:.0f}s wall-clock deadline")
+            _cap_read_timeout(src, remaining)   # bound THIS read to the remaining budget
+        try:
+            chunk = read(1024 * 1024)
+        except (TimeoutError, OSError) as exc:   # incl. socket.timeout from the capped read
+            if deadline is not None and time.monotonic() >= deadline:
+                raise RemoteReadTimeout("remote output read exceeded the wall-clock deadline") from exc
+            raise
         if not chunk:
             break
         total += len(chunk)
@@ -299,16 +332,8 @@ def detonate_remote(
         headers["X-aws-proxy-auth"] = token
         headers["X-aws-proxy-port"] = str(agent_port)
     if params:
-        _encoded = json.dumps(params)
-        # a single header line has a hard stdlib limit (http.client _MAXLINE = 65536); a params set that
-        # serializes past it would be rejected by the worker's HTTP parser BEFORE _parse_params runs, an
-        # opaque failure the cold/file paths (env-passed params) don't have. Fail fast with a clear reason.
-        _line = len(b"X-Blastbox-Params: ") + len(_encoded.encode("utf-8", "surrogatepass")) + 2
-        if _line > 65536:
-            raise ParamsTooLargeForRemote(
-                f"forwarded params serialize to {_line} header bytes (> 65536); reduce the allowlisted "
-                "per-job params for the remote tier")
-        headers["X-Blastbox-Params"] = _encoded
+        _check_params_header_size(params)   # belt-and-suspenders for direct callers (make_remote_validate
+        headers["X-Blastbox-Params"] = json.dumps(params)   # already checks BEFORE claiming a slot)
     # STREAM the input as the request body (open file handle + explicit Content-Length) instead of
     # read_bytes() -- otherwise the dispatcher holds the whole sample in RAM per concurrent claim
     # thread, so a burst of large-but-valid uploads (raised BLASTBOX_MAX_INPUT) can OOM it before any
@@ -395,13 +420,18 @@ def make_remote_validate(
     def validate(input_path: Path, *, params: dict[str, str] | None = None,
                  input_sha256: str | None = None,
                  owns: Callable[[], bool] | None = None) -> tuple[dict[str, Any] | None, bool]:
+        # Derive + size-check the params BEFORE claiming a slot: a raising params_for hook OR an oversized
+        # params set (many allowlisted 4KiB keys) must NOT claim+dirty a worker -- that would quarantine a
+        # static box for its cooldown / burn a disposable AWS slot without ever running a job (a cheap DoS).
+        try:
+            job_params = params if params is not None else (params_for(input_path) if params_for else None)
+            _check_params_header_size(job_params)
+        except Exception as exc:  # noqa: BLE001 -- local validation failure, no slot claimed yet
+            _log.warning("remote_http: params rejected before claim: %s", exc)
+            return {"error": _sanitized_failure(exc)}, False
         slot = claim()
         dirty = True  # only a clean, successful round-trip releases the slot as reusable
         try:
-            # per-job params from the dispatcher (already allowlist-gated) win; else the params_for hook.
-            # Derived INSIDE the try so a raising params_for still hits the finally -> the claimed slot is
-            # released dirty (retired/recycled) instead of leaking ASSIGNED until process shutdown.
-            job_params = params if params is not None else (params_for(input_path) if params_for else None)
             base = slot_base_url(slot, tls=ssl_context is not None)
             out_dir = output_dir_for(input_path)
             meta = detonate_remote(

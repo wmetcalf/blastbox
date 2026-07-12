@@ -704,8 +704,11 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # still pending, but create-microvm-auth-token needs a RUNNING VM -> it fails. Without this the
         # ~10Hz WARMING readiness poll would re-mint (and fail) every tick, storming the control plane. Skip
         # a re-mint within one throttle window of the last failure; the probe stays the readiness gate.
+        # back off after ANY failed mint, not just a first (tokenless) one: a slot with an aged cached
+        # token that _ensure_token re-mints past half-TTL can also hit a rejecting (suspended/never-ready)
+        # AWS and would otherwise storm the mint API every tick. Skip re-minting + probing within the window.
         throttle = max(self.cfg.resume_poll_s, 1.0)
-        if slot.auth_token is None and (self._clock() - self._mint_fail_at.get(slot.slot_id, -1e18)) < throttle:
+        if (self._clock() - self._mint_fail_at.get(slot.slot_id, -1e18)) < throttle:
             return False
         try:
             token = self._ensure_token(slot)
