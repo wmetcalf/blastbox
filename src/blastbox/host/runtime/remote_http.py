@@ -197,10 +197,11 @@ def dispatch_ssl_context_from_env(get: Callable[[str], str | None] = os.environ.
         return None
     if bool(cert) != bool(key):
         raise RuntimeError("BLASTBOX_DISPATCH_TLS_CERT and _TLS_KEY must be set together")
-    # BLASTBOX_DISPATCH_TLS_VERIFY_HOSTNAME=0 trusts any cert our private CA signed regardless of the
-    # address it answered on -- required for dynamically-addressed worker pools (a disposable-EC2 slot
-    # gets a fresh IP, so one baked server cert can't name it). CA-chain verification stays on; the
-    # safety of this rests on the CA being private (see blastbox.tls.client_ssl_context).
+    # BLASTBOX_DISPATCH_TLS_VERIFY_HOSTNAME=0 trusts any unexpired serverAuth cert our private CA
+    # signed regardless of the address it answered on -- required for dynamically-addressed worker
+    # pools (a disposable-EC2 slot gets a fresh IP, so one baked server cert can't name it). Chain
+    # signature/expiry/EKU stay enforced; safety rests on the CA being private + per-worker keys
+    # (see blastbox.tls.client_ssl_context).
     verify_host = (get("BLASTBOX_DISPATCH_TLS_VERIFY_HOSTNAME") or "1").strip().lower() not in (
         "0", "false", "no", "off",
     )

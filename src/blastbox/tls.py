@@ -32,13 +32,17 @@ def client_ssl_context(
     mTLS) present the dispatcher's client cert.
 
     ``verify_hostname=False`` keeps full CA-chain verification (``verify_mode`` stays
-    ``CERT_REQUIRED``) but drops the SAN/hostname match, so any cert **signed by ``ca_file``** is
-    trusted regardless of which address answered. This is the correct identity model for a pool of
+    ``CERT_REQUIRED``) but drops the SAN/hostname match, so any **unexpired ``serverAuth`` cert the
+    CA signed** is trusted regardless of which address answered -- chain signature, expiry, and the
+    ``serverAuth`` EKU are all still enforced. This is the correct identity model for a pool of
     interchangeable, dynamically-addressed workers (e.g. disposable EC2, where each slot gets a fresh
     IP a baked server cert can't name): identity is "issued by our private CA", not "is this exact
     IP". It is safe **only because ``ca_file`` is a private CA that signs nothing but our own
-    workers** -- against a public CA it would trust any valid cert. An untrusted / self-signed /
-    wrong-CA server cert is still rejected either way (chain verification is unchanged).
+    workers** -- against a public CA it would trust any valid cert. A self-signed / wrong-CA /
+    expired / client-only cert is still rejected either way; only the address check is relaxed.
+    Tradeoff: this drops per-worker identity pinning -- a leaked worker *server* key lets its holder
+    impersonate ANY worker in the pool to the dispatcher. Keep worker keys per-instance and cert
+    lifetimes short; the host output-trust gate still re-validates every returned result.
     """
     ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_file)
     if not verify_hostname:

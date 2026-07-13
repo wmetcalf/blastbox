@@ -255,6 +255,14 @@ def test_import_ca_refuses_overwriting_a_different_ca(tmp_path):
         import_ca(tmp_path, b.cert_pem, b.key_pem)    # a DIFFERENT CA -> refuse the silent rotation
 
 
+def test_import_ca_refuses_partial_state(tmp_path):
+    from blastbox.host.pki import import_ca
+    a = _generate_ca()
+    (tmp_path / "ca.key").write_bytes(a.key_pem)      # orphan key, no ca.crt -> partial state
+    with pytest.raises(RuntimeError):
+        import_ca(tmp_path, a.cert_pem, a.key_pem)    # mirror ensure_ca: refuse, don't complete silently
+
+
 def test_shared_imported_ca_interoperates_across_hosts(tmp_path):
     # The failover shape: one CA generated centrally, imported on two separate hosts. A client cert
     # issued on host A and a server cert issued on host B share one root, so they complete mTLS --

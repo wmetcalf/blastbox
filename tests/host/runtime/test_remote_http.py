@@ -206,6 +206,23 @@ def test_dispatch_ssl_context_verify_hostname_toggle(tmp_path):
     assert off.verify_mode == ssl.CERT_REQUIRED
 
 
+def test_dispatch_ssl_context_verify_hostname_fail_safe(tmp_path):
+    # The parse must FAIL SAFE: only an explicit off-token disables the hostname check; anything
+    # else (empty, whitespace, a typo, a truthy string) keeps verification ON.
+    from blastbox.host.pki import ensure_ca
+    from blastbox.host.runtime.remote_http import dispatch_ssl_context_from_env
+    ensure_ca(tmp_path)
+    ca = str(tmp_path / "ca.crt")
+    for val in ("", "  ", "banana", "1", "true", "YES", "2"):
+        ctx = dispatch_ssl_context_from_env(
+            {"BLASTBOX_DISPATCH_TLS_CA": ca, "BLASTBOX_DISPATCH_TLS_VERIFY_HOSTNAME": val}.get)
+        assert ctx.check_hostname is True, f"{val!r} should keep hostname verification ON"
+    for val in ("0", "false", "no", "off", "OFF", " off "):
+        ctx = dispatch_ssl_context_from_env(
+            {"BLASTBOX_DISPATCH_TLS_CA": ca, "BLASTBOX_DISPATCH_TLS_VERIFY_HOSTNAME": val}.get)
+        assert ctx.check_hostname is False, f"{val!r} should turn hostname verification OFF"
+
+
 def test_detonate_remote_caps_output(tmp_path):
     from blastbox.host.runtime.remote_http import RemoteOutputTooLarge
     (tmp_path / "in.bin").write_bytes(b"z")

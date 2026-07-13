@@ -242,7 +242,13 @@ def import_ca(pki_dir: Path, cert_pem: bytes, key_pem: bytes) -> CertAuthority:
     if not is_ca:
         raise ValueError("imported cert is not a CA (BasicConstraints ca=True required)")
     crt_path, key_path = pki_dir / "ca.crt", pki_dir / "ca.key"
-    if crt_path.exists():
+    have_crt, have_key = crt_path.exists(), key_path.exists()
+    if have_crt != have_key:
+        # mirror ensure_ca: refuse a partial CA state rather than silently completing it
+        raise RuntimeError(
+            f"partial CA state in {pki_dir} (have {'ca.crt' if have_crt else 'ca.key'}, missing the "
+            "other) -- clear both before importing")
+    if have_crt:  # both present: only the SAME CA may be re-imported (never a silent rotation)
         existing = x509.load_pem_x509_certificate(crt_path.read_bytes())
         if existing.fingerprint(hashes.SHA256()) != cert.fingerprint(hashes.SHA256()):
             raise RuntimeError(
@@ -251,7 +257,7 @@ def import_ca(pki_dir: Path, cert_pem: bytes, key_pem: bytes) -> CertAuthority:
     pki_dir.mkdir(parents=True, exist_ok=True)
     ca = CertAuthority(cert, key)
     crt_path.write_bytes(ca.cert_pem)          # normalize to the CA's own canonical PEM
-    _write_private(key_path, ca.key_pem)
+    _write_private(key_path, ca.key_pem)       # (re)writes the validated pair -- heals a tampered key
     return ca
 
 
