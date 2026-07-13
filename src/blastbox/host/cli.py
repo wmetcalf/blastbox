@@ -247,16 +247,18 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
             job_retention_s=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"),
         )
         pool.start()   # validation passed -> now spawn/warm slots (nothing to leak on an earlier raise)
-        # One-shot orphan sweep on start (aws-ec2-hibernate only; guarded by hasattr). A fresh run's
-        # run_id tags nothing yet, so this can only reclaim a PREDECESSOR/crashed run's leaked stopped
-        # slots -- never our own. Opt-in (BLASTBOX_EC2_ORPHAN_MAX_AGE_S); best-effort, never fatal.
-        _sweep = getattr(getattr(pool, "runtime", None), "sweep_orphans", None)
-        if callable(_sweep):
-            try:
-                _sweep()
-            except Exception:  # noqa: BLE001 - a sweep hiccup must not block dispatch
-                logging.getLogger("blastbox.host.cli").warning("startup orphan sweep failed", exc_info=True)
         try:
+            # One-shot orphan sweep on start (aws-ec2-hibernate only; guarded by hasattr). A fresh run's
+            # run_id tags nothing yet, so this can only reclaim a PREDECESSOR/crashed run's leaked stopped
+            # slots -- never our own. Opt-in (BLASTBOX_EC2_ORPHAN_MAX_AGE_S); best-effort, never fatal.
+            # INSIDE the try so a BaseException here (Ctrl-C, or a blocking describe/terminate) still
+            # runs the finally's pool.stop() instead of leaking the just-spawned slots.
+            _sweep = getattr(getattr(pool, "runtime", None), "sweep_orphans", None)
+            if callable(_sweep):
+                try:
+                    _sweep()
+                except Exception:  # noqa: BLE001 - a sweep hiccup must not block dispatch
+                    logging.getLogger("blastbox.host.cli").warning("startup orphan sweep failed", exc_info=True)
             vm.run()
         except BaseException:
             vm.stop()   # release the executor's worker loops so the finally's pool.stop() can reap
