@@ -60,6 +60,7 @@ Issues = "https://github.com/wmetcalf/blastbox/issues"
 
 [project.scripts]
 blastbox = "blastbox.host.cli:main"
+blastbox-netd = "blastbox.host.netd:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,0 +1,55 @@
+# blastbox-netd — the privileged egress-overlay helper for the netpolicy layer.
+#
+# netd runs OUT-OF-BAND from the cap-dropped dispatcher: it watches for worker containers
+# labeled by the dispatcher and wires their real network exit (netns TUN + tun2socks for the
+# `socks` tier, a host REDIRECT → tor for `tor`/transproxy, a default route to the VPN/NAT or
+# sslproxy/MITM gateway for `vpn`/`inspect`), and captures a host-side pcap sealed into the
+# result envelope. Without netd running, egress workers sit on an internal bridge with NO route
+# (fail-closed). This unit codifies the previously hand-run setsid invocation.
+#
+# Install:
+#   sudo cp deploy/systemd/blastbox-netd.service /etc/systemd/system/
+#   # 0600 — netd.env can hold a credentialed BLASTBOX_NETD_SOCKS_PROXY URL, so keep it secret:
+#   sudo install -Dm600 deploy/systemd/blastbox-netd.env /etc/blastbox/netd.env   # then edit
+#   sudo systemctl daemon-reload && sudo systemctl enable --now blastbox-netd
+#
+# Requires: the blastbox host package on PATH (the `blastbox-netd` console script) plus
+# tcpdump / iproute2 / nsenter / tun2socks; docker (netd reads container labels + netns).
+
+[Unit]
+Description=blastbox netd — netpolicy egress-overlay + capture helper
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+# Config is read from the BLASTBOX_JOB_ROOT + BLASTBOX_NETD_* environment (CLI flags override);
+# see blastbox-netd.env.
+EnvironmentFile=-/etc/blastbox/netd.env
+# systemd requires an ABSOLUTE ExecStart. `blastbox-netd` installs to the Python bin dir — usually
+# /usr/local/bin (pip) or /usr/bin (distro package); adjust this path to wherever it landed.
+ExecStart=/usr/local/bin/blastbox-netd
+Restart=on-failure
+RestartSec=5
+
+# netd genuinely needs privilege — it reads the docker socket, enters worker netns (nsenter),
+# manipulates routes/iptables/tun, and WRITES the sealed pcap under the (often dispatcher-owned)
+# per-job capture dirs. It therefore runs as **root** (no User=), but the CAPABILITY BOUNDING SET
+# below caps it to the capabilities it actually uses. NB: CAP_DAC_OVERRIDE is REQUIRED — root does
+# NOT bypass file permissions once it's dropped, and netd must create <job_root>/<job_id>/capture/
+# under dirs owned by the (possibly non-root) dispatcher, or capture sealing silently fails.
+# Caveat: netd talks to the docker socket, so a compromise could ask dockerd for a privileged
+# helper regardless of this bounding set — front the socket with a read-only docker-socket-proxy
+# to make the bounding set a real blast-radius limit. Tighten further to your environment.
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+# Private umask so the per-job capture dir + dump.pcap netd writes aren't world-readable on a
+# multi-user host (the job tree may be traversable).
+UMask=0077
+ProtectSystem=full
+# NB: do NOT set ProtectHome=true here — BLASTBOX_JOB_ROOT may live under /home (the env file only
+# requires it to match the dispatcher's), and ProtectHome would hide /home from netd so it couldn't
+# write captures there. Add it back only if your job root is outside /home, /root, /run/user.
+
+[Install]
+WantedBy=multi-user.target
