@@ -295,6 +295,14 @@ class AwsWorkerSlot:
 # Base runtime
 # ---------------------------------------------------------------------------
 
+# EC2 instance tag keys. blastbox-slot = per-slot id (existing); blastbox-tier lets the
+# hibernate orphan sweep filter precisely (never touches disposable/lambda); blastbox-run is
+# the sweep's per-dispatcher-process ownership fence.
+_TAG_SLOT = "blastbox-slot"
+_TAG_TIER = "blastbox-tier"
+_TAG_RUN = "blastbox-run"
+
+
 class AwsDisposableRuntime:
     """Shared machinery for AWS disposable-worker tiers. Concrete tiers implement the four hooks
     ``_launch`` / ``_health_ok`` / ``_running`` / ``_terminate``; this base wires them into the
@@ -326,6 +334,13 @@ class AwsDisposableRuntime:
         # cache the READINESS get-microvm/describe-instances too (is_ready is polled ~10Hz during WARMING,
         # and its endpoint-resolution describe is uncached) so a booting slot doesn't spam the control plane.
         self._desc_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        # Per-PROCESS ownership fence for the aws-ec2-hibernate orphan sweep. A leaked STOPPED slot
+        # from a CRASHED dispatcher isn't bounded by the guest uptime timer (it's frozen while
+        # hibernated), so sweep_orphans() reclaims stopped slots NOT carrying this id. Deliberately
+        # fresh per process (not env-overridable): a restarted dispatcher gets a new id, so its
+        # predecessor's parked slots correctly read as orphans; a stable id would make them look
+        # "ours" and never be swept.
+        self._run_id = uuid.uuid4().hex[:16]
 
     def _describe_cached(self, slot: "AwsWorkerSlot", ttl: float) -> dict[str, Any]:
         now = self._clock()
@@ -845,7 +860,11 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
     def _launch(self) -> AwsWorkerSlot:
         sid = uuid.uuid4().hex[:16]
         c = self.cfg
-        tag = f"ResourceType=instance,Tags=[{{Key=blastbox-slot,Value={sid}}}]"
+        # All values are hex/slug (no commas/brackets/spaces) → safe in the CLI shorthand parser.
+        tag_pairs = (f"{{Key={_TAG_SLOT},Value={sid}}},"
+                     f"{{Key={_TAG_TIER},Value={self.kind}}},"
+                     f"{{Key={_TAG_RUN},Value={self._run_id}}}")
+        tag = f"ResourceType=instance,Tags=[{tag_pairs}]"
         args = ["--image-id", c.image_id, "--instance-type", c.instance_type,
                 "--count", "1", "--client-token", sid, "--tag-specifications", tag,
                 # auto-terminate on the instance's own shutdown as a backstop reap
@@ -964,7 +983,7 @@ class Ec2HibernateConfig(Ec2Config):
     # unlike a wall-clock `shutdown -h +minutes` it can't fire on resume -- a leaked RUNNING instance
     # (crashed dispatcher) self-terminates after MAX_DURATION_S of cumulative running time, a parked one
     # never accrues it. (A stopped/hibernated leak from a crashed dispatcher is EBS-cost only and not bounded
-    # by a guest timer -- an external tag sweep is the follow-up for that.)
+    # by a guest timer -- the host-side sweep_orphans() reaps those, opt-in via BLASTBOX_EC2_ORPHAN_MAX_AGE_S.)
     self_terminate: bool = True
     root_device_name: str = "/dev/xvda"   # AL2023 ARM64 root device
     root_volume_gb: int = 30              # >= RAM + OS; the EBS must hold the saved RAM image
@@ -974,6 +993,10 @@ class Ec2HibernateConfig(Ec2Config):
     resume_timeout_s: float = 180.0       # < worker_timeout (300) so a slow start leaves budget for the job
     resume_poll_s: float = 5.0
     hibernate_timeout_s: float = 300.0    # per-slot budget for stop --hibernate -> stopped before re-driving
+    # Host-side orphan sweep: terminate STOPPED/hibernated slots (NOT owned by this dispatcher process)
+    # older than this many seconds. 0 (default) = OFF, matching the BLASTBOX_MAX_QUEUED_AGE_S opt-in
+    # precedent. Recommend a positive value >= peak park duration (e.g. 3600) to reclaim leaked EBS cost.
+    orphan_max_age_s: float = 0.0
 
     @classmethod
     def from_env(cls, get: Callable[[str], str | None], **overrides: Any) -> Ec2HibernateConfig:
@@ -988,6 +1011,7 @@ class Ec2HibernateConfig(Ec2Config):
             resume_timeout_s=float(_env(get, "BLASTBOX_EC2_HIBERNATE_RESUME_TIMEOUT_S", "180") or "180"),
             resume_poll_s=float(_env(get, "BLASTBOX_EC2_HIBERNATE_RESUME_POLL_S", "5") or "5"),
             hibernate_timeout_s=float(_env(get, "BLASTBOX_EC2_HIBERNATE_TIMEOUT_S", "300") or "300"),
+            orphan_max_age_s=float(_env(get, "BLASTBOX_EC2_ORPHAN_MAX_AGE_S", "0") or "0"),
         )
         fields.update(overrides)
         return cls(**fields)
@@ -1158,6 +1182,68 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         for d in (self._phase, self._desc_cache, self._hib_attempt, self._hib_started):
             d.pop(slot.slot_id, None)
         super().reap(slot)   # terminate-instances (disposable after one untrusted job)
+
+    def sweep_orphans(self, *, max_age_s: float | None = None, now: float | None = None,
+                      dry_run: bool = False) -> list[str]:
+        """Terminate STOPPED/hibernated hibernate-tier slots leaked by a CRASHED dispatcher.
+
+        The guest uptime backstop is frozen while hibernated, so a slot PARKED when its dispatcher
+        died never self-terminates (EBS cost). This reclaims them, keyed on the ``blastbox-tier`` tag
+        and fenced against our OWN live parked slots by ``blastbox-run`` (this process's id). Only
+        acts when ``orphan_max_age_s > 0`` (opt-in). Best-effort: any per-instance failure is logged
+        and skipped — a sweep error must never crash the pool. Returns the terminated instance ids."""
+        max_age = self.cfg.orphan_max_age_s if max_age_s is None else max_age_s
+        # `not (max_age > 0)` (not `max_age <= 0`) so a NaN — float("nan") passes both `<= 0` AND the
+        # later `age < max_age` as False, which would otherwise terminate EVERY stopped slot — is
+        # treated as "disabled". inf is fine: age < inf is always True, so nothing is ever old enough.
+        if not (max_age > 0):
+            return []
+        now = time.time() if now is None else now
+        resp = self._aws("ec2", "describe-instances", "--filters",
+                         f"Name=tag:{_TAG_TIER},Values={self.kind}",
+                         "Name=instance-state-name,Values=stopping,stopped")
+        killed: list[str] = []
+        for res in resp.get("Reservations", []):
+            for inst in res.get("Instances", []):
+                iid = inst.get("InstanceId")
+                tags = {t.get("Key"): t.get("Value") for t in inst.get("Tags", [])}
+                if not iid or tags.get(_TAG_RUN) == self._run_id:
+                    continue   # our own live parked slot -- never sweep (primary safety)
+                stopped_at = self._stopped_since(inst)
+                if stopped_at is None or (now - stopped_at) < max_age:
+                    continue   # unparseable age (fail-safe skip) or too young
+                if dry_run:
+                    killed.append(iid)
+                    continue
+                try:
+                    self._aws("ec2", "terminate-instances", "--instance-ids", iid)
+                    killed.append(iid)
+                except (AwsWorkerError, OSError) as e:  # noqa: PERF203
+                    _log.warning("ec2-hibernate orphan sweep: terminate %s failed: %s", iid, e)
+        if killed:
+            _log.info("ec2-hibernate orphan sweep %s %d leaked slot(s): %s",
+                      "would terminate" if dry_run else "terminated", len(killed), killed)
+        return killed
+
+    @staticmethod
+    def _stopped_since(inst: dict[str, Any]) -> float | None:
+        """Epoch seconds when the instance entered ``stopped``, parsed from ``StateTransitionReason``
+        (``'... (YYYY-MM-DD HH:MM:SS GMT)'``). ``None`` when it's missing/unparseable — the caller
+        treats ``None`` as "too young" (skip). We deliberately do NOT fall back to ``LaunchTime``:
+        that's the instance's CREATION time, so a slot that ran a long while then stopped RECENTLY
+        would look ancient and be terminated prematurely — the opposite of fail-safe."""
+        import datetime as _dt
+        import re as _re
+
+        m = _re.search(r"\((\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) GMT\)",
+                       inst.get("StateTransitionReason") or "")
+        if not m:
+            return None
+        try:
+            return _dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=_dt.timezone.utc).timestamp()
+        except ValueError:
+            return None
 
 
 def select_ec2_hibernate_runtime(

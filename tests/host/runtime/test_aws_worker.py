@@ -1147,3 +1147,135 @@ def test_ec2_self_terminate_can_be_disabled():
     rt.spawn()
     argv = next(a for k, a in fake.calls if k == "ec2 run-instances")
     assert "--user-data" not in argv   # opted out -> no injected TTL, no user-data
+
+
+# ---- aws-ec2-hibernate orphan sweep ------------------------------------------------------
+
+
+def _gmt_epoch(s):  # noqa: ANN001  "YYYY-MM-DD HH:MM:SS" GMT -> epoch seconds
+    import datetime as _dt
+    return _dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_dt.timezone.utc).timestamp()
+
+
+def _sweep_rt(orphan_max_age_s=3600.0):  # noqa: ANN001
+    cfg = Ec2HibernateConfig(region="us-east-1", image_id="ami-x", orphan_max_age_s=orphan_max_age_s)
+    fake = FakeAws({**_IDENT,
+                    "ec2 describe-instances": {"Reservations": []},
+                    "ec2 terminate-instances": {}})
+    rt = Ec2HibernateRuntime(cfg, aws_runner=fake, clock=lambda: 100.0)
+    return rt, fake
+
+
+def _stopped_inst(iid, run_tag, when="2026-07-11 00:00:00"):  # noqa: ANN001
+    return {"InstanceId": iid, "State": {"Name": "stopped"},
+            "StateTransitionReason": f"User initiated ({when} GMT)",
+            "Tags": [{"Key": "blastbox-tier", "Value": "aws-ec2-hibernate"},
+                     {"Key": "blastbox-run", "Value": run_tag}]}
+
+
+def _set_instances(fake, instances):  # noqa: ANN001
+    fake.responses["ec2 describe-instances"] = {"Reservations": [{"Instances": instances}]}
+
+
+def test_orphan_sweep_terminates_leaked_stopped_slot():
+    rt, fake = _sweep_rt(orphan_max_age_s=3600.0)
+    _set_instances(fake, [_stopped_inst("i-old", "some-dead-run")])
+    killed = rt.sweep_orphans(now=_gmt_epoch("2026-07-11 00:00:00") + 7200)  # 2h old > 1h max
+    assert killed == ["i-old"]
+    assert any(k == "ec2 terminate-instances" and "i-old" in a for k, a in fake.calls)
+
+
+def test_orphan_sweep_skips_our_own_live_parked_slot():
+    rt, fake = _sweep_rt(orphan_max_age_s=3600.0)
+    _set_instances(fake, [_stopped_inst("i-mine", rt._run_id)])  # carries OUR run id
+    killed = rt.sweep_orphans(now=_gmt_epoch("2026-07-11 00:00:00") + 7200)
+    assert killed == []
+    assert not any(k == "ec2 terminate-instances" for k, _ in fake.calls)
+
+
+def test_orphan_sweep_skips_too_young():
+    rt, fake = _sweep_rt(orphan_max_age_s=3600.0)
+    _set_instances(fake, [_stopped_inst("i-young", "some-dead-run")])
+    killed = rt.sweep_orphans(now=_gmt_epoch("2026-07-11 00:00:00") + 60)  # 60s < 1h max
+    assert killed == []
+
+
+def test_orphan_sweep_skips_unparseable_stopped_time():
+    # Fail-safe: a missing/unparseable StateTransitionReason must be treated as "too young" and
+    # SKIPPED -- we must NOT fall back to LaunchTime (creation time), which would over-age a
+    # recently-stopped but long-lived slot and terminate it prematurely.
+    rt, fake = _sweep_rt(orphan_max_age_s=3600.0)
+    _set_instances(fake, [{
+        "InstanceId": "i-weird", "State": {"Name": "stopped"},
+        "StateTransitionReason": "User initiated",          # no "(YYYY-MM-DD HH:MM:SS GMT)"
+        "LaunchTime": "2020-01-01T00:00:00Z",                # ancient — must NOT be used
+        "Tags": [{"Key": "blastbox-tier", "Value": "aws-ec2-hibernate"},
+                 {"Key": "blastbox-run", "Value": "some-dead-run"}],
+    }])
+    killed = rt.sweep_orphans(now=_gmt_epoch("2026-07-11 00:00:00") + 7200)
+    assert killed == []
+    assert not any(k == "ec2 terminate-instances" for k, _ in fake.calls)
+
+
+def test_orphan_sweep_disabled_when_max_age_zero():
+    rt, fake = _sweep_rt(orphan_max_age_s=0.0)
+    _set_instances(fake, [_stopped_inst("i-old", "some-dead-run")])
+    assert rt.sweep_orphans(now=_gmt_epoch("2026-07-11 00:00:00") + 99999) == []
+    assert "ec2 describe-instances" not in fake.ops()  # no calls at all when disabled
+
+
+def test_orphan_sweep_nan_max_age_is_disabled():
+    # float("nan") passes `max_age <= 0` as False AND `age < max_age` as False, which would
+    # terminate EVERY stopped slot. A NaN age must be treated as disabled (no describe/terminate).
+    rt, fake = _sweep_rt(orphan_max_age_s=float("nan"))
+    _set_instances(fake, [_stopped_inst("i-old", "some-dead-run")])
+    assert rt.sweep_orphans(now=_gmt_epoch("2026-07-11 00:00:00") + 99999) == []
+    assert "ec2 describe-instances" not in fake.ops()
+
+
+def test_orphan_sweep_swallows_terminate_error_and_continues():
+    rt, fake = _sweep_rt(orphan_max_age_s=3600.0)
+    _set_instances(fake, [_stopped_inst("i-a", "dead"), _stopped_inst("i-b", "dead")])
+
+    def term(argv):
+        return _cp(rc=254, stderr="boom") if "i-a" in argv else _cp(stdout="{}")
+
+    fake.responses["ec2 terminate-instances"] = term
+    killed = rt.sweep_orphans(now=_gmt_epoch("2026-07-11 00:00:00") + 7200)
+    assert killed == ["i-b"]   # i-a failed but the sweep kept going
+
+
+def test_orphan_sweep_filters_by_tier_and_stopped_state():
+    rt, fake = _sweep_rt(orphan_max_age_s=3600.0)
+    rt.sweep_orphans(now=1.0)
+    argv = next(a for k, a in fake.calls if k == "ec2 describe-instances")
+    assert "Name=tag:blastbox-tier,Values=aws-ec2-hibernate" in argv
+    assert "Name=instance-state-name,Values=stopping,stopped" in argv
+
+
+def test_orphan_sweep_dry_run_lists_without_terminating():
+    rt, fake = _sweep_rt(orphan_max_age_s=3600.0)
+    _set_instances(fake, [_stopped_inst("i-old", "dead")])
+    killed = rt.sweep_orphans(now=_gmt_epoch("2026-07-11 00:00:00") + 7200, dry_run=True)
+    assert killed == ["i-old"]
+    assert not any(k == "ec2 terminate-instances" for k, _ in fake.calls)
+
+
+def test_orphan_max_age_from_env():
+    cfg = Ec2HibernateConfig.from_env({"BLASTBOX_EC2_ORPHAN_MAX_AGE_S": "3600"}.get)
+    assert cfg.orphan_max_age_s == 3600.0
+    assert Ec2HibernateConfig.from_env({}.get).orphan_max_age_s == 0.0  # default off
+
+
+def test_launch_tags_include_tier_and_run_fence():
+    cfg = Ec2Config(region="us-east-1", image_id="ami-x")
+    fake = FakeAws({**_IDENT,
+                    "ec2 run-instances": {"Instances": [{"InstanceId": "i-1"}]},
+                    "ec2 describe-instances": {"Reservations": [{"Instances": [
+                        {"InstanceId": "i-1", "State": {"Name": "running"}, "PrivateIpAddress": "10.0.0.5"}]}]}})
+    rt = DisposableEc2Runtime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True, clock=lambda: 1.0)
+    rt.spawn()
+    argv = next(a for k, a in fake.calls if k == "ec2 run-instances")
+    tagspec = argv[argv.index("--tag-specifications") + 1]
+    assert "Key=blastbox-tier,Value=aws-ec2" in tagspec
+    assert f"Key=blastbox-run,Value={rt._run_id}" in tagspec
