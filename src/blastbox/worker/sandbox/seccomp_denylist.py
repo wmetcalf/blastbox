@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 
 _log = logging.getLogger("blastbox.worker.sandbox.seccomp")
 
@@ -57,19 +58,21 @@ CLONE_NS_BITS: tuple[int, ...] = (
 CLONE_NS_MASK = 0x7E020000  # == sum(CLONE_NS_BITS); the KAFEL clone_flags mask
 
 
-def libseccomp_available() -> bool:
-    try:
-        import seccomp  # type: ignore[import-not-found]  # noqa: F401
-    except Exception:
-        return False
-    return True
-
-
 def build_bpf_bytes() -> bytes | None:
     """Build the ``DEFAULT ALLOW`` denylist BPF via libseccomp and return its raw bytes (to feed
-    ``bwrap --seccomp <fd>``). Returns ``None`` if libseccomp is unavailable or the build fails —
-    the caller then keeps bwrap marked insecure (fail-safe). A syscall name that doesn't resolve
-    on this arch is logged + skipped (degrade, don't crash)."""
+    ``bwrap --seccomp <fd>``).
+
+    Returns ``None`` — so the caller keeps bwrap marked insecure — when the arch isn't x86_64,
+    libseccomp is unavailable, OR **any** deny rule (a name, ``clone3``, or a ``clone`` bit) can't
+    be added. That last case is deliberately **fail-CLOSED**: a partial denylist (e.g. an older
+    libseccomp that doesn't know ``clone3``) would still report ``seccomp_active=True`` while
+    silently allowing a denied syscall, breaking the parity guarantee — attach the FULL filter or
+    none at all.
+    """
+    if platform.machine() not in ("x86_64", "amd64"):
+        # The denylist (and the nsjail KAFEL policy it mirrors) is x86_64-only.
+        _log.warning("seccomp: denylist is x86_64-only; not building on %s", platform.machine())
+        return None
     try:
         import seccomp  # type: ignore[import-not-found]
     except Exception:
@@ -79,25 +82,27 @@ def build_bpf_bytes() -> bytes | None:
         for name in DENY_ERRNO1:
             try:
                 f.add_rule(seccomp.ERRNO(1), name)
-            except Exception as e:  # noqa: BLE001 - unresolved syscall on this arch, etc.
-                _log.warning("seccomp: skipping unresolvable syscall %r: %s", name, e)
+            except Exception as e:  # noqa: BLE001
+                _log.warning("seccomp: cannot add deny rule for %r (%s) — failing closed", name, e)
+                return None
         # clone3 → ENOSYS(38) so glibc falls back to the arg-filtered clone().
         try:
             f.add_rule(seccomp.ERRNO(38), "clone3")
         except Exception as e:  # noqa: BLE001
-            _log.warning("seccomp: skipping clone3 rule: %s", e)
+            _log.warning("seccomp: cannot add clone3 rule (%s) — failing closed", e)
+            return None
         # clone() with any new-namespace bit → EPERM (one MASKED_EQ rule per bit).
         for bit in CLONE_NS_BITS:
             try:
                 f.add_rule(seccomp.ERRNO(1), "clone", seccomp.Arg(0, seccomp.MASKED_EQ, bit, bit))
             except Exception as e:  # noqa: BLE001
-                _log.warning("seccomp: skipping clone ns-bit 0x%x rule: %s", bit, e)
-        # Export to a memfd (unconditionally deadlock-safe vs a pipe), then read it back.
+                _log.warning("seccomp: cannot add clone ns-bit 0x%x rule (%s) — failing closed", bit, e)
+                return None
+        # Export to a memfd (unconditionally deadlock-safe vs a pipe). closefd=False → outer os.close owns it.
         fd = os.memfd_create("blastbox_seccomp_build", 0)
         try:
-            bf = os.fdopen(fd, "wb", closefd=False)
-            f.export_bpf(bf)
-            bf.flush()
+            with os.fdopen(fd, "wb", closefd=False) as bf:
+                f.export_bpf(bf)   # flushed + closed by the with (fd stays open)
             os.lseek(fd, 0, os.SEEK_SET)
             return b"".join(iter(lambda: os.read(fd, 1 << 16), b""))
         finally:

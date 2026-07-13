@@ -284,12 +284,14 @@ class BubblewrapSandbox:
         # keeps it open + inheritable across the close_fds=True fork; the parent closes its copy
         # in the finally (the child already inherited it at fork time).
         seccomp_fd: int | None = None
-        if self._seccomp_bpf is not None:
-            seccomp_fd = os.memfd_create("blastbox_seccomp", 0)
-            os.write(seccomp_fd, self._seccomp_bpf)
-            os.lseek(seccomp_fd, 0, os.SEEK_SET)
-            os.set_inheritable(seccomp_fd, True)
         try:
+            # memfd setup is INSIDE the try so a failure (os.write/lseek) can't leak the fd —
+            # the finally owns closing it once it's been assigned.
+            if self._seccomp_bpf is not None:
+                seccomp_fd = os.memfd_create("blastbox_seccomp", 0)
+                os.write(seccomp_fd, self._seccomp_bpf)
+                os.lseek(seccomp_fd, 0, os.SEEK_SET)
+                os.set_inheritable(seccomp_fd, True)
             argv = self._build_argv(request, seccomp_fd=seccomp_fd)
             killed = False
 
