@@ -188,8 +188,11 @@ declare a **personality** (`BLASTBOX_NETPOLICY_<NAME>`, see CONFIGURATION.md →
 egress overlay*) and run the privileged **`blastbox-netd`** helper alongside the dispatcher. netd
 is out-of-band from the cap-dropped dispatcher: it watches labeled worker containers and wires
 their real exit (netns TUN + tun2socks, a host REDIRECT → tor, a default route to a VPN/NAT or
-sslproxy gateway) and seals a host-side pcap into the result envelope. **Without netd running, an
-egress worker sits on an internal bridge with no route — fail-closed.**
+sslproxy gateway) and seals a host-side pcap into the result envelope. For the **netd-wired**
+personalities (`socks` / `tor` / `httpproxy` / `wireguard` / `openvpn` / `inspect`), **without netd
+running the worker sits on an internal bridge with no route — fail-closed.** (This is *not* an
+egress kill-switch for the self-contained `direct` / `inetsim` personalities: they attach straight
+to their own `bb-net0` / `bb-fakenet` docker bridge and don't depend on netd.)
 
 Run it as a systemd unit (packaged in `deploy/systemd/`):
 

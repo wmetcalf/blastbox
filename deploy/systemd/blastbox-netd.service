@@ -9,7 +9,8 @@
 #
 # Install:
 #   sudo cp deploy/systemd/blastbox-netd.service /etc/systemd/system/
-#   sudo cp deploy/systemd/blastbox-netd.env    /etc/blastbox/netd.env   # edit first
+#   # 0600 — netd.env can hold a credentialed BLASTBOX_NETD_SOCKS_PROXY URL, so keep it secret:
+#   sudo install -Dm600 deploy/systemd/blastbox-netd.env /etc/blastbox/netd.env   # then edit
 #   sudo systemctl daemon-reload && sudo systemctl enable --now blastbox-netd
 #
 # Requires: the blastbox host package on PATH (the `blastbox-netd` console script) plus
@@ -33,10 +34,15 @@ Restart=on-failure
 RestartSec=5
 
 # netd genuinely needs privilege — it reads the docker socket, enters worker netns (nsenter),
-# and manipulates routes/iptables/tun. It therefore runs as **root** (no User=), but the
-# CAPABILITY BOUNDING SET below caps it to only the network/admin capabilities it uses, so a
-# compromised netd can't, e.g., load a kernel module. Tighten further to your environment.
-CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+# manipulates routes/iptables/tun, and WRITES the sealed pcap under the (often dispatcher-owned)
+# per-job capture dirs. It therefore runs as **root** (no User=), but the CAPABILITY BOUNDING SET
+# below caps it to the capabilities it actually uses. NB: CAP_DAC_OVERRIDE is REQUIRED — root does
+# NOT bypass file permissions once it's dropped, and netd must create <job_root>/<job_id>/capture/
+# under dirs owned by the (possibly non-root) dispatcher, or capture sealing silently fails.
+# Caveat: netd talks to the docker socket, so a compromise could ask dockerd for a privileged
+# helper regardless of this bounding set — front the socket with a read-only docker-socket-proxy
+# to make the bounding set a real blast-radius limit. Tighten further to your environment.
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
 ProtectSystem=full
 ProtectHome=true
 
