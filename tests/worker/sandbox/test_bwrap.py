@@ -513,7 +513,9 @@ def test_bwrap_denylist_matches_kafel_policy() -> None:
     deny the exact same syscalls (no drift)."""
     from blastbox.worker.sandbox.seccomp_denylist import CLONE_NS_BITS, CLONE_NS_MASK, DENY_ERRNO1
 
-    assert set(DENY_ERRNO1) == _kafel_deny_names()
+    # KAFEL can't lex `umount2` so the nsjail policy names that syscall `umount`; libseccomp needs
+    # the real x86_64 `umount2`. Same syscall, backend-appropriate name — normalize that one.
+    assert set(DENY_ERRNO1) == (_kafel_deny_names() - {"umount"}) | {"umount2"}
     assert len(DENY_ERRNO1) == len(set(DENY_ERRNO1))          # no duplicates
     assert sum(CLONE_NS_BITS) == CLONE_NS_MASK == 0x7E020000  # 7 CLONE_NEW* bits
 

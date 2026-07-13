@@ -26,7 +26,10 @@ _log = logging.getLogger("blastbox.worker.sandbox.seccomp")
 DENY_ERRNO1: tuple[str, ...] = (
     "init_module", "finit_module", "delete_module",
     "add_key", "keyctl", "request_key",
-    "mount", "umount", "pivot_root",
+    # libseccomp needs the REAL x86_64 syscall `umount2` (`umount` resolves to a pseudo that never
+    # matches); the nsjail KAFEL policy names the same syscall `umount` (KAFEL can't lex `umount2` —
+    # see the .policy header). Same intent, backend-appropriate name — the parity test normalizes it.
+    "mount", "umount2", "pivot_root",
     "kexec_load", "kexec_file_load", "reboot",
     "ptrace", "process_vm_readv", "process_vm_writev",
     "bpf", "perf_event_open",
