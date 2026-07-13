@@ -23,15 +23,20 @@ Requires=docker.service
 
 [Service]
 Type=simple
-# Config is read from the BLASTBOX_NETD_* environment (CLI flags override); see netd.env.
+# Config is read from the BLASTBOX_JOB_ROOT + BLASTBOX_NETD_* environment (CLI flags override);
+# see blastbox-netd.env.
 EnvironmentFile=-/etc/blastbox/netd.env
+# systemd requires an ABSOLUTE ExecStart. `blastbox-netd` installs to the Python bin dir — usually
+# /usr/local/bin (pip) or /usr/bin (distro package); adjust this path to wherever it landed.
 ExecStart=/usr/local/bin/blastbox-netd
 Restart=on-failure
 RestartSec=5
 
-# netd needs raw sockets (pcap) + netns/route/iptables manipulation, but NOT full root.
-AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_PTRACE
-NoNewPrivileges=false
+# netd genuinely needs privilege — it reads the docker socket, enters worker netns (nsenter),
+# and manipulates routes/iptables/tun. It therefore runs as **root** (no User=), but the
+# CAPABILITY BOUNDING SET below caps it to only the network/admin capabilities it uses, so a
+# compromised netd can't, e.g., load a kernel module. Tighten further to your environment.
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 ProtectSystem=full
 ProtectHome=true
 

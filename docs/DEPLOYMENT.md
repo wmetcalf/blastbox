@@ -199,10 +199,13 @@ sudo install -Dm600 deploy/systemd/blastbox-netd.env /etc/blastbox/netd.env   # 
 sudo systemctl daemon-reload && sudo systemctl enable --now blastbox-netd
 ```
 
-The unit runs the `blastbox-netd` console script with `AmbientCapabilities=CAP_NET_RAW
-CAP_NET_ADMIN …` (raw sockets + netns/route manipulation, not full root) and reads its config from
-`/etc/blastbox/netd.env` (the `BLASTBOX_NETD_*` knobs; all empty = inert). It needs
-`tcpdump`/`iproute2`/`nsenter`/`tun2socks` on the host and access to the docker socket.
+The unit runs the `blastbox-netd` console script and reads its config from `/etc/blastbox/netd.env`
+(`BLASTBOX_JOB_ROOT` + the `BLASTBOX_NETD_*` knobs; each tier is inert until its gateway/proxy is
+set). netd genuinely needs privilege (docker socket, `nsenter` into worker netns, route/iptables/tun
+manipulation), so the unit runs it as **root** with a `CapabilityBoundingSet` limiting it to the
+network/admin capabilities it uses (tighten to taste). It needs `tcpdump`/`iproute2`/`nsenter`/
+`tun2socks` on the host. Note the `ExecStart` path (`/usr/local/bin/blastbox-netd`) — adjust it to
+wherever the console script installed (`/usr/bin` for a distro package).
 
 ## Generating a sandbox policy (optional, advanced)
 
