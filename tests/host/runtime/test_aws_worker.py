@@ -1224,6 +1224,15 @@ def test_orphan_sweep_disabled_when_max_age_zero():
     assert "ec2 describe-instances" not in fake.ops()  # no calls at all when disabled
 
 
+def test_orphan_sweep_nan_max_age_is_disabled():
+    # float("nan") passes `max_age <= 0` as False AND `age < max_age` as False, which would
+    # terminate EVERY stopped slot. A NaN age must be treated as disabled (no describe/terminate).
+    rt, fake = _sweep_rt(orphan_max_age_s=float("nan"))
+    _set_instances(fake, [_stopped_inst("i-old", "some-dead-run")])
+    assert rt.sweep_orphans(now=_gmt_epoch("2026-07-11 00:00:00") + 99999) == []
+    assert "ec2 describe-instances" not in fake.ops()
+
+
 def test_orphan_sweep_swallows_terminate_error_and_continues():
     rt, fake = _sweep_rt(orphan_max_age_s=3600.0)
     _set_instances(fake, [_stopped_inst("i-a", "dead"), _stopped_inst("i-b", "dead")])

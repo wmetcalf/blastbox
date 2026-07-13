@@ -1193,7 +1193,10 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         acts when ``orphan_max_age_s > 0`` (opt-in). Best-effort: any per-instance failure is logged
         and skipped — a sweep error must never crash the pool. Returns the terminated instance ids."""
         max_age = self.cfg.orphan_max_age_s if max_age_s is None else max_age_s
-        if max_age <= 0:
+        # `not (max_age > 0)` (not `max_age <= 0`) so a NaN — float("nan") passes both `<= 0` AND the
+        # later `age < max_age` as False, which would otherwise terminate EVERY stopped slot — is
+        # treated as "disabled". inf is fine: age < inf is always True, so nothing is ever old enough.
+        if not (max_age > 0):
             return []
         now = time.time() if now is None else now
         resp = self._aws("ec2", "describe-instances", "--filters",
