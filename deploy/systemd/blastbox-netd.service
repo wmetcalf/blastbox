@@ -43,8 +43,13 @@ RestartSec=5
 # helper regardless of this bounding set — front the socket with a read-only docker-socket-proxy
 # to make the bounding set a real blast-radius limit. Tighten further to your environment.
 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+# Private umask so the per-job capture dir + dump.pcap netd writes aren't world-readable on a
+# multi-user host (the job tree may be traversable).
+UMask=0077
 ProtectSystem=full
-ProtectHome=true
+# NB: do NOT set ProtectHome=true here — BLASTBOX_JOB_ROOT may live under /home (the env file only
+# requires it to match the dispatcher's), and ProtectHome would hide /home from netd so it couldn't
+# write captures there. Add it back only if your job root is outside /home, /root, /run/user.
 
 [Install]
 WantedBy=multi-user.target

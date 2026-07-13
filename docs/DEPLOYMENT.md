@@ -188,19 +188,38 @@ declare a **personality** (`BLASTBOX_NETPOLICY_<NAME>`, see CONFIGURATION.md →
 egress overlay*) and run the privileged **`blastbox-netd`** helper alongside the dispatcher. netd
 is out-of-band from the cap-dropped dispatcher: it watches labeled worker containers and wires
 their real exit (netns TUN + tun2socks, a host REDIRECT → tor, a default route to a VPN/NAT or
-sslproxy gateway) and seals a host-side pcap into the result envelope. For the **netd-wired**
-personalities (`socks` / `tor` / `httpproxy` / `wireguard` / `openvpn` / `inspect`), **without netd
-running the worker sits on an internal bridge with no route — fail-closed.** (This is *not* an
-egress kill-switch for the self-contained `direct` / `inetsim` personalities: they attach straight
-to their own `bb-net0` / `bb-fakenet` docker bridge and don't depend on netd.)
+sslproxy gateway) and seals a host-side pcap into the result envelope. For the **netd-route-wired**
+personalities (`socks` / `tor` / `wireguard` / `openvpn` / `inspect`), **without netd running the
+worker sits on an internal bridge with no route — fail-closed.** (This is *not* an egress
+kill-switch for `direct` / `inetsim`, which attach to their own self-contained `bb-net0` /
+`bb-fakenet` bridge, nor for `httpproxy`, whose only exit is the injected `HTTP(S)_PROXY` env
+pointing at a proxy sidecar — those don't depend on netd's routing.)
 
-Run it as a systemd unit (packaged in `deploy/systemd/`):
+**Prerequisites** (the overlay needs more than just the netd process):
+- **Pre-create the internal docker bridges** the dispatcher attaches wired workers to:
+  `docker network create --internal bb-socks` (socks/tor), `bb-vpn` (openvpn/wireguard),
+  `bb-inspect`; plus `bb-net0` (`direct`) / `bb-fakenet` (`inetsim`) if you use those.
+- **Use the `runc` runtime for netd-wired tiers.** netd needs a **host-visible netns** to wire the
+  worker, so the dispatcher refuses `tor`/`socks`/`openvpn`/`wireguard`/route-inspected jobs unless
+  the runtime is `runc` (gVisor/FC hide the netns). Set `BLASTBOX_ALLOW_RUNC=1` accordingly.
+- **Declare `gateway=` in the personality** for `tor`/`openvpn`/`wireguard`/`inspect` (e.g.
+  `BLASTBOX_NETPOLICY_TORNET='exit=tor,gateway=<netd-transproxy-gw-ip>'`) so the worker waits for
+  netd's route before detonating — the `BLASTBOX_NETD_*` gateway alone isn't enough.
+- **Enable capture/decrypt on the dispatcher.** netd only captures a pcap when
+  `BLASTBOX_NET_CAPTURE=1` is set on the dispatcher (and TLS decrypt needs `BLASTBOX_NET_DECRYPT=1`);
+  both default off.
+
+Run netd as a systemd unit (packaged in `deploy/systemd/`):
 
 ```sh
 sudo cp deploy/systemd/blastbox-netd.service /etc/systemd/system/
 sudo install -Dm600 deploy/systemd/blastbox-netd.env /etc/blastbox/netd.env   # then edit
 sudo systemctl daemon-reload && sudo systemctl enable --now blastbox-netd
 ```
+
+Run netd as **the same user (or group) that owns the job tree** (or share a group + `UMask=0007`)
+so the dispatcher can later `rmtree` the root-created `<job>/capture/` — otherwise a non-root
+dispatcher can't remove netd's root-owned capture dir on job retention.
 
 The unit runs the `blastbox-netd` console script and reads its config from `/etc/blastbox/netd.env`
 (`BLASTBOX_JOB_ROOT` + the `BLASTBOX_NETD_*` knobs; each tier is inert until its gateway/proxy is
