@@ -1,0 +1,39 @@
+# blastbox-netd — the privileged egress-overlay helper for the netpolicy layer.
+#
+# netd runs OUT-OF-BAND from the cap-dropped dispatcher: it watches for worker containers
+# labeled by the dispatcher and wires their real network exit (netns TUN + tun2socks for the
+# `socks` tier, a host REDIRECT → tor for `tor`/transproxy, a default route to the VPN/NAT or
+# sslproxy/MITM gateway for `vpn`/`inspect`), and captures a host-side pcap sealed into the
+# result envelope. Without netd running, egress workers sit on an internal bridge with NO route
+# (fail-closed). This unit codifies the previously hand-run setsid invocation.
+#
+# Install:
+#   sudo cp deploy/systemd/blastbox-netd.service /etc/systemd/system/
+#   sudo cp deploy/systemd/blastbox-netd.env    /etc/blastbox/netd.env   # edit first
+#   sudo systemctl daemon-reload && sudo systemctl enable --now blastbox-netd
+#
+# Requires: the blastbox host package on PATH (the `blastbox-netd` console script) plus
+# tcpdump / iproute2 / nsenter / tun2socks; docker (netd reads container labels + netns).
+
+[Unit]
+Description=blastbox netd — netpolicy egress-overlay + capture helper
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+# Config is read from the BLASTBOX_NETD_* environment (CLI flags override); see netd.env.
+EnvironmentFile=-/etc/blastbox/netd.env
+ExecStart=/usr/local/bin/blastbox-netd
+Restart=on-failure
+RestartSec=5
+
+# netd needs raw sockets (pcap) + netns/route/iptables manipulation, but NOT full root.
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_PTRACE
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

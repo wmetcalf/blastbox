@@ -180,6 +180,30 @@ Source one, add a tier slice, done. The only non-config difference between engin
 worker image (ClippyShot bakes LibreOffice+PDFium; RedTusk bakes JDK+the Tika jar). Both are
 live-proven on the `aws-ec2` disposable tier.
 
+## Egress netpolicy + `blastbox-netd` (optional)
+
+Egress is **off by default** (workers run `--network=none`). To let a worker reach the network
+under a controlled exit — capture a pcap, route through SOCKS/tor/VPN, or MITM-decrypt TLS — you
+declare a **personality** (`BLASTBOX_NETPOLICY_<NAME>`, see CONFIGURATION.md → *Network policy /
+egress overlay*) and run the privileged **`blastbox-netd`** helper alongside the dispatcher. netd
+is out-of-band from the cap-dropped dispatcher: it watches labeled worker containers and wires
+their real exit (netns TUN + tun2socks, a host REDIRECT → tor, a default route to a VPN/NAT or
+sslproxy gateway) and seals a host-side pcap into the result envelope. **Without netd running, an
+egress worker sits on an internal bridge with no route — fail-closed.**
+
+Run it as a systemd unit (packaged in `deploy/systemd/`):
+
+```sh
+sudo cp deploy/systemd/blastbox-netd.service /etc/systemd/system/
+sudo install -Dm600 deploy/systemd/blastbox-netd.env /etc/blastbox/netd.env   # then edit
+sudo systemctl daemon-reload && sudo systemctl enable --now blastbox-netd
+```
+
+The unit runs the `blastbox-netd` console script with `AmbientCapabilities=CAP_NET_RAW
+CAP_NET_ADMIN …` (raw sockets + netns/route manipulation, not full root) and reads its config from
+`/etc/blastbox/netd.env` (the `BLASTBOX_NETD_*` knobs; all empty = inert). It needs
+`tcpdump`/`iproute2`/`nsenter`/`tun2socks` on the host and access to the docker socket.
+
 ## Generating a sandbox policy (optional, advanced)
 
 `blastbox.profile` traces an engine over a corpus and emits candidate seccomp/Landlock

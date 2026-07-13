@@ -855,3 +855,29 @@ def test_reconcile_survives_listing_error(tmp_path):
     d.list_running_fn = boom
     d._reconcile()  # must not raise
     assert spawned == []
+
+
+# --- blastbox-netd console-script packaging (deferred: netd was hand-run on toolz2) -------------
+
+def test_netd_entrypoint_resolves() -> None:
+    """The `blastbox-netd` console script target (blastbox.host.netd:main) resolves + is callable."""
+    from blastbox.host import netd
+
+    assert callable(netd.main)
+
+
+def test_netd_cli_exposes_documented_flags(capsys) -> None:  # noqa: ANN001
+    """`blastbox-netd --help` builds the parser + exits 0, and every knob the systemd unit /
+    docs reference is a registered flag (so the packaging + docs can't drift from the argparse)."""
+    import pytest
+
+    from blastbox.host import netd
+
+    with pytest.raises(SystemExit) as exc:
+        netd.main(["--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    for flag in ("--job-root", "--socks-proxy", "--vpn-gateway", "--inspect-gateway",
+                 "--inspect-keylog", "--transproxy-gateway", "--transproxy-trans-port",
+                 "--transproxy-dns-port"):
+        assert flag in out, f"{flag} missing from blastbox-netd --help"
