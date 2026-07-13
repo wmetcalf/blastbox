@@ -215,6 +215,46 @@ def ensure_ca(pki_dir: Path) -> CertAuthority:
     return ca
 
 
+def import_ca(pki_dir: Path, cert_pem: bytes, key_pem: bytes) -> CertAuthority:
+    """Install an EXTERNALLY-generated CA (``cert_pem`` + ``key_pem``) into ``pki_dir``, so several
+    hosts / a shared worker pool issue and trust leaves under **one** root -- the failover / multi-
+    dispatcher case, where each host's own ``ensure_ca`` would mint a *different* CA and the servers
+    would not trust each other's certs. Generate the CA once (e.g. ``_generate_ca`` on an offline box),
+    then ``import_ca`` it wherever certs are issued or verified.
+
+    Validates that the key matches the cert and that it IS a CA cert, writes ``ca.key`` 0600, and
+    **refuses to overwrite a *different* CA** already in ``pki_dir`` (a silent rotation would invalidate
+    every cert the old CA signed -- same stance as ``ensure_ca``'s partial-state refusal). Re-importing
+    the SAME CA is idempotent."""
+    pki_dir = Path(pki_dir)
+    cert = x509.load_pem_x509_certificate(cert_pem)
+    key = serialization.load_pem_private_key(key_pem, password=None)
+    if not isinstance(key, ec.EllipticCurvePrivateKey):
+        raise ValueError("CA key must be an EC private key")
+    # the key must match the cert -- else every leaf we sign would fail TLS against the published ca.crt
+    spki = serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    if key.public_key().public_bytes(*spki) != cert.public_key().public_bytes(*spki):
+        raise ValueError("CA key does not match the CA cert")
+    try:
+        is_ca = cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
+    except x509.ExtensionNotFound:
+        is_ca = False
+    if not is_ca:
+        raise ValueError("imported cert is not a CA (BasicConstraints ca=True required)")
+    crt_path, key_path = pki_dir / "ca.crt", pki_dir / "ca.key"
+    if crt_path.exists():
+        existing = x509.load_pem_x509_certificate(crt_path.read_bytes())
+        if existing.fingerprint(hashes.SHA256()) != cert.fingerprint(hashes.SHA256()):
+            raise RuntimeError(
+                f"a different CA already exists in {pki_dir} -- refusing to overwrite it (would "
+                "invalidate every cert it signed); clear ca.crt/ca.key first to replace it")
+    pki_dir.mkdir(parents=True, exist_ok=True)
+    ca = CertAuthority(cert, key)
+    crt_path.write_bytes(ca.cert_pem)          # normalize to the CA's own canonical PEM
+    _write_private(key_path, ca.key_pem)
+    return ca
+
+
 # SSL context builders moved to ``blastbox.tls`` (stdlib-only, so the worker can use them without
 # pulling ``cryptography``). Re-exported here for callers that already import from ``pki``.
 from blastbox.tls import client_ssl_context, server_ssl_context  # noqa: E402,F401

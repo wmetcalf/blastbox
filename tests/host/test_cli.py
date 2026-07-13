@@ -170,3 +170,19 @@ class TestPkiCli:
         crt = x509.load_pem_x509_certificate((tmp_path / "w.crt").read_bytes())
         ca = x509.load_pem_x509_certificate((tmp_path / "ca.crt").read_bytes())
         assert crt.issuer == ca.subject   # worker's key never left the box; dispatcher signed the CSR
+
+    def test_import_ca_installs_pregenerated(self, tmp_path):
+        from cryptography import x509
+
+        from blastbox.host.pki import _generate_ca
+        src = _generate_ca()
+        (tmp_path / "src.crt").write_bytes(src.cert_pem)
+        (tmp_path / "src.key").write_bytes(src.key_pem)
+        pki = tmp_path / "pki"
+        assert main(["pki", "--dir", str(pki), "import-ca",
+                     "--ca-cert", str(tmp_path / "src.crt"), "--ca-key", str(tmp_path / "src.key")]) == 0
+        assert (pki / "ca.crt").read_bytes() == src.cert_pem       # the imported CA, not a fresh one
+        assert oct((pki / "ca.key").stat().st_mode)[-3:] == "600"
+        assert main(["pki", "--dir", str(pki), "issue-client", "--cn", "d2"]) == 0   # issues from it
+        ca = x509.load_pem_x509_certificate((pki / "ca.crt").read_bytes())
+        assert x509.load_pem_x509_certificate((pki / "d2.crt").read_bytes()).issuer == ca.subject
