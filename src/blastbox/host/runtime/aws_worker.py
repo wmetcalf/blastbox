@@ -1224,28 +1224,23 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
 
     @staticmethod
     def _stopped_since(inst: dict[str, Any]) -> float | None:
-        """Epoch seconds when the instance entered stopped, from ``StateTransitionReason``
-        ``'(YYYY-MM-DD HH:MM:SS GMT)'``, falling back to ``LaunchTime`` (ISO8601). ``None`` when
-        unparseable -- the caller treats ``None`` as "too young" (skip) so a mis-parse can never
-        over-terminate."""
+        """Epoch seconds when the instance entered ``stopped``, parsed from ``StateTransitionReason``
+        (``'... (YYYY-MM-DD HH:MM:SS GMT)'``). ``None`` when it's missing/unparseable — the caller
+        treats ``None`` as "too young" (skip). We deliberately do NOT fall back to ``LaunchTime``:
+        that's the instance's CREATION time, so a slot that ran a long while then stopped RECENTLY
+        would look ancient and be terminated prematurely — the opposite of fail-safe."""
         import datetime as _dt
         import re as _re
 
         m = _re.search(r"\((\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) GMT\)",
                        inst.get("StateTransitionReason") or "")
-        if m:
-            try:
-                return _dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(
-                    tzinfo=_dt.timezone.utc).timestamp()
-            except ValueError:
-                pass
-        launch = inst.get("LaunchTime")
-        if isinstance(launch, str):
-            try:
-                return _dt.datetime.fromisoformat(launch.replace("Z", "+00:00")).timestamp()
-            except ValueError:
-                pass
-        return None
+        if not m:
+            return None
+        try:
+            return _dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=_dt.timezone.utc).timestamp()
+        except ValueError:
+            return None
 
 
 def select_ec2_hibernate_runtime(

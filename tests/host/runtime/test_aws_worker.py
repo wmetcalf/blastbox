@@ -1200,6 +1200,23 @@ def test_orphan_sweep_skips_too_young():
     assert killed == []
 
 
+def test_orphan_sweep_skips_unparseable_stopped_time():
+    # Fail-safe: a missing/unparseable StateTransitionReason must be treated as "too young" and
+    # SKIPPED -- we must NOT fall back to LaunchTime (creation time), which would over-age a
+    # recently-stopped but long-lived slot and terminate it prematurely.
+    rt, fake = _sweep_rt(orphan_max_age_s=3600.0)
+    _set_instances(fake, [{
+        "InstanceId": "i-weird", "State": {"Name": "stopped"},
+        "StateTransitionReason": "User initiated",          # no "(YYYY-MM-DD HH:MM:SS GMT)"
+        "LaunchTime": "2020-01-01T00:00:00Z",                # ancient — must NOT be used
+        "Tags": [{"Key": "blastbox-tier", "Value": "aws-ec2-hibernate"},
+                 {"Key": "blastbox-run", "Value": "some-dead-run"}],
+    }])
+    killed = rt.sweep_orphans(now=_gmt_epoch("2026-07-11 00:00:00") + 7200)
+    assert killed == []
+    assert not any(k == "ec2 terminate-instances" for k, _ in fake.calls)
+
+
 def test_orphan_sweep_disabled_when_max_age_zero():
     rt, fake = _sweep_rt(orphan_max_age_s=0.0)
     _set_instances(fake, [_stopped_inst("i-old", "some-dead-run")])
