@@ -179,3 +179,41 @@ def test_client_rejects_wrong_server_san(tmp_path):
     client_ctx = client_ssl_context(str(tmp_path / "ca.crt"), cert_file=str(ccrt), key_file=str(ckey))
     res = _handshake(server_ctx, client_ctx, "127.0.0.1")
     assert res.get("client_ok") is not True      # SAN mismatch -> client refuses the server
+
+
+def test_client_skip_hostname_accepts_ca_signed_wrong_san(tmp_path):
+    # verify_hostname=False: a cert our CA signed is trusted even though its SAN (10.9.9.9) does not
+    # match the dialed address -- the dynamic-IP / disposable-pool case where one baked server cert is
+    # shared by every worker. Contrast test_client_rejects_wrong_server_san (the default, hostname ON).
+    ca = ensure_ca(tmp_path / "pki")
+    srv = ca.issue_server(["10.9.9.9"])          # cert is NOT for 127.0.0.1
+    scrt, skey = srv.write(tmp_path, "server")
+    (tmp_path / "ca.crt").write_bytes(ca.cert_pem)
+    server_ctx = server_ssl_context(str(scrt), str(skey))
+    cli = ca.issue_client()
+    ccrt, ckey = cli.write(tmp_path, "client")
+    client_ctx = client_ssl_context(
+        str(tmp_path / "ca.crt"), cert_file=str(ccrt), key_file=str(ckey), verify_hostname=False,
+    )
+    res = _handshake(server_ctx, client_ctx, "127.0.0.1")
+    assert res.get("client_ok") is True          # SAN mismatch tolerated; CA-chain trust intact
+
+
+def test_client_skip_hostname_still_rejects_untrusted_ca(tmp_path):
+    # SECURITY: dropping the hostname check must NOT weaken CA-chain verification. A server cert signed
+    # by a CA we don't trust is rejected even with verify_hostname=False (verify_mode stays
+    # CERT_REQUIRED) -- so "any address is fine" never degrades to "any cert is fine".
+    ca = ensure_ca(tmp_path / "pki")
+    rogue = _generate_ca("rogue-ca")
+    srv = rogue.issue_server(["127.0.0.1"])      # correct SAN, but signed by an UNtrusted CA
+    scrt, skey = srv.write(tmp_path, "server")
+    (tmp_path / "ca.crt").write_bytes(ca.cert_pem)   # we trust ONLY the real ca
+    server_ctx = server_ssl_context(str(scrt), str(skey))
+    cli = ca.issue_client()
+    ccrt, ckey = cli.write(tmp_path, "client")
+    client_ctx = client_ssl_context(
+        str(tmp_path / "ca.crt"), cert_file=str(ccrt), key_file=str(ckey), verify_hostname=False,
+    )
+    res = _handshake(server_ctx, client_ctx, "127.0.0.1")
+    assert res.get("client_ok") is not True      # untrusted CA rejected despite hostname check off
+    assert res.get("client_error") == "SSLCertVerificationError"

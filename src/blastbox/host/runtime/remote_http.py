@@ -183,7 +183,9 @@ def _bounded_copy(src: Any, dst: Any, limit: int | None, deadline: float | None 
 def dispatch_ssl_context_from_env(get: Callable[[str], str | None] = os.environ.get) -> ssl.SSLContext | None:
     """Build the dispatcher's client (m)TLS context from env, or None if no CA is configured:
     ``BLASTBOX_DISPATCH_TLS_CA`` (verify workers) + optional ``_CERT``/``_KEY`` (present the client cert
-    for mTLS). Pass the result as ``ssl_context`` to ``make_remote_validate`` / ``detonate_remote``."""
+    for mTLS). ``BLASTBOX_DISPATCH_TLS_VERIFY_HOSTNAME=0`` trusts any cert the CA signed regardless of
+    the address it answered on (see below). Pass the result as ``ssl_context`` to
+    ``make_remote_validate`` / ``detonate_remote``."""
     ca = get("BLASTBOX_DISPATCH_TLS_CA")
     cert = get("BLASTBOX_DISPATCH_TLS_CERT") or None
     key = get("BLASTBOX_DISPATCH_TLS_KEY") or None
@@ -195,8 +197,15 @@ def dispatch_ssl_context_from_env(get: Callable[[str], str | None] = os.environ.
         return None
     if bool(cert) != bool(key):
         raise RuntimeError("BLASTBOX_DISPATCH_TLS_CERT and _TLS_KEY must be set together")
+    # BLASTBOX_DISPATCH_TLS_VERIFY_HOSTNAME=0 trusts any cert our private CA signed regardless of the
+    # address it answered on -- required for dynamically-addressed worker pools (a disposable-EC2 slot
+    # gets a fresh IP, so one baked server cert can't name it). CA-chain verification stays on; the
+    # safety of this rests on the CA being private (see blastbox.tls.client_ssl_context).
+    verify_host = (get("BLASTBOX_DISPATCH_TLS_VERIFY_HOSTNAME") or "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
     from blastbox.tls import client_ssl_context
-    return client_ssl_context(ca, cert_file=cert, key_file=key)
+    return client_ssl_context(ca, cert_file=cert, key_file=key, verify_hostname=verify_host)
 
 
 def make_tls_probe(ssl_context: ssl.SSLContext | None) -> Callable[[str, dict, float], bool]:
