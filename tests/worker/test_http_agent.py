@@ -70,6 +70,15 @@ def test_serve_rejects_partial_tls():
         serve(_NoopEngine(), bind="0.0.0.0", port=0, tls_cert="/c.pem")   # cert without key
 
 
+def test_serve_clear_error_on_unreadable_tls_material(tmp_path):
+    # A missing/unreadable cert or key must fail with an ACTIONABLE message (naming the readable-by-uid
+    # trap), not an opaque OSError traceback that crash-loops the container.
+    missing = str(tmp_path / "nope.pem")
+    with pytest.raises(SystemExit, match="cannot load TLS material.*READABLE by the agent uid"):
+        serve(_NoopEngine(), bind="0.0.0.0", port=0,
+              tls_cert=missing, tls_key=missing, client_ca=missing)
+
+
 def test_hard_deadline_s_derivation(monkeypatch):
     # P3: hard deadline = override if set (0 disables), else 2*timeout_s + 30 (strictly > the engine budget).
     from blastbox.worker.http_agent import _hard_deadline_s
