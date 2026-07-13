@@ -20,9 +20,10 @@ Security guarantees on every :meth:`run` call:
 
 ``insecurity_reasons`` / ``secure`` property:
 
-* ``seccomp_not_implemented`` — this backend attaches NO seccomp BPF filter (it never
-  passes ``--seccomp`` to bwrap), so it is ALWAYS recorded as insecure on the seccomp axis
-  and never self-certifies as fully secure. Use the nsjail backend for in-process seccomp.
+* ``seccomp_not_implemented`` — recorded ONLY when ``python3-libseccomp`` is absent so no BPF
+  can be built (a distro pkg, not on PyPI). When present, this backend builds the same denylist
+  the nsjail backend applies as KAFEL and installs it via ``bwrap --seccomp <fd>``; the reason is
+  then dropped and bwrap can self-certify secure. Fail-safe: no lib ⇒ marked insecure.
 * ``apparmor_missing`` — ``aa-exec`` helper is not found; no AppArmor profile
   can be attached to the child.
 * ``pid_limit_missing`` — bwrap does not support ``--cgroup-pids``; the fork-bomb
@@ -82,10 +83,11 @@ _MINIMAL_ENV: dict[str, str] = {
     "HOME": "/tmp",
 }
 
-# Attempt to import the libseccomp Python bindings.  They ship as the
-# ``seccomp`` package from the distro's ``python3-libseccomp`` package.
-# If absent we proceed without an in-process BPF filter and record
-# ``seccomp_missing`` in insecurity_reasons — no crash.
+# libseccomp Python bindings — the ``seccomp`` package from the distro's ``python3-libseccomp``
+# (NOT the ``libseccomp`` PyPI package). When present, the bwrap backend builds a BPF denylist
+# from it (seccomp_denylist.build_bpf_bytes) and installs it via ``bwrap --seccomp``; when absent
+# we proceed without an in-process filter and record ``seccomp_not_implemented`` — no crash.
+# _LIBSECCOMP_AVAILABLE is also the monkeypatch seam the tests use to force the branches.
 try:  # pragma: no cover - import path depends on host
     import seccomp as _libseccomp  # type: ignore[import-not-found]
     _LIBSECCOMP_AVAILABLE = True
@@ -191,26 +193,31 @@ class BubblewrapSandbox:
                 "mitigation=container_runtime_pid_limits"
             )
 
-        # Seccomp: NOT IMPLEMENTED for the bwrap backend. _build_argv() never builds a BPF
-        # program nor passes ``--seccomp <fd>`` to bwrap (the imported ``seccomp`` library is
-        # unused), so the untrusted child runs with NO syscall filter — only namespaces +
-        # cap-drop. We therefore report it honestly and UNCONDITIONALLY as an insecurity reason
-        # (regardless of whether python3-libseccomp happens to be importable), so the security
-        # gate never mistakes bwrap for fully secure. Use the nsjail backend for in-process
-        # seccomp (KAFEL), or opt into bwrap explicitly with BLASTBOX_WARN_ON_INSECURE.
-        # TODO: wire a real libseccomp BPF program via bwrap --seccomp/--add-seccomp-fd, then
-        # this can become conditional on the filter actually being attached.
-        self._seccomp_active = False
-        _log.warning(
-            "bwrap_seccomp_not_implemented impact=child_runs_without_syscall_filter "
-            "fix=use_nsjail_backend_or_set_BLASTBOX_WARN_ON_INSECURE"
-        )
+        # Seccomp: build a DEFAULT-ALLOW + ERRNO denylist BPF via libseccomp — the SAME denylist
+        # the nsjail backend applies as KAFEL (ERRNO(1) names + clone-namespace arg-filter + clone3
+        # → ENOSYS; a parity test guards against drift) — and pass it per-run via bwrap
+        # `--seccomp <fd>` (see run() / _build_argv). The filter installs behind bwrap's
+        # PR_SET_NO_NEW_PRIVS (no privilege) and survives the aa-exec execve. Where
+        # python3-libseccomp is absent (a distro pkg, not on PyPI) build_bpf_bytes() returns None
+        # and we keep marking the seccomp axis insecure — fail-safe, so the gate never mistakes an
+        # UNFILTERED bwrap for secure.
+        from blastbox.worker.sandbox.seccomp_denylist import build_bpf_bytes
+
+        # Gate on _LIBSECCOMP_AVAILABLE (the tests' monkeypatch seam) so False forces no-filter.
+        self._seccomp_bpf = build_bpf_bytes() if _LIBSECCOMP_AVAILABLE else None
+        self._seccomp_active = self._seccomp_bpf is not None
+        if not self._seccomp_active:
+            _log.warning(
+                "bwrap_seccomp_unavailable impact=child_runs_without_syscall_filter "
+                "fix=install_python3-libseccomp_or_use_nsjail_backend_or_set_BLASTBOX_WARN_ON_INSECURE"
+            )
 
         self._insecurity_reasons: list[str] = []
         if not self._binary_present:
             self._insecurity_reasons.append("binary_missing")
-        # bwrap applies no seccomp filter -> always insecure on the seccomp axis.
-        self._insecurity_reasons.append("seccomp_not_implemented")
+        if not self._seccomp_active:
+            # No BPF attached -> insecure on the seccomp axis (keep the historical reason string).
+            self._insecurity_reasons.append("seccomp_not_implemented")
         if not self._aa_exec:
             self._insecurity_reasons.append("apparmor_missing")
         if not self._cgroup_pids_supported:
@@ -273,48 +280,62 @@ class BubblewrapSandbox:
         if not self._binary_present:
             raise SandboxUnavailable(f"bwrap not found at {self._bwrap!r}")
 
-        argv = self._build_argv(request)
-        killed = False
-
+        # A FRESH memfd per run holds the BPF program bwrap reads via --seccomp <fd>. pass_fds
+        # keeps it open + inheritable across the close_fds=True fork; the parent closes its copy
+        # in the finally (the child already inherited it at fork time).
+        seccomp_fd: int | None = None
+        if self._seccomp_bpf is not None:
+            seccomp_fd = os.memfd_create("blastbox_seccomp", 0)
+            os.write(seccomp_fd, self._seccomp_bpf)
+            os.lseek(seccomp_fd, 0, os.SEEK_SET)
+            os.set_inheritable(seccomp_fd, True)
         try:
-            proc = subprocess.Popen(
-                argv,                      # list, never shell=True
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                close_fds=True,
-                preexec_fn=_make_apply_rlimits(request.limits),
-                start_new_session=True,
-            )
-        except FileNotFoundError as exc:
-            raise SandboxError(f"failed to start bwrap: {exc}") from exc
+            argv = self._build_argv(request, seccomp_fd=seccomp_fd)
+            killed = False
 
-        try:
-            stdout, stderr = proc.communicate(timeout=request.limits.timeout_s)
-            exit_code = proc.returncode
-        except subprocess.TimeoutExpired:
-            killed = True
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
+                proc = subprocess.Popen(
+                    argv,                      # list, never shell=True
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    close_fds=True,
+                    pass_fds=() if seccomp_fd is None else (seccomp_fd,),
+                    preexec_fn=_make_apply_rlimits(request.limits),
+                    start_new_session=True,
+                )
+            except FileNotFoundError as exc:
+                raise SandboxError(f"failed to start bwrap: {exc}") from exc
+
             try:
-                stdout, stderr = proc.communicate(timeout=2.0)
+                stdout, stderr = proc.communicate(timeout=request.limits.timeout_s)
+                exit_code = proc.returncode
             except subprocess.TimeoutExpired:
-                stdout, stderr = b"", b""
-            exit_code = -int(signal.SIGKILL)
+                killed = True
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+                try:
+                    stdout, stderr = proc.communicate(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    stdout, stderr = b"", b""
+                exit_code = -int(signal.SIGKILL)
 
-        return SandboxResult(
-            exit_code=exit_code,
-            stdout=stdout or b"",
-            stderr=stderr or b"",
-            killed=killed,
-        )
+            return SandboxResult(
+                exit_code=exit_code,
+                stdout=stdout or b"",
+                stderr=stderr or b"",
+                killed=killed,
+            )
+        finally:
+            if seccomp_fd is not None:
+                os.close(seccomp_fd)
 
     # ------------------------------------------------------------------
     # Internal
 
-    def _build_argv(self, req: SandboxRequest) -> list[str]:
+    def _build_argv(self, req: SandboxRequest, *, seccomp_fd: int | None = None) -> list[str]:
         """Build the full bwrap argument vector for ``req``.
 
         All mount source/target paths are placed as value arguments after
@@ -367,6 +388,10 @@ class BubblewrapSandbox:
         # os.environ.  request.env overlays any engine-specific additions.
         for k, v in {**_MINIMAL_ENV, **req.env}.items():
             argv += ["--setenv", k, v]
+
+        # Install the seccomp BPF (the inherited memfd from run()) — must precede the `--`.
+        if seccomp_fd is not None:
+            argv += ["--seccomp", str(seccomp_fd)]
 
         argv += ["--"]
 
