@@ -246,16 +246,17 @@ class TestBwrapArgvBuilding:
 class TestBwrapInsecurityReasons:
     """Test insecurity_reasons without running bwrap."""
 
-    def test_seccomp_not_implemented_is_always_a_reason(self, monkeypatch) -> None:
-        """bwrap attaches NO BPF filter, so 'seccomp_not_implemented' is ALWAYS recorded and
-        secure is False — even when python3-libseccomp is importable (the import is unused).
-        Prevents the backend from falsely self-certifying as secure on a mere library import."""
+    def test_seccomp_active_when_bpf_builds(self, monkeypatch) -> None:
+        """With libseccomp present and a BPF successfully built, 'seccomp_not_implemented' is NOT
+        recorded and seccomp_active is True — the filter is attached per-run via --seccomp <fd>.
+        (Builder mocked so this runs where python3-libseccomp is absent.)"""
         import blastbox.worker.sandbox.bwrap as bwrap_mod
-        monkeypatch.setattr(bwrap_mod, "_LIBSECCOMP_AVAILABLE", True)  # even WITH the lib present
+        import blastbox.worker.sandbox.seccomp_denylist as denylist_mod
+        monkeypatch.setattr(bwrap_mod, "_LIBSECCOMP_AVAILABLE", True)
+        monkeypatch.setattr(denylist_mod, "build_bpf_bytes", lambda: b"\x00" * 16)
         sb = _make_sandbox()
-        assert "seccomp_not_implemented" in sb.insecurity_reasons
-        assert sb.secure is False
-        assert sb.seccomp_active is False
+        assert "seccomp_not_implemented" not in sb.insecurity_reasons
+        assert sb.seccomp_active is True
 
     def test_secure_false_when_seccomp_missing(self, monkeypatch) -> None:
         """secure is False when seccomp lib is absent."""
@@ -287,12 +288,16 @@ class TestBwrapInsecurityReasons:
         r2 = sb.insecurity_reasons
         assert "injected" not in r2
 
-    def test_seccomp_axis_insecure_regardless_of_venv_lib(self) -> None:
-        """bwrap reports the seccomp axis insecure whether or not the venv has
-        python3-libseccomp, because it never attaches a filter (no --seccomp wiring)."""
+    def test_seccomp_insecure_without_libseccomp(self, monkeypatch) -> None:
+        """No libseccomp -> no BPF is built -> 'seccomp_not_implemented' recorded + secure False.
+        Fail-safe: the gate never mistakes an UNFILTERED bwrap for secure (nsjail carries seccomp
+        via KAFEL; the deployed container/gVisor path is preferred)."""
+        import blastbox.worker.sandbox.bwrap as bwrap_mod
+        monkeypatch.setattr(bwrap_mod, "_LIBSECCOMP_AVAILABLE", False)
         sb = _make_sandbox()
         assert "seccomp_not_implemented" in sb.insecurity_reasons
         assert sb.secure is False
+        assert sb.seccomp_active is False
 
 
 # ---------------------------------------------------------------------------
@@ -476,3 +481,60 @@ def test_aa_exec_gated_on_profile_loaded(monkeypatch):
     monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "myprofile, other")
     assert _apparmor_profile_loaded("myprofile") is True
     assert _apparmor_profile_loaded("notlisted") is False
+
+
+# ---------------------------------------------------------------------------
+# Part 3: seccomp BPF denylist (bwrap --seccomp wiring)
+# ---------------------------------------------------------------------------
+
+
+def _kafel_deny_names() -> set[str]:
+    """Plain syscall names in the KAFEL blastbox_deny ERRNO(1) block. Any line containing a brace
+    is skipped — that drops the block delimiters AND the nested `clone { ... }` arg-filter, which
+    is asserted separately (names never share a line with a brace here)."""
+    policy = Path(__file__).resolve().parents[3] / "deploy" / "seccomp" / "blastbox.seccomp.policy"
+    text = policy.read_text()
+    block = text[text.index("ERRNO(1) {"):text.index("USE ")]
+    names: set[str] = set()
+    for line in block.splitlines():
+        line = line.split("//", 1)[0].strip()
+        if "{" in line or "}" in line:
+            continue
+        for tok in line.split(","):
+            tok = tok.strip()
+            if tok and tok.isidentifier():
+                names.add(tok)
+    return names
+
+
+def test_bwrap_denylist_matches_kafel_policy() -> None:
+    """The bwrap BPF denylist (seccomp_denylist.DENY_ERRNO1) MUST equal the nsjail KAFEL ERRNO(1)
+    plain-name block, and the clone namespace bitmask must equal the KAFEL mask — so both backends
+    deny the exact same syscalls (no drift)."""
+    from blastbox.worker.sandbox.seccomp_denylist import CLONE_NS_BITS, CLONE_NS_MASK, DENY_ERRNO1
+
+    # KAFEL can't lex `umount2` so the nsjail policy names that syscall `umount`; libseccomp needs
+    # the real x86_64 `umount2`. Same syscall, backend-appropriate name — normalize that one.
+    assert set(DENY_ERRNO1) == (_kafel_deny_names() - {"umount"}) | {"umount2"}
+    assert len(DENY_ERRNO1) == len(set(DENY_ERRNO1))          # no duplicates
+    assert sum(CLONE_NS_BITS) == CLONE_NS_MASK == 0x7E020000  # 7 CLONE_NEW* bits
+
+
+def test_build_bpf_bytes_valid() -> None:
+    """Where python3-libseccomp is installed, build_bpf_bytes() returns a non-empty BPF program
+    (a whole number of 8-byte sock_filter instructions). Skips where the distro lib is absent."""
+    pytest.importorskip("seccomp")
+    from blastbox.worker.sandbox.seccomp_denylist import build_bpf_bytes
+
+    bpf = build_bpf_bytes()
+    assert bpf is not None
+    assert len(bpf) > 0 and len(bpf) % 8 == 0
+
+
+def test_build_argv_appends_seccomp_fd_before_separator() -> None:
+    """_build_argv(seccomp_fd=N) inserts `--seccomp N` in the bwrap options, before the `--`."""
+    sb = _make_sandbox()
+    argv = sb._build_argv(SandboxRequest(argv=["/usr/bin/true"]), seccomp_fd=7)
+    assert "--seccomp" in argv and argv[argv.index("--seccomp") + 1] == "7"
+    assert argv.index("--seccomp") < argv.index("--")
+    assert "--seccomp" not in sb._build_argv(SandboxRequest(argv=["/usr/bin/true"]))
