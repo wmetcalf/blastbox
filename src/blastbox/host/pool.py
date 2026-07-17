@@ -519,6 +519,40 @@ class WarmPool:
             return len(self._slots)
 
     @property
+    def assigned_count(self) -> int:
+        """Slots currently serving a job (the pool's live concurrent load)."""
+        with self._lock:
+            return sum(1 for s in self._slots.values() if s.state == SlotState.ASSIGNED)
+
+    @property
+    def warm_size(self) -> int:
+        with self._lock:
+            return self._warm_size
+
+    @property
+    def concurrent_ceiling(self) -> int:
+        with self._lock:
+            return self._concurrent_ceiling
+
+    def resize(self, *, warm_size: int | None = None, concurrent_ceiling: int | None = None) -> None:
+        """Retune the warm target / hard ceiling on a live pool. Used by an external
+        controller (the node autosizer) to re-allocate a node's capacity across engines.
+        The background tick() converges to the new target on its own schedule; this only
+        moves the setpoints. warm_size is clamped to the (possibly new) ceiling."""
+        with self._lock:
+            if concurrent_ceiling is not None:
+                if concurrent_ceiling < 1:
+                    raise ValueError("concurrent_ceiling must be >= 1")
+                self._concurrent_ceiling = concurrent_ceiling
+            if warm_size is not None:
+                if warm_size < 0:
+                    raise ValueError("warm_size must be >= 0")
+                self._warm_size = warm_size
+            # keep warm within the ceiling
+            if self._warm_size > self._concurrent_ceiling:
+                self._warm_size = self._concurrent_ceiling
+
+    @property
     def effective_target(self) -> int:
         """Current warm target: warm_size + burst_size (clamped to ceiling) when burst active."""
         with self._lock:
