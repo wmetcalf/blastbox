@@ -46,6 +46,11 @@ class NodeConfig:
     vcpu_oversubscription: float = 2.0
     adaptive: bool = False                # opt-in: adapt the budget from observed free RAM
     interval_s: float = 5.0
+    # shared-store (dispatcher self-sizing) transport: the node dir every engine's
+    # dispatcher publishes its demand to + reads peers from. Snapshots older than
+    # stale_after_s are ignored (a dead engine drops out of the node view).
+    share_dir: str = "/var/lib/blastbox/node"
+    stale_after_s: float = 20.0
 
     @property
     def active(self) -> bool:
@@ -110,4 +115,7 @@ class NodeConfig:
             vcpu_oversubscription=_float("BLASTBOX_NODE_VCPU_OVERSUBSCRIPTION", 2.0),
             adaptive=_bool("BLASTBOX_NODE_ADAPTIVE", False),
             interval_s=_float("BLASTBOX_NODE_INTERVAL_S", 5.0),
+            share_dir=os.environ.get("BLASTBOX_NODE_SHARE_DIR", "/var/lib/blastbox/node").strip()
+            or "/var/lib/blastbox/node",
+            stale_after_s=_float("BLASTBOX_NODE_STALE_AFTER_S", 20.0),
         )

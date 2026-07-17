@@ -297,12 +297,38 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         # reachable_tiers; reused here so the gate and the dispatcher agree on cold-fallback.)
         warm_only=warm_only,
     )
+    # Opt-in node self-sizer: size THIS engine's warm pool from the shared node view
+    # (queue backlog + node budget). Inert unless a warm pool exists AND BLASTBOX_NODE_*
+    # turns on resource_management or balancing — otherwise the pool self-manages as today.
+    sizer_stop = None
+    if pool is not None:
+        from blastbox.host.node_config import EngineNode, NodeConfig
+
+        node_cfg = NodeConfig.from_env()
+        if node_cfg.resource_management or node_cfg.balancing:
+            import threading as _threading
+
+            from blastbox.host.dispatcher_sizer import DispatcherSizer
+            from blastbox.host.node_share import FileNodeShare
+            from blastbox.host.node_sizer import local_backlog_fn
+
+            ename = next(iter(engines)) if engines else os.environ.get("BLASTBOX_ENGINE", "engine")
+            spec = next((e for e in node_cfg.engines if e.name == ename),
+                        EngineNode(name=ename, url=""))
+            sizer_stop = _threading.Event()
+            DispatcherSizer(spec, pool, FileNodeShare(node_cfg.share_dir), node_cfg,
+                            backlog_fn=local_backlog_fn(store)).start_thread(sizer_stop)
+            print(f"node self-sizer: managing '{ename}' warm pool from {node_cfg.share_dir} "
+                  f"({'balancing' if node_cfg.balancing else 'static shares'})", file=sys.stderr)
+
     try:
         dispatcher.run_forever(
             poll_interval_s=args.poll_interval,
             concurrency=int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1"),
         )
     finally:
+        if sizer_stop is not None:
+            sizer_stop.set()
         if pool is not None:
             pool.stop()
     return 0
