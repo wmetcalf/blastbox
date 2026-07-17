@@ -142,6 +142,60 @@ def test_controller_demand_from_live_state():
     assert plan["hot"].concurrent_ceiling > plan["cold"].concurrent_ceiling
 
 
+def test_backlog_drives_scale_up_and_down_to_min():
+    # one engine on a big node; demand is driven purely by its QUEUED backlog. min_warm
+    # is the floor it returns to once the backlog drains.
+    fc = _FakePool(RUNTIME_FIRECRACKER, assigned=0)
+    mp = ManagedPool(PoolSpec("clip", slot_ram_mib=1024, min_warm=1, max_ceiling=64), fc)
+    backlog = {"n": 0}
+    sizer = NodeAutoSizer([mp], backlog_fn=lambda _e: backlog["n"],
+                          capacity_fn=_budget(64 * 1024, 999))
+    # idle → warm at the floor
+    p0 = sizer.plan()["clip"]
+    assert p0.warm_size == 1
+    # backlog spikes → scale UP (warm tracks backlog)
+    backlog["n"] = 12
+    p1 = sizer.plan()["clip"]
+    assert p1.warm_size == 12 and p1.concurrent_ceiling >= 12
+    # backlog drains → scale back DOWN to the min floor
+    backlog["n"] = 0
+    p2 = sizer.plan()["clip"]
+    assert p2.warm_size == 1
+
+
+def test_backlog_splits_node_between_engines_by_queue():
+    a = _FakePool(RUNTIME_FIRECRACKER, assigned=0)
+    b = _FakePool(RUNTIME_FIRECRACKER, assigned=0)
+    depth = {"a": 30, "b": 3}
+    sizer = NodeAutoSizer(
+        [ManagedPool(PoolSpec("a", slot_ram_mib=1024, max_ceiling=64), a),
+         ManagedPool(PoolSpec("b", slot_ram_mib=1024, max_ceiling=64), b)],
+        backlog_fn=lambda e: depth[e], capacity_fn=_budget(10 * 1024, 999))
+    plan = sizer.tick()
+    assert plan["a"].concurrent_ceiling > plan["b"].concurrent_ceiling
+    assert plan["a"].concurrent_ceiling + plan["b"].concurrent_ceiling == 10
+
+
+def test_run_loop_ticks_and_stops():
+    fc = _FakePool(RUNTIME_FIRECRACKER, assigned=2)
+    sizer = NodeAutoSizer([ManagedPool(PoolSpec("a", slot_ram_mib=1024), fc)],
+                          capacity_fn=_budget(8 * 1024, 99))
+    ticks = {"n": 0}
+    sizer.run(interval_s=0, max_ticks=3, sleep=lambda _s: ticks.__setitem__("n", ticks["n"] + 1))
+    assert fc.resized is not None                  # applied at least once
+
+
+def test_local_backlog_fn_reads_queued_count():
+    from blastbox.host.jobs.base import JobStatus
+    from blastbox.host.node_sizer import local_backlog_fn
+
+    class _Store:
+        def count(self, status=None, *, q=None):
+            return 7 if status == JobStatus.QUEUED else 99
+    fn = local_backlog_fn(_Store())
+    assert fn("clip") == 7                          # only QUEUED counted
+
+
 def test_adaptive_shrinks_when_node_hot():
     fc = _FakePool(RUNTIME_FIRECRACKER, assigned=2)
     mp = ManagedPool(PoolSpec("a", slot_ram_mib=1024, max_ceiling=64), fc)

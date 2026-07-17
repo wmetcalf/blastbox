@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import math
 import os
+import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -175,7 +177,7 @@ class NodeAutoSizer:
         vcpu_oversubscription: float = 2.0,
         adaptive: bool = False,
         min_free_mib: float = 2048.0,     # adaptive: keep at least this much node RAM free
-        clock: Callable[[], float] = None,  # type: ignore[assignment]
+        backlog_fn: Optional[Callable[[str], int]] = None,
         capacity_fn: Callable[[float, float], NodeBudget] = node_capacity,
         avail_fn: Callable[[], Optional[float]] = _mem_available_mib,
     ) -> None:
@@ -185,6 +187,10 @@ class NodeAutoSizer:
         self._vcpu_over = vcpu_oversubscription
         self._adaptive = adaptive
         self._min_free_mib = min_free_mib
+        # engine name → pending (QUEUED) job count. The queue backlog is the LEADING
+        # scale signal (busy slots lag it): a pool with a growing backlog wants more of
+        # the node now. None → demand is busy-slots only.
+        self._backlog_fn = backlog_fn
         self._capacity_fn = capacity_fn
         self._avail_fn = avail_fn
         self._budget_scale = 1.0          # adaptive correction on the RAM budget (EWMA-driven)
@@ -194,13 +200,17 @@ class NodeAutoSizer:
         return [mp.spec.name for mp in self._pools]
 
     def _live_demand(self, mp: ManagedPool) -> float:
-        """Current wantedness of a pool: slots busy right now, lifted while bursting so a
-        pool under sustained pressure pulls extra node share."""
+        """Current wantedness of a pool = in-flight work + queued backlog. Busy slots are
+        what's running now; the QUEUED backlog is what's waiting — the leading signal
+        that this engine needs to scale UP. As the backlog drains, demand falls and the
+        pool scales back DOWN toward its min_warm floor."""
         pool = mp.pool
-        busy = float(getattr(pool, "assigned_count", 0))
+        demand = float(getattr(pool, "assigned_count", 0))
+        if self._backlog_fn is not None:
+            demand += float(max(0, self._backlog_fn(mp.spec.name)))
         if getattr(pool, "burst_active", False):
-            busy += 1.0                    # +1 slot of intent while under sustained pressure
-        return busy
+            demand += 1.0                  # +1 slot of intent while under sustained pressure
+        return demand
 
     def _adapt_budget(self, budget: NodeBudget) -> NodeBudget:
         """Nudge the RAM budget from observed free memory: if the node is running hotter
@@ -248,3 +258,31 @@ class NodeAutoSizer:
                 concurrent_ceiling=size.concurrent_ceiling,
             )
         return plan
+
+    def run(self, *, interval_s: float = 5.0, stop: Optional[threading.Event] = None,
+            max_ticks: Optional[int] = None, sleep: Callable[[float], None] = time.sleep) -> None:
+        """Run the sizing loop: tick() every ``interval_s`` until ``stop`` is set (or
+        ``max_ticks`` ticks elapse). Scale-up follows backlog growth; scale-down follows
+        its drain. Blocking — run in a daemon thread."""
+        n = 0
+        while not (stop is not None and stop.is_set()):
+            self.tick()
+            n += 1
+            if max_ticks is not None and n >= max_ticks:
+                return
+            sleep(interval_s)
+
+
+def local_backlog_fn(job_store: object) -> Callable[[str], int]:
+    """A backlog source for a single engine's `serve` process: the number of QUEUED jobs
+    in its own store (each engine process owns its queue, so this is that engine's
+    backlog). Ignores the engine-name arg. A central node coordinator instead scrapes
+    each engine's status endpoint for its backlog."""
+    from .jobs.base import JobStatus
+
+    def _fn(_engine: str = "") -> int:
+        try:
+            return int(job_store.count(JobStatus.QUEUED))  # type: ignore[attr-defined]
+        except Exception:
+            return 0
+    return _fn
