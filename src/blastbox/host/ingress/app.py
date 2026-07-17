@@ -851,6 +851,13 @@ def build_app(
     if similar_router is not None:
         app.include_router(similar_router)
 
+    # Pool control surface (/v1/pool/status + /v1/pool/resize) for the node coordinator.
+    # Self-gating: status is read-only telemetry; resize is fail-closed behind
+    # BLASTBOX_ADMIN_TOKEN (unset → 503). Safe to always mount.
+    from .pool_routes import build_pool_router
+
+    app.include_router(build_pool_router())
+
     # Product routes mounted on the shared core. They inherit the app's
     # middleware (bearer auth, limits); the core owns auth + path-confinement.
     if extension is not None:
