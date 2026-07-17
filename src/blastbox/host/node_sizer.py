@@ -77,14 +77,27 @@ class PoolSize:
 def plan_sizes(specs: list[PoolSpec], budget: NodeBudget) -> dict[str, PoolSize]:
     """Allocate the node budget across pools. Pure + deterministic.
 
-    Ceilings are water-filled by demand so that Σ ceiling·footprint ≤ budget on BOTH
-    RAM and vCPU — i.e. even if every engine simultaneously bursts to its ceiling, the
-    node still fits (no oversubscription). Warm target then tracks each engine's demand
-    (don't hold the whole node hot when idle). Floors (min_warm) are honoured first;
-    per-engine max_ceiling caps growth.
+    Ceilings are water-filled by demand so that, ABOVE the mandatory 1-slot-per-engine
+    baseline, Σ ceiling·footprint ≤ budget on BOTH RAM and vCPU — i.e. once every engine
+    can seat its one guaranteed slot, no further growth oversubscribes the node. The
+    baseline itself is unconditional (a WarmPool needs ceiling ≥ 1 to run at all): a node
+    too small to seat even one slot per engine is undersized and gets 1 each anyway —
+    that's the ONLY case Σ can exceed budget, and it's viability-over-budget by design.
+    Warm target then tracks each engine's demand (don't hold the whole node hot when
+    idle). min_warm is honoured up to the afforded ceiling; per-engine max_ceiling caps
+    growth. A non-positive footprint is clamped to a tiny positive so the water-fill
+    always terminates (a 0-RAM slot would otherwise "fit" forever).
     """
     if not specs:
         return {}
+    # clamp footprints > 0 so fit() can't loop forever on a mis-declared 0-RAM/0-vCPU slot
+    specs = [
+        s if (s.slot_ram_mib > 0 and s.slot_vcpus > 0)
+        else PoolSpec(name=s.name, slot_ram_mib=max(s.slot_ram_mib, 1.0),
+                      slot_vcpus=max(s.slot_vcpus, 0.01), demand=s.demand,
+                      min_warm=s.min_warm, max_ceiling=s.max_ceiling)
+        for s in specs
+    ]
 
     # Hard baseline: every managed pool must be able to run at least one job, so ceiling
     # starts at 1 (WarmPool requires ceiling >= 1). This is counted against the budget;

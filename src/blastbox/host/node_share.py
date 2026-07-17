@@ -61,6 +61,27 @@ class FileNodeShare:
                 snap = DemandSnapshot(**json.loads(f.read_text()))
             except Exception:
                 continue                        # a torn/foreign file just doesn't contribute
-            if now - snap.ts <= max_age_s:
+            if _valid(snap, f.stem) and now - snap.ts <= max_age_s:
                 out.append(snap)
         return out
+
+
+# A snapshot is a request to spend node resources, so validate it — even a stray/hostile
+# <engine>.json can't drive a spawn-storm or an unbounded water-fill:
+#   * the self-declared engine must match the filename (no impersonating a peer),
+#   * footprints must be POSITIVE (a 0 footprint makes plan_sizes' fit() always true →
+#     it would water-fill to max_ceiling; also a plain misconfig guard),
+#   * counts non-negative, ceiling positive and sanity-capped.
+_MAX_CEILING_SANE = 4096
+
+def _valid(snap: DemandSnapshot, filename_stem: str) -> bool:
+    return (
+        snap.engine == filename_stem
+        and snap.slot_ram_mib > 0
+        and snap.slot_vcpus > 0
+        and snap.backlog >= 0
+        and snap.assigned >= 0
+        and 1 <= snap.max_ceiling <= _MAX_CEILING_SANE
+        and snap.min_warm >= 0
+        and snap.weight >= 0
+    )

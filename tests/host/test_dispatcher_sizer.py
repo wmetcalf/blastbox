@@ -7,7 +7,7 @@ from blastbox.host.dispatcher_sizer import DispatcherSizer
 from blastbox.host.node_config import EngineNode, NodeConfig
 from blastbox.host.node_share import DemandSnapshot, FileNodeShare
 from blastbox.host.node_sizer import NodeBudget
-from blastbox.host.pool_config import RUNTIME_FIRECRACKER
+from blastbox.host.pool_config import RUNTIME_AWS_LAMBDA_MICROVM, RUNTIME_FIRECRACKER
 
 
 class _Pool:
@@ -43,7 +43,7 @@ def test_file_share_roundtrip_and_staleness(tmp_path):
 def test_off_by_default_is_noop(tmp_path):
     share = FileNodeShare(str(tmp_path))
     cfg = NodeConfig()  # both switches off
-    ds = DispatcherSizer(EngineNode("clip", "-"), _Pool(), share, cfg, backlog_fn=lambda: 9)
+    ds = DispatcherSizer(EngineNode("clip", "-"), _Pool(), share, cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 9)
     assert ds.tick() is None                       # no sizing, and nothing published
     assert share.read_all(max_age_s=1e9, now=1.0) == []
 
@@ -58,7 +58,7 @@ def test_sizes_own_pool_from_shared_node_view(tmp_path):
     cfg = NodeConfig(balancing=True, resource_management=True, stale_after_s=60,
                      ram_headroom_frac=1.0, vcpu_oversubscription=999)
     ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64),
-                         pool, share, cfg, backlog_fn=lambda: 4,
+                         pool, share, cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 4,
                          capacity_fn=_budget(10 * 1024, 999), clock=lambda: 1000.0)
     mine = ds.tick()
     # node has 10 slots; red's backlog(40) >> clip's(4) → red gets the larger share, but
@@ -78,7 +78,7 @@ def test_static_mode_uses_weight_not_backlog(tmp_path):
     cfg = NodeConfig(resource_management=True, balancing=False, stale_after_s=60,
                      ram_headroom_frac=1.0, vcpu_oversubscription=999)
     ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64, weight=4.0),
-                         pool, share, cfg, backlog_fn=lambda: 0,
+                         pool, share, cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 0,
                          capacity_fn=_budget(10 * 1024, 999), clock=lambda: 5.0)
     ds.tick()
     view = {s.engine: s for s in share.read_all(max_age_s=60, now=5.0)}
@@ -91,11 +91,10 @@ def test_static_mode_uses_weight_not_backlog(tmp_path):
 
 
 def test_skips_non_node_runtime(tmp_path):
-    from blastbox.host.pool_config import RUNTIME_AWS_LAMBDA_MICROVM
     share = FileNodeShare(str(tmp_path))
     cfg = NodeConfig(balancing=True, resource_management=True)
     pool = _Pool(runtime=RUNTIME_AWS_LAMBDA_MICROVM)
-    ds = DispatcherSizer(EngineNode("lam", "-"), pool, share, cfg, backlog_fn=lambda: 50)
+    ds = DispatcherSizer(EngineNode("lam", "-"), pool, share, cfg, runtime=RUNTIME_AWS_LAMBDA_MICROVM, backlog_fn=lambda: 50)
     assert ds.tick() is None                       # lambda pool never sized here
 
 
@@ -105,6 +104,46 @@ def test_run_loop_ticks_and_stops(tmp_path):
                      vcpu_oversubscription=999, interval_s=0)
     pool = _Pool(assigned=1)
     ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024), pool, share, cfg,
-                         backlog_fn=lambda: 2, capacity_fn=_budget(8 * 1024, 99))
+                         runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 2, capacity_fn=_budget(8 * 1024, 99))
     ds.run(max_ticks=3, sleep=lambda _s: None)
     assert pool.concurrent_ceiling >= 1            # sized at least once
+
+
+# --- regression: finding 1 (real WarmPool.runtime is an OBJECT, not a string) ---
+
+class _RealishRuntimeObj:
+    """Mimics WarmPool.runtime returning a SlotRuntime OBJECT (no .strip())."""
+
+
+def test_gating_uses_runtime_name_not_pool_object(tmp_path):
+    # the pool's .runtime is an object (like a real WarmPool); gating must use the
+    # runtime= NAME string, or manages() would crash and the sizer silently no-op.
+    share = FileNodeShare(str(tmp_path))
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    pool = _Pool(assigned=1)
+    pool.runtime = _RealishRuntimeObj()          # object, not a string
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024), pool, share, cfg,
+                         runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 3,
+                         capacity_fn=_budget(8 * 1024, 99), clock=lambda: 1.0)
+    mine = ds.tick()                              # must NOT raise, must actually size
+    assert mine is not None and pool.concurrent_ceiling >= 1
+
+
+# --- regression: finding 4 (untrusted snapshot values are validated) ---
+
+def test_read_all_drops_invalid_and_impersonating_snapshots(tmp_path):
+    share = FileNodeShare(str(tmp_path))
+    good = DemandSnapshot("clip", 2, 0, 1024, 1, 0, 64, 1.0, ts=1.0)
+    share.publish(good)
+    # zero footprint (would make plan_sizes water-fill forever) — written under its own name
+    share.publish(DemandSnapshot("zero", 1, 0, 0, 0, 0, 64, 1.0, ts=1.0))
+    # absurd ceiling
+    share.publish(DemandSnapshot("huge", 1, 0, 1024, 1, 0, 2_000_000_000, 1.0, ts=1.0))
+    # impersonation: a file named evil.json that claims engine="clip"
+    import json as _json
+    (tmp_path / "evil.json").write_text(_json.dumps({
+        "engine": "clip", "backlog": 1, "assigned": 0, "slot_ram_mib": 1024,
+        "slot_vcpus": 1, "min_warm": 0, "max_ceiling": 64, "weight": 1.0, "ts": 1.0}))
+    kept = {s.engine for s in share.read_all(max_age_s=60, now=1.0)}
+    assert kept == {"clip"}                       # only the valid, non-impersonating snapshot

@@ -441,7 +441,24 @@ class WarmPool:
         self._health_check()
         self._update_burst(ready)
         self._spawn_to_deficit(ready)
+        self._reap_surplus()
         self._sample_metrics()
+
+    def _reap_surplus(self) -> None:
+        """Reap IDLE slots above the (possibly just-lowered) effective target, so a
+        downsize — e.g. the node autosizer lowering warm_size/ceiling — actually shrinks
+        the pool and frees node resources now, instead of only converging lazily as
+        one-job-per-slot consumption drains it. Only IDLE slots are taken; ASSIGNED /
+        WARMING / DRAINING are left alone."""
+        with self._lock:
+            target = self._effective_target_unlocked()
+            non_draining = sum(1 for s in self._slots.values() if s.state != SlotState.DRAINING)
+            surplus = non_draining - target
+            if surplus <= 0:
+                return
+            victims = [s for s in self._slots.values() if s.state == SlotState.IDLE][:surplus]
+        for slot in victims:
+            self.retire(slot)   # re-checks under lock, marks DRAINING, reaps, pops
 
     def _runtime_ready(self) -> bool:
         """Kick the warm runtime's async prepare (if any) and report whether it can spawn this

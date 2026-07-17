@@ -1120,3 +1120,17 @@ def test_dirty_release_reaps_when_no_recycle_method() -> None:
     pool.release(s1, dirty=True)
     assert rt.reaped == [s1.slot_id]
     pool.stop()
+
+
+def test_resize_down_reaps_surplus_idle_slots() -> None:
+    # regression (marla finding 3): lowering the target must proactively reap surplus IDLE
+    # slots so a node-autosizer downsize actually frees resources — not just lazily.
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=4, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    for _ in range(6):
+        pool.tick()                          # spawn + promote WARMING→IDLE up to warm_size=4
+    assert pool.idle_count == 4 and pool.slot_count == 4
+    pool.resize(warm_size=1, concurrent_ceiling=1)
+    pool.tick()                              # should reap the 3 surplus IDLE slots
+    assert pool.slot_count == 1
+    assert len(rt.reaped) == 3

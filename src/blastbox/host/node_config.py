@@ -45,6 +45,7 @@ class NodeConfig:
     ram_headroom_frac: float = 0.8
     vcpu_oversubscription: float = 2.0
     adaptive: bool = False                # opt-in: adapt the budget from observed free RAM
+    min_free_mib: float = 2048.0          # adaptive: keep at least this much node RAM free
     interval_s: float = 5.0
     # shared-store (dispatcher self-sizing) transport: the node dir every engine's
     # dispatcher publishes its demand to + reads peers from. Snapshots older than
@@ -114,6 +115,7 @@ class NodeConfig:
             ram_headroom_frac=_float("BLASTBOX_NODE_RAM_HEADROOM", 0.8),
             vcpu_oversubscription=_float("BLASTBOX_NODE_VCPU_OVERSUBSCRIPTION", 2.0),
             adaptive=_bool("BLASTBOX_NODE_ADAPTIVE", False),
+            min_free_mib=_float("BLASTBOX_NODE_MIN_FREE_MIB", 2048.0),
             interval_s=_float("BLASTBOX_NODE_INTERVAL_S", 5.0),
             share_dir=os.environ.get("BLASTBOX_NODE_SHARE_DIR", "/var/lib/blastbox/node").strip()
             or "/var/lib/blastbox/node",

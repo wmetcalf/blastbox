@@ -197,11 +197,6 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     pool = build_warm_pool()   # built, NOT started -- start only after all validation below, so a
     # config error (mixed cascade / multi-engine) can't leak already-spawned cloud slots.
 
-    # Expose this process's pool + store to the /v1/pool/* control routes (node
-    # coordinator scrapes status + pushes resize). Safe when pool is None (cold node).
-    from blastbox.host import pool_registry
-    pool_registry.register(pool, store)
-
     # Tier identity, derived ALONGSIDE the pool so a misconfig fails fast HERE rather than the
     # dispatcher silently mislabeling/misrouting warm jobs as "cold". A built warm pool MUST
     # have a known warm runtime; no pool ⇒ "cold". (build_warm_pool only builds a pool for a
@@ -316,7 +311,10 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
             spec = next((e for e in node_cfg.engines if e.name == ename),
                         EngineNode(name=ename, url=""))
             sizer_stop = _threading.Event()
+            # `tier` is the pool's runtime NAME (firecracker/gvisor/cold) — WarmPool.runtime
+            # is the SlotRuntime object, so gating must use this string, not the pool.
             DispatcherSizer(spec, pool, FileNodeShare(node_cfg.share_dir), node_cfg,
+                            runtime=tier,
                             backlog_fn=local_backlog_fn(store)).start_thread(sizer_stop)
             print(f"node self-sizer: managing '{ename}' warm pool from {node_cfg.share_dir} "
                   f"({'balancing' if node_cfg.balancing else 'static shares'})", file=sys.stderr)
@@ -333,35 +331,6 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
             pool.stop()
     return 0
 
-
-def _node_sizer_cmd(args: argparse.Namespace) -> int:
-    """Run the opt-in node pool coordinator. Reads BLASTBOX_NODE_* for the engine
-    inventory + toggles; a no-op (logs and exits) unless resource_management or balancing
-    is enabled. Requires BLASTBOX_ADMIN_TOKEN to push resizes to the engines."""
-    from blastbox.host.node_config import NodeConfig
-    from blastbox.host.node_coord import NodeCoordinator, http_fetch_status, http_push_resize
-
-    cfg = NodeConfig.from_env()
-    if not cfg.active:
-        print("node-sizer: inactive — set BLASTBOX_NODE_ENGINES and enable "
-              "BLASTBOX_NODE_RESOURCE_MANAGEMENT or _BALANCING to turn it on. Exiting.",
-              file=sys.stderr)
-        return 0
-    admin = os.environ.get("BLASTBOX_ADMIN_TOKEN", "").strip()
-    if not admin:
-        print("node-sizer: BLASTBOX_ADMIN_TOKEN is required to push pool resizes.", file=sys.stderr)
-        return 1
-    mode = "balancing (backlog-driven)" if cfg.balancing else "static weight shares"
-    print(f"node-sizer: managing {len(cfg.engines)} engine(s) — {mode}; "
-          f"budget headroom={cfg.ram_headroom_frac} oversubscription={cfg.vcpu_oversubscription} "
-          f"adaptive={cfg.adaptive}; interval={cfg.interval_s}s", file=sys.stderr)
-    coord = NodeCoordinator(cfg, fetch_status=http_fetch_status(),
-                            push_resize=http_push_resize(admin))
-    try:
-        coord.run()
-    except KeyboardInterrupt:
-        pass
-    return 0
 
 
 def _bench_cmd(args: argparse.Namespace) -> int:
@@ -466,11 +435,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma-separated NAME=image:tag engine specs",
     )
     pd.set_defaults(func=_dispatch_cmd)
-
-    pn = sub.add_parser("node-sizer",
-                        help="run the opt-in node pool coordinator (size engine pools by "
-                             "backlog + resource budget; config from BLASTBOX_NODE_*)")
-    pn.set_defaults(func=_node_sizer_cmd)
 
     # bench
     pb = sub.add_parser("bench", help="run a performance benchmark scenario")

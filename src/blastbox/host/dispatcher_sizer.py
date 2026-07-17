@@ -16,32 +16,63 @@ from typing import Callable, Optional
 
 from .node_config import EngineNode, NodeConfig
 from .node_share import DemandSnapshot, NodeShare
-from .node_sizer import PoolSpec, PoolSize, manages, node_capacity, plan_sizes
+from .node_sizer import (
+    NodeBudget,
+    PoolSize,
+    PoolSpec,
+    _mem_available_mib,
+    manages,
+    node_capacity,
+    plan_sizes,
+)
 
 
 class DispatcherSizer:
     def __init__(
         self,
         engine: EngineNode,
-        pool: object,                         # the local WarmPool (assigned_count/runtime/resize)
+        pool: object,                         # the local WarmPool (assigned_count/resize)
         share: NodeShare,
         config: NodeConfig,
         *,
+        runtime: str,                         # the pool's runtime NAME (BLASTBOX_POOL_RUNTIME /
+                                              # dispatcher tier) — WarmPool.runtime is the
+                                              # SlotRuntime OBJECT, not a name, so gating must
+                                              # use this string.
         backlog_fn: Callable[[], int],        # this engine's own QUEUED count
-        capacity_fn: Callable[[float, float], object] = node_capacity,
+        capacity_fn: Callable[[float, float], NodeBudget] = node_capacity,
+        avail_fn: Callable[[], Optional[float]] = _mem_available_mib,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._engine = engine
         self._pool = pool
         self._share = share
         self._config = config
+        self._runtime = (runtime or "").strip().lower()
         self._backlog_fn = backlog_fn
         self._capacity_fn = capacity_fn
+        self._avail_fn = avail_fn
         self._clock = clock
+        self._budget_scale = 1.0              # adaptive correction, persisted across ticks
 
     def _active(self) -> bool:
         cfg = self._config
-        return (cfg.resource_management or cfg.balancing) and manages(getattr(self._pool, "runtime", ""))
+        return (cfg.resource_management or cfg.balancing) and manages(self._runtime)
+
+    def _adapt(self, budget: "NodeBudget") -> "NodeBudget":
+        """Nudge the RAM budget from observed free memory when BLASTBOX_NODE_ADAPTIVE is
+        on. Persisted across ticks (unlike a per-tick sizer), bounded [0.5, 1.25]."""
+        if not self._config.adaptive:
+            return budget
+        free = self._avail_fn()
+        if free is None:
+            return budget
+        floor = self._config.min_free_mib
+        if free < floor:
+            self._budget_scale = max(0.5, self._budget_scale - 0.1)
+        elif free > floor * 2:
+            self._budget_scale = min(1.25, self._budget_scale + 0.05)
+        return NodeBudget(ram_mib=budget.ram_mib * self._budget_scale, vcpus=budget.vcpus)
 
     def tick(self) -> Optional[PoolSize]:
         """Publish own demand, read the node view, size the local pool. Returns this
@@ -71,7 +102,8 @@ class DispatcherSizer:
             )
             for s in snaps
         ]
-        budget = self._capacity_fn(self._config.ram_headroom_frac, self._config.vcpu_oversubscription)
+        budget = self._adapt(self._capacity_fn(self._config.ram_headroom_frac,
+                                               self._config.vcpu_oversubscription))
         plan = plan_sizes(specs, budget)  # type: ignore[arg-type]
         mine = plan.get(e.name)
         if mine is not None and hasattr(self._pool, "resize"):
