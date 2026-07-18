@@ -236,3 +236,67 @@ def test_valid_bounds_reject_overflow_and_infinite_ts(tmp_path):
         "engine": "inf", "backlog": 1, "assigned": 0, "slot_ram_mib": 1024, "slot_vcpus": 1,
         "min_warm": 0, "max_ceiling": 64, "weight": 1.0, "ts": 1e999}))
     assert {s.engine for s in share.read_all(max_age_s=60, now=1.0)} == {"good"}   # no crash
+
+
+# --- round-6 regressions ---
+
+def test_partial_node_config_still_coordinates(tmp_path):
+    # regression: on ONE host, if some engines set BLASTBOX_NODE_ID and some don't, the
+    # UNTAGGED engine must still see a TAGGED peer (symmetric filter) — the old asymmetric
+    # `s.node in ("", self._node)` hid the tagged peer from an untagged reader → it thought
+    # it was alone → oversubscribed. clip(untagged) shares a 10-slot node with red(tagged).
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("red", 40, 0, 1024, 1, 0, 64, 1.0, ts=1.0, node="hostA"))
+    pool = _Pool(assigned=0)
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64), pool, share, cfg,
+                         runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 4, node="",  # untagged
+                         capacity_fn=_budget(10 * 1024, 999), clock=lambda: 1.0)
+    mine = ds.tick()
+    assert mine.concurrent_ceiling < 10       # sees red → shares, not isolated to the whole node
+
+
+def test_static_mode_warm_tracks_real_demand_not_weight(tmp_path):
+    # regression: static mode used weight as WARM demand → a big weight held ceil(weight)
+    # slots hot at zero backlog. Weight is a CEILING share, not a warm target: clip has
+    # weight=8 (→ big ceiling to burst into) but backlog 0 → 0 warm slots.
+    share = FileNodeShare(str(tmp_path))
+    pool = _Pool(assigned=0)
+    cfg = NodeConfig(resource_management=True, balancing=False, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64, weight=8.0,
+                                    min_warm=0),
+                         pool, share, cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 0,
+                         capacity_fn=_budget(32 * 1024, 999), clock=lambda: 1.0)
+    mine = ds.tick()
+    assert mine.concurrent_ceiling > 1        # weight bought a big ceiling to burst into
+    assert mine.warm_size == 0                # but nothing held hot at zero backlog
+    assert pool.warm_size == 0
+
+
+def test_adaptive_never_exceeds_physical_ram(tmp_path):
+    # regression (codex HIGH): the adaptive UP-scale (cap 1.25) times a high headroom can
+    # target >100% of node RAM → OOM. With headroom 1.0 the baseline budget already IS the
+    # whole node, so the scale must cap at 1.0 (1/headroom) — never inflate past total.
+    share = FileNodeShare(str(tmp_path))
+    cfg = NodeConfig(balancing=True, resource_management=True, adaptive=True,
+                     ram_headroom_frac=1.0, min_free_mib=100.0)
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024), _Pool(), share, cfg,
+                         runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 1,
+                         avail_fn=lambda: 1_000_000.0)   # tons of free RAM → wants to ramp up
+    base = NodeBudget(ram_mib=1000.0, vcpus=10.0)
+    for _ in range(50):
+        out = ds._adapt(base)
+    assert out.ram_mib <= base.ram_mib + 1e-6   # headroom 1.0 → never grows past total
+
+    # contrast: with headroom 0.8 the baseline is 80% of node, so ramping to 1.25× is safe
+    # (0.8 × 1.25 = 1.0 = the whole node, still not over).
+    cfg2 = NodeConfig(balancing=True, resource_management=True, adaptive=True,
+                      ram_headroom_frac=0.8, min_free_mib=100.0)
+    ds2 = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024), _Pool(), share, cfg2,
+                          runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 1,
+                          avail_fn=lambda: 1_000_000.0)
+    for _ in range(50):
+        out2 = ds2._adapt(base)
+    assert 1.24 <= out2.ram_mib / base.ram_mib <= 1.25   # allowed up to 1.25×, no further

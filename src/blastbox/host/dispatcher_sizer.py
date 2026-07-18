@@ -79,17 +79,22 @@ class DispatcherSizer:
 
     def _adapt(self, budget: "NodeBudget") -> "NodeBudget":
         """Nudge the RAM budget from observed free memory when BLASTBOX_NODE_ADAPTIVE is
-        on. Persisted across ticks (unlike a per-tick sizer), bounded [0.5, 1.25]."""
+        on. Persisted across ticks. The UP-scale is capped so the adapted budget never
+        exceeds physical RAM: with headroom_frac h the baseline budget is total·h, so the
+        scale is capped at 1/h (times the safety 1.25) — otherwise a high headroom (e.g.
+        1.0) × 1.25 would target 125% of node RAM → OOM."""
         if not self._config.adaptive:
             return budget
         free = self._avail_fn()
         if free is None:
             return budget
+        hi = min(1.25, 1.0 / max(self._config.ram_headroom_frac, 0.05))
         floor = self._config.min_free_mib
         if free < floor:
             self._budget_scale = max(0.5, self._budget_scale - 0.1)
         elif free > floor * 2:
-            self._budget_scale = min(1.25, self._budget_scale + 0.05)
+            self._budget_scale = min(hi, self._budget_scale + 0.05)
+        self._budget_scale = min(self._budget_scale, hi)   # clamp if headroom changed
         return NodeBudget(ram_mib=budget.ram_mib * self._budget_scale, vcpus=budget.vcpus)
 
     def tick(self) -> Optional[PoolSize]:
@@ -116,10 +121,12 @@ class DispatcherSizer:
         # and collapse every engine to "sees only itself" → node oversubscription.
         max_age = max(self._config.stale_after_s,
                       (self._config.interval_s + self._last_tick_dur) * 2.0)
-        # Filter to this physical node (default node == "" → the share_dir is the boundary,
-        # so all same-dir engines coordinate; a set BLASTBOX_NODE_ID isolates hosts).
+        # Node filter, SYMMETRIC so a partial config (some engines set BLASTBOX_NODE_ID,
+        # some not, on one host) still coordinates instead of each thinking it's alone
+        # (→ oversubscription): include a peer if either side is untagged, or the tags
+        # match. A set-vs-different-set pair (real cross-host isolation) is excluded.
         snaps = [s for s in self._share.read_all(max_age_s=max_age, now=now)
-                 if s.node in ("", self._node)]
+                 if s.node == "" or self._node == "" or s.node == self._node]
         self._last_tick_dur = max(0.0, self._clock() - started)
         if not snaps:
             return None
@@ -128,7 +135,7 @@ class DispatcherSizer:
         specs = [
             PoolSpec(
                 name=s.engine, slot_ram_mib=s.slot_ram_mib, slot_vcpus=s.slot_vcpus,
-                # balancing → live backlog + in-flight; else the configured static weight
+                # ceiling water-fill: by live backlog (balancing) or the static weight share.
                 demand=float(s.backlog + s.assigned) if balancing else float(s.weight),
                 min_warm=s.min_warm, max_ceiling=s.max_ceiling,
             )
@@ -139,8 +146,13 @@ class DispatcherSizer:
         plan = plan_sizes(specs, budget)  # type: ignore[arg-type]
         mine = plan.get(e.name)
         if mine is not None and hasattr(self._pool, "resize"):
+            # WARM tracks THIS engine's REAL demand (not the weight, which is only a
+            # ceiling-share ratio) so static mode doesn't hold idle engines hot: a big
+            # weight buys a big ceiling to burst into, but few hot slots when idle.
+            warm = min(mine.concurrent_ceiling, max(e.min_warm, backlog + assigned))
+            mine = PoolSize(warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)
             self._pool.resize(  # type: ignore[attr-defined]
-                warm_size=mine.warm_size, concurrent_ceiling=mine.concurrent_ceiling)
+                warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)
         return mine
 
     def run(self, *, stop: Optional[threading.Event] = None, max_ticks: Optional[int] = None,
