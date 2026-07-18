@@ -1136,6 +1136,28 @@ def test_resize_down_reaps_surplus_idle_slots() -> None:
     assert len(rt.reaped) == 3
 
 
+def test_spawn_stops_when_resize_lowers_ceiling_mid_batch() -> None:
+    # regression (PR #60 review): a resize() lowering the ceiling WHILE _spawn_to_deficit is
+    # mid-batch must not over-commit. `to_spawn` is computed once for the old ceiling; the
+    # per-spawn ceiling recheck must pick up the concurrent downsize and stop early, so the
+    # pool never exceeds the new ceiling (a transient RAM overshoot on a tight node).
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=8, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    orig_spawn = rt.spawn
+    calls = {"n": 0}
+
+    def racing_spawn() -> Slot:
+        calls["n"] += 1
+        if calls["n"] == 1:                       # a concurrent autosizer downsize mid-batch
+            pool.resize(warm_size=2, concurrent_ceiling=2)
+        return orig_spawn()
+
+    rt.spawn = racing_spawn                        # type: ignore[method-assign]
+    pool._spawn_to_deficit(ready=True)            # would spawn 8 for the old ceiling
+    assert pool.slot_count <= 2                    # but stopped at the lowered ceiling
+    pool.stop()
+
+
 def test_reap_surplus_noop_until_autosized() -> None:
     # regression (round-7 holistic): _reap_surplus must be a NO-OP on a pool that never
     # opted into the autosizer, so a default deployment keeps its exact prior behavior —

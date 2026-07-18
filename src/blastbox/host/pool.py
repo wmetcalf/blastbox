@@ -768,6 +768,18 @@ class WarmPool:
             if not self._bucket.consume():
                 break
 
+            # Re-check the ceiling before each (expensive) spawn: `to_spawn` was computed
+            # once up front, but a concurrent resize() — the node autosizer lowering THIS
+            # pool's ceiling — can shrink the budget mid-batch. Without this recheck a
+            # downsize racing a spawn burst over-commits past the new ceiling for a tick
+            # (a transient RAM overshoot that matters on a tight node). Stop early instead;
+            # _reap_surplus converges any already-published surplus next. (Stop/shutdown is
+            # deliberately NOT checked here — the publish block below reaps a spawn that
+            # completes during stop, so an in-flight cloud worker is never leaked.)
+            with self._lock:
+                if len(self._slots) >= self._concurrent_ceiling:
+                    break
+
             try:
                 slot = self._runtime.spawn()
                 slot.state = SlotState.WARMING
