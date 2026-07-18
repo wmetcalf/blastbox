@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol
@@ -103,10 +105,30 @@ class FileNodeShare:
         return "@".join(parts) + ".json"
 
     def publish(self, snap: DemandSnapshot) -> None:
-        path = self._dir / self._filename(snap.engine, snap.tier, snap.node, snap.instance)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(asdict(snap)))
-        tmp.replace(path)                       # atomic swap; readers never see a partial file
+        name = self._filename(snap.engine, snap.tier, snap.node, snap.instance)
+        path = self._dir / name
+        # Path-traversal guard: the identity components ARE the filename, so a component with
+        # '/', '\\' or '..' (a hostile/typo'd engine name or BLASTBOX_NODE_ID) could escape
+        # the share dir and clobber an unrelated file. Refuse anything that isn't a plain
+        # basename resolving directly under the dir.
+        if os.sep in name or (os.altsep and os.altsep in name) or path.parent != self._dir:
+            raise ValueError(f"unsafe snapshot identity {name!r}: path separators not allowed")
+        # Write via an UNPREDICTABLE temp file (tempfile.mkstemp uses O_CREAT|O_EXCL, 0600),
+        # then atomically rename it in. A predictable `<pool>.json.tmp` could be pre-created by
+        # a peer as a symlink so a plain write_text() follows it and truncates a file outside
+        # the dir; an unpredictable, exclusively-created temp closes that. os.replace onto the
+        # destination replaces a symlink there rather than following it.
+        fd, tmp = tempfile.mkstemp(dir=self._dir, prefix=f".{name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(json.dumps(asdict(snap)))
+            os.replace(tmp, path)               # atomic swap; readers never see a partial file
+        except BaseException:
+            try:
+                os.unlink(tmp)                  # don't leave the temp behind on failure
+            except OSError:
+                pass
+            raise
 
     def remove(self, snap: DemandSnapshot) -> None:
         """Delete this unit's own snapshot — called on a graceful stop so a restart doesn't

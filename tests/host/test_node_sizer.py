@@ -140,6 +140,18 @@ def test_from_env_clamps_footgun_config(monkeypatch):
     assert next(e for e in c.engines if e.name == "clip").slot_ram_mib >= 1.0
 
 
+def test_from_env_rejects_unsafe_engine_name(monkeypatch):
+    # regression (PR #60 P2): an engine name becomes part of the snapshot filename, so a
+    # path separator / '..' must be rejected at config load (backed by publish's hard guard).
+    import pytest
+
+    from blastbox.host.node_config import NodeConfig
+    for bad in ("ev/il", "../escape", "a\\b", ".."):
+        monkeypatch.setenv("BLASTBOX_NODE_ENGINES", bad)
+        with pytest.raises(ValueError):
+            NodeConfig.from_env()
+
+
 def test_from_env_rejects_non_finite_intervals(monkeypatch):
     # regression (PR #60 review): inf/nan durations slip past float() and max()/min() don't
     # tame them — an infinite interval makes time.sleep(inf) raise OverflowError and kill the

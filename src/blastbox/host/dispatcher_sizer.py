@@ -134,9 +134,13 @@ class DispatcherSizer:
         ))
         # Effective staleness widens by the measured tick cost: the real publish period is
         # interval + tick_time, so a slow count (huge shared store) must not age peers out
-        # and collapse every engine to "sees only itself" → node oversubscription.
+        # and collapse every engine to "sees only itself" → node oversubscription. Use the
+        # LARGER of the previous tick's duration and THIS tick's count latency (now - started):
+        # a first tick, or a suddenly-slow count, would otherwise size against a window built
+        # from a stale-fast previous duration and drop a live peer this very tick.
+        this_tick_cost = max(0.0, now - started)
         max_age = max(self._config.stale_after_s,
-                      (self._config.interval_s + self._last_tick_dur) * 2.0)
+                      (self._config.interval_s + max(self._last_tick_dur, this_tick_cost)) * 2.0)
         # Node filter, SYMMETRIC so a partial config (some engines set BLASTBOX_NODE_ID,
         # some not, on one host) still coordinates instead of each thinking it's alone
         # (→ oversubscription): include a peer if either side is untagged, or the tags

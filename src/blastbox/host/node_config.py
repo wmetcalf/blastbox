@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from dataclasses import dataclass, replace
 
 # The bounds the READER (node_share._valid) enforces on a published snapshot. from_env is
@@ -29,6 +30,16 @@ from dataclasses import dataclass, replace
 # from its own and every peer's node view (→ it never sizes, and peers water-fill as if its
 # slots don't exist → oversubscription). Import them so writer and reader can't drift.
 from .node_share import _MAX_CEILING_SANE, _MAX_WEIGHT
+
+# An engine name becomes part of the on-disk snapshot FILENAME (node_share keys the file by
+# the identity), so it must be a plain slug — a '/', '\\' or '..' would let the publish path
+# escape the share dir and clobber an unrelated file. Validate at config load (fail fast +
+# visible), backed up by a hard guard in FileNodeShare.publish.
+_SAFE_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _is_safe_slug(s: str) -> bool:
+    return bool(_SAFE_SLUG.match(s)) and ".." not in s
 
 
 @dataclass(frozen=True)
@@ -126,6 +137,10 @@ class NodeConfig:
             name, url = name.strip(), url.strip()
             if not name:
                 raise ValueError(f"BLASTBOX_NODE_ENGINES entry must name an engine, got {item!r}")
+            if not _is_safe_slug(name):
+                raise ValueError(
+                    f"BLASTBOX_NODE_ENGINES engine name {name!r} is not a safe slug "
+                    "(letters/digits/._- only, no path separators or '..')")
             up = name.upper().replace("-", "_")
             engines.append(EngineNode(
                 name=name, url=url,

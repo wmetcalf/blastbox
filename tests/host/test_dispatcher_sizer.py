@@ -283,6 +283,55 @@ def test_read_all_gcs_long_abandoned_file(tmp_path):
     assert list(tmp_path.glob("*.json")) == []         # AND physically GC'd
 
 
+def test_publish_does_not_follow_planted_tmp_symlink(tmp_path):
+    # regression (PR #60 P1): a peer pre-creating a predictable `<pool>.json.tmp` as a
+    # symlink to a victim file must not cause publish() to follow it and truncate the victim.
+    # mkstemp writes to an unpredictable, exclusively-created temp, so the planted link is
+    # simply ignored.
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious")
+    sdir = tmp_path / "share"
+    share = FileNodeShare(str(sdir))
+    name = share._filename("clip", "firecracker", "n", "p1")
+    # the old code's predictable temp name (<name>.json -> <name>.json.tmp), as a symlink
+    (sdir / (name + ".tmp")).symlink_to(victim)
+    share.publish(DemandSnapshot("clip", 1, 0, 1024, 1, 0, 64, 1.0, ts=1.0,
+                                 node="n", tier="firecracker", instance="p1"))
+    assert victim.read_text() == "precious"           # untouched — link not followed
+    assert (sdir / name).exists()                     # snapshot still written correctly
+
+
+def test_publish_rejects_path_traversal_identity(tmp_path):
+    # regression (PR #60 P2): an identity component with a path separator must not let the
+    # write escape the share dir.
+    import pytest
+    share = FileNodeShare(str(tmp_path))
+    with pytest.raises(ValueError):
+        share.publish(DemandSnapshot("../evil", 1, 0, 1024, 1, 0, 64, 1.0, ts=1.0,
+                                     node="n", tier="firecracker", instance="p1"))
+
+
+def test_slow_current_count_widens_staleness_and_keeps_peer(tmp_path):
+    # regression (PR #60 P2): a suddenly-slow count THIS tick must widen the staleness window
+    # now (from now-started), not rely on the previous tick's fast duration — otherwise a
+    # live peer is aged out and this dispatcher sizes to the full node budget.
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("red", 40, 0, 1024, 1, 0, 64, 1.0, ts=0.0,
+                                 node="toolz2", tier="firecracker", instance="r1"))
+    pool = _Pool()
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, interval_s=5.0, stale_after_s=20.0)
+    times = iter([0.0, 25.0, 25.0, 25.0, 25.0])       # started=0, now=25 → a 25s count
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64), pool, share,
+                         cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 4, node="toolz2",
+                         instance="c1", capacity_fn=_budget(8 * 1024, 999),
+                         clock=lambda: next(times))
+    mine = ds.tick()
+    # red is 25s old > the 20s base window, but now-started=25 widens it to ~60s → red stays
+    # in view → clip SHARES the 8-slot node instead of grabbing all 8.
+    assert mine.concurrent_ceiling < 8
+
+
 def test_node_isolation_ignores_foreign_host(tmp_path):
     # F3: a share_dir accidentally shared across hosts must not conflate them.
     share = FileNodeShare(str(tmp_path))
