@@ -155,7 +155,7 @@ def test_from_env_output_always_passes_reader_validation(monkeypatch):
     e = NodeConfig.from_env().engines[0]
     snap = DemandSnapshot(e.name, 0, 0, e.slot_ram_mib, e.slot_vcpus,
                           e.min_warm, e.max_ceiling, e.weight, ts=1.0, node="")
-    assert _valid(snap, e.name)          # writer's output survives the reader → no self-eviction
+    assert _valid(snap)                  # writer's output survives the reader → no self-eviction
 
 
 def test_local_backlog_sums_across_served_engines():

@@ -36,6 +36,14 @@ from .node_sizer import (
 )
 
 
+def _pool_key(engine: str, tier: str) -> str:
+    """Identity of a warm pool within a node view = (engine, tier). The same engine on two
+    node-managed tiers on one host is two distinct pools; keying by engine alone would merge
+    them in the allocation. Deterministic + identical across every dispatcher, so all agree
+    on the plan. (node is not in the key — the view is already node-filtered.)"""
+    return f"{engine}@{tier}" if tier else engine
+
+
 class DispatcherSizer:
     def __init__(
         self,
@@ -114,7 +122,7 @@ class DispatcherSizer:
             engine=e.name, backlog=backlog, assigned=assigned,
             slot_ram_mib=e.slot_ram_mib, slot_vcpus=e.slot_vcpus,
             min_warm=e.min_warm, max_ceiling=e.max_ceiling, weight=e.weight, ts=now,
-            node=self._node,
+            node=self._node, tier=self._runtime,
         ))
         # Effective staleness widens by the measured tick cost: the real publish period is
         # interval + tick_time, so a slow count (huge shared store) must not age peers out
@@ -134,7 +142,12 @@ class DispatcherSizer:
         balancing = self._config.balancing
         specs = [
             PoolSpec(
-                name=s.engine, slot_ram_mib=s.slot_ram_mib, slot_vcpus=s.slot_vcpus,
+                # key each pool by (engine, tier): the same engine on two node-managed tiers
+                # (firecracker + gvisor) on one host is TWO pools competing for the budget —
+                # keying by engine alone would collapse them and each would size to the whole
+                # budget. `_pool_key` matches what THIS dispatcher looks up for itself below.
+                name=_pool_key(s.engine, s.tier),
+                slot_ram_mib=s.slot_ram_mib, slot_vcpus=s.slot_vcpus,
                 # ceiling water-fill: by live backlog (balancing) or the static weight share.
                 demand=float(s.backlog + s.assigned) if balancing else float(s.weight),
                 min_warm=s.min_warm, max_ceiling=s.max_ceiling,
@@ -144,7 +157,7 @@ class DispatcherSizer:
         budget = self._adapt(self._capacity_fn(self._config.ram_headroom_frac,
                                                self._config.vcpu_oversubscription))
         plan = plan_sizes(specs, budget)  # type: ignore[arg-type]
-        mine = plan.get(e.name)
+        mine = plan.get(_pool_key(e.name, self._runtime))
         if mine is not None and hasattr(self._pool, "resize"):
             # WARM tracks THIS engine's REAL demand (not the weight, which is only a
             # ceiling-share ratio) so static mode doesn't hold idle engines hot: a big

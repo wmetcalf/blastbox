@@ -196,12 +196,41 @@ def test_same_engine_across_two_physical_nodes_sizes_independently(tmp_path):
     ds3 = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64),
                           pool3, share, cfg, node="toolz3", **common)
     mine2, mine3 = ds2.tick(), ds3.tick()
-    # no filename collision on the shared dir — one file per (engine, physical node)
-    assert sorted(p.name for p in tmp_path.glob("*.json")) == ["clip@toolz2.json", "clip@toolz3.json"]
+    # no filename collision on the shared dir — one file per (engine, tier, physical node)
+    assert sorted(p.name for p in tmp_path.glob("*.json")) == [
+        "clip@firecracker@toolz2.json", "clip@firecracker@toolz3.json"]
     # each node sized ITS OWN clip pool to ITS OWN full 8-slot budget — not halved or
     # doubled by the peer node's identically-named engine (independent LB/failover pools)
     assert mine2.concurrent_ceiling == 8 and pool2.concurrent_ceiling == 8
     assert mine3.concurrent_ceiling == 8 and pool3.concurrent_ceiling == 8
+
+
+def test_same_engine_two_tiers_on_one_node_are_distinct_pools(tmp_path):
+    # regression (PR #60 review, Will-confirmed): one host can run the SAME engine on TWO
+    # node-managed tiers (firecracker + gvisor) — two separate WarmPools. Keyed by engine
+    # ALONE they'd collide on <engine>.json and each size to the whole budget (2x
+    # oversubscription). Keyed by (engine, tier) they're distinct pools that SHARE the node
+    # budget. 8-slot node, both busy → they split it, Σ ceiling == 8 (no oversubscription).
+    from blastbox.host.pool_config import RUNTIME_GVISOR
+    share = FileNodeShare(str(tmp_path))
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    pool_fc, pool_gv = _Pool(assigned=0), _Pool(assigned=0)
+    common = dict(backlog_fn=lambda: 10, node="toolz2",
+                  capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0)
+    ds_fc = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64),
+                            pool_fc, share, cfg, runtime=RUNTIME_FIRECRACKER, **common)
+    ds_gv = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64),
+                            pool_gv, share, cfg, runtime=RUNTIME_GVISOR, **common)
+    ds_fc.tick()
+    ds_gv.tick()
+    # distinct files — no collision between the two tiers of the same engine on one host
+    assert sorted(p.name for p in tmp_path.glob("*.json")) == [
+        "clip@firecracker@toolz2.json", "clip@gvisor@toolz2.json"]
+    # both are in each other's view now; re-tick so each sees the full 2-pool node
+    m_fc, m_gv = ds_fc.tick(), ds_gv.tick()
+    assert m_fc.concurrent_ceiling + m_gv.concurrent_ceiling == 8    # SHARE budget, no 2x
+    assert m_fc.concurrent_ceiling >= 1 and m_gv.concurrent_ceiling >= 1
 
 
 def test_node_isolation_ignores_foreign_host(tmp_path):

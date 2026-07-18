@@ -37,6 +37,10 @@ class DemandSnapshot:
     ts: float                    # publish time (for staleness)
     node: str = ""               # publishing host — so a share_dir accidentally shared
                                  # across hosts (NFS) doesn't conflate their demand/budget
+    tier: str = ""               # the pool's runtime tier (firecracker/gvisor). Part of the
+                                 # identity: ONE engine can run on TWO node-managed tiers on
+                                 # one host (separate pools) — without the tier they'd share a
+                                 # key and collapse into one, each sizing to the whole budget.
 
 
 class NodeShare(Protocol):
@@ -45,27 +49,28 @@ class NodeShare(Protocol):
 
 
 class FileNodeShare:
-    """Directory-backed share. Each engine owns `<dir>/<engine>.json`, or
-    `<dir>/<engine>@<node>.json` when a node id is set (so two hosts sharing the dir
-    don't collide)."""
+    """Directory-backed share. Each publishing unit — a dispatcher = (engine, tier, node)
+    — owns one `<dir>/<engine>[@<tier>][@<node>].json`, so distinct pools never collide."""
 
     def __init__(self, directory: str) -> None:
         self._dir = Path(directory)
         self._dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
-    def _filename(engine: str, node: str) -> str:
-        # Namespace the file by node WHEN SET so two HOSTS that accidentally share the dir
-        # (NFS/PV) don't both write `<engine>.json` — the node FIELD isolates the data, but
-        # if the FILE collides last-writer-wins destroys a host's own snapshot (it then
-        # reads back a foreign node, filters itself out, and sizes from an empty view →
-        # oversubscription). This is exactly the case BLASTBOX_NODE_ID exists to defend, so
-        # it must change the path too. Default node="" keeps the plain `<engine>.json`.
-        # `@` can't appear in an engine slug or a DNS hostname, so the split is unambiguous.
-        return f"{engine}.json" if not node else f"{engine}@{node}.json"
+    def _filename(engine: str, tier: str, node: str) -> str:
+        # The file is keyed by the FULL publishing-unit identity (engine, tier, node), each
+        # optional part appended only when set. Two things make this necessary:
+        #   * node — two HOSTS accidentally sharing the dir (NFS/PV) must not both write
+        #     `<engine>.json` (last-writer-wins destroys a host's own snapshot → it reads a
+        #     foreign node, filters itself out, sizes from an empty view → oversubscription).
+        #   * tier — ONE host can run the same engine on firecracker AND gvisor (two pools);
+        #     without the tier they'd share `<engine>.json` and each size to the whole budget.
+        # `@` can't appear in an engine slug, a runtime name, or a DNS hostname, so the join
+        # is unambiguous. Default (tier="", node="") keeps the plain `<engine>.json`.
+        return "@".join([engine, *([tier] if tier else []), *([node] if node else [])]) + ".json"
 
     def publish(self, snap: DemandSnapshot) -> None:
-        path = self._dir / self._filename(snap.engine, snap.node)
+        path = self._dir / self._filename(snap.engine, snap.tier, snap.node)
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(asdict(snap)))
         tmp.replace(path)                       # atomic swap; readers never see a partial file
@@ -81,21 +86,20 @@ class FileNodeShare:
                 # → that peer silently drops out of this node's view → oversubscription. So
                 # tolerate extra fields. (The reverse direction — an older writer omitting a
                 # field a newer reader needs — is handled by giving new fields defaults, as
-                # `node` already has.) A non-dict payload makes .items() raise → skipped.
+                # `node`/`tier` do.) A non-dict payload makes .items() raise → skipped.
                 snap = DemandSnapshot(**{k: v for k, v in data.items()
                                          if k in DemandSnapshot.__dataclass_fields__})
-                # filename is `<engine>` or `<engine>@<node>`; BOTH parts must match the
-                # snapshot's self-declared engine/node — anti-impersonation across a shared
-                # dir (a file can't claim another engine, or another host's identity).
-                eng_part, _, node_part = f.stem.partition("@")
+                # Anti-impersonation: the filename must be EXACTLY the canonical slug of the
+                # snapshot's self-declared (engine, tier, node). A file can't claim another
+                # engine/tier/host, and one unit can't masquerade as another's pool.
                 # validate INSIDE the try: an untyped dataclass accepts wrong-typed fields
                 # (e.g. slot_ram_mib=null), so `_valid`'s comparisons can raise TypeError —
                 # that must skip the poisoned file, not propagate out and kill the sizer.
                 # Age bounded BOTH ways: reject a snapshot more than one staleness window in
                 # the FUTURE (bad clock / far-future stale file) — otherwise its negative age
                 # reads as fresh forever and a stopped engine keeps consuming node budget.
-                ok = (_valid(snap, eng_part)
-                      and snap.node == node_part
+                ok = (_valid(snap)
+                      and f.name == self._filename(snap.engine, snap.tier, snap.node)
                       and -max_age_s <= (now - snap.ts) <= max_age_s)
             except Exception:
                 continue                        # torn / foreign / type-poisoned → doesn't contribute
@@ -105,8 +109,9 @@ class FileNodeShare:
 
 
 # A snapshot is a request to spend node resources, so validate it — even a stray/hostile
-# <engine>.json can't drive a spawn-storm or an unbounded water-fill:
-#   * the self-declared engine must match the filename (no impersonating a peer),
+# file can't drive a spawn-storm or an unbounded water-fill (identity/filename agreement is
+# checked separately by the caller):
+#   * engine/tier/node must be STRINGS (they form the identity + are compared/joined),
 #   * footprints must be POSITIVE (a 0 footprint makes plan_sizes' fit() always true →
 #     it would water-fill to max_ceiling; also a plain misconfig guard),
 #   * counts non-negative, ceiling positive and sanity-capped.
@@ -129,9 +134,9 @@ def _finite_in(x: object, lo: float, hi: float) -> bool:
     return lo <= x <= hi                      # int compare is exact (no float coercion)
 
 
-def _valid(snap: DemandSnapshot, filename_stem: str) -> bool:
+def _valid(snap: DemandSnapshot) -> bool:
     return (
-        snap.engine == filename_stem
+        isinstance(snap.engine, str) and isinstance(snap.tier, str) and isinstance(snap.node, str)
         and _finite_in(snap.slot_ram_mib, 1e-9, _MAX_SLOT_RAM_MIB) and snap.slot_ram_mib > 0
         and _finite_in(snap.slot_vcpus, 1e-9, 1024) and snap.slot_vcpus > 0
         and _finite_in(snap.backlog, 0, _MAX_COUNT)
