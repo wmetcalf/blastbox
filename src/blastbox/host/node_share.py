@@ -8,9 +8,25 @@ dispatcher then runs the same deterministic allocation over the same node view a
 its OWN pool. No cross-process push, no admin endpoint, and it lives exactly where the
 pool is.
 
-The share is a directory (bind-mounted into each engine stack on a node): one
-`<engine>.json` per engine, written atomically. Snapshots older than a staleness window
-are ignored, so a stopped engine drops out of the node view on its own.
+The share is a directory (bind-mounted into each engine stack on a node): one file per
+PUBLISHING UNIT (a dispatcher process = engine × tier × host × instance), written
+atomically. Snapshots older than a staleness window are ignored, so a stopped engine drops
+out of the node view on its own; a graceful stop also removes its own file, and read_all
+garbage-collects long-abandoned files (a crashed process's remnant).
+
+Trust model
+-----------
+The share dir is a NODE-LOCAL COORDINATION SURFACE within a SINGLE TRUST DOMAIN — like a
+`/var/run` socket dir. It is written ONLY by the dispatcher processes (trusted infra);
+untrusted sample code runs in the sealed slots/microVMs (blastbox's isolation boundary) and
+never touches this dir. Snapshots are therefore validated for well-formedness + resource
+bounds (`_valid`) and pinned to their canonical filename (a file can't claim another unit's
+identity), but they are NOT cryptographically authenticated: a shared-secret HMAC among
+mutually-distrusting dispatchers would be theater (a compromised dispatcher holds the
+secret), so the correct isolation for a deployment that does NOT trust its own dispatchers
+equally is FILESYSTEM per-owner write permissions — mount/chmod the dir so each engine
+container can write only its own `<identity>.json` to a commonly-readable dir. Do NOT put a
+share dir on a surface writable by anything outside the dispatcher trust domain.
 """
 
 from __future__ import annotations
@@ -41,42 +57,68 @@ class DemandSnapshot:
                                  # identity: ONE engine can run on TWO node-managed tiers on
                                  # one host (separate pools) — without the tier they'd share a
                                  # key and collapse into one, each sizing to the whole budget.
+    instance: str = ""           # the publishing PROCESS (pid). Part of the identity so two
+                                 # replicas of the same engine/tier/node on one host — e.g.
+                                 # briefly overlapping during a rolling deploy — are TWO
+                                 # distinct pools that split the budget in plan_sizes, rather
+                                 # than colliding on one file and each taking the full ceiling.
 
 
 class NodeShare(Protocol):
     def publish(self, snap: DemandSnapshot) -> None: ...
     def read_all(self, *, max_age_s: float, now: float) -> list[DemandSnapshot]: ...
+    def remove(self, snap: DemandSnapshot) -> None: ...
 
 
 class FileNodeShare:
-    """Directory-backed share. Each publishing unit — a dispatcher = (engine, tier, node)
-    — owns one `<dir>/<engine>[@<tier>][@<node>].json`, so distinct pools never collide."""
+    """Directory-backed share. Each publishing unit — a dispatcher process =
+    (engine, tier, node, instance) — owns one
+    `<dir>/<engine>[@<tier>][@<node>][@<instance>].json`, so distinct pools never collide."""
+
+    # A file untouched for this long past the staleness window belongs to a crashed process
+    # (a live dispatcher rewrites its file every tick); read_all GCs it so the dir doesn't
+    # accumulate remnants across restarts. Far beyond staleness, so a live unit is never hit.
+    _GC_AGE_MULT = 20.0
+    _GC_AGE_FLOOR_S = 300.0
 
     def __init__(self, directory: str) -> None:
         self._dir = Path(directory)
         self._dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
-    def _filename(engine: str, tier: str, node: str) -> str:
-        # The file is keyed by the FULL publishing-unit identity (engine, tier, node), each
-        # optional part appended only when set. Two things make this necessary:
+    def _filename(engine: str, tier: str, node: str, instance: str = "") -> str:
+        # The file is keyed by the FULL publishing-unit identity (engine, tier, node,
+        # instance), each optional part appended only when set. Each part is load-bearing:
         #   * node — two HOSTS accidentally sharing the dir (NFS/PV) must not both write
         #     `<engine>.json` (last-writer-wins destroys a host's own snapshot → it reads a
         #     foreign node, filters itself out, sizes from an empty view → oversubscription).
         #   * tier — ONE host can run the same engine on firecracker AND gvisor (two pools);
         #     without the tier they'd share `<engine>.json` and each size to the whole budget.
-        # `@` can't appear in an engine slug, a runtime name, or a DNS hostname, so the join
-        # is unambiguous. Default (tier="", node="") keeps the plain `<engine>.json`.
-        return "@".join([engine, *([tier] if tier else []), *([node] if node else [])]) + ".json"
+        #   * instance — two REPLICAS of the same engine/tier/node (a rolling deploy's brief
+        #     overlap) are two real pools; a shared file would let each take the full ceiling.
+        # `@` can't appear in an engine slug, a runtime name, a DNS hostname, or a pid, so the
+        # join is unambiguous. Default (all optional parts "") keeps the plain `<engine>.json`.
+        parts = [engine, *([tier] if tier else []), *([node] if node else []),
+                 *([instance] if instance else [])]
+        return "@".join(parts) + ".json"
 
     def publish(self, snap: DemandSnapshot) -> None:
-        path = self._dir / self._filename(snap.engine, snap.tier, snap.node)
+        path = self._dir / self._filename(snap.engine, snap.tier, snap.node, snap.instance)
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(asdict(snap)))
         tmp.replace(path)                       # atomic swap; readers never see a partial file
 
+    def remove(self, snap: DemandSnapshot) -> None:
+        """Delete this unit's own snapshot — called on a graceful stop so a restart doesn't
+        leave a phantom pool lingering in the node view for a whole staleness window."""
+        try:
+            (self._dir / self._filename(snap.engine, snap.tier, snap.node, snap.instance)).unlink()
+        except OSError:
+            pass                                # already gone / not ours to worry about
+
     def read_all(self, *, max_age_s: float, now: float) -> list[DemandSnapshot]:
         out: list[DemandSnapshot] = []
+        gc_age = max(self._GC_AGE_FLOOR_S, max_age_s * self._GC_AGE_MULT)
         for f in sorted(self._dir.glob("*.json")):
             try:
                 data = json.loads(f.read_text())
@@ -90,17 +132,21 @@ class FileNodeShare:
                 snap = DemandSnapshot(**{k: v for k, v in data.items()
                                          if k in DemandSnapshot.__dataclass_fields__})
                 # Anti-impersonation: the filename must be EXACTLY the canonical slug of the
-                # snapshot's self-declared (engine, tier, node). A file can't claim another
-                # engine/tier/host, and one unit can't masquerade as another's pool.
+                # snapshot's self-declared (engine, tier, node, instance). A file can't claim
+                # another unit's identity, and one unit can't masquerade as another's pool.
                 # validate INSIDE the try: an untyped dataclass accepts wrong-typed fields
                 # (e.g. slot_ram_mib=null), so `_valid`'s comparisons can raise TypeError —
                 # that must skip the poisoned file, not propagate out and kill the sizer.
                 # Age bounded BOTH ways: reject a snapshot more than one staleness window in
                 # the FUTURE (bad clock / far-future stale file) — otherwise its negative age
                 # reads as fresh forever and a stopped engine keeps consuming node budget.
-                ok = (_valid(snap)
-                      and f.name == self._filename(snap.engine, snap.tier, snap.node)
-                      and -max_age_s <= (now - snap.ts) <= max_age_s)
+                identity_ok = f.name == self._filename(snap.engine, snap.tier, snap.node,
+                                                       snap.instance)
+                age = now - snap.ts if math.isfinite(snap.ts) else None
+                if identity_ok and age is not None and age > gc_age:
+                    f.unlink(missing_ok=True)   # GC a crashed process's long-abandoned remnant
+                    continue
+                ok = _valid(snap) and identity_ok and age is not None and -max_age_s <= age <= max_age_s
             except Exception:
                 continue                        # torn / foreign / type-poisoned → doesn't contribute
             if ok:
@@ -136,7 +182,8 @@ def _finite_in(x: object, lo: float, hi: float) -> bool:
 
 def _valid(snap: DemandSnapshot) -> bool:
     return (
-        isinstance(snap.engine, str) and isinstance(snap.tier, str) and isinstance(snap.node, str)
+        isinstance(snap.engine, str) and isinstance(snap.tier, str)
+        and isinstance(snap.node, str) and isinstance(snap.instance, str)
         and _finite_in(snap.slot_ram_mib, 1e-9, _MAX_SLOT_RAM_MIB) and snap.slot_ram_mib > 0
         and _finite_in(snap.slot_vcpus, 1e-9, 1024) and snap.slot_vcpus > 0
         and _finite_in(snap.backlog, 0, _MAX_COUNT)

@@ -36,12 +36,14 @@ from .node_sizer import (
 )
 
 
-def _pool_key(engine: str, tier: str) -> str:
-    """Identity of a warm pool within a node view = (engine, tier). The same engine on two
-    node-managed tiers on one host is two distinct pools; keying by engine alone would merge
-    them in the allocation. Deterministic + identical across every dispatcher, so all agree
-    on the plan. (node is not in the key — the view is already node-filtered.)"""
-    return f"{engine}@{tier}" if tier else engine
+def _pool_key(engine: str, tier: str, instance: str = "") -> str:
+    """Identity of a warm pool within a node view = (engine, tier, instance). The same engine
+    on two node-managed tiers on one host is two distinct pools; two REPLICAS of one
+    engine/tier (a rolling deploy's brief overlap) are also two distinct pools. Keying by
+    engine alone would merge them in the allocation and each would take the whole budget.
+    Deterministic + identical across every dispatcher, so all agree on the plan. (node is not
+    in the key — the view is already node-filtered.)"""
+    return "@".join([engine, *([tier] if tier else []), *([instance] if instance else [])])
 
 
 class DispatcherSizer:
@@ -58,6 +60,7 @@ class DispatcherSizer:
                                               # use this string.
         backlog_fn: Callable[[], int],        # this engine's own QUEUED count
         node: Optional[str] = None,           # physical-node id; default from BLASTBOX_NODE_ID
+        instance: Optional[str] = None,       # publishing process id; default os.getpid()
         capacity_fn: Callable[[float, float], NodeBudget] = node_capacity,
         avail_fn: Callable[[], Optional[float]] = _mem_available_mib,
         clock: Callable[[], float] = time.time,
@@ -68,6 +71,11 @@ class DispatcherSizer:
         self._config = config
         self._runtime = (runtime or "").strip().lower()
         self._backlog_fn = backlog_fn
+        # The publishing PROCESS identity, so two replicas of this engine/tier/node (a rolling
+        # deploy's overlap) publish to DISTINCT files and split the budget instead of
+        # colliding. pid is unique among concurrently-live processes on the host (all that's
+        # needed); on a graceful stop we remove our own file so a restart leaves no phantom.
+        self._instance = str(instance if instance is not None else os.getpid())
         # The node id must identify the PHYSICAL HOST, shared by every engine container on
         # it — NOT socket.gethostname(), which inside a container is the container's own
         # name (so each engine would see only itself → no coordination, the common toolz2
@@ -122,7 +130,7 @@ class DispatcherSizer:
             engine=e.name, backlog=backlog, assigned=assigned,
             slot_ram_mib=e.slot_ram_mib, slot_vcpus=e.slot_vcpus,
             min_warm=e.min_warm, max_ceiling=e.max_ceiling, weight=e.weight, ts=now,
-            node=self._node, tier=self._runtime,
+            node=self._node, tier=self._runtime, instance=self._instance,
         ))
         # Effective staleness widens by the measured tick cost: the real publish period is
         # interval + tick_time, so a slow count (huge shared store) must not age peers out
@@ -142,11 +150,12 @@ class DispatcherSizer:
         balancing = self._config.balancing
         specs = [
             PoolSpec(
-                # key each pool by (engine, tier): the same engine on two node-managed tiers
-                # (firecracker + gvisor) on one host is TWO pools competing for the budget —
-                # keying by engine alone would collapse them and each would size to the whole
-                # budget. `_pool_key` matches what THIS dispatcher looks up for itself below.
-                name=_pool_key(s.engine, s.tier),
+                # key each pool by (engine, tier, instance): the same engine on two node-
+                # managed tiers, or two replicas of one engine/tier (rolling-deploy overlap),
+                # are distinct pools competing for the budget — keying by engine alone would
+                # collapse them and each would size to the whole budget. `_pool_key` matches
+                # what THIS dispatcher looks up for itself below.
+                name=_pool_key(s.engine, s.tier, s.instance),
                 slot_ram_mib=s.slot_ram_mib, slot_vcpus=s.slot_vcpus,
                 # ceiling water-fill: by live backlog (balancing) or the static weight share.
                 demand=float(s.backlog + s.assigned) if balancing else float(s.weight),
@@ -157,7 +166,7 @@ class DispatcherSizer:
         budget = self._adapt(self._capacity_fn(self._config.ram_headroom_frac,
                                                self._config.vcpu_oversubscription))
         plan = plan_sizes(specs, budget)  # type: ignore[arg-type]
-        mine = plan.get(_pool_key(e.name, self._runtime))
+        mine = plan.get(_pool_key(e.name, self._runtime, self._instance))
         if mine is not None and hasattr(self._pool, "resize"):
             # WARM tracks THIS engine's REAL demand (not the weight, which is only a
             # ceiling-share ratio) so static mode doesn't hold idle engines hot: a big
@@ -168,20 +177,41 @@ class DispatcherSizer:
                 warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)
         return mine
 
+    def _identity(self) -> DemandSnapshot:
+        """A minimal snapshot carrying only THIS unit's identity — for removing our own file
+        on stop (the metric fields are irrelevant to the filename)."""
+        e = self._engine
+        return DemandSnapshot(
+            engine=e.name, backlog=0, assigned=0, slot_ram_mib=e.slot_ram_mib,
+            slot_vcpus=e.slot_vcpus, min_warm=e.min_warm, max_ceiling=e.max_ceiling,
+            weight=e.weight, ts=0.0, node=self._node, tier=self._runtime,
+            instance=self._instance)
+
     def run(self, *, stop: Optional[threading.Event] = None, max_ticks: Optional[int] = None,
             sleep: Callable[[float], None] = time.sleep) -> None:
         n = 0
-        while not (stop is not None and stop.is_set()):
+        try:
+            while not (stop is not None and stop.is_set()):
+                try:
+                    self.tick()
+                except Exception:  # a sizing hiccup must never take down the dispatcher
+                    logging.getLogger("blastbox.node_sizer").warning(
+                        "node self-sizer tick failed for %s (continuing)", self._engine.name,
+                        exc_info=True)
+                n += 1
+                if max_ticks is not None and n >= max_ticks:
+                    return
+                sleep(self._config.interval_s)
+        finally:
+            # Graceful stop (loop exit or max_ticks): remove our own snapshot so a restart
+            # doesn't leave a phantom pool lingering in the node view for a staleness window
+            # (which would split this pool's budget with its dead former self). A crash skips
+            # this — read_all's GC eventually sweeps the remnant; the staleness filter ignores
+            # it in the meantime after the window passes.
             try:
-                self.tick()
-            except Exception:  # a sizing hiccup must never take down the dispatcher
-                logging.getLogger("blastbox.node_sizer").warning(
-                    "node self-sizer tick failed for %s (continuing)", self._engine.name,
-                    exc_info=True)
-            n += 1
-            if max_ticks is not None and n >= max_ticks:
-                return
-            sleep(self._config.interval_s)
+                self._share.remove(self._identity())
+            except Exception:
+                pass
 
     def start_thread(self, stop: threading.Event) -> threading.Thread:
         """Start the loop in a daemon thread (for use alongside the dispatcher loop)."""

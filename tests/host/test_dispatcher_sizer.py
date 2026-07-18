@@ -189,16 +189,16 @@ def test_same_engine_across_two_physical_nodes_sizes_independently(tmp_path):
     cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
                      vcpu_oversubscription=999, stale_after_s=60)
     pool2, pool3 = _Pool(assigned=0), _Pool(assigned=0)
-    common = dict(runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 5,
+    common = dict(runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 5, instance="p1",
                   capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0)
     ds2 = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64),
                           pool2, share, cfg, node="toolz2", **common)
     ds3 = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64),
                           pool3, share, cfg, node="toolz3", **common)
     mine2, mine3 = ds2.tick(), ds3.tick()
-    # no filename collision on the shared dir — one file per (engine, tier, physical node)
+    # no filename collision on the shared dir — one file per (engine, tier, node, instance)
     assert sorted(p.name for p in tmp_path.glob("*.json")) == [
-        "clip@firecracker@toolz2.json", "clip@firecracker@toolz3.json"]
+        "clip@firecracker@toolz2@p1.json", "clip@firecracker@toolz3@p1.json"]
     # each node sized ITS OWN clip pool to ITS OWN full 8-slot budget — not halved or
     # doubled by the peer node's identically-named engine (independent LB/failover pools)
     assert mine2.concurrent_ceiling == 8 and pool2.concurrent_ceiling == 8
@@ -216,7 +216,7 @@ def test_same_engine_two_tiers_on_one_node_are_distinct_pools(tmp_path):
     cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
                      vcpu_oversubscription=999, stale_after_s=60)
     pool_fc, pool_gv = _Pool(assigned=0), _Pool(assigned=0)
-    common = dict(backlog_fn=lambda: 10, node="toolz2",
+    common = dict(backlog_fn=lambda: 10, node="toolz2", instance="p1",
                   capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0)
     ds_fc = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64),
                             pool_fc, share, cfg, runtime=RUNTIME_FIRECRACKER, **common)
@@ -226,11 +226,61 @@ def test_same_engine_two_tiers_on_one_node_are_distinct_pools(tmp_path):
     ds_gv.tick()
     # distinct files — no collision between the two tiers of the same engine on one host
     assert sorted(p.name for p in tmp_path.glob("*.json")) == [
-        "clip@firecracker@toolz2.json", "clip@gvisor@toolz2.json"]
+        "clip@firecracker@toolz2@p1.json", "clip@gvisor@toolz2@p1.json"]
     # both are in each other's view now; re-tick so each sees the full 2-pool node
     m_fc, m_gv = ds_fc.tick(), ds_gv.tick()
     assert m_fc.concurrent_ceiling + m_gv.concurrent_ceiling == 8    # SHARE budget, no 2x
     assert m_fc.concurrent_ceiling >= 1 and m_gv.concurrent_ceiling >= 1
+
+
+def test_overlapping_replicas_split_budget_not_double(tmp_path):
+    # regression (PR #60 review): two replicas of the SAME engine/tier/node — a rolling
+    # deploy's brief overlap — must be two distinct pools that SHARE the budget, not collide
+    # on one file and each take the full ceiling (2x oversubscription). Keyed by instance.
+    share = FileNodeShare(str(tmp_path))
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    common = dict(runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 20, node="toolz2",
+                  capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0)
+    old = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64),
+                          _Pool(), share, cfg, instance="old", **common)
+    new = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64),
+                          _Pool(), share, cfg, instance="new", **common)
+    old.tick()
+    new.tick()
+    assert sorted(p.name for p in tmp_path.glob("*.json")) == [
+        "clip@firecracker@toolz2@new.json", "clip@firecracker@toolz2@old.json"]
+    m_old, m_new = old.tick(), new.tick()             # each now sees both replicas
+    # 8-slot node; the two replicas SPLIT it (Σ == 8), neither takes the full budget
+    assert m_old.concurrent_ceiling + m_new.concurrent_ceiling == 8
+    assert m_old.concurrent_ceiling < 8 and m_new.concurrent_ceiling < 8
+
+
+def test_run_removes_own_snapshot_on_graceful_stop(tmp_path):
+    # regression (PR #60 review): a graceful stop removes the unit's own snapshot so a
+    # restart leaves no phantom pool lingering in the node view (which would split the
+    # pool's budget with its dead former self for a whole staleness window).
+    share = FileNodeShare(str(tmp_path))
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, interval_s=0.5)
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024), _Pool(assigned=1),
+                         share, cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 2,
+                         node="toolz2", instance="p9", capacity_fn=_budget(8 * 1024, 99))
+    ds.run(max_ticks=2, sleep=lambda _s: None)
+    assert list(tmp_path.glob("*.json")) == []        # own file removed on loop exit
+
+
+def test_read_all_gcs_long_abandoned_file(tmp_path):
+    # regression (PR #60 review): a crashed process's snapshot (never gracefully removed) is
+    # swept by read_all once it's far past the staleness window, so the dir self-cleans
+    # across restarts instead of accumulating dead per-instance files.
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("dead", 1, 0, 1024, 1, 0, 64, 1.0, ts=0.0,
+                                 node="n", tier="firecracker", instance="ghost"))
+    assert (tmp_path / "dead@firecracker@n@ghost.json").exists()
+    kept = share.read_all(max_age_s=20, now=10_000.0)  # age 10000 >> GC horizon (~400s)
+    assert kept == []                                  # aged out of the view
+    assert list(tmp_path.glob("*.json")) == []         # AND physically GC'd
 
 
 def test_node_isolation_ignores_foreign_host(tmp_path):

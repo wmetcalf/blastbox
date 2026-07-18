@@ -60,8 +60,9 @@ def main() -> int:
             ds.tick()
 
     allfiles = sorted(os.listdir(share_dir))
-    mine = [f for f in allfiles if f.endswith(f"@{node}.json")]
-    foreign = [f for f in allfiles if not f.endswith(f"@{node}.json")]
+    # filename is engine[@tier]@<node>[@<instance>].json — mine carry this node id as a part
+    mine = [f for f in allfiles if f"@{node}@" in f or f.endswith(f"@{node}.json")]
+    foreign = [f for f in allfiles if f not in mine]
     total_slots = sum(p.concurrent_ceiling for _, _, p, _ in sizers)
 
     print(f"node={node}  budget={budget:,.0f} MiB")
