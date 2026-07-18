@@ -82,6 +82,16 @@ def test_warm_floor_shed_under_tight_budget():
     assert plan["a"].warm_size < 2
 
 
+def test_warm_never_negative_on_out_of_contract_input():
+    # defense-in-depth (round-9): min_warm/demand are non-negative by contract (and _valid
+    # enforces it upstream), but plan_sizes must never emit a negative warm target — it
+    # would crash WarmPool.resize(warm_size<0). A negative min_warm/demand clamps to 0.
+    plan = plan_sizes([PoolSpec("a", slot_ram_mib=10, demand=-5.0, min_warm=-3, max_ceiling=4)],
+                      NodeBudget(ram_mib=1000, vcpus=100))
+    assert plan["a"].warm_size == 0
+    assert plan["a"].concurrent_ceiling >= 1
+
+
 def test_empty_specs():
     assert plan_sizes([], NodeBudget(ram_mib=1024, vcpus=8)) == {}
 

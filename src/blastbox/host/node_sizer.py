@@ -131,8 +131,11 @@ def plan_sizes(specs: list[PoolSpec], budget: NodeBudget) -> dict[str, PoolSize]
     out: dict[str, PoolSize] = {}
     for s in specs:
         ceiling = alloc[s.name]                      # >= 1 by construction
-        # keep warm what demand needs (honouring the soft floor), never above ceiling
-        warm = min(ceiling, max(s.min_warm, math.ceil(s.demand)))
+        # keep warm what demand needs (honouring the soft floor), never above ceiling.
+        # Floor at 0: min_warm/demand are non-negative by contract (and _valid enforces it
+        # upstream), but a negative from an out-of-contract caller must never reach
+        # WarmPool.resize() as a negative warm target — clamp defensively.
+        warm = max(0, min(ceiling, max(s.min_warm, math.ceil(s.demand))))
         out[s.name] = PoolSize(warm_size=warm, concurrent_ceiling=ceiling)
     return out
 
