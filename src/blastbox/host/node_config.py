@@ -19,6 +19,7 @@ own burst logic exactly as before.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, replace
 
@@ -92,11 +93,26 @@ class NodeConfig:
 
         def _float(key: str, default: float) -> float:
             raw = os.environ.get(key, "").strip()
-            return float(raw) if raw else default
+            if not raw:
+                return default
+            try:
+                v = float(raw)
+            except ValueError:
+                return default
+            # Reject inf/nan: they slip past float() and max()/min() don't tame them — an
+            # infinite interval makes time.sleep(inf) raise OverflowError and kill the sizer
+            # thread, and a non-finite stale window never ages a snapshot out (or rejects
+            # every one). Fall back to the default, like an unparseable value.
+            return v if math.isfinite(v) else default
 
         def _int(key: str, default: int) -> int:
             raw = os.environ.get(key, "").strip()
-            return int(raw) if raw else default
+            if not raw:
+                return default
+            try:
+                return int(raw)
+            except ValueError:                       # 'inf'/'nan'/garbage → default, never crash
+                return default
 
         def _clamp(val: float, lo: float, hi: float) -> float:
             return max(lo, min(hi, val))

@@ -1158,6 +1158,29 @@ def test_spawn_stops_when_resize_lowers_ceiling_mid_batch() -> None:
     pool.stop()
 
 
+def test_spawn_reaps_slot_when_ceiling_drops_during_slow_spawn() -> None:
+    # regression (PR #60 review): the pre-spawn ceiling check can't catch a resize() that
+    # fires WHILE runtime.spawn() is blocked — the check already passed against the old
+    # ceiling. The PUBLISH step must re-check and reap the completed slot rather than admit
+    # it one past the new cap (RAM overshoot on a tight node).
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=2, spawn_rate_limit=1000.0)
+    orig_spawn = rt.spawn
+    calls = {"n": 0}
+
+    def slow_spawn() -> Slot:
+        calls["n"] += 1
+        if calls["n"] == 2:                       # ceiling drops DURING the 2nd in-flight spawn
+            pool.resize(warm_size=1, concurrent_ceiling=1)
+        return orig_spawn()
+
+    rt.spawn = slow_spawn                          # type: ignore[method-assign]
+    pool._spawn_to_deficit(ready=True)
+    assert pool.slot_count == 1                    # 1st published; 2nd reaped at publish (over cap)
+    assert len(rt.reaped) >= 1
+    pool.stop()
+
+
 def test_reap_surplus_noop_until_autosized() -> None:
     # regression (round-7 holistic): _reap_surplus must be a NO-OP on a pool that never
     # opted into the autosizer, so a default deployment keeps its exact prior behavior —

@@ -789,21 +789,27 @@ class WarmPool:
                 logger.exception("pool.spawn_failed")
                 continue
 
-            # Publish under the lock, BUT only if shutdown hasn't begun. A slow spawn (e.g. AWS
-            # run-instances / run-microvm blocks up to cli_timeout_s=120s, far past stop()'s 10s
-            # thread-join) can complete AFTER stop() snapshotted _slots -- publishing then would leak a
-            # live EC2 instance / MicroVM (never reaped until its TTL). Checking _stop_event under the
-            # same lock stop() flips slots to DRAINING under closes the race either way.
+            # Publish under the lock, BUT only if shutdown hasn't begun AND we're still under
+            # the ceiling. Two races to close, both possible because runtime.spawn() ran
+            # OUTSIDE the lock and can be slow (AWS run-instances / run-microvm up to
+            # cli_timeout_s=120s):
+            #   * stop() may have snapshotted _slots meanwhile — publishing then leaks a live
+            #     EC2 instance / MicroVM (never reaped until its TTL);
+            #   * a concurrent resize() (the autosizer) may have LOWERED the ceiling meanwhile
+            #     — the pre-spawn check passed against the OLD ceiling, so without re-checking
+            #     here this in-flight slot would land one past the new cap (RAM overshoot on a
+            #     tight node) until a later tick reaps it.
+            # Either way: don't publish, reap the just-created slot instead.
             with self._lock:
-                stopping = self._stop_event.is_set()
-                if not stopping:
+                drop = self._stop_event.is_set() or len(self._slots) >= self._concurrent_ceiling
+                if not drop:
                     self._slots[slot.slot_id] = slot
-            if stopping:
+            if drop:
                 reaped = False
                 try:
                     reaped = self._reap_and_count(slot)   # reap the just-created (untracked) slot ourselves
                 except Exception:
-                    logger.exception("pool.reap_after_stop_failed slot_id=%s — quarantining (worker may "
+                    logger.exception("pool.reap_unpublished_failed slot_id=%s — quarantining (worker may "
                                      "persist)", slot.slot_id)
                 if not reaped:
                     # the terminate raised (the EC2/MicroVM may still be running): TRACK the husk as

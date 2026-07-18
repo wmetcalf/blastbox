@@ -140,6 +140,24 @@ def test_from_env_clamps_footgun_config(monkeypatch):
     assert next(e for e in c.engines if e.name == "clip").slot_ram_mib >= 1.0
 
 
+def test_from_env_rejects_non_finite_intervals(monkeypatch):
+    # regression (PR #60 review): inf/nan durations slip past float() and max()/min() don't
+    # tame them — an infinite interval makes time.sleep(inf) raise OverflowError and kill the
+    # sizer thread. Non-finite env values must fall back to finite defaults.
+    from blastbox.host.node_config import NodeConfig
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")
+    monkeypatch.setenv("BLASTBOX_NODE_INTERVAL_S", "inf")
+    monkeypatch.setenv("BLASTBOX_NODE_STALE_AFTER_S", "nan")
+    monkeypatch.setenv("BLASTBOX_NODE_RAM_HEADROOM", "inf")
+    monkeypatch.setenv("BLASTBOX_NODE_MIN_FREE_MIB", "nan")
+    c = NodeConfig.from_env()
+    import math as _m
+    assert _m.isfinite(c.interval_s) and c.interval_s >= 0.5
+    assert _m.isfinite(c.stale_after_s) and c.stale_after_s >= c.interval_s * 2
+    assert _m.isfinite(c.ram_headroom_frac) and 0.0 < c.ram_headroom_frac <= 1.0
+    assert _m.isfinite(c.min_free_mib)
+
+
 def test_from_env_output_always_passes_reader_validation(monkeypatch):
     # regression (round-8): from_env is the WRITER of a dispatcher's own snapshot; every
     # EngineNode it produces must round-trip through node_share._valid, or the engine's
