@@ -220,6 +220,11 @@ class WarmPool:
         self._first_miss_at: float | None = None   # time of first unserviced claim miss
         self._last_miss_at: float | None = None    # time of most recent unserviced claim miss
         self._burst_active: bool = False            # True when effective target is lifted
+        self._autosized: bool = False               # True once an external controller (the node
+                                                    # autosizer) has resize()d this pool; gates
+                                                    # eager surplus reaping so a pool that never
+                                                    # opts in keeps its exact prior burst-drain
+                                                    # (lazy) behavior — "off by default = as today"
 
         # Health tracking — all access under _lock
         self._last_idle_at: float | None = None    # clock() when a slot last became IDLE
@@ -449,7 +454,15 @@ class WarmPool:
         downsize — e.g. the node autosizer lowering warm_size/ceiling — actually shrinks
         the pool and frees node resources now, instead of only converging lazily as
         one-job-per-slot consumption drains it. Only IDLE slots are taken; ASSIGNED /
-        WARMING / DRAINING are left alone."""
+        WARMING / DRAINING are left alone.
+
+        No-op until the pool has been resize()d by an external controller: a pool that
+        never opts into the autosizer keeps its exact prior behavior, where post-burst
+        surplus drains lazily (a lingering warm cushion for the next spike) rather than
+        being reaped the instant burst deactivates. This preserves the feature's promise
+        that a node behaves exactly as today unless an operator turns the autosizer on."""
+        if not self._autosized:
+            return
         with self._lock:
             target = self._effective_target_unlocked()
             non_draining = sum(1 for s in self._slots.values() if s.state != SlotState.DRAINING)
@@ -580,6 +593,9 @@ class WarmPool:
             # keep warm within the ceiling
             if self._warm_size > self._concurrent_ceiling:
                 self._warm_size = self._concurrent_ceiling
+            # This pool is now under external (autosizer) control → eager surplus reaping
+            # is enabled so a downsize frees node RAM promptly instead of draining lazily.
+            self._autosized = True
 
     @property
     def effective_target(self) -> int:

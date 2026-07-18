@@ -1136,6 +1136,29 @@ def test_resize_down_reaps_surplus_idle_slots() -> None:
     assert len(rt.reaped) == 3
 
 
+def test_reap_surplus_noop_until_autosized() -> None:
+    # regression (round-7 holistic): _reap_surplus must be a NO-OP on a pool that never
+    # opted into the autosizer, so a default deployment keeps its exact prior behavior —
+    # post-burst surplus drains lazily (a lingering warm cushion for the next spike)
+    # instead of being reaped the instant the effective target drops. Only a pool an
+    # external controller has resize()d reaps surplus eagerly.
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=4, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    for _ in range(6):
+        pool.tick()
+    assert pool.idle_count == 4
+    # simulate the post-burst-drain state: the effective target drops below the live slot
+    # count, WITHOUT a resize() — i.e. this pool never opted into the autosizer.
+    pool._warm_size = 1
+    pool._reap_surplus()
+    assert pool.slot_count == 4 and rt.reaped == []       # cushion preserved, nothing reaped
+    # once an external controller resize()s it, eager surplus reaping turns on
+    pool.resize(warm_size=1, concurrent_ceiling=1)
+    pool._reap_surplus()
+    assert pool.slot_count == 1 and len(rt.reaped) == 3
+    pool.stop()
+
+
 def test_reap_surplus_leaves_assigned_slots_untouched() -> None:
     # regression (round-2): surplus reaping must only take IDLE slots; a slot serving a
     # job (ASSIGNED) must never be reaped, even when it counts toward the surplus.
