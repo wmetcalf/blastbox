@@ -19,9 +19,9 @@ manages concurrency (no node pool to size), and EC2/cloud capacity is the contro
 plane's job (Loadout's queue-depth autoscaler), not this node's. Sizing them here would
 be meaningless, so ``manages()`` returns False and they're left untouched.
 
-The allocation math (``plan_sizes``) is pure + testable; ``NodeAutoSizer`` is the thin
-controller that reads live pool state, (optionally) adapts the budget from observed
-node headroom, and applies the plan via ``WarmPool.resize()``.
+The allocation math (``plan_sizes``) is pure + testable; ``dispatcher_sizer.DispatcherSizer``
+is the thin controller that reads live pool state, (optionally) adapts the budget from
+observed node headroom, and applies the plan via ``WarmPool.resize()``.
 """
 
 from __future__ import annotations
@@ -168,16 +168,17 @@ def _mem_available_mib() -> Optional[float]:
     return None
 
 
-def local_backlog_fn(job_store: object) -> Callable[[str], int]:
-    """A backlog source for a single engine's `serve` process: the number of QUEUED jobs
-    in its own store (each engine process owns its queue, so this is that engine's
-    backlog). Ignores the engine-name arg. A central node coordinator instead scrapes
-    each engine's status endpoint for its backlog."""
+def local_backlog_fn(job_store: object, engine: Optional[str] = None) -> Callable[[str], int]:
+    """This engine's QUEUED backlog from the dispatcher's store. Scoped to `engine` so a
+    SHARED multi-engine store (blastbox supports one store across engines) reports only
+    THIS engine's queue — without the scope every dispatcher would publish the node-wide
+    backlog as its own and balancing would split the budget evenly instead of by real
+    demand. With a per-engine store the scope is a harmless no-op."""
     from .jobs.base import JobStatus
 
     def _fn(_engine: str = "") -> int:
         try:
-            return int(job_store.count(JobStatus.QUEUED))  # type: ignore[attr-defined]
+            return int(job_store.count(JobStatus.QUEUED, engine=engine))  # type: ignore[attr-defined]
         except Exception:
             return 0
     return _fn

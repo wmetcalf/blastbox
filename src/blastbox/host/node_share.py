@@ -16,6 +16,7 @@ are ignored, so a stopped engine drops out of the node view on its own.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol
@@ -34,6 +35,8 @@ class DemandSnapshot:
     max_ceiling: int
     weight: float                # static share when balancing is off
     ts: float                    # publish time (for staleness)
+    node: str = ""               # publishing host — so a share_dir accidentally shared
+                                 # across hosts (NFS) doesn't conflate their demand/budget
 
 
 class NodeShare(Protocol):
@@ -77,12 +80,17 @@ class FileNodeShare:
 #     it would water-fill to max_ceiling; also a plain misconfig guard),
 #   * counts non-negative, ceiling positive and sanity-capped.
 _MAX_CEILING_SANE = 4096
+_MAX_SLOT_RAM_MIB = 1024 * 1024        # 1 TiB per slot — no real microVM is bigger
 
 def _valid(snap: DemandSnapshot, filename_stem: str) -> bool:
+    # NOTE: json parses 1e999/Infinity into float('inf'), and `inf > 0` is True — so
+    # footprints need a FINITE upper bound, not just `> 0`. Without it one poisoned file
+    # with slot_ram_mib=inf makes fit() False for every engine and pins the whole node to
+    # ceiling=1.
     return (
         snap.engine == filename_stem
-        and snap.slot_ram_mib > 0
-        and snap.slot_vcpus > 0
+        and math.isfinite(snap.slot_ram_mib) and 0 < snap.slot_ram_mib <= _MAX_SLOT_RAM_MIB
+        and math.isfinite(snap.slot_vcpus) and 0 < snap.slot_vcpus <= 1024
         and snap.backlog >= 0
         and snap.assigned >= 0
         and 1 <= snap.max_ceiling <= _MAX_CEILING_SANE

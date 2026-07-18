@@ -160,3 +160,48 @@ def test_read_all_skips_type_poisoned_file_without_crashing(tmp_path):
         "slot_vcpus": 1, "min_warm": 0, "max_ceiling": 64, "weight": 1.0, "ts": 1.0}))
     kept = {s.engine for s in share.read_all(max_age_s=60, now=1.0)}   # must not raise
     assert kept == {"red"}
+
+
+# --- regression: round-3 findings ---
+
+def test_local_backlog_fn_scopes_to_engine():
+    # F1: on a SHARED multi-engine store, backlog must be scoped to THIS engine, else
+    # every dispatcher reports the node-wide queue and balancing splits evenly.
+    from blastbox.host.jobs.base import Job, JobStatus
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    from blastbox.host.node_sizer import local_backlog_fn
+    store = InMemoryJobStore()
+    for eng in ("clip", "clip", "red"):
+        store.create(Job.new(engine=eng, filename="x"))
+    assert local_backlog_fn(store, "clip")() == 2      # only clip's QUEUED
+    assert local_backlog_fn(store, "red")() == 1
+    assert local_backlog_fn(store)() == 3              # unscoped = whole store
+    assert store.count(JobStatus.QUEUED, engine="clip") == 2
+
+
+def test_node_isolation_ignores_foreign_host(tmp_path):
+    # F3: a share_dir accidentally shared across hosts must not conflate them.
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("red", 50, 0, 1024, 1, 0, 64, 1.0, ts=1.0, node="hostB"))  # other host
+    pool = _Pool(assigned=0)
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64), pool, share, cfg,
+                         runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 3, node="hostA",
+                         capacity_fn=_budget(10 * 1024, 999), clock=lambda: 1.0)
+    ds.tick()
+    # clip sizes as if it's the only engine on hostA — hostB's red is not in its view
+    from blastbox.host.node_share import DemandSnapshot as DS
+    view = [s.engine for s in share.read_all(max_age_s=60, now=1.0) if s.node in ("", "hostA")]
+    assert view == ["clip"]
+    _ = DS
+
+
+def test_valid_rejects_infinite_footprint(tmp_path):
+    import json as _json
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("good", 1, 0, 1024, 1, 0, 64, 1.0, ts=1.0))
+    (tmp_path / "inf.json").write_text(_json.dumps({
+        "engine": "inf", "backlog": 1, "assigned": 0, "slot_ram_mib": 1e999,  # → inf
+        "slot_vcpus": 1, "min_warm": 0, "max_ceiling": 64, "weight": 1.0, "ts": 1.0}))
+    assert {s.engine for s in share.read_all(max_age_s=60, now=1.0)} == {"good"}

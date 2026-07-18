@@ -176,7 +176,8 @@ class RedisJobStore:
             offset=offset, limit=limit,
         )
 
-    def count(self, status: JobStatus | None = None, *, q: str | None = None) -> int:
+    def count(self, status: JobStatus | None = None, *, q: str | None = None,
+              engine: str | None = None) -> int:
         n = 0
         ql = q.lower() if q else None
         for k in self._r.scan_iter(match=_PREFIX + "*", count=200):
@@ -187,6 +188,8 @@ class RedisJobStore:
             if job is None:
                 continue
             if status is not None and job.status != status:
+                continue
+            if engine is not None and job.engine != engine:
                 continue
             if ql and ql not in (job.filename or "").lower():
                 continue

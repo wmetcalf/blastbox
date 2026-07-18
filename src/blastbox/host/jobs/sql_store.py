@@ -465,9 +465,13 @@ class SqlJobStore:
             rows = conn.execute(sql, tuple(params)).fetchall()
         return [job for row in rows if (job := self._row_to_job(row)) is not None]
 
-    def count(self, status: JobStatus | None = None, *, q: str | None = None) -> int:
+    def count(self, status: JobStatus | None = None, *, q: str | None = None,
+              engine: str | None = None) -> int:
         sql = "SELECT COUNT(*) FROM jobs"
         where, params = self._where_status_q(status, q)
+        if engine is not None:
+            where.append(f"engine = {self._param}")
+            params.append(engine)
         if where:
             sql += " WHERE " + " AND ".join(where)
         with self._lock, self._connect() as conn:

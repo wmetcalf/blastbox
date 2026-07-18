@@ -107,11 +107,14 @@ class InMemoryJobStore:
         )
         return [copy.deepcopy(j) for j in jobs]
 
-    def count(self, status: JobStatus | None = None, *, q: str | None = None) -> int:
+    def count(self, status: JobStatus | None = None, *, q: str | None = None,
+              engine: str | None = None) -> int:
         with self._lock:
             jobs = list(self._jobs.values())
         if status is not None:
             jobs = [j for j in jobs if j.status == status]
+        if engine is not None:
+            jobs = [j for j in jobs if j.engine == engine]
         if q:
             ql = q.lower()
             jobs = [j for j in jobs if ql in (j.filename or "").lower()]

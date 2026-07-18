@@ -18,6 +18,7 @@ than drifting; it is not a hard oversubscription guarantee.
 from __future__ import annotations
 
 import logging
+import socket
 import threading
 import time
 from typing import Callable, Optional
@@ -48,6 +49,7 @@ class DispatcherSizer:
                                               # SlotRuntime OBJECT, not a name, so gating must
                                               # use this string.
         backlog_fn: Callable[[], int],        # this engine's own QUEUED count
+        node: Optional[str] = None,           # this host's id (defaults to the hostname)
         capacity_fn: Callable[[float, float], NodeBudget] = node_capacity,
         avail_fn: Callable[[], Optional[float]] = _mem_available_mib,
         clock: Callable[[], float] = time.time,
@@ -58,6 +60,7 @@ class DispatcherSizer:
         self._config = config
         self._runtime = (runtime or "").strip().lower()
         self._backlog_fn = backlog_fn
+        self._node = node or socket.gethostname()
         self._capacity_fn = capacity_fn
         self._avail_fn = avail_fn
         self._clock = clock
@@ -95,8 +98,13 @@ class DispatcherSizer:
             assigned=int(getattr(self._pool, "assigned_count", 0)),
             slot_ram_mib=e.slot_ram_mib, slot_vcpus=e.slot_vcpus,
             min_warm=e.min_warm, max_ceiling=e.max_ceiling, weight=e.weight, ts=now,
+            node=self._node,
         ))
-        snaps = self._share.read_all(max_age_s=self._config.stale_after_s, now=now)
+        # Only THIS host's snapshots — so a share_dir accidentally shared across hosts
+        # (NFS / an operator pointing several hosts at one dir) can't conflate their demand
+        # into one host's budget. Legacy snapshots (node == "") are treated as same-host.
+        snaps = [s for s in self._share.read_all(max_age_s=self._config.stale_after_s, now=now)
+                 if s.node in ("", self._node)]
         if not snaps:
             return None
 

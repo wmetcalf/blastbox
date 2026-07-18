@@ -250,8 +250,10 @@ class JobStore(Protocol):
         """
         ...
 
-    def count(self, status: JobStatus | None = None, *, q: str | None = None) -> int:
-        """Total number of jobs (optionally filtered by ``status`` + filename ``q``).
+    def count(self, status: JobStatus | None = None, *, q: str | None = None,
+              engine: str | None = None) -> int:
+        """Total number of jobs (optionally filtered by ``status`` + filename ``q`` +
+        ``engine`` — the last scopes a SHARED multi-engine store to one engine's queue).
 
         Paired with ``list(..., limit=, offset=)`` so the listing endpoint can
         report ``total`` without materializing every row.

@@ -297,27 +297,43 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     # turns on resource_management or balancing — otherwise the pool self-manages as today.
     sizer_stop = None
     if pool is not None:
-        from blastbox.host.node_config import EngineNode, NodeConfig
+        from blastbox.host.node_config import NodeConfig
 
         node_cfg = NodeConfig.from_env()
         if node_cfg.resource_management or node_cfg.balancing:
-            import threading as _threading
+            # The whole self-sizer setup is guarded: it runs AFTER pool.start() but BEFORE
+            # the try/finally that stops the pool, so an unguarded failure here (e.g. an
+            # unwritable BLASTBOX_NODE_SHARE_DIR) would both crash core dispatch AND leak
+            # the already-started warm pool. An opt-in optimizer must never do either —
+            # on any error we log, leave sizing off, and let dispatch run normally.
+            try:
+                import threading as _threading
 
-            from blastbox.host.dispatcher_sizer import DispatcherSizer
-            from blastbox.host.node_share import FileNodeShare
-            from blastbox.host.node_sizer import local_backlog_fn
+                from blastbox.host.dispatcher_sizer import DispatcherSizer
+                from blastbox.host.node_share import FileNodeShare
+                from blastbox.host.node_sizer import local_backlog_fn
 
-            ename = next(iter(engines)) if engines else os.environ.get("BLASTBOX_ENGINE", "engine")
-            spec = next((e for e in node_cfg.engines if e.name == ename),
-                        EngineNode(name=ename, url=""))
-            sizer_stop = _threading.Event()
-            # `tier` is the pool's runtime NAME (firecracker/gvisor/cold) — WarmPool.runtime
-            # is the SlotRuntime object, so gating must use this string, not the pool.
-            DispatcherSizer(spec, pool, FileNodeShare(node_cfg.share_dir), node_cfg,
-                            runtime=tier,
-                            backlog_fn=local_backlog_fn(store)).start_thread(sizer_stop)
-            print(f"node self-sizer: managing '{ename}' warm pool from {node_cfg.share_dir} "
-                  f"({'balancing' if node_cfg.balancing else 'static shares'})", file=sys.stderr)
+                ename = next(iter(engines)) if engines else os.environ.get("BLASTBOX_ENGINE", "")
+                spec = next((e for e in node_cfg.engines if e.name == ename), None)
+                if spec is None:
+                    # Sizing an engine absent from the inventory with generic 2GiB/64
+                    # defaults would mis-budget the node — require it be declared.
+                    print(f"node self-sizer: engine {ename!r} not in BLASTBOX_NODE_ENGINES "
+                          f"— not sizing it (declare it to enable).", file=sys.stderr)
+                else:
+                    sizer_stop = _threading.Event()
+                    # `tier` is the pool's runtime NAME (firecracker/gvisor/cold) —
+                    # WarmPool.runtime is the SlotRuntime object, so gating uses this string.
+                    DispatcherSizer(spec, pool, FileNodeShare(node_cfg.share_dir), node_cfg,
+                                    runtime=tier,
+                                    backlog_fn=local_backlog_fn(store, ename)).start_thread(sizer_stop)
+                    print(f"node self-sizer: managing {ename!r} warm pool from "
+                          f"{node_cfg.share_dir} "
+                          f"({'balancing' if node_cfg.balancing else 'static shares'})",
+                          file=sys.stderr)
+            except Exception:
+                logging.getLogger("blastbox.node_sizer").warning(
+                    "node self-sizer setup failed — continuing without it", exc_info=True)
 
     try:
         dispatcher.run_forever(
