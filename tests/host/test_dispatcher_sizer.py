@@ -205,3 +205,34 @@ def test_valid_rejects_infinite_footprint(tmp_path):
         "engine": "inf", "backlog": 1, "assigned": 0, "slot_ram_mib": 1e999,  # → inf
         "slot_vcpus": 1, "min_warm": 0, "max_ceiling": 64, "weight": 1.0, "ts": 1.0}))
     assert {s.engine for s in share.read_all(max_age_s=60, now=1.0)} == {"good"}
+
+
+# --- round-5 regressions ---
+
+def test_default_node_lets_containers_coordinate(tmp_path, monkeypatch):
+    # regression: node id must NOT default to the container hostname (each engine container
+    # has a different one → they'd never see each other). Default "" = share_dir boundary.
+    monkeypatch.delenv("BLASTBOX_NODE_ID", raising=False)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("red", 40, 0, 1024, 1, 0, 64, 1.0, ts=1.0, node=""))
+    pool = _Pool(assigned=0)
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64), pool, share, cfg,
+                         runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 4,
+                         capacity_fn=_budget(10 * 1024, 999), clock=lambda: 1.0)
+    mine = ds.tick()
+    assert mine.concurrent_ceiling < 10       # shares the node with red — NOT isolated to itself
+
+
+def test_valid_bounds_reject_overflow_and_infinite_ts(tmp_path):
+    import json as _json
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("good", 5, 0, 1024, 1, 0, 64, 1.0, ts=1.0))
+    (tmp_path / "big.json").write_text(_json.dumps({   # 400-digit backlog → float() overflow
+        "engine": "big", "backlog": int("9" * 400), "assigned": 0, "slot_ram_mib": 1024,
+        "slot_vcpus": 1, "min_warm": 0, "max_ceiling": 64, "weight": 1.0, "ts": 1.0}))
+    (tmp_path / "inf.json").write_text(_json.dumps({   # non-finite ts never ages out
+        "engine": "inf", "backlog": 1, "assigned": 0, "slot_ram_mib": 1024, "slot_vcpus": 1,
+        "min_warm": 0, "max_ceiling": 64, "weight": 1.0, "ts": 1e999}))
+    assert {s.engine for s in share.read_all(max_age_s=60, now=1.0)} == {"good"}   # no crash

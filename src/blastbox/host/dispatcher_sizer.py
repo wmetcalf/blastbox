@@ -18,7 +18,7 @@ than drifting; it is not a hard oversubscription guarantee.
 from __future__ import annotations
 
 import logging
-import socket
+import os
 import threading
 import time
 from typing import Callable, Optional
@@ -49,7 +49,7 @@ class DispatcherSizer:
                                               # SlotRuntime OBJECT, not a name, so gating must
                                               # use this string.
         backlog_fn: Callable[[], int],        # this engine's own QUEUED count
-        node: Optional[str] = None,           # this host's id (defaults to the hostname)
+        node: Optional[str] = None,           # physical-node id; default from BLASTBOX_NODE_ID
         capacity_fn: Callable[[float, float], NodeBudget] = node_capacity,
         avail_fn: Callable[[], Optional[float]] = _mem_available_mib,
         clock: Callable[[], float] = time.time,
@@ -60,11 +60,18 @@ class DispatcherSizer:
         self._config = config
         self._runtime = (runtime or "").strip().lower()
         self._backlog_fn = backlog_fn
-        self._node = node or socket.gethostname()
+        # The node id must identify the PHYSICAL HOST, shared by every engine container on
+        # it — NOT socket.gethostname(), which inside a container is the container's own
+        # name (so each engine would see only itself → no coordination, the common toolz2
+        # layout). Default "" means "the share_dir IS the node boundary" (correct when all
+        # of a host's engines bind-mount one dir); set BLASTBOX_NODE_ID per physical host
+        # only to defend a share_dir accidentally shared ACROSS hosts.
+        self._node = node if node is not None else os.environ.get("BLASTBOX_NODE_ID", "").strip()
         self._capacity_fn = capacity_fn
         self._avail_fn = avail_fn
         self._clock = clock
         self._budget_scale = 1.0              # adaptive correction, persisted across ticks
+        self._last_tick_dur = 0.0             # measured, to widen the staleness window
 
     def _active(self) -> bool:
         cfg = self._config
@@ -90,21 +97,30 @@ class DispatcherSizer:
         engine's decided size (None when the feature is off or the view is empty)."""
         if not self._active():
             return None
-        now = self._clock()
+        started = self._clock()
         e = self._engine
+        # Do the (possibly slow) backlog count FIRST, then stamp ts — otherwise the
+        # snapshot is written already-aged by the count latency (on a large shared store
+        # the count scans every key), which can push peers past the staleness window.
+        backlog = max(0, int(self._backlog_fn()))
+        assigned = int(getattr(self._pool, "assigned_count", 0))
+        now = self._clock()
         self._share.publish(DemandSnapshot(
-            engine=e.name,
-            backlog=max(0, int(self._backlog_fn())),
-            assigned=int(getattr(self._pool, "assigned_count", 0)),
+            engine=e.name, backlog=backlog, assigned=assigned,
             slot_ram_mib=e.slot_ram_mib, slot_vcpus=e.slot_vcpus,
             min_warm=e.min_warm, max_ceiling=e.max_ceiling, weight=e.weight, ts=now,
             node=self._node,
         ))
-        # Only THIS host's snapshots — so a share_dir accidentally shared across hosts
-        # (NFS / an operator pointing several hosts at one dir) can't conflate their demand
-        # into one host's budget. Legacy snapshots (node == "") are treated as same-host.
-        snaps = [s for s in self._share.read_all(max_age_s=self._config.stale_after_s, now=now)
+        # Effective staleness widens by the measured tick cost: the real publish period is
+        # interval + tick_time, so a slow count (huge shared store) must not age peers out
+        # and collapse every engine to "sees only itself" → node oversubscription.
+        max_age = max(self._config.stale_after_s,
+                      (self._config.interval_s + self._last_tick_dur) * 2.0)
+        # Filter to this physical node (default node == "" → the share_dir is the boundary,
+        # so all same-dir engines coordinate; a set BLASTBOX_NODE_ID isolates hosts).
+        snaps = [s for s in self._share.read_all(max_age_s=max_age, now=now)
                  if s.node in ("", self._node)]
+        self._last_tick_dur = max(0.0, self._clock() - started)
         if not snaps:
             return None
 

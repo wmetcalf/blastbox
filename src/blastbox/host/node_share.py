@@ -81,19 +81,32 @@ class FileNodeShare:
 #   * counts non-negative, ceiling positive and sanity-capped.
 _MAX_CEILING_SANE = 4096
 _MAX_SLOT_RAM_MIB = 1024 * 1024        # 1 TiB per slot — no real microVM is bigger
+_MAX_COUNT = 1 << 30                   # sane cap on backlog/assigned (a real queue is small)
+_MAX_WEIGHT = 1 << 20
+
+
+def _finite_in(x: object, lo: float, hi: float) -> bool:
+    # json parses 1e999→inf and huge integers into arbitrary-precision ints, both of which
+    # pass a bare `>= 0`; a NON-FINITE or over-cap value must be rejected, because it later
+    # flows into float()/ceil() arithmetic (float(10**400) raises OverflowError and would
+    # wedge the whole sizer for as long as the file exists). NB: a huge int must be
+    # range-checked WITHOUT float conversion — even math.isfinite(10**400) overflows.
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return False
+    if isinstance(x, float) and not math.isfinite(x):
+        return False
+    return lo <= x <= hi                      # int compare is exact (no float coercion)
+
 
 def _valid(snap: DemandSnapshot, filename_stem: str) -> bool:
-    # NOTE: json parses 1e999/Infinity into float('inf'), and `inf > 0` is True — so
-    # footprints need a FINITE upper bound, not just `> 0`. Without it one poisoned file
-    # with slot_ram_mib=inf makes fit() False for every engine and pins the whole node to
-    # ceiling=1.
     return (
         snap.engine == filename_stem
-        and math.isfinite(snap.slot_ram_mib) and 0 < snap.slot_ram_mib <= _MAX_SLOT_RAM_MIB
-        and math.isfinite(snap.slot_vcpus) and 0 < snap.slot_vcpus <= 1024
-        and snap.backlog >= 0
-        and snap.assigned >= 0
-        and 1 <= snap.max_ceiling <= _MAX_CEILING_SANE
-        and snap.min_warm >= 0
-        and snap.weight >= 0
+        and _finite_in(snap.slot_ram_mib, 1e-9, _MAX_SLOT_RAM_MIB) and snap.slot_ram_mib > 0
+        and _finite_in(snap.slot_vcpus, 1e-9, 1024) and snap.slot_vcpus > 0
+        and _finite_in(snap.backlog, 0, _MAX_COUNT)
+        and _finite_in(snap.assigned, 0, _MAX_COUNT)
+        and _finite_in(snap.max_ceiling, 1, _MAX_CEILING_SANE)
+        and _finite_in(snap.min_warm, 0, _MAX_CEILING_SANE)
+        and _finite_in(snap.weight, 0, _MAX_WEIGHT)
+        and math.isfinite(snap.ts)           # a non-finite ts would never age out
     )
