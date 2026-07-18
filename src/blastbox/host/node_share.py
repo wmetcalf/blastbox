@@ -61,7 +61,16 @@ class FileNodeShare:
         out: list[DemandSnapshot] = []
         for f in sorted(self._dir.glob("*.json")):
             try:
-                snap = DemandSnapshot(**json.loads(f.read_text()))
+                data = json.loads(f.read_text())
+                # Drop UNKNOWN keys before constructing: during a rolling upgrade a NEWER
+                # peer may add a DemandSnapshot field, and an OLDER reader passing it to the
+                # constructor would raise TypeError (unexpected kwarg) → the file is skipped
+                # → that peer silently drops out of this node's view → oversubscription. So
+                # tolerate extra fields. (The reverse direction — an older writer omitting a
+                # field a newer reader needs — is handled by giving new fields defaults, as
+                # `node` already has.) A non-dict payload makes .items() raise → skipped.
+                snap = DemandSnapshot(**{k: v for k, v in data.items()
+                                         if k in DemandSnapshot.__dataclass_fields__})
                 # validate INSIDE the try: an untyped dataclass accepts wrong-typed fields
                 # (e.g. slot_ram_mib=null), so `_valid`'s comparisons can raise TypeError —
                 # that must skip the poisoned file, not propagate out and kill the sizer.

@@ -225,6 +225,20 @@ def test_default_node_lets_containers_coordinate(tmp_path, monkeypatch):
     assert mine.concurrent_ceiling < 10       # shares the node with red — NOT isolated to itself
 
 
+def test_read_all_tolerates_unknown_future_fields(tmp_path):
+    # regression (PR #60 review): a NEWER peer that adds a DemandSnapshot field must not
+    # make an OLDER reader drop its snapshot (TypeError → silent eviction → oversubscription
+    # during a rolling upgrade). Unknown keys are filtered before construction.
+    import json as _json
+    share = FileNodeShare(str(tmp_path))
+    good = DemandSnapshot("red", 2, 0, 1024, 1, 0, 64, 1.0, ts=1.0)
+    payload = {**good.__dict__, "some_future_field": {"nested": [1, 2, 3]}, "another": 42}
+    (tmp_path / "red.json").write_text(_json.dumps(payload))
+    kept = share.read_all(max_age_s=60, now=1.0)
+    assert [s.engine for s in kept] == ["red"]        # accepted despite the extra fields
+    assert kept[0].backlog == 2 and kept[0].max_ceiling == 64
+
+
 def test_valid_bounds_reject_overflow_and_infinite_ts(tmp_path):
     import json as _json
     share = FileNodeShare(str(tmp_path))

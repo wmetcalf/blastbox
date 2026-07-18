@@ -153,7 +153,9 @@ def node_capacity(ram_headroom_frac: float = 0.8,
                 if line.startswith("MemTotal:"):
                     total_kib = float(line.split()[1])
                     break
-    except OSError:
+    except (OSError, ValueError, IndexError):
+        # malformed/empty/mocked /proc/meminfo (missing column, non-numeric) → 0 budget,
+        # a safe degradation (every engine gets the viable baseline), not a crashed tick.
         total_kib = 0.0
     ram_mib = (total_kib / 1024.0) * ram_headroom_frac
     vcpus = float(os.cpu_count() or 1) * vcpu_oversubscription
@@ -166,8 +168,8 @@ def _mem_available_mib() -> Optional[float]:
             for line in fh:
                 if line.startswith("MemAvailable:"):
                     return float(line.split()[1]) / 1024.0
-    except OSError:
-        return None
+    except (OSError, ValueError, IndexError):
+        return None                     # malformed/mocked /proc/meminfo → adaptive no-ops safely
     return None
 
 

@@ -102,6 +102,24 @@ def test_node_capacity_reads_real_node():
     assert b.ram_mib > 0 and b.vcpus >= 1
 
 
+def test_node_capacity_survives_malformed_meminfo(monkeypatch, tmp_path):
+    # regression (PR #60 review): a malformed/empty /proc/meminfo (missing column,
+    # non-numeric) must degrade to a 0 RAM budget, not crash the sizer tick.
+    import builtins
+    bad = tmp_path / "meminfo"
+    bad.write_text("MemTotal:\nGarbage line without colon\nMemAvailable: notanumber kB\n")
+    real_open = builtins.open
+
+    def fake_open(path, *a, **k):
+        return real_open(bad if path == "/proc/meminfo" else path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    b = node_capacity(ram_headroom_frac=0.8, vcpu_oversubscription=2.0)
+    assert b.ram_mib == 0.0 and b.vcpus >= 1          # safe degradation, no exception
+    from blastbox.host.node_sizer import _mem_available_mib
+    assert _mem_available_mib() is None               # malformed MemAvailable → None
+
+
 # --- round-4: config clamping + optional url ---
 
 def test_from_env_clamps_footgun_config(monkeypatch):
