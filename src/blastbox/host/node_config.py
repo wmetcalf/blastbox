@@ -3,7 +3,8 @@
 Everything here is OFF by default — a node runs exactly as it does today unless an
 operator turns features on. Three independent switches, layered:
 
-  1. run the coordinator at all         (you start `blastbox node-sizer`, or you don't)
+  1. run it at all                      (the sizer runs inside `blastbox dispatch` only
+                                         when a switch below is on; otherwise it never starts)
   2. resource_management: bool          (enforce the node RAM/vCPU budget — cap total slots
                                          so engines can't oversubscribe the node)
   3. balancing: bool                    (dynamically rebalance the budget across engines by

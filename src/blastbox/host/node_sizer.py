@@ -28,8 +28,6 @@ from __future__ import annotations
 
 import math
 import os
-import threading
-import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -42,8 +40,11 @@ NODE_MANAGED_RUNTIMES: frozenset[str] = frozenset({RUNTIME_FIRECRACKER, RUNTIME_
 
 
 def manages(runtime: str) -> bool:
-    """True if a pool on this runtime should be sized by the node autosizer."""
-    return (runtime or "").strip().lower() in NODE_MANAGED_RUNTIMES
+    """True if a pool on this runtime should be sized by the node autosizer. Takes the
+    runtime NAME string (not a SlotRuntime object); a non-string is defensively False."""
+    if not isinstance(runtime, str):
+        return False
+    return runtime.strip().lower() in NODE_MANAGED_RUNTIMES
 
 
 @dataclass(frozen=True)
@@ -165,125 +166,6 @@ def _mem_available_mib() -> Optional[float]:
     except OSError:
         return None
     return None
-
-
-@dataclass
-class ManagedPool:
-    """Binds a live WarmPool to its sizing inputs. `pool` is any object exposing
-    `runtime`, `assigned_count`, `burst_active`, `slot_count`, and `resize(...)`
-    (WarmPool does)."""
-
-    spec: PoolSpec
-    pool: object                          # WarmPool (kept structural for testability)
-
-
-class NodeAutoSizer:
-    """Node-level controller. Each tick(): read live demand per managed pool, (optionally)
-    adapt the budget from observed node headroom, compute a plan, and apply it. Pools on
-    non-node-managed runtimes are ignored."""
-
-    def __init__(
-        self,
-        pools: list[ManagedPool],
-        *,
-        ram_headroom_frac: float = 0.8,
-        vcpu_oversubscription: float = 2.0,
-        adaptive: bool = False,
-        min_free_mib: float = 2048.0,     # adaptive: keep at least this much node RAM free
-        backlog_fn: Optional[Callable[[str], int]] = None,
-        capacity_fn: Callable[[float, float], NodeBudget] = node_capacity,
-        avail_fn: Callable[[], Optional[float]] = _mem_available_mib,
-    ) -> None:
-        # only manage pools on node-managed runtimes (skip lambda/ec2/static/none)
-        self._pools = [mp for mp in pools if manages(getattr(mp.pool, "runtime", ""))]
-        self._ram_headroom = ram_headroom_frac
-        self._vcpu_over = vcpu_oversubscription
-        self._adaptive = adaptive
-        self._min_free_mib = min_free_mib
-        # engine name → pending (QUEUED) job count. The queue backlog is the LEADING
-        # scale signal (busy slots lag it): a pool with a growing backlog wants more of
-        # the node now. None → demand is busy-slots only.
-        self._backlog_fn = backlog_fn
-        self._capacity_fn = capacity_fn
-        self._avail_fn = avail_fn
-        self._budget_scale = 1.0          # adaptive correction on the RAM budget (EWMA-driven)
-
-    @property
-    def managed_names(self) -> list[str]:
-        return [mp.spec.name for mp in self._pools]
-
-    def _live_demand(self, mp: ManagedPool) -> float:
-        """Current wantedness of a pool = in-flight work + queued backlog. Busy slots are
-        what's running now; the QUEUED backlog is what's waiting — the leading signal
-        that this engine needs to scale UP. As the backlog drains, demand falls and the
-        pool scales back DOWN toward its min_warm floor."""
-        pool = mp.pool
-        demand = float(getattr(pool, "assigned_count", 0))
-        if self._backlog_fn is not None:
-            demand += float(max(0, self._backlog_fn(mp.spec.name)))
-        if getattr(pool, "burst_active", False):
-            demand += 1.0                  # +1 slot of intent while under sustained pressure
-        return demand
-
-    def _adapt_budget(self, budget: NodeBudget) -> NodeBudget:
-        """Nudge the RAM budget from observed free memory: if the node is running hotter
-        than the model expects (free RAM below the safety floor) shrink; if there's lots
-        of slack, relax back toward 1.0. Bounded to [0.5, 1.25]. No-op when not adaptive
-        or when free memory can't be read."""
-        if not self._adaptive:
-            return budget
-        free = self._avail_fn()
-        if free is None:
-            return budget
-        if free < self._min_free_mib:
-            self._budget_scale = max(0.5, self._budget_scale - 0.1)
-        elif free > self._min_free_mib * 2:
-            self._budget_scale = min(1.25, self._budget_scale + 0.05)
-        return NodeBudget(ram_mib=budget.ram_mib * self._budget_scale, vcpus=budget.vcpus)
-
-    def plan(self) -> dict[str, PoolSize]:
-        """Compute (but don't apply) the current sizing plan."""
-        if not self._pools:
-            return {}
-        budget = self._adapt_budget(self._capacity_fn(self._ram_headroom, self._vcpu_over))
-        specs = [
-            PoolSpec(
-                name=mp.spec.name,
-                slot_ram_mib=mp.spec.slot_ram_mib,
-                slot_vcpus=mp.spec.slot_vcpus,
-                demand=self._live_demand(mp),
-                min_warm=mp.spec.min_warm,
-                max_ceiling=mp.spec.max_ceiling,
-            )
-            for mp in self._pools
-        ]
-        return plan_sizes(specs, budget)
-
-    def tick(self) -> dict[str, PoolSize]:
-        """Compute the plan and apply it to every managed pool. Returns the plan."""
-        plan = self.plan()
-        for mp in self._pools:
-            size = plan.get(mp.spec.name)
-            if size is None:
-                continue
-            mp.pool.resize(  # type: ignore[attr-defined]
-                warm_size=size.warm_size,
-                concurrent_ceiling=size.concurrent_ceiling,
-            )
-        return plan
-
-    def run(self, *, interval_s: float = 5.0, stop: Optional[threading.Event] = None,
-            max_ticks: Optional[int] = None, sleep: Callable[[float], None] = time.sleep) -> None:
-        """Run the sizing loop: tick() every ``interval_s`` until ``stop`` is set (or
-        ``max_ticks`` ticks elapse). Scale-up follows backlog growth; scale-down follows
-        its drain. Blocking — run in a daemon thread."""
-        n = 0
-        while not (stop is not None and stop.is_set()):
-            self.tick()
-            n += 1
-            if max_ticks is not None and n >= max_ticks:
-                return
-            sleep(interval_s)
 
 
 def local_backlog_fn(job_store: object) -> Callable[[str], int]:

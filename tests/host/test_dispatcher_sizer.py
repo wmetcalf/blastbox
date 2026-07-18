@@ -147,3 +147,16 @@ def test_read_all_drops_invalid_and_impersonating_snapshots(tmp_path):
         "slot_vcpus": 1, "min_warm": 0, "max_ceiling": 64, "weight": 1.0, "ts": 1.0}))
     kept = {s.engine for s in share.read_all(max_age_s=60, now=1.0)}
     assert kept == {"clip"}                       # only the valid, non-impersonating snapshot
+
+
+def test_read_all_skips_type_poisoned_file_without_crashing(tmp_path):
+    # regression (round-2): a valid-JSON but wrong-typed field must skip that file, not
+    # raise out of read_all() and silently wedge the sizer node-wide.
+    import json as _json
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("red", 1, 0, 1024, 1, 0, 64, 1.0, ts=1.0))
+    (tmp_path / "clip.json").write_text(_json.dumps({
+        "engine": "clip", "backlog": 1, "assigned": 0, "slot_ram_mib": None,   # poisoned
+        "slot_vcpus": 1, "min_warm": 0, "max_ceiling": 64, "weight": 1.0, "ts": 1.0}))
+    kept = {s.engine for s in share.read_all(max_age_s=60, now=1.0)}   # must not raise
+    assert kept == {"red"}

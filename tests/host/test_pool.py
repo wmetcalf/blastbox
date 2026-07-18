@@ -1134,3 +1134,19 @@ def test_resize_down_reaps_surplus_idle_slots() -> None:
     pool.tick()                              # should reap the 3 surplus IDLE slots
     assert pool.slot_count == 1
     assert len(rt.reaped) == 3
+
+
+def test_reap_surplus_leaves_assigned_slots_untouched() -> None:
+    # regression (round-2): surplus reaping must only take IDLE slots; a slot serving a
+    # job (ASSIGNED) must never be reaped, even when it counts toward the surplus.
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=3, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    for _ in range(6):
+        pool.tick()
+    assert pool.idle_count == 3
+    claimed = pool.claim(timeout_s=1.0)               # one slot IDLE -> ASSIGNED
+    assert claimed is not None and pool.assigned_count == 1
+    pool.resize(warm_size=0, concurrent_ceiling=1)
+    pool.tick()                                       # reap surplus IDLE, NOT the assigned one
+    assert claimed.slot_id in pool._slots             # the in-flight slot survives
+    assert claimed.slot_id not in rt.reaped

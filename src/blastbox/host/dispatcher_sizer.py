@@ -6,10 +6,18 @@ deterministic allocation (node_sizer.plan_sizes) over the whole node and resizes
 pool. Because every engine's dispatcher runs the identical allocation over the identical
 shared view, the node partitions consistently — no central daemon, no HTTP push, no admin
 endpoint. Off unless NodeConfig enables resource_management or balancing.
+
+Consistency is EVENTUAL, not instantaneous: dispatchers publish/read on their own clocks
+(and adaptive scale is per-process), so two engines can act on slightly divergent views
+for one interval and transiently sum above budget. That window is bounded — the staleness
+horizon is short, each engine's real RAM use is capped by IDLE-slot reaping + the warm
+target tracking demand, and the views reconverge next tick — so it self-corrects rather
+than drifting; it is not a hard oversubscription guarantee.
 """
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import Callable, Optional
@@ -118,7 +126,9 @@ class DispatcherSizer:
             try:
                 self.tick()
             except Exception:  # a sizing hiccup must never take down the dispatcher
-                pass
+                logging.getLogger("blastbox.node_sizer").warning(
+                    "node self-sizer tick failed for %s (continuing)", self._engine.name,
+                    exc_info=True)
             n += 1
             if max_ticks is not None and n >= max_ticks:
                 return

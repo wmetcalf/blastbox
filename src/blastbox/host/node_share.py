@@ -59,9 +59,13 @@ class FileNodeShare:
         for f in sorted(self._dir.glob("*.json")):
             try:
                 snap = DemandSnapshot(**json.loads(f.read_text()))
+                # validate INSIDE the try: an untyped dataclass accepts wrong-typed fields
+                # (e.g. slot_ram_mib=null), so `_valid`'s comparisons can raise TypeError —
+                # that must skip the poisoned file, not propagate out and kill the sizer.
+                ok = _valid(snap, f.stem) and (now - snap.ts) <= max_age_s
             except Exception:
-                continue                        # a torn/foreign file just doesn't contribute
-            if _valid(snap, f.stem) and now - snap.ts <= max_age_s:
+                continue                        # torn / foreign / type-poisoned → doesn't contribute
+            if ok:
                 out.append(snap)
         return out
 

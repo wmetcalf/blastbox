@@ -457,8 +457,20 @@ class WarmPool:
             if surplus <= 0:
                 return
             victims = [s for s in self._slots.values() if s.state == SlotState.IDLE][:surplus]
+            # Flip to DRAINING HERE, still under the selection lock, so a concurrent
+            # claim() (which only takes IDLE) cannot grab a victim between selection and
+            # reap — otherwise we'd destroy a slot mid-job. (stop() takes the same care.)
+            for slot in victims:
+                slot.state = SlotState.DRAINING
         for slot in victims:
-            self.retire(slot)   # re-checks under lock, marks DRAINING, reaps, pops
+            reaped = False
+            try:
+                reaped = self._reap_and_count(slot)   # False = another thread owns the reap
+            except Exception:
+                logger.exception("pool.reap_surplus_error slot_id=%s — quarantining", slot.slot_id)
+            if reaped:
+                with self._lock:
+                    self._slots.pop(slot.slot_id, None)
 
     def _runtime_ready(self) -> bool:
         """Kick the warm runtime's async prepare (if any) and report whether it can spawn this
