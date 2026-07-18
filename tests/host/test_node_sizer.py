@@ -112,6 +112,24 @@ def test_from_env_clamps_footgun_config(monkeypatch):
     assert next(e for e in c.engines if e.name == "clip").slot_ram_mib >= 1.0
 
 
+def test_from_env_output_always_passes_reader_validation(monkeypatch):
+    # regression (round-8): from_env is the WRITER of a dispatcher's own snapshot; every
+    # EngineNode it produces must round-trip through node_share._valid, or the engine's
+    # self-snapshot is silently dropped from its own + peers' node view → it never sizes
+    # and peers oversubscribe. Absurd min_warm/weight must be clamped to the reader's caps.
+    from blastbox.host.node_config import NodeConfig
+    from blastbox.host.node_share import DemandSnapshot, _valid
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")
+    monkeypatch.setenv("BLASTBOX_NODE_BALANCING", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_CLIP_MIN_WARM", "5000")      # > _MAX_CEILING_SANE
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_CLIP_WEIGHT", "2000000")     # > _MAX_WEIGHT
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_CLIP_MAX_CEILING", "999999")  # > _MAX_CEILING_SANE
+    e = NodeConfig.from_env().engines[0]
+    snap = DemandSnapshot(e.name, 0, 0, e.slot_ram_mib, e.slot_vcpus,
+                          e.min_warm, e.max_ceiling, e.weight, ts=1.0, node="")
+    assert _valid(snap, e.name)          # writer's output survives the reader → no self-eviction
+
+
 def test_local_backlog_sums_across_served_engines():
     from blastbox.host.jobs.base import Job
     from blastbox.host.jobs.memory import InMemoryJobStore

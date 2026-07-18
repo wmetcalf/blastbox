@@ -22,6 +22,13 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, replace
 
+# The bounds the READER (node_share._valid) enforces on a published snapshot. from_env is
+# the WRITER of a dispatcher's own snapshot, so it MUST clamp to these same caps — a value
+# from_env accepts but _valid rejects makes the engine's self-snapshot silently dropped
+# from its own and every peer's node view (→ it never sizes, and peers water-fill as if its
+# slots don't exist → oversubscription). Import them so writer and reader can't drift.
+from .node_share import _MAX_CEILING_SANE, _MAX_WEIGHT
+
 
 @dataclass(frozen=True)
 class EngineNode:
@@ -110,9 +117,11 @@ class NodeConfig:
                 # 0-RAM slot (water-fill footgun) or a runaway ceiling.
                 slot_ram_mib=_clamp(_float(f"BLASTBOX_NODE_ENGINE_{up}_RAM_MIB", 2048.0), 1.0, 1 << 20),
                 slot_vcpus=_clamp(_float(f"BLASTBOX_NODE_ENGINE_{up}_VCPUS", 1.0), 0.01, 1024.0),
-                min_warm=max(0, _int(f"BLASTBOX_NODE_ENGINE_{up}_MIN_WARM", 0)),
-                max_ceiling=int(_clamp(_int(f"BLASTBOX_NODE_ENGINE_{up}_MAX_CEILING", 64), 1, 4096)),
-                weight=max(0.0, _float(f"BLASTBOX_NODE_ENGINE_{up}_WEIGHT", 1.0))))
+                # min_warm/weight clamped to the READER's _valid caps (not just >= 0), or
+                # the engine's own snapshot fails validation → silent self-eviction.
+                min_warm=int(_clamp(_int(f"BLASTBOX_NODE_ENGINE_{up}_MIN_WARM", 0), 0, _MAX_CEILING_SANE)),
+                max_ceiling=int(_clamp(_int(f"BLASTBOX_NODE_ENGINE_{up}_MAX_CEILING", 64), 1, _MAX_CEILING_SANE)),
+                weight=_clamp(_float(f"BLASTBOX_NODE_ENGINE_{up}_WEIGHT", 1.0), 0.0, _MAX_WEIGHT)))
         balancing = _bool("BLASTBOX_NODE_BALANCING", False)
         # Clamp the budget knobs — these are footguns: headroom is a FRACTION (0,1], so a
         # bare "80" meaning 80% would give an 80× budget → OOM; a non-positive interval is
