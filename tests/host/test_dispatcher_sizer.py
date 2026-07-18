@@ -179,6 +179,31 @@ def test_local_backlog_fn_scopes_to_engine():
     assert store.count(JobStatus.QUEUED, engine="clip") == 2
 
 
+def test_same_engine_across_two_physical_nodes_sizes_independently(tmp_path):
+    # The real multi-node model (Will): one engine (clip) runs on TWO physical nodes
+    # sharing a QUEUE for load-balancing/failover. The sizer is PER-NODE — each host sizes
+    # its OWN clip pool against its OWN hardware budget from its OWN node view. Even on a
+    # shared share_dir (NFS/PV), the two nodes must not collide on the file nor contaminate
+    # each other's view: node-namespaced filenames + the node filter keep them independent.
+    share = FileNodeShare(str(tmp_path))
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    pool2, pool3 = _Pool(assigned=0), _Pool(assigned=0)
+    common = dict(runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 5,
+                  capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0)
+    ds2 = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64),
+                          pool2, share, cfg, node="toolz2", **common)
+    ds3 = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64),
+                          pool3, share, cfg, node="toolz3", **common)
+    mine2, mine3 = ds2.tick(), ds3.tick()
+    # no filename collision on the shared dir — one file per (engine, physical node)
+    assert sorted(p.name for p in tmp_path.glob("*.json")) == ["clip@toolz2.json", "clip@toolz3.json"]
+    # each node sized ITS OWN clip pool to ITS OWN full 8-slot budget — not halved or
+    # doubled by the peer node's identically-named engine (independent LB/failover pools)
+    assert mine2.concurrent_ceiling == 8 and pool2.concurrent_ceiling == 8
+    assert mine3.concurrent_ceiling == 8 and pool3.concurrent_ceiling == 8
+
+
 def test_node_isolation_ignores_foreign_host(tmp_path):
     # F3: a share_dir accidentally shared across hosts must not conflate them.
     share = FileNodeShare(str(tmp_path))
