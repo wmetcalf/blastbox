@@ -91,34 +91,47 @@ class NodeConfig:
             raw = os.environ.get(key, "").strip()
             return int(raw) if raw else default
 
+        def _clamp(val: float, lo: float, hi: float) -> float:
+            return max(lo, min(hi, val))
+
         engines: list[EngineNode] = []
         raw = os.environ.get("BLASTBOX_NODE_ENGINES", "").strip()
         for item in (p for p in raw.split(",") if p.strip()):
+            # `name` or `name=url`; url is optional + unused by the shipped sizer (a
+            # leftover from the removed HTTP-push design) — don't make it mandatory.
             name, _, url = item.partition("=")
             name, url = name.strip(), url.strip()
-            if not name or not url:
-                raise ValueError(f"BLASTBOX_NODE_ENGINES entry must be 'name=url', got {item!r}")
+            if not name:
+                raise ValueError(f"BLASTBOX_NODE_ENGINES entry must name an engine, got {item!r}")
             up = name.upper().replace("-", "_")
             engines.append(EngineNode(
                 name=name, url=url,
-                slot_ram_mib=_float(f"BLASTBOX_NODE_ENGINE_{up}_RAM_MIB", 2048.0),
-                slot_vcpus=_float(f"BLASTBOX_NODE_ENGINE_{up}_VCPUS", 1.0),
-                min_warm=_int(f"BLASTBOX_NODE_ENGINE_{up}_MIN_WARM", 0),
-                max_ceiling=_int(f"BLASTBOX_NODE_ENGINE_{up}_MAX_CEILING", 64),
-                weight=_float(f"BLASTBOX_NODE_ENGINE_{up}_WEIGHT", 1.0)))
+                # footprints/caps clamped to sane positives so a typo can't produce a
+                # 0-RAM slot (water-fill footgun) or a runaway ceiling.
+                slot_ram_mib=_clamp(_float(f"BLASTBOX_NODE_ENGINE_{up}_RAM_MIB", 2048.0), 1.0, 1 << 20),
+                slot_vcpus=_clamp(_float(f"BLASTBOX_NODE_ENGINE_{up}_VCPUS", 1.0), 0.01, 1024.0),
+                min_warm=max(0, _int(f"BLASTBOX_NODE_ENGINE_{up}_MIN_WARM", 0)),
+                max_ceiling=int(_clamp(_int(f"BLASTBOX_NODE_ENGINE_{up}_MAX_CEILING", 64), 1, 4096)),
+                weight=max(0.0, _float(f"BLASTBOX_NODE_ENGINE_{up}_WEIGHT", 1.0))))
         balancing = _bool("BLASTBOX_NODE_BALANCING", False)
+        # Clamp the budget knobs — these are footguns: headroom is a FRACTION (0,1], so a
+        # bare "80" meaning 80% would give an 80× budget → OOM; a non-positive interval is
+        # a busy-loop; a staleness window shorter than the publish interval ages peers out
+        # every tick → each engine sees only itself → N-way oversubscription.
+        interval_s = max(0.5, _float("BLASTBOX_NODE_INTERVAL_S", 5.0))
+        stale_after_s = max(_float("BLASTBOX_NODE_STALE_AFTER_S", 20.0), interval_s * 2.0)
         return cls(
             engines=tuple(engines),
             # balancing implies resource_management (you can't rebalance a budget you
             # don't enforce), so enabling balancing turns budget enforcement on too.
             resource_management=_bool("BLASTBOX_NODE_RESOURCE_MANAGEMENT", False) or balancing,
             balancing=balancing,
-            ram_headroom_frac=_float("BLASTBOX_NODE_RAM_HEADROOM", 0.8),
-            vcpu_oversubscription=_float("BLASTBOX_NODE_VCPU_OVERSUBSCRIPTION", 2.0),
+            ram_headroom_frac=_clamp(_float("BLASTBOX_NODE_RAM_HEADROOM", 0.8), 0.05, 1.0),
+            vcpu_oversubscription=_clamp(_float("BLASTBOX_NODE_VCPU_OVERSUBSCRIPTION", 2.0), 0.5, 64.0),
             adaptive=_bool("BLASTBOX_NODE_ADAPTIVE", False),
-            min_free_mib=_float("BLASTBOX_NODE_MIN_FREE_MIB", 2048.0),
-            interval_s=_float("BLASTBOX_NODE_INTERVAL_S", 5.0),
+            min_free_mib=max(0.0, _float("BLASTBOX_NODE_MIN_FREE_MIB", 2048.0)),
+            interval_s=interval_s,
             share_dir=os.environ.get("BLASTBOX_NODE_SHARE_DIR", "/var/lib/blastbox/node").strip()
             or "/var/lib/blastbox/node",
-            stale_after_s=_float("BLASTBOX_NODE_STALE_AFTER_S", 20.0),
+            stale_after_s=stale_after_s,
         )

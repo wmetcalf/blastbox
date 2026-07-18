@@ -29,7 +29,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 from .pool_config import RUNTIME_FIRECRACKER, RUNTIME_GVISOR
 
@@ -168,17 +168,25 @@ def _mem_available_mib() -> Optional[float]:
     return None
 
 
-def local_backlog_fn(job_store: object, engine: Optional[str] = None) -> Callable[[str], int]:
-    """This engine's QUEUED backlog from the dispatcher's store. Scoped to `engine` so a
-    SHARED multi-engine store (blastbox supports one store across engines) reports only
-    THIS engine's queue — without the scope every dispatcher would publish the node-wide
-    backlog as its own and balancing would split the budget evenly instead of by real
-    demand. With a per-engine store the scope is a harmless no-op."""
+def local_backlog_fn(job_store: object,
+                     engine: "str | Iterable[str] | None" = None) -> Callable[[str], int]:
+    """QUEUED backlog from the dispatcher's store, scoped to the engine(s) this dispatcher
+    serves. Scoping matters on a SHARED multi-engine store (blastbox supports one store
+    across engines): without it every dispatcher reports the node-wide queue and balancing
+    splits evenly instead of by real demand. A dispatcher serving SEVERAL engines on one
+    pool sums their queues (the pool's total demand). None → whole store."""
     from .jobs.base import JobStatus
+
+    engines: Optional[list[str]] = None
+    if engine is not None:
+        engines = [engine] if isinstance(engine, str) else [e for e in engine if e]
 
     def _fn(_engine: str = "") -> int:
         try:
-            return int(job_store.count(JobStatus.QUEUED, engine=engine))  # type: ignore[attr-defined]
+            if engines is None:
+                return int(job_store.count(JobStatus.QUEUED))  # type: ignore[attr-defined]
+            return sum(int(job_store.count(JobStatus.QUEUED, engine=e))  # type: ignore[attr-defined,misc]
+                       for e in engines)
         except Exception:
             return 0
     return _fn

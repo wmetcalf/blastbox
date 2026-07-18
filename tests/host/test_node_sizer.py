@@ -90,3 +90,34 @@ def test_node_capacity_reads_real_node():
     # reads /proc/meminfo + cpu_count on this host; headroom + oversubscription applied
     b = node_capacity(ram_headroom_frac=0.5, vcpu_oversubscription=1.0)
     assert b.ram_mib > 0 and b.vcpus >= 1
+
+
+# --- round-4: config clamping + optional url ---
+
+def test_from_env_clamps_footgun_config(monkeypatch):
+    from blastbox.host.node_config import NodeConfig
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip,red")   # url optional (bare names)
+    monkeypatch.setenv("BLASTBOX_NODE_BALANCING", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_RAM_HEADROOM", "80")    # meant 80% → clamp to 1.0
+    monkeypatch.setenv("BLASTBOX_NODE_INTERVAL_S", "0")       # busy-loop → floor
+    monkeypatch.setenv("BLASTBOX_NODE_STALE_AFTER_S", "1")    # < interval → raise to 2×
+    monkeypatch.setenv("BLASTBOX_NODE_VCPU_OVERSUBSCRIPTION", "999")
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_CLIP_RAM_MIB", "0")  # 0-RAM footgun → clamp
+    c = NodeConfig.from_env()
+    assert {e.name for e in c.engines} == {"clip", "red"}     # bare names parsed (url optional)
+    assert c.ram_headroom_frac == 1.0
+    assert c.interval_s >= 0.5
+    assert c.stale_after_s >= c.interval_s * 2
+    assert c.vcpu_oversubscription <= 64.0
+    assert next(e for e in c.engines if e.name == "clip").slot_ram_mib >= 1.0
+
+
+def test_local_backlog_sums_across_served_engines():
+    from blastbox.host.jobs.base import Job
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    from blastbox.host.node_sizer import local_backlog_fn
+    s = InMemoryJobStore()
+    for e in ("clip", "clip", "red"):
+        s.create(Job.new(engine=e, filename="x"))
+    assert local_backlog_fn(s, ["clip", "red"])() == 3       # multi-engine dispatcher: total
+    assert local_backlog_fn(s, "clip")() == 2
