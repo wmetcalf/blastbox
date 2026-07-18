@@ -251,9 +251,16 @@ class JobStore(Protocol):
         ...
 
     def count(self, status: JobStatus | None = None, *, q: str | None = None,
-              engine: str | None = None) -> int:
+              engine: str | None = None, claimant_tier: str | None = None) -> int:
         """Total number of jobs (optionally filtered by ``status`` + filename ``q`` +
         ``engine`` — the last scopes a SHARED multi-engine store to one engine's queue).
+
+        ``claimant_tier`` mirrors ``claim_next``'s tier routing so a caller can count only
+        the jobs THIS claimant could actually claim: when set, restrict to jobs whose
+        ``target_tier`` is unset OR equals ``claimant_tier`` (used by the node sizer so a
+        warm dispatcher doesn't size its pool for jobs pinned to another tier it can never
+        drain). NOTE the default differs from ``claim_next``: ``claimant_tier=None`` here
+        means "count ALL tiers" (the listing endpoint's total), NOT "untargeted only".
 
         Paired with ``list(..., limit=, offset=)`` so the listing endpoint can
         report ``total`` without materializing every row.

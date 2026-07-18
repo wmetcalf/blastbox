@@ -466,12 +466,15 @@ class SqlJobStore:
         return [job for row in rows if (job := self._row_to_job(row)) is not None]
 
     def count(self, status: JobStatus | None = None, *, q: str | None = None,
-              engine: str | None = None) -> int:
+              engine: str | None = None, claimant_tier: str | None = None) -> int:
         sql = "SELECT COUNT(*) FROM jobs"
         where, params = self._where_status_q(status, q)
         if engine is not None:
             where.append(f"engine = {self._param}")
             params.append(engine)
+        if claimant_tier is not None:      # mirror claim_next's tier predicate
+            where.append(f"(target_tier IS NULL OR target_tier = {self._param})")
+            params.append(claimant_tier)
         if where:
             sql += " WHERE " + " AND ".join(where)
         with self._lock, self._connect() as conn:

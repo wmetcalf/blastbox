@@ -167,3 +167,28 @@ def test_local_backlog_sums_across_served_engines():
         s.create(Job.new(engine=e, filename="x"))
     assert local_backlog_fn(s, ["clip", "red"])() == 3       # multi-engine dispatcher: total
     assert local_backlog_fn(s, "clip")() == 2
+
+
+def test_local_backlog_scopes_to_claimable_tier():
+    # regression (PR #60 review): a tiered dispatcher must count only jobs it can CLAIM —
+    # target_tier routing means a job pinned to another tier is undrainable here, so sizing
+    # the pool for it would steal node budget. Mirrors claim_next(claimant_tier=).
+    from blastbox.host.jobs.base import Job, JobStatus
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    from blastbox.host.node_sizer import local_backlog_fn
+    s = InMemoryJobStore()
+
+    def _job(fn, tier=None):
+        j = Job.new(engine="clip", filename=fn)
+        j.target_tier = tier
+        return j
+
+    s.create(_job("a"))                        # untargeted
+    s.create(_job("b", "firecracker"))
+    s.create(_job("c", "cold"))                # not claimable by a firecracker dispatcher
+    # a firecracker sizer counts the untargeted + fc-pinned (2), NOT the cold-pinned one
+    assert local_backlog_fn(s, "clip", claimant_tier="firecracker")() == 2
+    assert local_backlog_fn(s, "clip", claimant_tier="cold")() == 2       # untargeted + cold
+    assert local_backlog_fn(s, "clip")() == 3                            # no tier filter = all
+    # count() mirrors claim_next's predicate directly
+    assert s.count(JobStatus.QUEUED, engine="clip", claimant_tier="firecracker") == 2

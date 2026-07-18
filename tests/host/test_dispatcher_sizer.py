@@ -225,6 +225,51 @@ def test_default_node_lets_containers_coordinate(tmp_path, monkeypatch):
     assert mine.concurrent_ceiling < 10       # shares the node with red — NOT isolated to itself
 
 
+def test_node_namespaced_files_dont_collide_across_hosts(tmp_path):
+    # regression (PR #60 review): with BLASTBOX_NODE_ID set to isolate an accidentally
+    # shared dir, two hosts running the SAME engine must not collide on <engine>.json —
+    # the file is namespaced <engine>@<node>.json so each host keeps its own snapshot.
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("clip", 3, 0, 1024, 1, 0, 64, 1.0, ts=1.0, node="hostA"))
+    share.publish(DemandSnapshot("clip", 9, 0, 1024, 1, 0, 64, 1.0, ts=1.0, node="hostB"))
+    names = sorted(p.name for p in tmp_path.glob("*.json"))
+    assert names == ["clip@hostA.json", "clip@hostB.json"]     # no collision
+    seen = {(s.node, s.backlog) for s in share.read_all(max_age_s=60, now=1.0)}
+    assert seen == {("hostA", 3), ("hostB", 9)}                # both survive
+
+
+def test_default_node_keeps_plain_filename(tmp_path):
+    # backcompat: node="" (the common single-host case) still writes <engine>.json.
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("clip", 2, 0, 1024, 1, 0, 64, 1.0, ts=1.0))
+    assert [p.name for p in tmp_path.glob("*.json")] == ["clip.json"]
+    assert [s.engine for s in share.read_all(max_age_s=60, now=1.0)] == ["clip"]
+
+
+def test_read_all_rejects_far_future_snapshot(tmp_path):
+    # regression (PR #60 review): a snapshot dated far in the future (bad clock / stale
+    # file) must not read as fresh forever — its negative age would keep a stopped engine
+    # consuming node budget. Bound the age one staleness window on BOTH sides.
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("red", 5, 0, 1024, 1, 0, 64, 1.0, ts=10_000.0))  # 9000s ahead
+    assert share.read_all(max_age_s=60, now=1000.0) == []          # rejected as future
+    # a modest skew within the window is still tolerated
+    share.publish(DemandSnapshot("red", 5, 0, 1024, 1, 0, 64, 1.0, ts=1030.0))    # 30s ahead
+    assert [s.engine for s in share.read_all(max_age_s=60, now=1000.0)] == ["red"]
+
+
+def test_node_filename_mismatch_is_rejected(tmp_path):
+    # anti-impersonation: a file named clip@hostA.json whose snapshot claims node=hostB
+    # must be dropped (the filename node and the self-declared node must agree).
+    import json as _json
+    share = FileNodeShare(str(tmp_path))
+    (tmp_path / "clip@hostA.json").write_text(_json.dumps({
+        "engine": "clip", "backlog": 1, "assigned": 0, "slot_ram_mib": 1024,
+        "slot_vcpus": 1, "min_warm": 0, "max_ceiling": 64, "weight": 1.0,
+        "ts": 1.0, "node": "hostB"}))       # filename says hostA, payload says hostB
+    assert share.read_all(max_age_s=60, now=1.0) == []
+
+
 def test_read_all_tolerates_unknown_future_fields(tmp_path):
     # regression (PR #60 review): a NEWER peer that adds a DemandSnapshot field must not
     # make an OLDER reader drop its snapshot (TypeError → silent eviction → oversubscription

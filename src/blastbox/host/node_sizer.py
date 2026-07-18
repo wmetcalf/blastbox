@@ -174,12 +174,18 @@ def _mem_available_mib() -> Optional[float]:
 
 
 def local_backlog_fn(job_store: object,
-                     engine: "str | Iterable[str] | None" = None) -> Callable[[str], int]:
+                     engine: "str | Iterable[str] | None" = None,
+                     claimant_tier: "str | None" = None) -> Callable[[str], int]:
     """QUEUED backlog from the dispatcher's store, scoped to the engine(s) this dispatcher
     serves. Scoping matters on a SHARED multi-engine store (blastbox supports one store
     across engines): without it every dispatcher reports the node-wide queue and balancing
     splits evenly instead of by real demand. A dispatcher serving SEVERAL engines on one
-    pool sums their queues (the pool's total demand). None → whole store."""
+    pool sums their queues (the pool's total demand). None → whole store.
+
+    ``claimant_tier`` scopes the count to jobs THIS dispatcher can actually claim (same
+    ``target_tier`` routing as ``claim_next``): a warm/gvisor sizer must not grow its pool
+    for jobs pinned to another tier (e.g. ``cold``) that it can never drain and that would
+    steal node budget from peers with claimable work. None → count all tiers."""
     from .jobs.base import JobStatus
 
     engines: Optional[list[str]] = None
@@ -189,8 +195,10 @@ def local_backlog_fn(job_store: object,
     def _fn(_engine: str = "") -> int:
         try:
             if engines is None:
-                return int(job_store.count(JobStatus.QUEUED))  # type: ignore[attr-defined]
-            return sum(int(job_store.count(JobStatus.QUEUED, engine=e))  # type: ignore[attr-defined,misc]
+                return int(job_store.count(JobStatus.QUEUED,  # type: ignore[attr-defined]
+                                           claimant_tier=claimant_tier))
+            return sum(int(job_store.count(JobStatus.QUEUED, engine=e,  # type: ignore[attr-defined,misc]
+                                           claimant_tier=claimant_tier))
                        for e in engines)
         except Exception:
             return 0

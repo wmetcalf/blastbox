@@ -45,14 +45,27 @@ class NodeShare(Protocol):
 
 
 class FileNodeShare:
-    """Directory-backed share. Each engine owns `<dir>/<engine>.json`."""
+    """Directory-backed share. Each engine owns `<dir>/<engine>.json`, or
+    `<dir>/<engine>@<node>.json` when a node id is set (so two hosts sharing the dir
+    don't collide)."""
 
     def __init__(self, directory: str) -> None:
         self._dir = Path(directory)
         self._dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _filename(engine: str, node: str) -> str:
+        # Namespace the file by node WHEN SET so two HOSTS that accidentally share the dir
+        # (NFS/PV) don't both write `<engine>.json` — the node FIELD isolates the data, but
+        # if the FILE collides last-writer-wins destroys a host's own snapshot (it then
+        # reads back a foreign node, filters itself out, and sizes from an empty view →
+        # oversubscription). This is exactly the case BLASTBOX_NODE_ID exists to defend, so
+        # it must change the path too. Default node="" keeps the plain `<engine>.json`.
+        # `@` can't appear in an engine slug or a DNS hostname, so the split is unambiguous.
+        return f"{engine}.json" if not node else f"{engine}@{node}.json"
+
     def publish(self, snap: DemandSnapshot) -> None:
-        path = self._dir / f"{snap.engine}.json"
+        path = self._dir / self._filename(snap.engine, snap.node)
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(asdict(snap)))
         tmp.replace(path)                       # atomic swap; readers never see a partial file
@@ -71,10 +84,19 @@ class FileNodeShare:
                 # `node` already has.) A non-dict payload makes .items() raise → skipped.
                 snap = DemandSnapshot(**{k: v for k, v in data.items()
                                          if k in DemandSnapshot.__dataclass_fields__})
+                # filename is `<engine>` or `<engine>@<node>`; BOTH parts must match the
+                # snapshot's self-declared engine/node — anti-impersonation across a shared
+                # dir (a file can't claim another engine, or another host's identity).
+                eng_part, _, node_part = f.stem.partition("@")
                 # validate INSIDE the try: an untyped dataclass accepts wrong-typed fields
                 # (e.g. slot_ram_mib=null), so `_valid`'s comparisons can raise TypeError —
                 # that must skip the poisoned file, not propagate out and kill the sizer.
-                ok = _valid(snap, f.stem) and (now - snap.ts) <= max_age_s
+                # Age bounded BOTH ways: reject a snapshot more than one staleness window in
+                # the FUTURE (bad clock / far-future stale file) — otherwise its negative age
+                # reads as fresh forever and a stopped engine keeps consuming node budget.
+                ok = (_valid(snap, eng_part)
+                      and snap.node == node_part
+                      and -max_age_s <= (now - snap.ts) <= max_age_s)
             except Exception:
                 continue                        # torn / foreign / type-poisoned → doesn't contribute
             if ok:

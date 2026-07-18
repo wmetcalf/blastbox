@@ -208,7 +208,10 @@ def _start_node_sizer(pool, engines, store, tier):
         # the SlotRuntime object, so gating uses this string.
         DispatcherSizer(spec, pool, FileNodeShare(node_cfg.share_dir), node_cfg,
                         runtime=tier,
-                        backlog_fn=local_backlog_fn(store, served)).start_thread(sizer_stop)
+                        # scope backlog to jobs THIS tier can claim (target_tier routing) so
+                        # the pool isn't sized for work pinned to a tier it can never drain.
+                        backlog_fn=local_backlog_fn(store, served, claimant_tier=tier),
+                        ).start_thread(sizer_stop)
         print(f"node self-sizer: managing {spec.name!r} warm pool (backlog over {served}) "
               f"from {node_cfg.share_dir} "
               f"({'balancing' if node_cfg.balancing else 'static shares'})", file=sys.stderr)
