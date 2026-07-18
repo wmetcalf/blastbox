@@ -24,3 +24,6 @@ deploy/firecracker/clippyshot_engine.py
 /AGENTS.md
 /docs/specs/2026-06-08-contract-extensible-fields-design.md
 /docs/specs/2026-06-08-detections-and-fleet-roadmap.md
+
+# marla-singer review scratch (adversarial review harness)
+.marla-mechanical.json
