@@ -161,7 +161,10 @@ class DispatcherSizer:
         # tick's backlog so peers keep seeing us alive even when THIS count — a huge shared-
         # store scan — runs long; otherwise they age us out mid-count and reallocate our share
         # → oversubscription. (For a count longer than the staleness window, also raise
-        # BLASTBOX_NODE_STALE_AFTER_S; see docs.)
+        # BLASTBOX_NODE_STALE_AFTER_S; see docs.) FENCED on stop like the update below, so a
+        # shutdown that already removed our file isn't followed by a heartbeat republish.
+        if self._stop_event is not None and self._stop_event.is_set():
+            return None
         self._share.publish(_snapshot(self._last_backlog, started))
         backlog = max(0, int(self._backlog_fn()))                    # the possibly-slow count
         self._last_backlog = backlog

@@ -180,11 +180,15 @@ class SqlJobStore:
             if self._driver == "postgres":
                 conn.execute(page_hashes_sql)
             self._ensure_columns(conn)
-        # Best-effort page_hashes indexes run AFTER the table-creation
-        # transaction commits, each in its OWN transaction. On Postgres a failed
-        # statement (a CREATE INDEX lock/permission error) aborts the WHOLE
-        # transaction, so creating them inline would risk rolling back the
-        # page_hashes table itself. Also caches bktree availability (static).
+        # Best-effort indexes run AFTER the table-creation transaction commits, each in its
+        # OWN transaction. On Postgres a failed statement (a CREATE INDEX lock/permission
+        # error) aborts the WHOLE transaction, so creating them inline would risk rolling back
+        # the tables. Covering index for the hot claim + autosizer-backlog predicates
+        # (status, engine, target_tier) — without it the node sizer's per-tick COUNT(*) is a
+        # full-table scan on a large retained history. Runs on both backends.
+        self._try_ddl(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_status_engine_tier "
+            "ON jobs (status, engine, target_tier)")
         if self._driver == "postgres":
             self._ensure_page_hash_indexes()
 

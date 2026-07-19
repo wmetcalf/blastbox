@@ -175,6 +175,20 @@ def _parse_engine_specs(engines_raw: str) -> dict:
     return engines
 
 
+def _node_manages_tier(tier: str) -> bool:
+    """True if the node autosizer is enabled AND it manages this dispatcher's runtime tier
+    (firecracker/gvisor). Fully guarded — a bad BLASTBOX_NODE_* config never crashes dispatch,
+    it just reports 'not managed'. Used to make the node budget a HARD cap at startup:
+    force warm_only (no uncounted cold spill) and start the pool unspawned until the sizer's
+    first allocation (no legacy over-spawn)."""
+    try:
+        from blastbox.host.node_config import NodeConfig
+        from blastbox.host.node_sizer import manages
+        return NodeConfig.from_env().active and manages(tier)
+    except Exception:
+        return False
+
+
 def _start_node_sizer(pool, engines, store, tier):
     """Start the opt-in node self-sizer for this dispatcher's warm pool, or return None.
 
@@ -201,10 +215,22 @@ def _start_node_sizer(pool, engines, store, tier):
         # footprint across the served engines — a slot must fit the biggest of them; using
         # the first/smallest would under-count RAM/vCPU and let the ceiling oversubscribe.
         served = list(engines) if engines else [e for e in [os.environ.get("BLASTBOX_ENGINE", "")] if e]
+        declared = {e.name for e in node_cfg.engines}
         mine = [e for e in node_cfg.engines if e.name in served]
         if not mine:
             print(f"node self-sizer: none of this dispatcher's engines {served} are in "
                   f"BLASTBOX_NODE_ENGINES — not sizing (declare one to enable).", file=sys.stderr)
+            return None
+        missing = [s for s in served if s not in declared]
+        if missing:
+            # The pool serves ALL of `served`, but the footprint/ceiling are derived only from
+            # the DECLARED subset. Sizing on a partial inventory would under-count RAM/vCPU (an
+            # omitted engine's slots are invisible) and oversubscribe. Fail closed: require the
+            # whole pool declared, or don't size (the pool keeps its static config, no worse
+            # than pre-autosizer).
+            print(f"node self-sizer: served engines {sorted(missing)} are missing from "
+                  f"BLASTBOX_NODE_ENGINES — not sizing (declare EVERY served engine so the "
+                  f"pool footprint is complete).", file=sys.stderr)
             return None
         base = mine[0]
         spec = replace(  # type: ignore[call-arg]
@@ -235,6 +261,16 @@ def _start_node_sizer(pool, engines, store, tier):
         print(f"node self-sizer: managing {spec.name!r} warm pool (backlog over {served}) "
               f"from {node_cfg.share_dir} "
               f"({'balancing' if node_cfg.balancing else 'static shares'})", file=sys.stderr)
+        # ONE synchronous sizing before the periodic thread + before dispatch serves: the pool
+        # was started unspawned (warm=0), so this sizes it from the node budget now, closing
+        # the startup window where it would otherwise run at its legacy target until the first
+        # background tick. Guarded — a first-tick hiccup must not disable sizing.
+        try:
+            sizer.tick()
+        except Exception:
+            logging.getLogger("blastbox.node_sizer").warning(
+                "node self-sizer: first sizing tick failed (background loop will retry)",
+                exc_info=True)
         thread = sizer.start_thread(sizer_stop)
         # Return the thread + sizer so the caller can JOIN on shutdown (else the daemon is torn
         # down without its finally, which removes this unit's snapshot → phantom pool on
@@ -289,6 +325,16 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
 
     warm_only = (os.environ.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower()
                  in ("1", "true", "yes", "on"))
+    # When the node autosizer manages this pool, the node RAM/vCPU budget is meant to be a
+    # HARD cap — but cold fallback runs OUTSIDE the warm pool and its RAM isn't counted, so
+    # excess concurrency spilling to cold would silently exceed the budget. Force warm_only so
+    # the managed ceiling is authoritative (excess load queues for a warm slot instead of
+    # cold-bursting past the budget). Enforced, not left to the operator.
+    node_managed = _node_manages_tier(tier)
+    if node_managed and not warm_only:
+        warm_only = True
+        print("node self-sizer: resource management on → forcing warm_only so the managed "
+              "node budget is a hard cap (no uncounted cold fallback).", file=sys.stderr)
 
     # Fail-closed BEFORE pool.start(): refuse to run an engine on ANY tier this dispatcher can execute
     # it on — the advertised tier PLUS the cold-fallback/egress-bypass ("cold") and cascade overflow
@@ -341,6 +387,17 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         return 0
 
     if pool is not None:
+        if node_managed:
+            # Start UNSPAWNED under the node autosizer: shrink to warm=0/ceiling=1 before
+            # start(), so the pool doesn't warm its legacy BLASTBOX_POOL_WARM_SIZE (which,
+            # summed across engines at a full/rolling startup, can exceed the node budget)
+            # before the sizer's first allocation. The synchronous first tick in
+            # _start_node_sizer then sizes it from the node budget before serving begins.
+            try:
+                pool.resize(warm_size=0, concurrent_ceiling=1)  # type: ignore[attr-defined]
+            except Exception:
+                logging.getLogger("blastbox.host.cli").warning(
+                    "node self-sizer: could not pre-shrink pool before start", exc_info=True)
         pool.start()   # file-handshake warm path: start after tier-identity validation
     dispatcher = Dispatcher(
         job_store=store,

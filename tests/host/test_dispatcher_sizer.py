@@ -341,6 +341,52 @@ def test_multi_engine_weight_clamped_to_valid_cap(tmp_path, monkeypatch):
         sizer.remove_own_snapshot()
 
 
+def test_node_manages_tier_gating(monkeypatch):
+    # PR #60 r13: _node_manages_tier drives the hard-cap startup wiring (force warm_only,
+    # start unspawned). True only when RM is on AND the tier is node-managed (fc/gvisor).
+    from blastbox.host.cli import _node_manages_tier
+    monkeypatch.delenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", raising=False)
+    monkeypatch.delenv("BLASTBOX_NODE_BALANCING", raising=False)
+    assert not _node_manages_tier("firecracker")          # RM off → not managed
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    assert _node_manages_tier("firecracker") and _node_manages_tier("gvisor")
+    assert not _node_manages_tier("cold")                 # RM on but cold isn't node-managed
+    assert not _node_manages_tier("aws-ec2")
+
+
+def test_start_node_sizer_skips_on_incomplete_inventory(tmp_path, monkeypatch):
+    # PR #60 r13 (SF7Lh): a dispatcher serving engines not all in BLASTBOX_NODE_ENGINES must
+    # NOT size — the pool footprint would be derived from a partial inventory → under-count.
+    from blastbox.host.cli import _start_node_sizer
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")   # only clip declared
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
+    res = _start_node_sizer(_Pool(), ["clip", "red"], InMemoryJobStore(), "firecracker")
+    assert res is None                                    # red undeclared → fail closed
+
+
+def test_start_node_sizer_sizes_pool_synchronously(tmp_path, monkeypatch):
+    # PR #60 r13 (SDoR-): the sizer does one synchronous tick before the background thread, so
+    # a pool started unspawned is sized from the node budget before dispatch serves.
+    from blastbox.host.cli import _start_node_sizer
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
+    pool = _Pool()
+    res = _start_node_sizer(pool, ["clip"], InMemoryJobStore(), "firecracker")
+    assert res is not None
+    stop, thread, sizer = res
+    try:
+        assert pool.concurrent_ceiling >= 1              # sized by the synchronous first tick
+    finally:
+        stop.set()
+        thread.join(2.0)
+        sizer.remove_own_snapshot()
+
+
 def test_multi_engine_pool_uses_max_footprint(tmp_path, monkeypatch):
     # PR #60 r12: a dispatcher serving several engines with DIFFERENT slot footprints sizes
     # one shared pool — it must use the CONSERVATIVE (max) footprint across them, or the

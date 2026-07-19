@@ -113,6 +113,15 @@ today unless a switch below is on. Each dispatcher publishes a demand snapshot t
 node dir and reads its peers', then runs the same deterministic allocation over the whole-node
 view and resizes its own pool. See `src/blastbox/host/node_sizer.py`.
 
+**Hard-cap enforcement.** When the autosizer manages a pool (`RESOURCE_MANAGEMENT`/`BALANCING`
+on, firecracker/gvisor tier), the node budget is enforced as a HARD cap: the dispatcher is
+forced to `warm_only` (excess load queues for a warm slot rather than spilling to the
+uncounted cold-detonation path and exceeding the budget), and the pool starts **unspawned**
+(`warm=0`) and is sized synchronously from the node budget before it serves — so a full or
+rolling startup can't transiently over-spawn past the budget. For a SQL job store, an index on
+`jobs(status, engine, target_tier)` is created so the per-tick backlog counts stay cheap on a
+large retained history.
+
 | Var | Default | Notes |
 |---|---|---|
 | `BLASTBOX_NODE_RESOURCE_MANAGEMENT` | `0` | Enforce the node RAM/vCPU budget: cap total slots so engines can't oversubscribe the host. With balancing off, each engine gets a static, weight-proportional share. |
