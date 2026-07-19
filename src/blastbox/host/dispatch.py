@@ -56,6 +56,7 @@ from blastbox.observability.metrics import (
 from blastbox.worker.warm import HostWarmControl, WarmJobSpec
 
 if TYPE_CHECKING:
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
     from blastbox.host.pool import Slot, WarmPool
 
 
@@ -260,7 +261,12 @@ class Dispatcher:
         requeue_grace_s: float = 60.0,
         warm_only: bool = False,
         warm_requeue_backoff_s: float = 1.0,
+        concurrency_gate: "DynamicConcurrencyGate | None" = None,
     ) -> None:
+        # Optional live concurrency cap driven by the node autosizer: workers hold a permit
+        # while processing a job so CONCURRENT detonations (warm+cold) never exceed the sizer's
+        # current ceiling → the node RAM budget is a hard cap even over the cold path.
+        self._concurrency_gate = concurrency_gate
         self._job_store = job_store
         # engines is kept as an immutable mapping snapshot so callers cannot
         # mutate it after construction.
@@ -460,13 +466,23 @@ class Dispatcher:
         def _should_stop() -> bool:
             return stop_evt.is_set() or (stop is not None and stop())
 
+        gate = self._concurrency_gate
+
         def _worker() -> None:
             while not _should_stop():
+                # Hold a permit for the whole claim+dispatch so CONCURRENT jobs (warm or cold)
+                # never exceed the sizer's live ceiling. A timed acquire keeps shutdown
+                # responsive; if the limit is currently full we just re-check stop and retry.
+                if gate is not None and not gate.acquire(timeout=poll_interval_s):
+                    continue
                 try:
                     progressed = self.dispatch_once()
                 except Exception:  # noqa: BLE001
                     _log.exception("dispatch_once failed; continuing")
                     progressed = False
+                finally:
+                    if gate is not None:
+                        gate.release()
                 if not progressed:
                     time.sleep(poll_interval_s)
 

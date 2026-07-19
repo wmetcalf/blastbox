@@ -65,9 +65,13 @@ class DispatcherSizer:
         capacity_fn: Callable[[float, float], NodeBudget] = node_capacity,
         avail_fn: Callable[[], Optional[float]] = _mem_available_mib,
         clock: Callable[[], float] = time.time,
+        concurrency_gate: object = None,      # DynamicConcurrencyGate; its live limit tracks
+                                              # the pool ceiling so CONCURRENT jobs (warm+cold)
+                                              # never exceed the budget-allocated ceiling.
     ) -> None:
         self._engine = engine
         self._pool = pool
+        self._gate = concurrency_gate
         self._share = share
         self._config = config
         self._runtime = (runtime or "").strip().lower()
@@ -235,6 +239,11 @@ class DispatcherSizer:
             mine = PoolSize(warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)
             self._pool.resize(  # type: ignore[attr-defined]
                 warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)
+            # Drive the dispatcher's live concurrency to the same ceiling, so CONCURRENT jobs
+            # (warm AND cold-fallback) are bounded by the budget-allocated ceiling — the node
+            # RAM cap holds even over the cold path, which the warm pool alone can't bound.
+            if self._gate is not None:
+                self._gate.set_limit(mine.concurrent_ceiling)  # type: ignore[attr-defined]
         return mine
 
     def remove_own_snapshot(self) -> None:

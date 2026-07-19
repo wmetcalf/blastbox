@@ -235,6 +235,25 @@ def test_same_engine_two_tiers_on_one_node_are_distinct_pools(tmp_path):
     assert m_fc.concurrent_ceiling >= 1 and m_gv.concurrent_ceiling >= 1
 
 
+def test_sizer_drives_concurrency_gate_to_ceiling(tmp_path):
+    # PR #60 r14: the sizer drives the dispatcher's live concurrency gate to the pool's
+    # budget-allocated ceiling on each resize — so CONCURRENT jobs (warm AND cold) are bounded
+    # by the ceiling, making the node budget a hard cap that also covers cold fallback.
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+    share = FileNodeShare(str(tmp_path))
+    gate = DynamicConcurrencyGate(64)
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    pool = _Pool()
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=6), pool, share,
+                         cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 20, node="n",
+                         instance="i", capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0,
+                         concurrency_gate=gate)
+    mine = ds.tick()
+    assert gate.limit == mine.concurrent_ceiling      # gate tracks the pool ceiling
+    assert gate.limit == pool.concurrent_ceiling
+
+
 def test_overlapping_replicas_split_budget_not_double(tmp_path):
     # regression (PR #60 review): two replicas of the SAME engine/tier/node — a rolling
     # deploy's brief overlap — must be two distinct pools that SHARE the budget, not collide

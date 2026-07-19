@@ -189,7 +189,7 @@ def _node_manages_tier(tier: str) -> bool:
         return False
 
 
-def _start_node_sizer(pool, engines, store, tier, concurrency=1):
+def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gate=None):
     """Start the opt-in node self-sizer for this dispatcher's warm pool, or return None.
 
     Fully guarded (`except Exception`): a bad BLASTBOX_NODE_* config, an unwritable
@@ -258,6 +258,7 @@ def _start_node_sizer(pool, engines, store, tier, concurrency=1):
             # scope backlog to jobs THIS tier can claim (target_tier routing) so
             # the pool isn't sized for work pinned to a tier it can never drain.
             backlog_fn=local_backlog_fn(store, served, claimant_tier=tier),
+            concurrency_gate=concurrency_gate,   # sizer drives its live limit on each resize
         )
         # Print the status FIRST, then start the thread LAST — otherwise if this print raises
         # (broken pipe / closed stderr) the except below returns None while the thread is
@@ -335,6 +336,12 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     # the operator's Σ(concurrency·footprint) ≤ budget. (A fully dynamic sizer→concurrency
     # control is a tracked follow-on.)
     dispatch_concurrency = int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1")
+    # When node-managed, a live concurrency gate makes the node budget a HARD cap that also
+    # covers cold fallback: dispatch workers hold a permit per in-flight job, and the sizer
+    # drives the gate limit to the pool's budget-allocated ceiling on every resize. Off (None)
+    # when unmanaged — no behavior change.
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+    concurrency_gate = DynamicConcurrencyGate(dispatch_concurrency) if node_managed else None
 
     # Fail-closed BEFORE pool.start(): refuse to run an engine on ANY tier this dispatcher can execute
     # it on — the advertised tier PLUS the cold-fallback/egress-bypass ("cold") and cascade overflow
@@ -425,13 +432,16 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         # would fail closed here — no docker socket). Inert without a pool. (Parsed above for
         # reachable_tiers; reused here so the gate and the dispatcher agree on cold-fallback.)
         warm_only=warm_only,
+        # live concurrency cap driven by the node autosizer (None when unmanaged) — bounds
+        # CONCURRENT jobs (warm+cold) to the budget-allocated ceiling.
+        concurrency_gate=concurrency_gate,
     )
     # Opt-in node self-sizer started INSIDE the try below, so pool.stop() in the finally
     # always runs — even if sizer setup raises (bad BLASTBOX_NODE_* / unwritable share_dir)
     # or is Ctrl-C'd mid-mkdir. It must never crash core dispatch or leak the warm pool.
     sizer = None
     try:
-        sizer = _start_node_sizer(pool, engines, store, tier, dispatch_concurrency)
+        sizer = _start_node_sizer(pool, engines, store, tier, dispatch_concurrency, concurrency_gate)
         # If we pre-shrank the pool for the autosizer but the sizer did NOT start (incomplete
         # inventory, unwritable share_dir, setup error), nothing will ever size it — restore
         # its configured warm/ceiling so it runs normally (pre-autosizer static behavior)
