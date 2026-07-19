@@ -68,10 +68,13 @@ class DispatcherSizer:
         concurrency_gate: object = None,      # DynamicConcurrencyGate; its live limit tracks
                                               # the pool ceiling so CONCURRENT jobs (warm+cold)
                                               # never exceed the budget-allocated ceiling.
+        cold_slot_ram_mib: float = 0.0,       # cold worker footprint (BLASTBOX_WORKER_MEMORY) in
+                                              # MiB; prices cold permits. 0 = unknown → warm 1:1.
     ) -> None:
         self._engine = engine
         self._pool = pool
         self._gate = concurrency_gate
+        self._cold_slot_ram_mib = max(0.0, float(cold_slot_ram_mib))
         self._share = share
         self._config = config
         self._runtime = (runtime or "").strip().lower()
@@ -106,6 +109,7 @@ class DispatcherSizer:
         self._stop_event: Optional[threading.Event] = None  # set in run(); fences the update-publish
         self._warned_mixed_nodes = False      # one-shot: warn on an inconsistent node-id view
         self._warned_mixed_modes = False      # one-shot: warn on mixed balancing modes on a node
+        self._last_publish_ok = 0.0           # clock of the last successful publish (fail-closed timer)
 
     def _active(self) -> bool:
         cfg = self._config
@@ -185,10 +189,26 @@ class DispatcherSizer:
         #        consume it (the cold gate only bounds OUR cold admission, not the peer). Holding
         #        the reservation at current residency until it actually reaps means we shrink FIRST
         #        and peers grow only as fast as we truly free RAM — no cross-pool oversubscription.
+        # assigned_warm — WARM slots busy now. Drives the WARM target only. Cold work must NOT
+        # inflate this: cold jobs bypass the warm pool, so counting them would warm VMs they can
+        # never use AND shrink the cold headroom to its floor (an egress batch would run serially).
         assigned_warm = int(getattr(self._pool, "assigned_count", 0))      # cheap
-        cold_in_flight = int(getattr(self._gate, "in_flight", 0)) if self._gate is not None else 0
-        resident = int(getattr(self._pool, "slot_count", 0))
-        assigned = max(assigned_warm + cold_in_flight, resident)
+
+        # The PUBLISHED reservation (the pool's ceiling SHARE) is re-sampled FRESH at each publish
+        # (heartbeat AND the post-count update), not captured once at tick start: the backlog count
+        # can be a slow shared-store scan during which the pool grows, and re-publishing a stale
+        # reservation with a fresh ts would let a peer treat the just-grown residency as free.
+        #   footprint = max(warm-assigned, warm residency) + cold in flight, because:
+        #     - resident warm VMs persist until an async reap (resize() only moves setpoints), so
+        #       we must keep reserving them until they actually drain — else a peer grows into the
+        #       "freed" budget while our VMs still hold it;
+        #     - cold workers spawn OUTSIDE the warm pool and COEXIST with warm residency, so they
+        #       ADD to it (a max would understate by min(idle_warm, cold_in_flight)).
+        def _reservation() -> int:
+            aw = int(getattr(self._pool, "assigned_count", 0))
+            res = int(getattr(self._pool, "slot_count", 0))
+            cif = int(getattr(self._gate, "in_flight", 0)) if self._gate is not None else 0
+            return max(aw, res) + cif
 
         # Compute OUR view of the node budget up front so we can PUBLISH it: readers reconcile to
         # one budget (the elementwise MIN across the view), so a dispatcher with a different
@@ -201,7 +221,7 @@ class DispatcherSizer:
         refresh_s = self._config.interval_s + self._last_tick_dur
         def _snapshot(backlog: int, ts: float) -> DemandSnapshot:
             return DemandSnapshot(
-                engine=e.name, backlog=backlog, assigned=assigned,
+                engine=e.name, backlog=backlog, assigned=_reservation(),
                 slot_ram_mib=e.slot_ram_mib, slot_vcpus=e.slot_vcpus,
                 min_warm=e.min_warm, max_ceiling=e.max_ceiling, weight=e.weight, ts=ts,
                 node=self._node, tier=self._runtime, instance=self._instance,
@@ -217,6 +237,7 @@ class DispatcherSizer:
         if self._stop_event is not None and self._stop_event.is_set():
             return None
         self._share.publish(_snapshot(self._last_backlog, started))
+        self._last_publish_ok = started        # peers can see us → clears the fail-closed timer
         backlog = max(0, int(self._backlog_fn()))                    # the possibly-slow count
         self._last_backlog = backlog
         now = self._clock()
@@ -332,14 +353,28 @@ class DispatcherSizer:
             # pool tick — so when a tick LOWERS warm (say 8→1), using the target alone would open
             # ceiling−1 cold permits while 8 VMs are still resident (≈2× the budget). Reserving
             # max(target, resident) holds the cold limit down until the surplus actually drains,
-            # and also reserves for warm that is still SPAWNING UP toward a raised target. Floored
-            # at 1 so cold (egress / warm-miss) never fully starves — a bounded, self-correcting
-            # overshoot, per this module's eventual-consistency note.
+            # and also reserves for warm that is still SPAWNING UP toward a raised target. The gate
+            # floors the limit at 1 (see set_limit) so cold (egress / warm-miss) never fully starves
+            # under sustained warm load — a DELIBERATE liveness choice: for a forensics node an
+            # egress detonation is often the important analysis, so we accept ≤1 unbudgeted cold
+            # worker per warm-saturated engine (a bounded overshoot: Σ ≤ budget + (such engines)).
+            # For a strict hard cap instead, size BLASTBOX_WORKER_MEMORY ≤ the slot RAM, or put a
+            # cgroup memory limit on the engine containers. Only RAM is priced here — cold vCPU
+            # isn't gated (CPU is compressible and the budget already oversubscribes vCPU by design).
             resident = int(getattr(self._pool, "slot_count", warm))
-            cold_headroom = mine.concurrent_ceiling - max(warm, resident)
+            headroom_slots = mine.concurrent_ceiling - max(warm, resident)
             if self._gate is not None:
+                # PRICE cold permits by the COLD worker footprint, which can EXCEED the warm slot's
+                # (BLASTBOX_WORKER_MEMORY defaults to 4g while a warm slot's RAM_MIB defaults to
+                # 2048): the headroom is (headroom_slots × warm-slot RAM); dividing by the cold
+                # worker RAM gives how many cold workers actually FIT. Converting slots→permits 1:1
+                # would let a pool priced for 2g slots admit 4g cold workers = ≈2× its RAM. cold=0
+                # / unknown → fall back to the warm footprint (1:1, prior behaviour).
+                cold_ram = self._cold_slot_ram_mib or e.slot_ram_mib
+                cold_permits = (int(headroom_slots * e.slot_ram_mib / cold_ram)
+                                if cold_ram > 0 else headroom_slots)
                 # set_limit floors at 1, so cold never fully starves even when headroom ≤ 0.
-                self._gate.set_limit(cold_headroom)  # type: ignore[attr-defined]
+                self._gate.set_limit(cold_permits)  # type: ignore[attr-defined]
         return mine
 
     def remove_own_snapshot(self) -> None:
@@ -365,6 +400,8 @@ class DispatcherSizer:
     def run(self, *, stop: Optional[threading.Event] = None, max_ticks: Optional[int] = None,
             sleep: Callable[[float], None] = time.sleep) -> None:
         self._stop_event = stop               # so tick() can fence its update-publish on stop
+        self._last_publish_ok = self._clock()  # grace baseline: assume visible until proven otherwise
+        warned_unpublished = False
         n = 0
         try:
             while not (stop is not None and stop.is_set()):
@@ -374,6 +411,22 @@ class DispatcherSizer:
                     logging.getLogger("blastbox.node_sizer").warning(
                         "node self-sizer tick failed for %s (continuing)", self._engine.name,
                         exc_info=True)
+                # FAIL CLOSED if we can no longer PUBLISH (permission change, broken bind mount,
+                # full disk): once we've been unpublished longer than the staleness window, peers
+                # have expired our snapshot and reallocated our share — yet our pool is still live
+                # and consuming node RAM. Shrink to the floor so we stop oversubscribing. Recovers
+                # automatically: the next successful publish clears the timer and the tick after it
+                # re-sizes from the live view.
+                if self._clock() - self._last_publish_ok > self._config.stale_after_s:
+                    if not warned_unpublished:
+                        warned_unpublished = True
+                        logging.getLogger("blastbox.node_sizer").warning(
+                            "node self-sizer for %s could not publish for > the staleness window — "
+                            "peers have reclaimed our share; shrinking the pool to its floor to "
+                            "avoid oversubscribing until publication recovers.", self._engine.name)
+                    self._size_to_floor()
+                else:
+                    warned_unpublished = False
                 n += 1
                 if max_ticks is not None and n >= max_ticks:
                     return

@@ -257,8 +257,12 @@ class WarmPool:
                or getattr(self._runtime, "cli_timeout_s", None) or 0.0)
         return max(150.0, 2.0 * float(cli) + 30.0)
 
-    def stop(self, stop_timeout_s: float | None = None) -> None:
-        """Stop the background loop and reap ALL slots (no orphans).
+    def stop(self, stop_timeout_s: float | None = None) -> int:
+        """Stop the background loop and reap ALL slots. Returns the number of slots that could
+        NOT be reaped (orphans left tracked as DRAINING because their VM may still be running) —
+        the caller uses this to decide whether to release its node-budget reservation: an orphan
+        still consumes RAM/vCPU, so the reservation must NOT be dropped while orphans remain, or
+        peers would reallocate still-in-use capacity (node oversubscription). 0 = clean shutdown.
 
         Waits (BOUNDED) for the daemon to finish an in-flight tick so its OWN post-spawn reap disposes a
         slot spawned during shutdown: a slow AWS ``run-instances``/``run-microvm`` racing stop() isn't yet
@@ -309,6 +313,11 @@ class WarmPool:
                 if disposed:   # skip-because-another-thread-owns-it (False) -> leave it for that thread
                     with self._lock:
                         self._slots.pop(slot.slot_id, None)
+
+        # Whatever remains in _slots failed to reap (or is owned by another thread mid-dispose) —
+        # a still-live VM the caller must keep reserving for. Return the count.
+        with self._lock:
+            return len(self._slots)
 
     # ------------------------------------------------------------------
     # Public interface

@@ -189,7 +189,24 @@ def _node_manages_tier(tier: str) -> bool:
         return False
 
 
-def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gate=None):
+def _parse_mem_mib(raw: str) -> float:
+    """Parse a docker --memory-style size ("4g", "512m", "2048k", bare "2048"=MiB) to MiB.
+    Returns 0.0 on anything unparseable (caller falls back to the warm-slot footprint)."""
+    s = (raw or "").strip().lower()
+    if not s:
+        return 0.0
+    mult = {"b": 1.0 / (1024 * 1024), "k": 1.0 / 1024, "m": 1.0, "g": 1024.0}
+    unit = s[-1]
+    try:
+        if unit in mult:
+            return max(0.0, float(s[:-1]) * mult[unit])
+        return max(0.0, float(s))          # bare number → MiB (matches our RAM_MIB convention)
+    except ValueError:
+        return 0.0
+
+
+def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gate=None,
+                      cold_slot_ram_mib=0.0):
     """Start the opt-in node self-sizer for this dispatcher's warm pool, or return None.
 
     Fully guarded (`except Exception`): a bad BLASTBOX_NODE_* config, an unwritable
@@ -198,6 +215,7 @@ def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gat
     stops the pool.) Returns the stop Event when started, else None."""
     if pool is None:
         return None
+    sizer = None
     try:
         from blastbox.host.node_config import NodeConfig
 
@@ -261,13 +279,14 @@ def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gat
         sizer_stop = _threading.Event()
         # `tier` is the pool's runtime NAME (firecracker/gvisor/cold) — WarmPool.runtime is
         # the SlotRuntime object, so gating uses this string.
-        sizer = DispatcherSizer(
+        sizer = DispatcherSizer(  # noqa: F841 — bound so the except can clean up its snapshot
             spec, pool, FileNodeShare(node_cfg.share_dir), node_cfg,
             runtime=tier,
             # scope backlog to jobs THIS tier can claim (target_tier routing) so
             # the pool isn't sized for work pinned to a tier it can never drain.
             backlog_fn=local_backlog_fn(store, served, claimant_tier=tier),
             concurrency_gate=concurrency_gate,   # sizer drives its live limit on each resize
+            cold_slot_ram_mib=cold_slot_ram_mib,  # price cold permits by the cold worker footprint
         )
         # Print the status FIRST, then start the thread LAST — otherwise if this print raises
         # (broken pipe / closed stderr) the except below returns None while the thread is
@@ -291,6 +310,13 @@ def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gat
     except Exception:
         logging.getLogger("blastbox.node_sizer").warning(
             "node self-sizer setup failed — continuing without it", exc_info=True)
+        # The synchronous first tick may have already PUBLISHED a snapshot (the heartbeat succeeds
+        # before a later step — the update publish, a read, or start_thread — raises). If we return
+        # None now, the caller restores the pool to its legacy size but the phantom snapshot lingers
+        # advertising ~0 demand, then ages out permanently → peers reclaim this node's share while
+        # the pool runs unmanaged at full size = persistent oversubscription. Remove it on the way out.
+        if sizer is not None:
+            sizer.remove_own_snapshot()
         return None
 
 
@@ -352,6 +378,9 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     # guarantee. Off (None) when unmanaged — no behavior change.
     from blastbox.host.concurrency_gate import DynamicConcurrencyGate
     concurrency_gate = DynamicConcurrencyGate(dispatch_concurrency) if node_managed else None
+    # Cold worker footprint (BLASTBOX_WORKER_MEMORY, docker --memory default "4g"), so the sizer
+    # prices cold permits by REAL cold RAM rather than assuming a cold worker == one warm slot.
+    cold_slot_ram_mib = _parse_mem_mib(os.environ.get("BLASTBOX_WORKER_MEMORY", "") or "4g")
 
     # Fail-closed BEFORE pool.start(): refuse to run an engine on ANY tier this dispatcher can execute
     # it on — the advertised tier PLUS the cold-fallback/egress-bypass ("cold") and cascade overflow
@@ -454,7 +483,8 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     # or is Ctrl-C'd mid-mkdir. It must never crash core dispatch or leak the warm pool.
     sizer = None
     try:
-        sizer = _start_node_sizer(pool, engines, store, tier, dispatch_concurrency, concurrency_gate)
+        sizer = _start_node_sizer(pool, engines, store, tier, dispatch_concurrency,
+                                  concurrency_gate, cold_slot_ram_mib)
         # If we pre-shrank the pool for the autosizer but the sizer did NOT start (incomplete
         # inventory, unwritable share_dir, setup error), nothing will ever size it — restore
         # its configured warm/ceiling so it runs normally (pre-autosizer static behavior)
@@ -478,13 +508,27 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         # a pool.stop() longer than the staleness window would let peers reallocate our share
         # while our slots still hold node RAM. Only after the slots are gone do we stop the
         # sizer and remove the snapshot.
-        if pool is not None:
-            pool.stop()
+        orphans = pool.stop() if pool is not None else 0
+        # Cold workers spawn OUTSIDE the pool, so pool.stop() can't see them; the dispatch loop's
+        # bounded join may have abandoned a hung cold detonation still holding a gate permit.
+        cold_inflight = concurrency_gate.in_flight if concurrency_gate is not None else 0
         if sizer is not None:
             sizer_stop, sizer_thread, sizer_obj = sizer
             sizer_stop.set()
             sizer_thread.join(timeout=5.0)     # sleeps on the event → returns promptly
-            sizer_obj.remove_own_snapshot()    # slots reaped → release the reservation
+            # Release the reservation ONLY when EVERYTHING this node was running is gone — every
+            # warm slot reaped AND no cold worker still in flight. An orphaned warm VM (destroy
+            # failed) or cold container (hung kill past the join deadline) still consumes RAM/vCPU;
+            # removing the snapshot would let peers reallocate that still-used capacity (node
+            # oversubscription). Leave it to age out after the staleness window instead — by when
+            # the orphan's self-terminate TTL should have fired.
+            if orphans == 0 and cold_inflight == 0:
+                sizer_obj.remove_own_snapshot()
+            else:
+                logging.getLogger("blastbox.host.cli").warning(
+                    "node self-sizer: shutdown left %d unreaped warm slot(s) + %d cold worker(s) "
+                    "in flight — keeping the node reservation until it ages out so peers don't "
+                    "reallocate still-used capacity", orphans, cold_inflight)
     return 0
 
 

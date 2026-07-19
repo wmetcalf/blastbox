@@ -1204,6 +1204,25 @@ def test_reap_surplus_noop_until_autosized() -> None:
     pool.stop()
 
 
+def test_stop_returns_orphan_count_for_unreaped_slots() -> None:
+    # regression (PR #60 codex P1): stop() must report slots it could NOT reap (VM may still be
+    # running) so the caller keeps its node-budget reservation for the still-consumed RAM instead
+    # of removing the snapshot and letting peers reallocate it. Clean stop → 0; failed reap → >0.
+    rt = _ReapFailRuntime()
+    pool = WarmPool(runtime=rt, warm_size=3, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    for _ in range(6):
+        pool.tick()
+    assert pool.slot_count == 3
+    orphans = pool.stop()
+    assert orphans == 3                       # every reap raised → all 3 left tracked as orphans
+
+    rt2 = _FakeRuntime()
+    pool2 = WarmPool(runtime=rt2, warm_size=2, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    for _ in range(6):
+        pool2.tick()
+    assert pool2.stop() == 0                   # clean shutdown → no orphans
+
+
 def test_resize_mark_autosized_false_keeps_legacy_behavior() -> None:
     # regression (PR #60 codex P2): resize() normally sets _autosized=True permanently, which
     # turns on eager surplus reaping. The CLI's PROVISIONAL moves — the pre-start shrink and the

@@ -394,6 +394,61 @@ def test_cold_gate_reserves_resident_slots_not_just_target(tmp_path):
     assert gate.limit == 1
 
 
+def test_cold_gate_priced_by_cold_worker_footprint(tmp_path):
+    # PR #60 codex P1: a cold worker (BLASTBOX_WORKER_MEMORY, default 4g) can be bigger than a
+    # warm slot (RAM_MIB, default 2048). Converting warm-slot headroom to cold permits 1:1 would
+    # let a pool priced for 2g slots admit 4g cold workers = ~2x its RAM. Price permits by the
+    # cold footprint: permits = headroom_slots * warm_slot_ram / cold_ram.
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+    share = FileNodeShare(str(tmp_path))
+    gate = DynamicConcurrencyGate(64)
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    pool = _Pool()
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=2048, max_ceiling=8, min_warm=0),
+                         pool, share, cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 2,
+                         node="n", instance="i", capacity_fn=_budget(8 * 2048, 999),
+                         clock=lambda: 1.0, concurrency_gate=gate,
+                         cold_slot_ram_mib=4096)          # cold worker is 2x the warm slot
+    mine = ds.tick()
+    headroom = mine.concurrent_ceiling - mine.warm_size
+    assert headroom >= 2
+    assert gate.limit == headroom * 2048 // 4096          # priced down by the 2x footprint
+
+
+def test_sizer_fails_closed_when_publish_keeps_failing(tmp_path):
+    # PR #60 codex P1: if publish() keeps failing (permission change / broken bind mount), peers
+    # expire our snapshot and reclaim our share — but our pool is still live and consuming RAM.
+    # After the staleness window with no successful publish, shrink to the floor to stop
+    # oversubscribing (recovers when publish works again).
+    class _FailingShare:
+        def publish(self, snap):
+            raise OSError("permission denied")
+
+        def read_all(self, *, max_age_s, now):
+            return []
+
+        def remove(self, snap):
+            pass
+
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=1.0)
+    pool = _Pool()
+    pool.resize(warm_size=6, concurrent_ceiling=6)        # pretend it grew earlier
+    ticks = {"n": 0}
+
+    def clock():                                          # advances 10s per call → past the 1s window
+        ticks["n"] += 1
+        return ticks["n"] * 10.0
+
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8, min_warm=1),
+                         pool, _FailingShare(), cfg, runtime=RUNTIME_FIRECRACKER,
+                         backlog_fn=lambda: 5, node="n", instance="i",
+                         capacity_fn=_budget(8 * 1024, 999), clock=clock)
+    ds.run(max_ticks=2, sleep=lambda _s: None)
+    assert pool.concurrent_ceiling == 1                   # floored (min_warm=1), not left at 6
+
+
 def test_sizer_floors_cold_gate_at_one_when_warm_saturates(tmp_path):
     # when warm demand claims the whole ceiling, cold headroom is 0 — but the gate floors at 1 so
     # egress / warm-miss jobs never fully starve (a bounded, self-correcting overshoot).
@@ -553,6 +608,50 @@ def test_read_all_rejects_poisoned_consensus_field(tmp_path):
         "min_warm": 0, "max_ceiling": 64, "weight": 1.0, "ts": 1.0, "budget_ram_mib": "oops"}))
     engines = {s.engine for s in share.read_all(max_age_s=60, now=1.0)}
     assert engines == {"clip"}     # poisoned red dropped; good clip survives
+
+
+def test_reservation_sums_resident_warm_and_cold_in_flight(tmp_path):
+    # PR #60 audit P1: cold workers spawn OUTSIDE the warm pool, so they COEXIST with resident
+    # warm VMs — the reservation must be (warm residency) + (cold in flight), not the MAX. A pool
+    # with 6 idle warm + 2 cold in flight physically runs 8; publishing max(6,2)=6 would let a peer
+    # reallocate the 2 cold slots' RAM while both are live.
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+    share = FileNodeShare(str(tmp_path))
+    gate = DynamicConcurrencyGate(64)
+    for _ in range(2):
+        gate.acquire(0.0)                       # 2 cold workers in flight
+    assert gate.in_flight == 2
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    pool = _Pool(assigned=0, slot_count=6)      # 6 warm resident, all idle
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64), pool, share,
+                         cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 0, node="n",
+                         instance="i", capacity_fn=_budget(64 * 1024, 999), clock=lambda: 1.0,
+                         concurrency_gate=gate)
+    ds.tick()
+    mine = next(s for s in share.read_all(max_age_s=60, now=1.0) if s.engine == "clip")
+    assert mine.assigned == 8                   # 6 warm + 2 cold, NOT max(6, 2)=6
+
+
+def test_start_node_sizer_removes_snapshot_when_setup_aborts_after_publish(tmp_path, monkeypatch):
+    # PR #60 audit P1: the synchronous first tick publishes a heartbeat; if a LATER setup step
+    # (here start_thread) raises, _start_node_sizer returns None — but the published phantom
+    # snapshot must NOT be left behind (it advertises ~0 demand, ages out permanently, and peers
+    # reclaim this node's share while the pool runs unmanaged = persistent oversubscription).
+    from blastbox.host.cli import _start_node_sizer
+    from blastbox.host.dispatcher_sizer import DispatcherSizer
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
+
+    def _boom(self, stop):                       # start_thread fails AFTER tick() published
+        raise RuntimeError("thread exhaustion")
+    monkeypatch.setattr(DispatcherSizer, "start_thread", _boom)
+
+    res = _start_node_sizer(_Pool(), ["clip"], InMemoryJobStore(), "firecracker")
+    assert res is None                                              # setup aborted
+    assert list(tmp_path.glob("*.json")) == []                     # phantom snapshot cleaned up
 
 
 def test_published_reservation_holds_resident_slots(tmp_path):
