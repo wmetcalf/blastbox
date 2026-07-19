@@ -206,16 +206,20 @@ def _start_node_sizer(pool, engines, store, tier):
         sizer_stop = _threading.Event()
         # `tier` is the pool's runtime NAME (firecracker/gvisor/cold) — WarmPool.runtime is
         # the SlotRuntime object, so gating uses this string.
-        thread = DispatcherSizer(
+        sizer = DispatcherSizer(
             spec, pool, FileNodeShare(node_cfg.share_dir), node_cfg,
             runtime=tier,
             # scope backlog to jobs THIS tier can claim (target_tier routing) so
             # the pool isn't sized for work pinned to a tier it can never drain.
             backlog_fn=local_backlog_fn(store, served, claimant_tier=tier),
-        ).start_thread(sizer_stop)
+        )
+        # Print the status FIRST, then start the thread LAST — otherwise if this print raises
+        # (broken pipe / closed stderr) the except below returns None while the thread is
+        # already running, leaking a daemon the caller can never stop or join.
         print(f"node self-sizer: managing {spec.name!r} warm pool (backlog over {served}) "
               f"from {node_cfg.share_dir} "
               f"({'balancing' if node_cfg.balancing else 'static shares'})", file=sys.stderr)
+        thread = sizer.start_thread(sizer_stop)
         # Return the thread too so the caller can JOIN it on shutdown — otherwise the daemon
         # thread is torn down without running its finally (which removes this unit's snapshot
         # so a restart leaves no phantom pool). The run loop sleeps on sizer_stop, so the join

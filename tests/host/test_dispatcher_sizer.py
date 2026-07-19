@@ -258,6 +258,33 @@ def test_overlapping_replicas_split_budget_not_double(tmp_path):
     assert m_old.concurrent_ceiling < 8 and m_new.concurrent_ceiling < 8
 
 
+def test_start_node_sizer_no_thread_leak_if_status_print_fails(tmp_path, monkeypatch):
+    # regression (PR #60 r11): the status print() must happen BEFORE start_thread(), or a
+    # broken-pipe/closed-stderr OSError from print leaves the just-started daemon thread
+    # running while _start_node_sizer returns None (caller can never stop/join it).
+    import builtins
+    import sys
+    import threading as _th
+
+    from blastbox.host.cli import _start_node_sizer
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
+    real_print = builtins.print
+
+    def boom(*a, **k):
+        if k.get("file") is sys.stderr:               # ONLY the status line (not logging's IO)
+            raise OSError("broken pipe")
+        return real_print(*a, **k)
+
+    monkeypatch.setattr(builtins, "print", boom)
+    before = _th.active_count()
+    res = _start_node_sizer(_Pool(), ["clip"], InMemoryJobStore(), "firecracker")
+    assert res is None                                 # setup failed → no sizer handle
+    assert _th.active_count() == before                # and NO leaked thread
+
+
 def test_default_instance_is_unique_per_process_not_pid(tmp_path):
     # regression (PR #60 r10, codex HIGH): the instance token must be RANDOM, not os.getpid()
     # — each dispatcher runs in its own container where pid is almost always 1, so two

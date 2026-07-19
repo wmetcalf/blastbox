@@ -66,11 +66,12 @@ class DemandSnapshot:
                                  # identity: ONE engine can run on TWO node-managed tiers on
                                  # one host (separate pools) — without the tier they'd share a
                                  # key and collapse into one, each sizing to the whole budget.
-    instance: str = ""           # the publishing PROCESS (pid). Part of the identity so two
-                                 # replicas of the same engine/tier/node on one host — e.g.
-                                 # briefly overlapping during a rolling deploy — are TWO
-                                 # distinct pools that split the budget in plan_sizes, rather
-                                 # than colliding on one file and each taking the full ceiling.
+    instance: str = ""           # the publishing PROCESS's random per-process token (NOT pid —
+                                 # containers share pid 1). Part of the identity so two replicas
+                                 # of the same engine/tier/node on one host — e.g. briefly
+                                 # overlapping during a rolling deploy — are TWO distinct pools
+                                 # that split the budget in plan_sizes, rather than colliding on
+                                 # one file and each taking the full ceiling.
 
 
 class NodeShare(Protocol):
