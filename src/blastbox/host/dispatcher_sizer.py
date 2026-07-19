@@ -109,7 +109,10 @@ class DispatcherSizer:
 
     def _active(self) -> bool:
         cfg = self._config
-        return (cfg.resource_management or cfg.balancing) and manages(self._runtime)
+        # Mirror NodeConfig.active — adaptive counts too. from_env folds adaptive into
+        # resource_management, but a DIRECTLY-constructed NodeConfig(adaptive=True,
+        # resource_management=False) would otherwise no-op here despite active=True.
+        return (cfg.resource_management or cfg.balancing or cfg.adaptive) and manages(self._runtime)
 
     # Adaptive control loop bounds. Deliberately a DAMPED, asymmetric ramp (shrink faster
     # than grow) rather than a hard MemAvailable cap: a cap that tracks free RAM directly

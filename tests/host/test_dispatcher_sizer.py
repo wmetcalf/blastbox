@@ -572,6 +572,25 @@ def test_published_reservation_holds_resident_slots(tmp_path):
     assert mine.assigned >= 8      # reservation reflects the 8 still-resident slots, not 0
 
 
+def test_adaptive_only_direct_config_is_active(tmp_path):
+    # PR #60 codex P2: a DIRECTLY-constructed NodeConfig(adaptive=True) reports active=True, so
+    # the sizer's own _active() gate must agree — else tick() returns None and adaptive never
+    # runs. (from_env folds adaptive into resource_management; the construction API path doesn't,
+    # so _active must include adaptive too.)
+    share = FileNodeShare(str(tmp_path))
+    cfg = NodeConfig(engines=(EngineNode("clip", "-"),), adaptive=True,
+                     resource_management=False, balancing=False, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    assert cfg.active is True
+    pool = _Pool()
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8), pool, share,
+                         cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 3, node="n",
+                         instance="i", capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0)
+    mine = ds.tick()
+    assert mine is not None                 # sized, NOT no-op'd by the _active() gate
+    assert pool.concurrent_ceiling >= 1
+
+
 def test_node_manages_tier_gating(monkeypatch):
     # PR #60 r13: _node_manages_tier drives the hard-cap startup wiring (force warm_only,
     # start unspawned). True only when RM is on AND the tier is node-managed (fc/gvisor).
