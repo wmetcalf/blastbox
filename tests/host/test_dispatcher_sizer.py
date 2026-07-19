@@ -68,6 +68,49 @@ def test_preprovisioned_share_dir_perms_left_untouched(tmp_path):
     assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
 
 
+def test_mixed_node_ids_fail_closed_to_floor(tmp_path):
+    # PR #60 codex P1: a tagged dispatcher + an untagged peer give each process a DIFFERENT
+    # planner view (the symmetric node filter), so their independent slices sum past the budget.
+    # No local plan can fix a globally-inconsistent view → fail closed: size to the warm floor
+    # (never grow), so every affected dispatcher floors identically and none over-allocates.
+    share = FileNodeShare(str(tmp_path))
+    # an UNTAGGED peer with a deep backlog sits in the shared dir
+    share.publish(DemandSnapshot("red", 40, 0, 1024, 1, 0, 64, 1.0, ts=1.0, node=""))
+    pool = _Pool()
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    # THIS dispatcher is TAGGED "n" → its view is {n(self), ""(peer)} = mixed identities.
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64, min_warm=1),
+                         pool, share, cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 30,
+                         node="n", instance="c", capacity_fn=_budget(10 * 1024, 999),
+                         clock=lambda: 1.0)
+    mine = ds.tick()
+    # floored to min_warm — NOT grown to a big share despite the deep backlog + 10-slot budget.
+    assert mine.warm_size == 1 and mine.concurrent_ceiling == 1
+    assert pool.concurrent_ceiling == 1
+
+
+def test_budget_consensus_uses_min_across_view(tmp_path):
+    # PR #60 codex P1: dispatchers with different headroom/vcpu config or per-process adaptive
+    # scale each compute their own budget and pick incompatible slices that sum past the true
+    # budget. Reconcile to the elementwise MIN so every reader plans against the same (tightest)
+    # budget → Σ ≤ min ≤ everyone's actual.
+    share = FileNodeShare(str(tmp_path))
+    # a same-node peer publishes a SMALL budget (4 slots) — the tightest view.
+    share.publish(DemandSnapshot("red", 2, 0, 1024, 1, 0, 64, 1.0, ts=1.0, node="n",
+                                 budget_ram_mib=4 * 1024, budget_vcpus=4))
+    pool = _Pool()
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    # THIS dispatcher's OWN budget is 16 slots, but it must reconcile down to the peer's 4.
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64), pool, share,
+                         cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 40, node="n",
+                         instance="c", capacity_fn=_budget(16 * 1024, 16), clock=lambda: 1.0)
+    mine = ds.tick()
+    # clip + red share the CONSENSUS 4-slot budget → clip's ceiling is bounded by 4, not 16.
+    assert mine.concurrent_ceiling <= 4
+
+
 def test_mixed_balancing_modes_on_a_node_do_not_oversubscribe(tmp_path):
     # regression (PR #60 codex P1): two dispatchers on ONE node with DIFFERENT
     # BLASTBOX_NODE_BALANCING values used to each apply its own mode to the shared snapshots,

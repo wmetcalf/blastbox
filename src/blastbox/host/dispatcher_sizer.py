@@ -143,6 +143,21 @@ class DispatcherSizer:
         self._budget_scale = min(self._budget_scale, hi)   # clamp if headroom changed
         return NodeBudget(ram_mib=budget.ram_mib * self._budget_scale, vcpus=budget.vcpus)
 
+    def _size_to_floor(self) -> "PoolSize":
+        """Fail-closed sizing: hold the pool at its warm floor and never grow. Used when the node
+        view is globally inconsistent (mixed node ids) so no local plan can be made safe — every
+        affected dispatcher floors identically, so none over-allocates while the pool still serves
+        at its min_warm floor until the operator fixes the config."""
+        e = self._engine
+        ceiling = max(1, e.min_warm)
+        warm = min(e.min_warm, ceiling)
+        if hasattr(self._pool, "resize"):
+            self._pool.resize(  # type: ignore[attr-defined]
+                warm_size=warm, concurrent_ceiling=ceiling)
+            if self._gate is not None:
+                self._gate.set_limit(ceiling - warm)  # type: ignore[attr-defined]
+        return PoolSize(warm_size=warm, concurrent_ceiling=ceiling)
+
     def tick(self) -> Optional[PoolSize]:
         """Publish own demand, read the node view, size the local pool. Returns this
         engine's decided size (None when the feature is off or the view is empty)."""
@@ -159,6 +174,13 @@ class DispatcherSizer:
         if self._gate is not None:
             assigned += int(getattr(self._gate, "in_flight", 0))
 
+        # Compute OUR view of the node budget up front so we can PUBLISH it: readers reconcile to
+        # one budget (the elementwise MIN across the view), so a dispatcher with a different
+        # headroom/vcpu config or adaptive scale can't plan against a bigger budget than a peer
+        # and pick an incompatible slice that oversubscribes the node.
+        my_budget = self._adapt(self._capacity_fn(self._config.ram_headroom_frac,
+                                                  self._config.vcpu_oversubscription))
+
         # tell peers our expected refresh period so a slow count doesn't get us aged out
         refresh_s = self._config.interval_s + self._last_tick_dur
         def _snapshot(backlog: int, ts: float) -> DemandSnapshot:
@@ -167,7 +189,8 @@ class DispatcherSizer:
                 slot_ram_mib=e.slot_ram_mib, slot_vcpus=e.slot_vcpus,
                 min_warm=e.min_warm, max_ceiling=e.max_ceiling, weight=e.weight, ts=ts,
                 node=self._node, tier=self._runtime, instance=self._instance,
-                refresh_s=refresh_s, balancing=self._config.balancing)
+                refresh_s=refresh_s, balancing=self._config.balancing,
+                budget_ram_mib=my_budget.ram_mib, budget_vcpus=my_budget.vcpus)
 
         # HEARTBEAT before the (possibly-slow) count: publish a fresh-ts snapshot with the last
         # tick's backlog so peers keep seeing us alive even when THIS count — a huge shared-
@@ -205,19 +228,25 @@ class DispatcherSizer:
         self._last_tick_dur = max(0.0, self._clock() - started)
         if not snaps:
             return None
-        # Observability: the node filter is intentionally symmetric (so a single host's
-        # partial node-id config still coordinates), which makes an untagged reader see
-        # tagged peers too. If the view mixes DISTINCT node ids, that usually means a
-        # share_dir was accidentally shared ACROSS hosts without consistent tagging — a
-        # misconfig that conflates their budgets. Warn once so an operator can spot it
-        # (we keep coordinating rather than fail-closed, per the documented invariant).
-        if not self._warned_mixed_nodes and len({s.node for s in snaps}) > 1:
-            self._warned_mixed_nodes = True
-            logging.getLogger("blastbox.node_sizer").warning(
-                "node view for %s mixes distinct node ids %s — if this share_dir is shared "
-                "across physical hosts, set a DISTINCT BLASTBOX_NODE_ID on every host (see "
-                "docs/CONFIGURATION.md); mixing conflates their budgets.",
-                self._engine.name, sorted({s.node for s in snaps}))
+        # The node filter is symmetric (so a single host's partial node-id config still
+        # coordinates), which makes an untagged reader see tagged peers too. But a view that
+        # MIXES distinct node ids gives every process a DIFFERENT planner view (tagged A sees
+        # {A, untagged}, tagged B sees {B, untagged}, untagged sees all three) → each plans from
+        # a divergent subset and their slices sum PAST the budget. No local decision can fix a
+        # globally-inconsistent view, so FAIL CLOSED: size to the warm floor only (never grow) and
+        # warn. Every affected dispatcher does the same, so none over-allocates; the pool still
+        # serves at its min_warm floor until the operator gives every co-located dispatcher a
+        # CONSISTENT BLASTBOX_NODE_ID (all "" for one host, or one shared tag).
+        if len({s.node for s in snaps}) > 1:
+            if not self._warned_mixed_nodes:
+                self._warned_mixed_nodes = True
+                logging.getLogger("blastbox.node_sizer").warning(
+                    "node view for %s mixes distinct node ids %s — refusing to grow (sizing to the "
+                    "warm floor) to avoid oversubscribing from divergent views; set a CONSISTENT "
+                    "BLASTBOX_NODE_ID on every co-located dispatcher (all \"\" for one host, or one "
+                    "shared tag). See docs/CONFIGURATION.md.",
+                    self._engine.name, sorted({s.node for s in snaps}))
+            return self._size_to_floor()
 
         # CONSENSUS allocation mode across the node view. The demand basis (live backlog vs
         # static weight) must be identical for EVERY dispatcher on the node — otherwise each
@@ -254,8 +283,18 @@ class DispatcherSizer:
             )
             for s in snaps
         ]
-        budget = self._adapt(self._capacity_fn(self._config.ram_headroom_frac,
-                                               self._config.vcpu_oversubscription))
+        # CONSENSUS budget: reconcile to the elementwise MINIMUM budget across the view (our own
+        # + every peer that published one). Dispatchers with a different headroom/vcpu config or a
+        # different per-process adaptive scale otherwise each plan against their OWN budget and
+        # pick incompatible slices that sum past the true node budget. Taking the min is the
+        # conservative consensus: every reader computes the same (tightest) budget → the same plan
+        # → Σ ≤ min ≤ everyone's actual, so the node is never oversubscribed. A peer that hasn't
+        # published a budget yet (0.0 = unknown) is ignored rather than collapsing the budget to 0.
+        peer_budget_ram = [s.budget_ram_mib for s in snaps if s.budget_ram_mib > 0]
+        peer_budget_vcpus = [s.budget_vcpus for s in snaps if s.budget_vcpus > 0]
+        budget = NodeBudget(
+            ram_mib=min([my_budget.ram_mib, *peer_budget_ram]),
+            vcpus=min([my_budget.vcpus, *peer_budget_vcpus]))
         plan = plan_sizes(specs, budget)  # type: ignore[arg-type]
         mine = plan.get(_pool_key(e.name, self._runtime, self._instance))
         if mine is not None and hasattr(self._pool, "resize"):

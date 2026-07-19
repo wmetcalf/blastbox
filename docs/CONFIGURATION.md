@@ -113,6 +113,23 @@ today unless a switch below is on. Each dispatcher publishes a demand snapshot t
 node dir and reads its peers', then runs the same deterministic allocation over the whole-node
 view and resizes its own pool. See `src/blastbox/host/node_sizer.py`.
 
+**Node-wide participation is required.** The budget is only honored if **every** dispatcher on a
+host participates with a **consistent** config. Coordination is a whole-node protocol: the plan
+is a pure function of the shared view, so all dispatchers must agree on it. Concretely, on one
+host:
+- **Enable node management on ALL co-located dispatchers, or none.** A dispatcher left with
+  `RESOURCE_MANAGEMENT`/`BALANCING` off publishes no reservation and keeps running its static pool,
+  but its footprint is then invisible to the managed peers, which allocate the whole budget as if
+  it weren't there — persistent oversubscription. This cannot be detected from the shared view (a
+  non-participant is silent), so it is an operating requirement, not something the sizer can guard.
+- **Use a consistent `BLASTBOX_NODE_ID`** (all unset for one host, or one shared tag) and a
+  consistent `BLASTBOX_NODE_BALANCING` / budget config (`RAM_HEADROOM`, `VCPU_OVERSUBSCRIPTION`).
+  Divergences the sizer *can* see it reconciles safely — a mixed balancing mode falls back to
+  static for all, a divergent budget reconciles to the elementwise minimum, and a mixed
+  tagged/untagged node view fails closed to the warm floor — each with a one-time warning. These
+  are safety nets, not a substitute for consistent config: they degrade capacity to avoid
+  oversubscribing, and clear once the config is aligned.
+
 **Budget bounding.** When the autosizer manages a pool (`RESOURCE_MANAGEMENT`/`BALANCING` on,
 firecracker/gvisor tier): the pool ceiling is capped at `BLASTBOX_DISPATCH_CONCURRENCY` (the
 sizer never warms more slots than the dispatcher can run — each in-flight job, warm *or* cold,

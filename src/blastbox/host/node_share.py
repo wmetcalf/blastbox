@@ -83,6 +83,13 @@ class DemandSnapshot:
                                  # and each applied its OWN mode to the shared snapshots, they'd
                                  # compute different plans and their slices could sum past the
                                  # budget (N-way oversubscription). See DispatcherSizer.tick.
+    budget_ram_mib: float = 0.0  # this unit's view of the NODE budget (RAM/vCPU), after headroom
+    budget_vcpus: float = 0.0    # + adaptive scaling. Published so readers reconcile to ONE
+                                 # budget (the elementwise MIN across the view) — dispatchers
+                                 # with different headroom/vcpu config or adaptive scale otherwise
+                                 # each plan against their OWN budget and pick incompatible slices
+                                 # that sum past the true budget. 0.0 = unknown → ignored in the
+                                 # consensus (older peer / pre-budget snapshot).
 
 
 class NodeShare(Protocol):
