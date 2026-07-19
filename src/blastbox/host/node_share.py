@@ -66,6 +66,11 @@ class DemandSnapshot:
                                  # identity: ONE engine can run on TWO node-managed tiers on
                                  # one host (separate pools) — without the tier they'd share a
                                  # key and collapse into one, each sizing to the whole budget.
+    refresh_s: float = 0.0       # the publisher's own expected refresh period (interval +
+                                 # measured tick cost). A reader ages this snapshot out by the
+                                 # LARGER of its own staleness window and this, so a publisher
+                                 # whose backlog count is consistently slow (a huge shared-store
+                                 # scan) isn't expired by fast peers mid-count → oversubscription.
     instance: str = ""           # the publishing PROCESS's random per-process token (NOT pid —
                                  # containers share pid 1). Part of the identity so two replicas
                                  # of the same engine/tier/node on one host — e.g. briefly
@@ -184,10 +189,17 @@ class FileNodeShare:
                 # numeric field uses _finite_in). Age bounded BOTH ways: a snapshot more than
                 # one staleness window in the FUTURE (bad clock) is rejected too, or its
                 # negative age would read as fresh forever.
+                # Effective staleness = the LARGER of the reader's own window and the
+                # publisher's declared refresh period (×2, for one missed beat), so a
+                # consistently-slow publisher isn't aged out by fast peers. Capped at the GC
+                # floor so a spoofed refresh_s can't keep a phantom in view past when the mtime
+                # GC would sweep it anyway.
+                eff = max(max_age_s, min(snap.refresh_s * 2.0, self._GC_AGE_FLOOR_S)) \
+                    if _finite_in(snap.refresh_s, 0, _MAX_TS) else max_age_s
                 ok = (_valid(snap)
                       and f.name == self._filename(snap.engine, snap.tier, snap.node, snap.instance)
                       and _finite_in(snap.ts, -_MAX_TS, _MAX_TS)
-                      and -max_age_s <= (now - snap.ts) <= max_age_s)
+                      and -eff <= (now - snap.ts) <= eff)
             except Exception:
                 continue                        # torn / foreign / type-poisoned → doesn't contribute
             if ok:
@@ -259,4 +271,5 @@ def _valid(snap: DemandSnapshot) -> bool:
         and _finite_in(snap.min_warm, 0, _MAX_CEILING_SANE)
         and _finite_in(snap.weight, 0, _MAX_WEIGHT)
         and _finite_in(snap.ts, -_MAX_TS, _MAX_TS)   # bounded (NOT bare math.isfinite, which
-    )                                                # OverflowErrors on a huge-int ts)
+        and _finite_in(snap.refresh_s, 0, _MAX_TS)   # OverflowErrors on a huge-int ts/refresh)
+    )

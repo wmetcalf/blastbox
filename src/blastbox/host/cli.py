@@ -193,7 +193,7 @@ def _start_node_sizer(pool, engines, store, tier):
         import threading as _threading
 
         from blastbox.host.dispatcher_sizer import DispatcherSizer
-        from blastbox.host.node_share import FileNodeShare
+        from blastbox.host.node_share import _MAX_WEIGHT, FileNodeShare
         from blastbox.host.node_sizer import local_backlog_fn
 
         # A dispatcher may serve several engines on ONE pool; size on ALL of their combined
@@ -215,7 +215,9 @@ def _start_node_sizer(pool, engines, store, tier):
             max_ceiling=min(e.max_ceiling for e in mine),
             # the shared pool represents the COMBINED engines, so its static weight is the
             # SUM of their weights — using only the first engine's understates its share.
-            weight=sum(e.weight for e in mine),
+            # Clamp to _MAX_WEIGHT: the reader (_valid) rejects a snapshot weight above it, so
+            # an unclamped sum would silently self-evict this pool from every node view.
+            weight=min(sum(e.weight for e in mine), float(_MAX_WEIGHT)),
         )
         sizer_stop = _threading.Event()
         # `tier` is the pool's runtime NAME (firecracker/gvisor/cold) — WarmPool.runtime is

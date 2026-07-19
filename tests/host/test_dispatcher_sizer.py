@@ -303,6 +303,44 @@ def test_default_instance_is_unique_per_process_not_pid(tmp_path):
     assert len(files) == 2                             # two distinct files, no collision
 
 
+def test_slow_publisher_refresh_hint_prevents_aging(tmp_path):
+    # PR #60 r13: a publisher whose count is consistently slow declares its refresh period
+    # (refresh_s), and a fast reader ages it out by the LARGER of its own window and that —
+    # so it isn't expired mid-count and its share reallocated. Bounded by the GC floor.
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("red", 5, 0, 1024, 1, 0, 64, 1.0, ts=0.0, node="n",
+                                 tier="firecracker", instance="i", refresh_s=35.0))
+    # a 20s reader window would normally expire a 30s-old snapshot...
+    assert [s.engine for s in share.read_all(max_age_s=20.0, now=30.0)] == ["red"]  # kept (eff 70s)
+    # ...but a truly-dead one past the cap is still dropped
+    assert share.read_all(max_age_s=20.0, now=10_000.0) == []
+
+
+def test_multi_engine_weight_clamped_to_valid_cap(tmp_path, monkeypatch):
+    # PR #60 r13: summing multi-engine weights can exceed _MAX_WEIGHT; the reader rejects a
+    # snapshot above it, so the sum must be clamped or the pool self-evicts from every view.
+    from blastbox.host.cli import _start_node_sizer
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    from blastbox.host.node_share import _MAX_WEIGHT
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "aa,bb")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_AA_WEIGHT", "600000")
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_BB_WEIGHT", "600000")   # sum 1.2M > _MAX_WEIGHT
+    monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
+    res = _start_node_sizer(_Pool(), ["aa", "bb"], InMemoryJobStore(), "firecracker")
+    assert res is not None
+    stop, thread, sizer = res
+    try:
+        assert sizer._engine.weight <= _MAX_WEIGHT                    # clamped, so _valid passes
+        # its own snapshot round-trips through the reader (not self-evicted)
+        from blastbox.host.node_share import _valid
+        assert _valid(sizer._identity())
+    finally:
+        stop.set()
+        thread.join(2.0)
+        sizer.remove_own_snapshot()
+
+
 def test_multi_engine_pool_uses_max_footprint(tmp_path, monkeypatch):
     # PR #60 r12: a dispatcher serving several engines with DIFFERENT slot footprints sizes
     # one shared pool — it must use the CONSERVATIVE (max) footprint across them, or the

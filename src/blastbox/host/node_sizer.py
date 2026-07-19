@@ -134,18 +134,29 @@ def plan_sizes(specs: list[PoolSpec], budget: NodeBudget) -> dict[str, PoolSize]
     def fits(s: PoolSpec) -> bool:
         return alloc[s.name] < s.max_ceiling and budget_has_room(s)
 
+    # Per-slot cost as a fraction of the node budget, taking the BINDING resource (whichever
+    # of RAM/vCPU is tighter for THIS pool). Dividing the water-fill score by this makes
+    # `demand`/`weight` buy a share of the node's actual bottleneck resource, not just RAM:
+    # two equal-weight pools that differ only in slot_vcpus get equal CPU share on a
+    # vCPU-bound node (and equal RAM on a RAM-bound one). Budget dims are >0 (headroom/
+    # oversub clamps + cpu_count>=1); guard anyway.
+    def slot_cost(s: PoolSpec) -> float:
+        ram_frac = s.slot_ram_mib / budget.ram_mib if budget.ram_mib > 0 else 0.0
+        vcpu_frac = s.slot_vcpus / budget.vcpus if budget.vcpus > 0 else 0.0
+        return max(ram_frac, vcpu_frac, 1e-12)
+
     while True:
         cands = [s for s in specs if fits(s)]
         if not cands:
             break
-        # Diminishing returns, RESOURCE-normalised: (demand + epsilon) / (RAM the pool would
-        # then hold). Dividing by (alloc+1)·footprint means `demand`/`weight` buys a share of
-        # the node's RAM BUDGET, not a raw slot count — so with heterogeneous footprints two
-        # equal-weight pools get equal RAM (a 4 GiB pool gets ~1/4 the slots of a 1 GiB one),
-        # not equal slots (which would hand the big-footprint pool 4× the RAM). Same-footprint
-        # pools are unaffected (footprint is a constant factor). A tie or zero-demand engine
-        # still fills a beefy node after busy ones are satisfied, up to its cap.
-        pick = max(cands, key=lambda s: (s.demand + 1e-3) / ((alloc[s.name] + 1) * s.slot_ram_mib))
+        # Diminishing returns, normalised by the BINDING-resource cost: (demand + epsilon) /
+        # (share of the bottleneck resource the pool would then hold). So demand/weight buys a
+        # share of the node's tight resource, not a raw slot count — with heterogeneous
+        # footprints two equal-weight pools get equal RESOURCE (a 4 GiB / 4 vCPU pool gets
+        # ~1/4 the slots of a 1 GiB / 1 vCPU one), not equal slots. Same-footprint pools are
+        # unaffected. A tie or zero-demand engine still fills a beefy node after busy ones are
+        # satisfied, up to its cap.
+        pick = max(cands, key=lambda s: (s.demand + 1e-3) / ((alloc[s.name] + 1) * slot_cost(s)))
         alloc[pick.name] += 1
         used_ram += pick.slot_ram_mib
         used_vcpu += pick.slot_vcpus

@@ -147,12 +147,15 @@ class DispatcherSizer:
         e = self._engine
         assigned = int(getattr(self._pool, "assigned_count", 0))      # cheap
 
+        # tell peers our expected refresh period so a slow count doesn't get us aged out
+        refresh_s = self._config.interval_s + self._last_tick_dur
         def _snapshot(backlog: int, ts: float) -> DemandSnapshot:
             return DemandSnapshot(
                 engine=e.name, backlog=backlog, assigned=assigned,
                 slot_ram_mib=e.slot_ram_mib, slot_vcpus=e.slot_vcpus,
                 min_warm=e.min_warm, max_ceiling=e.max_ceiling, weight=e.weight, ts=ts,
-                node=self._node, tier=self._runtime, instance=self._instance)
+                node=self._node, tier=self._runtime, instance=self._instance,
+                refresh_s=refresh_s)
 
         # HEARTBEAT before the (possibly-slow) count: publish a fresh-ts snapshot with the last
         # tick's backlog so peers keep seeing us alive even when THIS count — a huge shared-

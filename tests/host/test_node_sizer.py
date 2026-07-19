@@ -70,6 +70,19 @@ def test_warm_tracks_demand_not_whole_node():
     assert plan["a"].warm_size == 2                # but only 2 kept hot (demand)
 
 
+def test_resource_share_normalizes_by_binding_vcpu():
+    # PR #60 r13: when vCPU (not RAM) is the binding budget, equal-weight/equal-RAM pools with
+    # different slot_vcpus get an equal CPU share, not equal slots.
+    specs = [PoolSpec("a", slot_ram_mib=1024, slot_vcpus=1, demand=5, max_ceiling=99),
+             PoolSpec("b", slot_ram_mib=1024, slot_vcpus=4, demand=5, max_ceiling=99)]
+    plan = plan_sizes(specs, NodeBudget(ram_mib=100 * 1024, vcpus=20))     # RAM huge, vCPU tight
+    a_cpu = plan["a"].concurrent_ceiling * 1
+    b_cpu = plan["b"].concurrent_ceiling * 4
+    assert plan["a"].concurrent_ceiling > plan["b"].concurrent_ceiling     # a gets more slots
+    assert abs(a_cpu - b_cpu) <= 4                                         # ~equal vCPU share
+    assert a_cpu + b_cpu <= 20                                             # within vCPU budget
+
+
 def test_weight_allocates_resource_share_not_slot_count():
     # PR #60 r12: equal-weight/equal-demand pools with DIFFERENT footprints get an equal RAM
     # SHARE, not equal slot counts — a 4 GiB pool gets ~1/4 the slots of a 1 GiB one, so both
