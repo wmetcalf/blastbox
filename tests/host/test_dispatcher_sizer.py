@@ -1011,6 +1011,24 @@ def test_node_namespaced_files_dont_collide_across_hosts(tmp_path):
     assert seen == {("hostA", 3), ("hostB", 9)}                # both survive
 
 
+def test_staleness_uses_publisher_declared_window_not_reader(tmp_path):
+    # PR #60 audit P1: a peer's liveness is decided by ITS OWN published window (refresh_s /
+    # stale_after_s), so two readers with different LOCAL windows agree on the same snapshot set —
+    # otherwise a slow-but-live peer aged out by fast readers and kept by slow ones splits the node
+    # into divergent plans → oversubscription. A peer declaring stale_after_s=50 stays visible to a
+    # reader whose own max_age is only 20, and ages out at the SAME point (50) for everyone.
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("red", 5, 0, 1024, 1, 0, 64, 1.0, ts=100.0, node="n",
+                                 stale_after_s=50.0))
+    # reader passes a SMALL window (20), but the publisher declared 50 → still fresh at age 40.
+    assert {s.engine for s in share.read_all(max_age_s=20.0, now=140.0)} == {"red"}
+    # a reader with a LARGER window (90) agrees it's still fresh — same publisher window governs.
+    assert {s.engine for s in share.read_all(max_age_s=90.0, now=140.0)} == {"red"}
+    # past the publisher's own 50s window → aged out (age 60 > 50), consistently for any reader.
+    assert {s.engine for s in share.read_all(max_age_s=20.0, now=160.0)} == set()
+    assert {s.engine for s in share.read_all(max_age_s=90.0, now=160.0)} == set()
+
+
 def test_default_node_keeps_plain_filename(tmp_path):
     # backcompat: node="" (the common single-host case) still writes <engine>.json.
     share = FileNodeShare(str(tmp_path))

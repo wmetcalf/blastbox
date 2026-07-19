@@ -226,7 +226,8 @@ class DispatcherSizer:
                 min_warm=e.min_warm, max_ceiling=e.max_ceiling, weight=e.weight, ts=ts,
                 node=self._node, tier=self._runtime, instance=self._instance,
                 refresh_s=refresh_s, balancing=self._config.balancing,
-                budget_ram_mib=my_budget.ram_mib, budget_vcpus=my_budget.vcpus)
+                budget_ram_mib=my_budget.ram_mib, budget_vcpus=my_budget.vcpus,
+                stale_after_s=self._config.stale_after_s)
 
         # HEARTBEAT before the (possibly-slow) count: publish a fresh-ts snapshot with the last
         # tick's backlog so peers keep seeing us alive even when THIS count — a huge shared-

@@ -83,6 +83,12 @@ class DemandSnapshot:
                                  # and each applied its OWN mode to the shared snapshots, they'd
                                  # compute different plans and their slices could sum past the
                                  # budget (N-way oversubscription). See DispatcherSizer.tick.
+    stale_after_s: float = 0.0   # the publisher's OWN staleness window. Published so EVERY reader
+                                 # ages this unit out by the SAME (publisher-declared) horizon —
+                                 # if each reader used its own local window, a slow-but-live peer
+                                 # could be aged out by fast readers and kept by slow ones, giving
+                                 # them different snapshot sets → different plans → oversubscription.
+                                 # 0 = unspecified (older peer) → reader falls back to its own value.
     budget_ram_mib: float = 0.0  # this unit's view of the NODE budget (RAM/vCPU), after headroom
     budget_vcpus: float = 0.0    # + adaptive scaling. Published so readers reconcile to ONE
                                  # budget (the elementwise MIN across the view) — dispatchers
@@ -219,13 +225,18 @@ class FileNodeShare:
                 # numeric field uses _finite_in). Age bounded BOTH ways: a snapshot more than
                 # one staleness window in the FUTURE (bad clock) is rejected too, or its
                 # negative age would read as fresh forever.
-                # Effective staleness = the LARGER of the reader's own window and the
-                # publisher's declared refresh period (×2, for one missed beat), so a
-                # consistently-slow publisher isn't aged out by fast peers. Capped at the GC
-                # floor so a spoofed refresh_s can't keep a phantom in view past when the mtime
-                # GC would sweep it anyway.
-                eff = max(max_age_s, min(snap.refresh_s * 2.0, self._GC_AGE_FLOOR_S)) \
-                    if _finite_in(snap.refresh_s, 0, _MAX_TS) else max_age_s
+                # Effective staleness window is PUBLISHER-DECLARED so every reader agrees on when this
+                # unit is stale: the LARGER of its refresh period (×2, one missed beat) and its own
+                # configured stale_after_s. Both come from the SNAPSHOT, not the reader, so two
+                # readers with different local cadence/config can't disagree about a peer's liveness
+                # (which would split the node into divergent plans → oversubscription). Falls back
+                # to the reader's own max_age_s only when the publisher declared neither (a
+                # pre-upgrade snapshot). Capped at the GC floor so a spoofed window can't keep a
+                # phantom past the mtime sweep.
+                declared = max(
+                    snap.refresh_s * 2.0 if _finite_in(snap.refresh_s, 0, _MAX_TS) else 0.0,
+                    snap.stale_after_s if _finite_in(snap.stale_after_s, 0, _MAX_TS) else 0.0)
+                eff = min(declared, self._GC_AGE_FLOOR_S) if declared > 0 else max_age_s
                 ok = (_valid(snap)
                       and f.name == self._filename(snap.engine, snap.tier, snap.node, snap.instance)
                       and _finite_in(snap.ts, -_MAX_TS, _MAX_TS)
@@ -309,4 +320,5 @@ def _valid(snap: DemandSnapshot) -> bool:
         and isinstance(snap.balancing, bool)
         and _finite_in(snap.budget_ram_mib, 0, _MAX_SLOT_RAM_MIB * _MAX_CEILING_SANE)
         and _finite_in(snap.budget_vcpus, 0, 1024 * _MAX_CEILING_SANE)
+        and _finite_in(snap.stale_after_s, 0, _MAX_TS)
     )
