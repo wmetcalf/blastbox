@@ -119,13 +119,16 @@ sizer never warms more slots than the dispatcher can run — each in-flight job,
 is one slot of RAM), and the pool starts **unspawned** (`warm=0`) and is sized synchronously
 from the node budget before it serves, so a full/rolling startup can't transiently over-spawn.
 The autosizer does **not** force `warm_only` — that would break jobs needing a cold egress
-personality (which bypass the warm pool) and doesn't bound cold RAM anyway. Instead the node
-budget is enforced as a **hard cap over the cold path too**: the sizer drives a live concurrency
-gate to the pool's budget-allocated ceiling on every resize, and each dispatch worker holds one
-permit for the whole claim+dispatch, so **active jobs (warm *and* cold) ≤ ceiling ≤ budget**
-automatically — not just the operator's arithmetic. Set `BLASTBOX_DISPATCH_CONCURRENCY` per
-engine so that Σ(concurrency·slot-footprint) ≤ the node budget across the engines a node serves;
-the sizer distributes warm capacity under the budget and bounds in-flight work to what it warmed.
+personality (which bypass the warm pool) and doesn't bound cold RAM anyway. Instead the cold
+path is bounded against the same budget: a cold worker spawns footprint **outside** the warm
+pool, so the sizer drives a live gate to the budget's **cold headroom** (`ceiling − warm
+reservation`) on every resize. Only the cold path takes a permit (warm dispatch reuses a
+resident slot and is never gated); when there's no headroom a cold job is requeued rather than
+oversubscribing. So **warm residency + cold workers stay within the ceiling** instead of each
+independently reaching it. This is **best-effort**, not a hard guarantee — a warm burst within a
+sizing interval can transiently overshoot before the gate catches up, a bounded overshoot that
+self-corrects next tick (plus idle-slot reaping). Set `BLASTBOX_DISPATCH_CONCURRENCY` per engine
+so that Σ(concurrency·slot-footprint) ≤ the node budget across the engines a node serves.
 For a SQL job store an index on `jobs(status, engine, target_tier)` is created — `CONCURRENTLY`
 on Postgres so upgrading a large table doesn't block writes — keeping the per-tick backlog
 counts cheap.

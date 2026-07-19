@@ -80,9 +80,12 @@ class NodeConfig:
 
     @property
     def active(self) -> bool:
-        """True if the coordinator should touch pools at all. With both switches off it
-        is a pure no-op (pools self-manage) — the safest default."""
-        return bool(self.engines) and (self.resource_management or self.balancing)
+        """True if the coordinator should touch pools at all. With every switch off it
+        is a pure no-op (pools self-manage) — the safest default. adaptive counts too: it
+        tunes the budget, which is meaningless unless the sizer runs (from_env already folds
+        adaptive into resource_management; this covers a directly-constructed config)."""
+        return bool(self.engines) and (
+            self.resource_management or self.balancing or self.adaptive)
 
     def add_engine(self, engine: EngineNode) -> "NodeConfig":
         """Return a copy with `engine` added (or replaced by name) — add a HW node's
@@ -197,15 +200,19 @@ class NodeConfig:
         # stale_after_s only feeds mtime staleness comparison (never wait()/sleep()), so it needs
         # no time_t cap — but it MUST stay >= 2*interval or peers age out every tick.
         stale_after_s = max(_float("BLASTBOX_NODE_STALE_AFTER_S", 20.0), interval_s * 2.0)
+        adaptive = _bool("BLASTBOX_NODE_ADAPTIVE", False)
         return cls(
             engines=tuple(engines),
-            # balancing implies resource_management (you can't rebalance a budget you
-            # don't enforce), so enabling balancing turns budget enforcement on too.
-            resource_management=_bool("BLASTBOX_NODE_RESOURCE_MANAGEMENT", False) or balancing,
+            # balancing AND adaptive both imply resource_management: you can't rebalance or
+            # adaptively shed a budget you don't enforce. Without this, BLASTBOX_NODE_ADAPTIVE=1
+            # alone would leave `active` False → the managed startup wiring is skipped and the
+            # documented adaptive opt-in silently does nothing.
+            resource_management=(
+                _bool("BLASTBOX_NODE_RESOURCE_MANAGEMENT", False) or balancing or adaptive),
             balancing=balancing,
             ram_headroom_frac=_clamp(_float("BLASTBOX_NODE_RAM_HEADROOM", 0.8), 0.05, 1.0),
             vcpu_oversubscription=_clamp(_float("BLASTBOX_NODE_VCPU_OVERSUBSCRIPTION", 2.0), 0.5, 64.0),
-            adaptive=_bool("BLASTBOX_NODE_ADAPTIVE", False),
+            adaptive=adaptive,
             min_free_mib=max(0.0, _float("BLASTBOX_NODE_MIN_FREE_MIB", 2048.0)),
             interval_s=interval_s,
             share_dir=os.environ.get("BLASTBOX_NODE_SHARE_DIR", "/var/lib/blastbox/node").strip()

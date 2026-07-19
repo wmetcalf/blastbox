@@ -81,7 +81,7 @@ def main() -> int:
 
     tier = "firecracker"
     node_managed = _node_manages_tier(tier)
-    check("node manages fc tier (RM on) → hard-cap wiring active", node_managed)
+    check("node manages fc tier (RM on) → cold-gate wiring active", node_managed)
     check("cold tier NOT node-managed", not _node_manages_tier("cold"))
 
     # ---- managed startup sequence (as _dispatch_cmd does) ----
@@ -91,8 +91,8 @@ def main() -> int:
     pool.start()
     check("pool starts unspawned (warm=0) before first sizing", pool.warm_size == 0)
 
-    # A live concurrency gate (as _dispatch_cmd builds when node-managed) — seeded with the
-    # operator's dispatch concurrency, then driven by the sizer to the budget-allocated ceiling.
+    # A live COLD-admission gate (as _dispatch_cmd builds when node-managed) — seeded with the
+    # operator's dispatch concurrency, then driven by the sizer to the budget's cold HEADROOM.
     from blastbox.host.concurrency_gate import DynamicConcurrencyGate
     gate = DynamicConcurrencyGate(concurrency)
     sizer = _start_node_sizer(pool, ["clip", "red"], store, tier, concurrency, gate)
@@ -101,16 +101,24 @@ def main() -> int:
           f"ceiling={pool.concurrent_ceiling}")
     check("pool ceiling capped at dispatch concurrency (not warmed beyond usable)",
           pool.concurrent_ceiling <= concurrency, f"{pool.concurrent_ceiling} <= {concurrency}")
-    # The gate limit now tracks the pool ceiling → CONCURRENT jobs (warm+cold) are bounded to it.
-    check("sizer drove the concurrency gate to the pool ceiling",
-          gate.limit == pool.concurrent_ceiling, f"gate={gate.limit} ceiling={pool.concurrent_ceiling}")
-    # And the gate actually bounds: acquire the ceiling's worth of permits, the next one blocks.
-    got = [gate.acquire(0.05) for _ in range(pool.concurrent_ceiling)]
+    # The gate is the COLD headroom = max(1, ceiling − warm reservation): warm dispatch reuses a
+    # resident slot (never gated); cold spawns outside the pool, so headroom is what keeps
+    # warm residency + cold within the budget instead of each independently reaching the ceiling.
+    expect_headroom = max(1, pool.concurrent_ceiling - pool.warm_size)
+    check("sizer drove the cold gate to (ceiling − warm) headroom",
+          gate.limit == expect_headroom,
+          f"gate={gate.limit} expected={expect_headroom} (ceiling={pool.concurrent_ceiling} warm={pool.warm_size})")
+    # warm residency + cold admission stays within the ceiling (+1 liveness floor):
+    check("warm reservation + cold headroom ≤ ceiling (+1 floor)",
+          pool.warm_size + gate.limit <= pool.concurrent_ceiling + 1,
+          f"warm={pool.warm_size} + cold={gate.limit} vs ceiling={pool.concurrent_ceiling}")
+    # And the gate actually bounds: acquire the headroom's worth of permits, the next one blocks.
+    got = [gate.acquire(0.05) for _ in range(gate.limit)]
     over = gate.acquire(0.05)
     for _ in range(sum(got)):
         gate.release()
-    check("gate admits exactly the ceiling and blocks the over-limit job",
-          all(got) and not over, f"admitted={sum(got)}/{pool.concurrent_ceiling} over_limit_blocked={not over}")
+    check("cold gate admits exactly the headroom and blocks the over-limit job",
+          all(got) and not over, f"admitted={sum(got)}/{expect_headroom} over_limit_blocked={not over}")
     files = os.listdir(share_dir)
     check("published a node-view snapshot", any(f.endswith(".json") for f in files), str(files))
 

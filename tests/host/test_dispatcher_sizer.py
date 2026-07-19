@@ -301,10 +301,33 @@ def test_same_engine_two_tiers_on_one_node_are_distinct_pools(tmp_path):
     assert m_fc.concurrent_ceiling >= 1 and m_gv.concurrent_ceiling >= 1
 
 
-def test_sizer_drives_concurrency_gate_to_ceiling(tmp_path):
-    # PR #60 r14: the sizer drives the dispatcher's live concurrency gate to the pool's
-    # budget-allocated ceiling on each resize — so CONCURRENT jobs (warm AND cold) are bounded
-    # by the ceiling, making the node budget a hard cap that also covers cold fallback.
+def test_sizer_drives_concurrency_gate_to_cold_headroom(tmp_path):
+    # PR #60: the sizer drives the dispatcher's COLD-admission gate to the budget's cold
+    # HEADROOM (ceiling − warm reservation), NOT the whole ceiling — the warm pool already
+    # bounds warm slots, and cold workers spawn outside it, so headroom is what keeps warm
+    # residency + cold within the budget instead of each reaching the ceiling (→ ~2× the node).
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+    share = FileNodeShare(str(tmp_path))
+    gate = DynamicConcurrencyGate(64)
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    pool = _Pool()
+    # low backlog → warm target well below the ceiling, so there's real cold headroom to check.
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=6), pool, share,
+                         cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 2, node="n",
+                         instance="i", capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0,
+                         concurrency_gate=gate)
+    mine = ds.tick()
+    assert mine.warm_size < mine.concurrent_ceiling                        # genuine headroom
+    assert gate.limit == max(1, mine.concurrent_ceiling - mine.warm_size)  # gate == cold headroom
+    # and warm residency (≤ ceiling in the pool) + cold (≤ gate) never exceeds the ceiling except
+    # for the floor-of-1 liveness margin:
+    assert mine.warm_size + gate.limit <= mine.concurrent_ceiling + 1
+
+
+def test_sizer_floors_cold_gate_at_one_when_warm_saturates(tmp_path):
+    # when warm demand claims the whole ceiling, cold headroom is 0 — but the gate floors at 1 so
+    # egress / warm-miss jobs never fully starve (a bounded, self-correcting overshoot).
     from blastbox.host.concurrency_gate import DynamicConcurrencyGate
     share = FileNodeShare(str(tmp_path))
     gate = DynamicConcurrencyGate(64)
@@ -312,12 +335,12 @@ def test_sizer_drives_concurrency_gate_to_ceiling(tmp_path):
                      vcpu_oversubscription=999, stale_after_s=60)
     pool = _Pool()
     ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=6), pool, share,
-                         cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 20, node="n",
+                         cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 50, node="n",
                          instance="i", capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0,
                          concurrency_gate=gate)
     mine = ds.tick()
-    assert gate.limit == mine.concurrent_ceiling      # gate tracks the pool ceiling
-    assert gate.limit == pool.concurrent_ceiling
+    assert mine.warm_size == mine.concurrent_ceiling      # warm saturated the ceiling
+    assert gate.limit == 1                                # floored, not 0
 
 
 def test_overlapping_replicas_split_budget_not_double(tmp_path):

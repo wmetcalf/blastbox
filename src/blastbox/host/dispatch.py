@@ -263,9 +263,12 @@ class Dispatcher:
         warm_requeue_backoff_s: float = 1.0,
         concurrency_gate: "DynamicConcurrencyGate | None" = None,
     ) -> None:
-        # Optional live concurrency cap driven by the node autosizer: workers hold a permit
-        # while processing a job so CONCURRENT detonations (warm+cold) never exceed the sizer's
-        # current ceiling → the node RAM budget is a hard cap even over the cold path.
+        # Optional live cold-admission cap driven by the node autosizer. ONLY the cold path
+        # acquires a permit (see _dispatch_claimed_job): a cold worker spawns footprint OUTSIDE
+        # the warm pool, so the sizer sets the gate limit to the budget's cold headroom
+        # (ceiling − warm reservation) → warm residency + cold workers stay within the node
+        # budget. Warm dispatch is never gated (it reuses a resident slot). Best-effort, not a
+        # hard guarantee — see the eventual-consistency note in dispatcher_sizer.
         self._concurrency_gate = concurrency_gate
         self._job_store = job_store
         # engines is kept as an immutable mapping snapshot so callers cannot
@@ -466,23 +469,17 @@ class Dispatcher:
         def _should_stop() -> bool:
             return stop_evt.is_set() or (stop is not None and stop())
 
-        gate = self._concurrency_gate
-
         def _worker() -> None:
             while not _should_stop():
-                # Hold a permit for the whole claim+dispatch so CONCURRENT jobs (warm or cold)
-                # never exceed the sizer's live ceiling. A timed acquire keeps shutdown
-                # responsive; if the limit is currently full we just re-check stop and retry.
-                if gate is not None and not gate.acquire(timeout=poll_interval_s):
-                    continue
+                # The concurrency gate is NOT held here: warm dispatch runs in an already-resident
+                # slot (adds no footprint) and must never be blocked. Only the COLD path — which
+                # spawns a NEW worker outside the warm pool — acquires a gate permit, inside
+                # _dispatch_claimed_job, so the node budget's cold headroom bounds it.
                 try:
                     progressed = self.dispatch_once()
                 except Exception:  # noqa: BLE001
                     _log.exception("dispatch_once failed; continuing")
                     progressed = False
-                finally:
-                    if gate is not None:
-                        gate.release()
                 if not progressed:
                     time.sleep(poll_interval_s)
 
@@ -733,45 +730,57 @@ class Dispatcher:
             elif self._warm_only:
                 # Warm-only sidecar: do NOT cold-fall-back (no docker socket here — the cold
                 # path would fail closed and FAIL the job). Release the claim back to QUEUED so
-                # the cold dispatcher (or another warm tier) claims it. CAS-fenced on OUR
-                # claim_id and clears it, so a job reclaimed since we claimed is left untouched;
-                # started_at/worker_runtime are reset so it looks fresh. The staged input is NOT
-                # deleted — the next owner needs it (we only delete input on paths WE terminate).
-                requeued = self._job_store.update_if_status(
-                    job.job_id,
-                    JobStatus.RUNNING,
-                    expect_claim_id=job.claim_id,
-                    status=JobStatus.QUEUED,
-                    started_at=None,
-                    worker_runtime=None,
-                    worker_tier=None,  # reset in lockstep with worker_runtime (see cold requeue)
-                    claim_id=None,
-                    error=None,
-                )
-                _log.info(
-                    "warm_pool_miss job_id=%s; warm_only requeue=%s (no cold fallback)",
-                    job.job_id,
-                    requeued,
-                )
-                # Yield before returning: dispatch_once() reports progress (a job was claimed),
-                # so run_forever loops without its poll sleep — without this, THIS dispatcher
-                # re-claims the just-requeued job in a ~warm_claim_timeout_s-paced churn loop and
-                # the cold dispatcher never gets a turn at it. The backoff hands it off.
-                if self._warm_requeue_backoff_s:
-                    time.sleep(self._warm_requeue_backoff_s)
+                # the cold dispatcher (or another warm tier) claims it.
+                self._requeue_claimed(job, reason="warm_only requeue (no cold fallback)")
                 return
             else:
                 _log.info("warm_pool_miss job_id=%s; falling back to cold path", job.job_id)
 
-        # COLD PATH (default / fallback)
+        # COLD PATH (default / fallback). A cold worker spawns NEW footprint OUTSIDE the warm
+        # pool, so it must fit the node budget's COLD HEADROOM: the sizer caps concurrent cold
+        # workers at (ceiling − warm reservation) via the gate. If there's no headroom right now
+        # (warm is using the budget), REQUEUE rather than block a dispatch thread or oversubscribe
+        # — a worker reclaims it once the sizer frees headroom (idle-warm reaping). Best-effort,
+        # per the eventual-consistency model in dispatcher_sizer: a warm burst mid-interval can
+        # transiently overshoot, corrected next tick.
+        gate = self._concurrency_gate
+        if gate is not None and not gate.acquire(timeout=0.0):
+            self._requeue_claimed(job, reason="no cold budget headroom")
+            return
         t0 = time.monotonic()
         try:
             self._dispatch_inner(job, input_path, output_dir)
         finally:
+            if gate is not None:
+                gate.release()
             # Delete the malicious input on every terminal path WE own, regardless of success,
             # failure, exception, or unknown engine. We never touch output/ here.
             self._delete_input_if_owned(job, input_path)
             self._record_outcome(job, path="cold", started=t0)
+
+    def _requeue_claimed(self, job: Job, *, reason: str) -> None:
+        """Release OUR claim back to QUEUED so another worker/dispatcher takes the job. CAS-fenced
+        on our claim_id and clears it, so a job reclaimed since we claimed is left untouched;
+        started_at/worker_runtime/worker_tier are reset so it looks fresh. The staged input is
+        NOT deleted — the next owner needs it (we only delete input on paths WE terminate).
+
+        Then yields (backoff): dispatch_once() reports progress (a job WAS claimed), so run_forever
+        loops without its poll sleep — without a pause THIS dispatcher re-claims the just-requeued
+        job in a tight churn loop and no peer gets a turn. The backoff hands it off."""
+        requeued = self._job_store.update_if_status(
+            job.job_id,
+            JobStatus.RUNNING,
+            expect_claim_id=job.claim_id,
+            status=JobStatus.QUEUED,
+            started_at=None,
+            worker_runtime=None,
+            worker_tier=None,
+            claim_id=None,
+            error=None,
+        )
+        _log.info("job_id=%s requeued=%s (%s)", job.job_id, requeued, reason)
+        if self._warm_requeue_backoff_s:
+            time.sleep(self._warm_requeue_backoff_s)
 
     def _delete_input_if_owned(self, job: Job, input_path: Path) -> None:
         """Delete the shared staged input ONLY if we still hold the claim (or the job

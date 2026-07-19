@@ -1988,3 +1988,60 @@ def test_no_capture_artifact_when_netd_produced_none(tmp_path, monkeypatch):
     sealed = json.loads((output_dir / "metadata.json").read_text())
     assert not any(a["kind"] == "network_capture" for a in sealed["artifacts"])
     assert store.get(job.job_id).status == JobStatus.DONE
+
+
+def test_cold_dispatch_requeues_when_no_gate_headroom(tmp_path):
+    # PR #60 codex P1: a cold worker spawns footprint OUTSIDE the warm pool, so cold admission is
+    # bounded by the node budget's cold headroom (the sizer's gate). With NO headroom, the job
+    # must be REQUEUED — never detonated anyway (→ oversubscription) and never blocking the thread.
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+
+    ran: list = []
+
+    def fake_runner(argv, **kw):
+        ran.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    gate = DynamicConcurrencyGate(1)
+    assert gate.acquire(0.0)               # consume the only permit → cold headroom is full
+    dispatcher._concurrency_gate = gate
+    dispatcher._warm_requeue_backoff_s = 0.0   # no sleep in the test
+
+    assert dispatcher.dispatch_once() is True   # a job WAS claimed...
+    assert ran == []                            # ...but the cold worker never spawned
+    final = store.get(job.job_id)
+    assert final is not None
+    assert final.status == JobStatus.QUEUED     # requeued for a later worker/tick
+    assert final.claim_id is None               # claim released
+
+
+def test_cold_dispatch_acquires_and_releases_gate_permit(tmp_path):
+    # With headroom, the cold path acquires ONE permit for the detonation and releases it after,
+    # so the gate's in-flight count returns to zero (the reservation is transient, per job).
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    output_dir = tmp_path / job.job_id / "output"
+    _setup_job_dirs(tmp_path, job)
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    gate = DynamicConcurrencyGate(2)
+    dispatcher._concurrency_gate = gate
+
+    assert dispatcher.dispatch_once() is True
+    assert store.get(job.job_id).status == JobStatus.DONE
+    assert gate.in_flight == 0                   # permit taken for the run, then released

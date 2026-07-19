@@ -150,7 +150,14 @@ class DispatcherSizer:
             return None
         started = self._clock()
         e = self._engine
+        # Active demand = warm-assigned slots PLUS cold workers in flight. The gate counts
+        # cold-only (see dispatch), and those jobs have already LEFT the queued backlog and hold
+        # NO warm slot, so without adding them the snapshot would under-report demand — the
+        # planner could shrink this pool and let peers expand while the cold work still runs and
+        # set_limit() can't recall it. Counting them keeps the reservation until they finish.
         assigned = int(getattr(self._pool, "assigned_count", 0))      # cheap
+        if self._gate is not None:
+            assigned += int(getattr(self._gate, "in_flight", 0))
 
         # tell peers our expected refresh period so a slow count doesn't get us aged out
         refresh_s = self._config.interval_s + self._last_tick_dur
@@ -259,11 +266,16 @@ class DispatcherSizer:
             mine = PoolSize(warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)
             self._pool.resize(  # type: ignore[attr-defined]
                 warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)
-            # Drive the dispatcher's live concurrency to the same ceiling, so CONCURRENT jobs
-            # (warm AND cold-fallback) are bounded by the budget-allocated ceiling — the node
-            # RAM cap holds even over the cold path, which the warm pool alone can't bound.
+            # Drive the dispatcher's COLD-admission gate to the budget's COLD HEADROOM: the warm
+            # pool already caps warm slots at the ceiling, and cold workers spawn OUTSIDE it, so
+            # the cold headroom is (ceiling − warm reservation). This keeps warm residency + cold
+            # workers within the ceiling instead of each independently reaching it (which would
+            # let warm + cold approach 2× the budget). The gate floors the limit at 1, so cold
+            # (egress / warm-miss) never fully starves even when warm claims the whole budget —
+            # a bounded, self-correcting overshoot, per this module's eventual-consistency note.
             if self._gate is not None:
-                self._gate.set_limit(mine.concurrent_ceiling)  # type: ignore[attr-defined]
+                self._gate.set_limit(  # type: ignore[attr-defined]
+                    mine.concurrent_ceiling - warm)
         return mine
 
     def remove_own_snapshot(self) -> None:

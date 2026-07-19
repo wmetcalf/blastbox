@@ -233,16 +233,21 @@ def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gat
                   f"pool footprint is complete).", file=sys.stderr)
             return None
         base = mine[0]
+        # Cap the ceiling at the dispatcher's worker concurrency: run_forever runs at most
+        # `concurrency` jobs at once, so warming more slots than that is wasted RAM (and the
+        # ceiling above it is meaningless). This is also how the node budget stays bounded
+        # by ACTUAL in-flight RAM (warm+cold) rather than by warm slots alone.
+        combined_ceiling = max(1, min(min(e.max_ceiling for e in mine), concurrency))
         spec = replace(  # type: ignore[call-arg]
             base,
             slot_ram_mib=max(e.slot_ram_mib for e in mine),
             slot_vcpus=max(e.slot_vcpus for e in mine),
-            min_warm=max(e.min_warm for e in mine),
-            # Cap the ceiling at the dispatcher's worker concurrency: run_forever runs at most
-            # `concurrency` jobs at once, so warming more slots than that is wasted RAM (and the
-            # ceiling above it is meaningless). This is also how the node budget stays bounded
-            # by ACTUAL in-flight RAM (warm+cold) rather than by warm slots alone.
-            max_ceiling=max(1, min(min(e.max_ceiling for e in mine), concurrency)),
+            # The shared pool serves ALL of `mine`, so its warm floor is the SUM of the engines'
+            # floors — each engine wants its own min_warm hot. Taking the max discards the other
+            # engines' floors (two engines @ MIN_WARM=2 would keep only 2 hot, not 4). Cap by the
+            # combined ceiling: you can't warm more than the pool's hard ceiling anyway.
+            min_warm=min(sum(e.min_warm for e in mine), combined_ceiling),
+            max_ceiling=combined_ceiling,
             # the shared pool represents the COMBINED engines, so its static weight is the
             # SUM of their weights — using only the first engine's understates its share.
             # Clamp to _MAX_WEIGHT: the reader (_valid) rejects a snapshot weight above it, so
@@ -336,10 +341,11 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     # to that same budget-allocated ceiling, so active jobs ≤ ceiling ≤ budget — a hard NODE cap
     # that holds automatically over the cold path, not just the operator's Σ arithmetic.
     dispatch_concurrency = int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1")
-    # When node-managed, a live concurrency gate makes the node budget a HARD cap that also
-    # covers cold fallback: dispatch workers hold a permit per in-flight job, and the sizer
-    # drives the gate limit to the pool's budget-allocated ceiling on every resize. Off (None)
-    # when unmanaged — no behavior change.
+    # When node-managed, a live gate bounds COLD admission to the node budget's cold headroom
+    # (ceiling − warm reservation): the cold path spawns footprint outside the warm pool, so the
+    # sizer drives the gate each resize to keep warm residency + cold workers within the budget.
+    # Warm dispatch is never gated. Best-effort (bounded, self-correcting overshoot), not a hard
+    # guarantee. Off (None) when unmanaged — no behavior change.
     from blastbox.host.concurrency_gate import DynamicConcurrencyGate
     concurrency_gate = DynamicConcurrencyGate(dispatch_concurrency) if node_managed else None
 
@@ -435,8 +441,8 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         # would fail closed here — no docker socket). Inert without a pool. (Parsed above for
         # reachable_tiers; reused here so the gate and the dispatcher agree on cold-fallback.)
         warm_only=warm_only,
-        # live concurrency cap driven by the node autosizer (None when unmanaged) — bounds
-        # CONCURRENT jobs (warm+cold) to the budget-allocated ceiling.
+        # live COLD-admission cap driven by the node autosizer (None when unmanaged) — bounds
+        # concurrent cold workers to the budget's cold headroom (ceiling − warm reservation).
         concurrency_gate=concurrency_gate,
     )
     # Opt-in node self-sizer started INSIDE the try below, so pool.stop() in the finally

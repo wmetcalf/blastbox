@@ -1,15 +1,19 @@
-"""Dynamic concurrency gate — the sizer's live control over how many jobs a dispatcher runs.
+"""Dynamic concurrency gate — the sizer's live cap on COLD-path admission.
 
-The node autosizer allocates each engine a slot ceiling under the node RAM/vCPU budget. But a
-warm pool only bounds WARM slots; the cold-fallback path (and egress jobs, which must go cold)
-runs OUTSIDE the pool, so bounding warm slots alone doesn't bound node RAM. Each in-flight
-detonation — warm OR cold — is one slot's worth of RAM, so the honest bound is on CONCURRENT
-JOB PROCESSING, whatever tier it lands on.
+The node autosizer allocates each engine a slot ceiling under the node RAM/vCPU budget. The
+warm pool already bounds warm slots at that ceiling. But the cold-fallback path (and egress
+jobs, which must go cold) spawns workers OUTSIDE the pool, so those add footprint ON TOP of
+warm residency — bounding warm slots alone doesn't bound the node.
 
-This gate provides exactly that: dispatch workers acquire a permit before processing a job and
-release it after, and the sizer calls :meth:`set_limit` on every resize to track the pool's
-current ceiling. With the pool ceiling capped at the dispatcher's worker count, we get
-``active ≤ ceiling ≤ budget`` at all times — a hard node cap that also covers cold fallback.
+This gate bounds cold admission to the budget's COLD HEADROOM. Only the cold path acquires a
+permit (warm dispatch reuses an already-resident slot and adds nothing, so it is never gated);
+the sizer calls :meth:`set_limit` on every resize with ``ceiling − warm reservation``, so warm
+residency + cold workers stay within the ceiling instead of each independently reaching it. The
+limit floors at 1 so cold never fully starves when warm claims the whole budget.
+
+This is BEST-EFFORT, not a hard guarantee: the warm pool can burst above its reservation within
+a sizing interval before the gate limit catches up, a bounded overshoot that self-corrects on
+the next tick (plus idle-slot reaping) — see the eventual-consistency note in dispatcher_sizer.
 """
 
 from __future__ import annotations
