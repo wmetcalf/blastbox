@@ -302,4 +302,11 @@ def _valid(snap: DemandSnapshot) -> bool:
         and _finite_in(snap.weight, 0, _MAX_WEIGHT)
         and _finite_in(snap.ts, -_MAX_TS, _MAX_TS)   # bounded (NOT bare math.isfinite, which
         and _finite_in(snap.refresh_s, 0, _MAX_TS)   # OverflowErrors on a huge-int ts/refresh)
+        # Consensus fields — validate here too, else a poisoned budget_ram_mib="oops" survives
+        # read_all and every later tick raises on `s.budget_ram_mib > 0`; because the heartbeat
+        # already published, the run loop then retries forever and freezes the pool at a stale
+        # allocation instead of just skipping the one bad file. 0 = "unknown budget" (allowed).
+        and isinstance(snap.balancing, bool)
+        and _finite_in(snap.budget_ram_mib, 0, _MAX_SLOT_RAM_MIB * _MAX_CEILING_SANE)
+        and _finite_in(snap.budget_vcpus, 0, 1024 * _MAX_CEILING_SANE)
     )

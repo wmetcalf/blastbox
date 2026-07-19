@@ -170,15 +170,22 @@ class DispatcherSizer:
         #    Cold work must NOT inflate this: cold jobs bypass the warm pool, so counting them
         #    would warm VMs they can never use AND shrink the cold headroom (ceiling − warm) to
         #    its floor → an egress batch would run essentially serially.
-        #  * assigned (total) — warm-assigned PLUS cold workers in flight. Drives the PUBLISHED
-        #    demand (the pool's ceiling SHARE / reservation). Cold jobs have already LEFT the
-        #    queued backlog and hold no warm slot, so without them the snapshot under-reports
-        #    demand — the planner could shrink this pool's ceiling and let peers expand while the
-        #    cold work still runs (the gate can't recall in-flight permits). Counting them keeps
-        #    the reservation until they finish.
+        #  * assigned (total) — the PUBLISHED reservation (the pool's ceiling SHARE). It is the
+        #    MAX of active work and CURRENTLY-RESIDENT slots:
+        #      - active work = warm-assigned + cold in flight. Cold jobs have already LEFT the
+        #        queued backlog and hold no warm slot, so without them the snapshot under-reports
+        #        demand and the planner could shrink this pool while cold work still runs (the gate
+        #        can't recall in-flight permits).
+        #      - resident slots — resize() only moves setpoints; surplus IDLE/WARMING VMs aren't
+        #        reaped until a later pool tick. If demand drops and we advertised the LOWER share
+        #        immediately, a peer would spawn into the "freed" budget while our old VMs still
+        #        consume it (the cold gate only bounds OUR cold admission, not the peer). Holding
+        #        the reservation at current residency until it actually reaps means we shrink FIRST
+        #        and peers grow only as fast as we truly free RAM — no cross-pool oversubscription.
         assigned_warm = int(getattr(self._pool, "assigned_count", 0))      # cheap
         cold_in_flight = int(getattr(self._gate, "in_flight", 0)) if self._gate is not None else 0
-        assigned = assigned_warm + cold_in_flight
+        resident = int(getattr(self._pool, "slot_count", 0))
+        assigned = max(assigned_warm + cold_in_flight, resident)
 
         # Compute OUR view of the node budget up front so we can PUBLISH it: readers reconcile to
         # one budget (the elementwise MIN across the view), so a dispatcher with a different

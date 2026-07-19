@@ -233,11 +233,15 @@ def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gat
                   f"pool footprint is complete).", file=sys.stderr)
             return None
         base = mine[0]
-        # Cap the ceiling at the dispatcher's worker concurrency: run_forever runs at most
-        # `concurrency` jobs at once, so warming more slots than that is wasted RAM (and the
-        # ceiling above it is meaningless). This is also how the node budget stays bounded
-        # by ACTUAL in-flight RAM (warm+cold) rather than by warm slots alone.
-        combined_ceiling = max(1, min(min(e.max_ceiling for e in mine), concurrency))
+        # The shared pool's ceiling is the LARGEST engine's ceiling (not the smallest): taking the
+        # min would let a low-cap engine throttle the whole pool — clip(cap 1) + red(cap 32) would
+        # cap at 1 even when all queued work is red and the budget permits 32. The busiest engine
+        # must be able to reach its own cap. Bounded by the dispatcher's worker concurrency
+        # (run_forever runs at most `concurrency` jobs at once, so a higher ceiling is wasted RAM)
+        # and, downstream, by the node budget's water-fill — so this never oversubscribes. (A
+        # shared pool can't enforce each engine's individual sub-cap without per-engine tracking;
+        # the node budget bounds the aggregate, which is what matters for oversubscription.)
+        combined_ceiling = max(1, min(max(e.max_ceiling for e in mine), concurrency))
         spec = replace(  # type: ignore[call-arg]
             base,
             slot_ram_mib=max(e.slot_ram_mib for e in mine),

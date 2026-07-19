@@ -518,6 +518,60 @@ def test_multi_engine_weight_clamped_to_valid_cap(tmp_path, monkeypatch):
         sizer.remove_own_snapshot()
 
 
+def test_multi_engine_pool_ceiling_is_largest_not_smallest(tmp_path, monkeypatch):
+    # PR #60 codex P2: a shared pool serving engines with different MAX_CEILING must take the
+    # LARGEST (bounded by concurrency), not the smallest — else a low-cap engine throttles the
+    # whole pool (clip cap 1 + red cap 32 → capped at 1 even when all work is red).
+    from blastbox.host.cli import _start_node_sizer
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip,red")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_CLIP_MAX_CEILING", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_RED_MAX_CEILING", "32")
+    monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
+    res = _start_node_sizer(_Pool(), ["clip", "red"], InMemoryJobStore(), "firecracker", 32)
+    assert res is not None
+    stop, thread, sizer = res
+    try:
+        assert sizer._engine.max_ceiling == 32     # largest engine's cap, not min(1, 32)=1
+    finally:
+        stop.set()
+        thread.join(2.0)
+        sizer.remove_own_snapshot()
+
+
+def test_read_all_rejects_poisoned_consensus_field(tmp_path):
+    # PR #60 codex P2: a malformed consensus field (budget_ram_mib="oops") must be DROPPED by
+    # read_all — else it survives to tick() where `s.budget_ram_mib > 0` raises; the heartbeat
+    # already published, so the run loop retries forever, freezing pools at stale allocations.
+    import json
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("clip", 2, 0, 1024, 1, 0, 64, 1.0, ts=1.0))
+    # hand-write a poisoned file (bypassing publish's typed API); filename must match the slug.
+    (tmp_path / "red.json").write_text(json.dumps({
+        "engine": "red", "backlog": 1, "assigned": 0, "slot_ram_mib": 1024, "slot_vcpus": 1,
+        "min_warm": 0, "max_ceiling": 64, "weight": 1.0, "ts": 1.0, "budget_ram_mib": "oops"}))
+    engines = {s.engine for s in share.read_all(max_age_s=60, now=1.0)}
+    assert engines == {"clip"}     # poisoned red dropped; good clip survives
+
+
+def test_published_reservation_holds_resident_slots(tmp_path):
+    # PR #60 codex P1: resize() only moves setpoints — surplus IDLE/WARMING VMs aren't reaped
+    # until a later pool tick. If demand drops and we advertised the LOWER share immediately, a
+    # peer would spawn into the "freed" budget while our old VMs still consume it. The published
+    # reservation must hold at current residency until it actually reaps.
+    share = FileNodeShare(str(tmp_path))
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    pool = _Pool(assigned=0, slot_count=8)      # 8 VMs still resident, but no active work / backlog
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64), pool, share,
+                         cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 0, node="n",
+                         instance="i", capacity_fn=_budget(16 * 1024, 999), clock=lambda: 1.0)
+    ds.tick()
+    mine = next(s for s in share.read_all(max_age_s=60, now=1.0) if s.engine == "clip")
+    assert mine.assigned >= 8      # reservation reflects the 8 still-resident slots, not 0
+
+
 def test_node_manages_tier_gating(monkeypatch):
     # PR #60 r13: _node_manages_tier drives the hard-cap startup wiring (force warm_only,
     # start unspawned). True only when RM is on AND the tier is node-managed (fc/gvisor).
