@@ -227,12 +227,10 @@ def local_backlog_fn(job_store: object,
 
     def _fn(_engine: str = "") -> int:
         try:
-            if engines is None:
-                return int(job_store.count(JobStatus.QUEUED,  # type: ignore[attr-defined]
-                                           claimant_tier=claimant_tier))
-            return sum(int(job_store.count(JobStatus.QUEUED, engine=e,  # type: ignore[attr-defined,misc]
-                                           claimant_tier=claimant_tier))
-                       for e in engines)
+            # ONE store call for the whole served set (count() takes a collection), so a
+            # multi-engine dispatcher's backlog is a single scan/query, not one per engine.
+            return int(job_store.count(JobStatus.QUEUED,  # type: ignore[attr-defined]
+                                       engine=engines, claimant_tier=claimant_tier))
         except Exception:
             return 0
     return _fn

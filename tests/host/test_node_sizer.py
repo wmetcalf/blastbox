@@ -228,6 +228,42 @@ def test_from_env_output_always_passes_reader_validation(monkeypatch):
     assert _valid(snap)                  # writer's output survives the reader → no self-eviction
 
 
+def test_from_env_rejects_bad_boolean(monkeypatch):
+    # PR #60 r13: a misspelled bool (flase) must NOT be treated as True and silently enable
+    # hard-cap management + forced warm_only + startup pre-shrinking.
+    import pytest
+
+    from blastbox.host.node_config import NodeConfig
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")
+    monkeypatch.setenv("BLASTBOX_NODE_BALANCING", "flase")
+    with pytest.raises(ValueError):
+        NodeConfig.from_env()
+
+
+def test_from_env_rejects_duplicate_engines(monkeypatch):
+    # PR #60 r13: a repeated engine would double-count (doubled weight in static mode) — reject.
+    import pytest
+
+    from blastbox.host.node_config import NodeConfig
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip,clip,red")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    with pytest.raises(ValueError):
+        NodeConfig.from_env()
+
+
+def test_count_accepts_engine_collection():
+    # PR #60 r13: count() takes a COLLECTION so a multi-engine backlog is ONE store scan, not
+    # one per engine (a full Redis SCAN each).
+    from blastbox.host.jobs.base import Job, JobStatus
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    s = InMemoryJobStore()
+    for e in ("clip", "clip", "red", "titan"):
+        s.create(Job.new(engine=e, filename="x"))
+    assert s.count(JobStatus.QUEUED, engine=["clip", "red"]) == 3      # one pass, both engines
+    assert s.count(JobStatus.QUEUED, engine=["clip"]) == 2
+    assert s.count(JobStatus.QUEUED, engine="titan") == 1             # single name still works
+
+
 def test_local_backlog_sums_across_served_engines():
     from blastbox.host.jobs.base import Job
     from blastbox.host.jobs.memory import InMemoryJobStore

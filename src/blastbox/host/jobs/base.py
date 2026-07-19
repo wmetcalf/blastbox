@@ -251,9 +251,12 @@ class JobStore(Protocol):
         ...
 
     def count(self, status: JobStatus | None = None, *, q: str | None = None,
-              engine: str | None = None, claimant_tier: str | None = None) -> int:
+              engine: "str | Collection[str] | None" = None,
+              claimant_tier: str | None = None) -> int:
         """Total number of jobs (optionally filtered by ``status`` + filename ``q`` +
-        ``engine`` — the last scopes a SHARED multi-engine store to one engine's queue).
+        ``engine`` — the last scopes a SHARED multi-engine store to one engine's queue, or a
+        COLLECTION of engines counted in a SINGLE pass so a multi-engine dispatcher's backlog
+        isn't one full store scan per engine).
 
         ``claimant_tier`` mirrors ``claim_next``'s tier routing so a caller can count only
         the jobs THIS claimant could actually claim: when set, restrict to jobs whose

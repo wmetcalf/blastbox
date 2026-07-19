@@ -447,10 +447,10 @@ def test_update_publish_is_fenced_when_stopped_mid_count(tmp_path):
     assert list(tmp_path.glob("*.json")) == []        # heartbeat removed, update fenced → gone
 
 
-def test_run_removes_own_snapshot_on_graceful_stop(tmp_path):
-    # regression (PR #60 review): a graceful stop removes the unit's own snapshot so a
-    # restart leaves no phantom pool lingering in the node view (which would split the
-    # pool's budget with its dead former self for a whole staleness window).
+def test_remove_own_snapshot_clears_the_pool_reservation(tmp_path):
+    # regression (PR #60 r13): removal is the CALLER's job (the CLI calls it AFTER pool.stop()
+    # reaps the slots, so the reservation isn't released while our RAM is still in use). run()
+    # itself no longer removes on exit; remove_own_snapshot() clears exactly this unit's file.
     share = FileNodeShare(str(tmp_path))
     cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
                      vcpu_oversubscription=999, interval_s=0.5)
@@ -458,7 +458,10 @@ def test_run_removes_own_snapshot_on_graceful_stop(tmp_path):
                          share, cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 2,
                          node="toolz2", instance="p9", capacity_fn=_budget(8 * 1024, 99))
     ds.run(max_ticks=2, sleep=lambda _s: None)
-    assert list(tmp_path.glob("*.json")) == []        # own file removed on loop exit
+    assert list(tmp_path.glob("*.json"))              # snapshot still there after run() (not
+    #                                                   removed early — reservation retained)
+    ds.remove_own_snapshot()                          # the caller releases it (post-reap)
+    assert list(tmp_path.glob("*.json")) == []
 
 
 def test_read_all_gcs_long_abandoned_file(tmp_path):

@@ -283,15 +283,12 @@ class DispatcherSizer:
                 else:
                     sleep(self._config.interval_s)
         finally:
-            # Graceful stop (loop exit or max_ticks): remove our own snapshot so a restart
-            # doesn't leave a phantom pool lingering in the node view for a staleness window
-            # (which would split this pool's budget with its dead former self). A crash skips
-            # this — read_all's GC eventually sweeps the remnant; the staleness filter ignores
-            # it in the meantime after the window passes.
-            try:
-                self._share.remove(self._identity())
-            except Exception:
-                pass
+            # NB: removal of our snapshot is the CALLER's job (cli calls remove_own_snapshot()
+            # AFTER pool.stop() has reaped the slots), so the reservation stays advertised until
+            # our RAM is actually released — removing it here on thread-exit would free it too
+            # early (peers reallocate our share while our slots are still being reaped). A
+            # standalone caller that doesn't remove relies on staleness + the mtime GC.
+            pass
 
     def start_thread(self, stop: threading.Event) -> threading.Thread:
         """Start the loop in a daemon thread (for use alongside the dispatcher loop)."""

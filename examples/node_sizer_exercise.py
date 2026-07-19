@@ -84,8 +84,13 @@ def main() -> int:
     files = sorted(f.name for f in __import__("pathlib").Path(d).glob("*.json"))
     check("tier identity: 4 distinct pool files", len(files) == 4, str(files))
     total_ram = sum(p.concurrent_ceiling * 2048 for _, _, p, _ in sizers)
-    check("no oversubscription (Σ ≤ budget)", total_ram <= cap.ram_mib,
-          f"{total_ram:,.0f} ≤ {cap.ram_mib:,.0f} MiB")
+    # Undersized-node exception: if the host can't even seat one 2-GiB slot per pool, plan_sizes
+    # intentionally returns the 1-per-pool baseline even though Σ exceeds the budget (a pool that
+    # can't run is useless). Allow that documented case (as node_sizer's own tests do).
+    baseline_ram = len(sizers) * 2048
+    check("no oversubscription (Σ ≤ budget, or undersized baseline)",
+          total_ram <= cap.ram_mib or total_ram <= baseline_ram,
+          f"{total_ram:,.0f} vs budget {cap.ram_mib:,.0f} MiB")
     rt_fc = next(p for n, t, p, _ in sizers if n == "redtusk" and t == RUNTIME_FIRECRACKER)
     rt_gv = next(p for n, t, p, _ in sizers if n == "redtusk" and t == RUNTIME_GVISOR)
     check("redtusk fc+gvisor both sized, demand-weighted",

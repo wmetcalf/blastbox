@@ -100,7 +100,17 @@ class NodeConfig:
         """
         def _bool(key: str, default: bool) -> bool:
             raw = os.environ.get(key, "").strip().lower()
-            return default if not raw else raw not in ("0", "false", "no", "off")
+            if not raw:
+                return default
+            if raw in ("1", "true", "yes", "on"):
+                return True
+            if raw in ("0", "false", "no", "off"):
+                return False
+            # Reject an unrecognised spelling (e.g. 'flase') rather than treating any nonempty
+            # value as True — a typo must NOT silently enable hard-cap management, forced
+            # warm_only, and startup pre-shrinking.
+            raise ValueError(
+                f"{key}={raw!r} is not a valid boolean (use 1/0/true/false/yes/no/on/off)")
 
         def _float(key: str, default: float) -> float:
             raw = os.environ.get(key, "").strip()
@@ -129,6 +139,7 @@ class NodeConfig:
             return max(lo, min(hi, val))
 
         engines: list[EngineNode] = []
+        seen: set[str] = set()
         raw = os.environ.get("BLASTBOX_NODE_ENGINES", "").strip()
         for item in (p for p in raw.split(",") if p.strip()):
             # `name` or `name=url`; url is optional + unused by the shipped sizer (a
@@ -141,6 +152,11 @@ class NodeConfig:
                 raise ValueError(
                     f"BLASTBOX_NODE_ENGINES engine name {name!r} is not a safe slug "
                     "(letters/digits/._- only, no path separators or '..')")
+            if name in seen:
+                # a repeat would be counted twice (doubled weight in static mode, double the
+                # footprint in the node view) — reject rather than silently double-count.
+                raise ValueError(f"BLASTBOX_NODE_ENGINES lists engine {name!r} more than once")
+            seen.add(name)
             up = name.upper().replace("-", "_")
             engines.append(EngineNode(
                 name=name, url=url,

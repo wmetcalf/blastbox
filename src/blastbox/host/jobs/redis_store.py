@@ -177,9 +177,11 @@ class RedisJobStore:
         )
 
     def count(self, status: JobStatus | None = None, *, q: str | None = None,
-              engine: str | None = None, claimant_tier: str | None = None) -> int:
+              engine: "str | Collection[str] | None" = None,
+              claimant_tier: str | None = None) -> int:
         n = 0
         ql = q.lower() if q else None
+        engines = normalize_engine_filter(engine)   # count ALL requested engines in ONE scan
         for k in self._r.scan_iter(match=_PREFIX + "*", count=200):
             raw = self._r.get(k)
             if raw is None:
@@ -189,7 +191,7 @@ class RedisJobStore:
                 continue
             if status is not None and job.status != status:
                 continue
-            if engine is not None and job.engine != engine:
+            if engines is not None and job.engine not in engines:
                 continue
             if claimant_tier is not None and not (   # mirror claim_next's tier routing
                     job.target_tier is None or job.target_tier == claimant_tier):

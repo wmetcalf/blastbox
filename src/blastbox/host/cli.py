@@ -386,6 +386,8 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
             pool.stop()
         return 0
 
+    pre_shrunk = None   # (warm_size, ceiling) captured before pre-shrink, to restore if the
+    #                     sizer ends up NOT managing this pool (see below)
     if pool is not None:
         if node_managed:
             # Start UNSPAWNED under the node autosizer: shrink to warm=0/ceiling=1 before
@@ -394,8 +396,10 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
             # before the sizer's first allocation. The synchronous first tick in
             # _start_node_sizer then sizes it from the node budget before serving begins.
             try:
+                pre_shrunk = (pool.warm_size, pool.concurrent_ceiling)  # type: ignore[attr-defined]
                 pool.resize(warm_size=0, concurrent_ceiling=1)  # type: ignore[attr-defined]
             except Exception:
+                pre_shrunk = None
                 logging.getLogger("blastbox.host.cli").warning(
                     "node self-sizer: could not pre-shrink pool before start", exc_info=True)
         pool.start()   # file-handshake warm path: start after tier-identity validation
@@ -428,6 +432,16 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     sizer = None
     try:
         sizer = _start_node_sizer(pool, engines, store, tier)
+        # If we pre-shrank the pool for the autosizer but the sizer did NOT start (incomplete
+        # inventory, unwritable share_dir, setup error), nothing will ever size it — restore
+        # its configured warm/ceiling so it runs normally (pre-autosizer static behavior)
+        # instead of being stuck at warm=0 and unable to serve.
+        if sizer is None and pre_shrunk is not None and pool is not None:
+            try:
+                pool.resize(warm_size=pre_shrunk[0], concurrent_ceiling=pre_shrunk[1])
+            except Exception:
+                logging.getLogger("blastbox.host.cli").warning(
+                    "node self-sizer: could not restore pool after skipped sizing", exc_info=True)
         dispatcher.run_forever(
             poll_interval_s=args.poll_interval,
             concurrency=int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1"),
@@ -436,15 +450,14 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         if sizer is not None:
             sizer_stop, sizer_thread, sizer_obj = sizer
             sizer_stop.set()
-            # Join so the sizer's finally runs (removes its snapshot → no phantom on restart).
-            # It sleeps on the event, so this returns promptly; bounded so a wedged sizer can't
-            # block dispatch shutdown.
-            sizer_thread.join(timeout=5.0)
-            # Belt-and-suspenders: remove the snapshot directly too, in case the join timed out
-            # while a tick was mid slow-count and the thread's finally didn't run before exit.
-            sizer_obj.remove_own_snapshot()
+            sizer_thread.join(timeout=5.0)     # sleeps on the event → returns promptly
         if pool is not None:
-            pool.stop()
+            pool.stop()                        # reap THIS pool's slots FIRST...
+        if sizer is not None:
+            # ...then release the reservation, so peers don't reallocate our share while our
+            # (slow fc/gVisor) slots are still being reaped and still consuming node RAM/CPU —
+            # which would transiently violate the advertised hard cap.
+            sizer_obj.remove_own_snapshot()
     return 0
 
 

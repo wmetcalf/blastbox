@@ -470,12 +470,14 @@ class SqlJobStore:
         return [job for row in rows if (job := self._row_to_job(row)) is not None]
 
     def count(self, status: JobStatus | None = None, *, q: str | None = None,
-              engine: str | None = None, claimant_tier: str | None = None) -> int:
+              engine: "str | Collection[str] | None" = None,
+              claimant_tier: str | None = None) -> int:
         sql = "SELECT COUNT(*) FROM jobs"
         where, params = self._where_status_q(status, q)
-        if engine is not None:
-            where.append(f"engine = {self._param}")
-            params.append(engine)
+        engines = normalize_engine_filter(engine)   # one indexed IN(...) query for the whole set
+        if engines is not None:
+            where.append(f"engine IN ({','.join(self._param for _ in engines)})")
+            params.extend(engines)
         if claimant_tier is not None:      # mirror claim_next's tier predicate
             where.append(f"(target_tier IS NULL OR target_tier = {self._param})")
             params.append(claimant_tier)

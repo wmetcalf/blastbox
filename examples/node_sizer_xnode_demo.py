@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import socket
+import time
 import sys
 
 from blastbox.host.dispatcher_sizer import DispatcherSizer
@@ -71,11 +72,17 @@ def main() -> int:
     print("  my pools: " + ", ".join(f"{n}@{t}={p.concurrent_ceiling}" for n, t, p, _ in sizers))
     print(f"Σ my ceilings = {total_slots} slots -> {total_slots*SLOT:,.0f} MiB of {budget:,.0f} MiB budget")
 
-    ok = total_slots * SLOT <= budget + 1e-6
-    if foreign and total_slots * SLOT > budget + 1e-6:
-        print("  -> would be OVER budget: contaminated by the foreign node!")
-    print("RESULT:", "PASS — sized only from own node, foreign pools ignored"
-          if ok else "FAIL — foreign node contaminated the budget")
+    # DIRECT proof of isolation: apply the sizer's node filter to the whole shared dir and
+    # assert NO foreign node survives into the view we plan over. (A budget check alone can't
+    # prove this — plan_sizes clamps the combined view to budget regardless, so summing local
+    # pools stays ≤ budget even if foreign pools entered.)
+    view = [s for s in share.read_all(max_age_s=3600.0, now=time.time())
+            if s.node == "" or node == "" or s.node == node]
+    foreign_in_view = sorted({s.node for s in view if s.node not in ("", node)})
+    print(f"  foreign nodes surviving the filter: {foreign_in_view} (must be empty)")
+    ok = not foreign_in_view and total_slots * SLOT <= budget + 1e-6
+    print("RESULT:", "PASS — foreign snapshots filtered out of the planning view"
+          if ok else "FAIL — a foreign node's pools entered the view")
     return 0 if ok else 1
 
 
