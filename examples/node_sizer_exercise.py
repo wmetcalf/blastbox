@@ -11,7 +11,7 @@ filesystem, with fake pools (touches no production container), and asserts each:
   6. adaptive shedding  — under simulated memory pressure the budget sheds toward the floor
   7. heartbeat + fence  — snapshot stays fresh across a slow count; no republish after stop
   8. cross-node iso     — foreign-node snapshots in a shared dir are ignored
-  9. graceful cleanup   — a stopped unit removes its own snapshot
+  9. graceful cleanup   — run() holds the reservation; the CALLER removes it after reaping
 
 Run:  PYTHONPATH=src python3 examples/node_sizer_exercise.py
 Exit code 0 = all PASS.
@@ -167,14 +167,19 @@ def main() -> int:
     check("cross-node: foreign pools ignored, sized only from own node",
           own <= 8 * 2048, f"own Σ={own/1024:.0f}GiB ≤ 16GiB budget")
 
-    # 9 — graceful cleanup removes own snapshot
+    # 9 — graceful cleanup: removal is CALLER-owned (as cli.py does: reap the pool FIRST while
+    # the sizer keeps heartbeating the reservation, THEN remove the snapshot). run() itself does
+    # NOT remove — otherwise the reservation would vanish before peers see the pool drain.
     d9 = tempfile.mkdtemp(prefix="bb-ex-")
     sh9 = FileNodeShare(d9)
     ds9 = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=2048), FakePool(), sh9,
                           cfg(interval_s=0.5), runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 2,
                           node="n", instance="g")
     ds9.run(max_ticks=2, sleep=lambda _s: None)
-    check("graceful stop removes own snapshot",
+    check("run() keeps the reservation until the caller reaps (no auto-remove)",
+          list(pathlib.Path(d9).glob("*.json")) != [])
+    ds9.remove_own_snapshot()                       # caller-owned removal, after pool reap
+    check("caller remove_own_snapshot() clears the snapshot",
           list(pathlib.Path(d9).glob("*.json")) == [])
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
