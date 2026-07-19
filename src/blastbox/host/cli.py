@@ -213,6 +213,9 @@ def _start_node_sizer(pool, engines, store, tier):
             slot_vcpus=max(e.slot_vcpus for e in mine),
             min_warm=max(e.min_warm for e in mine),
             max_ceiling=min(e.max_ceiling for e in mine),
+            # the shared pool represents the COMBINED engines, so its static weight is the
+            # SUM of their weights — using only the first engine's understates its share.
+            weight=sum(e.weight for e in mine),
         )
         sizer_stop = _threading.Event()
         # `tier` is the pool's runtime NAME (firecracker/gvisor/cold) — WarmPool.runtime is

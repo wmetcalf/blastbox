@@ -337,6 +337,32 @@ def test_node_id_with_path_separator_is_rejected(tmp_path):
                         runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 1, node="site/rack1")
 
 
+def test_update_publish_is_fenced_when_stopped_mid_count(tmp_path):
+    # regression (PR #60 r12): tick() publishes a heartbeat at start, then the UPDATED
+    # snapshot after the (slow) count — but the update is fenced on the stop event. So a
+    # shutdown that removes our file while we're blocked in the count isn't followed by a
+    # republish that would leave a phantom pool. Simulate the CLI removing mid-count.
+    import threading
+    share = FileNodeShare(str(tmp_path))
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    stop = threading.Event()
+    holder = {}
+
+    def slow_count() -> int:                          # the CLI stops + removes us mid-count
+        stop.set()
+        holder["ds"].remove_own_snapshot()
+        return 3
+
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024), _Pool(), share, cfg,
+                         runtime=RUNTIME_FIRECRACKER, backlog_fn=slow_count, node="n",
+                         instance="i", capacity_fn=_budget(8 * 1024, 99), clock=lambda: 1.0)
+    holder["ds"] = ds
+    ds._stop_event = stop
+    ds.tick()
+    assert list(tmp_path.glob("*.json")) == []        # heartbeat removed, update fenced → gone
+
+
 def test_run_removes_own_snapshot_on_graceful_stop(tmp_path):
     # regression (PR #60 review): a graceful stop removes the unit's own snapshot so a
     # restart leaves no phantom pool lingering in the node view (which would split the

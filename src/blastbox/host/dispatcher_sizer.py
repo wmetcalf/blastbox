@@ -98,6 +98,8 @@ class DispatcherSizer:
         self._clock = clock
         self._budget_scale = 1.0              # adaptive correction, persisted across ticks
         self._last_tick_dur = 0.0             # measured, to widen the staleness window
+        self._last_backlog = 0                # published as a heartbeat before the (slow) count
+        self._stop_event: Optional[threading.Event] = None  # set in run(); fences the update-publish
         self._warned_mixed_nodes = False      # one-shot: warn on an inconsistent node-id view
 
     def _active(self) -> bool:
@@ -131,18 +133,30 @@ class DispatcherSizer:
             return None
         started = self._clock()
         e = self._engine
-        # Do the (possibly slow) backlog count FIRST, then stamp ts — otherwise the
-        # snapshot is written already-aged by the count latency (on a large shared store
-        # the count scans every key), which can push peers past the staleness window.
-        backlog = max(0, int(self._backlog_fn()))
-        assigned = int(getattr(self._pool, "assigned_count", 0))
+        assigned = int(getattr(self._pool, "assigned_count", 0))      # cheap
+
+        def _snapshot(backlog: int, ts: float) -> DemandSnapshot:
+            return DemandSnapshot(
+                engine=e.name, backlog=backlog, assigned=assigned,
+                slot_ram_mib=e.slot_ram_mib, slot_vcpus=e.slot_vcpus,
+                min_warm=e.min_warm, max_ceiling=e.max_ceiling, weight=e.weight, ts=ts,
+                node=self._node, tier=self._runtime, instance=self._instance)
+
+        # HEARTBEAT before the (possibly-slow) count: publish a fresh-ts snapshot with the last
+        # tick's backlog so peers keep seeing us alive even when THIS count — a huge shared-
+        # store scan — runs long; otherwise they age us out mid-count and reallocate our share
+        # → oversubscription. (For a count longer than the staleness window, also raise
+        # BLASTBOX_NODE_STALE_AFTER_S; see docs.)
+        self._share.publish(_snapshot(self._last_backlog, started))
+        backlog = max(0, int(self._backlog_fn()))                    # the possibly-slow count
+        self._last_backlog = backlog
         now = self._clock()
-        self._share.publish(DemandSnapshot(
-            engine=e.name, backlog=backlog, assigned=assigned,
-            slot_ram_mib=e.slot_ram_mib, slot_vcpus=e.slot_vcpus,
-            min_warm=e.min_warm, max_ceiling=e.max_ceiling, weight=e.weight, ts=now,
-            node=self._node, tier=self._runtime, instance=self._instance,
-        ))
+        # UPDATED publish with the FRESH backlog so the node converges in one tick (not lagged).
+        # FENCED on the stop event: on shutdown the CLI sets stop, times out the join while we
+        # were mid-count, and removes our file — this guard means we don't then republish a
+        # phantom after the count returns.
+        if self._stop_event is None or not self._stop_event.is_set():
+            self._share.publish(_snapshot(backlog, now))
         # Effective staleness widens by the measured tick cost: the real publish period is
         # interval + tick_time, so a slow count (huge shared store) must not age peers out
         # and collapse every engine to "sees only itself" → node oversubscription. Use the
@@ -227,6 +241,7 @@ class DispatcherSizer:
 
     def run(self, *, stop: Optional[threading.Event] = None, max_ticks: Optional[int] = None,
             sleep: Callable[[float], None] = time.sleep) -> None:
+        self._stop_event = stop               # so tick() can fence its update-publish on stop
         n = 0
         try:
             while not (stop is not None and stop.is_set()):
