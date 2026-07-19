@@ -189,7 +189,7 @@ def _node_manages_tier(tier: str) -> bool:
         return False
 
 
-def _start_node_sizer(pool, engines, store, tier):
+def _start_node_sizer(pool, engines, store, tier, concurrency=1):
     """Start the opt-in node self-sizer for this dispatcher's warm pool, or return None.
 
     Fully guarded (`except Exception`): a bad BLASTBOX_NODE_* config, an unwritable
@@ -238,7 +238,11 @@ def _start_node_sizer(pool, engines, store, tier):
             slot_ram_mib=max(e.slot_ram_mib for e in mine),
             slot_vcpus=max(e.slot_vcpus for e in mine),
             min_warm=max(e.min_warm for e in mine),
-            max_ceiling=min(e.max_ceiling for e in mine),
+            # Cap the ceiling at the dispatcher's worker concurrency: run_forever runs at most
+            # `concurrency` jobs at once, so warming more slots than that is wasted RAM (and the
+            # ceiling above it is meaningless). This is also how the node budget stays bounded
+            # by ACTUAL in-flight RAM (warm+cold) rather than by warm slots alone.
+            max_ceiling=max(1, min(min(e.max_ceiling for e in mine), concurrency)),
             # the shared pool represents the COMBINED engines, so its static weight is the
             # SUM of their weights — using only the first engine's understates its share.
             # Clamp to _MAX_WEIGHT: the reader (_valid) rejects a snapshot weight above it, so
@@ -264,13 +268,10 @@ def _start_node_sizer(pool, engines, store, tier):
         # ONE synchronous sizing before the periodic thread + before dispatch serves: the pool
         # was started unspawned (warm=0), so this sizes it from the node budget now, closing
         # the startup window where it would otherwise run at its legacy target until the first
-        # background tick. Guarded — a first-tick hiccup must not disable sizing.
-        try:
-            sizer.tick()
-        except Exception:
-            logging.getLogger("blastbox.node_sizer").warning(
-                "node self-sizer: first sizing tick failed (background loop will retry)",
-                exc_info=True)
+        # background tick. If this FAILS (e.g. the share_dir is read-only so publish() raises),
+        # the sizer can never work AND the pool is still at warm=0 — so let it propagate to the
+        # except below, which returns None → the caller restores the pool to its static config.
+        sizer.tick()
         thread = sizer.start_thread(sizer_stop)
         # Return the thread + sizer so the caller can JOIN on shutdown (else the daemon is torn
         # down without its finally, which removes this unit's snapshot → phantom pool on
@@ -325,16 +326,15 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
 
     warm_only = (os.environ.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower()
                  in ("1", "true", "yes", "on"))
-    # When the node autosizer manages this pool, the node RAM/vCPU budget is meant to be a
-    # HARD cap — but cold fallback runs OUTSIDE the warm pool and its RAM isn't counted, so
-    # excess concurrency spilling to cold would silently exceed the budget. Force warm_only so
-    # the managed ceiling is authoritative (excess load queues for a warm slot instead of
-    # cold-bursting past the budget). Enforced, not left to the operator.
     node_managed = _node_manages_tier(tier)
-    if node_managed and not warm_only:
-        warm_only = True
-        print("node self-sizer: resource management on → forcing warm_only so the managed "
-              "node budget is a hard cap (no uncounted cold fallback).", file=sys.stderr)
+    # NB: we deliberately do NOT force warm_only when node-managed. warm_only would break jobs
+    # that resolve to an egress network personality (dispatch bypasses the warm pool for
+    # egress), and it doesn't actually bound cold RAM. The node budget is bounded instead by
+    # DISPATCH concurrency: each in-flight job (warm OR cold) is one slot of RAM, so the sizer
+    # caps the pool ceiling at BLASTBOX_DISPATCH_CONCURRENCY (below), and a hard NODE cap is
+    # the operator's Σ(concurrency·footprint) ≤ budget. (A fully dynamic sizer→concurrency
+    # control is a tracked follow-on.)
+    dispatch_concurrency = int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1")
 
     # Fail-closed BEFORE pool.start(): refuse to run an engine on ANY tier this dispatcher can execute
     # it on — the advertised tier PLUS the cold-fallback/egress-bypass ("cold") and cascade overflow
@@ -431,7 +431,7 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     # or is Ctrl-C'd mid-mkdir. It must never crash core dispatch or leak the warm pool.
     sizer = None
     try:
-        sizer = _start_node_sizer(pool, engines, store, tier)
+        sizer = _start_node_sizer(pool, engines, store, tier, dispatch_concurrency)
         # If we pre-shrank the pool for the autosizer but the sizer did NOT start (incomplete
         # inventory, unwritable share_dir, setup error), nothing will ever size it — restore
         # its configured warm/ceiling so it runs normally (pre-autosizer static behavior)
@@ -444,20 +444,21 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
                     "node self-sizer: could not restore pool after skipped sizing", exc_info=True)
         dispatcher.run_forever(
             poll_interval_s=args.poll_interval,
-            concurrency=int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1"),
+            concurrency=dispatch_concurrency,
         )
     finally:
+        # Stop the POOL first (reap its slots) while the sizer thread is STILL heartbeating, so
+        # our reservation stays fresh in peers' views for the whole (possibly slow) reap — else
+        # a pool.stop() longer than the staleness window would let peers reallocate our share
+        # while our slots still hold node RAM. Only after the slots are gone do we stop the
+        # sizer and remove the snapshot.
+        if pool is not None:
+            pool.stop()
         if sizer is not None:
             sizer_stop, sizer_thread, sizer_obj = sizer
             sizer_stop.set()
             sizer_thread.join(timeout=5.0)     # sleeps on the event → returns promptly
-        if pool is not None:
-            pool.stop()                        # reap THIS pool's slots FIRST...
-        if sizer is not None:
-            # ...then release the reservation, so peers don't reallocate our share while our
-            # (slow fc/gVisor) slots are still being reaped and still consuming node RAM/CPU —
-            # which would transiently violate the advertised hard cap.
-            sizer_obj.remove_own_snapshot()
+            sizer_obj.remove_own_snapshot()    # slots reaped → release the reservation
     return 0
 
 

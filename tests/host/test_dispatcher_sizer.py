@@ -367,6 +367,50 @@ def test_start_node_sizer_skips_on_incomplete_inventory(tmp_path, monkeypatch):
     assert res is None                                    # red undeclared → fail closed
 
 
+def test_start_node_sizer_caps_ceiling_at_concurrency(tmp_path, monkeypatch):
+    # PR #60 r14: the pool ceiling is capped at BLASTBOX_DISPATCH_CONCURRENCY — the sizer must
+    # not warm more slots than the dispatcher can actually run (each in-flight job = one slot
+    # of RAM). This is how the node budget stays bounded by real in-flight RAM (warm+cold).
+    from blastbox.host.cli import _start_node_sizer
+    from blastbox.host.jobs.base import Job
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_CLIP_MAX_CEILING", "64")
+    monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
+    store = InMemoryJobStore()
+    for _ in range(50):
+        store.create(Job.new(engine="clip", filename="x"))     # huge backlog → wants many slots
+    pool = _Pool()
+    res = _start_node_sizer(pool, ["clip"], store, "firecracker", 3)   # concurrency=3
+    assert res is not None
+    stop, thread, sizer = res
+    try:
+        assert pool.concurrent_ceiling <= 3                    # capped despite the big backlog
+    finally:
+        stop.set()
+        thread.join(2.0)
+        sizer.remove_own_snapshot()
+
+
+def test_start_node_sizer_returns_none_if_publish_fails(tmp_path, monkeypatch):
+    # PR #60 r14: if the synchronous first tick can't publish (e.g. read-only share_dir), the
+    # sizer can never work AND the pool is still unspawned — return None so the caller restores
+    # the pool instead of leaving a non-working sizer + a dead pool.
+    from blastbox.host import node_share
+    from blastbox.host.cli import _start_node_sizer
+    from blastbox.host.jobs.memory import InMemoryJobStore
+
+    def boom(self, snap):
+        raise OSError("read-only share")
+
+    monkeypatch.setattr(node_share.FileNodeShare, "publish", boom)
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
+    assert _start_node_sizer(_Pool(), ["clip"], InMemoryJobStore(), "firecracker", 4) is None
+
+
 def test_start_node_sizer_sizes_pool_synchronously(tmp_path, monkeypatch):
     # PR #60 r13 (SDoR-): the sizer does one synchronous tick before the background thread, so
     # a pool started unspawned is sized from the node budget before dispatch serves.

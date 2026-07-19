@@ -240,6 +240,18 @@ def test_from_env_rejects_bad_boolean(monkeypatch):
         NodeConfig.from_env()
 
 
+def test_from_env_rejects_env_prefix_collision(monkeypatch):
+    # PR #60 r14: two names normalising to the same env prefix (foo-bar vs foo_bar) would read
+    # identical BLASTBOX_NODE_ENGINE_<NAME>_* vars — reject the ambiguity.
+    import pytest
+
+    from blastbox.host.node_config import NodeConfig
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "foo-bar,foo_bar")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    with pytest.raises(ValueError):
+        NodeConfig.from_env()
+
+
 def test_from_env_rejects_duplicate_engines(monkeypatch):
     # PR #60 r13: a repeated engine would double-count (doubled weight in static mode) — reject.
     import pytest

@@ -140,6 +140,7 @@ class NodeConfig:
 
         engines: list[EngineNode] = []
         seen: set[str] = set()
+        seen_up: set[str] = set()
         raw = os.environ.get("BLASTBOX_NODE_ENGINES", "").strip()
         for item in (p for p in raw.split(",") if p.strip()):
             # `name` or `name=url`; url is optional + unused by the shipped sizer (a
@@ -158,6 +159,14 @@ class NodeConfig:
                 raise ValueError(f"BLASTBOX_NODE_ENGINES lists engine {name!r} more than once")
             seen.add(name)
             up = name.upper().replace("-", "_")
+            if up in seen_up:
+                # two distinct names that normalise to the same env prefix (foo-bar vs foo_bar,
+                # or Clip vs clip) would read the IDENTICAL BLASTBOX_NODE_ENGINE_<UP>_* vars, so
+                # you couldn't give them distinct footprints/ceilings — reject the ambiguity.
+                raise ValueError(
+                    f"BLASTBOX_NODE_ENGINES: engine name {name!r} collides with another on the "
+                    f"env-var prefix {up!r} (names differing only in case or -/_ are ambiguous)")
+            seen_up.add(up)
             engines.append(EngineNode(
                 name=name, url=url,
                 # footprints/caps clamped to sane positives so a typo can't produce a

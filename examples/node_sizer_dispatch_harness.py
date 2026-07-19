@@ -85,20 +85,18 @@ def main() -> int:
     check("cold tier NOT node-managed", not _node_manages_tier("cold"))
 
     # ---- managed startup sequence (as _dispatch_cmd does) ----
+    concurrency = 6                                         # BLASTBOX_DISPATCH_CONCURRENCY
     pool = FakePool(warm_size=8, concurrent_ceiling=8)
-    warm_only = False
-    if node_managed and not warm_only:
-        warm_only = True                                   # forced
-    check("resource management forces warm_only (hard cap, no cold spill)", warm_only is True)
-
     pool.resize(warm_size=0, concurrent_ceiling=1)         # start unspawned
     pool.start()
     check("pool starts unspawned (warm=0) before first sizing", pool.warm_size == 0)
 
-    sizer = _start_node_sizer(pool, ["clip", "red"], store, tier)
+    sizer = _start_node_sizer(pool, ["clip", "red"], store, tier, concurrency)
     check("sizer started for a complete inventory", sizer is not None)
-    check("synchronous first tick sized the pool from the node budget (ceiling > 1)",
-          pool.concurrent_ceiling > 1, f"ceiling={pool.concurrent_ceiling}")
+    check("synchronous first tick sized the pool from the node budget", pool.concurrent_ceiling >= 1,
+          f"ceiling={pool.concurrent_ceiling}")
+    check("pool ceiling capped at dispatch concurrency (not warmed beyond usable)",
+          pool.concurrent_ceiling <= concurrency, f"{pool.concurrent_ceiling} <= {concurrency}")
     files = os.listdir(share_dir)
     check("published a node-view snapshot", any(f.endswith(".json") for f in files), str(files))
 

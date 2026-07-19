@@ -183,14 +183,30 @@ class SqlJobStore:
         # Best-effort indexes run AFTER the table-creation transaction commits, each in its
         # OWN transaction. On Postgres a failed statement (a CREATE INDEX lock/permission
         # error) aborts the WHOLE transaction, so creating them inline would risk rolling back
-        # the tables. Covering index for the hot claim + autosizer-backlog predicates
-        # (status, engine, target_tier) — without it the node sizer's per-tick COUNT(*) is a
-        # full-table scan on a large retained history. Runs on both backends.
-        self._try_ddl(
-            "CREATE INDEX IF NOT EXISTS idx_jobs_status_engine_tier "
-            "ON jobs (status, engine, target_tier)")
+        # the tables.
+        self._ensure_jobs_indexes()
         if self._driver == "postgres":
             self._ensure_page_hash_indexes()
+
+    def _ensure_jobs_indexes(self) -> None:
+        """Covering index for the hot claim + node-autosizer-backlog predicates
+        (status, engine, target_tier) — without it the sizer's per-tick COUNT(*) is a
+        full-table scan on a large retained history. Best-effort.
+
+        On Postgres, build it CONCURRENTLY on an AUTOCOMMIT connection (CONCURRENTLY cannot
+        run inside a transaction): a plain CREATE INDEX takes an ACCESS EXCLUSIVE-ish lock and
+        would block writes for the whole build when upgrading a large existing jobs table, even
+        when the autosizer is off. On SQLite a plain create (no CONCURRENTLY, no such block)."""
+        stmt_tail = "idx_jobs_status_engine_tier ON jobs (status, engine, target_tier)"
+        if self._driver != "postgres" or self._pool is None:
+            self._try_ddl(f"CREATE INDEX IF NOT EXISTS {stmt_tail}")
+            return
+        try:
+            with self._lock, self._pool.connection() as conn:
+                conn.autocommit = True   # CONCURRENTLY must be outside a transaction block
+                conn.execute(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {stmt_tail}")
+        except Exception:
+            pass   # lock/permission/already-building → just slower autosizer counts, never fatal
 
     def _ensure_columns(self, conn) -> None:
         """Add any columns that don't exist yet (forward-compat migrations)."""

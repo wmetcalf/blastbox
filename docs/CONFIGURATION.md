@@ -113,14 +113,19 @@ today unless a switch below is on. Each dispatcher publishes a demand snapshot t
 node dir and reads its peers', then runs the same deterministic allocation over the whole-node
 view and resizes its own pool. See `src/blastbox/host/node_sizer.py`.
 
-**Hard-cap enforcement.** When the autosizer manages a pool (`RESOURCE_MANAGEMENT`/`BALANCING`
-on, firecracker/gvisor tier), the node budget is enforced as a HARD cap: the dispatcher is
-forced to `warm_only` (excess load queues for a warm slot rather than spilling to the
-uncounted cold-detonation path and exceeding the budget), and the pool starts **unspawned**
-(`warm=0`) and is sized synchronously from the node budget before it serves — so a full or
-rolling startup can't transiently over-spawn past the budget. For a SQL job store, an index on
-`jobs(status, engine, target_tier)` is created so the per-tick backlog counts stay cheap on a
-large retained history.
+**Budget bounding.** When the autosizer manages a pool (`RESOURCE_MANAGEMENT`/`BALANCING` on,
+firecracker/gvisor tier): the pool ceiling is capped at `BLASTBOX_DISPATCH_CONCURRENCY` (the
+sizer never warms more slots than the dispatcher can run — each in-flight job, warm *or* cold,
+is one slot of RAM), and the pool starts **unspawned** (`warm=0`) and is sized synchronously
+from the node budget before it serves, so a full/rolling startup can't transiently over-spawn.
+The autosizer does **not** force `warm_only` — that would break jobs needing a cold egress
+personality (which bypass the warm pool) and doesn't bound cold RAM anyway. A hard **node**
+cap is therefore the operator's responsibility: size `BLASTBOX_DISPATCH_CONCURRENCY` per engine
+so that Σ(concurrency·slot-footprint) ≤ the node budget; the sizer then distributes warm
+capacity under the budget. (A fully dynamic sizer→concurrency control is a tracked follow-on.)
+For a SQL job store an index on `jobs(status, engine, target_tier)` is created — `CONCURRENTLY`
+on Postgres so upgrading a large table doesn't block writes — keeping the per-tick backlog
+counts cheap.
 
 | Var | Default | Notes |
 |---|---|---|
