@@ -119,10 +119,13 @@ sizer never warms more slots than the dispatcher can run — each in-flight job,
 is one slot of RAM), and the pool starts **unspawned** (`warm=0`) and is sized synchronously
 from the node budget before it serves, so a full/rolling startup can't transiently over-spawn.
 The autosizer does **not** force `warm_only` — that would break jobs needing a cold egress
-personality (which bypass the warm pool) and doesn't bound cold RAM anyway. A hard **node**
-cap is therefore the operator's responsibility: size `BLASTBOX_DISPATCH_CONCURRENCY` per engine
-so that Σ(concurrency·slot-footprint) ≤ the node budget; the sizer then distributes warm
-capacity under the budget. (A fully dynamic sizer→concurrency control is a tracked follow-on.)
+personality (which bypass the warm pool) and doesn't bound cold RAM anyway. Instead the node
+budget is enforced as a **hard cap over the cold path too**: the sizer drives a live concurrency
+gate to the pool's budget-allocated ceiling on every resize, and each dispatch worker holds one
+permit for the whole claim+dispatch, so **active jobs (warm *and* cold) ≤ ceiling ≤ budget**
+automatically — not just the operator's arithmetic. Set `BLASTBOX_DISPATCH_CONCURRENCY` per
+engine so that Σ(concurrency·slot-footprint) ≤ the node budget across the engines a node serves;
+the sizer distributes warm capacity under the budget and bounds in-flight work to what it warmed.
 For a SQL job store an index on `jobs(status, engine, target_tier)` is created — `CONCURRENTLY`
 on Postgres so upgrading a large table doesn't block writes — keeping the per-tick backlog
 counts cheap.

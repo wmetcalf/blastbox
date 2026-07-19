@@ -331,10 +331,10 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     # NB: we deliberately do NOT force warm_only when node-managed. warm_only would break jobs
     # that resolve to an egress network personality (dispatch bypasses the warm pool for
     # egress), and it doesn't actually bound cold RAM. The node budget is bounded instead by
-    # DISPATCH concurrency: each in-flight job (warm OR cold) is one slot of RAM, so the sizer
-    # caps the pool ceiling at BLASTBOX_DISPATCH_CONCURRENCY (below), and a hard NODE cap is
-    # the operator's Σ(concurrency·footprint) ≤ budget. (A fully dynamic sizer→concurrency
-    # control is a tracked follow-on.)
+    # DISPATCH concurrency: each in-flight job (warm OR cold) is one slot of RAM. The sizer caps
+    # the pool ceiling at BLASTBOX_DISPATCH_CONCURRENCY (below) AND drives a live concurrency gate
+    # to that same budget-allocated ceiling, so active jobs ≤ ceiling ≤ budget — a hard NODE cap
+    # that holds automatically over the cold path, not just the operator's Σ arithmetic.
     dispatch_concurrency = int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1")
     # When node-managed, a live concurrency gate makes the node budget a HARD cap that also
     # covers cold fallback: dispatch workers hold a permit per in-flight job, and the sizer

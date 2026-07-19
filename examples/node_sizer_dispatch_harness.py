@@ -91,12 +91,26 @@ def main() -> int:
     pool.start()
     check("pool starts unspawned (warm=0) before first sizing", pool.warm_size == 0)
 
-    sizer = _start_node_sizer(pool, ["clip", "red"], store, tier, concurrency)
+    # A live concurrency gate (as _dispatch_cmd builds when node-managed) — seeded with the
+    # operator's dispatch concurrency, then driven by the sizer to the budget-allocated ceiling.
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+    gate = DynamicConcurrencyGate(concurrency)
+    sizer = _start_node_sizer(pool, ["clip", "red"], store, tier, concurrency, gate)
     check("sizer started for a complete inventory", sizer is not None)
     check("synchronous first tick sized the pool from the node budget", pool.concurrent_ceiling >= 1,
           f"ceiling={pool.concurrent_ceiling}")
     check("pool ceiling capped at dispatch concurrency (not warmed beyond usable)",
           pool.concurrent_ceiling <= concurrency, f"{pool.concurrent_ceiling} <= {concurrency}")
+    # The gate limit now tracks the pool ceiling → CONCURRENT jobs (warm+cold) are bounded to it.
+    check("sizer drove the concurrency gate to the pool ceiling",
+          gate.limit == pool.concurrent_ceiling, f"gate={gate.limit} ceiling={pool.concurrent_ceiling}")
+    # And the gate actually bounds: acquire the ceiling's worth of permits, the next one blocks.
+    got = [gate.acquire(0.05) for _ in range(pool.concurrent_ceiling)]
+    over = gate.acquire(0.05)
+    for _ in range(sum(got)):
+        gate.release()
+    check("gate admits exactly the ceiling and blocks the over-limit job",
+          all(got) and not over, f"admitted={sum(got)}/{pool.concurrent_ceiling} over_limit_blocked={not over}")
     files = os.listdir(share_dir)
     check("published a node-view snapshot", any(f.endswith(".json") for f in files), str(files))
 
