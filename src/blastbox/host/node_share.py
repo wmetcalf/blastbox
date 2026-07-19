@@ -35,6 +35,7 @@ import json
 import math
 import os
 import tempfile
+import time as _time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol
@@ -53,8 +54,14 @@ class DemandSnapshot:
     max_ceiling: int
     weight: float                # static share when balancing is off
     ts: float                    # publish time (for staleness)
-    node: str = ""               # publishing host — so a share_dir accidentally shared
-                                 # across hosts (NFS) doesn't conflate their demand/budget
+    node: str = ""               # publishing host — so a share_dir accidentally shared across
+                                 # hosts (NFS) doesn't conflate their demand/budget. INVARIANT:
+                                 # every unit sharing a dir MUST use a CONSISTENT node id — all
+                                 # "" for a single host's local dir, or each host a DISTINCT id
+                                 # when a dir is (accidentally) shared. An untagged reader
+                                 # (node="") treats untagged peers as same-node, so mixing a
+                                 # tagged host and an untagged host on ONE shared dir conflates
+                                 # them → oversubscription. Tag every host, or don't share dirs.
     tier: str = ""               # the pool's runtime tier (firecracker/gvisor). Part of the
                                  # identity: ONE engine can run on TWO node-managed tiers on
                                  # one host (separate pools) — without the tier they'd share a
@@ -140,7 +147,6 @@ class FileNodeShare:
 
     def read_all(self, *, max_age_s: float, now: float) -> list[DemandSnapshot]:
         out: list[DemandSnapshot] = []
-        gc_age = max(self._GC_AGE_FLOOR_S, max_age_s * self._GC_AGE_MULT)
         for f in sorted(self._dir.glob("*.json")):
             try:
                 data = json.loads(f.read_text())
@@ -159,21 +165,43 @@ class FileNodeShare:
                 # validate INSIDE the try: an untyped dataclass accepts wrong-typed fields
                 # (e.g. slot_ram_mib=null), so `_valid`'s comparisons can raise TypeError —
                 # that must skip the poisoned file, not propagate out and kill the sizer.
-                # Age bounded BOTH ways: reject a snapshot more than one staleness window in
-                # the FUTURE (bad clock / far-future stale file) — otherwise its negative age
-                # reads as fresh forever and a stopped engine keeps consuming node budget.
-                identity_ok = f.name == self._filename(snap.engine, snap.tier, snap.node,
-                                                       snap.instance)
-                age = now - snap.ts if math.isfinite(snap.ts) else None
-                if identity_ok and age is not None and age > gc_age:
-                    f.unlink(missing_ok=True)   # GC a crashed process's long-abandoned remnant
-                    continue
-                ok = _valid(snap) and identity_ok and age is not None and -max_age_s <= age <= max_age_s
+                # ts is bounded via _finite_in (NOT bare math.isfinite, which OVERFLOWS on a
+                # huge-int ts out of json and would crash-skip — the same reason every other
+                # numeric field uses _finite_in). Age bounded BOTH ways: a snapshot more than
+                # one staleness window in the FUTURE (bad clock) is rejected too, or its
+                # negative age would read as fresh forever.
+                ok = (_valid(snap)
+                      and f.name == self._filename(snap.engine, snap.tier, snap.node, snap.instance)
+                      and _finite_in(snap.ts, -_MAX_TS, _MAX_TS)
+                      and -max_age_s <= (now - snap.ts) <= max_age_s)
             except Exception:
                 continue                        # torn / foreign / type-poisoned → doesn't contribute
             if ok:
                 out.append(snap)
+        self._gc(max(self._GC_AGE_FLOOR_S, max_age_s * self._GC_AGE_MULT))
         return out
+
+    def _gc(self, older_than_s: float) -> None:
+        """Sweep long-abandoned files by FILESYSTEM mtime — both stale `*.json` snapshots a
+        crashed process never gracefully removed AND leaked `*.tmp` temps from a publish
+        killed mid-write (which the `*.json` view never enumerates, so they'd accumulate on a
+        substrate that gets OOM-killed). mtime (not the parsed ts) is robust to a malformed or
+        hostile payload and, re-stat'd here, spares a file an owner just re-published (fresh
+        mtime) — closing the read-then-unlink race a ts-based GC had. Best-effort; far beyond
+        the staleness window, so a live unit (rewritten every tick) is never hit."""
+        now_wall = _time.time()
+        try:
+            entries = list(self._dir.iterdir())   # iterdir sees dotfiles (mkstemp temps)
+        except OSError:
+            return
+        for f in entries:
+            if not (f.name.endswith(".json") or f.name.endswith(".tmp")):
+                continue
+            try:
+                if f.is_file() and now_wall - f.stat().st_mtime > older_than_s:
+                    f.unlink()
+            except OSError:
+                continue                        # gone / racing another reader's GC — fine
 
 
 # A snapshot is a request to spend node resources, so validate it — even a stray/hostile
@@ -187,6 +215,9 @@ _MAX_CEILING_SANE = 4096
 _MAX_SLOT_RAM_MIB = 1024 * 1024        # 1 TiB per slot — no real microVM is bigger
 _MAX_COUNT = 1 << 30                   # sane cap on backlog/assigned (a real queue is small)
 _MAX_WEIGHT = 1 << 20
+_MAX_TS = 1 << 40                      # ~year 36812: any unix ts fits; rejects a huge-int ts
+                                       # via _finite_in WITHOUT float coercion (float(10**400)
+                                       # and even bare math.isfinite(10**400) OverflowError).
 
 
 def _finite_in(x: object, lo: float, hi: float) -> bool:
@@ -213,5 +244,5 @@ def _valid(snap: DemandSnapshot) -> bool:
         and _finite_in(snap.max_ceiling, 1, _MAX_CEILING_SANE)
         and _finite_in(snap.min_warm, 0, _MAX_CEILING_SANE)
         and _finite_in(snap.weight, 0, _MAX_WEIGHT)
-        and math.isfinite(snap.ts)           # a non-finite ts would never age out
-    )
+        and _finite_in(snap.ts, -_MAX_TS, _MAX_TS)   # bounded (NOT bare math.isfinite, which
+    )                                                # OverflowErrors on a huge-int ts)

@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import threading
 import time
 from typing import Callable, Optional
 
-from .node_config import EngineNode, NodeConfig
+from .node_config import EngineNode, NodeConfig, _is_safe_slug
 from .node_share import DemandSnapshot, NodeShare
 from .node_sizer import (
     NodeBudget,
@@ -73,9 +74,10 @@ class DispatcherSizer:
         self._backlog_fn = backlog_fn
         # The publishing PROCESS identity, so two replicas of this engine/tier/node (a rolling
         # deploy's overlap) publish to DISTINCT files and split the budget instead of
-        # colliding. pid is unique among concurrently-live processes on the host (all that's
-        # needed); on a graceful stop we remove our own file so a restart leaves no phantom.
-        self._instance = str(instance if instance is not None else os.getpid())
+        # colliding. A RANDOM per-process token, NOT os.getpid(): each dispatcher runs in its
+        # own container where pid is almost always 1, so pid would collide across replicas.
+        # On a graceful stop we remove our own file so a restart leaves no phantom.
+        self._instance = str(instance if instance is not None else secrets.token_hex(8))
         # The node id must identify the PHYSICAL HOST, shared by every engine container on
         # it — NOT socket.gethostname(), which inside a container is the container's own
         # name (so each engine would see only itself → no coordination, the common toolz2
@@ -83,6 +85,14 @@ class DispatcherSizer:
         # of a host's engines bind-mount one dir); set BLASTBOX_NODE_ID per physical host
         # only to defend a share_dir accidentally shared ACROSS hosts.
         self._node = node if node is not None else os.environ.get("BLASTBOX_NODE_ID", "").strip()
+        # The node id becomes a filename component; a '/'/'\\'/'..' would make every publish
+        # raise (traversal guard) and the sizer loop forever without ever publishing → peers
+        # oversubscribe. Validate here (engine names are validated in from_env; this is the
+        # other identity component that comes from raw env). Empty is fine (the default).
+        if self._node and not _is_safe_slug(self._node):
+            raise ValueError(
+                f"BLASTBOX_NODE_ID {self._node!r} is not a safe slug "
+                "(letters/digits/._- only, no path separators or '..')")
         self._capacity_fn = capacity_fn
         self._avail_fn = avail_fn
         self._clock = clock
@@ -205,7 +215,16 @@ class DispatcherSizer:
                 n += 1
                 if max_ticks is not None and n >= max_ticks:
                     return
-                sleep(self._config.interval_s)
+                # Sleep on the stop event (when present) so a shutdown wakes us IMMEDIATELY —
+                # otherwise a plain sleep(interval) delays the finally's file-removal by up to
+                # interval_s (60s+), long past the dispatcher's shutdown/join window, and the
+                # graceful cleanup degrades to the crash path (a phantom pool for a staleness
+                # window). stop.wait returns True when set → break to the finally.
+                if stop is not None:
+                    if stop.wait(self._config.interval_s):
+                        break
+                else:
+                    sleep(self._config.interval_s)
         finally:
             # Graceful stop (loop exit or max_ticks): remove our own snapshot so a restart
             # doesn't leave a phantom pool lingering in the node view for a staleness window

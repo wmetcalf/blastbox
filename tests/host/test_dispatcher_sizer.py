@@ -3,6 +3,8 @@ serve/dispatch split (pool in the dispatcher, coordinated via a shared file)."""
 
 from __future__ import annotations
 
+import time
+
 from blastbox.host.dispatcher_sizer import DispatcherSizer
 from blastbox.host.node_config import EngineNode, NodeConfig
 from blastbox.host.node_share import DemandSnapshot, FileNodeShare
@@ -256,6 +258,36 @@ def test_overlapping_replicas_split_budget_not_double(tmp_path):
     assert m_old.concurrent_ceiling < 8 and m_new.concurrent_ceiling < 8
 
 
+def test_default_instance_is_unique_per_process_not_pid(tmp_path):
+    # regression (PR #60 r10, codex HIGH): the instance token must be RANDOM, not os.getpid()
+    # — each dispatcher runs in its own container where pid is almost always 1, so two
+    # replicas would collide on `@1` and each size to the full budget. With a random token
+    # they publish DISTINCT files even sharing a pid namespace.
+    share = FileNodeShare(str(tmp_path))
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    common = dict(runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 5, node="toolz2",
+                  capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0)
+    a = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024), _Pool(), share, cfg, **common)
+    b = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024), _Pool(), share, cfg, **common)
+    a.tick()
+    b.tick()
+    files = list(tmp_path.glob("*.json"))
+    assert len(files) == 2                             # two distinct files, no collision
+
+
+def test_node_id_with_path_separator_is_rejected(tmp_path):
+    # regression (PR #60 r10): a BLASTBOX_NODE_ID with a path separator would make every
+    # publish raise (traversal guard) and the sizer loop forever without publishing → peers
+    # oversubscribe. Reject it at construction, like engine names.
+    import pytest
+    share = FileNodeShare(str(tmp_path))
+    cfg = NodeConfig(balancing=True, resource_management=True)
+    with pytest.raises(ValueError):
+        DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024), _Pool(), share, cfg,
+                        runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 1, node="site/rack1")
+
+
 def test_run_removes_own_snapshot_on_graceful_stop(tmp_path):
     # regression (PR #60 review): a graceful stop removes the unit's own snapshot so a
     # restart leaves no phantom pool lingering in the node view (which would split the
@@ -272,15 +304,48 @@ def test_run_removes_own_snapshot_on_graceful_stop(tmp_path):
 
 def test_read_all_gcs_long_abandoned_file(tmp_path):
     # regression (PR #60 review): a crashed process's snapshot (never gracefully removed) is
-    # swept by read_all once it's far past the staleness window, so the dir self-cleans
-    # across restarts instead of accumulating dead per-instance files.
+    # swept by read_all once its FILE MTIME is far past the staleness window, so the dir
+    # self-cleans across restarts instead of accumulating dead per-instance files. GC is by
+    # filesystem mtime (robust to a malformed payload; spares a just-republished file).
+    import os
     share = FileNodeShare(str(tmp_path))
     share.publish(DemandSnapshot("dead", 1, 0, 1024, 1, 0, 64, 1.0, ts=0.0,
                                  node="n", tier="firecracker", instance="ghost"))
-    assert (tmp_path / "dead@firecracker@n@ghost.json").exists()
-    kept = share.read_all(max_age_s=20, now=10_000.0)  # age 10000 >> GC horizon (~400s)
-    assert kept == []                                  # aged out of the view
-    assert list(tmp_path.glob("*.json")) == []         # AND physically GC'd
+    f = tmp_path / "dead@firecracker@n@ghost.json"
+    assert f.exists()
+    old = time.time() - 100_000                        # make the file's mtime ancient
+    os.utime(f, (old, old))
+    kept = share.read_all(max_age_s=20, now=time.time())
+    assert [s.engine for s in kept] == []              # stale → out of the view
+    assert not f.exists()                              # AND physically GC'd (by mtime)
+
+
+def test_read_all_gcs_leaked_tmp_file(tmp_path):
+    # regression (PR #60 r10): a `.tmp` left by a publish killed mid-write (SIGKILL/OOM) is
+    # invisible to the `*.json` view, so it must be swept by the mtime GC or it accumulates.
+    import os
+    share = FileNodeShare(str(tmp_path))
+    leaked = tmp_path / ".engine@firecracker@n@x.json.abc123.tmp"   # mkstemp-style dotfile
+    leaked.write_text("{}")
+    old = time.time() - 100_000
+    os.utime(leaked, (old, old))
+    share.read_all(max_age_s=20, now=time.time())
+    assert not leaked.exists()                         # leaked temp GC'd by mtime
+
+
+def test_read_all_survives_huge_int_ts(tmp_path):
+    # regression (PR #60 r10): a huge-int ts out of json makes bare math.isfinite OVERFLOW;
+    # read_all must skip such a file (via _finite_in bound), not raise out and wedge sizing.
+    import json as _json
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("ok", 1, 0, 1024, 1, 0, 64, 1.0, ts=1.0,
+                                 node="n", tier="firecracker", instance="g"))
+    (tmp_path / "big@firecracker@n@h.json").write_text(_json.dumps({
+        "engine": "big", "backlog": 1, "assigned": 0, "slot_ram_mib": 1024, "slot_vcpus": 1,
+        "min_warm": 0, "max_ceiling": 64, "weight": 1.0, "ts": 10 ** 400,
+        "node": "n", "tier": "firecracker", "instance": "h"}))
+    kept = {s.engine for s in share.read_all(max_age_s=20, now=1.0)}   # must not raise
+    assert kept == {"ok"}
 
 
 def test_publish_does_not_follow_planted_tmp_symlink(tmp_path):

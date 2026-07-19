@@ -206,16 +206,21 @@ def _start_node_sizer(pool, engines, store, tier):
         sizer_stop = _threading.Event()
         # `tier` is the pool's runtime NAME (firecracker/gvisor/cold) — WarmPool.runtime is
         # the SlotRuntime object, so gating uses this string.
-        DispatcherSizer(spec, pool, FileNodeShare(node_cfg.share_dir), node_cfg,
-                        runtime=tier,
-                        # scope backlog to jobs THIS tier can claim (target_tier routing) so
-                        # the pool isn't sized for work pinned to a tier it can never drain.
-                        backlog_fn=local_backlog_fn(store, served, claimant_tier=tier),
-                        ).start_thread(sizer_stop)
+        thread = DispatcherSizer(
+            spec, pool, FileNodeShare(node_cfg.share_dir), node_cfg,
+            runtime=tier,
+            # scope backlog to jobs THIS tier can claim (target_tier routing) so
+            # the pool isn't sized for work pinned to a tier it can never drain.
+            backlog_fn=local_backlog_fn(store, served, claimant_tier=tier),
+        ).start_thread(sizer_stop)
         print(f"node self-sizer: managing {spec.name!r} warm pool (backlog over {served}) "
               f"from {node_cfg.share_dir} "
               f"({'balancing' if node_cfg.balancing else 'static shares'})", file=sys.stderr)
-        return sizer_stop
+        # Return the thread too so the caller can JOIN it on shutdown — otherwise the daemon
+        # thread is torn down without running its finally (which removes this unit's snapshot
+        # so a restart leaves no phantom pool). The run loop sleeps on sizer_stop, so the join
+        # returns promptly.
+        return sizer_stop, thread
     except Exception:
         logging.getLogger("blastbox.node_sizer").warning(
             "node self-sizer setup failed — continuing without it", exc_info=True)
@@ -343,16 +348,21 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     # Opt-in node self-sizer started INSIDE the try below, so pool.stop() in the finally
     # always runs — even if sizer setup raises (bad BLASTBOX_NODE_* / unwritable share_dir)
     # or is Ctrl-C'd mid-mkdir. It must never crash core dispatch or leak the warm pool.
-    sizer_stop = None
+    sizer = None
     try:
-        sizer_stop = _start_node_sizer(pool, engines, store, tier)
+        sizer = _start_node_sizer(pool, engines, store, tier)
         dispatcher.run_forever(
             poll_interval_s=args.poll_interval,
             concurrency=int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1"),
         )
     finally:
-        if sizer_stop is not None:
+        if sizer is not None:
+            sizer_stop, sizer_thread = sizer
             sizer_stop.set()
+            # Join so the sizer's finally runs (removes its snapshot → no phantom on restart).
+            # It sleeps on the event, so this returns promptly; bounded so a wedged sizer can't
+            # block dispatch shutdown.
+            sizer_thread.join(timeout=5.0)
         if pool is not None:
             pool.stop()
     return 0
