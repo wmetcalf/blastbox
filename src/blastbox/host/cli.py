@@ -404,7 +404,10 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
             # _start_node_sizer then sizes it from the node budget before serving begins.
             try:
                 pre_shrunk = (pool.warm_size, pool.concurrent_ceiling)  # type: ignore[attr-defined]
-                pool.resize(warm_size=0, concurrent_ceiling=1)  # type: ignore[attr-defined]
+                # Provisional (mark_autosized=False): if the sizer never starts, this must not
+                # turn on eager reaping — the pool has to behave exactly as a legacy pool would.
+                pool.resize(warm_size=0, concurrent_ceiling=1,  # type: ignore[attr-defined]
+                            mark_autosized=False)
             except Exception:
                 pre_shrunk = None
                 logging.getLogger("blastbox.host.cli").warning(
@@ -448,7 +451,10 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         # instead of being stuck at warm=0 and unable to serve.
         if sizer is None and pre_shrunk is not None and pool is not None:
             try:
-                pool.resize(warm_size=pre_shrunk[0], concurrent_ceiling=pre_shrunk[1])
+                # Restore AND leave the pool un-managed (mark_autosized=False) so a skipped
+                # opt-in keeps legacy lazy-drain behavior, not eager surplus reaping.
+                pool.resize(warm_size=pre_shrunk[0], concurrent_ceiling=pre_shrunk[1],
+                            mark_autosized=False)
             except Exception:
                 logging.getLogger("blastbox.host.cli").warning(
                     "node self-sizer: could not restore pool after skipped sizing", exc_info=True)

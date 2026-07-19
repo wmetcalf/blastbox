@@ -210,6 +210,30 @@ def test_from_env_rejects_non_finite_intervals(monkeypatch):
     assert _m.isfinite(c.min_free_mib)
 
 
+def test_from_env_clamps_huge_finite_interval_to_time_t_safe(monkeypatch):
+    # regression (PR #60 codex P2): a finite-but-huge interval (e.g. 1e10) PASSES the non-finite
+    # guard, then OverflowError-s in stop.wait()/time.sleep() ("timestamp out of range for
+    # platform time_t") — OUTSIDE the tick handler — killing the sizing thread while its pool
+    # keeps its last allocation (peers later expire it and reallocate). Clamp to a safe upper
+    # bound, and prove the clamped value survives the exact call the sizer makes.
+    import threading
+
+    from blastbox.host.node_config import NodeConfig, _MAX_INTERVAL_S
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")
+    monkeypatch.setenv("BLASTBOX_NODE_INTERVAL_S", "10000000000")   # 1e10 s
+    c = NodeConfig.from_env()
+    assert c.interval_s <= _MAX_INTERVAL_S
+    assert c.stale_after_s >= c.interval_s * 2
+    # The sizer's run() blocks on stop.wait(interval_s), which converts the timeout to a
+    # time_t deadline. Exercise that exact C conversion WITHOUT blocking: acquiring a free lock
+    # with a timeout converts the deadline eagerly, then returns immediately. The clamped value
+    # must convert cleanly; the raw 1e10 would OverflowError on the same call.
+    import pytest
+    assert threading.Lock().acquire(timeout=c.interval_s) is True   # clamped: no overflow
+    with pytest.raises(OverflowError):
+        threading.Lock().acquire(timeout=1e10)                      # raw: crashes the sizer thread
+
+
 def test_from_env_output_always_passes_reader_validation(monkeypatch):
     # regression (round-8): from_env is the WRITER of a dispatcher's own snapshot; every
     # EngineNode it produces must round-trip through node_share._valid, or the engine's

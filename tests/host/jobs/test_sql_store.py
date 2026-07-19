@@ -293,3 +293,54 @@ def test_postgres_claim_next_respects_target_tier():
         assert claimed.status == JobStatus.RUNNING
     finally:
         store.delete(job.job_id)
+
+
+def test_ensure_jobs_indexes_uses_dedicated_conn_not_pool(monkeypatch):
+    # regression (PR #60 codex P2): the CONCURRENTLY index must run on a DEDICATED autocommit
+    # connection, never a borrowed pool connection. Mutating a pooled connection to
+    # autocommit=True and returning it (the pool does not reset session state) poisons the next
+    # borrower, so a later multi-statement write (e.g. upsert_page_hashes) would commit each
+    # executemany independently and a mid-batch error could leave a partial batch that
+    # _connect()'s rollback can no longer undo. Prove the pool is never touched and that
+    # psycopg.connect is called with autocommit=True.
+    import sys
+    import threading
+    import types
+
+    calls: dict = {}
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql):
+            calls["sql"] = sql
+
+    fake_psycopg = types.ModuleType("psycopg")
+
+    def _connect(dsn, autocommit=False):
+        calls["dsn"] = dsn
+        calls["autocommit"] = autocommit
+        return _FakeConn()
+
+    fake_psycopg.connect = _connect  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    class _PoolBoom:
+        def connection(self):
+            raise AssertionError("the pool must NOT be borrowed for the CONCURRENTLY index")
+
+    store = SqlJobStore.__new__(SqlJobStore)
+    store._driver = "postgres"
+    store._pool = _PoolBoom()
+    store._database_url = "postgresql://u@h/db"
+    store._lock = threading.RLock()
+
+    store._ensure_jobs_indexes()   # must not raise (pool would AssertionError if touched)
+
+    assert calls["autocommit"] is True
+    assert calls["dsn"] == "postgresql://u@h/db"
+    assert "CREATE INDEX CONCURRENTLY" in calls["sql"]

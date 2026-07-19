@@ -37,6 +37,11 @@ from .node_share import _MAX_CEILING_SANE, _MAX_WEIGHT
 # visible), backed up by a hard guard in FileNodeShare.publish.
 _SAFE_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
+# Upper bound on the sizing interval (seconds). A finite-but-huge value passes float()
+# but OverflowError-s in stop.wait()/time.sleep() and kills the sizing thread; one day is
+# absurdly long for a heartbeat yet safely within platform time_t.
+_MAX_INTERVAL_S = 86_400.0
+
 
 def _is_safe_slug(s: str) -> bool:
     return bool(_SAFE_SLUG.match(s)) and ".." not in s
@@ -183,7 +188,14 @@ class NodeConfig:
         # bare "80" meaning 80% would give an 80× budget → OOM; a non-positive interval is
         # a busy-loop; a staleness window shorter than the publish interval ages peers out
         # every tick → each engine sees only itself → N-way oversubscription.
-        interval_s = max(0.5, _float("BLASTBOX_NODE_INTERVAL_S", 5.0))
+        # Upper-bound too: a huge but finite interval (e.g. 1e10) passes _float() but then
+        # OverflowError-s in stop.wait()/time.sleep() ("timestamp out of range for platform
+        # time_t"), OUTSIDE the tick handler — the sizing thread dies while its pool keeps its
+        # last allocation and peers eventually expire its snapshot and reallocate. A day is
+        # already absurd for a heartbeat and safely within time_t.
+        interval_s = _clamp(_float("BLASTBOX_NODE_INTERVAL_S", 5.0), 0.5, _MAX_INTERVAL_S)
+        # stale_after_s only feeds mtime staleness comparison (never wait()/sleep()), so it needs
+        # no time_t cap — but it MUST stay >= 2*interval or peers age out every tick.
         stale_after_s = max(_float("BLASTBOX_NODE_STALE_AFTER_S", 20.0), interval_s * 2.0)
         return cls(
             engines=tuple(engines),

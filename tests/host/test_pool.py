@@ -1204,6 +1204,27 @@ def test_reap_surplus_noop_until_autosized() -> None:
     pool.stop()
 
 
+def test_resize_mark_autosized_false_keeps_legacy_behavior() -> None:
+    # regression (PR #60 codex P2): resize() normally sets _autosized=True permanently, which
+    # turns on eager surplus reaping. The CLI's PROVISIONAL moves — the pre-start shrink and the
+    # restore when the sizer is SKIPPED (incomplete inventory / unwritable share_dir) — must NOT
+    # change the pool's behavior: a failed opt-in has to drain lazily exactly like an un-managed
+    # pool. resize(mark_autosized=False) makes those moves a true no-op for reaping.
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=4, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    for _ in range(6):
+        pool.tick()
+    assert pool.idle_count == 4
+    # the CLI pre-shrink then restore-on-skip, both provisional:
+    pool.resize(warm_size=0, concurrent_ceiling=1, mark_autosized=False)
+    pool.resize(warm_size=4, concurrent_ceiling=8, mark_autosized=False)
+    assert pool._autosized is False                       # never flipped into managed mode
+    pool._warm_size = 1                                    # target drops (as post-burst drain)
+    pool._reap_surplus()
+    assert pool.slot_count == 4 and rt.reaped == []        # lazy drain preserved — nothing reaped
+    pool.stop()
+
+
 def test_reap_surplus_leaves_assigned_slots_untouched() -> None:
     # regression (round-2): surplus reaping must only take IDLE slots; a slot serving a
     # job (ASSIGNED) must never be reaped, even when it counts toward the surplus.

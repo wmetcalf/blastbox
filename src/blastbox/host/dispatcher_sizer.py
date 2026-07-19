@@ -105,6 +105,7 @@ class DispatcherSizer:
         self._last_backlog = 0                # published as a heartbeat before the (slow) count
         self._stop_event: Optional[threading.Event] = None  # set in run(); fences the update-publish
         self._warned_mixed_nodes = False      # one-shot: warn on an inconsistent node-id view
+        self._warned_mixed_modes = False      # one-shot: warn on mixed balancing modes on a node
 
     def _active(self) -> bool:
         cfg = self._config
@@ -159,7 +160,7 @@ class DispatcherSizer:
                 slot_ram_mib=e.slot_ram_mib, slot_vcpus=e.slot_vcpus,
                 min_warm=e.min_warm, max_ceiling=e.max_ceiling, weight=e.weight, ts=ts,
                 node=self._node, tier=self._runtime, instance=self._instance,
-                refresh_s=refresh_s)
+                refresh_s=refresh_s, balancing=self._config.balancing)
 
         # HEARTBEAT before the (possibly-slow) count: publish a fresh-ts snapshot with the last
         # tick's backlog so peers keep seeing us alive even when THIS count — a huge shared-
@@ -211,7 +212,26 @@ class DispatcherSizer:
                 "docs/CONFIGURATION.md); mixing conflates their budgets.",
                 self._engine.name, sorted({s.node for s in snaps}))
 
-        balancing = self._config.balancing
+        # CONSENSUS allocation mode across the node view. The demand basis (live backlog vs
+        # static weight) must be identical for EVERY dispatcher on the node — otherwise each
+        # applies its own mode to the same snapshots, computes a different plan, and their
+        # self-slices can sum past the budget (e.g. a static unit takes its weight share while a
+        # balancing neighbour with all the backlog takes a big share → 14 slots from a 10-slot
+        # node). Derive ONE mode deterministically from the shared view so all readers agree:
+        # balancing is on only if THIS unit AND every peer opts in (unanimous). A lone
+        # misconfigured unit therefore can't silently flip the node's basis or oversubscribe it;
+        # the node falls back to static (the conservative floor) and we warn once so an operator
+        # aligns BLASTBOX_NODE_BALANCING. `all()` over the view already includes our own
+        # published snapshot, but AND-ing the local flag is robust even if it isn't in view yet.
+        peer_modes = {bool(getattr(s, "balancing", False)) for s in snaps}
+        balancing = self._config.balancing and all(peer_modes)
+        if len(peer_modes) > 1 and not self._warned_mixed_modes:
+            self._warned_mixed_modes = True
+            logging.getLogger("blastbox.node_sizer").warning(
+                "node view for %s mixes BLASTBOX_NODE_BALANCING modes across dispatchers %s — "
+                "using STATIC allocation for all (the safe consensus) to avoid oversubscribing "
+                "the node budget; set a CONSISTENT balancing mode on every dispatcher of a node.",
+                self._engine.name, sorted(peer_modes))
         specs = [
             PoolSpec(
                 # key each pool by (engine, tier, instance): the same engine on two node-

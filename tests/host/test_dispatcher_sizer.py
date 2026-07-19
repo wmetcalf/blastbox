@@ -40,6 +40,72 @@ def test_file_share_roundtrip_and_staleness(tmp_path):
     assert {s.engine for s in share.read_all(max_age_s=20, now=130.0)} == set()
 
 
+def test_auto_created_share_dir_is_writable_by_cross_uid_peers(tmp_path):
+    # regression (PR #60 codex P2): when FileNodeShare AUTO-creates the dir and dispatchers run
+    # under different UIDs, a default-umask dir (0755) lets peers READ but not create their own
+    # <identity>.json → their publish fails, they fall back to static sizing, and the first
+    # dispatcher sees only itself and allocates the WHOLE node budget. An auto-created dir must
+    # be sticky world-writable (0o1777, /tmp semantics) so any peer UID can publish.
+    import os
+    import stat
+    d = tmp_path / "share-auto"
+    assert not d.exists()
+    FileNodeShare(str(d))
+    mode = stat.S_IMODE(os.stat(d).st_mode)
+    assert mode & 0o002, f"auto-created share dir not world-writable: {oct(mode)}"
+    assert mode & stat.S_ISVTX, f"auto-created share dir missing sticky bit: {oct(mode)}"
+
+
+def test_preprovisioned_share_dir_perms_left_untouched(tmp_path):
+    # the flip side: if an operator PRE-PROVISIONED the dir (the trust-sensitive path — tight
+    # per-owner perms on a mounted dir), FileNodeShare must NOT loosen it.
+    import os
+    import stat
+    d = tmp_path / "share-tight"
+    d.mkdir(mode=0o700)
+    os.chmod(d, 0o700)               # ensure exact perms regardless of umask
+    FileNodeShare(str(d))
+    assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
+
+
+def test_mixed_balancing_modes_on_a_node_do_not_oversubscribe(tmp_path):
+    # regression (PR #60 codex P1): two dispatchers on ONE node with DIFFERENT
+    # BLASTBOX_NODE_BALANCING values used to each apply its own mode to the shared snapshots,
+    # compute a different plan, and take self-slices that summed PAST the node budget. With the
+    # published-mode consensus (balancing only if unanimous, else static), every reader derives
+    # the SAME basis, so the slices sum to the budget. Construct the worst case: the balancing
+    # engine holds ALL the backlog while the static engine holds ALL the weight — under the old
+    # per-dispatcher mode each would claim the lion's share and Σ would blow past the budget.
+    share = FileNodeShare(str(tmp_path))
+    budget_slots = 10
+    cap = _budget(budget_slots * 1024, 999)   # 10 slots @ 1024 MiB
+    clip_pool, red_pool = _Pool(), _Pool()
+    # clip: BALANCING, all the backlog, tiny weight.
+    clip = DispatcherSizer(
+        EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64, min_warm=0, weight=1.0),
+        clip_pool, share,
+        NodeConfig(balancing=True, resource_management=True, stale_after_s=1e9,
+                   ram_headroom_frac=1.0, vcpu_oversubscription=999),
+        runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 40, node="n", instance="c",
+        capacity_fn=cap, clock=lambda: 1000.0)
+    # red: STATIC, no backlog, big weight.
+    red = DispatcherSizer(
+        EngineNode("red", "-", slot_ram_mib=1024, max_ceiling=64, min_warm=0, weight=9.0),
+        red_pool, share,
+        NodeConfig(balancing=False, resource_management=True, stale_after_s=1e9,
+                   ram_headroom_frac=1.0, vcpu_oversubscription=999),
+        runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 0, node="n", instance="r",
+        capacity_fn=cap, clock=lambda: 1000.0)
+    for _ in range(3):        # a few rounds so both see each other and converge
+        clip.tick()
+        red.tick()
+    # THE invariant: the two independently-computed self-slices never exceed the node budget.
+    assert clip_pool.concurrent_ceiling + red_pool.concurrent_ceiling <= budget_slots
+    # And consensus fell to STATIC (weight basis): red's big weight wins the ceiling, not clip's
+    # backlog — proving the balancer didn't silently impose its own basis.
+    assert red_pool.concurrent_ceiling > clip_pool.concurrent_ceiling
+
+
 # --- dispatcher self-sizer --------------------------------------------------
 
 def test_off_by_default_is_noop(tmp_path):

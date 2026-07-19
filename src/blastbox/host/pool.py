@@ -576,11 +576,18 @@ class WarmPool:
         with self._lock:
             return self._concurrent_ceiling
 
-    def resize(self, *, warm_size: int | None = None, concurrent_ceiling: int | None = None) -> None:
+    def resize(self, *, warm_size: int | None = None, concurrent_ceiling: int | None = None,
+               mark_autosized: bool = True) -> None:
         """Retune the warm target / hard ceiling on a live pool. Used by an external
         controller (the node autosizer) to re-allocate a node's capacity across engines.
         The background tick() converges to the new target on its own schedule; this only
-        moves the setpoints. warm_size is clamped to the (possibly new) ceiling."""
+        moves the setpoints. warm_size is clamped to the (possibly new) ceiling.
+
+        mark_autosized (default True) records that an external controller now owns this
+        pool, enabling eager surplus reaping. Pass False for a PROVISIONAL move that must
+        NOT change the pool's legacy behavior — e.g. the CLI's pre-start shrink and its
+        restore-on-skip: if the sizer never actually takes over, the pool must drain
+        lazily exactly as an un-managed pool would, so a failed opt-in is a true no-op."""
         with self._lock:
             if concurrent_ceiling is not None:
                 if concurrent_ceiling < 1:
@@ -595,7 +602,10 @@ class WarmPool:
                 self._warm_size = self._concurrent_ceiling
             # This pool is now under external (autosizer) control → eager surplus reaping
             # is enabled so a downsize frees node RAM promptly instead of draining lazily.
-            self._autosized = True
+            # Skipped for provisional moves (mark_autosized=False) so an opt-in that never
+            # starts leaves the pool in exactly its pre-autosizer state.
+            if mark_autosized:
+                self._autosized = True
 
     @property
     def effective_target(self) -> int:

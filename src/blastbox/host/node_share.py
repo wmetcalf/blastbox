@@ -77,6 +77,12 @@ class DemandSnapshot:
                                  # overlapping during a rolling deploy — are TWO distinct pools
                                  # that split the budget in plan_sizes, rather than colliding on
                                  # one file and each taking the full ceiling.
+    balancing: bool = False      # this unit's allocation MODE (backlog-balancing vs static
+                                 # weight). Published so every reader derives ONE consensus mode
+                                 # for the whole node view — if dispatchers on a node disagreed
+                                 # and each applied its OWN mode to the shared snapshots, they'd
+                                 # compute different plans and their slices could sum past the
+                                 # budget (N-way oversubscription). See DispatcherSizer.tick.
 
 
 class NodeShare(Protocol):
@@ -98,7 +104,24 @@ class FileNodeShare:
 
     def __init__(self, directory: str) -> None:
         self._dir = Path(directory)
+        existed = self._dir.exists()
         self._dir.mkdir(parents=True, exist_ok=True)
+        if not existed:
+            # We just AUTO-created the dir. Dispatchers for different engines can run under
+            # DIFFERENT UIDs; each must be able to create its own `<identity>.json`. A dir made
+            # under the default umask (0755) would let peers READ but not WRITE, so every
+            # other-UID peer's publish would fail and it would fall back to static sizing while
+            # THIS process sees only itself and allocates the whole node budget. Make it sticky
+            # world-writable (0o1777, /tmp semantics): any peer can create its own file, the
+            # sticky bit stops one peer unlinking another's (GC already tolerates a failed
+            # unlink), and each owner can always rewrite/remove its own snapshot.
+            #
+            # If an operator PRE-PROVISIONED the dir (the trust-sensitive path in the module
+            # docstring — tight per-owner perms on a mounted dir), we leave its perms untouched.
+            try:
+                os.chmod(self._dir, 0o1777)
+            except OSError:
+                pass
 
     @staticmethod
     def _filename(engine: str, tier: str, node: str, instance: str = "") -> str:

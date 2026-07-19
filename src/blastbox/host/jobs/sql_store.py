@@ -196,14 +196,22 @@ class SqlJobStore:
         On Postgres, build it CONCURRENTLY on an AUTOCOMMIT connection (CONCURRENTLY cannot
         run inside a transaction): a plain CREATE INDEX takes an ACCESS EXCLUSIVE-ish lock and
         would block writes for the whole build when upgrading a large existing jobs table, even
-        when the autosizer is off. On SQLite a plain create (no CONCURRENTLY, no such block)."""
+        when the autosizer is off. On SQLite a plain create (no CONCURRENTLY, no such block).
+
+        The autocommit connection is a DEDICATED one-off — never a pooled connection: mutating
+        a borrowed pool connection to autocommit=True and returning it (the pool does not reset
+        session state) would poison the next borrower, so a later multi-statement write
+        (e.g. upsert_page_hashes) would commit each executemany independently and a mid-batch
+        error could leave a partial batch that _connect()'s rollback can no longer undo."""
         stmt_tail = "idx_jobs_status_engine_tier ON jobs (status, engine, target_tier)"
         if self._driver != "postgres" or self._pool is None:
             self._try_ddl(f"CREATE INDEX IF NOT EXISTS {stmt_tail}")
             return
         try:
-            with self._lock, self._pool.connection() as conn:
-                conn.autocommit = True   # CONCURRENTLY must be outside a transaction block
+            import psycopg  # type: ignore[import-not-found]
+
+            # Dedicated autocommit connection, opened and closed here — leaves the pool untouched.
+            with self._lock, psycopg.connect(self._database_url, autocommit=True) as conn:
                 conn.execute(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {stmt_tail}")
         except Exception:
             pass   # lock/permission/already-building → just slower autosizer counts, never fatal
