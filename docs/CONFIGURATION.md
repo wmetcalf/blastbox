@@ -104,6 +104,34 @@ The default CSP (`middleware.DEFAULT_CSP`) is `default-src 'self'; script-src 's
 | `BLASTBOX_POOL_WARMING_TIMEOUT_S` | `120` | Max seconds a slot may sit WARMING before eviction. **Raise for cloud tiers** (`aws-ec2` first-boot can exceed 120s) or healthy-but-slow slots get churned. |
 | `BLASTBOX_POOL_WARM_SNAPSHOT` | `0` | FC only: restore from a memory snapshot (warm-UNO) instead of cold-booting the guest. |
 
+## Node pool autosizer (opt-in)
+
+Right-sizes every node-managed warm pool (firecracker/gvisor only) on one physical host from
+live demand under the host's RAM/vCPU budget, instead of hand-tuning `BLASTBOX_POOL_CEILING`
+per engine. Runs inside `blastbox dispatch`; **OFF by default** — a node behaves exactly as
+today unless a switch below is on. Each dispatcher publishes a demand snapshot to a shared
+node dir and reads its peers', then runs the same deterministic allocation over the whole-node
+view and resizes its own pool. See `src/blastbox/host/node_sizer.py`.
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_NODE_RESOURCE_MANAGEMENT` | `0` | Enforce the node RAM/vCPU budget: cap total slots so engines can't oversubscribe the host. With balancing off, each engine gets a static, weight-proportional share. |
+| `BLASTBOX_NODE_BALANCING` | `0` | Dynamically rebalance the budget across engines by live queue backlog (implies `RESOURCE_MANAGEMENT`). |
+| `BLASTBOX_NODE_ADAPTIVE` | `0` | Nudge the RAM budget from observed free memory (bounded; never exceeds physical RAM). |
+| `BLASTBOX_NODE_ENGINES` | — | Inventory of engines on this host: `name` or `name=url`, comma-separated (e.g. `clippyshot,redtusk,titanarum`). Engine names must be plain slugs (`[A-Za-z0-9._-]`, no path separators). |
+| `BLASTBOX_NODE_ENGINE_<NAME>_RAM_MIB` | `2048` | Per-slot RAM footprint for that engine (a warm microVM). |
+| `BLASTBOX_NODE_ENGINE_<NAME>_VCPUS` | `1` | Per-slot vCPU footprint. |
+| `BLASTBOX_NODE_ENGINE_<NAME>_MIN_WARM` | `0` | Warm floor (slots kept hot even at zero backlog; soft — shed to the afforded ceiling under a tight budget). |
+| `BLASTBOX_NODE_ENGINE_<NAME>_MAX_CEILING` | `64` | Per-engine hard cap. |
+| `BLASTBOX_NODE_ENGINE_<NAME>_WEIGHT` | `1.0` | Static budget share when balancing is off. |
+| `BLASTBOX_NODE_RAM_HEADROOM` | `0.8` | Fraction (0,1] of MemTotal the sizer may allocate to pools. |
+| `BLASTBOX_NODE_VCPU_OVERSUBSCRIPTION` | `2.0` | vCPU multiplier over `cpu_count()`. |
+| `BLASTBOX_NODE_MIN_FREE_MIB` | `2048` | Adaptive: keep at least this much host RAM free. |
+| `BLASTBOX_NODE_INTERVAL_S` | `5` | Sizer tick interval. |
+| `BLASTBOX_NODE_STALE_AFTER_S` | `20` | A peer snapshot older than this drops out of the node view (floored at 2× interval). |
+| `BLASTBOX_NODE_SHARE_DIR` | `/var/lib/blastbox/node` | Shared dir every engine's dispatcher on this host publishes to + reads from. **Bind-mount it into each engine stack on the host.** It is a single-trust-domain surface (written only by dispatchers). |
+| `BLASTBOX_NODE_ID` | unset | Physical-host id. Leave unset when the share dir is local to one host (the default). **Only** set it — to a distinct slug per host — if a share dir is (accidentally) shared across hosts (NFS): every participating host must then set a *distinct* id, and never mix tagged + untagged hosts on one shared dir. |
+
 ## Runtime: Firecracker
 
 | Var | Default | Notes |
