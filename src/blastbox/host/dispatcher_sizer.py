@@ -106,12 +106,24 @@ class DispatcherSizer:
         cfg = self._config
         return (cfg.resource_management or cfg.balancing) and manages(self._runtime)
 
+    # Adaptive control loop bounds. Deliberately a DAMPED, asymmetric ramp (shrink faster
+    # than grow) rather than a hard MemAvailable cap: a cap that tracks free RAM directly
+    # oscillates (shrink pools → free rises → cap rises → grow → free drops → …). Extending
+    # this proven-stable loop's range with a low floor lets it shed enough to honour min_free
+    # under severe pressure without a second, unstable control loop. It's best-effort host
+    # protection — for a HARD OOM guarantee use cgroup memory limits on the engine containers.
+    _SCALE_FLOOR = 0.25          # shed up to 75% of the budget under sustained memory pressure
+    _SCALE_DOWN = 0.10           # per tick when free < min_free (fast shrink)
+    _SCALE_UP = 0.05             # per tick when free > 2·min_free (slow grow — conservative)
+
     def _adapt(self, budget: "NodeBudget") -> "NodeBudget":
         """Nudge the RAM budget from observed free memory when BLASTBOX_NODE_ADAPTIVE is
         on. Persisted across ticks. The UP-scale is capped so the adapted budget never
         exceeds physical RAM: with headroom_frac h the baseline budget is total·h, so the
         scale is capped at 1/h (times the safety 1.25) — otherwise a high headroom (e.g.
-        1.0) × 1.25 would target 125% of node RAM → OOM."""
+        1.0) × 1.25 would target 125% of node RAM → OOM. The DOWN-scale floors at
+        _SCALE_FLOOR so it can shed most of the budget under real memory pressure (the
+        1-per-engine baseline still keeps every pool viable)."""
         if not self._config.adaptive:
             return budget
         free = self._avail_fn()
@@ -120,9 +132,9 @@ class DispatcherSizer:
         hi = min(1.25, 1.0 / max(self._config.ram_headroom_frac, 0.05))
         floor = self._config.min_free_mib
         if free < floor:
-            self._budget_scale = max(0.5, self._budget_scale - 0.1)
+            self._budget_scale = max(self._SCALE_FLOOR, self._budget_scale - self._SCALE_DOWN)
         elif free > floor * 2:
-            self._budget_scale = min(hi, self._budget_scale + 0.05)
+            self._budget_scale = min(hi, self._budget_scale + self._SCALE_UP)
         self._budget_scale = min(self._budget_scale, hi)   # clamp if headroom changed
         return NodeBudget(ram_mib=budget.ram_mib * self._budget_scale, vcpus=budget.vcpus)
 

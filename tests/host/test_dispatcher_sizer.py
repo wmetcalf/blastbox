@@ -627,6 +627,22 @@ def test_static_mode_warm_tracks_real_demand_not_weight(tmp_path):
     assert pool.warm_size == 0
 
 
+def test_adaptive_sheds_below_half_under_sustained_pressure(tmp_path):
+    # PR #60 r12: under sustained memory pressure the adaptive scale sheds to the 0.25 floor
+    # (was 0.5, which could still authorize ~half the RAM under pressure → OOM risk). The
+    # 1-per-engine baseline still keeps pools viable regardless.
+    share = FileNodeShare(str(tmp_path))
+    cfg = NodeConfig(balancing=True, resource_management=True, adaptive=True,
+                     ram_headroom_frac=0.8, min_free_mib=2048.0)
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024), _Pool(), share, cfg,
+                         runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 1,
+                         avail_fn=lambda: 100.0)          # far below min_free → real pressure
+    base = NodeBudget(ram_mib=1000.0, vcpus=10.0)
+    for _ in range(30):
+        out = ds._adapt(base)
+    assert 0.24 <= out.ram_mib / base.ram_mib <= 0.26     # shed to the 0.25 floor
+
+
 def test_adaptive_never_exceeds_physical_ram(tmp_path):
     # regression (codex HIGH): the adaptive UP-scale (cap 1.25) times a high headroom can
     # target >100% of node RAM → OOM. With headroom 1.0 the baseline budget already IS the

@@ -70,6 +70,20 @@ def test_warm_tracks_demand_not_whole_node():
     assert plan["a"].warm_size == 2                # but only 2 kept hot (demand)
 
 
+def test_weight_allocates_resource_share_not_slot_count():
+    # PR #60 r12: equal-weight/equal-demand pools with DIFFERENT footprints get an equal RAM
+    # SHARE, not equal slot counts — a 4 GiB pool gets ~1/4 the slots of a 1 GiB one, so both
+    # use ~the same RAM (not the 4x a slot-count split would hand the big pool).
+    specs = [PoolSpec("small", slot_ram_mib=1024, demand=5, max_ceiling=64),
+             PoolSpec("big", slot_ram_mib=4096, demand=5, max_ceiling=64)]
+    plan = plan_sizes(specs, NodeBudget(ram_mib=20 * 1024, vcpus=9999))    # 20 GiB
+    small_ram = plan["small"].concurrent_ceiling * 1024
+    big_ram = plan["big"].concurrent_ceiling * 4096
+    assert plan["small"].concurrent_ceiling > plan["big"].concurrent_ceiling   # more small slots
+    assert abs(small_ram - big_ram) <= 4096                                    # ~equal RAM share
+    assert small_ram + big_ram <= 20 * 1024                                    # within budget
+
+
 def test_min_warm_reserved_before_busy_demand():
     # PR #60 r12: min_warm is now a RESERVED floor, not soft — an IDLE latency-critical pool
     # keeps its min_warm hot even when a busy neighbour wants the whole budget.

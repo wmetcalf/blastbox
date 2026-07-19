@@ -138,10 +138,14 @@ def plan_sizes(specs: list[PoolSpec], budget: NodeBudget) -> dict[str, PoolSize]
         cands = [s for s in specs if fits(s)]
         if not cands:
             break
-        # diminishing returns: (demand + epsilon) / (already-allocated + 1). A tie or a
-        # zero-demand engine still fills a beefy node after busy ones are satisfied, but
-        # only up to its cap — busy engines are served first.
-        pick = max(cands, key=lambda s: (s.demand + 1e-3) / (alloc[s.name] + 1))
+        # Diminishing returns, RESOURCE-normalised: (demand + epsilon) / (RAM the pool would
+        # then hold). Dividing by (alloc+1)·footprint means `demand`/`weight` buys a share of
+        # the node's RAM BUDGET, not a raw slot count — so with heterogeneous footprints two
+        # equal-weight pools get equal RAM (a 4 GiB pool gets ~1/4 the slots of a 1 GiB one),
+        # not equal slots (which would hand the big-footprint pool 4× the RAM). Same-footprint
+        # pools are unaffected (footprint is a constant factor). A tie or zero-demand engine
+        # still fills a beefy node after busy ones are satisfied, up to its cap.
+        pick = max(cands, key=lambda s: (s.demand + 1e-3) / ((alloc[s.name] + 1) * s.slot_ram_mib))
         alloc[pick.name] += 1
         used_ram += pick.slot_ram_mib
         used_vcpu += pick.slot_vcpus
