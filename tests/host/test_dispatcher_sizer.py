@@ -13,13 +13,16 @@ from blastbox.host.pool_config import RUNTIME_AWS_LAMBDA_MICROVM, RUNTIME_FIRECR
 
 
 class _Pool:
-    def __init__(self, assigned=0, runtime=RUNTIME_FIRECRACKER):
+    def __init__(self, assigned=0, runtime=RUNTIME_FIRECRACKER, slot_count=0):
         self.runtime = runtime
         self.assigned_count = assigned
         self.warm_size = 0
         self.concurrent_ceiling = 0
+        # resident slot count (IDLE+WARMING+ASSIGNED). resize() only moves setpoints; real
+        # residency lags, so tests set this explicitly to simulate an async resize/reap.
+        self.slot_count = slot_count
 
-    def resize(self, *, warm_size, concurrent_ceiling):
+    def resize(self, *, warm_size, concurrent_ceiling, mark_autosized=True):
         self.warm_size = warm_size
         self.concurrent_ceiling = concurrent_ceiling
 
@@ -366,6 +369,29 @@ def test_sizer_drives_concurrency_gate_to_cold_headroom(tmp_path):
     # and warm residency (≤ ceiling in the pool) + cold (≤ gate) never exceeds the ceiling except
     # for the floor-of-1 liveness margin:
     assert mine.warm_size + gate.limit <= mine.concurrent_ceiling + 1
+
+
+def test_cold_gate_reserves_resident_slots_not_just_target(tmp_path):
+    # PR #60 codex P1: resize() only moves setpoints — surplus IDLE/WARMING slots aren't reaped
+    # until a later pool tick. When a tick LOWERS warm (8 resident → target 1), basing cold
+    # headroom on the target alone would open ceiling−1 permits while 8 VMs are still resident
+    # (≈2× budget). Reserve max(target, resident) so the cold limit stays down until the surplus
+    # actually drains.
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+    share = FileNodeShare(str(tmp_path))
+    gate = DynamicConcurrencyGate(64)
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    pool = _Pool(slot_count=8)                 # 8 VMs still resident from a prior larger warm
+    # low backlog + min_warm=1 → new warm target is 1, well below the 8 still resident.
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8, min_warm=1),
+                         pool, share, cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 0,
+                         node="n", instance="i", capacity_fn=_budget(8 * 1024, 999),
+                         clock=lambda: 1.0, concurrency_gate=gate)
+    mine = ds.tick()
+    assert mine.warm_size == 1                  # target dropped to the floor
+    # headroom = ceiling − max(target=1, resident=8) = 8 − 8 = 0 → floored to 1, NOT ceiling−1=7.
+    assert gate.limit == 1
 
 
 def test_sizer_floors_cold_gate_at_one_when_warm_saturates(tmp_path):

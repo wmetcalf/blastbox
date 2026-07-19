@@ -307,7 +307,11 @@ def test_ensure_jobs_indexes_uses_dedicated_conn_not_pool(monkeypatch):
     import threading
     import types
 
-    calls: dict = {}
+    calls: dict = {"sql": []}
+
+    class _Result:
+        def fetchone(self):
+            return None                 # index is valid / absent → no drop needed
 
     class _FakeConn:
         def __enter__(self):
@@ -316,8 +320,9 @@ def test_ensure_jobs_indexes_uses_dedicated_conn_not_pool(monkeypatch):
         def __exit__(self, *a):
             return False
 
-        def execute(self, sql):
-            calls["sql"] = sql
+        def execute(self, sql, params=None):
+            calls["sql"].append(sql)
+            return _Result()
 
     fake_psycopg = types.ModuleType("psycopg")
 
@@ -343,4 +348,49 @@ def test_ensure_jobs_indexes_uses_dedicated_conn_not_pool(monkeypatch):
 
     assert calls["autocommit"] is True
     assert calls["dsn"] == "postgresql://u@h/db"
-    assert "CREATE INDEX CONCURRENTLY" in calls["sql"]
+    assert any("CREATE INDEX CONCURRENTLY" in s for s in calls["sql"])
+    assert any("indisvalid" in s for s in calls["sql"])   # checks for an invalid index first
+
+
+def test_ensure_jobs_indexes_rebuilds_invalid_index(monkeypatch):
+    # regression (PR #60 codex P2): a prior CONCURRENTLY build that was cancelled/crashed leaves
+    # an INVALID same-named index; IF NOT EXISTS would skip healing it forever. When the validity
+    # probe finds one, DROP it before rebuilding.
+    import sys
+    import threading
+    import types
+
+    executed: list = []
+
+    class _Result:
+        def fetchone(self):
+            return (1,)                 # an INVALID index of this name exists
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            executed.append(sql)
+            return _Result()
+
+    fake_psycopg = types.ModuleType("psycopg")
+    fake_psycopg.connect = lambda dsn, autocommit=False: _FakeConn()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    store = SqlJobStore.__new__(SqlJobStore)
+    store._driver = "postgres"
+    store._pool = object()
+    store._database_url = "postgresql://u@h/db"
+    store._lock = threading.RLock()
+
+    store._ensure_jobs_indexes()
+
+    joined = " | ".join(executed)
+    assert "DROP INDEX CONCURRENTLY" in joined          # invalid index dropped...
+    assert "CREATE INDEX CONCURRENTLY" in joined        # ...then rebuilt
+    assert executed.index(next(s for s in executed if "DROP" in s)) < \
+        executed.index(next(s for s in executed if "CREATE INDEX" in s))

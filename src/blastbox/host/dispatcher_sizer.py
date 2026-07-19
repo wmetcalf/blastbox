@@ -165,14 +165,20 @@ class DispatcherSizer:
             return None
         started = self._clock()
         e = self._engine
-        # Active demand = warm-assigned slots PLUS cold workers in flight. The gate counts
-        # cold-only (see dispatch), and those jobs have already LEFT the queued backlog and hold
-        # NO warm slot, so without adding them the snapshot would under-report demand — the
-        # planner could shrink this pool and let peers expand while the cold work still runs and
-        # set_limit() can't recall it. Counting them keeps the reservation until they finish.
-        assigned = int(getattr(self._pool, "assigned_count", 0))      # cheap
-        if self._gate is not None:
-            assigned += int(getattr(self._gate, "in_flight", 0))
+        # Two DIFFERENT active-work counts, kept separate on purpose:
+        #  * assigned_warm — WARM slots busy now. Drives the WARM target (warm slots to keep hot).
+        #    Cold work must NOT inflate this: cold jobs bypass the warm pool, so counting them
+        #    would warm VMs they can never use AND shrink the cold headroom (ceiling − warm) to
+        #    its floor → an egress batch would run essentially serially.
+        #  * assigned (total) — warm-assigned PLUS cold workers in flight. Drives the PUBLISHED
+        #    demand (the pool's ceiling SHARE / reservation). Cold jobs have already LEFT the
+        #    queued backlog and hold no warm slot, so without them the snapshot under-reports
+        #    demand — the planner could shrink this pool's ceiling and let peers expand while the
+        #    cold work still runs (the gate can't recall in-flight permits). Counting them keeps
+        #    the reservation until they finish.
+        assigned_warm = int(getattr(self._pool, "assigned_count", 0))      # cheap
+        cold_in_flight = int(getattr(self._gate, "in_flight", 0)) if self._gate is not None else 0
+        assigned = assigned_warm + cold_in_flight
 
         # Compute OUR view of the node budget up front so we can PUBLISH it: readers reconcile to
         # one budget (the elementwise MIN across the view), so a dispatcher with a different
@@ -298,23 +304,32 @@ class DispatcherSizer:
         plan = plan_sizes(specs, budget)  # type: ignore[arg-type]
         mine = plan.get(_pool_key(e.name, self._runtime, self._instance))
         if mine is not None and hasattr(self._pool, "resize"):
-            # WARM tracks THIS engine's REAL demand (not the weight, which is only a
-            # ceiling-share ratio) so static mode doesn't hold idle engines hot: a big
-            # weight buys a big ceiling to burst into, but few hot slots when idle.
-            warm = min(mine.concurrent_ceiling, max(e.min_warm, backlog + assigned))
+            # WARM tracks THIS engine's WARM-eligible demand (not the weight, a ceiling-share
+            # ratio only; and not cold in-flight, which bypasses the warm pool) so static mode
+            # doesn't hold idle engines hot: a big weight buys a big ceiling to burst into, but
+            # few hot slots when idle. (A backlog of egress jobs still counts here — the sizer
+            # can't cheaply tell which queued jobs resolve to egress; run a predominantly-egress
+            # engine on the cold tier, not a warm-managed one, since warm-tier networking is a
+            # future phase and those jobs bypass the warm pool anyway.)
+            warm = min(mine.concurrent_ceiling, max(e.min_warm, backlog + assigned_warm))
             mine = PoolSize(warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)
             self._pool.resize(  # type: ignore[attr-defined]
                 warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)
-            # Drive the dispatcher's COLD-admission gate to the budget's COLD HEADROOM: the warm
-            # pool already caps warm slots at the ceiling, and cold workers spawn OUTSIDE it, so
-            # the cold headroom is (ceiling − warm reservation). This keeps warm residency + cold
-            # workers within the ceiling instead of each independently reaching it (which would
-            # let warm + cold approach 2× the budget). The gate floors the limit at 1, so cold
-            # (egress / warm-miss) never fully starves even when warm claims the whole budget —
-            # a bounded, self-correcting overshoot, per this module's eventual-consistency note.
+            # Drive the dispatcher's COLD-admission gate to the budget's COLD HEADROOM. Cold
+            # workers spawn OUTSIDE the warm pool, so headroom is (ceiling − warm RESIDENCY). Base
+            # it on the LARGER of the new warm target and the slots RESIDENT right now: resize()
+            # only moves setpoints, and surplus IDLE/WARMING slots are not reaped until a later
+            # pool tick — so when a tick LOWERS warm (say 8→1), using the target alone would open
+            # ceiling−1 cold permits while 8 VMs are still resident (≈2× the budget). Reserving
+            # max(target, resident) holds the cold limit down until the surplus actually drains,
+            # and also reserves for warm that is still SPAWNING UP toward a raised target. Floored
+            # at 1 so cold (egress / warm-miss) never fully starves — a bounded, self-correcting
+            # overshoot, per this module's eventual-consistency note.
+            resident = int(getattr(self._pool, "slot_count", warm))
+            cold_headroom = mine.concurrent_ceiling - max(warm, resident)
             if self._gate is not None:
-                self._gate.set_limit(  # type: ignore[attr-defined]
-                    mine.concurrent_ceiling - warm)
+                # set_limit floors at 1, so cold never fully starves even when headroom ≤ 0.
+                self._gate.set_limit(cold_headroom)  # type: ignore[attr-defined]
         return mine
 
     def remove_own_snapshot(self) -> None:

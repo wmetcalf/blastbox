@@ -203,7 +203,8 @@ class SqlJobStore:
         session state) would poison the next borrower, so a later multi-statement write
         (e.g. upsert_page_hashes) would commit each executemany independently and a mid-batch
         error could leave a partial batch that _connect()'s rollback can no longer undo."""
-        stmt_tail = "idx_jobs_status_engine_tier ON jobs (status, engine, target_tier)"
+        index_name = "idx_jobs_status_engine_tier"
+        stmt_tail = f"{index_name} ON jobs (status, engine, target_tier)"
         if self._driver != "postgres" or self._pool is None:
             self._try_ddl(f"CREATE INDEX IF NOT EXISTS {stmt_tail}")
             return
@@ -212,6 +213,15 @@ class SqlJobStore:
 
             # Dedicated autocommit connection, opened and closed here — leaves the pool untouched.
             with self._lock, psycopg.connect(self._database_url, autocommit=True) as conn:
+                # A CONCURRENTLY build that was cancelled / deadlocked / crashed leaves an INVALID
+                # index of the same name behind. CREATE INDEX ... IF NOT EXISTS would then see the
+                # name and SKIP forever, so the best-effort init never heals and autosizer counts
+                # keep full-scanning the jobs table. Drop an invalid one first, then (re)build.
+                invalid = conn.execute(
+                    "SELECT 1 FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid "
+                    "WHERE c.relname = %s AND NOT i.indisvalid", (index_name,)).fetchone()
+                if invalid is not None:
+                    conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {index_name}")
                 conn.execute(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {stmt_tail}")
         except Exception:
             pass   # lock/permission/already-building → just slower autosizer counts, never fatal
