@@ -303,6 +303,28 @@ def test_default_instance_is_unique_per_process_not_pid(tmp_path):
     assert len(files) == 2                             # two distinct files, no collision
 
 
+def test_multi_engine_pool_uses_max_footprint(tmp_path, monkeypatch):
+    # PR #60 r12: a dispatcher serving several engines with DIFFERENT slot footprints sizes
+    # one shared pool — it must use the CONSERVATIVE (max) footprint across them, or the
+    # ceiling under-counts RAM and oversubscribes the node.
+    from blastbox.host.cli import _start_node_sizer
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip,red")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_CLIP_RAM_MIB", "512")
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_RED_RAM_MIB", "2048")
+    monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
+    res = _start_node_sizer(_Pool(), ["clip", "red"], InMemoryJobStore(), "firecracker")
+    assert res is not None
+    stop, thread, sizer = res
+    try:
+        assert sizer._engine.slot_ram_mib == 2048.0        # max of clip(512) + red(2048)
+    finally:
+        stop.set()
+        thread.join(2.0)
+        sizer.remove_own_snapshot()
+
+
 def test_node_id_with_path_separator_is_rejected(tmp_path):
     # regression (PR #60 r10): a BLASTBOX_NODE_ID with a path separator would make every
     # publish raise (traversal guard) and the sizer loop forever without publishing → peers

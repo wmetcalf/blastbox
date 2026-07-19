@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from blastbox import __version__
@@ -195,14 +196,24 @@ def _start_node_sizer(pool, engines, store, tier):
         from blastbox.host.node_share import FileNodeShare
         from blastbox.host.node_sizer import local_backlog_fn
 
-        # A dispatcher may serve several engines on one pool; size on ALL of their
-        # combined backlog, using the (first) declared engine's footprint for the spec.
+        # A dispatcher may serve several engines on ONE pool; size on ALL of their combined
+        # backlog. The pool has a single per-slot footprint, so use the CONSERVATIVE (max)
+        # footprint across the served engines — a slot must fit the biggest of them; using
+        # the first/smallest would under-count RAM/vCPU and let the ceiling oversubscribe.
         served = list(engines) if engines else [e for e in [os.environ.get("BLASTBOX_ENGINE", "")] if e]
-        spec = next((e for e in node_cfg.engines if e.name in served), None)
-        if spec is None:
+        mine = [e for e in node_cfg.engines if e.name in served]
+        if not mine:
             print(f"node self-sizer: none of this dispatcher's engines {served} are in "
                   f"BLASTBOX_NODE_ENGINES — not sizing (declare one to enable).", file=sys.stderr)
             return None
+        base = mine[0]
+        spec = replace(  # type: ignore[call-arg]
+            base,
+            slot_ram_mib=max(e.slot_ram_mib for e in mine),
+            slot_vcpus=max(e.slot_vcpus for e in mine),
+            min_warm=max(e.min_warm for e in mine),
+            max_ceiling=min(e.max_ceiling for e in mine),
+        )
         sizer_stop = _threading.Event()
         # `tier` is the pool's runtime NAME (firecracker/gvisor/cold) — WarmPool.runtime is
         # the SlotRuntime object, so gating uses this string.
