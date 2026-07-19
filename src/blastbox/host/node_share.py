@@ -112,15 +112,21 @@ class FileNodeShare:
                  *([instance] if instance else [])]
         return "@".join(parts) + ".json"
 
-    def publish(self, snap: DemandSnapshot) -> None:
+    def _safe_path(self, snap: DemandSnapshot) -> Path:
+        """The snapshot's file path, GUARDED against traversal: the identity components ARE
+        the filename, so a component with '/', '\\' or '..' (a hostile/typo'd engine name or
+        BLASTBOX_NODE_ID) could escape the share dir and clobber/unlink an unrelated file.
+        Refuse anything that isn't a plain basename resolving directly under the dir. Used by
+        BOTH publish and remove so neither can be steered outside the dir."""
         name = self._filename(snap.engine, snap.tier, snap.node, snap.instance)
         path = self._dir / name
-        # Path-traversal guard: the identity components ARE the filename, so a component with
-        # '/', '\\' or '..' (a hostile/typo'd engine name or BLASTBOX_NODE_ID) could escape
-        # the share dir and clobber an unrelated file. Refuse anything that isn't a plain
-        # basename resolving directly under the dir.
         if os.sep in name or (os.altsep and os.altsep in name) or path.parent != self._dir:
             raise ValueError(f"unsafe snapshot identity {name!r}: path separators not allowed")
+        return path
+
+    def publish(self, snap: DemandSnapshot) -> None:
+        path = self._safe_path(snap)
+        name = path.name
         # Write via an UNPREDICTABLE temp file (tempfile.mkstemp uses O_CREAT|O_EXCL, 0600),
         # then atomically rename it in. A predictable `<pool>.json.tmp` could be pre-created by
         # a peer as a symlink so a plain write_text() follows it and truncates a file outside
@@ -130,6 +136,11 @@ class FileNodeShare:
         try:
             with os.fdopen(fd, "w") as fh:
                 fh.write(json.dumps(asdict(snap)))
+            # mkstemp makes the file 0600; make it world-READable so peer dispatchers running
+            # under a DIFFERENT uid (each engine container may) can read the node view — else
+            # they get PermissionError, drop this pool, and oversubscribe. The payload is
+            # non-sensitive demand data (engine/tier/counts). Writable stays owner-only.
+            os.chmod(tmp, 0o644)
             os.replace(tmp, path)               # atomic swap; readers never see a partial file
         except BaseException:
             try:
@@ -140,11 +151,13 @@ class FileNodeShare:
 
     def remove(self, snap: DemandSnapshot) -> None:
         """Delete this unit's own snapshot — called on a graceful stop so a restart doesn't
-        leave a phantom pool lingering in the node view for a whole staleness window."""
+        leave a phantom pool lingering in the node view for a whole staleness window. Goes
+        through the same traversal guard as publish, so an unsafe identity can't unlink
+        outside the dir."""
         try:
-            (self._dir / self._filename(snap.engine, snap.tier, snap.node, snap.instance)).unlink()
-        except OSError:
-            pass                                # already gone / not ours to worry about
+            self._safe_path(snap).unlink()
+        except (OSError, ValueError):
+            pass                                # already gone / unsafe / not ours to worry about
 
     def read_all(self, *, max_age_s: float, now: float) -> list[DemandSnapshot]:
         out: list[DemandSnapshot] = []
