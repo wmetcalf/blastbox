@@ -220,11 +220,11 @@ def _start_node_sizer(pool, engines, store, tier):
               f"from {node_cfg.share_dir} "
               f"({'balancing' if node_cfg.balancing else 'static shares'})", file=sys.stderr)
         thread = sizer.start_thread(sizer_stop)
-        # Return the thread too so the caller can JOIN it on shutdown — otherwise the daemon
-        # thread is torn down without running its finally (which removes this unit's snapshot
-        # so a restart leaves no phantom pool). The run loop sleeps on sizer_stop, so the join
-        # returns promptly.
-        return sizer_stop, thread
+        # Return the thread + sizer so the caller can JOIN on shutdown (else the daemon is torn
+        # down without its finally, which removes this unit's snapshot → phantom pool on
+        # restart) AND directly remove the snapshot after join, guaranteeing removal even if
+        # the join times out mid-tick. The run loop sleeps on sizer_stop, so the join is quick.
+        return sizer_stop, thread, sizer
     except Exception:
         logging.getLogger("blastbox.node_sizer").warning(
             "node self-sizer setup failed — continuing without it", exc_info=True)
@@ -361,12 +361,15 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         )
     finally:
         if sizer is not None:
-            sizer_stop, sizer_thread = sizer
+            sizer_stop, sizer_thread, sizer_obj = sizer
             sizer_stop.set()
             # Join so the sizer's finally runs (removes its snapshot → no phantom on restart).
             # It sleeps on the event, so this returns promptly; bounded so a wedged sizer can't
             # block dispatch shutdown.
             sizer_thread.join(timeout=5.0)
+            # Belt-and-suspenders: remove the snapshot directly too, in case the join timed out
+            # while a tick was mid slow-count and the thread's finally didn't run before exit.
+            sizer_obj.remove_own_snapshot()
         if pool is not None:
             pool.stop()
     return 0

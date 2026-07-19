@@ -98,6 +98,7 @@ class DispatcherSizer:
         self._clock = clock
         self._budget_scale = 1.0              # adaptive correction, persisted across ticks
         self._last_tick_dur = 0.0             # measured, to widen the staleness window
+        self._warned_mixed_nodes = False      # one-shot: warn on an inconsistent node-id view
 
     def _active(self) -> bool:
         cfg = self._config
@@ -160,6 +161,19 @@ class DispatcherSizer:
         self._last_tick_dur = max(0.0, self._clock() - started)
         if not snaps:
             return None
+        # Observability: the node filter is intentionally symmetric (so a single host's
+        # partial node-id config still coordinates), which makes an untagged reader see
+        # tagged peers too. If the view mixes DISTINCT node ids, that usually means a
+        # share_dir was accidentally shared ACROSS hosts without consistent tagging — a
+        # misconfig that conflates their budgets. Warn once so an operator can spot it
+        # (we keep coordinating rather than fail-closed, per the documented invariant).
+        if not self._warned_mixed_nodes and len({s.node for s in snaps}) > 1:
+            self._warned_mixed_nodes = True
+            logging.getLogger("blastbox.node_sizer").warning(
+                "node view for %s mixes distinct node ids %s — if this share_dir is shared "
+                "across physical hosts, set a DISTINCT BLASTBOX_NODE_ID on every host (see "
+                "docs/CONFIGURATION.md); mixing conflates their budgets.",
+                self._engine.name, sorted({s.node for s in snaps}))
 
         balancing = self._config.balancing
         specs = [
@@ -190,6 +204,16 @@ class DispatcherSizer:
             self._pool.resize(  # type: ignore[attr-defined]
                 warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)
         return mine
+
+    def remove_own_snapshot(self) -> None:
+        """Remove this unit's published snapshot. Idempotent — the run() loop's finally also
+        does this, but the CLI calls it directly after join(timeout): if the join times out
+        because a tick is mid slow-count, the finally may not run before the process exits,
+        so this guarantees the file is gone and no phantom pool lingers on restart."""
+        try:
+            self._share.remove(self._identity())
+        except Exception:
+            pass
 
     def _identity(self) -> DemandSnapshot:
         """A minimal snapshot carrying only THIS unit's identity — for removing our own file

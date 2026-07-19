@@ -85,9 +85,11 @@ def plan_sizes(specs: list[PoolSpec], budget: NodeBudget) -> dict[str, PoolSize]
     too small to seat even one slot per engine is undersized and gets 1 each anyway —
     that's the ONLY case Σ can exceed budget, and it's viability-over-budget by design.
     Warm target then tracks each engine's demand (don't hold the whole node hot when
-    idle). min_warm is honoured up to the afforded ceiling; per-engine max_ceiling caps
-    growth. A non-positive footprint is clamped to a tiny positive so the water-fill
-    always terminates (a 0-RAM slot would otherwise "fit" forever).
+    idle). min_warm is RESERVED before demand-filling — a real latency floor a busy
+    neighbour can't starve — bounded by the budget and, when the floors can't all fit,
+    seated by demand priority. per-engine max_ceiling caps growth. A non-positive footprint
+    is clamped to a tiny positive so the water-fill always terminates (a 0-RAM slot would
+    otherwise "fit" forever).
     """
     if not specs:
         return {}
@@ -103,18 +105,34 @@ def plan_sizes(specs: list[PoolSpec], budget: NodeBudget) -> dict[str, PoolSize]
     # Hard baseline: every managed pool must be able to run at least one job, so ceiling
     # starts at 1 (WarmPool requires ceiling >= 1). This is counted against the budget;
     # if even the 1-per-engine baseline exceeds the budget the node is simply undersized
-    # and we don't shed below 1 (a pool that can't run is useless). `min_warm` is a soft
-    # WARM floor, honoured later only up to the ceiling the budget affords.
+    # and we don't shed below 1 (a pool that can't run is useless).
     alloc: dict[str, int] = {s.name: 1 for s in specs}
     used_ram = sum(s.slot_ram_mib for s in specs)
     used_vcpu = sum(s.slot_vcpus for s in specs)
 
+    def budget_has_room(s: PoolSpec) -> bool:
+        return (used_ram + s.slot_ram_mib <= budget.ram_mib
+                and used_vcpu + s.slot_vcpus <= budget.vcpus)
+
+    # min_warm RESERVATION: seat each pool's warm floor BEFORE demand-filling, so a latency
+    # floor is a real reservation — an idle pool with min_warm=N keeps N hot even when a busy
+    # neighbour wants the budget (a soft floor a neighbour could starve isn't a floor). Bounded
+    # by the budget (never over-commits above the baseline); when Σ min_warm can't all fit, the
+    # floors are seated by demand priority, so a busy pool's floor beats an idle pool's.
+    while True:
+        below = [s for s in specs
+                 if alloc[s.name] < min(s.min_warm, s.max_ceiling) and budget_has_room(s)]
+        if not below:
+            break
+        pick = max(below, key=lambda s: s.demand)      # busy floors first under contention
+        alloc[pick.name] += 1
+        used_ram += pick.slot_ram_mib
+        used_vcpu += pick.slot_vcpus
+
     # Water-fill the remaining budget one slot at a time to the most-starved engine
     # (highest demand relative to what it already has), respecting caps + footprint.
     def fits(s: PoolSpec) -> bool:
-        return (alloc[s.name] < s.max_ceiling
-                and used_ram + s.slot_ram_mib <= budget.ram_mib
-                and used_vcpu + s.slot_vcpus <= budget.vcpus)
+        return alloc[s.name] < s.max_ceiling and budget_has_room(s)
 
     while True:
         cands = [s for s in specs if fits(s)]

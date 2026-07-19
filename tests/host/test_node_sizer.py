@@ -70,6 +70,19 @@ def test_warm_tracks_demand_not_whole_node():
     assert plan["a"].warm_size == 2                # but only 2 kept hot (demand)
 
 
+def test_min_warm_reserved_before_busy_demand():
+    # PR #60 r12: min_warm is now a RESERVED floor, not soft — an IDLE latency-critical pool
+    # keeps its min_warm hot even when a busy neighbour wants the whole budget.
+    specs = [PoolSpec("idle", slot_ram_mib=1024, demand=0, min_warm=4, max_ceiling=64),
+             PoolSpec("busy", slot_ram_mib=1024, demand=50, min_warm=0, max_ceiling=64)]
+    plan = plan_sizes(specs, NodeBudget(ram_mib=5 * 1024, vcpus=99))        # 5 slots
+    assert plan["idle"].warm_size == 4                                      # floor honoured...
+    assert plan["idle"].concurrent_ceiling >= 4
+    assert plan["busy"].concurrent_ceiling == 1                            # ...even over demand
+    # never over budget
+    assert sum(p.concurrent_ceiling for p in plan.values()) == 5
+
+
 def test_warm_floor_shed_under_tight_budget():
     # both want min_warm=2 (4 warm slots) but the node only affords 3 slots total; the
     # busy engine keeps its floor, the idle engine's floor is shed to its ceiling.
