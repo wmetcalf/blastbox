@@ -113,6 +113,10 @@ class DispatcherSizer:
         self._last_view_ok = 0.0              # clock of the last tick that CONFIRMED we're visible
                                               # (published AND read our own snapshot back) — the
                                               # fail-closed timer, covering both write and read loss
+        self._publish_lock = threading.Lock()  # serialize each publish against the CLI's final
+                                              # remove/lease — else a publish still in flight past
+                                              # the join could os.replace() a removed file back or
+                                              # clobber the orphan lease with a short-lived heartbeat
 
     def _active(self) -> bool:
         cfg = self._config
@@ -250,8 +254,28 @@ class DispatcherSizer:
         # shutdown that already removed our file isn't followed by a heartbeat republish.
         if self._stop_event is not None and self._stop_event.is_set():
             return None
-        self._share.publish(_snapshot(self._last_backlog, started))
-        backlog = max(0, int(self._backlog_fn()))                    # the possibly-slow count
+        with self._publish_lock:
+            self._share.publish(_snapshot(self._last_backlog, started))
+        # Run the (possibly slow) count in a thread and KEEP RE-PUBLISHING the heartbeat while it
+        # runs, so a count that unexpectedly exceeds the staleness window doesn't let peers expire
+        # us mid-count and reallocate our still-live pool. A snapshot's advertised refresh_s reflects
+        # the PRIOR tick, so it can't cover an unobserved slow query — an active heartbeat can.
+        count_result: dict = {}
+
+        def _count() -> None:
+            try:
+                count_result["v"] = max(0, int(self._backlog_fn()))
+            except Exception:
+                count_result["v"] = self._last_backlog
+        count_thread = threading.Thread(target=_count, name="node-sizer-count", daemon=True)
+        count_thread.start()
+        while count_thread.is_alive():
+            count_thread.join(timeout=max(0.5, self._config.interval_s))
+            if count_thread.is_alive() and (self._stop_event is None
+                                            or not self._stop_event.is_set()):
+                with self._publish_lock:
+                    self._share.publish(_snapshot(self._last_backlog, self._clock()))
+        backlog = count_result.get("v", self._last_backlog)
         self._last_backlog = backlog
         now = self._clock()
         # UPDATED publish with the FRESH backlog so the node converges in one tick (not lagged).
@@ -259,7 +283,8 @@ class DispatcherSizer:
         # were mid-count, and removes our file — this guard means we don't then republish a
         # phantom after the count returns.
         if self._stop_event is None or not self._stop_event.is_set():
-            self._share.publish(_snapshot(backlog, now))
+            with self._publish_lock:
+                self._share.publish(_snapshot(backlog, now))
         # Effective staleness widens by the measured tick cost: the real publish period is
         # interval + tick_time, so a slow count (huge shared store) must not age peers out
         # and collapse every engine to "sees only itself" → node oversubscription. Use the
@@ -429,25 +454,43 @@ class DispatcherSizer:
         cold_ram = self._cold_slot_ram_mib or e.slot_ram_mib
         cold_units = (cold_ram / e.slot_ram_mib) if e.slot_ram_mib > 0 else 1.0
         reserved = max(0, int(warm_orphans)) + math.ceil(max(0, int(cold_inflight)) * cold_units)
+        # Cap the lease's max_ceiling (and min_warm) AT the reservation so plan_sizes reserves
+        # exactly what's still running and can't demand-fill spare budget INTO a dead pool — an
+        # equal-weight orphan holding 1 slot on a 16-slot node would otherwise still be planned ~8
+        # slots, throttling the live pools for the whole lease.
+        capped = max(1, reserved)
+        # Under the publish lock (bounded) so an in-flight run-loop publish still finishing past the
+        # join can't os.replace() a normal short-lived heartbeat over this extended lease afterward.
+        snap = DemandSnapshot(
+            engine=e.name, backlog=0, assigned=reserved,
+            slot_ram_mib=e.slot_ram_mib, slot_vcpus=e.slot_vcpus,
+            min_warm=min(e.min_warm, capped), max_ceiling=capped, weight=e.weight,
+            ts=self._clock(), node=self._node, tier=self._runtime, instance=self._instance,
+            refresh_s=0.0, balancing=self._config.balancing,
+            stale_after_s=FileNodeShare._GC_AGE_FLOOR_S)
+        self._locked_final(lambda: self._share.publish(snap))
+
+    def _locked_final(self, fn: Callable[[], None]) -> None:
+        """Run a FINAL cleanup publish/remove under the publish lock, so no in-flight run-loop
+        publish clobbers it afterward. Bounded acquire (a wedged publish mustn't hang shutdown) —
+        on timeout we proceed best-effort rather than block the process from exiting."""
+        got = self._publish_lock.acquire(timeout=10.0)
         try:
-            self._share.publish(DemandSnapshot(
-                engine=e.name, backlog=0, assigned=reserved,
-                slot_ram_mib=e.slot_ram_mib, slot_vcpus=e.slot_vcpus, min_warm=e.min_warm,
-                max_ceiling=e.max_ceiling, weight=e.weight, ts=self._clock(), node=self._node,
-                tier=self._runtime, instance=self._instance, refresh_s=0.0,
-                balancing=self._config.balancing, stale_after_s=FileNodeShare._GC_AGE_FLOOR_S))
+            fn()
         except Exception:
             pass
+        finally:
+            if got:
+                self._publish_lock.release()
 
     def remove_own_snapshot(self) -> None:
         """Remove this unit's published snapshot. Idempotent — the run() loop's finally also
         does this, but the CLI calls it directly after join(timeout): if the join times out
         because a tick is mid slow-count, the finally may not run before the process exits,
-        so this guarantees the file is gone and no phantom pool lingers on restart."""
-        try:
-            self._share.remove(self._identity())
-        except Exception:
-            pass
+        so this guarantees the file is gone and no phantom pool lingers on restart. Taken under
+        the publish lock so a publish still in flight past the join can't os.replace() the file
+        back AFTER we remove it (peers would then see a phantom pool for a staleness window)."""
+        self._locked_final(lambda: self._share.remove(self._identity()))
 
     def _identity(self) -> DemandSnapshot:
         """A minimal snapshot carrying only THIS unit's identity — for removing our own file

@@ -190,8 +190,10 @@ def _node_manages_tier(tier: str) -> bool:
 
 
 def _parse_mem_mib(raw: str) -> float:
-    """Parse a docker --memory-style size ("4g", "512m", "2048k", bare "2048"=MiB) to MiB.
-    Returns 0.0 on anything unparseable (caller falls back to the warm-slot footprint)."""
+    """Parse a docker --memory-style size to MiB. Suffixes b/k/m/g; a BARE number is BYTES —
+    matching what `docker run --memory` enforces and host_limits.parse_memory_gb (so sizing lines
+    up with the real container limit). Returns 0.0 on anything unparseable (caller falls back to
+    the warm-slot footprint)."""
     s = (raw or "").strip().lower()
     if not s:
         return 0.0
@@ -200,7 +202,7 @@ def _parse_mem_mib(raw: str) -> float:
     try:
         if unit in mult:
             return max(0.0, float(s[:-1]) * mult[unit])
-        return max(0.0, float(s))          # bare number → MiB (matches our RAM_MIB convention)
+        return max(0.0, float(s) / (1024 * 1024))   # BARE number → bytes (docker's unit) → MiB
     except ValueError:
         return 0.0
 

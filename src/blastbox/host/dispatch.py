@@ -270,6 +270,12 @@ class Dispatcher:
         # budget. Warm dispatch is never gated (it reuses a resident slot). Best-effort, not a
         # hard guarantee — see the eventual-consistency note in dispatcher_sizer.
         self._concurrency_gate = concurrency_gate
+        # Cold workers whose timeout-kill was NOT confirmed: we RETAIN their gate permit (so no
+        # worker stacks on a possible orphan) and reconcile in maintenance — once `docker ps` shows
+        # the container is gone, we release the permit. Without this the permit leaks permanently
+        # and cold capacity bleeds to zero after enough failed kills. name → nothing (a set).
+        self._retained_cold_orphans: set[str] = set()
+        self._retained_lock = threading.Lock()
         self._job_store = job_store
         # engines is kept as an immutable mapping snapshot so callers cannot
         # mutate it after construction.
@@ -748,22 +754,24 @@ class Dispatcher:
             self._requeue_claimed(job, reason="no cold budget headroom")
             return
         t0 = time.monotonic()
-        orphaned: list[bool] = []          # set by _dispatch_inner iff a timeout kill FAILED
+        orphaned: list[str] = []           # container name(s) whose timeout kill FAILED
         try:
             self._dispatch_inner(job, input_path, output_dir, orphan_out=orphaned)
         finally:
             # RELEASE the cold permit only when the worker is CONFIRMED gone. If a timed-out
             # container's `docker kill` failed, it may still be running and holding node RAM;
             # releasing the permit would let another cold worker be admitted on top of the orphan,
-            # accumulating past the budget across repeated failures. Keep the permit (a bounded
-            # capacity cost) so the reservation stays until the container actually dies / a sweep
-            # reaps it.
+            # accumulating past the budget across repeated failures. RETAIN the permit and record
+            # the container so maintenance can reclaim it once `docker ps` confirms the container
+            # is gone (else the permit would leak permanently and cold capacity bleed to zero).
             if gate is not None and not orphaned:
                 gate.release()
             elif gate is not None:
+                with self._retained_lock:
+                    self._retained_cold_orphans.update(orphaned)
                 _log.warning("cold worker cleanup unconfirmed for job_id=%s (docker kill failed) — "
-                             "retaining the concurrency permit so no worker stacks on the orphan",
-                             job.job_id)
+                             "retaining the concurrency permit until a sweep confirms the container "
+                             "is gone", job.job_id)
             # Delete the malicious input on every terminal path WE own, regardless of success,
             # failure, exception, or unknown engine. We never touch output/ here.
             self._delete_input_if_owned(job, input_path)
@@ -1088,7 +1096,7 @@ class Dispatcher:
 
     def _dispatch_inner(
         self, job: Job, input_path: Path, output_dir: Path,
-        orphan_out: list[bool] | None = None,
+        orphan_out: list[str] | None = None,
     ) -> None:
         """Core dispatch logic.  Called from within the try/finally."""
 
@@ -1399,7 +1407,7 @@ class Dispatcher:
             # Kill the stuck container. If the kill is NOT confirmed, flag a possible orphan so the
             # caller keeps its cold-permit reservation (the container may still hold node RAM).
             if not self._kill_container(container_name) and orphan_out is not None:
-                orphan_out.append(True)
+                orphan_out.append(container_name)
             self._fail_job(job, f"worker timed out after {self._worker_timeout_s}s")
             return
         except Exception as exc:  # noqa: BLE001
@@ -1911,6 +1919,32 @@ class Dispatcher:
                     _log.info("retention_sweep_expired count=%d", len(expired))
             except Exception:  # noqa: BLE001
                 _log.exception("retention sweep failed")
+        try:
+            self._reconcile_cold_orphans()
+        except Exception:  # noqa: BLE001
+            _log.exception("cold-orphan reconcile failed")
+
+    def _reconcile_cold_orphans(self) -> None:
+        """Release cold permits we RETAINED for a failed-kill container ONCE `docker ps` confirms
+        the container is gone (it exited on its own, or a later kill/host reaper got it). Until
+        then the permit stays held so no worker stacks on a possible orphan; here we reclaim it so
+        the retention isn't permanent. If docker ps can't be read we keep retaining (can't confirm
+        absence)."""
+        gate = self._concurrency_gate
+        with self._retained_lock:
+            if gate is None or not self._retained_cold_orphans:
+                return
+        live_ids = self._list_active_worker_job_ids()
+        if live_ids is None:
+            return                        # can't confirm absence → keep retaining
+        live_names = {f"blastbox-worker-{jid[:12]}" for jid in live_ids}
+        with self._retained_lock:
+            gone = [n for n in self._retained_cold_orphans if n not in live_names]
+            for name in gone:
+                self._retained_cold_orphans.discard(name)
+                gate.release()            # container confirmed gone → reclaim its permit
+        if gone:
+            _log.info("reclaimed %d cold permit(s) from confirmed-gone orphan container(s)", len(gone))
 
     def _kill_container(self, container_name: str) -> bool:
         """``docker kill`` a timed-out worker. Returns True only if the container is CONFIRMED

@@ -2093,3 +2093,28 @@ def test_cold_permit_released_when_kill_confirms(tmp_path):
 
     assert dispatcher.dispatch_once() is True
     assert gate.in_flight == 0                    # confirmed gone → permit released
+
+
+def test_retained_cold_permit_reclaimed_when_container_confirmed_gone(tmp_path):
+    # PR #60 codex P2: a permit retained for a failed-kill container must be RECLAIMED once
+    # `docker ps` confirms the container is gone — else it leaks permanently and cold capacity
+    # bleeds to zero. If docker ps can't be read, keep retaining (can't confirm absence).
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    gate = DynamicConcurrencyGate(2)
+    dispatcher._concurrency_gate = gate
+
+    gate.acquire(0.0)                                    # the retained permit
+    dispatcher._retained_cold_orphans.add("blastbox-worker-abc123def456")
+    dispatcher._list_active_worker_job_ids = lambda: set()   # docker ps: no live workers
+    dispatcher._reconcile_cold_orphans()
+    assert gate.in_flight == 0                           # reclaimed
+    assert not dispatcher._retained_cold_orphans
+
+    gate.acquire(0.0)                                    # another orphan, but docker ps unreadable
+    dispatcher._retained_cold_orphans.add("blastbox-worker-999888777666")
+    dispatcher._list_active_worker_job_ids = lambda: None
+    dispatcher._reconcile_cold_orphans()
+    assert gate.in_flight == 1                           # still retained (absence unconfirmed)

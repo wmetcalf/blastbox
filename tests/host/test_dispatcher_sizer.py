@@ -1136,6 +1136,19 @@ def test_publish_orphan_lease_prices_cold_workers(tmp_path):
     ds.publish_orphan_lease(1, 2)                 # 1 warm orphan + 2 cold @ 2x footprint
     mine = next(s for s in share.read_all(max_age_s=20.0, now=1100.0) if s.engine == "clip")
     assert mine.assigned == 1 + 2 * 2            # warm 1 + cold 2×(4096/2048) = 5
+    # PR #60 codex P2: the lease caps max_ceiling AT the reservation, so plan_sizes can't
+    # demand-fill spare budget into the dead pool (it reserves what's held, never grows).
+    assert mine.max_ceiling == mine.assigned
+
+
+def test_parse_mem_mib_bare_value_is_bytes():
+    # PR #60 codex P2: a bare docker --memory value is BYTES (matches what docker enforces), not
+    # MiB — mispricing it as MiB would balloon the cold footprint and throttle the node.
+    from blastbox.host.cli import _parse_mem_mib
+    assert _parse_mem_mib("4g") == 4096
+    assert _parse_mem_mib("512m") == 512
+    assert _parse_mem_mib("4294967296") == 4096      # 4 GiB in bytes → 4096 MiB
+    assert _parse_mem_mib("") == 0.0
 
 
 def test_publish_orphan_lease_extends_reservation_lifetime(tmp_path):
