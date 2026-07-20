@@ -1221,6 +1221,31 @@ def test_backlog_remainder_distributed_not_floored_to_zero(tmp_path):
     assert mine.warm_size == 1        # "a" (lowest-ranked) gets the +1, not floor(1/2)=0 for all
 
 
+def test_untargeted_backlog_deduped_across_engine_tiers(tmp_path):
+    # PR #60: fc + gvisor of ONE engine drain the SAME untargeted queue, so its demand is counted
+    # ONCE across the engine's tier-pools, not once per tier. A fc pool sharing the untargeted queue
+    # with a gvisor peer of the same engine gets a SMALLER ceiling than the same fc pool alone.
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+
+    def _ceiling(with_gvisor_peer):
+        share = FileNodeShare(str(tmp_path / ("b" if with_gvisor_peer else "a")))
+        if with_gvisor_peer:
+            # a gvisor peer of the SAME engine, draining the same 10 untargeted jobs
+            share.publish(DemandSnapshot("clip", 10, 0, 1024, 1, 0, 64, 1.0, ts=1.0, node="n",
+                                         tier="gvisor", instance="g", untargeted_backlog=10))
+        pool = _Pool()
+        ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64), pool, share,
+                             cfg, runtime="firecracker", backlog_fn=lambda: 10,
+                             untargeted_backlog_fn=lambda: 10, node="n", instance="f",
+                             capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0)
+        return ds.tick().concurrent_ceiling
+
+    alone = _ceiling(with_gvisor_peer=False)          # fc alone: untargeted demand 10
+    shared = _ceiling(with_gvisor_peer=True)          # fc + gvisor: untargeted demand split → 5 each
+    assert shared < alone                             # the shared untargeted queue isn't double-counted
+
+
 def test_shared_backlog_split_across_replicas(tmp_path):
     # PR #60 codex P2: two replicas of the same engine+tier drain the SAME queue, so each reporting
     # the full backlog doubles that engine's demand. Split it: clip (2 replicas, backlog 10 each)
@@ -1554,3 +1579,27 @@ def test_adaptive_never_exceeds_physical_ram(tmp_path):
     for _ in range(50):
         out2 = ds2._adapt(base)
     assert 1.24 <= out2.ram_mib / base.ram_mib <= 1.25   # allowed up to 1.25×, no further
+
+
+def test_demand_snapshot_field_order_is_append_only():
+    """Regression: `untargeted_backlog` must be the LAST dataclass field, so adding it never
+    reinterprets an existing POSITIONAL constructor arg. A caller that passed the consensus
+    fields positionally (…, balancing, stale_after_s, budget_ram_mib, budget_vcpus) must keep
+    binding them to those fields — not silently absorb one into untargeted_backlog."""
+    import dataclasses
+
+    fields = [f.name for f in dataclasses.fields(DemandSnapshot)]
+    assert fields[-1] == "untargeted_backlog", (
+        f"untargeted_backlog must stay last (append-only); order is {fields}")
+
+    # Positional construction through `balancing` still lands each value on its field.
+    snap = DemandSnapshot(
+        "eng", 10, 2, 1024.0, 1.0, 0, 64, 1.0, 100.0,   # engine..ts (9 positional)
+        "node-x", "firecracker", 5.0, "inst-1", True,   # node, tier, refresh_s, instance, balancing
+    )
+    assert snap.engine == "eng" and snap.backlog == 10 and snap.ts == 100.0
+    assert (snap.node == "node-x" and snap.tier == "firecracker"
+            and snap.refresh_s == 5.0 and snap.instance == "inst-1" and snap.balancing is True)
+    # The consensus/budget/untargeted fields keep their defaults — none was shifted by the append.
+    assert snap.untargeted_backlog == 0
+    assert snap.budget_ram_mib == 0.0 and snap.budget_vcpus == 0.0 and snap.stale_after_s == 0.0

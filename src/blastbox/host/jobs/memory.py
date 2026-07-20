@@ -109,7 +109,7 @@ class InMemoryJobStore:
 
     def count(self, status: JobStatus | None = None, *, q: str | None = None,
               engine: "str | Collection[str] | None" = None,
-              claimant_tier: str | None = None) -> int:
+              claimant_tier: str | None = None, untargeted_only: bool = False) -> int:
         with self._lock:
             jobs = list(self._jobs.values())
         if status is not None:
@@ -117,7 +117,9 @@ class InMemoryJobStore:
         engines = normalize_engine_filter(engine)
         if engines is not None:
             jobs = [j for j in jobs if j.engine in engines]
-        if claimant_tier is not None:      # same routing as claim_next: untargeted OR mine
+        if untargeted_only:                # target_tier IS NULL only (the cross-tier shared queue)
+            jobs = [j for j in jobs if j.target_tier is None]
+        elif claimant_tier is not None:    # same routing as claim_next: untargeted OR mine
             jobs = [j for j in jobs
                     if j.target_tier is None or j.target_tier == claimant_tier]
         if q:

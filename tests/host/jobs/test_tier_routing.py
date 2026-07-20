@@ -122,3 +122,17 @@ def test_claimable_after_round_trips(store):
     store.create(j)
     got = store.get(j.job_id)
     assert got is not None and got.claimable_after == 1234.5
+
+
+# --- untargeted_only count (cross-tier dedup) --------------------------------------------
+
+def test_count_untargeted_only(store):
+    # PR #60: count(untargeted_only=True) counts ONLY target_tier IS NULL — the queue shared by
+    # every tier of an engine — so the sizer can de-duplicate it across a multi-tier engine.
+    store.create(_queued(filename="u1.docx", target_tier=None))          # untargeted
+    store.create(_queued(filename="fc.docx", target_tier="firecracker"))  # targeted
+    store.create(_queued(filename="u2.docx", target_tier=None))          # untargeted
+    assert store.count(JobStatus.QUEUED, untargeted_only=True) == 2       # only the 2 untargeted
+    assert store.count(JobStatus.QUEUED) == 3                             # all
+    assert store.count(JobStatus.QUEUED, claimant_tier="firecracker") == 3  # untargeted + fc-targeted
+    assert store.count(JobStatus.QUEUED, claimant_tier="gvisor") == 2     # untargeted only (no gv-targeted)

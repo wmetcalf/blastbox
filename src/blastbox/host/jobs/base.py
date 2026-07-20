@@ -260,11 +260,16 @@ class JobStore(Protocol):
 
     def count(self, status: JobStatus | None = None, *, q: str | None = None,
               engine: "str | Collection[str] | None" = None,
-              claimant_tier: str | None = None) -> int:
+              claimant_tier: str | None = None, untargeted_only: bool = False) -> int:
         """Total number of jobs (optionally filtered by ``status`` + filename ``q`` +
         ``engine`` — the last scopes a SHARED multi-engine store to one engine's queue, or a
         COLLECTION of engines counted in a SINGLE pass so a multi-engine dispatcher's backlog
         isn't one full store scan per engine).
+
+        ``untargeted_only`` (overrides ``claimant_tier``): count ONLY jobs with ``target_tier``
+        unset — the queue shared by EVERY tier of the engine. The node sizer uses this to
+        de-duplicate the untargeted backlog across a multi-tier engine's pools (each tier drains
+        the same untargeted jobs, so counting them once avoids doubling that engine's demand).
 
         ``claimant_tier`` mirrors ``claim_next``'s tier routing so a caller can count only
         the jobs THIS claimant could actually claim: when set, restrict to jobs whose

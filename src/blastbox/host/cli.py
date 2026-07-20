@@ -304,6 +304,19 @@ def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gat
             # scope backlog to jobs THIS tier can claim (target_tier routing) so
             # the pool isn't sized for work pinned to a tier it can never drain.
             backlog_fn=local_backlog_fn(store, served, claimant_tier=tier),
+            # the UNTARGETED portion (target_tier IS NULL) — shared by every tier of the engine —
+            # so the planner counts it ONCE across the engine's tier-pools, not once per tier.
+            # ATTRIBUTION: like backlog_fn above, this aggregates over ALL of `served` and the
+            # snapshot is keyed to mine[0] (base). If two tiers serve DIFFERENT-but-overlapping
+            # engine sets that collide on mine[0]'s name (fc serves {aa,bb}, gvisor serves {aa}),
+            # bb's untargeted is deduped against gvisor even though gvisor can't drain it — the
+            # SAME aggregate-attribution approximation the targeted path already makes (see the
+            # per-engine sub-cap note at combined_ceiling). It only ever LOWERS a pool's demand
+            # (dedup-under, replacing the pre-dedup per-tier double-count-OVER), so it can under-
+            # serve a pool but never oversubscribe — the node budget water-fill remains the hard
+            # bound. Precise per-engine untargeted would need per-engine snapshot counts (schema
+            # expansion); deferred as a bounded, safe-direction approximation.
+            untargeted_backlog_fn=local_backlog_fn(store, served, untargeted_only=True),
             concurrency_gate=concurrency_gate,   # sizer drives its live limit on each resize
             cold_slot_ram_mib=cold_slot_ram_mib,  # price cold permits by the cold worker footprint
         )

@@ -549,14 +549,16 @@ class SqlJobStore:
 
     def count(self, status: JobStatus | None = None, *, q: str | None = None,
               engine: "str | Collection[str] | None" = None,
-              claimant_tier: str | None = None) -> int:
+              claimant_tier: str | None = None, untargeted_only: bool = False) -> int:
         sql = "SELECT COUNT(*) FROM jobs"
         where, params = self._where_status_q(status, q)
         engines = normalize_engine_filter(engine)   # one indexed IN(...) query for the whole set
         if engines is not None:
             where.append(f"engine IN ({','.join(self._param for _ in engines)})")
             params.extend(engines)
-        if claimant_tier is not None:      # mirror claim_next's tier predicate
+        if untargeted_only:                # target_tier IS NULL only (the cross-tier shared queue)
+            where.append("target_tier IS NULL")
+        elif claimant_tier is not None:    # mirror claim_next's tier predicate
             where.append(f"(target_tier IS NULL OR target_tier = {self._param})")
             params.append(claimant_tier)
         if where:

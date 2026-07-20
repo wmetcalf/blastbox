@@ -97,6 +97,16 @@ class DemandSnapshot:
                                  # each plan against their OWN budget and pick incompatible slices
                                  # that sum past the true budget. 0.0 = unknown → ignored in the
                                  # consensus (older peer / pre-budget snapshot).
+    # APPENDED LAST (never inserted mid-dataclass): a new optional field placed before the
+    # existing defaulted fields would silently reinterpret any positional constructor call past
+    # `balancing` (e.g. `DemandSnapshot(..., balancing=True, 60.0, 8192.0)` would bind 60.0 here
+    # instead of to stale_after_s). Keeping new fields at the tail preserves positional callers.
+    untargeted_backlog: int = 0  # of `backlog`, how many QUEUED jobs are UNTARGETED (target_tier
+                                 # IS NULL) and so claimable by EVERY tier of this engine. Published
+                                 # so the planner counts the shared untargeted queue ONCE across the
+                                 # engine's tier-pools (fc+gvisor of one engine drain the same
+                                 # untargeted jobs) instead of once per tier — else that engine's
+                                 # demand doubles. 0 = all backlog is tier-targeted (no dedup).
 
 
 class NodeShare(Protocol):
@@ -336,4 +346,5 @@ def _valid(snap: DemandSnapshot) -> bool:
         and _finite_in(snap.budget_ram_mib, 0, _MAX_SLOT_RAM_MIB * _MAX_CEILING_SANE)
         and _finite_in(snap.budget_vcpus, 0, 1024 * _MAX_CEILING_SANE)
         and _finite_in(snap.stale_after_s, 0, _MAX_TS)
+        and _finite_in(snap.untargeted_backlog, 0, _MAX_COUNT)
     )

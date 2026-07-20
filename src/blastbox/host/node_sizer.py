@@ -231,7 +231,8 @@ def _mem_available_mib() -> Optional[float]:
 
 def local_backlog_fn(job_store: object,
                      engine: "str | Iterable[str] | None" = None,
-                     claimant_tier: "str | None" = None) -> Callable[[str], int]:
+                     claimant_tier: "str | None" = None,
+                     untargeted_only: bool = False) -> Callable[[str], int]:
     """QUEUED backlog from the dispatcher's store, scoped to the engine(s) this dispatcher
     serves. Scoping matters on a SHARED multi-engine store (blastbox supports one store
     across engines): without it every dispatcher reports the node-wide queue and balancing
@@ -256,5 +257,6 @@ def local_backlog_fn(job_store: object,
         # even though the queue is unchanged. Let it propagate so the sizer's count wrapper falls
         # back to the LAST-KNOWN backlog instead of a false zero.
         return int(job_store.count(JobStatus.QUEUED,  # type: ignore[attr-defined]
-                                   engine=engines, claimant_tier=claimant_tier))
+                                   engine=engines, claimant_tier=claimant_tier,
+                                   untargeted_only=untargeted_only))
     return _fn

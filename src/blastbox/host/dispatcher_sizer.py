@@ -60,7 +60,10 @@ class DispatcherSizer:
                                               # dispatcher tier) — WarmPool.runtime is the
                                               # SlotRuntime OBJECT, not a name, so gating must
                                               # use this string.
-        backlog_fn: Callable[[], int],        # this engine's own QUEUED count
+        backlog_fn: Callable[[], int],        # this engine's own QUEUED count (total, tier-scoped)
+        untargeted_backlog_fn: Optional[Callable[[], int]] = None,  # of that total, the UNTARGETED
+                                              # count (target_tier IS NULL). None → no cross-tier
+                                              # dedup (all backlog treated as tier-local).
         node: Optional[str] = None,           # physical-node id; default from BLASTBOX_NODE_ID
         instance: Optional[str] = None,       # publishing process id; default os.getpid()
         capacity_fn: Callable[[float, float], NodeBudget] = node_capacity,
@@ -80,6 +83,8 @@ class DispatcherSizer:
         self._config = config
         self._runtime = (runtime or "").strip().lower()
         self._backlog_fn = backlog_fn
+        self._untargeted_backlog_fn = untargeted_backlog_fn
+        self._last_untargeted = 0             # last untargeted count (published in the snapshot)
         # The publishing PROCESS identity, so two replicas of this engine/tier/node (a rolling
         # deploy's overlap) publish to DISTINCT files and split the budget instead of
         # colliding. A RANDOM per-process token, NOT os.getpid(): each dispatcher runs in its
@@ -261,7 +266,8 @@ class DispatcherSizer:
                 node=self._node, tier=self._runtime, instance=self._instance,
                 refresh_s=refresh_s, balancing=self._config.balancing,
                 budget_ram_mib=my_budget.ram_mib, budget_vcpus=my_budget.vcpus,
-                stale_after_s=self._config.stale_after_s)
+                stale_after_s=self._config.stale_after_s,
+                untargeted_backlog=min(backlog, self._last_untargeted))
 
         # HEARTBEAT before the (possibly-slow) count: publish a fresh-ts snapshot with the last
         # tick's backlog so peers keep seeing us alive even when THIS count — a huge shared-
@@ -291,12 +297,19 @@ class DispatcherSizer:
             # despite queued work).
             if self._count_thread is not None and "v" in self._count_result:
                 self._last_backlog = self._count_result["v"]
+                if "u" in self._count_result:
+                    self._last_untargeted = self._count_result["u"]
             self._count_result = {}
             holder = self._count_result
 
             def _count() -> None:
                 try:
                     holder["v"] = max(0, int(self._backlog_fn()))
+                    # of the total, the UNTARGETED portion — for cross-tier dedup (an engine's
+                    # untargeted queue is drained by ALL its tiers, so count it once). Clamp to the
+                    # total (the two counts run in one thread but aren't a single snapshot).
+                    if self._untargeted_backlog_fn is not None:
+                        holder["u"] = min(holder["v"], max(0, int(self._untargeted_backlog_fn())))
                 except Exception:
                     holder["v"] = self._last_backlog
             self._count_thread = threading.Thread(target=_count, name="node-sizer-count",
@@ -317,6 +330,7 @@ class DispatcherSizer:
                     with self._publish_lock:
                         self._share.publish(_snapshot(self._last_backlog, self._clock()))
             backlog = holder.get("v", self._last_backlog)
+            self._last_untargeted = min(backlog, holder.get("u", self._last_untargeted))
         self._last_backlog = backlog
         now = self._clock()
         # UPDATED publish with the FRESH backlog so the node converges in one tick (not lagged).
@@ -420,6 +434,36 @@ class DispatcherSizer:
             rank = insts.index(instance) if instance in insts else n
             return base + (1 if rank < rem else 0)
 
+        # UNTARGETED jobs (target_tier IS NULL) are drained by EVERY tier of the engine, so their
+        # demand is counted ONCE across ALL the engine's pools (fc + gvisor + replicas), not per
+        # tier. TARGETED jobs stay tier-scoped (split across same-(engine,tier) replicas only).
+        engine_pools: dict[str, int] = {}
+        engine_insts: dict[str, list[tuple[str, str]]] = {}
+        for s in snaps:
+            engine_pools[s.engine] = engine_pools.get(s.engine, 0) + 1
+            engine_insts.setdefault(s.engine, []).append((s.tier, s.instance))
+        for _elst in engine_insts.values():
+            _elst.sort()
+
+        def _split(s) -> tuple[int, int]:
+            """(targeted-to-this-tier, untargeted) from a snapshot's backlog."""
+            u = max(0, min(s.backlog, int(getattr(s, "untargeted_backlog", 0))))
+            return s.backlog - u, u
+
+        def _backlog_demand(s) -> float:
+            targeted, untargeted = _split(s)
+            return (_share(targeted, s.engine, s.tier)                  # tier-scoped, per replica
+                    + untargeted / max(1, engine_pools.get(s.engine, 1)))  # engine-wide, per pool
+
+        def _engine_int_share(total: int, engine: str, tier: str, instance: str) -> int:
+            # like _int_share, but over ALL of the engine's pools (every tier) — for splitting the
+            # UNTARGETED count so the shares still SUM to it across the engine's tiers + replicas.
+            lst = engine_insts.get(engine, [(tier, instance)])
+            n = max(1, len(lst))
+            base, rem = divmod(max(0, total), n)
+            rank = lst.index((tier, instance)) if (tier, instance) in lst else n
+            return base + (1 if rank < rem else 0)
+
         specs = [
             PoolSpec(
                 # key each pool by (engine, tier, instance): the same engine on two node-
@@ -429,10 +473,10 @@ class DispatcherSizer:
                 # what THIS dispatcher looks up for itself below.
                 name=_pool_key(s.engine, s.tier, s.instance),
                 slot_ram_mib=s.slot_ram_mib, slot_vcpus=s.slot_vcpus,
-                # ceiling water-fill: live backlog (balancing) or the static WEIGHT share — BOTH
-                # split across same-queue replicas so a rolling overlap doesn't double the engine's
-                # node share (in balancing OR static mode).
-                demand=(_share(s.backlog, s.engine, s.tier) + s.assigned) if balancing
+                # ceiling water-fill: live backlog (balancing) or the static WEIGHT share — split
+                # across same-queue replicas (and, for backlog, untargeted split engine-wide across
+                # tiers) so a rolling overlap OR a multi-tier engine doesn't double its node share.
+                demand=(_backlog_demand(s) + s.assigned) if balancing
                 else _share(s.weight, s.engine, s.tier),
                 # PER-ENGINE floor + cap are also split across same-queue replicas — else two
                 # replicas of a cap-8 engine could each be allocated 8 (aggregate 16) and a floor
@@ -480,7 +524,24 @@ class DispatcherSizer:
             # 8 VMs for 4 jobs. Use the deterministic remainder split so the replicas' warm targets
             # still SUM to the backlog even when it's smaller than the replica count (a plain floor
             # would give every replica 0 and strand the job in warm-only mode).
-            my_backlog = _int_share(backlog, e.name, self._runtime, self._instance)
+            # split THIS pool's warm backlog: targeted per same-tier replica, untargeted engine-wide
+            # across tiers — so a multi-tier engine doesn't warm each tier for the whole untargeted
+            # queue. Both use the deterministic remainder split so the shares still SUM to the count.
+            # Two intentional, SAFE-DIRECTION approximations here (never over-warm / oversubscribe):
+            #  (a) COLD tiers are in `engine_insts` (they publish snapshots and DO claim untargeted
+            #      target_tier-IS-NULL jobs via cold detonation), so they take a share of the
+            #      untargeted WARM split too — a cold-only pool warms 0, letting its share fall to
+            #      cold detonation rather than pre-warming it on the warm tiers. That under-warms the
+            #      warm tiers by cold's share (latency onto the cold path), which is exactly a cold-
+            #      only dispatcher's purpose; it reserves its own cold-footprint budget separately.
+            #  (b) the untargeted warm target uses _engine_int_share's (tier,instance)-rank remainder
+            #      bias while the ceiling water-fill breaks ties by snaps order, so under a tight
+            #      budget + non-divisible untargeted one warmable job can stay QUEUED a tick (served
+            #      when a slot frees or via cold). No job loss, Σwarm ≤ Σceiling ≤ budget always.
+            my_targeted = max(0, backlog - min(backlog, self._last_untargeted))
+            my_backlog = (_int_share(my_targeted, e.name, self._runtime, self._instance)
+                          + _engine_int_share(min(backlog, self._last_untargeted),
+                                              e.name, self._runtime, self._instance))
             # the warm FLOOR is also split across same-queue replicas — else two overlapping
             # replicas each hold the full min_warm hot (aggregate 2× the configured floor).
             my_min_warm = _int_share(e.min_warm, e.name, self._runtime, self._instance)
