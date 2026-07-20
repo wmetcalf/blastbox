@@ -260,9 +260,23 @@ class SqlJobStore:
             if col not in existing:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
         # claimable_after is NUMERIC (compared against wall-clock in claim_next), not TEXT — a text
-        # column would make the Postgres `<= now` comparison a string compare.
+        # column would make the Postgres `<= now` comparison a string compare. Make the migration
+        # idempotent ACROSS PROCESSES (the instance RLock only serializes threads): during a rolling
+        # deploy two dispatchers can both read the old column set and both ALTER, and the loser would
+        # raise duplicate-column and crash __init__. Postgres has ADD COLUMN IF NOT EXISTS; SQLite is
+        # single-process (the `not in existing` guard suffices), and either way we swallow a
+        # concurrent duplicate rather than fail startup.
         if "claimable_after" not in existing:
-            conn.execute("ALTER TABLE jobs ADD COLUMN claimable_after DOUBLE PRECISION")
+            if self._driver == "postgres":
+                ddl = "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS claimable_after DOUBLE PRECISION"
+            else:
+                ddl = "ALTER TABLE jobs ADD COLUMN claimable_after DOUBLE PRECISION"
+            try:
+                conn.execute(ddl)
+            except Exception:
+                # a concurrent starter already added it (or a benign race) — re-reading the schema
+                # on the next call will see it; never fail store construction on a best-effort index.
+                pass
 
     def _try_ddl(self, stmt: str) -> bool:
         """Run one best-effort DDL statement in its OWN transaction.
