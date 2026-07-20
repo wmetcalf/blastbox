@@ -175,19 +175,26 @@ def _parse_engine_specs(engines_raw: str) -> dict:
     return engines
 
 
-def _node_manages_tier(tier: str) -> bool:
+def _node_manages_tier(tier: str, pool: object = None) -> bool:
     """True if the node autosizer is enabled AND it manages this dispatcher's runtime tier
     (firecracker/gvisor). Fully guarded — a bad BLASTBOX_NODE_* config never crashes dispatch,
     it just reports 'not managed'. Used to make the node budget a HARD cap at startup:
     force warm_only (no uncounted cold spill) and start the pool unspawned until the sizer's
-    first allocation (no legacy over-spawn)."""
+    first allocation (no legacy over-spawn).
+
+    An ALL-LOCAL cascade pool (``tier == "cascade"`` with every member on fc/gvisor) is managed
+    too — its whole ceiling is this node's RAM, so it belongs in the water-fill; a cascade with
+    any off-node member (aws/static/remote) is left unmanaged (see ``cascade_all_local``)."""
     try:
         from blastbox.host.node_config import NodeConfig
-        from blastbox.host.node_sizer import manages
+        from blastbox.host.node_sizer import cascade_all_local, manages
         # firecracker/gvisor = warm-pool managed; "cold" = pool-less cold-only dispatcher (a
         # separate cold process in the warm-sidecar deployment) — its docker workers spawn outside
-        # any warm pool, so it also needs a budgeted gate + a published cold reservation.
-        return NodeConfig.from_env().active and (manages(tier) or tier == "cold")
+        # any warm pool, so it also needs a budgeted gate + a published cold reservation. An
+        # all-local cascade (fc/gvisor members only) is managed via member inspection of its pool.
+        return NodeConfig.from_env().active and (
+            manages(tier) or tier == "cold"
+            or cascade_all_local(getattr(pool, "runtime", None)))
     except Exception:
         return False
 
@@ -279,6 +286,13 @@ def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gat
         # A cold-only pool's "slot" IS a docker cold worker, so its footprint is the cold worker
         # RAM (BLASTBOX_WORKER_MEMORY), not the declared warm-slot RAM, and it has NO warm floor.
         cold_footprint = cold_slot_ram_mib if (cold_only and cold_slot_ram_mib > 0) else None
+        # NB for an all-local CASCADE (fc+gvisor members): the whole ceiling is priced at this ONE
+        # per-ENGINE footprint, but the cascade fills its tiers in order so the marginal slot's real
+        # RAM depends on which member tier it lands on. If the fc and gvisor slots of an engine cost
+        # materially different RAM, declare BLASTBOX_NODE_ENGINE_<E>_RAM_MIB at the CONSERVATIVE (max)
+        # tier footprint — else the reservation understates residency and a sibling could grow into
+        # the heavier tier's RAM. (Per-engine, not per-runtime, pricing predates cascades; enrolling
+        # the cascade is still strictly better than the prior state where it reserved nothing.)
         spec = replace(  # type: ignore[call-arg]
             base,
             slot_ram_mib=cold_footprint if cold_footprint else max(e.slot_ram_mib for e in mine),
@@ -395,7 +409,7 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
 
     warm_only = (os.environ.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower()
                  in ("1", "true", "yes", "on"))
-    node_managed = _node_manages_tier(tier)
+    node_managed = _node_manages_tier(tier, pool)
     # NB: we deliberately do NOT force warm_only when node-managed. warm_only would break jobs
     # that resolve to an egress network personality (dispatch bypasses the warm pool for
     # egress), and it doesn't actually bound cold RAM. The node budget is bounded instead by
@@ -516,8 +530,14 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
     # or is Ctrl-C'd mid-mkdir. It must never crash core dispatch or leak the warm pool.
     sizer = None
     try:
-        sizer = _start_node_sizer(pool, engines, store, tier, dispatch_concurrency,
-                                  concurrency_gate, cold_slot_ram_mib)
+        # Gate on node_managed so ONLY a tier the autosizer actually manages is sized: fc/gvisor,
+        # the cold-only dispatcher, and an ALL-LOCAL cascade (fc/gvisor members). Without this gate
+        # _start_node_sizer would size ANY file-dispatch pool whenever NodeConfig is active — e.g. a
+        # cascade carrying an off-node member — folding non-local capacity into the local water-fill.
+        # (Network pools already returned above via the VmJobDispatcher branch and never reach here.)
+        if node_managed:
+            sizer = _start_node_sizer(pool, engines, store, tier, dispatch_concurrency,
+                                      concurrency_gate, cold_slot_ram_mib)
         # If we pre-shrank the pool for the autosizer but the sizer did NOT start (incomplete
         # inventory, unwritable share_dir, setup error), nothing will ever size it — restore
         # its configured warm/ceiling so it runs normally (pre-autosizer static behavior)

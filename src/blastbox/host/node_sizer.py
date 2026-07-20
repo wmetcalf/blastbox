@@ -47,6 +47,70 @@ def manages(runtime: str) -> bool:
     return runtime.strip().lower() in NODE_MANAGED_RUNTIMES
 
 
+def cascade_all_local(runtime: object) -> bool:
+    """True if ``runtime`` is a cascade whose EVERY member tier runs on a node-managed LOCAL
+    backend (firecracker/gvisor).
+
+    A ``cascade`` runtime (``runtime.host.cascade.CascadingRuntime``) composes an ordered list of
+    member tiers — ``runtime.tiers``, each a ``Tier(name, runtime, capacity)`` — and its pool
+    ceiling (``BLASTBOX_POOL_CEILING``) is the SUM of the members' capacities. ``manages()`` is
+    False for the bare name ``"cascade"``, so such a pool is NOT node-sized by default even though
+    its slots consume real node RAM — an all-local cascade would then run OUTSIDE the water-fill
+    and oversubscribe the node against sibling fc/gvisor pools.
+
+    Only an ALL-LOCAL cascade is safe to enroll: then its whole ceiling is THIS node's RAM, so the
+    autosizer can budget it exactly like any warm pool (max member footprint · ceiling ≤ budget).
+    A cascade with ANY off-node member (aws-*, static, remote) has cloud/other-host slots inside
+    that same ceiling — folding the whole ceiling into the LOCAL budget would over-reserve local
+    RAM and mis-shed under memory pressure — so it stays UNMANAGED (fail-closed), exactly as before.
+
+    Member identity is the parsed ``BLASTBOX_POOL_TIERS`` backend NAME (``Tier.name``, e.g.
+    ``firecracker``/``gvisor``/``aws-ec2``), which ``select_runtime_by_name`` matches EXACTLY (no
+    aliases) — the same names ``manages()`` checks. A non-cascade runtime, an empty/malformed
+    cascade, or a member whose backend isn't a recognized local runtime → False (fail-closed)."""
+    if getattr(runtime, "kind", None) != "cascade":
+        return False
+    members = getattr(runtime, "tiers", None)
+    try:
+        members = list(members)  # type: ignore[arg-type]
+    except TypeError:
+        return False
+    if not members:
+        return False
+    return all(manages(getattr(t, "name", "")) for t in members)
+
+
+def cascade_capacity(runtime: object) -> "int | None":
+    """The number of slots an all-local cascade can ACTUALLY spawn — the sum of its SURVIVING
+    members' ``Tier.capacity`` — or ``None`` if ``runtime`` isn't a cascade (so callers can leave
+    non-cascade pools unchanged).
+
+    ``build_cascade_runtime`` SKIPS an overflow tier that is unavailable at boot (e.g. gVisor/runsc
+    missing), so ``runtime.tiers`` can carry FEWER slots than ``BLASTBOX_POOL_CEILING`` was
+    configured for. The autosizer must cap the cascade's warm target at THIS number, not the
+    configured ceiling: otherwise it reserves warm slots the runtime can never spawn
+    (``CascadeExhausted``) and — because the cold-admission gate is ``ceiling − warm reservation`` —
+    it starves the cold path of the freed budget (only 1 cold worker despite idle capacity), which
+    with ``BLASTBOX_MAX_QUEUED_AGE_S`` can even age out + delete jobs while the node sits underused.
+
+    Fail-closed on a malformed cascade (non-iterable ``tiers``, a member missing or non-int
+    ``capacity``) → ``0`` for that member, so the cap is conservative (never inflates capacity)."""
+    if getattr(runtime, "kind", None) != "cascade":
+        return None
+    members = getattr(runtime, "tiers", None)
+    try:
+        members = list(members)  # type: ignore[arg-type]
+    except TypeError:
+        return 0
+    total = 0
+    for t in members:
+        try:
+            total += max(0, int(getattr(t, "capacity", 0)))
+        except (TypeError, ValueError):
+            continue          # a garbled capacity contributes 0 (conservative)
+    return total
+
+
 @dataclass(frozen=True)
 class NodeBudget:
     """The resource envelope the sizer may allocate on this node."""

@@ -785,6 +785,25 @@ def test_node_manages_tier_gating(monkeypatch):
     assert _node_manages_tier("cold")                     # cold is now managed pool-lessly (gate + reservation)
     assert not _node_manages_tier("aws-ec2")              # cloud tiers stay unmanaged (platform owns concurrency)
 
+    # An all-local cascade (fc/gvisor members only) IS managed via pool member inspection — a bare
+    # tier=="cascade" is not node-managed by name, so without the pool it stays unmanaged.
+    class _T:
+        def __init__(self, name): self.name = name
+
+    class _Casc:
+        kind = "cascade"
+        def __init__(self, *names): self.tiers = [_T(n) for n in names]
+
+    class _Pool:
+        def __init__(self, rt): self.runtime = rt
+
+    assert not _node_manages_tier("cascade")                             # no pool → can't inspect → unmanaged
+    assert _node_manages_tier("cascade", _Pool(_Casc("firecracker", "gvisor")))   # all-local → managed
+    assert not _node_manages_tier("cascade", _Pool(_Casc("firecracker", "aws-ec2")))  # off-node member → not
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "0")
+    monkeypatch.delenv("BLASTBOX_NODE_BALANCING", raising=False)
+    assert not _node_manages_tier("cascade", _Pool(_Casc("firecracker", "gvisor")))  # RM off → unmanaged even all-local
+
 
 def test_cold_only_dispatcher_gets_budgeted_gate_and_publishes(tmp_path, monkeypatch):
     # PR #60 codex P1 (feature): a cold-ONLY dispatcher (tier="cold", no warm pool) is now managed
@@ -812,6 +831,85 @@ def test_cold_only_dispatcher_gets_budgeted_gate_and_publishes(tmp_path, monkeyp
         assert mine[0].min_warm == 0                # no warm floor for a pool-less cold dispatcher
         # gate driven to a budgeted ceiling (>=1, and never above its cold concurrency cap)
         assert 1 <= gate.limit <= 8
+    finally:
+        stop.set()
+        thread.join(2.0)
+        sizer.remove_own_snapshot()
+
+
+def test_all_local_cascade_is_sized_and_published(tmp_path, monkeypatch):
+    # Feature: an ALL-LOCAL cascade (fc/gvisor members) is enrolled in node management — its whole
+    # ceiling is this node's RAM, so _start_node_sizer sizes its warm pool and publishes a snapshot
+    # under tier="cascade", exactly like an fc/gvisor pool. (A cascade with an off-node member is
+    # gated OUT at the caller via _node_manages_tier; covered in test_node_manages_tier_gating.)
+    from blastbox.host.cli import _start_node_sizer
+    from blastbox.host.jobs.memory import InMemoryJobStore
+
+    class _CascTier:
+        def __init__(self, name): self.name = name
+
+    class _CascRuntime:
+        kind = "cascade"
+        def __init__(self, *names): self.tiers = [_CascTier(n) for n in names]
+
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_CLIP_RAM_MIB", "2048")
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_CLIP_MAX_CEILING", "8")
+    monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
+    pool = _Pool(runtime=_CascRuntime("firecracker", "gvisor"))
+    res = _start_node_sizer(pool, ["clip"], InMemoryJobStore(), "cascade", 8, None, 0.0)
+    assert res is not None                              # the cascade pool got a sizer
+    stop, thread, sizer = res
+    try:
+        snaps = FileNodeShare(str(tmp_path)).read_all(max_age_s=1e9, now=time.time())
+        mine = [s for s in snaps if s.engine == "clip" and s.tier == "cascade"]
+        assert len(mine) == 1                           # published under the cascade tier identity
+        assert mine[0].slot_ram_mib == 2048             # sized by the engine's declared local footprint
+        assert pool.concurrent_ceiling >= 1             # the warm pool was actually resized (managed)
+    finally:
+        stop.set()
+        thread.join(2.0)
+        sizer.remove_own_snapshot()
+
+
+def test_cascade_warm_capped_at_surviving_capacity_frees_cold_headroom(tmp_path, monkeypatch):
+    # Regression (codex escalate, run-16 MEDIUM): an all-local cascade whose overflow tier was
+    # unavailable at boot has FEWER real slots than the configured ceiling. The sizer must cap the
+    # warm target at the cascade's surviving capacity — else it reserves warm slots the runtime
+    # can never spawn, and the cold gate (ceiling − warm) zeroes out → cold starves to its floor of
+    # 1 and the node runs at ~5/8 while queued jobs could age out (MAX_QUEUED_AGE_S) and be deleted.
+    from blastbox.host.cli import _start_node_sizer
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+    from blastbox.host.jobs.base import Job
+    from blastbox.host.jobs.memory import InMemoryJobStore
+
+    class _CTier:
+        def __init__(self, name, cap):
+            self.name = name
+            self.capacity = cap
+
+    class _CRuntime:  # gvisor overflow tier was unavailable at boot → only firecracker:4 survives
+        kind = "cascade"
+        def __init__(self): self.tiers = [_CTier("firecracker", 4)]
+
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_CLIP_RAM_MIB", "512")   # small → budget easily fits 8
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_CLIP_MAX_CEILING", "8")  # configured for 8, runtime holds 4
+    monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
+    store = InMemoryJobStore()
+    for i in range(8):                                               # backlog 8 > surviving capacity 4
+        store.create(Job.new(engine="clip", filename=f"f{i}.docx"))
+    gate = DynamicConcurrencyGate(8)
+    pool = _Pool(runtime=_CRuntime())
+    res = _start_node_sizer(pool, ["clip"], store, "cascade", 8, gate, 0.0)  # cold priced 1:1 (0.0)
+    assert res is not None
+    stop, thread, sizer = res
+    try:
+        assert pool.warm_size <= 4                  # capped at surviving capacity, not the ceiling of 8
+        # the 4 slots the cascade can't warm are freed to the cold path, not lost off the budget
+        assert gate.limit >= 2, f"cold gate starved to {gate.limit} (should get the freed headroom)"
     finally:
         stop.set()
         thread.join(2.0)

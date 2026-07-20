@@ -32,6 +32,8 @@ from .node_sizer import (
     PoolSize,
     PoolSpec,
     _mem_available_mib,
+    cascade_all_local,
+    cascade_capacity,
     manages,
     node_capacity,
     plan_sizes,
@@ -132,15 +134,23 @@ class DispatcherSizer:
         pool-less runtime can't accidentally activate as a managed cold pool."""
         return self._pool is None and self._runtime == "cold"
 
+    def _all_local_cascade(self) -> bool:
+        """This pool is an ALL-LOCAL cascade (tier=="cascade", every member fc/gvisor). Its whole
+        ceiling is THIS node's RAM, so it's node-managed like an fc/gvisor pool — unlike a cascade
+        with an off-node member, which `cascade_all_local` fails closed on (kept unmanaged)."""
+        return self._runtime == "cascade" and cascade_all_local(
+            getattr(self._pool, "runtime", None))
+
     def _active(self) -> bool:
         cfg = self._config
         # Mirror NodeConfig.active — adaptive counts too. from_env folds adaptive into
         # resource_management, but a DIRECTLY-constructed NodeConfig(adaptive=True,
         # resource_management=False) would otherwise no-op here despite active=True.
         # A pool-less cold-only sizer is managed too (its docker workers still consume the budget),
-        # even though "cold" isn't a warm-managed runtime.
+        # even though "cold" isn't a warm-managed runtime. An all-local cascade is managed like a
+        # warm fc/gvisor pool (member inspection — see _all_local_cascade / cascade_all_local).
         return (cfg.resource_management or cfg.balancing or cfg.adaptive) and (
-            manages(self._runtime) or self._cold_only())
+            manages(self._runtime) or self._cold_only() or self._all_local_cascade())
 
     # Adaptive control loop bounds. Deliberately a DAMPED, asymmetric ramp (shrink faster
     # than grow) rather than a hard MemAvailable cap: a cap that tracks free RAM directly
@@ -546,6 +556,17 @@ class DispatcherSizer:
             # replicas each hold the full min_warm hot (aggregate 2× the configured floor).
             my_min_warm = _int_share(e.min_warm, e.name, self._runtime, self._instance)
             warm = min(mine.concurrent_ceiling, max(my_min_warm, my_backlog + assigned_warm))
+            # CASCADE cap: an all-local cascade can only spawn Σ surviving-tier capacity slots — an
+            # overflow tier unavailable at boot is skipped, so that can be FEWER than the configured
+            # ceiling. Cap the warm target there so we don't reserve warm slots the runtime can never
+            # spawn (CascadeExhausted): the cold gate below is (ceiling − warm), so an over-large warm
+            # reservation would zero out cold headroom and starve the cold path of the unspawnable
+            # budget (→ underutilization, and with BLASTBOX_MAX_QUEUED_AGE_S even aged-out jobs) while
+            # the node sits idle. cascade_capacity is None for non-cascade pools (no cap). The ceiling
+            # is left at the budgeted value so the freed slots flow to cold, not off the budget.
+            _casc_cap = cascade_capacity(getattr(self._pool, "runtime", None))
+            if _casc_cap is not None:
+                warm = min(warm, _casc_cap)
             mine = PoolSize(warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)
             self._pool.resize(  # type: ignore[attr-defined]
                 warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)

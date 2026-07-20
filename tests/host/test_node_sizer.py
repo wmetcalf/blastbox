@@ -28,6 +28,97 @@ def test_manages_only_node_runtimes():
         assert not manages(r)
 
 
+# --- all-local cascade enrollment (feature: budget a cascade whose members are all fc/gvisor) --
+
+class _FakeTier:
+    def __init__(self, name):
+        self.name = name
+
+
+class _FakeCascade:
+    kind = "cascade"
+
+    def __init__(self, *member_names):
+        self.tiers = [_FakeTier(n) for n in member_names]
+
+
+class _FakeGvisorRuntime:
+    kind = "gvisor"
+
+
+def test_cascade_all_local_true_for_fc_gvisor_members():
+    from blastbox.host.node_sizer import cascade_all_local
+
+    assert cascade_all_local(_FakeCascade("firecracker", "gvisor"))
+    assert cascade_all_local(_FakeCascade("gvisor"))            # single local member
+    assert cascade_all_local(_FakeCascade("firecracker", "firecracker"))
+
+
+def test_cascade_all_local_false_with_any_offnode_member():
+    from blastbox.host.node_sizer import cascade_all_local
+
+    # ANY off-node member (cloud/static/remote) disqualifies the WHOLE cascade — its ceiling then
+    # contains slots that don't live on this node, so it must not enter the local water-fill.
+    assert not cascade_all_local(_FakeCascade("firecracker", "aws-ec2"))
+    assert not cascade_all_local(_FakeCascade("gvisor", "static"))
+    assert not cascade_all_local(_FakeCascade("aws-lambda-microvm"))
+    assert not cascade_all_local(_FakeCascade("firecracker", "libvirt-vm"))  # file but not managed
+
+
+def test_cascade_all_local_false_for_non_cascade_or_malformed():
+    from blastbox.host.node_sizer import cascade_all_local
+
+    assert not cascade_all_local(_FakeGvisorRuntime())         # a plain fc/gvisor runtime, not a cascade
+    assert not cascade_all_local(None)                          # pool with no runtime
+    assert not cascade_all_local(_FakeCascade())                # empty cascade (no members)
+    assert not cascade_all_local(object())                      # no .kind / .tiers
+
+    class _BadTiers:
+        kind = "cascade"
+        tiers = 5                                               # not iterable
+
+    assert not cascade_all_local(_BadTiers())
+
+    # A non-string Tier.name must fail CLOSED (not crash): manages() rejects non-strings, so an
+    # adversarial/garbled member is treated as off-node → the whole cascade stays unmanaged.
+    assert not cascade_all_local(_FakeCascade(None))            # name is None
+    assert not cascade_all_local(_FakeCascade(5))               # name is an int
+    assert not cascade_all_local(_FakeCascade("firecracker", None))  # one good, one garbled
+    assert not cascade_all_local(type("_C", (), {"kind": "cascade", "tiers": [object()]})())  # no .name
+
+
+class _FakeCapTier:
+    def __init__(self, name, capacity):
+        self.name = name
+        self.capacity = capacity
+
+
+class _FakeCapCascade:
+    kind = "cascade"
+
+    def __init__(self, *pairs):
+        self.tiers = [_FakeCapTier(n, c) for n, c in pairs]
+
+
+def test_cascade_capacity_sums_surviving_tier_capacities():
+    from blastbox.host.node_sizer import cascade_capacity
+
+    assert cascade_capacity(_FakeCapCascade(("firecracker", 4), ("gvisor", 8))) == 12
+    assert cascade_capacity(_FakeCapCascade(("firecracker", 4))) == 4   # overflow tier skipped at boot
+    assert cascade_capacity(_FakeCapCascade()) == 0                      # empty → 0, not None
+
+
+def test_cascade_capacity_none_for_non_cascade_and_conservative_on_garbled():
+    from blastbox.host.node_sizer import cascade_capacity
+
+    assert cascade_capacity(None) is None                               # not a cascade → leave uncapped
+    assert cascade_capacity(object()) is None
+    assert cascade_capacity(type("_C", (), {"kind": "cascade", "tiers": 5})()) == 0   # non-iterable
+    # a garbled/missing capacity contributes 0 (never inflates the cap)
+    assert cascade_capacity(_FakeCapCascade(("firecracker", "oops"), ("gvisor", 8))) == 8
+    assert cascade_capacity(type("_C", (), {"kind": "cascade", "tiers": [object()]})()) == 0  # no .capacity
+
+
 # --- pure allocation --------------------------------------------------------
 
 def test_no_oversubscription_invariant():
