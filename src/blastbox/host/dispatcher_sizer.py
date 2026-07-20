@@ -403,7 +403,12 @@ class DispatcherSizer:
             # can't cheaply tell which queued jobs resolve to egress; run a predominantly-egress
             # engine on the cold tier, not a warm-managed one, since warm-tier networking is a
             # future phase and those jobs bypass the warm pool anyway.)
-            warm = min(mine.concurrent_ceiling, max(e.min_warm, backlog + assigned_warm))
+            # Split the shared backlog across same-queue replicas HERE too (not just in the ceiling
+            # demand): otherwise two overlapping replicas would each warm for the WHOLE queue —
+            # 8 VMs for 4 jobs — and then publish that duplicated residency as reservations.
+            my_replicas = replicas.get((e.name, self._runtime), 1)
+            warm = min(mine.concurrent_ceiling,
+                       max(e.min_warm, int(backlog / my_replicas) + assigned_warm))
             mine = PoolSize(warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)
             self._pool.resize(  # type: ignore[attr-defined]
                 warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)

@@ -573,22 +573,23 @@ def test_multi_engine_weight_clamped_to_valid_cap(tmp_path, monkeypatch):
         sizer.remove_own_snapshot()
 
 
-def test_multi_engine_pool_ceiling_is_largest_not_smallest(tmp_path, monkeypatch):
-    # PR #60 codex P2: a shared pool serving engines with different MAX_CEILING must take the
-    # LARGEST (bounded by concurrency), not the smallest — else a low-cap engine throttles the
-    # whole pool (clip cap 1 + red cap 32 → capped at 1 even when all work is red).
+def test_multi_engine_pool_ceiling_sums_caps_bounded_by_concurrency(tmp_path, monkeypatch):
+    # PR #60 codex P2: a shared pool serving multiple engines must SUM their usable ceilings
+    # (bounded by dispatch concurrency), not take the min (a low-cap engine throttles the pool) nor
+    # the max (undercounts SIMULTANEOUS multi-engine work). Two engines capped 8 each, concurrency
+    # 16 → 16 usable, so both can run at once; the node budget still bounds the actual allocation.
     from blastbox.host.cli import _start_node_sizer
     from blastbox.host.jobs.memory import InMemoryJobStore
     monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip,red")
     monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
-    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_CLIP_MAX_CEILING", "1")
-    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_RED_MAX_CEILING", "32")
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_CLIP_MAX_CEILING", "8")
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_RED_MAX_CEILING", "8")
     monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
-    res = _start_node_sizer(_Pool(), ["clip", "red"], InMemoryJobStore(), "firecracker", 32)
+    res = _start_node_sizer(_Pool(), ["clip", "red"], InMemoryJobStore(), "firecracker", 16)
     assert res is not None
     stop, thread, sizer = res
     try:
-        assert sizer._engine.max_ceiling == 32     # largest engine's cap, not min(1, 32)=1
+        assert sizer._engine.max_ceiling == 16     # sum(8,8)=16, bounded by concurrency 16
     finally:
         stop.set()
         thread.join(2.0)

@@ -253,15 +253,15 @@ def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gat
                   f"pool footprint is complete).", file=sys.stderr)
             return None
         base = mine[0]
-        # The shared pool's ceiling is the LARGEST engine's ceiling (not the smallest): taking the
-        # min would let a low-cap engine throttle the whole pool — clip(cap 1) + red(cap 32) would
-        # cap at 1 even when all queued work is red and the budget permits 32. The busiest engine
-        # must be able to reach its own cap. Bounded by the dispatcher's worker concurrency
-        # (run_forever runs at most `concurrency` jobs at once, so a higher ceiling is wasted RAM)
-        # and, downstream, by the node budget's water-fill — so this never oversubscribes. (A
-        # shared pool can't enforce each engine's individual sub-cap without per-engine tracking;
+        # The shared pool serves ALL of `mine`, so its usable ceiling is the SUM of the engines'
+        # caps (not the min, which lets a low-cap engine throttle the pool; nor the max, which
+        # undercounts SIMULTANEOUS multi-engine work — two engines capped at 8 with concurrency 16
+        # and budget for 16 should be able to run 8+8). Bounded by the dispatcher's worker
+        # concurrency (run_forever runs at most `concurrency` jobs at once, so a higher ceiling is
+        # wasted RAM) and, downstream, by the node budget's water-fill — so it never oversubscribes.
+        # (A shared pool can't enforce each engine's individual sub-cap without per-engine tracking;
         # the node budget bounds the aggregate, which is what matters for oversubscription.)
-        combined_ceiling = max(1, min(max(e.max_ceiling for e in mine), concurrency))
+        combined_ceiling = max(1, min(sum(e.max_ceiling for e in mine), concurrency))
         spec = replace(  # type: ignore[call-arg]
             base,
             slot_ram_mib=max(e.slot_ram_mib for e in mine),
