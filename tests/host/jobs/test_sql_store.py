@@ -293,3 +293,107 @@ def test_postgres_claim_next_respects_target_tier():
         assert claimed.status == JobStatus.RUNNING
     finally:
         store.delete(job.job_id)
+
+
+def test_ensure_jobs_indexes_uses_dedicated_conn_not_pool(monkeypatch):
+    # regression (PR #60 codex P2): the CONCURRENTLY index must run on a DEDICATED autocommit
+    # connection, never a borrowed pool connection. Mutating a pooled connection to
+    # autocommit=True and returning it (the pool does not reset session state) poisons the next
+    # borrower, so a later multi-statement write (e.g. upsert_page_hashes) would commit each
+    # executemany independently and a mid-batch error could leave a partial batch that
+    # _connect()'s rollback can no longer undo. Prove the pool is never touched and that
+    # psycopg.connect is called with autocommit=True.
+    import sys
+    import threading
+    import types
+
+    calls: dict = {"sql": []}
+
+    class _Result:
+        def fetchone(self):
+            return None                 # index is valid / absent → no drop needed
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            calls["sql"].append(sql)
+            return _Result()
+
+    fake_psycopg = types.ModuleType("psycopg")
+
+    def _connect(dsn, autocommit=False):
+        calls["dsn"] = dsn
+        calls["autocommit"] = autocommit
+        return _FakeConn()
+
+    fake_psycopg.connect = _connect  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    class _PoolBoom:
+        def connection(self):
+            raise AssertionError("the pool must NOT be borrowed for the CONCURRENTLY index")
+
+    store = SqlJobStore.__new__(SqlJobStore)
+    store._driver = "postgres"
+    store._pool = _PoolBoom()
+    store._database_url = "postgresql://u@h/db"
+    store._lock = threading.RLock()
+
+    # call the synchronous worker directly (the PG path now runs in a background thread)
+    store._build_jobs_index_pg("idx_jobs_status_engine_tier",
+                               "idx_jobs_status_engine_tier ON jobs (status, engine, target_tier)")
+
+    assert calls["autocommit"] is True
+    assert calls["dsn"] == "postgresql://u@h/db"
+    assert any("CREATE INDEX CONCURRENTLY" in s for s in calls["sql"])
+    assert any("indisvalid" in s for s in calls["sql"])   # checks for an invalid index first
+
+
+def test_ensure_jobs_indexes_rebuilds_invalid_index(monkeypatch):
+    # regression (PR #60 codex P2): a prior CONCURRENTLY build that was cancelled/crashed leaves
+    # an INVALID same-named index; IF NOT EXISTS would skip healing it forever. When the validity
+    # probe finds one, DROP it before rebuilding.
+    import sys
+    import threading
+    import types
+
+    executed: list = []
+
+    class _Result:
+        def fetchone(self):
+            return (1,)                 # an INVALID index of this name exists
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            executed.append(sql)
+            return _Result()
+
+    fake_psycopg = types.ModuleType("psycopg")
+    fake_psycopg.connect = lambda dsn, autocommit=False: _FakeConn()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    store = SqlJobStore.__new__(SqlJobStore)
+    store._driver = "postgres"
+    store._pool = object()
+    store._database_url = "postgresql://u@h/db"
+    store._lock = threading.RLock()
+
+    store._build_jobs_index_pg("idx_jobs_status_engine_tier",
+                               "idx_jobs_status_engine_tier ON jobs (status, engine, target_tier)")
+
+    joined = " | ".join(executed)
+    assert "DROP INDEX CONCURRENTLY" in joined          # invalid index dropped...
+    assert "CREATE INDEX CONCURRENTLY" in joined        # ...then rebuilt
+    assert executed.index(next(s for s in executed if "DROP" in s)) < \
+        executed.index(next(s for s in executed if "CREATE INDEX" in s))

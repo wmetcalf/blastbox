@@ -56,6 +56,7 @@ from blastbox.observability.metrics import (
 from blastbox.worker.warm import HostWarmControl, WarmJobSpec
 
 if TYPE_CHECKING:
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
     from blastbox.host.pool import Slot, WarmPool
 
 
@@ -260,7 +261,25 @@ class Dispatcher:
         requeue_grace_s: float = 60.0,
         warm_only: bool = False,
         warm_requeue_backoff_s: float = 1.0,
+        concurrency_gate: "DynamicConcurrencyGate | None" = None,
     ) -> None:
+        # Optional live cold-admission cap driven by the node autosizer. ONLY the cold path
+        # acquires a permit (see _dispatch_claimed_job): a cold worker spawns footprint OUTSIDE
+        # the warm pool, so the sizer sets the gate limit to the budget's cold headroom
+        # (ceiling − warm reservation) → warm residency + cold workers stay within the node
+        # budget. Warm dispatch is never gated (it reuses a resident slot). Best-effort, not a
+        # hard guarantee — see the eventual-consistency note in dispatcher_sizer.
+        self._concurrency_gate = concurrency_gate
+        # Cold workers whose timeout-kill was NOT confirmed: we RETAIN their gate permit (so no
+        # worker stacks on a possible orphan) and reconcile in maintenance — once `docker ps` shows
+        # the container is gone, we release the permit. Without this the permit leaks permanently
+        # and cold capacity bleeds to zero after enough failed kills. name → nothing (a set).
+        self._retained_cold_orphans: set[str] = set()
+        self._retained_lock = threading.Lock()
+        # Set once shutdown begins: a dispatch worker abandoned past the join deadline (e.g. blocked
+        # in a slow claim_next) must NOT acquire a cold permit and spawn a container after the CLI
+        # has removed the node reservation. The cold path checks this before acquiring the gate.
+        self._shutting_down = threading.Event()
         self._job_store = job_store
         # engines is kept as an immutable mapping snapshot so callers cannot
         # mutate it after construction.
@@ -462,6 +481,10 @@ class Dispatcher:
 
         def _worker() -> None:
             while not _should_stop():
+                # The concurrency gate is NOT held here: warm dispatch runs in an already-resident
+                # slot (adds no footprint) and must never be blocked. Only the COLD path — which
+                # spawns a NEW worker outside the warm pool — acquires a gate permit, inside
+                # _dispatch_claimed_job, so the node budget's cold headroom bounds it.
                 try:
                     progressed = self.dispatch_once()
                 except Exception:  # noqa: BLE001
@@ -488,6 +511,10 @@ class Dispatcher:
                 time.sleep(min(poll_interval_s, 1.0))
         finally:
             stop_evt.set()
+            # Fence NEW cold admissions: a worker abandoned past the join (below), e.g. blocked in a
+            # slow claim_next, must not acquire a gate permit and spawn a container after the CLI
+            # removes the reservation. The cold path re-checks this after its claim.
+            self._shutting_down.set()
             # Collective deadline: bound TOTAL shutdown to ~(worker_timeout+5), not
             # concurrency*(worker_timeout) — sequential joins each with the full timeout
             # would accumulate if several threads are mid-detonation.
@@ -717,45 +744,93 @@ class Dispatcher:
             elif self._warm_only:
                 # Warm-only sidecar: do NOT cold-fall-back (no docker socket here — the cold
                 # path would fail closed and FAIL the job). Release the claim back to QUEUED so
-                # the cold dispatcher (or another warm tier) claims it. CAS-fenced on OUR
-                # claim_id and clears it, so a job reclaimed since we claimed is left untouched;
-                # started_at/worker_runtime are reset so it looks fresh. The staged input is NOT
-                # deleted — the next owner needs it (we only delete input on paths WE terminate).
-                requeued = self._job_store.update_if_status(
-                    job.job_id,
-                    JobStatus.RUNNING,
-                    expect_claim_id=job.claim_id,
-                    status=JobStatus.QUEUED,
-                    started_at=None,
-                    worker_runtime=None,
-                    worker_tier=None,  # reset in lockstep with worker_runtime (see cold requeue)
-                    claim_id=None,
-                    error=None,
-                )
-                _log.info(
-                    "warm_pool_miss job_id=%s; warm_only requeue=%s (no cold fallback)",
-                    job.job_id,
-                    requeued,
-                )
-                # Yield before returning: dispatch_once() reports progress (a job was claimed),
-                # so run_forever loops without its poll sleep — without this, THIS dispatcher
-                # re-claims the just-requeued job in a ~warm_claim_timeout_s-paced churn loop and
-                # the cold dispatcher never gets a turn at it. The backoff hands it off.
-                if self._warm_requeue_backoff_s:
-                    time.sleep(self._warm_requeue_backoff_s)
+                # the cold dispatcher (or another warm tier) claims it.
+                self._requeue_claimed(job, reason="warm_only requeue (no cold fallback)")
                 return
             else:
                 _log.info("warm_pool_miss job_id=%s; falling back to cold path", job.job_id)
 
-        # COLD PATH (default / fallback)
+        # COLD PATH (default / fallback). A cold worker spawns NEW footprint OUTSIDE the warm
+        # pool, so it must fit the node budget's COLD HEADROOM: the sizer caps concurrent cold
+        # workers at (ceiling − warm reservation) via the gate. If there's no headroom right now
+        # (warm is using the budget), REQUEUE rather than block a dispatch thread or oversubscribe
+        # — a worker reclaims it once the sizer frees headroom (idle-warm reaping). Best-effort,
+        # per the eventual-consistency model in dispatcher_sizer: a warm burst mid-interval can
+        # transiently overshoot, corrected next tick.
+        gate = self._concurrency_gate
+        if gate is not None and self._shutting_down.is_set():
+            # Shutdown began while we were between claim and cold admission (e.g. a slow
+            # claim_next). Do NOT spawn a container after the reservation is being torn down —
+            # requeue the job for a fresh dispatcher/restart to pick up.
+            self._requeue_claimed(job, reason="shutdown before cold admission")
+            return
+        if gate is not None and not gate.acquire(timeout=0.0):
+            # DEFER (set claimable_after) so this capacity-blocked cold job is temporarily
+            # INELIGIBLE: claim_next() skips it for a short window, so warm-eligible work reaches
+            # idle warm slots instead of dispatch threads reclaiming+requeuing this same job in a
+            # loop. created_at (submission time / max_queued_age) is preserved.
+            self._requeue_claimed(job, reason="no cold budget headroom", defer=True)
+            return
         t0 = time.monotonic()
+        orphaned: list[str] = []           # container name(s) whose timeout kill FAILED
         try:
-            self._dispatch_inner(job, input_path, output_dir)
+            self._dispatch_inner(job, input_path, output_dir, orphan_out=orphaned)
         finally:
+            # RELEASE the cold permit only when the worker is CONFIRMED gone. If a timed-out
+            # container's `docker kill` failed, it may still be running and holding node RAM;
+            # releasing the permit would let another cold worker be admitted on top of the orphan,
+            # accumulating past the budget across repeated failures. RETAIN the permit and record
+            # the container so maintenance can reclaim it once `docker ps` confirms the container
+            # is gone (else the permit would leak permanently and cold capacity bleed to zero).
+            if gate is not None and not orphaned:
+                gate.release()
+            elif gate is not None:
+                with self._retained_lock:
+                    self._retained_cold_orphans.update(orphaned)
+                _log.warning("cold worker cleanup unconfirmed for job_id=%s (docker kill failed) — "
+                             "retaining the concurrency permit until a sweep confirms the container "
+                             "is gone", job.job_id)
             # Delete the malicious input on every terminal path WE own, regardless of success,
             # failure, exception, or unknown engine. We never touch output/ here.
             self._delete_input_if_owned(job, input_path)
             self._record_outcome(job, path="cold", started=t0)
+
+    def _requeue_claimed(self, job: Job, *, reason: str, defer: bool = False) -> None:
+        """Release OUR claim back to QUEUED so another worker/dispatcher takes the job. CAS-fenced
+        on our claim_id and clears it, so a job reclaimed since we claimed is left untouched;
+        started_at/worker_runtime/worker_tier are reset so it looks fresh. The staged input is
+        NOT deleted — the next owner needs it (we only delete input on paths WE terminate).
+
+        ``defer`` (capacity requeue): set claimable_after to a short window in the future so the job
+        becomes temporarily INELIGIBLE — claim_next() skips it, so warm-eligible work reaches idle
+        warm slots instead of dispatch threads reclaiming+requeuing this same capacity-blocked cold
+        job in a loop. This does NOT touch created_at (the submission time used for public ordering
+        and max_queued_age expiry). Warm-miss requeues do not defer (the cold dispatcher should take
+        the job promptly).
+
+        Then yields (backoff): dispatch_once() reports progress (a job WAS claimed), so run_forever
+        loops without its poll sleep — without a pause THIS dispatcher re-claims the just-requeued
+        job in a tight churn loop and no peer gets a turn. The backoff hands it off."""
+        fields: dict[str, object] = dict(
+            started_at=None,
+            worker_runtime=None,
+            worker_tier=None,
+            claim_id=None,
+            error=None,
+        )
+        if defer:
+            # ineligible for a short window; retried once warm may have freed cold headroom.
+            fields["claimable_after"] = time.time() + max(2.0, self._warm_requeue_backoff_s)
+        requeued = self._job_store.update_if_status(
+            job.job_id,
+            JobStatus.RUNNING,
+            expect_claim_id=job.claim_id,
+            status=JobStatus.QUEUED,
+            **fields,
+        )
+        _log.info("job_id=%s requeued=%s defer=%s (%s)", job.job_id, requeued, defer, reason)
+        if self._warm_requeue_backoff_s:
+            time.sleep(self._warm_requeue_backoff_s)
 
     def _delete_input_if_owned(self, job: Job, input_path: Path) -> None:
         """Delete the shared staged input ONLY if we still hold the claim (or the job
@@ -1051,7 +1126,8 @@ class Dispatcher:
             self._pool.release(slot, dirty=not warm_clean)  # type: ignore[union-attr]  # non-None here
 
     def _dispatch_inner(
-        self, job: Job, input_path: Path, output_dir: Path
+        self, job: Job, input_path: Path, output_dir: Path,
+        orphan_out: list[str] | None = None,
     ) -> None:
         """Core dispatch logic.  Called from within the try/finally."""
 
@@ -1359,8 +1435,10 @@ class Dispatcher:
                 timeout=self._worker_timeout_s,
             )
         except subprocess.TimeoutExpired:
-            # Best-effort kill of the stuck container.
-            self._kill_container(container_name)
+            # Kill the stuck container. If the kill is NOT confirmed, flag a possible orphan so the
+            # caller keeps its cold-permit reservation (the container may still hold node RAM).
+            if not self._kill_container(container_name) and orphan_out is not None:
+                orphan_out.append(container_name)
             self._fail_job(job, f"worker timed out after {self._worker_timeout_s}s")
             return
         except Exception as exc:  # noqa: BLE001
@@ -1872,11 +1950,40 @@ class Dispatcher:
                     _log.info("retention_sweep_expired count=%d", len(expired))
             except Exception:  # noqa: BLE001
                 _log.exception("retention sweep failed")
-
-    def _kill_container(self, container_name: str) -> None:
-        """Best-effort ``docker kill`` on a timed-out worker."""
         try:
-            self._subprocess_runner(
+            self._reconcile_cold_orphans()
+        except Exception:  # noqa: BLE001
+            _log.exception("cold-orphan reconcile failed")
+
+    def _reconcile_cold_orphans(self) -> None:
+        """Release cold permits we RETAINED for a failed-kill container ONCE `docker ps` confirms
+        the container is gone (it exited on its own, or a later kill/host reaper got it). Until
+        then the permit stays held so no worker stacks on a possible orphan; here we reclaim it so
+        the retention isn't permanent. If docker ps can't be read we keep retaining (can't confirm
+        absence)."""
+        gate = self._concurrency_gate
+        with self._retained_lock:
+            if gate is None or not self._retained_cold_orphans:
+                return
+        live_ids = self._list_active_worker_job_ids()
+        if live_ids is None:
+            return                        # can't confirm absence → keep retaining
+        live_names = {f"blastbox-worker-{jid[:12]}" for jid in live_ids}
+        with self._retained_lock:
+            gone = [n for n in self._retained_cold_orphans if n not in live_names]
+            for name in gone:
+                self._retained_cold_orphans.discard(name)
+                gate.release()            # container confirmed gone → reclaim its permit
+        if gone:
+            _log.info("reclaimed %d cold permit(s) from confirmed-gone orphan container(s)", len(gone))
+
+    def _kill_container(self, container_name: str) -> bool:
+        """``docker kill`` a timed-out worker. Returns True only if the container is CONFIRMED
+        stopped (kill returned 0), False if the kill failed / errored / timed out — in which case
+        the container may still be running and holding node RAM, so the caller must keep its
+        reservation (not free the cold permit) until a later sweep confirms cleanup."""
+        try:
+            proc = self._subprocess_runner(
                 ["docker", "kill", container_name],
                 capture_output=True,
                 text=True,
@@ -1884,7 +1991,8 @@ class Dispatcher:
                 timeout=10,
             )
         except Exception:  # noqa: BLE001
-            pass
+            return False
+        return getattr(proc, "returncode", 1) == 0
 
     def _list_active_worker_job_ids(self) -> set[str] | None:
         """Query docker ps for worker containers and return their job IDs.

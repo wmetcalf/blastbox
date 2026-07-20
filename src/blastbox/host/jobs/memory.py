@@ -107,11 +107,21 @@ class InMemoryJobStore:
         )
         return [copy.deepcopy(j) for j in jobs]
 
-    def count(self, status: JobStatus | None = None, *, q: str | None = None) -> int:
+    def count(self, status: JobStatus | None = None, *, q: str | None = None,
+              engine: "str | Collection[str] | None" = None,
+              claimant_tier: str | None = None, untargeted_only: bool = False) -> int:
         with self._lock:
             jobs = list(self._jobs.values())
         if status is not None:
             jobs = [j for j in jobs if j.status == status]
+        engines = normalize_engine_filter(engine)
+        if engines is not None:
+            jobs = [j for j in jobs if j.engine in engines]
+        if untargeted_only:                # target_tier IS NULL only (the cross-tier shared queue)
+            jobs = [j for j in jobs if j.target_tier is None]
+        elif claimant_tier is not None:    # same routing as claim_next: untargeted OR mine
+            jobs = [j for j in jobs
+                    if j.target_tier is None or j.target_tier == claimant_tier]
         if q:
             ql = q.lower()
             jobs = [j for j in jobs if ql in (j.filename or "").lower()]
@@ -126,12 +136,16 @@ class InMemoryJobStore:
         or the set of engines this claimant handles) restricts the claim (shared multi-engine stores).
         """
         engines = normalize_engine_filter(engine)
+        now = time.time()
         with self._lock:
             queued = [
                 job for job in self._jobs.values()
                 if job.status == JobStatus.QUEUED
                 and (job.target_tier is None or job.target_tier == claimant_tier)
                 and (engines is None or job.engine in engines)
+                # skip DEFERRED jobs (claimable_after in the future) so a capacity-blocked cold job
+                # isn't reclaimed ahead of claimable work
+                and (job.claimable_after is None or job.claimable_after <= now)
             ]
             if not queued:
                 return None

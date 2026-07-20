@@ -38,6 +38,7 @@ _COLUMNS = (
     "worker_tier",
     "target_tier",
     "net_policy",
+    "claimable_after",
     "error",
     "security_warnings",
     "params",
@@ -138,6 +139,7 @@ class SqlJobStore:
             worker_tier       TEXT,
             target_tier       TEXT,
             net_policy        TEXT,
+            claimable_after   DOUBLE PRECISION,
             error             TEXT,
             security_warnings TEXT,
             params            TEXT,
@@ -180,13 +182,75 @@ class SqlJobStore:
             if self._driver == "postgres":
                 conn.execute(page_hashes_sql)
             self._ensure_columns(conn)
-        # Best-effort page_hashes indexes run AFTER the table-creation
-        # transaction commits, each in its OWN transaction. On Postgres a failed
-        # statement (a CREATE INDEX lock/permission error) aborts the WHOLE
-        # transaction, so creating them inline would risk rolling back the
-        # page_hashes table itself. Also caches bktree availability (static).
+        # Best-effort indexes run AFTER the table-creation transaction commits, each in its
+        # OWN transaction. On Postgres a failed statement (a CREATE INDEX lock/permission
+        # error) aborts the WHOLE transaction, so creating them inline would risk rolling back
+        # the tables. Run the SYNCHRONOUS page-hash DDL FIRST, then spawn the BACKGROUND jobs
+        # index — two CREATE INDEX statements running at once (even CONCURRENTLY) can deadlock on
+        # the shared system catalog, so the backgrounded jobs build must not overlap other DDL.
         if self._driver == "postgres":
             self._ensure_page_hash_indexes()
+        self._ensure_jobs_indexes()
+
+    def _ensure_jobs_indexes(self) -> None:
+        """Covering index for the hot claim + node-autosizer-backlog predicates
+        (status, engine, target_tier) — without it the sizer's per-tick COUNT(*) is a
+        full-table scan on a large retained history. Best-effort.
+
+        On Postgres, build it CONCURRENTLY on an AUTOCOMMIT connection (CONCURRENTLY cannot
+        run inside a transaction): a plain CREATE INDEX takes an ACCESS EXCLUSIVE-ish lock and
+        would block writes for the whole build when upgrading a large existing jobs table, even
+        when the autosizer is off. On SQLite a plain create (no CONCURRENTLY, no such block).
+
+        The autocommit connection is a DEDICATED one-off — never a pooled connection: mutating
+        a borrowed pool connection to autocommit=True and returning it (the pool does not reset
+        session state) would poison the next borrower, so a later multi-statement write
+        (e.g. upsert_page_hashes) would commit each executemany independently and a mid-batch
+        error could leave a partial batch that _connect()'s rollback can no longer undo."""
+        index_name = "idx_jobs_status_engine_tier"
+        stmt_tail = f"{index_name} ON jobs (status, engine, target_tier)"
+        if self._driver != "postgres" or self._pool is None:
+            self._try_ddl(f"CREATE INDEX IF NOT EXISTS {stmt_tail}")
+            return
+        # Build it here, but WITHOUT holding self._lock (the dedicated autocommit connection shares
+        # no state with the pooled ones) so it never blocks concurrent job reads/claims/writes.
+        # NB: it is NOT backgrounded — CREATE INDEX CONCURRENTLY takes system-catalog locks, and a
+        # daemon thread doing it can DEADLOCK with other concurrent index DDL (e.g. the page-hash
+        # index, or another store's build) where Postgres may pick a FOREGROUND statement as the
+        # victim. Running it synchronously here serializes it with the other _init_db DDL. On a
+        # very large pre-existing jobs table this adds startup latency (mitigated: no lock held, so
+        # only THIS constructor waits) — pre-create the index in ops if that matters.
+        self._build_jobs_index_pg(index_name, stmt_tail)
+
+    def _build_jobs_index_pg(self, index_name: str, stmt_tail: str) -> None:
+        try:
+            import psycopg  # type: ignore[import-not-found]
+
+            # Dedicated autocommit connection, opened and closed here — leaves the pool untouched.
+            # Do NOT hold self._lock: the whole point of backgrounding this is to keep startup and
+            # every job read/claim/write responsive; grabbing the instance-wide lock for the full
+            # CREATE INDEX CONCURRENTLY would block them all until the build finishes. The dedicated
+            # connection shares no state with the pooled ones, so it needs no instance lock.
+            with psycopg.connect(self._database_url, autocommit=True) as conn:
+                # A CONCURRENTLY build that was cancelled / deadlocked / crashed leaves an INVALID
+                # index of the same name behind. CREATE INDEX ... IF NOT EXISTS would then see the
+                # name and SKIP forever, so the best-effort init never heals and autosizer counts
+                # keep full-scanning the jobs table. Drop an invalid one first, then (re)build.
+                # SCOPE the check to THIS store's `jobs` table (resolved via search_path) and
+                # SCHEMA-QUALIFY the drop: a same-named invalid index in an UNRELATED schema must
+                # not make us drop the VALID index in our own schema and rebuild it every startup.
+                invalid = conn.execute(
+                    "SELECT n.nspname FROM pg_class c "
+                    "JOIN pg_index i ON i.indexrelid = c.oid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE c.relname = %s AND i.indrelid = 'jobs'::regclass "
+                    "AND NOT i.indisvalid", (index_name,)).fetchone()
+                if invalid is not None:
+                    conn.execute(
+                        f'DROP INDEX CONCURRENTLY IF EXISTS "{invalid[0]}".{index_name}')
+                conn.execute(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {stmt_tail}")
+        except Exception:
+            pass   # lock/permission/already-building → just slower autosizer counts, never fatal
 
     def _ensure_columns(self, conn) -> None:
         """Add any columns that don't exist yet (forward-compat migrations)."""
@@ -195,6 +259,24 @@ class SqlJobStore:
                     "worker_tier", "target_tier", "net_policy"):
             if col not in existing:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
+        # claimable_after is NUMERIC (compared against wall-clock in claim_next), not TEXT — a text
+        # column would make the Postgres `<= now` comparison a string compare. Make the migration
+        # idempotent ACROSS PROCESSES (the instance RLock only serializes threads): during a rolling
+        # deploy two dispatchers can both read the old column set and both ALTER, and the loser would
+        # raise duplicate-column and crash __init__. Postgres has ADD COLUMN IF NOT EXISTS; SQLite is
+        # single-process (the `not in existing` guard suffices), and either way we swallow a
+        # concurrent duplicate rather than fail startup.
+        if "claimable_after" not in existing:
+            if self._driver == "postgres":
+                ddl = "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS claimable_after DOUBLE PRECISION"
+            else:
+                ddl = "ALTER TABLE jobs ADD COLUMN claimable_after DOUBLE PRECISION"
+            try:
+                conn.execute(ddl)
+            except Exception:
+                # a concurrent starter already added it (or a benign race) — re-reading the schema
+                # on the next call will see it; never fail store construction on a best-effort index.
+                pass
 
     def _try_ddl(self, stmt: str) -> bool:
         """Run one best-effort DDL statement in its OWN transaction.
@@ -465,12 +547,28 @@ class SqlJobStore:
             rows = conn.execute(sql, tuple(params)).fetchall()
         return [job for row in rows if (job := self._row_to_job(row)) is not None]
 
-    def count(self, status: JobStatus | None = None, *, q: str | None = None) -> int:
+    def count(self, status: JobStatus | None = None, *, q: str | None = None,
+              engine: "str | Collection[str] | None" = None,
+              claimant_tier: str | None = None, untargeted_only: bool = False) -> int:
         sql = "SELECT COUNT(*) FROM jobs"
         where, params = self._where_status_q(status, q)
+        engines = normalize_engine_filter(engine)   # one indexed IN(...) query for the whole set
+        if engines is not None:
+            where.append(f"engine IN ({','.join(self._param for _ in engines)})")
+            params.extend(engines)
+        if untargeted_only:                # target_tier IS NULL only (the cross-tier shared queue)
+            where.append("target_tier IS NULL")
+        elif claimant_tier is not None:    # mirror claim_next's tier predicate
+            where.append(f"(target_tier IS NULL OR target_tier = {self._param})")
+            params.append(claimant_tier)
         if where:
             sql += " WHERE " + " AND ".join(where)
-        with self._lock, self._connect() as conn:
+        # NO instance lock: count() is READ-ONLY and the node autosizer runs it in a background
+        # thread. The instance _lock serializes WRITERS (claim_next's BEGIN IMMEDIATE); holding it
+        # for a read would let a slow/wedged COUNT on a large jobs table block every claim/read/
+        # write on the store. A read needs no write-serialization — SQLite WAL and Postgres MVCC
+        # both allow a reader concurrent with the writer (each _connect() is its own connection).
+        with self._connect() as conn:
             row = conn.execute(sql, tuple(params)).fetchone()
         return int(row[0]) if row else 0
 
@@ -514,10 +612,14 @@ class SqlJobStore:
         # claimant takes only untargeted jobs. Existing rows are NULL → unchanged behaviour.
         # `engines`: when set, restrict to `engine IN (...)`; absent = no engine filter.
         eng_clause, eng_params = self._engine_clause(engines)
+        # Eligibility: skip jobs a dispatcher DEFERRED (claimable_after in the future) so a
+        # capacity-blocked cold job doesn't get reclaimed in a loop ahead of claimable work.
+        now = time.time()
         select_sql = (
             f"SELECT {', '.join(_COLUMNS)} FROM jobs "
             f"WHERE status = {self._param} "
             f"AND (target_tier IS NULL OR target_tier = {self._param}) "
+            f"AND (claimable_after IS NULL OR claimable_after <= {self._param}) "
             f"{eng_clause}"
             f"ORDER BY created_at ASC, job_id ASC LIMIT 1"
         )
@@ -535,7 +637,7 @@ class SqlJobStore:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                select_sql, (JobStatus.QUEUED.value, claimant_tier, *eng_params)
+                select_sql, (JobStatus.QUEUED.value, claimant_tier, now, *eng_params)
             ).fetchone()
             if row is None:
                 return None
@@ -569,12 +671,14 @@ class SqlJobStore:
         # matching this claimant are eligible; claimant_tier=None ⇒ target_tier IS NULL only.
         # `engines`: when set, restrict to `engine IN (...)`; absent = no engine filter.
         eng_clause, eng_params = self._engine_clause(engines)
+        # Eligibility: skip DEFERRED jobs (claimable_after in the future) — see _claim_next_sqlite.
         sql = f"""
         WITH next_job AS (
             SELECT job_id
             FROM jobs
             WHERE status = {self._param}
             AND (target_tier IS NULL OR target_tier = {self._param})
+            AND (claimable_after IS NULL OR claimable_after <= {self._param})
             {eng_clause}
             ORDER BY created_at ASC, job_id ASC
             FOR UPDATE SKIP LOCKED
@@ -589,6 +693,7 @@ class SqlJobStore:
         params = (
             JobStatus.QUEUED.value,
             claimant_tier,
+            time.time(),
             *eng_params,
             JobStatus.RUNNING.value,
             time.time(),

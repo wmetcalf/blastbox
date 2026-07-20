@@ -220,6 +220,11 @@ class WarmPool:
         self._first_miss_at: float | None = None   # time of first unserviced claim miss
         self._last_miss_at: float | None = None    # time of most recent unserviced claim miss
         self._burst_active: bool = False            # True when effective target is lifted
+        self._autosized: bool = False               # True once an external controller (the node
+                                                    # autosizer) has resize()d this pool; gates
+                                                    # eager surplus reaping so a pool that never
+                                                    # opts in keeps its exact prior burst-drain
+                                                    # (lazy) behavior — "off by default = as today"
 
         # Health tracking — all access under _lock
         self._last_idle_at: float | None = None    # clock() when a slot last became IDLE
@@ -252,8 +257,12 @@ class WarmPool:
                or getattr(self._runtime, "cli_timeout_s", None) or 0.0)
         return max(150.0, 2.0 * float(cli) + 30.0)
 
-    def stop(self, stop_timeout_s: float | None = None) -> None:
-        """Stop the background loop and reap ALL slots (no orphans).
+    def stop(self, stop_timeout_s: float | None = None) -> int:
+        """Stop the background loop and reap ALL slots. Returns the number of slots that could
+        NOT be reaped (orphans left tracked as DRAINING because their VM may still be running) —
+        the caller uses this to decide whether to release its node-budget reservation: an orphan
+        still consumes RAM/vCPU, so the reservation must NOT be dropped while orphans remain, or
+        peers would reallocate still-in-use capacity (node oversubscription). 0 = clean shutdown.
 
         Waits (BOUNDED) for the daemon to finish an in-flight tick so its OWN post-spawn reap disposes a
         slot spawned during shutdown: a slow AWS ``run-instances``/``run-microvm`` racing stop() isn't yet
@@ -267,6 +276,7 @@ class WarmPool:
         in-flight spawn returns within one poll."""
         if stop_timeout_s is None:
             stop_timeout_s = self._default_stop_budget()
+        thread_wedged = False        # a spawn still in flight past the timeout — an untracked orphan
         self._stop_event.set()
         if self._thread is not None:
             # Fast path returns immediately when the daemon has already exited (no spawn in flight).
@@ -279,6 +289,7 @@ class WarmPool:
             if self._thread.is_alive():
                 logger.warning("pool.stop: background thread still running after %.0fs (wedged spawn?) — "
                                "proceeding; an in-flight cloud slot may leak until its TTL", stop_timeout_s)
+                thread_wedged = True
             self._thread = None
 
         # Reap every slot regardless of state. Pop each ONLY after a successful reap: if reap RAISES
@@ -304,6 +315,13 @@ class WarmPool:
                 if disposed:   # skip-because-another-thread-owns-it (False) -> leave it for that thread
                     with self._lock:
                         self._slots.pop(slot.slot_id, None)
+
+        # Whatever remains in _slots failed to reap (or is owned by another thread mid-dispose) —
+        # a still-live VM the caller must keep reserving for. A wedged background thread means an
+        # in-flight spawn that isn't in _slots yet but may still complete into a live worker, so
+        # count it as one more orphan too — the caller must hold the reservation for it.
+        with self._lock:
+            return len(self._slots) + (1 if thread_wedged else 0)
 
     # ------------------------------------------------------------------
     # Public interface
@@ -441,7 +459,44 @@ class WarmPool:
         self._health_check()
         self._update_burst(ready)
         self._spawn_to_deficit(ready)
+        self._reap_surplus()
         self._sample_metrics()
+
+    def _reap_surplus(self) -> None:
+        """Reap IDLE slots above the (possibly just-lowered) effective target, so a
+        downsize — e.g. the node autosizer lowering warm_size/ceiling — actually shrinks
+        the pool and frees node resources now, instead of only converging lazily as
+        one-job-per-slot consumption drains it. Only IDLE slots are taken; ASSIGNED /
+        WARMING / DRAINING are left alone.
+
+        No-op until the pool has been resize()d by an external controller: a pool that
+        never opts into the autosizer keeps its exact prior behavior, where post-burst
+        surplus drains lazily (a lingering warm cushion for the next spike) rather than
+        being reaped the instant burst deactivates. This preserves the feature's promise
+        that a node behaves exactly as today unless an operator turns the autosizer on."""
+        if not self._autosized:
+            return
+        with self._lock:
+            target = self._effective_target_unlocked()
+            non_draining = sum(1 for s in self._slots.values() if s.state != SlotState.DRAINING)
+            surplus = non_draining - target
+            if surplus <= 0:
+                return
+            victims = [s for s in self._slots.values() if s.state == SlotState.IDLE][:surplus]
+            # Flip to DRAINING HERE, still under the selection lock, so a concurrent
+            # claim() (which only takes IDLE) cannot grab a victim between selection and
+            # reap — otherwise we'd destroy a slot mid-job. (stop() takes the same care.)
+            for slot in victims:
+                slot.state = SlotState.DRAINING
+        for slot in victims:
+            reaped = False
+            try:
+                reaped = self._reap_and_count(slot)   # False = another thread owns the reap
+            except Exception:
+                logger.exception("pool.reap_surplus_error slot_id=%s — quarantining", slot.slot_id)
+            if reaped:
+                with self._lock:
+                    self._slots.pop(slot.slot_id, None)
 
     def _runtime_ready(self) -> bool:
         """Kick the warm runtime's async prepare (if any) and report whether it can spawn this
@@ -517,6 +572,53 @@ class WarmPool:
     def slot_count(self) -> int:
         with self._lock:
             return len(self._slots)
+
+    @property
+    def assigned_count(self) -> int:
+        """Slots currently serving a job (the pool's live concurrent load)."""
+        with self._lock:
+            return sum(1 for s in self._slots.values() if s.state == SlotState.ASSIGNED)
+
+    @property
+    def warm_size(self) -> int:
+        with self._lock:
+            return self._warm_size
+
+    @property
+    def concurrent_ceiling(self) -> int:
+        with self._lock:
+            return self._concurrent_ceiling
+
+    def resize(self, *, warm_size: int | None = None, concurrent_ceiling: int | None = None,
+               mark_autosized: bool = True) -> None:
+        """Retune the warm target / hard ceiling on a live pool. Used by an external
+        controller (the node autosizer) to re-allocate a node's capacity across engines.
+        The background tick() converges to the new target on its own schedule; this only
+        moves the setpoints. warm_size is clamped to the (possibly new) ceiling.
+
+        mark_autosized (default True) records that an external controller now owns this
+        pool, enabling eager surplus reaping. Pass False for a PROVISIONAL move that must
+        NOT change the pool's legacy behavior — e.g. the CLI's pre-start shrink and its
+        restore-on-skip: if the sizer never actually takes over, the pool must drain
+        lazily exactly as an un-managed pool would, so a failed opt-in is a true no-op."""
+        with self._lock:
+            if concurrent_ceiling is not None:
+                if concurrent_ceiling < 1:
+                    raise ValueError("concurrent_ceiling must be >= 1")
+                self._concurrent_ceiling = concurrent_ceiling
+            if warm_size is not None:
+                if warm_size < 0:
+                    raise ValueError("warm_size must be >= 0")
+                self._warm_size = warm_size
+            # keep warm within the ceiling
+            if self._warm_size > self._concurrent_ceiling:
+                self._warm_size = self._concurrent_ceiling
+            # This pool is now under external (autosizer) control → eager surplus reaping
+            # is enabled so a downsize frees node RAM promptly instead of draining lazily.
+            # Skipped for provisional moves (mark_autosized=False) so an opt-in that never
+            # starts leaves the pool in exactly its pre-autosizer state.
+            if mark_autosized:
+                self._autosized = True
 
     @property
     def effective_target(self) -> int:
@@ -689,6 +791,18 @@ class WarmPool:
             if not self._bucket.consume():
                 break
 
+            # Re-check the ceiling before each (expensive) spawn: `to_spawn` was computed
+            # once up front, but a concurrent resize() — the node autosizer lowering THIS
+            # pool's ceiling — can shrink the budget mid-batch. Without this recheck a
+            # downsize racing a spawn burst over-commits past the new ceiling for a tick
+            # (a transient RAM overshoot that matters on a tight node). Stop early instead;
+            # _reap_surplus converges any already-published surplus next. (Stop/shutdown is
+            # deliberately NOT checked here — the publish block below reaps a spawn that
+            # completes during stop, so an in-flight cloud worker is never leaked.)
+            with self._lock:
+                if len(self._slots) >= self._concurrent_ceiling:
+                    break
+
             try:
                 slot = self._runtime.spawn()
                 slot.state = SlotState.WARMING
@@ -698,21 +812,27 @@ class WarmPool:
                 logger.exception("pool.spawn_failed")
                 continue
 
-            # Publish under the lock, BUT only if shutdown hasn't begun. A slow spawn (e.g. AWS
-            # run-instances / run-microvm blocks up to cli_timeout_s=120s, far past stop()'s 10s
-            # thread-join) can complete AFTER stop() snapshotted _slots -- publishing then would leak a
-            # live EC2 instance / MicroVM (never reaped until its TTL). Checking _stop_event under the
-            # same lock stop() flips slots to DRAINING under closes the race either way.
+            # Publish under the lock, BUT only if shutdown hasn't begun AND we're still under
+            # the ceiling. Two races to close, both possible because runtime.spawn() ran
+            # OUTSIDE the lock and can be slow (AWS run-instances / run-microvm up to
+            # cli_timeout_s=120s):
+            #   * stop() may have snapshotted _slots meanwhile — publishing then leaks a live
+            #     EC2 instance / MicroVM (never reaped until its TTL);
+            #   * a concurrent resize() (the autosizer) may have LOWERED the ceiling meanwhile
+            #     — the pre-spawn check passed against the OLD ceiling, so without re-checking
+            #     here this in-flight slot would land one past the new cap (RAM overshoot on a
+            #     tight node) until a later tick reaps it.
+            # Either way: don't publish, reap the just-created slot instead.
             with self._lock:
-                stopping = self._stop_event.is_set()
-                if not stopping:
+                drop = self._stop_event.is_set() or len(self._slots) >= self._concurrent_ceiling
+                if not drop:
                     self._slots[slot.slot_id] = slot
-            if stopping:
+            if drop:
                 reaped = False
                 try:
                     reaped = self._reap_and_count(slot)   # reap the just-created (untracked) slot ourselves
                 except Exception:
-                    logger.exception("pool.reap_after_stop_failed slot_id=%s — quarantining (worker may "
+                    logger.exception("pool.reap_unpublished_failed slot_id=%s — quarantining (worker may "
                                      "persist)", slot.slot_id)
                 if not reaped:
                     # the terminate raised (the EC2/MicroVM may still be running): TRACK the husk as

@@ -59,6 +59,11 @@ class Job:
     # honored at submit when BLASTBOX_ALLOW_NETPOLICY_OVERRIDE is on; resolved fail-closed at
     # dispatch. Mirrors target_tier.
     net_policy: str | None = None
+    # Eligibility timestamp: a job is only CLAIMABLE once wall-clock >= claimable_after (None =
+    # immediately, the default). Set when a dispatcher DEFERS a job it can't run right now (e.g. a
+    # cold job with no node-budget headroom) so it moves temporarily behind claimable work WITHOUT
+    # mutating created_at (which is the submission time used for public ordering + max_queued_age).
+    claimable_after: float | None = None
     error: str | None = None
     # Per-claim ownership token: claim_next() stamps a fresh value on each QUEUED->RUNNING
     # transition; requeue clears it. Terminal/recovery writes CAS on (status, claim_id) so a
@@ -88,7 +93,8 @@ class Job:
         """Return a dict safe to expose publicly.
 
         Strips ``result_dir`` (internal server path), ``params`` (may contain
-        sensitive engine options), and ``claim_id`` (an internal ownership token),
+        sensitive engine options), ``claim_id`` (an internal ownership token),
+        and ``claimable_after`` (an internal capacity-deferral scheduling timestamp),
         and sanitizes the ``error`` field to remove internal filesystem paths.
 
         ``worker_tier`` and ``target_tier`` are INTENTIONALLY kept public: this is
@@ -101,6 +107,7 @@ class Job:
         d.pop("result_dir", None)
         d.pop("params", None)
         d.pop("claim_id", None)
+        d.pop("claimable_after", None)   # internal capacity-deferral scheduling detail
         if isinstance(d.get("error"), str):
             d["error"] = sanitize_public_error(d["error"])
         return d
@@ -122,6 +129,7 @@ class Job:
             worker_tier=d.get("worker_tier"),
             target_tier=d.get("target_tier"),
             net_policy=d.get("net_policy"),
+            claimable_after=float(d["claimable_after"]) if d.get("claimable_after") else None,
             error=d.get("error"),
             claim_id=d.get("claim_id"),
             security_warnings=(
@@ -250,8 +258,25 @@ class JobStore(Protocol):
         """
         ...
 
-    def count(self, status: JobStatus | None = None, *, q: str | None = None) -> int:
-        """Total number of jobs (optionally filtered by ``status`` + filename ``q``).
+    def count(self, status: JobStatus | None = None, *, q: str | None = None,
+              engine: "str | Collection[str] | None" = None,
+              claimant_tier: str | None = None, untargeted_only: bool = False) -> int:
+        """Total number of jobs (optionally filtered by ``status`` + filename ``q`` +
+        ``engine`` — the last scopes a SHARED multi-engine store to one engine's queue, or a
+        COLLECTION of engines counted in a SINGLE pass so a multi-engine dispatcher's backlog
+        isn't one full store scan per engine).
+
+        ``untargeted_only`` (overrides ``claimant_tier``): count ONLY jobs with ``target_tier``
+        unset — the queue shared by EVERY tier of the engine. The node sizer uses this to
+        de-duplicate the untargeted backlog across a multi-tier engine's pools (each tier drains
+        the same untargeted jobs, so counting them once avoids doubling that engine's demand).
+
+        ``claimant_tier`` mirrors ``claim_next``'s tier routing so a caller can count only
+        the jobs THIS claimant could actually claim: when set, restrict to jobs whose
+        ``target_tier`` is unset OR equals ``claimant_tier`` (used by the node sizer so a
+        warm dispatcher doesn't size its pool for jobs pinned to another tier it can never
+        drain). NOTE the default differs from ``claim_next``: ``claimant_tier=None`` here
+        means "count ALL tiers" (the listing endpoint's total), NOT "untargeted only".
 
         Paired with ``list(..., limit=, offset=)`` so the listing endpoint can
         report ``total`` without materializing every row.

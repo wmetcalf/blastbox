@@ -104,6 +104,71 @@ The default CSP (`middleware.DEFAULT_CSP`) is `default-src 'self'; script-src 's
 | `BLASTBOX_POOL_WARMING_TIMEOUT_S` | `120` | Max seconds a slot may sit WARMING before eviction. **Raise for cloud tiers** (`aws-ec2` first-boot can exceed 120s) or healthy-but-slow slots get churned. |
 | `BLASTBOX_POOL_WARM_SNAPSHOT` | `0` | FC only: restore from a memory snapshot (warm-UNO) instead of cold-booting the guest. |
 
+## Node pool autosizer (opt-in)
+
+Right-sizes every node-managed warm pool (firecracker/gvisor only) on one physical host from
+live demand under the host's RAM/vCPU budget, instead of hand-tuning `BLASTBOX_POOL_CEILING`
+per engine. Runs inside `blastbox dispatch`; **OFF by default** — a node behaves exactly as
+today unless a switch below is on. Each dispatcher publishes a demand snapshot to a shared
+node dir and reads its peers', then runs the same deterministic allocation over the whole-node
+view and resizes its own pool. See `src/blastbox/host/node_sizer.py`.
+
+**Node-wide participation is required.** The budget is only honored if **every** dispatcher on a
+host participates with a **consistent** config. Coordination is a whole-node protocol: the plan
+is a pure function of the shared view, so all dispatchers must agree on it. Concretely, on one
+host:
+- **Enable node management on ALL co-located dispatchers, or none.** A dispatcher left with
+  `RESOURCE_MANAGEMENT`/`BALANCING` off publishes no reservation and keeps running its static pool,
+  but its footprint is then invisible to the managed peers, which allocate the whole budget as if
+  it weren't there — persistent oversubscription. This cannot be detected from the shared view (a
+  non-participant is silent), so it is an operating requirement, not something the sizer can guard.
+- **Use a consistent `BLASTBOX_NODE_ID`** (all unset for one host, or one shared tag) and a
+  consistent `BLASTBOX_NODE_BALANCING` / budget config (`RAM_HEADROOM`, `VCPU_OVERSUBSCRIPTION`).
+  Divergences the sizer *can* see it reconciles safely — a mixed balancing mode falls back to
+  static for all, a divergent budget reconciles to the elementwise minimum, and a mixed
+  tagged/untagged node view fails closed to the warm floor — each with a one-time warning. These
+  are safety nets, not a substitute for consistent config: they degrade capacity to avoid
+  oversubscribing, and clear once the config is aligned.
+
+**Budget bounding.** When the autosizer manages a pool (`RESOURCE_MANAGEMENT`/`BALANCING` on,
+firecracker/gvisor tier): the pool ceiling is capped at `BLASTBOX_DISPATCH_CONCURRENCY` (the
+sizer never warms more slots than the dispatcher can run — each in-flight job, warm *or* cold,
+is one slot of RAM), and the pool starts **unspawned** (`warm=0`) and is sized synchronously
+from the node budget before it serves, so a full/rolling startup can't transiently over-spawn.
+The autosizer does **not** force `warm_only` — that would break jobs needing a cold egress
+personality (which bypass the warm pool) and doesn't bound cold RAM anyway. Instead the cold
+path is bounded against the same budget: a cold worker spawns footprint **outside** the warm
+pool, so the sizer drives a live gate to the budget's **cold headroom** (`ceiling − warm
+reservation`) on every resize. Only the cold path takes a permit (warm dispatch reuses a
+resident slot and is never gated); when there's no headroom a cold job is requeued rather than
+oversubscribing. So **warm residency + cold workers stay within the ceiling** instead of each
+independently reaching it. This is **best-effort**, not a hard guarantee — a warm burst within a
+sizing interval can transiently overshoot before the gate catches up, a bounded overshoot that
+self-corrects next tick (plus idle-slot reaping). Set `BLASTBOX_DISPATCH_CONCURRENCY` per engine
+so that Σ(concurrency·slot-footprint) ≤ the node budget across the engines a node serves.
+For a SQL job store an index on `jobs(status, engine, target_tier)` is created — `CONCURRENTLY`
+on Postgres so upgrading a large table doesn't block writes — keeping the per-tick backlog
+counts cheap.
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_NODE_RESOURCE_MANAGEMENT` | `0` | Enforce the node RAM/vCPU budget: cap total slots so engines can't oversubscribe the host. With balancing off, each engine gets a static, weight-proportional share. |
+| `BLASTBOX_NODE_BALANCING` | `0` | Dynamically rebalance the budget across engines by live queue backlog (implies `RESOURCE_MANAGEMENT`). |
+| `BLASTBOX_NODE_ADAPTIVE` | `0` | Nudge the RAM budget from observed free memory (bounded; never exceeds physical RAM). |
+| `BLASTBOX_NODE_ENGINES` | — | Inventory of engines on this host: `name` or `name=url`, comma-separated (e.g. `clippyshot,redtusk,titanarum`). Engine names must be plain slugs (`[A-Za-z0-9._-]`, no path separators). |
+| `BLASTBOX_NODE_ENGINE_<NAME>_RAM_MIB` | `2048` | Per-slot RAM footprint for that engine (a warm microVM). |
+| `BLASTBOX_NODE_ENGINE_<NAME>_VCPUS` | `1` | Per-slot vCPU footprint. |
+| `BLASTBOX_NODE_ENGINE_<NAME>_MIN_WARM` | `0` | Warm floor (slots kept hot even at zero backlog; soft — shed to the afforded ceiling under a tight budget). |
+| `BLASTBOX_NODE_ENGINE_<NAME>_MAX_CEILING` | `64` | Per-engine hard cap. |
+| `BLASTBOX_NODE_ENGINE_<NAME>_WEIGHT` | `1.0` | Static budget share when balancing is off. |
+| `BLASTBOX_NODE_RAM_HEADROOM` | `0.8` | Fraction (0,1] of MemTotal the sizer may allocate to pools. |
+| `BLASTBOX_NODE_VCPU_OVERSUBSCRIPTION` | `2.0` | vCPU multiplier over `cpu_count()`. |
+| `BLASTBOX_NODE_MIN_FREE_MIB` | `2048` | Adaptive: keep at least this much host RAM free. |
+| `BLASTBOX_NODE_INTERVAL_S` | `5` | Sizer tick interval. |
+| `BLASTBOX_NODE_STALE_AFTER_S` | `20` | A peer snapshot older than this drops out of the node view (floored at 2× interval). |
+| `BLASTBOX_NODE_SHARE_DIR` | `/var/lib/blastbox/node` | Shared dir every engine's dispatcher on this host publishes to + reads from. **Bind-mount it into each engine stack on the host.** It is a single-trust-domain surface (written only by dispatchers). |
+| `BLASTBOX_NODE_ID` | unset | Physical-host id. Leave unset when the share dir is local to one host (the default). **Only** set it — to a distinct slug per host — if a share dir is (accidentally) shared across hosts (NFS): every participating host must then set a *distinct* id, and never mix tagged + untagged hosts on one shared dir. |
+
 ## Runtime: Firecracker
 
 | Var | Default | Notes |

@@ -1120,3 +1120,141 @@ def test_dirty_release_reaps_when_no_recycle_method() -> None:
     pool.release(s1, dirty=True)
     assert rt.reaped == [s1.slot_id]
     pool.stop()
+
+
+def test_resize_down_reaps_surplus_idle_slots() -> None:
+    # regression (marla finding 3): lowering the target must proactively reap surplus IDLE
+    # slots so a node-autosizer downsize actually frees resources — not just lazily.
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=4, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    for _ in range(6):
+        pool.tick()                          # spawn + promote WARMING→IDLE up to warm_size=4
+    assert pool.idle_count == 4 and pool.slot_count == 4
+    pool.resize(warm_size=1, concurrent_ceiling=1)
+    pool.tick()                              # should reap the 3 surplus IDLE slots
+    assert pool.slot_count == 1
+    assert len(rt.reaped) == 3
+
+
+def test_spawn_stops_when_resize_lowers_ceiling_mid_batch() -> None:
+    # regression (PR #60 review): a resize() lowering the ceiling WHILE _spawn_to_deficit is
+    # mid-batch must not over-commit. `to_spawn` is computed once for the old ceiling; the
+    # per-spawn ceiling recheck must pick up the concurrent downsize and stop early, so the
+    # pool never exceeds the new ceiling (a transient RAM overshoot on a tight node).
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=8, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    orig_spawn = rt.spawn
+    calls = {"n": 0}
+
+    def racing_spawn() -> Slot:
+        calls["n"] += 1
+        if calls["n"] == 1:                       # a concurrent autosizer downsize mid-batch
+            pool.resize(warm_size=2, concurrent_ceiling=2)
+        return orig_spawn()
+
+    rt.spawn = racing_spawn                        # type: ignore[method-assign]
+    pool._spawn_to_deficit(ready=True)            # would spawn 8 for the old ceiling
+    assert pool.slot_count <= 2                    # but stopped at the lowered ceiling
+    pool.stop()
+
+
+def test_spawn_reaps_slot_when_ceiling_drops_during_slow_spawn() -> None:
+    # regression (PR #60 review): the pre-spawn ceiling check can't catch a resize() that
+    # fires WHILE runtime.spawn() is blocked — the check already passed against the old
+    # ceiling. The PUBLISH step must re-check and reap the completed slot rather than admit
+    # it one past the new cap (RAM overshoot on a tight node).
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=2, spawn_rate_limit=1000.0)
+    orig_spawn = rt.spawn
+    calls = {"n": 0}
+
+    def slow_spawn() -> Slot:
+        calls["n"] += 1
+        if calls["n"] == 2:                       # ceiling drops DURING the 2nd in-flight spawn
+            pool.resize(warm_size=1, concurrent_ceiling=1)
+        return orig_spawn()
+
+    rt.spawn = slow_spawn                          # type: ignore[method-assign]
+    pool._spawn_to_deficit(ready=True)
+    assert pool.slot_count == 1                    # 1st published; 2nd reaped at publish (over cap)
+    assert len(rt.reaped) >= 1
+    pool.stop()
+
+
+def test_reap_surplus_noop_until_autosized() -> None:
+    # regression (round-7 holistic): _reap_surplus must be a NO-OP on a pool that never
+    # opted into the autosizer, so a default deployment keeps its exact prior behavior —
+    # post-burst surplus drains lazily (a lingering warm cushion for the next spike)
+    # instead of being reaped the instant the effective target drops. Only a pool an
+    # external controller has resize()d reaps surplus eagerly.
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=4, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    for _ in range(6):
+        pool.tick()
+    assert pool.idle_count == 4
+    # simulate the post-burst-drain state: the effective target drops below the live slot
+    # count, WITHOUT a resize() — i.e. this pool never opted into the autosizer.
+    pool._warm_size = 1
+    pool._reap_surplus()
+    assert pool.slot_count == 4 and rt.reaped == []       # cushion preserved, nothing reaped
+    # once an external controller resize()s it, eager surplus reaping turns on
+    pool.resize(warm_size=1, concurrent_ceiling=1)
+    pool._reap_surplus()
+    assert pool.slot_count == 1 and len(rt.reaped) == 3
+    pool.stop()
+
+
+def test_stop_returns_orphan_count_for_unreaped_slots() -> None:
+    # regression (PR #60 codex P1): stop() must report slots it could NOT reap (VM may still be
+    # running) so the caller keeps its node-budget reservation for the still-consumed RAM instead
+    # of removing the snapshot and letting peers reallocate it. Clean stop → 0; failed reap → >0.
+    rt = _ReapFailRuntime()
+    pool = WarmPool(runtime=rt, warm_size=3, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    for _ in range(6):
+        pool.tick()
+    assert pool.slot_count == 3
+    orphans = pool.stop()
+    assert orphans == 3                       # every reap raised → all 3 left tracked as orphans
+
+    rt2 = _FakeRuntime()
+    pool2 = WarmPool(runtime=rt2, warm_size=2, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    for _ in range(6):
+        pool2.tick()
+    assert pool2.stop() == 0                   # clean shutdown → no orphans
+
+
+def test_resize_mark_autosized_false_keeps_legacy_behavior() -> None:
+    # regression (PR #60 codex P2): resize() normally sets _autosized=True permanently, which
+    # turns on eager surplus reaping. The CLI's PROVISIONAL moves — the pre-start shrink and the
+    # restore when the sizer is SKIPPED (incomplete inventory / unwritable share_dir) — must NOT
+    # change the pool's behavior: a failed opt-in has to drain lazily exactly like an un-managed
+    # pool. resize(mark_autosized=False) makes those moves a true no-op for reaping.
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=4, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    for _ in range(6):
+        pool.tick()
+    assert pool.idle_count == 4
+    # the CLI pre-shrink then restore-on-skip, both provisional:
+    pool.resize(warm_size=0, concurrent_ceiling=1, mark_autosized=False)
+    pool.resize(warm_size=4, concurrent_ceiling=8, mark_autosized=False)
+    assert pool._autosized is False                       # never flipped into managed mode
+    pool._warm_size = 1                                    # target drops (as post-burst drain)
+    pool._reap_surplus()
+    assert pool.slot_count == 4 and rt.reaped == []        # lazy drain preserved — nothing reaped
+    pool.stop()
+
+
+def test_reap_surplus_leaves_assigned_slots_untouched() -> None:
+    # regression (round-2): surplus reaping must only take IDLE slots; a slot serving a
+    # job (ASSIGNED) must never be reaped, even when it counts toward the surplus.
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=3, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    for _ in range(6):
+        pool.tick()
+    assert pool.idle_count == 3
+    claimed = pool.claim(timeout_s=1.0)               # one slot IDLE -> ASSIGNED
+    assert claimed is not None and pool.assigned_count == 1
+    pool.resize(warm_size=0, concurrent_ceiling=1)
+    pool.tick()                                       # reap surplus IDLE, NOT the assigned one
+    assert claimed.slot_id in pool._slots             # the in-flight slot survives
+    assert claimed.slot_id not in rt.reaped

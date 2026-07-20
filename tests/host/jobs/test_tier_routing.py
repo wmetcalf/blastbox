@@ -77,3 +77,62 @@ def test_worker_tier_and_target_tier_round_trip(store):
     assert got is not None
     assert got.target_tier == "gvisor"
     assert got.worker_tier == "gvisor"
+
+
+# --- claimable_after (capacity-deferral eligibility) --------------------------------------
+
+def test_deferred_job_not_claimed_until_window_passes(store):
+    # PR #60: a job with claimable_after in the FUTURE is temporarily ineligible (a dispatcher
+    # deferred it for lack of node-budget headroom), so claim_next skips it — on all backends.
+    import time
+
+    j = _queued(filename="deferred.docx")
+    j.claimable_after = time.time() + 100.0        # not claimable yet
+    store.create(j)
+    assert store.claim_next(claimant_tier="cold") is None      # skipped
+
+    # once eligible (claimable_after in the past), it's claimable.
+    j2 = _queued(filename="eligible.docx")
+    j2.claimable_after = time.time() - 1.0
+    store.create(j2)
+    claimed = store.claim_next(claimant_tier="cold")
+    assert claimed is not None and claimed.filename == "eligible.docx"
+
+
+def test_deferred_job_does_not_block_claimable_work(store):
+    # The whole point: a DEFERRED (capacity-blocked) job that is OLDER must not starve a newer
+    # claimable job — claim_next takes the oldest ELIGIBLE job, skipping the deferred one.
+    import time
+
+    old_deferred = _queued(filename="old_deferred.docx")
+    old_deferred.created_at = 100.0                # oldest
+    old_deferred.claimable_after = time.time() + 100.0
+    store.create(old_deferred)
+    newer = _queued(filename="newer.docx")
+    newer.created_at = 200.0
+    store.create(newer)
+
+    claimed = store.claim_next(claimant_tier="cold")
+    assert claimed is not None and claimed.filename == "newer.docx"   # skipped the older deferred one
+
+
+def test_claimable_after_round_trips(store):
+    j = _queued()
+    j.claimable_after = 1234.5
+    store.create(j)
+    got = store.get(j.job_id)
+    assert got is not None and got.claimable_after == 1234.5
+
+
+# --- untargeted_only count (cross-tier dedup) --------------------------------------------
+
+def test_count_untargeted_only(store):
+    # PR #60: count(untargeted_only=True) counts ONLY target_tier IS NULL — the queue shared by
+    # every tier of an engine — so the sizer can de-duplicate it across a multi-tier engine.
+    store.create(_queued(filename="u1.docx", target_tier=None))          # untargeted
+    store.create(_queued(filename="fc.docx", target_tier="firecracker"))  # targeted
+    store.create(_queued(filename="u2.docx", target_tier=None))          # untargeted
+    assert store.count(JobStatus.QUEUED, untargeted_only=True) == 2       # only the 2 untargeted
+    assert store.count(JobStatus.QUEUED) == 3                             # all
+    assert store.count(JobStatus.QUEUED, claimant_tier="firecracker") == 3  # untargeted + fc-targeted
+    assert store.count(JobStatus.QUEUED, claimant_tier="gvisor") == 2     # untargeted only (no gv-targeted)

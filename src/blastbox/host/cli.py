@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from blastbox import __version__
@@ -174,6 +175,198 @@ def _parse_engine_specs(engines_raw: str) -> dict:
     return engines
 
 
+def _node_manages_tier(tier: str, pool: object = None) -> bool:
+    """True if the node autosizer is enabled AND it manages this dispatcher's runtime tier
+    (firecracker/gvisor). Fully guarded — a bad BLASTBOX_NODE_* config never crashes dispatch,
+    it just reports 'not managed'. Used to make the node budget a HARD cap at startup:
+    force warm_only (no uncounted cold spill) and start the pool unspawned until the sizer's
+    first allocation (no legacy over-spawn).
+
+    An ALL-LOCAL cascade pool (``tier == "cascade"`` with every member on fc/gvisor) is managed
+    too — its whole ceiling is this node's RAM, so it belongs in the water-fill; a cascade with
+    any off-node member (aws/static/remote) is left unmanaged (see ``cascade_all_local``)."""
+    try:
+        from blastbox.host.node_config import NodeConfig
+        from blastbox.host.node_sizer import cascade_all_local, manages
+        # firecracker/gvisor = warm-pool managed; "cold" = pool-less cold-only dispatcher (a
+        # separate cold process in the warm-sidecar deployment) — its docker workers spawn outside
+        # any warm pool, so it also needs a budgeted gate + a published cold reservation. An
+        # all-local cascade (fc/gvisor members only) is managed via member inspection of its pool.
+        return NodeConfig.from_env().active and (
+            manages(tier) or tier == "cold"
+            or cascade_all_local(getattr(pool, "runtime", None)))
+    except Exception:
+        return False
+
+
+def _parse_mem_mib(raw: str) -> float:
+    """Parse a docker --memory-style size to MiB. Suffixes b/k/m/g; a BARE number is BYTES —
+    matching what `docker run --memory` enforces and host_limits.parse_memory_gb (so sizing lines
+    up with the real container limit). Returns 0.0 on anything unparseable (caller falls back to
+    the warm-slot footprint)."""
+    s = (raw or "").strip().lower()
+    if not s:
+        return 0.0
+    mult = {"b": 1.0 / (1024 * 1024), "k": 1.0 / 1024, "m": 1.0, "g": 1024.0}
+    unit = s[-1]
+    try:
+        if unit in mult:
+            return max(0.0, float(s[:-1]) * mult[unit])
+        return max(0.0, float(s) / (1024 * 1024))   # BARE number → bytes (docker's unit) → MiB
+    except ValueError:
+        return 0.0
+
+
+def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gate=None,
+                      cold_slot_ram_mib=0.0):
+    """Start the opt-in node self-sizer for this dispatcher's warm pool, or return None.
+
+    Fully guarded (`except Exception`): a bad BLASTBOX_NODE_* config, an unwritable
+    share_dir, or any setup error logs and disables sizing — it NEVER crashes dispatch.
+    (KeyboardInterrupt/SystemExit deliberately propagate so the caller's finally still
+    stops the pool.) Returns the stop Event when started, else None.
+
+    A cold-ONLY dispatcher (tier="cold") has NO warm pool (pool is None): it is still managed
+    pool-lessly — the sizer publishes a cold-footprint reservation into the node view and drives
+    the concurrency gate to a budgeted cold ceiling, so warm fc/gvisor peers account for this
+    process's docker workers instead of over-allocating the whole budget to warm slots."""
+    cold_only = pool is None and tier == "cold"
+    if pool is None and not cold_only:
+        return None       # a non-cold dispatcher with no pool has nothing to manage
+    sizer = None
+    try:
+        from blastbox.host.node_config import NodeConfig
+
+        node_cfg = NodeConfig.from_env()   # inside the guard: parse errors mustn't crash dispatch
+        if not (node_cfg.resource_management or node_cfg.balancing):
+            return None
+        import threading as _threading
+
+        from blastbox.host.dispatcher_sizer import DispatcherSizer
+        from blastbox.host.node_share import _MAX_CEILING_SANE, _MAX_WEIGHT, FileNodeShare
+        from blastbox.host.node_sizer import local_backlog_fn
+
+        # A dispatcher may serve several engines on ONE pool; size on ALL of their combined
+        # backlog. The pool has a single per-slot footprint, so use the CONSERVATIVE (max)
+        # footprint across the served engines — a slot must fit the biggest of them; using
+        # the first/smallest would under-count RAM/vCPU and let the ceiling oversubscribe.
+        served = list(engines) if engines else [e for e in [os.environ.get("BLASTBOX_ENGINE", "")] if e]
+        declared = {e.name for e in node_cfg.engines}
+        mine = [e for e in node_cfg.engines if e.name in served]
+        if not mine:
+            print(f"node self-sizer: none of this dispatcher's engines {served} are in "
+                  f"BLASTBOX_NODE_ENGINES — not sizing (declare one to enable).", file=sys.stderr)
+            return None
+        missing = [s for s in served if s not in declared]
+        if missing:
+            # The pool serves ALL of `served`, but the footprint/ceiling are derived only from
+            # the DECLARED subset. Sizing on a partial inventory would under-count RAM/vCPU (an
+            # omitted engine's slots are invisible) and oversubscribe. Fail closed: require the
+            # whole pool declared, or don't size (the pool keeps its static config, no worse
+            # than pre-autosizer).
+            print(f"node self-sizer: served engines {sorted(missing)} are missing from "
+                  f"BLASTBOX_NODE_ENGINES — not sizing (declare EVERY served engine so the "
+                  f"pool footprint is complete).", file=sys.stderr)
+            return None
+        base = mine[0]
+        # The shared pool serves ALL of `mine`, so its usable ceiling is the SUM of the engines'
+        # caps (not the min, which lets a low-cap engine throttle the pool; nor the max, which
+        # undercounts SIMULTANEOUS multi-engine work — two engines capped at 8 with concurrency 16
+        # and budget for 16 should be able to run 8+8). Bounded by the dispatcher's worker
+        # concurrency (run_forever runs at most `concurrency` jobs at once, so a higher ceiling is
+        # wasted RAM) and, downstream, by the node budget's water-fill — so it never oversubscribes.
+        # (A shared pool can't enforce each engine's individual sub-cap without per-engine tracking;
+        # the node budget bounds the aggregate, which is what matters for oversubscription.)
+        # Clamp to _MAX_CEILING_SANE too: the reader's _valid() rejects a snapshot whose
+        # max_ceiling exceeds it, so an unclamped sum (many high-cap engines + huge concurrency)
+        # would silently self-evict this pool from every node view (tick returns no size, pool
+        # stuck at warm-0/ceiling-1) — the same guard already applied to the summed weight.
+        combined_ceiling = max(1, min(sum(e.max_ceiling for e in mine), concurrency,
+                                      _MAX_CEILING_SANE))
+        # A cold-only pool's "slot" IS a docker cold worker, so its footprint is the cold worker
+        # RAM (BLASTBOX_WORKER_MEMORY), not the declared warm-slot RAM, and it has NO warm floor.
+        cold_footprint = cold_slot_ram_mib if (cold_only and cold_slot_ram_mib > 0) else None
+        # NB for an all-local CASCADE (fc+gvisor members): the whole ceiling is priced at this ONE
+        # per-ENGINE footprint, but the cascade fills its tiers in order so the marginal slot's real
+        # RAM depends on which member tier it lands on. If the fc and gvisor slots of an engine cost
+        # materially different RAM, declare BLASTBOX_NODE_ENGINE_<E>_RAM_MIB at the CONSERVATIVE (max)
+        # tier footprint — else the reservation understates residency and a sibling could grow into
+        # the heavier tier's RAM. (Per-engine, not per-runtime, pricing predates cascades; enrolling
+        # the cascade is still strictly better than the prior state where it reserved nothing.)
+        spec = replace(  # type: ignore[call-arg]
+            base,
+            slot_ram_mib=cold_footprint if cold_footprint else max(e.slot_ram_mib for e in mine),
+            slot_vcpus=max(e.slot_vcpus for e in mine),
+            # The shared pool serves ALL of `mine`, so its warm floor is the SUM of the engines'
+            # floors — each engine wants its own min_warm hot. Taking the max discards the other
+            # engines' floors (two engines @ MIN_WARM=2 would keep only 2 hot, not 4). Cap by the
+            # combined ceiling: you can't warm more than the pool's hard ceiling anyway.
+            min_warm=0 if cold_only else min(sum(e.min_warm for e in mine), combined_ceiling),
+            max_ceiling=combined_ceiling,
+            # the shared pool represents the COMBINED engines, so its static weight is the
+            # SUM of their weights — using only the first engine's understates its share.
+            # Clamp to _MAX_WEIGHT: the reader (_valid) rejects a snapshot weight above it, so
+            # an unclamped sum would silently self-evict this pool from every node view.
+            weight=min(sum(e.weight for e in mine), float(_MAX_WEIGHT)),
+        )
+        sizer_stop = _threading.Event()
+        # `tier` is the pool's runtime NAME (firecracker/gvisor/cold) — WarmPool.runtime is
+        # the SlotRuntime object, so gating uses this string.
+        sizer = DispatcherSizer(  # noqa: F841 — bound so the except can clean up its snapshot
+            spec, pool, FileNodeShare(node_cfg.share_dir), node_cfg,
+            runtime=tier,
+            # scope backlog to jobs THIS tier can claim (target_tier routing) so
+            # the pool isn't sized for work pinned to a tier it can never drain.
+            backlog_fn=local_backlog_fn(store, served, claimant_tier=tier),
+            # the UNTARGETED portion (target_tier IS NULL) — shared by every tier of the engine —
+            # so the planner counts it ONCE across the engine's tier-pools, not once per tier.
+            # ATTRIBUTION: like backlog_fn above, this aggregates over ALL of `served` and the
+            # snapshot is keyed to mine[0] (base). If two tiers serve DIFFERENT-but-overlapping
+            # engine sets that collide on mine[0]'s name (fc serves {aa,bb}, gvisor serves {aa}),
+            # bb's untargeted is deduped against gvisor even though gvisor can't drain it — the
+            # SAME aggregate-attribution approximation the targeted path already makes (see the
+            # per-engine sub-cap note at combined_ceiling). It only ever LOWERS a pool's demand
+            # (dedup-under, replacing the pre-dedup per-tier double-count-OVER), so it can under-
+            # serve a pool but never oversubscribe — the node budget water-fill remains the hard
+            # bound. Precise per-engine untargeted would need per-engine snapshot counts (schema
+            # expansion); deferred as a bounded, safe-direction approximation.
+            untargeted_backlog_fn=local_backlog_fn(store, served, untargeted_only=True),
+            concurrency_gate=concurrency_gate,   # sizer drives its live limit on each resize
+            cold_slot_ram_mib=cold_slot_ram_mib,  # price cold permits by the cold worker footprint
+        )
+        # Print the status FIRST, then start the thread LAST — otherwise if this print raises
+        # (broken pipe / closed stderr) the except below returns None while the thread is
+        # already running, leaking a daemon the caller can never stop or join.
+        print(f"node self-sizer: managing {spec.name!r} "
+              f"{'cold-only gate' if cold_only else 'warm pool'} (backlog over {served}) "
+              f"from {node_cfg.share_dir} "
+              f"({'balancing' if node_cfg.balancing else 'static shares'})", file=sys.stderr)
+        # ONE synchronous sizing before the periodic thread + before dispatch serves: the pool
+        # was started unspawned (warm=0), so this sizes it from the node budget now, closing
+        # the startup window where it would otherwise run at its legacy target until the first
+        # background tick. If this FAILS (e.g. the share_dir is read-only so publish() raises),
+        # the sizer can never work AND the pool is still at warm=0 — so let it propagate to the
+        # except below, which returns None → the caller restores the pool to its static config.
+        sizer.tick()
+        thread = sizer.start_thread(sizer_stop)
+        # Return the thread + sizer so the caller can JOIN on shutdown (else the daemon is torn
+        # down without its finally, which removes this unit's snapshot → phantom pool on
+        # restart) AND directly remove the snapshot after join, guaranteeing removal even if
+        # the join times out mid-tick. The run loop sleeps on sizer_stop, so the join is quick.
+        return sizer_stop, thread, sizer
+    except Exception:
+        logging.getLogger("blastbox.node_sizer").warning(
+            "node self-sizer setup failed — continuing without it", exc_info=True)
+        # The synchronous first tick may have already PUBLISHED a snapshot (the heartbeat succeeds
+        # before a later step — the update publish, a read, or start_thread — raises). If we return
+        # None now, the caller restores the pool to its legacy size but the phantom snapshot lingers
+        # advertising ~0 demand, then ages out permanently → peers reclaim this node's share while
+        # the pool runs unmanaged at full size = persistent oversubscription. Remove it on the way out.
+        if sizer is not None:
+            sizer.remove_own_snapshot()
+        return None
+
+
 def _dispatch_cmd(args: argparse.Namespace) -> int:
     from blastbox.host.dispatch import Dispatcher
     from blastbox.host.jobs.factory import build_job_store_from_env
@@ -216,6 +409,25 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
 
     warm_only = (os.environ.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower()
                  in ("1", "true", "yes", "on"))
+    node_managed = _node_manages_tier(tier, pool)
+    # NB: we deliberately do NOT force warm_only when node-managed. warm_only would break jobs
+    # that resolve to an egress network personality (dispatch bypasses the warm pool for
+    # egress), and it doesn't actually bound cold RAM. The node budget is bounded instead by
+    # DISPATCH concurrency: each in-flight job (warm OR cold) is one slot of RAM. The sizer caps
+    # the pool ceiling at BLASTBOX_DISPATCH_CONCURRENCY (below) AND drives a live concurrency gate
+    # to that same budget-allocated ceiling, so active jobs ≤ ceiling ≤ budget — a hard NODE cap
+    # that holds automatically over the cold path, not just the operator's Σ arithmetic.
+    dispatch_concurrency = int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1")
+    # When node-managed, a live gate bounds COLD admission to the node budget's cold headroom
+    # (ceiling − warm reservation): the cold path spawns footprint outside the warm pool, so the
+    # sizer drives the gate each resize to keep warm residency + cold workers within the budget.
+    # Warm dispatch is never gated. Best-effort (bounded, self-correcting overshoot), not a hard
+    # guarantee. Off (None) when unmanaged — no behavior change.
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+    concurrency_gate = DynamicConcurrencyGate(dispatch_concurrency) if node_managed else None
+    # Cold worker footprint (BLASTBOX_WORKER_MEMORY, docker --memory default "4g"), so the sizer
+    # prices cold permits by REAL cold RAM rather than assuming a cold worker == one warm slot.
+    cold_slot_ram_mib = _parse_mem_mib(os.environ.get("BLASTBOX_WORKER_MEMORY", "") or "4g")
 
     # Fail-closed BEFORE pool.start(): refuse to run an engine on ANY tier this dispatcher can execute
     # it on — the advertised tier PLUS the cold-fallback/egress-bypass ("cold") and cascade overflow
@@ -267,7 +479,25 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
             pool.stop()
         return 0
 
+    pre_shrunk = None   # (warm_size, ceiling) captured before pre-shrink, to restore if the
+    #                     sizer ends up NOT managing this pool (see below)
     if pool is not None:
+        if node_managed:
+            # Start UNSPAWNED under the node autosizer: shrink to warm=0/ceiling=1 before
+            # start(), so the pool doesn't warm its legacy BLASTBOX_POOL_WARM_SIZE (which,
+            # summed across engines at a full/rolling startup, can exceed the node budget)
+            # before the sizer's first allocation. The synchronous first tick in
+            # _start_node_sizer then sizes it from the node budget before serving begins.
+            try:
+                pre_shrunk = (pool.warm_size, pool.concurrent_ceiling)  # type: ignore[attr-defined]
+                # Provisional (mark_autosized=False): if the sizer never starts, this must not
+                # turn on eager reaping — the pool has to behave exactly as a legacy pool would.
+                pool.resize(warm_size=0, concurrent_ceiling=1,  # type: ignore[attr-defined]
+                            mark_autosized=False)
+            except Exception:
+                pre_shrunk = None
+                logging.getLogger("blastbox.host.cli").warning(
+                    "node self-sizer: could not pre-shrink pool before start", exc_info=True)
         pool.start()   # file-handshake warm path: start after tier-identity validation
     dispatcher = Dispatcher(
         job_store=store,
@@ -291,16 +521,80 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         # would fail closed here — no docker socket). Inert without a pool. (Parsed above for
         # reachable_tiers; reused here so the gate and the dispatcher agree on cold-fallback.)
         warm_only=warm_only,
+        # live COLD-admission cap driven by the node autosizer (None when unmanaged) — bounds
+        # concurrent cold workers to the budget's cold headroom (ceiling − warm reservation).
+        concurrency_gate=concurrency_gate,
     )
+    # Opt-in node self-sizer started INSIDE the try below, so pool.stop() in the finally
+    # always runs — even if sizer setup raises (bad BLASTBOX_NODE_* / unwritable share_dir)
+    # or is Ctrl-C'd mid-mkdir. It must never crash core dispatch or leak the warm pool.
+    sizer = None
     try:
+        # Gate on node_managed so ONLY a tier the autosizer actually manages is sized: fc/gvisor,
+        # the cold-only dispatcher, and an ALL-LOCAL cascade (fc/gvisor members). Without this gate
+        # _start_node_sizer would size ANY file-dispatch pool whenever NodeConfig is active — e.g. a
+        # cascade carrying an off-node member — folding non-local capacity into the local water-fill.
+        # (Network pools already returned above via the VmJobDispatcher branch and never reach here.)
+        if node_managed:
+            sizer = _start_node_sizer(pool, engines, store, tier, dispatch_concurrency,
+                                      concurrency_gate, cold_slot_ram_mib)
+        # If we pre-shrank the pool for the autosizer but the sizer did NOT start (incomplete
+        # inventory, unwritable share_dir, setup error), nothing will ever size it — restore
+        # its configured warm/ceiling so it runs normally (pre-autosizer static behavior)
+        # instead of being stuck at warm=0 and unable to serve.
+        if sizer is None and pre_shrunk is not None and pool is not None:
+            try:
+                # Restore AND leave the pool un-managed (mark_autosized=False) so a skipped
+                # opt-in keeps legacy lazy-drain behavior, not eager surplus reaping.
+                pool.resize(warm_size=pre_shrunk[0], concurrent_ceiling=pre_shrunk[1],
+                            mark_autosized=False)
+                # The synchronous first tick may have already lowered the gate to the autosizer's
+                # cold limit (~1) before setup rolled back; restore it to the operator's dispatch
+                # concurrency so an aborted opt-in doesn't leave the dispatcher throttled to 1 cold
+                # job until restart.
+                if concurrency_gate is not None:
+                    concurrency_gate.set_limit(dispatch_concurrency)
+            except Exception:
+                logging.getLogger("blastbox.host.cli").warning(
+                    "node self-sizer: could not restore pool after skipped sizing", exc_info=True)
         dispatcher.run_forever(
             poll_interval_s=args.poll_interval,
-            concurrency=int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1"),
+            concurrency=dispatch_concurrency,
         )
     finally:
-        if pool is not None:
-            pool.stop()
+        # Stop the POOL first (reap its slots) while the sizer thread is STILL heartbeating, so
+        # our reservation stays fresh in peers' views for the whole (possibly slow) reap — else
+        # a pool.stop() longer than the staleness window would let peers reallocate our share
+        # while our slots still hold node RAM. Only after the slots are gone do we stop the
+        # sizer and remove the snapshot.
+        orphans = pool.stop() if pool is not None else 0
+        # Cold workers spawn OUTSIDE the pool, so pool.stop() can't see them; the dispatch loop's
+        # bounded join may have abandoned a hung cold detonation still holding a gate permit.
+        cold_inflight = concurrency_gate.in_flight if concurrency_gate is not None else 0
+        if sizer is not None:
+            sizer_stop, sizer_thread, sizer_obj = sizer
+            sizer_stop.set()
+            sizer_thread.join(timeout=5.0)     # sleeps on the event → returns promptly
+            # Release the reservation ONLY when EVERYTHING this node was running is gone — every
+            # warm slot reaped AND no cold worker still in flight. An orphaned warm VM (destroy
+            # failed) or cold container (hung kill past the join deadline) still consumes RAM/vCPU;
+            # removing the snapshot would let peers reallocate that still-used capacity (node
+            # oversubscription). Leave it to age out after the staleness window instead — by when
+            # the orphan's self-terminate TTL should have fired.
+            if orphans == 0 and cold_inflight == 0:
+                sizer_obj.remove_own_snapshot()
+            else:
+                # Re-publish a LEASED reservation for exactly what's still running, with an extended
+                # lifetime (the sizer thread is stopped, so nothing else refreshes it): peers keep
+                # honoring it well past the normal 20s window — a Firecracker orphan has no idle TTL.
+                sizer_obj.publish_orphan_lease(orphans, cold_inflight)
+                logging.getLogger("blastbox.host.cli").warning(
+                    "node self-sizer: shutdown left %d unreaped warm slot(s) + %d cold worker(s) "
+                    "in flight — leased the node reservation (extended lifetime) so peers don't "
+                    "reallocate still-used capacity; a permanent orphan needs an external reaper",
+                    orphans, cold_inflight)
     return 0
+
 
 
 def _bench_cmd(args: argparse.Namespace) -> int:

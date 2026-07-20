@@ -1988,3 +1988,169 @@ def test_no_capture_artifact_when_netd_produced_none(tmp_path, monkeypatch):
     sealed = json.loads((output_dir / "metadata.json").read_text())
     assert not any(a["kind"] == "network_capture" for a in sealed["artifacts"])
     assert store.get(job.job_id).status == JobStatus.DONE
+
+
+def test_cold_dispatch_requeues_when_no_gate_headroom(tmp_path):
+    # PR #60 codex P1: a cold worker spawns footprint OUTSIDE the warm pool, so cold admission is
+    # bounded by the node budget's cold headroom (the sizer's gate). With NO headroom, the job
+    # must be REQUEUED — never detonated anyway (→ oversubscription) and never blocking the thread.
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    job.created_at = 100.0                  # old timestamp
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+
+    ran: list = []
+
+    def fake_runner(argv, **kw):
+        ran.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    gate = DynamicConcurrencyGate(1)
+    assert gate.acquire(0.0)               # consume the only permit → cold headroom is full
+    dispatcher._concurrency_gate = gate
+    dispatcher._warm_requeue_backoff_s = 0.0   # no sleep in the test
+
+    assert dispatcher.dispatch_once() is True   # a job WAS claimed...
+    assert ran == []                            # ...but the cold worker never spawned
+    final = store.get(job.job_id)
+    assert final is not None
+    assert final.status == JobStatus.QUEUED     # requeued for a later worker/tick
+    assert final.claim_id is None               # claim released
+    # PR #60: DEFERRED via claimable_after (NOT created_at) so it's temporarily ineligible and
+    # warm-eligible work is claimed first — created_at (submission time / max_queued_age) is
+    # preserved.
+    assert final.created_at == 100.0            # submission time unchanged
+    assert final.claimable_after is not None and final.claimable_after > time.time()
+
+
+def test_cold_dispatch_acquires_and_releases_gate_permit(tmp_path):
+    # With headroom, the cold path acquires ONE permit for the detonation and releases it after,
+    # so the gate's in-flight count returns to zero (the reservation is transient, per job).
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    output_dir = tmp_path / job.job_id / "output"
+    _setup_job_dirs(tmp_path, job)
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    gate = DynamicConcurrencyGate(2)
+    dispatcher._concurrency_gate = gate
+
+    assert dispatcher.dispatch_once() is True
+    assert store.get(job.job_id).status == JobStatus.DONE
+    assert gate.in_flight == 0                   # permit taken for the run, then released
+
+
+def test_cold_permit_retained_when_container_kill_fails(tmp_path):
+    # PR #60 codex P1: when a timed-out cold worker's `docker kill` fails, the container may still
+    # run; releasing the gate permit would let another cold worker stack on the orphan and exceed
+    # the node budget. The permit must be RETAINED until cleanup is confirmed.
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+
+    def runner(argv, **kw):
+        if "kill" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "kill failed")   # kill FAILS (rc!=0)
+        raise subprocess.TimeoutExpired(argv, kw.get("timeout"))             # worker times out
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=runner)
+    gate = DynamicConcurrencyGate(2)
+    dispatcher._concurrency_gate = gate
+
+    assert dispatcher.dispatch_once() is True
+    assert gate.in_flight == 1                    # permit RETAINED (orphan may still consume RAM)
+
+
+def test_cold_permit_released_when_kill_confirms(tmp_path):
+    # the flip side: a confirmed kill (rc 0) releases the permit as normal.
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+
+    def runner(argv, **kw):
+        if "kill" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")             # kill CONFIRMED
+        raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=runner)
+    gate = DynamicConcurrencyGate(2)
+    dispatcher._concurrency_gate = gate
+
+    assert dispatcher.dispatch_once() is True
+    assert gate.in_flight == 0                    # confirmed gone → permit released
+
+
+def test_retained_cold_permit_reclaimed_when_container_confirmed_gone(tmp_path):
+    # PR #60 codex P2: a permit retained for a failed-kill container must be RECLAIMED once
+    # `docker ps` confirms the container is gone — else it leaks permanently and cold capacity
+    # bleeds to zero. If docker ps can't be read, keep retaining (can't confirm absence).
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    gate = DynamicConcurrencyGate(2)
+    dispatcher._concurrency_gate = gate
+
+    gate.acquire(0.0)                                    # the retained permit
+    dispatcher._retained_cold_orphans.add("blastbox-worker-abc123def456")
+    dispatcher._list_active_worker_job_ids = lambda: set()   # docker ps: no live workers
+    dispatcher._reconcile_cold_orphans()
+    assert gate.in_flight == 0                           # reclaimed
+    assert not dispatcher._retained_cold_orphans
+
+    gate.acquire(0.0)                                    # another orphan, but docker ps unreadable
+    dispatcher._retained_cold_orphans.add("blastbox-worker-999888777666")
+    dispatcher._list_active_worker_job_ids = lambda: None
+    dispatcher._reconcile_cold_orphans()
+    assert gate.in_flight == 1                           # still retained (absence unconfirmed)
+
+
+def test_cold_dispatch_fenced_after_shutdown_begins(tmp_path):
+    # PR #60 codex P1: once shutdown begins, a dispatch worker abandoned mid-claim must NOT acquire
+    # a cold permit and spawn a container after the node reservation is torn down. It requeues.
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+
+    ran: list = []
+
+    def fake_runner(argv, **kw):
+        ran.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    gate = DynamicConcurrencyGate(4)               # plenty of headroom...
+    dispatcher._concurrency_gate = gate
+    dispatcher._warm_requeue_backoff_s = 0.0
+    dispatcher._shutting_down.set()                # ...but shutdown has begun
+
+    assert dispatcher.dispatch_once() is True      # claimed...
+    assert ran == []                               # ...but NOT detonated (fenced)
+    assert gate.in_flight == 0                     # no permit acquired
+    final = store.get(job.job_id)
+    assert final is not None and final.status == JobStatus.QUEUED   # requeued for restart
