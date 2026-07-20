@@ -269,10 +269,18 @@ class DispatcherSizer:
                 count_result["v"] = self._last_backlog
         count_thread = threading.Thread(target=_count, name="node-sizer-count", daemon=True)
         count_thread.start()
-        while count_thread.is_alive():
-            count_thread.join(timeout=max(0.5, self._config.interval_s))
-            if count_thread.is_alive() and (self._stop_event is None
-                                            or not self._stop_event.is_set()):
+        # BOUND the wait: if count() wedges indefinitely, don't hang here forever — the synchronous
+        # startup tick would never return (dispatch never begins) and a running loop would never
+        # read the node view again (a new peer could split the budget while we hold a stale ceiling)
+        # nor reach the fail-closed check. Past the deadline, proceed with the last-known backlog
+        # (conservative) and let the daemon thread finish in the background.
+        deadline = self._clock() + max(self._config.stale_after_s, self._config.interval_s * 3)
+        heartbeat_s = max(0.5, self._config.interval_s)
+        while count_thread.is_alive() and self._clock() < deadline:
+            count_thread.join(timeout=heartbeat_s)
+            if self._stop_event is not None and self._stop_event.is_set():
+                break
+            if count_thread.is_alive() and count_result.get("v") is None:
                 with self._publish_lock:
                     self._share.publish(_snapshot(self._last_backlog, self._clock()))
         backlog = count_result.get("v", self._last_backlog)
@@ -358,9 +366,27 @@ class DispatcherSizer:
         # TOTAL backlog demand is counted once. Failover-safe: if a replica drops, the next tick
         # sees fewer replicas and each recomputes a larger share. (assigned is per-pool — the
         # replica's own residency — so it is NOT divided.)
-        replicas: dict[tuple[str, str], int] = {}
+        # SORTED instance lists per (engine, tier) so every dispatcher distributes a shared
+        # quantity — and its integer remainder — IDENTICALLY across the same-queue replicas.
+        replica_insts: dict[tuple[str, str], list[str]] = {}
         for s in snaps:
-            replicas[(s.engine, s.tier)] = replicas.get((s.engine, s.tier), 0) + 1
+            replica_insts.setdefault((s.engine, s.tier), []).append(s.instance)
+        for _lst in replica_insts.values():
+            _lst.sort()
+
+        def _share(total: float, engine: str, tier: str) -> float:
+            return total / max(1, len(replica_insts.get((engine, tier), [None])))
+
+        def _int_share(total: int, engine: str, tier: str, instance: str) -> int:
+            # divide an integer quantity across same-queue replicas, handing the REMAINDER to the
+            # lowest-ranked instances — so N replicas' shares still SUM to `total` (flooring alone
+            # would give every replica 0 when total < N, stranding jobs in warm-only mode).
+            insts = replica_insts.get((engine, tier), [instance])
+            n = max(1, len(insts))
+            base, rem = divmod(max(0, total), n)
+            rank = insts.index(instance) if instance in insts else n
+            return base + (1 if rank < rem else 0)
+
         specs = [
             PoolSpec(
                 # key each pool by (engine, tier, instance): the same engine on two node-
@@ -370,10 +396,11 @@ class DispatcherSizer:
                 # what THIS dispatcher looks up for itself below.
                 name=_pool_key(s.engine, s.tier, s.instance),
                 slot_ram_mib=s.slot_ram_mib, slot_vcpus=s.slot_vcpus,
-                # ceiling water-fill: by live backlog (balancing, split across same-queue replicas)
-                # or the static weight share.
-                demand=(s.backlog / replicas[(s.engine, s.tier)] + s.assigned) if balancing
-                else float(s.weight),
+                # ceiling water-fill: live backlog (balancing) or the static WEIGHT share — BOTH
+                # split across same-queue replicas so a rolling overlap doesn't double the engine's
+                # node share (in balancing OR static mode).
+                demand=(_share(s.backlog, s.engine, s.tier) + s.assigned) if balancing
+                else _share(s.weight, s.engine, s.tier),
                 min_warm=s.min_warm, max_ceiling=s.max_ceiling,
                 # the pool's published reservation (resident warm + cold in flight) is a HARD
                 # ceiling floor — a peer must not be handed slots this pool is still running.
@@ -405,10 +432,11 @@ class DispatcherSizer:
             # future phase and those jobs bypass the warm pool anyway.)
             # Split the shared backlog across same-queue replicas HERE too (not just in the ceiling
             # demand): otherwise two overlapping replicas would each warm for the WHOLE queue —
-            # 8 VMs for 4 jobs — and then publish that duplicated residency as reservations.
-            my_replicas = replicas.get((e.name, self._runtime), 1)
-            warm = min(mine.concurrent_ceiling,
-                       max(e.min_warm, int(backlog / my_replicas) + assigned_warm))
+            # 8 VMs for 4 jobs. Use the deterministic remainder split so the replicas' warm targets
+            # still SUM to the backlog even when it's smaller than the replica count (a plain floor
+            # would give every replica 0 and strand the job in warm-only mode).
+            my_backlog = _int_share(backlog, e.name, self._runtime, self._instance)
+            warm = min(mine.concurrent_ceiling, max(e.min_warm, my_backlog + assigned_warm))
             mine = PoolSize(warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)
             self._pool.resize(  # type: ignore[attr-defined]
                 warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)

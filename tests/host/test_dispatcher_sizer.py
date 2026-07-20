@@ -1048,6 +1048,25 @@ def test_node_namespaced_files_dont_collide_across_hosts(tmp_path):
     assert seen == {("hostA", 3), ("hostB", 9)}                # both survive
 
 
+def test_backlog_remainder_distributed_not_floored_to_zero(tmp_path):
+    # PR #60 codex P1: when the shared backlog is SMALLER than the replica count, flooring the
+    # divisor gave EVERY replica a warm target of 0, stranding the job (warm-only mode won't burst
+    # without a demand miss). The remainder is now handed to the lowest-sorted instances so the
+    # replicas' warm targets still SUM to the backlog.
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("clip", 1, 0, 1024, 1, 0, 64, 1.0, ts=1.0, node="n",
+                                 tier="firecracker", instance="b"))     # replica peer, sorts after "a"
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    pool = _Pool()
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8, min_warm=0),
+                         pool, share, cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 1,
+                         node="n", instance="a", capacity_fn=_budget(8 * 1024, 999),
+                         clock=lambda: 1.0)
+    mine = ds.tick()
+    assert mine.warm_size == 1        # "a" (lowest-ranked) gets the +1, not floor(1/2)=0 for all
+
+
 def test_shared_backlog_split_across_replicas(tmp_path):
     # PR #60 codex P2: two replicas of the same engine+tier drain the SAME queue, so each reporting
     # the full backlog doubles that engine's demand. Split it: clip (2 replicas, backlog 10 each)
