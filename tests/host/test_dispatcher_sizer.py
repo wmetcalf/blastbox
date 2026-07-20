@@ -1011,6 +1011,23 @@ def test_node_namespaced_files_dont_collide_across_hosts(tmp_path):
     assert seen == {("hostA", 3), ("hostB", 9)}                # both survive
 
 
+def test_publish_orphan_lease_extends_reservation_lifetime(tmp_path):
+    # PR #60 codex P1: on shutdown with unreaped VMs (a Firecracker guest has NO idle TTL), the
+    # reservation must outlive the normal ~20s window. publish_orphan_lease re-publishes what's
+    # still running with an extended lifetime (up to the reader's GC floor), so peers keep it.
+    share = FileNodeShare(str(tmp_path))
+    cfg = NodeConfig(balancing=True, resource_management=True, stale_after_s=20.0)
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8), _Pool(), share,
+                         cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 0, node="n",
+                         instance="i", clock=lambda: 1000.0)
+    ds.publish_orphan_lease(3)                    # 3 slots still consuming
+    # far past the normal 20s window, but within the extended lease → still visible, reserving 3.
+    live = [s for s in share.read_all(max_age_s=20.0, now=1000.0 + 200) if s.engine == "clip"]
+    assert len(live) == 1 and live[0].assigned == 3
+    # past the reader's GC floor (~300s) → finally aged out.
+    assert [s for s in share.read_all(max_age_s=20.0, now=1000.0 + 400) if s.engine == "clip"] == []
+
+
 def test_staleness_uses_publisher_declared_window_not_reader(tmp_path):
     # PR #60 audit P1: a peer's liveness is decided by ITS OWN published window (refresh_s /
     # stale_after_s), so two readers with different LOCAL windows agree on the same snapshot set —

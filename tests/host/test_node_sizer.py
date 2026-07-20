@@ -41,6 +41,18 @@ def test_no_oversubscription_invariant():
     assert plan["a"].concurrent_ceiling == 2 and plan["b"].concurrent_ceiling == 2
 
 
+def test_reserved_is_a_hard_ceiling_floor():
+    # PR #60 codex P1: a pool physically running `reserved` slots (resident warm + cold in flight)
+    # must not be allocated FEWER — resize() only lowers setpoints, VMs drain later, and a smaller
+    # advertised ceiling would let a peer grow into still-in-use capacity → oversubscription.
+    # A: 8 reserved but LOW demand; B: no reserved but huge backlog. A keeps its 8 floor.
+    specs = [PoolSpec("a", slot_ram_mib=1024, demand=1, max_ceiling=64, reserved=8),
+             PoolSpec("b", slot_ram_mib=1024, demand=100, max_ceiling=64, reserved=0)]
+    plan = plan_sizes(specs, NodeBudget(ram_mib=10 * 1024, vcpus=999))
+    assert plan["a"].concurrent_ceiling >= 8      # in-use slots preserved as a floor, despite low demand
+    assert plan["a"].concurrent_ceiling + plan["b"].concurrent_ceiling <= 10   # no oversubscription
+
+
 def test_allocates_by_demand():
     # busy engine gets the lion's share of a beefy node; idle keeps its viable baseline (1)
     specs = [PoolSpec("busy", slot_ram_mib=1024, demand=20, max_ceiling=64),
@@ -223,6 +235,7 @@ def test_from_env_clamps_huge_finite_interval_to_time_t_safe(monkeypatch):
     monkeypatch.setenv("BLASTBOX_NODE_INTERVAL_S", "10000000000")   # 1e10 s
     c = NodeConfig.from_env()
     assert c.interval_s <= _MAX_INTERVAL_S
+    assert _MAX_INTERVAL_S <= 150.0            # ≤ GC floor / 2, so a beat can't expire between ticks
     assert c.stale_after_s >= c.interval_s * 2
     # The sizer's run() blocks on stop.wait(interval_s), which converts the timeout to a
     # time_t deadline. Exercise that exact C conversion WITHOUT blocking: acquiring a free lock

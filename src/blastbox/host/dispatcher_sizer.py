@@ -25,7 +25,7 @@ import time
 from typing import Callable, Optional
 
 from .node_config import EngineNode, NodeConfig, _is_safe_slug
-from .node_share import DemandSnapshot, NodeShare
+from .node_share import DemandSnapshot, FileNodeShare, NodeShare
 from .node_sizer import (
     NodeBudget,
     PoolSize,
@@ -318,6 +318,9 @@ class DispatcherSizer:
                 # ceiling water-fill: by live backlog (balancing) or the static weight share.
                 demand=float(s.backlog + s.assigned) if balancing else float(s.weight),
                 min_warm=s.min_warm, max_ceiling=s.max_ceiling,
+                # the pool's published reservation (resident warm + cold in flight) is a HARD
+                # ceiling floor — a peer must not be handed slots this pool is still running.
+                reserved=s.assigned,
             )
             for s in snaps
         ]
@@ -377,6 +380,25 @@ class DispatcherSizer:
                 # set_limit floors at 1, so cold never fully starves even when headroom ≤ 0.
                 self._gate.set_limit(cold_permits)  # type: ignore[attr-defined]
         return mine
+
+    def publish_orphan_lease(self, reserved: int) -> None:
+        """On shutdown with UNREAPED resources (a warm VM whose destroy failed, or a cold worker
+        the bounded join abandoned), re-publish a FINAL snapshot reserving `reserved` slots with an
+        EXTENDED lifetime, so peers keep honoring the reservation well past the normal staleness
+        window. A managed Firecracker guest has NO idle TTL (it waits for the host reaper), so a
+        failed reap can consume RAM long after 20s; leasing to the reader's GC floor (~5 min, the
+        max a reader will honor) shrinks that oversubscription window. Best-effort — a truly
+        permanent orphan needs an external reaper / runtime watchdog (a tracked follow-on)."""
+        e = self._engine
+        try:
+            self._share.publish(DemandSnapshot(
+                engine=e.name, backlog=0, assigned=max(0, int(reserved)),
+                slot_ram_mib=e.slot_ram_mib, slot_vcpus=e.slot_vcpus, min_warm=e.min_warm,
+                max_ceiling=e.max_ceiling, weight=e.weight, ts=self._clock(), node=self._node,
+                tier=self._runtime, instance=self._instance, refresh_s=0.0,
+                balancing=self._config.balancing, stale_after_s=FileNodeShare._GC_AGE_FLOOR_S))
+        except Exception:
+            pass
 
     def remove_own_snapshot(self) -> None:
         """Remove this unit's published snapshot. Idempotent — the run() loop's finally also

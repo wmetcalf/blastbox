@@ -37,10 +37,14 @@ from .node_share import _MAX_CEILING_SANE, _MAX_WEIGHT
 # visible), backed up by a hard guard in FileNodeShare.publish.
 _SAFE_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
-# Upper bound on the sizing interval (seconds). A finite-but-huge value passes float()
-# but OverflowError-s in stop.wait()/time.sleep() and kills the sizing thread; one day is
-# absurdly long for a heartbeat yet safely within platform time_t.
-_MAX_INTERVAL_S = 86_400.0
+# Upper bound on the sizing interval (seconds). Two constraints:
+#   * a finite-but-huge value OverflowError-s in stop.wait()/time.sleep() and kills the thread;
+#   * a snapshot's published lifetime is capped at the reader's GC floor (300s), so if the
+#     republish interval exceeded that a healthy peer would repeatedly expire between its own
+#     beats and peers would oversubscribe until a coincident refresh. Cap at HALF the GC floor
+#     (150s) so refresh_s ≈ interval always fits within the lifetime with a beat to spare — a
+#     150s heartbeat is already very long (default 5s), and it's safely within time_t.
+_MAX_INTERVAL_S = 150.0
 
 
 def _is_safe_slug(s: str) -> bool:

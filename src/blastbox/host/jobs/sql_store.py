@@ -217,11 +217,18 @@ class SqlJobStore:
                 # index of the same name behind. CREATE INDEX ... IF NOT EXISTS would then see the
                 # name and SKIP forever, so the best-effort init never heals and autosizer counts
                 # keep full-scanning the jobs table. Drop an invalid one first, then (re)build.
+                # SCOPE the check to THIS store's `jobs` table (resolved via search_path) and
+                # SCHEMA-QUALIFY the drop: a same-named invalid index in an UNRELATED schema must
+                # not make us drop the VALID index in our own schema and rebuild it every startup.
                 invalid = conn.execute(
-                    "SELECT 1 FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid "
-                    "WHERE c.relname = %s AND NOT i.indisvalid", (index_name,)).fetchone()
+                    "SELECT n.nspname FROM pg_class c "
+                    "JOIN pg_index i ON i.indexrelid = c.oid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE c.relname = %s AND i.indrelid = 'jobs'::regclass "
+                    "AND NOT i.indisvalid", (index_name,)).fetchone()
                 if invalid is not None:
-                    conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {index_name}")
+                    conn.execute(
+                        f'DROP INDEX CONCURRENTLY IF EXISTS "{invalid[0]}".{index_name}')
                 conn.execute(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {stmt_tail}")
         except Exception:
             pass   # lock/permission/already-building → just slower autosizer counts, never fatal

@@ -65,6 +65,11 @@ class PoolSpec:
     demand: float = 0.0                  # current wantedness (busy slots + pressure)
     min_warm: int = 0                    # guaranteed warm floor (latency baseline)
     max_ceiling: int = 64               # per-engine hard cap (never exceed regardless of budget)
+    reserved: int = 0                    # slots this pool is ALREADY consuming (resident warm +
+                                         # cold in flight). A HARD ceiling floor: the allocator
+                                         # must not hand this pool fewer slots than it's physically
+                                         # running, or a peer would grow into capacity that's still
+                                         # in use (resize() shrinks setpoints; VMs drain later).
 
 
 @dataclass(frozen=True)
@@ -98,7 +103,7 @@ def plan_sizes(specs: list[PoolSpec], budget: NodeBudget) -> dict[str, PoolSize]
         s if (s.slot_ram_mib > 0 and s.slot_vcpus > 0)
         else PoolSpec(name=s.name, slot_ram_mib=max(s.slot_ram_mib, 1.0),
                       slot_vcpus=max(s.slot_vcpus, 0.01), demand=s.demand,
-                      min_warm=s.min_warm, max_ceiling=s.max_ceiling)
+                      min_warm=s.min_warm, max_ceiling=s.max_ceiling, reserved=s.reserved)
         for s in specs
     ]
 
@@ -113,6 +118,24 @@ def plan_sizes(specs: list[PoolSpec], budget: NodeBudget) -> dict[str, PoolSize]
     def budget_has_room(s: PoolSpec) -> bool:
         return (used_ram + s.slot_ram_mib <= budget.ram_mib
                 and used_vcpu + s.slot_vcpus <= budget.vcpus)
+
+    # RESERVED (in-use) FLOOR — seated FIRST, before any other allocation. A pool that is
+    # physically running `reserved` slots (resident warm VMs + cold workers in flight) must not be
+    # allocated fewer than that: resize() only lowers setpoints, so those VMs drain over later pool
+    # ticks, and if we advertised a smaller ceiling a peer would grow into capacity that's STILL in
+    # use → node oversubscription. This is the ceiling analogue of min_warm, but it takes priority
+    # (it's real current consumption, not a latency target). Bounded by max_ceiling and the budget;
+    # if reservations can't all fit the node is already transiently over-committed and we seat by
+    # demand priority (busy pools' in-use slots first) — the plan can't un-spend RAM already spent.
+    while True:
+        below = [s for s in specs
+                 if alloc[s.name] < min(s.reserved, s.max_ceiling) and budget_has_room(s)]
+        if not below:
+            break
+        pick = max(below, key=lambda s: s.demand)
+        alloc[pick.name] += 1
+        used_ram += pick.slot_ram_mib
+        used_vcpu += pick.slot_vcpus
 
     # min_warm RESERVATION: seat each pool's warm floor BEFORE demand-filling, so a latency
     # floor is a real reservation — an idle pool with min_warm=N keeps N hot even when a busy
