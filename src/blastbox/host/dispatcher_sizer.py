@@ -121,12 +121,21 @@ class DispatcherSizer:
         self._count_result: dict = {}                           # count (a wedged one mustn't spawn
                                                                 # a new thread every tick)
 
+    def _cold_only(self) -> bool:
+        """A pool-less cold dispatcher: no warm pool to resize, just a gate + a cold reservation.
+        Requires BOTH no pool AND the cold tier — so a directly-constructed sizer for some other
+        pool-less runtime can't accidentally activate as a managed cold pool."""
+        return self._pool is None and self._runtime == "cold"
+
     def _active(self) -> bool:
         cfg = self._config
         # Mirror NodeConfig.active — adaptive counts too. from_env folds adaptive into
         # resource_management, but a DIRECTLY-constructed NodeConfig(adaptive=True,
         # resource_management=False) would otherwise no-op here despite active=True.
-        return (cfg.resource_management or cfg.balancing or cfg.adaptive) and manages(self._runtime)
+        # A pool-less cold-only sizer is managed too (its docker workers still consume the budget),
+        # even though "cold" isn't a warm-managed runtime.
+        return (cfg.resource_management or cfg.balancing or cfg.adaptive) and (
+            manages(self._runtime) or self._cold_only())
 
     # Adaptive control loop bounds. Deliberately a DAMPED, asymmetric ramp (shrink faster
     # than grow) rather than a hard MemAvailable cap: a cap that tracks free RAM directly
@@ -171,12 +180,17 @@ class DispatcherSizer:
         a consistent BLASTBOX_NODE_ID."""
         e = self._engine
         ceiling = 1
-        warm = 1 if e.min_warm >= 1 else 0
+        warm = 0 if self._cold_only() else (1 if e.min_warm >= 1 else 0)
         if hasattr(self._pool, "resize"):
             self._pool.resize(  # type: ignore[attr-defined]
                 warm_size=warm, concurrent_ceiling=ceiling)
-            if self._gate is not None:
-                self._gate.set_limit(ceiling - warm)  # type: ignore[attr-defined]
+        # Bound the gate UNCONDITIONALLY — NOT only when there's a warm pool. A cold-only
+        # dispatcher has no pool to resize, but its concurrency gate must STILL be floored here
+        # (to ceiling−warm = 1 cold worker), or the fail-closed net leaves it admitting the full
+        # budgeted ceiling exactly when the node view is inconsistent / unreadable (oversubscription
+        # in the case this method exists to prevent). set_limit floors at 1.
+        if self._gate is not None:
+            self._gate.set_limit(ceiling - warm)  # type: ignore[attr-defined]
         return PoolSize(warm_size=warm, concurrent_ceiling=ceiling)
 
     def tick(self) -> Optional[PoolSize]:
@@ -503,6 +517,14 @@ class DispatcherSizer:
                                 if cold_ram > 0 else headroom_slots)
                 # set_limit floors at 1, so cold never fully starves even when headroom ≤ 0.
                 self._gate.set_limit(cold_permits)  # type: ignore[attr-defined]
+        elif mine is not None and self._cold_only():
+            # COLD-ONLY dispatcher: no warm pool to resize. The pool's "slot" IS a docker cold
+            # worker (footprint already the cold worker RAM), so the whole budget-allocated ceiling
+            # is the cold-admission limit — drive the gate to it directly (no warm residency to
+            # subtract, no warm→cold footprint conversion). warm_size is 0 (nothing to keep hot).
+            mine = PoolSize(warm_size=0, concurrent_ceiling=mine.concurrent_ceiling)
+            if self._gate is not None:
+                self._gate.set_limit(mine.concurrent_ceiling)  # type: ignore[attr-defined]
         return mine
 
     def publish_orphan_lease(self, warm_orphans: int, cold_inflight: int = 0) -> None:

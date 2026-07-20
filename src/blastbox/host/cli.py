@@ -184,7 +184,10 @@ def _node_manages_tier(tier: str) -> bool:
     try:
         from blastbox.host.node_config import NodeConfig
         from blastbox.host.node_sizer import manages
-        return NodeConfig.from_env().active and manages(tier)
+        # firecracker/gvisor = warm-pool managed; "cold" = pool-less cold-only dispatcher (a
+        # separate cold process in the warm-sidecar deployment) — its docker workers spawn outside
+        # any warm pool, so it also needs a budgeted gate + a published cold reservation.
+        return NodeConfig.from_env().active and (manages(tier) or tier == "cold")
     except Exception:
         return False
 
@@ -214,9 +217,15 @@ def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gat
     Fully guarded (`except Exception`): a bad BLASTBOX_NODE_* config, an unwritable
     share_dir, or any setup error logs and disables sizing — it NEVER crashes dispatch.
     (KeyboardInterrupt/SystemExit deliberately propagate so the caller's finally still
-    stops the pool.) Returns the stop Event when started, else None."""
-    if pool is None:
-        return None
+    stops the pool.) Returns the stop Event when started, else None.
+
+    A cold-ONLY dispatcher (tier="cold") has NO warm pool (pool is None): it is still managed
+    pool-lessly — the sizer publishes a cold-footprint reservation into the node view and drives
+    the concurrency gate to a budgeted cold ceiling, so warm fc/gvisor peers account for this
+    process's docker workers instead of over-allocating the whole budget to warm slots."""
+    cold_only = pool is None and tier == "cold"
+    if pool is None and not cold_only:
+        return None       # a non-cold dispatcher with no pool has nothing to manage
     sizer = None
     try:
         from blastbox.host.node_config import NodeConfig
@@ -267,15 +276,18 @@ def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gat
         # stuck at warm-0/ceiling-1) — the same guard already applied to the summed weight.
         combined_ceiling = max(1, min(sum(e.max_ceiling for e in mine), concurrency,
                                       _MAX_CEILING_SANE))
+        # A cold-only pool's "slot" IS a docker cold worker, so its footprint is the cold worker
+        # RAM (BLASTBOX_WORKER_MEMORY), not the declared warm-slot RAM, and it has NO warm floor.
+        cold_footprint = cold_slot_ram_mib if (cold_only and cold_slot_ram_mib > 0) else None
         spec = replace(  # type: ignore[call-arg]
             base,
-            slot_ram_mib=max(e.slot_ram_mib for e in mine),
+            slot_ram_mib=cold_footprint if cold_footprint else max(e.slot_ram_mib for e in mine),
             slot_vcpus=max(e.slot_vcpus for e in mine),
             # The shared pool serves ALL of `mine`, so its warm floor is the SUM of the engines'
             # floors — each engine wants its own min_warm hot. Taking the max discards the other
             # engines' floors (two engines @ MIN_WARM=2 would keep only 2 hot, not 4). Cap by the
             # combined ceiling: you can't warm more than the pool's hard ceiling anyway.
-            min_warm=min(sum(e.min_warm for e in mine), combined_ceiling),
+            min_warm=0 if cold_only else min(sum(e.min_warm for e in mine), combined_ceiling),
             max_ceiling=combined_ceiling,
             # the shared pool represents the COMBINED engines, so its static weight is the
             # SUM of their weights — using only the first engine's understates its share.
@@ -298,7 +310,8 @@ def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gat
         # Print the status FIRST, then start the thread LAST — otherwise if this print raises
         # (broken pipe / closed stderr) the except below returns None while the thread is
         # already running, leaking a daemon the caller can never stop or join.
-        print(f"node self-sizer: managing {spec.name!r} warm pool (backlog over {served}) "
+        print(f"node self-sizer: managing {spec.name!r} "
+              f"{'cold-only gate' if cold_only else 'warm pool'} (backlog over {served}) "
               f"from {node_cfg.share_dir} "
               f"({'balancing' if node_cfg.balancing else 'static shares'})", file=sys.stderr)
         # ONE synchronous sizing before the periodic thread + before dispatch serves: the pool

@@ -69,6 +69,27 @@ def test_preprovisioned_share_dir_perms_left_untouched(tmp_path):
     assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
 
 
+def test_cold_only_gate_floored_on_fail_closed(tmp_path):
+    # PR #60 marla P1: _size_to_floor is the fail-closed net (mixed node ids / lost visibility). For
+    # a pool-less cold-only dispatcher there's no pool to resize, but its GATE must STILL be floored
+    # to 1 — else it keeps admitting the full budgeted ceiling of cold workers exactly when peers
+    # have reclaimed its share (oversubscription in the case this net exists to prevent).
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+    share = FileNodeShare(str(tmp_path))
+    # an UNTAGGED peer makes THIS tagged ("n") cold dispatcher's view mixed → fail closed.
+    share.publish(DemandSnapshot("clip", 5, 0, 4096, 1, 0, 8, 1.0, ts=1.0, node="", tier="cold"))
+    gate = DynamicConcurrencyGate(8)
+    gate.set_limit(8)                                      # currently admitting the full budget
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=4096, max_ceiling=8), None, share,
+                         cfg, runtime="cold", backlog_fn=lambda: 5, node="n", instance="i",
+                         capacity_fn=_budget(8 * 4096, 999), clock=lambda: 1.0,
+                         concurrency_gate=gate, cold_slot_ram_mib=4096)
+    ds.tick()                                             # mixed view → _size_to_floor
+    assert gate.limit == 1                                # cold gate floored, NOT left at 8
+
+
 def test_mixed_node_ids_fail_closed_to_floor(tmp_path):
     # PR #60 codex P1: a tagged dispatcher + an untagged peer give each process a DIFFERENT
     # planner view (the symmetric node filter), so their independent slices sum past the budget.
@@ -761,8 +782,40 @@ def test_node_manages_tier_gating(monkeypatch):
     monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")
     monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
     assert _node_manages_tier("firecracker") and _node_manages_tier("gvisor")
-    assert not _node_manages_tier("cold")                 # RM on but cold isn't node-managed
-    assert not _node_manages_tier("aws-ec2")
+    assert _node_manages_tier("cold")                     # cold is now managed pool-lessly (gate + reservation)
+    assert not _node_manages_tier("aws-ec2")              # cloud tiers stay unmanaged (platform owns concurrency)
+
+
+def test_cold_only_dispatcher_gets_budgeted_gate_and_publishes(tmp_path, monkeypatch):
+    # PR #60 codex P1 (feature): a cold-ONLY dispatcher (tier="cold", no warm pool) is now managed
+    # pool-lessly — _start_node_sizer builds a sizer that publishes a COLD-footprint reservation
+    # into the node view AND drives the concurrency gate to a budgeted cold ceiling, so warm peers
+    # account for its docker workers instead of over-allocating the whole budget to warm slots.
+    from blastbox.host.cli import _start_node_sizer
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_CLIP_RAM_MIB", "4096")     # cold worker footprint
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_CLIP_MAX_CEILING", "8")
+    monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
+    gate = DynamicConcurrencyGate(8)
+    res = _start_node_sizer(None, ["clip"], InMemoryJobStore(), "cold", 8, gate, 4096)  # pool=None!
+    assert res is not None                          # cold-only sizer started despite no warm pool
+    stop, thread, sizer = res
+    try:
+        # published a cold-tier snapshot with the COLD worker footprint (not a warm-slot RAM)
+        snaps = FileNodeShare(str(tmp_path)).read_all(max_age_s=1e9, now=time.time())
+        mine = [s for s in snaps if s.engine == "clip" and s.tier == "cold"]
+        assert len(mine) == 1
+        assert mine[0].slot_ram_mib == 4096         # priced as a cold worker
+        assert mine[0].min_warm == 0                # no warm floor for a pool-less cold dispatcher
+        # gate driven to a budgeted ceiling (>=1, and never above its cold concurrency cap)
+        assert 1 <= gate.limit <= 8
+    finally:
+        stop.set()
+        thread.join(2.0)
+        sizer.remove_own_snapshot()
 
 
 def test_start_node_sizer_skips_on_incomplete_inventory(tmp_path, monkeypatch):

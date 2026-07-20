@@ -82,7 +82,7 @@ def main() -> int:
     tier = "firecracker"
     node_managed = _node_manages_tier(tier)
     check("node manages fc tier (RM on) → cold-gate wiring active", node_managed)
-    check("cold tier NOT node-managed", not _node_manages_tier("cold"))
+    check("cold tier IS node-managed (pool-less cold-only dispatcher)", _node_manages_tier("cold"))
 
     # ---- managed startup sequence (as _dispatch_cmd does) ----
     concurrency = 6                                         # BLASTBOX_DISPATCH_CONCURRENCY
