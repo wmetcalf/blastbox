@@ -2021,9 +2021,11 @@ def test_cold_dispatch_requeues_when_no_gate_headroom(tmp_path):
     assert final is not None
     assert final.status == JobStatus.QUEUED     # requeued for a later worker/tick
     assert final.claim_id is None               # claim released
-    # PR #60 codex P1: DEFERRED — created_at bumped so it moves behind claimable work (a
-    # capacity-blocked cold job at its original ts would be reclaimed in a loop, starving warm).
-    assert final.created_at > 100.0
+    # PR #60: DEFERRED via claimable_after (NOT created_at) so it's temporarily ineligible and
+    # warm-eligible work is claimed first — created_at (submission time / max_queued_age) is
+    # preserved.
+    assert final.created_at == 100.0            # submission time unchanged
+    assert final.claimable_after is not None and final.claimable_after > time.time()
 
 
 def test_cold_dispatch_acquires_and_releases_gate_permit(tmp_path):

@@ -216,6 +216,7 @@ class RedisJobStore:
         """
         engines = normalize_engine_filter(engine)
         while True:
+            now = time.time()
             candidates: list[tuple[float, str, str]] = []
             for k in self._r.scan_iter(match=_PREFIX + "*", count=200):
                 raw = self._r.get(k)
@@ -227,6 +228,10 @@ class RedisJobStore:
                 if job.target_tier is not None and job.target_tier != claimant_tier:
                     continue
                 if engines is not None and job.engine not in engines:
+                    continue
+                # skip DEFERRED jobs (claimable_after in the future) — a capacity-blocked cold job
+                # must not be reclaimed ahead of claimable work
+                if job.claimable_after is not None and job.claimable_after > now:
                     continue
                 if job.status == JobStatus.QUEUED:
                     # Decode key to str for comparison; fakeredis may return bytes
@@ -254,6 +259,8 @@ class RedisJobStore:
                     # an engine-scoped dispatcher it no longer matches. WATCH aborts the EXEC on any such
                     # write, but re-checking keeps the guard correct even when the value is re-read here.
                     if job.target_tier is not None and job.target_tier != claimant_tier:
+                        continue
+                    if job.claimable_after is not None and job.claimable_after > now:
                         continue
                     if engines is not None and job.engine not in engines:
                         continue

@@ -59,6 +59,11 @@ class Job:
     # honored at submit when BLASTBOX_ALLOW_NETPOLICY_OVERRIDE is on; resolved fail-closed at
     # dispatch. Mirrors target_tier.
     net_policy: str | None = None
+    # Eligibility timestamp: a job is only CLAIMABLE once wall-clock >= claimable_after (None =
+    # immediately, the default). Set when a dispatcher DEFERS a job it can't run right now (e.g. a
+    # cold job with no node-budget headroom) so it moves temporarily behind claimable work WITHOUT
+    # mutating created_at (which is the submission time used for public ordering + max_queued_age).
+    claimable_after: float | None = None
     error: str | None = None
     # Per-claim ownership token: claim_next() stamps a fresh value on each QUEUED->RUNNING
     # transition; requeue clears it. Terminal/recovery writes CAS on (status, claim_id) so a
@@ -88,7 +93,8 @@ class Job:
         """Return a dict safe to expose publicly.
 
         Strips ``result_dir`` (internal server path), ``params`` (may contain
-        sensitive engine options), and ``claim_id`` (an internal ownership token),
+        sensitive engine options), ``claim_id`` (an internal ownership token),
+        and ``claimable_after`` (an internal capacity-deferral scheduling timestamp),
         and sanitizes the ``error`` field to remove internal filesystem paths.
 
         ``worker_tier`` and ``target_tier`` are INTENTIONALLY kept public: this is
@@ -101,6 +107,7 @@ class Job:
         d.pop("result_dir", None)
         d.pop("params", None)
         d.pop("claim_id", None)
+        d.pop("claimable_after", None)   # internal capacity-deferral scheduling detail
         if isinstance(d.get("error"), str):
             d["error"] = sanitize_public_error(d["error"])
         return d
@@ -122,6 +129,7 @@ class Job:
             worker_tier=d.get("worker_tier"),
             target_tier=d.get("target_tier"),
             net_policy=d.get("net_policy"),
+            claimable_after=float(d["claimable_after"]) if d.get("claimable_after") else None,
             error=d.get("error"),
             claim_id=d.get("claim_id"),
             security_warnings=(

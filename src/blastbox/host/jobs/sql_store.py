@@ -38,6 +38,7 @@ _COLUMNS = (
     "worker_tier",
     "target_tier",
     "net_policy",
+    "claimable_after",
     "error",
     "security_warnings",
     "params",
@@ -138,6 +139,7 @@ class SqlJobStore:
             worker_tier       TEXT,
             target_tier       TEXT,
             net_policy        TEXT,
+            claimable_after   DOUBLE PRECISION,
             error             TEXT,
             security_warnings TEXT,
             params            TEXT,
@@ -257,6 +259,10 @@ class SqlJobStore:
                     "worker_tier", "target_tier", "net_policy"):
             if col not in existing:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
+        # claimable_after is NUMERIC (compared against wall-clock in claim_next), not TEXT — a text
+        # column would make the Postgres `<= now` comparison a string compare.
+        if "claimable_after" not in existing:
+            conn.execute("ALTER TABLE jobs ADD COLUMN claimable_after DOUBLE PRECISION")
 
     def _try_ddl(self, stmt: str) -> bool:
         """Run one best-effort DDL statement in its OWN transaction.
@@ -585,10 +591,14 @@ class SqlJobStore:
         # claimant takes only untargeted jobs. Existing rows are NULL → unchanged behaviour.
         # `engines`: when set, restrict to `engine IN (...)`; absent = no engine filter.
         eng_clause, eng_params = self._engine_clause(engines)
+        # Eligibility: skip jobs a dispatcher DEFERRED (claimable_after in the future) so a
+        # capacity-blocked cold job doesn't get reclaimed in a loop ahead of claimable work.
+        now = time.time()
         select_sql = (
             f"SELECT {', '.join(_COLUMNS)} FROM jobs "
             f"WHERE status = {self._param} "
             f"AND (target_tier IS NULL OR target_tier = {self._param}) "
+            f"AND (claimable_after IS NULL OR claimable_after <= {self._param}) "
             f"{eng_clause}"
             f"ORDER BY created_at ASC, job_id ASC LIMIT 1"
         )
@@ -606,7 +616,7 @@ class SqlJobStore:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                select_sql, (JobStatus.QUEUED.value, claimant_tier, *eng_params)
+                select_sql, (JobStatus.QUEUED.value, claimant_tier, now, *eng_params)
             ).fetchone()
             if row is None:
                 return None
@@ -640,12 +650,14 @@ class SqlJobStore:
         # matching this claimant are eligible; claimant_tier=None ⇒ target_tier IS NULL only.
         # `engines`: when set, restrict to `engine IN (...)`; absent = no engine filter.
         eng_clause, eng_params = self._engine_clause(engines)
+        # Eligibility: skip DEFERRED jobs (claimable_after in the future) — see _claim_next_sqlite.
         sql = f"""
         WITH next_job AS (
             SELECT job_id
             FROM jobs
             WHERE status = {self._param}
             AND (target_tier IS NULL OR target_tier = {self._param})
+            AND (claimable_after IS NULL OR claimable_after <= {self._param})
             {eng_clause}
             ORDER BY created_at ASC, job_id ASC
             FOR UPDATE SKIP LOCKED
@@ -660,6 +672,7 @@ class SqlJobStore:
         params = (
             JobStatus.QUEUED.value,
             claimant_tier,
+            time.time(),
             *eng_params,
             JobStatus.RUNNING.value,
             time.time(),

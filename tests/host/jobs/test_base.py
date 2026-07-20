@@ -111,6 +111,15 @@ def test_public_dict_strips_params():
     assert "params" not in pub
 
 
+def test_public_dict_strips_claimable_after():
+    # claimable_after is an internal capacity-deferral scheduling detail — not exposed publicly,
+    # but retained in the internal dict for persistence.
+    job = Job.new(engine="e", filename="f.txt")
+    job.claimable_after = 1234.5
+    assert "claimable_after" not in job.to_public_dict()
+    assert job.to_dict().get("claimable_after") == 1234.5
+
+
 def test_public_dict_sanitizes_error():
     job = Job.new(engine="e", filename="f.txt")
     job.error = "file not found: /var/lib/blastbox/jobs/abc/input.docx"

@@ -751,10 +751,10 @@ class Dispatcher:
         # transiently overshoot, corrected next tick.
         gate = self._concurrency_gate
         if gate is not None and not gate.acquire(timeout=0.0):
-            # DEFER (bump created_at) so this capacity-blocked cold job moves BEHIND currently
-            # claimable work: claim_next() takes the oldest first, so requeuing it with its original
-            # created_at would make dispatch threads reclaim+requeue this same job in a loop while
-            # newer warm-eligible jobs never reach idle warm slots (warm-queue starvation).
+            # DEFER (set claimable_after) so this capacity-blocked cold job is temporarily
+            # INELIGIBLE: claim_next() skips it for a short window, so warm-eligible work reaches
+            # idle warm slots instead of dispatch threads reclaiming+requeuing this same job in a
+            # loop. created_at (submission time / max_queued_age) is preserved.
             self._requeue_claimed(job, reason="no cold budget headroom", defer=True)
             return
         t0 = time.monotonic()
@@ -787,10 +787,12 @@ class Dispatcher:
         started_at/worker_runtime/worker_tier are reset so it looks fresh. The staged input is
         NOT deleted — the next owner needs it (we only delete input on paths WE terminate).
 
-        ``defer`` (capacity requeue): also bump created_at to NOW so the job moves BEHIND currently
-        claimable work — claim_next() takes the oldest first, so a capacity-blocked job kept at its
-        original created_at would be reclaimed+requeued in a loop while newer claimable jobs starve.
-        Warm-miss requeues leave created_at (the cold dispatcher should take the job promptly).
+        ``defer`` (capacity requeue): set claimable_after to a short window in the future so the job
+        becomes temporarily INELIGIBLE — claim_next() skips it, so warm-eligible work reaches idle
+        warm slots instead of dispatch threads reclaiming+requeuing this same capacity-blocked cold
+        job in a loop. This does NOT touch created_at (the submission time used for public ordering
+        and max_queued_age expiry). Warm-miss requeues do not defer (the cold dispatcher should take
+        the job promptly).
 
         Then yields (backoff): dispatch_once() reports progress (a job WAS claimed), so run_forever
         loops without its poll sleep — without a pause THIS dispatcher re-claims the just-requeued
@@ -803,7 +805,8 @@ class Dispatcher:
             error=None,
         )
         if defer:
-            fields["created_at"] = time.time()      # move behind claimable work
+            # ineligible for a short window; retried once warm may have freed cold headroom.
+            fields["claimable_after"] = time.time() + max(2.0, self._warm_requeue_backoff_s)
         requeued = self._job_store.update_if_status(
             job.job_id,
             JobStatus.RUNNING,
