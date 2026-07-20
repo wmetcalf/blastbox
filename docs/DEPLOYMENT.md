@@ -180,6 +180,45 @@ Source one, add a tier slice, done. The only non-config difference between engin
 worker image (ClippyShot bakes LibreOffice+PDFium; RedTusk bakes JDK+the Tika jar). Both are
 live-proven on the `aws-ec2` disposable tier.
 
+### 4. Auto-sizing a multi-worker host (node pool autosizer)
+
+Shapes 2 and 3 hand-tune `BLASTBOX_POOL_CEILING`/`WARM_SIZE` per dispatcher. On a host that runs
+**several engines and/or several tiers**, the **node pool autosizer** instead sizes every warm pool
+from live queue demand under the host's RAM/vCPU budget — turn it on and drop the hand-tuned
+ceilings. Opt-in, OFF by default; full knob table in CONFIGURATION.md → *Node pool autosizer*. It is
+a whole-node protocol, so **every dispatcher on the host must participate with a consistent config**
+and share one dir:
+
+```sh
+# on EVERY dispatcher on the host (each warm sidecar AND the cold dispatcher):
+BLASTBOX_NODE_RESOURCE_MANAGEMENT=1              # enforce the host budget (+ _BALANCING=1 = live rebalance by backlog)
+BLASTBOX_NODE_ENGINES=clippyshot,redtusk,titanarum
+BLASTBOX_NODE_ENGINE_CLIPPYSHOT_RAM_MIB=2048     # per-slot footprint, per engine
+BLASTBOX_NODE_SHARE_DIR=/var/lib/blastbox/node   # bind-mount this into every engine stack on the host
+BLASTBOX_DISPATCH_CONCURRENCY=16                 # per dispatcher; the sizer caps the pool at this
+```
+
+The modes this unlocks on one host:
+
+- **Same engine on two tiers** (a firecracker AND a gVisor sidecar for one engine): each is a
+  distinct `(engine, tier)` pool that **shares** the host budget — they don't each size to the whole
+  node. Untargeted jobs (no pinned `target_tier`) are claimable by either tier, so the sizer counts
+  that shared queue **once** across the engine's tiers, not once per tier (no double-provisioning).
+- **The cold dispatcher is budgeted too.** The pool-less cold-only dispatcher (the break-glass /
+  overflow process from shape 2) publishes a cold-worker reservation and gets a budgeted admission
+  gate, so the warm sidecars account for its docker workers instead of handing the whole budget to
+  warm slots. A cold job that finds no headroom is **deferred** (re-queued with a `claimable_after`
+  timestamp) rather than dropped, and becomes claimable again once capacity frees.
+- **An all-local cascade is budgeted as one pool.** A cascade whose tiers are all local
+  (`BLASTBOX_POOL_TIERS=firecracker:4,gvisor:8`) is now sized like any warm pool. Declare that
+  engine's `_RAM_MIB` at the **heavier** tier's footprint — the cascade fills tiers in order and one
+  footprint prices the whole ceiling. A cascade with any **off-node** tier (aws/static/remote) is
+  left unmanaged: its off-box slots don't belong in the local budget.
+
+Validate the sizing on a real host without touching production containers with
+`examples/node_sizer_exercise.py` (fake pools, real `/proc/meminfo` budget; prints a per-check
+PASS/FAIL) and `examples/node_sizer_xnode_demo.py` (cross-host snapshot isolation).
+
 ## Egress netpolicy + `blastbox-netd` (optional)
 
 Egress is **off by default** (workers run `--network=none`). To let a worker reach the network

@@ -106,12 +106,20 @@ The default CSP (`middleware.DEFAULT_CSP`) is `default-src 'self'; script-src 's
 
 ## Node pool autosizer (opt-in)
 
-Right-sizes every node-managed warm pool (firecracker/gvisor only) on one physical host from
-live demand under the host's RAM/vCPU budget, instead of hand-tuning `BLASTBOX_POOL_CEILING`
-per engine. Runs inside `blastbox dispatch`; **OFF by default** — a node behaves exactly as
-today unless a switch below is on. Each dispatcher publishes a demand snapshot to a shared
-node dir and reads its peers', then runs the same deterministic allocation over the whole-node
-view and resizes its own pool. See `src/blastbox/host/node_sizer.py`.
+Right-sizes every node-managed pool on one physical host from live demand under the host's
+RAM/vCPU budget, instead of hand-tuning `BLASTBOX_POOL_CEILING` per engine. Runs inside
+`blastbox dispatch`; **OFF by default** — a node behaves exactly as today unless a switch below is
+on. Each dispatcher publishes a demand snapshot to a shared node dir and reads its peers', then
+runs the same deterministic allocation over the whole-node view and resizes its own pool. See
+`src/blastbox/host/node_sizer.py`.
+
+It manages **firecracker/gvisor** warm pools, the **pool-less cold-only dispatcher** (which
+publishes a cold-worker reservation + gets a budgeted admission gate), and an **all-local cascade**
+(a `BLASTBOX_POOL_TIERS` cascade whose tiers are all fc/gvisor — a cascade with any off-node tier
+stays unmanaged). The same engine on two tiers is two `(engine, tier)` pools that **share** the
+budget, and their shared **untargeted** backlog (jobs with no pinned `target_tier`, claimable by
+either tier) is counted **once** across the tiers rather than once per tier. Worked multi-worker /
+multi-tier examples: DEPLOYMENT.md → *Auto-sizing a multi-worker host*.
 
 **Node-wide participation is required.** The budget is only honored if **every** dispatcher on a
 host participates with a **consistent** config. Coordination is a whole-node protocol: the plan
