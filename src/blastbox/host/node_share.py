@@ -127,19 +127,17 @@ class FileNodeShare:
         existed = self._dir.exists()
         self._dir.mkdir(parents=True, exist_ok=True)
         if not existed:
-            # We just AUTO-created the dir. Dispatchers for different engines can run under
-            # DIFFERENT UIDs; each must be able to create its own `<identity>.json`. A dir made
-            # under the default umask (0755) would let peers READ but not WRITE, so every
-            # other-UID peer's publish would fail and it would fall back to static sizing while
-            # THIS process sees only itself and allocates the whole node budget. Make it sticky
-            # world-writable (0o1777, /tmp semantics): any peer can create its own file, the
-            # sticky bit stops one peer unlinking another's (GC already tolerates a failed
-            # unlink), and each owner can always rewrite/remove its own snapshot.
-            #
-            # If an operator PRE-PROVISIONED the dir (the trust-sensitive path in the module
-            # docstring — tight per-owner perms on a mounted dir), we leave its perms untouched.
+            # We just AUTO-created the dir. Snapshots are UNAUTHENTICATED (see the trust model in
+            # the module docstring), so the write surface MUST stay inside the dispatcher trust
+            # domain — a world-writable dir would let any local UID publish a fake snapshot (a tiny
+            # budget or a huge reservation) and force every real pool to its baseline. So make it
+            # GROUP-writable, not world-writable (0o0770): dispatchers running under different UIDs
+            # but a shared dispatcher GROUP can each create their own `<identity>.json`, while
+            # untrusted local users cannot. Deployments whose dispatchers do NOT share a group must
+            # PRE-PROVISION the dir with a dispatcher-only group/ACL (documented) — we never widen
+            # to the world. If an operator pre-provisioned it, we left its perms untouched above.
             try:
-                os.chmod(self._dir, 0o1777)
+                os.chmod(self._dir, 0o0770)
             except OSError:
                 pass
 

@@ -43,20 +43,18 @@ def test_file_share_roundtrip_and_staleness(tmp_path):
     assert {s.engine for s in share.read_all(max_age_s=20, now=130.0)} == set()
 
 
-def test_auto_created_share_dir_is_writable_by_cross_uid_peers(tmp_path):
-    # regression (PR #60 codex P2): when FileNodeShare AUTO-creates the dir and dispatchers run
-    # under different UIDs, a default-umask dir (0755) lets peers READ but not create their own
-    # <identity>.json → their publish fails, they fall back to static sizing, and the first
-    # dispatcher sees only itself and allocates the WHOLE node budget. An auto-created dir must
-    # be sticky world-writable (0o1777, /tmp semantics) so any peer UID can publish.
+def test_auto_created_share_dir_is_group_writable_not_world(tmp_path):
+    # regression (PR #60 codex P1): an auto-created share must let a peer under a DIFFERENT UID (but
+    # the same dispatcher GROUP) publish its own <identity>.json — but must NOT be world-writable,
+    # since snapshots are unauthenticated and any local UID could otherwise publish a poisoned one.
     import os
     import stat
     d = tmp_path / "share-auto"
     assert not d.exists()
     FileNodeShare(str(d))
     mode = stat.S_IMODE(os.stat(d).st_mode)
-    assert mode & 0o002, f"auto-created share dir not world-writable: {oct(mode)}"
-    assert mode & stat.S_ISVTX, f"auto-created share dir missing sticky bit: {oct(mode)}"
+    assert mode & 0o070 == 0o070, f"auto-created share dir not group-writable: {oct(mode)}"
+    assert not (mode & 0o007), f"auto-created share dir must NOT be world-accessible: {oct(mode)}"
 
 
 def test_preprovisioned_share_dir_perms_left_untouched(tmp_path):
@@ -1047,6 +1045,60 @@ def test_node_namespaced_files_dont_collide_across_hosts(tmp_path):
     assert names == ["clip@hostA.json", "clip@hostB.json"]     # no collision
     seen = {(s.node, s.backlog) for s in share.read_all(max_age_s=60, now=1.0)}
     assert seen == {("hostA", 3), ("hostB", 9)}                # both survive
+
+
+def test_shared_backlog_split_across_replicas(tmp_path):
+    # PR #60 codex P2: two replicas of the same engine+tier drain the SAME queue, so each reporting
+    # the full backlog doubles that engine's demand. Split it: clip (2 replicas, backlog 10 each)
+    # and red (1 pool, backlog 10) should get EQUAL total shares, not clip 2×.
+    share = FileNodeShare(str(tmp_path))
+    # a clip replica peer + a red peer, all backlog 10, on the same node.
+    share.publish(DemandSnapshot("clip", 10, 0, 1024, 1, 0, 64, 1.0, ts=1.0, node="n",
+                                 tier="firecracker", instance="c2"))
+    share.publish(DemandSnapshot("red", 10, 0, 1024, 1, 0, 64, 1.0, ts=1.0, node="n",
+                                 tier="firecracker", instance="r1"))
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    pool = _Pool()
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64), pool, share,
+                         cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 10, node="n",
+                         instance="c1", capacity_fn=_budget(12 * 1024, 999), clock=lambda: 1.0)
+    ds.tick()
+    # THIS clip replica gets ~a quarter of the budget (clip's half, split over 2 replicas), i.e.
+    # roughly half of red's share — NOT an equal-to-red share that would double clip's engine total.
+    assert pool.concurrent_ceiling <= 5           # not the ~8 it'd take if the backlog weren't split
+
+
+def test_fail_closed_when_view_cannot_be_read(tmp_path):
+    # PR #60 codex P1: if PUBLISH works but the READ/list of the share fails, the dispatcher never
+    # sees peers reclaiming its share and would hold a stale ceiling. Fail closed on lost visibility
+    # (we can't read our own snapshot back), not just on publish failure.
+    class _WriteOnlyShare:
+        def publish(self, snap):
+            pass                                   # writes "succeed"...
+
+        def read_all(self, *, max_age_s, now):
+            raise OSError("cannot list share")     # ...but the view can't be read
+
+        def remove(self, snap):
+            pass
+
+    cfg = NodeConfig(balancing=True, resource_management=True, stale_after_s=1.0,
+                     ram_headroom_frac=1.0, vcpu_oversubscription=999)
+    pool = _Pool()
+    pool.resize(warm_size=6, concurrent_ceiling=6)         # grew earlier
+    ticks = {"n": 0}
+
+    def clock():
+        ticks["n"] += 1
+        return ticks["n"] * 10.0                           # advances past the 1s window
+
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8, min_warm=1),
+                         pool, _WriteOnlyShare(), cfg, runtime=RUNTIME_FIRECRACKER,
+                         backlog_fn=lambda: 5, node="n", instance="i",
+                         capacity_fn=_budget(8 * 1024, 999), clock=clock)
+    ds.run(max_ticks=2, sleep=lambda _s: None)
+    assert pool.concurrent_ceiling == 1                    # floored — lost visibility, not held at 6
 
 
 def test_slow_backlog_count_does_not_trigger_fail_closed(tmp_path):

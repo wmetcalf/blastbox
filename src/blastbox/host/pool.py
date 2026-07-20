@@ -276,6 +276,7 @@ class WarmPool:
         in-flight spawn returns within one poll."""
         if stop_timeout_s is None:
             stop_timeout_s = self._default_stop_budget()
+        thread_wedged = False        # a spawn still in flight past the timeout — an untracked orphan
         self._stop_event.set()
         if self._thread is not None:
             # Fast path returns immediately when the daemon has already exited (no spawn in flight).
@@ -288,6 +289,7 @@ class WarmPool:
             if self._thread.is_alive():
                 logger.warning("pool.stop: background thread still running after %.0fs (wedged spawn?) — "
                                "proceeding; an in-flight cloud slot may leak until its TTL", stop_timeout_s)
+                thread_wedged = True
             self._thread = None
 
         # Reap every slot regardless of state. Pop each ONLY after a successful reap: if reap RAISES
@@ -315,9 +317,11 @@ class WarmPool:
                         self._slots.pop(slot.slot_id, None)
 
         # Whatever remains in _slots failed to reap (or is owned by another thread mid-dispose) —
-        # a still-live VM the caller must keep reserving for. Return the count.
+        # a still-live VM the caller must keep reserving for. A wedged background thread means an
+        # in-flight spawn that isn't in _slots yet but may still complete into a live worker, so
+        # count it as one more orphan too — the caller must hold the reservation for it.
         with self._lock:
-            return len(self._slots)
+            return len(self._slots) + (1 if thread_wedged else 0)
 
     # ------------------------------------------------------------------
     # Public interface

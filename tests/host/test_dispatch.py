@@ -2045,3 +2045,51 @@ def test_cold_dispatch_acquires_and_releases_gate_permit(tmp_path):
     assert dispatcher.dispatch_once() is True
     assert store.get(job.job_id).status == JobStatus.DONE
     assert gate.in_flight == 0                   # permit taken for the run, then released
+
+
+def test_cold_permit_retained_when_container_kill_fails(tmp_path):
+    # PR #60 codex P1: when a timed-out cold worker's `docker kill` fails, the container may still
+    # run; releasing the gate permit would let another cold worker stack on the orphan and exceed
+    # the node budget. The permit must be RETAINED until cleanup is confirmed.
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+
+    def runner(argv, **kw):
+        if "kill" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "kill failed")   # kill FAILS (rc!=0)
+        raise subprocess.TimeoutExpired(argv, kw.get("timeout"))             # worker times out
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=runner)
+    gate = DynamicConcurrencyGate(2)
+    dispatcher._concurrency_gate = gate
+
+    assert dispatcher.dispatch_once() is True
+    assert gate.in_flight == 1                    # permit RETAINED (orphan may still consume RAM)
+
+
+def test_cold_permit_released_when_kill_confirms(tmp_path):
+    # the flip side: a confirmed kill (rc 0) releases the permit as normal.
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+
+    def runner(argv, **kw):
+        if "kill" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")             # kill CONFIRMED
+        raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=runner)
+    gate = DynamicConcurrencyGate(2)
+    dispatcher._concurrency_gate = gate
+
+    assert dispatcher.dispatch_once() is True
+    assert gate.in_flight == 0                    # confirmed gone → permit released

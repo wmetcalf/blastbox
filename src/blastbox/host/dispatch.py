@@ -748,11 +748,22 @@ class Dispatcher:
             self._requeue_claimed(job, reason="no cold budget headroom")
             return
         t0 = time.monotonic()
+        orphaned: list[bool] = []          # set by _dispatch_inner iff a timeout kill FAILED
         try:
-            self._dispatch_inner(job, input_path, output_dir)
+            self._dispatch_inner(job, input_path, output_dir, orphan_out=orphaned)
         finally:
-            if gate is not None:
+            # RELEASE the cold permit only when the worker is CONFIRMED gone. If a timed-out
+            # container's `docker kill` failed, it may still be running and holding node RAM;
+            # releasing the permit would let another cold worker be admitted on top of the orphan,
+            # accumulating past the budget across repeated failures. Keep the permit (a bounded
+            # capacity cost) so the reservation stays until the container actually dies / a sweep
+            # reaps it.
+            if gate is not None and not orphaned:
                 gate.release()
+            elif gate is not None:
+                _log.warning("cold worker cleanup unconfirmed for job_id=%s (docker kill failed) — "
+                             "retaining the concurrency permit so no worker stacks on the orphan",
+                             job.job_id)
             # Delete the malicious input on every terminal path WE own, regardless of success,
             # failure, exception, or unknown engine. We never touch output/ here.
             self._delete_input_if_owned(job, input_path)
@@ -1076,7 +1087,8 @@ class Dispatcher:
             self._pool.release(slot, dirty=not warm_clean)  # type: ignore[union-attr]  # non-None here
 
     def _dispatch_inner(
-        self, job: Job, input_path: Path, output_dir: Path
+        self, job: Job, input_path: Path, output_dir: Path,
+        orphan_out: list[bool] | None = None,
     ) -> None:
         """Core dispatch logic.  Called from within the try/finally."""
 
@@ -1384,8 +1396,10 @@ class Dispatcher:
                 timeout=self._worker_timeout_s,
             )
         except subprocess.TimeoutExpired:
-            # Best-effort kill of the stuck container.
-            self._kill_container(container_name)
+            # Kill the stuck container. If the kill is NOT confirmed, flag a possible orphan so the
+            # caller keeps its cold-permit reservation (the container may still hold node RAM).
+            if not self._kill_container(container_name) and orphan_out is not None:
+                orphan_out.append(True)
             self._fail_job(job, f"worker timed out after {self._worker_timeout_s}s")
             return
         except Exception as exc:  # noqa: BLE001
@@ -1898,10 +1912,13 @@ class Dispatcher:
             except Exception:  # noqa: BLE001
                 _log.exception("retention sweep failed")
 
-    def _kill_container(self, container_name: str) -> None:
-        """Best-effort ``docker kill`` on a timed-out worker."""
+    def _kill_container(self, container_name: str) -> bool:
+        """``docker kill`` a timed-out worker. Returns True only if the container is CONFIRMED
+        stopped (kill returned 0), False if the kill failed / errored / timed out — in which case
+        the container may still be running and holding node RAM, so the caller must keep its
+        reservation (not free the cold permit) until a later sweep confirms cleanup."""
         try:
-            self._subprocess_runner(
+            proc = self._subprocess_runner(
                 ["docker", "kill", container_name],
                 capture_output=True,
                 text=True,
@@ -1909,7 +1926,8 @@ class Dispatcher:
                 timeout=10,
             )
         except Exception:  # noqa: BLE001
-            pass
+            return False
+        return getattr(proc, "returncode", 1) == 0
 
     def _list_active_worker_job_ids(self) -> set[str] | None:
         """Query docker ps for worker containers and return their job IDs.

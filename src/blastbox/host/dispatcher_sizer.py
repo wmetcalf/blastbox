@@ -110,7 +110,9 @@ class DispatcherSizer:
         self._stop_event: Optional[threading.Event] = None  # set in run(); fences the update-publish
         self._warned_mixed_nodes = False      # one-shot: warn on an inconsistent node-id view
         self._warned_mixed_modes = False      # one-shot: warn on mixed balancing modes on a node
-        self._last_publish_ok = 0.0           # clock of the last successful publish (fail-closed timer)
+        self._last_view_ok = 0.0              # clock of the last tick that CONFIRMED we're visible
+                                              # (published AND read our own snapshot back) — the
+                                              # fail-closed timer, covering both write and read loss
 
     def _active(self) -> bool:
         cfg = self._config
@@ -249,7 +251,6 @@ class DispatcherSizer:
         if self._stop_event is not None and self._stop_event.is_set():
             return None
         self._share.publish(_snapshot(self._last_backlog, started))
-        self._last_publish_ok = started        # peers can see us → clears the fail-closed timer
         backlog = max(0, int(self._backlog_fn()))                    # the possibly-slow count
         self._last_backlog = backlog
         now = self._clock()
@@ -259,9 +260,6 @@ class DispatcherSizer:
         # phantom after the count returns.
         if self._stop_event is None or not self._stop_event.is_set():
             self._share.publish(_snapshot(backlog, now))
-            self._last_publish_ok = now        # advance PAST the (possibly slow) count — else a
-                                               # count longer than stale_after_s would make run()
-                                               # fail-closed to the floor after every good tick
         # Effective staleness widens by the measured tick cost: the real publish period is
         # interval + tick_time, so a slow count (huge shared store) must not age peers out
         # and collapse every engine to "sees only itself" → node oversubscription. Use the
@@ -278,6 +276,14 @@ class DispatcherSizer:
         snaps = [s for s in self._share.read_all(max_age_s=max_age, now=now)
                  if s.node == "" or self._node == "" or s.node == self._node]
         self._last_tick_dur = max(0.0, self._clock() - started)
+        # CONFIRM we're visible to the node: we published our snapshot moments ago, so a working
+        # view MUST read it back. Seeing ourselves proves BOTH the write AND the read/list path
+        # work — the fail-closed timer in run() keys on this, so a dispatcher that can still PUBLISH
+        # but has lost the ability to READ the share (so it never notices peers reclaiming its
+        # share) still shrinks instead of holding a stale ceiling that later bursts.
+        mine_key = _pool_key(e.name, self._runtime, self._instance)
+        if any(_pool_key(s.engine, s.tier, s.instance) == mine_key for s in snaps):
+            self._last_view_ok = now
         if not snaps:
             return None
         # The node filter is symmetric (so a single host's partial node-id config still
@@ -320,6 +326,16 @@ class DispatcherSizer:
                 "using STATIC allocation for all (the safe consensus) to avoid oversubscribing "
                 "the node budget; set a CONSISTENT balancing mode on every dispatcher of a node.",
                 self._engine.name, sorted(peer_modes))
+        # REPLICAS of the same (engine, tier) drain the SAME tier-scoped queue, so each reports the
+        # WHOLE backlog as its own — 10 queued jobs across 2 replicas look like demand 20, doubling
+        # that engine's share vs unrelated pools and warming each replica for all 10. Split the
+        # shared backlog across the replicas draining it (by identical engine+tier), so the engine's
+        # TOTAL backlog demand is counted once. Failover-safe: if a replica drops, the next tick
+        # sees fewer replicas and each recomputes a larger share. (assigned is per-pool — the
+        # replica's own residency — so it is NOT divided.)
+        replicas: dict[tuple[str, str], int] = {}
+        for s in snaps:
+            replicas[(s.engine, s.tier)] = replicas.get((s.engine, s.tier), 0) + 1
         specs = [
             PoolSpec(
                 # key each pool by (engine, tier, instance): the same engine on two node-
@@ -329,8 +345,10 @@ class DispatcherSizer:
                 # what THIS dispatcher looks up for itself below.
                 name=_pool_key(s.engine, s.tier, s.instance),
                 slot_ram_mib=s.slot_ram_mib, slot_vcpus=s.slot_vcpus,
-                # ceiling water-fill: by live backlog (balancing) or the static weight share.
-                demand=float(s.backlog + s.assigned) if balancing else float(s.weight),
+                # ceiling water-fill: by live backlog (balancing, split across same-queue replicas)
+                # or the static weight share.
+                demand=(s.backlog / replicas[(s.engine, s.tier)] + s.assigned) if balancing
+                else float(s.weight),
                 min_warm=s.min_warm, max_ceiling=s.max_ceiling,
                 # the pool's published reservation (resident warm + cold in flight) is a HARD
                 # ceiling floor — a peer must not be handed slots this pool is still running.
@@ -444,8 +462,8 @@ class DispatcherSizer:
     def run(self, *, stop: Optional[threading.Event] = None, max_ticks: Optional[int] = None,
             sleep: Callable[[float], None] = time.sleep) -> None:
         self._stop_event = stop               # so tick() can fence its update-publish on stop
-        self._last_publish_ok = self._clock()  # grace baseline: assume visible until proven otherwise
-        warned_unpublished = False
+        self._last_view_ok = self._clock()     # grace baseline: assume visible until proven otherwise
+        warned_invisible = False
         n = 0
         try:
             while not (stop is not None and stop.is_set()):
@@ -455,22 +473,23 @@ class DispatcherSizer:
                     logging.getLogger("blastbox.node_sizer").warning(
                         "node self-sizer tick failed for %s (continuing)", self._engine.name,
                         exc_info=True)
-                # FAIL CLOSED if we can no longer PUBLISH (permission change, broken bind mount,
-                # full disk): once we've been unpublished longer than the staleness window, peers
-                # have expired our snapshot and reallocated our share — yet our pool is still live
-                # and consuming node RAM. Shrink to the floor so we stop oversubscribing. Recovers
-                # automatically: the next successful publish clears the timer and the tick after it
-                # re-sizes from the live view.
-                if self._clock() - self._last_publish_ok > self._config.stale_after_s:
-                    if not warned_unpublished:
-                        warned_unpublished = True
+                # FAIL CLOSED if we can no longer confirm we're VISIBLE to the node — either the
+                # PUBLISH fails (permission change, broken bind mount, full disk) OR the READ/list
+                # fails (we can still write but no longer see the share, so we'd never notice peers
+                # reclaiming our share). Once we haven't read our own snapshot back for longer than
+                # the staleness window, peers have reallocated our share while our pool is still
+                # live — shrink to the floor so we stop oversubscribing. Recovers automatically: the
+                # next tick that reads itself back clears the timer and re-sizes from the live view.
+                if self._clock() - self._last_view_ok > self._config.stale_after_s:
+                    if not warned_invisible:
+                        warned_invisible = True
                         logging.getLogger("blastbox.node_sizer").warning(
-                            "node self-sizer for %s could not publish for > the staleness window — "
-                            "peers have reclaimed our share; shrinking the pool to its floor to "
-                            "avoid oversubscribing until publication recovers.", self._engine.name)
+                            "node self-sizer for %s could not confirm visibility (publish or read) "
+                            "for > the staleness window — peers may have reclaimed our share; "
+                            "shrinking the pool to its floor until it recovers.", self._engine.name)
                     self._size_to_floor()
                 else:
-                    warned_unpublished = False
+                    warned_invisible = False
                 n += 1
                 if max_ticks is not None and n >= max_ticks:
                     return

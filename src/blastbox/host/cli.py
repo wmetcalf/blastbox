@@ -495,6 +495,12 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
                 # opt-in keeps legacy lazy-drain behavior, not eager surplus reaping.
                 pool.resize(warm_size=pre_shrunk[0], concurrent_ceiling=pre_shrunk[1],
                             mark_autosized=False)
+                # The synchronous first tick may have already lowered the gate to the autosizer's
+                # cold limit (~1) before setup rolled back; restore it to the operator's dispatch
+                # concurrency so an aborted opt-in doesn't leave the dispatcher throttled to 1 cold
+                # job until restart.
+                if concurrency_gate is not None:
+                    concurrency_gate.set_limit(dispatch_concurrency)
             except Exception:
                 logging.getLogger("blastbox.host.cli").warning(
                     "node self-sizer: could not restore pool after skipped sizing", exc_info=True)

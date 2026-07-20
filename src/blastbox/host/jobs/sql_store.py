@@ -222,7 +222,11 @@ class SqlJobStore:
             import psycopg  # type: ignore[import-not-found]
 
             # Dedicated autocommit connection, opened and closed here — leaves the pool untouched.
-            with self._lock, psycopg.connect(self._database_url, autocommit=True) as conn:
+            # Do NOT hold self._lock: the whole point of backgrounding this is to keep startup and
+            # every job read/claim/write responsive; grabbing the instance-wide lock for the full
+            # CREATE INDEX CONCURRENTLY would block them all until the build finishes. The dedicated
+            # connection shares no state with the pooled ones, so it needs no instance lock.
+            with psycopg.connect(self._database_url, autocommit=True) as conn:
                 # A CONCURRENTLY build that was cancelled / deadlocked / crashed leaves an INVALID
                 # index of the same name behind. CREATE INDEX ... IF NOT EXISTS would then see the
                 # name and SKIP forever, so the best-effort init never heals and autosizer counts
