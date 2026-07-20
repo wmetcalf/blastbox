@@ -208,6 +208,16 @@ class SqlJobStore:
         if self._driver != "postgres" or self._pool is None:
             self._try_ddl(f"CREATE INDEX IF NOT EXISTS {stmt_tail}")
             return
+        # On a large existing jobs table CREATE INDEX CONCURRENTLY can take a long time, and while
+        # CONCURRENTLY lets OTHER sessions keep writing, it is NOT async for THIS connection — so
+        # awaiting it here would block every SqlJobStore construction (dispatcher / API startup),
+        # even when node autosizing is off. Run this best-effort optimization in a background daemon
+        # thread so startup returns immediately; a slow build just means slower autosizer COUNTs
+        # until it lands.
+        threading.Thread(target=self._build_jobs_index_pg, args=(index_name, stmt_tail),
+                         name="bb-jobs-index-build", daemon=True).start()
+
+    def _build_jobs_index_pg(self, index_name: str, stmt_tail: str) -> None:
         try:
             import psycopg  # type: ignore[import-not-found]
 

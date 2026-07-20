@@ -152,13 +152,17 @@ class DispatcherSizer:
         return NodeBudget(ram_mib=budget.ram_mib * self._budget_scale, vcpus=budget.vcpus)
 
     def _size_to_floor(self) -> "PoolSize":
-        """Fail-closed sizing: hold the pool at its warm floor and never grow. Used when the node
-        view is globally inconsistent (mixed node ids) so no local plan can be made safe — every
-        affected dispatcher floors identically, so none over-allocates while the pool still serves
-        at its min_warm floor until the operator fixes the config."""
+        """Fail-closed sizing: shrink to the genuinely minimal viable target and never grow. Used
+        when the node view is globally inconsistent (mixed node ids) so no local plan can be made
+        safe. The floor is ONE slot — the same 1-per-engine baseline plan_sizes uses — NOT the
+        configured min_warm: with an inconsistent view a dispatcher can't know how many peers
+        exist, so honouring a big min_warm (e.g. 8) would let N dispatchers each resize to 8 and
+        oversubscribe the very node this branch is protecting. Ceiling 1 / warm ≤ 1 is the safest
+        each can pick independently (matches the undersized-node baseline) until the operator sets
+        a consistent BLASTBOX_NODE_ID."""
         e = self._engine
-        ceiling = max(1, e.min_warm)
-        warm = min(e.min_warm, ceiling)
+        ceiling = 1
+        warm = 1 if e.min_warm >= 1 else 0
         if hasattr(self._pool, "resize"):
             self._pool.resize(  # type: ignore[attr-defined]
                 warm_size=warm, concurrent_ceiling=ceiling)
@@ -255,6 +259,9 @@ class DispatcherSizer:
         # phantom after the count returns.
         if self._stop_event is None or not self._stop_event.is_set():
             self._share.publish(_snapshot(backlog, now))
+            self._last_publish_ok = now        # advance PAST the (possibly slow) count — else a
+                                               # count longer than stale_after_s would make run()
+                                               # fail-closed to the floor after every good tick
         # Effective staleness widens by the measured tick cost: the real publish period is
         # interval + tick_time, so a slow count (huge shared store) must not age peers out
         # and collapse every engine to "sees only itself" → node oversubscription. Use the
@@ -388,18 +395,25 @@ class DispatcherSizer:
                 self._gate.set_limit(cold_permits)  # type: ignore[attr-defined]
         return mine
 
-    def publish_orphan_lease(self, reserved: int) -> None:
+    def publish_orphan_lease(self, warm_orphans: int, cold_inflight: int = 0) -> None:
         """On shutdown with UNREAPED resources (a warm VM whose destroy failed, or a cold worker
-        the bounded join abandoned), re-publish a FINAL snapshot reserving `reserved` slots with an
-        EXTENDED lifetime, so peers keep honoring the reservation well past the normal staleness
+        the bounded join abandoned), re-publish a FINAL snapshot reserving what's still running with
+        an EXTENDED lifetime, so peers keep honoring the reservation well past the normal staleness
         window. A managed Firecracker guest has NO idle TTL (it waits for the host reaper), so a
         failed reap can consume RAM long after 20s; leasing to the reader's GC floor (~5 min, the
         max a reader will honor) shrinks that oversubscription window. Best-effort — a truly
-        permanent orphan needs an external reaper / runtime watchdog (a tracked follow-on)."""
+        permanent orphan needs an external reaper / runtime watchdog (a tracked follow-on).
+
+        Cold workers are priced in WARM-SLOT EQUIVALENTS (the same conversion _reservation() uses),
+        since a hung 4 GiB cold worker on a 2 GiB slot must reserve 2 units or peers reallocate the
+        missing RAM for the whole lease."""
         e = self._engine
+        cold_ram = self._cold_slot_ram_mib or e.slot_ram_mib
+        cold_units = (cold_ram / e.slot_ram_mib) if e.slot_ram_mib > 0 else 1.0
+        reserved = max(0, int(warm_orphans)) + math.ceil(max(0, int(cold_inflight)) * cold_units)
         try:
             self._share.publish(DemandSnapshot(
-                engine=e.name, backlog=0, assigned=max(0, int(reserved)),
+                engine=e.name, backlog=0, assigned=reserved,
                 slot_ram_mib=e.slot_ram_mib, slot_vcpus=e.slot_vcpus, min_warm=e.min_warm,
                 max_ceiling=e.max_ceiling, weight=e.weight, ts=self._clock(), node=self._node,
                 tier=self._runtime, instance=self._instance, refresh_s=0.0,

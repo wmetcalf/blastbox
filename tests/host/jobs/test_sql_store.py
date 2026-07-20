@@ -344,7 +344,9 @@ def test_ensure_jobs_indexes_uses_dedicated_conn_not_pool(monkeypatch):
     store._database_url = "postgresql://u@h/db"
     store._lock = threading.RLock()
 
-    store._ensure_jobs_indexes()   # must not raise (pool would AssertionError if touched)
+    # call the synchronous worker directly (the PG path now runs in a background thread)
+    store._build_jobs_index_pg("idx_jobs_status_engine_tier",
+                               "idx_jobs_status_engine_tier ON jobs (status, engine, target_tier)")
 
     assert calls["autocommit"] is True
     assert calls["dsn"] == "postgresql://u@h/db"
@@ -387,7 +389,8 @@ def test_ensure_jobs_indexes_rebuilds_invalid_index(monkeypatch):
     store._database_url = "postgresql://u@h/db"
     store._lock = threading.RLock()
 
-    store._ensure_jobs_indexes()
+    store._build_jobs_index_pg("idx_jobs_status_engine_tier",
+                               "idx_jobs_status_engine_tier ON jobs (status, engine, target_tier)")
 
     joined = " | ".join(executed)
     assert "DROP INDEX CONCURRENTLY" in joined          # invalid index dropped...

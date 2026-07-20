@@ -82,14 +82,16 @@ def test_mixed_node_ids_fail_closed_to_floor(tmp_path):
     pool = _Pool()
     cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
                      vcpu_oversubscription=999, stale_after_s=60)
-    # THIS dispatcher is TAGGED "n" → its view is {n(self), ""(peer)} = mixed identities.
-    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64, min_warm=1),
+    # THIS dispatcher is TAGGED "n" → its view is {n(self), ""(peer)} = mixed identities. A LARGE
+    # min_warm (8) must NOT be honored as the floor: with an inconsistent view the dispatcher can't
+    # know how many peers exist, so N pools each flooring to 8 would oversubscribe the very node
+    # this branch protects. The safe floor is ONE slot (the plan_sizes baseline).
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64, min_warm=8),
                          pool, share, cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 30,
                          node="n", instance="c", capacity_fn=_budget(10 * 1024, 999),
                          clock=lambda: 1.0)
     mine = ds.tick()
-    # floored to min_warm — NOT grown to a big share despite the deep backlog + 10-slot budget.
-    assert mine.warm_size == 1 and mine.concurrent_ceiling == 1
+    assert mine.warm_size == 1 and mine.concurrent_ceiling == 1   # ceiling 1, NOT min_warm=8
     assert pool.concurrent_ceiling == 1
 
 
@@ -1045,6 +1047,43 @@ def test_node_namespaced_files_dont_collide_across_hosts(tmp_path):
     assert names == ["clip@hostA.json", "clip@hostB.json"]     # no collision
     seen = {(s.node, s.backlog) for s in share.read_all(max_age_s=60, now=1.0)}
     assert seen == {("hostA", 3), ("hostB", 9)}                # both survive
+
+
+def test_slow_backlog_count_does_not_trigger_fail_closed(tmp_path):
+    # PR #60 codex P2 (regression in the fail-closed fix): a backlog count slower than stale_after_s
+    # must NOT make run() shrink the pool to its floor after an otherwise-successful tick. The
+    # post-count update publish advances _last_publish_ok past the count, so the fail-closed timer
+    # doesn't fire on a healthy-but-slow tick.
+    share = FileNodeShare(str(tmp_path))
+    cfg = NodeConfig(balancing=True, resource_management=True, stale_after_s=1.0,
+                     ram_headroom_frac=1.0, vcpu_oversubscription=999)
+    t = {"v": 0.0}
+
+    def clock():
+        return t["v"]
+
+    def slow_count():
+        t["v"] += 100.0                          # the count takes 100s, >> stale_after_s=1
+        return 5
+
+    pool = _Pool()
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8, min_warm=1),
+                         pool, share, cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=slow_count,
+                         node="n", instance="i", capacity_fn=_budget(8 * 1024, 999), clock=clock)
+    ds.run(max_ticks=1, sleep=lambda _s: None)
+    assert pool.concurrent_ceiling > 1           # sized from the successful publish, NOT floored
+
+
+def test_publish_orphan_lease_prices_cold_workers(tmp_path):
+    # PR #60 codex P1: the orphan lease must price hung COLD workers in warm-slot equivalents too.
+    share = FileNodeShare(str(tmp_path))
+    cfg = NodeConfig(balancing=True, resource_management=True, stale_after_s=20.0)
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=2048, max_ceiling=8), _Pool(), share,
+                         cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 0, node="n",
+                         instance="i", clock=lambda: 1000.0, cold_slot_ram_mib=4096)
+    ds.publish_orphan_lease(1, 2)                 # 1 warm orphan + 2 cold @ 2x footprint
+    mine = next(s for s in share.read_all(max_age_s=20.0, now=1100.0) if s.engine == "clip")
+    assert mine.assigned == 1 + 2 * 2            # warm 1 + cold 2×(4096/2048) = 5
 
 
 def test_publish_orphan_lease_extends_reservation_lifetime(tmp_path):

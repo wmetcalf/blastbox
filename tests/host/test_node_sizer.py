@@ -222,6 +222,22 @@ def test_from_env_rejects_non_finite_intervals(monkeypatch):
     assert _m.isfinite(c.min_free_mib)
 
 
+def test_from_env_clamps_published_stale_after_to_reader_bound(monkeypatch):
+    # PR #60 codex P2: stale_after_s is now PUBLISHED, so a huge finite value (1e100) that _float
+    # accepts would be REJECTED by node_share._valid (> _MAX_TS) → snapshot dropped → pool stays
+    # throttled. Clamp to the reader's honored lifetime cap (300s) so the snapshot always validates.
+    from blastbox.host.node_config import NodeConfig, _MAX_STALE_AFTER_S
+    from blastbox.host.node_share import DemandSnapshot, _valid
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")
+    monkeypatch.setenv("BLASTBOX_NODE_STALE_AFTER_S", "1e100")
+    c = NodeConfig.from_env()
+    assert c.stale_after_s <= _MAX_STALE_AFTER_S == 300.0
+    # a snapshot carrying this stale_after must PASS the reader's validation (not be dropped)
+    snap = DemandSnapshot("clip", 1, 0, 1024, 1, 0, 64, 1.0, ts=1.0, node="n",
+                          tier="firecracker", instance="i", stale_after_s=c.stale_after_s)
+    assert _valid(snap)
+
+
 def test_from_env_clamps_huge_finite_interval_to_time_t_safe(monkeypatch):
     # regression (PR #60 codex P2): a finite-but-huge interval (e.g. 1e10) PASSES the non-finite
     # guard, then OverflowError-s in stop.wait()/time.sleep() ("timestamp out of range for

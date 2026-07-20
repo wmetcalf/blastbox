@@ -45,6 +45,9 @@ _SAFE_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 #     (150s) so refresh_s ≈ interval always fits within the lifetime with a beat to spare — a
 #     150s heartbeat is already very long (default 5s), and it's safely within time_t.
 _MAX_INTERVAL_S = 150.0
+# Max published staleness window — the reader's GC floor (node_share._GC_AGE_FLOOR_S), the
+# longest lifetime any reader honors; a larger value is pointless and, if huge, fails _valid.
+_MAX_STALE_AFTER_S = 300.0
 
 
 def _is_safe_slug(s: str) -> bool:
@@ -201,9 +204,13 @@ class NodeConfig:
         # last allocation and peers eventually expire its snapshot and reallocate. A day is
         # already absurd for a heartbeat and safely within time_t.
         interval_s = _clamp(_float("BLASTBOX_NODE_INTERVAL_S", 5.0), 0.5, _MAX_INTERVAL_S)
-        # stale_after_s only feeds mtime staleness comparison (never wait()/sleep()), so it needs
-        # no time_t cap — but it MUST stay >= 2*interval or peers age out every tick.
-        stale_after_s = max(_float("BLASTBOX_NODE_STALE_AFTER_S", 20.0), interval_s * 2.0)
+        # stale_after_s must stay >= 2*interval (or peers age out every tick) AND <= the lifetime a
+        # reader will actually honor. It's now PUBLISHED, so an unclamped huge value (e.g. 1e100)
+        # would be REJECTED by node_share._valid and the snapshot silently dropped → the pool stays
+        # throttled at warm-0/ceiling-1. Cap at the reader's GC floor (300s) — the max lifetime
+        # honored anyway. interval <= 150 keeps the 2*interval lower bound within that cap.
+        stale_after_s = min(
+            max(_float("BLASTBOX_NODE_STALE_AFTER_S", 20.0), interval_s * 2.0), _MAX_STALE_AFTER_S)
         adaptive = _bool("BLASTBOX_NODE_ADAPTIVE", False)
         return cls(
             engines=tuple(engines),

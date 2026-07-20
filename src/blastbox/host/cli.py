@@ -528,7 +528,7 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
                 # Re-publish a LEASED reservation for exactly what's still running, with an extended
                 # lifetime (the sizer thread is stopped, so nothing else refreshes it): peers keep
                 # honoring it well past the normal 20s window — a Firecracker orphan has no idle TTL.
-                sizer_obj.publish_orphan_lease(orphans + cold_inflight)
+                sizer_obj.publish_orphan_lease(orphans, cold_inflight)
                 logging.getLogger("blastbox.host.cli").warning(
                     "node self-sizer: shutdown left %d unreaped warm slot(s) + %d cold worker(s) "
                     "in flight — leased the node reservation (extended lifetime) so peers don't "
