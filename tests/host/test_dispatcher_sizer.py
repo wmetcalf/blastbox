@@ -727,6 +727,30 @@ def test_adaptive_only_direct_config_is_active(tmp_path):
     assert pool.concurrent_ceiling >= 1
 
 
+def test_combined_ceiling_clamped_to_reader_bound(tmp_path, monkeypatch):
+    # PR #60 codex P2: the summed multi-engine ceiling must be clamped to _MAX_CEILING_SANE — else
+    # the dispatcher's own snapshot is rejected by the reader's _valid() and the pool stalls at
+    # warm-0/ceiling-1.
+    from blastbox.host.cli import _start_node_sizer
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    from blastbox.host.node_share import _MAX_CEILING_SANE, _valid
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip,red")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_CLIP_MAX_CEILING", "3000")
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINE_RED_MAX_CEILING", "3000")
+    monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
+    res = _start_node_sizer(_Pool(), ["clip", "red"], InMemoryJobStore(), "firecracker", 6000)
+    assert res is not None
+    stop, thread, sizer = res
+    try:
+        assert sizer._engine.max_ceiling <= _MAX_CEILING_SANE   # clamped (sum 6000 > 4096)
+        assert _valid(sizer._identity())                        # own snapshot round-trips
+    finally:
+        stop.set()
+        thread.join(2.0)
+        sizer.remove_own_snapshot()
+
+
 def test_node_manages_tier_gating(monkeypatch):
     # PR #60 r13: _node_manages_tier drives the hard-cap startup wiring (force warm_only,
     # start unspawned). True only when RM is on AND the tier is node-managed (fc/gvisor).
@@ -1046,6 +1070,48 @@ def test_node_namespaced_files_dont_collide_across_hosts(tmp_path):
     assert names == ["clip@hostA.json", "clip@hostB.json"]     # no collision
     seen = {(s.node, s.backlog) for s in share.read_all(max_age_s=60, now=1.0)}
     assert seen == {("hostA", 3), ("hostB", 9)}                # both survive
+
+
+def test_per_engine_cap_and_floor_split_across_replicas(tmp_path):
+    # PR #60 codex P2: min_warm and max_ceiling are per-ENGINE — splitting only backlog/weight let
+    # two replicas of a cap-8 engine each get 8 (aggregate 16) and a floor of 4 become 8. The cap
+    # and floor are now split across replicas too.
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("clip", 100, 0, 1024, 1, 2, 8, 1.0, ts=1.0, node="n",
+                                 tier="firecracker", instance="b"))   # min_warm=2, max_ceiling=8
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    pool = _Pool()
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8, min_warm=2),
+                         pool, share, cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 100,
+                         node="n", instance="a", capacity_fn=_budget(64 * 1024, 999),
+                         clock=lambda: 1.0)                            # huge budget + backlog
+    mine = ds.tick()
+    assert mine.concurrent_ceiling <= 4        # split cap 8/2=4, NOT the full 8 despite the budget
+
+
+def test_late_finishing_count_is_consumed_not_discarded(tmp_path):
+    # PR #60 codex P1: a count that exceeds its deadline but finishes before the next tick must be
+    # CONSUMED (into _last_backlog), not discarded when the replacement is launched — else a
+    # consistently-just-over-deadline query never advances the backlog.
+    import threading
+    share = FileNodeShare(str(tmp_path))
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=0.3, interval_s=0.3)
+    block = threading.Event()
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8), _Pool(), share,
+                         cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: block.wait(5.0) or 1,
+                         node="n", instance="i", capacity_fn=_budget(8 * 1024, 999))
+
+    class _DoneThread:                          # a prior count that already finished
+        def is_alive(self):
+            return False
+    ds._count_thread = _DoneThread()
+    ds._count_result = {"v": 9}                 # its (late) result, not yet consumed
+    ds._last_backlog = 0
+    ds.tick()                                   # new count blocks past the deadline → falls back
+    block.set()
+    assert ds._last_backlog == 9                # consumed the prior result, didn't reset to 0
 
 
 def test_backlog_remainder_distributed_not_floored_to_zero(tmp_path):

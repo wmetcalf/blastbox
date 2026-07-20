@@ -249,11 +249,12 @@ def local_backlog_fn(job_store: object,
         engines = [engine] if isinstance(engine, str) else [e for e in engine if e]
 
     def _fn(_engine: str = "") -> int:
-        try:
-            # ONE store call for the whole served set (count() takes a collection), so a
-            # multi-engine dispatcher's backlog is a single scan/query, not one per engine.
-            return int(job_store.count(JobStatus.QUEUED,  # type: ignore[attr-defined]
-                                       engine=engines, claimant_tier=claimant_tier))
-        except Exception:
-            return 0
+        # ONE store call for the whole served set (count() takes a collection), so a
+        # multi-engine dispatcher's backlog is a single scan/query, not one per engine.
+        # Do NOT swallow a store error into 0 — a transient Redis/SQL failure would then look
+        # like an EMPTY queue and shrink the warm target to its floor (handing capacity to peers)
+        # even though the queue is unchanged. Let it propagate so the sizer's count wrapper falls
+        # back to the LAST-KNOWN backlog instead of a false zero.
+        return int(job_store.count(JobStatus.QUEUED,  # type: ignore[attr-defined]
+                                   engine=engines, claimant_tier=claimant_tier))
     return _fn

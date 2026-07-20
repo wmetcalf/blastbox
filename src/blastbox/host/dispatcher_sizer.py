@@ -271,6 +271,12 @@ class DispatcherSizer:
         if self._count_thread is not None and self._count_thread.is_alive():
             backlog = self._last_backlog
         else:
+            # CONSUME a prior count that finished AFTER its deadline (between ticks) before starting
+            # a replacement — otherwise a query that's consistently just over the deadline would
+            # have every sample discarded and _last_backlog would never advance (stuck at the floor
+            # despite queued work).
+            if self._count_thread is not None and "v" in self._count_result:
+                self._last_backlog = self._count_result["v"]
             self._count_result = {}
             holder = self._count_result
 
@@ -414,7 +420,12 @@ class DispatcherSizer:
                 # node share (in balancing OR static mode).
                 demand=(_share(s.backlog, s.engine, s.tier) + s.assigned) if balancing
                 else _share(s.weight, s.engine, s.tier),
-                min_warm=s.min_warm, max_ceiling=s.max_ceiling,
+                # PER-ENGINE floor + cap are also split across same-queue replicas — else two
+                # replicas of a cap-8 engine could each be allocated 8 (aggregate 16) and a floor
+                # of 4 becomes an aggregate 8. Deterministic remainder so the shares sum to the
+                # configured value; max_ceiling floored at 1 (a pool needs a runnable slot).
+                min_warm=_int_share(s.min_warm, s.engine, s.tier, s.instance),
+                max_ceiling=max(1, _int_share(s.max_ceiling, s.engine, s.tier, s.instance)),
                 # the pool's published reservation (resident warm + cold in flight) is a HARD
                 # ceiling floor — a peer must not be handed slots this pool is still running.
                 reserved=s.assigned,

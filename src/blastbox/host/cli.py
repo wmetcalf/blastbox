@@ -227,7 +227,7 @@ def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gat
         import threading as _threading
 
         from blastbox.host.dispatcher_sizer import DispatcherSizer
-        from blastbox.host.node_share import _MAX_WEIGHT, FileNodeShare
+        from blastbox.host.node_share import _MAX_CEILING_SANE, _MAX_WEIGHT, FileNodeShare
         from blastbox.host.node_sizer import local_backlog_fn
 
         # A dispatcher may serve several engines on ONE pool; size on ALL of their combined
@@ -261,7 +261,12 @@ def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gat
         # wasted RAM) and, downstream, by the node budget's water-fill — so it never oversubscribes.
         # (A shared pool can't enforce each engine's individual sub-cap without per-engine tracking;
         # the node budget bounds the aggregate, which is what matters for oversubscription.)
-        combined_ceiling = max(1, min(sum(e.max_ceiling for e in mine), concurrency))
+        # Clamp to _MAX_CEILING_SANE too: the reader's _valid() rejects a snapshot whose
+        # max_ceiling exceeds it, so an unclamped sum (many high-cap engines + huge concurrency)
+        # would silently self-evict this pool from every node view (tick returns no size, pool
+        # stuck at warm-0/ceiling-1) — the same guard already applied to the summed weight.
+        combined_ceiling = max(1, min(sum(e.max_ceiling for e in mine), concurrency,
+                                      _MAX_CEILING_SANE))
         spec = replace(  # type: ignore[call-arg]
             base,
             slot_ram_mib=max(e.slot_ram_mib for e in mine),
