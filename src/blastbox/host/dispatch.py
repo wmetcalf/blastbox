@@ -751,7 +751,11 @@ class Dispatcher:
         # transiently overshoot, corrected next tick.
         gate = self._concurrency_gate
         if gate is not None and not gate.acquire(timeout=0.0):
-            self._requeue_claimed(job, reason="no cold budget headroom")
+            # DEFER (bump created_at) so this capacity-blocked cold job moves BEHIND currently
+            # claimable work: claim_next() takes the oldest first, so requeuing it with its original
+            # created_at would make dispatch threads reclaim+requeue this same job in a loop while
+            # newer warm-eligible jobs never reach idle warm slots (warm-queue starvation).
+            self._requeue_claimed(job, reason="no cold budget headroom", defer=True)
             return
         t0 = time.monotonic()
         orphaned: list[str] = []           # container name(s) whose timeout kill FAILED
@@ -777,27 +781,37 @@ class Dispatcher:
             self._delete_input_if_owned(job, input_path)
             self._record_outcome(job, path="cold", started=t0)
 
-    def _requeue_claimed(self, job: Job, *, reason: str) -> None:
+    def _requeue_claimed(self, job: Job, *, reason: str, defer: bool = False) -> None:
         """Release OUR claim back to QUEUED so another worker/dispatcher takes the job. CAS-fenced
         on our claim_id and clears it, so a job reclaimed since we claimed is left untouched;
         started_at/worker_runtime/worker_tier are reset so it looks fresh. The staged input is
         NOT deleted — the next owner needs it (we only delete input on paths WE terminate).
 
+        ``defer`` (capacity requeue): also bump created_at to NOW so the job moves BEHIND currently
+        claimable work — claim_next() takes the oldest first, so a capacity-blocked job kept at its
+        original created_at would be reclaimed+requeued in a loop while newer claimable jobs starve.
+        Warm-miss requeues leave created_at (the cold dispatcher should take the job promptly).
+
         Then yields (backoff): dispatch_once() reports progress (a job WAS claimed), so run_forever
         loops without its poll sleep — without a pause THIS dispatcher re-claims the just-requeued
         job in a tight churn loop and no peer gets a turn. The backoff hands it off."""
-        requeued = self._job_store.update_if_status(
-            job.job_id,
-            JobStatus.RUNNING,
-            expect_claim_id=job.claim_id,
-            status=JobStatus.QUEUED,
+        fields: dict[str, object] = dict(
             started_at=None,
             worker_runtime=None,
             worker_tier=None,
             claim_id=None,
             error=None,
         )
-        _log.info("job_id=%s requeued=%s (%s)", job.job_id, requeued, reason)
+        if defer:
+            fields["created_at"] = time.time()      # move behind claimable work
+        requeued = self._job_store.update_if_status(
+            job.job_id,
+            JobStatus.RUNNING,
+            expect_claim_id=job.claim_id,
+            status=JobStatus.QUEUED,
+            **fields,
+        )
+        _log.info("job_id=%s requeued=%s defer=%s (%s)", job.job_id, requeued, defer, reason)
         if self._warm_requeue_backoff_s:
             time.sleep(self._warm_requeue_backoff_s)
 

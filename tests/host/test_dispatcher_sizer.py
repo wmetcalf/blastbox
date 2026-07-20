@@ -1171,6 +1171,63 @@ def test_parse_mem_mib_bare_value_is_bytes():
     assert _parse_mem_mib("") == 0.0
 
 
+def test_locked_final_skips_when_publish_in_progress(tmp_path):
+    # PR #60 codex P1: if a publish is still in progress (lock can't be acquired), the final
+    # remove/lease must SKIP rather than run anyway — else the in-flight publish's os.replace()
+    # would clobber it (recreate a removed snapshot / overwrite the orphan lease) afterward.
+    calls = []
+
+    class _Share:
+        def publish(self, snap):
+            pass
+
+        def read_all(self, *, max_age_s, now):
+            return []
+
+        def remove(self, snap):
+            calls.append("remove")
+
+    class _HeldLock:                     # a publish is in flight → acquire fails
+        def acquire(self, timeout=None):
+            return False
+
+        def release(self):
+            pass
+
+    cfg = NodeConfig(balancing=True, resource_management=True)
+    ds = DispatcherSizer(EngineNode("clip", "-"), _Pool(), _Share(), cfg,
+                         runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 0, node="n", instance="i")
+    ds._publish_lock = _HeldLock()
+    ds.remove_own_snapshot()
+    assert calls == []                   # skipped — did NOT race the in-flight publish
+
+
+def test_count_skipped_while_previous_thread_alive(tmp_path):
+    # PR #60 codex P2: at most ONE outstanding count — a still-running prior count thread (wedged
+    # backlog_fn) must not spawn another every tick (thread/connection accumulation). Skip and use
+    # the last-known backlog.
+    share = FileNodeShare(str(tmp_path))
+    calls = {"n": 0}
+
+    def backlog_fn():
+        calls["n"] += 1
+        return 3
+
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8), _Pool(), share,
+                         cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=backlog_fn, node="n",
+                         instance="i", capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0)
+    ds._last_backlog = 7
+
+    class _AliveThread:                  # pretend a prior count is still running
+        def is_alive(self):
+            return True
+    ds._count_thread = _AliveThread()
+    ds.tick()
+    assert calls["n"] == 0               # backlog_fn NOT invoked — reused last_backlog
+
+
 def test_publish_orphan_lease_extends_reservation_lifetime(tmp_path):
     # PR #60 codex P1: on shutdown with unreaped VMs (a Firecracker guest has NO idle TTL), the
     # reservation must outlive the normal ~20s window. publish_orphan_lease re-publishes what's

@@ -1999,6 +1999,7 @@ def test_cold_dispatch_requeues_when_no_gate_headroom(tmp_path):
     store = InMemoryJobStore()
     job = _make_job()
     job.input_sha256 = _INPUT_SHA
+    job.created_at = 100.0                  # old timestamp
     store.create(job)
     _setup_job_dirs(tmp_path, job)
 
@@ -2020,6 +2021,9 @@ def test_cold_dispatch_requeues_when_no_gate_headroom(tmp_path):
     assert final is not None
     assert final.status == JobStatus.QUEUED     # requeued for a later worker/tick
     assert final.claim_id is None               # claim released
+    # PR #60 codex P1: DEFERRED — created_at bumped so it moves behind claimable work (a
+    # capacity-blocked cold job at its original ts would be reclaimed in a loop, starving warm).
+    assert final.created_at > 100.0
 
 
 def test_cold_dispatch_acquires_and_releases_gate_permit(tmp_path):

@@ -117,6 +117,9 @@ class DispatcherSizer:
                                               # remove/lease — else a publish still in flight past
                                               # the join could os.replace() a removed file back or
                                               # clobber the orphan lease with a short-lived heartbeat
+        self._count_thread: Optional[threading.Thread] = None   # the single outstanding backlog
+        self._count_result: dict = {}                           # count (a wedged one mustn't spawn
+                                                                # a new thread every tick)
 
     def _active(self) -> bool:
         cfg = self._config
@@ -260,30 +263,40 @@ class DispatcherSizer:
         # runs, so a count that unexpectedly exceeds the staleness window doesn't let peers expire
         # us mid-count and reallocate our still-live pool. A snapshot's advertised refresh_s reflects
         # the PRIOR tick, so it can't cover an unobserved slow query — an active heartbeat can.
-        count_result: dict = {}
+        #
+        # Keep at most ONE outstanding count: if a prior tick's count is STILL wedged, do NOT spawn
+        # another (that would accumulate a daemon thread + a store connection every tick until the
+        # process OOMs). Skip the count this tick and use the last-known backlog; the single
+        # outstanding thread's result is picked up whenever it finishes.
+        if self._count_thread is not None and self._count_thread.is_alive():
+            backlog = self._last_backlog
+        else:
+            self._count_result = {}
+            holder = self._count_result
 
-        def _count() -> None:
-            try:
-                count_result["v"] = max(0, int(self._backlog_fn()))
-            except Exception:
-                count_result["v"] = self._last_backlog
-        count_thread = threading.Thread(target=_count, name="node-sizer-count", daemon=True)
-        count_thread.start()
-        # BOUND the wait: if count() wedges indefinitely, don't hang here forever — the synchronous
-        # startup tick would never return (dispatch never begins) and a running loop would never
-        # read the node view again (a new peer could split the budget while we hold a stale ceiling)
-        # nor reach the fail-closed check. Past the deadline, proceed with the last-known backlog
-        # (conservative) and let the daemon thread finish in the background.
-        deadline = self._clock() + max(self._config.stale_after_s, self._config.interval_s * 3)
-        heartbeat_s = max(0.5, self._config.interval_s)
-        while count_thread.is_alive() and self._clock() < deadline:
-            count_thread.join(timeout=heartbeat_s)
-            if self._stop_event is not None and self._stop_event.is_set():
-                break
-            if count_thread.is_alive() and count_result.get("v") is None:
-                with self._publish_lock:
-                    self._share.publish(_snapshot(self._last_backlog, self._clock()))
-        backlog = count_result.get("v", self._last_backlog)
+            def _count() -> None:
+                try:
+                    holder["v"] = max(0, int(self._backlog_fn()))
+                except Exception:
+                    holder["v"] = self._last_backlog
+            self._count_thread = threading.Thread(target=_count, name="node-sizer-count",
+                                                  daemon=True)
+            self._count_thread.start()
+            # BOUND the wait: if count() wedges, don't hang here forever — the synchronous startup
+            # tick would never return (dispatch never begins) and a running loop would never read
+            # the node view again (a new peer could split the budget while we hold a stale ceiling)
+            # nor reach the fail-closed check. Past the deadline, proceed with the last-known
+            # backlog and let the (single) daemon thread finish in the background.
+            deadline = self._clock() + max(self._config.stale_after_s, self._config.interval_s * 3)
+            heartbeat_s = max(0.5, self._config.interval_s)
+            while self._count_thread.is_alive() and self._clock() < deadline:
+                self._count_thread.join(timeout=heartbeat_s)
+                if self._stop_event is not None and self._stop_event.is_set():
+                    break
+                if self._count_thread.is_alive() and holder.get("v") is None:
+                    with self._publish_lock:
+                        self._share.publish(_snapshot(self._last_backlog, self._clock()))
+            backlog = holder.get("v", self._last_backlog)
         self._last_backlog = backlog
         now = self._clock()
         # UPDATED publish with the FRESH backlog so the node converges in one tick (not lagged).
@@ -504,17 +517,22 @@ class DispatcherSizer:
         self._locked_final(lambda: self._share.publish(snap))
 
     def _locked_final(self, fn: Callable[[], None]) -> None:
-        """Run a FINAL cleanup publish/remove under the publish lock, so no in-flight run-loop
-        publish clobbers it afterward. Bounded acquire (a wedged publish mustn't hang shutdown) —
-        on timeout we proceed best-effort rather than block the process from exiting."""
-        got = self._publish_lock.acquire(timeout=10.0)
+        """Run a FINAL cleanup publish/remove UNDER the publish lock, so no in-flight run-loop
+        publish clobbers it afterward. Bounded acquire (a wedged publish mustn't hang shutdown).
+        If the lock can't be taken, a publish is still in progress — do NOT run fn() anyway: racing
+        it would let that publish's os.replace() recreate a removed snapshot or overwrite the orphan
+        lease afterward. Skip and let the in-flight publish + staleness govern (best-effort)."""
+        if not self._publish_lock.acquire(timeout=10.0):
+            logging.getLogger("blastbox.node_sizer").warning(
+                "node self-sizer for %s: publish still in progress at shutdown — skipping final "
+                "snapshot cleanup to avoid racing it", self._engine.name)
+            return
         try:
             fn()
         except Exception:
             pass
         finally:
-            if got:
-                self._publish_lock.release()
+            self._publish_lock.release()
 
     def remove_own_snapshot(self) -> None:
         """Remove this unit's published snapshot. Idempotent — the run() loop's finally also
