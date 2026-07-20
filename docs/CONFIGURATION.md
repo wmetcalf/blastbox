@@ -119,7 +119,7 @@ publishes a cold-worker reservation + gets a budgeted admission gate), and an **
 stays unmanaged). The same engine on two tiers is two `(engine, tier)` pools that **share** the
 budget, and their shared **untargeted** backlog (jobs with no pinned `target_tier`, claimable by
 either tier) is counted **once** across the tiers rather than once per tier. Worked multi-worker /
-multi-tier examples: DEPLOYMENT.md → *Auto-sizing a multi-worker host*.
+multi-tier examples: [DEPLOYMENT.md → *Auto-sizing a multi-worker host*](DEPLOYMENT.md#4-auto-sizing-a-multi-worker-host-node-pool-autosizer).
 
 **Node-wide participation is required.** The budget is only honored if **every** dispatcher on a
 host participates with a **consistent** config. Coordination is a whole-node protocol: the plan
