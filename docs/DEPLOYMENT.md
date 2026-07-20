@@ -193,7 +193,8 @@ restores its configured static pool rather than running unsized. It is a whole-n
 
 ```sh
 # on EVERY dispatcher on the host (each warm sidecar AND the cold dispatcher):
-BLASTBOX_NODE_RESOURCE_MANAGEMENT=1              # enforce the host budget (+ BLASTBOX_NODE_BALANCING=1 = live rebalance by backlog)
+BLASTBOX_NODE_RESOURCE_MANAGEMENT=1              # enforce the host budget (static weight shares)
+# BLASTBOX_NODE_BALANCING=1                      # optional: rebalance the budget live by queue backlog (implies RESOURCE_MANAGEMENT)
 BLASTBOX_NODE_ENGINES=clippyshot,redtusk,titanarum
 BLASTBOX_NODE_ENGINE_CLIPPYSHOT_RAM_MIB=2048     # per-slot footprint, per engine
 BLASTBOX_NODE_SHARE_DIR=/var/lib/blastbox/node   # bind-mount this into every engine stack on the host
@@ -222,9 +223,11 @@ The modes this unlocks on one host:
 
 Validate the sizing on a real host without touching production containers with
 `examples/node_sizer_exercise.py` (fake pools, real `/proc/meminfo` budget; prints a per-check
-PASS/FAIL) and `examples/node_sizer_xnode_demo.py` (cross-host snapshot isolation). Point the demos
-at a **scratch** `BLASTBOX_NODE_SHARE_DIR`, never the live one — they publish fake demand snapshots
-they don't clean up, which would pollute a production node view.
+PASS/FAIL — it uses its own temp dirs, so it never touches your share dir) and
+`examples/node_sizer_xnode_demo.py` (cross-host snapshot isolation). The xnode demo takes the share
+dir as its **first argument** (default `/tmp/bb-xnode`) — give it a scratch path, never your live
+`BLASTBOX_NODE_SHARE_DIR`: it publishes fake demand snapshots it doesn't clean up, which would
+pollute a production node view.
 
 ## Egress netpolicy + `blastbox-netd` (optional)
 
