@@ -183,10 +183,12 @@ class SqlJobStore:
         # Best-effort indexes run AFTER the table-creation transaction commits, each in its
         # OWN transaction. On Postgres a failed statement (a CREATE INDEX lock/permission
         # error) aborts the WHOLE transaction, so creating them inline would risk rolling back
-        # the tables.
-        self._ensure_jobs_indexes()
+        # the tables. Run the SYNCHRONOUS page-hash DDL FIRST, then spawn the BACKGROUND jobs
+        # index — two CREATE INDEX statements running at once (even CONCURRENTLY) can deadlock on
+        # the shared system catalog, so the backgrounded jobs build must not overlap other DDL.
         if self._driver == "postgres":
             self._ensure_page_hash_indexes()
+        self._ensure_jobs_indexes()
 
     def _ensure_jobs_indexes(self) -> None:
         """Covering index for the hot claim + node-autosizer-backlog predicates
@@ -208,14 +210,15 @@ class SqlJobStore:
         if self._driver != "postgres" or self._pool is None:
             self._try_ddl(f"CREATE INDEX IF NOT EXISTS {stmt_tail}")
             return
-        # On a large existing jobs table CREATE INDEX CONCURRENTLY can take a long time, and while
-        # CONCURRENTLY lets OTHER sessions keep writing, it is NOT async for THIS connection — so
-        # awaiting it here would block every SqlJobStore construction (dispatcher / API startup),
-        # even when node autosizing is off. Run this best-effort optimization in a background daemon
-        # thread so startup returns immediately; a slow build just means slower autosizer COUNTs
-        # until it lands.
-        threading.Thread(target=self._build_jobs_index_pg, args=(index_name, stmt_tail),
-                         name="bb-jobs-index-build", daemon=True).start()
+        # Build it here, but WITHOUT holding self._lock (the dedicated autocommit connection shares
+        # no state with the pooled ones) so it never blocks concurrent job reads/claims/writes.
+        # NB: it is NOT backgrounded — CREATE INDEX CONCURRENTLY takes system-catalog locks, and a
+        # daemon thread doing it can DEADLOCK with other concurrent index DDL (e.g. the page-hash
+        # index, or another store's build) where Postgres may pick a FOREGROUND statement as the
+        # victim. Running it synchronously here serializes it with the other _init_db DDL. On a
+        # very large pre-existing jobs table this adds startup latency (mitigated: no lock held, so
+        # only THIS constructor waits) — pre-create the index in ops if that matters.
+        self._build_jobs_index_pg(index_name, stmt_tail)
 
     def _build_jobs_index_pg(self, index_name: str, stmt_tail: str) -> None:
         try:
