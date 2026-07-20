@@ -18,6 +18,7 @@ than drifting; it is not a hard oversubscription guarantee.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import secrets
 import threading
@@ -203,12 +204,18 @@ class DispatcherSizer:
         #       we must keep reserving them until they actually drain — else a peer grows into the
         #       "freed" budget while our VMs still hold it;
         #     - cold workers spawn OUTSIDE the warm pool and COEXIST with warm residency, so they
-        #       ADD to it (a max would understate by min(idle_warm, cold_in_flight)).
+        #       ADD to it (a max would understate by min(idle_warm, cold_in_flight)); AND they are
+        #       priced in WARM-SLOT EQUIVALENTS — the planner values `assigned` at slot_ram_mib, so
+        #       a 4 GiB cold worker on a 2 GiB slot must reserve 2 units, not 1, or a peer would
+        #       allocate the missing RAM (the same conversion the cold GATE already applies).
+        cold_ram = self._cold_slot_ram_mib or e.slot_ram_mib
+        cold_units = (cold_ram / e.slot_ram_mib) if e.slot_ram_mib > 0 else 1.0
+
         def _reservation() -> int:
             aw = int(getattr(self._pool, "assigned_count", 0))
             res = int(getattr(self._pool, "slot_count", 0))
             cif = int(getattr(self._gate, "in_flight", 0)) if self._gate is not None else 0
-            return max(aw, res) + cif
+            return max(aw, res) + math.ceil(cif * cold_units)
 
         # Compute OUR view of the node budget up front so we can PUBLISH it: readers reconcile to
         # one budget (the elementwise MIN across the view), so a dispatcher with a different

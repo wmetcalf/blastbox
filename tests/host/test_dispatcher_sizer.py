@@ -633,6 +633,42 @@ def test_reservation_sums_resident_warm_and_cold_in_flight(tmp_path):
     assert mine.assigned == 8                   # 6 warm + 2 cold, NOT max(6, 2)=6
 
 
+def test_reservation_prices_cold_in_warm_slot_equivalents(tmp_path):
+    # PR #60 codex P1: the planner values `assigned` at slot_ram_mib, so a cold worker bigger than
+    # a warm slot (BLASTBOX_WORKER_MEMORY 4g vs a 2g slot) must reserve MULTIPLE warm-slot units,
+    # not 1 — else a peer allocates the missing RAM. 2 cold workers @ 2x footprint = 4 units.
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+    share = FileNodeShare(str(tmp_path))
+    gate = DynamicConcurrencyGate(64)
+    for _ in range(2):
+        gate.acquire(0.0)                        # 2 cold workers in flight
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    pool = _Pool(assigned=0, slot_count=0)       # no warm residency — isolate the cold pricing
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=2048, max_ceiling=64), pool, share,
+                         cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 0, node="n",
+                         instance="i", capacity_fn=_budget(64 * 2048, 999), clock=lambda: 1.0,
+                         concurrency_gate=gate, cold_slot_ram_mib=4096)   # cold = 2x warm slot
+    ds.tick()
+    mine = next(s for s in share.read_all(max_age_s=60, now=1.0) if s.engine == "clip")
+    assert mine.assigned == 4                     # 2 cold workers × (4096/2048) = 4 warm-slot units
+
+
+def test_long_identity_hashed_into_filesystem_safe_key(tmp_path):
+    # PR #60 codex P2: a long-but-valid engine/node identity can exceed the FS per-component limit
+    # (mkstemp's temp decoration hits it sooner) → publish raises → unmanaged fallback → budget
+    # unenforced. Long keys are hashed to a bounded name; publish + read_all still agree on it.
+    share = FileNodeShare(str(tmp_path))
+    long_node = "n" * 250                         # valid slug, but way over the FS limit
+    snap = DemandSnapshot("clip", 3, 0, 1024, 1, 0, 64, 1.0, ts=1.0,
+                          node=long_node, tier="firecracker", instance="i1")
+    share.publish(snap)                           # must NOT raise ENAMETOOLONG
+    names = [p.name for p in tmp_path.glob("*.json")]
+    assert len(names) == 1 and len(names[0]) < 120        # bounded, hashed
+    round_tripped = share.read_all(max_age_s=60, now=1.0)  # anti-impersonation check still passes
+    assert len(round_tripped) == 1 and round_tripped[0].node == long_node
+
+
 def test_start_node_sizer_removes_snapshot_when_setup_aborts_after_publish(tmp_path, monkeypatch):
     # PR #60 audit P1: the synchronous first tick publishes a heartbeat; if a LATER setup step
     # (here start_thread) raises, _start_node_sizer returns None — but the published phantom

@@ -31,6 +31,7 @@ share dir on a surface writable by anything outside the dispatcher trust domain.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -104,6 +105,12 @@ class NodeShare(Protocol):
     def remove(self, snap: DemandSnapshot) -> None: ...
 
 
+# Max length of the concatenated on-disk key before we hash it. Well under the usual 255-byte
+# per-component filesystem limit, leaving headroom for the ".json" suffix and mkstemp's
+# ".{name}.<random>.tmp" temp-file decoration.
+_MAX_KEY_LEN = 180
+
+
 class FileNodeShare:
     """Directory-backed share. Each publishing unit — a dispatcher process =
     (engine, tier, node, instance) — owns one
@@ -151,7 +158,17 @@ class FileNodeShare:
         # join is unambiguous. Default (all optional parts "") keeps the plain `<engine>.json`.
         parts = [engine, *([tier] if tier else []), *([node] if node else []),
                  *([instance] if instance else [])]
-        return "@".join(parts) + ".json"
+        joined = "@".join(parts)
+        # Long-but-valid slugs (a big BLASTBOX_NODE_ID + engine name) can make the concatenated
+        # key exceed the filesystem's per-component limit — and mkstemp's `.{name}.<rand>.tmp`
+        # hits ENAMETOOLONG even sooner — so the synchronous publish would raise and the sizer
+        # fall back to unmanaged static sizing (budget not enforced). Past a safe bound, key by a
+        # fixed-length hash of the identity instead. Deterministic, so publish and the read_all
+        # anti-impersonation check (both call _filename) still agree; the plain `<engine>.json`
+        # form is preserved for the common short case.
+        if len(joined) > _MAX_KEY_LEN:
+            joined = "h_" + hashlib.sha256(joined.encode("utf-8")).hexdigest()[:40]
+        return joined + ".json"
 
     def _safe_path(self, snap: DemandSnapshot) -> Path:
         """The snapshot's file path, GUARDED against traversal: the identity components ARE
