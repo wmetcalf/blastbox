@@ -2124,3 +2124,33 @@ def test_retained_cold_permit_reclaimed_when_container_confirmed_gone(tmp_path):
     dispatcher._list_active_worker_job_ids = lambda: None
     dispatcher._reconcile_cold_orphans()
     assert gate.in_flight == 1                           # still retained (absence unconfirmed)
+
+
+def test_cold_dispatch_fenced_after_shutdown_begins(tmp_path):
+    # PR #60 codex P1: once shutdown begins, a dispatch worker abandoned mid-claim must NOT acquire
+    # a cold permit and spawn a container after the node reservation is torn down. It requeues.
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+
+    ran: list = []
+
+    def fake_runner(argv, **kw):
+        ran.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    gate = DynamicConcurrencyGate(4)               # plenty of headroom...
+    dispatcher._concurrency_gate = gate
+    dispatcher._warm_requeue_backoff_s = 0.0
+    dispatcher._shutting_down.set()                # ...but shutdown has begun
+
+    assert dispatcher.dispatch_once() is True      # claimed...
+    assert ran == []                               # ...but NOT detonated (fenced)
+    assert gate.in_flight == 0                     # no permit acquired
+    final = store.get(job.job_id)
+    assert final is not None and final.status == JobStatus.QUEUED   # requeued for restart

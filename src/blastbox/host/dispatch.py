@@ -276,6 +276,10 @@ class Dispatcher:
         # and cold capacity bleeds to zero after enough failed kills. name → nothing (a set).
         self._retained_cold_orphans: set[str] = set()
         self._retained_lock = threading.Lock()
+        # Set once shutdown begins: a dispatch worker abandoned past the join deadline (e.g. blocked
+        # in a slow claim_next) must NOT acquire a cold permit and spawn a container after the CLI
+        # has removed the node reservation. The cold path checks this before acquiring the gate.
+        self._shutting_down = threading.Event()
         self._job_store = job_store
         # engines is kept as an immutable mapping snapshot so callers cannot
         # mutate it after construction.
@@ -507,6 +511,10 @@ class Dispatcher:
                 time.sleep(min(poll_interval_s, 1.0))
         finally:
             stop_evt.set()
+            # Fence NEW cold admissions: a worker abandoned past the join (below), e.g. blocked in a
+            # slow claim_next, must not acquire a gate permit and spawn a container after the CLI
+            # removes the reservation. The cold path re-checks this after its claim.
+            self._shutting_down.set()
             # Collective deadline: bound TOTAL shutdown to ~(worker_timeout+5), not
             # concurrency*(worker_timeout) — sequential joins each with the full timeout
             # would accumulate if several threads are mid-detonation.
@@ -750,6 +758,12 @@ class Dispatcher:
         # per the eventual-consistency model in dispatcher_sizer: a warm burst mid-interval can
         # transiently overshoot, corrected next tick.
         gate = self._concurrency_gate
+        if gate is not None and self._shutting_down.is_set():
+            # Shutdown began while we were between claim and cold admission (e.g. a slow
+            # claim_next). Do NOT spawn a container after the reservation is being torn down —
+            # requeue the job for a fresh dispatcher/restart to pick up.
+            self._requeue_claimed(job, reason="shutdown before cold admission")
+            return
         if gate is not None and not gate.acquire(timeout=0.0):
             # DEFER (set claimable_after) so this capacity-blocked cold job is temporarily
             # INELIGIBLE: claim_next() skips it for a short window, so warm-eligible work reaches

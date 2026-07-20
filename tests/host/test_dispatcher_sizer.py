@@ -1072,6 +1072,41 @@ def test_node_namespaced_files_dont_collide_across_hosts(tmp_path):
     assert seen == {("hostA", 3), ("hostB", 9)}                # both survive
 
 
+def test_split_cap_never_clips_incumbent_reservation(tmp_path):
+    # PR #60 codex P1: splitting max_ceiling when a replica joins must NOT clip the INCUMBENT's
+    # hard `reserved` floor — plan_sizes seats min(reserved, max_ceiling), so a cap split below the
+    # incumbent's residency would let a newcomer grow into slots the incumbent's VMs still occupy.
+    # cap = max(split, reserved), so the incumbent holds its 8 resident until it drains.
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("clip", 0, 0, 1024, 1, 0, 8, 1.0, ts=1.0, node="n",
+                                 tier="firecracker", instance="b"))     # newly joined replica
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    pool = _Pool(slot_count=8)                                          # incumbent: 8 resident VMs
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8), pool, share,
+                         cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 0, node="a",
+                         instance="a", capacity_fn=_budget(12 * 1024, 999), clock=lambda: 1.0)
+    mine = ds.tick()
+    assert mine.concurrent_ceiling >= 8            # reservation preserved, NOT clipped to split-cap 4
+
+
+def test_local_warm_floor_split_across_replicas(tmp_path):
+    # PR #60 codex P2: the LOCAL warm target must use the split min_warm too — else two replicas of
+    # a min_warm=2 engine each warm 2 (aggregate 4) for the configured floor of 2.
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("clip", 0, 0, 1024, 1, 2, 8, 1.0, ts=1.0, node="n",
+                                 tier="firecracker", instance="b"))     # replica peer, min_warm=2
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=60)
+    pool = _Pool()
+    ds = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8, min_warm=2),
+                         pool, share, cfg, runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 0,
+                         node="n", instance="a", capacity_fn=_budget(16 * 1024, 999),
+                         clock=lambda: 1.0)
+    mine = ds.tick()
+    assert mine.warm_size == 1                      # split floor 2/2=1, not the full 2
+
+
 def test_per_engine_cap_and_floor_split_across_replicas(tmp_path):
     # PR #60 codex P2: min_warm and max_ceiling are per-ENGINE — splitting only backlog/weight let
     # two replicas of a cap-8 engine each get 8 (aggregate 16) and a floor of 4 become 8. The cap

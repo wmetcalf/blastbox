@@ -425,7 +425,14 @@ class DispatcherSizer:
                 # of 4 becomes an aggregate 8. Deterministic remainder so the shares sum to the
                 # configured value; max_ceiling floored at 1 (a pool needs a runnable slot).
                 min_warm=_int_share(s.min_warm, s.engine, s.tier, s.instance),
-                max_ceiling=max(1, _int_share(s.max_ceiling, s.engine, s.tier, s.instance)),
+                # cap = the split share, but NEVER below this pool's own reservation — else
+                # splitting a joining replica's cap would clip the INCUMBENT's hard `reserved`
+                # floor (plan_sizes seats min(reserved, max_ceiling)) and a newcomer could grow
+                # into slots the incumbent's still-resident VMs occupy (residency > budget until
+                # they reap). Keeping cap >= reserved lets the incumbent hold its residency and
+                # starves the newcomer's growth until the incumbent actually drains.
+                max_ceiling=max(1, _int_share(s.max_ceiling, s.engine, s.tier, s.instance),
+                                s.assigned),
                 # the pool's published reservation (resident warm + cold in flight) is a HARD
                 # ceiling floor — a peer must not be handed slots this pool is still running.
                 reserved=s.assigned,
@@ -460,7 +467,10 @@ class DispatcherSizer:
             # still SUM to the backlog even when it's smaller than the replica count (a plain floor
             # would give every replica 0 and strand the job in warm-only mode).
             my_backlog = _int_share(backlog, e.name, self._runtime, self._instance)
-            warm = min(mine.concurrent_ceiling, max(e.min_warm, my_backlog + assigned_warm))
+            # the warm FLOOR is also split across same-queue replicas — else two overlapping
+            # replicas each hold the full min_warm hot (aggregate 2× the configured floor).
+            my_min_warm = _int_share(e.min_warm, e.name, self._runtime, self._instance)
+            warm = min(mine.concurrent_ceiling, max(my_min_warm, my_backlog + assigned_warm))
             mine = PoolSize(warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)
             self._pool.resize(  # type: ignore[attr-defined]
                 warm_size=warm, concurrent_ceiling=mine.concurrent_ceiling)

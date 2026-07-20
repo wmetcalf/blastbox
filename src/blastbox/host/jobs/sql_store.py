@@ -547,7 +547,12 @@ class SqlJobStore:
             params.append(claimant_tier)
         if where:
             sql += " WHERE " + " AND ".join(where)
-        with self._lock, self._connect() as conn:
+        # NO instance lock: count() is READ-ONLY and the node autosizer runs it in a background
+        # thread. The instance _lock serializes WRITERS (claim_next's BEGIN IMMEDIATE); holding it
+        # for a read would let a slow/wedged COUNT on a large jobs table block every claim/read/
+        # write on the store. A read needs no write-serialization — SQLite WAL and Postgres MVCC
+        # both allow a reader concurrent with the writer (each _connect() is its own connection).
+        with self._connect() as conn:
             row = conn.execute(sql, tuple(params)).fetchone()
         return int(row[0]) if row else 0
 
