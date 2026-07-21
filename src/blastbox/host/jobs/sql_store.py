@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Collection
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -16,6 +17,19 @@ from urllib.parse import unquote, urlparse
 
 from blastbox.contract import Envelope, Page, find_by_type, phash_hex_to_int8
 from blastbox.host.jobs.base import LISTABLE_SORT_FIELDS, Job, JobStatus, normalize_engine_filter
+
+
+def _env_int(name: str, default: int, *, low: int = 0) -> int:
+    """Read a positive int from the environment, falling back on anything unusable.
+
+    Pool sizing must never be the reason a node fails to start, so a malformed or
+    out-of-range value degrades to *default* rather than raising at import time.
+    """
+    try:
+        value = int(os.environ[name])
+    except (KeyError, TypeError, ValueError):
+        return default
+    return value if value >= low else default
 
 
 # Allowlist of column names in the ``jobs`` table.  ``update()`` validates
@@ -75,8 +89,20 @@ class SqlJobStore:
         if self._driver == "postgres":
             from psycopg_pool import ConnectionPool  # type: ignore[import-not-found]
 
+            # Pool sizing is the ingress concurrency ceiling: EVERY job submit/poll
+            # borrows a connection, so `max_size` caps how many API requests can be
+            # in flight at once regardless of how many uvicorn/CPU resources exist.
+            # The old hardcoded 8 was far below postgres' own max_connections (100)
+            # and throttled clients long before the database or host was stressed --
+            # and because the excess waits out `timeout` and then raises, a polling
+            # client sees opaque timeouts rather than backpressure. Configurable so a
+            # node can be tuned to its postgres without a code change; keep the sum of
+            # max_size across all API/dispatcher processes under max_connections.
             self._pool = ConnectionPool(
-                self._database_url, min_size=1, max_size=8, timeout=10.0
+                self._database_url,
+                min_size=_env_int("BLASTBOX_DB_POOL_MIN", 2, low=1),
+                max_size=_env_int("BLASTBOX_DB_POOL_MAX", 32, low=1),
+                timeout=float(os.environ.get("BLASTBOX_DB_POOL_TIMEOUT", "10.0")),
             )
         self._init_db()
 
