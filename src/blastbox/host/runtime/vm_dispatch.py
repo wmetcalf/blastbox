@@ -382,10 +382,11 @@ class VmJobDispatcher:
                     error=f"net_policy {effective_policy!r} ({kind}) not honored by {self._worker_tier} "
                           f"tier (fixed egress {fixed_policy!r})",
                     expires_at=self._expiry(finished)):
-                try:  # we owned the terminal write → drop the spooled input
-                    self._input_path(job).unlink()
-                except OSError:
-                    pass
+                # we owned the terminal write → this is a terminal state, so the purge invariant
+                # applies unconditionally (not just a bare input unlink): nothing may survive on
+                # this worker's disk, even if _process is ever reordered so this check runs after
+                # materialisation/validation and output/ has content too.
+                self._purge_job_dir(job)
             logger.warning("vm_dispatch: rejecting job %s — net_policy %r (%s) != fixed egress %r on %s",
                            job.job_id, effective_policy, kind, fixed_policy, self._worker_tier)
             return

@@ -4,11 +4,15 @@ Workers are frequently spare hardware (a laptop, an old desktop), not hardened
 sample repositories. The failure paths matter most: they are where a purge is
 easiest to omit, and ~1.6% of a real corpus hits the timeout path.
 """
+import logging
+import shutil
+
 import pytest
 
 from blastbox.host.blobs.base import BlobFetchError
 from blastbox.host.jobs.base import Job, JobStatus
 from blastbox.host.jobs.memory import InMemoryJobStore
+from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
 
 SECRET = b"MALWARE-BYTES-MUST-NOT-PERSIST"
 
@@ -79,3 +83,74 @@ def test_no_residue_after_release_back_to_queued(vm_dispatcher_factory, tmp_path
 
     assert store.get(job.job_id).status is JobStatus.QUEUED
     assert _residue(tmp_path) == []
+
+
+def test_purge_refuses_path_outside_job_root(tmp_path, caplog):
+    """The containment refusal: _purge_job_dir must never rmtree anything that doesn't
+    resolve strictly under job_root -- it must refuse and log an error instead."""
+    job_root = tmp_path / "job_root"
+    job_root.mkdir()
+    outside = tmp_path / "outside-target"
+    outside.mkdir()
+    (outside / "secret.bin").write_bytes(SECRET)
+
+    disp = VmJobDispatcher(store=InMemoryJobStore(), job_root=str(job_root),
+                           validate=lambda p: ({}, True))
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = "../outside-target"   # job_root / job_id resolves OUTSIDE job_root
+
+    with caplog.at_level(logging.ERROR, logger="blastbox.host.runtime.vm_dispatch"):
+        disp._purge_job_dir(job)
+
+    assert outside.exists() and (outside / "secret.bin").exists(), "refused purge must leave the dir intact"
+    assert any("refus" in r.message.lower() for r in caplog.records), "containment refusal must be logged"
+
+
+def test_purge_logs_error_and_does_not_raise_on_rmtree_failure(tmp_path, monkeypatch, caplog):
+    """The OSError branch: an rmtree failure must be logged loudly at ERROR and must NOT
+    raise -- it must never mask the job's real (already-written) terminal outcome."""
+    job_root = tmp_path / "job_root"
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job_dir = job_root / job.job_id
+    (job_dir / "input").mkdir(parents=True)
+    (job_dir / "input" / "a.doc").write_bytes(SECRET)
+
+    disp = VmJobDispatcher(store=InMemoryJobStore(), job_root=str(job_root),
+                           validate=lambda p: ({}, True))
+
+    def _boom(path):
+        raise OSError("device or resource busy")
+
+    monkeypatch.setattr(shutil, "rmtree", _boom)
+
+    with caplog.at_level(logging.ERROR, logger="blastbox.host.runtime.vm_dispatch"):
+        disp._purge_job_dir(job)   # must not raise
+
+    assert any("PURGE FAILED" in r.message for r in caplog.records), "rmtree failure must be logged at ERROR"
+
+
+def test_no_residue_after_net_policy_rejection(tmp_path):
+    """The net_policy-rejection path is a terminal (FAILED) write and must go through the
+    same unconditional purge invariant as every other terminal path -- not a bare input
+    unlink that leaves the (now-empty) job dir behind."""
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.net_policy = "tor"
+    root = tmp_path / job.job_id
+    (root / "input").mkdir(parents=True)
+    (root / "input" / "a.doc").write_bytes(SECRET)
+    job.result_dir = str(root)
+    store.create(job)
+    claimed = store.claim_next()
+
+    def _validate(in_path):
+        raise AssertionError("validate() must not run -- job is rejected before detonation")
+
+    disp = VmJobDispatcher(store=store, job_root=str(tmp_path), validate=_validate,
+                           fixed_net_policy="none")   # pool declared no-network; job wants "tor"
+    disp._process(claimed)
+
+    got = store.get(job.job_id)
+    assert got.status is JobStatus.FAILED
+    assert _residue(tmp_path) == [], "sample bytes survived a net_policy-rejected terminal state"
+    assert not (tmp_path / job.job_id).exists(), "job dir must not survive a net_policy-rejected job"
