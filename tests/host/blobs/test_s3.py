@@ -89,3 +89,22 @@ def test_delete_job_removes_outputs_but_not_samples(store, tmp_path):
     s3 = boto3.client("s3", region_name="us-east-1")
     assert s3.list_objects_v2(Bucket=BUCKET, Prefix="pfx/results/j5/")["KeyCount"] == 0
     assert s3.list_objects_v2(Bucket=BUCKET, Prefix="pfx/samples/")["KeyCount"] == 1
+
+
+def test_put_sample_propagates_non_404_errors(store, tmp_path):
+    """Non-404 errors in head_object (e.g., AccessDenied) must raise, not be swallowed."""
+    from unittest.mock import patch
+    import botocore.exceptions
+
+    data = b"sample data"
+    digest = hashlib.sha256(data).hexdigest()
+    src = _write(tmp_path, "in/test.doc", data)
+
+    # Simulate a permissions error on head_object
+    error_response = {"Error": {"Code": "AccessDenied", "Message": "Access Denied"}}
+    client_error = botocore.exceptions.ClientError(error_response, "HeadObject")
+
+    with patch.object(store._s3, "head_object", side_effect=client_error):
+        with pytest.raises(botocore.exceptions.ClientError) as exc_info:
+            store.put_sample(digest, src)
+        assert exc_info.value.response["Error"]["Code"] == "AccessDenied"

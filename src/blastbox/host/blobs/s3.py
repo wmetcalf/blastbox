@@ -46,8 +46,17 @@ class S3BlobStore:
         try:
             self._s3.head_object(Bucket=self._bucket, Key=key)
             return                      # already present: content-addressed => identical
-        except Exception:
-            pass
+        except Exception as exc:
+            # Let non-404 errors propagate; only swallow object-not-found
+            import botocore.exceptions  # noqa: PLC0415 — optional dep
+            if isinstance(exc, botocore.exceptions.ClientError):
+                error_code = exc.response.get("Error", {}).get("Code", "")
+                if error_code in ("404", "NoSuchKey"):
+                    pass  # object doesn't exist; fall through to upload
+                else:
+                    raise  # re-raise: real error (permissions, throttling, etc.)
+            else:
+                raise  # re-raise: not a ClientError
         try:
             self._s3.upload_file(str(src), self._bucket, key)
         except Exception as exc:
