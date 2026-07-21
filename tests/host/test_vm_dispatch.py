@@ -97,23 +97,46 @@ def test_fail_stale_queued_disabled_by_default(tmp_path):
     assert store.get(old.job_id).status is JobStatus.QUEUED   # no TTL configured -> no-op
 
 
+def _capture_ensure_metadata(d):
+    """Wrap ``_ensure_metadata`` to capture the JSON it wrote, AT WRITE TIME.
+
+    Task 5's worker purge invariant (vm_dispatch.py's ``_purge_job_dir``) removes the WHOLE job
+    dir — input AND output — once ``_process`` reaches a terminal state, so a test that read
+    ``output/metadata.json`` from disk AFTER ``_process()`` returned would just find it gone. This
+    still exercises the real write (no mock of the write itself), just observed before the purge
+    that necessarily follows it.
+    """
+    import json as _json
+    real = d._ensure_metadata
+    captured: dict[str, object] = {}
+
+    def spy(job, summary):
+        ok = real(job, summary)
+        if ok:
+            path = d._job_dir(job) / "output" / "metadata.json"
+            captured["written"] = _json.loads(path.read_text())
+        return ok
+
+    d._ensure_metadata = spy  # type: ignore[method-assign]
+    return captured
+
+
 def test_dispatch_writes_metadata_json_on_done(tmp_path):
     # ingress /metadata, /artifacts, /result require <output>/metadata.json once a job is DONE; the
     # dispatcher materializes it from the summary so those routes don't 404 on a VM job.
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"verdict": {"status": "Valid"}}, True))
+    captured = _capture_ensure_metadata(d)
     d._process(store.claim_next())
-    meta = tmp_path / job.job_id / "output" / "metadata.json"
-    assert meta.is_file()
-    import json
-    assert json.loads(meta.read_text())["verdict"]["status"] == "Valid"
+    assert captured["written"]["verdict"]["status"] == "Valid"   # type: ignore[index]
+    # Task 5: the worker purge invariant — nothing (including output/) survives a terminal state.
+    assert not (tmp_path / job.job_id).exists()
 
 
 def test_dispatch_metadata_overwrites_stale_and_neuters_artifacts(tmp_path):
     # metadata.json is overwritten (not skip-if-exists) so a reclaim race resolves to OUR validation,
     # and the guest-supplied artifacts list is neutered to [] (never served as trusted output).
-    import json
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     out = tmp_path / job.job_id / "output"
@@ -121,10 +144,12 @@ def test_dispatch_metadata_overwrites_stale_and_neuters_artifacts(tmp_path):
     (out / "metadata.json").write_text('{"stale": true, "artifacts": [{"id": "x", "path": "../etc"}]}')
     d = VmJobDispatcher(store, str(tmp_path),
                         lambda p: ({"verdict": "ok", "artifacts": [{"id": "y", "path": "z"}]}, True))
+    captured = _capture_ensure_metadata(d)
     d._process(store.claim_next())
-    meta = json.loads((out / "metadata.json").read_text())
+    meta = captured["written"]
     assert meta.get("verdict") == "ok" and "stale" not in meta   # overwritten with our result
     assert meta["artifacts"] == []                               # guest artifacts neutered (security)
+    assert not (tmp_path / job.job_id).exists()                  # Task 5: purged after DONE
 
 
 def test_dispatch_trust_output_metadata_preserves_sealed_artifacts(tmp_path):
@@ -138,10 +163,12 @@ def test_dispatch_trust_output_metadata_preserves_sealed_artifacts(tmp_path):
     sealed = {"status": "ok", "artifacts": [{"id": "p1", "path": "page.png", "sha256": "ab", "bytes": 3}]}
     (out / "metadata.json").write_text(json.dumps(sealed))
     d = VmJobDispatcher(store, str(tmp_path), lambda p: (sealed, True), trust_output_metadata=True)
+    captured = _capture_ensure_metadata(d)
     d._process(store.claim_next())
-    meta = json.loads((out / "metadata.json").read_text())
+    meta = captured["written"]
     assert meta["status"] == "ok"
     assert meta["artifacts"][0]["id"] == "p1"   # preserved, NOT neutered
+    assert not (tmp_path / job.job_id).exists()   # Task 5: purged after DONE
 
 
 def test_dispatch_forwards_sanitized_params_to_validate(tmp_path):

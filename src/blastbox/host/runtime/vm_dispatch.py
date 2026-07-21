@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 from collections.abc import Callable
@@ -203,6 +204,36 @@ class VmJobDispatcher:
         # directory components a non-ingress producer left in `filename`, so the join (and the
         # finally-block unlink) can never escape the job's own input/ dir.
         return self._job_dir(job) / "input" / Path(job.filename).name
+
+    def _purge_job_dir(self, job: Job) -> None:
+        """Remove this job's entire dir (input AND output) from THIS worker's disk.
+
+        SECURITY INVARIANT, not housekeeping: a worker is a malware-analysis node,
+        frequently spare hardware that is not a hardened sample repository. Nothing
+        may survive a terminal state (or a release of this worker's claim on the
+        job), and there is deliberately no setting that disables this. Best-effort
+        by design — a purge failure must never mask the job's real outcome — but it
+        IS logged loudly, never silently swallowed, so an operator can see a worker
+        that is failing to clean up after itself.
+
+        Containment mirrors JobRetentionSweeper._safe_rmtree (jobs/retention.py):
+        resolve first, then refuse anything that doesn't land strictly under
+        ``job_root`` (guards a job_id/path with traversal components).
+        """
+        root = self._job_dir(job).resolve()
+        try:
+            root.relative_to(self._job_root.resolve())
+        except ValueError:
+            logger.error("vm_dispatch: refusing to purge %s (outside job_root %s)",
+                        root, self._job_root)
+            return
+        if not root.exists():
+            return
+        try:
+            shutil.rmtree(root)
+        except OSError as exc:
+            logger.error("vm_dispatch: PURGE FAILED for job %s at %s: %s — sample bytes may "
+                        "remain on this worker's disk", job.job_id, root, exc)
 
     def _expiry(self, finished_at: float) -> float | None:
         return finished_at + self._retention_s if self._retention_s > 0 else None
@@ -437,6 +468,10 @@ class VmJobDispatcher:
                         claimable_after=time.time() + self._blob_retry_backoff_s,
                         materialise_attempts=attempts,
                     )
+                    # Releasing the claim relinquishes THIS worker's involvement with the job —
+                    # purge whatever it holds (nothing should have materialised on a failed fetch,
+                    # but this is the security invariant, not a best-guess: never assume).
+                    self._purge_job_dir(job)
                     return
             summary, ok = self._validate_with_heartbeat(job, in_path)
             summary = self._bounded_summary(summary)   # cap untrusted summary before store/metadata
@@ -512,13 +547,16 @@ class VmJobDispatcher:
                 status=JobStatus.FAILED, finished_at=finished, error=type(exc).__name__,
                 expires_at=self._expiry(finished))
         finally:
-            # Drop the spooled input ONLY if WE still own the job (terminal write applied). If it was
-            # reclaimed, the CAS returned False and the input now belongs to the new owner — leave it.
+            # Purge the WHOLE job dir (input AND output) ONLY if WE still own the job (a terminal
+            # write applied — DONE or FAILED). If it was reclaimed, the CAS returned False and the
+            # dir now belongs to the new owner — leave it untouched.
+            #
+            # SECURITY INVARIANT (not housekeeping): nothing survives a terminal state on this
+            # worker's disk. This deliberately purges output/ too (previously only the spooled input
+            # was unlinked, keeping output around for local-disk reads) — a worker is frequently spare
+            # hardware, not a hardened sample repository, and there is no setting that disables this.
             if owned:
-                try:  # the sample is consumed; drop the spooled input (keep any sealed output)
-                    in_path.unlink()
-                except OSError:
-                    pass
+                self._purge_job_dir(job)
             # Metric parity with the cold dispatcher: count the terminal outcome + wall time -- but ONLY
             # for THIS attempt's own winning CAS (owned + the status we wrote). Requeued (NoWarmSlot)
             # attempts set owned=False, and a reclaimed attempt loses the CAS -> both are skipped. Gating
