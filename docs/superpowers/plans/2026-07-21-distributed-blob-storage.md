@@ -1628,3 +1628,168 @@ and caught in exactly one place (Task 4).
 
 **Placeholder scan:** no TBD/TODO; every code step contains complete code; every test
 step contains the actual assertions.
+
+---
+
+### Task 9: `LocalBlobStore` becomes a real store; purge becomes unconditional
+
+**Added 2026-07-21 after Task 5 review.** The no-op `LocalBlobStore` was incompatible
+with the worker purge invariant and forced a mode-specific branch into the dispatcher.
+See the amended design section "LocalBlobStore is a real filesystem-backed store".
+
+**Files:**
+- Modify: `src/blastbox/host/blobs/local.py`
+- Modify: `src/blastbox/host/blobs/factory.py`
+- Modify: `src/blastbox/host/runtime/vm_dispatch.py` (the two reclaim early-returns)
+- Modify: `tests/host/blobs/test_local.py` (the no-op assertions are now wrong)
+- Modify: `tests/host/test_vm_dispatch.py` (the "left for the new owner" assertion)
+- Test: `tests/host/blobs/test_local_roundtrip.py`
+
+**Interfaces:**
+- Consumes: `BlobStore`, `BlobFetchError` (Task 1); `_purge_job_dir` (Task 5).
+- Produces: `LocalBlobStore(job_root, blob_root=None)` performing real filesystem
+  storage under `<blob_root>/samples/<sha256>` and `<blob_root>/results/<job_id>/`;
+  `BLASTBOX_BLOB_LOCAL_ROOT` env selects `blob_root` (default: sibling `blobs` dir).
+
+**Why both halves are one task:** the unconditional purge is only safe because
+re-materialisation always works, and re-materialisation only always works because the
+local store is real. Splitting them would leave a commit where the purge deletes bytes
+nothing can restore.
+
+- [ ] **Step 1: Write the failing round-trip tests**
+
+`tests/host/blobs/test_local_roundtrip.py` — the local backend must satisfy the same
+contract as S3, including surviving destruction of the job dir:
+
+```python
+"""LocalBlobStore is a REAL store: bytes survive the job dir being destroyed.
+
+This is the property the worker purge invariant depends on. A store whose only copy
+is the job dir cannot serve anything once the worker purges.
+"""
+import hashlib
+import shutil
+
+import pytest
+
+from blastbox.host.blobs.base import BlobFetchError
+from blastbox.host.blobs.local import LocalBlobStore
+
+
+def _store(tmp_path):
+    return LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+
+
+def _spool(tmp_path, job_id, name, data):
+    p = tmp_path / "jobs" / job_id / "input" / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+    return p
+
+
+def test_sample_survives_job_dir_destruction(tmp_path):
+    data = b"malware bytes"
+    digest = hashlib.sha256(data).hexdigest()
+    store = _store(tmp_path)
+    store.put_sample(digest, _spool(tmp_path, "j1", "invoice.doc", data))
+
+    shutil.rmtree(tmp_path / "jobs" / "j1")          # the worker purge
+
+    dest = tmp_path / "jobs" / "j2" / "input" / "other-name.doc"
+    store.get_sample(digest, dest)
+    assert dest.read_bytes() == data
+
+
+def test_identical_bytes_under_two_names_store_once(tmp_path):
+    data = b"same bytes"
+    digest = hashlib.sha256(data).hexdigest()
+    store = _store(tmp_path)
+    store.put_sample(digest, _spool(tmp_path, "j1", "a.doc", data))
+    store.put_sample(digest, _spool(tmp_path, "j2", "PO_08312020.xls", data))
+    assert len(list((tmp_path / "blobs" / "samples").iterdir())) == 1
+
+
+def test_missing_sample_raises_blob_fetch_error(tmp_path):
+    with pytest.raises(BlobFetchError):
+        _store(tmp_path).get_sample("f" * 64, tmp_path / "jobs" / "j" / "input" / "x.doc")
+
+
+def test_output_survives_job_dir_destruction(tmp_path):
+    store = _store(tmp_path)
+    out = tmp_path / "jobs" / "j1" / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_bytes(b'{"status":"ok"}')
+    store.put_output("j1", out)
+
+    shutil.rmtree(tmp_path / "jobs" / "j1")          # the worker purge
+
+    with store.open_output("j1", "metadata.json") as fh:
+        assert fh.read() == b'{"status":"ok"}'
+
+
+def test_delete_job_removes_results_but_not_samples(tmp_path):
+    data = b"shared"
+    digest = hashlib.sha256(data).hexdigest()
+    store = _store(tmp_path)
+    store.put_sample(digest, _spool(tmp_path, "j1", "a.doc", data))
+    out = tmp_path / "jobs" / "j1" / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_bytes(b"{}")
+    store.put_output("j1", out)
+
+    store.delete_job("j1")
+
+    assert not (tmp_path / "blobs" / "results" / "j1").exists()
+    assert (tmp_path / "blobs" / "samples" / digest).exists(), "shared sample must survive"
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+Run: `./.venv/bin/python -m pytest tests/host/blobs/test_local_roundtrip.py -v`
+Expected: FAIL — `LocalBlobStore` takes no `blob_root`, and its put/get move no bytes.
+
+- [ ] **Step 3: Implement the real local store**
+
+Rewrite `src/blastbox/host/blobs/local.py` so each method performs real filesystem
+work, mirroring `S3BlobStore`'s key layout. `put_sample` is idempotent (skip if the
+key exists) and writes via a temp file + atomic rename so a crash cannot leave a
+truncated blob that a later `get_sample` would trust. `delete_job` removes
+`results/<job_id>` ONLY — sample blobs are shared and must survive.
+
+- [ ] **Step 4: Wire `blob_root` through the factory**
+
+`build_blob_store_from_env` reads `BLASTBOX_BLOB_LOCAL_ROOT`, defaulting to a `blobs`
+directory beside `job_root`, and passes it to `LocalBlobStore`.
+
+- [ ] **Step 5: Make the purge unconditional**
+
+In `vm_dispatch.py`, the two reclaim early-returns (job reclaimed before validate, and
+claim lost during validate) currently return without purging, deliberately leaving the
+input "for the new owner". Add `self._purge_job_dir(job)` before each return.
+
+Update the existing assertion in `tests/host/test_vm_dispatch.py` that documents the
+old behaviour ("the shared input is left for the new owner (we didn't unlink it)") to
+assert the opposite, with a comment explaining why: peers no longer depend on a
+sibling's leftovers because the blob store can always re-materialise, and in a real
+fleet the peer is on another host where those bytes would be orphaned malware.
+
+- [ ] **Step 6: Fix the now-wrong no-op tests**
+
+`tests/host/blobs/test_local.py` asserts `put_output`/`delete_job` are no-ops and that
+`get_sample` succeeds on an already-present file. Those encode the old design. Update
+them to the real-store contract; do not delete coverage, re-point it.
+
+- [ ] **Step 7: Run all three gates**
+
+```
+./.venv/bin/python -m ruff check src
+./.venv/bin/python -m mypy src
+./.venv/bin/python -m pytest tests/ -q
+```
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add -A src tests
+git commit -m "feat(blobs): real local store; purge unconditionally on reclaim"
+```
