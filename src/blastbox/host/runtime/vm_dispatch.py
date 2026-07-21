@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from blastbox.contract.envelope import atomic_write_confined
+from blastbox.host.blobs.base import BlobFetchError, BlobStore
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.jobs.retention import JobRetentionSweeper
 from blastbox.host.runtime.remote_http import WorkerBusy   # 409 from a busy worker -> requeue, not fail
@@ -76,7 +77,9 @@ class VmJobDispatcher:
                  sanitize_params: Callable[[dict[str, str]], dict[str, str]] | None = None,
                  output_validator: Callable[[Job, Path], None] | None = None,
                  max_queued_age_s: float = 0.0,
-                 max_summary_bytes: int = _MAX_SUMMARY_BYTES) -> None:
+                 max_summary_bytes: int = _MAX_SUMMARY_BYTES,
+                 blob_store: BlobStore | None = None,
+                 blob_retry_backoff_s: float = 30.0) -> None:
         self._store = store
         self._job_root = Path(job_root)
         self._validate = validate
@@ -141,6 +144,21 @@ class VmJobDispatcher:
         # each job's engine default instead of silently skipping the check.
         self._engine_net_policy = engine_net_policy
         self._max_summary_bytes = max(1024, int(max_summary_bytes))
+        # Backing blob store for on-demand sample materialisation (Task 4). None (the default, and
+        # every existing call site) lazily resolves BLASTBOX_BLOB_URL -- unset means LocalBlobStore,
+        # whose get_sample() only ever raises (there's no second copy in single-node mode), matching
+        # today's behaviour exactly. Imported here, not at module scope, to mirror ingress/app.py's
+        # lazy factory import.
+        if blob_store is not None:
+            self._blobs = blob_store
+        else:
+            from blastbox.host.blobs.factory import build_blob_store_from_env
+
+            self._blobs = build_blob_store_from_env()
+        # How long a job that just failed to fetch is deferred (claimable_after) before it's eligible
+        # again -- long enough that THIS worker doesn't immediately re-claim and spin on a sample its
+        # own connectivity can't reach (see the release branch in _process).
+        self._blob_retry_backoff_s = max(0.0, float(blob_retry_backoff_s))
         self._retention = JobRetentionSweeper(self._job_root)
         self._stop = threading.Event()
 
@@ -348,7 +366,41 @@ class VmJobDispatcher:
         t0 = time.monotonic()   # for the job-duration metric (parity with the cold dispatcher)
         try:
             if not in_path.exists():
-                raise FileNotFoundError(f"spooled input missing: {in_path}")
+                # Materialise on demand. In local mode this re-raises (there is no
+                # second copy); in S3 mode it fetches and hash-verifies.
+                #
+                # A fetch failure RELEASES the claim instead of failing the job: the
+                # object store being unreachable says something about this worker's
+                # connectivity, not about the sample. Failing here would permanently
+                # discard work because one node's link was down.
+                if job.input_sha256 is None:
+                    # No content key to fetch by -- there's nothing a blob store could
+                    # materialise. Same terminal shape as before this feature existed.
+                    raise FileNotFoundError(f"spooled input missing: {in_path}")
+                try:
+                    self._blobs.get_sample(job.input_sha256, in_path)
+                except BlobFetchError:
+                    logger.warning(
+                        "vm_dispatch: job %s could not materialise its sample; "
+                        "releasing the claim for another node", job.job_id,
+                    )
+                    # RUNNING -> QUEUED, CAS'd on (status, claim_id) so a stale owner
+                    # can't clobber a job that was already RECLAIMED. claim_id is
+                    # cleared so the next claim_next() stamps a fresh token.
+                    #
+                    # claimable_after backs the job off briefly: without it THIS worker
+                    # is free to instantly re-claim the job it just failed to fetch and
+                    # spin on it. created_at is deliberately untouched, so public
+                    # ordering and max_queued_age still see the real submission time.
+                    self._store.update_if_status(
+                        job.job_id,
+                        JobStatus.RUNNING,
+                        expect_claim_id=job.claim_id,
+                        status=JobStatus.QUEUED,
+                        claim_id=None,
+                        claimable_after=time.time() + self._blob_retry_backoff_s,
+                    )
+                    return
             summary, ok = self._validate_with_heartbeat(job, in_path)
             summary = self._bounded_summary(summary)   # cap untrusted summary before store/metadata
             err: str | None = None
