@@ -51,12 +51,18 @@ twice both matter.
   **outbound connections only**.
 - The **single-node deployment keeps working with zero configuration changes and no
   new dependencies**. This is a hard requirement, not a nice-to-have.
+  Note this is a guarantee about EXTERNAL behaviour — submit, run, retrieve — and
+  about dependencies. It is NOT a guarantee that bytes stay in the same place on
+  disk: `job_root` becomes ephemeral per-job scratch and durable copies move under
+  `blob_root` (see "LocalBlobStore is a real filesystem-backed store"). An operator
+  sets nothing and sees no behavioural difference; the on-disk layout does change.
 - No change to the Firecracker execution path or its isolation properties.
 
 ## Non-goals
 
 - Replacing `job_root`. Firecracker bind-mounts need a real local path; the local
-  job dir stays. Object storage is a *transport between nodes*, not the working set.
+  job dir stays as the per-job working set. What changes is that it becomes purely
+  ephemeral scratch — durable bytes live in the blob store in every mode.
 - Cross-region replication, lifecycle policies, or a storage control plane. Out of
   scope; MinIO/S3 handle these natively if wanted later.
 - Changing `claim_next()` semantics. They already work for this.
@@ -85,11 +91,43 @@ class BlobStore(Protocol):
     def delete_job(self, job_id: str) -> None: ...              # retention
 ```
 
-**`LocalBlobStore` is a near-no-op.** Ingress already writes the input into
-`job_root/<job_id>/input/`, and the dispatcher already reads it there, so
-`put_sample`/`get_sample` reduce to "verify it exists". This is what keeps the
-single-node path unchanged: same filesystem layout, same code path, no S3 client,
-no network. A single-node operator sets nothing and notices nothing.
+**`LocalBlobStore` is a real filesystem-backed store**, not a no-op.
+
+An earlier draft made it a no-op that merely verified the file already sitting in
+`job_root/<job_id>/input/`, on the theory that this kept single-node behaviour
+byte-identical. That was wrong, and it broke in two places at once:
+
+1. **It is incompatible with the worker purge invariant.** Once a worker deletes its
+   job dir on every terminal path, a store whose only copy *was* the job dir has
+   nothing left to serve — results would vanish and a re-claim could never
+   re-materialise its sample.
+2. **It made the abstraction dishonest.** `LocalBlobStore.get_sample` could only ever
+   fail; it was not an implementation of the protocol so much as a stub pretending to
+   be one. That forced a mode-specific branch into the dispatcher (*"purge only if a
+   remote store is configured"*), which encodes "am I colocated with my peers?" as "is
+   S3 configured?" — two different questions that will drift apart.
+
+So the local backend stores bytes for real, under a root **outside `job_root`**:
+
+```
+<blob_root>/samples/<input_sha256>      content-addressed, shared between jobs
+<blob_root>/results/<job_id>/…          job-scoped
+```
+
+`BLASTBOX_BLOB_LOCAL_ROOT` selects it (default: `blobs` as a sibling of the job root).
+This keeps the worker-purge invariant intact — everything under `job_root` is still
+destroyed — while making re-materialisation always possible.
+
+**The payoff is that mode 1 and mode 3 become the same code path.** The dispatcher
+purges unconditionally, with no knowledge of which backend is configured and no
+branch to rot. Single-node stops being a special case that only *looks* like the
+distributed one.
+
+What a single-node operator notices: nothing externally. Uploads, jobs, and result
+retrieval behave exactly as before. What changes is *where bytes live on disk* —
+`job_root` becomes ephemeral per-job scratch, and the durable copies live under
+`blob_root`. That is a better arrangement independent of this feature, because it is
+what makes `job_root` safe to put on tmpfs.
 
 **Optional dependency, lazily imported.** `sql_store.py` already imports
 `psycopg_pool` *inside* the postgres branch so sqlite users need not install it.
@@ -128,6 +166,18 @@ Therefore, on a worker:
 - no sample survives between jobs, and no sample cache exists;
 - `BLASTBOX_BLOB_KEEP_LOCAL` applies to the **head node only** and is ignored on
   workers, which have no configuration that lets them retain sample bytes.
+
+**The purge is unconditional — including when a peer reclaims the job mid-flight.**
+A worker that loses its claim still destroys its job dir. It must not leave bytes
+behind "for the new owner": that only works when peers share a filesystem, which is
+precisely the arrangement this design rejects, and it is an invisible coupling —
+correctness would depend on co-location that nothing enforces. In a real fleet the
+peer is on another host, so those bytes are simply orphaned malware with no retention
+backstop (this worker never writes a terminal status, so `expires_at` is never set).
+
+This is safe *because* the blob store can always re-materialise, in every mode — which
+is the concrete reason `LocalBlobStore` had to become a real store rather than a
+no-op. The two requirements are the same requirement.
 
 `vm_dispatch.py` already unlinks the input after processing; this design makes that
 guarantee explicit, extends it to the output, and forbids the cache that would
