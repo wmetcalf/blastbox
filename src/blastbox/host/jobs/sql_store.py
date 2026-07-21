@@ -53,6 +53,7 @@ _COLUMNS = (
     "target_tier",
     "net_policy",
     "claimable_after",
+    "materialise_attempts",
     "error",
     "security_warnings",
     "params",
@@ -166,6 +167,7 @@ class SqlJobStore:
             target_tier       TEXT,
             net_policy        TEXT,
             claimable_after   DOUBLE PRECISION,
+            materialise_attempts INTEGER NOT NULL DEFAULT 0,
             error             TEXT,
             security_warnings TEXT,
             params            TEXT,
@@ -297,6 +299,20 @@ class SqlJobStore:
                 ddl = "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS claimable_after DOUBLE PRECISION"
             else:
                 ddl = "ALTER TABLE jobs ADD COLUMN claimable_after DOUBLE PRECISION"
+            try:
+                conn.execute(ddl)
+            except Exception:
+                # a concurrent starter already added it (or a benign race) — re-reading the schema
+                # on the next call will see it; never fail store construction on a best-effort index.
+                pass
+        # materialise_attempts (Task 4/5 bounded-retry counter): same idempotent-across-processes
+        # migration shape as claimable_after above. INTEGER with a 0 default so an existing row
+        # (predating this column) reads as "no failed attempt yet", not NULL.
+        if "materialise_attempts" not in existing:
+            if self._driver == "postgres":
+                ddl = "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS materialise_attempts INTEGER NOT NULL DEFAULT 0"
+            else:
+                ddl = "ALTER TABLE jobs ADD COLUMN materialise_attempts INTEGER NOT NULL DEFAULT 0"
             try:
                 conn.execute(ddl)
             except Exception:

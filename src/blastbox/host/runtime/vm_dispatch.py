@@ -44,6 +44,13 @@ from blastbox.observability.metrics import (
 # value and every status/list response for the job.
 _MAX_SUMMARY_BYTES = 256 * 1024
 
+# Bound the release-on-BlobFetchError loop (Task 4/5): a TRANSIENT fetch failure (this worker's
+# connectivity) should release the claim and let another node try. But a PERMANENTLY missing
+# sample (deleted/never-written blob) would otherwise release -> reclaim -> release forever with
+# no terminal state. Once a job's materialise_attempts reaches this ceiling, the dispatcher marks
+# it FAILED instead of releasing again.
+MAX_MATERIALISE_ATTEMPTS = 3
+
 logger = logging.getLogger(__name__)
 
 
@@ -380,6 +387,30 @@ class VmJobDispatcher:
                 try:
                     self._blobs.get_sample(job.input_sha256, in_path)
                 except BlobFetchError:
+                    attempts = job.materialise_attempts + 1
+                    if attempts >= MAX_MATERIALISE_ATTEMPTS:
+                        # Bounded out: this isn't a transient connectivity blip anymore --
+                        # `attempts` failed materialisations in a row means the sample itself
+                        # is gone (deleted / never written), and no amount of releasing will
+                        # ever fetch it. FAIL terminally instead of releasing again, so the
+                        # job stops looping release -> reclaim -> release forever.
+                        logger.warning(
+                            "vm_dispatch: job %s could not materialise its sample after "
+                            "%d attempts; failing", job.job_id, attempts,
+                        )
+                        finished = time.time()
+                        owned = self._store.update_if_status(
+                            job.job_id,
+                            JobStatus.RUNNING,
+                            expect_claim_id=job.claim_id,
+                            status=JobStatus.FAILED,
+                            finished_at=finished,
+                            error=f"sample could not be materialised after {attempts} attempts",
+                            materialise_attempts=attempts,
+                            expires_at=self._expiry(finished),
+                        )
+                        terminal_status = JobStatus.FAILED
+                        return
                     logger.warning(
                         "vm_dispatch: job %s could not materialise its sample; "
                         "releasing the claim for another node", job.job_id,
@@ -392,6 +423,11 @@ class VmJobDispatcher:
                     # is free to instantly re-claim the job it just failed to fetch and
                     # spin on it. created_at is deliberately untouched, so public
                     # ordering and max_queued_age still see the real submission time.
+                    #
+                    # materialise_attempts is persisted incremented so the counter survives
+                    # the release -- it's a durable Job field (not an in-memory counter)
+                    # precisely so a DIFFERENT node reclaiming this job on the next attempt
+                    # still sees how many times materialisation has already failed.
                     self._store.update_if_status(
                         job.job_id,
                         JobStatus.RUNNING,
@@ -399,6 +435,7 @@ class VmJobDispatcher:
                         status=JobStatus.QUEUED,
                         claim_id=None,
                         claimable_after=time.time() + self._blob_retry_backoff_s,
+                        materialise_attempts=attempts,
                     )
                     return
             summary, ok = self._validate_with_heartbeat(job, in_path)
