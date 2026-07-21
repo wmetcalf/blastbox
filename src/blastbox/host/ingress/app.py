@@ -210,6 +210,7 @@ def build_app(
     metrics_public: bool | None = None,
     extension: IngressExtension | None = None,
     zip_password: str | None = None,
+    blob_store: "BlobStore | None" = None,
 ) -> FastAPI:
     """Construct and return the blastbox ingress FastAPI application.
 
@@ -232,6 +233,8 @@ def build_app(
         metrics_public: Whether ``GET /metrics`` bypasses bearer auth.  Defaults to
                         ``BLASTBOX_METRICS_PUBLIC`` (true unless ``false``/``0``/``no``/``off``).
                         Only takes effect when ``api_key`` is set (otherwise nothing is gated).
+        blob_store: Backing blob store. Defaults to ``build_blob_store_from_env()`` —
+                    ``BLASTBOX_BLOB_URL`` unset means ``LocalBlobStore`` (no bytes moved).
     """
     configure_logging()
 
@@ -242,6 +245,10 @@ def build_app(
     _job_root = job_root or Path(
         os.environ.get("BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs")
     ).expanduser()
+
+    from blastbox.host.blobs.factory import build_blob_store_from_env
+
+    _blob_store = blob_store if blob_store is not None else build_blob_store_from_env()
 
     # Engine allowlist
     _allowed_engines: set[str]
@@ -592,6 +599,16 @@ def build_app(
 
         job.input_sha256 = sha256
         job.result_dir = str(output_dir)
+
+        # Upload BEFORE the row exists: a job is claimable the instant it is created,
+        # and a worker that claims one whose blob is missing would be forced down the
+        # release-and-retry path for a sample that was never actually missing.
+        try:
+            _blob_store.put_sample(sha256, input_path)
+        except Exception as exc:
+            shutil.rmtree(root, ignore_errors=True)
+            _log.warning("blob_put_sample_failed", error=str(exc))
+            raise HTTPException(503, "blob store unavailable") from exc
 
         try:
             _job_store.create(job)
