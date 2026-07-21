@@ -13,6 +13,7 @@ import gzip
 import hashlib
 import io
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import urlparse
@@ -23,7 +24,9 @@ _CHUNK = 1024 * 1024
 
 
 class S3BlobStore:
-    def __init__(self, url: str, *, job_root: Path, env: dict[str, str] | None = None) -> None:
+    def __init__(
+        self, url: str, *, job_root: Path, env: Mapping[str, str] | None = None
+    ) -> None:
         import boto3  # type: ignore[import-untyped]  # noqa: PLC0415 — optional dep, see module docstring
 
         e = os.environ if env is None else env
@@ -48,7 +51,7 @@ class S3BlobStore:
             return                      # already present: content-addressed => identical
         except Exception as exc:
             # Let non-404 errors propagate; only swallow object-not-found
-            import botocore.exceptions  # noqa: PLC0415 — optional dep
+            import botocore.exceptions  # type: ignore[import-untyped]  # noqa: PLC0415 — optional dep
             if isinstance(exc, botocore.exceptions.ClientError):
                 error_code = exc.response.get("Error", {}).get("Code", "")
                 if error_code in ("404", "NoSuchKey"):

@@ -36,6 +36,7 @@ from prometheus_client import CONTENT_TYPE_LATEST
 
 from blastbox import __version__
 from blastbox.errors import sanitize_public_error
+from blastbox.host.blobs.base import BlobStore
 from blastbox.host.jobs.base import VALID_TIERS, Job, JobStatus, JobStore
 from blastbox.host.jobs.factory import build_job_store_from_env
 from blastbox.limits import Limits
@@ -210,7 +211,7 @@ def build_app(
     metrics_public: bool | None = None,
     extension: IngressExtension | None = None,
     zip_password: str | None = None,
-    blob_store: "BlobStore | None" = None,
+    blob_store: BlobStore | None = None,
 ) -> FastAPI:
     """Construct and return the blastbox ingress FastAPI application.
 
