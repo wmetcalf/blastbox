@@ -117,6 +117,9 @@ def _make_dispatcher(
     tier: str = "cold",
     max_queued_age_s: float = 0.0,
     pool=None,
+    blob_store=None,
+    put_output_max_attempts: int = 3,
+    put_output_retry_backoff_s: float = 0.0,
 ) -> Dispatcher:
     if engines is None:
         engines = {_ENGINE_NAME: _engine_spec()}
@@ -134,6 +137,9 @@ def _make_dispatcher(
         pool=pool,
         tier=tier,
         max_queued_age_s=max_queued_age_s,
+        blob_store=blob_store,
+        put_output_max_attempts=put_output_max_attempts,
+        put_output_retry_backoff_s=put_output_retry_backoff_s,
     )
 
 
@@ -200,6 +206,104 @@ def test_happy_path_done_result_summary_input_gone(tmp_path):
     assert "warning_count" in final_job.result_summary
     assert final_job.finished_at is not None
     # Input file and directory must be gone
+    assert not input_path.exists()
+    assert not input_path.parent.exists()
+
+
+# ---------------------------------------------------------------------------
+# Finding P1: the classic (cold) Dispatcher must upload results to the blob
+# store, exactly like VmJobDispatcher — otherwise the API's result routes
+# (which read ONLY through BlobStore.open_output) 404 on every completed job
+# in the default local deployment.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingBlobs:
+    """Minimal BlobStore double that records put_output calls + a snapshot of
+    whether metadata.json existed in out_dir at call time (it must -- upload
+    happens BEFORE the DONE write, not after)."""
+
+    def __init__(self, fail_times: int = 0):
+        self.fail_times = fail_times
+        self.calls = 0
+        self.uploaded: list[str] = []
+        self.saw_metadata = False
+
+    def put_sample(self, sha256, src): ...
+    def get_sample(self, sha256, dest): ...
+    def put_output(self, job_id, out_dir):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise OSError(f"object store down (attempt {self.calls})")
+        self.saw_metadata = (Path(out_dir) / "metadata.json").is_file()
+        self.uploaded.append(job_id)
+    def open_output(self, job_id, name): ...
+    def delete_job(self, job_id): ...
+
+
+def test_cold_dispatch_uploads_result_to_blob_store_before_done(tmp_path):
+    """P1: the cold path's success write must call put_output BEFORE marking DONE,
+    with the sealed metadata.json already on disk in the uploaded directory."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    input_path = _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    blobs = _RecordingBlobs()
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner, blob_store=blobs,
+    )
+    result = dispatcher.dispatch_once()
+
+    assert result is True
+    assert blobs.uploaded == [job.job_id]
+    assert blobs.saw_metadata, "metadata.json must already be sealed when put_output runs"
+    final_job = store.get(job.job_id)
+    assert final_job.status == JobStatus.DONE
+    assert not input_path.exists()
+
+
+def test_cold_dispatch_upload_failure_fails_job_not_done(tmp_path):
+    """Finding D1 applied to the classic Dispatcher: an upload that fails every
+    bounded inline attempt must NOT be marked DONE. It takes the normal failure
+    path (FAILED, scrubbed error) and the normal input cleanup runs -- exactly
+    like every other post-detonation failure in this dispatcher (trust failure,
+    output-too-large, etc). There is no "leave it RUNNING" branch here either."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    input_path = _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    blobs = _RecordingBlobs(fail_times=999)  # every attempt fails
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner, blob_store=blobs,
+        put_output_max_attempts=3,
+    )
+    result = dispatcher.dispatch_once()
+
+    assert result is True
+    assert blobs.calls == 3, "must exhaust the bounded retry budget, not give up early"
+    assert blobs.uploaded == []
+    final_job = store.get(job.job_id)
+    assert final_job.status == JobStatus.FAILED, "must not be marked DONE with an unstored result"
+    assert final_job.error is not None
+    assert "upload" in final_job.error.lower()
+    # Normal cleanup for this dispatcher: the untrusted input is deleted on every
+    # terminal path it owns, exactly as on every other failure branch.
     assert not input_path.exists()
     assert not input_path.parent.exists()
 
