@@ -6,7 +6,7 @@ from blastbox.host.blobs.local import LocalBlobStore
 
 
 def _local(tmp_path, request):
-    return LocalBlobStore(tmp_path)
+    return LocalBlobStore(tmp_path, blob_root=tmp_path / "blobs")
 
 
 def _s3(tmp_path, request):

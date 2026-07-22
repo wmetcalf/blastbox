@@ -8,7 +8,7 @@ import shutil
 
 import pytest
 
-from blastbox.host.blobs.base import BlobFetchError
+from blastbox.host.blobs.base import BlobFetchError, BlobIntegrityError
 from blastbox.host.blobs.local import LocalBlobStore
 
 
@@ -61,6 +61,23 @@ def test_output_survives_job_dir_destruction(tmp_path):
 
     with store.open_output("j1", "metadata.json") as fh:
         assert fh.read() == b'{"status":"ok"}'
+
+
+def test_get_sample_raises_blob_integrity_error_on_corrupt_stored_blob(tmp_path):
+    """A blob corrupted on disk (bug, bit rot) after put_sample must not be trusted
+    forever just because the key already existed — get_sample re-hashes and rejects
+    it, mirroring S3BlobStore, and must not leave a corrupt copy at dest."""
+    data = b"trustworthy bytes"
+    digest = hashlib.sha256(data).hexdigest()
+    store = _store(tmp_path)
+    store.put_sample(digest, _spool(tmp_path, "j1", "invoice.doc", data))
+
+    (tmp_path / "blobs" / "samples" / digest).write_bytes(b"corrupted!!")
+
+    dest = tmp_path / "jobs" / "j2" / "input" / "invoice.doc"
+    with pytest.raises(BlobIntegrityError):
+        store.get_sample(digest, dest)
+    assert not dest.exists(), "a corrupt fetch must not leave bytes at dest"
 
 
 def test_delete_job_removes_results_but_not_samples(tmp_path):

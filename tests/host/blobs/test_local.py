@@ -2,6 +2,8 @@
 rooted OUTSIDE job_root (see tests/host/blobs/test_local_roundtrip.py for the
 property this exists to guarantee: bytes surviving job-dir destruction). These
 tests cover the per-method contract in isolation."""
+import hashlib
+
 import pytest
 
 from blastbox.host.blobs.base import BlobFetchError
@@ -35,10 +37,12 @@ def test_get_sample_materialises_a_copy_from_the_blob_root(tmp_path):
     # put_sample stores it once; get_sample must be able to write it to a BRAND NEW
     # destination, not merely verify a file that's already there (the old no-op
     # contract this replaces — see test_local_roundtrip.py for why that broke).
+    data = b"payload"
+    digest = hashlib.sha256(data).hexdigest()
     store = _store(tmp_path)
-    store.put_sample("a" * 64, _mk_job(tmp_path / "jobs", data=b"payload"))
+    store.put_sample(digest, _mk_job(tmp_path / "jobs", data=data))
     dest = tmp_path / "jobs" / "j2" / "input" / "renamed.doc"
-    store.get_sample("a" * 64, dest)
+    store.get_sample(digest, dest)
     assert dest.read_bytes() == b"payload"
 
 
