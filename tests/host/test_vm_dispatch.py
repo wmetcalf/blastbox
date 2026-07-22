@@ -793,9 +793,9 @@ def test_dispatch_sets_retention_expiry(tmp_path):
     assert got.expires_at == pytest.approx(got.finished_at + 100)   # retention sweeper can reclaim it
 
 
-def test_dispatch_keeps_input_when_job_was_reclaimed(tmp_path):
+def test_dispatch_purges_input_when_job_was_reclaimed_before_validate(tmp_path):
     # if validation outran a recovery requeue and another dispatcher reclaimed the job, our terminal
-    # CAS fails (stale claim_id) and we must NOT unlink the shared input out from under the new owner.
+    # CAS fails (stale claim_id) before we even reach validate.
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     stale = store.claim_next()                                       # claim A
@@ -804,7 +804,11 @@ def test_dispatch_keeps_input_when_job_was_reclaimed(tmp_path):
     store.claim_next()                                              # reclaim B (now RUNNING under B)
     d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"v": 1}, True))
     d._process(stale)                                              # process with the STALE claim A
-    assert (tmp_path / job.job_id / "input" / "evil.dll").exists()  # preserved for the new owner
+    # Task 9: the purge is now unconditional, even here. We no longer leave the input "for the new
+    # owner" -- in a real fleet the new owner is on ANOTHER host and could never read bytes left on
+    # THIS worker's disk anyway, and the blob store (real in every mode) can always re-materialise
+    # the sample for whoever runs the job next. So this worker purges its own dir regardless.
+    assert not (tmp_path / job.job_id / "input" / "evil.dll").exists()
     assert store.get(job.job_id).status is JobStatus.RUNNING        # stale owner couldn't terminate it
 
 
@@ -1091,8 +1095,11 @@ def test_does_not_write_metadata_when_claim_lost_during_validate(tmp_path):
     assert not (tmp_path / job.job_id / "output" / "metadata.json").exists()
     got = store.get(job.job_id)
     assert got.status is JobStatus.RUNNING and got.claim_id == "peer-now-owns-it"  # peer still owns it
-    # and the shared input is left for the new owner (we didn't unlink it)
-    assert (tmp_path / job.job_id / "input" / job.filename).exists()
+    # Task 9: the purge is now unconditional here too. We no longer leave the shared input for the
+    # new owner -- in a real fleet the peer holds its OWN copy on its OWN host (this worker's disk
+    # was never shared with it), and the blob store can always re-materialise the sample if needed.
+    # So this worker purges its own dir even though a peer now owns the job.
+    assert not (tmp_path / job.job_id / "input" / job.filename).exists()
 
 
 def test_dispatch_marks_failed_when_validate_raises_baseexception(tmp_path):

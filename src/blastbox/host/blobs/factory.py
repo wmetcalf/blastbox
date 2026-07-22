@@ -24,7 +24,12 @@ def build_blob_store_from_env(env: dict[str, str] | None = None) -> BlobStore:
     job_root = Path(e.get("BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs"))
     url = e.get("BLASTBOX_BLOB_URL", "").strip()
     if not url:
-        return LocalBlobStore(job_root)
+        # Durable bytes live OUTSIDE job_root (a sibling `blobs` dir by default) so the
+        # worker purge — which destroys job_root wholesale on every terminal path — can
+        # never take the local store's only copy with it. See local.py.
+        local_root = e.get("BLASTBOX_BLOB_LOCAL_ROOT", "").strip()
+        blob_root = Path(local_root) if local_root else job_root.parent / "blobs"
+        return LocalBlobStore(job_root, blob_root=blob_root)
 
     scheme = urlparse(url).scheme.lower()
     if scheme == "s3":

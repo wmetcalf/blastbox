@@ -153,16 +153,25 @@ class VmJobDispatcher:
         self._engine_net_policy = engine_net_policy
         self._max_summary_bytes = max(1024, int(max_summary_bytes))
         # Backing blob store for on-demand sample materialisation (Task 4). None (the default, and
-        # every existing call site) lazily resolves BLASTBOX_BLOB_URL -- unset means LocalBlobStore,
-        # whose get_sample() only ever raises (there's no second copy in single-node mode), matching
-        # today's behaviour exactly. Imported here, not at module scope, to mirror ingress/app.py's
-        # lazy factory import.
+        # every existing call site) lazily resolves BLASTBOX_BLOB_URL -- unset means LocalBlobStore, a
+        # REAL filesystem-backed store rooted outside job_root (Task 9), so get_sample() can
+        # re-materialise a sample this worker purged, exactly like the S3 backend. Imported here, not
+        # at module scope, to mirror ingress/app.py's lazy factory import.
         if blob_store is not None:
             self._blobs = blob_store
         else:
             from blastbox.host.blobs.factory import build_blob_store_from_env
 
-            self._blobs = build_blob_store_from_env()
+            # Task 9: LocalBlobStore derives its default blob_root FROM job_root (a sibling
+            # `blobs` dir), so the factory must see the job_root THIS dispatcher actually
+            # uses, not just the raw env var -- else a caller that passes an explicit
+            # `job_root=` (differing from BLASTBOX_JOB_ROOT) would get a local store rooted
+            # at the wrong directory, and get_sample() would raise "not present" for a
+            # sample this same process's ingress just put_sample'd. Mirrors ingress/app.py's
+            # build_app fix for the identical mismatch.
+            self._blobs = build_blob_store_from_env(
+                {**os.environ, "BLASTBOX_JOB_ROOT": str(self._job_root)}
+            )
         # How long a job that just failed to fetch is deferred (claimable_after) before it's eligible
         # again -- long enough that THIS worker doesn't immediately re-claim and spin on a sample its
         # own connectivity can't reach (see the release branch in _process).
@@ -398,6 +407,12 @@ class VmJobDispatcher:
         if not self._store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                                             worker_runtime="warm", worker_tier=self._worker_tier):
             logger.info("vm_dispatch: job %s reclaimed before validate; skipping", job.job_id)
+            # Purge unconditionally (Task 9): this worker's involvement with the job ends here, and
+            # the blob store (real in every mode, not just S3) can always re-materialise the sample
+            # for whichever node now owns it. We no longer leave the input "for the new owner" — in a
+            # real fleet the new owner is on ANOTHER host, so leftovers here are just orphaned malware
+            # bytes on spare hardware, not something a peer could ever read.
+            self._purge_job_dir(job)
             return
         in_path = self._input_path(job)
         owned = False
@@ -512,6 +527,10 @@ class VmJobDispatcher:
             if ok and not self._claim_is_still_ours(job):
                 logger.info("vm_dispatch: job %s reclaimed during validate; not publishing metadata "
                             "or CAS (peer owns it now)", job.job_id)
+                # Purge unconditionally (Task 9): same reasoning as the reclaimed-before-validate
+                # return above -- the blob store can always re-materialise this job's sample for its
+                # new owner, so there's no reason to leave bytes behind on this worker's disk.
+                self._purge_job_dir(job)
                 return
             if ok and not self._ensure_metadata(job, summary):
                 ok, err = False, "metadata_write_failed"

@@ -249,7 +249,17 @@ def build_app(
 
     from blastbox.host.blobs.factory import build_blob_store_from_env
 
-    _blob_store = blob_store if blob_store is not None else build_blob_store_from_env()
+    # Task 9: LocalBlobStore is a REAL store now, and its default blob_root is derived
+    # FROM job_root (a sibling `blobs` dir) -- so the factory must see the job_root this
+    # app actually uses, not just the raw env var. Without this override, an explicit
+    # `job_root=` caller (every test, and any deployment that doesn't rely purely on
+    # BLASTBOX_JOB_ROOT) would get a LocalBlobStore rooted at the WRONG directory: samples
+    # spooled under `_job_root` would be put_sample'd into a blob_root computed from a
+    # different (default) path, and likely fail outright (e.g. no permission to create
+    # ``/var/lib/blastbox/blobs``) where the old no-op store never touched the filesystem.
+    _blob_store = blob_store if blob_store is not None else build_blob_store_from_env(
+        {**os.environ, "BLASTBOX_JOB_ROOT": str(_job_root)}
+    )
 
     # Engine allowlist
     _allowed_engines: set[str]
