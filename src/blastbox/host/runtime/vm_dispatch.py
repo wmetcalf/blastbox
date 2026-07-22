@@ -534,6 +534,25 @@ class VmJobDispatcher:
                 return
             if ok and not self._ensure_metadata(job, summary):
                 ok, err = False, "metadata_write_failed"
+            # Upload the sealed output BEFORE the terminal CAS below -- and long before the
+            # `finally` purge, which is about to delete it. Unlike a get_sample fetch failure
+            # (which releases the claim because the WORK hasn't happened yet), a put_output
+            # failure is the mirror image: the expensive detonation already ran and its result
+            # is sitting right here. Retry is out of scope, so don't record a FAILED outcome and
+            # don't let the purge erase it -- skip the terminal CAS entirely and return. The
+            # store's status field is untouched (still RUNNING from the warm-stamp CAS earlier in
+            # this method), `owned` stays False, so `finally` does not purge, and the reclaim
+            # sweeper (or a peer) picks the job up for another attempt instead of the result being
+            # silently discarded.
+            if ok:
+                try:
+                    self._blobs.put_output(job.job_id, self._job_dir(job) / "output")
+                except Exception as exc:  # noqa: BLE001 -- must not throw away completed work
+                    logger.error(
+                        "vm_dispatch: result upload failed for %s (%s); leaving RUNNING for the "
+                        "sweeper rather than discarding completed work", job.job_id, exc,
+                    )
+                    return
             finished = time.time()
             # CAS on (status, claim_id) so a stale owner can't clobber a job that was reclaimed
             # (RUNNING->QUEUED->RUNNING under another dispatcher). The return value is OUR ownership.
