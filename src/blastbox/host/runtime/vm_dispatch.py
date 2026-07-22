@@ -544,6 +544,29 @@ class VmJobDispatcher:
             # this method), `owned` stays False, so `finally` does not purge, and the reclaim
             # sweeper (or a peer) picks the job up for another attempt instead of the result being
             # silently discarded.
+            #
+            # But put_output writes to a deterministic per-job key (results/<job_id>/...) as a
+            # per-file overwrite/union -- it is NOT a claim-fenced atomic swap the way the store's
+            # CAS is. If our claim was reclaimed since the `_claim_is_still_ours` check above (e.g.
+            # during `_ensure_metadata`'s filesystem I/O), and a peer has since re-detonated,
+            # uploaded its OWN result, and CAS-committed DONE, this worker's write would land
+            # stale/divergent bytes over the peer's already-correct, already-DONE result --
+            # detonation is not guaranteed deterministic run-to-run, so this is a real corruption,
+            # not a harmless redundant rewrite. Re-checking ownership IMMEDIATELY before the call
+            # narrows that window to the same width the rest of this file already accepts for its
+            # store operations (the same TOCTOU `_claim_is_still_ours` above narrows for the
+            # metadata write) -- it does NOT fully close it: there is no store-level compare-and-
+            # swap on the uploaded object itself (S3 offers no such primitive), so a reclaim landing
+            # AFTER this check but DURING the upload call is still possible and is not fenced here.
+            if ok and not self._claim_is_still_ours(job):
+                logger.info("vm_dispatch: job %s reclaimed before upload; skipping put_output "
+                            "(peer owns it now)", job.job_id)
+                # Same reasoning as the other lost-claim returns in this method: our local copy
+                # is a stale attempt now, the peer's own upload is the correct result, and the
+                # blob store can always re-materialise the sample if this job needs to run again
+                # -- nothing may survive on this worker's disk once we're no longer the owner.
+                self._purge_job_dir(job)
+                return
             if ok:
                 try:
                     self._blobs.put_output(job.job_id, self._job_dir(job) / "output")
