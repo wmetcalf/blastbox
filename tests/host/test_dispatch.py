@@ -308,6 +308,79 @@ def test_cold_dispatch_upload_failure_fails_job_not_done(tmp_path):
     assert not input_path.parent.exists()
 
 
+def test_cold_dispatch_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(tmp_path):
+    """Round-2 finding R2-1: put_output writes to a deterministic per-job key that is a
+    per-file overwrite/union, not a claim-fenced atomic swap. If a peer reclaims this job
+    (e.g. an orphan/requeue sweep) in the narrow window between the last local ownership
+    check and the upload -- here simulated by flipping claim_id right after
+    _write_sealed_metadata runs, mirroring VmJobDispatcher's own
+    test_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result -- this worker must
+    NOT then upload its (possibly stale) bytes over the peer's already-correct result.
+    put_output must never be invoked once ownership is lost, and the job must not be
+    marked DONE by this (no-longer-owning) worker."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    input_path = _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    blobs = _RecordingBlobs()
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner, blob_store=blobs,
+    )
+
+    # Simulate a peer reclaiming the job right after the host seals metadata.json but
+    # before the dispatcher re-checks ownership for the upload.
+    real_write_sealed_metadata = dispatcher._write_sealed_metadata
+
+    def _write_sealed_metadata_then_peer_reclaims(envelope, out_dir):
+        real_write_sealed_metadata(envelope, out_dir)
+        store.update(job.job_id, claim_id="peer-claim-id-not-ours")
+
+    dispatcher._write_sealed_metadata = _write_sealed_metadata_then_peer_reclaims  # type: ignore[method-assign]
+
+    result = dispatcher.dispatch_once()
+
+    assert result is True
+    assert blobs.uploaded == [], "put_output must never be called once ownership is lost"
+    stored = store.get(job.job_id)
+    assert stored.status == JobStatus.RUNNING, "must not clobber the peer's ownership of this job"
+    assert stored.claim_id == "peer-claim-id-not-ours"
+    # Input is the new (peer) owner's responsibility now -- not deleted by the reclaimed worker.
+    assert input_path.exists()
+
+
+def test_cold_dispatch_still_owned_uploads_and_marks_done(tmp_path):
+    """Sanity companion to the reclaim test above: when ownership is intact throughout,
+    the normal upload + DONE path is unaffected by the new recheck."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    blobs = _RecordingBlobs()
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner, blob_store=blobs,
+    )
+    result = dispatcher.dispatch_once()
+
+    assert result is True
+    assert blobs.uploaded == [job.job_id]
+    assert store.get(job.job_id).status == JobStatus.DONE
+
+
 def test_cold_dispatch_serves_host_sealed_metadata(tmp_path):
     """#5: a worker that fabricates artifact sha256/bytes in metadata.json must NOT have those
     served — after DONE the on-disk metadata.json carries the host-recomputed (real) values."""

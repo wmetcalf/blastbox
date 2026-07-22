@@ -1123,7 +1123,26 @@ class Dispatcher:
             # DONE (Finding P1) — same policy as the cold path (Finding D1: bounded inline
             # retry, then fail instead of DONE). warm_clean stays False on failure, so the
             # `finally` below releases the slot DIRTY, same as every other warm failure.
+            #
+            # But put_output writes to a deterministic per-job key as a per-file overwrite,
+            # NOT a claim-fenced atomic swap the way the store's CAS is. If our claim was
+            # reclaimed since this attempt last checked (peer orphan/requeue sweep → a
+            # second worker re-ran + uploaded ITS result + CAS-committed DONE), our write
+            # here would land stale/divergent bytes over the peer's already-correct result
+            # (Round-2 finding R2-1). Re-checking ownership IMMEDIATELY before the call
+            # narrows that window (mirrors VmJobDispatcher._process's identical recheck,
+            # and the cold path's above) — it does NOT fully close it: a reclaim landing
+            # AFTER this check but DURING the upload call is still possible and unfenced.
+            # warm_clean stays False (the finally releases the slot dirty, same as any
+            # other lost-claim/failure path) and we do NOT call _fail_job — the job is no
+            # longer ours to terminalize; the peer's own state is left untouched.
             # ------------------------------------------------------------------
+            if not self._claim_is_still_ours(job):
+                _log.info(
+                    "warm job %s reclaimed before upload; skipping put_output (peer owns "
+                    "it now)", job.job_id,
+                )
+                return
             if not self._upload_output(job, output_dir):
                 self._fail_job(
                     job,
@@ -1590,7 +1609,27 @@ class Dispatcher:
         # so a job marked DONE without a stored result would 404 on every result route in
         # the default local deployment. A failure here (after bounded inline retries, see
         # Finding D1) takes the normal failure path instead of DONE.
+        #
+        # But put_output writes to a deterministic per-job key (results/<job_id>/...) as a
+        # per-file overwrite, NOT a claim-fenced atomic swap the way the store's CAS is. If
+        # our claim was reclaimed since this attempt last checked (e.g. a peer's orphan/
+        # requeue sweep decided this job's owner was gone, requeued it, and a second worker
+        # re-ran + uploaded ITS result + CAS-committed DONE), our write here would land
+        # stale/divergent bytes over the peer's already-correct, already-DONE result —
+        # detonation is not guaranteed deterministic run-to-run, so this is a real
+        # corruption, not a harmless redundant rewrite (Round-2 finding R2-1). Re-checking
+        # ownership IMMEDIATELY before the call narrows that window (mirrors
+        # VmJobDispatcher._process's identical recheck) — it does NOT fully close it: there
+        # is no store-level compare-and-swap on the uploaded object itself, so a reclaim
+        # landing AFTER this check but DURING the upload call is still possible and is not
+        # fenced here.
         # ------------------------------------------------------------------
+        if not self._claim_is_still_ours(job):
+            _log.info(
+                "cold job %s reclaimed before upload; skipping put_output (peer owns it "
+                "now)", job.job_id,
+            )
+            return
         if not self._upload_output(job, output_dir):
             self._fail_job(
                 job,
@@ -1637,6 +1676,19 @@ class Dispatcher:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _claim_is_still_ours(self, job: Job) -> bool:
+        """Whether we still own the claim: the stored job is RUNNING with OUR claim_id.
+
+        Mirrors ``VmJobDispatcher._claim_is_still_ours`` — a best-effort TOCTOU narrowing
+        for ``_upload_output``, which the store's CAS can't fence (``put_output`` writes to
+        a deterministic per-job key as a per-file overwrite, not a claim-fenced atomic
+        swap). A store read error is treated as "not ours" — fail closed, don't upload."""
+        try:
+            cur = self._job_store.get(job.job_id)
+        except Exception:  # noqa: BLE001 — a transient store error → don't risk a stale upload
+            return False
+        return cur is not None and cur.status == JobStatus.RUNNING and cur.claim_id == job.claim_id
 
     def _upload_output(self, job: Job, output_dir: Path) -> bool:
         """Upload *output_dir* (already sealed) to the blob store, with a bounded inline

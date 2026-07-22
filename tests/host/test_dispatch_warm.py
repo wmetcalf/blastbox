@@ -571,6 +571,56 @@ def test_warm_upload_failure_fails_job_and_releases_slot_dirty(tmp_path):
     assert pool.release_dirty == [True]
 
 
+def test_warm_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(tmp_path):
+    """Round-2 finding R2-1 (warm completion path): put_output writes to a deterministic
+    per-job key that is a per-file overwrite/union, not a claim-fenced atomic swap. If a
+    peer reclaims this job in the narrow window between the last local ownership check
+    and the upload -- here simulated by flipping claim_id right after
+    _materialize_sealed_warm_output runs, mirroring VmJobDispatcher's own
+    test_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result -- this worker must
+    NOT then upload its (possibly stale) bytes over the peer's already-correct result."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)
+    _start_fake_worker(
+        slot,
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
+    )
+
+    blobs = _RecordingBlobs()
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10, blob_store=blobs,
+    )
+
+    # Simulate a peer reclaiming the job right after the host materializes + seals the
+    # output but before the dispatcher re-checks ownership for the upload.
+    real_materialize = dispatcher._materialize_sealed_warm_output
+
+    def _materialize_then_peer_reclaims(envelope, src_dir, dst_dir):
+        real_materialize(envelope, src_dir, dst_dir)
+        store.update(job.job_id, claim_id="peer-claim-id-not-ours")
+
+    dispatcher._materialize_sealed_warm_output = _materialize_then_peer_reclaims  # type: ignore[method-assign]
+
+    result = dispatcher.dispatch_once()
+
+    assert result is True
+    assert blobs.uploaded == [], "put_output must never be called once ownership is lost"
+    stored = store.get(job.job_id)
+    assert stored.status == JobStatus.RUNNING, "must not clobber the peer's ownership of this job"
+    assert stored.claim_id == "peer-claim-id-not-ours"
+
+    # The slot must still be released exactly once (dirty -- this attempt did not cleanly finish).
+    assert len(pool.release_calls) == 1
+    assert pool.release_calls[0] is slot
+    assert pool.release_dirty == [True]
+
+
 def test_warm_dispatch_stamps_worker_tier(tmp_path):
     """Feature #1: a warm dispatch records WHICH backend ran the job (worker_tier), alongside the
     generic worker_runtime="warm" — so FC-warm and gVisor-warm are distinguishable in the result.
