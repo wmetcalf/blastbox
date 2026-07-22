@@ -5,6 +5,7 @@ need a real path. A remote backend does not replace ``job_root``, it feeds it.
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import BinaryIO, Protocol, runtime_checkable
 
@@ -39,3 +40,38 @@ class BlobStore(Protocol):
 
     def delete_job(self, job_id: str) -> None:
         """Drop *job_id*'s outputs. MUST NOT touch shared ``samples/`` blobs."""
+
+
+def upload_output_with_retry(
+    store: "BlobStore",
+    job_id: str,
+    out_dir: Path,
+    *,
+    attempts: int = 3,
+    backoff_s: float = 1.0,
+) -> Exception | None:
+    """Call ``store.put_output`` up to *attempts* times with a short sleep between
+    tries, and return the last exception (or ``None`` on success).
+
+    This is the shared upload-failure policy for BOTH dispatchers (Finding D1): the
+    detonation already finished and its result is sitting in ``out_dir`` right now,
+    while this worker still holds the job's claim — so a transient failure (a
+    momentary object-store blip) deserves a real, bounded, in-line chance to
+    succeed before the caller gives up on the result. It is deliberately NOT
+    unbounded and does NOT leave the job in a non-terminal state for some other
+    process to retry later: callers that exhaust every attempt must treat the
+    upload as failed, fail the job, and let their normal terminal-path cleanup run
+    — there is no consumer that would ever pick a "preserved for retry" job back
+    up (see the finding).
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            store.put_output(job_id, out_dir)
+            return None
+        except Exception as exc:  # noqa: BLE001 — any backend failure is retryable here;
+            # the caller decides what to do once every attempt is exhausted.
+            last_exc = exc
+            if attempt < attempts:
+                time.sleep(max(0.0, backoff_s))
+    return last_exc

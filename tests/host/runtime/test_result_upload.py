@@ -1,15 +1,30 @@
-"""Results are uploaded BEFORE the purge, and a failed upload never discards work.
+"""Results are uploaded BEFORE the purge, and a failed upload gets a bounded
+inline retry — then the job FAILS and cleans up like every other terminal path.
 
-put_output failure is the mirror image of get_sample failure: the work is already
-done and expensive, so retry and leave it for the sweeper — do not throw it away.
+Finding D1: an earlier version of this file asserted the OPPOSITE contract — that
+a put_output failure should leave the job RUNNING "for the sweeper", preserving
+its job dir "for a retry". That was the bug: nothing ever re-runs a RUNNING job
+(there is no consumer for a "preserved" result), and the orphan-recovery path
+that eventually FAILs an abandoned RUNNING job unlinks only the INPUT file, not
+the output dir — with the default job_retention_s=0 the resulting FAILED job's
+expires_at is None, which retention.expire_due skips forever. So the "preserved"
+directory was never cleaned up AND the "preserved" result was never used: pure
+loss on both sides of the trade the old contract claimed to make. The fix is a
+bounded inline retry (a transient blip gets a real chance to succeed while this
+worker still holds the claim and the output dir exists), and on exhaustion an
+unconditional FAIL + purge — the same shape as every other terminal path.
 """
 from blastbox.host.jobs.base import Job, JobStatus
 from blastbox.host.jobs.memory import InMemoryJobStore
 
 
 class Blobs:
-    def __init__(self, fail_put=False):
+    def __init__(self, fail_put=False, fail_times=None):
+        # fail_put=True: every attempt fails. fail_times=N: the first N attempts
+        # fail, then it succeeds (models a transient blip that clears up).
         self.fail_put = fail_put
+        self.fail_times = fail_times
+        self.put_output_calls = 0
         self.uploaded: list[str] = []
         self.saw_metadata = False
     def put_sample(self, sha256, src): ...
@@ -17,8 +32,9 @@ class Blobs:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(b"x")
     def put_output(self, job_id, out_dir):
-        if self.fail_put:
-            raise OSError("object store down")
+        self.put_output_calls += 1
+        if self.fail_put or (self.fail_times is not None and self.put_output_calls <= self.fail_times):
+            raise OSError(f"object store down (attempt {self.put_output_calls})")
         self.saw_metadata = (out_dir / "metadata.json").is_file()
         self.uploaded.append(job_id)
     def open_output(self, job_id, name): ...
@@ -42,20 +58,50 @@ def test_output_uploaded_before_purge(vm_dispatcher_factory, tmp_path):
     assert store.get(job.job_id).status is JobStatus.DONE
 
 
-def test_upload_failure_leaves_the_job_running_for_the_sweeper(vm_dispatcher_factory, tmp_path):
+def test_upload_retries_inline_and_recovers_from_a_transient_failure(vm_dispatcher_factory, tmp_path):
+    """A blip that clears up within the retry budget must still produce a normal
+    DONE — the retry is supposed to be invisible to the job's outcome."""
     store = InMemoryJobStore()
     job = Job.new(engine="redtusk", filename="a.doc")
     job.input_sha256 = "b" * 64
     store.create(job)
     claimed = store.claim_next()
 
-    disp = vm_dispatcher_factory(store=store, blob_store=Blobs(fail_put=True), validate_ok=True)
+    blobs = Blobs(fail_times=2)  # fails twice, then succeeds -- within a 3-attempt budget
+    disp = vm_dispatcher_factory(
+        store=store, blob_store=blobs, validate_ok=True, put_output_max_attempts=3,
+    )
     disp._process(claimed)
 
-    assert store.get(job.job_id).status is JobStatus.RUNNING
-    # the job dir (including output/) must NOT have been purged -- the result is un-uploaded,
-    # not discarded, and the reclaim sweeper needs it to still be there for a retry.
-    assert (tmp_path / job.job_id / "output" / "metadata.json").is_file()
+    assert blobs.put_output_calls == 3
+    assert blobs.uploaded == [job.job_id]
+    assert store.get(job.job_id).status is JobStatus.DONE
+    assert not (tmp_path / job.job_id).exists(), "purge must still run on the recovered success path"
+
+
+def test_upload_failure_after_exhausting_retries_fails_the_job_and_purges(vm_dispatcher_factory, tmp_path):
+    """Finding D1's replacement contract: once every inline attempt fails, the
+    upload is treated as failed -- FAIL the job (never leave it RUNNING) and let
+    the unconditional purge run (never leave a leftover output dir "for later").
+    """
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.input_sha256 = "b" * 64
+    store.create(job)
+    claimed = store.claim_next()
+
+    blobs = Blobs(fail_put=True)
+    disp = vm_dispatcher_factory(
+        store=store, blob_store=blobs, validate_ok=True, put_output_max_attempts=3,
+    )
+    disp._process(claimed)
+
+    assert blobs.put_output_calls == 3, "must exhaust the bounded retry budget, not give up early"
+    final = store.get(job.job_id)
+    assert final.status is JobStatus.FAILED, "must not be left RUNNING -- there is no consumer for that"
+    assert "upload failed" in (final.error or "").lower()
+    # the cleanup invariant holds on every terminal path -- no leftover output dir survives.
+    assert not (tmp_path / job.job_id).exists(), "job dir (input AND output) must be purged, not preserved"
 
 
 def test_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(vm_dispatcher_factory, tmp_path):

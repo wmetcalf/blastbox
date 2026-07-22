@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from blastbox.contract.envelope import atomic_write_confined
-from blastbox.host.blobs.base import BlobFetchError, BlobStore
+from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.jobs.retention import JobRetentionSweeper
 from blastbox.host.runtime.remote_http import WorkerBusy   # 409 from a busy worker -> requeue, not fail
@@ -51,6 +51,15 @@ _MAX_SUMMARY_BYTES = 256 * 1024
 # no terminal state. Once a job's materialise_attempts reaches this ceiling, the dispatcher marks
 # it FAILED instead of releasing again.
 MAX_MATERIALISE_ATTEMPTS = 3
+
+# Bound the inline put_output retry (Finding D1). The detonation already ran and its
+# result is sitting on disk right now, while this worker still holds the claim -- a
+# transient upload failure (a momentary object-store blip) deserves a real, bounded,
+# IN-LINE chance to succeed. There is deliberately no "leave it RUNNING for later"
+# fallback: nothing ever re-runs a RUNNING job, so once every attempt is exhausted the
+# job FAILs and its dir is purged like every other terminal path -- see _process.
+PUT_OUTPUT_MAX_ATTEMPTS = 3
+PUT_OUTPUT_RETRY_BACKOFF_S = 1.0
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +96,9 @@ class VmJobDispatcher:
                  max_queued_age_s: float = 0.0,
                  max_summary_bytes: int = _MAX_SUMMARY_BYTES,
                  blob_store: BlobStore | None = None,
-                 blob_retry_backoff_s: float = 30.0) -> None:
+                 blob_retry_backoff_s: float = 30.0,
+                 put_output_max_attempts: int = PUT_OUTPUT_MAX_ATTEMPTS,
+                 put_output_retry_backoff_s: float = PUT_OUTPUT_RETRY_BACKOFF_S) -> None:
         self._store = store
         self._job_root = Path(job_root)
         self._validate = validate
@@ -176,6 +187,11 @@ class VmJobDispatcher:
         # again -- long enough that THIS worker doesn't immediately re-claim and spin on a sample its
         # own connectivity can't reach (see the release branch in _process).
         self._blob_retry_backoff_s = max(0.0, float(blob_retry_backoff_s))
+        # Bounded inline retry policy for a result upload (Finding D1) -- see the
+        # module-level constants for why this is bounded and has no "retry later"
+        # fallback: put_output_max_attempts tries, put_output_retry_backoff_s apart.
+        self._put_output_max_attempts = max(1, int(put_output_max_attempts))
+        self._put_output_retry_backoff_s = max(0.0, float(put_output_retry_backoff_s))
         # Reap result blobs alongside the on-disk dir; delete_job is scoped to
         # results/<job_id> only, so shared samples/<sha256> blobs are never touched.
         self._retention = JobRetentionSweeper(self._job_root, blob_store=self._blobs)
@@ -426,11 +442,11 @@ class VmJobDispatcher:
         terminal_status: JobStatus | None = None   # the terminal state THIS attempt CAS-won (for metrics)
         # The `finally` purge is UNCONDITIONAL for every terminal state and every lost/released claim
         # (the security invariant: this worker is spare hardware that must not accumulate malware, and
-        # the blob store always re-materialises the sample for whoever owns the job now). The ONE
-        # documented exception is a put_output failure -- the job stays RUNNING under OUR OWN claim
-        # (not terminal, not released) holding a completed result that isn't in the blob store yet;
-        # discarding it would throw away expensive work. Only that path sets this True.
-        preserve_result_for_retry = False
+        # the blob store always re-materialises the sample for whoever owns the job now). There is no
+        # exception for a put_output failure: Finding D1 removed the earlier "leave it RUNNING for the
+        # sweeper" branch (preserve_result_for_retry) because nothing ever consumes a job left that
+        # way -- see the upload block below, which retries inline (bounded) and, on exhaustion, FAILs
+        # the job so this purge runs like every other terminal path.
         t0 = time.monotonic()   # for the job-duration metric (parity with the cold dispatcher)
         try:
             if not in_path.exists():
@@ -580,19 +596,25 @@ class VmJobDispatcher:
                 # unconditional `finally` purge (below) handles it.
                 return
             if ok:
-                try:
-                    self._blobs.put_output(job.job_id, self._job_dir(job) / "output")
-                except Exception as exc:  # noqa: BLE001 -- must not throw away completed work
+                upload_exc = upload_output_with_retry(
+                    self._blobs, job.job_id, self._job_dir(job) / "output",
+                    attempts=self._put_output_max_attempts,
+                    backoff_s=self._put_output_retry_backoff_s,
+                )
+                if upload_exc is not None:
+                    # Finding D1: every inline attempt failed. There is no consumer for a job left
+                    # RUNNING "for the sweeper" (nothing re-runs a RUNNING job), so treat this the
+                    # same as any other post-detonation failure -- FAIL the job (the terminal write
+                    # below) and let the unconditional `finally` purge run. The completed result is
+                    # discarded (it was never durably stored), but the job dir + claim don't leak.
                     logger.error(
-                        "vm_dispatch: result upload failed for %s (%s); leaving RUNNING for the "
-                        "sweeper rather than discarding completed work", job.job_id, exc,
+                        "vm_dispatch: result upload failed for %s after %d attempt(s) (%s); "
+                        "discarding the result and failing the job (no leftover output dir)",
+                        job.job_id, self._put_output_max_attempts, upload_exc,
                     )
-                    # The ONE documented exception to the unconditional purge below: the job stays
-                    # RUNNING under OUR OWN claim (not terminal, not released) with a completed but
-                    # un-uploaded result. Purging here would discard expensive work -- preserve the
-                    # dir so the reclaim sweeper / a retry can still find it.
-                    preserve_result_for_retry = True
-                    return
+                    ok = False
+                    err = (f"result upload failed after {self._put_output_max_attempts} attempts; "
+                           "result discarded")
             finished = time.time()
             # CAS on (status, claim_id) so a stale owner can't clobber a job that was reclaimed
             # (RUNNING->QUEUED->RUNNING under another dispatcher). The return value is OUR ownership.
@@ -629,17 +651,14 @@ class VmJobDispatcher:
             # SECURITY INVARIANT (not housekeeping): nothing survives on this worker's disk once its
             # attempt ends. The purge is UNCONDITIONAL across every terminal state (DONE/FAILED) AND
             # every lost/released claim -- crucially including when a peer reclaimed the job mid-flight
-            # so our terminal CAS lost (owned=False). Bytes left behind then are orphaned malware that
-            # no peer on another host could ever read (this design rejects a shared filesystem), while
-            # the blob store (real in every mode) always re-materialises the sample for the new owner.
-            # It deliberately purges output/ too, and there is no setting that disables it.
-            #
-            # The ONLY exception is a put_output failure (preserve_result_for_retry): there the job
-            # stays RUNNING under OUR OWN claim -- not terminal, not released -- holding a completed
-            # result that isn't in the blob store yet. Discarding it would throw away expensive work,
-            # so that path (and only that path) keeps the dir for the reclaim sweeper / a retry.
-            if not preserve_result_for_retry:
-                self._purge_job_dir(job)
+            # so our terminal CAS lost (owned=False), AND a put_output failure that exhausted its
+            # retry budget (Finding D1 removed the "leave it RUNNING for the sweeper" exception: no
+            # consumer ever picks a RUNNING job like that back up, so that branch could only ever
+            # leak a job dir forever). Bytes left behind would be orphaned malware that no peer on
+            # another host could ever read (this design rejects a shared filesystem), while the blob
+            # store (real in every mode) always re-materialises the sample for the new owner. It
+            # deliberately purges output/ too, and there is no setting that disables it.
+            self._purge_job_dir(job)
             # Metric parity with the cold dispatcher: count the terminal outcome + wall time -- but ONLY
             # for THIS attempt's own winning CAS (owned + the status we wrote). Requeued (NoWarmSlot)
             # attempts set owned=False, and a reclaimed attempt loses the CAS -> both are skipped. Gating
