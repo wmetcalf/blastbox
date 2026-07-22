@@ -96,6 +96,11 @@ def test_result_zip_serves_only_validated_artifacts(tmp_path):
     outside = tmp_path / "outside_secret"
     outside.write_bytes(b"OUTSIDE-SECRET")
     (output_dir / "leak").symlink_to(outside)
+    # Re-push: put_output uploads EVERYTHING under output_dir (not just declared
+    # artifacts), mirroring the dispatcher uploading whatever a compromised worker left
+    # behind. The declared-artifacts filter that matters now lives at SERVE time
+    # (_zip_validated_artifacts only ever reads `rels`), which is what this asserts.
+    _push_to_blob(tmp_path, job.job_id, output_dir)
 
     resp = client.get(f"/v1/jobs/{job.job_id}/result")
     assert resp.status_code == 200
@@ -175,7 +180,12 @@ def test_readyz_does_not_leak_store_error(tmp_path):
 
 
 def test_serve_endpoints_reject_symlinked_output(tmp_path):
-    """A compromised worker's symlinked artifact / metadata.json must not be served."""
+    """A compromised worker's symlinked artifact must not be served.
+
+    ``/artifacts/{id}`` (get_artifact) is unchanged by Task 7 -- it still reads the
+    job's live output/ dir from the local filesystem -- so the symlink-rejection check
+    there is exercised exactly as before.
+    """
     client, store = _make_client(tmp_path)
     job, output_dir = _make_done_job(tmp_path, store)
     outside = tmp_path / "outside_secret"
@@ -188,13 +198,54 @@ def test_serve_endpoints_reject_symlinked_output(tmp_path):
     assert r.status_code == 404
     assert b"OUTSIDE-SECRET" not in r.content
 
-    # metadata.json replaced by a symlink -> 404
+
+def test_metadata_post_seal_disk_tamper_is_inert(tmp_path):
+    """Task 7: /metadata no longer reads the live job dir at all -- it reads the
+    BlobStore snapshot ``put_output`` captured once, right after the dispatcher sealed
+    the job (mirrored here by ``_make_done_job``'s ``_push_to_blob`` call). So swapping
+    ``output/metadata.json`` for a symlink AFTER that point (as a compromised worker
+    might, in the purge window before the dir is destroyed) has no effect on what gets
+    served: there is no later disk read left for the symlink to subvert.
+
+    This supersedes the old filesystem-era assertion (symlinked metadata.json -> 404):
+    that check protected a *live* read that no longer happens. The route is not
+    literally rejecting a hostile symlink here -- it is structurally immune, because it
+    never looks at output/ again once put_output has run. (The one open item this does
+    NOT cover: LocalBlobStore.put_output / S3BlobStore.put_output themselves follow
+    symlinks -- ``Path.is_file()`` is true for a symlink to a regular file -- when
+    walking output/ to decide what to upload. Hardening put_output to skip symlinks,
+    mirroring what this serve-time check used to do, is a latent finding outside this
+    task's file scope; see the Task 7 report.)
+    """
+    client, store = _make_client(tmp_path)
+    job, output_dir = _make_done_job(tmp_path, store)
+
     meta = output_dir / "metadata.json"
-    data = meta.read_bytes()
+    pristine = meta.read_bytes()
+    (tmp_path / "ext_meta.json").write_bytes(pristine)
     meta.unlink()
-    (tmp_path / "ext_meta.json").write_bytes(data)
     meta.symlink_to(tmp_path / "ext_meta.json")
-    assert client.get(f"/v1/jobs/{job.job_id}/metadata").status_code == 404
+
+    resp = client.get(f"/v1/jobs/{job.job_id}/metadata")
+    assert resp.status_code == 200
+    assert resp.content == pristine
+
+
+def _push_to_blob(tmp_path: Path, job_id: str, output_dir: Path) -> None:
+    """Upload *output_dir* into the same (real) ``LocalBlobStore`` ``build_app``'s
+    default factory constructs for this ``job_root`` — mirroring what the dispatcher's
+    ``put_output`` call does right after sealing a job's output, before the worker purge.
+
+    Task 7: ``/metadata`` and ``/result`` now read exclusively through the BlobStore,
+    not ``job_root`` — so any test that wants those routes to see a given on-disk state
+    must push that state into the blob store, at the point it wants it captured. Tests
+    that tamper ``output_dir`` AFTER calling ``_make_done_job`` (which already pushes
+    the pristine state once) and want that tampering reflected by ``/metadata``/
+    ``/result`` must call this again afterwards.
+    """
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs").put_output(job_id, output_dir)
 
 
 def _make_done_job(
@@ -208,7 +259,9 @@ def _make_done_job(
 ) -> tuple[Job, Path]:
     """Create a DONE job with a valid metadata.json and one artifact.
 
-    Returns (job, output_dir).
+    Also pushes the pristine output into the BlobStore (Task 7: /metadata and /result
+    read through it, not job_root) — mirroring the dispatcher calling put_output right
+    after sealing. Returns (job, output_dir).
     """
     job = Job.new(engine=engine, filename=filename)
     output_dir = tmp_path / "jobs" / job.job_id / "output"
@@ -245,6 +298,8 @@ def _make_done_job(
     job.status = JobStatus.DONE
     job.finished_at = time.time()
     job_store.create(job)
+
+    _push_to_blob(tmp_path, job.job_id, output_dir)
 
     return job, output_dir
 

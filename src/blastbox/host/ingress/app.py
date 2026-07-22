@@ -68,6 +68,10 @@ _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 _MAX_PARAMS = 64
 _MAX_PARAM_LEN = 4096
 
+# Chunk size for streaming a BlobStore artifact (e.g. metadata.json) back to the client
+# without buffering the whole object in this process.
+_STREAM_CHUNK = 1024 * 1024
+
 
 def _safe_upload_name(raw: str | None) -> str:
     """Sanitize a client-supplied filename to a safe basename.
@@ -154,7 +158,12 @@ def _declared_artifact_paths(output_dir: Path) -> frozenset[str]:
 
 
 def _zip_validated_artifacts(
-    output_dir: Path, artifact_rels: list[str], dest, password: str | None = None
+    blob_store: BlobStore,
+    job_id: str,
+    metadata_bytes: bytes,
+    artifact_rels: list[str],
+    dest,
+    password: str | None = None,
 ) -> None:
     """Write a ZIP of ONLY the dispatcher-validated artifacts (+ ``metadata.json``) to ``dest``
     (a writable binary file object). The caller streams from a TEMP FILE, so the ZIP — up to
@@ -165,10 +174,18 @@ def _zip_validated_artifacts(
     don't auto-open or quarantine them in transit (default password ``"infected"``). An
     empty/None password writes a plain ``ZIP_DEFLATED`` archive.
 
-    A compromised worker can drop EXTRA undeclared files or a symlink (``output/leak ->
-    /etc/passwd``) into output/; we serve only the relative paths the trust gate declared in
-    ``metadata.json``, each run through ``_safe_artifact_path`` (resolve + containment) and
-    skipped if it is a symlink or not a regular file."""
+    Task 7: reads every byte through the BlobStore (``open_output``), not the local
+    filesystem — after Task 5's worker purge, the job's local ``output/`` dir is gone by
+    the time this runs on a real (multi-node) deployment. ``metadata_bytes`` is the
+    already-fetched ``metadata.json`` content (the caller reads it once, both to derive
+    ``artifact_rels`` and to embed here). A compromised worker can get EXTRA undeclared
+    files uploaded alongside the sealed output (``put_output`` copies everything under
+    ``output/``, not just declared artifacts) — we still serve only the relative paths the
+    trust gate declared in ``metadata.json``, silently skipping any declared artifact the
+    blob store can't produce (mirrors the old filesystem version's skip-on-missing/symlink
+    behaviour, just with the trust boundary at "was it uploaded under this job_id" instead
+    of filesystem containment).
+    """
     if password:
         import pyzipper  # type: ignore[import-untyped]
 
@@ -181,18 +198,18 @@ def _zip_validated_artifacts(
     with zf_cm as zf:
         if password:
             zf.setpassword(password.encode("utf-8"))
-        for rel in ["metadata.json", *artifact_rels]:
+        zf.writestr("metadata.json", metadata_bytes)
+        seen.add("metadata.json")
+        for rel in artifact_rels:
             if not rel or rel in seen:
                 continue
             seen.add(rel)
-            # Don't follow a symlink to its (possibly outside) target...
-            if (output_dir / rel).is_symlink():
+            try:
+                with blob_store.open_output(job_id, rel) as fh:
+                    data = fh.read()
+            except Exception:
                 continue
-            # ...and resolve+confine (catches a symlink in any parent component too).
-            safe = _safe_artifact_path(output_dir, rel)
-            if safe is None or safe.is_symlink() or not safe.is_file():
-                continue
-            zf.write(safe, arcname=rel)
+            zf.writestr(rel, data)
 
 
 # ---------------------------------------------------------------------------
@@ -706,22 +723,37 @@ def build_app(
 
     @app.get("/v1/jobs/{job_id}/metadata")
     def get_metadata(job_id: str):
-        """Serve the dispatcher-validated ``output/metadata.json``.
+        """Serve the dispatcher-validated ``metadata.json`` through the BlobStore.
 
-        Returns 409 if the job is not DONE; 410 if expired.
+        Returns 409 if the job is not DONE; 410 if expired (job-store status only —
+        see Task 7: after the worker purge, the local job dir is gone by design, so
+        its absence is no longer used as an expiry signal).
+
+        BLASTBOX_BLOB_RESULT_ACCESS defaults to ``stream``: read from the blob store
+        and stream through this API, so the object store itself stays PRIVATE
+        (clients need no credentials or network path to it). This route never
+        redirects.
         """
         _validate_job_id(job_id)
         _require_done(job_id)
-        out = _output_dir_for(job_id)
-        if not out.is_dir():
-            raise HTTPException(410, "result expired")
-        meta_json = out / "metadata.json"
-        # Reject a symlinked metadata.json (don't follow it to an outside target) — mirrors
-        # _zip_validated_artifacts; defense-in-depth even though output/ is not live at serve time.
-        if meta_json.is_symlink() or not meta_json.is_file():
+        try:
+            fh = _blob_store.open_output(job_id, "metadata.json")
+        except Exception:
             raise HTTPException(404, "metadata.json not found")
-        from fastapi.responses import FileResponse
-        return FileResponse(meta_json, media_type="application/json")
+
+        from fastapi.responses import StreamingResponse
+
+        def _iter_fh():
+            try:
+                while True:
+                    chunk = fh.read(_STREAM_CHUNK)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                fh.close()
+
+        return StreamingResponse(_iter_fh(), media_type="application/json")
 
     @app.get("/v1/jobs/{job_id}/artifacts/{artifact_id}")
     def get_artifact(job_id: str, artifact_id: str):
@@ -776,23 +808,28 @@ def build_app(
 
     @app.get("/v1/jobs/{job_id}/result")
     async def get_result(job_id: str):
-        """Stream a ZIP of the dispatcher-validated artifacts (+ ``metadata.json``).
+        """Stream a ZIP of the dispatcher-validated artifacts (+ ``metadata.json``),
+        read entirely through the BlobStore (Task 7) — after the worker purge, the
+        job's local output/ dir no longer exists on a real deployment.
 
-        Serves only the artifact paths declared in the validated ``metadata.json`` — NOT a
-        blind walk of output/ — so a compromised worker's undeclared/symlinked files are not
-        disclosed (see ``_zip_validated_artifacts``).
+        Serves only the artifact paths declared in the validated ``metadata.json`` — NOT
+        everything ``put_output`` happened to upload — so a compromised worker's
+        undeclared extra files are not disclosed (see ``_zip_validated_artifacts``).
+
+        BLASTBOX_BLOB_RESULT_ACCESS defaults to ``stream``: bytes come from the blob
+        store and stream through this API; the object store stays PRIVATE and this
+        route never redirects.
         """
         _validate_job_id(job_id)
         _require_done(job_id)
-        out = _output_dir_for(job_id)
-        if not out.is_dir():
-            raise HTTPException(410, "result expired")
 
-        meta_json = out / "metadata.json"
-        if meta_json.is_symlink() or not meta_json.is_file():
+        try:
+            with _blob_store.open_output(job_id, "metadata.json") as meta_fh:
+                meta_bytes = meta_fh.read()
+        except Exception:
             raise HTTPException(404, "metadata.json not found")
         try:
-            meta = json.loads(meta_json.read_bytes())
+            meta = json.loads(meta_bytes)
         except Exception:
             raise HTTPException(500, "could not parse metadata.json")
         rels = [
@@ -810,7 +847,9 @@ def build_app(
             fd, tmp_path = tempfile.mkstemp(prefix="bbresult-", suffix=".zip")
             try:
                 with os.fdopen(fd, "wb") as fh:
-                    _zip_validated_artifacts(out, rels, fh, password=_zip_password)
+                    _zip_validated_artifacts(
+                        _blob_store, job_id, meta_bytes, rels, fh, password=_zip_password
+                    )
                 return tmp_path
             except BaseException:
                 os.unlink(tmp_path)
@@ -868,6 +907,7 @@ def build_app(
     # Context for product ingress extensions (job lookups + confined artifact serving).
     app.state.job_store = _job_store
     app.state.job_root = _job_root
+    app.state.blob_store = _blob_store
     app.state.serve_artifact_file = _serve_artifact_file
 
     # Generic perceptual-hash search (GET /v1/similar), mounted only when the
