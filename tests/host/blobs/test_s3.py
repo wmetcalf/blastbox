@@ -75,6 +75,34 @@ def test_put_output_compresses_by_default(store, tmp_path):
         assert fh.read() == b'{"a":1}' * 500        # transparent on read
 
 
+def test_put_output_skips_a_symlink_to_a_file_outside_the_output_dir(store, tmp_path):
+    """Security regression (mirrors the LocalBlobStore test): a compromised worker
+    can plant e.g. output/metadata.json -> /etc/passwd before put_output runs.
+    rglob("*") + is_file() FOLLOWS a symlink and would previously read + upload the
+    TARGET's bytes, later served as trusted job output. put_output must skip a
+    symlinked entry (never store/serve it) while still uploading legitimate
+    sibling files."""
+    out = tmp_path / "j10" / "output"
+    out.mkdir(parents=True)
+    (out / "legit.txt").write_bytes(b"legit-bytes")
+
+    secret = tmp_path / "outside_secret.txt"
+    secret.write_bytes(b"TOP-SECRET-OUTSIDE-BYTES")
+    (out / "metadata.json").symlink_to(secret)
+
+    store.put_output("j10", out)
+
+    with pytest.raises(BlobFetchError):
+        store.open_output("j10", "metadata.json")
+    s3 = boto3.client("s3", region_name="us-east-1")
+    assert s3.list_objects_v2(
+        Bucket=BUCKET, Prefix="pfx/results/j10/metadata.json"
+    )["KeyCount"] == 0
+
+    with store.open_output("j10", "legit.txt") as fh:
+        assert fh.read() == b"legit-bytes"
+
+
 def test_delete_job_removes_outputs_but_not_samples(store, tmp_path):
     data = b"shared sample"
     digest = hashlib.sha256(data).hexdigest()

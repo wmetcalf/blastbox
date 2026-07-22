@@ -6,10 +6,11 @@ Security properties (review will probe):
 2. ``_safe_upload_name`` strips directory components, rejects hidden names, and
    replaces unsafe characters — path traversal via filename is impossible.
 3. Artifact serving is id-based: ``GET /v1/jobs/{id}/artifacts/{artifact_id}``
-   looks up the artifact's *path* in the dispatcher-validated ``metadata.json``;
-   the resolved file is confirmed under the job's ``output/`` via
-   ``_safe_artifact_path`` (``Path.resolve() + relative_to``).  No client-
-   supplied path is ever used directly.
+   looks up the artifact's *path* in the dispatcher-validated ``metadata.json``
+   (read through the BlobStore, not disk); the declared relative path is
+   confirmed non-absolute and traversal-free via ``_safe_relative_artifact_path``
+   before it is ever used as a BlobStore key.  No client-supplied path is ever
+   used directly.
 4. Bearer auth is off by default (proxy-fronted); a loud warning is logged.
    ``hmac.compare_digest`` prevents timing oracles.
 5. ``_intake_gate`` semaphore (sized from ``BLASTBOX_API_WORKERS``, parsed +
@@ -23,12 +24,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import shutil
 import uuid
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
@@ -97,37 +99,58 @@ def _safe_upload_name(raw: str | None) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _safe_artifact_path(output_dir: Path, relative: str) -> Path | None:
-    """Resolve ``output_dir / relative`` and return only if it stays under ``output_dir``.
+def _safe_relative_artifact_path(relative: str) -> str | None:
+    """Validate a metadata-declared artifact path is a safe, CONTAINED relative name,
+    without touching disk.
 
-    Defense-in-depth: ``relative`` is derived from the dispatcher-validated
-    ``metadata.json`` (not from the client), but we still check in case of a
-    compromised worker that managed to pass the trust gate.
+    Task 7 gap 2: after the worker purge, a job's local ``output/`` dir may not exist
+    on this node at all, so there is no real filesystem path left to
+    ``Path.resolve() + relative_to()`` against (the old ``_safe_artifact_path``
+    approach). Containment is re-expressed purely on the declared relative name
+    itself: reject an absolute path or any ``..`` traversal component *before* the
+    caller ever calls ``BlobStore.open_output``. Returns ``relative`` unchanged if
+    it's safe, else ``None`` (mirrors the old function's None-on-escape contract).
+    """
+    if not relative or not isinstance(relative, str):
+        return None
+    p = PurePosixPath(relative)
+    if p.is_absolute():
+        return None
+    if any(part in ("..", "") for part in p.parts):
+        return None
+    return relative
 
-    Returns ``None`` if the resolved path escapes ``output_dir``.
+
+def _fetch_and_parse_metadata(blob_store: BlobStore, job_id: str) -> object:
+    """Fetch + parse ``metadata.json`` through the BlobStore.
+
+    Task 7 gap 2: artifact routes must never read the local job dir — by the time
+    they run on a real (multi-node) deployment the worker has already purged it.
+    Mirrors ``get_result``'s metadata fetch. Raises 404 if the object is missing or
+    unreadable, 500 if it isn't valid JSON.
     """
     try:
-        out_resolved = output_dir.resolve(strict=False)
-        candidate = (output_dir / relative).resolve(strict=False)
-        candidate.relative_to(out_resolved)
-    except (OSError, ValueError):
-        return None
-    return candidate
-
-
-def _declared_artifact_paths(output_dir: Path) -> frozenset[str]:
-    """Return the set of ``artifacts[].path`` declared in the dispatcher-sealed
-    ``metadata.json`` — the only paths the trust gate re-hashed and thus the only
-    paths a fixed-filename serve route may return. Fail-closed: a missing /
-    symlinked / unparseable manifest yields the empty set (→ caller 404s), so an
-    undeclared file a compromised worker dropped is never served as trusted output."""
-    meta_json = output_dir / "metadata.json"
+        with blob_store.open_output(job_id, "metadata.json") as fh:
+            meta_bytes = fh.read()
+    except Exception:
+        raise HTTPException(404, "metadata.json not found")
     try:
-        if meta_json.is_symlink() or not meta_json.is_file():
-            return frozenset()
-        meta = json.loads(meta_json.read_bytes())
-    except (OSError, ValueError):
-        return frozenset()
+        return json.loads(meta_bytes)
+    except Exception:
+        raise HTTPException(500, "could not parse metadata.json")
+
+
+def _declared_artifact_paths_from_meta(meta: object) -> frozenset[str]:
+    """Return the set of ``artifacts[].path`` declared in an already-parsed
+    ``metadata.json`` object — the only paths the trust gate re-hashed and thus the
+    only paths a fixed-filename serve route may return. Fail-closed: a malformed
+    manifest shape yields the empty set (→ caller 404s), so an undeclared file a
+    compromised worker dropped is never served as trusted output.
+
+    Task 7 gap 2: takes the already-parsed object (fetched via the BlobStore by
+    ``_fetch_and_parse_metadata``) rather than reading+parsing ``output_dir`` off
+    disk itself.
+    """
     if not isinstance(meta, dict):
         # A top-level JSON array/scalar (e.g. "[]") would make .get() raise — fail closed.
         return frozenset()
@@ -416,18 +439,52 @@ def build_app(
             raise HTTPException(409, f"job not done (status={job.status.value})")
         return job
 
-    def _output_dir_for(job_id: str) -> Path:
-        """Re-derive the output directory from job_root and job_id.
-
-        FIX 3: Do NOT trust ``job.result_dir`` (a persisted store value is a
-        weaker trust boundary than the server-controlled ``job_root``).  Always
-        compute ``job_root / <uuid> / output`` so that a tampered or corrupted
-        ``result_dir`` cannot redirect artifact serving outside job_root.
-        """
-        return _job_root / job_id / "output"
-
     def _public_detail(exc: Exception | str) -> str:
         return sanitize_public_error(str(exc))
+
+    def _stream_artifact_response(
+        job_id: str,
+        rel: str,
+        *,
+        media_type: str | None,
+        filename: str | None,
+    ):
+        """Open ``rel`` through the BlobStore and return it as a streaming response,
+        matching ``FileResponse``'s media-type inference / Content-Disposition
+        behaviour without ever touching disk. Raises 404 if the object can't be
+        opened.
+        """
+        from fastapi.responses import StreamingResponse
+
+        try:
+            fh = _blob_store.open_output(job_id, rel)
+        except Exception:
+            raise HTTPException(404, "artifact file not found")
+
+        resolved_media_type = media_type or (
+            mimetypes.guess_type(filename or rel)[0] or "application/octet-stream"
+        )
+        headers: dict[str, str] = {}
+        if filename is not None:
+            from urllib.parse import quote
+
+            quoted = quote(filename)
+            if quoted != filename:
+                headers["content-disposition"] = f"attachment; filename*=utf-8''{quoted}"
+            else:
+                headers["content-disposition"] = f'attachment; filename="{filename}"'
+
+        def _iter_fh():
+            try:
+                while True:
+                    chunk = fh.read(_STREAM_CHUNK)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                fh.close()
+
+        return StreamingResponse(_iter_fh(), media_type=resolved_media_type, headers=headers)
 
     def _serve_artifact_file(
         job_id: str,
@@ -436,11 +493,17 @@ def build_app(
         media_type: str | None = None,
         filename: str | None = None,
     ):
-        """Serve a FIXED relative artifact path from a job's output dir.
+        """Serve a FIXED relative artifact path, read through the BlobStore.
 
         Exposed on ``app.state`` so product ingress extensions (e.g. ClippyShot's
         ``/pdf`` + typed page-PNG routes) reuse the core's confinement: DONE-gated,
-        ``resolve()+relative_to()`` containment, and no-symlink-follow.
+        declared-artifact + traversal/absolute-path containment, streamed bytes.
+
+        Task 7 gap 2: after the worker purge, a job's local ``output/`` dir may not
+        exist on this node at all — this never reads the local filesystem. The
+        declared-artifact check and the relative-path containment check both run
+        against the BlobStore-fetched ``metadata.json`` / the declared name itself,
+        BEFORE any ``open_output`` call for the artifact bytes.
 
         TRUST-GATE ENFORCEMENT: unlike ``get_artifact`` (which resolves the served
         path *from* the sealed manifest by id), this route is keyed by a fixed
@@ -452,22 +515,21 @@ def build_app(
         bypass). The host re-hashes only DECLARED artifacts, so anything not in the
         manifest was never validated and must 404.
         """
-        from fastapi.responses import FileResponse
-
         _validate_job_id(job_id)
         _require_done(job_id)
-        out = _output_dir_for(job_id)
-        if not out.is_dir():
-            raise HTTPException(410, "result expired")
-        if relative not in _declared_artifact_paths(out):
+
+        meta = _fetch_and_parse_metadata(_blob_store, job_id)
+        if relative not in _declared_artifact_paths_from_meta(meta):
             # Not a sealed/declared artifact → never re-validated by the trust gate.
             raise HTTPException(404, "artifact file not found")
-        if (out / relative).is_symlink():
+
+        safe_rel = _safe_relative_artifact_path(relative)
+        if safe_rel is None:
             raise HTTPException(404, "artifact file not found")
-        safe = _safe_artifact_path(out, relative)
-        if safe is None or safe.is_symlink() or not safe.is_file():
-            raise HTTPException(404, "artifact file not found")
-        return FileResponse(safe, media_type=media_type, filename=filename)
+
+        return _stream_artifact_response(
+            job_id, safe_rel, media_type=media_type, filename=filename
+        )
 
     # -------------------------------------------------------------------
     # Health / version / metrics (always public)
@@ -757,54 +819,51 @@ def build_app(
 
     @app.get("/v1/jobs/{job_id}/artifacts/{artifact_id}")
     def get_artifact(job_id: str, artifact_id: str):
-        """Serve a single artifact by its id (from dispatcher-validated metadata).
+        """Serve a single artifact by its id (from dispatcher-validated metadata),
+        read through the BlobStore (Task 7 gap 2) — after the worker purge, the
+        job's local ``output/`` dir is gone by the time this runs on a real
+        (multi-node) deployment.
 
         Security (requirement 3):
         - ``artifact_id`` is used as a *key* into the validated artifact list,
           never as a filesystem path.
         - The artifact's ``path`` field comes from ``metadata.json`` (validated
-          by the dispatcher's trust gate), not from the client.
-        - ``_safe_artifact_path`` does a final ``resolve() + relative_to()``
-          containment check before serving.
+          by the dispatcher's trust gate, fetched via the BlobStore), not from
+          the client.
+        - ``_safe_relative_artifact_path`` rejects an absolute or traversal
+          declared path BEFORE any ``open_output`` call — containment is
+          re-expressed on the declared relative name itself, since there is no
+          guaranteed on-disk ``output_dir`` left to ``resolve()`` against.
         """
         _validate_job_id(job_id)
         _require_done(job_id)
-        out = _output_dir_for(job_id)
-        if not out.is_dir():
-            raise HTTPException(410, "result expired")
 
-        meta_json = out / "metadata.json"
-        if meta_json.is_symlink() or not meta_json.is_file():
-            raise HTTPException(404, "metadata.json not found")
-
-        try:
-            raw = meta_json.read_bytes()
-            meta = json.loads(raw)
-        except Exception:
-            raise HTTPException(500, "could not parse metadata.json")
+        meta = _fetch_and_parse_metadata(_blob_store, job_id)
 
         # Find the artifact whose id matches (artifacts are in the top-level list).
-        artifacts = meta.get("artifacts", [])
+        artifacts = meta.get("artifacts", []) if isinstance(meta, dict) else []
         matched = None
-        for a in artifacts:
-            if isinstance(a, dict) and a.get("id") == artifact_id:
-                matched = a
-                break
+        if isinstance(artifacts, list):
+            for a in artifacts:
+                if isinstance(a, dict) and a.get("id") == artifact_id:
+                    matched = a
+                    break
 
         if matched is None:
             raise HTTPException(404, f"artifact {artifact_id!r} not found")
 
         artifact_rel_path = matched.get("path", "")
-        # Requirement 3: containment check + reject a symlinked artifact (don't follow it to an
-        # outside target), mirroring _zip_validated_artifacts.
-        if (out / artifact_rel_path).is_symlink():
-            raise HTTPException(404, "artifact file not found")
-        safe = _safe_artifact_path(out, artifact_rel_path)
-        if safe is None or safe.is_symlink() or not safe.is_file():
+        # Requirement 3: containment check, mirroring _zip_validated_artifacts — a
+        # symlink can no longer reach here at all (put_output now refuses to store one;
+        # see LocalBlobStore/S3BlobStore.put_output), so the check that matters is the
+        # declared-path containment itself.
+        safe_rel = _safe_relative_artifact_path(artifact_rel_path)
+        if safe_rel is None:
             raise HTTPException(404, "artifact file not found")
 
-        from fastapi.responses import FileResponse
-        return FileResponse(safe)
+        return _stream_artifact_response(
+            job_id, safe_rel, media_type=None, filename=None
+        )
 
     @app.get("/v1/jobs/{job_id}/result")
     async def get_result(job_id: str):

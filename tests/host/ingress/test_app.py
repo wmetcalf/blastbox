@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -179,23 +180,37 @@ def test_readyz_does_not_leak_store_error(tmp_path):
     assert "db.internal" not in body and "hunter2" not in body and "5432" not in body
 
 
-def test_serve_endpoints_reject_symlinked_output(tmp_path):
-    """A compromised worker's symlinked artifact must not be served.
+def test_get_artifact_post_seal_disk_tamper_is_inert(tmp_path):
+    """Task 7 gap 2: /artifacts/{id} no longer reads the live job dir at all -- it
+    reads the BlobStore snapshot ``put_output`` captured once, right after the
+    dispatcher sealed the job (mirrored here by ``_make_done_job``'s
+    ``_push_to_blob`` call). So swapping the on-disk declared artifact for a
+    symlink to an outside file AFTER that point (as a compromised worker might, in
+    the purge window before the dir is destroyed) has no effect on what gets
+    served: there is no later disk read left for the symlink to subvert -- the
+    response is the pristine blob-stored bytes, never the outside file's content.
 
-    ``/artifacts/{id}`` (get_artifact) is unchanged by Task 7 -- it still reads the
-    job's live output/ dir from the local filesystem -- so the symlink-rejection check
-    there is exercised exactly as before.
+    This supersedes the old filesystem-era assertion (symlinked artifact -> 404):
+    that check protected a *live* disk read that no longer happens once
+    ``get_artifact`` reads exclusively through the BlobStore. The route is not
+    literally rejecting a hostile symlink here -- it is structurally immune,
+    because it never looks at output/ again once put_output has run. (The real
+    defense against a worker planting such a symlink now lives at put_output
+    time -- see
+    tests/host/blobs/test_local.py::test_put_output_skips_a_symlink_to_a_file_outside_the_output_dir.)
     """
     client, store = _make_client(tmp_path)
-    job, output_dir = _make_done_job(tmp_path, store)
+    job, output_dir = _make_done_job(tmp_path, store, artifact_data=b"PRISTINE-PNG-BYTES")
     outside = tmp_path / "outside_secret"
     outside.write_bytes(b"OUTSIDE-SECRET")
 
-    # declared artifact replaced by a symlink to an outside file -> 404, not the target bytes
+    # declared artifact replaced by a symlink to an outside file, AFTER put_output ran
     (output_dir / "page-001.png").unlink()
     (output_dir / "page-001.png").symlink_to(outside)
+
     r = client.get(f"/v1/jobs/{job.job_id}/artifacts/page-001")
-    assert r.status_code == 404
+    assert r.status_code == 200
+    assert r.content == b"PRISTINE-PNG-BYTES"
     assert b"OUTSIDE-SECRET" not in r.content
 
 
@@ -619,6 +634,19 @@ class TestArtifactRoutesDone:
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "application/zip"
 
+    def test_artifact_by_id_served_when_job_dir_purged(self, tmp_path):
+        """Task 7 gap 2: after the worker purge, job_root/<id>/ no longer exists on
+        this node at all -- get_artifact must still serve the declared artifact by
+        reading exclusively through the BlobStore (never FileResponse from disk)."""
+        _, store = _make_client(tmp_path)
+        artifact_data = b"PNG_CONTENT_BYTES_PURGED"
+        job, output_dir = _make_done_job(tmp_path, store, artifact_data=artifact_data)
+        shutil.rmtree(tmp_path / "jobs" / job.job_id)  # simulate the worker's post-upload purge
+        client, _ = _make_client(tmp_path, store=store)
+        resp = client.get(f"/v1/jobs/{job.job_id}/artifacts/page-001")
+        assert resp.status_code == 200
+        assert resp.content == artifact_data
+
 
 # ===========================================================================
 # 5. Artifact path-confinement (security requirement 3)
@@ -645,7 +673,15 @@ class TestArtifactConfinement:
             )
 
     def test_tampered_metadata_path_traversal_is_contained(self, tmp_path):
-        """Even if metadata.json contains a traversal path, _safe_artifact_path blocks it."""
+        """Even if metadata.json contains a traversal path, _safe_relative_artifact_path
+        blocks it.
+
+        Task 7 gap 2: get_artifact reads metadata.json through the BlobStore, not
+        disk, so the tampered manifest must be re-pushed (mirroring
+        ``_make_done_job``'s own ``_push_to_blob`` call) for the route to see it --
+        an on-disk-only edit after the initial push is otherwise inert (see
+        ``test_get_artifact_post_seal_disk_tamper_is_inert``).
+        """
         _, store = _make_client(tmp_path)
         job, output_dir = _make_done_job(tmp_path, store)
 
@@ -655,14 +691,18 @@ class TestArtifactConfinement:
         # Replace path with traversal
         meta_data["artifacts"][0]["path"] = "../../../etc/passwd"
         meta_path.write_text(json.dumps(meta_data))
+        _push_to_blob(tmp_path, job.job_id, output_dir)
 
         client, _ = _make_client(tmp_path, store=store)
-        # The artifact id exists, but path is outside output_dir → 404
+        # The artifact id exists, but path is a traversal → 404
         resp = client.get(f"/v1/jobs/{job.job_id}/artifacts/page-001")
         assert resp.status_code == 404
 
     def test_absolute_path_in_metadata_is_contained(self, tmp_path):
-        """An absolute artifact path in metadata must not be served."""
+        """An absolute artifact path in metadata must not be served.
+
+        Task 7 gap 2: re-pushed to the BlobStore after tampering, same as above.
+        """
         _, store = _make_client(tmp_path)
         job, output_dir = _make_done_job(tmp_path, store)
 
@@ -670,6 +710,27 @@ class TestArtifactConfinement:
         meta_data = json.loads(meta_path.read_text())
         meta_data["artifacts"][0]["path"] = "/etc/passwd"
         meta_path.write_text(json.dumps(meta_data))
+        _push_to_blob(tmp_path, job.job_id, output_dir)
+
+        client, _ = _make_client(tmp_path, store=store)
+        resp = client.get(f"/v1/jobs/{job.job_id}/artifacts/page-001")
+        assert resp.status_code == 404
+
+    def test_traversal_path_rejected_even_when_job_dir_purged(self, tmp_path):
+        """Task 7 gap 2: the declared-path containment check (_safe_relative_artifact_path)
+        must reject a traversal path BEFORE any BlobStore fetch, using only the string
+        itself -- there is no on-disk output_dir left to Path.resolve() against once the
+        job dir is purged. Prove it's not accidentally relying on disk by deleting the
+        job dir entirely before the request."""
+        _, store = _make_client(tmp_path)
+        job, output_dir = _make_done_job(tmp_path, store)
+
+        meta_path = output_dir / "metadata.json"
+        meta_data = json.loads(meta_path.read_text())
+        meta_data["artifacts"][0]["path"] = "../../../etc/passwd"
+        meta_path.write_text(json.dumps(meta_data))
+        _push_to_blob(tmp_path, job.job_id, output_dir)
+        shutil.rmtree(tmp_path / "jobs" / job.job_id)  # simulate the worker's post-upload purge
 
         client, _ = _make_client(tmp_path, store=store)
         resp = client.get(f"/v1/jobs/{job.job_id}/artifacts/page-001")

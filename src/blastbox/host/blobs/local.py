@@ -24,6 +24,9 @@ from pathlib import Path
 from typing import BinaryIO
 
 from blastbox.host.blobs.base import BlobFetchError, BlobIntegrityError
+from blastbox.observability import get_logger
+
+_log = get_logger("blastbox.blobs.local")
 
 _CHUNK = 1024 * 1024
 
@@ -101,7 +104,24 @@ class LocalBlobStore:
     def put_output(self, job_id: str, out_dir: Path) -> None:
         out_dir = Path(out_dir)
         dest_dir = self._results_dir(job_id)
-        for path in sorted(p for p in out_dir.rglob("*") if p.is_file()):
+        for path in sorted(out_dir.rglob("*")):
+            # Skip symlinks BEFORE is_file() -- is_file() follows a symlink to its
+            # target, so `p.is_symlink() or not p.is_file()` (checked in that
+            # order) never reads or uploads a symlink's target bytes. A worker
+            # that plants e.g. output/metadata.json -> /etc/passwd before this
+            # runs must not get that file's bytes stored (and later served) as
+            # trusted job output. A single hostile entry is skipped + logged,
+            # not raised — it must not fail the upload of the rest of a
+            # legitimate job's output.
+            if path.is_symlink():
+                _log.warning(
+                    "put_output_skipped_symlink",
+                    job_id=job_id,
+                    path=str(path.relative_to(out_dir)),
+                )
+                continue
+            if not path.is_file():
+                continue
             rel = path.relative_to(out_dir)
             self._atomic_copy(path, dest_dir / rel)
 

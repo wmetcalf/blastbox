@@ -68,6 +68,38 @@ def test_put_output_then_open_output_reads_the_stored_copy(tmp_path):
         assert fh.read() == b'{"ok":true}'
 
 
+def test_put_output_skips_a_symlink_to_a_file_outside_the_output_dir(tmp_path):
+    """Security regression: a compromised worker can plant e.g.
+    output/metadata.json -> /etc/passwd (or any host path) in the output dir before
+    put_output runs. rglob("*") + is_file() FOLLOWS a symlink and would previously
+    copy the TARGET's bytes into the blob store, where they'd later be served as
+    trusted job output through a route with no check (the old check lived at
+    serve time and was removed when /metadata + /result switched to open_output).
+
+    put_output must skip (not follow) a symlinked entry, log a warning, and
+    continue uploading the rest of the legitimate output untouched.
+    """
+    out = tmp_path / "jobs" / "j1" / "output"
+    out.mkdir(parents=True)
+    (out / "legit.txt").write_bytes(b"legit-bytes")
+
+    secret = tmp_path / "outside_secret.txt"
+    secret.write_bytes(b"TOP-SECRET-OUTSIDE-BYTES")
+    (out / "metadata.json").symlink_to(secret)
+
+    store = _store(tmp_path)
+    store.put_output("j1", out)
+
+    # The symlink's target bytes were never stored/uploaded: the key is absent.
+    with pytest.raises(BlobFetchError):
+        store.open_output("j1", "metadata.json")
+    assert not (tmp_path / "blobs" / "results" / "j1" / "metadata.json").exists()
+
+    # The legitimate sibling file WAS stored.
+    with store.open_output("j1", "legit.txt") as fh:
+        assert fh.read() == b"legit-bytes"
+
+
 def test_open_output_raises_when_absent(tmp_path):
     with pytest.raises(BlobFetchError):
         _store(tmp_path).open_output("nope", "metadata.json")
