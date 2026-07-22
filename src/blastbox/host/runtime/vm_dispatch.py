@@ -387,17 +387,22 @@ class VmJobDispatcher:
         if effective_policy != fixed_policy:
             kind = "override" if job.net_policy else "engine-default"
             finished = time.time()
-            if self._store.update_if_status(
+            self._store.update_if_status(
                     job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                     status=JobStatus.FAILED, finished_at=finished,
                     error=f"net_policy {effective_policy!r} ({kind}) not honored by {self._worker_tier} "
                           f"tier (fixed egress {fixed_policy!r})",
-                    expires_at=self._expiry(finished)):
-                # we owned the terminal write → this is a terminal state, so the purge invariant
-                # applies unconditionally (not just a bare input unlink): nothing may survive on
-                # this worker's disk, even if _process is ever reordered so this check runs after
-                # materialisation/validation and output/ has content too.
-                self._purge_job_dir(job)
+                    expires_at=self._expiry(finished))
+            # Purge unconditionally, regardless of whether the FAILED CAS above won: this worker's
+            # involvement with the job ends here either way. If the CAS won, this is a terminal
+            # write and the purge invariant applies unconditionally (not just a bare input unlink) --
+            # nothing may survive on this worker's disk, even if _process is ever reordered so this
+            # check runs after materialisation/validation and output/ has content too. If the CAS
+            # LOST, a peer reclaimed the job between our claim_next() and this check, so leaving the
+            # spooled input here would just be orphaned malware bytes on spare hardware that no peer
+            # (on another host) could ever read -- the blob store always re-materialises the sample
+            # for whoever owns the job now. Mirrors the reclaim-before-validate purge just below.
+            self._purge_job_dir(job)
             logger.warning("vm_dispatch: rejecting job %s — net_policy %r (%s) != fixed egress %r on %s",
                            job.job_id, effective_policy, kind, fixed_policy, self._worker_tier)
             return

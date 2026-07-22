@@ -205,3 +205,43 @@ def test_no_residue_after_net_policy_rejection(tmp_path):
     assert got.status is JobStatus.FAILED
     assert _residue(tmp_path) == [], "sample bytes survived a net_policy-rejected terminal state"
     assert not (tmp_path / job.job_id).exists(), "job dir must not survive a net_policy-rejected job"
+
+
+def test_no_residue_after_net_policy_rejection_when_failed_cas_loses(tmp_path):
+    """The terminal-CAS-loss seam for the net_policy-rejection path: a peer reclaims the job in
+    the window between this worker's claim_next() and the FAILED CAS here, so the CAS loses
+    (before the fix, the purge was gated INSIDE that `if`, so a lost CAS skipped it entirely --
+    leaving the spooled malware sample on this worker's disk). The purge must run regardless.
+    Mirrors test_purge_after_peer_reclaims_right_before_terminal_cas for the DONE/FAILED path."""
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.net_policy = "tor"
+    root = tmp_path / job.job_id
+    (root / "input").mkdir(parents=True)
+    (root / "input" / "a.doc").write_bytes(SECRET)
+    job.result_dir = str(root)
+    store.create(job)
+    claimed = store.claim_next()
+
+    # Simulate a peer reclaiming the job right after our claim_next(): flip the LIVE claim_id
+    # directly (bypassing the CAS) so the net_policy rejection's expect_claim_id=claimed.claim_id
+    # no longer matches -- its FAILED CAS below returns False even though this worker is still
+    # the one running `_process(claimed)`.
+    store.update(job.job_id, claim_id="peer-claim-not-ours")
+
+    def _validate(in_path):
+        raise AssertionError("validate() must not run -- job is rejected before detonation")
+
+    disp = VmJobDispatcher(store=store, job_root=str(tmp_path), validate=_validate,
+                           fixed_net_policy="none")   # pool declared no-network; job wants "tor"
+    disp._process(claimed)
+
+    got = store.get(job.job_id)
+    # Our FAILED CAS lost: the job is left under the peer's claim, still RUNNING -- NOT the
+    # FAILED status this (stale) attempt tried to write.
+    assert got.claim_id == "peer-claim-not-ours"
+    assert got.status is JobStatus.RUNNING
+    assert _residue(tmp_path) == [], \
+        "sample bytes survived a net_policy-rejected job whose FAILED CAS lost"
+    assert not (tmp_path / job.job_id).exists(), \
+        "job dir must be purged even when the net_policy FAILED CAS lost"
