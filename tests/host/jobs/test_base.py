@@ -120,6 +120,23 @@ def test_public_dict_strips_claimable_after():
     assert job.to_dict().get("claimable_after") == 1234.5
 
 
+def test_public_dict_strips_materialise_attempts():
+    # materialise_attempts is an internal bounded-retry scheduling counter — a sibling
+    # of claimable_after -- not exposed publicly, but retained in the internal dict.
+    job = Job.new(engine="e", filename="f.txt")
+    job.materialise_attempts = 2
+    pub = job.to_public_dict()
+    assert "materialise_attempts" not in pub
+    assert job.to_dict().get("materialise_attempts") == 2
+
+
+def test_public_dict_still_contains_genuinely_public_fields():
+    job = Job.new(engine="e", filename="f.txt")
+    pub = job.to_public_dict()
+    for field in ("job_id", "engine", "filename", "status", "created_at"):
+        assert field in pub
+
+
 def test_public_dict_sanitizes_error():
     job = Job.new(engine="e", filename="f.txt")
     job.error = "file not found: /var/lib/blastbox/jobs/abc/input.docx"

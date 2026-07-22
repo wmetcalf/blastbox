@@ -938,7 +938,10 @@ def build_app(
         """Delete a job's store entry and artifacts.
 
         Refuses to delete QUEUED/RUNNING jobs.  Deletion is confined under
-        ``job_root`` — the directory removed is always ``job_root/<job_id>/``.
+        ``job_root`` — the directory removed is always ``job_root/<job_id>/`` —
+        and also reaps the job's durable result blobs from ``_blob_store`` (which
+        live under ``blob_root``, OUTSIDE ``job_root``, so the rmtree above never
+        touches them).
         """
         _validate_job_id(job_id)
         job = _job_store.get(job_id)
@@ -960,6 +963,18 @@ def build_app(
             raise HTTPException(500, "job directory outside job_root")
 
         shutil.rmtree(root, ignore_errors=True)
+        # Durable result artifacts live under blob_store's blob_root, a SIBLING of
+        # job_root -- so the rmtree above removes nothing durable, and without this
+        # call an explicit DELETE would return {"deleted": ...} while the artifacts
+        # remain in the store forever (this route is the companion site to the
+        # retention sweeper's JobRetentionSweeper._expire_job, which already reaps
+        # blobs). Best-effort, matching the ignore_errors=True posture of the rmtree
+        # above: a blob-store failure is logged, not raised, so it can't 500 a
+        # request whose on-disk cleanup + store-row removal should still proceed.
+        try:
+            _blob_store.delete_job(job_id)
+        except Exception as exc:
+            _log.warning("blob_delete_job_failed", job_id=job_id, error=str(exc))
         _job_store.delete(job_id)
         return {"deleted": job_id}
 

@@ -150,3 +150,26 @@ def test_delete_job_removes_the_stored_results_but_not_samples(tmp_path):
 
 def test_delete_job_on_a_job_with_no_stored_results_is_a_noop(tmp_path):
     _store(tmp_path).delete_job("never-existed")  # must not raise
+
+
+def test_delete_job_propagates_a_real_removal_error(tmp_path, monkeypatch):
+    """retention._expire_job only advances a job to EXPIRED (clearing expires_at)
+    when delete_job did NOT raise, so a transient failure gets retried by a later
+    sweep. LocalBlobStore must therefore let a genuine OSError propagate rather than
+    swallowing it via ignore_errors=True -- otherwise a partial/failed local delete
+    is indistinguishable from success and the leftover bytes are never retried."""
+    import shutil as shutil_mod
+
+    store = _store(tmp_path)
+    out = tmp_path / "jobs" / "j1" / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_bytes(b"{}")
+    store.put_output("j1", out)
+
+    def _boom(path, *a, **kw):
+        raise OSError("simulated permission error removing results dir")
+
+    monkeypatch.setattr(shutil_mod, "rmtree", _boom)
+
+    with pytest.raises(OSError):
+        store.delete_job("j1")

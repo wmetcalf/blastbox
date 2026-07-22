@@ -873,6 +873,73 @@ class TestDeleteJob:
         del_resp = client.delete(f"/v1/jobs/{job_id}")
         assert del_resp.status_code == 409
 
+    def test_delete_reaps_result_blobs(self, tmp_path):
+        """P2: result artifacts live under blob_root/results/<id>, a SIBLING of
+        job_root -- so DELETE's rmtree(job_root/<id>) removes nothing durable.
+        The route must also call blob_store.delete_job so the artifacts don't
+        outlive an explicit delete forever."""
+        from blastbox.host.blobs.local import LocalBlobStore
+
+        store = InMemoryJobStore()
+        job, output_dir = _make_done_job(tmp_path, store)
+        # _make_done_job already pushed the pristine output into the blob store
+        # rooted at tmp_path/blobs (see _push_to_blob) -- confirm it's really there
+        # before deleting.
+        results_dir = tmp_path / "blobs" / "results" / job.job_id
+        assert results_dir.exists()
+
+        client = TestClient(
+            build_app(
+                job_store=store,
+                job_root=tmp_path / "jobs",
+                allowed_engines=_ALLOWED,
+                limits=Limits(max_input_bytes=10 * 1024 * 1024),
+            ),
+            raise_server_exceptions=False,
+        )
+
+        del_resp = client.delete(f"/v1/jobs/{job.job_id}")
+        assert del_resp.status_code == 200
+        assert del_resp.json()["deleted"] == job.job_id
+        assert store.get(job.job_id) is None
+        assert not results_dir.exists()
+
+        # The blob store's delete_job is genuinely wired up, not just coincidentally
+        # absent: a fresh LocalBlobStore instance pointed at the same blob_root sees
+        # the results gone too (not merely a same-process cache artifact).
+        assert not LocalBlobStore(
+            tmp_path / "jobs", blob_root=tmp_path / "blobs"
+        )._results_dir(job.job_id).exists()
+
+    def test_delete_blob_failure_is_logged_not_fatal(self, tmp_path, monkeypatch):
+        """A blob-store delete_job failure must not 500 the request: the store row
+        + on-disk job dir removal proceed regardless (matches the existing
+        ignore_errors=True posture of the on-disk rmtree)."""
+        store = InMemoryJobStore()
+        job, _output_dir = _make_done_job(tmp_path, store)
+
+        client = TestClient(
+            build_app(
+                job_store=store,
+                job_root=tmp_path / "jobs",
+                allowed_engines=_ALLOWED,
+                limits=Limits(max_input_bytes=10 * 1024 * 1024),
+            ),
+            raise_server_exceptions=False,
+        )
+
+        from blastbox.host.blobs.local import LocalBlobStore
+
+        def _boom(self, job_id):
+            raise OSError("simulated blob store failure")
+
+        monkeypatch.setattr(LocalBlobStore, "delete_job", _boom)
+
+        del_resp = client.delete(f"/v1/jobs/{job.job_id}")
+        assert del_resp.status_code == 200
+        assert del_resp.json()["deleted"] == job.job_id
+        assert store.get(job.job_id) is None
+
 
 # ===========================================================================
 # 9. Error scrubbing

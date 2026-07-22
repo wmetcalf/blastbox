@@ -175,6 +175,15 @@ correctness would depend on co-location that nothing enforces. In a real fleet t
 peer is on another host, so those bytes are simply orphaned malware with no retention
 backstop (this worker never writes a terminal status, so `expires_at` is never set).
 
+This is why every node — in every mode, including mode 2 — MUST have its OWN
+private `job_root`, never one shared across nodes. `job_root` is ephemeral per-node
+scratch, unconditionally purgeable BECAUSE nothing else can be reading it; a shared
+`job_root` would make that false and turn this same unconditional purge into one peer
+deleting another peer's ACTIVE job dir mid-flight. Nowhere in this design does
+"shared filesystem" mean a shared `job_root` — see the mode-2 section below, where
+the only thing a shared filesystem may back is the **blob store** (`blob_root`),
+which is durable, content-addressed, and designed to be read from multiple nodes.
+
 This is safe *because* the blob store can always re-materialise, in every mode — which
 is the concrete reason `LocalBlobStore` had to become a real store rather than a
 no-op. The two requirements are the same requirement.
@@ -341,11 +350,18 @@ configuration.** There is no "distributed edition" and no separate install.
 The ladder below is strictly additive — each rung adds one piece of infrastructure,
 and you climb only as far as you need.
 
+Every mode below assumes each node has its OWN private `job_root` — never one
+shared across nodes (see "The purge is unconditional" above). The `job store`
+column is genuinely shared between nodes in modes 2-3 (that is what makes work
+stealing possible); the `blob store` column is what may OPTIONALLY be shared —
+either a `local` backend pointed at a shared mount via `BLASTBOX_BLOB_LOCAL_ROOT`
+(kept separate from any node's private `job_root`), or `s3://`.
+
 | # | mode | job store | blob store | processes | when |
 |---|------|-----------|------------|-----------|------|
 | 0 | embedded | in-memory (unset) | local (unset) | 1 | tests, `bench`, library use |
 | 1 | **single node** | `sqlite://` | local (unset) | serve + dispatch | **default; small installs** |
-| 2 | multi-node LAN | shared `postgresql://` | local + shared FS, or `s3://` | serve xN + dispatch xM | role separation |
+| 2 | multi-node LAN | shared `postgresql://` | local on a shared MOUNT (`BLASTBOX_BLOB_LOCAL_ROOT`), or `s3://` | serve xN + dispatch xM | role separation |
 | 3 | distributed | HA postgres (Patroni) | `s3://` MinIO/S3 | serve x2 behind LB + workers anywhere | firewalled fleet |
 
 ### Mode 0 — embedded (single process)
@@ -372,9 +388,14 @@ design.
 ### Mode 2 — multi-node on a LAN
 
 Point several nodes at one postgres and `claim_next()`'s `FOR UPDATE SKIP LOCKED`
-gives lock-free work stealing with no further machinery. Blobs can move either via a
-shared filesystem (keeping `BLASTBOX_BLOB_URL` unset) or via `s3://`. This rung is
-where role separation becomes possible: API nodes and worker nodes are just different
+gives lock-free work stealing with no further machinery. Blobs can move either via
+`s3://`, or — with `BLASTBOX_BLOB_URL` still unset — via `LocalBlobStore` pointed at
+a shared mount through `BLASTBOX_BLOB_LOCAL_ROOT` (e.g. an NFS export common to every
+node). Either way this is a **shared `blob_root`, never a shared `job_root`**: each
+node keeps its own private, ephemeral `job_root` regardless of how the blob store is
+configured — see "The purge is unconditional" earlier in this document for why a
+shared `job_root` is not a supported configuration in any mode. This rung is where
+role separation becomes possible: API nodes and worker nodes are just different
 subcommands against the same store.
 
 ### Mode 3 — distributed / firewalled

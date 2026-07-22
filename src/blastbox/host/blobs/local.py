@@ -151,5 +151,18 @@ class LocalBlobStore:
         never deleted here — doing so would break every other job referencing the
         same bytes, including a future re-run of the corpus. Mirrors
         ``S3BlobStore.delete_job``.
+
+        A job with no stored results is a clean no-op (NOT an error: most jobs
+        that never reached DONE have nothing here). But a genuine removal failure
+        (permission/IO error on an existing tree) MUST propagate rather than be
+        swallowed: ``retention._expire_job`` only advances a job to EXPIRED
+        (clearing ``expires_at``) when this call does NOT raise, specifically so a
+        transient failure is retried by a later sweep. Blanket
+        ``ignore_errors=True`` would defeat that guard by making every failure mode
+        indistinguishable from success.
         """
-        shutil.rmtree(self._results_dir(job_id), ignore_errors=True)
+        results_dir = self._results_dir(job_id)
+        try:
+            shutil.rmtree(results_dir)
+        except FileNotFoundError:
+            pass

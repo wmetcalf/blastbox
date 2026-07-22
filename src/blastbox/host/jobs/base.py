@@ -102,8 +102,10 @@ class Job:
 
         Strips ``result_dir`` (internal server path), ``params`` (may contain
         sensitive engine options), ``claim_id`` (an internal ownership token),
-        and ``claimable_after`` (an internal capacity-deferral scheduling timestamp),
-        and sanitizes the ``error`` field to remove internal filesystem paths.
+        ``claimable_after`` (an internal capacity-deferral scheduling timestamp),
+        and ``materialise_attempts`` (an internal bounded-retry scheduling counter,
+        a sibling of ``claimable_after``), and sanitizes the ``error`` field to
+        remove internal filesystem paths.
 
         ``worker_tier`` and ``target_tier`` are INTENTIONALLY kept public: this is
         observability for the testing the feature exists for (read back which warm
@@ -116,6 +118,7 @@ class Job:
         d.pop("params", None)
         d.pop("claim_id", None)
         d.pop("claimable_after", None)   # internal capacity-deferral scheduling detail
+        d.pop("materialise_attempts", None)   # internal bounded-retry scheduling counter
         if isinstance(d.get("error"), str):
             d["error"] = sanitize_public_error(d["error"])
         return d
