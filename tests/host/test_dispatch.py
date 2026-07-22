@@ -310,6 +310,57 @@ def test_run_maintenance_expires_and_requeues(tmp_path):
     assert store.get(running.job_id).status == JobStatus.QUEUED  # orphan requeued
 
 
+class _StubBlobs:
+    """Minimal BlobStore double — only delete_job's call is asserted."""
+
+    def __init__(self) -> None:
+        self.deleted: list[str] = []
+
+    def put_sample(self, sha256, src): ...
+    def get_sample(self, sha256, dest): ...
+    def put_output(self, job_id, out_dir): ...
+    def open_output(self, job_id, name): ...
+
+    def delete_job(self, job_id):
+        self.deleted.append(job_id)
+
+
+def test_run_maintenance_reaps_result_blob_when_blob_store_configured(tmp_path):
+    """The dispatch.py retention sweeper must reap the result blob too.
+
+    In a mixed-tier fleet sharing one JobStore (FC-warm nodes driven by this
+    file-handshake Dispatcher + AWS Lambda burst driven by the always blob-backed
+    VmJobDispatcher/network dispatch_style), a burst job's results are put_output'd to
+    S3/blob storage. expire_due lists expired jobs with no node/tier scoping, so THIS
+    Dispatcher's maintenance can claim and expire that job. Without blob_store wired
+    through to JobRetentionSweeper, expire_due only clears the (harmlessly-absent,
+    wrong-host) local dir and clears expires_at — no sweeper ever revisits it and the
+    result blob leaks permanently. This proves Dispatcher._run_maintenance now builds
+    the sweeper WITH the configured blob store and that delete_job is actually called.
+    """
+    store = InMemoryJobStore()
+    done = Job.new(engine=_ENGINE_NAME, filename="d.docx")
+    done.status = JobStatus.DONE
+    done.finished_at = time.time() - 100
+    done.expires_at = time.time() - 50
+    store.create(done)
+
+    blobs = _StubBlobs()
+    d = Dispatcher(
+        job_store=store,
+        engines={_ENGINE_NAME: _engine_spec()},
+        limits=_limits(),
+        job_root=tmp_path,
+        runtime_selector=_fake_runtime,
+        job_retention_seconds=60,
+        blob_store=blobs,
+    )
+    d._run_maintenance()
+
+    assert store.get(done.job_id).status == JobStatus.EXPIRED
+    assert blobs.deleted == [done.job_id]
+
+
 # ---------------------------------------------------------------------------
 # Test 3: Worker non-zero exit (no valid output) → FAILED, input gone
 # ---------------------------------------------------------------------------

@@ -40,6 +40,7 @@ from blastbox.contract.envelope import (
     open_confined_regular_fd,
 )
 from blastbox.errors import OutputTrustError, WarmTimeout, sanitize_public_error
+from blastbox.host.blobs.base import BlobStore
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.runtime.docker import (
     RuntimeSelection,
@@ -262,6 +263,7 @@ class Dispatcher:
         warm_only: bool = False,
         warm_requeue_backoff_s: float = 1.0,
         concurrency_gate: "DynamicConcurrencyGate | None" = None,
+        blob_store: BlobStore | None = None,
     ) -> None:
         # Optional live cold-admission cap driven by the node autosizer. ONLY the cold path
         # acquires a permit (see _dispatch_claimed_job): a cold worker spawns footprint OUTSIDE
@@ -288,6 +290,27 @@ class Dispatcher:
         self._job_root = Path(job_root)
         self._runtime_selector = runtime_selector
         self._subprocess_runner = subprocess_runner
+        # Backing blob store for the retention sweeper (see _run_maintenance): in a mixed-tier
+        # fleet sharing one JobStore, a job dispatched over the network (VmJobDispatcher,
+        # blob-backed) can be reaped by THIS (file-handshake) dispatcher's maintenance sweep —
+        # without a blob store, expire_due deletes only the (harmlessly-absent, wrong-host) local
+        # dir and clears expires_at, orphaning the result blob forever. None (the default, and
+        # every existing call site) lazily resolves BLASTBOX_BLOB_URL, mirroring
+        # VmJobDispatcher.__init__ — unset means LocalBlobStore, whose delete_job is a no-op/miss
+        # for a job this node never stored, so single-node/unset deployments are unaffected.
+        # Imported here, not at module scope, to mirror ingress/app.py's lazy factory import.
+        if blob_store is not None:
+            self._blobs = blob_store
+        else:
+            from blastbox.host.blobs.factory import build_blob_store_from_env
+
+            # Mirrors VmJobDispatcher: the factory must see the job_root THIS dispatcher
+            # actually uses, not just the raw env var, or a caller passing an explicit
+            # job_root= (differing from BLASTBOX_JOB_ROOT) gets a LocalBlobStore rooted at
+            # the wrong directory.
+            self._blobs = build_blob_store_from_env(
+                {**os.environ, "BLASTBOX_JOB_ROOT": str(self._job_root)}
+            )
         self._worker_timeout_s = max(1, int(worker_timeout_s))
         self._job_retention_seconds = max(0, int(job_retention_seconds))
         # Opt-in ceiling (0 = off) on how long a job may sit QUEUED before the maintenance sweep
@@ -1945,7 +1968,9 @@ class Dispatcher:
             try:
                 from blastbox.host.jobs.retention import JobRetentionSweeper
 
-                expired = JobRetentionSweeper(self._job_root).expire_due(self._job_store)
+                expired = JobRetentionSweeper(
+                    self._job_root, blob_store=self._blobs
+                ).expire_due(self._job_store)
                 if expired:
                     _log.info("retention_sweep_expired count=%d", len(expired))
             except Exception:  # noqa: BLE001
