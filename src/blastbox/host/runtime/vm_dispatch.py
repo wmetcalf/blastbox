@@ -518,6 +518,21 @@ class VmJobDispatcher:
                     # unconditional `finally` purge (below) destroys whatever it holds (nothing should
                     # have materialised on a failed fetch, but the invariant never assumes).
                     return
+                else:
+                    # Finding E3: a successful fetch means this attempt's failure streak is
+                    # over -- reset the counter so only CONSECUTIVE fetch failures accumulate
+                    # toward MAX_MATERIALISE_ATTEMPTS, matching its "permanently missing"
+                    # intent. Persisted (not just the in-memory `job`) so a LATER release/
+                    # reclaim cycle (e.g. after a NoWarmSlot/WorkerBusy requeue purges this
+                    # job dir and it must re-fetch) doesn't inherit an earlier, unrelated
+                    # failure streak.
+                    if job.materialise_attempts:
+                        self._store.update_if_status(
+                            job.job_id,
+                            JobStatus.RUNNING,
+                            expect_claim_id=job.claim_id,
+                            materialise_attempts=0,
+                        )
             summary, ok = self._validate_with_heartbeat(job, in_path)
             summary = self._bounded_summary(summary)   # cap untrusted summary before store/metadata
             err: str | None = None

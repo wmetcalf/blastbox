@@ -40,7 +40,7 @@ from blastbox.contract.envelope import (
     open_confined_regular_fd,
 )
 from blastbox.errors import OutputTrustError, WarmTimeout, sanitize_public_error
-from blastbox.host.blobs.base import BlobStore, upload_output_with_retry
+from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.runtime.docker import (
     RuntimeSelection,
@@ -143,6 +143,15 @@ _MAX_OUTPUT_ENTRIES = 65536
 # that was never durably stored.
 _PUT_OUTPUT_MAX_ATTEMPTS = 3
 _PUT_OUTPUT_RETRY_BACKOFF_S = 1.0
+
+# Bound the release-on-BlobFetchError loop (Finding E1, mirrors VmJobDispatcher's identical
+# policy in runtime/vm_dispatch.py -- see that module for the full rationale): a TRANSIENT
+# fetch failure (this worker's connectivity) releases the claim back to QUEUED so another
+# node can retry; a job that fails MAX_MATERIALISE_ATTEMPTS times IN A ROW is FAILED instead
+# of released again, so a PERMANENTLY missing sample reaches a terminal state rather than
+# looping release -> reclaim -> release forever.
+MAX_MATERIALISE_ATTEMPTS = 3
+_BLOB_RETRY_BACKOFF_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -275,6 +284,7 @@ class Dispatcher:
         blob_store: BlobStore | None = None,
         put_output_max_attempts: int = _PUT_OUTPUT_MAX_ATTEMPTS,
         put_output_retry_backoff_s: float = _PUT_OUTPUT_RETRY_BACKOFF_S,
+        blob_retry_backoff_s: float = _BLOB_RETRY_BACKOFF_S,
     ) -> None:
         # Optional live cold-admission cap driven by the node autosizer. ONLY the cold path
         # acquires a permit (see _dispatch_claimed_job): a cold worker spawns footprint OUTSIDE
@@ -330,6 +340,11 @@ class Dispatcher:
         # no "leave it running" fallback.
         self._put_output_max_attempts = max(1, int(put_output_max_attempts))
         self._put_output_retry_backoff_s = max(0.0, float(put_output_retry_backoff_s))
+        # How long a job that just failed to fetch its sample is deferred (claimable_after)
+        # before it's eligible again -- long enough that THIS dispatcher doesn't immediately
+        # re-claim and spin on a sample its own connectivity can't reach. Mirrors
+        # VmJobDispatcher's identical backoff (Finding E1).
+        self._blob_retry_backoff_s = max(0.0, float(blob_retry_backoff_s))
         self._worker_timeout_s = max(1, int(worker_timeout_s))
         self._job_retention_seconds = max(0, int(job_retention_seconds))
         # Opt-in ceiling (0 = off) on how long a job may sit QUEUED before the maintenance sweep
@@ -965,6 +980,15 @@ class Dispatcher:
             job.worker_tier = self._tier
 
             # ------------------------------------------------------------------
+            # Step 2b: Materialise the sample on demand (Finding E1) if this node never
+            # spooled it locally -- see the identical comment in _dispatch_inner (cold
+            # path). Must run BEFORE staging: the vsock seam reads bytes FROM
+            # staged_input_path on the host, and the file-based seam shutil.copy2's it.
+            # ------------------------------------------------------------------
+            if not self._materialise_sample(job, staged_input_path):
+                return
+
+            # ------------------------------------------------------------------
             # Step 3: Stage input — over the wire (vsock) or into slot.input_dir
             # ------------------------------------------------------------------
             if callable(stage_fn):
@@ -1213,6 +1237,17 @@ class Dispatcher:
         engine = self._engines.get(job.engine)
         if engine is None:
             self._fail_job(job, "unknown engine")
+            return
+
+        # ------------------------------------------------------------------
+        # Step 2b: Materialise the sample on demand (Finding E1) if this node never
+        # spooled it locally -- the shared-queue / blob-store deployment, where a
+        # worker claims a job whose input was uploaded via another node's ingress.
+        # A no-op when the input is already on disk (today's single-node default).
+        # Must run BEFORE the bind-mount below: docker silently creates an empty
+        # directory for a nonexistent bind source instead of failing.
+        # ------------------------------------------------------------------
+        if not self._materialise_sample(job, input_path):
             return
 
         # ------------------------------------------------------------------
@@ -1689,6 +1724,106 @@ class Dispatcher:
         except Exception:  # noqa: BLE001 — a transient store error → don't risk a stale upload
             return False
         return cur is not None and cur.status == JobStatus.RUNNING and cur.claim_id == job.claim_id
+
+    def _materialise_sample(self, job: Job, input_path: Path) -> bool:
+        """Ensure *input_path* exists on THIS node's disk before it's consumed (the cold
+        bind-mount / the warm stage-into-slot copy), fetching it from the blob store on
+        demand if not (Finding E1). Mirrors ``VmJobDispatcher._process``'s identical
+        on-demand materialise + bounded-release policy -- see that module for the full
+        rationale.
+
+        Returns True to tell the caller to proceed (the input is present, whether it was
+        already there or was just fetched). Returns False to tell the caller to stop
+        immediately (``return``): this method has already terminalized the claim itself --
+        either RELEASED it back to QUEUED (bounded retry) or FAILED it once
+        ``MAX_MATERIALISE_ATTEMPTS`` is reached -- so the caller must not run the worker or
+        write any further job state.
+
+        Single-node behaviour is UNCHANGED: when ``input_path`` already exists (the
+        default -- this node's own ingress spooled it), this is a pure no-op with no
+        ``get_sample`` call and no store write.
+        """
+        if input_path.exists():
+            return True
+        if job.input_sha256 is None:
+            # No content key to fetch by -- there's nothing a blob store could
+            # materialise. Same terminal shape as before this feature existed.
+            self._fail_job(job, f"spooled input missing: {input_path}")
+            return False
+        try:
+            self._blobs.get_sample(job.input_sha256, input_path)
+        except BlobFetchError:
+            # A fetch failure is a property of THIS worker's connectivity, not of the
+            # sample -- release the claim (bounded) rather than failing the job outright,
+            # so another node can retry. See MAX_MATERIALISE_ATTEMPTS above.
+            attempts = job.materialise_attempts + 1
+            finished = time.time()
+            expires_at = (
+                finished + self._job_retention_seconds
+                if self._job_retention_seconds > 0
+                else None
+            )
+            if attempts >= MAX_MATERIALISE_ATTEMPTS:
+                _log.warning(
+                    "job %s could not materialise its sample after %d attempts; failing",
+                    job.job_id, attempts,
+                )
+                self._job_store.update_if_status(
+                    job.job_id,
+                    JobStatus.RUNNING,
+                    expect_claim_id=job.claim_id,
+                    status=JobStatus.FAILED,
+                    finished_at=finished,
+                    error=sanitize_public_error(
+                        f"sample could not be materialised after {attempts} attempts"
+                    ),
+                    materialise_attempts=attempts,
+                    expires_at=expires_at,
+                )
+            else:
+                _log.warning(
+                    "job %s could not materialise its sample; releasing the claim for "
+                    "another node", job.job_id,
+                )
+                # RUNNING -> QUEUED, CAS'd on (status, claim_id) so a stale owner can't
+                # clobber a job that was already RECLAIMED. claim_id is cleared so the
+                # next claim_next() stamps a fresh token; worker_runtime/worker_tier are
+                # reset (mirrors _requeue_claimed) so a re-claim looks fresh regardless of
+                # which path (warm/cold) picks it up next. claimable_after backs the job
+                # off briefly so THIS dispatcher doesn't instantly re-claim + spin on a
+                # sample its own connectivity can't reach; created_at is left untouched
+                # (public ordering + max_queued_age must still see the real submission time).
+                self._job_store.update_if_status(
+                    job.job_id,
+                    JobStatus.RUNNING,
+                    expect_claim_id=job.claim_id,
+                    status=JobStatus.QUEUED,
+                    claim_id=None,
+                    worker_runtime=None,
+                    worker_tier=None,
+                    claimable_after=time.time() + self._blob_retry_backoff_s,
+                    materialise_attempts=attempts,
+                )
+            # This attempt never materialised anything -- clean up whatever this worker's
+            # job dir accumulated (e.g. an empty input/ dir a failed get_sample's atomic-copy
+            # helper may have created via its parent mkdir) so nothing lingers on this node.
+            self._delete_input(input_path)
+            return False
+        else:
+            # Finding E3: a successful fetch means this attempt's failure streak is over --
+            # reset the counter so only CONSECUTIVE fetch failures accumulate toward
+            # MAX_MATERIALISE_ATTEMPTS, matching its "permanently missing" intent. Persisted
+            # (not just the in-memory `job`) so a later reclaim that must re-fetch (the
+            # sample vanished from THIS node again, e.g. a different node next time) starts
+            # counting from zero instead of inheriting an earlier, unrelated failure streak.
+            if job.materialise_attempts:
+                self._job_store.update_if_status(
+                    job.job_id,
+                    JobStatus.RUNNING,
+                    expect_claim_id=job.claim_id,
+                    materialise_attempts=0,
+                )
+            return True
 
     def _upload_output(self, job: Job, output_dir: Path) -> bool:
         """Upload *output_dir* (already sealed) to the blob store, with a bounded inline
