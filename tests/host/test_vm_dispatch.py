@@ -295,7 +295,11 @@ def test_remote_no_slot_requeues_not_fails(tmp_path):
     d._process(store.claim_next())
     got = store.get(job.job_id)
     assert got.status is JobStatus.QUEUED and got.claim_id is None   # requeued (never ran), NOT failed
-    assert (tmp_path / job.job_id / "input" / "evil.dll").exists()   # input preserved for the retry
+    # The requeue RELEASES this worker's claim, so the purge invariant applies: the input must NOT
+    # be left behind "for the retry". In a real fleet the next claimant is on another host and could
+    # never read this worker's disk anyway; the blob store re-materialises the sample when the
+    # requeued job is re-claimed. (Was: input preserved -- an old shared-filesystem assumption.)
+    assert not (tmp_path / job.job_id).exists()   # released claim -> job dir purged
 
 
 def test_dispatch_records_terminal_metrics(tmp_path):

@@ -103,6 +103,25 @@ def test_put_output_skips_a_symlink_to_a_file_outside_the_output_dir(store, tmp_
         assert fh.read() == b"legit-bytes"
 
 
+def test_open_output_reads_a_nested_artifact_path(store, tmp_path):
+    """put_output writes a nested key (results/<id>/foo/bar.png via rel.as_posix()); open_output must
+    read the SAME key rather than collapsing to the basename."""
+    out = tmp_path / "j11" / "output"
+    (out / "foo").mkdir(parents=True)
+    (out / "foo" / "bar.png").write_bytes(b"PNGDATA")
+    store.put_output("j11", out)
+    with store.open_output("j11", "foo/bar.png") as fh:
+        assert fh.read() == b"PNGDATA"
+
+
+@pytest.mark.parametrize("evil", ["../secret", "/etc/passwd", "a/../../b"])
+def test_open_output_refuses_traversal_and_absolute_names(store, evil):
+    """open_output must normalise + reject a traversal/absolute name on its OWN before building a
+    key, so it can never read outside this job's results prefix."""
+    with pytest.raises(BlobFetchError):
+        store.open_output("j11", evil)
+
+
 def test_delete_job_removes_outputs_but_not_samples(store, tmp_path):
     data = b"shared sample"
     digest = hashlib.sha256(data).hexdigest()

@@ -419,6 +419,13 @@ class VmJobDispatcher:
         in_path = self._input_path(job)
         owned = False
         terminal_status: JobStatus | None = None   # the terminal state THIS attempt CAS-won (for metrics)
+        # The `finally` purge is UNCONDITIONAL for every terminal state and every lost/released claim
+        # (the security invariant: this worker is spare hardware that must not accumulate malware, and
+        # the blob store always re-materialises the sample for whoever owns the job now). The ONE
+        # documented exception is a put_output failure -- the job stays RUNNING under OUR OWN claim
+        # (not terminal, not released) holding a completed result that isn't in the blob store yet;
+        # discarding it would throw away expensive work. Only that path sets this True.
+        preserve_result_for_retry = False
         t0 = time.monotonic()   # for the job-duration metric (parity with the cold dispatcher)
         try:
             if not in_path.exists():
@@ -486,10 +493,9 @@ class VmJobDispatcher:
                         claimable_after=time.time() + self._blob_retry_backoff_s,
                         materialise_attempts=attempts,
                     )
-                    # Releasing the claim relinquishes THIS worker's involvement with the job —
-                    # purge whatever it holds (nothing should have materialised on a failed fetch,
-                    # but this is the security invariant, not a best-guess: never assume).
-                    self._purge_job_dir(job)
+                    # Releasing the claim relinquishes THIS worker's involvement with the job; the
+                    # unconditional `finally` purge (below) destroys whatever it holds (nothing should
+                    # have materialised on a failed fetch, but the invariant never assumes).
                     return
             summary, ok = self._validate_with_heartbeat(job, in_path)
             summary = self._bounded_summary(summary)   # cap untrusted summary before store/metadata
@@ -529,10 +535,9 @@ class VmJobDispatcher:
             if ok and not self._claim_is_still_ours(job):
                 logger.info("vm_dispatch: job %s reclaimed during validate; not publishing metadata "
                             "or CAS (peer owns it now)", job.job_id)
-                # Purge unconditionally (Task 9): same reasoning as the reclaimed-before-validate
-                # return above -- the blob store can always re-materialise this job's sample for its
-                # new owner, so there's no reason to leave bytes behind on this worker's disk.
-                self._purge_job_dir(job)
+                # The unconditional `finally` purge (below) destroys this worker's dir: the blob
+                # store can always re-materialise this job's sample for its new owner, so there's no
+                # reason to leave bytes behind on this worker's disk.
                 return
             if ok and not self._ensure_metadata(job, summary):
                 ok, err = False, "metadata_write_failed"
@@ -566,8 +571,8 @@ class VmJobDispatcher:
                 # Same reasoning as the other lost-claim returns in this method: our local copy
                 # is a stale attempt now, the peer's own upload is the correct result, and the
                 # blob store can always re-materialise the sample if this job needs to run again
-                # -- nothing may survive on this worker's disk once we're no longer the owner.
-                self._purge_job_dir(job)
+                # -- nothing may survive on this worker's disk once we're no longer the owner. The
+                # unconditional `finally` purge (below) handles it.
                 return
             if ok:
                 try:
@@ -577,6 +582,11 @@ class VmJobDispatcher:
                         "vm_dispatch: result upload failed for %s (%s); leaving RUNNING for the "
                         "sweeper rather than discarding completed work", job.job_id, exc,
                     )
+                    # The ONE documented exception to the unconditional purge below: the job stays
+                    # RUNNING under OUR OWN claim (not terminal, not released) with a completed but
+                    # un-uploaded result. Purging here would discard expensive work -- preserve the
+                    # dir so the reclaim sweeper / a retry can still find it.
+                    preserve_result_for_retry = True
                     return
             finished = time.time()
             # CAS on (status, claim_id) so a stale owner can't clobber a job that was reclaimed
@@ -611,15 +621,19 @@ class VmJobDispatcher:
                 status=JobStatus.FAILED, finished_at=finished, error=type(exc).__name__,
                 expires_at=self._expiry(finished))
         finally:
-            # Purge the WHOLE job dir (input AND output) ONLY if WE still own the job (a terminal
-            # write applied — DONE or FAILED). If it was reclaimed, the CAS returned False and the
-            # dir now belongs to the new owner — leave it untouched.
+            # SECURITY INVARIANT (not housekeeping): nothing survives on this worker's disk once its
+            # attempt ends. The purge is UNCONDITIONAL across every terminal state (DONE/FAILED) AND
+            # every lost/released claim -- crucially including when a peer reclaimed the job mid-flight
+            # so our terminal CAS lost (owned=False). Bytes left behind then are orphaned malware that
+            # no peer on another host could ever read (this design rejects a shared filesystem), while
+            # the blob store (real in every mode) always re-materialises the sample for the new owner.
+            # It deliberately purges output/ too, and there is no setting that disables it.
             #
-            # SECURITY INVARIANT (not housekeeping): nothing survives a terminal state on this
-            # worker's disk. This deliberately purges output/ too (previously only the spooled input
-            # was unlinked, keeping output around for local-disk reads) — a worker is frequently spare
-            # hardware, not a hardened sample repository, and there is no setting that disables this.
-            if owned:
+            # The ONLY exception is a put_output failure (preserve_result_for_retry): there the job
+            # stays RUNNING under OUR OWN claim -- not terminal, not released -- holding a completed
+            # result that isn't in the blob store yet. Discarding it would throw away expensive work,
+            # so that path (and only that path) keeps the dir for the reclaim sweeper / a retry.
+            if not preserve_result_for_retry:
                 self._purge_job_dir(job)
             # Metric parity with the cold dispatcher: count the terminal outcome + wall time -- but ONLY
             # for THIS attempt's own winning CAS (owned + the status we wrote). Requeued (NoWarmSlot)

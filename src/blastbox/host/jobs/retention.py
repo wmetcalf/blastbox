@@ -94,6 +94,7 @@ class JobRetentionSweeper:
         if result_dir is not None:
             self._safe_rmtree(job_id, Path(result_dir))
 
+        blob_delete_ok = True
         if self._blobs is not None:
             # Result blobs only. Sample blobs are content-addressed and shared
             # between jobs, so deleting them here would break every other job
@@ -102,11 +103,26 @@ class JobRetentionSweeper:
             try:
                 self._blobs.delete_job(job_id)
             except Exception as exc:
-                _log.warning("retention: blob delete failed for %s: %s", job_id, exc)
+                # A transient blob-store delete failure must NOT advance the job to
+                # EXPIRED with expires_at=None: an EXPIRED job with a null expires_at
+                # is never re-selected, so the result blob would be orphaned forever.
+                # Leave the job in its terminal state with expires_at intact so the
+                # NEXT sweep retries the (idempotent) delete. The on-disk rmtree above
+                # may already have run; that is fine — both rmtree and delete_job are
+                # idempotent.
+                _log.warning(
+                    "retention: blob delete failed for %s: %s; leaving expires_at "
+                    "intact so the next sweep retries", job_id, exc,
+                )
+                blob_delete_ok = False
 
-        # Update the store regardless of whether result_dir existed. Clear expires_at so the now-
-        # EXPIRED job (EXPIRED is in _TERMINAL) isn't re-selected + re-swept on every subsequent
-        # pass — wasteful churn, and a rmtree retry on an already-deleted tree.
+        # Only advance to EXPIRED once the blob delete has succeeded (or there is no blob store).
+        # Clearing expires_at is safe only then: the durable bytes are gone, so there is nothing
+        # left to retry, and the now-EXPIRED job (EXPIRED is in _TERMINAL) is not re-selected +
+        # re-swept on every subsequent pass. If the delete failed, do NOT touch the store — the
+        # job stays sweepable and a later sweep finishes the expiry.
+        if not blob_delete_ok:
+            return
         job = job_store.get(job_id)
         if job is not None:
             job_store.update(job_id, status=JobStatus.EXPIRED, result_dir=None, expires_at=None)

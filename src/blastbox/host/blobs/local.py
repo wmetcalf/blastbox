@@ -126,9 +126,21 @@ class LocalBlobStore:
             self._atomic_copy(path, dest_dir / rel)
 
     def open_output(self, job_id: str, name: str) -> BinaryIO:
-        path = self._results_dir(job_id) / Path(name).name
+        # put_output stores nested rel paths (results/<job_id>/<foo/bar.png>), so open_output must
+        # read at the SAME key -- collapsing to the basename would 404 (or silently omit) a nested
+        # artifact. But it must stay safe on its own: resolve the candidate and refuse anything
+        # (``..``, an absolute name, a symlink escape) that lands outside this job's results dir,
+        # mirroring JobRetentionSweeper._safe_rmtree's containment posture.
+        base = self._results_dir(job_id).resolve()
+        candidate = (base / name).resolve()
         try:
-            return open(path, "rb")
+            candidate.relative_to(base)
+        except ValueError as exc:
+            raise BlobFetchError(
+                f"result fetch refused (escapes job dir): {job_id}/{name}"
+            ) from exc
+        try:
+            return open(candidate, "rb")
         except OSError as exc:
             raise BlobFetchError(f"result fetch failed: {job_id}/{name}") from exc
 

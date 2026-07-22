@@ -100,6 +100,31 @@ def test_put_output_skips_a_symlink_to_a_file_outside_the_output_dir(tmp_path):
         assert fh.read() == b"legit-bytes"
 
 
+def test_open_output_reads_a_nested_artifact_path(tmp_path):
+    """put_output stores nested rel paths (results/<id>/foo/bar.png); open_output must read them at
+    the SAME key, not collapse to the basename -- collapsing 404s / silently omits nested artifacts
+    (a Mode-1 regression vs the old FileResponse on output/foo/bar.png)."""
+    out = tmp_path / "jobs" / "j1" / "output"
+    (out / "foo").mkdir(parents=True)
+    (out / "foo" / "bar.png").write_bytes(b"PNGDATA")
+    store = _store(tmp_path)
+    store.put_output("j1", out)
+    assert (tmp_path / "blobs" / "results" / "j1" / "foo" / "bar.png").read_bytes() == b"PNGDATA"
+    with store.open_output("j1", "foo/bar.png") as fh:
+        assert fh.read() == b"PNGDATA"
+
+
+@pytest.mark.parametrize("evil", ["../secret", "/etc/passwd", "a/../../b"])
+def test_open_output_refuses_traversal_and_absolute_names(tmp_path, evil):
+    """open_output must contain the lookup under results/<job_id>/ on its OWN -- a caller must never
+    read outside it even if an upstream validator is bypassed."""
+    store = _store(tmp_path)
+    (tmp_path / "blobs" / "results" / "j1").mkdir(parents=True)
+    (tmp_path / "blobs" / "results" / "secret").write_bytes(b"OUTSIDE")  # a sibling a traversal could reach
+    with pytest.raises(BlobFetchError):
+        store.open_output("j1", evil)
+
+
 def test_open_output_raises_when_absent(tmp_path):
     with pytest.raises(BlobFetchError):
         _store(tmp_path).open_output("nope", "metadata.json")

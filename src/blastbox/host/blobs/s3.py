@@ -14,7 +14,7 @@ import hashlib
 import io
 import os
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 from urllib.parse import urlparse
 
@@ -124,8 +124,23 @@ class S3BlobStore:
                 **extra,
             )
 
+    @staticmethod
+    def _safe_rel(name: str) -> str:
+        """Normalise *name* to a relative POSIX sub-path under ``results/<job_id>/``, rejecting an
+        absolute name or any ``..`` traversal BEFORE it is built into a key -- so open_output can
+        never read outside this job's results prefix. Mirrors put_output's ``rel.as_posix()`` key."""
+        p = PurePosixPath(name)
+        if p.is_absolute() or ".." in p.parts:
+            raise BlobFetchError(f"result fetch refused (unsafe name): {name}")
+        rel = p.as_posix()
+        if rel in ("", "."):
+            raise BlobFetchError(f"result fetch refused (empty name): {name}")
+        return rel
+
     def open_output(self, job_id: str, name: str) -> BinaryIO:
-        key = self._key("results", job_id, Path(name).name)
+        # Mirror put_output's nested key (results/<job_id>/<rel>) instead of collapsing to the
+        # basename, but normalise + reject a traversal/absolute name first (see _safe_rel).
+        key = self._key("results", job_id, self._safe_rel(name))
         try:
             obj = self._s3.get_object(Bucket=self._bucket, Key=key)
         except Exception as exc:

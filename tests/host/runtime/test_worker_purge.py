@@ -85,6 +85,57 @@ def test_no_residue_after_release_back_to_queued(vm_dispatcher_factory, tmp_path
     assert _residue(tmp_path) == []
 
 
+def test_purge_after_peer_reclaims_right_before_terminal_cas(vm_dispatcher_factory, tmp_path):
+    """The terminal-CAS-loss seam: a peer reclaims in the window AFTER the pre-upload ownership
+    recheck but BEFORE the DONE CAS, so the CAS loses (owned=False). The job dir (input AND output)
+    must still be purged -- the sample is re-materialisable and no peer on another host could ever
+    read bytes left on THIS worker's disk. Before the fix the `if owned:` gate left them behind."""
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.input_sha256 = "d" * 64
+    store.create(job)
+    claimed = store.claim_next()
+
+    class ReclaimingBlobs(Blobs):
+        # put_output runs after the last ownership recheck and before the terminal DONE CAS -- flip
+        # the claim out from under this worker there, exactly as a peer's claim_next() would.
+        def put_output(self, job_id, out_dir):
+            store.update(job_id, claim_id="peer-claim-not-ours")
+
+    disp = vm_dispatcher_factory(store=store, blob_store=ReclaimingBlobs(), validate_ok=True)
+    disp._process(claimed)
+
+    # Our terminal CAS lost (claim_id no longer ours): the job is left under the peer's claim, NOT
+    # marked DONE by this stale attempt.
+    assert store.get(job.job_id).claim_id == "peer-claim-not-ours"
+    assert store.get(job.job_id).status is JobStatus.RUNNING
+    # ...but the security invariant holds regardless: nothing survives on THIS worker's disk.
+    assert _residue(tmp_path) == [], "sample bytes survived a lost terminal CAS"
+    assert not (tmp_path / job.job_id).exists(), "job dir must be purged even when the terminal CAS lost"
+
+
+def test_purge_after_reclaim_during_a_raising_validate(vm_dispatcher_factory, tmp_path):
+    """The generic-except terminal-CAS-loss seam (the wider window): validate raises AND a peer
+    reclaimed mid-validate, so the FAILED CAS loses (owned=False). The job dir must still be purged."""
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.input_sha256 = "e" * 64
+    store.create(job)
+    claimed = store.claim_next()
+
+    def _boom_and_reclaim(in_path):
+        store.update(job.job_id, claim_id="peer-claim-not-ours")   # peer reclaims mid-validate
+        raise RuntimeError("engine blew up")
+
+    disp = vm_dispatcher_factory(store=store, blob_store=Blobs(), validate_ok=True)
+    disp._validate = _boom_and_reclaim
+    disp._process(claimed)
+
+    assert store.get(job.job_id).claim_id == "peer-claim-not-ours"   # our FAILED CAS lost
+    assert _residue(tmp_path) == [], "sample bytes survived a lost FAILED CAS"
+    assert not (tmp_path / job.job_id).exists(), "job dir must be purged even when the FAILED CAS lost"
+
+
 def test_purge_refuses_path_outside_job_root(tmp_path, caplog):
     """The containment refusal: _purge_job_dir must never rmtree anything that doesn't
     resolve strictly under job_root -- it must refuse and log an error instead."""
