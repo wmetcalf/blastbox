@@ -1852,6 +1852,23 @@ class Dispatcher:
             "(result discarded, not stored)",
             job.job_id, self._put_output_max_attempts, exc,
         )
+        # Finding S1: a partial result may already be sitting under results/<job_id> (e.g.
+        # some of put_output's per-file put_object calls landed before a later one failed).
+        # The caller below marks the job FAILED via _fail_job, never DONE, so this job will
+        # never be served (open_output is DONE-gated) -- and with the default
+        # job_retention_seconds=0, expires_at is None, so the retention sweeper skips it
+        # forever (retention.py: `if job.expires_at is None ... continue`). Without reaping
+        # here, that partial blob is orphaned permanently, recoverable only by an explicit
+        # DELETE. delete_job is results-scoped + idempotent, so call it unconditionally on
+        # exhaustion. Best-effort: a reap failure must not mask the real upload failure /
+        # FAILED outcome this method is already reporting.
+        try:
+            self._blobs.delete_job(job.job_id)
+        except Exception as reap_exc:  # noqa: BLE001
+            _log.warning(
+                "failed to reap partial result blob for job %s after upload exhaustion: %s",
+                job.job_id, reap_exc,
+            )
         return False
 
     def _index_page_hashes(self, job_id: str, envelope: object) -> None:

@@ -156,10 +156,29 @@ class S3BlobStore:
         Sample blobs are content-addressed and shared between jobs, so they are
         never deleted here — doing so would break every other job referencing the
         same bytes, including a future re-run of the corpus.
+
+        Finding C4: ``delete_objects`` returns HTTP 200 even when SOME objects
+        failed to delete (an IAM condition, object lock, etc.) — the failures are
+        reported only in ``response["Errors"]``, which the caller must inspect;
+        boto3 does not raise for them. Silently ignoring that field would report a
+        partial delete as a full success, so the retention sweeper's guard (only
+        clear ``expires_at`` when ``delete_job`` does NOT raise) would clear it
+        anyway and the undeleted result object would leak forever with nothing left
+        to retry it. Raise here so the caller's error-handling (retention's guard,
+        or the ingress DELETE route) leaves the job retryable instead.
         """
         prefix = self._key("results", job_id) + "/"
         paginator = self._s3.get_paginator("list_objects_v2")
+        errors: list[dict] = []
         for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
             keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
-            if keys:
-                self._s3.delete_objects(Bucket=self._bucket, Delete={"Objects": keys})
+            if not keys:
+                continue
+            response = self._s3.delete_objects(Bucket=self._bucket, Delete={"Objects": keys})
+            errors.extend(response.get("Errors") or [])
+        if errors:
+            first = errors[0]
+            raise BlobFetchError(
+                f"delete_job partially failed for {job_id}: {len(errors)} object(s) "
+                f"undeleted (first: key={first.get('Key')!r} code={first.get('Code')!r})"
+            )

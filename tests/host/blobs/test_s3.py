@@ -155,3 +155,45 @@ def test_put_sample_propagates_non_404_errors(store, tmp_path):
         with pytest.raises(botocore.exceptions.ClientError) as exc_info:
             store.put_sample(digest, src)
         assert exc_info.value.response["Error"]["Code"] == "AccessDenied"
+
+
+def test_delete_job_raises_when_delete_objects_reports_partial_errors(store, tmp_path):
+    """Finding C4: delete_objects returns HTTP 200 even when some keys failed to delete --
+    the failures are reported ONLY in response["Errors"], which delete_job must inspect
+    and raise on, not ignore. Otherwise a partial delete looks like a full success to the
+    retention sweeper's guard, which would then clear expires_at and orphan the undeleted
+    object forever."""
+    from unittest.mock import patch
+
+    out = tmp_path / "j6" / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_bytes(b"{}")
+    store.put_output("j6", out)
+
+    real_delete_objects = store._s3.delete_objects
+
+    def _partial_failure(**kwargs):
+        response = real_delete_objects(**kwargs)
+        response["Errors"] = [
+            {"Key": "pfx/results/j6/metadata.json", "Code": "AccessDenied",
+             "Message": "insufficient permissions"}
+        ]
+        return response
+
+    with patch.object(store._s3, "delete_objects", side_effect=_partial_failure):
+        with pytest.raises(BlobFetchError):
+            store.delete_job("j6")
+
+
+def test_delete_job_all_success_path_does_not_raise(store, tmp_path):
+    """The normal (no Errors) path must not raise -- a regression guard alongside the
+    partial-failure test above."""
+    out = tmp_path / "j7" / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_bytes(b"{}")
+    store.put_output("j7", out)
+
+    store.delete_job("j7")  # must not raise
+
+    s3 = boto3.client("s3", region_name="us-east-1")
+    assert s3.list_objects_v2(Bucket=BUCKET, Prefix="pfx/results/j7/")["KeyCount"] == 0

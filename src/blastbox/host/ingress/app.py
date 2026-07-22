@@ -706,6 +706,21 @@ def build_app(
             shutil.rmtree(root, ignore_errors=True)
             # Don't reflect the store exception (DB driver errors carry host:port/DSN). Log it.
             _log.warning("job_store_create_failed", error=str(exc))
+            # Finding C3: this job's own job_root/<id> dir is removed above, but the
+            # samples/<sha256> blob just put_sample'd is DELIBERATELY left in place, not
+            # deleted here. Unlike results/<job_id> (job-scoped), samples/<sha256> is
+            # content-addressed and SHARED across jobs: put_sample is a dedup no-op for any
+            # sha256 already present, so a CONCURRENT request for the same content may have
+            # skipped its own upload and now depends on exactly this blob. There is no
+            # refcount on it, so deleting it here on THIS request's create-failure could
+            # yank the sample out from under that other, otherwise-healthy job the instant
+            # after it dedup-skipped -- a race this handler cannot detect or fence against.
+            # An orphaned sample (no job ever referencing it, e.g. because create() failed
+            # for every request that ever uploaded that content) is reclaimed by the
+            # sample-retention/GC policy instead (BLASTBOX_BLOB_SAMPLE_RETENTION / bucket
+            # lifecycle) -- the same aging-out policy already documented for the
+            # content-addressed blobs the retention sweeper also declines to delete inline
+            # (see JobRetentionSweeper._expire_job).
             raise HTTPException(503, "store unavailable") from exc
 
         # Bound the engine metrics label to the allowlist: in open-allowlist mode (empty set) an
@@ -940,8 +955,19 @@ def build_app(
         Refuses to delete QUEUED/RUNNING jobs.  Deletion is confined under
         ``job_root`` — the directory removed is always ``job_root/<job_id>/`` —
         and also reaps the job's durable result blobs from ``_blob_store`` (which
-        live under ``blob_root``, OUTSIDE ``job_root``, so the rmtree above never
-        touches them).
+        live under ``blob_root``, OUTSIDE ``job_root``, so the on-disk rmtree
+        never touches them).
+
+        Ordering (Finding E2): the blob delete is attempted BEFORE the job row is
+        removed, and the row is removed ONLY if it succeeds — symmetric with the
+        retention sweeper (``JobRetentionSweeper._expire_job``), which likewise
+        withholds its terminal-state write until ``delete_job`` succeeds. A
+        transient blob-store failure (S3 throttling, a real LocalBlobStore error)
+        must not be swallowed AND have the job row removed underneath it — that
+        would orphan the ``results/<job_id>`` blob with no record left for any
+        future DELETE/retention sweep to retry. On failure this returns 503 and
+        leaves the row intact so the caller (or a later retention pass, once the
+        job is terminal with a real expires_at) can retry the same delete.
         """
         _validate_job_id(job_id)
         job = _job_store.get(job_id)
@@ -962,19 +988,23 @@ def build_app(
         except ValueError:
             raise HTTPException(500, "job directory outside job_root")
 
+        # On-disk cleanup under job_root is independent of the durable blob store and of
+        # the job row: it is not the record that a retry would need intact, so it proceeds
+        # unconditionally (best-effort, as before) regardless of the blob-delete outcome
+        # checked next.
         shutil.rmtree(root, ignore_errors=True)
+
         # Durable result artifacts live under blob_store's blob_root, a SIBLING of
-        # job_root -- so the rmtree above removes nothing durable, and without this
-        # call an explicit DELETE would return {"deleted": ...} while the artifacts
-        # remain in the store forever (this route is the companion site to the
-        # retention sweeper's JobRetentionSweeper._expire_job, which already reaps
-        # blobs). Best-effort, matching the ignore_errors=True posture of the rmtree
-        # above: a blob-store failure is logged, not raised, so it can't 500 a
-        # request whose on-disk cleanup + store-row removal should still proceed.
+        # job_root -- so the rmtree above removes nothing durable. Attempt this BEFORE
+        # touching the job row: if it fails, do NOT delete the row (see the ordering note
+        # in the docstring above) -- error out instead so the client/operator knows the
+        # job was NOT deleted and can retry.
         try:
             _blob_store.delete_job(job_id)
         except Exception as exc:
             _log.warning("blob_delete_job_failed", job_id=job_id, error=str(exc))
+            raise HTTPException(503, "blob store unavailable; job not deleted") from exc
+
         _job_store.delete(job_id)
         return {"deleted": job_id}
 

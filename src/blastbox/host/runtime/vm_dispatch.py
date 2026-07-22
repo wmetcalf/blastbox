@@ -630,6 +630,24 @@ class VmJobDispatcher:
                     ok = False
                     err = (f"result upload failed after {self._put_output_max_attempts} attempts; "
                            "result discarded")
+                    # Finding S1: a partial result may already be sitting under
+                    # results/<job_id> (some of put_output's per-file writes may have landed
+                    # before a later one failed). This attempt marks the job FAILED (never
+                    # DONE), so it will never be served (open_output is DONE-gated) -- and
+                    # with the default job_retention_s=0, expires_at is None, so the
+                    # retention sweeper skips it forever (retention.py: `if job.expires_at
+                    # is None ... continue`). Without reaping here, that partial blob is
+                    # orphaned permanently, recoverable only by an explicit DELETE.
+                    # delete_job is results-scoped + idempotent. Best-effort: a reap
+                    # failure must not mask the real upload failure / FAILED outcome this
+                    # method is already reporting.
+                    try:
+                        self._blobs.delete_job(job.job_id)
+                    except Exception as reap_exc:  # noqa: BLE001
+                        logger.warning(
+                            "vm_dispatch: failed to reap partial result blob for job %s "
+                            "after upload exhaustion: %s", job.job_id, reap_exc,
+                        )
             finished = time.time()
             # CAS on (status, claim_id) so a stale owner can't clobber a job that was reclaimed
             # (RUNNING->QUEUED->RUNNING under another dispatcher). The return value is OUR ownership.

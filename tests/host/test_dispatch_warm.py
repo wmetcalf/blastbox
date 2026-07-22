@@ -491,6 +491,7 @@ class _RecordingBlobs:
         self.calls = 0
         self.uploaded: list[str] = []
         self.saw_metadata = False
+        self.deleted: list[str] = []
 
     def put_sample(self, sha256, src): ...
     def get_sample(self, sha256, dest): ...
@@ -501,7 +502,8 @@ class _RecordingBlobs:
         self.saw_metadata = (Path(out_dir) / "metadata.json").is_file()
         self.uploaded.append(job_id)
     def open_output(self, job_id, name): ...
-    def delete_job(self, job_id): ...
+    def delete_job(self, job_id):
+        self.deleted.append(job_id)
 
 
 def test_warm_dispatch_uploads_result_to_blob_store_before_done(tmp_path):
@@ -569,6 +571,11 @@ def test_warm_upload_failure_fails_job_and_releases_slot_dirty(tmp_path):
     assert len(pool.release_calls) == 1
     assert pool.release_calls[0] is slot
     assert pool.release_dirty == [True]
+
+    # Finding S1: the exhaustion path must reap any partial result blob -- else, with the
+    # default job_retention_seconds=0 (expires_at=None), the retention sweeper skips this
+    # FAILED job forever and the partial results/<job_id> blob leaks unbounded.
+    assert blobs.deleted == [job.job_id]
 
 
 def test_warm_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(tmp_path):

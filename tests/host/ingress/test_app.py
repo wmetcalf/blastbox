@@ -911,10 +911,12 @@ class TestDeleteJob:
             tmp_path / "jobs", blob_root=tmp_path / "blobs"
         )._results_dir(job.job_id).exists()
 
-    def test_delete_blob_failure_is_logged_not_fatal(self, tmp_path, monkeypatch):
-        """A blob-store delete_job failure must not 500 the request: the store row
-        + on-disk job dir removal proceed regardless (matches the existing
-        ignore_errors=True posture of the on-disk rmtree)."""
+    def test_delete_blob_failure_leaves_job_row_intact(self, tmp_path, monkeypatch):
+        """Finding E2: a blob-store delete_job failure must NOT be swallowed with the
+        job row removed underneath it -- that would orphan the results/<job_id> blob
+        with no record left for any future DELETE/retention sweep to retry (asymmetric
+        with the retention sweeper's own careful guard in JobRetentionSweeper._expire_job).
+        The route must error out and leave the row intact so a retry is possible."""
         store = InMemoryJobStore()
         job, _output_dir = _make_done_job(tmp_path, store)
 
@@ -936,9 +938,10 @@ class TestDeleteJob:
         monkeypatch.setattr(LocalBlobStore, "delete_job", _boom)
 
         del_resp = client.delete(f"/v1/jobs/{job.job_id}")
-        assert del_resp.status_code == 200
-        assert del_resp.json()["deleted"] == job.job_id
-        assert store.get(job.job_id) is None
+        assert del_resp.status_code == 503
+        # The job row must survive a failed blob delete so a later DELETE/retention
+        # sweep can retry it -- the blob is otherwise orphaned with no record left.
+        assert store.get(job.job_id) is not None
 
 
 # ===========================================================================

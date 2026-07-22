@@ -27,6 +27,7 @@ class Blobs:
         self.put_output_calls = 0
         self.uploaded: list[str] = []
         self.saw_metadata = False
+        self.deleted: list[str] = []
     def put_sample(self, sha256, src): ...
     def get_sample(self, sha256, dest):
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -38,7 +39,8 @@ class Blobs:
         self.saw_metadata = (out_dir / "metadata.json").is_file()
         self.uploaded.append(job_id)
     def open_output(self, job_id, name): ...
-    def delete_job(self, job_id): ...
+    def delete_job(self, job_id):
+        self.deleted.append(job_id)
 
 
 def test_output_uploaded_before_purge(vm_dispatcher_factory, tmp_path):
@@ -102,6 +104,10 @@ def test_upload_failure_after_exhausting_retries_fails_the_job_and_purges(vm_dis
     assert "upload failed" in (final.error or "").lower()
     # the cleanup invariant holds on every terminal path -- no leftover output dir survives.
     assert not (tmp_path / job.job_id).exists(), "job dir (input AND output) must be purged, not preserved"
+    # Finding S1: the exhaustion path must reap any partial result blob -- else, with the
+    # default job_retention_s=0 (expires_at=None), the retention sweeper skips this FAILED
+    # job forever and the partial results/<job_id> blob leaks unbounded.
+    assert blobs.deleted == [job.job_id]
 
 
 def test_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(vm_dispatcher_factory, tmp_path):
