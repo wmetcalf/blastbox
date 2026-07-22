@@ -176,7 +176,9 @@ class VmJobDispatcher:
         # again -- long enough that THIS worker doesn't immediately re-claim and spin on a sample its
         # own connectivity can't reach (see the release branch in _process).
         self._blob_retry_backoff_s = max(0.0, float(blob_retry_backoff_s))
-        self._retention = JobRetentionSweeper(self._job_root)
+        # Reap result blobs alongside the on-disk dir; delete_job is scoped to
+        # results/<job_id> only, so shared samples/<sha256> blobs are never touched.
+        self._retention = JobRetentionSweeper(self._job_root, blob_store=self._blobs)
         self._stop = threading.Event()
 
     def _engine_default_policy(self, engine: str | None) -> str:

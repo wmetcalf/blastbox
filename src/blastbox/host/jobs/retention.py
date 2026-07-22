@@ -19,6 +19,7 @@ import shutil
 import time
 from pathlib import Path
 
+from blastbox.host.blobs.base import BlobStore
 from blastbox.host.jobs.base import JobStatus, JobStore
 
 _log = logging.getLogger("blastbox.host.jobs.retention")
@@ -34,6 +35,11 @@ class JobRetentionSweeper:
     subdirectories live.  Any ``result_dir`` that does not resolve strictly
     inside ``job_root`` is refused — this prevents a malicious or misconfigured
     ``result_dir`` from deleting arbitrary paths on the host.
+
+    ``blob_store``, if given, is also reaped per expired job (``delete_job``)
+    so result bytes uploaded via ``BlobStore.put_output`` don't outlive the
+    on-disk copy this sweeper already deletes. Defaults to ``None`` — every
+    existing call site (mode 1, no object storage) is unaffected.
     """
 
     def __init__(
@@ -41,9 +47,11 @@ class JobRetentionSweeper:
         job_root: Path | str,
         *,
         clock=None,
+        blob_store: BlobStore | None = None,
     ) -> None:
         self._job_root = Path(job_root).resolve()
         self._clock = clock or time.time
+        self._blobs = blob_store
 
     # ------------------------------------------------------------------
     # Public API
@@ -85,6 +93,16 @@ class JobRetentionSweeper:
         """Delete artifacts and mark the job EXPIRED in the store."""
         if result_dir is not None:
             self._safe_rmtree(job_id, Path(result_dir))
+
+        if self._blobs is not None:
+            # Result blobs only. Sample blobs are content-addressed and shared
+            # between jobs, so deleting them here would break every other job
+            # referencing the same bytes; they age out on their own policy
+            # (BLASTBOX_BLOB_SAMPLE_RETENTION / bucket lifecycle).
+            try:
+                self._blobs.delete_job(job_id)
+            except Exception as exc:
+                _log.warning("retention: blob delete failed for %s: %s", job_id, exc)
 
         # Update the store regardless of whether result_dir existed. Clear expires_at so the now-
         # EXPIRED job (EXPIRED is in _TERMINAL) isn't re-selected + re-swept on every subsequent
