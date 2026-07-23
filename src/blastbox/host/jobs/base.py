@@ -64,6 +64,14 @@ class Job:
     # cold job with no node-budget headroom) so it moves temporarily behind claimable work WITHOUT
     # mutating created_at (which is the submission time used for public ordering + max_queued_age).
     claimable_after: float | None = None
+    # Durable count of on-demand sample-materialisation attempts (Task 4/5): incremented each
+    # time the dispatcher releases a claim back to QUEUED after a BlobFetchError. Bounds that
+    # release-retry loop -- once it reaches MAX_MATERIALISE_ATTEMPTS the dispatcher marks the
+    # job FAILED instead of releasing again, so a PERMANENTLY missing sample reaches a terminal
+    # state rather than looping release->reclaim->release forever. Must persist across releases
+    # (hence a Job field, not an in-memory dispatcher counter) since a different node/thread may
+    # reclaim the job on each attempt. 0 = no failed materialisation attempt yet.
+    materialise_attempts: int = 0
     error: str | None = None
     # Per-claim ownership token: claim_next() stamps a fresh value on each QUEUED->RUNNING
     # transition; requeue clears it. Terminal/recovery writes CAS on (status, claim_id) so a
@@ -94,8 +102,10 @@ class Job:
 
         Strips ``result_dir`` (internal server path), ``params`` (may contain
         sensitive engine options), ``claim_id`` (an internal ownership token),
-        and ``claimable_after`` (an internal capacity-deferral scheduling timestamp),
-        and sanitizes the ``error`` field to remove internal filesystem paths.
+        ``claimable_after`` (an internal capacity-deferral scheduling timestamp),
+        and ``materialise_attempts`` (an internal bounded-retry scheduling counter,
+        a sibling of ``claimable_after``), and sanitizes the ``error`` field to
+        remove internal filesystem paths.
 
         ``worker_tier`` and ``target_tier`` are INTENTIONALLY kept public: this is
         observability for the testing the feature exists for (read back which warm
@@ -108,6 +118,7 @@ class Job:
         d.pop("params", None)
         d.pop("claim_id", None)
         d.pop("claimable_after", None)   # internal capacity-deferral scheduling detail
+        d.pop("materialise_attempts", None)   # internal bounded-retry scheduling counter
         if isinstance(d.get("error"), str):
             d["error"] = sanitize_public_error(d["error"])
         return d
@@ -130,6 +141,7 @@ class Job:
             target_tier=d.get("target_tier"),
             net_policy=d.get("net_policy"),
             claimable_after=float(d["claimable_after"]) if d.get("claimable_after") else None,
+            materialise_attempts=int(d.get("materialise_attempts") or 0),
             error=d.get("error"),
             claim_id=d.get("claim_id"),
             security_warnings=(

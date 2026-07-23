@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 from collections.abc import Callable
@@ -29,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from blastbox.contract.envelope import atomic_write_confined
+from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.jobs.retention import JobRetentionSweeper
 from blastbox.host.runtime.remote_http import WorkerBusy   # 409 from a busy worker -> requeue, not fail
@@ -42,6 +44,22 @@ from blastbox.observability.metrics import (
 # compromised/buggy VM agent could otherwise return a huge nested blob that balloons the DB/Redis
 # value and every status/list response for the job.
 _MAX_SUMMARY_BYTES = 256 * 1024
+
+# Bound the release-on-BlobFetchError loop (Task 4/5): a TRANSIENT fetch failure (this worker's
+# connectivity) should release the claim and let another node try. But a PERMANENTLY missing
+# sample (deleted/never-written blob) would otherwise release -> reclaim -> release forever with
+# no terminal state. Once a job's materialise_attempts reaches this ceiling, the dispatcher marks
+# it FAILED instead of releasing again.
+MAX_MATERIALISE_ATTEMPTS = 3
+
+# Bound the inline put_output retry (Finding D1). The detonation already ran and its
+# result is sitting on disk right now, while this worker still holds the claim -- a
+# transient upload failure (a momentary object-store blip) deserves a real, bounded,
+# IN-LINE chance to succeed. There is deliberately no "leave it RUNNING for later"
+# fallback: nothing ever re-runs a RUNNING job, so once every attempt is exhausted the
+# job FAILs and its dir is purged like every other terminal path -- see _process.
+PUT_OUTPUT_MAX_ATTEMPTS = 3
+PUT_OUTPUT_RETRY_BACKOFF_S = 1.0
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +94,11 @@ class VmJobDispatcher:
                  sanitize_params: Callable[[dict[str, str]], dict[str, str]] | None = None,
                  output_validator: Callable[[Job, Path], None] | None = None,
                  max_queued_age_s: float = 0.0,
-                 max_summary_bytes: int = _MAX_SUMMARY_BYTES) -> None:
+                 max_summary_bytes: int = _MAX_SUMMARY_BYTES,
+                 blob_store: BlobStore | None = None,
+                 blob_retry_backoff_s: float = 30.0,
+                 put_output_max_attempts: int = PUT_OUTPUT_MAX_ATTEMPTS,
+                 put_output_retry_backoff_s: float = PUT_OUTPUT_RETRY_BACKOFF_S) -> None:
         self._store = store
         self._job_root = Path(job_root)
         self._validate = validate
@@ -141,7 +163,38 @@ class VmJobDispatcher:
         # each job's engine default instead of silently skipping the check.
         self._engine_net_policy = engine_net_policy
         self._max_summary_bytes = max(1024, int(max_summary_bytes))
-        self._retention = JobRetentionSweeper(self._job_root)
+        # Backing blob store for on-demand sample materialisation (Task 4). None (the default, and
+        # every existing call site) lazily resolves BLASTBOX_BLOB_URL -- unset means LocalBlobStore, a
+        # REAL filesystem-backed store rooted outside job_root (Task 9), so get_sample() can
+        # re-materialise a sample this worker purged, exactly like the S3 backend. Imported here, not
+        # at module scope, to mirror ingress/app.py's lazy factory import.
+        if blob_store is not None:
+            self._blobs = blob_store
+        else:
+            from blastbox.host.blobs.factory import build_blob_store_from_env
+
+            # Task 9: LocalBlobStore derives its default blob_root FROM job_root (a sibling
+            # `blobs` dir), so the factory must see the job_root THIS dispatcher actually
+            # uses, not just the raw env var -- else a caller that passes an explicit
+            # `job_root=` (differing from BLASTBOX_JOB_ROOT) would get a local store rooted
+            # at the wrong directory, and get_sample() would raise "not present" for a
+            # sample this same process's ingress just put_sample'd. Mirrors ingress/app.py's
+            # build_app fix for the identical mismatch.
+            self._blobs = build_blob_store_from_env(
+                {**os.environ, "BLASTBOX_JOB_ROOT": str(self._job_root)}
+            )
+        # How long a job that just failed to fetch is deferred (claimable_after) before it's eligible
+        # again -- long enough that THIS worker doesn't immediately re-claim and spin on a sample its
+        # own connectivity can't reach (see the release branch in _process).
+        self._blob_retry_backoff_s = max(0.0, float(blob_retry_backoff_s))
+        # Bounded inline retry policy for a result upload (Finding D1) -- see the
+        # module-level constants for why this is bounded and has no "retry later"
+        # fallback: put_output_max_attempts tries, put_output_retry_backoff_s apart.
+        self._put_output_max_attempts = max(1, int(put_output_max_attempts))
+        self._put_output_retry_backoff_s = max(0.0, float(put_output_retry_backoff_s))
+        # Reap result blobs alongside the on-disk dir; delete_job is scoped to
+        # results/<job_id> only, so shared samples/<sha256> blobs are never touched.
+        self._retention = JobRetentionSweeper(self._job_root, blob_store=self._blobs)
         self._stop = threading.Event()
 
     def _engine_default_policy(self, engine: str | None) -> str:
@@ -178,6 +231,36 @@ class VmJobDispatcher:
         # directory components a non-ingress producer left in `filename`, so the join (and the
         # finally-block unlink) can never escape the job's own input/ dir.
         return self._job_dir(job) / "input" / Path(job.filename).name
+
+    def _purge_job_dir(self, job: Job) -> None:
+        """Remove this job's entire dir (input AND output) from THIS worker's disk.
+
+        SECURITY INVARIANT, not housekeeping: a worker is a malware-analysis node,
+        frequently spare hardware that is not a hardened sample repository. Nothing
+        may survive a terminal state (or a release of this worker's claim on the
+        job), and there is deliberately no setting that disables this. Best-effort
+        by design — a purge failure must never mask the job's real outcome — but it
+        IS logged loudly, never silently swallowed, so an operator can see a worker
+        that is failing to clean up after itself.
+
+        Containment mirrors JobRetentionSweeper._safe_rmtree (jobs/retention.py):
+        resolve first, then refuse anything that doesn't land strictly under
+        ``job_root`` (guards a job_id/path with traversal components).
+        """
+        root = self._job_dir(job).resolve()
+        try:
+            root.relative_to(self._job_root.resolve())
+        except ValueError:
+            logger.error("vm_dispatch: refusing to purge %s (outside job_root %s)",
+                        root, self._job_root)
+            return
+        if not root.exists():
+            return
+        try:
+            shutil.rmtree(root)
+        except OSError as exc:
+            logger.error("vm_dispatch: PURGE FAILED for job %s at %s: %s — sample bytes may "
+                        "remain on this worker's disk", job.job_id, root, exc)
 
     def _expiry(self, finished_at: float) -> float | None:
         return finished_at + self._retention_s if self._retention_s > 0 else None
@@ -320,16 +403,22 @@ class VmJobDispatcher:
         if effective_policy != fixed_policy:
             kind = "override" if job.net_policy else "engine-default"
             finished = time.time()
-            if self._store.update_if_status(
+            self._store.update_if_status(
                     job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                     status=JobStatus.FAILED, finished_at=finished,
                     error=f"net_policy {effective_policy!r} ({kind}) not honored by {self._worker_tier} "
                           f"tier (fixed egress {fixed_policy!r})",
-                    expires_at=self._expiry(finished)):
-                try:  # we owned the terminal write → drop the spooled input
-                    self._input_path(job).unlink()
-                except OSError:
-                    pass
+                    expires_at=self._expiry(finished))
+            # Purge unconditionally, regardless of whether the FAILED CAS above won: this worker's
+            # involvement with the job ends here either way. If the CAS won, this is a terminal
+            # write and the purge invariant applies unconditionally (not just a bare input unlink) --
+            # nothing may survive on this worker's disk, even if _process is ever reordered so this
+            # check runs after materialisation/validation and output/ has content too. If the CAS
+            # LOST, a peer reclaimed the job between our claim_next() and this check, so leaving the
+            # spooled input here would just be orphaned malware bytes on spare hardware that no peer
+            # (on another host) could ever read -- the blob store always re-materialises the sample
+            # for whoever owns the job now. Mirrors the reclaim-before-validate purge just below.
+            self._purge_job_dir(job)
             logger.warning("vm_dispatch: rejecting job %s — net_policy %r (%s) != fixed egress %r on %s",
                            job.job_id, effective_policy, kind, fixed_policy, self._worker_tier)
             return
@@ -341,14 +430,109 @@ class VmJobDispatcher:
         if not self._store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                                             worker_runtime="warm", worker_tier=self._worker_tier):
             logger.info("vm_dispatch: job %s reclaimed before validate; skipping", job.job_id)
+            # Purge unconditionally (Task 9): this worker's involvement with the job ends here, and
+            # the blob store (real in every mode, not just S3) can always re-materialise the sample
+            # for whichever node now owns it. We no longer leave the input "for the new owner" — in a
+            # real fleet the new owner is on ANOTHER host, so leftovers here are just orphaned malware
+            # bytes on spare hardware, not something a peer could ever read.
+            self._purge_job_dir(job)
             return
         in_path = self._input_path(job)
         owned = False
         terminal_status: JobStatus | None = None   # the terminal state THIS attempt CAS-won (for metrics)
+        # The `finally` purge is UNCONDITIONAL for every terminal state and every lost/released claim
+        # (the security invariant: this worker is spare hardware that must not accumulate malware, and
+        # the blob store always re-materialises the sample for whoever owns the job now). There is no
+        # exception for a put_output failure: Finding D1 removed the earlier "leave it RUNNING for the
+        # sweeper" branch (preserve_result_for_retry) because nothing ever consumes a job left that
+        # way -- see the upload block below, which retries inline (bounded) and, on exhaustion, FAILs
+        # the job so this purge runs like every other terminal path.
         t0 = time.monotonic()   # for the job-duration metric (parity with the cold dispatcher)
         try:
             if not in_path.exists():
-                raise FileNotFoundError(f"spooled input missing: {in_path}")
+                # Materialise on demand. In local mode this re-raises (there is no
+                # second copy); in S3 mode it fetches and hash-verifies.
+                #
+                # A fetch failure RELEASES the claim instead of failing the job: the
+                # object store being unreachable says something about this worker's
+                # connectivity, not about the sample. Failing here would permanently
+                # discard work because one node's link was down.
+                if job.input_sha256 is None:
+                    # No content key to fetch by -- there's nothing a blob store could
+                    # materialise. Same terminal shape as before this feature existed.
+                    raise FileNotFoundError(f"spooled input missing: {in_path}")
+                try:
+                    self._blobs.get_sample(job.input_sha256, in_path)
+                except BlobFetchError:
+                    attempts = job.materialise_attempts + 1
+                    if attempts >= MAX_MATERIALISE_ATTEMPTS:
+                        # Bounded out: this isn't a transient connectivity blip anymore --
+                        # `attempts` failed materialisations in a row means the sample itself
+                        # is gone (deleted / never written), and no amount of releasing will
+                        # ever fetch it. FAIL terminally instead of releasing again, so the
+                        # job stops looping release -> reclaim -> release forever.
+                        logger.warning(
+                            "vm_dispatch: job %s could not materialise its sample after "
+                            "%d attempts; failing", job.job_id, attempts,
+                        )
+                        finished = time.time()
+                        owned = self._store.update_if_status(
+                            job.job_id,
+                            JobStatus.RUNNING,
+                            expect_claim_id=job.claim_id,
+                            status=JobStatus.FAILED,
+                            finished_at=finished,
+                            error=f"sample could not be materialised after {attempts} attempts",
+                            materialise_attempts=attempts,
+                            expires_at=self._expiry(finished),
+                        )
+                        terminal_status = JobStatus.FAILED
+                        return
+                    logger.warning(
+                        "vm_dispatch: job %s could not materialise its sample; "
+                        "releasing the claim for another node", job.job_id,
+                    )
+                    # RUNNING -> QUEUED, CAS'd on (status, claim_id) so a stale owner
+                    # can't clobber a job that was already RECLAIMED. claim_id is
+                    # cleared so the next claim_next() stamps a fresh token.
+                    #
+                    # claimable_after backs the job off briefly: without it THIS worker
+                    # is free to instantly re-claim the job it just failed to fetch and
+                    # spin on it. created_at is deliberately untouched, so public
+                    # ordering and max_queued_age still see the real submission time.
+                    #
+                    # materialise_attempts is persisted incremented so the counter survives
+                    # the release -- it's a durable Job field (not an in-memory counter)
+                    # precisely so a DIFFERENT node reclaiming this job on the next attempt
+                    # still sees how many times materialisation has already failed.
+                    self._store.update_if_status(
+                        job.job_id,
+                        JobStatus.RUNNING,
+                        expect_claim_id=job.claim_id,
+                        status=JobStatus.QUEUED,
+                        claim_id=None,
+                        claimable_after=time.time() + self._blob_retry_backoff_s,
+                        materialise_attempts=attempts,
+                    )
+                    # Releasing the claim relinquishes THIS worker's involvement with the job; the
+                    # unconditional `finally` purge (below) destroys whatever it holds (nothing should
+                    # have materialised on a failed fetch, but the invariant never assumes).
+                    return
+                else:
+                    # Finding E3: a successful fetch means this attempt's failure streak is
+                    # over -- reset the counter so only CONSECUTIVE fetch failures accumulate
+                    # toward MAX_MATERIALISE_ATTEMPTS, matching its "permanently missing"
+                    # intent. Persisted (not just the in-memory `job`) so a LATER release/
+                    # reclaim cycle (e.g. after a NoWarmSlot/WorkerBusy requeue purges this
+                    # job dir and it must re-fetch) doesn't inherit an earlier, unrelated
+                    # failure streak.
+                    if job.materialise_attempts:
+                        self._store.update_if_status(
+                            job.job_id,
+                            JobStatus.RUNNING,
+                            expect_claim_id=job.claim_id,
+                            materialise_attempts=0,
+                        )
             summary, ok = self._validate_with_heartbeat(job, in_path)
             summary = self._bounded_summary(summary)   # cap untrusted summary before store/metadata
             err: str | None = None
@@ -387,9 +571,101 @@ class VmJobDispatcher:
             if ok and not self._claim_is_still_ours(job):
                 logger.info("vm_dispatch: job %s reclaimed during validate; not publishing metadata "
                             "or CAS (peer owns it now)", job.job_id)
+                # The unconditional `finally` purge (below) destroys this worker's dir: the blob
+                # store can always re-materialise this job's sample for its new owner, so there's no
+                # reason to leave bytes behind on this worker's disk.
                 return
             if ok and not self._ensure_metadata(job, summary):
                 ok, err = False, "metadata_write_failed"
+            # Upload the sealed output BEFORE the terminal CAS below -- and long before the
+            # `finally` purge, which is about to delete it. Unlike a get_sample fetch failure
+            # (which releases the claim because the WORK hasn't happened yet), a put_output
+            # failure is the mirror image: the expensive detonation already ran and its result
+            # is sitting right here. Retry is out of scope, so don't record a FAILED outcome and
+            # don't let the purge erase it -- skip the terminal CAS entirely and return. The
+            # store's status field is untouched (still RUNNING from the warm-stamp CAS earlier in
+            # this method), `owned` stays False, so `finally` does not purge, and the reclaim
+            # sweeper (or a peer) picks the job up for another attempt instead of the result being
+            # silently discarded.
+            #
+            # But put_output writes to a deterministic per-job key (results/<job_id>/...) as a
+            # per-file overwrite/union -- it is NOT a claim-fenced atomic swap the way the store's
+            # CAS is. If our claim was reclaimed since the `_claim_is_still_ours` check above (e.g.
+            # during `_ensure_metadata`'s filesystem I/O), and a peer has since re-detonated,
+            # uploaded its OWN result, and CAS-committed DONE, this worker's write would land
+            # stale/divergent bytes over the peer's already-correct, already-DONE result --
+            # detonation is not guaranteed deterministic run-to-run, so this is a real corruption,
+            # not a harmless redundant rewrite. Re-checking ownership IMMEDIATELY before the call
+            # narrows that window to the same width the rest of this file already accepts for its
+            # store operations (the same TOCTOU `_claim_is_still_ours` above narrows for the
+            # metadata write) -- it does NOT fully close it: there is no store-level compare-and-
+            # swap on the uploaded object itself (S3 offers no such primitive), so a reclaim landing
+            # AFTER this check but DURING the upload call is still possible and is not fenced here.
+            # Accepted residual with a documented closure path: design doc "Known limitations"
+            # (Finding C2) — a claim-scoped result key or object-level conditional write.
+            if ok and not self._claim_is_still_ours(job):
+                logger.info("vm_dispatch: job %s reclaimed before upload; skipping put_output "
+                            "(peer owns it now)", job.job_id)
+                # Same reasoning as the other lost-claim returns in this method: our local copy
+                # is a stale attempt now, the peer's own upload is the correct result, and the
+                # blob store can always re-materialise the sample if this job needs to run again
+                # -- nothing may survive on this worker's disk once we're no longer the owner. The
+                # unconditional `finally` purge (below) handles it.
+                return
+            if ok:
+                upload_exc = upload_output_with_retry(
+                    self._blobs, job.job_id, self._job_dir(job) / "output",
+                    attempts=self._put_output_max_attempts,
+                    backoff_s=self._put_output_retry_backoff_s,
+                )
+                if upload_exc is not None:
+                    # Finding D1: every inline attempt failed. There is no consumer for a job left
+                    # RUNNING "for the sweeper" (nothing re-runs a RUNNING job), so treat this the
+                    # same as any other post-detonation failure -- FAIL the job (the terminal write
+                    # below) and let the unconditional `finally` purge run. The completed result is
+                    # discarded (it was never durably stored), but the job dir + claim don't leak.
+                    logger.error(
+                        "vm_dispatch: result upload failed for %s after %d attempt(s) (%s); "
+                        "discarding the result and failing the job (no leftover output dir)",
+                        job.job_id, self._put_output_max_attempts, upload_exc,
+                    )
+                    ok = False
+                    err = (f"result upload failed after {self._put_output_max_attempts} attempts; "
+                           "result discarded")
+                    # Finding S1: a partial result may already be sitting under
+                    # results/<job_id> (some of put_output's per-file writes may have landed
+                    # before a later one failed). This attempt marks the job FAILED (never
+                    # DONE), so it will never be served (open_output is DONE-gated) -- and
+                    # with the default job_retention_s=0, expires_at is None, so the
+                    # retention sweeper skips it forever (retention.py: `if job.expires_at
+                    # is None ... continue`). Without reaping here, that partial blob is
+                    # orphaned permanently, recoverable only by an explicit DELETE.
+                    # delete_job is results-scoped + idempotent. Best-effort: a reap
+                    # failure must not mask the real upload failure / FAILED outcome this
+                    # method is already reporting.
+                    #
+                    # Claim-fenced (ultrareview bug_001): the `_claim_is_still_ours`
+                    # check above ran BEFORE the retry loop -- if a peer requeued +
+                    # re-ran + CAS-committed DONE during the backoff window, its upload
+                    # landed at this same results/<job_id> prefix, and an unconditional
+                    # delete would wipe the peer's authoritative result while the job
+                    # store says DONE (every result route then 404s, unrepairably). On
+                    # a lost claim the prefix isn't ours to reap -- skip; the bounded
+                    # partial-blob leak in the no-peer-upload case is the smaller cost.
+                    if self._claim_is_still_ours(job):
+                        try:
+                            self._blobs.delete_job(job.job_id)
+                        except Exception as reap_exc:  # noqa: BLE001
+                            logger.warning(
+                                "vm_dispatch: failed to reap partial result blob for job %s "
+                                "after upload exhaustion: %s", job.job_id, reap_exc,
+                            )
+                    else:
+                        logger.info(
+                            "vm_dispatch: job %s: skipping partial-blob reap on upload "
+                            "exhaustion; claim lost -- results/<job_id> belongs to a peer now",
+                            job.job_id,
+                        )
             finished = time.time()
             # CAS on (status, claim_id) so a stale owner can't clobber a job that was reclaimed
             # (RUNNING->QUEUED->RUNNING under another dispatcher). The return value is OUR ownership.
@@ -423,13 +699,17 @@ class VmJobDispatcher:
                 status=JobStatus.FAILED, finished_at=finished, error=type(exc).__name__,
                 expires_at=self._expiry(finished))
         finally:
-            # Drop the spooled input ONLY if WE still own the job (terminal write applied). If it was
-            # reclaimed, the CAS returned False and the input now belongs to the new owner — leave it.
-            if owned:
-                try:  # the sample is consumed; drop the spooled input (keep any sealed output)
-                    in_path.unlink()
-                except OSError:
-                    pass
+            # SECURITY INVARIANT (not housekeeping): nothing survives on this worker's disk once its
+            # attempt ends. The purge is UNCONDITIONAL across every terminal state (DONE/FAILED) AND
+            # every lost/released claim -- crucially including when a peer reclaimed the job mid-flight
+            # so our terminal CAS lost (owned=False), AND a put_output failure that exhausted its
+            # retry budget (Finding D1 removed the "leave it RUNNING for the sweeper" exception: no
+            # consumer ever picks a RUNNING job like that back up, so that branch could only ever
+            # leak a job dir forever). Bytes left behind would be orphaned malware that no peer on
+            # another host could ever read (this design rejects a shared filesystem), while the blob
+            # store (real in every mode) always re-materialises the sample for the new owner. It
+            # deliberately purges output/ too, and there is no setting that disables it.
+            self._purge_job_dir(job)
             # Metric parity with the cold dispatcher: count the terminal outcome + wall time -- but ONLY
             # for THIS attempt's own winning CAS (owned + the status we wrote). Requeued (NoWarmSlot)
             # attempts set owned=False, and a reclaimed attempt loses the CAS -> both are skipped. Gating

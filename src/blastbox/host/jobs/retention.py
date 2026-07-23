@@ -19,6 +19,7 @@ import shutil
 import time
 from pathlib import Path
 
+from blastbox.host.blobs.base import BlobStore
 from blastbox.host.jobs.base import JobStatus, JobStore
 
 _log = logging.getLogger("blastbox.host.jobs.retention")
@@ -34,6 +35,11 @@ class JobRetentionSweeper:
     subdirectories live.  Any ``result_dir`` that does not resolve strictly
     inside ``job_root`` is refused — this prevents a malicious or misconfigured
     ``result_dir`` from deleting arbitrary paths on the host.
+
+    ``blob_store``, if given, is also reaped per expired job (``delete_job``)
+    so result bytes uploaded via ``BlobStore.put_output`` don't outlive the
+    on-disk copy this sweeper already deletes. Defaults to ``None`` — every
+    existing call site (mode 1, no object storage) is unaffected.
     """
 
     def __init__(
@@ -41,9 +47,11 @@ class JobRetentionSweeper:
         job_root: Path | str,
         *,
         clock=None,
+        blob_store: BlobStore | None = None,
     ) -> None:
         self._job_root = Path(job_root).resolve()
         self._clock = clock or time.time
+        self._blobs = blob_store
 
     # ------------------------------------------------------------------
     # Public API
@@ -86,9 +94,35 @@ class JobRetentionSweeper:
         if result_dir is not None:
             self._safe_rmtree(job_id, Path(result_dir))
 
-        # Update the store regardless of whether result_dir existed. Clear expires_at so the now-
-        # EXPIRED job (EXPIRED is in _TERMINAL) isn't re-selected + re-swept on every subsequent
-        # pass — wasteful churn, and a rmtree retry on an already-deleted tree.
+        blob_delete_ok = True
+        if self._blobs is not None:
+            # Result blobs only. Sample blobs are content-addressed and shared
+            # between jobs, so deleting them here would break every other job
+            # referencing the same bytes; they age out on their own policy
+            # (BLASTBOX_BLOB_SAMPLE_RETENTION / bucket lifecycle).
+            try:
+                self._blobs.delete_job(job_id)
+            except Exception as exc:
+                # A transient blob-store delete failure must NOT advance the job to
+                # EXPIRED with expires_at=None: an EXPIRED job with a null expires_at
+                # is never re-selected, so the result blob would be orphaned forever.
+                # Leave the job in its terminal state with expires_at intact so the
+                # NEXT sweep retries the (idempotent) delete. The on-disk rmtree above
+                # may already have run; that is fine — both rmtree and delete_job are
+                # idempotent.
+                _log.warning(
+                    "retention: blob delete failed for %s: %s; leaving expires_at "
+                    "intact so the next sweep retries", job_id, exc,
+                )
+                blob_delete_ok = False
+
+        # Only advance to EXPIRED once the blob delete has succeeded (or there is no blob store).
+        # Clearing expires_at is safe only then: the durable bytes are gone, so there is nothing
+        # left to retry, and the now-EXPIRED job (EXPIRED is in _TERMINAL) is not re-selected +
+        # re-swept on every subsequent pass. If the delete failed, do NOT touch the store — the
+        # job stays sweepable and a later sweep finishes the expiry.
+        if not blob_delete_ok:
+            return
         job = job_store.get(job_id)
         if job is not None:
             job_store.update(job_id, status=JobStatus.EXPIRED, result_dir=None, expires_at=None)

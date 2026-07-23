@@ -243,6 +243,9 @@ def _make_dispatcher_with_pool(
     warm_claim_timeout_s: float = 0.5,
     warm_only: bool = False,
     tier: str = "cold",
+    blob_store: Any = None,
+    put_output_max_attempts: int = 3,
+    put_output_retry_backoff_s: float = 0.0,
 ) -> Dispatcher:
     if engines is None:
         engines = {_ENGINE_NAME: _engine_spec()}
@@ -262,6 +265,9 @@ def _make_dispatcher_with_pool(
         warm_claim_timeout_s=warm_claim_timeout_s,
         warm_only=warm_only,
         warm_requeue_backoff_s=0.0,  # tests must not sleep the real 1.0s requeue backoff
+        blob_store=blob_store,
+        put_output_max_attempts=put_output_max_attempts,
+        put_output_retry_backoff_s=put_output_retry_backoff_s,
     )
 
 
@@ -474,6 +480,152 @@ def test_1_warm_happy_path(tmp_path):
     # slot input dir copy must be gone too
     slot_input = slot.input_dir / Path(job.filename).name
     assert not slot_input.exists()
+
+
+class _RecordingBlobs:
+    """Minimal BlobStore double for the warm-path P1/D1 tests (mirrors the cold-path
+    double in test_dispatch.py)."""
+
+    def __init__(self, fail_times: int = 0):
+        self.fail_times = fail_times
+        self.calls = 0
+        self.uploaded: list[str] = []
+        self.saw_metadata = False
+        self.deleted: list[str] = []
+
+    def put_sample(self, sha256, src): ...
+    def get_sample(self, sha256, dest): ...
+    def put_output(self, job_id, out_dir):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise OSError(f"object store down (attempt {self.calls})")
+        self.saw_metadata = (Path(out_dir) / "metadata.json").is_file()
+        self.uploaded.append(job_id)
+    def open_output(self, job_id, name): ...
+    def delete_job(self, job_id):
+        self.deleted.append(job_id)
+
+
+def test_warm_dispatch_uploads_result_to_blob_store_before_done(tmp_path):
+    """P1 (warm completion path): the warm path must also call put_output, with the
+    HOST job_root output dir (not the slot dir) already sealed, BEFORE marking DONE."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)
+    _start_fake_worker(
+        slot,
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
+    )
+
+    blobs = _RecordingBlobs()
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10, blob_store=blobs,
+    )
+    result = dispatcher.dispatch_once()
+
+    assert result is True
+    assert blobs.uploaded == [job.job_id]
+    assert blobs.saw_metadata, "the host-materialized output dir must be sealed before upload"
+    final_job = store.get(job.job_id)
+    assert final_job.status == JobStatus.DONE
+
+
+def test_warm_upload_failure_fails_job_and_releases_slot_dirty(tmp_path):
+    """Finding D1 (warm completion path): an upload that exhausts every bounded
+    inline attempt must FAIL the job (never DONE) and release the slot DIRTY —
+    the same shape as every other warm-path failure (see test_2_warm_trust_failure)."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)
+    _start_fake_worker(
+        slot,
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
+    )
+
+    blobs = _RecordingBlobs(fail_times=999)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10, blob_store=blobs,
+        put_output_max_attempts=3,
+    )
+    result = dispatcher.dispatch_once()
+
+    assert result is True
+    assert blobs.calls == 3
+    assert blobs.uploaded == []
+    final_job = store.get(job.job_id)
+    assert final_job.status == JobStatus.FAILED
+    assert final_job.error is not None
+    assert "upload" in final_job.error.lower()
+
+    # Slot released exactly once, DIRTY — a failed run force-recycles it before reuse.
+    assert len(pool.release_calls) == 1
+    assert pool.release_calls[0] is slot
+    assert pool.release_dirty == [True]
+
+    # Finding S1: the exhaustion path must reap any partial result blob -- else, with the
+    # default job_retention_seconds=0 (expires_at=None), the retention sweeper skips this
+    # FAILED job forever and the partial results/<job_id> blob leaks unbounded.
+    assert blobs.deleted == [job.job_id]
+
+
+def test_warm_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(tmp_path):
+    """Round-2 finding R2-1 (warm completion path): put_output writes to a deterministic
+    per-job key that is a per-file overwrite/union, not a claim-fenced atomic swap. If a
+    peer reclaims this job in the narrow window between the last local ownership check
+    and the upload -- here simulated by flipping claim_id right after
+    _materialize_sealed_warm_output runs, mirroring VmJobDispatcher's own
+    test_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result -- this worker must
+    NOT then upload its (possibly stale) bytes over the peer's already-correct result."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)
+    _start_fake_worker(
+        slot,
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
+    )
+
+    blobs = _RecordingBlobs()
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10, blob_store=blobs,
+    )
+
+    # Simulate a peer reclaiming the job right after the host materializes + seals the
+    # output but before the dispatcher re-checks ownership for the upload.
+    real_materialize = dispatcher._materialize_sealed_warm_output
+
+    def _materialize_then_peer_reclaims(envelope, src_dir, dst_dir):
+        real_materialize(envelope, src_dir, dst_dir)
+        store.update(job.job_id, claim_id="peer-claim-id-not-ours")
+
+    dispatcher._materialize_sealed_warm_output = _materialize_then_peer_reclaims  # type: ignore[method-assign]
+
+    result = dispatcher.dispatch_once()
+
+    assert result is True
+    assert blobs.uploaded == [], "put_output must never be called once ownership is lost"
+    stored = store.get(job.job_id)
+    assert stored.status == JobStatus.RUNNING, "must not clobber the peer's ownership of this job"
+    assert stored.claim_id == "peer-claim-id-not-ours"
+
+    # The slot must still be released exactly once (dirty -- this attempt did not cleanly finish).
+    assert len(pool.release_calls) == 1
+    assert pool.release_calls[0] is slot
+    assert pool.release_dirty == [True]
 
 
 def test_warm_dispatch_stamps_worker_tier(tmp_path):

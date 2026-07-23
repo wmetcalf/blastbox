@@ -117,6 +117,9 @@ def _make_dispatcher(
     tier: str = "cold",
     max_queued_age_s: float = 0.0,
     pool=None,
+    blob_store=None,
+    put_output_max_attempts: int = 3,
+    put_output_retry_backoff_s: float = 0.0,
 ) -> Dispatcher:
     if engines is None:
         engines = {_ENGINE_NAME: _engine_spec()}
@@ -134,6 +137,9 @@ def _make_dispatcher(
         pool=pool,
         tier=tier,
         max_queued_age_s=max_queued_age_s,
+        blob_store=blob_store,
+        put_output_max_attempts=put_output_max_attempts,
+        put_output_retry_backoff_s=put_output_retry_backoff_s,
     )
 
 
@@ -202,6 +208,230 @@ def test_happy_path_done_result_summary_input_gone(tmp_path):
     # Input file and directory must be gone
     assert not input_path.exists()
     assert not input_path.parent.exists()
+
+
+# ---------------------------------------------------------------------------
+# Finding P1: the classic (cold) Dispatcher must upload results to the blob
+# store, exactly like VmJobDispatcher — otherwise the API's result routes
+# (which read ONLY through BlobStore.open_output) 404 on every completed job
+# in the default local deployment.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingBlobs:
+    """Minimal BlobStore double that records put_output calls + a snapshot of
+    whether metadata.json existed in out_dir at call time (it must -- upload
+    happens BEFORE the DONE write, not after)."""
+
+    def __init__(self, fail_times: int = 0):
+        self.fail_times = fail_times
+        self.calls = 0
+        self.uploaded: list[str] = []
+        self.saw_metadata = False
+        self.deleted: list[str] = []
+
+    def put_sample(self, sha256, src): ...
+    def get_sample(self, sha256, dest): ...
+    def put_output(self, job_id, out_dir):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise OSError(f"object store down (attempt {self.calls})")
+        self.saw_metadata = (Path(out_dir) / "metadata.json").is_file()
+        self.uploaded.append(job_id)
+    def open_output(self, job_id, name): ...
+    def delete_job(self, job_id):
+        self.deleted.append(job_id)
+
+
+def test_cold_dispatch_uploads_result_to_blob_store_before_done(tmp_path):
+    """P1: the cold path's success write must call put_output BEFORE marking DONE,
+    with the sealed metadata.json already on disk in the uploaded directory."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    input_path = _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    blobs = _RecordingBlobs()
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner, blob_store=blobs,
+    )
+    result = dispatcher.dispatch_once()
+
+    assert result is True
+    assert blobs.uploaded == [job.job_id]
+    assert blobs.saw_metadata, "metadata.json must already be sealed when put_output runs"
+    final_job = store.get(job.job_id)
+    assert final_job.status == JobStatus.DONE
+    assert not input_path.exists()
+
+
+def test_cold_dispatch_upload_failure_fails_job_not_done(tmp_path):
+    """Finding D1 applied to the classic Dispatcher: an upload that fails every
+    bounded inline attempt must NOT be marked DONE. It takes the normal failure
+    path (FAILED, scrubbed error) and the normal input cleanup runs -- exactly
+    like every other post-detonation failure in this dispatcher (trust failure,
+    output-too-large, etc). There is no "leave it RUNNING" branch here either."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    input_path = _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    blobs = _RecordingBlobs(fail_times=999)  # every attempt fails
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner, blob_store=blobs,
+        put_output_max_attempts=3,
+    )
+    result = dispatcher.dispatch_once()
+
+    assert result is True
+    assert blobs.calls == 3, "must exhaust the bounded retry budget, not give up early"
+    assert blobs.uploaded == []
+    final_job = store.get(job.job_id)
+    assert final_job.status == JobStatus.FAILED, "must not be marked DONE with an unstored result"
+    assert final_job.error is not None
+    assert "upload" in final_job.error.lower()
+    # Normal cleanup for this dispatcher: the untrusted input is deleted on every
+    # terminal path it owns, exactly as on every other failure branch.
+    assert not input_path.exists()
+    assert not input_path.parent.exists()
+    # Finding S1: the exhaustion path must reap any partial result blob -- else, with the
+    # default job_retention_seconds=0 (expires_at=None), the retention sweeper skips this
+    # FAILED job forever and the partial results/<job_id> blob leaks unbounded.
+    assert blobs.deleted == [job.job_id]
+
+
+def test_cold_dispatch_upload_exhaustion_with_lost_claim_does_not_reap_peer_result(tmp_path):
+    """Ultrareview bug_001: the exhaustion reap (Finding S1) must be claim-fenced. The
+    pre-upload `_claim_is_still_ours` check runs ONCE, before the retry loop -- the whole
+    backoff window sits between it and the reap. If a peer requeues + re-runs + CAS-commits
+    DONE during that window (its upload landed at the same results/<job_id> prefix), our
+    unconditional `delete_job` would wipe the peer's authoritative result out from under
+    the DONE status it wrote: job store says DONE, every result route 404s, forever (the
+    retention sweeper never touches it). On a lost claim the blob prefix belongs to the
+    peer -- the exhaustion path must NOT reap it."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    class _PeerWinsDuringRetryBlobs(_RecordingBlobs):
+        """Every put_output attempt fails; the first failure simulates the peer's full
+        requeue -> re-run -> upload -> DONE-CAS landing during our retry/backoff window."""
+        def put_output(self, job_id, out_dir):
+            first = self.calls == 0
+            try:
+                super().put_output(job_id, out_dir)
+            finally:
+                if first:
+                    store.update(job_id, status=JobStatus.DONE, claim_id="peer-claim-id-not-ours")
+
+    blobs = _PeerWinsDuringRetryBlobs(fail_times=999)  # every attempt fails
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner, blob_store=blobs,
+        put_output_max_attempts=3,
+    )
+    result = dispatcher.dispatch_once()
+
+    assert result is True
+    assert blobs.calls == 3
+    assert blobs.deleted == [], "must not reap the peer's authoritative result blob"
+    stored = store.get(job.job_id)
+    assert stored.status == JobStatus.DONE, "the peer's terminal DONE must survive untouched"
+    assert stored.claim_id == "peer-claim-id-not-ours"
+
+
+def test_cold_dispatch_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(tmp_path):
+    """Round-2 finding R2-1: put_output writes to a deterministic per-job key that is a
+    per-file overwrite/union, not a claim-fenced atomic swap. If a peer reclaims this job
+    (e.g. an orphan/requeue sweep) in the narrow window between the last local ownership
+    check and the upload -- here simulated by flipping claim_id right after
+    _write_sealed_metadata runs, mirroring VmJobDispatcher's own
+    test_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result -- this worker must
+    NOT then upload its (possibly stale) bytes over the peer's already-correct result.
+    put_output must never be invoked once ownership is lost, and the job must not be
+    marked DONE by this (no-longer-owning) worker."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    input_path = _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    blobs = _RecordingBlobs()
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner, blob_store=blobs,
+    )
+
+    # Simulate a peer reclaiming the job right after the host seals metadata.json but
+    # before the dispatcher re-checks ownership for the upload.
+    real_write_sealed_metadata = dispatcher._write_sealed_metadata
+
+    def _write_sealed_metadata_then_peer_reclaims(envelope, out_dir):
+        real_write_sealed_metadata(envelope, out_dir)
+        store.update(job.job_id, claim_id="peer-claim-id-not-ours")
+
+    dispatcher._write_sealed_metadata = _write_sealed_metadata_then_peer_reclaims  # type: ignore[method-assign]
+
+    result = dispatcher.dispatch_once()
+
+    assert result is True
+    assert blobs.uploaded == [], "put_output must never be called once ownership is lost"
+    stored = store.get(job.job_id)
+    assert stored.status == JobStatus.RUNNING, "must not clobber the peer's ownership of this job"
+    assert stored.claim_id == "peer-claim-id-not-ours"
+    # Input is the new (peer) owner's responsibility now -- not deleted by the reclaimed worker.
+    assert input_path.exists()
+
+
+def test_cold_dispatch_still_owned_uploads_and_marks_done(tmp_path):
+    """Sanity companion to the reclaim test above: when ownership is intact throughout,
+    the normal upload + DONE path is unaffected by the new recheck."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    blobs = _RecordingBlobs()
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner, blob_store=blobs,
+    )
+    result = dispatcher.dispatch_once()
+
+    assert result is True
+    assert blobs.uploaded == [job.job_id]
+    assert store.get(job.job_id).status == JobStatus.DONE
 
 
 def test_cold_dispatch_serves_host_sealed_metadata(tmp_path):
@@ -308,6 +538,57 @@ def test_run_maintenance_expires_and_requeues(tmp_path):
     assert store.get(done.job_id).status == JobStatus.EXPIRED
     assert not out.exists()  # artifacts swept
     assert store.get(running.job_id).status == JobStatus.QUEUED  # orphan requeued
+
+
+class _StubBlobs:
+    """Minimal BlobStore double — only delete_job's call is asserted."""
+
+    def __init__(self) -> None:
+        self.deleted: list[str] = []
+
+    def put_sample(self, sha256, src): ...
+    def get_sample(self, sha256, dest): ...
+    def put_output(self, job_id, out_dir): ...
+    def open_output(self, job_id, name): ...
+
+    def delete_job(self, job_id):
+        self.deleted.append(job_id)
+
+
+def test_run_maintenance_reaps_result_blob_when_blob_store_configured(tmp_path):
+    """The dispatch.py retention sweeper must reap the result blob too.
+
+    In a mixed-tier fleet sharing one JobStore (FC-warm nodes driven by this
+    file-handshake Dispatcher + AWS Lambda burst driven by the always blob-backed
+    VmJobDispatcher/network dispatch_style), a burst job's results are put_output'd to
+    S3/blob storage. expire_due lists expired jobs with no node/tier scoping, so THIS
+    Dispatcher's maintenance can claim and expire that job. Without blob_store wired
+    through to JobRetentionSweeper, expire_due only clears the (harmlessly-absent,
+    wrong-host) local dir and clears expires_at — no sweeper ever revisits it and the
+    result blob leaks permanently. This proves Dispatcher._run_maintenance now builds
+    the sweeper WITH the configured blob store and that delete_job is actually called.
+    """
+    store = InMemoryJobStore()
+    done = Job.new(engine=_ENGINE_NAME, filename="d.docx")
+    done.status = JobStatus.DONE
+    done.finished_at = time.time() - 100
+    done.expires_at = time.time() - 50
+    store.create(done)
+
+    blobs = _StubBlobs()
+    d = Dispatcher(
+        job_store=store,
+        engines={_ENGINE_NAME: _engine_spec()},
+        limits=_limits(),
+        job_root=tmp_path,
+        runtime_selector=_fake_runtime,
+        job_retention_seconds=60,
+        blob_store=blobs,
+    )
+    d._run_maintenance()
+
+    assert store.get(done.job_id).status == JobStatus.EXPIRED
+    assert blobs.deleted == [done.job_id]
 
 
 # ---------------------------------------------------------------------------

@@ -97,23 +97,46 @@ def test_fail_stale_queued_disabled_by_default(tmp_path):
     assert store.get(old.job_id).status is JobStatus.QUEUED   # no TTL configured -> no-op
 
 
+def _capture_ensure_metadata(d):
+    """Wrap ``_ensure_metadata`` to capture the JSON it wrote, AT WRITE TIME.
+
+    Task 5's worker purge invariant (vm_dispatch.py's ``_purge_job_dir``) removes the WHOLE job
+    dir — input AND output — once ``_process`` reaches a terminal state, so a test that read
+    ``output/metadata.json`` from disk AFTER ``_process()`` returned would just find it gone. This
+    still exercises the real write (no mock of the write itself), just observed before the purge
+    that necessarily follows it.
+    """
+    import json as _json
+    real = d._ensure_metadata
+    captured: dict[str, object] = {}
+
+    def spy(job, summary):
+        ok = real(job, summary)
+        if ok:
+            path = d._job_dir(job) / "output" / "metadata.json"
+            captured["written"] = _json.loads(path.read_text())
+        return ok
+
+    d._ensure_metadata = spy  # type: ignore[method-assign]
+    return captured
+
+
 def test_dispatch_writes_metadata_json_on_done(tmp_path):
     # ingress /metadata, /artifacts, /result require <output>/metadata.json once a job is DONE; the
     # dispatcher materializes it from the summary so those routes don't 404 on a VM job.
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"verdict": {"status": "Valid"}}, True))
+    captured = _capture_ensure_metadata(d)
     d._process(store.claim_next())
-    meta = tmp_path / job.job_id / "output" / "metadata.json"
-    assert meta.is_file()
-    import json
-    assert json.loads(meta.read_text())["verdict"]["status"] == "Valid"
+    assert captured["written"]["verdict"]["status"] == "Valid"   # type: ignore[index]
+    # Task 5: the worker purge invariant — nothing (including output/) survives a terminal state.
+    assert not (tmp_path / job.job_id).exists()
 
 
 def test_dispatch_metadata_overwrites_stale_and_neuters_artifacts(tmp_path):
     # metadata.json is overwritten (not skip-if-exists) so a reclaim race resolves to OUR validation,
     # and the guest-supplied artifacts list is neutered to [] (never served as trusted output).
-    import json
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     out = tmp_path / job.job_id / "output"
@@ -121,10 +144,12 @@ def test_dispatch_metadata_overwrites_stale_and_neuters_artifacts(tmp_path):
     (out / "metadata.json").write_text('{"stale": true, "artifacts": [{"id": "x", "path": "../etc"}]}')
     d = VmJobDispatcher(store, str(tmp_path),
                         lambda p: ({"verdict": "ok", "artifacts": [{"id": "y", "path": "z"}]}, True))
+    captured = _capture_ensure_metadata(d)
     d._process(store.claim_next())
-    meta = json.loads((out / "metadata.json").read_text())
+    meta = captured["written"]
     assert meta.get("verdict") == "ok" and "stale" not in meta   # overwritten with our result
     assert meta["artifacts"] == []                               # guest artifacts neutered (security)
+    assert not (tmp_path / job.job_id).exists()                  # Task 5: purged after DONE
 
 
 def test_dispatch_trust_output_metadata_preserves_sealed_artifacts(tmp_path):
@@ -138,10 +163,12 @@ def test_dispatch_trust_output_metadata_preserves_sealed_artifacts(tmp_path):
     sealed = {"status": "ok", "artifacts": [{"id": "p1", "path": "page.png", "sha256": "ab", "bytes": 3}]}
     (out / "metadata.json").write_text(json.dumps(sealed))
     d = VmJobDispatcher(store, str(tmp_path), lambda p: (sealed, True), trust_output_metadata=True)
+    captured = _capture_ensure_metadata(d)
     d._process(store.claim_next())
-    meta = json.loads((out / "metadata.json").read_text())
+    meta = captured["written"]
     assert meta["status"] == "ok"
     assert meta["artifacts"][0]["id"] == "p1"   # preserved, NOT neutered
+    assert not (tmp_path / job.job_id).exists()   # Task 5: purged after DONE
 
 
 def test_dispatch_forwards_sanitized_params_to_validate(tmp_path):
@@ -268,7 +295,11 @@ def test_remote_no_slot_requeues_not_fails(tmp_path):
     d._process(store.claim_next())
     got = store.get(job.job_id)
     assert got.status is JobStatus.QUEUED and got.claim_id is None   # requeued (never ran), NOT failed
-    assert (tmp_path / job.job_id / "input" / "evil.dll").exists()   # input preserved for the retry
+    # The requeue RELEASES this worker's claim, so the purge invariant applies: the input must NOT
+    # be left behind "for the retry". In a real fleet the next claimant is on another host and could
+    # never read this worker's disk anyway; the blob store re-materialises the sample when the
+    # requeued job is re-claimed. (Was: input preserved -- an old shared-filesystem assumption.)
+    assert not (tmp_path / job.job_id).exists()   # released claim -> job dir purged
 
 
 def test_dispatch_records_terminal_metrics(tmp_path):
@@ -766,9 +797,9 @@ def test_dispatch_sets_retention_expiry(tmp_path):
     assert got.expires_at == pytest.approx(got.finished_at + 100)   # retention sweeper can reclaim it
 
 
-def test_dispatch_keeps_input_when_job_was_reclaimed(tmp_path):
+def test_dispatch_purges_input_when_job_was_reclaimed_before_validate(tmp_path):
     # if validation outran a recovery requeue and another dispatcher reclaimed the job, our terminal
-    # CAS fails (stale claim_id) and we must NOT unlink the shared input out from under the new owner.
+    # CAS fails (stale claim_id) before we even reach validate.
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     stale = store.claim_next()                                       # claim A
@@ -777,7 +808,11 @@ def test_dispatch_keeps_input_when_job_was_reclaimed(tmp_path):
     store.claim_next()                                              # reclaim B (now RUNNING under B)
     d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"v": 1}, True))
     d._process(stale)                                              # process with the STALE claim A
-    assert (tmp_path / job.job_id / "input" / "evil.dll").exists()  # preserved for the new owner
+    # Task 9: the purge is now unconditional, even here. We no longer leave the input "for the new
+    # owner" -- in a real fleet the new owner is on ANOTHER host and could never read bytes left on
+    # THIS worker's disk anyway, and the blob store (real in every mode) can always re-materialise
+    # the sample for whoever runs the job next. So this worker purges its own dir regardless.
+    assert not (tmp_path / job.job_id / "input" / "evil.dll").exists()
     assert store.get(job.job_id).status is JobStatus.RUNNING        # stale owner couldn't terminate it
 
 
@@ -1064,8 +1099,11 @@ def test_does_not_write_metadata_when_claim_lost_during_validate(tmp_path):
     assert not (tmp_path / job.job_id / "output" / "metadata.json").exists()
     got = store.get(job.job_id)
     assert got.status is JobStatus.RUNNING and got.claim_id == "peer-now-owns-it"  # peer still owns it
-    # and the shared input is left for the new owner (we didn't unlink it)
-    assert (tmp_path / job.job_id / "input" / job.filename).exists()
+    # Task 9: the purge is now unconditional here too. We no longer leave the shared input for the
+    # new owner -- in a real fleet the peer holds its OWN copy on its OWN host (this worker's disk
+    # was never shared with it), and the blob store can always re-materialise the sample if needed.
+    # So this worker purges its own dir even though a peer now owns the job.
+    assert not (tmp_path / job.job_id / "input" / job.filename).exists()
 
 
 def test_dispatch_marks_failed_when_validate_raises_baseexception(tmp_path):

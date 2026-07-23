@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -96,6 +97,11 @@ def test_result_zip_serves_only_validated_artifacts(tmp_path):
     outside = tmp_path / "outside_secret"
     outside.write_bytes(b"OUTSIDE-SECRET")
     (output_dir / "leak").symlink_to(outside)
+    # Re-push: put_output uploads EVERYTHING under output_dir (not just declared
+    # artifacts), mirroring the dispatcher uploading whatever a compromised worker left
+    # behind. The declared-artifacts filter that matters now lives at SERVE time
+    # (_zip_validated_artifacts only ever reads `rels`), which is what this asserts.
+    _push_to_blob(tmp_path, job.job_id, output_dir)
 
     resp = client.get(f"/v1/jobs/{job.job_id}/result")
     assert resp.status_code == 200
@@ -174,27 +180,87 @@ def test_readyz_does_not_leak_store_error(tmp_path):
     assert "db.internal" not in body and "hunter2" not in body and "5432" not in body
 
 
-def test_serve_endpoints_reject_symlinked_output(tmp_path):
-    """A compromised worker's symlinked artifact / metadata.json must not be served."""
+def test_get_artifact_post_seal_disk_tamper_is_inert(tmp_path):
+    """Task 7 gap 2: /artifacts/{id} no longer reads the live job dir at all -- it
+    reads the BlobStore snapshot ``put_output`` captured once, right after the
+    dispatcher sealed the job (mirrored here by ``_make_done_job``'s
+    ``_push_to_blob`` call). So swapping the on-disk declared artifact for a
+    symlink to an outside file AFTER that point (as a compromised worker might, in
+    the purge window before the dir is destroyed) has no effect on what gets
+    served: there is no later disk read left for the symlink to subvert -- the
+    response is the pristine blob-stored bytes, never the outside file's content.
+
+    This supersedes the old filesystem-era assertion (symlinked artifact -> 404):
+    that check protected a *live* disk read that no longer happens once
+    ``get_artifact`` reads exclusively through the BlobStore. The route is not
+    literally rejecting a hostile symlink here -- it is structurally immune,
+    because it never looks at output/ again once put_output has run. (The real
+    defense against a worker planting such a symlink now lives at put_output
+    time -- see
+    tests/host/blobs/test_local.py::test_put_output_skips_a_symlink_to_a_file_outside_the_output_dir.)
+    """
     client, store = _make_client(tmp_path)
-    job, output_dir = _make_done_job(tmp_path, store)
+    job, output_dir = _make_done_job(tmp_path, store, artifact_data=b"PRISTINE-PNG-BYTES")
     outside = tmp_path / "outside_secret"
     outside.write_bytes(b"OUTSIDE-SECRET")
 
-    # declared artifact replaced by a symlink to an outside file -> 404, not the target bytes
+    # declared artifact replaced by a symlink to an outside file, AFTER put_output ran
     (output_dir / "page-001.png").unlink()
     (output_dir / "page-001.png").symlink_to(outside)
+
     r = client.get(f"/v1/jobs/{job.job_id}/artifacts/page-001")
-    assert r.status_code == 404
+    assert r.status_code == 200
+    assert r.content == b"PRISTINE-PNG-BYTES"
     assert b"OUTSIDE-SECRET" not in r.content
 
-    # metadata.json replaced by a symlink -> 404
+
+def test_metadata_post_seal_disk_tamper_is_inert(tmp_path):
+    """Task 7: /metadata no longer reads the live job dir at all -- it reads the
+    BlobStore snapshot ``put_output`` captured once, right after the dispatcher sealed
+    the job (mirrored here by ``_make_done_job``'s ``_push_to_blob`` call). So swapping
+    ``output/metadata.json`` for a symlink AFTER that point (as a compromised worker
+    might, in the purge window before the dir is destroyed) has no effect on what gets
+    served: there is no later disk read left for the symlink to subvert.
+
+    This supersedes the old filesystem-era assertion (symlinked metadata.json -> 404):
+    that check protected a *live* read that no longer happens. The route is not
+    literally rejecting a hostile symlink here -- it is structurally immune, because it
+    never looks at output/ again once put_output has run. (The one open item this does
+    NOT cover: LocalBlobStore.put_output / S3BlobStore.put_output themselves follow
+    symlinks -- ``Path.is_file()`` is true for a symlink to a regular file -- when
+    walking output/ to decide what to upload. Hardening put_output to skip symlinks,
+    mirroring what this serve-time check used to do, is a latent finding outside this
+    task's file scope; see the Task 7 report.)
+    """
+    client, store = _make_client(tmp_path)
+    job, output_dir = _make_done_job(tmp_path, store)
+
     meta = output_dir / "metadata.json"
-    data = meta.read_bytes()
+    pristine = meta.read_bytes()
+    (tmp_path / "ext_meta.json").write_bytes(pristine)
     meta.unlink()
-    (tmp_path / "ext_meta.json").write_bytes(data)
     meta.symlink_to(tmp_path / "ext_meta.json")
-    assert client.get(f"/v1/jobs/{job.job_id}/metadata").status_code == 404
+
+    resp = client.get(f"/v1/jobs/{job.job_id}/metadata")
+    assert resp.status_code == 200
+    assert resp.content == pristine
+
+
+def _push_to_blob(tmp_path: Path, job_id: str, output_dir: Path) -> None:
+    """Upload *output_dir* into the same (real) ``LocalBlobStore`` ``build_app``'s
+    default factory constructs for this ``job_root`` — mirroring what the dispatcher's
+    ``put_output`` call does right after sealing a job's output, before the worker purge.
+
+    Task 7: ``/metadata`` and ``/result`` now read exclusively through the BlobStore,
+    not ``job_root`` — so any test that wants those routes to see a given on-disk state
+    must push that state into the blob store, at the point it wants it captured. Tests
+    that tamper ``output_dir`` AFTER calling ``_make_done_job`` (which already pushes
+    the pristine state once) and want that tampering reflected by ``/metadata``/
+    ``/result`` must call this again afterwards.
+    """
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs").put_output(job_id, output_dir)
 
 
 def _make_done_job(
@@ -208,7 +274,9 @@ def _make_done_job(
 ) -> tuple[Job, Path]:
     """Create a DONE job with a valid metadata.json and one artifact.
 
-    Returns (job, output_dir).
+    Also pushes the pristine output into the BlobStore (Task 7: /metadata and /result
+    read through it, not job_root) — mirroring the dispatcher calling put_output right
+    after sealing. Returns (job, output_dir).
     """
     job = Job.new(engine=engine, filename=filename)
     output_dir = tmp_path / "jobs" / job.job_id / "output"
@@ -245,6 +313,8 @@ def _make_done_job(
     job.status = JobStatus.DONE
     job.finished_at = time.time()
     job_store.create(job)
+
+    _push_to_blob(tmp_path, job.job_id, output_dir)
 
     return job, output_dir
 
@@ -564,6 +634,19 @@ class TestArtifactRoutesDone:
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "application/zip"
 
+    def test_artifact_by_id_served_when_job_dir_purged(self, tmp_path):
+        """Task 7 gap 2: after the worker purge, job_root/<id>/ no longer exists on
+        this node at all -- get_artifact must still serve the declared artifact by
+        reading exclusively through the BlobStore (never FileResponse from disk)."""
+        _, store = _make_client(tmp_path)
+        artifact_data = b"PNG_CONTENT_BYTES_PURGED"
+        job, output_dir = _make_done_job(tmp_path, store, artifact_data=artifact_data)
+        shutil.rmtree(tmp_path / "jobs" / job.job_id)  # simulate the worker's post-upload purge
+        client, _ = _make_client(tmp_path, store=store)
+        resp = client.get(f"/v1/jobs/{job.job_id}/artifacts/page-001")
+        assert resp.status_code == 200
+        assert resp.content == artifact_data
+
 
 # ===========================================================================
 # 5. Artifact path-confinement (security requirement 3)
@@ -590,7 +673,15 @@ class TestArtifactConfinement:
             )
 
     def test_tampered_metadata_path_traversal_is_contained(self, tmp_path):
-        """Even if metadata.json contains a traversal path, _safe_artifact_path blocks it."""
+        """Even if metadata.json contains a traversal path, _safe_relative_artifact_path
+        blocks it.
+
+        Task 7 gap 2: get_artifact reads metadata.json through the BlobStore, not
+        disk, so the tampered manifest must be re-pushed (mirroring
+        ``_make_done_job``'s own ``_push_to_blob`` call) for the route to see it --
+        an on-disk-only edit after the initial push is otherwise inert (see
+        ``test_get_artifact_post_seal_disk_tamper_is_inert``).
+        """
         _, store = _make_client(tmp_path)
         job, output_dir = _make_done_job(tmp_path, store)
 
@@ -600,14 +691,18 @@ class TestArtifactConfinement:
         # Replace path with traversal
         meta_data["artifacts"][0]["path"] = "../../../etc/passwd"
         meta_path.write_text(json.dumps(meta_data))
+        _push_to_blob(tmp_path, job.job_id, output_dir)
 
         client, _ = _make_client(tmp_path, store=store)
-        # The artifact id exists, but path is outside output_dir → 404
+        # The artifact id exists, but path is a traversal → 404
         resp = client.get(f"/v1/jobs/{job.job_id}/artifacts/page-001")
         assert resp.status_code == 404
 
     def test_absolute_path_in_metadata_is_contained(self, tmp_path):
-        """An absolute artifact path in metadata must not be served."""
+        """An absolute artifact path in metadata must not be served.
+
+        Task 7 gap 2: re-pushed to the BlobStore after tampering, same as above.
+        """
         _, store = _make_client(tmp_path)
         job, output_dir = _make_done_job(tmp_path, store)
 
@@ -615,6 +710,27 @@ class TestArtifactConfinement:
         meta_data = json.loads(meta_path.read_text())
         meta_data["artifacts"][0]["path"] = "/etc/passwd"
         meta_path.write_text(json.dumps(meta_data))
+        _push_to_blob(tmp_path, job.job_id, output_dir)
+
+        client, _ = _make_client(tmp_path, store=store)
+        resp = client.get(f"/v1/jobs/{job.job_id}/artifacts/page-001")
+        assert resp.status_code == 404
+
+    def test_traversal_path_rejected_even_when_job_dir_purged(self, tmp_path):
+        """Task 7 gap 2: the declared-path containment check (_safe_relative_artifact_path)
+        must reject a traversal path BEFORE any BlobStore fetch, using only the string
+        itself -- there is no on-disk output_dir left to Path.resolve() against once the
+        job dir is purged. Prove it's not accidentally relying on disk by deleting the
+        job dir entirely before the request."""
+        _, store = _make_client(tmp_path)
+        job, output_dir = _make_done_job(tmp_path, store)
+
+        meta_path = output_dir / "metadata.json"
+        meta_data = json.loads(meta_path.read_text())
+        meta_data["artifacts"][0]["path"] = "../../../etc/passwd"
+        meta_path.write_text(json.dumps(meta_data))
+        _push_to_blob(tmp_path, job.job_id, output_dir)
+        shutil.rmtree(tmp_path / "jobs" / job.job_id)  # simulate the worker's post-upload purge
 
         client, _ = _make_client(tmp_path, store=store)
         resp = client.get(f"/v1/jobs/{job.job_id}/artifacts/page-001")
@@ -756,6 +872,76 @@ class TestDeleteJob:
         job_id = resp.json()["job_id"]
         del_resp = client.delete(f"/v1/jobs/{job_id}")
         assert del_resp.status_code == 409
+
+    def test_delete_reaps_result_blobs(self, tmp_path):
+        """P2: result artifacts live under blob_root/results/<id>, a SIBLING of
+        job_root -- so DELETE's rmtree(job_root/<id>) removes nothing durable.
+        The route must also call blob_store.delete_job so the artifacts don't
+        outlive an explicit delete forever."""
+        from blastbox.host.blobs.local import LocalBlobStore
+
+        store = InMemoryJobStore()
+        job, output_dir = _make_done_job(tmp_path, store)
+        # _make_done_job already pushed the pristine output into the blob store
+        # rooted at tmp_path/blobs (see _push_to_blob) -- confirm it's really there
+        # before deleting.
+        results_dir = tmp_path / "blobs" / "results" / job.job_id
+        assert results_dir.exists()
+
+        client = TestClient(
+            build_app(
+                job_store=store,
+                job_root=tmp_path / "jobs",
+                allowed_engines=_ALLOWED,
+                limits=Limits(max_input_bytes=10 * 1024 * 1024),
+            ),
+            raise_server_exceptions=False,
+        )
+
+        del_resp = client.delete(f"/v1/jobs/{job.job_id}")
+        assert del_resp.status_code == 200
+        assert del_resp.json()["deleted"] == job.job_id
+        assert store.get(job.job_id) is None
+        assert not results_dir.exists()
+
+        # The blob store's delete_job is genuinely wired up, not just coincidentally
+        # absent: a fresh LocalBlobStore instance pointed at the same blob_root sees
+        # the results gone too (not merely a same-process cache artifact).
+        assert not LocalBlobStore(
+            tmp_path / "jobs", blob_root=tmp_path / "blobs"
+        )._results_dir(job.job_id).exists()
+
+    def test_delete_blob_failure_leaves_job_row_intact(self, tmp_path, monkeypatch):
+        """Finding E2: a blob-store delete_job failure must NOT be swallowed with the
+        job row removed underneath it -- that would orphan the results/<job_id> blob
+        with no record left for any future DELETE/retention sweep to retry (asymmetric
+        with the retention sweeper's own careful guard in JobRetentionSweeper._expire_job).
+        The route must error out and leave the row intact so a retry is possible."""
+        store = InMemoryJobStore()
+        job, _output_dir = _make_done_job(tmp_path, store)
+
+        client = TestClient(
+            build_app(
+                job_store=store,
+                job_root=tmp_path / "jobs",
+                allowed_engines=_ALLOWED,
+                limits=Limits(max_input_bytes=10 * 1024 * 1024),
+            ),
+            raise_server_exceptions=False,
+        )
+
+        from blastbox.host.blobs.local import LocalBlobStore
+
+        def _boom(self, job_id):
+            raise OSError("simulated blob store failure")
+
+        monkeypatch.setattr(LocalBlobStore, "delete_job", _boom)
+
+        del_resp = client.delete(f"/v1/jobs/{job.job_id}")
+        assert del_resp.status_code == 503
+        # The job row must survive a failed blob delete so a later DELETE/retention
+        # sweep can retry it -- the blob is otherwise orphaned with no record left.
+        assert store.get(job.job_id) is not None
 
 
 # ===========================================================================
