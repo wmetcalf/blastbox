@@ -128,10 +128,35 @@ class LocalBlobStore:
     def open_output(self, job_id: str, name: str) -> BinaryIO:
         # put_output stores nested rel paths (results/<job_id>/<foo/bar.png>), so open_output must
         # read at the SAME key -- collapsing to the basename would 404 (or silently omit) a nested
-        # artifact. But it must stay safe on its own: resolve the candidate and refuse anything
-        # (``..``, an absolute name, a symlink escape) that lands outside this job's results dir,
+        # artifact. Each candidate stays safe on its own: resolve it and refuse anything
+        # (``..``, an absolute name, a symlink escape) that lands outside its base dir,
         # mirroring JobRetentionSweeper._safe_rmtree's containment posture.
-        base = self._results_dir(job_id).resolve()
+        primary = self._contained_open(self._results_dir(job_id), name, job_id)
+        if primary is not None:
+            return primary
+
+        # Upgrade compatibility (Finding C1): a job that completed BEFORE this blob-store
+        # feature shipped has its output at the legacy `<job_root>/<id>/output/<name>` and
+        # was never put_output'd into the store, so the primary lookup above 404s it. Fall
+        # back to that legacy on-disk location. Scoped to the LOCAL backend on purpose --
+        # S3BlobStore has no such legacy path -- and self-limiting: jobs run under the
+        # current code purge their job dir after uploading, so this only ever finds
+        # pre-upgrade results. New/distributed deployments never hit it.
+        legacy = self._contained_open(self._job_root / job_id / "output", name, job_id)
+        if legacy is not None:
+            return legacy
+
+        raise BlobFetchError(f"result fetch failed: {job_id}/{name}")
+
+    def _contained_open(self, base_dir: Path, name: str, job_id: str) -> BinaryIO | None:
+        """Open ``base_dir/name`` if present and contained under ``base_dir``.
+
+        Returns the open file, or ``None`` when the file is simply absent (so the caller can
+        try a fallback location). A containment violation (``..``/absolute/symlink escape) is
+        fatal -- it raises rather than returning None -- because it signals a crafted name,
+        not a missing file.
+        """
+        base = base_dir.resolve()
         candidate = (base / name).resolve()
         try:
             candidate.relative_to(base)
@@ -141,6 +166,8 @@ class LocalBlobStore:
             ) from exc
         try:
             return open(candidate, "rb")
+        except FileNotFoundError:
+            return None
         except OSError as exc:
             raise BlobFetchError(f"result fetch failed: {job_id}/{name}") from exc
 

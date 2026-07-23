@@ -601,6 +601,8 @@ class VmJobDispatcher:
             # metadata write) -- it does NOT fully close it: there is no store-level compare-and-
             # swap on the uploaded object itself (S3 offers no such primitive), so a reclaim landing
             # AFTER this check but DURING the upload call is still possible and is not fenced here.
+            # Accepted residual with a documented closure path: design doc "Known limitations"
+            # (Finding C2) — a claim-scoped result key or object-level conditional write.
             if ok and not self._claim_is_still_ours(job):
                 logger.info("vm_dispatch: job %s reclaimed before upload; skipping put_output "
                             "(peer owns it now)", job.job_id)

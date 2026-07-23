@@ -94,3 +94,42 @@ def test_delete_job_removes_results_but_not_samples(tmp_path):
 
     assert not (tmp_path / "blobs" / "results" / "j1").exists()
     assert (tmp_path / "blobs" / "samples" / digest).exists(), "shared sample must survive"
+
+
+def test_open_output_falls_back_to_legacy_job_root_output(tmp_path):
+    """C1 upgrade-compat: a pre-blob-store DONE job has its output only at the legacy
+    <job_root>/<id>/output/ location (never put_output'd). open_output must serve it."""
+    store = _store(tmp_path)
+    # No results/<id> blob at all — simulate a job that completed under the old code.
+    legacy_out = tmp_path / "jobs" / "legacy-job" / "output"
+    legacy_out.mkdir(parents=True)
+    (legacy_out / "metadata.json").write_bytes(b'{"status":"ok","legacy":true}')
+
+    with store.open_output("legacy-job", "metadata.json") as fh:
+        assert fh.read() == b'{"status":"ok","legacy":true}'
+
+
+def test_open_output_prefers_the_blob_store_over_legacy(tmp_path):
+    """When both exist, the current blob-store copy wins (legacy is only a fallback)."""
+    store = _store(tmp_path)
+    out = tmp_path / "jobs" / "j1" / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_bytes(b"NEW-BLOB-STORE-BYTES")
+    store.put_output("j1", out)
+    # A stale legacy copy with different bytes must NOT shadow the store copy.
+    legacy = tmp_path / "jobs" / "j1" / "output"
+    (legacy / "metadata.json").write_bytes(b"STALE-LEGACY-BYTES")
+    # store already has the NEW bytes; the legacy on-disk write above is at the same path
+    # as put_output read from, so re-stage to be unambiguous:
+    (out / "metadata.json").write_bytes(b"NEW-BLOB-STORE-BYTES")
+    store.put_output("j1", out)
+    (legacy / "metadata.json").write_bytes(b"STALE-LEGACY-BYTES")
+    with store.open_output("j1", "metadata.json") as fh:
+        assert fh.read() == b"NEW-BLOB-STORE-BYTES"
+
+
+def test_legacy_fallback_still_enforces_containment(tmp_path):
+    """The legacy fallback must reject a traversal name just like the primary path."""
+    store = _store(tmp_path)
+    with pytest.raises(BlobFetchError):
+        store.open_output("j1", "../../../etc/passwd")

@@ -481,3 +481,49 @@ deliberate act rather than a default.
 
 None outstanding — the three previously open items are resolved as configuration
 above.
+
+## Known limitations
+
+### Result-upload TOCTOU residual (Finding C2) — accepted, not closed
+
+Both dispatchers re-check claim ownership (`_claim_is_still_ours`) immediately before
+`put_output`, so a stale worker whose claim was already reclaimed will not upload. That
+recheck narrows the window but does not fully close it: `put_output` writes to a
+deterministic per-job key (`results/<job_id>/…`) and is a per-key overwrite, not a
+claim-fenced compare-and-set. If a worker's claim is reclaimed *during* the `put_output`
+call itself (after the recheck passed), and a peer meanwhile re-runs the job and
+CAS-commits DONE, the stale worker's write can land divergent bytes over the peer's
+already-correct result. The job's status/`result_summary` then describe the peer's run
+while the served bytes are the stale run's.
+
+**This is accepted, not a bug to fix now**, for three reasons:
+
+1. **The window is narrow and the trigger is a rare conjunction** — a job slow enough to
+   be reclaimed, a peer re-running it, the reclaim landing inside the upload call, *and*
+   non-deterministic run-to-run output (identical output is a harmless overwrite). It is
+   recoverable: a `DELETE` + re-submit produces a correct result.
+2. **It is the same residual the whole design already lives with** — the identical TOCTOU
+   applies to the metadata write, and three independent review passes (two adversarial
+   multi-model rounds + a cloud review) examined and accepted it.
+3. **The fix is riskier than the residual.** Fully closing it requires the result write to
+   be claim-fenced at the storage layer — e.g. each worker writes to a claim-scoped key
+   (`results/<job_id>/<claim_id>/…`), the winning claim is persisted on the DONE
+   transition, and `open_output`/`delete_job` resolve through it; or object-level
+   conditional writes (S3 `If-None-Match`). Either touches the read path, the job schema,
+   both dispatchers, and both blob backends — the hottest concurrency code, where every
+   prior change in this feature's review history introduced a regression that a later pass
+   had to catch. Refactoring it for a narrow, recoverable, already-reviewed residual is a
+   net negative on risk.
+
+If a future workload makes the residual matter (high reclaim rates on non-deterministic
+engines), the claim-scoped-key approach above is the documented closure path.
+
+### Pre-upgrade result serving (Finding C1) — resolved for the local backend
+
+An in-place upgrade of a single-node install carries DONE jobs whose results were written
+to `job_root/<id>/output` before this feature and were never uploaded to the store.
+`LocalBlobStore.open_output` falls back to that legacy on-disk location when the store copy
+is absent (scoped to the local backend; S3 has no such path; self-limiting because
+current-code jobs purge their job dir after uploading). No migration step is required for
+local upgrades. A distributed (S3) deployment starting fresh never has pre-upgrade local
+results, so no fallback is needed there.
