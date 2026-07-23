@@ -62,3 +62,27 @@ def test_default_result_access_is_stream_not_redirect(ingress_client_factory):
     got = client.get(f"/v1/jobs/{job_id}/result", follow_redirects=False)
     assert got.status_code == 200, "default must stream, never 302 to the object store"
     assert got.headers["content-type"] == "application/zip"
+
+
+def test_result_route_non_dict_metadata_manifest_is_not_500(ingress_client_factory):
+    """Ultrareview bug_003: a metadata.json whose top-level JSON value is not a dict
+    (``[]``, ``null``, a scalar) parses fine, so ``meta.get("artifacts", [])`` raises
+    AttributeError OUTSIDE both try/excepts -> bare 500. The sibling routes
+    (``get_artifact``, ``_declared_artifact_paths_from_meta``) already guard this exact
+    case -- ``get_result`` must too: fall back to the zero-declared-artifacts path
+    (metadata-only ZIP), never a server error."""
+    client, _ = ingress_client_factory(blob_store_cls=MemoryBlobStore)
+    store = client.app.state.blob_store
+    for bad in (b"[]", b"null", b"5", b'"str"'):
+        resp = client.post(
+            "/v1/jobs",
+            files={"file": ("a.doc", b"bytes", "application/octet-stream")},
+            data={"engine": "redtusk"},
+        )
+        job_id = resp.json()["job_id"]
+        store.objects[(job_id, "metadata.json")] = bad
+        client.app.state.job_store.update(job_id, status="done")
+
+        got = client.get(f"/v1/jobs/{job_id}/result")
+        assert got.status_code == 200, f"manifest {bad!r} must hit the empty-artifacts fallback, not 500"
+        assert got.headers["content-type"] == "application/zip"

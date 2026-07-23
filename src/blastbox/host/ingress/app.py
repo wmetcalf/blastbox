@@ -906,9 +906,13 @@ def build_app(
             meta = json.loads(meta_bytes)
         except Exception:
             raise HTTPException(500, "could not parse metadata.json")
+        # A top-level non-dict manifest (`[]`, `null`, a scalar) parses fine but would
+        # make `.get()` raise outside both try/excepts -> bare 500. Guard like the
+        # sibling routes (get_artifact, _declared_artifact_paths_from_meta) and fall
+        # back to the zero-declared-artifacts path (metadata-only ZIP).
         rels = [
             a["path"]
-            for a in meta.get("artifacts", [])
+            for a in (meta.get("artifacts", []) if isinstance(meta, dict) else [])
             if isinstance(a, dict) and isinstance(a.get("path"), str)
         ]
 

@@ -110,6 +110,43 @@ def test_upload_failure_after_exhausting_retries_fails_the_job_and_purges(vm_dis
     assert blobs.deleted == [job.job_id]
 
 
+def test_upload_exhaustion_with_lost_claim_does_not_reap_peer_result(vm_dispatcher_factory, tmp_path):
+    """Ultrareview bug_001 (VM path): the exhaustion reap (Finding S1) must be claim-fenced.
+    The pre-upload `_claim_is_still_ours` check runs once, BEFORE the retry loop; if a peer
+    requeues + re-runs + CAS-commits DONE during the backoff window, its result sits at the
+    same results/<job_id> prefix -- an unconditional delete_job on exhaustion would wipe the
+    peer's authoritative result while the job store says DONE (every result route then 404s,
+    and nothing ever repairs it). On a lost claim, skip the reap: the prefix isn't ours."""
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.input_sha256 = "d" * 64
+    store.create(job)
+    claimed = store.claim_next()
+
+    class PeerWinsDuringRetryBlobs(Blobs):
+        """Every put_output attempt fails; the first failure simulates the peer's full
+        requeue -> re-run -> upload -> DONE-CAS landing during our retry window."""
+        def put_output(self, job_id, out_dir):
+            first = self.put_output_calls == 0
+            try:
+                super().put_output(job_id, out_dir)
+            finally:
+                if first:
+                    store.update(job_id, status=JobStatus.DONE, claim_id="peer-claim-id-not-ours")
+
+    blobs = PeerWinsDuringRetryBlobs(fail_put=True)
+    disp = vm_dispatcher_factory(
+        store=store, blob_store=blobs, validate_ok=True, put_output_max_attempts=3,
+    )
+    disp._process(claimed)
+
+    assert blobs.put_output_calls == 3
+    assert blobs.deleted == [], "must not reap the peer's authoritative result blob"
+    stored = store.get(job.job_id)
+    assert stored.status is JobStatus.DONE, "the peer's terminal DONE must survive untouched"
+    assert stored.claim_id == "peer-claim-id-not-ours"
+
+
 def test_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(vm_dispatcher_factory, tmp_path):
     """Regression for the TOCTOU in the finding: put_output writes to a deterministic per-job key
     that is a per-file overwrite/union, not a claim-fenced atomic swap. If our claim is reclaimed

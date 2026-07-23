@@ -1859,15 +1859,32 @@ class Dispatcher:
         # job_retention_seconds=0, expires_at is None, so the retention sweeper skips it
         # forever (retention.py: `if job.expires_at is None ... continue`). Without reaping
         # here, that partial blob is orphaned permanently, recoverable only by an explicit
-        # DELETE. delete_job is results-scoped + idempotent, so call it unconditionally on
-        # exhaustion. Best-effort: a reap failure must not mask the real upload failure /
-        # FAILED outcome this method is already reporting.
-        try:
-            self._blobs.delete_job(job.job_id)
-        except Exception as reap_exc:  # noqa: BLE001
-            _log.warning(
-                "failed to reap partial result blob for job %s after upload exhaustion: %s",
-                job.job_id, reap_exc,
+        # DELETE. delete_job is results-scoped + idempotent. Best-effort: a reap failure
+        # must not mask the real upload failure / FAILED outcome this method is already
+        # reporting.
+        #
+        # Claim-fenced (ultrareview bug_001): the pre-upload `_claim_is_still_ours` check
+        # ran BEFORE the retry loop -- the whole backoff window sits between it and here.
+        # If a peer requeued + re-ran + CAS-committed DONE during that window, its upload
+        # landed at this same results/<job_id> prefix and an unconditional delete_job
+        # would wipe the peer's authoritative result out from under the DONE it wrote
+        # (job store says DONE, every result route 404s, and nothing ever repairs it --
+        # our _fail_job CAS correctly no-ops on the stale claim, but only AFTER this
+        # delete would have run). On a lost claim the prefix isn't ours to reap; the
+        # bounded partial-blob leak in the rare lost-claim-but-no-peer-upload case is the
+        # strictly smaller cost (recoverable via DELETE), so skip.
+        if self._claim_is_still_ours(job):
+            try:
+                self._blobs.delete_job(job.job_id)
+            except Exception as reap_exc:  # noqa: BLE001
+                _log.warning(
+                    "failed to reap partial result blob for job %s after upload exhaustion: %s",
+                    job.job_id, reap_exc,
+                )
+        else:
+            _log.info(
+                "job %s: skipping partial-blob reap on upload exhaustion; claim lost -- "
+                "results/<job_id> belongs to a peer now", job.job_id,
             )
         return False
 

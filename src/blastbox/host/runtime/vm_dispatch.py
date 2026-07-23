@@ -641,12 +641,28 @@ class VmJobDispatcher:
                     # delete_job is results-scoped + idempotent. Best-effort: a reap
                     # failure must not mask the real upload failure / FAILED outcome this
                     # method is already reporting.
-                    try:
-                        self._blobs.delete_job(job.job_id)
-                    except Exception as reap_exc:  # noqa: BLE001
-                        logger.warning(
-                            "vm_dispatch: failed to reap partial result blob for job %s "
-                            "after upload exhaustion: %s", job.job_id, reap_exc,
+                    #
+                    # Claim-fenced (ultrareview bug_001): the `_claim_is_still_ours`
+                    # check above ran BEFORE the retry loop -- if a peer requeued +
+                    # re-ran + CAS-committed DONE during the backoff window, its upload
+                    # landed at this same results/<job_id> prefix, and an unconditional
+                    # delete would wipe the peer's authoritative result while the job
+                    # store says DONE (every result route then 404s, unrepairably). On
+                    # a lost claim the prefix isn't ours to reap -- skip; the bounded
+                    # partial-blob leak in the no-peer-upload case is the smaller cost.
+                    if self._claim_is_still_ours(job):
+                        try:
+                            self._blobs.delete_job(job.job_id)
+                        except Exception as reap_exc:  # noqa: BLE001
+                            logger.warning(
+                                "vm_dispatch: failed to reap partial result blob for job %s "
+                                "after upload exhaustion: %s", job.job_id, reap_exc,
+                            )
+                    else:
+                        logger.info(
+                            "vm_dispatch: job %s: skipping partial-blob reap on upload "
+                            "exhaustion; claim lost -- results/<job_id> belongs to a peer now",
+                            job.job_id,
                         )
             finished = time.time()
             # CAS on (status, claim_id) so a stale owner can't clobber a job that was reclaimed

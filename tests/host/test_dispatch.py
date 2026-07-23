@@ -314,6 +314,53 @@ def test_cold_dispatch_upload_failure_fails_job_not_done(tmp_path):
     assert blobs.deleted == [job.job_id]
 
 
+def test_cold_dispatch_upload_exhaustion_with_lost_claim_does_not_reap_peer_result(tmp_path):
+    """Ultrareview bug_001: the exhaustion reap (Finding S1) must be claim-fenced. The
+    pre-upload `_claim_is_still_ours` check runs ONCE, before the retry loop -- the whole
+    backoff window sits between it and the reap. If a peer requeues + re-runs + CAS-commits
+    DONE during that window (its upload landed at the same results/<job_id> prefix), our
+    unconditional `delete_job` would wipe the peer's authoritative result out from under
+    the DONE status it wrote: job store says DONE, every result route 404s, forever (the
+    retention sweeper never touches it). On a lost claim the blob prefix belongs to the
+    peer -- the exhaustion path must NOT reap it."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    class _PeerWinsDuringRetryBlobs(_RecordingBlobs):
+        """Every put_output attempt fails; the first failure simulates the peer's full
+        requeue -> re-run -> upload -> DONE-CAS landing during our retry/backoff window."""
+        def put_output(self, job_id, out_dir):
+            first = self.calls == 0
+            try:
+                super().put_output(job_id, out_dir)
+            finally:
+                if first:
+                    store.update(job_id, status=JobStatus.DONE, claim_id="peer-claim-id-not-ours")
+
+    blobs = _PeerWinsDuringRetryBlobs(fail_times=999)  # every attempt fails
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner, blob_store=blobs,
+        put_output_max_attempts=3,
+    )
+    result = dispatcher.dispatch_once()
+
+    assert result is True
+    assert blobs.calls == 3
+    assert blobs.deleted == [], "must not reap the peer's authoritative result blob"
+    stored = store.get(job.job_id)
+    assert stored.status == JobStatus.DONE, "the peer's terminal DONE must survive untouched"
+    assert stored.claim_id == "peer-claim-id-not-ours"
+
+
 def test_cold_dispatch_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(tmp_path):
     """Round-2 finding R2-1: put_output writes to a deterministic per-job key that is a
     per-file overwrite/union, not a claim-fenced atomic swap. If a peer reclaims this job
