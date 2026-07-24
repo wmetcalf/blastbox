@@ -24,6 +24,25 @@ from blastbox.observability import configure_logging
 def _serve_cmd(args: argparse.Namespace) -> int:
     import uvicorn
 
+    workers = args.workers if getattr(args, "workers", None) else int(
+        os.environ.get("BLASTBOX_SERVE_WORKERS", "1")
+    )
+
+    if workers and workers > 1:
+        # uvicorn forks `workers` processes; each must build its own app, so we pass an
+        # import-string factory (app_from_env) instead of a prebuilt object. Propagate the
+        # CLI --allowed-engines into env so the forked workers reconstruct it identically.
+        if args.allowed_engines:
+            os.environ["BLASTBOX_ALLOWED_ENGINES"] = args.allowed_engines
+        uvicorn.run(
+            "blastbox.host.ingress.app:app_from_env",
+            factory=True,
+            host=args.host,
+            port=args.port,
+            workers=workers,
+        )
+        return 0
+
     from blastbox.host.ingress.app import build_app
     from blastbox.host.ingress.extension import load_ingress_extension
 
@@ -678,6 +697,14 @@ def build_parser() -> argparse.ArgumentParser:
     ps = sub.add_parser("serve", help="run the ingress HTTP API")
     ps.add_argument("--host", default="127.0.0.1")
     ps.add_argument("--port", type=int, default=8000)
+    ps.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="uvicorn worker processes (default 1, or BLASTBOX_SERVE_WORKERS). "
+        ">1 forks; the ingress is otherwise a single event loop whose blob I/O "
+        "serializes, so raise this to scale submit/collect throughput.",
+    )
     ps.add_argument(
         "--allowed-engines",
         default=os.environ.get("BLASTBOX_ALLOWED_ENGINES", ""),
