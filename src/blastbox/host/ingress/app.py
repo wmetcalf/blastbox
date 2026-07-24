@@ -1038,6 +1038,23 @@ def build_app(
     return app
 
 
+def app_from_env() -> FastAPI:
+    """uvicorn import-string factory for multi-worker serving (``blastbox serve --workers N``).
+
+    ``uvicorn.run`` with ``workers>1`` forks worker processes, each of which must build its
+    own app instance — so it needs an import string + ``factory=True`` rather than a prebuilt
+    app object. Every knob ``build_app`` reads is already env-driven; this reconstructs the two
+    that ``_serve_cmd`` otherwise passes as arguments (allowed engines + the ingress extension)
+    from ``BLASTBOX_ALLOWED_ENGINES`` / ``BLASTBOX_INGRESS_EXTENSION`` so each forked worker is
+    identical to the single-process app."""
+    from blastbox.host.ingress.extension import load_ingress_extension
+
+    raw = os.environ.get("BLASTBOX_ALLOWED_ENGINES", "")
+    allowed = {e.strip() for e in raw.split(",") if e.strip()} or None
+    extension = load_ingress_extension(os.environ.get("BLASTBOX_INGRESS_EXTENSION"))
+    return build_app(allowed_engines=allowed, extension=extension)
+
+
 def _mount_static_ui(app: FastAPI, ui: StaticUI) -> None:
     """Serve a per-engine web UI: ``GET /`` -> index, ``/assets`` -> static dir.
 
