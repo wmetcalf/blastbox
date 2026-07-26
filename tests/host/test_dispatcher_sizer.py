@@ -1701,3 +1701,64 @@ def test_demand_snapshot_field_order_is_append_only():
     # The consensus/budget/untargeted fields keep their defaults — none was shifted by the append.
     assert snap.untargeted_backlog == 0
     assert snap.budget_ram_mib == 0.0 and snap.budget_vcpus == 0.0 and snap.stale_after_s == 0.0
+
+
+def test_sizer_warns_when_min_warm_floor_starved(tmp_path, caplog):
+    # Reproduce the production wedge (issue #68): a node whose RAM budget can't seat BOTH
+    # clippyshot's 12x4096 MiB warm floor (~48 GiB) AND redtusk's 8x2048 MiB floor (~16 GiB).
+    # The higher-demand engine (clip) seats its floor; redtusk is clamped BELOW its min_warm.
+    # The sizer must WARN so the over-subscription is visible instead of a silent warm-only wedge.
+    import logging
+
+    share = FileNodeShare(str(tmp_path))
+    cap = _budget(53_000, 999)                 # RAM is the binding resource
+    common = dict(balancing=True, resource_management=True, stale_after_s=1e9,
+                  ram_headroom_frac=1.0, vcpu_oversubscription=999)
+    clip = DispatcherSizer(
+        EngineNode("clip", "-", slot_ram_mib=4096, max_ceiling=64, min_warm=12),
+        _Pool(), share, NodeConfig(**common),
+        runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 40, node="n", instance="c",
+        capacity_fn=cap, clock=lambda: 1000.0)
+    red = DispatcherSizer(
+        EngineNode("red", "-", slot_ram_mib=2048, max_ceiling=64, min_warm=8),
+        _Pool(), share, NodeConfig(**common),
+        runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 8, node="n", instance="r",
+        capacity_fn=cap, clock=lambda: 1000.0)
+
+    with caplog.at_level(logging.WARNING, logger="blastbox.node_sizer"):
+        for _ in range(3):                     # converge the shared view
+            clip.tick()
+            red.tick()
+
+    starved_warns = [r.getMessage() for r in caplog.records if "blastbox#68" in r.getMessage()]
+    # Under proportional shrink BOTH engines land below their declared floors on an
+    # over-subscribed node — the warning must fire for the pool that asked for a floor it
+    # isn't getting (redtusk here; clip too, since neither is fully seated).
+    assert any("engine=red" in m and "configured min_warm=8" in m for m in starved_warns), starved_warns
+
+
+def test_sizer_no_floor_warning_when_floors_fit(tmp_path, caplog):
+    # Same node, clippyshot floor capped to 6 (~24 GiB): 24 + 16 = 40 < 53 → both fit, no warning.
+    import logging
+
+    share = FileNodeShare(str(tmp_path))
+    cap = _budget(53_000, 999)
+    common = dict(balancing=True, resource_management=True, stale_after_s=1e9,
+                  ram_headroom_frac=1.0, vcpu_oversubscription=999)
+    clip = DispatcherSizer(
+        EngineNode("clip", "-", slot_ram_mib=4096, max_ceiling=64, min_warm=6),
+        _Pool(), share, NodeConfig(**common),
+        runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 40, node="n", instance="c",
+        capacity_fn=cap, clock=lambda: 1000.0)
+    red = DispatcherSizer(
+        EngineNode("red", "-", slot_ram_mib=2048, max_ceiling=64, min_warm=8),
+        _Pool(), share, NodeConfig(**common),
+        runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 8, node="n", instance="r",
+        capacity_fn=cap, clock=lambda: 1000.0)
+
+    with caplog.at_level(logging.WARNING, logger="blastbox.node_sizer"):
+        for _ in range(3):
+            clip.tick()
+            red.tick()
+
+    assert not [r for r in caplog.records if "blastbox#68" in r.getMessage()]

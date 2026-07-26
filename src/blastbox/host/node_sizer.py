@@ -204,14 +204,31 @@ def plan_sizes(specs: list[PoolSpec], budget: NodeBudget) -> dict[str, PoolSize]
     # min_warm RESERVATION: seat each pool's warm floor BEFORE demand-filling, so a latency
     # floor is a real reservation — an idle pool with min_warm=N keeps N hot even when a busy
     # neighbour wants the budget (a soft floor a neighbour could starve isn't a floor). Bounded
-    # by the budget (never over-commits above the baseline); when Σ min_warm can't all fit, the
-    # floors are seated by demand priority, so a busy pool's floor beats an idle pool's.
+    # by the budget (never over-commits above the baseline).
+    #
+    # PROPORTIONAL SHRINK when Σ min_warm can't all fit (issue #68): seat the engine that is
+    # FURTHEST below its floor (smallest alloc/floor fraction) each step, so all floors approach
+    # completion together and the shortfall is SHARED — every pool keeps a proportional slice of
+    # its floor instead of the highest-demand engine seating its whole floor and clamping a
+    # neighbour to the 1-slot baseline (which, on a warm-only dispatcher, requeue-wedges). E.g.
+    # redtusk(min_warm=8,2GiB) + clippyshot(min_warm=12,4GiB) on a ~53 GiB budget → ~7 and ~9
+    # (both warm + functional) rather than 1 and 12. Ties break by demand then name (deterministic
+    # across every dispatcher). Cold fallback is intentionally NOT a knob here — warm stays warm,
+    # just fairly smaller under contention; capacity/topology fixes are surfaced via
+    # unseatable_floors() + the sizer's over-subscription warning.
     while True:
         below = [s for s in specs
                  if alloc[s.name] < min(s.min_warm, s.max_ceiling) and budget_has_room(s)]
         if not below:
             break
-        pick = max(below, key=lambda s: s.demand)      # busy floors first under contention
+        # DEMAND TIER (adversarial-review fix): seat pools that HAVE demand before idle ones — the
+        # engine with jobs NOW keeps its floor before an IDLE neighbour's speculative floor, else a
+        # demand=0 pool with a large min_warm would starve a busy small-floor pool below ITS floor
+        # (re-wedging the busy engine). Within a tier: most-starved-by-fraction first (proportional
+        # shrink); ties break by demand then name (deterministic across dispatchers).
+        pick = min(below, key=lambda s: (0 if s.demand > 0 else 1,
+                                         alloc[s.name] / min(s.min_warm, s.max_ceiling),
+                                         -s.demand, s.name))
         alloc[pick.name] += 1
         used_ram += pick.slot_ram_mib
         used_vcpu += pick.slot_vcpus
@@ -258,6 +275,33 @@ def plan_sizes(specs: list[PoolSpec], budget: NodeBudget) -> dict[str, PoolSize]
         warm = max(0, min(ceiling, max(s.min_warm, math.ceil(s.demand))))
         out[s.name] = PoolSize(warm_size=warm, concurrent_ceiling=ceiling)
     return out
+
+
+def unseatable_floors(
+    specs: list[PoolSpec], budget: NodeBudget
+) -> dict[str, tuple[int, int]]:
+    """Engines whose ``min_warm`` floor ``plan_sizes`` could NOT fully seat within the
+    budget, mapped to ``(granted_warm, wanted_floor)``. Empty when every floor fits.
+
+    ``plan_sizes`` reserves ``min_warm`` by demand priority and, when the floors can't
+    all fit the node budget, silently clamps the loser's ceiling to the 1-slot baseline —
+    so its warm target lands BELOW ``min_warm`` with no signal in the returned plan. On a
+    ``BLASTBOX_DISPATCH_WARM_ONLY`` dispatcher that starved pool then wedges (every job
+    requeues, no cold fallback) with no diagnostic. This pure companion re-derives the
+    plan and reports which floors were starved so the controller can WARN — turning a
+    silent, fleet-wide over-subscription into a visible, actionable one. See issue #68.
+
+    A ``min_warm`` above the pool's own ``max_ceiling`` is a config choice (the cap wins),
+    NOT starvation, so the comparison is against ``min(min_warm, max_ceiling)``.
+    """
+    plan = plan_sizes(specs, budget)
+    starved: dict[str, tuple[int, int]] = {}
+    for s in specs:
+        wanted = min(s.min_warm, s.max_ceiling)
+        got = plan[s.name].warm_size
+        if wanted > 0 and got < wanted:
+            starved[s.name] = (got, wanted)
+    return starved
 
 
 def node_capacity(ram_headroom_frac: float = 0.8,

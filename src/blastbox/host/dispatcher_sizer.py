@@ -37,6 +37,7 @@ from .node_sizer import (
     manages,
     node_capacity,
     plan_sizes,
+    unseatable_floors,
 )
 
 
@@ -115,6 +116,7 @@ class DispatcherSizer:
         self._last_tick_dur = 0.0             # measured, to widen the staleness window
         self._last_backlog = 0                # published as a heartbeat before the (slow) count
         self._stop_event: Optional[threading.Event] = None  # set in run(); fences the update-publish
+        self._last_floor_warn = 0.0           # rate-limit the min_warm-starved warning (issue #68)
         self._warned_mixed_nodes = False      # one-shot: warn on an inconsistent node-id view
         self._warned_mixed_modes = False      # one-shot: warn on mixed balancing modes on a node
         self._last_view_ok = 0.0              # clock of the last tick that CONFIRMED we're visible
@@ -520,7 +522,29 @@ class DispatcherSizer:
             ram_mib=min([my_budget.ram_mib, *peer_budget_ram]),
             vcpus=min([my_budget.vcpus, *peer_budget_vcpus]))
         plan = plan_sizes(specs, budget)  # type: ignore[arg-type]
-        mine = plan.get(_pool_key(e.name, self._runtime, self._instance))
+        my_key = _pool_key(e.name, self._runtime, self._instance)
+        mine = plan.get(my_key)
+        # issue #68: when the node budget can't seat every co-located engine's min_warm floor,
+        # plan_sizes now shrinks the floors PROPORTIONALLY (each pool keeps a fair slice, none
+        # clamped to the 1-slot baseline) so warm stays warm and no pool requeue-wedges. That's
+        # graceful, but the operator still asked for a floor they aren't getting — surface it
+        # (rate-limited) so the over-subscription is visible + actionable instead of invisible.
+        starved = unseatable_floors(specs, budget)  # type: ignore[arg-type]
+        if my_key in starved:
+            now = self._clock()
+            if now - self._last_floor_warn >= max(60.0, self._config.interval_s * 20):
+                self._last_floor_warn = now
+                got, _want = starved[my_key]
+                # Report the OPERATOR-CONFIGURED floor (e.min_warm) + the tier, not the per-replica
+                # split min_warm the allocator sees — so a rolling-deploy overlap (2 replicas) still
+                # names the real min_warm the operator set, and fc-vs-gvisor is unambiguous.
+                logging.getLogger("blastbox.node_sizer").warning(
+                    "engine=%s tier=%s warm=%d is BELOW its configured min_warm=%d — the node RAM "
+                    "budget can't seat every co-located engine's warm floor, so the pools were "
+                    "proportionally shrunk to fit (busy pools' floors first). All pools stay warm "
+                    "(no cold fallback, no wedge), just smaller. To run every floor at full size, "
+                    "cap a co-located engine's warm pool, dedicate engines to separate nodes, or "
+                    "add RAM. See blastbox#68.", e.name, self._runtime, got, e.min_warm)
         if mine is not None and hasattr(self._pool, "resize"):
             # WARM tracks THIS engine's WARM-eligible demand (not the weight, a ceiling-share
             # ratio only; and not cold in-flight, which bypasses the warm pool) so static mode
