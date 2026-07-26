@@ -459,9 +459,13 @@ def test_local_backlog_scopes_to_claimable_tier():
 
 # --- min_warm floor feasibility: surface silent over-subscription (issue #68) ---
 
-def _sz(name, ram, demand, min_warm, cap=64):
+def _sz(name, ram, demand, min_warm, cap=64, queued=None):
+    # queued defaults to demand: a pool with demand is assumed BACKLOGGED (the common case). Pass
+    # queued=0 with demand>0 to model a pool that is merely RUNNING a job (assigned) with an empty
+    # queue — which must tier as idle for the min_warm floor (escalation-review case).
     return PoolSpec(name=name, slot_ram_mib=ram, slot_vcpus=1.0,
-                    demand=demand, min_warm=min_warm, max_ceiling=cap)
+                    demand=demand, queued=demand if queued is None else queued,
+                    min_warm=min_warm, max_ceiling=cap)
 
 
 def test_unseatable_floors_flags_starved_engine():
@@ -535,3 +539,17 @@ def test_busy_engine_floor_not_starved_by_idle_neighbor():
     assert plan["busy"].warm_size >= 4, plan     # busy floor MET (was 2 — starved — before the fix)
     assert plan["idle"].warm_size <= 6, plan     # idle gets only the remainder, not the lion's share
     assert (plan["busy"].warm_size + plan["idle"].warm_size) * 1024 <= budget.ram_mib
+
+
+def test_running_but_empty_queue_pool_tiers_as_idle():
+    # issue #68 (escalation review): the floor demand-tier must key on QUEUED backlog, not `demand`
+    # (which includes `assigned` in-flight jobs). A pool merely RUNNING a job with an EMPTY queue
+    # (demand>0, queued==0) must NOT out-tier a truly-backlogged neighbour and starve its floor.
+    budget = NodeBudget(ram_mib=10 * 1024, vcpus=64)
+    # 'running_idle': a job in flight (demand=1) but nothing queued (queued=0), big floor.
+    running_idle = _sz("running_idle", ram=1024, demand=1, min_warm=20, queued=0)
+    # 'busy': 99 queued, small floor.
+    busy = _sz("busy", ram=1024, demand=99, min_warm=4, queued=99)
+    plan = plan_sizes([running_idle, busy], budget)
+    assert plan["busy"].warm_size >= 4, plan             # busy floor MET (was starved to 2 pre-fix)
+    assert plan["running_idle"].warm_size <= 6, plan     # the no-queue pool yields, despite demand>0

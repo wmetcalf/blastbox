@@ -490,6 +490,10 @@ class DispatcherSizer:
                 # tiers) so a rolling overlap OR a multi-tier engine doesn't double its node share.
                 demand=(_backlog_demand(s) + s.assigned) if balancing
                 else _share(s.weight, s.engine, s.tier),
+                # QUEUED backlog only (no `assigned`) — drives the min_warm floor demand-tier so a
+                # pool running a job but with an empty queue doesn't out-tier a backlogged neighbour
+                # (issue #68, escalation review). Static mode has no live backlog → 0 (all one tier).
+                queued=_backlog_demand(s) if balancing else 0.0,
                 # PER-ENGINE floor + cap are also split across same-queue replicas — else two
                 # replicas of a cap-8 engine could each be allocated 8 (aggregate 16) and a floor
                 # of 4 becomes an aggregate 8. Deterministic remainder so the shares sum to the
@@ -530,7 +534,11 @@ class DispatcherSizer:
         # graceful, but the operator still asked for a floor they aren't getting — surface it
         # (rate-limited) so the over-subscription is visible + actionable instead of invisible.
         starved = unseatable_floors(specs, budget)  # type: ignore[arg-type]
-        if my_key in starved:
+        # Only for pools that actually HAVE a warm floor: a cold-only dispatcher applies warm=0
+        # regardless of a (misconfigured) min_warm>0, so the warm-shrink message would be both
+        # misleading (it describes warm-pool semantics) and report a plan warm the cold tier never
+        # uses. Skip it there (issue #68, escalation review).
+        if my_key in starved and not self._cold_only():
             now = self._clock()
             if now - self._last_floor_warn >= max(60.0, self._config.interval_s * 20):
                 self._last_floor_warn = now
