@@ -9,6 +9,7 @@ from blastbox.host.node_sizer import (
     manages,
     node_capacity,
     plan_sizes,
+    unseatable_floors,
 )
 from blastbox.host.pool_config import (
     RUNTIME_AWS_EC2,
@@ -454,3 +455,50 @@ def test_local_backlog_scopes_to_claimable_tier():
     assert local_backlog_fn(s, "clip")() == 3                            # no tier filter = all
     # count() mirrors claim_next's predicate directly
     assert s.count(JobStatus.QUEUED, engine="clip", claimant_tier="firecracker") == 2
+
+
+# --- min_warm floor feasibility: surface silent over-subscription (issue #68) ---
+
+def _sz(name, ram, demand, min_warm, cap=64):
+    return PoolSpec(name=name, slot_ram_mib=ram, slot_vcpus=1.0,
+                    demand=demand, min_warm=min_warm, max_ceiling=cap)
+
+
+def test_unseatable_floors_flags_starved_engine():
+    # The production wedge: a 62 GiB node (budget ~53 GiB) can't seat BOTH
+    # clippyshot's 12x4096 MiB (~48 GiB) warm floor AND redtusk's 8x2048 MiB (~16 GiB).
+    # Under simultaneous demand the higher-demand engine seats its floor; the other is
+    # silently clamped to ceiling=1 (warm below its min_warm). unseatable_floors must
+    # NAME the starved engine so the controller can warn instead of wedging silently.
+    budget = NodeBudget(ram_mib=53_000, vcpus=100)   # RAM is the binding resource here
+    clippy = _sz("clippyshot", ram=4096, demand=12, min_warm=12)
+    redtusk = _sz("redtusk", ram=2048, demand=8, min_warm=8)
+
+    starved = unseatable_floors([clippy, redtusk], budget)
+
+    assert "redtusk" in starved, starved
+    got, want = starved["redtusk"]
+    assert want == 8 and got < 8            # floor requested 8, seated fewer
+    # sanity: the plan itself confirms the silent violation this helper detects
+    assert plan_sizes([clippy, redtusk], budget)["redtusk"].warm_size == got
+
+
+def test_unseatable_floors_empty_when_all_floors_fit():
+    # Same node, but clippyshot capped to a 6-slot warm floor (~24 GiB): 24 + 16 = 40 < 53,
+    # so both floors fit and nothing is starved.
+    budget = NodeBudget(ram_mib=53_000, vcpus=100)
+    clippy = _sz("clippyshot", ram=4096, demand=12, min_warm=6)
+    redtusk = _sz("redtusk", ram=2048, demand=8, min_warm=8)
+
+    assert unseatable_floors([clippy, redtusk], budget) == {}
+    # and both floors are actually honored in the plan
+    plan = plan_sizes([clippy, redtusk], budget)
+    assert plan["clippyshot"].warm_size >= 6 and plan["redtusk"].warm_size >= 8
+
+
+def test_unseatable_floors_ignores_floor_above_its_own_cap():
+    # min_warm > max_ceiling is a config choice (the cap wins), NOT starvation: the
+    # helper compares against min(min_warm, max_ceiling), so it must stay quiet here.
+    budget = NodeBudget(ram_mib=53_000, vcpus=100)
+    solo = _sz("redtusk", ram=2048, demand=4, min_warm=10, cap=4)   # cap 4 < floor 10
+    assert unseatable_floors([solo], budget) == {}

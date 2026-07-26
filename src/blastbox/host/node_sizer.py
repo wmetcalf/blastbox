@@ -260,6 +260,33 @@ def plan_sizes(specs: list[PoolSpec], budget: NodeBudget) -> dict[str, PoolSize]
     return out
 
 
+def unseatable_floors(
+    specs: list[PoolSpec], budget: NodeBudget
+) -> dict[str, tuple[int, int]]:
+    """Engines whose ``min_warm`` floor ``plan_sizes`` could NOT fully seat within the
+    budget, mapped to ``(granted_warm, wanted_floor)``. Empty when every floor fits.
+
+    ``plan_sizes`` reserves ``min_warm`` by demand priority and, when the floors can't
+    all fit the node budget, silently clamps the loser's ceiling to the 1-slot baseline —
+    so its warm target lands BELOW ``min_warm`` with no signal in the returned plan. On a
+    ``BLASTBOX_DISPATCH_WARM_ONLY`` dispatcher that starved pool then wedges (every job
+    requeues, no cold fallback) with no diagnostic. This pure companion re-derives the
+    plan and reports which floors were starved so the controller can WARN — turning a
+    silent, fleet-wide over-subscription into a visible, actionable one. See issue #68.
+
+    A ``min_warm`` above the pool's own ``max_ceiling`` is a config choice (the cap wins),
+    NOT starvation, so the comparison is against ``min(min_warm, max_ceiling)``.
+    """
+    plan = plan_sizes(specs, budget)
+    starved: dict[str, tuple[int, int]] = {}
+    for s in specs:
+        wanted = min(s.min_warm, s.max_ceiling)
+        got = plan[s.name].warm_size
+        if wanted > 0 and got < wanted:
+            starved[s.name] = (got, wanted)
+    return starved
+
+
 def node_capacity(ram_headroom_frac: float = 0.8,
                   vcpu_oversubscription: float = 2.0) -> NodeBudget:
     """Static node budget from /proc/meminfo + os.cpu_count() (dependency-free).

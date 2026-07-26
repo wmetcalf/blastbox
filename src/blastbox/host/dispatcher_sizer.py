@@ -37,6 +37,7 @@ from .node_sizer import (
     manages,
     node_capacity,
     plan_sizes,
+    unseatable_floors,
 )
 
 
@@ -115,6 +116,7 @@ class DispatcherSizer:
         self._last_tick_dur = 0.0             # measured, to widen the staleness window
         self._last_backlog = 0                # published as a heartbeat before the (slow) count
         self._stop_event: Optional[threading.Event] = None  # set in run(); fences the update-publish
+        self._last_floor_warn = 0.0           # rate-limit the min_warm-starved warning (issue #68)
         self._warned_mixed_nodes = False      # one-shot: warn on an inconsistent node-id view
         self._warned_mixed_modes = False      # one-shot: warn on mixed balancing modes on a node
         self._last_view_ok = 0.0              # clock of the last tick that CONFIRMED we're visible
@@ -520,7 +522,24 @@ class DispatcherSizer:
             ram_mib=min([my_budget.ram_mib, *peer_budget_ram]),
             vcpus=min([my_budget.vcpus, *peer_budget_vcpus]))
         plan = plan_sizes(specs, budget)  # type: ignore[arg-type]
-        mine = plan.get(_pool_key(e.name, self._runtime, self._instance))
+        my_key = _pool_key(e.name, self._runtime, self._instance)
+        mine = plan.get(my_key)
+        # issue #68: if the node budget can't seat every co-located engine's min_warm floor,
+        # plan_sizes silently clamps the loser's warm target BELOW its floor. On a warm-only
+        # dispatcher that pool then requeue-wedges with no diagnostic. Surface it (rate-limited)
+        # so an over-subscribed node is visible + actionable instead of a silent, fleet-wide hang.
+        starved = unseatable_floors(specs, budget)  # type: ignore[arg-type]
+        if my_key in starved:
+            now = self._clock()
+            if now - self._last_floor_warn >= max(60.0, self._config.interval_s * 20):
+                self._last_floor_warn = now
+                got, want = starved[my_key]
+                logging.getLogger("blastbox.node_sizer").warning(
+                    "min_warm floor STARVED for engine=%s: warm clamped to %d of min_warm=%d — the "
+                    "node RAM budget can't seat every co-located engine's warm floor. A warm-only "
+                    "dispatcher will requeue-wedge here (no cold fallback). Cap a co-located "
+                    "engine's warm pool (e.g. lower its POOL_WARM_SIZE), dedicate engines to "
+                    "separate nodes, or add RAM. See blastbox#68.", e.name, got, want)
         if mine is not None and hasattr(self._pool, "resize"):
             # WARM tracks THIS engine's WARM-eligible demand (not the weight, a ceiling-share
             # ratio only; and not cold in-flight, which bypasses the warm pool) so static mode
