@@ -1308,3 +1308,19 @@ def test_warm_only_gate_blocks_second_claim_while_slot_in_flight(tmp_path):
     # No job was lost or double-claimed: A's slot came back None so its job requeued, and the
     # second job was never claimed — both are back QUEUED, ready for a freed slot.
     assert len(store.list(status=JobStatus.QUEUED)) == 2
+
+
+def test_warm_reservation_released_if_predispatch_raises(tmp_path):
+    # issue #72 regression (found by adversarial review): dispatch_once() hands off sole ownership
+    # of releasing the gate reservation to _dispatch_claimed_job, whose release lives in the
+    # try/finally around the slot claim. But the pre-claim path construction (Path(job.filename))
+    # runs BEFORE that try — an exception there must NOT leak the reservation, else the warm gate
+    # under-admits forever and the sidecar re-wedges.
+    d = Dispatcher(job_store=InMemoryJobStore(), engines={}, limits=_limits(),
+                   job_root=tmp_path, pool=_CapPool(idle=1, slot=object()), warm_only=True)
+    d._warm_slot_reservations = 1            # simulate: dispatch_once reserved before claiming
+    bad = _make_job()
+    bad.filename = None                      # Path(None) raises TypeError in the pre-claim window
+    with pytest.raises(TypeError):
+        d._dispatch_claimed_job(bad, warm_reserved=True)
+    assert d._warm_slot_reservations == 0    # released despite the exception (RED before the fix)

@@ -477,6 +477,11 @@ class Dispatcher:
         if pool is None:
             return False
         with self._warm_gate_lock:
+            # Lock order is _warm_gate_lock → pool._lock (idle_count takes the pool's own lock).
+            # Safe: the pool holds no reference to this gate and never calls back into it, so the
+            # order is acyclic — no inversion is possible. INVARIANT: never acquire _warm_gate_lock
+            # while holding pool._lock (e.g. from a future slot-state callback), or that would
+            # create the reverse edge and a deadlock.
             idle = int(getattr(pool, "idle_count", 0) or 0)
             if idle - self._warm_slot_reservations <= 0:
                 return False
@@ -823,10 +828,22 @@ class Dispatcher:
         WARM path runs.  If no slot is available (pool.claim returns None), the
         COLD path runs as a fallback.  When no pool is configured, COLD always.
         """
-        root = self._job_root / job.job_id
-        input_dir = root / "input"
-        output_dir = root / "output"
-        input_path = input_dir / Path(job.filename).name
+        # issue #72: dispatch_once() handed off SOLE ownership of releasing the warm-slot gate
+        # reservation to this method (freed in the finally around the slot claim below). That
+        # finally does NOT cover this pre-claim setup, so an exception here (e.g. Path() on a job
+        # whose filename is None — filename is treated as possibly-falsy elsewhere) would leak the
+        # reservation, permanently shrinking the gate until the sidecar re-wedges. Release + re-raise
+        # so a pre-claim failure can never strand a reservation. (Only fires on the error path; the
+        # normal path's release is the finally at the claim below — no double-release.)
+        try:
+            root = self._job_root / job.job_id
+            input_dir = root / "input"
+            output_dir = root / "output"
+            input_path = input_dir / Path(job.filename).name
+        except BaseException:
+            if warm_reserved:
+                self._release_warm_reservation()
+            raise
 
         # Try the warm path if a pool is configured. EXCEPTION: an egress personality needs the cold
         # path's netd netns-wiring + dispatcher network args/labels, which the warm tier can't apply
