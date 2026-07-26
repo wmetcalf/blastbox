@@ -1262,3 +1262,49 @@ def test_warm_only_requeues_on_slot_miss(tmp_path):
     final = store.get(job.job_id)
     assert final.status == JobStatus.QUEUED  # requeued for the cold dispatcher / another sidecar
     assert final.claim_id is None
+
+
+def test_warm_slot_reservation_counter_caps_at_idle(tmp_path):
+    # issue #72: the atomic gate reservation admits at most idle_count concurrent claims.
+    d = Dispatcher(job_store=InMemoryJobStore(), engines={}, limits=_limits(),
+                   job_root=tmp_path, pool=_CapPool(idle=2), warm_only=True)
+    assert d._reserve_warm_slot() is True     # 1 of 2 idle
+    assert d._reserve_warm_slot() is True     # 2 of 2 idle
+    assert d._reserve_warm_slot() is False    # idle exhausted by reservations → GATED
+    d._release_warm_reservation()
+    assert d._reserve_warm_slot() is True      # freed → capacity available again
+
+
+def test_warm_only_gate_blocks_second_claim_while_slot_in_flight(tmp_path):
+    # issue #72 (the race): with ONE idle slot, a second concurrent dispatch_once() must be
+    # GATED while the first is still resolving its slot — never claim-then-requeue-churn.
+    import threading as _t
+
+    store = InMemoryJobStore()
+    store.create(_make_job())
+    store.create(_make_job())
+
+    in_claim = _t.Event()
+    release = _t.Event()
+
+    class _BlockingPool(_CapPool):
+        def claim(self, *, timeout_s):        # noqa: ARG002
+            in_claim.set()                     # thread A is now INSIDE claim(), holding its reservation
+            release.wait(5)
+            return self._slot                  # slot=None → A requeues its job (irrelevant to the gate)
+
+    d = Dispatcher(job_store=store, engines={}, limits=_limits(), job_root=tmp_path,
+                   pool=_BlockingPool(idle=1, slot=None), warm_only=True)
+
+    a = _t.Thread(target=d.dispatch_once, daemon=True)
+    a.start()
+    assert in_claim.wait(5)                    # A reserved the 1 idle slot and is in claim()
+
+    # The single idle slot is reserved by A → a second dispatch must NOT claim (was over-claim pre-#72)
+    assert d.dispatch_once() is False          # GATED: returns immediately, nothing claimed
+
+    release.set()
+    a.join(5)
+    # No job was lost or double-claimed: A's slot came back None so its job requeued, and the
+    # second job was never claimed — both are back QUEUED, ready for a freed slot.
+    assert len(store.list(status=JobStatus.QUEUED)) == 2

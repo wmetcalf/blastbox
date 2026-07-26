@@ -387,6 +387,18 @@ class Dispatcher:
                 "warm_only dispatcher requires a warm pool (set BLASTBOX_POOL_RUNTIME)"
             )
 
+        # Warm-only concurrency cap (issue #72): a warm sidecar with N idle slots must admit at
+        # most N concurrent claims. The old gate checked ``idle_count > 0`` but that is RACY —
+        # under DISPATCH_CONCURRENCY threads, all pass when idle>0, all claim a job, and the excess
+        # requeue-churn (especially once the node sizer has shrunk the pool below the static
+        # concurrency). This atomic reservation caps the number of threads that reach pool.claim()
+        # to the LIVE idle count, so overflow stays QUEUED (backpressure) instead of requeuing.
+        # Reserved at the gate (dispatch_once); released the moment the slot is resolved
+        # (acquired or not) in _dispatch_claimed_job. Only warm-only sidecars gate this way — a
+        # warm+cold dispatcher can still claim freely and cold-fall-back.
+        self._warm_gate_lock = threading.Lock()
+        self._warm_slot_reservations = 0
+
         # This dispatcher's tier identity ("cold"/"firecracker"/"gvisor"), for optional per-job
         # routing (target_tier) and the warm-backend result label (worker_tier). Passed to
         # claim_next so a job targeting a specific tier is only claimed here when it matches; an
@@ -451,28 +463,70 @@ class Dispatcher:
     # Public API
     # ------------------------------------------------------------------
 
+    def _reserve_warm_slot(self) -> bool:
+        """Atomically reserve gate capacity against a currently-idle warm slot (issue #72).
+
+        Returns True if a reservation was taken — the caller MUST then release it exactly once
+        (via _release_warm_reservation, done in _dispatch_claimed_job once the slot resolves, or
+        here if no job is claimed). False when there is no idle capacity left to reserve, i.e.
+        every idle slot is already spoken for by a concurrent claimer. This caps the number of
+        threads that reach pool.claim() to the LIVE idle count, so a warm-only sidecar never
+        over-claims and requeue-churns.
+        """
+        pool = self._pool
+        if pool is None:
+            return False
+        with self._warm_gate_lock:
+            idle = int(getattr(pool, "idle_count", 0) or 0)
+            if idle - self._warm_slot_reservations <= 0:
+                return False
+            self._warm_slot_reservations += 1
+            return True
+
+    def _release_warm_reservation(self) -> None:
+        with self._warm_gate_lock:
+            if self._warm_slot_reservations > 0:
+                self._warm_slot_reservations -= 1
+
     def dispatch_once(self) -> bool:
         """Claim and dispatch the next queued job.
 
         Returns True if a job was claimed, False if the queue was empty.
         """
-        # Warm-sidecar claim-gate: don't pull a job unless a warm slot is free right NOW.
-        # Overflow stays queued for the cold dispatcher / another warm sidecar — a warm-only
-        # dispatcher has no cold path, so it must not claim work it can't immediately serve.
-        if self._warm_only and (self._pool is None or self._pool.idle_count <= 0):
-            return False
+        # Warm-sidecar claim-gate (issue #72): a warm-only dispatcher has no cold path, so it must
+        # not claim work it can't immediately serve. Reserve one idle warm slot ATOMICALLY before
+        # claiming — capping concurrent claims to the live idle count, so overflow stays QUEUED
+        # (backpressure) for another sidecar instead of being claimed-then-requeued under
+        # concurrency (the old `idle_count > 0` check was racy: N threads all passed on the same
+        # few idle slots). The reservation is freed the instant the slot is resolved
+        # (in _dispatch_claimed_job) or here when no job is claimed.
+        reserved = False
+        if self._warm_only:
+            if not self._reserve_warm_slot():
+                return False
+            reserved = True
         # Engine scoping is OPT-IN (shared multi-dispatcher stores): scoped → leave another
         # dispatcher's engine's jobs for it; unscoped (default) → claim anything, and the
         # _dispatch_claimed_job path FAILs a genuinely-unknown engine fast. Only pass engine= when
         # scoping is on, so the default path keeps the original claim_next(*, claimant_tier=) shape an
         # injected/legacy JobStore double may implement (no new keyword forced on it).
-        if self._engine_scoped:
-            job = self._job_store.claim_next(claimant_tier=self._tier, engine=frozenset(self._engines))
-        else:
-            job = self._job_store.claim_next(claimant_tier=self._tier)
+        try:
+            if self._engine_scoped:
+                job = self._job_store.claim_next(claimant_tier=self._tier,
+                                                 engine=frozenset(self._engines))
+            else:
+                job = self._job_store.claim_next(claimant_tier=self._tier)
+        except BaseException:
+            if reserved:
+                self._release_warm_reservation()
+            raise
         if job is None:
+            if reserved:
+                self._release_warm_reservation()
             return False
-        self._dispatch_claimed_job(job)
+        # From here _dispatch_claimed_job owns releasing the reservation (freed once the slot is
+        # resolved there); do NOT release it again in this method.
+        self._dispatch_claimed_job(job, warm_reserved=reserved)
         return True
 
     def run_forever(
@@ -754,8 +808,12 @@ class Dispatcher:
             allow_override=self._allow_net_override,
         )
 
-    def _dispatch_claimed_job(self, job: Job) -> None:
+    def _dispatch_claimed_job(self, job: Job, *, warm_reserved: bool = False) -> None:
         """Execute one claimed job (status is already RUNNING on entry).
+
+        ``warm_reserved`` (issue #72): the caller took a warm-slot gate reservation before
+        claiming this job. This method releases it exactly once, the instant the slot is resolved
+        (acquired or missed) — never held across the long warm detonation.
 
         Security: input is deleted via a finally block on every branch — but only when we
         still own the claim (``_delete_input_if_owned``); a job a peer reclaimed keeps its
@@ -777,11 +835,18 @@ class Dispatcher:
         # cold dispatcher (existing branch below); a warm+cold dispatcher cold-falls-through. Either
         # way the job runs WITH egress instead of failing.
         if self._pool is not None:
-            egress = self._resolve_personality(job).exit_driver not in ("none", "drop")
-            if egress:
-                _log.info("net_policy egress job_id=%s → bypassing warm slot (cold wires egress)",
-                          job.job_id)
-            slot = None if egress else self._pool.claim(timeout_s=self._warm_claim_timeout_s)
+            try:
+                egress = self._resolve_personality(job).exit_driver not in ("none", "drop")
+                if egress:
+                    _log.info("net_policy egress job_id=%s → bypassing warm slot (cold wires egress)",
+                              job.job_id)
+                slot = None if egress else self._pool.claim(timeout_s=self._warm_claim_timeout_s)
+            finally:
+                # The reservation covered gate→slot-resolution only. Free it now: the slot is
+                # ASSIGNED (out of idle_count) or was missed, so keeping the reservation would
+                # double-count against idle_count and needlessly gate peers during the detonation.
+                if warm_reserved:
+                    self._release_warm_reservation()
             if not egress:
                 record_warm_claim(hit=slot is not None)
             if slot is not None:
