@@ -524,10 +524,11 @@ class DispatcherSizer:
         plan = plan_sizes(specs, budget)  # type: ignore[arg-type]
         my_key = _pool_key(e.name, self._runtime, self._instance)
         mine = plan.get(my_key)
-        # issue #68: if the node budget can't seat every co-located engine's min_warm floor,
-        # plan_sizes silently clamps the loser's warm target BELOW its floor. On a warm-only
-        # dispatcher that pool then requeue-wedges with no diagnostic. Surface it (rate-limited)
-        # so an over-subscribed node is visible + actionable instead of a silent, fleet-wide hang.
+        # issue #68: when the node budget can't seat every co-located engine's min_warm floor,
+        # plan_sizes now shrinks the floors PROPORTIONALLY (each pool keeps a fair slice, none
+        # clamped to the 1-slot baseline) so warm stays warm and no pool requeue-wedges. That's
+        # graceful, but the operator still asked for a floor they aren't getting — surface it
+        # (rate-limited) so the over-subscription is visible + actionable instead of invisible.
         starved = unseatable_floors(specs, budget)  # type: ignore[arg-type]
         if my_key in starved:
             now = self._clock()
@@ -535,11 +536,11 @@ class DispatcherSizer:
                 self._last_floor_warn = now
                 got, want = starved[my_key]
                 logging.getLogger("blastbox.node_sizer").warning(
-                    "min_warm floor STARVED for engine=%s: warm clamped to %d of min_warm=%d — the "
-                    "node RAM budget can't seat every co-located engine's warm floor. A warm-only "
-                    "dispatcher will requeue-wedge here (no cold fallback). Cap a co-located "
-                    "engine's warm pool (e.g. lower its POOL_WARM_SIZE), dedicate engines to "
-                    "separate nodes, or add RAM. See blastbox#68.", e.name, got, want)
+                    "engine=%s warm=%d is BELOW its min_warm=%d — the node RAM budget can't seat "
+                    "every co-located engine's warm floor, so the pools were proportionally shrunk "
+                    "to fit. All pools stay warm (no cold fallback, no wedge), just smaller. To run "
+                    "every floor at full size, cap a co-located engine's warm pool, dedicate "
+                    "engines to separate nodes, or add RAM. See blastbox#68.", e.name, got, want)
         if mine is not None and hasattr(self._pool, "resize"):
             # WARM tracks THIS engine's WARM-eligible demand (not the weight, a ceiling-share
             # ratio only; and not cold in-flight, which bypasses the warm pool) so static mode

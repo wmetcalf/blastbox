@@ -1730,11 +1730,11 @@ def test_sizer_warns_when_min_warm_floor_starved(tmp_path, caplog):
             clip.tick()
             red.tick()
 
-    starved_warns = [r.getMessage() for r in caplog.records
-                     if "min_warm floor STARVED" in r.getMessage()]
-    assert any("engine=red" in m for m in starved_warns), starved_warns
-    # clip (the floor that WAS seated) must NOT be warned about
-    assert not any("engine=clip" in m for m in starved_warns), starved_warns
+    starved_warns = [r.getMessage() for r in caplog.records if "blastbox#68" in r.getMessage()]
+    # Under proportional shrink BOTH engines land below their declared floors on an
+    # over-subscribed node — the warning must fire for the pool that asked for a floor it
+    # isn't getting (redtusk here; clip too, since neither is fully seated).
+    assert any("engine=red" in m and "BELOW its min_warm=8" in m for m in starved_warns), starved_warns
 
 
 def test_sizer_no_floor_warning_when_floors_fit(tmp_path, caplog):
@@ -1761,4 +1761,4 @@ def test_sizer_no_floor_warning_when_floors_fit(tmp_path, caplog):
             clip.tick()
             red.tick()
 
-    assert not [r for r in caplog.records if "min_warm floor STARVED" in r.getMessage()]
+    assert not [r for r in caplog.records if "blastbox#68" in r.getMessage()]

@@ -204,14 +204,26 @@ def plan_sizes(specs: list[PoolSpec], budget: NodeBudget) -> dict[str, PoolSize]
     # min_warm RESERVATION: seat each pool's warm floor BEFORE demand-filling, so a latency
     # floor is a real reservation — an idle pool with min_warm=N keeps N hot even when a busy
     # neighbour wants the budget (a soft floor a neighbour could starve isn't a floor). Bounded
-    # by the budget (never over-commits above the baseline); when Σ min_warm can't all fit, the
-    # floors are seated by demand priority, so a busy pool's floor beats an idle pool's.
+    # by the budget (never over-commits above the baseline).
+    #
+    # PROPORTIONAL SHRINK when Σ min_warm can't all fit (issue #68): seat the engine that is
+    # FURTHEST below its floor (smallest alloc/floor fraction) each step, so all floors approach
+    # completion together and the shortfall is SHARED — every pool keeps a proportional slice of
+    # its floor instead of the highest-demand engine seating its whole floor and clamping a
+    # neighbour to the 1-slot baseline (which, on a warm-only dispatcher, requeue-wedges). E.g.
+    # redtusk(min_warm=8,2GiB) + clippyshot(min_warm=12,4GiB) on a ~53 GiB budget → ~7 and ~9
+    # (both warm + functional) rather than 1 and 12. Ties break by demand then name (deterministic
+    # across every dispatcher). Cold fallback is intentionally NOT a knob here — warm stays warm,
+    # just fairly smaller under contention; capacity/topology fixes are surfaced via
+    # unseatable_floors() + the sizer's over-subscription warning.
     while True:
         below = [s for s in specs
                  if alloc[s.name] < min(s.min_warm, s.max_ceiling) and budget_has_room(s)]
         if not below:
             break
-        pick = max(below, key=lambda s: s.demand)      # busy floors first under contention
+        # most-starved-relative-to-its-floor first → proportional shrink under contention
+        pick = min(below, key=lambda s: (alloc[s.name] / min(s.min_warm, s.max_ceiling),
+                                         -s.demand, s.name))
         alloc[pick.name] += 1
         used_ram += pick.slot_ram_mib
         used_vcpu += pick.slot_vcpus

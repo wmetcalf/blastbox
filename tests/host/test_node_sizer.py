@@ -502,3 +502,23 @@ def test_unseatable_floors_ignores_floor_above_its_own_cap():
     budget = NodeBudget(ram_mib=53_000, vcpus=100)
     solo = _sz("redtusk", ram=2048, demand=4, min_warm=10, cap=4)   # cap 4 < floor 10
     assert unseatable_floors([solo], budget) == {}
+
+
+def test_min_warm_shrinks_proportionally_not_clamped_to_one():
+    # issue #68 fix: on an over-subscribed node (12x4096 + 8x2048 = 64 GiB > 53 GiB budget) the
+    # floors SHRINK PROPORTIONALLY — neither engine is clamped to the 1-slot baseline (which would
+    # requeue-wedge a warm-only dispatcher). Both keep a functional warm pool; cold is never used.
+    budget = NodeBudget(ram_mib=53_000, vcpus=999)
+    clippy = _sz("clippyshot", ram=4096, demand=40, min_warm=12)   # higher demand
+    redtusk = _sz("redtusk", ram=2048, demand=8, min_warm=8)       # lower demand — must NOT be starved to 1
+    plan = plan_sizes([clippy, redtusk], budget)
+
+    assert plan["redtusk"].warm_size >= 4, plan        # was 1 under the old demand-priority clamp
+    assert plan["clippyshot"].warm_size >= 8, plan
+    # proportional: similar FRACTION of each declared floor (not winner-take-all)
+    r_frac = plan["redtusk"].warm_size / 8
+    c_frac = plan["clippyshot"].warm_size / 12
+    assert abs(r_frac - c_frac) <= 0.25, (r_frac, c_frac)
+    # never oversubscribed
+    assert (plan["redtusk"].warm_size * 2048
+            + plan["clippyshot"].warm_size * 4096) <= budget.ram_mib
