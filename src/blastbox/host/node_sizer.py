@@ -221,8 +221,13 @@ def plan_sizes(specs: list[PoolSpec], budget: NodeBudget) -> dict[str, PoolSize]
                  if alloc[s.name] < min(s.min_warm, s.max_ceiling) and budget_has_room(s)]
         if not below:
             break
-        # most-starved-relative-to-its-floor first → proportional shrink under contention
-        pick = min(below, key=lambda s: (alloc[s.name] / min(s.min_warm, s.max_ceiling),
+        # DEMAND TIER (adversarial-review fix): seat pools that HAVE demand before idle ones — the
+        # engine with jobs NOW keeps its floor before an IDLE neighbour's speculative floor, else a
+        # demand=0 pool with a large min_warm would starve a busy small-floor pool below ITS floor
+        # (re-wedging the busy engine). Within a tier: most-starved-by-fraction first (proportional
+        # shrink); ties break by demand then name (deterministic across dispatchers).
+        pick = min(below, key=lambda s: (0 if s.demand > 0 else 1,
+                                         alloc[s.name] / min(s.min_warm, s.max_ceiling),
                                          -s.demand, s.name))
         alloc[pick.name] += 1
         used_ram += pick.slot_ram_mib

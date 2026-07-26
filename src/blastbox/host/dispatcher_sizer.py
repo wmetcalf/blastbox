@@ -534,13 +534,17 @@ class DispatcherSizer:
             now = self._clock()
             if now - self._last_floor_warn >= max(60.0, self._config.interval_s * 20):
                 self._last_floor_warn = now
-                got, want = starved[my_key]
+                got, _want = starved[my_key]
+                # Report the OPERATOR-CONFIGURED floor (e.min_warm) + the tier, not the per-replica
+                # split min_warm the allocator sees — so a rolling-deploy overlap (2 replicas) still
+                # names the real min_warm the operator set, and fc-vs-gvisor is unambiguous.
                 logging.getLogger("blastbox.node_sizer").warning(
-                    "engine=%s warm=%d is BELOW its min_warm=%d — the node RAM budget can't seat "
-                    "every co-located engine's warm floor, so the pools were proportionally shrunk "
-                    "to fit. All pools stay warm (no cold fallback, no wedge), just smaller. To run "
-                    "every floor at full size, cap a co-located engine's warm pool, dedicate "
-                    "engines to separate nodes, or add RAM. See blastbox#68.", e.name, got, want)
+                    "engine=%s tier=%s warm=%d is BELOW its configured min_warm=%d — the node RAM "
+                    "budget can't seat every co-located engine's warm floor, so the pools were "
+                    "proportionally shrunk to fit (busy pools' floors first). All pools stay warm "
+                    "(no cold fallback, no wedge), just smaller. To run every floor at full size, "
+                    "cap a co-located engine's warm pool, dedicate engines to separate nodes, or "
+                    "add RAM. See blastbox#68.", e.name, self._runtime, got, e.min_warm)
         if mine is not None and hasattr(self._pool, "resize"):
             # WARM tracks THIS engine's WARM-eligible demand (not the weight, a ceiling-share
             # ratio only; and not cold in-flight, which bypasses the warm pool) so static mode

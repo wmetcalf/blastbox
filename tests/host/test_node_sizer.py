@@ -522,3 +522,16 @@ def test_min_warm_shrinks_proportionally_not_clamped_to_one():
     # never oversubscribed
     assert (plan["redtusk"].warm_size * 2048
             + plan["clippyshot"].warm_size * 4096) <= budget.ram_mib
+
+
+def test_busy_engine_floor_not_starved_by_idle_neighbor():
+    # issue #68 fairness (adversarial review): under contention an IDLE engine with a large floor
+    # must NOT starve a BUSY engine below ITS floor. Busy engines' floors are seated before idle
+    # ones (proportional within a demand tier), so the engine with jobs NOW keeps its warm floor.
+    budget = NodeBudget(ram_mib=10 * 1024, vcpus=64)          # 10 x 1GiB slots
+    idle = _sz("idle", ram=1024, demand=0, min_warm=20)       # huge floor, NO demand
+    busy = _sz("busy", ram=1024, demand=99, min_warm=4)       # small floor, hot
+    plan = plan_sizes([idle, busy], budget)
+    assert plan["busy"].warm_size >= 4, plan     # busy floor MET (was 2 — starved — before the fix)
+    assert plan["idle"].warm_size <= 6, plan     # idle gets only the remainder, not the lion's share
+    assert (plan["busy"].warm_size + plan["idle"].warm_size) * 1024 <= budget.ram_mib
