@@ -636,11 +636,13 @@ class WarmPool:
             if require_tracked and slot.slot_id not in self._slots:
                 return False
             self._reaping.add(slot.slot_id)
+        disposed = False
         try:
             if self._reap_takes_dirty:
                 self._runtime.reap(slot, dirty=dirty)  # type: ignore[call-arg]
             else:
                 self._runtime.reap(slot)
+            disposed = True                 # ONLY a reap that RETURNED disposed the worker
         finally:
             record_slot_reaped()
             with self._lock:
@@ -649,7 +651,10 @@ class WarmPool:
                 # longer owned, and a concurrent stop() would terminate it a SECOND time (duplicate
                 # control-plane call + double reap accounting). Callers that must keep a husk
                 # tracked on failure (the quarantine policy) leave this False and pop themselves.
-                if pop_on_success:
+                # `disposed` gate is essential: this is a FINALLY, so it also runs when reap()
+                # RAISED. Popping then would untrack a worker whose disposal FAILED and may still be
+                # running — exactly the orphan the quarantine policy exists to prevent.
+                if pop_on_success and disposed:
                     self._slots.pop(slot.slot_id, None)
                 self._reaping.discard(slot.slot_id)
         return True

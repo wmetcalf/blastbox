@@ -1647,3 +1647,22 @@ def test_successful_reap_pops_under_the_ownership_lock() -> None:
     with pool._lock:
         assert slot.slot_id not in pool._slots      # untracked atomically with the ownership release
         assert slot.slot_id not in pool._reaping
+
+
+def test_pop_on_success_keeps_a_failed_reap_quarantined() -> None:
+    # issue #75 (review, HIGH): pop_on_success lives in a FINALLY, so without gating it on the reap
+    # actually RETURNING it would untrack a slot whose disposal RAISED — orphaning a worker that may
+    # still be running, which is precisely what the quarantine policy prevents.
+    rt = _ReapFailRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+
+    try:
+        pool._reap_and_count(slot, pop_on_success=True)
+        raise AssertionError("expected the failing reap to propagate")
+    except RuntimeError:
+        pass
+    with pool._lock:
+        assert slot.slot_id in pool._slots, "a FAILED reap must stay tracked (quarantined)"
+        assert slot.slot_id not in pool._reaping, "ownership must still be released"
