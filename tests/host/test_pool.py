@@ -183,9 +183,14 @@ def test_stop_is_bounded_when_spawn_wedged() -> None:
     pool.start()
     assert entered.wait(timeout=5)
     t0 = time.monotonic()
-    pool.stop(stop_timeout_s=1.0)
+    orphans = pool.stop(stop_timeout_s=1.0)
     dt = time.monotonic() - t0
     assert 0.8 < dt < 5.0                           # gave up ~1s (the ceiling), did NOT hang for 10s
+    # ...and the in-flight spawn is REPORTED as an orphan. It isn't in _slots yet, so len(_slots)
+    # can't see it — the +1 for a wedged thread is the only thing that keeps the caller's node-budget
+    # reservation alive for a worker that may still come up. (Previously untested: dropping the +1
+    # left the suite green while stop() under-reported and peers reallocated its RAM.)
+    assert orphans >= 1, f"wedged spawn must be counted as an orphan, got {orphans}"
 
 
 def test_after_stop_spawn_tracks_slot_when_reap_fails() -> None:
@@ -1563,7 +1568,10 @@ def test_wedged_reaper_does_not_inflate_the_orphan_count() -> None:
     time.sleep(0.2)
     try:
         orphans = pool.stop(stop_timeout_s=0.5)       # reaper still wedged -> join expires
-        assert orphans == len(pool._slots), f"orphans={orphans} but {len(pool._slots)} tracked"
+        # ABSOLUTE, not `orphans == len(_slots)` — that is a tautology (both sides read the same
+        # dict), so any mutation dropping the slot satisfies it while under-reporting the orphan.
+        assert orphans == 1, f"expected exactly 1 orphan (the wedged live worker), got {orphans}"
+        assert slot.slot_id in pool._slots, "the wedged reaper's slot must remain tracked"
     finally:
         hang.set()
         _join_reaper(pool)
@@ -1610,27 +1618,40 @@ def test_stop_clears_the_deferred_queue_so_a_restart_cannot_re_terminate() -> No
 
 def test_stop_budget_is_shared_between_tick_thread_and_reaper() -> None:
     # issue #75 (review): the reaper join must draw on the SAME shutdown budget as the tick-thread
-    # join. Giving it a second full stop_timeout_s meant a hung spawn followed by a hung reap cost
-    # 2x the caller's timeout — so the timeout stopped meaning what it says.
-    hang = threading.Event()
-    rt = _CachedLivenessRuntime(hang=hang)
-    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    # join — otherwise a hung spawn followed by a hung reap costs 2x the caller's timeout.
+    # The pool MUST be started with a WEDGED SPAWN, else stop() skips the tick-join branch entirely
+    # and a per-join budget is indistinguishable from a shared one (mutation-proven).
+    spawn_gate = threading.Event()
+    reap_gate = threading.Event()
+
+    class _BothWedged(_CachedLivenessRuntime):
+        def spawn(self) -> Slot:
+            slot = super().spawn()
+            if self.fresh_dead:              # wedge only AFTER the first slot exists
+                spawn_gate.wait(20)
+            return slot
+
+    rt = _BothWedged(hang=reap_gate)
+    pool = WarmPool(runtime=rt, warm_size=2, spawn_rate_limit=100.0, poll_interval=0.01)
     pool._spawn_to_deficit(ready=True)
     pool._promote_warming()
     slot = next(iter(pool._slots.values()))
-    rt.fresh_dead.add(slot.slot_id)
+    rt.fresh_dead.add(slot.slot_id)          # from here spawns wedge too
     rt.hang_slot = slot.slot_id
-    pool._try_claim_one()
-    pool._reap_deferred()
-    time.sleep(0.2)
+    pool._try_claim_one()                    # defer the husk
+    pool._reap_deferred()                    # reaper wedges in reap
+    pool.start()                             # tick thread wedges in spawn
+    time.sleep(0.3)
     try:
         t0 = time.monotonic()
-        pool.stop(stop_timeout_s=0.5)
+        pool.stop(stop_timeout_s=0.5)        # BOTH wedged: must stay within ONE budget
         elapsed = time.monotonic() - t0
-        assert elapsed < 1.5, f"shutdown took {elapsed:.2f}s on a 0.5s budget (double-charged?)"
+        assert elapsed < 1.0, f"shutdown took {elapsed:.2f}s on a 0.5s budget (double-charged?)"
     finally:
-        hang.set()
+        spawn_gate.set()
+        reap_gate.set()
         _join_reaper(pool)
+
 
 
 def test_successful_reap_pops_under_the_ownership_lock() -> None:
@@ -1666,3 +1687,53 @@ def test_pop_on_success_keeps_a_failed_reap_quarantined() -> None:
     with pool._lock:
         assert slot.slot_id in pool._slots, "a FAILED reap must stay tracked (quarantined)"
         assert slot.slot_id not in pool._reaping, "ownership must still be released"
+
+
+def test_dead_reapers_are_pruned_so_the_queue_keeps_draining() -> None:
+    # issue #75 (review): the `_reaper_threads = [t for t in ... if t.is_alive()]` prune is
+    # LOAD-BEARING for liveness. Without it, once _MAX_REAPERS threads have EVER been created the
+    # slot budget is permanently exhausted, _reap_deferred returns early forever, and husks pile up
+    # in _deferred_reap holding ceiling headroom — the tier quietly stops replacing slots.
+    # More rounds than _MAX_REAPERS, so an unpruned list would stall partway through.
+    rt = _CachedLivenessRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=4, spawn_rate_limit=1000.0)
+    rounds = 6
+    assert rounds > pool._MAX_REAPERS
+    for _ in range(rounds):
+        pool._spawn_to_deficit(ready=True)
+        pool._promote_warming()
+        idle = [s for s in pool._slots.values() if s.state == SlotState.IDLE]
+        assert idle, "expected a fresh IDLE slot each round"
+        rt.fresh_dead.add(idle[0].slot_id)
+        pool._try_claim_one()                    # defers it
+        pool._reap_deferred()
+        _join_reaper(pool)
+    assert len(rt.reaped) == rounds, f"only {len(rt.reaped)}/{rounds} husks disposed"
+    with pool._lock:
+        assert not pool._deferred_reap, f"queue stalled with {len(pool._deferred_reap)} husks"
+
+
+def test_drain_passes_both_guards_to_the_reap_primitive() -> None:
+    # issue #75 (review): the guards were pinned only at the PRIMITIVE — dropping the kwargs at the
+    # drain CALL SITE left the suite green while silently reintroducing the double-terminate.
+    # Pin the call site's contract directly.
+    rt = _CachedLivenessRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    slot = next(iter(pool._slots.values()))
+    rt.fresh_dead.add(slot.slot_id)
+    pool._try_claim_one()
+
+    seen: list[dict] = []
+    real = pool._reap_and_count
+
+    def _spy(s, **kw):
+        seen.append(kw)
+        return real(s, **kw)
+
+    pool._reap_and_count = _spy            # type: ignore[method-assign]
+    pool._drain_deferred_reaps()
+    assert seen, "the drain never reached the reap primitive"
+    assert seen[0].get("require_tracked") is True, seen[0]
+    assert seen[0].get("pop_on_success") is True, seen[0]

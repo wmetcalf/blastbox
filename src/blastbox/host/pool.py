@@ -350,7 +350,12 @@ class WarmPool:
 
         for slot in to_reap:
             try:
-                disposed = self._reap_and_count(slot)
+                # require_tracked: after a reaper-join TIMEOUT this list is a snapshot — a reaper
+                # may have disposed+popped a slot since. Verifying membership in the same critical
+                # section that takes ownership stops a SECOND terminate on that worker. A False
+                # return leaves nothing to pop and the slot is already out of _slots, so it is
+                # correctly NOT counted as an orphan below.
+                disposed = self._reap_and_count(slot, require_tracked=True)
             except Exception:
                 logger.exception("pool.reap_error_on_stop slot_id=%s — quarantining (still DRAINING, "
                                  "never claimable)", slot.slot_id)
@@ -452,7 +457,7 @@ class WarmPool:
         reaped = False
         try:
             # forward dirty so a reusing runtime can quarantine; False = another thread owns the reap
-            reaped = self._reap_and_count(slot, dirty=dirty)
+            reaped = self._reap_and_count(slot, dirty=dirty, require_tracked=True, pop_on_success=True)
         except Exception:
             # reap() raises when it could NOT dispose the worker (e.g. a libvirt VM whose `virsh
             # destroy` failed and may still be running). Do NOT pop the slot: keep it tracked
@@ -479,7 +484,7 @@ class WarmPool:
             slot.state = SlotState.DRAINING  # unclaimable from here, even if the reap is slow
         reaped = False
         try:
-            reaped = self._reap_and_count(slot)   # False = another thread owns the reap -> don't pop
+            reaped = self._reap_and_count(slot, require_tracked=True, pop_on_success=True)   # False = another thread owns it, or it is already gone
         except Exception:
             logger.exception("pool.retire_reap_error slot_id=%s — quarantining (worker may persist)",
                              slot.slot_id)
@@ -596,7 +601,7 @@ class WarmPool:
         for slot in victims:
             reaped = False
             try:
-                reaped = self._reap_and_count(slot)   # False = another thread owns the reap
+                reaped = self._reap_and_count(slot, require_tracked=True, pop_on_success=True)
             except Exception:
                 logger.exception("pool.reap_surplus_error slot_id=%s — quarantining", slot.slot_id)
             if reaped:
@@ -644,7 +649,8 @@ class WarmPool:
                 self._runtime.reap(slot)
             disposed = True                 # ONLY a reap that RETURNED disposed the worker
         finally:
-            record_slot_reaped()
+            if disposed:
+                record_slot_reaped()   # count DISPOSALS, not attempts: a raising reap quarantines
             with self._lock:
                 # pop_on_success: untrack the slot in the SAME critical section that releases
                 # ownership. Otherwise there is a window where the slot is still tracked but no
@@ -810,6 +816,12 @@ class WarmPool:
         """
         scan_deadline = None if deadline is None else max(deadline, self._clock() + self._SCAN_GRACE_S)
         while True:
+            # Shutdown in progress: hand out NOTHING. stop() reaps every slot after its joins, so a
+            # slot claimed during that window would be destroyed mid-job; and a dead slot deferred
+            # here would repopulate the queue stop() just cleared, making a restarted pool
+            # re-terminate a husk whose disposal already failed. The caller requeues instead.
+            if self._stop_event.is_set():
+                return None
             # Find a candidate inside the lock
             with self._lock:
                 candidate: Slot | None = None
@@ -893,7 +905,7 @@ class WarmPool:
                 # (If is_ready RAISED, we never enter here — same quarantine intent.)
                 reaped = False
                 try:
-                    reaped = self._reap_and_count(slot)   # False = another thread owns it -> don't pop
+                    reaped = self._reap_and_count(slot, require_tracked=True, pop_on_success=True)
                 except Exception:
                     logger.exception("pool.promote_reap_error slot_id=%s — quarantining", slot.slot_id)
                 with self._lock:
@@ -1079,7 +1091,7 @@ class WarmPool:
             logger.warning("pool.health_evicted_dead_slot slot_id=%s", slot.slot_id)
             reaped = False
             try:
-                reaped = self._reap_and_count(slot)   # False = another thread owns it -> don't pop
+                reaped = self._reap_and_count(slot, require_tracked=True, pop_on_success=True)
             except Exception:
                 # reap raised (worker not disposed — may still run): quarantine, don't pop (like
                 # release()), so a live worker isn't orphaned off pool accounting.
