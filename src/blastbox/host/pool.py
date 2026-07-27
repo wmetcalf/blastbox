@@ -234,7 +234,10 @@ class WarmPool:
         # Wall-clock bound for the hand-out liveness probe. Short ON PURPOSE: it sits on
         # job-dispatch latency and holds the caller's warm-gate reservation (#72), so a slot that
         # can't be described in a few seconds is better skipped than waited on (issue #77).
-        self._claim_probe_timeout_s = max(0.1, float(claim_probe_timeout_s))
+        # 0 (or negative) DISABLES the watchdog — probe inline, pre-#77 behaviour — for an operator
+        # whose runtime is slow but reliable and who would rather wait than skip a slot. Clamped at 0
+        # rather than a positive floor so that escape hatch is actually reachable.
+        self._claim_probe_timeout_s = max(0.0, float(claim_probe_timeout_s))
         self._thread: threading.Thread | None = None
 
         # Burst demand tracking — all access under _lock
