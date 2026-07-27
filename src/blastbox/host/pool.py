@@ -565,10 +565,11 @@ class WarmPool:
                 slot = self._slots.get(slot_id)
                 if slot is None:
                     continue                # already disposed+popped by stop()/another path
-            reaped = False
             try:
-                # require_tracked closes the stop()-race: never re-terminate a popped slot.
-                reaped = self._reap_and_count(slot, require_tracked=True, pop_on_success=True)
+                # require_tracked closes the stop()-race (never re-terminate a popped slot) and
+                # pop_on_success untracks it in the same critical section that releases ownership,
+                # so there is nothing for this caller to do with the result.
+                self._reap_and_count(slot, require_tracked=True, pop_on_success=True)
             except Exception:
                 logger.exception("pool.reap_deferred_error slot_id=%s — quarantining", slot.slot_id)
 
