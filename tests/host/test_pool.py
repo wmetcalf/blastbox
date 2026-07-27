@@ -496,7 +496,8 @@ def test_5_liveness_race() -> None:
         assert dead_id in pool._deferred_reap
     assert dead_id not in rt.reaped        # not reaped on the claim path...
     pool.tick()
-    assert dead_id in rt.reaped            # ...disposed by the background tick instead
+    _join_reaper(pool)                     # disposal runs on the dedicated reaper thread
+    assert dead_id in rt.reaped            # ...disposed off the tick + claim paths instead
     assert dead_id not in pool._slots      # and untracked once disposed
 
 
@@ -1321,6 +1322,7 @@ def test_deferred_husk_does_not_stall_its_replacement_a_tick() -> None:
     assert slots[0].slot_id in pool._deferred_reap
 
     pool.tick()
+    _join_reaper(pool)                                 # disposal is async (own thread) — wait for it
     assert slots[0].slot_id in rt.reaped               # husk disposed...
     assert slots[0].slot_id not in pool._slots         # ...and untracked
     # ...and the replacement was spawned in the SAME tick (headroom freed first)
@@ -1340,3 +1342,104 @@ def test_stop_disposes_a_deferred_husk() -> None:
     assert slots[0].slot_id in pool._deferred_reap
     pool.stop()
     assert slots[0].slot_id in rt.reaped
+
+
+def _join_reaper(pool, timeout: float = 5.0) -> None:
+    """Wait for the dedicated deferred-reap thread (issue #75 disposal is asynchronous)."""
+    t = pool._reaper_thread
+    if t is not None:
+        t.join(timeout)
+
+
+class _CachedLivenessRuntime(_FakeRuntime):
+    """The cloud shape: a CACHED background is_alive() vs a FRESH is_alive_for_claim().
+
+    This is why the deferred disposal must NOT run on the tick thread: for a slot the provider
+    terminated inside the cache window, claim() — not _health_check — is the DISCOVERER, so putting
+    the (possibly wedged) reap on the tick loop would trade one stalled claim for a whole-tier stall.
+    """
+
+    def __init__(self, hang: threading.Event | None = None, probe_delay: float = 0.0) -> None:
+        super().__init__()
+        self.fresh_dead: set[str] = set()
+        self._hang = hang
+        self._probe_delay = probe_delay
+        # wedge the reap of exactly ONE slot (None = every fresh-dead slot), so a test can pin
+        # which disposal stalls instead of accidentally wedging stop()'s own reaps too.
+        self.hang_slot: str | None = None
+
+    def is_alive(self, slot: Slot) -> bool:          # background/tick view: still cached-alive
+        return True
+
+    def is_alive_for_claim(self, slot: Slot) -> bool:
+        if self._probe_delay:
+            time.sleep(self._probe_delay)
+        return slot.slot_id not in self.fresh_dead
+
+    def reap(self, slot: Slot) -> None:
+        wedge = (slot.slot_id == self.hang_slot) if self.hang_slot else (slot.slot_id in self.fresh_dead)
+        if self._hang is not None and wedge:
+            self._hang.wait(20)                       # wedged disposal
+        super().reap(slot)
+
+
+def test_pool_keeps_serving_while_a_deferred_reap_is_wedged() -> None:
+    # issue #75 (review finding): the disposal must run on its OWN thread, not the tick loop.
+    # Otherwise a wedged reap stalls promotion/spawn/health-check and the whole warm tier goes
+    # down — strictly worse than the single stalled claim thread the fix set out to remove.
+    hang = threading.Event()
+    rt = _CachedLivenessRuntime(hang=hang)
+    pool = WarmPool(runtime=rt, warm_size=2, spawn_rate_limit=100.0, poll_interval=0.02)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    slots = list(pool._slots.values())
+    rt.fresh_dead.add(slots[0].slot_id)               # dead only to the FRESH hand-out check
+    pool.start()
+    try:
+        assert pool.claim(timeout_s=1.0) is not None  # defers the husk, hands out the healthy slot
+        time.sleep(0.4)                               # ticks run while the reaper is wedged
+        # the tier is STILL serving: maintenance ran and a replacement is available
+        assert pool.claim(timeout_s=1.0) is not None, "pool stopped serving while a reap was wedged"
+    finally:
+        hang.set()
+        pool.stop()
+
+
+def test_claim_scan_is_bounded_when_every_probe_stalls() -> None:
+    # issue #75 (review finding): the hand-out probe (is_alive_for_claim) is itself a remote call —
+    # up to cli_timeout_s on the cloud tiers. N dead slots must not hold the caller (and its
+    # warm-gate reservation, #72) for N x probe. The rescan is deadline-bounded with a grace floor.
+    rt = _CachedLivenessRuntime(probe_delay=0.4)
+    pool = WarmPool(runtime=rt, warm_size=4, concurrent_ceiling=4, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    for s in pool._slots.values():
+        rt.fresh_dead.add(s.slot_id)                  # every slot dead at hand-out
+    t0 = time.monotonic()
+    assert pool.claim(timeout_s=0.05) is None
+    elapsed = time.monotonic() - t0
+    # grace (1.0s) + at most one in-flight probe — NOT 4 x 0.4s of unbounded scanning
+    assert elapsed < pool._SCAN_GRACE_S + 1.0, f"claim scan ran away: {elapsed:.2f}s"
+    pool.stop()
+
+
+def test_stop_racing_the_reaper_does_not_double_terminate() -> None:
+    # issue #75 (review finding): the reaper must re-check membership UNDER THE LOCK before each
+    # disposal. Reaping from a stale snapshot let stop() pop a slot the reaper then terminated a
+    # SECOND time (a double control-plane terminate against a possibly-recycled id).
+    hang = threading.Event()
+    rt = _CachedLivenessRuntime(hang=hang)
+    pool = WarmPool(runtime=rt, warm_size=3, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    slots = list(pool._slots.values())
+    for s in slots[:2]:
+        rt.fresh_dead.add(s.slot_id)                  # two husks; the reaper wedges on the first
+    rt.hang_slot = slots[0].slot_id                   # ONLY the first wedges (stop() must stay free)
+    pool._try_claim_one()
+    pool._reap_deferred()
+    time.sleep(0.2)
+    pool.stop()                                       # reaps+pops everything while the reaper hangs
+    hang.set()
+    _join_reaper(pool)
+    assert len(rt.reaped) == len(set(rt.reaped)), f"double-terminated: {rt.reaped}"
