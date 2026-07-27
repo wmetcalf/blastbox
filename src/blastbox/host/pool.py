@@ -461,10 +461,13 @@ class WarmPool:
         ready = self._runtime_ready()
         self._promote_warming()
         self._health_check()
+        # BEFORE _spawn_to_deficit: a husk claim() deferred (issue #75) still occupies one slot of
+        # `concurrent_ceiling` headroom, so disposing it here lets THIS tick spawn the replacement
+        # instead of stalling it a full tick on a pool sitting at its ceiling.
+        self._reap_deferred()
         self._update_burst(ready)
         self._spawn_to_deficit(ready)
         self._reap_surplus()
-        self._reap_deferred()
         self._sample_metrics()
 
     def _reap_deferred(self) -> None:

@@ -1304,3 +1304,39 @@ def test_claim_not_blocked_by_a_hung_dead_slot_reap() -> None:
     finally:
         release.set()
         t.join(5)
+
+
+def test_deferred_husk_does_not_stall_its_replacement_a_tick() -> None:
+    # issue #75 follow-through: a husk claim() deferred still occupies one slot of
+    # concurrent_ceiling headroom, so _reap_deferred must run BEFORE _spawn_to_deficit — else a
+    # pool sitting at its ceiling spawns the replacement a whole tick late.
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=2, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    slots = list(pool._slots.values())
+    for s in slots:
+        s.state = SlotState.IDLE
+    rt.set_alive(slots[0].slot_id, False)
+    assert pool._try_claim_one() is not None          # hands out the healthy one, defers the dead
+    assert slots[0].slot_id in pool._deferred_reap
+
+    pool.tick()
+    assert slots[0].slot_id in rt.reaped               # husk disposed...
+    assert slots[0].slot_id not in pool._slots         # ...and untracked
+    # ...and the replacement was spawned in the SAME tick (headroom freed first)
+    assert len(pool._slots) == 2, {s.slot_id: s.state for s in pool._slots.values()}
+
+
+def test_stop_disposes_a_deferred_husk() -> None:
+    # a husk awaiting its deferred reap must NOT survive shutdown (that would leak a live VM).
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=2, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    slots = list(pool._slots.values())
+    for s in slots:
+        s.state = SlotState.IDLE
+    rt.set_alive(slots[0].slot_id, False)
+    pool._try_claim_one()
+    assert slots[0].slot_id in pool._deferred_reap
+    pool.stop()
+    assert slots[0].slot_id in rt.reaped
