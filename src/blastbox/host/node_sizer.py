@@ -126,7 +126,7 @@ class PoolSpec:
     name: str
     slot_ram_mib: float                  # RAM footprint of a single slot (microVM)
     slot_vcpus: float = 1.0              # vCPU footprint of a single slot
-    demand: float = 0.0                  # current wantedness (busy slots + pressure)
+    demand: float = 0.0                  # current wantedness (busy slots + pressure) — drives ceiling
     min_warm: int = 0                    # guaranteed warm floor (latency baseline)
     max_ceiling: int = 64               # per-engine hard cap (never exceed regardless of budget)
     reserved: int = 0                    # slots this pool is ALREADY consuming (resident warm +
@@ -134,6 +134,14 @@ class PoolSpec:
                                          # must not hand this pool fewer slots than it's physically
                                          # running, or a peer would grow into capacity that's still
                                          # in use (resize() shrinks setpoints; VMs drain later).
+    queued: float = 0.0                  # QUEUED backlog only (jobs waiting for a slot NOW). Drives
+                                         # the min_warm floor demand-tier: a pool running a job but
+                                         # with an empty queue (demand>0 via `assigned`, queued==0)
+                                         # is NOT competing for more warm floor, so it must not
+                                         # out-tier a truly-backlogged pool. Defaults to 0 (idle).
+                                         # LAST field (not inserted mid-list) so positional callers
+                                         # of the older signature keep binding min_warm/max_ceiling/
+                                         # reserved correctly (escalation review).
 
 
 @dataclass(frozen=True)
@@ -166,7 +174,7 @@ def plan_sizes(specs: list[PoolSpec], budget: NodeBudget) -> dict[str, PoolSize]
     specs = [
         s if (s.slot_ram_mib > 0 and s.slot_vcpus > 0)
         else PoolSpec(name=s.name, slot_ram_mib=max(s.slot_ram_mib, 1.0),
-                      slot_vcpus=max(s.slot_vcpus, 0.01), demand=s.demand,
+                      slot_vcpus=max(s.slot_vcpus, 0.01), demand=s.demand, queued=s.queued,
                       min_warm=s.min_warm, max_ceiling=s.max_ceiling, reserved=s.reserved)
         for s in specs
     ]
@@ -221,14 +229,16 @@ def plan_sizes(specs: list[PoolSpec], budget: NodeBudget) -> dict[str, PoolSize]
                  if alloc[s.name] < min(s.min_warm, s.max_ceiling) and budget_has_room(s)]
         if not below:
             break
-        # DEMAND TIER (adversarial-review fix): seat pools that HAVE demand before idle ones — the
-        # engine with jobs NOW keeps its floor before an IDLE neighbour's speculative floor, else a
-        # demand=0 pool with a large min_warm would starve a busy small-floor pool below ITS floor
-        # (re-wedging the busy engine). Within a tier: most-starved-by-fraction first (proportional
-        # shrink); ties break by demand then name (deterministic across dispatchers).
-        pick = min(below, key=lambda s: (0 if s.demand > 0 else 1,
+        # BACKLOG TIER (adversarial-review fix): seat pools with QUEUED work before idle ones — the
+        # engine with jobs waiting for a slot NOW keeps its floor before an idle neighbour's
+        # speculative floor, else an idle pool with a large min_warm would starve a busy small-floor
+        # pool below ITS floor (re-wedging the busy engine). Tier on `queued` (backlog), NOT `demand`:
+        # `demand` includes `assigned` (in-flight jobs), so a pool merely RUNNING a job with an empty
+        # queue would falsely out-tier a truly-backlogged neighbour. Within a tier: most-starved-by-
+        # fraction first (proportional shrink); ties break by queued/demand then name (deterministic).
+        pick = min(below, key=lambda s: (0 if s.queued > 0 else 1,
                                          alloc[s.name] / min(s.min_warm, s.max_ceiling),
-                                         -s.demand, s.name))
+                                         -s.queued, -s.demand, s.name))
         alloc[pick.name] += 1
         used_ram += pick.slot_ram_mib
         used_vcpu += pick.slot_vcpus

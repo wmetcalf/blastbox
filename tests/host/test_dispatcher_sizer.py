@@ -1762,3 +1762,34 @@ def test_sizer_no_floor_warning_when_floors_fit(tmp_path, caplog):
             red.tick()
 
     assert not [r for r in caplog.records if "blastbox#68" in r.getMessage()]
+
+
+def test_no_floor_warning_for_cold_only_dispatcher(tmp_path, caplog):
+    # issue #68 (escalation review): a cold-only dispatcher (pool=None, runtime=cold) applies warm=0
+    # regardless of a misconfigured min_warm>0 — so even when unseatable_floors flags its cold
+    # ceiling below that floor, it must NOT emit the warm-shrink warning (wrong semantics for cold).
+    import logging
+
+    share = FileNodeShare(str(tmp_path))
+    cap = _budget(7000, 999)                    # tight: can't seat the cold floor
+    common = dict(balancing=True, resource_management=True, stale_after_s=1e9,
+                  ram_headroom_frac=1.0, vcpu_oversubscription=999)
+    cold = DispatcherSizer(
+        EngineNode("cold", "-", slot_ram_mib=4096, max_ceiling=64, min_warm=5),
+        None, share, NodeConfig(**common),      # pool=None → cold-only
+        runtime="cold", backlog_fn=lambda: 0, node="n", instance="c",
+        capacity_fn=cap, clock=lambda: 1000.0)
+    fc = DispatcherSizer(
+        EngineNode("fc", "-", slot_ram_mib=2048, max_ceiling=64, min_warm=2),
+        _Pool(), share, NodeConfig(**common),
+        runtime=RUNTIME_FIRECRACKER, backlog_fn=lambda: 50, node="n", instance="f",
+        capacity_fn=cap, clock=lambda: 1000.0)
+
+    with caplog.at_level(logging.WARNING, logger="blastbox.node_sizer"):
+        for _ in range(3):
+            fc.tick()
+            cold.tick()
+
+    cold_warns = [r.getMessage() for r in caplog.records
+                  if "blastbox#68" in r.getMessage() and "engine=cold" in r.getMessage()]
+    assert not cold_warns, cold_warns
