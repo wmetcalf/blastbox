@@ -563,12 +563,9 @@ class WarmPool:
             reaped = False
             try:
                 # require_tracked closes the stop()-race: never re-terminate a popped slot.
-                reaped = self._reap_and_count(slot, require_tracked=True)
+                reaped = self._reap_and_count(slot, require_tracked=True, pop_on_success=True)
             except Exception:
                 logger.exception("pool.reap_deferred_error slot_id=%s — quarantining", slot.slot_id)
-            if reaped:
-                with self._lock:
-                    self._slots.pop(slot.slot_id, None)
 
     def _reap_surplus(self) -> None:
         """Reap IDLE slots above the (possibly just-lowered) effective target, so a
@@ -615,7 +612,7 @@ class WarmPool:
         return True
 
     def _reap_and_count(self, slot: "Slot", *, dirty: bool = False,
-                        require_tracked: bool = False) -> bool:
+                        require_tracked: bool = False, pop_on_success: bool = False) -> bool:
         """Reap a slot via the runtime and count the disposal (metrics). ``dirty`` (from a failed
         release) is forwarded to a reap() that accepts it, so a reusing runtime can quarantine.
 
@@ -647,6 +644,13 @@ class WarmPool:
         finally:
             record_slot_reaped()
             with self._lock:
+                # pop_on_success: untrack the slot in the SAME critical section that releases
+                # ownership. Otherwise there is a window where the slot is still tracked but no
+                # longer owned, and a concurrent stop() would terminate it a SECOND time (duplicate
+                # control-plane call + double reap accounting). Callers that must keep a husk
+                # tracked on failure (the quarantine policy) leave this False and pop themselves.
+                if pop_on_success:
+                    self._slots.pop(slot.slot_id, None)
                 self._reaping.discard(slot.slot_id)
         return True
 

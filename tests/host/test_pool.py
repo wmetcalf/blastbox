@@ -1631,3 +1631,19 @@ def test_stop_budget_is_shared_between_tick_thread_and_reaper() -> None:
     finally:
         hang.set()
         _join_reaper(pool)
+
+
+def test_successful_reap_pops_under_the_ownership_lock() -> None:
+    # issue #75 (review): _reap_and_count released reap ownership (_reaping) and only THEN did the
+    # caller pop _slots. In that window the slot is tracked but unowned, so a concurrent stop()
+    # would terminate it a SECOND time. pop_on_success closes it by untracking in the same critical
+    # section that releases ownership.
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+
+    assert pool._reap_and_count(slot, pop_on_success=True) is True
+    with pool._lock:
+        assert slot.slot_id not in pool._slots      # untracked atomically with the ownership release
+        assert slot.slot_id not in pool._reaping
