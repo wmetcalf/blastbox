@@ -574,3 +574,22 @@ def test_poolspec_positional_binding_stable():
     s = PoolSpec("x", 1024.0, 1.0, 5.0, 2, 10, 3)   # name, ram, vcpus, demand, min_warm, max_ceiling, reserved
     assert (s.demand, s.min_warm, s.max_ceiling, s.reserved) == (5.0, 2, 10, 3)
     assert s.queued == 0.0                            # new trailing field defaults
+
+
+def test_drained_pool_self_heals_to_its_floor_under_light_load():
+    # issue #70: after a full drain (every warm slot idle-retired), a LIGHT job stream must
+    # re-warm the pool on the next tick — no restart needed. The mechanism is the min_warm floor:
+    # warm = max(min_warm, ceil(demand)), so a single queued job is enough to pull the pool back
+    # to its floor. (The original "needs a manual bounce" symptom was the floor being clamped to 1
+    # by the over-subscription starvation bug, not a missing re-warm path — see #68.)
+    budget = NodeBudget(ram_mib=53_000, vcpus=999)
+    drained = _sz("redtusk", ram=2048, demand=1, min_warm=8, queued=1)   # 0 resident, 1 queued job
+    idle_neighbor = _sz("clippyshot", ram=4096, demand=0, min_warm=12, queued=0)
+
+    plan = plan_sizes([drained, idle_neighbor], budget)
+    assert plan["redtusk"].warm_size >= 8, plan        # back to its floor off a SINGLE queued job
+
+    # ...and even while a busy neighbour contends, it re-warms to a functional pool (not 1).
+    busy_neighbor = _sz("clippyshot", ram=4096, demand=40, min_warm=12, queued=40)
+    contended = plan_sizes([drained, busy_neighbor], budget)
+    assert contended["redtusk"].warm_size >= 4, contended

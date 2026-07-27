@@ -488,8 +488,16 @@ def test_5_liveness_race() -> None:
         f"claim handed out dead slot {dead_id} instead of live {live_id}"
     )
 
-    # Dead slot should have been reaped (or dropped)
-    assert dead_id in rt.reaped
+    # Dead slot must be unclaimable immediately, but its disposal is DEFERRED to the tick
+    # (issue #75: claim() never reaps inline — a wedged reap would block the claim path and, with
+    # the warm-only gate, hold a slot reservation that locks peers out of healthy slots).
+    with pool._lock:
+        assert pool._slots[dead_id].state == SlotState.DRAINING   # can't be handed out again
+        assert dead_id in pool._deferred_reap
+    assert dead_id not in rt.reaped        # not reaped on the claim path...
+    pool.tick()
+    assert dead_id in rt.reaped            # ...disposed by the background tick instead
+    assert dead_id not in pool._slots      # and untracked once disposed
 
 
 # ---------------------------------------------------------------------------
@@ -1258,3 +1266,41 @@ def test_reap_surplus_leaves_assigned_slots_untouched() -> None:
     pool.tick()                                       # reap surplus IDLE, NOT the assigned one
     assert claimed.slot_id in pool._slots             # the in-flight slot survives
     assert claimed.slot_id not in rt.reaped
+
+
+def test_claim_not_blocked_by_a_hung_dead_slot_reap() -> None:
+    # issue #75: claim(timeout_s=) bounded only the wait-for-idle, NOT the dead-slot reap inside
+    # _try_claim_one — a wedged reap (hung runsc/virsh destroy) made claim() block far past its
+    # timeout. With the #72 warm-only gate that also holds a slot reservation, so peers are gated
+    # off HEALTHY slots. claim() must never block on a reap: defer it to the background tick.
+    release = threading.Event()
+
+    class _HungReapRuntime(_FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reap_entered = threading.Event()
+
+        def reap(self, slot: Slot) -> None:
+            self.reap_entered.set()
+            release.wait(30)          # wedged disposal
+            super().reap(slot)
+
+    rt = _HungReapRuntime()
+    pool = WarmPool(runtime=rt, warm_size=2, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    slots = list(pool._slots.values())
+    for s in slots:
+        s.state = SlotState.IDLE
+    rt.set_alive(slots[0].slot_id, False)      # first candidate is dead -> triggers the reap path
+
+    got: list = []
+    t = threading.Thread(target=lambda: got.append(pool.claim(timeout_s=0.5)), daemon=True)
+    t.start()
+    t.join(10)
+    try:
+        assert not t.is_alive(), "claim() blocked on the hung dead-slot reap (issue #75)"
+        # and it still hands out the OTHER, healthy slot rather than failing the caller
+        assert got and got[0] is not None and got[0].slot_id == slots[1].slot_id
+    finally:
+        release.set()
+        t.join(5)

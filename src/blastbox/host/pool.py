@@ -214,6 +214,10 @@ class WarmPool:
         # Background thread
         self._stop_event = threading.Event()
         self._reaping: set[str] = set()   # slot_ids currently being disposed (dedupe concurrent reaps)
+        # slot_ids claim() found DEAD and demoted to DRAINING but deliberately did NOT reap inline
+        # (issue #75): a wedged reap must never block the claim path (it would also hold a warm-only
+        # gate reservation and lock peers out of HEALTHY slots). tick() disposes these instead.
+        self._deferred_reap: set[str] = set()
         self._thread: threading.Thread | None = None
 
         # Burst demand tracking — all access under _lock
@@ -460,7 +464,31 @@ class WarmPool:
         self._update_burst(ready)
         self._spawn_to_deficit(ready)
         self._reap_surplus()
+        self._reap_deferred()
         self._sample_metrics()
+
+    def _reap_deferred(self) -> None:
+        """Dispose slots claim() found dead and deferred (issue #75).
+
+        claim() never reaps inline — a wedged reap would block the claim path (and hold a warm-only
+        gate reservation). It demotes the husk to DRAINING and records it here; this tick-side pass
+        does the (possibly slow) disposal off the claim path. Scoped to exactly those ids, so
+        DRAINING slots owned by release()/stop()/_reap_surplus — or quarantined after a reap that
+        RAISED — are untouched. A reap that raises here keeps the slot tracked (quarantined) and
+        drops it from the deferred set, matching every other reap path: never re-terminate a
+        resource whose disposal already failed."""
+        with self._lock:
+            pending = [self._slots[sid] for sid in list(self._deferred_reap) if sid in self._slots]
+            self._deferred_reap.clear()
+        for slot in pending:
+            reaped = False
+            try:
+                reaped = self._reap_and_count(slot)   # False = another thread owns it -> don't pop
+            except Exception:
+                logger.exception("pool.reap_deferred_error slot_id=%s — quarantining", slot.slot_id)
+            if reaped:
+                with self._lock:
+                    self._slots.pop(slot.slot_id, None)
 
     def _reap_surplus(self) -> None:
         """Reap IDLE slots above the (possibly just-lowered) effective target, so a
@@ -668,9 +696,16 @@ class WarmPool:
     def _try_claim_one(self) -> Slot | None:
         """Scan for an IDLE slot, flip to ASSIGNED inside the lock.
 
-        If the chosen slot is dead: demote to DRAINING, reap+remove outside
-        the lock (a new slot will be spawned by next tick), and retry.
-        Returns the ASSIGNED slot, or None if no live IDLE slot exists.
+        If the chosen slot is dead: demote to DRAINING and DEFER its disposal to the background
+        tick (``_reap_deferred``), then retry the scan. Returns the ASSIGNED slot, or None if no
+        live IDLE slot exists.
+
+        Issue #75 — the claim path never reaps: a wedged ``runtime.reap`` (hung ``runsc delete`` /
+        ``virsh destroy``) used to run INLINE here, so ``claim(timeout_s=)`` — which only bounded
+        the wait-for-idle between scans — could block far past its timeout. With the warm-only gate
+        (issue #72) that call also holds a slot reservation, locking peers out of HEALTHY slots.
+        Deferring keeps claim bounded; the slot is already DRAINING so it is unclaimable meanwhile,
+        and ``_spawn_to_deficit`` (which ignores DRAINING) still spawns its replacement.
         """
         while True:
             # Find a candidate inside the lock
@@ -702,26 +737,22 @@ class WarmPool:
             if alive:
                 return candidate
 
-            # Slot was dead — demote it and spawn a replacement
-            logger.warning("pool.claim_found_dead_slot slot_id=%s", candidate.slot_id)
+            # Slot was dead — demote it (unclaimable from here) and hand the disposal to the
+            # background tick. NO inline reap: see the docstring (issue #75). DRAINING is excluded
+            # from _spawn_to_deficit's count, so the replacement still spawns on the next tick even
+            # while this husk is awaiting its (possibly slow) reap.
+            logger.warning("pool.claim_found_dead_slot slot_id=%s (reap deferred to tick)",
+                           candidate.slot_id)
             with self._lock:
                 candidate.state = SlotState.DRAINING
+                self._deferred_reap.add(candidate.slot_id)
 
-            # Reap + remove (best-effort; don't crash claim on failure). If reap RAISES (could not
-            # dispose the worker — e.g. a libvirt VM whose `virsh destroy` failed and may still run),
-            # do NOT pop: keep it quarantined/tracked, like release(), so a live worker isn't orphaned
-            # off the books while a replacement spawns.
-            reaped = False
-            try:
-                reaped = self._reap_and_count(candidate)   # False = another thread owns it -> don't pop
-            except Exception:
-                logger.exception("pool.reap_dead_slot_error slot_id=%s — quarantining", candidate.slot_id)
-            finally:
-                if reaped:
-                    with self._lock:
-                        self._slots.pop(candidate.slot_id, None)
-
-            # Loop: try to find another IDLE slot
+            # Loop: try to find another IDLE slot. TERMINATION: every iteration either returns a
+            # slot, returns None (no IDLE candidate left), or moves exactly one slot out of IDLE
+            # (→DRAINING) — so the rescan is bounded by the IDLE-slot count and cannot spin. That
+            # bound is what deferring the reap buys: the unbounded part was the disposal, not the
+            # scan, so claim() needs no deadline of its own here (and must NOT take one, or a
+            # claim(timeout_s=0) would abandon a HEALTHY slot sitting behind a dead one).
 
     def _promote_warming(self) -> None:
         """Promote WARMING slots to IDLE when is_ready() returns True."""
