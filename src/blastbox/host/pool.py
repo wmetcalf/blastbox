@@ -291,6 +291,10 @@ class WarmPool:
         if stop_timeout_s is None:
             stop_timeout_s = self._default_stop_budget()
         thread_wedged = False        # a spawn still in flight past the timeout — an untracked orphan
+        # ONE budget for the whole shutdown, shared by the tick-thread join AND the reaper join
+        # below — otherwise a hung spawn followed by a hung reap costs 2 x stop_timeout_s, and the
+        # caller's timeout stops meaning what it says.
+        stop_deadline = self._clock() + stop_timeout_s
         self._stop_event.set()
         if self._thread is not None:
             # Fast path returns immediately when the daemon has already exited (no spawn in flight).
@@ -311,11 +315,10 @@ class WarmPool:
         # below CANNOT cover that slot — _reap_and_count's ownership guard makes it skip whatever the
         # reaper already owns — so waiting here is the only thing that disposes it. Past the budget we
         # log and proceed, exactly like the wedged-spawn case above.
-        deadline = self._clock() + stop_timeout_s
         for reaper in list(self._reaper_threads):
             if not reaper.is_alive():
                 continue
-            reaper.join(timeout=max(0.0, deadline - self._clock()))
+            reaper.join(timeout=max(0.0, stop_deadline - self._clock()))
             if reaper.is_alive():
                 # NOTE: do NOT set thread_wedged here. That flag adds +1 to the orphan count for the
                 # wedged-SPAWN case, whose slot is NOT yet in _slots and so is invisible to the

@@ -1606,3 +1606,28 @@ def test_stop_clears_the_deferred_queue_so_a_restart_cannot_re_terminate() -> No
         pool._deferred_reap.add(slot.slot_id)
     pool.stop(stop_timeout_s=1.0)
     assert slot.slot_id not in pool._deferred_reap
+
+
+def test_stop_budget_is_shared_between_tick_thread_and_reaper() -> None:
+    # issue #75 (review): the reaper join must draw on the SAME shutdown budget as the tick-thread
+    # join. Giving it a second full stop_timeout_s meant a hung spawn followed by a hung reap cost
+    # 2x the caller's timeout — so the timeout stopped meaning what it says.
+    hang = threading.Event()
+    rt = _CachedLivenessRuntime(hang=hang)
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    slot = next(iter(pool._slots.values()))
+    rt.fresh_dead.add(slot.slot_id)
+    rt.hang_slot = slot.slot_id
+    pool._try_claim_one()
+    pool._reap_deferred()
+    time.sleep(0.2)
+    try:
+        t0 = time.monotonic()
+        pool.stop(stop_timeout_s=0.5)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.5, f"shutdown took {elapsed:.2f}s on a 0.5s budget (double-charged?)"
+    finally:
+        hang.set()
+        _join_reaper(pool)
