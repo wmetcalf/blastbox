@@ -214,6 +214,20 @@ class WarmPool:
         # Background thread
         self._stop_event = threading.Event()
         self._reaping: set[str] = set()   # slot_ids currently being disposed (dedupe concurrent reaps)
+        # slot_ids claim() found DEAD and demoted to DRAINING but deliberately did NOT reap inline
+        # (issue #75): a wedged reap must never block the claim path (it would also hold a warm-only
+        # gate reservation and lock peers out of HEALTHY slots). Disposed by a DEDICATED reaper
+        # thread — never the tick loop: claim() is the *discoverer* of a slot the cloud terminated
+        # inside is_alive()'s cache window (it uses the fresh is_alive_for_claim, _health_check the
+        # cached is_alive), so putting the disposal on the tick thread would trade a one-thread
+        # stall for a whole-tier outage (no promote/spawn/health-check while a reap hangs).
+        self._deferred_reap: set[str] = set()
+        # Bounded pool of disposal threads. Parallel because a MASS slot death (spot reclamation /
+        # AZ event terminating the fleet inside is_alive()'s cache window) is exactly what this path
+        # exists for: draining N husks serially would stall a ceiling-bound tier for N x reap
+        # latency, whereas pre-#75 each claim thread reaped its own dead slot concurrently. Bounded
+        # so a mass death can't spawn an unbounded thread fan-out.
+        self._reaper_threads: list[threading.Thread] = []
         self._thread: threading.Thread | None = None
 
         # Burst demand tracking — all access under _lock
@@ -277,6 +291,10 @@ class WarmPool:
         if stop_timeout_s is None:
             stop_timeout_s = self._default_stop_budget()
         thread_wedged = False        # a spawn still in flight past the timeout — an untracked orphan
+        # ONE budget for the whole shutdown, shared by the tick-thread join AND the reaper join
+        # below — otherwise a hung spawn followed by a hung reap costs 2 x stop_timeout_s, and the
+        # caller's timeout stops meaning what it says.
+        stop_deadline = self._clock() + stop_timeout_s
         self._stop_event.set()
         if self._thread is not None:
             # Fast path returns immediately when the daemon has already exited (no spawn in flight).
@@ -292,6 +310,26 @@ class WarmPool:
                 thread_wedged = True
             self._thread = None
 
+        # Join the DEFERRED REAPER within the same budget (issue #75 review): it is a daemon, so if
+        # the process exits while it is mid-terminate the worker is leaked. stop()'s own reap loop
+        # below CANNOT cover that slot — _reap_and_count's ownership guard makes it skip whatever the
+        # reaper already owns — so waiting here is the only thing that disposes it. Past the budget we
+        # log and proceed, exactly like the wedged-spawn case above.
+        for reaper in list(self._reaper_threads):
+            if not reaper.is_alive():
+                continue
+            reaper.join(timeout=max(0.0, stop_deadline - self._clock()))
+            if reaper.is_alive():
+                # NOTE: do NOT set thread_wedged here. That flag adds +1 to the orphan count for the
+                # wedged-SPAWN case, whose slot is NOT yet in _slots and so is invisible to the
+                # len(_slots) tally below. A wedged REAPER's slot is the opposite: it is still
+                # tracked (the reaper only pops after a successful reap, and stop()'s own loop skips
+                # it because _reaping ownership makes _reap_and_count return False), so it is already
+                # counted. Adding +1 would report a phantom orphan and make the caller hold a
+                # node-budget reservation for capacity that does not exist.
+                logger.warning("pool.stop: deferred reaper still running after %.0fs (wedged reap?) — "
+                               "proceeding; that worker may leak until its TTL", stop_timeout_s)
+
         # Reap every slot regardless of state. Pop each ONLY after a successful reap: if reap RAISES
         # (e.g. a libvirt VM whose `virsh destroy` failed during a rolling restart), KEEP it tracked —
         # else the still-running domain (with its overlay + egress rules) is forgotten outside pool
@@ -301,13 +339,23 @@ class WarmPool:
         # snapshotting to_reap and reaping must not be handed a slot stop() is about to dispose. After
         # this, reap failures simply leave the (already-DRAINING) husk tracked for manual cleanup.
         with self._lock:
+            # Drop the deferred queue: stop() disposes every tracked slot itself below, and a slot
+            # whose reap RAISES stays tracked as a QUARANTINED husk. Leaving its id queued would let
+            # a restarted pool's first tick re-terminate a resource whose disposal already failed —
+            # exactly what _drain_deferred_reaps' contract forbids.
+            self._deferred_reap.clear()
             to_reap = list(self._slots.values())
             for slot in to_reap:
                 slot.state = SlotState.DRAINING
 
         for slot in to_reap:
             try:
-                disposed = self._reap_and_count(slot)
+                # require_tracked: after a reaper-join TIMEOUT this list is a snapshot — a reaper
+                # may have disposed+popped a slot since. Verifying membership in the same critical
+                # section that takes ownership stops a SECOND terminate on that worker. A False
+                # return leaves nothing to pop and the slot is already out of _slots, so it is
+                # correctly NOT counted as an orphan below.
+                disposed = self._reap_and_count(slot, require_tracked=True)
             except Exception:
                 logger.exception("pool.reap_error_on_stop slot_id=%s — quarantining (still DRAINING, "
                                  "never claimable)", slot.slot_id)
@@ -338,7 +386,7 @@ class WarmPool:
         deadline = self._clock() + timeout_s
 
         while True:
-            slot = self._try_claim_one()
+            slot = self._try_claim_one(deadline)
             if slot is not None:
                 return slot
 
@@ -409,7 +457,7 @@ class WarmPool:
         reaped = False
         try:
             # forward dirty so a reusing runtime can quarantine; False = another thread owns the reap
-            reaped = self._reap_and_count(slot, dirty=dirty)
+            reaped = self._reap_and_count(slot, dirty=dirty, require_tracked=True, pop_on_success=True)
         except Exception:
             # reap() raises when it could NOT dispose the worker (e.g. a libvirt VM whose `virsh
             # destroy` failed and may still be running). Do NOT pop the slot: keep it tracked
@@ -436,7 +484,7 @@ class WarmPool:
             slot.state = SlotState.DRAINING  # unclaimable from here, even if the reap is slow
         reaped = False
         try:
-            reaped = self._reap_and_count(slot)   # False = another thread owns the reap -> don't pop
+            reaped = self._reap_and_count(slot, require_tracked=True, pop_on_success=True)   # False = another thread owns it, or it is already gone
         except Exception:
             logger.exception("pool.retire_reap_error slot_id=%s — quarantining (worker may persist)",
                              slot.slot_id)
@@ -457,10 +505,73 @@ class WarmPool:
         ready = self._runtime_ready()
         self._promote_warming()
         self._health_check()
+        # Kick the deferred reaper EARLY so its (asynchronous) disposal overlaps the rest of the
+        # tick. NOTE: it does NOT free `concurrent_ceiling` headroom for this tick's
+        # _spawn_to_deficit — the husk stays tracked until the reaper thread actually disposes it,
+        # so on a pool sitting exactly at its ceiling the replacement spawns on a LATER tick. That
+        # is deliberate: a husk whose disposal has not been confirmed may still be a live worker
+        # holding node RAM, and this file's policy is to keep counting it (see _spawn_to_deficit's
+        # headroom + the quarantine comments) rather than risk over-committing the node.
+        self._reap_deferred()
         self._update_burst(ready)
         self._spawn_to_deficit(ready)
         self._reap_surplus()
         self._sample_metrics()
+
+    _MAX_REAPERS = 4          # concurrent disposal threads (bounds a mass-death fan-out)
+
+    def _reap_deferred(self) -> None:
+        """Kick the DEDICATED reaper thread for slots claim() found dead and deferred (issue #75).
+
+        Never disposes inline. claim() must not reap (a wedged reap would block the claim path and
+        hold a warm-only gate reservation, #72) — and neither must the tick loop: for the cloud
+        tiers, claim() is the *discoverer* of a slot terminated inside is_alive()'s cache window
+        (claim uses the fresh ``is_alive_for_claim``, ``_health_check`` the cached ``is_alive``), so
+        disposing here would turn a single stalled claim thread into a whole-tier outage — no
+        promotion, no spawn-to-deficit, no health eviction, no metrics — for as long as the reap
+        hangs. So the (possibly wedged) disposal runs on its own thread.
+
+        At most ONE reaper is in flight: if a previous batch is still wedged, the ids simply stay
+        queued and are drained when it finishes. stop() reaps every tracked slot regardless, so a
+        wedged reaper can never leak a live worker past shutdown."""
+        with self._lock:
+            self._reaper_threads = [t for t in self._reaper_threads if t.is_alive()]
+            want = min(len(self._deferred_reap), self._MAX_REAPERS - len(self._reaper_threads))
+            if want <= 0:
+                return                      # queue empty, or every reaper slot is busy/wedged
+            for _ in range(want):
+                t = threading.Thread(target=self._drain_deferred_reaps,
+                                     name="blastbox-pool-reaper", daemon=True)
+                self._reaper_threads.append(t)
+                # START INSIDE the lock: a created-but-not-yet-started thread reports
+                # is_alive()==False, so releasing first would let a concurrent tick see fewer live
+                # reapers and over-spawn past _MAX_REAPERS. start() does not take _lock — the new
+                # thread just blocks on its first acquisition until we release here.
+                t.start()
+
+    def _drain_deferred_reaps(self) -> None:
+        """Dispose every queued husk, one at a time, off the tick + claim paths.
+
+        Scoped to ids claim() deferred, so DRAINING slots owned by release()/stop()/_reap_surplus —
+        or quarantined after a reap that RAISED — are untouched. A reap that raises keeps the slot
+        tracked (quarantined) and drops it from the queue, matching every other reap path: never
+        re-terminate a resource whose disposal already failed."""
+        while True:
+            with self._lock:
+                if not self._deferred_reap:
+                    return
+                slot_id = next(iter(self._deferred_reap))
+                self._deferred_reap.discard(slot_id)
+                slot = self._slots.get(slot_id)
+                if slot is None:
+                    continue                # already disposed+popped by stop()/another path
+            try:
+                # require_tracked closes the stop()-race (never re-terminate a popped slot) and
+                # pop_on_success untracks it in the same critical section that releases ownership,
+                # so there is nothing for this caller to do with the result.
+                self._reap_and_count(slot, require_tracked=True, pop_on_success=True)
+            except Exception:
+                logger.exception("pool.reap_deferred_error slot_id=%s — quarantining", slot.slot_id)
 
     def _reap_surplus(self) -> None:
         """Reap IDLE slots above the (possibly just-lowered) effective target, so a
@@ -491,7 +602,7 @@ class WarmPool:
         for slot in victims:
             reaped = False
             try:
-                reaped = self._reap_and_count(slot)   # False = another thread owns the reap
+                reaped = self._reap_and_count(slot, require_tracked=True, pop_on_success=True)
             except Exception:
                 logger.exception("pool.reap_surplus_error slot_id=%s — quarantining", slot.slot_id)
             if reaped:
@@ -506,7 +617,8 @@ class WarmPool:
             return bool(prepare())
         return True
 
-    def _reap_and_count(self, slot: "Slot", *, dirty: bool = False) -> bool:
+    def _reap_and_count(self, slot: "Slot", *, dirty: bool = False,
+                        require_tracked: bool = False, pop_on_success: bool = False) -> bool:
         """Reap a slot via the runtime and count the disposal (metrics). ``dirty`` (from a failed
         release) is forwarded to a reap() that accepts it, so a reusing runtime can quarantine.
 
@@ -523,15 +635,34 @@ class WarmPool:
         with self._lock:
             if slot.slot_id in self._reaping:
                 return False
+            # require_tracked: verify the slot is STILL tracked in the same critical section that
+            # takes ownership. The deferred reaper resolves its work list before reaping, so without
+            # this a stop() that disposed+popped the slot in between would be followed by a SECOND
+            # terminate on the same (possibly recycled) resource + a double reap metric (issue #75).
+            if require_tracked and slot.slot_id not in self._slots:
+                return False
             self._reaping.add(slot.slot_id)
+        disposed = False
         try:
             if self._reap_takes_dirty:
                 self._runtime.reap(slot, dirty=dirty)  # type: ignore[call-arg]
             else:
                 self._runtime.reap(slot)
+            disposed = True                 # ONLY a reap that RETURNED disposed the worker
         finally:
-            record_slot_reaped()
+            if disposed:
+                record_slot_reaped()   # count DISPOSALS, not attempts: a raising reap quarantines
             with self._lock:
+                # pop_on_success: untrack the slot in the SAME critical section that releases
+                # ownership. Otherwise there is a window where the slot is still tracked but no
+                # longer owned, and a concurrent stop() would terminate it a SECOND time (duplicate
+                # control-plane call + double reap accounting). Callers that must keep a husk
+                # tracked on failure (the quarantine policy) leave this False and pop themselves.
+                # `disposed` gate is essential: this is a FINALLY, so it also runs when reap()
+                # RAISED. Popping then would untrack a worker whose disposal FAILED and may still be
+                # running — exactly the orphan the quarantine policy exists to prevent.
+                if pop_on_success and disposed:
+                    self._slots.pop(slot.slot_id, None)
                 self._reaping.discard(slot.slot_id)
         return True
 
@@ -665,14 +796,33 @@ class WarmPool:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _try_claim_one(self) -> Slot | None:
+    # Grace floor for the claim rescan (issue #75): even at claim(timeout_s=0) the scan gets this
+    # long to step past dead slots and find a healthy one behind them. Small enough that a stalled
+    # remote probe can't hold the caller (or its warm-gate reservation) for long.
+    _SCAN_GRACE_S = 1.0
+
+    def _try_claim_one(self, deadline: float | None = None) -> Slot | None:
         """Scan for an IDLE slot, flip to ASSIGNED inside the lock.
 
-        If the chosen slot is dead: demote to DRAINING, reap+remove outside
-        the lock (a new slot will be spawned by next tick), and retry.
-        Returns the ASSIGNED slot, or None if no live IDLE slot exists.
+        If the chosen slot is dead: demote to DRAINING and DEFER its disposal to the background
+        tick (``_reap_deferred``), then retry the scan. Returns the ASSIGNED slot, or None if no
+        live IDLE slot exists.
+
+        Issue #75 — the claim path never reaps: a wedged ``runtime.reap`` (hung ``runsc delete`` /
+        ``virsh destroy``) used to run INLINE here, so ``claim(timeout_s=)`` — which only bounded
+        the wait-for-idle between scans — could block far past its timeout. With the warm-only gate
+        (issue #72) that call also holds a slot reservation, locking peers out of HEALTHY slots.
+        Deferring keeps claim bounded; the slot is already DRAINING so it is unclaimable meanwhile,
+        and ``_spawn_to_deficit`` (which ignores DRAINING) still spawns its replacement.
         """
+        scan_deadline = None if deadline is None else max(deadline, self._clock() + self._SCAN_GRACE_S)
         while True:
+            # Shutdown in progress: hand out NOTHING. stop() reaps every slot after its joins, so a
+            # slot claimed during that window would be destroyed mid-job; and a dead slot deferred
+            # here would repopulate the queue stop() just cleared, making a restarted pool
+            # re-terminate a husk whose disposal already failed. The caller requeues instead.
+            if self._stop_event.is_set():
+                return None
             # Find a candidate inside the lock
             with self._lock:
                 candidate: Slot | None = None
@@ -702,26 +852,28 @@ class WarmPool:
             if alive:
                 return candidate
 
-            # Slot was dead — demote it and spawn a replacement
-            logger.warning("pool.claim_found_dead_slot slot_id=%s", candidate.slot_id)
+            # Slot was dead — demote it (unclaimable from here) and hand the disposal to the
+            # background tick. NO inline reap: see the docstring (issue #75). DRAINING is excluded
+            # from _spawn_to_deficit's count, so the replacement still spawns on the next tick even
+            # while this husk is awaiting its (possibly slow) reap.
+            logger.warning("pool.claim_found_dead_slot slot_id=%s (reap deferred to tick)",
+                           candidate.slot_id)
             with self._lock:
                 candidate.state = SlotState.DRAINING
+                self._deferred_reap.add(candidate.slot_id)
 
-            # Reap + remove (best-effort; don't crash claim on failure). If reap RAISES (could not
-            # dispose the worker — e.g. a libvirt VM whose `virsh destroy` failed and may still run),
-            # do NOT pop: keep it quarantined/tracked, like release(), so a live worker isn't orphaned
-            # off the books while a replacement spawns.
-            reaped = False
-            try:
-                reaped = self._reap_and_count(candidate)   # False = another thread owns it -> don't pop
-            except Exception:
-                logger.exception("pool.reap_dead_slot_error slot_id=%s — quarantining", candidate.slot_id)
-            finally:
-                if reaped:
-                    with self._lock:
-                        self._slots.pop(candidate.slot_id, None)
-
-            # Loop: try to find another IDLE slot
+            # Loop: try to find another IDLE slot. Every iteration returns, or moves one slot out
+            # of IDLE (→DRAINING), so the rescan is bounded by the IDLE-slot count — but NOT in
+            # wall-clock: the per-candidate hand-out probe (is_alive_for_claim) is itself a remote
+            # call, up to cli_timeout_s (120s) on the cloud tiers. N dead slots would then hold the
+            # caller — and its warm-gate reservation (#72) — for N×120s regardless of timeout_s.
+            # So bound the RESCAN by the caller's deadline, with a small grace floor: the grace
+            # guarantees at least one rescan when probes are fast, so a HEALTHY slot sitting behind
+            # a dead one is still found even at claim(timeout_s=0), while a brownout where every
+            # probe stalls yields promptly instead of running away.
+            if scan_deadline is not None and self._clock() >= scan_deadline:
+                logger.warning("pool.claim_scan_deadline_exceeded — yielding with dead slots pending")
+                return None
 
     def _promote_warming(self) -> None:
         """Promote WARMING slots to IDLE when is_ready() returns True."""
@@ -754,7 +906,7 @@ class WarmPool:
                 # (If is_ready RAISED, we never enter here — same quarantine intent.)
                 reaped = False
                 try:
-                    reaped = self._reap_and_count(slot)   # False = another thread owns it -> don't pop
+                    reaped = self._reap_and_count(slot, require_tracked=True, pop_on_success=True)
                 except Exception:
                     logger.exception("pool.promote_reap_error slot_id=%s — quarantining", slot.slot_id)
                 with self._lock:
@@ -940,7 +1092,7 @@ class WarmPool:
             logger.warning("pool.health_evicted_dead_slot slot_id=%s", slot.slot_id)
             reaped = False
             try:
-                reaped = self._reap_and_count(slot)   # False = another thread owns it -> don't pop
+                reaped = self._reap_and_count(slot, require_tracked=True, pop_on_success=True)
             except Exception:
                 # reap raised (worker not disposed — may still run): quarantine, don't pop (like
                 # release()), so a live worker isn't orphaned off pool accounting.
