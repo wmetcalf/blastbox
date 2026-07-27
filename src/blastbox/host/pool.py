@@ -301,6 +301,19 @@ class WarmPool:
                 thread_wedged = True
             self._thread = None
 
+        # Join the DEFERRED REAPER within the same budget (issue #75 review): it is a daemon, so if
+        # the process exits while it is mid-terminate the worker is leaked. stop()'s own reap loop
+        # below CANNOT cover that slot — _reap_and_count's ownership guard makes it skip whatever the
+        # reaper already owns — so waiting here is the only thing that disposes it. Past the budget we
+        # log and proceed, exactly like the wedged-spawn case above.
+        reaper = self._reaper_thread
+        if reaper is not None and reaper.is_alive():
+            reaper.join(timeout=stop_timeout_s)
+            if reaper.is_alive():
+                logger.warning("pool.stop: deferred reaper still running after %.0fs (wedged reap?) — "
+                               "proceeding; that worker may leak until its TTL", stop_timeout_s)
+                thread_wedged = True
+
         # Reap every slot regardless of state. Pop each ONLY after a successful reap: if reap RAISES
         # (e.g. a libvirt VM whose `virsh destroy` failed during a rolling restart), KEEP it tracked —
         # else the still-running domain (with its overlay + egress rules) is forgotten outside pool
@@ -466,9 +479,13 @@ class WarmPool:
         ready = self._runtime_ready()
         self._promote_warming()
         self._health_check()
-        # BEFORE _spawn_to_deficit: a husk claim() deferred (issue #75) still occupies one slot of
-        # `concurrent_ceiling` headroom, so disposing it here lets THIS tick spawn the replacement
-        # instead of stalling it a full tick on a pool sitting at its ceiling.
+        # Kick the deferred reaper EARLY so its (asynchronous) disposal overlaps the rest of the
+        # tick. NOTE: it does NOT free `concurrent_ceiling` headroom for this tick's
+        # _spawn_to_deficit — the husk stays tracked until the reaper thread actually disposes it,
+        # so on a pool sitting exactly at its ceiling the replacement spawns on a LATER tick. That
+        # is deliberate: a husk whose disposal has not been confirmed may still be a live worker
+        # holding node RAM, and this file's policy is to keep counting it (see _spawn_to_deficit's
+        # headroom + the quarantine comments) rather than risk over-committing the node.
         self._reap_deferred()
         self._update_burst(ready)
         self._spawn_to_deficit(ready)
@@ -517,7 +534,8 @@ class WarmPool:
                     continue                # already disposed+popped by stop()/another path
             reaped = False
             try:
-                reaped = self._reap_and_count(slot)   # False = another thread owns it -> don't pop
+                # require_tracked closes the stop()-race: never re-terminate a popped slot.
+                reaped = self._reap_and_count(slot, require_tracked=True)
             except Exception:
                 logger.exception("pool.reap_deferred_error slot_id=%s — quarantining", slot.slot_id)
             if reaped:
@@ -568,7 +586,8 @@ class WarmPool:
             return bool(prepare())
         return True
 
-    def _reap_and_count(self, slot: "Slot", *, dirty: bool = False) -> bool:
+    def _reap_and_count(self, slot: "Slot", *, dirty: bool = False,
+                        require_tracked: bool = False) -> bool:
         """Reap a slot via the runtime and count the disposal (metrics). ``dirty`` (from a failed
         release) is forwarded to a reap() that accepts it, so a reusing runtime can quarantine.
 
@@ -584,6 +603,12 @@ class WarmPool:
         second path untrack a slot whose real terminate later fails, orphaning a live cloud resource."""
         with self._lock:
             if slot.slot_id in self._reaping:
+                return False
+            # require_tracked: verify the slot is STILL tracked in the same critical section that
+            # takes ownership. The deferred reaper resolves its work list before reaping, so without
+            # this a stop() that disposed+popped the slot in between would be followed by a SECOND
+            # terminate on the same (possibly recycled) resource + a double reap metric (issue #75).
+            if require_tracked and slot.slot_id not in self._slots:
                 return False
             self._reaping.add(slot.slot_id)
         try:

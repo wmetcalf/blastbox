@@ -1307,10 +1307,13 @@ def test_claim_not_blocked_by_a_hung_dead_slot_reap() -> None:
         t.join(5)
 
 
-def test_deferred_husk_does_not_stall_its_replacement_a_tick() -> None:
-    # issue #75 follow-through: a husk claim() deferred still occupies one slot of
-    # concurrent_ceiling headroom, so _reap_deferred must run BEFORE _spawn_to_deficit — else a
-    # pool sitting at its ceiling spawns the replacement a whole tick late.
+def test_deferred_husk_is_disposed_and_replaced_without_blocking_the_tick() -> None:
+    # issue #75: disposal is ASYNCHRONOUS (dedicated reaper thread), so tick() only KICKS it and
+    # returns immediately — that is the whole point (a wedged reap must not stall maintenance).
+    # Consequence, asserted here so it can't silently change: the husk still counts against
+    # concurrent_ceiling until the reaper actually disposes it, so on a pool sitting exactly at its
+    # ceiling the replacement spawns on a LATER tick. Deliberate — an unconfirmed disposal may still
+    # be a live worker holding node RAM, and this pool counts it rather than over-commit the node.
     rt = _FakeRuntime()
     pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=2, spawn_rate_limit=100.0)
     pool._spawn_to_deficit(ready=True)
@@ -1321,11 +1324,12 @@ def test_deferred_husk_does_not_stall_its_replacement_a_tick() -> None:
     assert pool._try_claim_one() is not None          # hands out the healthy one, defers the dead
     assert slots[0].slot_id in pool._deferred_reap
 
-    pool.tick()
-    _join_reaper(pool)                                 # disposal is async (own thread) — wait for it
-    assert slots[0].slot_id in rt.reaped               # husk disposed...
+    pool.tick()                                        # kicks the reaper; does NOT block on it
+    _join_reaper(pool)
+    assert slots[0].slot_id in rt.reaped               # husk disposed off the tick + claim paths
     assert slots[0].slot_id not in pool._slots         # ...and untracked
-    # ...and the replacement was spawned in the SAME tick (headroom freed first)
+
+    pool.tick()                                        # headroom now really free -> replacement
     assert len(pool._slots) == 2, {s.slot_id: s.state for s in pool._slots.values()}
 
 
@@ -1443,3 +1447,25 @@ def test_stop_racing_the_reaper_does_not_double_terminate() -> None:
     hang.set()
     _join_reaper(pool)
     assert len(rt.reaped) == len(set(rt.reaped)), f"double-terminated: {rt.reaped}"
+
+
+def test_stop_waits_for_a_reaper_mid_terminate() -> None:
+    # issue #75 (review finding): the deferred reaper is a DAEMON thread, so if stop() returned
+    # while it was mid-terminate the process exit would kill it and leak a live worker. stop()'s own
+    # reap loop cannot cover that slot either — _reap_and_count's ownership guard makes it skip
+    # whatever the reaper already owns — so stop() must JOIN the reaper within its budget.
+    release = threading.Event()
+    rt = _CachedLivenessRuntime(hang=release)
+    pool = WarmPool(runtime=rt, warm_size=2, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    slots = list(pool._slots.values())
+    rt.fresh_dead.add(slots[0].slot_id)
+    rt.hang_slot = slots[0].slot_id
+    pool._try_claim_one()
+    pool._reap_deferred()
+    time.sleep(0.15)                               # reaper is now inside the wedged terminate
+    threading.Timer(0.4, release.set).start()      # it completes shortly after stop() begins
+    orphans = pool.stop(stop_timeout_s=5)
+    assert slots[0].slot_id in rt.reaped, "stop() left a worker the reaper was mid-terminate on"
+    assert orphans == 0
