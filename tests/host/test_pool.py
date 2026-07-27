@@ -1829,48 +1829,6 @@ def test_promote_warming_passes_both_reap_guards() -> None:
     seen = _spy_reap_kwargs(pool)
     pool._promote_warming()
     _assert_guarded(seen, "_promote_warming()")
-
-
-def test_wedged_hand_out_probe_is_skipped_non_destructively() -> None:
-    # issue #77: the hand-out probe is a REMOTE call (aws CLI, bounded only by cli_timeout_s=120s)
-    # sitting on dispatch latency while the caller holds a warm-gate reservation (#72). Bound it —
-    # but a slow control plane is NOT evidence of death, so a slot whose probe times out must be
-    # SKIPPED (left IDLE, never deferred for disposal), and a healthy slot behind it still served.
-    stuck = threading.Event()
-
-    class _StuckProbe(_FakeRuntime):
-        def __init__(self) -> None:
-            super().__init__()
-            self.wedge: set[str] = set()
-
-        def is_alive_for_claim(self, slot: Slot) -> bool:
-            if slot.slot_id in self.wedge:
-                stuck.wait(30)                      # control-plane brownout
-            return True
-
-    rt = _StuckProbe()
-    pool = WarmPool(runtime=rt, warm_size=2, spawn_rate_limit=100.0, claim_probe_timeout_s=0.3)
-    pool._spawn_to_deficit(ready=True)
-    pool._promote_warming()
-    slots = list(pool._slots.values())
-    rt.wedge.add(slots[0].slot_id)                  # first candidate's probe hangs
-    try:
-        t0 = time.monotonic()
-        got = pool.claim(timeout_s=2.0)
-        elapsed = time.monotonic() - t0
-        assert got is not None and got.slot_id == slots[1].slot_id, "healthy slot behind it not served"
-        assert elapsed < 2.0, f"claim waited on the wedged probe: {elapsed:.2f}s"
-        # the un-probeable slot must be left ALIVE and claimable later — not destroyed
-        with pool._lock:
-            assert slots[0].slot_id in pool._slots
-            assert slots[0].state == SlotState.IDLE
-            assert slots[0].slot_id not in pool._deferred_reap, "a slow probe must not queue a reap"
-        assert slots[0].slot_id not in rt.reaped, "a slow probe must never destroy the worker"
-    finally:
-        stuck.set()
-        pool.stop(stop_timeout_s=1.0)
-
-
 def test_wedged_reapers_stop_counting_so_the_queue_keeps_draining() -> None:
     # issue #77: a wedged runtime.reap can't be killed, but it must not hold a slot in the reaper
     # pool forever — _MAX_REAPERS stuck disposals would otherwise stop the queue draining for the
@@ -1917,10 +1875,12 @@ def test_wedged_reapers_stop_counting_so_the_queue_keeps_draining() -> None:
         _join_reaper(pool)
 
 
-def test_local_tiers_probe_inline_without_spawning_a_thread() -> None:
-    # issue #77 perf: the watchdog exists for REMOTE probes. A runtime with no is_alive_for_claim
-    # seam (file / firecracker / libvirt) does a cheap local poll, so it must be called INLINE —
-    # otherwise every claim on the hottest path pays a thread creation for nothing.
+def test_hand_out_probe_is_always_inline_never_threaded() -> None:
+    # issue #77: the claim probe must never be wrapped in a watchdog thread — for ANY runtime,
+    # seam or not. A thread cannot cancel a blocking call, only abandon it, and one abandoned
+    # thread (plus its aws CLI subprocess) per probe under a control-plane brownout is a resource
+    # storm during exactly the incident the bound exists to survive. The bound belongs in the
+    # runtime (see AwsWorkerConfig.claim_probe_timeout_s), which can actually cancel its own call.
     import blastbox.host.pool as pool_mod
 
     made: list[str] = []
@@ -1931,43 +1891,48 @@ def test_local_tiers_probe_inline_without_spawning_a_thread() -> None:
             super().__init__(*a, **k)
             made.append(k.get("name") or "")
 
-    rt = _FakeRuntime()                      # no is_alive_for_claim
-    assert not hasattr(rt, "is_alive_for_claim")
-    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    for rt in (_FakeRuntime(), _CachedLivenessRuntime()):   # without AND with the remote seam
+        pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+        pool._spawn_to_deficit(ready=True)
+        pool._promote_warming()
+        made.clear()
+        pool_mod.threading.Thread = _CountingThread
+        try:
+            assert pool._try_claim_one() is not None
+        finally:
+            pool_mod.threading.Thread = real_thread
+        assert not [n for n in made if "probe" in n], (
+            f"spawned a probe thread for {type(rt).__name__}: {made}")
+
+
+def test_total_reaper_threads_are_hard_capped_even_when_all_are_wedged() -> None:
+    # issue #77 (review): the wedged-reaper watchdog frees pool slots so a stuck disposal can't halt
+    # the queue — but on its own it removed the ONLY bound, because a wedged reaper never exits and
+    # is never pruned, so every tick could start _MAX_REAPERS more (measured: 64 live threads
+    # against a cap of 4). _MAX_REAPER_THREADS is the hard ceiling, wedged ones included.
+    hang = threading.Event()
+
+    class _NeverReaps(_FakeRuntime):
+        def reap(self, slot: Slot) -> None:
+            hang.wait(300)
+
+    rt = _NeverReaps()
+    n = 80
+    pool = WarmPool(runtime=rt, warm_size=n, concurrent_ceiling=n, spawn_rate_limit=10000.0)
+    pool._REAPER_WEDGED_AFTER_S = 0.02        # every reaper counts as wedged almost immediately
     pool._spawn_to_deficit(ready=True)
     pool._promote_warming()
-
-    pool_mod.threading.Thread = _CountingThread
+    with pool._lock:
+        for sid, slot in pool._slots.items():
+            slot.state = SlotState.DRAINING
+            pool._deferred_reap.add(sid)
     try:
-        assert pool._try_claim_one() is not None
+        for _ in range(60):                    # hammer the kick; watchdog keeps freeing slots
+            pool._reap_deferred()
+            time.sleep(0.02)
+        alive = sum(1 for t in threading.enumerate() if t.name == "blastbox-pool-reaper")
+        assert alive <= pool._MAX_REAPER_THREADS, (
+            f"{alive} live reapers exceeds the hard cap of {pool._MAX_REAPER_THREADS}")
     finally:
-        pool_mod.threading.Thread = real_thread
-    assert not [n for n in made if "probe" in n], f"spawned a probe thread on a local tier: {made}"
-
-
-def test_claim_probe_watchdog_can_be_disabled() -> None:
-    # issue #77: claim_probe_timeout_s <= 0 must actually DISABLE the watchdog (probe inline,
-    # pre-#77 behaviour) for an operator who would rather wait than skip a slot. The knob was
-    # previously clamped to a positive floor, so that documented escape hatch was unreachable.
-    import blastbox.host.pool as pool_mod
-
-    made: list[str] = []
-    real_thread = threading.Thread
-
-    class _CountingThread(real_thread):     # type: ignore[misc,valid-type]
-        def __init__(self, *a, **k):
-            super().__init__(*a, **k)
-            made.append(k.get("name") or "")
-
-    rt = _CachedLivenessRuntime()           # HAS is_alive_for_claim -> would normally be threaded
-    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, claim_probe_timeout_s=0)
-    assert pool._claim_probe_timeout_s == 0
-    pool._spawn_to_deficit(ready=True)
-    pool._promote_warming()
-
-    pool_mod.threading.Thread = _CountingThread
-    try:
-        assert pool._try_claim_one() is not None
-    finally:
-        pool_mod.threading.Thread = real_thread
-    assert not [n for n in made if "probe" in n], f"watchdog not disabled: {made}"
+        hang.set()
+        _join_reaper(pool, timeout=10)

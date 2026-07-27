@@ -174,7 +174,6 @@ class WarmPool:
         warming_timeout_s: float = 120.0,
         jobs_per_recycle: int = 1,
         max_jobs_per_slot: int = 0,
-        claim_probe_timeout_s: float = 5.0,
     ) -> None:
         self._runtime = runtime
         # Some runtimes (static pool) reuse a long-lived box on reap and care whether the just-finished
@@ -234,10 +233,6 @@ class WarmPool:
         # Wall-clock bound for the hand-out liveness probe. Short ON PURPOSE: it sits on
         # job-dispatch latency and holds the caller's warm-gate reservation (#72), so a slot that
         # can't be described in a few seconds is better skipped than waited on (issue #77).
-        # 0 (or negative) DISABLES the watchdog — probe inline, pre-#77 behaviour — for an operator
-        # whose runtime is slow but reliable and who would rather wait than skip a slot. Clamped at 0
-        # rather than a positive floor so that escape hatch is actually reachable.
-        self._claim_probe_timeout_s = max(0.0, float(claim_probe_timeout_s))
         self._thread: threading.Thread | None = None
 
         # Burst demand tracking — all access under _lock
@@ -534,6 +529,12 @@ class WarmPool:
     # The thread is abandoned, not killed — Python cannot interrupt a blocking call — but its slot
     # in the pool is freed so healthy husks keep getting disposed.
     _REAPER_WEDGED_AFTER_S = 60.0
+    # HARD ceiling on live reaper threads, wedged ones INCLUDED. Without it the watchdog above
+    # removes the only bound: a wedged reaper stops counting toward _MAX_REAPERS but never exits and
+    # is never removed, so every tick could start 4 more — measured 64 live threads against a cap of
+    # 4 on a permanently-hung terminate. Past this we stop starting reapers; the queue waits rather
+    # than melting the host, and stop() still disposes everything it can.
+    _MAX_REAPER_THREADS = 32
 
     def _reap_deferred(self) -> None:
         """Kick the DEDICATED reaper thread for slots claim() found dead and deferred (issue #75).
@@ -557,7 +558,12 @@ class WarmPool:
             # or four stuck disposals stop the queue draining for the life of the pool (issue #77).
             live = sum(1 for (t, ts) in self._reaper_threads
                        if now - ts < self._REAPER_WEDGED_AFTER_S)
-            want = min(len(self._deferred_reap), self._MAX_REAPERS - live)
+            # Two bounds: _MAX_REAPERS caps CONCURRENT PROGRESS (wedged ones don't count, so a stuck
+            # disposal can't halt the queue), and _MAX_REAPER_THREADS caps TOTAL live threads
+            # (wedged ones DO count, so a permanently-hung runtime can't spawn threads forever).
+            headroom = min(self._MAX_REAPERS - live,
+                           self._MAX_REAPER_THREADS - len(self._reaper_threads))
+            want = min(len(self._deferred_reap), headroom)
             if want <= 0:
                 return                      # queue empty, or every reaper slot is busy/wedged
             for _ in range(want):
@@ -822,46 +828,31 @@ class WarmPool:
     # remote probe can't hold the caller (or its warm-gate reservation) for long.
     _SCAN_GRACE_S = 1.0
 
-    def _probe_alive(self, slot: "Slot") -> bool | None:
-        """Hand-out liveness probe with a WALL-CLOCK bound (issue #77).
+    def _probe_alive(self, slot: "Slot") -> "bool | None":
+        """Hand-out liveness probe (issue #77).
 
-        ``is_alive_for_claim`` is a REMOTE call on the cloud tiers — an ``aws`` CLI invocation
-        bounded only by ``cli_timeout_s`` (120s) — and it sits directly on job-dispatch latency,
-        holding the caller's warm-gate reservation (#72) the whole time. Run it on a throwaway
-        thread and give up after ``claim_probe_timeout_s``.
+        Called INLINE — deliberately no watchdog thread. The bound belongs in the runtime, not
+        here: a thread can't cancel a blocking call, only abandon it, and abandoning one per probe
+        under a control-plane brownout produced unbounded threads (and, on the cloud tiers, one
+        live ``aws`` CLI subprocess each) during exactly the incident the bound exists to ride out.
+        A wrapper also can't see through ``cascade``, whose ``is_alive_for_claim`` delegates to the
+        owning tier, so it threaded LOCAL claims too.
 
-        Returns True/False, or **None** for "unknown, the probe did not answer in time". None is
-        deliberately NOT treated as dead: a control-plane brownout must not get healthy workers
-        destroyed. The caller skips the slot for this scan and leaves it IDLE for the next one.
+        So the cloud runtimes bound their own claim-time describe (``claim_probe_timeout_s`` on the
+        AWS config) and return False on timeout; the local tiers were never the problem — their
+        ``is_alive`` is a process poll. A probe that raises is treated as not-alive, as before.
         """
         claim_check = getattr(self._runtime, "is_alive_for_claim", None)
-        if not callable(claim_check) or self._claim_probe_timeout_s <= 0:
-            # No fresh-probe seam (file / firecracker / libvirt tiers) — is_alive() there is a local
-            # poll, not a remote call, so the watchdog would cost a thread per claim on the hottest
-            # path for no benefit. Only the runtimes that declare is_alive_for_claim do a REMOTE
-            # describe, and they are the ones #77 is about. (timeout <= 0 disables the bound too.)
-            try:
-                return bool(self._runtime.is_alive(slot))
-            except Exception:
-                logger.exception("pool.is_alive_error slot_id=%s", slot.slot_id)
-                return False
-        result: dict[str, bool] = {}
-
-        def _run() -> None:
-            try:
-                result["alive"] = bool(claim_check(slot))
-            except Exception:
-                logger.exception("pool.is_alive_error slot_id=%s", slot.slot_id)
-                result["alive"] = False
-
-        t = threading.Thread(target=_run, name="blastbox-pool-probe", daemon=True)
-        t.start()
-        t.join(self._claim_probe_timeout_s)
-        if t.is_alive():
-            logger.warning("pool.claim_probe_timeout slot_id=%s after %.1fs — skipping this slot",
-                           slot.slot_id, self._claim_probe_timeout_s)
-            return None
-        return result.get("alive", False)
+        if not callable(claim_check):
+            claim_check = self._runtime.is_alive
+        try:
+            alive = claim_check(slot)
+        except Exception:
+            logger.exception("pool.is_alive_error slot_id=%s", slot.slot_id)
+            return False
+        # None = the runtime bounded its own probe and the control plane didn't answer. UNKNOWN,
+        # NOT dead — a brownout must not get healthy workers destroyed (issue #77).
+        return None if alive is None else bool(alive)
 
     def _try_claim_one(self, deadline: float | None = None) -> Slot | None:
         """Scan for an IDLE slot, flip to ASSIGNED inside the lock.
@@ -878,7 +869,7 @@ class WarmPool:
         and ``_spawn_to_deficit`` (which ignores DRAINING) still spawns its replacement.
         """
         scan_deadline = None if deadline is None else max(deadline, self._clock() + self._SCAN_GRACE_S)
-        unprobeable: set[str] = set()   # slots whose hand-out probe timed out THIS scan (issue #77)
+        unprobeable: set[str] = set()   # runtime couldn't answer in its budget THIS scan (issue #77)
         while True:
             # Shutdown in progress: hand out NOTHING. stop() reaps every slot after its joins, so a
             # slot claimed during that window would be destroyed mid-job; and a dead slot deferred
@@ -906,9 +897,10 @@ class WarmPool:
             alive = self._probe_alive(candidate)
 
             if alive is None:
-                # Probe didn't answer in time (issue #77). The slot may be perfectly healthy — a slow
-                # control plane is not evidence of death — so do NOT defer it for disposal. Put it
-                # back IDLE, exclude it from THIS scan so we don't spin on it, and try another slot.
+                # UNKNOWN (the runtime's own probe budget expired). Leave the slot IDLE and skip it
+                # for THIS scan — never defer it for disposal: a slow control plane is not evidence
+                # of death, and destroying healthy workers during a brownout is far worse than a
+                # missed claim. It stays claimable on the next scan.
                 with self._lock:
                     if candidate.state == SlotState.ASSIGNED:
                         candidate.state = SlotState.IDLE

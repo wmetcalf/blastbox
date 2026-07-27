@@ -15,6 +15,7 @@ import pytest
 
 from blastbox.host.pool import SlotRuntime, SlotState
 from blastbox.host.runtime.aws_worker import (
+    AwsWorkerConfig,
     AwsUnavailable,
     AwsWorkerError,
     AwsWorkerSlot,
@@ -1313,3 +1314,96 @@ def test_claim_probe_uses_a_short_cli_budget_background_calls_do_not():
     assert seen, "background liveness issued no aws call"
     assert all(t == rt.cfg.cli_timeout_s for t in seen), (
         f"background call used {seen}, want the full {rt.cfg.cli_timeout_s}s")
+
+
+def test_claim_probe_budget_is_thread_local_not_shared():
+    # issue #77 (review): the design's headline safety property — a claim probe must NOT shorten
+    # the budget of concurrent calls on OTHER threads — had zero coverage: swapping
+    # threading.local() for a shared namespace left the suite green. With a shared attribute a
+    # `terminate-instances` issued by the tick thread WHILE a probe is in flight would silently drop
+    # from cli_timeout_s to the probe budget, raise, and LEAK a live worker.
+    import threading
+
+    in_probe = threading.Event()
+    release = threading.Event()
+    rt, _fake = _lambda_rt({"lambda-microvms run-microvm": {"microvmId": "mv-1"},
+                            "lambda-microvms get-microvm": {"state": "running"}})
+    slot = rt._launch()
+
+    seen: list[tuple[str, float]] = []
+    real = rt._run_aws
+
+    def _spy(argv, timeout):        # noqa: ANN001
+        seen.append((argv[2], timeout))
+        if argv[2] == "get-microvm":          # inside the claim probe
+            in_probe.set()
+            release.wait(10)                  # hold the probe OPEN
+        return real(argv, timeout)
+
+    rt._run_aws = _spy              # type: ignore[method-assign]
+
+    probe = threading.Thread(target=lambda: rt.is_alive_for_claim(slot), daemon=True)
+    probe.start()
+    assert in_probe.wait(5), "probe never started"
+    try:
+        # concurrent call on ANOTHER thread, while the probe holds its budget open
+        rt._desc_cache.pop(slot.slot_id, None)
+        rt._live_cache.pop(slot.slot_id, None)
+        other: list[float] = []
+        t = threading.Thread(target=lambda: (rt.is_alive(slot), other.extend(
+            [to for op, to in seen if op == "get-microvm"][-1:])), daemon=True)
+        t.start()
+        t.join(5)
+        concurrent = [to for op, to in seen[1:]]
+        assert concurrent, "the concurrent call issued no aws call"
+        assert all(to == rt.cfg.cli_timeout_s for to in concurrent), (
+            f"a concurrent call inherited the probe budget: {concurrent}")
+    finally:
+        release.set()
+        probe.join(5)
+
+
+def test_claim_probe_budget_is_restored_not_cleared():
+    # issue #77 (review): the scope must SAVE/RESTORE. A hard reset to None let a nested probe wipe
+    # an outer scope's budget — which is exactly how the JWE re-mint escaped the bound and ran at
+    # the full cli_timeout_s on the claim path.
+    rt, _fake = _lambda_rt({"lambda-microvms run-microvm": {"microvmId": "mv-1"},
+                            "lambda-microvms get-microvm": {"state": "running"}})
+    with rt._claim_probe_budget():
+        outer = rt._tls.probe_budget_s
+        with rt._claim_probe_budget():
+            assert rt._tls.probe_budget_s == rt.cfg.claim_probe_timeout_s
+        assert rt._tls.probe_budget_s == outer, "nested scope clobbered the outer budget"
+    assert getattr(rt._tls, "probe_budget_s", None) is None
+
+
+def test_aws_config_positional_binding_is_stable():
+    # issue #77 (review): claim_probe_timeout_s was inserted MID-dataclass, so a positional caller's
+    # later fields silently rebound (the same trap PoolSpec.queued hit). Declared last now — lock it.
+    cfg = AwsWorkerConfig("us-east-1", "prof", 9999, "/hz", 11.0, 12.0, 13.0, 14.0)
+    assert cfg.region == "us-east-1" and cfg.profile == "prof"
+    assert cfg.agent_port == 9999 and cfg.agent_health_path == "/hz"
+    assert (cfg.ready_timeout_s, cfg.probe_timeout_s) == (11.0, 12.0)
+    assert (cfg.cli_timeout_s, cfg.max_duration_s) == (13.0, 14.0)
+    assert cfg.claim_probe_timeout_s == 5.0          # trailing field keeps its default
+
+
+def test_claim_probe_timeout_reports_unknown_not_dead():
+    # issue #77 (review, HIGH): a claim probe that TIMES OUT must report UNKNOWN, never False.
+    # False would make the pool defer the slot for disposal — destroying a possibly-healthy microVM
+    # because the control plane was slow, which is far worse than a missed claim.
+    import subprocess
+
+    def _timeout_runner(argv, timeout):     # noqa: ANN001
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+
+    rt, _fake = _lambda_rt({"lambda-microvms run-microvm": {"microvmId": "mv-1"},
+                            "lambda-microvms get-microvm": {"state": "running"}})
+    slot = rt._launch()
+    rt._run_aws = _timeout_runner           # type: ignore[method-assign]
+    assert rt.is_alive_for_claim(slot) is None, "a probe timeout must be UNKNOWN, not dead"
+    # ...while a genuine non-timeout failure is still a definite False
+    def _boom(argv, timeout):               # noqa: ANN001
+        raise OSError("no such binary")
+    rt._run_aws = _boom                     # type: ignore[method-assign]
+    assert rt.is_alive_for_claim(slot) is False
