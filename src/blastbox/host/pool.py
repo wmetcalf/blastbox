@@ -391,9 +391,13 @@ class WarmPool:
         concurrent callers cannot pick the same slot.
         """
         deadline = self._clock() + timeout_s
+        # Arm the scan grace ONCE for the whole claim (issue #77 review): re-arming it per rescan
+        # gave a scan starting near the deadline a fresh floor, so claim() overran timeout_s while
+        # holding the caller's warm-gate reservation.
+        scan_deadline = max(deadline, self._clock() + self._SCAN_GRACE_S)
 
         while True:
-            slot = self._try_claim_one(deadline)
+            slot = self._try_claim_one(deadline, scan_deadline)
             if slot is not None:
                 return slot
 
@@ -848,8 +852,10 @@ class WarmPool:
         owning tier, so it threaded LOCAL claims too.
 
         So the cloud runtimes bound their own claim-time describe (``claim_probe_timeout_s`` on the
-        AWS config) and return False on timeout; the local tiers were never the problem — their
-        ``is_alive`` is a process poll. A probe that raises is treated as not-alive, as before.
+        AWS config) and on timeout report **None = UNKNOWN — never False**: a slow control plane is
+        not evidence of death, and the caller must skip such a slot rather than destroy it. The
+        local tiers were never the problem — their ``is_alive`` is a process poll. A probe that
+        RAISES is treated as not-alive, as before.
         """
         claim_check = getattr(self._runtime, "is_alive_for_claim", None)
         if not callable(claim_check):
@@ -863,7 +869,8 @@ class WarmPool:
         # NOT dead — a brownout must not get healthy workers destroyed (issue #77).
         return None if alive is None else bool(alive)
 
-    def _try_claim_one(self, deadline: float | None = None) -> Slot | None:
+    def _try_claim_one(self, deadline: float | None = None,
+                       scan_deadline: float | None = None) -> Slot | None:
         """Scan for an IDLE slot, flip to ASSIGNED inside the lock.
 
         If the chosen slot is dead: demote to DRAINING and DEFER its disposal to the background
@@ -877,7 +884,11 @@ class WarmPool:
         Deferring keeps claim bounded; the slot is already DRAINING so it is unclaimable meanwhile,
         and ``_spawn_to_deficit`` (which ignores DRAINING) still spawns its replacement.
         """
-        scan_deadline = None if deadline is None else max(deadline, self._clock() + self._SCAN_GRACE_S)
+        if scan_deadline is None and deadline is not None:
+            # Fallback for direct callers/tests. claim() passes an ALREADY-ARMED deadline so the
+            # grace floor is applied ONCE per claim, not re-armed on every rescan (which let a scan
+            # starting just before the deadline get a fresh 1s and overrun the caller's timeout).
+            scan_deadline = max(deadline, self._clock() + self._SCAN_GRACE_S)
         unprobeable: set[str] = set()   # runtime couldn't answer in its budget THIS scan (issue #77)
         while True:
             # Shutdown in progress: hand out NOTHING. stop() reaps every slot after its joins, so a

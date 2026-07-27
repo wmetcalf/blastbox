@@ -1901,8 +1901,9 @@ def test_hand_out_probe_is_always_inline_never_threaded() -> None:
             assert pool._try_claim_one() is not None
         finally:
             pool_mod.threading.Thread = real_thread
-        assert not [n for n in made if "probe" in n], (
-            f"spawned a probe thread for {type(rt).__name__}: {made}")
+        # Assert on the PROPERTY (no thread at all), not on a name — a watchdog reintroduced
+        # under any other thread name would otherwise slip past this regression test.
+        assert made == [], f"_try_claim_one created thread(s) for {type(rt).__name__}: {made}"
 
 
 def test_total_reaper_threads_are_hard_capped_even_when_all_are_wedged() -> None:
@@ -1976,3 +1977,62 @@ def test_a_reaper_making_progress_is_not_treated_as_wedged() -> None:
                     f"{len(pool._reaper_threads)} reapers for _MAX_REAPERS=1")
     finally:
         _join_reaper(pool, timeout=15)
+
+
+class _UnknownProbeRuntime(_FakeRuntime):
+    """A cloud-shaped runtime whose hand-out probe reports UNKNOWN (None) — the tri-state the
+    redesign turns on. Nothing else in the suite ever returns None, so the pool's whole UNKNOWN
+    branch was dead code under test (mutations that deleted or inverted it all survived)."""
+
+    def __init__(self) -> None:            # noqa: D107
+        super().__init__()
+        self.unknown: set[str] = set()
+        self.probe_delay = 0.0
+
+    def is_alive_for_claim(self, slot: Slot) -> "bool | None":
+        if slot.slot_id in self.unknown:
+            if self.probe_delay:
+                time.sleep(self.probe_delay)   # a REAL brownout probe is slow, not instant
+            return None
+        return True
+
+
+def test_unknown_probe_never_destroys_and_serves_a_healthy_slot_behind_it() -> None:
+    # issue #77: UNKNOWN must be skipped NON-DESTRUCTIVELY — left IDLE, never deferred for reap —
+    # and a healthy slot behind it must still be served.
+    rt = _UnknownProbeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=3, spawn_rate_limit=1000.0)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    slots = list(pool._slots.values())
+    rt.unknown = {slots[0].slot_id, slots[1].slot_id}       # first two can't be probed
+
+    got = pool.claim(timeout_s=2.0)
+    assert got is not None and got.slot_id == slots[2].slot_id, "healthy slot behind UNKNOWN not served"
+    with pool._lock:
+        for s in slots[:2]:
+            assert s.state == SlotState.IDLE, f"UNKNOWN slot left in {s.state}, must stay IDLE"
+            assert s.slot_id not in pool._deferred_reap, "UNKNOWN slot queued for disposal"
+    assert not rt.reaped, f"UNKNOWN destroyed a worker: {rt.reaped}"
+
+
+def test_all_unknown_claim_terminates_promptly_without_destroying_anything() -> None:
+    # issue #77: with EVERY slot UNKNOWN the scan must not spin — it returns None within the
+    # caller's budget and leaves the whole (possibly healthy) pool intact.
+    rt = _UnknownProbeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=8, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    with pool._lock:
+        rt.unknown = set(pool._slots)
+    rt.probe_delay = 0.3                  # 8 slots x 0.3s = 2.4s if the scan ignores its deadline
+
+    t0 = time.monotonic()
+    assert pool.claim(timeout_s=0.1) is None
+    elapsed = time.monotonic() - t0
+    # bounded by the grace floor + one in-flight probe, NOT by probing every slot
+    assert elapsed < pool._SCAN_GRACE_S + 0.9, f"all-UNKNOWN scan ran away: {elapsed:.2f}s"
+    with pool._lock:
+        assert all(s.state == SlotState.IDLE for s in pool._slots.values())
+        assert not pool._deferred_reap
+    assert not rt.reaped

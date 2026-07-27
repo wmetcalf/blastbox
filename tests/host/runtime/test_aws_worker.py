@@ -1314,8 +1314,11 @@ def test_claim_probe_uses_a_short_cli_budget_background_calls_do_not():
     rt._live_cache.pop(slot.slot_id, None)
     rt.is_alive(slot)
     assert seen, "background liveness issued no aws call"
-    assert all(t == rt.cfg.cli_timeout_s for t in seen), (
-        f"background call used {seen}, want the full {rt.cfg.cli_timeout_s}s")
+    # background is bounded too (issue #77 — it runs on the single tick thread), but by the
+    # GENEROUS health budget, never the tight claim budget.
+    assert all(0 < t <= rt.cfg.health_probe_timeout_s for t in seen), seen
+    assert all(t > rt.cfg.claim_probe_timeout_s for t in seen), (
+        f"background call inherited the CLAIM budget: {seen}")
 
 
 def test_claim_probe_budget_is_thread_local_not_shared():
@@ -1358,8 +1361,8 @@ def test_claim_probe_budget_is_thread_local_not_shared():
         t.join(5)
         concurrent = [to for op, to in seen[1:]]
         assert concurrent, "the concurrent call issued no aws call"
-        assert all(to == rt.cfg.cli_timeout_s for to in concurrent), (
-            f"a concurrent call inherited the probe budget: {concurrent}")
+        assert all(to > rt.cfg.claim_probe_timeout_s for to in concurrent), (
+            f"a concurrent call inherited the CLAIM probe budget: {concurrent}")
     finally:
         release.set()
         probe.join(5)

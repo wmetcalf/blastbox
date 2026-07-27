@@ -117,6 +117,9 @@ class AwsWorkerConfig:
     # destroying a possibly-healthy worker. DECLARED LAST so adding it can't silently rebind a
     # positional caller's later fields.
     claim_probe_timeout_s: float = dc_field(default=5.0, kw_only=True)
+    # Background/health describe budget. Generous (not on dispatch latency) but finite, so a
+    # brownout can't stall the tick thread for cli_timeout_s per IDLE slot.
+    health_probe_timeout_s: float = dc_field(default=30.0, kw_only=True)
 
     def aws_argv(self, service: str, op: str, *args: str) -> list[str]:
         argv = ["aws", service, op, "--region", self.region, "--output", "json"]
@@ -145,6 +148,14 @@ class LambdaMicroVmConfig(AwsWorkerConfig):
     allow_default_egress: bool = False
 
     def __post_init__(self) -> None:
+        # issue #77: a mistyped 0/negative here would make the probe deadline already-expired, so
+        # EVERY claim reports UNKNOWN and no AWS slot is ever claimable — silently, with the tier
+        # green in metrics. (0 used to mean "disable the bound"; it must not brick instead.) Clamp
+        # to a small positive, matching how the other numeric knobs on this config are handled.
+        if self.claim_probe_timeout_s <= 0:
+            object.__setattr__(self, "claim_probe_timeout_s", 5.0)
+        if self.health_probe_timeout_s <= 0:
+            object.__setattr__(self, "health_probe_timeout_s", 30.0)
         # Clamp to the AWS bounds so a mistyped env can't turn every call into an opaque reject:
         # run-microvm --maximum-duration-in-seconds <= 28800 (8h); create-microvm-auth-token
         # --expiration-in-minutes in [1, 60]. (SnapStart's __post_init__ chains to this via super().)
@@ -382,6 +393,19 @@ class AwsDisposableRuntime:
 
     # -- aws cli seam -------------------------------------------------------
     @contextlib.contextmanager
+    def _health_probe_budget(self):
+        """Bound the BACKGROUND liveness describe (issue #77). It runs on the single tick thread, so
+        an unbounded call per IDLE slot stalls promotion, spawn-to-deficit, deferred reaping and
+        metrics for the whole pool. More generous than the claim budget — this is not on dispatch
+        latency — but finite."""
+        prev = getattr(self._tls, "probe_deadline", None)
+        self._tls.probe_deadline = self._clock() + self.cfg.health_probe_timeout_s
+        try:
+            yield
+        finally:
+            self._tls.probe_deadline = prev
+
+    @contextlib.contextmanager
     def _claim_probe_budget(self):
         """Apply the SHORT claim-probe budget to every aws call made on THIS thread inside the
         block (issue #77). Save/restore rather than clear: a subclass override wraps its whole body
@@ -458,13 +482,23 @@ class AwsDisposableRuntime:
 
     def is_alive(self, slot: AwsWorkerSlot) -> bool:
         # cache for _liveness_cache_s so the pool's fast tick (~0.1s) doesn't issue an AWS describe per
-        # tick per slot (throttling / cost / dispatcher CPU). Real liveness changes are seconds-scale.
+        # tick per slot.
         now = self._clock()
         cached = self._live_cache.get(slot.slot_id)
         if cached is not None and (now - cached[0]) < self._liveness_cache_s:
             return cached[1]
         try:
-            alive = self._running(slot)
+            with self._health_probe_budget():
+                alive = self._running(slot)
+        except AwsProbeTimeout:
+            # The control plane didn't answer in time. NOT evidence of death (issue #77): returning
+            # False here makes _health_check evict + reap the slot, which would destroy exactly the
+            # workers the UNKNOWN claim path just spared — the whole tier, one tick into a brownout.
+            # Keep the last known state (default: alive); the claim-time FRESH probe is the gate that
+            # decides hand-out, and a genuinely dead slot is caught there or at detonate.
+            _log.warning("aws.health_probe_timeout slot_id=%s — keeping slot (unknown, not dead)",
+                         slot.slot_id)
+            return cached[1] if cached is not None else True
         except (AwsWorkerError, OSError):
             alive = False
         self._live_cache[slot.slot_id] = (now, alive)
