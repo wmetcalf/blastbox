@@ -832,8 +832,16 @@ class WarmPool:
         destroyed. The caller skips the slot for this scan and leaves it IDLE for the next one.
         """
         claim_check = getattr(self._runtime, "is_alive_for_claim", None)
-        if not callable(claim_check):
-            claim_check = self._runtime.is_alive
+        if not callable(claim_check) or self._claim_probe_timeout_s <= 0:
+            # No fresh-probe seam (file / firecracker / libvirt tiers) — is_alive() there is a local
+            # poll, not a remote call, so the watchdog would cost a thread per claim on the hottest
+            # path for no benefit. Only the runtimes that declare is_alive_for_claim do a REMOTE
+            # describe, and they are the ones #77 is about. (timeout <= 0 disables the bound too.)
+            try:
+                return bool(self._runtime.is_alive(slot))
+            except Exception:
+                logger.exception("pool.is_alive_error slot_id=%s", slot.slot_id)
+                return False
         result: dict[str, bool] = {}
 
         def _run() -> None:

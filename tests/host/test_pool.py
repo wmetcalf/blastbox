@@ -1915,3 +1915,31 @@ def test_wedged_reapers_stop_counting_so_the_queue_keeps_draining() -> None:
     finally:
         hang.set()
         _join_reaper(pool)
+
+
+def test_local_tiers_probe_inline_without_spawning_a_thread() -> None:
+    # issue #77 perf: the watchdog exists for REMOTE probes. A runtime with no is_alive_for_claim
+    # seam (file / firecracker / libvirt) does a cheap local poll, so it must be called INLINE —
+    # otherwise every claim on the hottest path pays a thread creation for nothing.
+    import blastbox.host.pool as pool_mod
+
+    made: list[str] = []
+    real_thread = threading.Thread
+
+    class _CountingThread(real_thread):     # type: ignore[misc,valid-type]
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            made.append(k.get("name") or "")
+
+    rt = _FakeRuntime()                      # no is_alive_for_claim
+    assert not hasattr(rt, "is_alive_for_claim")
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+
+    pool_mod.threading.Thread = _CountingThread
+    try:
+        assert pool._try_claim_one() is not None
+    finally:
+        pool_mod.threading.Thread = real_thread
+    assert not [n for n in made if "probe" in n], f"spawned a probe thread on a local tier: {made}"
