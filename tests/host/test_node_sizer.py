@@ -553,3 +553,24 @@ def test_running_but_empty_queue_pool_tiers_as_idle():
     plan = plan_sizes([running_idle, busy], budget)
     assert plan["busy"].warm_size >= 4, plan             # busy floor MET (was starved to 2 pre-fix)
     assert plan["running_idle"].warm_size <= 6, plan     # the no-queue pool yields, despite demand>0
+
+
+def test_clamp_reconstruction_preserves_queued():
+    # issue #68 (escalation round 2): a spec with a non-positive footprint is rebuilt to clamp the
+    # footprint; that reconstruction must carry `queued` (else a clamped-but-backlogged pool tiers
+    # as idle and re-opens the floor inversion). Defensive path: an out-of-contract / hostile peer
+    # snapshot can arrive with slot_ram_mib=0.
+    budget = NodeBudget(ram_mib=12.0, vcpus=64)
+    busy = PoolSpec("busy", slot_ram_mib=0.0, slot_vcpus=1.0, demand=99, queued=99, min_warm=4)
+    idle = PoolSpec("idle", slot_ram_mib=1.0, slot_vcpus=1.0, demand=0, queued=0, min_warm=20)
+    plan = plan_sizes([busy, idle], budget)
+    assert plan["busy"].warm_size >= 4, plan     # clamped pool keeps its backlog tier → floor met
+
+
+def test_poolspec_positional_binding_stable():
+    # issue #68 (escalation round 2): `queued` was appended LAST so a positional caller of the
+    # older signature still binds min_warm/max_ceiling/reserved correctly (a mid-list insertion
+    # would silently rebind them). Lock the field order.
+    s = PoolSpec("x", 1024.0, 1.0, 5.0, 2, 10, 3)   # name, ram, vcpus, demand, min_warm, max_ceiling, reserved
+    assert (s.demand, s.min_warm, s.max_ceiling, s.reserved) == (5.0, 2, 10, 3)
+    assert s.queued == 0.0                            # new trailing field defaults

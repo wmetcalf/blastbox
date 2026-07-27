@@ -127,11 +127,6 @@ class PoolSpec:
     slot_ram_mib: float                  # RAM footprint of a single slot (microVM)
     slot_vcpus: float = 1.0              # vCPU footprint of a single slot
     demand: float = 0.0                  # current wantedness (busy slots + pressure) — drives ceiling
-    queued: float = 0.0                  # QUEUED backlog only (jobs waiting for a slot NOW). Drives
-                                         # the min_warm floor demand-tier: a pool running a job but
-                                         # with an empty queue (demand>0 via `assigned`, queued==0)
-                                         # is NOT competing for more warm floor, so it must not
-                                         # out-tier a truly-backlogged pool. Defaults to 0 (idle).
     min_warm: int = 0                    # guaranteed warm floor (latency baseline)
     max_ceiling: int = 64               # per-engine hard cap (never exceed regardless of budget)
     reserved: int = 0                    # slots this pool is ALREADY consuming (resident warm +
@@ -139,6 +134,14 @@ class PoolSpec:
                                          # must not hand this pool fewer slots than it's physically
                                          # running, or a peer would grow into capacity that's still
                                          # in use (resize() shrinks setpoints; VMs drain later).
+    queued: float = 0.0                  # QUEUED backlog only (jobs waiting for a slot NOW). Drives
+                                         # the min_warm floor demand-tier: a pool running a job but
+                                         # with an empty queue (demand>0 via `assigned`, queued==0)
+                                         # is NOT competing for more warm floor, so it must not
+                                         # out-tier a truly-backlogged pool. Defaults to 0 (idle).
+                                         # LAST field (not inserted mid-list) so positional callers
+                                         # of the older signature keep binding min_warm/max_ceiling/
+                                         # reserved correctly (escalation review).
 
 
 @dataclass(frozen=True)
@@ -171,7 +174,7 @@ def plan_sizes(specs: list[PoolSpec], budget: NodeBudget) -> dict[str, PoolSize]
     specs = [
         s if (s.slot_ram_mib > 0 and s.slot_vcpus > 0)
         else PoolSpec(name=s.name, slot_ram_mib=max(s.slot_ram_mib, 1.0),
-                      slot_vcpus=max(s.slot_vcpus, 0.01), demand=s.demand,
+                      slot_vcpus=max(s.slot_vcpus, 0.01), demand=s.demand, queued=s.queued,
                       min_warm=s.min_warm, max_ceiling=s.max_ceiling, reserved=s.reserved)
         for s in specs
     ]

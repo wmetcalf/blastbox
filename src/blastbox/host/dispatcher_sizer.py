@@ -492,8 +492,10 @@ class DispatcherSizer:
                 else _share(s.weight, s.engine, s.tier),
                 # QUEUED backlog only (no `assigned`) — drives the min_warm floor demand-tier so a
                 # pool running a job but with an empty queue doesn't out-tier a backlogged neighbour
-                # (issue #68, escalation review). Static mode has no live backlog → 0 (all one tier).
-                queued=_backlog_demand(s) if balancing else 0.0,
+                # (issue #68, escalation review). Uses the real backlog in BOTH modes: static mode
+                # sizes the CEILING by weight but still HAS a live queue (the warm target below uses
+                # it too), so a backlogged weight>0 pool must keep its floor priority.
+                queued=_backlog_demand(s),
                 # PER-ENGINE floor + cap are also split across same-queue replicas — else two
                 # replicas of a cap-8 engine could each be allocated 8 (aggregate 16) and a floor
                 # of 4 becomes an aggregate 8. Deterministic remainder so the shares sum to the
