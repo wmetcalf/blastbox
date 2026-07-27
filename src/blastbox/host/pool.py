@@ -514,7 +514,13 @@ class WarmPool:
             t = threading.Thread(target=self._drain_deferred_reaps,
                                  name="blastbox-pool-reaper", daemon=True)
             self._reaper_thread = t
-        t.start()
+            # START INSIDE the lock: a thread that is created-but-not-yet-started reports
+            # is_alive()==False, so releasing the lock first would let a concurrent tick see "no
+            # reaper" and spawn a SECOND one. (Harmless for correctness — the queue pop and the
+            # require_tracked/_reaping guards are all lock-protected — but it would leak threads on a
+            # busy pool.) start() does not take _lock; the new thread simply blocks on its first
+            # acquisition until we release here.
+            t.start()
 
     def _drain_deferred_reaps(self) -> None:
         """Dispose every queued husk, one at a time, off the tick + claim paths.

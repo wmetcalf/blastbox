@@ -1469,3 +1469,39 @@ def test_stop_waits_for_a_reaper_mid_terminate() -> None:
     orphans = pool.stop(stop_timeout_s=5)
     assert slots[0].slot_id in rt.reaped, "stop() left a worker the reaper was mid-terminate on"
     assert orphans == 0
+
+
+def test_concurrent_ticks_start_exactly_one_reaper() -> None:
+    # issue #75 (self-review): the check-and-set must start the reaper INSIDE the lock. A thread
+    # created-but-not-yet-started reports is_alive()==False, so releasing the lock before start()
+    # let a concurrent tick see "no reaper" and spawn another (thread leak on a busy pool).
+    import blastbox.host.pool as pool_mod
+
+    created: list[int] = []
+    real_thread = threading.Thread
+
+    class _CountingThread(real_thread):     # type: ignore[misc,valid-type]
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            if k.get("name") == "blastbox-pool-reaper":
+                created.append(1)
+
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    slot.state = SlotState.DRAINING
+    with pool._lock:
+        pool._deferred_reap.add(slot.slot_id)
+
+    pool_mod.threading.Thread = _CountingThread
+    try:
+        kicks = [real_thread(target=pool._reap_deferred) for _ in range(20)]
+        for t in kicks:
+            t.start()
+        for t in kicks:
+            t.join(5)
+    finally:
+        pool_mod.threading.Thread = real_thread
+    _join_reaper(pool)
+    assert len(created) == 1, f"spawned {len(created)} reaper threads, want exactly 1"
