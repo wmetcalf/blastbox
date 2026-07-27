@@ -1737,3 +1737,95 @@ def test_drain_passes_both_guards_to_the_reap_primitive() -> None:
     assert seen, "the drain never reached the reap primitive"
     assert seen[0].get("require_tracked") is True, seen[0]
     assert seen[0].get("pop_on_success") is True, seen[0]
+
+
+def _spy_reap_kwargs(pool):
+    """Record the kwargs every disposal path passes to _reap_and_count."""
+    seen: list[dict] = []
+    real = pool._reap_and_count
+
+    def _spy(slot, **kw):
+        seen.append(kw)
+        return real(slot, **kw)
+
+    pool._reap_and_count = _spy            # type: ignore[method-assign]
+    return seen
+
+
+def _assert_guarded(seen, path: str) -> None:
+    assert seen, f"{path} never reached the reap primitive"
+    for kw in seen:
+        assert kw.get("require_tracked") is True, f"{path} lost require_tracked: {kw}"
+        assert kw.get("pop_on_success") is True, f"{path} lost pop_on_success: {kw}"
+
+
+# --- every two-phase disposal path must take BOTH guards (issue #75 review) -----------------
+# Without them the "still tracked?" check runs in a DIFFERENT critical section from the one that
+# takes reap ownership, and the pop happens in a SEPARATE lock acquisition after ownership is
+# released — two windows in which a concurrent stop() terminates the same worker a second time.
+# These pin each CALL SITE (mutation-proven: stripping the kwargs from any one of them used to
+# leave the whole suite green).
+
+def test_release_passes_both_reap_guards() -> None:
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    slot.state = SlotState.ASSIGNED
+    seen = _spy_reap_kwargs(pool)
+    pool.release(slot)
+    _assert_guarded(seen, "release()")
+
+
+def test_retire_passes_both_reap_guards() -> None:
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    slot.state = SlotState.ASSIGNED
+    seen = _spy_reap_kwargs(pool)
+    pool.retire(slot)
+    _assert_guarded(seen, "retire()")
+
+
+def test_reap_surplus_passes_both_reap_guards() -> None:
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=4, concurrent_ceiling=4, spawn_rate_limit=1000.0)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    pool.resize(warm_size=1, concurrent_ceiling=1)      # marks the pool autosized -> surplus reaping
+    seen = _spy_reap_kwargs(pool)
+    pool._reap_surplus()
+    _assert_guarded(seen, "_reap_surplus()")
+
+
+def test_health_check_passes_both_reap_guards() -> None:
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    slot = next(iter(pool._slots.values()))
+    rt.set_alive(slot.slot_id, False)                   # dead IDLE slot -> health eviction
+    seen = _spy_reap_kwargs(pool)
+    pool._health_check()
+    _assert_guarded(seen, "_health_check()")
+
+
+def test_promote_warming_passes_both_reap_guards() -> None:
+    # The DRAINING-while-WARMING branch: is_ready() returns False on a slot an external stop()
+    # already flipped to DRAINING, so the pool disposes it itself. Same two-phase shape, same guards.
+    # The branch is reached only when the slot was WARMING at snapshot time and became DRAINING
+    # DURING the loop — exactly what a concurrent stop() does — so flip it inside is_ready().
+    class _NotReadyFlipsToDraining(_FakeRuntime):
+        def is_ready(self, slot: Slot) -> bool:
+            slot.state = SlotState.DRAINING    # a concurrent stop() flips it mid-promote
+            return False
+
+    rt = _NotReadyFlipsToDraining()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    assert slot.state == SlotState.WARMING
+    seen = _spy_reap_kwargs(pool)
+    pool._promote_warming()
+    _assert_guarded(seen, "_promote_warming()")
