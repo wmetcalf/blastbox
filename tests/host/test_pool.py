@@ -1350,8 +1350,7 @@ def test_stop_disposes_a_deferred_husk() -> None:
 
 def _join_reaper(pool, timeout: float = 5.0) -> None:
     """Wait for the dedicated deferred-reap thread (issue #75 disposal is asynchronous)."""
-    t = pool._reaper_thread
-    if t is not None:
+    for t in list(getattr(pool, "_reaper_threads", [])):
         t.join(timeout)
 
 
@@ -1371,6 +1370,10 @@ class _CachedLivenessRuntime(_FakeRuntime):
         # wedge the reap of exactly ONE slot (None = every fresh-dead slot), so a test can pin
         # which disposal stalls instead of accidentally wedging stop()'s own reaps too.
         self.hang_slot: str | None = None
+        self._reap_delay = 0.0
+
+    def set_reap_delay(self, seconds: float) -> None:
+        self._reap_delay = seconds
 
     def is_alive(self, slot: Slot) -> bool:          # background/tick view: still cached-alive
         return True
@@ -1384,6 +1387,8 @@ class _CachedLivenessRuntime(_FakeRuntime):
         wedge = (slot.slot_id == self.hang_slot) if self.hang_slot else (slot.slot_id in self.fresh_dead)
         if self._hang is not None and wedge:
             self._hang.wait(20)                       # wedged disposal
+        if self._reap_delay:
+            time.sleep(self._reap_delay)              # slow-but-working disposal
         super().reap(slot)
 
 
@@ -1414,7 +1419,7 @@ def test_claim_scan_is_bounded_when_every_probe_stalls() -> None:
     # up to cli_timeout_s on the cloud tiers. N dead slots must not hold the caller (and its
     # warm-gate reservation, #72) for N x probe. The rescan is deadline-bounded with a grace floor.
     rt = _CachedLivenessRuntime(probe_delay=0.4)
-    pool = WarmPool(runtime=rt, warm_size=4, concurrent_ceiling=4, spawn_rate_limit=100.0)
+    pool = WarmPool(runtime=rt, warm_size=10, concurrent_ceiling=10, spawn_rate_limit=1000.0)
     pool._spawn_to_deficit(ready=True)
     pool._promote_warming()
     for s in pool._slots.values():
@@ -1422,7 +1427,9 @@ def test_claim_scan_is_bounded_when_every_probe_stalls() -> None:
     t0 = time.monotonic()
     assert pool.claim(timeout_s=0.05) is None
     elapsed = time.monotonic() - t0
-    # grace (1.0s) + at most one in-flight probe — NOT 4 x 0.4s of unbounded scanning
+    # Discriminating bound: unbounded scanning would probe all 10 slots = 4.0s. The deadline+grace
+    # must cut it to ~grace (1.0s) + one in-flight probe. (Verified by mutation: disabling the
+    # scan_deadline check makes this FAIL, which the earlier 4-slot version did not.)
     assert elapsed < pool._SCAN_GRACE_S + 1.0, f"claim scan ran away: {elapsed:.2f}s"
     pool.stop()
 
@@ -1443,7 +1450,7 @@ def test_stop_racing_the_reaper_does_not_double_terminate() -> None:
     pool._try_claim_one()
     pool._reap_deferred()
     time.sleep(0.2)
-    pool.stop()                                       # reaps+pops everything while the reaper hangs
+    pool.stop(stop_timeout_s=1.0)                     # bounded: don't burn the 150s default budget
     hang.set()
     _join_reaper(pool)
     assert len(rt.reaped) == len(set(rt.reaped)), f"double-terminated: {rt.reaped}"
@@ -1471,12 +1478,16 @@ def test_stop_waits_for_a_reaper_mid_terminate() -> None:
     assert orphans == 0
 
 
-def test_concurrent_ticks_start_exactly_one_reaper() -> None:
-    # issue #75 (self-review): the check-and-set must start the reaper INSIDE the lock. A thread
-    # created-but-not-yet-started reports is_alive()==False, so releasing the lock before start()
-    # let a concurrent tick see "no reaper" and spawn another (thread leak on a busy pool).
+def test_concurrent_ticks_never_exceed_the_reaper_bound() -> None:
+    # issue #75 (review): the check-and-set must start reapers INSIDE the lock — a
+    # created-but-not-yet-started thread reports is_alive()==False, so releasing the lock first lets
+    # concurrent ticks over-spawn past _MAX_REAPERS (thread fan-out on a busy pool).
+    # DETERMINISTIC by construction: the reapers block on a gate until every kick has returned, so
+    # the racing window is held open instead of being won by luck (the earlier version of this test
+    # only caught the regression ~10% of runs).
     import blastbox.host.pool as pool_mod
 
+    gate = threading.Event()
     created: list[int] = []
     real_thread = threading.Thread
 
@@ -1486,22 +1497,112 @@ def test_concurrent_ticks_start_exactly_one_reaper() -> None:
             if k.get("name") == "blastbox-pool-reaper":
                 created.append(1)
 
+    class _GatedRuntime(_FakeRuntime):
+        def reap(self, slot: Slot) -> None:
+            gate.wait(10)                    # hold every reaper alive for the whole race
+            super().reap(slot)
+
+    rt = _GatedRuntime()
+    pool = WarmPool(runtime=rt, warm_size=12, concurrent_ceiling=12, spawn_rate_limit=1000.0)
+    pool._spawn_to_deficit(ready=True)
+    for slot in pool._slots.values():        # a queue deep enough to want many reapers
+        slot.state = SlotState.DRAINING
+        with pool._lock:
+            pool._deferred_reap.add(slot.slot_id)
+
+    pool_mod.threading.Thread = _CountingThread
+    try:
+        kicks = [real_thread(target=pool._reap_deferred) for _ in range(24)]
+        for t in kicks:
+            t.start()
+        for t in kicks:
+            t.join(5)
+        assert len(created) <= pool._MAX_REAPERS, (
+            f"spawned {len(created)} reapers, bound is {pool._MAX_REAPERS}")
+    finally:
+        pool_mod.threading.Thread = real_thread
+        gate.set()
+        _join_reaper(pool)
+
+
+def test_require_tracked_refuses_to_reap_an_untracked_slot() -> None:
+    # issue #75 (review): the deferred reaper resolves its work list before disposing, so a slot
+    # stop() already disposed+popped in between must NOT be terminated a second time. The guard has
+    # to be evaluated in the SAME critical section that takes reap ownership — tested directly here,
+    # because stop()'s reaper-join now serializes away the interleaving that used to reach it.
     rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+
+    with pool._lock:                          # simulate: another path already disposed + popped it
+        pool._slots.pop(slot.slot_id, None)
+
+    assert pool._reap_and_count(slot, require_tracked=True) is False
+    assert slot.slot_id not in rt.reaped, "re-terminated a slot that was already disposed"
+    # ...while the default (untracked-tolerant) call still disposes, as every other path relies on
+    assert pool._reap_and_count(slot) is True
+    assert slot.slot_id in rt.reaped
+
+
+def test_wedged_reaper_does_not_inflate_the_orphan_count() -> None:
+    # issue #75 (review): stop()'s orphan return drives the caller's node-budget reservation. The
+    # +1 for a wedged thread exists for the wedged-SPAWN case, whose slot is NOT in _slots. A wedged
+    # REAPER's slot IS tracked (it only pops after a successful reap), so counting it twice would
+    # make the caller hold a reservation for capacity that doesn't exist.
+    hang = threading.Event()
+    rt = _CachedLivenessRuntime(hang=hang)
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    slot = next(iter(pool._slots.values()))
+    rt.fresh_dead.add(slot.slot_id)
+    rt.hang_slot = slot.slot_id
+    pool._try_claim_one()
+    pool._reap_deferred()
+    time.sleep(0.2)
+    try:
+        orphans = pool.stop(stop_timeout_s=0.5)       # reaper still wedged -> join expires
+        assert orphans == len(pool._slots), f"orphans={orphans} but {len(pool._slots)} tracked"
+    finally:
+        hang.set()
+        _join_reaper(pool)
+
+
+def test_mass_slot_death_drains_in_parallel() -> None:
+    # issue #75 (review): a mass death (spot reclamation / AZ event inside is_alive()'s cache
+    # window) is exactly what this path exists for. Draining serially would stall a ceiling-bound
+    # tier for N x reap latency; pre-#75 each claim thread reaped concurrently, so the bounded
+    # reaper pool must keep recovery parallel.
+    rt = _CachedLivenessRuntime()
+    n = 8
+    pool = WarmPool(runtime=rt, warm_size=n, concurrent_ceiling=n, spawn_rate_limit=1000.0)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    for s in pool._slots.values():
+        rt.fresh_dead.add(s.slot_id)
+    slow = 0.3
+    rt.set_reap_delay(slow)
+    pool._try_claim_one()                              # discovers + defers all of them
+    t0 = time.monotonic()
+    pool.tick()
+    _join_reaper(pool, timeout=60)
+    elapsed = time.monotonic() - t0
+    assert len(rt.reaped) == n, rt.reaped
+    # parallel across _MAX_REAPERS -> well under the serial n*slow
+    assert elapsed < n * slow * 0.75, f"drain looks serial: {elapsed:.2f}s for {n} x {slow}s"
+
+
+def test_stop_clears_the_deferred_queue_so_a_restart_cannot_re_terminate() -> None:
+    # issue #75 (review): a slot whose reap RAISES stays tracked as a QUARANTINED husk. If stop()
+    # left its id queued, a restarted pool's first tick would re-terminate a resource whose
+    # disposal already failed — which _drain_deferred_reaps' own contract forbids.
+    rt = _ReapFailRuntime()
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
     pool._spawn_to_deficit(ready=True)
     slot = next(iter(pool._slots.values()))
     slot.state = SlotState.DRAINING
     with pool._lock:
         pool._deferred_reap.add(slot.slot_id)
-
-    pool_mod.threading.Thread = _CountingThread
-    try:
-        kicks = [real_thread(target=pool._reap_deferred) for _ in range(20)]
-        for t in kicks:
-            t.start()
-        for t in kicks:
-            t.join(5)
-    finally:
-        pool_mod.threading.Thread = real_thread
-    _join_reaper(pool)
-    assert len(created) == 1, f"spawned {len(created)} reaper threads, want exactly 1"
+    pool.stop(stop_timeout_s=1.0)
+    assert slot.slot_id not in pool._deferred_reap

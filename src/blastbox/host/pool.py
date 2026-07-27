@@ -222,7 +222,12 @@ class WarmPool:
         # cached is_alive), so putting the disposal on the tick thread would trade a one-thread
         # stall for a whole-tier outage (no promote/spawn/health-check while a reap hangs).
         self._deferred_reap: set[str] = set()
-        self._reaper_thread: threading.Thread | None = None
+        # Bounded pool of disposal threads. Parallel because a MASS slot death (spot reclamation /
+        # AZ event terminating the fleet inside is_alive()'s cache window) is exactly what this path
+        # exists for: draining N husks serially would stall a ceiling-bound tier for N x reap
+        # latency, whereas pre-#75 each claim thread reaped its own dead slot concurrently. Bounded
+        # so a mass death can't spawn an unbounded thread fan-out.
+        self._reaper_threads: list[threading.Thread] = []
         self._thread: threading.Thread | None = None
 
         # Burst demand tracking — all access under _lock
@@ -306,13 +311,21 @@ class WarmPool:
         # below CANNOT cover that slot — _reap_and_count's ownership guard makes it skip whatever the
         # reaper already owns — so waiting here is the only thing that disposes it. Past the budget we
         # log and proceed, exactly like the wedged-spawn case above.
-        reaper = self._reaper_thread
-        if reaper is not None and reaper.is_alive():
-            reaper.join(timeout=stop_timeout_s)
+        deadline = self._clock() + stop_timeout_s
+        for reaper in list(self._reaper_threads):
+            if not reaper.is_alive():
+                continue
+            reaper.join(timeout=max(0.0, deadline - self._clock()))
             if reaper.is_alive():
+                # NOTE: do NOT set thread_wedged here. That flag adds +1 to the orphan count for the
+                # wedged-SPAWN case, whose slot is NOT yet in _slots and so is invisible to the
+                # len(_slots) tally below. A wedged REAPER's slot is the opposite: it is still
+                # tracked (the reaper only pops after a successful reap, and stop()'s own loop skips
+                # it because _reaping ownership makes _reap_and_count return False), so it is already
+                # counted. Adding +1 would report a phantom orphan and make the caller hold a
+                # node-budget reservation for capacity that does not exist.
                 logger.warning("pool.stop: deferred reaper still running after %.0fs (wedged reap?) — "
                                "proceeding; that worker may leak until its TTL", stop_timeout_s)
-                thread_wedged = True
 
         # Reap every slot regardless of state. Pop each ONLY after a successful reap: if reap RAISES
         # (e.g. a libvirt VM whose `virsh destroy` failed during a rolling restart), KEEP it tracked —
@@ -323,6 +336,11 @@ class WarmPool:
         # snapshotting to_reap and reaping must not be handed a slot stop() is about to dispose. After
         # this, reap failures simply leave the (already-DRAINING) husk tracked for manual cleanup.
         with self._lock:
+            # Drop the deferred queue: stop() disposes every tracked slot itself below, and a slot
+            # whose reap RAISES stays tracked as a QUARANTINED husk. Leaving its id queued would let
+            # a restarted pool's first tick re-terminate a resource whose disposal already failed —
+            # exactly what _drain_deferred_reaps' contract forbids.
+            self._deferred_reap.clear()
             to_reap = list(self._slots.values())
             for slot in to_reap:
                 slot.state = SlotState.DRAINING
@@ -492,6 +510,8 @@ class WarmPool:
         self._reap_surplus()
         self._sample_metrics()
 
+    _MAX_REAPERS = 4          # concurrent disposal threads (bounds a mass-death fan-out)
+
     def _reap_deferred(self) -> None:
         """Kick the DEDICATED reaper thread for slots claim() found dead and deferred (issue #75).
 
@@ -507,20 +527,19 @@ class WarmPool:
         queued and are drained when it finishes. stop() reaps every tracked slot regardless, so a
         wedged reaper can never leak a live worker past shutdown."""
         with self._lock:
-            if not self._deferred_reap:
-                return
-            if self._reaper_thread is not None and self._reaper_thread.is_alive():
-                return                      # a batch is already draining (possibly wedged)
-            t = threading.Thread(target=self._drain_deferred_reaps,
-                                 name="blastbox-pool-reaper", daemon=True)
-            self._reaper_thread = t
-            # START INSIDE the lock: a thread that is created-but-not-yet-started reports
-            # is_alive()==False, so releasing the lock first would let a concurrent tick see "no
-            # reaper" and spawn a SECOND one. (Harmless for correctness — the queue pop and the
-            # require_tracked/_reaping guards are all lock-protected — but it would leak threads on a
-            # busy pool.) start() does not take _lock; the new thread simply blocks on its first
-            # acquisition until we release here.
-            t.start()
+            self._reaper_threads = [t for t in self._reaper_threads if t.is_alive()]
+            want = min(len(self._deferred_reap), self._MAX_REAPERS - len(self._reaper_threads))
+            if want <= 0:
+                return                      # queue empty, or every reaper slot is busy/wedged
+            for _ in range(want):
+                t = threading.Thread(target=self._drain_deferred_reaps,
+                                     name="blastbox-pool-reaper", daemon=True)
+                self._reaper_threads.append(t)
+                # START INSIDE the lock: a created-but-not-yet-started thread reports
+                # is_alive()==False, so releasing first would let a concurrent tick see fewer live
+                # reapers and over-spawn past _MAX_REAPERS. start() does not take _lock — the new
+                # thread just blocks on its first acquisition until we release here.
+                t.start()
 
     def _drain_deferred_reaps(self) -> None:
         """Dispose every queued husk, one at a time, off the tick + claim paths.
