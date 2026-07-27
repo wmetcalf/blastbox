@@ -1304,8 +1304,9 @@ def test_claim_probe_uses_a_short_cli_budget_background_calls_do_not():
     seen.clear()
     rt.is_alive_for_claim(slot)
     assert seen, "claim probe issued no aws call"
-    assert all(t == rt.cfg.claim_probe_timeout_s for t in seen), (
-        f"claim probe used {seen}, want {rt.cfg.claim_probe_timeout_s}s")
+    # each call gets what remains of the WHOLE-probe deadline (<= the budget, > 0)
+    assert all(0 < t <= rt.cfg.claim_probe_timeout_s for t in seen), (
+        f"claim probe used {seen}, want <= {rt.cfg.claim_probe_timeout_s}s")
     assert rt.cfg.claim_probe_timeout_s < rt.cfg.cli_timeout_s
 
     seen.clear()
@@ -1371,11 +1372,12 @@ def test_claim_probe_budget_is_restored_not_cleared():
     rt, _fake = _lambda_rt({"lambda-microvms run-microvm": {"microvmId": "mv-1"},
                             "lambda-microvms get-microvm": {"state": "running"}})
     with rt._claim_probe_budget():
-        outer = rt._tls.probe_budget_s
+        outer = rt._tls.probe_deadline
+        assert outer is not None
         with rt._claim_probe_budget():
-            assert rt._tls.probe_budget_s == rt.cfg.claim_probe_timeout_s
-        assert rt._tls.probe_budget_s == outer, "nested scope clobbered the outer budget"
-    assert getattr(rt._tls, "probe_budget_s", None) is None
+            assert rt._tls.probe_deadline is not None
+        assert rt._tls.probe_deadline == outer, "nested scope clobbered the outer deadline"
+    assert getattr(rt._tls, "probe_deadline", None) is None
 
 
 def test_aws_config_positional_binding_is_stable():
@@ -1442,3 +1444,49 @@ def test_claim_mint_timeout_reports_unknown_not_unusable():
 
     rt._run_aws = _timeout_the_mint             # type: ignore[method-assign]
     assert rt.is_alive_for_claim(slot) is None, "a mint timeout must be UNKNOWN, not unusable"
+
+
+def test_claim_probe_budget_is_shared_across_the_whole_probe():
+    # issue #77 (review): the budget must bound the probe AS A WHOLE, not each call. A describe at
+    # 4.9s followed by a token mint at 4.9s would otherwise take ~9.8s while holding the warm-gate
+    # reservation, blowing a claim(timeout_s=2) contract by ~5x. Uses an ADVANCING clock — the
+    # module's default fixture freezes time, which would hide exactly this.
+    now = {"t": 1000.0}
+    cfg = LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:img",
+                              allow_default_egress=True)
+    fake = FakeAws({**_IDENT,
+                    "lambda-microvms run-microvm": {"microvmId": "mv-1"},
+                    "lambda-microvms get-microvm": {"state": "running", "endpoint": "h.x"},
+                    "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}})
+    rt = LambdaMicroVmRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True,
+                              clock=lambda: now["t"])
+    slot = rt._launch()
+    slot.auth_token = "old"
+    slot.token_minted_at = -1e9                  # force the re-mint inside the same probe
+
+    budgets: list[float] = []
+    real = rt._run_aws
+
+    def _spy(argv, timeout):                     # noqa: ANN001
+        budgets.append(timeout)
+        now["t"] += 3.0                          # each call burns 3s of the probe's deadline
+        return real(argv, timeout)
+
+    rt._run_aws = _spy                           # type: ignore[method-assign]
+    rt.is_alive_for_claim(slot)
+
+    assert len(budgets) >= 2, f"expected describe + mint, got {budgets}"
+    assert budgets[1] < budgets[0], (
+        f"second call got a fresh budget instead of the remainder: {budgets}")
+    assert sum(3.0 for _ in budgets) <= rt.cfg.claim_probe_timeout_s + 3.0, budgets
+
+
+def test_subclass_config_positional_binding_survives_the_new_base_field():
+    # issue #77 (review): dataclass inheritance appends SUBCLASS fields AFTER the base's, so adding
+    # claim_probe_timeout_s to the BASE — even "last" — still inserted it BEFORE image_identifier &
+    # friends, silently rebinding positional subclass calls. kw_only takes it out of positional
+    # ordering entirely. (This is the same trap PoolSpec.queued hit, one inheritance level up.)
+    cfg = LambdaMicroVmConfig("us-east-1", "prof", 8765, "/hz", 300.0, 5.0, 120.0, 3600.0, "arn:img")
+    assert cfg.image_identifier == "arn:img", "the new base field rebound a subclass field"
+    assert cfg.max_duration_s == 3600.0
+    assert cfg.claim_probe_timeout_s == 5.0

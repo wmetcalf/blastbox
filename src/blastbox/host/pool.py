@@ -227,9 +227,11 @@ class WarmPool:
         # exists for: draining N husks serially would stall a ceiling-bound tier for N x reap
         # latency, whereas pre-#75 each claim thread reaped its own dead slot concurrently. Bounded
         # so a mass death can't spawn an unbounded thread fan-out.
-        # (thread, started_at) — the timestamp lets a WEDGED reaper stop counting against
-        # _MAX_REAPERS so four stuck disposals can't halt the queue forever (issue #77).
-        self._reaper_threads: list[tuple[threading.Thread, float]] = []
+        # [thread, last_progress_at] — MUTABLE so a draining reaper can stamp progress. "Wedged"
+        # means NO PROGRESS for _REAPER_WEDGED_AFTER_S, not merely old: a reaper steadily disposing
+        # a long queue (40s per terminate x N) is working, and counting it as wedged would spawn
+        # redundant reapers against the same queue (issue #77).
+        self._reaper_threads: list[list] = []
         # Wall-clock bound for the hand-out liveness probe. Short ON PURPOSE: it sits on
         # job-dispatch latency and holds the caller's warm-gate reservation (#72), so a slot that
         # can't be described in a few seconds is better skipped than waited on (issue #77).
@@ -320,7 +322,7 @@ class WarmPool:
         # below CANNOT cover that slot — _reap_and_count's ownership guard makes it skip whatever the
         # reaper already owns — so waiting here is the only thing that disposes it. Past the budget we
         # log and proceed, exactly like the wedged-spawn case above.
-        for reaper, _started in list(self._reaper_threads):
+        for reaper, _progress in list(self._reaper_threads):
             if not reaper.is_alive():
                 continue
             reaper.join(timeout=max(0.0, stop_deadline - self._clock()))
@@ -552,12 +554,12 @@ class WarmPool:
         wedged reaper can never leak a live worker past shutdown."""
         with self._lock:
             now = self._clock()
-            self._reaper_threads = [(t, ts) for (t, ts) in self._reaper_threads if t.is_alive()]
+            self._reaper_threads = [e for e in self._reaper_threads if e[0].is_alive()]
             # Count only reapers that are still making progress. One wedged in a hung terminate is
             # abandoned (Python can't interrupt it) but must not hold a slot in the pool forever,
             # or four stuck disposals stop the queue draining for the life of the pool (issue #77).
-            live = sum(1 for (t, ts) in self._reaper_threads
-                       if now - ts < self._REAPER_WEDGED_AFTER_S)
+            live = sum(1 for entry in self._reaper_threads
+                       if now - entry[1] < self._REAPER_WEDGED_AFTER_S)
             # Two bounds: _MAX_REAPERS caps CONCURRENT PROGRESS (wedged ones don't count, so a stuck
             # disposal can't halt the queue), and _MAX_REAPER_THREADS caps TOTAL live threads
             # (wedged ones DO count, so a permanently-hung runtime can't spawn threads forever).
@@ -567,16 +569,19 @@ class WarmPool:
             if want <= 0:
                 return                      # queue empty, or every reaper slot is busy/wedged
             for _ in range(want):
-                t = threading.Thread(target=self._drain_deferred_reaps,
+                entry_box: list = []
+                t = threading.Thread(target=lambda: self._drain_deferred_reaps(entry_box),
                                      name="blastbox-pool-reaper", daemon=True)
-                self._reaper_threads.append((t, now))
+                entry = [t, now]
+                entry_box.append(entry)          # let the thread stamp its own progress
+                self._reaper_threads.append(entry)
                 # START INSIDE the lock: a created-but-not-yet-started thread reports
                 # is_alive()==False, so releasing first would let a concurrent tick see fewer live
                 # reapers and over-spawn past _MAX_REAPERS. start() does not take _lock — the new
                 # thread just blocks on its first acquisition until we release here.
                 t.start()
 
-    def _drain_deferred_reaps(self) -> None:
+    def _drain_deferred_reaps(self, entry_box: "list | None" = None) -> None:
         """Dispose every queued husk, one at a time, off the tick + claim paths.
 
         Scoped to ids claim() deferred, so DRAINING slots owned by release()/stop()/_reap_surplus —
@@ -599,6 +604,10 @@ class WarmPool:
                 self._reap_and_count(slot, require_tracked=True, pop_on_success=True)
             except Exception:
                 logger.exception("pool.reap_deferred_error slot_id=%s — quarantining", slot.slot_id)
+            # Stamp PROGRESS: this reaper just finished a disposal, so it is working, not wedged.
+            if entry_box:
+                with self._lock:
+                    entry_box[0][1] = self._clock()
 
     def _reap_surplus(self) -> None:
         """Reap IDLE slots above the (possibly just-lowered) effective target, so a

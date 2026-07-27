@@ -1936,3 +1936,43 @@ def test_total_reaper_threads_are_hard_capped_even_when_all_are_wedged() -> None
     finally:
         hang.set()
         _join_reaper(pool, timeout=10)
+
+
+def test_a_reaper_making_progress_is_not_treated_as_wedged() -> None:
+    # issue #77 (review): "wedged" must mean NO PROGRESS, not merely old. A reaper steadily draining
+    # a long queue (slow-but-working terminates) would otherwise be reclassified as wedged the
+    # moment it aged past the watchdog, spawning redundant reapers against the same queue.
+    # The reap must be SLOW so the queue is still non-empty at the second kick — with instant reaps
+    # the queue drains first and the test passes even with progress-tracking removed.
+    class _SlowButWorking(_FakeRuntime):
+        def reap(self, slot: Slot) -> None:
+            time.sleep(0.05)                    # working, just not instant
+            super().reap(slot)
+
+    rt = _SlowButWorking()
+    n = 40
+    pool = WarmPool(runtime=rt, warm_size=n, concurrent_ceiling=n, spawn_rate_limit=10000.0)
+    pool._MAX_REAPERS = 1                       # exactly ONE reaper may make progress
+    # Watchdog LONGER than one reap (0.05s) but far shorter than the whole drain (40 x 0.05 = 2s):
+    # a progressing reaper stamps every ~0.05s so it never looks stalled, while age-based detection
+    # would flag it after 0.3s. (A watchdog shorter than one reap would flag even a working reaper
+    # mid-disposal — progress is only observable BETWEEN disposals.)
+    pool._REAPER_WEDGED_AFTER_S = 0.3
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    with pool._lock:
+        for sid, slot in pool._slots.items():
+            slot.state = SlotState.DRAINING
+            pool._deferred_reap.add(sid)
+
+    try:
+        pool._reap_deferred()                   # start the single reaper
+        for _ in range(12):                     # keep kicking well past the watchdog window
+            time.sleep(0.1)
+            pool._reap_deferred()
+            with pool._lock:
+                assert len(pool._reaper_threads) <= 1, (
+                    f"a progressing reaper was misread as wedged: "
+                    f"{len(pool._reaper_threads)} reapers for _MAX_REAPERS=1")
+    finally:
+        _join_reaper(pool, timeout=15)

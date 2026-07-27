@@ -40,6 +40,7 @@ import urllib.request
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from dataclasses import field as dc_field
 from typing import Any
 
 from blastbox.host.pool import SlotState
@@ -115,7 +116,7 @@ class AwsWorkerConfig:
     # UNKNOWN (AwsProbeTimeout -> None), never "dead", so the pool skips the slot instead of
     # destroying a possibly-healthy worker. DECLARED LAST so adding it can't silently rebind a
     # positional caller's later fields.
-    claim_probe_timeout_s: float = 5.0
+    claim_probe_timeout_s: float = dc_field(default=5.0, kw_only=True)
 
     def aws_argv(self, service: str, op: str, *args: str) -> list[str]:
         argv = ["aws", service, op, "--region", self.region, "--output", "json"]
@@ -386,12 +387,12 @@ class AwsDisposableRuntime:
         block (issue #77). Save/restore rather than clear: a subclass override wraps its whole body
         and calls super() inside it, so a hard reset would drop the outer scope's budget and let the
         rest of the probe (e.g. the JWE re-mint) run at the full cli_timeout_s."""
-        prev = getattr(self._tls, "probe_budget_s", None)
-        self._tls.probe_budget_s = self.cfg.claim_probe_timeout_s
+        prev = getattr(self._tls, "probe_deadline", None)
+        self._tls.probe_deadline = self._clock() + self.cfg.claim_probe_timeout_s
         try:
             yield
         finally:
-            self._tls.probe_budget_s = prev
+            self._tls.probe_deadline = prev
 
     def _aws(self, service: str, op: str, *args: str,
              timeout_s: float | None = None) -> dict[str, Any]:
@@ -399,14 +400,20 @@ class AwsDisposableRuntime:
         # A claim-probe budget set by is_alive_for_claim on THIS thread wins over the default. It is
         # thread-local on purpose: the background tick calls _aws concurrently and must keep the full
         # cli_timeout_s (a slow terminate is not a dispatch-latency problem). See issue #77.
-        probe_budget = getattr(self._tls, "probe_budget_s", None)
-        if timeout_s is None and probe_budget is not None:
-            timeout_s = probe_budget
+        # A claim probe is bounded AS A WHOLE, not per call: a describe at 4.9s followed by a token
+        # mint at 4.9s would otherwise blow a claim(timeout_s=2) contract by ~5x while holding the
+        # warm-gate reservation. Each call gets only what's left of the probe's deadline.
+        probe_deadline = getattr(self._tls, "probe_deadline", None)
+        if timeout_s is None and probe_deadline is not None:
+            remaining = probe_deadline - self._clock()
+            if remaining <= 0:
+                raise AwsProbeTimeout(f"aws {service} {op}: claim probe budget exhausted")
+            timeout_s = min(remaining, self.cfg.cli_timeout_s)
         budget = self.cfg.cli_timeout_s if timeout_s is None else timeout_s
         try:
             cp = self._run_aws(argv, budget)
         except subprocess.TimeoutExpired as exc:
-            if getattr(self._tls, "probe_budget_s", None) is not None:
+            if getattr(self._tls, "probe_deadline", None) is not None:
                 # Inside a claim probe: report UNKNOWN, not failure (issue #77).
                 raise AwsProbeTimeout(f"aws {service} {op}: timed out after {budget}s") from exc
             raise AwsWorkerError(f"aws {service} {op}: timed out after {budget}s") from exc
