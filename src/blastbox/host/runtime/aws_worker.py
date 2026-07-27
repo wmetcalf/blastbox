@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import subprocess
+import threading
 import tempfile
 import time
 import urllib.error
@@ -99,6 +100,12 @@ class AwsWorkerConfig:
     ready_timeout_s: float = 300.0     # overall budget the pool gives a slot to become ready
     probe_timeout_s: float = 5.0       # per health-probe HTTP timeout
     cli_timeout_s: float = 120.0       # per aws-cli call timeout
+    # SHORT bound for the claim-time hand-out probe (issue #77). That probe sits directly on
+    # job-dispatch latency and holds the dispatcher's warm-gate reservation (#72), so waiting the
+    # full cli_timeout_s on a control-plane brownout stalls dispatch. A slot that can't be described
+    # in a few seconds is better treated as not-claimable-right-now than waited on; the pool skips
+    # it (non-destructively) and tries another.
+    claim_probe_timeout_s: float = 5.0
     max_duration_s: int = 3600         # hard lifetime cap requested of the tier (belt+braces reap)
 
     def aws_argv(self, service: str, op: str, *args: str) -> list[str]:
@@ -330,6 +337,9 @@ class AwsDisposableRuntime:
         # health probe defaults to the TLS-aware one (see the select_* helpers).
         self.ssl_context = ssl_context
         self._live_cache: dict[str, tuple[float, bool]] = {}
+        # Per-THREAD aws-cli budget override, set only for the duration of a claim probe (issue
+        # #77). Thread-local so the background tick's concurrent calls keep the full cli_timeout_s.
+        self._tls = threading.local()
         self._mint_fail_at: dict[str, float] = {}   # slot_id -> last failed-token-mint time (throttle)
         # cache the READINESS get-microvm/describe-instances too (is_ready is polled ~10Hz during WARMING,
         # and its endpoint-resolution describe is uncached) so a booting slot doesn't spam the control plane.
@@ -361,12 +371,20 @@ class AwsDisposableRuntime:
         return float(self.cfg.ready_timeout_s)
 
     # -- aws cli seam -------------------------------------------------------
-    def _aws(self, service: str, op: str, *args: str) -> dict[str, Any]:
+    def _aws(self, service: str, op: str, *args: str,
+             timeout_s: float | None = None) -> dict[str, Any]:
         argv = self.cfg.aws_argv(service, op, *args)
+        # A claim-probe budget set by is_alive_for_claim on THIS thread wins over the default. It is
+        # thread-local on purpose: the background tick calls _aws concurrently and must keep the full
+        # cli_timeout_s (a slow terminate is not a dispatch-latency problem). See issue #77.
+        probe_budget = getattr(self._tls, "probe_budget_s", None)
+        if timeout_s is None and probe_budget is not None:
+            timeout_s = probe_budget
+        budget = self.cfg.cli_timeout_s if timeout_s is None else timeout_s
         try:
-            cp = self._run_aws(argv, self.cfg.cli_timeout_s)
+            cp = self._run_aws(argv, budget)
         except subprocess.TimeoutExpired as exc:
-            raise AwsWorkerError(f"aws {service} {op}: timed out after {self.cfg.cli_timeout_s}s") from exc
+            raise AwsWorkerError(f"aws {service} {op}: timed out after {budget}s") from exc
         if cp.returncode != 0:
             raise AwsWorkerError(f"aws {service} {op} failed (rc={cp.returncode}): {(cp.stderr or '').strip()[:400]}")
         out = (cp.stdout or "").strip()
@@ -430,10 +448,17 @@ class AwsDisposableRuntime:
         runtime provides it (optional protocol method; file/libvirt tiers fall back to ``is_alive``)."""
         now = self._clock()
         self._desc_cache.pop(slot.slot_id, None)   # force a fresh get-instance/get-microvm this call
+        # Bound the describe to the claim-probe budget (issue #77): this call is on job-dispatch
+        # latency and holds the dispatcher's warm-gate reservation, so it must not wait out the full
+        # cli_timeout_s during a control-plane brownout. A timeout raises AwsWorkerError -> "not
+        # alive" here, and the POOL treats an over-budget probe non-destructively (skips the slot).
+        self._tls.probe_budget_s = self.cfg.claim_probe_timeout_s
         try:
             alive = self._running(slot)
         except (AwsWorkerError, OSError):
             alive = False
+        finally:
+            self._tls.probe_budget_s = None
         self._live_cache[slot.slot_id] = (now, alive)   # keep the background-tick cache coherent
         return alive
 

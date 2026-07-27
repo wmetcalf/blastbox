@@ -1279,3 +1279,37 @@ def test_launch_tags_include_tier_and_run_fence():
     tagspec = argv[argv.index("--tag-specifications") + 1]
     assert "Key=blastbox-tier,Value=aws-ec2" in tagspec
     assert f"Key=blastbox-run,Value={rt._run_id}" in tagspec
+
+
+def test_claim_probe_uses_a_short_cli_budget_background_calls_do_not():
+    # issue #77: the claim-time hand-out probe is on job-dispatch latency and holds the dispatcher's
+    # warm-gate reservation (#72), so it must NOT wait out cli_timeout_s (120s) during a
+    # control-plane brownout. It runs under claim_probe_timeout_s; every other call (background
+    # health tick, terminate) keeps the full budget — a slow terminate isn't a latency problem.
+    rt, _fake = _lambda_rt({"lambda-microvms run-microvm": {"microvmId": "mv-1"},
+                            "lambda-microvms get-microvm": {"state": "running"}})
+    slot = rt._launch()
+
+    seen: list[float] = []
+    real = rt._run_aws
+
+    def _spy(argv, timeout):        # noqa: ANN001
+        seen.append(timeout)
+        return real(argv, timeout)
+
+    rt._run_aws = _spy              # type: ignore[method-assign]
+
+    seen.clear()
+    rt.is_alive_for_claim(slot)
+    assert seen, "claim probe issued no aws call"
+    assert all(t == rt.cfg.claim_probe_timeout_s for t in seen), (
+        f"claim probe used {seen}, want {rt.cfg.claim_probe_timeout_s}s")
+    assert rt.cfg.claim_probe_timeout_s < rt.cfg.cli_timeout_s
+
+    seen.clear()
+    rt._desc_cache.pop(slot.slot_id, None)      # force a fresh background describe
+    rt._live_cache.pop(slot.slot_id, None)
+    rt.is_alive(slot)
+    assert seen, "background liveness issued no aws call"
+    assert all(t == rt.cfg.cli_timeout_s for t in seen), (
+        f"background call used {seen}, want the full {rt.cfg.cli_timeout_s}s")

@@ -1355,7 +1355,7 @@ def test_stop_disposes_a_deferred_husk() -> None:
 
 def _join_reaper(pool, timeout: float = 5.0) -> None:
     """Wait for the dedicated deferred-reap thread (issue #75 disposal is asynchronous)."""
-    for t in list(getattr(pool, "_reaper_threads", [])):
+    for t, _started in list(getattr(pool, "_reaper_threads", [])):
         t.join(timeout)
 
 
@@ -1829,3 +1829,89 @@ def test_promote_warming_passes_both_reap_guards() -> None:
     seen = _spy_reap_kwargs(pool)
     pool._promote_warming()
     _assert_guarded(seen, "_promote_warming()")
+
+
+def test_wedged_hand_out_probe_is_skipped_non_destructively() -> None:
+    # issue #77: the hand-out probe is a REMOTE call (aws CLI, bounded only by cli_timeout_s=120s)
+    # sitting on dispatch latency while the caller holds a warm-gate reservation (#72). Bound it —
+    # but a slow control plane is NOT evidence of death, so a slot whose probe times out must be
+    # SKIPPED (left IDLE, never deferred for disposal), and a healthy slot behind it still served.
+    stuck = threading.Event()
+
+    class _StuckProbe(_FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.wedge: set[str] = set()
+
+        def is_alive_for_claim(self, slot: Slot) -> bool:
+            if slot.slot_id in self.wedge:
+                stuck.wait(30)                      # control-plane brownout
+            return True
+
+    rt = _StuckProbe()
+    pool = WarmPool(runtime=rt, warm_size=2, spawn_rate_limit=100.0, claim_probe_timeout_s=0.3)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    slots = list(pool._slots.values())
+    rt.wedge.add(slots[0].slot_id)                  # first candidate's probe hangs
+    try:
+        t0 = time.monotonic()
+        got = pool.claim(timeout_s=2.0)
+        elapsed = time.monotonic() - t0
+        assert got is not None and got.slot_id == slots[1].slot_id, "healthy slot behind it not served"
+        assert elapsed < 2.0, f"claim waited on the wedged probe: {elapsed:.2f}s"
+        # the un-probeable slot must be left ALIVE and claimable later — not destroyed
+        with pool._lock:
+            assert slots[0].slot_id in pool._slots
+            assert slots[0].state == SlotState.IDLE
+            assert slots[0].slot_id not in pool._deferred_reap, "a slow probe must not queue a reap"
+        assert slots[0].slot_id not in rt.reaped, "a slow probe must never destroy the worker"
+    finally:
+        stuck.set()
+        pool.stop(stop_timeout_s=1.0)
+
+
+def test_wedged_reapers_stop_counting_so_the_queue_keeps_draining() -> None:
+    # issue #77: a wedged runtime.reap can't be killed, but it must not hold a slot in the reaper
+    # pool forever — _MAX_REAPERS stuck disposals would otherwise stop the queue draining for the
+    # life of the pool. A reaper older than _REAPER_WEDGED_AFTER_S stops counting against the cap.
+    # ORDERING MATTERS: the wedged ids are queued and picked up FIRST, so every reaper is blocked
+    # before the healthy ids arrive. Draining them then REQUIRES the watchdog to free pool slots
+    # (otherwise an initial reaper could have drained them incidentally and the test would pass
+    # even with the watchdog removed).
+    hang = threading.Event()
+    rt = _CachedLivenessRuntime(hang=hang)
+    pool = WarmPool(runtime=rt, warm_size=8, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    pool._REAPER_WEDGED_AFTER_S = 0.2                 # shrink the watchdog for the test
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    slots = list(pool._slots.values())
+    wedged = slots[:pool._MAX_REAPERS]
+    healthy = slots[pool._MAX_REAPERS:]
+    assert healthy, "need slots beyond the reaper cap"
+    rt.fresh_dead = {s.slot_id for s in wedged}       # ONLY these block inside reap()
+
+    try:
+        for s in wedged:                              # queue the wedging ones FIRST
+            with pool._lock:
+                s.state = SlotState.DRAINING
+                pool._deferred_reap.add(s.slot_id)
+        pool._reap_deferred()
+        time.sleep(0.35)                              # all reapers now blocked, past the watchdog
+
+        for s in healthy:                             # now the ones that must still get disposed
+            with pool._lock:
+                s.state = SlotState.DRAINING
+                pool._deferred_reap.add(s.slot_id)
+
+        want = {s.slot_id for s in healthy}
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not want.issubset(set(rt.reaped)):
+            pool._reap_deferred()                     # must be ALLOWED to start more reapers
+            time.sleep(0.05)
+        assert want.issubset(set(rt.reaped)), (
+            f"queue stalled behind {len(wedged)} wedged reapers: "
+            f"{len(set(rt.reaped) & want)}/{len(want)} disposed")
+    finally:
+        hang.set()
+        _join_reaper(pool)
