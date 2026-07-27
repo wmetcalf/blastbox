@@ -50,15 +50,15 @@ _log = logging.getLogger("blastbox.host.runtime.aws_worker")
 AwsRunner = Callable[[Sequence[str], float], subprocess.CompletedProcess]
 HttpProbe = Callable[[str, dict[str, str], float], bool]
 
+class AwsWorkerError(RuntimeError):
+    """An AWS CLI call failed or returned an unusable response."""
 
-class AwsProbeTimeout(RuntimeError):
+
+
+class AwsProbeTimeout(AwsWorkerError):
     """A claim-time describe exceeded its budget (issue #77). NOT evidence the worker is dead —
     the control plane simply didn't answer in time — so callers must treat it as UNKNOWN and skip
     the slot rather than destroying a possibly-healthy worker during a brownout."""
-
-
-class AwsWorkerError(RuntimeError):
-    """An AWS CLI call failed or returned an unusable response."""
 
 
 class AwsUnavailable(RuntimeError):
@@ -645,6 +645,14 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
             if alive and slot.auth_token:
                 try:
                     self._ensure_token(slot)
+                except AwsProbeTimeout:
+                    # The MINT hit the claim budget (control-plane brownout), which says nothing
+                    # about this worker's health. UNKNOWN, not unusable: the pool skips the slot
+                    # this scan instead of destroying it (issue #77). Listed before the generic
+                    # handler below, which stays the "token really can't be refreshed" case.
+                    _log.warning("aws.claim_mint_timeout slot_id=%s — treating as unknown",
+                                 slot.slot_id)
+                    return None
                 except (AwsWorkerError, OSError):
                     return False   # un-refreshable token at hand-out -> unusable slot (not a silent 403)
             return alive

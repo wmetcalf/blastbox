@@ -15,6 +15,7 @@ import pytest
 
 from blastbox.host.pool import SlotRuntime, SlotState
 from blastbox.host.runtime.aws_worker import (
+    AwsProbeTimeout,
     AwsWorkerConfig,
     AwsUnavailable,
     AwsWorkerError,
@@ -1407,3 +1408,37 @@ def test_claim_probe_timeout_reports_unknown_not_dead():
         raise OSError("no such binary")
     rt._run_aws = _boom                     # type: ignore[method-assign]
     assert rt.is_alive_for_claim(slot) is False
+
+
+def test_probe_timeout_is_an_aws_worker_error_subclass():
+    # issue #77 (self-review): AwsProbeTimeout is raised from inside _aws, which sits under ~16
+    # `except AwsWorkerError` handlers across this module. As a bare RuntimeError it would have
+    # ESCAPED all of them — a brownout would surface as an unhandled crash (or, via the pool's
+    # `except Exception`, as "dead" -> destroying a healthy worker). Subclassing keeps every
+    # existing handler working while is_alive_for_claim catches the specific type first.
+    assert issubclass(AwsProbeTimeout, AwsWorkerError)
+
+
+def test_claim_mint_timeout_reports_unknown_not_unusable():
+    # issue #77 (self-review): the JWE re-mint runs INSIDE the claim budget, and its handler
+    # returned False ("un-refreshable token -> unusable slot"). A TIMEOUT there is a control-plane
+    # brownout, not an unusable worker, so it must report UNKNOWN — otherwise the pool defers a
+    # perfectly healthy microVM for disposal.
+    import subprocess
+
+    rt, _fake = _lambda_rt({"lambda-microvms run-microvm": {"microvmId": "mv-1"},
+                            "lambda-microvms get-microvm": {"state": "running", "endpoint": "h.x"},
+                            "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}})
+    slot = rt._launch()
+    slot.auth_token = "old"
+    slot.token_minted_at = -1e9                 # force a re-mint at hand-out
+
+    real = rt._run_aws
+
+    def _timeout_the_mint(argv, timeout):       # noqa: ANN001
+        if "create-microvm-auth-token" in argv:
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+        return real(argv, timeout)
+
+    rt._run_aws = _timeout_the_mint             # type: ignore[method-assign]
+    assert rt.is_alive_for_claim(slot) is None, "a mint timeout must be UNKNOWN, not unusable"
