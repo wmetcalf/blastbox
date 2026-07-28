@@ -26,6 +26,7 @@ Invariants enforced:
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 import threading
 import time
@@ -33,7 +34,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from blastbox.observability.metrics import (
     record_pool_state,
@@ -223,6 +224,7 @@ class WarmPool:
         # cached is_alive), so putting the disposal on the tick thread would trade a one-thread
         # stall for a whole-tier outage (no promote/spawn/health-check while a reap hangs).
         self._deferred_reap: set[str] = set()
+        self._budget_kwarg_cache: dict[str, bool] = {}
         # Bounded pool of disposal threads. Parallel because a MASS slot death (spot reclamation /
         # AZ event terminating the fleet inside is_alive()'s cache window) is exactly what this path
         # exists for: draining N husks serially would stall a ceiling-bound tier for N x reap
@@ -861,7 +863,19 @@ class WarmPool:
     # remote probe can't hold the caller (or its warm-gate reservation) for long.
     _SCAN_GRACE_S = 1.0
 
-    def _probe_alive(self, slot: "Slot") -> "bool | None":
+    def _accepts_budget(self, fn: "Callable[..., Any]") -> bool:
+        """Whether a runtime's is_alive_for_claim takes the budget_s kwarg (cached per callable)."""
+        key = getattr(fn, "__qualname__", repr(fn))
+        cached = self._budget_kwarg_cache.get(key)
+        if cached is None:
+            try:
+                cached = "budget_s" in inspect.signature(fn).parameters
+            except (TypeError, ValueError):   # builtins / C callables have no introspectable sig
+                cached = False
+            self._budget_kwarg_cache[key] = cached
+        return cached
+
+    def _probe_alive(self, slot: "Slot", budget_s: float | None = None) -> "bool | None":
         """Hand-out liveness probe (issue #77).
 
         Called INLINE — deliberately no watchdog thread. The bound belongs in the runtime, not
@@ -877,11 +891,21 @@ class WarmPool:
         local tiers were never the problem — their ``is_alive`` is a process poll. A probe that
         RAISES is treated as not-alive, as before.
         """
-        claim_check = getattr(self._runtime, "is_alive_for_claim", None)
-        if not callable(claim_check):
-            claim_check = self._runtime.is_alive
+        fresh_check = getattr(self._runtime, "is_alive_for_claim", None)
         try:
-            alive = claim_check(slot)
+            if callable(fresh_check):
+                # Tell the runtime how long the CALLER actually has left, so its own probe bound is
+                # a CEILING rather than an entitlement (issue #77 round 2): claim(timeout_s=0.5)
+                # against a 5s claim_probe_timeout_s otherwise blocked ~5s while holding the
+                # dispatcher's warm-gate reservation. Only when it accepts the kwarg, so an external
+                # runtime predating it keeps working.
+                if budget_s is not None and self._accepts_budget(fresh_check):
+                    alive = fresh_check(slot, budget_s=budget_s)
+                else:
+                    alive = fresh_check(slot)
+            else:
+                # No fresh hook: fall back to the background contract, which takes no budget.
+                alive = self._runtime.is_alive(slot)
         except Exception:
             # UNKNOWN, not dead (issue #77). A runtime's exception enumeration is never complete —
             # an http.client.HTTPException from the static tier, a TypeError from a slot-shape
@@ -938,7 +962,8 @@ class WarmPool:
             # (AWS throttles the control-plane describe), so a slot terminated since the last tick could
             # otherwise be handed out and fail the user's job. Falls back to is_alive() for file/libvirt
             # tiers whose is_alive() is already a fresh check.
-            alive = self._probe_alive(candidate)
+            probe_budget = None if deadline is None else max(0.0, deadline - self._clock())
+            alive = self._probe_alive(candidate, probe_budget)
 
             if alive is None:
                 # UNKNOWN (the runtime's own probe budget expired). Leave the slot IDLE and skip it

@@ -2072,3 +2072,75 @@ def test_each_reaper_stamps_its_OWN_progress_entry() -> None:
     finally:
         gate.set()
         _join_reaper(pool, timeout=10)
+
+
+# ------------------------------------------------ issue #77 round 2: escalated-review regressions
+
+def _slot(slot_id: str, state):  # noqa: ANN001
+    from blastbox.host.pool import Slot
+    return Slot(slot_id=slot_id, control_dir="/tmp/c", input_dir="/tmp/i", output_dir="/tmp/o",
+                state=state)
+
+
+def test_f5_claim_passes_its_remaining_budget_to_the_runtimes_claim_probe():
+    """The runtime bounds its own claim probe (claim_probe_timeout_s), but nothing told it how long
+    the CALLER actually had. claim(timeout_s=0.5) against a 5s probe bound blocked ~5s -- a 10x
+    violation of the claim contract that also pinned the dispatcher's warm-gate reservation."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    seen: list[float | None] = []
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
+            seen.append(budget_s)
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    slot = _slot("s1", SlotState.IDLE)
+    pool._slots["s1"] = slot
+    got = pool.claim(timeout_s=0.5)
+    assert got is slot
+    assert seen and seen[0] is not None, "the runtime was given no claim budget at all"
+    assert seen[0] <= 0.5, f"probe was handed {seen[0]}s against a 0.5s claim contract"
+
+
+def test_f5_a_runtime_without_the_budget_kwarg_still_works():
+    """Back-compat: an external runtime whose is_alive_for_claim predates the kwarg must not break."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    class _OldRt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive_for_claim(self, slot):  # noqa: ANN001 -- no budget_s
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_OldRt(), warm_size=0)
+    slot = _slot("s1", SlotState.IDLE)
+    pool._slots["s1"] = slot
+    assert pool.claim(timeout_s=0.5) is slot

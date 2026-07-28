@@ -68,7 +68,11 @@ _TRANSIENT_AWS_MARKERS = (
     "internalerror",
     "internal error",
     "internalfailure",
-    "503",
+    "internalserverexception",  # the microvm/lambda control plane's own 5xx name; contains
+    "internal server error",    # neither "internalerror" nor "internal error" as a substring
+    "internalservererror",
+    "(500)",                    # "An error occurred (500) when calling ..." (bare "500" would
+    "503",                      # match instance ids / arns, so anchor it to the CLI's phrasing)
     "could not connect to the endpoint",
     "endpoint url",
     "connection was closed",
@@ -89,10 +93,20 @@ def _is_transient_aws_error(stderr: str) -> bool:
     return any(marker in low for marker in _TRANSIENT_AWS_MARKERS)
 
 
-class AwsProbeTimeout(AwsWorkerError):
-    """A claim-time describe exceeded its budget (issue #77). NOT evidence the worker is dead —
-    the control plane simply didn't answer in time — so callers must treat it as UNKNOWN and skip
-    the slot rather than destroying a possibly-healthy worker during a brownout."""
+class AwsUnknownState(AwsWorkerError):
+    """The control plane did not give us an answer about this worker (issue #77).
+
+    UNKNOWN is NOT death. Whether a failure means "unknown" or "confirmed gone" is a property of
+    the FAILURE, not of where it was raised: the first cut only applied this reading inside a probe
+    budget, so the same throttle/timeout at resume() time — where there is no budget in scope —
+    surfaced as a bare AwsWorkerError and _resume_on_claim terminated a healthy PARKED worker.
+    Every caller that can destroy a slot must treat this as "skip / try again", never "reap"."""
+
+
+class AwsProbeTimeout(AwsUnknownState):
+    """The control plane didn't answer in time — the timeout flavour of AwsUnknownState. Raised
+    whether or not a probe budget was in scope (a 120s cli_timeout_s expiring is no more evidence
+    of death than a 5s claim budget expiring)."""
 
 
 class AwsUnavailable(RuntimeError):
@@ -442,13 +456,23 @@ class AwsDisposableRuntime:
             self._tls.probe_deadline = prev
 
     @contextlib.contextmanager
-    def _claim_probe_budget(self):
+    def _claim_probe_budget(self, budget_s: float | None = None):
         """Apply the SHORT claim-probe budget to every aws call made on THIS thread inside the
         block (issue #77). Save/restore rather than clear: a subclass override wraps its whole body
         and calls super() inside it, so a hard reset would drop the outer scope's budget and let the
-        rest of the probe (e.g. the JWE re-mint) run at the full cli_timeout_s."""
+        rest of the probe (e.g. the JWE re-mint) run at the full cli_timeout_s.
+
+        ``budget_s`` is what the CALLER has left on its own claim deadline. The runtime's configured
+        bound is a CEILING, not an entitlement: claim(timeout_s=0.5) against claim_probe_timeout_s=5
+        otherwise blocked ~5s — a 10x contract violation that also pinned the dispatcher's warm-gate
+        reservation for the overrun. Take the smaller of the two. A nested scope never EXTENDS an
+        outer one either, for the same reason."""
+        bound = self.cfg.claim_probe_timeout_s
+        if budget_s is not None:
+            bound = min(bound, max(0.0, float(budget_s)))
         prev = getattr(self._tls, "probe_deadline", None)
-        self._tls.probe_deadline = self._clock() + self.cfg.claim_probe_timeout_s
+        deadline = self._clock() + bound
+        self._tls.probe_deadline = deadline if prev is None else min(prev, deadline)
         try:
             yield
         finally:
@@ -473,18 +497,19 @@ class AwsDisposableRuntime:
         try:
             cp = self._run_aws(argv, budget)
         except subprocess.TimeoutExpired as exc:
-            if getattr(self._tls, "probe_deadline", None) is not None:
-                # Inside a claim probe: report UNKNOWN, not failure (issue #77).
-                raise AwsProbeTimeout(f"aws {service} {op}: timed out after {budget}s") from exc
-            raise AwsWorkerError(f"aws {service} {op}: timed out after {budget}s") from exc
+            # UNKNOWN in every scope (issue #77 round 2): a timeout means the control plane never
+            # answered. Outside a probe this used to be a plain AwsWorkerError, and resume()'s
+            # caller — which string-matches transient markers, none of which cover "timed out" —
+            # read it as a dead worker and terminated a healthy warm slot.
+            raise AwsProbeTimeout(f"aws {service} {op}: timed out after {budget}s") from exc
         if cp.returncode != 0:
             stderr = (cp.stderr or "").strip()
             # Inside a claim/health probe, a TRANSIENT control-plane answer is UNKNOWN, not failure:
             # otherwise a throttle (which exits 255, never TimeoutExpired) is read as a dead worker
             # and the slot is terminated — the most likely brownout of all (issue #77).
-            if (getattr(self._tls, "probe_deadline", None) is not None
-                    and _is_transient_aws_error(stderr)):
-                raise AwsProbeTimeout(f"aws {service} {op}: transient (rc={cp.returncode}): {stderr[:200]}")
+            if _is_transient_aws_error(stderr):
+                # Also UNKNOWN in every scope, for the same reason as the timeout above.
+                raise AwsUnknownState(f"aws {service} {op}: transient (rc={cp.returncode}): {stderr[:200]}")
             raise AwsWorkerError(f"aws {service} {op} failed (rc={cp.returncode}): {stderr[:400]}")
         out = (cp.stdout or "").strip()
         if not out:
@@ -533,7 +558,7 @@ class AwsDisposableRuntime:
         try:
             with self._health_probe_budget():
                 alive = self._running(slot)
-        except AwsProbeTimeout:
+        except AwsUnknownState:
             # The control plane didn't answer in time. NOT evidence of death (issue #77): returning
             # False here makes _health_check evict + reap the slot, which would destroy exactly the
             # workers the UNKNOWN claim path just spared — the whole tier, one tick into a brownout.
@@ -547,7 +572,7 @@ class AwsDisposableRuntime:
         self._live_cache[slot.slot_id] = (now, alive)
         return alive
 
-    def is_alive_for_claim(self, slot: AwsWorkerSlot) -> "bool | None":
+    def is_alive_for_claim(self, slot: AwsWorkerSlot, *, budget_s: float | None = None) -> "bool | None":
         """Claim-time hand-out check: BYPASS the liveness cache. A slot seen alive by a background health
         tick may have been terminated by AWS since (SnapStart idle-policy auto-terminate, spot reclaim,
         hibernate expiry), and the cached ``is_alive()`` would still hand it to a user job -- whose remote
@@ -561,10 +586,10 @@ class AwsDisposableRuntime:
         # latency and holds the dispatcher's warm-gate reservation, so it must not wait out the full
         # cli_timeout_s during a control-plane brownout. A timeout raises AwsWorkerError -> "not
         # alive" here, and the POOL treats an over-budget probe non-destructively (skips the slot).
-        with self._claim_probe_budget():
+        with self._claim_probe_budget(budget_s):
             try:
                 alive = self._running(slot)
-            except AwsProbeTimeout:
+            except AwsUnknownState:
                 # The control plane didn't answer inside the claim budget. UNKNOWN, not dead: the
                 # pool skips this slot (non-destructively) instead of reaping a healthy worker.
                 _log.warning("aws.claim_probe_timeout slot_id=%s — treating as unknown",
@@ -706,13 +731,19 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
         (the transport reuses ``slot.auth_token`` for /detonate without re-minting)."""
         alive = super().is_alive(slot)
         if alive and slot.auth_token:
+            # The base's health-probe scope ends when super() returns, so this mint ran at the full
+            # cli_timeout_s (120s) instead of health_probe_timeout_s — on the SINGLE pool tick
+            # thread, stalling promotion/reaping/metrics for minutes across a slow-mint brownout.
+            # is_alive_for_claim already holds its budget across the whole probe for this exact
+            # reason (issue #77); the health path needs the same treatment.
             try:
-                self._ensure_token(slot)   # refresh only past half-TTL (cached otherwise)
+                with self._health_probe_budget():
+                    self._ensure_token(slot)   # refresh only past half-TTL (cached otherwise)
             except (AwsWorkerError, OSError):
                 pass   # best-effort; a real failure surfaces at readiness/detonate
         return alive
 
-    def is_alive_for_claim(self, slot: AwsWorkerSlot) -> "bool | None":
+    def is_alive_for_claim(self, slot: AwsWorkerSlot, *, budget_s: float | None = None) -> "bool | None":
         """The claim-time fresh check bypasses is_alive(), which is where the JWE is refreshed -- so also
         re-mint here past half-TTL, else a slot the background tick hasn't refreshed recently (scheduler/
         process pause, long tick gap) is handed out with a near/already-expired token and /detonate 403s a
@@ -724,12 +755,12 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
         # Hold the claim-probe budget across the WHOLE probe — the describe AND the JWE re-mint
         # below (issue #77): the base's scope ends when super() returns, so without this the mint
         # ran at the full cli_timeout_s on the claim path, which is what #77 exists to prevent.
-        with self._claim_probe_budget():
-            alive = super().is_alive_for_claim(slot)
+        with self._claim_probe_budget(budget_s):
+            alive = super().is_alive_for_claim(slot, budget_s=budget_s)
             if alive and slot.auth_token:
                 try:
                     self._ensure_token(slot)
-                except AwsProbeTimeout:
+                except AwsUnknownState:
                     # The MINT hit the claim budget (control-plane brownout), which says nothing
                     # about this worker's health. UNKNOWN, not unusable: the pool skips the slot
                     # this scan instead of destroying it (issue #77). Listed before the generic
@@ -910,12 +941,12 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # is unnecessary here. Use the base liveness (cached _running) directly.
         return AwsDisposableRuntime.is_alive(self, slot)
 
-    def is_alive_for_claim(self, slot: AwsWorkerSlot) -> "bool | None":
+    def is_alive_for_claim(self, slot: AwsWorkerSlot, *, budget_s: float | None = None) -> "bool | None":
         # Also skip the base Lambda claim-time refresh: a claimed slot is usually PARKED (mint needs
         # RUNNING -> always fails), and resume() force-mints a fresh JWE on wake AFTER the claim. Failing
         # the claim on a mint error (the base override) would reap EVERY parked warm slot before resume()
         # could wake it -> destroys the tier. Use the base liveness (fresh describe, no token touch).
-        return AwsDisposableRuntime.is_alive_for_claim(self, slot)
+        return AwsDisposableRuntime.is_alive_for_claim(self, slot, budget_s=budget_s)
 
     def reap(self, slot: AwsWorkerSlot) -> None:
         self._desc_cache.pop(slot.slot_id, None)
@@ -1244,6 +1275,43 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         headers = {"X-aws-proxy-auth": self.cfg.agent_token} if self.cfg.agent_token else {}
         return self._probe(url, headers, self.cfg.probe_timeout_s)
 
+    def _try_park(self, slot: AwsWorkerSlot) -> bool:
+        """Issue the THROTTLED ``stop --hibernate`` that parks a warmed slot. True iff it was accepted.
+
+        Throttled because the pool polls is_ready at ~10Hz, and TOLERANT of "not ready to hibernate
+        yet" (the ec2-hibinit-agent needs ~1-2min after boot to lay down the hibernation reserve):
+        a failed attempt leaves the phase alone so a later tick retries. Only a SUCCESSFUL stop
+        advances to "hibernating"."""
+        now = self._clock()
+        if now - self._hib_attempt.get(slot.slot_id, 0.0) < self._liveness_cache_s:
+            return False
+        self._hib_attempt[slot.slot_id] = now
+        try:
+            self._aws("ec2", "stop-instances", "--instance-ids", str(slot.resource_id), "--hibernate")
+        except AwsWorkerError as exc:
+            _log.info("ec2-hibernate: stop --hibernate %s not ready yet (%s); will retry",
+                      slot.slot_id, str(exc)[:120])
+            return False
+        self._desc_cache.pop(slot.slot_id, None)   # force a fresh describe next poll
+        self._phase[slot.slot_id] = "hibernating"
+        self._hib_started[slot.slot_id] = now
+        return True
+
+    def is_alive(self, slot: AwsWorkerSlot) -> bool:
+        """Liveness + RECONCILIATION of the phase map against reality (issue #77 round 2).
+
+        resume() can half-succeed: start-instances is accepted and THEN a describe browns out, so
+        the claim is handed back (UNKNOWN, non-destructive) with the instance RUNNING. is_ready --
+        which owns the boot -> warm -> park machine -- is only polled while a slot is WARMING, so
+        nothing re-parked an IDLE slot in that state: the pool counted a parked warm slot while EC2
+        billed a running one until the uptime backstop fired (forever, with self_terminate off).
+        The background tick DOES call is_alive for IDLE slots, so reconcile here."""
+        alive = super().is_alive(slot)
+        if alive and self._phase.get(slot.slot_id) == "warming" and slot.state == SlotState.IDLE:
+            with contextlib.suppress(AwsWorkerError, OSError):
+                self._try_park(slot)
+        return alive
+
     def is_ready(self, slot: AwsWorkerSlot) -> bool:
         # Per-slot state machine, polled by the pool during WARMING: boot -> warm -> hibernate -> parked.
         try:
@@ -1259,18 +1327,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 # ~10Hz) -- and TOLERATE "not ready to hibernate yet" (the ec2-hibinit-agent needs ~1-2min
                 # after boot to lay down the hibernation reserve). On a failed/throttled attempt we stay
                 # in "warming" and retry on a later tick; only a SUCCESSFUL stop advances to "hibernating".
-                if now - self._hib_attempt.get(slot.slot_id, 0.0) < self._liveness_cache_s:
-                    return False
-                self._hib_attempt[slot.slot_id] = now
-                try:
-                    self._aws("ec2", "stop-instances", "--instance-ids", str(slot.resource_id), "--hibernate")
-                except AwsWorkerError as exc:
-                    _log.info("ec2-hibernate: stop --hibernate %s not ready yet (%s); will retry",
-                              slot.slot_id, str(exc)[:120])
-                    return False
-                self._desc_cache.pop(slot.slot_id, None)   # force a fresh describe next poll
-                self._phase[slot.slot_id] = "hibernating"
-                self._hib_started[slot.slot_id] = now
+                self._try_park(slot)
                 return False
             if phase == "hibernating":
                 st = str(self._describe_cached(slot, self._liveness_cache_s)
@@ -1303,6 +1360,10 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             raise AwsWorkerError(f"ec2-hibernate slot {slot.slot_id} is {st!r}; cannot resume")
         if st == "stopped":
             self._aws("ec2", "start-instances", "--instance-ids", str(slot.resource_id))
+            # Truthful phase BEFORE anything else can fail: the instance is running now. If the rest
+            # of this resume browns out, the claim hands the slot back and is_alive's reconciler
+            # re-parks it -- which it cannot do while the map still claims the slot is "parked".
+            self._phase[slot.slot_id] = "warming"
         self._resolve_ip(slot, refresh=True)   # private IP is retained, but re-describe to be safe
         deadline = self._clock() + self.cfg.resume_timeout_s
         last_exc: Exception | None = None
@@ -1321,6 +1382,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             if cur == "stopped":   # not yet starting (or slid back) -> (re)issue start
                 try:
                     self._aws("ec2", "start-instances", "--instance-ids", str(slot.resource_id))
+                    self._phase[slot.slot_id] = "warming"   # running again; see above
                 except AwsWorkerError as exc:
                     last_exc = exc
             self._resolve_ip(slot, refresh=True)

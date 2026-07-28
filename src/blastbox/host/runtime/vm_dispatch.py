@@ -887,7 +887,10 @@ def _is_unknown_not_dead(exc: BaseException) -> bool:
     issue #77: resume() destroying a PARKED warm slot — already booted and engine-warmed, the most
     expensive kind — because a describe was throttled for a minute is the worst trade in the system.
     Only a CONFIRMED dead state should cost the slot."""
-    if type(exc).__name__ == "AwsProbeTimeout":
+    # Type first: the AWS runtime now raises AwsUnknownState (and its AwsProbeTimeout subclass)
+    # for every "the control plane didn't answer" failure, in or out of a probe budget. The string
+    # pass below stays as a fallback for errors that crossed a module/process boundary.
+    if any(c.__name__ in ("AwsUnknownState", "AwsProbeTimeout") for c in type(exc).__mro__):
         return True
     try:
         from blastbox.host.runtime.aws_worker import _is_transient_aws_error
@@ -930,6 +933,58 @@ def _resume_on_claim(pool: Any, slot: Any) -> None:
         except Exception:   # noqa: BLE001 -- release failure must not mask the resume error
             logger.warning("vm_dispatch: releasing un-resumable slot failed", exc_info=True)
         raise
+
+
+def _claim_resumable_slot(pool: Any, timeout_s: float, *,
+                          clock: "Callable[[], float]" = time.monotonic) -> Any:
+    """Claim a warm slot and resume it, trying OTHER slots when one can't be woken.
+
+    Returns the claimed+resumed slot, or None if the window closed without one.
+
+    issue #77 round 2: this loop used to rely on a failed resume having REMOVED the slot from the
+    pool (``release(dirty=True)``), so "try the next one" happened for free. Making the UNKNOWN
+    case non-destructive (``unclaim`` -> IDLE) broke that premise: ``pool.claim`` is
+    insertion-ordered, so the slot we just handed back is the very next one handed out, and a
+    single throttled slot spun until the deadline while a healthy slot sat idle behind it — the
+    job then requeued with NoWarmSlot despite live capacity. Track what we've tried and HOLD those
+    slots ASSIGNED so the scan advances; hand them all back when the window ends.
+    """
+    deadline = clock() + timeout_s
+    last_exc: Exception | None = None
+    tried: set[str] = set()
+    held: list[Any] = []
+    try:
+        while True:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                break
+            slot = pool.claim(timeout_s=remaining)
+            if slot is None:
+                break
+            sid = getattr(slot, "slot_id", None)
+            if sid is not None and sid in tried:
+                # Already failed this window and handed back. Keep it ASSIGNED for the rest of the
+                # window so the next claim reaches the slots behind it. This costs one extra claim
+                # per bad slot and briefly withholds it from other dispatch threads — both far
+                # cheaper than burning the whole claim window on one unreachable worker.
+                held.append(slot)
+                continue
+            if sid is not None:
+                tried.add(sid)
+            try:
+                _resume_on_claim(pool, slot)
+                return slot
+            except Exception as exc:  # noqa: BLE001 -- dead slots are already retired dirty by
+                last_exc = exc        # _resume_on_claim; UNKNOWN ones were handed back. Try another.
+    finally:
+        unclaim = getattr(pool, "unclaim", None)
+        if callable(unclaim):
+            for s in held:
+                with contextlib.suppress(Exception):
+                    unclaim(s)
+    if last_exc is not None:
+        raise NoWarmSlot("no resumable warm slot within claim timeout") from last_exc
+    return None
 
 
 def build_remote_vm_dispatcher(
@@ -1023,32 +1078,17 @@ def build_remote_vm_dispatcher(
         # worker_timeout_s, a slot appearing near the deadline would start detonating just as the parent
         # heartbeat watchdog (validate_timeout_s) fired, marking the job failed + deleting its input while
         # the daemon keeps a LIVE claimed slot. Capping the wait at warm_claim_timeout_s reserves the full
-        # worker_timeout_s for the detonation (validate_timeout_s = claim + detonate). No slot in that
-        # window -> NoWarmSlot -> requeue (capacity pressure, not a failure). If a claimed slot can't be
-        # resumed (snapstart: the platform auto-terminated a parked slot within the liveness-cache window),
-        # _resume_on_claim already released it dirty -> try ANOTHER slot. For non-resume runtimes
-        # _resume_on_claim never raises, so this returns on the first claim exactly as before.
-        deadline = time.monotonic() + warm_claim_timeout_s
-        last_exc: Exception | None = None
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            slot = pool.claim(timeout_s=remaining)
-            if slot is None:
-                break
-            try:
-                _resume_on_claim(pool, slot)
-                return slot
-            except Exception as exc:  # noqa: BLE001 -- slot already retired dirty; try the next one
-                last_exc = exc
-        # Exhausting the claim window on un-resumable slots is the SAME "no usable warm slot; the job never
-        # ran" condition as a plain capacity miss -- resume only wakes the SLOT, it never touched the job's
-        # input/content. So REQUEUE (NoWarmSlot), don't FAIL+delete-input: AWS auto-terminates parked slots
-        # in correlated batches, so a whole claim window can be stale at once and that must not fail jobs.
-        if last_exc is not None:
-            raise NoWarmSlot("no resumable warm slot within claim timeout") from last_exc
-        raise NoWarmSlot("no warm slot available within claim timeout")   # capacity -> REQUEUE the job
+        # worker_timeout_s for the detonation (validate_timeout_s = claim + detonate).
+        #
+        # Exhausting the window on un-resumable slots is the SAME "no usable warm slot; the job never
+        # ran" condition as a plain capacity miss -- resume only wakes the SLOT, it never touched the
+        # job's input/content. So REQUEUE (NoWarmSlot), don't FAIL+delete-input: AWS auto-terminates
+        # parked slots in correlated batches, so a whole claim window can be stale at once and that
+        # must not fail jobs.
+        slot = _claim_resumable_slot(pool, warm_claim_timeout_s)
+        if slot is None:
+            raise NoWarmSlot("no warm slot available within claim timeout")   # capacity -> REQUEUE
+        return slot
 
     def _release(slot: Any, dirty: bool = False) -> None:
         pool.release(slot, dirty=dirty)

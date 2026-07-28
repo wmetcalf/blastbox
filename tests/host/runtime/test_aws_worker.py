@@ -1537,3 +1537,202 @@ def test_every_tier_clamps_non_positive_probe_budgets():
         cfg = cls(region="us-east-1", claim_probe_timeout_s=0, health_probe_timeout_s=-5, **kw)
         assert cfg.claim_probe_timeout_s > 0, f"{cls.__name__} would brick: claim budget 0"
         assert cfg.health_probe_timeout_s > 0, f"{cls.__name__} health budget non-positive"
+
+
+# ------------------------------------------------- issue #77 round 2: escalated-review regressions
+# Every test below FAILS against the code as first written; each pins one finding from the
+# gpt-5.6-sol/ultra pass on PR #78. The theme is the same invariant, at sites the delta review
+# could not see: "the control plane didn't answer" must never be read as "this worker is dead".
+
+
+def _timeout(argv):  # noqa: ANN001
+    raise subprocess.TimeoutExpired(cmd="aws", timeout=120)
+
+
+class RecordingAws(FakeAws):
+    """FakeAws that also records the per-call timeout the runtime asked for."""
+
+    def __init__(self, responses: dict) -> None:
+        super().__init__(responses)
+        self.timeouts: list[tuple[str, float]] = []
+
+    def __call__(self, argv, timeout):  # noqa: ANN001
+        self.timeouts.append((f"{list(argv)[1]} {list(argv)[2]}", timeout))
+        return super().__call__(argv, timeout)
+
+    def timeout_for(self, key: str) -> float:
+        return next(t for k, t in self.timeouts if k == key)
+
+
+def test_f1_cli_timeout_outside_a_probe_budget_is_unknown_not_dead():
+    """A resume-time timeout has NO probe budget in scope, so it used to raise a plain
+    AwsWorkerError whose message ("timed out after 120s") matched no transient marker --
+    so _resume_on_claim dirty-released and TERMINATED a healthy PARKED SnapStart worker."""
+    from blastbox.host.runtime.vm_dispatch import _is_unknown_not_dead
+
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": _timeout})
+    with pytest.raises(AwsWorkerError) as ei:
+        rt._aws("lambda-microvms", "get-microvm", "--microvm-identifier", "mv-1")
+    assert _is_unknown_not_dead(ei.value), (
+        "a CLI timeout is 'the control plane did not answer' -- UNKNOWN, never confirmed death")
+
+
+def test_f1_transient_rc_outside_a_probe_budget_is_unknown_not_dead():
+    """Same for a throttle that exits non-zero outside a probe (resume() has no budget of its own)."""
+    from blastbox.host.runtime.vm_dispatch import _is_unknown_not_dead
+
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": _cp(rc=255, stderr="ThrottlingException: Rate exceeded")})
+    with pytest.raises(AwsWorkerError) as ei:
+        rt._aws("lambda-microvms", "get-microvm", "--microvm-identifier", "mv-1")
+    assert _is_unknown_not_dead(ei.value)
+
+
+def test_f1_a_confirmed_dead_verdict_is_still_dead():
+    """The widening must NOT soften a real terminal answer -- otherwise dead slots leak forever."""
+    from blastbox.host.runtime.vm_dispatch import _is_unknown_not_dead
+
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": _cp(rc=254, stderr="ResourceNotFoundException: no such microvm")})
+    with pytest.raises(AwsWorkerError) as ei:
+        rt._aws("lambda-microvms", "get-microvm", "--microvm-identifier", "mv-1")
+    assert not _is_unknown_not_dead(ei.value)
+
+
+@pytest.mark.parametrize("stderr", [
+    "An error occurred (InternalServerException) when calling the GetMicrovm operation",
+    "InternalServerException: Internal server error",
+    "An error occurred (500) when calling: Internal Server Error",
+])
+def test_f2_internal_server_exception_is_transient(stderr):
+    """AWS's 5xx spellings did not match any marker: 'internalserverexception' does not contain
+    'internalerror', and 'internal server error' does not contain 'internal error'."""
+    from blastbox.host.runtime.aws_worker import _is_transient_aws_error
+    assert _is_transient_aws_error(stderr)
+
+
+def test_f2_resource_not_found_is_not_transient():
+    """Guard the widening: a terminal 4xx must stay terminal."""
+    from blastbox.host.runtime.aws_worker import _is_transient_aws_error
+    assert not _is_transient_aws_error("ResourceNotFoundException: Function not found")
+
+
+def test_f4_health_path_token_mint_honours_the_health_budget():
+    """LambdaMicroVmRuntime.is_alive minted the JWE AFTER super().is_alive() had exited the
+    health-probe scope, so the mint ran at cli_timeout_s (120s) instead of health_probe_timeout_s.
+    One unresponsive mint then stalled the single pool tick thread for 2 minutes PER SLOT."""
+    cfg = LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:aws:lambda:us-east-1:aws:microvm-image:x",
+                              allow_default_egress=True, health_probe_timeout_s=3.0, cli_timeout_s=120.0)
+    fake = RecordingAws({**_IDENT,
+                         "lambda-microvms get-microvm": {"state": "RUNNING"},
+                         "lambda-microvms create-microvm-auth-token": {"authToken": "jwe-new"}})
+    rt = LambdaMicroVmRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True, clock=lambda: 100.0)
+    slot = AwsWorkerSlot(slot_id="s1", state=SlotState.IDLE, resource_id="mv-1",
+                         url="http://10.0.0.1:8080", auth_token="jwe-old")
+    slot.token_minted_at = -1000.0   # far past half-TTL -> forces a re-mint
+    rt.is_alive(slot)
+    minted = fake.timeout_for("lambda-microvms create-microvm-auth-token")
+    assert minted <= cfg.health_probe_timeout_s, (
+        f"mint ran at {minted}s, outside the {cfg.health_probe_timeout_s}s health budget")
+
+
+def test_f5_claim_probe_never_outruns_the_callers_claim_deadline():
+    """claim(timeout_s=0.5) with claim_probe_timeout_s=5 blocked ~5s -- a 10x contract violation
+    that also held the dispatcher's warm-gate reservation for the overrun."""
+    cfg = LambdaSnapStartConfig(region="us-east-1", image_identifier="arn:img", allow_default_egress=True,
+                                resume_poll_s=0.0, claim_probe_timeout_s=5.0, cli_timeout_s=120.0)
+    fake = RecordingAws({**_IDENT, "lambda-microvms get-microvm": {"Microvm": {"State": "RUNNING"}}})
+    rt = LambdaSnapStartRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True, clock=lambda: 100.0)
+    slot = AwsWorkerSlot(slot_id="s1", state=SlotState.IDLE, resource_id="mv-1", url="http://10.0.0.1:8080")
+    rt.is_alive_for_claim(slot, budget_s=0.5)
+    used = fake.timeout_for("lambda-microvms get-microvm")
+    assert used <= 0.5, f"probe asked for {used}s against a 0.5s claim budget"
+
+
+def test_f5_claim_probe_budget_still_applies_without_a_caller_deadline():
+    """The pool may not pass one (no claim timeout); the runtime's own bound must still hold."""
+    cfg = LambdaSnapStartConfig(region="us-east-1", image_identifier="arn:img", allow_default_egress=True,
+                                resume_poll_s=0.0, claim_probe_timeout_s=4.0, cli_timeout_s=120.0)
+    fake = RecordingAws({**_IDENT, "lambda-microvms get-microvm": {"Microvm": {"State": "RUNNING"}}})
+    rt = LambdaSnapStartRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True, clock=lambda: 100.0)
+    slot = AwsWorkerSlot(slot_id="s1", state=SlotState.IDLE, resource_id="mv-1", url="http://10.0.0.1:8080")
+    rt.is_alive_for_claim(slot)
+    assert fake.timeout_for("lambda-microvms get-microvm") <= 4.0
+
+
+def test_f6_a_half_completed_resume_leaves_a_truthful_phase_and_re_parks():
+    """resume() issues start-instances, then a LATER describe is throttled. The instance is now
+    RUNNING but the runtime's phase map still said "parked", so nothing ever re-hibernated it: the
+    pool counted a parked warm slot while EC2 billed a running one until the uptime backstop fired
+    (or forever, with self_terminate disabled)."""
+    from blastbox.host.runtime.aws_worker import Ec2HibernateConfig, Ec2HibernateRuntime
+
+    ops: list[str] = []
+    st = {"name": "stopped", "throttle": False}
+
+    def runner(argv, timeout):  # noqa: ANN001
+        argv = list(argv)
+        op = f"{argv[1]} {argv[2]}"
+        ops.append(op)
+        if op == "sts get-caller-identity":
+            return _cp(stdout=json.dumps({"Account": "1", "Arn": "arn:aws:iam::1:user/x"}))
+        if op == "ec2 start-instances":
+            st["name"], st["throttle"] = "running", True   # started -- and now the CP browns out
+            return _cp(stdout="{}")
+        if op == "ec2 describe-instances":
+            if st["throttle"]:
+                return _cp(rc=255, stderr="ThrottlingException: Rate exceeded")
+            return _cp(stdout=json.dumps({"Reservations": [{"Instances": [
+                {"InstanceId": "i-1", "State": {"Name": st["name"]}, "PrivateIpAddress": "10.0.0.5"}]}]}))
+        if op == "ec2 stop-instances":
+            return _cp(stdout="{}")
+        return _cp(rc=254, stderr=f"no fake for {op}")
+
+    t = [100.0]
+
+    def clock():
+        t[0] += 0.05
+        return t[0]
+
+    cfg = Ec2HibernateConfig(region="us-east-1", image_id="ami-0abc",
+                             resume_timeout_s=0.2, resume_poll_s=0.0)
+    rt = Ec2HibernateRuntime(cfg, aws_runner=runner, http_probe=lambda u, h, to: False, clock=clock)
+    slot = AwsWorkerSlot(slot_id="h1", resource_id="i-1", state=SlotState.ASSIGNED, ip="10.0.0.5")
+    rt._phase["h1"] = "parked"
+
+    with pytest.raises(AwsWorkerError):
+        rt.resume(slot)
+    assert rt._phase["h1"] != "parked", (
+        "the instance was STARTED; a phase still reading 'parked' means it is never re-hibernated")
+
+    # The background tick sees an IDLE slot that is running-but-unparked and re-parks it.
+    st["throttle"] = False
+    slot.state = SlotState.IDLE
+    ops.clear()
+    rt.is_alive(slot)
+    assert "ec2 stop-instances" in ops, f"the leaked running instance was never re-parked: {ops}"
+
+
+def test_f6_a_genuinely_parked_idle_slot_is_not_disturbed():
+    """Guard: the reconciliation must not stop a correctly-parked warm slot (that would churn the
+    whole tier every tick)."""
+    from blastbox.host.runtime.aws_worker import Ec2HibernateConfig, Ec2HibernateRuntime
+
+    ops: list[str] = []
+
+    def runner(argv, timeout):  # noqa: ANN001
+        argv = list(argv)
+        op = f"{argv[1]} {argv[2]}"
+        ops.append(op)
+        if op == "sts get-caller-identity":
+            return _cp(stdout=json.dumps({"Account": "1", "Arn": "arn:aws:iam::1:user/x"}))
+        if op == "ec2 describe-instances":
+            return _cp(stdout=json.dumps({"Reservations": [{"Instances": [
+                {"InstanceId": "i-1", "State": {"Name": "stopped"}, "PrivateIpAddress": "10.0.0.5"}]}]}))
+        return _cp(stdout="{}")
+
+    cfg = Ec2HibernateConfig(region="us-east-1", image_id="ami-0abc")
+    rt = Ec2HibernateRuntime(cfg, aws_runner=runner, http_probe=lambda u, h, to: False,
+                             clock=lambda: 100.0)
+    slot = AwsWorkerSlot(slot_id="h2", resource_id="i-1", state=SlotState.IDLE, ip="10.0.0.5")
+    rt._phase["h2"] = "parked"
+    rt.is_alive(slot)
+    assert "ec2 stop-instances" not in ops, "a correctly-parked slot must be left alone"

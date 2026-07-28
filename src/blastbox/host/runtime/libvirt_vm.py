@@ -218,6 +218,22 @@ class LibvirtVmConfig:
         return self.gateway or (self.subnet_prefix + "1")
 
 
+# virsh exits rc=1 for BOTH "libvirtd can't be reached" (UNKNOWN — correlated across every slot at
+# once, so reading it as death wipes the tier) and "that domain is gone" (CONFIRMED dead). Only the
+# stderr distinguishes them, and conflating them either destroys healthy slots (the original #77
+# bug) or strands deleted ones forever (its mirror image). Same vocabulary as _destroy_domain's
+# benign set, minus "not running" — that is a live domain in a different STATE, not an absent one.
+# NB "does not exist"/"failed to get domain", never a bare "not found": `sudo virsh` with virsh
+# missing from root's PATH says "virsh: command not found", which is a broken control plane.
+_DOMAIN_ABSENT_MARKERS = ("domain not found", "failed to get domain", "does not exist")
+
+
+def _domain_is_absent(stderr: str) -> bool:
+    """True iff libvirt CONFIRMED there is no such domain (vs. failing to answer at all)."""
+    low = (stderr or "").lower()
+    return any(m in low for m in _DOMAIN_ABSENT_MARKERS)
+
+
 @dataclass
 class VmSlot:
     """One VM worker. Unlike a container Slot this carries a network ``endpoint``
@@ -559,13 +575,20 @@ class LibvirtVmRuntime:
         again — a genuinely dead domain is still caught then, and at claim time."""
         cp = self._virsh("domstate", slot.domain)
         if cp.returncode != 0:
+            if _domain_is_absent(cp.stderr):
+                # CONFIRMED gone (deleted out from under us). Not "unknown": keeping it would hold a
+                # warm slot that can never be claimed and never be replaced — _spawn_to_deficit
+                # counts it, so a warm_size=1 tier would sit dead until the process restarted.
+                logger.warning("libvirt.domain_absent domain=%s — reaping slot (confirmed gone)",
+                               slot.domain)
+                return False
             logger.warning("libvirt.domstate_failed domain=%s rc=%s stderr=%s — keeping slot "
                          "(unknown, not dead)", slot.domain, cp.returncode,
                          (cp.stderr or "").strip()[:160])
             return True
         return "running" in cp.stdout
 
-    def is_alive_for_claim(self, slot: VmSlot) -> "bool | None":
+    def is_alive_for_claim(self, slot: VmSlot, *, budget_s: float | None = None) -> "bool | None":
         """Claim-time check: UNKNOWN (None) when libvirt cannot be queried (issue #77).
 
         ``is_alive`` keeps such a slot (a virsh/libvirtd blip is not evidence the domain died, and
@@ -573,8 +596,14 @@ class LibvirtVmRuntime:
         ``is_alive`` for the HAND-OUT probe when a runtime has no fresh hook, and there "keep" would
         mean "give this slot to a job" — handing out a VM we cannot confirm is running. Split the
         two: background = keep, hand-out = skip this slot and try another."""
-        cp = self._virsh("domstate", slot.domain)
+        # Bound virsh by whatever the caller has left on its claim deadline (issue #77 round 2):
+        # a wedged libvirtd otherwise blocks the default 90s inside a claim(timeout_s=2). _run maps
+        # a timeout to rc=124, which is not an absent-domain marker -> UNKNOWN -> skip, exactly right.
+        kw = {} if budget_s is None else {"timeout": max(1.0, float(budget_s))}
+        cp = self._virsh("domstate", slot.domain, **kw)
         if cp.returncode != 0:
+            if _domain_is_absent(cp.stderr):
+                return False   # confirmed gone -> dead, so the pool drops + replaces it
             logger.warning("libvirt.domstate_failed_at_claim domain=%s rc=%s — skipping slot "
                            "(unknown, not dead)", slot.domain, cp.returncode)
             return None

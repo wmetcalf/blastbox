@@ -561,3 +561,54 @@ def test_finalize_fails_closed_without_mac(monkeypatch):
                   ip="192.168.122.5", mac=None)  # domiflist missed the MAC
     assert rt.is_ready(slot) is False    # an under-firewalled finalize is rejected...
     assert reaped == ["bbvm-m"]          # ...and the VM is reaped (fail-closed)
+
+
+# ------------------------------------------------ issue #77 round 2: escalated-review regressions
+
+def _cp(rc: int, stdout: str = "", stderr: str = ""):
+    return type("C", (), {"returncode": rc, "stdout": stdout, "stderr": stderr})()
+
+
+@pytest.mark.parametrize("stderr", [
+    "error: failed to get domain 'bb-w1'",
+    "error: Domain not found: no domain with matching name 'bb-w1'",
+    "error: domain 'bb-w1' does not exist",
+])
+def test_f3_a_confirmed_missing_domain_is_dead_not_unknown(monkeypatch, stderr):
+    """Fixing "unknown read as dead" produced its mirror image: EVERY non-zero virsh rc became
+    "keep the slot". virsh uses rc=1 for BOTH "libvirtd is down" (genuinely unknown) and "domain
+    not found" (confirmed gone), so an externally-deleted domain was kept as a warm slot forever --
+    never claimable (is_alive_for_claim says UNKNOWN), never reaped, and still counted against the
+    warm target, so spawn-to-deficit never replaced it. A warm_size=1 tier stayed dead until restart."""
+    rt = _rt()
+    monkeypatch.setattr(rt, "_virsh", lambda *a, **k: _cp(1, "", stderr))
+    slot = VmSlot(slot_id="w1", domain="bb-w1", overlay="/tmp/w1.qcow2", agent_port=8765,
+                   state=SlotState.IDLE)
+    assert rt.is_alive(slot) is False, "a confirmed-absent domain must be reaped + replaced"
+    assert rt.is_alive_for_claim(slot) is False, "and must not be handed out"
+
+
+@pytest.mark.parametrize("stderr", [
+    "error: failed to connect to the hypervisor",
+    "error: Cannot recv data: Connection reset by peer",
+    "virsh: command not found",
+])
+def test_f3_an_unqueryable_control_plane_is_still_unknown_not_dead(monkeypatch, stderr):
+    """The original #77 guard must survive the fix: libvirtd being unreachable is correlated across
+    EVERY slot at once, so reading it as death would wipe the whole tier in one tick. Note
+    "command not found" is deliberately NOT an absent domain (sudo virsh with a bad PATH)."""
+    rt = _rt()
+    monkeypatch.setattr(rt, "_virsh", lambda *a, **k: _cp(1, "", stderr))
+    slot = VmSlot(slot_id="w1", domain="bb-w1", overlay="/tmp/w1.qcow2", agent_port=8765,
+                   state=SlotState.IDLE)
+    assert rt.is_alive(slot) is True, "an unreachable libvirtd must NOT be read as a dead domain"
+    assert rt.is_alive_for_claim(slot) is None, "unknown at hand-out means skip, not destroy"
+
+
+def test_f3_a_running_domain_is_unaffected(monkeypatch):
+    rt = _rt()
+    monkeypatch.setattr(rt, "_virsh", lambda *a, **k: _cp(0, "running\n", ""))
+    slot = VmSlot(slot_id="w1", domain="bb-w1", overlay="/tmp/w1.qcow2", agent_port=8765,
+                   state=SlotState.IDLE)
+    assert rt.is_alive(slot) is True
+    assert rt.is_alive_for_claim(slot) is True

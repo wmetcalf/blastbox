@@ -1177,3 +1177,135 @@ def test_resume_brownout_hands_the_parked_slot_back_instead_of_terminating_it():
     with contextlib.suppress(Exception):
         _resume_on_claim(pool2, slot2)
     assert killed2 == ["mvm-dead"], "a CONFIRMED dead slot must still be disposed"
+
+
+# ----------------------------------------------- issue #77 round 2: escalated-review regressions
+
+def test_f1_resume_timeout_hands_the_parked_slot_back_instead_of_terminating_it():
+    """A resume-time CLI TIMEOUT (not a throttle) had no probe budget in scope, so it raised a
+    plain AwsWorkerError whose message matched no transient marker -> dirty release -> the healthy
+    PARKED worker was terminated. Timeouts are the most common brownout signal of all."""
+    import contextlib
+    import subprocess
+
+    from blastbox.host.pool import SlotState, WarmPool
+    from blastbox.host.runtime.aws_worker import (
+        AwsWorkerSlot,
+        LambdaSnapStartConfig,
+        LambdaSnapStartRuntime,
+    )
+    from blastbox.host.runtime.vm_dispatch import _resume_on_claim
+
+    def _timeout_runner(argv, timeout):  # noqa: ANN001
+        raise subprocess.TimeoutExpired(cmd=list(argv), timeout=timeout)
+
+    rt = LambdaSnapStartRuntime(
+        LambdaSnapStartConfig(region="us-east-1", image_identifier="arn:x", allow_default_egress=True,
+                              resume_timeout_s=0.4, resume_poll_s=0.05),
+        aws_runner=_timeout_runner, http_probe=lambda u, h, t: False)
+    killed: list[str] = []
+    rt._terminate = lambda s: killed.append(s.resource_id)   # type: ignore[method-assign]
+    pool = WarmPool(runtime=rt, warm_size=1)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mvm-parked", state=SlotState.ASSIGNED)
+    pool._slots["p1"] = slot
+    with contextlib.suppress(Exception):
+        _resume_on_claim(pool, slot)
+    assert killed == [], f"a timed-out resume terminated a healthy parked slot: {killed}"
+    assert pool._slots["p1"].state == SlotState.IDLE, "slot not handed back for a later attempt"
+
+
+class _RetryPool:
+    """Insertion-ordered warm pool: claim() hands out the first IDLE slot, unclaim() returns it."""
+
+    def __init__(self, slots, resume):  # noqa: ANN001
+        from types import SimpleNamespace
+        self.slots = list(slots)
+        self.assigned: set[str] = set()
+        self.released: list[str] = []
+        self.resume_calls: list[str] = []
+        self.runtime = SimpleNamespace(resume=lambda s: self._resume(s))
+        self._resume_impl = resume
+
+    def _resume(self, slot):  # noqa: ANN001
+        self.resume_calls.append(slot.slot_id)
+        return self._resume_impl(slot)
+
+    def claim(self, *, timeout_s):  # noqa: ANN001
+        for s in self.slots:
+            if s.slot_id not in self.assigned:
+                self.assigned.add(s.slot_id)
+                return s
+        return None
+
+    def unclaim(self, slot):  # noqa: ANN001
+        self.assigned.discard(slot.slot_id)
+
+    def release(self, slot, dirty=False):  # noqa: ANN001
+        self.released.append(slot.slot_id)
+        self.assigned.discard(slot.slot_id)
+        self.slots = [s for s in self.slots if s.slot_id is not slot.slot_id]
+
+
+def test_f7_claim_retry_advances_to_a_healthy_slot_after_an_unknown_resume():
+    """The retry loop tracked no attempted slots. unclaim() returns the slot to IDLE and claim()
+    is insertion-ordered, so a slot whose resume was throttled was handed back and re-picked
+    forever -- the job requeued with NoWarmSlot while a healthy slot sat idle behind it.
+    (Before the unclaim change the loop was correct: a dirty release REMOVED the bad slot.)"""
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+    from blastbox.host.runtime.vm_dispatch import _claim_resumable_slot
+
+    a, b = SimpleNamespace(slot_id="A"), SimpleNamespace(slot_id="B")
+
+    def resume(slot):  # noqa: ANN001
+        if slot.slot_id == "A":
+            raise AwsUnknownState("aws lambda-microvms resume-microvm: transient (rc=255): Rate exceeded")
+
+    t = [0.0]
+    pool = _RetryPool([a, b], resume)
+    got = _claim_resumable_slot(pool, 5.0, clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0])
+    assert got is b, f"expected the healthy slot B, got {got}"
+    assert pool.released == [], "an UNKNOWN resume must not destroy the slot"
+    assert pool.resume_calls.count("A") == 1, (
+        f"slot A was retried {pool.resume_calls.count('A')}x instead of being passed over")
+
+
+def test_f7_the_passed_over_slot_is_returned_to_the_pool_afterwards():
+    """Holding A ASSIGNED is how the scan advances past it -- but it MUST be handed back when the
+    claim window ends, or a brownout would permanently leak every slot it touched."""
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+    from blastbox.host.runtime.vm_dispatch import _claim_resumable_slot
+
+    a, b = SimpleNamespace(slot_id="A"), SimpleNamespace(slot_id="B")
+
+    def resume(slot):  # noqa: ANN001
+        if slot.slot_id == "A":
+            raise AwsUnknownState("transient (rc=255): Rate exceeded")
+
+    t = [0.0]
+    pool = _RetryPool([a, b], resume)
+    _claim_resumable_slot(pool, 5.0, clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0])
+    assert pool.assigned == {"B"}, f"passed-over slots leaked as ASSIGNED: {pool.assigned}"
+
+
+def test_f7_a_confirmed_dead_slot_is_still_released_dirty():
+    """Guard: the pass-over path must not swallow a real terminal verdict."""
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.aws_worker import AwsWorkerError
+    from blastbox.host.runtime.vm_dispatch import _claim_resumable_slot
+
+    a, b = SimpleNamespace(slot_id="A"), SimpleNamespace(slot_id="B")
+
+    def resume(slot):  # noqa: ANN001
+        if slot.slot_id == "A":
+            raise AwsWorkerError("slot is 'terminated'; cannot resume")
+
+    t = [0.0]
+    pool = _RetryPool([a, b], resume)
+    got = _claim_resumable_slot(pool, 5.0, clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0])
+    assert got is b
+    assert pool.released == ["A"], "a confirmed-dead slot must still be retired dirty"

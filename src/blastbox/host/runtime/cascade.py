@@ -21,6 +21,7 @@ available is logged and skipped, so local capacity still comes up if the cloud t
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 from collections.abc import Callable
@@ -170,7 +171,7 @@ class CascadingRuntime:
         tier = self._tier_of(slot)
         return tier is not None and tier.runtime.is_alive(slot)
 
-    def is_alive_for_claim(self, slot: Any) -> "bool | None":
+    def is_alive_for_claim(self, slot: Any, *, budget_s: float | None = None) -> "bool | None":
         """Claim-time FRESH liveness, delegated to the owning tier's cache-bypassing hook when it has one
         (AWS tiers) -- else the tier's is_alive (file/libvirt, already fresh). Without this the pool's
         getattr(runtime, "is_alive_for_claim") finds nothing on the cascade and falls back to the cascade's
@@ -179,7 +180,18 @@ class CascadingRuntime:
         if tier is None:
             return False
         fresh = getattr(tier.runtime, "is_alive_for_claim", None)
-        return fresh(slot) if callable(fresh) else tier.runtime.is_alive(slot)
+        if not callable(fresh):
+            return tier.runtime.is_alive(slot)
+        # Forward the caller's remaining claim budget to the owning tier when it takes one. Without
+        # this a cascade-wrapped AWS tier -- the common production shape -- never sees the pool's
+        # deadline and probes at its own full bound (issue #77 round 2).
+        if budget_s is not None:
+            try:
+                if "budget_s" in inspect.signature(fresh).parameters:
+                    return fresh(slot, budget_s=budget_s)
+            except (TypeError, ValueError):
+                pass
+        return fresh(slot)
 
     def reap(self, slot: Any, dirty: bool = False) -> None:
         with self._lock:
