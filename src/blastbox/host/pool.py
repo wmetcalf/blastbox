@@ -481,6 +481,22 @@ class WarmPool:
                 if reaped:
                     self._slots.pop(slot.slot_id, None)
 
+    def unclaim(self, slot: Slot) -> None:
+        """Hand an ASSIGNED slot back UNUSED, without disposing it (issue #77).
+
+        ``release()`` reaps on every non-recycle runtime, so a caller that claimed a slot and then
+        could not tell whether it was usable — a resume whose describes were merely throttled — had
+        no way to give it back except by destroying it. That is how a control-plane brownout
+        terminated healthy PARKED warm slots, the most expensive kind. This returns it to IDLE so
+        the next claim (or the next tick's health check) can decide with better information."""
+        with self._lock:
+            cur = self._slots.get(slot.slot_id)
+            if cur is None or cur.state != SlotState.ASSIGNED:
+                return                      # already disposed/reclaimed by another path
+            cur.state = SlotState.IDLE
+            self._last_idle_at = self._clock()
+        self._idle_event.set()
+
     def retire(self, slot: Slot) -> None:
         """Permanently dispose ``slot`` WITHOUT recycling it — for a worker that may STILL be in use
         by an abandoned/hung thread (e.g. a validate that timed out). Unlike ``release(dirty=True)``,
@@ -863,8 +879,12 @@ class WarmPool:
         try:
             alive = claim_check(slot)
         except Exception:
-            logger.exception("pool.is_alive_error slot_id=%s", slot.slot_id)
-            return False
+            # UNKNOWN, not dead (issue #77). A runtime's exception enumeration is never complete —
+            # an http.client.HTTPException from the static tier, a TypeError from a slot-shape
+            # mismatch — and none of those are evidence the worker is gone. Skip the slot instead
+            # of terminating it; a genuinely dead one still fails at detonate and is reaped there.
+            logger.exception("pool.is_alive_error slot_id=%s — treating as unknown", slot.slot_id)
+            return None
         # None = the runtime bounded its own probe and the control plane didn't answer. UNKNOWN,
         # NOT dead — a brownout must not get healthy workers destroyed (issue #77).
         return None if alive is None else bool(alive)
@@ -1143,11 +1163,24 @@ class WarmPool:
                 "pool.warming_timeout_evict slot_id=%s age=%.1fs", slot.slot_id, now - slot.spawned_at
             )
         for slot in idle_slots:
+            # TRI-STATE, same contract as the claim probe (_probe_alive): True = alive,
+            # False = CONFIRMED dead, None = UNKNOWN. Only a CONFIRMED negative may evict — the
+            # background path was the structural hole that let every runtime-level fix be undone
+            # one tick later (issue #77): it read a falsy None as dead, so a runtime had no way to
+            # say "the control plane didn't answer" here, and an unenumerated exception was a death
+            # sentence. An UNKNOWN slot is simply left alone; the next tick asks again, and the
+            # claim-time fresh probe is still the gate before any job is handed to it.
             try:
                 alive = self._runtime.is_alive(slot)
             except Exception:
-                logger.exception("pool.health_is_alive_error slot_id=%s", slot.slot_id)
-                alive = False
+                # An exception is NOT evidence of death — it is evidence we could not tell. Killing
+                # a healthy worker over an unanticipated error is the worse failure.
+                logger.exception("pool.health_is_alive_error slot_id=%s — treating as unknown",
+                                 slot.slot_id)
+                alive = None
+            if alive is None:
+                logger.debug("pool.health_unknown slot_id=%s — keeping slot", slot.slot_id)
+                continue
             if not alive:
                 dead.append(slot)
 

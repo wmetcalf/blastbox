@@ -19,6 +19,7 @@ client-facing — its inputs are the queue + the spooled files.
 from __future__ import annotations
 
 import json
+import contextlib
 import logging
 import os
 import shutil
@@ -880,6 +881,25 @@ class VmJobDispatcher:
         self._stop.set()
 
 
+def _is_unknown_not_dead(exc: BaseException) -> bool:
+    """True if this failure means "the control plane didn't tell us", not "the worker is gone".
+
+    issue #77: resume() destroying a PARKED warm slot — already booted and engine-warmed, the most
+    expensive kind — because a describe was throttled for a minute is the worst trade in the system.
+    Only a CONFIRMED dead state should cost the slot."""
+    if type(exc).__name__ == "AwsProbeTimeout":
+        return True
+    try:
+        from blastbox.host.runtime.aws_worker import _is_transient_aws_error
+    except Exception:      # noqa: BLE001 -- aws extra not installed; nothing to classify
+        return False
+    msg = str(exc)
+    # A confirmed verdict ("slot is 'terminated'; cannot resume") must NOT be softened.
+    if "cannot resume" in msg:
+        return False
+    return _is_transient_aws_error(msg)
+
+
 def _resume_on_claim(pool: Any, slot: Any) -> None:
     """Optional per-claim resume seam (aws-lambda-snapstart): wake a parked/suspended warm slot and
     block until its agent answers BEFORE the transport POSTs (which has no retry). The runtime
@@ -891,7 +911,20 @@ def _resume_on_claim(pool: Any, slot: Any) -> None:
         return
     try:
         resume(slot)
-    except Exception:
+    except Exception as exc:
+        # UNKNOWN (the control plane never answered) is NOT "un-resumable": handing the slot back
+        # unused keeps a healthy PARKED worker alive through a brownout, where release(dirty=True)
+        # would terminate it — and concurrent dispatch threads would then walk the whole tier
+        # doing the same (issue #77). The job still requeues via the re-raise.
+        # UNKNOWN covers BOTH shapes: an explicit AwsProbeTimeout, and a plain runtime error whose
+        # message is a transient control-plane answer (a throttle/5xx exits non-zero, so it is not a
+        # timeout — resume() has no probe budget of its own, so it surfaces as AwsWorkerError).
+        if _is_unknown_not_dead(exc):
+            unclaim = getattr(pool, "unclaim", None)
+            if callable(unclaim):
+                with contextlib.suppress(Exception):
+                    unclaim(slot)
+                raise
         try:
             pool.release(slot, dirty=True)
         except Exception:   # noqa: BLE001 -- release failure must not mask the resume error

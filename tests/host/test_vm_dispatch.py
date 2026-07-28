@@ -1129,3 +1129,51 @@ def test_dispatch_missing_input_is_failed(tmp_path):
     d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True))
     d._process(store.claim_next())
     assert store.get(job.job_id).status is JobStatus.FAILED
+
+
+def test_resume_brownout_hands_the_parked_slot_back_instead_of_terminating_it():
+    # issue #77 sweep: resume() raises the SAME error for "the control plane never answered" as for
+    # "this slot is dead", and _resume_on_claim released it dirty -> reap -> terminate. That
+    # destroyed healthy PARKED warm slots (already booted + engine-warmed, the expensive kind) over
+    # a throttled describe, and concurrent dispatch threads then walked the whole tier doing it.
+    import contextlib
+    import subprocess
+
+    from blastbox.host.pool import SlotState, WarmPool
+    from blastbox.host.runtime.aws_worker import (
+        AwsWorkerSlot,
+        LambdaSnapStartConfig,
+        LambdaSnapStartRuntime,
+    )
+    from blastbox.host.runtime.vm_dispatch import _resume_on_claim
+
+    def _rt(runner):
+        return LambdaSnapStartRuntime(
+            LambdaSnapStartConfig(region="us-east-1", image_identifier="arn:x",
+                                  allow_default_egress=True, resume_timeout_s=0.4,
+                                  resume_poll_s=0.05),
+            aws_runner=runner, http_probe=lambda u, h, t: False)
+
+    # (a) TRANSIENT: throttled describes -> hand the slot back, never terminate
+    throttled = _rt(lambda a, t: subprocess.CompletedProcess(
+        list(a), 255, "", "(ThrottlingException) Rate exceeded"))
+    killed: list[str] = []
+    throttled._terminate = lambda s: killed.append(s.resource_id)   # type: ignore[method-assign]
+    pool = WarmPool(runtime=throttled, warm_size=1)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mvm-parked", state=SlotState.ASSIGNED)
+    pool._slots["p1"] = slot
+    with contextlib.suppress(Exception):
+        _resume_on_claim(pool, slot)
+    assert killed == [], f"a throttled resume terminated a healthy parked slot: {killed}"
+    assert pool._slots["p1"].state == SlotState.IDLE, "slot not handed back for a later attempt"
+
+    # (b) CONFIRMED dead: must STILL be disposed — the softening must not swallow real verdicts
+    dead = _rt(lambda a, t: subprocess.CompletedProcess(list(a), 0, '{"state": "TERMINATED"}', ""))
+    killed2: list[str] = []
+    dead._terminate = lambda s: killed2.append(s.resource_id)       # type: ignore[method-assign]
+    pool2 = WarmPool(runtime=dead, warm_size=1)
+    slot2 = AwsWorkerSlot(slot_id="p2", resource_id="mvm-dead", state=SlotState.ASSIGNED)
+    pool2._slots["p2"] = slot2
+    with contextlib.suppress(Exception):
+        _resume_on_claim(pool2, slot2)
+    assert killed2 == ["mvm-dead"], "a CONFIRMED dead slot must still be disposed"
