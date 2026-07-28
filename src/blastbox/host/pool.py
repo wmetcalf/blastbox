@@ -325,7 +325,8 @@ class WarmPool:
         # below CANNOT cover that slot — _reap_and_count's ownership guard makes it skip whatever the
         # reaper already owns — so waiting here is the only thing that disposes it. Past the budget we
         # log and proceed, exactly like the wedged-spawn case above.
-        for reaper, _progress in list(self._reaper_threads):
+        for entry in list(self._reaper_threads):
+            reaper = entry[0]                    # [thread, last_progress_at, retired]
             if not reaper.is_alive():
                 continue
             reaper.join(timeout=max(0.0, stop_deadline - self._clock()))
@@ -535,6 +536,7 @@ class WarmPool:
         ready = self._runtime_ready()
         self._promote_warming()
         self._health_check()
+        self._maintain_idle()
         # Kick the deferred reaper EARLY so its (asynchronous) disposal overlaps the rest of the
         # tick. NOTE: it does NOT free `concurrent_ceiling` headroom for this tick's
         # _spawn_to_deficit — the husk stays tracked until the reaper thread actually disposes it,
@@ -581,8 +583,17 @@ class WarmPool:
             # Count only reapers that are still making progress. One wedged in a hung terminate is
             # abandoned (Python can't interrupt it) but must not hold a slot in the pool forever,
             # or four stuck disposals stop the queue draining for the life of the pool (issue #77).
-            live = sum(1 for entry in self._reaper_threads
-                       if now - entry[1] < self._REAPER_WEDGED_AFTER_S)
+            live = 0
+            for entry in self._reaper_threads:
+                if now - entry[1] < self._REAPER_WEDGED_AFTER_S:
+                    live += 1
+                else:
+                    # RETIRE it. Dropping a wedged reaper from the progress count lets replacements
+                    # spawn, but nothing stopped the original: if its terminate finally returns it
+                    # resumes draining alongside them, so the "4 concurrent" bound silently became
+                    # _MAX_REAPER_THREADS (issue #77 round 3). It cannot be interrupted, but it can
+                    # be told to stop after its current disposal.
+                    entry[2] = True
             # Two bounds: _MAX_REAPERS caps CONCURRENT PROGRESS (wedged ones don't count, so a stuck
             # disposal can't halt the queue), and _MAX_REAPER_THREADS caps TOTAL live threads
             # (wedged ones DO count, so a permanently-hung runtime can't spawn threads forever).
@@ -598,7 +609,7 @@ class WarmPool:
                 # all reapers stamping one entry while the others looked wedged and over-spawned.
                 t = threading.Thread(target=functools.partial(self._drain_deferred_reaps, entry_box),
                                      name="blastbox-pool-reaper", daemon=True)
-                entry = [t, now]
+                entry = [t, now, False]   # [thread, last_progress_at, retired]
                 entry_box.append(entry)          # let the thread stamp its own progress
                 self._reaper_threads.append(entry)
                 # START INSIDE the lock: a created-but-not-yet-started thread reports
@@ -616,6 +627,8 @@ class WarmPool:
         re-terminate a resource whose disposal already failed."""
         while True:
             with self._lock:
+                if entry_box and entry_box[0][2]:
+                    return          # retired while wedged: a replacement owns the queue now
                 if not self._deferred_reap:
                     return
                 slot_id = next(iter(self._deferred_reap))
@@ -634,6 +647,46 @@ class WarmPool:
             if entry_box:
                 with self._lock:
                     entry_box[0][1] = self._clock()
+
+    def _maintain_idle(self) -> None:
+        """Give the runtime an EXCLUSIVE window to reconcile an IDLE slot with its real state.
+
+        A runtime cannot safely do this from is_alive(): claim() may flip an IDLE slot to ASSIGNED
+        at any instant, so a state-changing call already in flight (the hibernate tier's
+        ``stop --hibernate``) lands on a slot a job is starting on — and since a "stopping" instance
+        still reads as alive at claim time, the dispatcher resumes and POSTs to a worker on its way
+        down, failing the job (issue #77 round 3). Only the pool can exclude a claim, so the pool
+        drives it: CAS IDLE->ASSIGNED under the lock, run the runtime's maintenance OUTSIDE it (it
+        is a remote call and must not hold the tick lock), then hand the slot back.
+
+        Optional protocol: runtimes without both hooks are untouched."""
+        needs = getattr(self._runtime, "needs_maintenance", None)
+        maintain = getattr(self._runtime, "maintain", None)
+        if not callable(needs) or not callable(maintain):
+            return
+        with self._lock:
+            candidates = [s for s in self._slots.values() if s.state == SlotState.IDLE]
+        for slot in candidates:
+            try:
+                if not needs(slot):
+                    continue
+            except Exception:
+                logger.exception("pool.needs_maintenance_error slot_id=%s — skipping", slot.slot_id)
+                continue
+            with self._lock:
+                # Re-check UNDER the lock: it may have been claimed or reaped since the probe above.
+                if self._slots.get(slot.slot_id) is not slot or slot.state != SlotState.IDLE:
+                    continue
+                slot.state = SlotState.ASSIGNED     # claim() cannot take it while we work on it
+            try:
+                maintain(slot)
+            except Exception:
+                logger.exception("pool.maintain_error slot_id=%s", slot.slot_id)
+            finally:
+                with self._lock:
+                    # Only hand back what we still own: maintain() may legitimately have retired it.
+                    if self._slots.get(slot.slot_id) is slot and slot.state == SlotState.ASSIGNED:
+                        slot.state = SlotState.IDLE
 
     def _reap_surplus(self) -> None:
         """Reap IDLE slots above the (possibly just-lowered) effective target, so a

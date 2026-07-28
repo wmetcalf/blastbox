@@ -1355,8 +1355,8 @@ def test_stop_disposes_a_deferred_husk() -> None:
 
 def _join_reaper(pool, timeout: float = 5.0) -> None:
     """Wait for the dedicated deferred-reap thread (issue #75 disposal is asynchronous)."""
-    for t, _started in list(getattr(pool, "_reaper_threads", [])):
-        t.join(timeout)
+    for entry in list(getattr(pool, "_reaper_threads", [])):
+        entry[0].join(timeout)   # entry = [thread, last_progress_at, retired]
 
 
 class _CachedLivenessRuntime(_FakeRuntime):
@@ -2144,3 +2144,183 @@ def test_f5_a_runtime_without_the_budget_kwarg_still_works():
     slot = _slot("s1", SlotState.IDLE)
     pool._slots["s1"] = slot
     assert pool.claim(timeout_s=0.5) is slot
+
+
+# ------------------------- issue #77 round 3: the escalated review of the round-2 fixes ----------
+
+def test_f10_a_reaper_retired_while_wedged_does_not_rejoin_the_drain():
+    """Dropping a wedged reaper from the progress count is what lets replacements spawn -- but
+    nothing STOPPED the original. If its terminate ever returned it resumed draining alongside its
+    replacements, so the _MAX_REAPERS=4 concurrency bound silently became _MAX_REAPER_THREADS=32.
+    It can't be interrupted, but it can be told to stop after its current disposal."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    reaped: list[str] = []
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            reaped.append(slot.slot_id)
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    for i in range(3):
+        s = _slot(f"s{i}", SlotState.DRAINING)
+        pool._slots[s.slot_id] = s
+        pool._deferred_reap.add(s.slot_id)
+
+    retired_box = [[None, 0.0, True]]      # this reaper was declared wedged and retired
+    pool._drain_deferred_reaps(retired_box)
+    assert reaped == [], f"a retired reaper kept draining the queue: {reaped}"
+
+    live_box = [[None, 0.0, False]]        # a healthy one still drains it
+    pool._drain_deferred_reaps(live_box)
+    assert len(reaped) == 3, f"a live reaper must drain the queue, got {reaped}"
+
+
+def test_f12_a_slot_under_maintenance_cannot_be_claimed():
+    """The hibernate tier re-parks a running-but-should-be-parked slot with stop --hibernate. Doing
+    that from is_alive() raced claim(): a 'stopping' instance still reads ALIVE at claim time, so a
+    dispatcher would resume and POST to a worker on its way down and the job would fail. The pool
+    must hold the slot exclusively for the whole maintenance call."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    claimed_during: list = []
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def needs_maintenance(self, slot):  # noqa: ANN001
+            return True
+
+        def maintain(self, slot):  # noqa: ANN001
+            # Re-entrant probe: while we are working on this slot, can anyone else claim it?
+            claimed_during.append(pool.claim(timeout_s=0))
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    slot = _slot("s1", SlotState.IDLE)
+    pool._slots["s1"] = slot
+    pool._maintain_idle()
+    assert claimed_during == [None], (
+        f"the slot was claimable mid-maintenance: {claimed_during}")
+    assert slot.state == SlotState.IDLE, "the slot must be handed back after maintenance"
+
+
+def test_f12_maintenance_hands_the_slot_back_even_when_it_raises():
+    """A maintenance failure must not strand the slot as ASSIGNED -- that would silently shrink the
+    warm tier by one slot per failure."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def needs_maintenance(self, slot):  # noqa: ANN001
+            return True
+
+        def maintain(self, slot):  # noqa: ANN001
+            raise RuntimeError("stop --hibernate failed")
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    slot = _slot("s1", SlotState.IDLE)
+    pool._slots["s1"] = slot
+    pool._maintain_idle()
+    assert slot.state == SlotState.IDLE
+
+
+def test_f12_a_runtime_without_the_hooks_is_untouched():
+    """Optional protocol: file/libvirt/snapstart tiers have no maintenance and must be unaffected."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    slot = _slot("s1", SlotState.IDLE)
+    pool._slots["s1"] = slot
+    pool._maintain_idle()      # must not raise
+    assert slot.state == SlotState.IDLE
+
+
+def test_f10_the_spawner_retires_a_reaper_that_has_stopped_making_progress():
+    """The other half of F10: something must SET the retired flag. A reaper whose last progress is
+    older than _REAPER_WEDGED_AFTER_S stops counting toward _MAX_REAPERS so replacements can spawn;
+    that same decision must mark it retired, or it rejoins the drain if its terminate ever returns."""
+    import threading
+
+    from blastbox.host.pool import SlotState, WarmPool
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    release = threading.Event()
+    t = threading.Thread(target=release.wait, daemon=True)   # a real, still-alive thread
+    t.start()
+    try:
+        stale = [t, pool._clock() - (pool._REAPER_WEDGED_AFTER_S + 1.0), False]
+        pool._reaper_threads.append(stale)
+        s = _slot("s0", SlotState.DRAINING)          # give it a reason to look at the queue
+        pool._slots["s0"] = s
+        pool._deferred_reap.add("s0")
+        pool._reap_deferred()
+        assert stale[2] is True, "a wedged reaper was abandoned but never told to stop"
+    finally:
+        release.set()
+        t.join(timeout=5)

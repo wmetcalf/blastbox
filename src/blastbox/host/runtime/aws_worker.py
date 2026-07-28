@@ -71,8 +71,10 @@ _TRANSIENT_AWS_MARKERS = (
     "internalserverexception",  # the microvm/lambda control plane's own 5xx name; contains
     "internal server error",    # neither "internalerror" nor "internal error" as a substring
     "internalservererror",
-    "(500)",                    # "An error occurred (500) when calling ..." (bare "500" would
-    "503",                      # match instance ids / arns, so anchor it to the CLI's phrasing)
+    "(500)",                    # "An error occurred (500) when calling ..." -- ANCHORED: a bare
+    "(503)",                    # "503"/"500" matches instance ids and arns (i-0503deadbeef...), and
+                                # misreading a definitive NotFound as a brownout strands the slot
+                                # forever: never reaped, still counted, tier never refills.
     "could not connect to the endpoint",
     "endpoint url",
     "connection was closed",
@@ -988,8 +990,16 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
             except AwsWorkerError as exc:
                 last_exc = exc      # already-running / eventual-consistency wrong-state -> fine, probe is the gate
             time.sleep(self.cfg.resume_poll_s)
-        raise AwsWorkerError(
-            f"snapstart slot {slot.slot_id} not ready within {self.cfg.resume_timeout_s:.0f}s: {last_exc}")
+        # The deadline expiring does NOT upgrade an unknown to a confirmed death: if every
+        # answer we got was "the control plane did not answer", that is still all we know
+        # (issue #77 round 3). Round 2 fixed the raise site but this RE-raise flattened the
+        # type back to a plain AwsWorkerError, and "timed out" matches no transient marker,
+        # so a brownout outlasting resume_timeout_s still terminated a healthy parked worker.
+        # A failure with a HEALTHY control plane (agent never came up) stays a hard error.
+        exc_type = AwsUnknownState if isinstance(last_exc, AwsUnknownState) else AwsWorkerError
+        raise exc_type(
+            f"snapstart slot {slot.slot_id} not ready within {self.cfg.resume_timeout_s:.0f}s: {last_exc}"
+        ) from last_exc
 
 
 def select_lambda_snapstart_runtime(
@@ -1297,20 +1307,32 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         self._hib_started[slot.slot_id] = now
         return True
 
-    def is_alive(self, slot: AwsWorkerSlot) -> bool:
-        """Liveness + RECONCILIATION of the phase map against reality (issue #77 round 2).
+    def needs_maintenance(self, slot: AwsWorkerSlot) -> bool:
+        """True iff this warm slot is RUNNING when it ought to be parked (issue #77 round 3).
 
-        resume() can half-succeed: start-instances is accepted and THEN a describe browns out, so
-        the claim is handed back (UNKNOWN, non-destructive) with the instance RUNNING. is_ready --
-        which owns the boot -> warm -> park machine -- is only polled while a slot is WARMING, so
-        nothing re-parked an IDLE slot in that state: the pool counted a parked warm slot while EC2
-        billed a running one until the uptime backstop fired (forever, with self_terminate off).
-        The background tick DOES call is_alive for IDLE slots, so reconcile here."""
-        alive = super().is_alive(slot)
-        if alive and self._phase.get(slot.slot_id) == "warming" and slot.state == SlotState.IDLE:
-            with contextlib.suppress(AwsWorkerError, OSError):
-                self._try_park(slot)
-        return alive
+        Keyed on OBSERVED state, never on our own phase map: resume() can have its start-instances
+        ACCEPTED by AWS and still lose the response to a CLI timeout, which leaves the map reading
+        "parked" while the instance runs — and the bookkeeping is precisely what a lost response
+        corrupts, so it cannot also be the thing that detects the corruption. Reads the cached
+        describe the health tick just refreshed, so this costs no extra API call."""
+        if self._phase.get(slot.slot_id) == "hibernating":
+            return False            # a park is already in flight; _try_park's throttle owns it
+        try:
+            st = str(self._describe_cached(slot, self._liveness_cache_s)
+                     .get("State", {}).get("Name", "")).lower()
+        except (AwsWorkerError, OSError):
+            return False            # unknown -> do nothing (issue #77's whole point)
+        return st == "running"
+
+    def maintain(self, slot: AwsWorkerSlot) -> None:
+        """Re-park a warm slot that is running when it should be hibernated.
+
+        MUST NOT be called off is_alive(): stop --hibernate is state-changing, and an IDLE slot can
+        be claimed at any instant — the stop would then land on a slot a job is starting on, and
+        because a "stopping" instance still reads as ALIVE at claim time the dispatcher would
+        happily resume + POST to a worker that is on its way down, failing the job. Only the pool
+        can exclude a claim, so the POOL drives this and holds the slot ASSIGNED throughout."""
+        self._try_park(slot)
 
     def is_ready(self, slot: AwsWorkerSlot) -> bool:
         # Per-slot state machine, polled by the pool during WARMING: boot -> warm -> hibernate -> parked.
@@ -1387,8 +1409,16 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                     last_exc = exc
             self._resolve_ip(slot, refresh=True)
             time.sleep(self.cfg.resume_poll_s)
-        raise AwsWorkerError(
-            f"ec2-hibernate slot {slot.slot_id} not ready within {self.cfg.resume_timeout_s:.0f}s: {last_exc}")
+        # The deadline expiring does NOT upgrade an unknown to a confirmed death: if every
+        # answer we got was "the control plane did not answer", that is still all we know
+        # (issue #77 round 3). Round 2 fixed the raise site but this RE-raise flattened the
+        # type back to a plain AwsWorkerError, and "timed out" matches no transient marker,
+        # so a brownout outlasting resume_timeout_s still terminated a healthy parked worker.
+        # A failure with a HEALTHY control plane (agent never came up) stays a hard error.
+        exc_type = AwsUnknownState if isinstance(last_exc, AwsUnknownState) else AwsWorkerError
+        raise exc_type(
+            f"ec2-hibernate slot {slot.slot_id} not ready within {self.cfg.resume_timeout_s:.0f}s: {last_exc}"
+        ) from last_exc
 
     def reap(self, slot: AwsWorkerSlot) -> None:
         for d in (self._phase, self._desc_cache, self._hib_attempt, self._hib_started):

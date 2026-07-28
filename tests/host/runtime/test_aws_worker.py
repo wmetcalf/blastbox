@@ -1703,11 +1703,14 @@ def test_f6_a_half_completed_resume_leaves_a_truthful_phase_and_re_parks():
     assert rt._phase["h1"] != "parked", (
         "the instance was STARTED; a phase still reading 'parked' means it is never re-hibernated")
 
-    # The background tick sees an IDLE slot that is running-but-unparked and re-parks it.
+    # The pool's maintenance pass (NOT is_alive -- that raced claim(), see round 3 / F12) sees an
+    # IDLE slot that is running-but-unparked and re-parks it under an exclusive ASSIGNED window.
     st["throttle"] = False
     slot.state = SlotState.IDLE
+    rt._desc_cache.pop("h1", None)
     ops.clear()
-    rt.is_alive(slot)
+    assert rt.needs_maintenance(slot) is True
+    rt.maintain(slot)
     assert "ec2 stop-instances" in ops, f"the leaked running instance was never re-parked: {ops}"
 
 
@@ -1734,5 +1737,112 @@ def test_f6_a_genuinely_parked_idle_slot_is_not_disturbed():
                              clock=lambda: 100.0)
     slot = AwsWorkerSlot(slot_id="h2", resource_id="i-1", state=SlotState.IDLE, ip="10.0.0.5")
     rt._phase["h2"] = "parked"
-    rt.is_alive(slot)
+    assert rt.needs_maintenance(slot) is False, "a correctly-parked (stopped) slot needs nothing"
     assert "ec2 stop-instances" not in ops, "a correctly-parked slot must be left alone"
+
+
+# ------------------------- issue #77 round 3: the escalated review of the round-2 fixes ----------
+
+def test_f8_a_resume_that_exhausts_its_deadline_on_timeouts_is_still_unknown():
+    """Round 2 fixed the RAISE site but not the RE-RAISE: resume() swallows each AwsProbeTimeout
+    into last_exc and finally raises a NEW plain AwsWorkerError that merely INTERPOLATES it. The
+    type is lost and "timed out" matches no marker, so a brownout that outlasts resume_timeout_s
+    still terminated a healthy parked worker -- the exact bug, one level up the stack."""
+    from blastbox.host.runtime.vm_dispatch import _is_unknown_not_dead
+
+    tick = [100.0]
+    # EVERY control-plane call times out -- the real brownout shape. The loop keeps the last such
+    # error in last_exc and finally interpolates it into a fresh, plain AwsWorkerError.
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": _timeout,
+                           "lambda-microvms create-microvm-auth-token": _timeout,
+                           "lambda-microvms resume-microvm": _timeout},
+                          probe=lambda u, h, t: False,
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
+                          resume_timeout_s=5.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsWorkerError) as ei:
+        rt.resume(slot)
+    assert _is_unknown_not_dead(ei.value), (
+        "a resume that only ever saw timeouts is UNKNOWN, not a confirmed dead worker")
+
+
+def test_f8_a_resume_that_fails_on_a_healthy_control_plane_is_still_a_real_failure():
+    """Guard: if the control plane answered fine and the AGENT simply never came up, that IS
+    evidence the slot is unusable -- it must stay a hard failure so the slot is retired."""
+    from blastbox.host.runtime.vm_dispatch import _is_unknown_not_dead
+
+    tick = [100.0]
+    # The control plane answers everything; only the AGENT never comes up.
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "RUNNING"},
+                           "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"},
+                           "lambda-microvms resume-microvm": {}},
+                          probe=lambda u, h, t: False,
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
+                          resume_timeout_s=5.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsWorkerError) as ei:
+        rt.resume(slot)
+    assert not _is_unknown_not_dead(ei.value)
+
+
+@pytest.mark.parametrize("stderr", [
+    "An error occurred (InvalidInstanceID.NotFound) when calling DescribeInstances: i-0503deadbeef1",
+    "ResourceNotFoundException: microvm mv-500ab does not exist",
+])
+def test_f9_a_definitive_error_carrying_503_digits_is_not_transient(stderr):
+    """The marker list kept a BARE "503" directly under a comment explaining that bare digits match
+    instance ids and must be anchored. A definitive NotFound for an id containing those digits was
+    therefore read as a brownout: the slot is never reaped, keeps counting against the warm target,
+    and the tier never refills -- the same 'dead read as unknown' failure as the libvirt one."""
+    from blastbox.host.runtime.aws_worker import _is_transient_aws_error
+    assert not _is_transient_aws_error(stderr)
+
+
+def test_f9_a_real_503_is_still_transient():
+    from blastbox.host.runtime.aws_worker import _is_transient_aws_error
+    assert _is_transient_aws_error("An error occurred (503) when calling the GetMicrovm operation")
+    assert _is_transient_aws_error("ServiceUnavailable: please retry")
+
+
+def test_f11_a_start_whose_response_is_lost_is_still_reconciled():
+    """Round 2 recorded the phase only AFTER start-instances RETURNED. AWS can accept the start and
+    the CLI still time out waiting for the response, leaving the instance running with the phase
+    reading 'parked' -- which the reconciler skipped. Reconciliation must key off OBSERVED state,
+    not our own bookkeeping, because the bookkeeping is exactly what a lost response corrupts."""
+    from blastbox.host.runtime.aws_worker import Ec2HibernateConfig, Ec2HibernateRuntime
+
+    st = {"name": "stopped", "lose_start_response": True}
+
+    def runner(argv, timeout):  # noqa: ANN001
+        argv = list(argv)
+        op = f"{argv[1]} {argv[2]}"
+        if op == "sts get-caller-identity":
+            return _cp(stdout=json.dumps({"Account": "1", "Arn": "arn:aws:iam::1:user/x"}))
+        if op == "ec2 start-instances":
+            st["name"] = "running"                  # AWS ACCEPTED it ...
+            if st["lose_start_response"]:
+                raise subprocess.TimeoutExpired(cmd="aws", timeout=120)   # ... we never heard back
+            return _cp(stdout="{}")
+        if op == "ec2 describe-instances":
+            return _cp(stdout=json.dumps({"Reservations": [{"Instances": [
+                {"InstanceId": "i-1", "State": {"Name": st["name"]}, "PrivateIpAddress": "10.0.0.5"}]}]}))
+        return _cp(stdout="{}")
+
+    t = [100.0]
+
+    def clock():
+        t[0] += 0.05
+        return t[0]
+
+    rt = Ec2HibernateRuntime(Ec2HibernateConfig(region="us-east-1", image_id="ami-0abc",
+                                                resume_timeout_s=0.2, resume_poll_s=0.0),
+                             aws_runner=runner, http_probe=lambda u, h, to: False, clock=clock)
+    slot = AwsWorkerSlot(slot_id="h1", resource_id="i-1", state=SlotState.ASSIGNED, ip="10.0.0.5")
+    rt._phase["h1"] = "parked"
+    with pytest.raises(AwsWorkerError):
+        rt.resume(slot)
+    slot.state = SlotState.IDLE
+    assert rt.needs_maintenance(slot) is True, (
+        "a RUNNING instance the pool believes is parked must be reconciled regardless of phase")
