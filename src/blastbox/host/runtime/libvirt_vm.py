@@ -547,7 +547,23 @@ class LibvirtVmRuntime:
         raise RuntimeError(f"{slot.domain}: not ready within {self.cfg.boot_timeout_s:.0f}s")
 
     def is_alive(self, slot: VmSlot) -> bool:
-        return "running" in self._virsh("domstate", slot.domain).stdout
+        """True iff libvirt CONFIRMS the domain is running.
+
+        issue #77: this used to test the stdout substring alone. ``_virsh`` never raises — a
+        subprocess timeout returns rc=124, a missing binary rc=127, and a libvirtd connect failure
+        rc=1 with the message on STDERR and stdout EMPTY — so every transient local control-plane
+        fault read as "not running", and the pool's health check then ``virsh destroy``d healthy
+        warm VMs. libvirtd is a single shared daemon, so that fault is correlated across every slot
+        at once (a `systemctl restart libvirtd` would wipe the tier). Only a SUCCESSFUL query is
+        evidence: on any non-zero rc, keep the slot (unknown, not dead) and let the next tick ask
+        again — a genuinely dead domain is still caught then, and at claim time."""
+        cp = self._virsh("domstate", slot.domain)
+        if cp.returncode != 0:
+            logger.warning("libvirt.domstate_failed domain=%s rc=%s stderr=%s — keeping slot "
+                         "(unknown, not dead)", slot.domain, cp.returncode,
+                         (cp.stderr or "").strip()[:160])
+            return True
+        return "running" in cp.stdout
 
     def reap(self, slot: VmSlot) -> None:
         slot.state = SlotState.DRAINING

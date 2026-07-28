@@ -56,6 +56,39 @@ class AwsWorkerError(RuntimeError):
 
 
 
+# Control-plane responses that mean "ask again later", NOT "this worker is gone". The aws CLI
+# exits 255 for all of these AFTER its own internal retries, so they are NOT TimeoutExpired — which
+# is why bounding the call by time alone missed the most common brownout of all (issue #77).
+_TRANSIENT_AWS_MARKERS = (
+    "throttl",                 # ThrottlingException / Throttling / RequestThrottled
+    "requestlimitexceeded",
+    "rate exceeded",
+    "serviceunavailable",
+    "service unavailable",
+    "internalerror",
+    "internal error",
+    "internalfailure",
+    "503",
+    "could not connect to the endpoint",
+    "endpoint url",
+    "connection was closed",
+    "connection reset",
+    "temporarily unavailable",
+    "requestexpired",
+    "expiredtoken",            # an IMDS credential-refresh stall, not a dead worker
+    "credentials",
+)
+
+
+def _is_transient_aws_error(stderr: str) -> bool:
+    """True if this aws-cli failure says 'retry later' rather than 'the resource is gone'.
+
+    A throttle/5xx/endpoint blip must never be read as a dead worker: the control plane ANSWERED,
+    it just refused to tell us anything. Treated exactly like a probe timeout (issue #77)."""
+    low = (stderr or "").lower()
+    return any(marker in low for marker in _TRANSIENT_AWS_MARKERS)
+
+
 class AwsProbeTimeout(AwsWorkerError):
     """A claim-time describe exceeded its budget (issue #77). NOT evidence the worker is dead —
     the control plane simply didn't answer in time — so callers must treat it as UNKNOWN and skip
@@ -442,7 +475,14 @@ class AwsDisposableRuntime:
                 raise AwsProbeTimeout(f"aws {service} {op}: timed out after {budget}s") from exc
             raise AwsWorkerError(f"aws {service} {op}: timed out after {budget}s") from exc
         if cp.returncode != 0:
-            raise AwsWorkerError(f"aws {service} {op} failed (rc={cp.returncode}): {(cp.stderr or '').strip()[:400]}")
+            stderr = (cp.stderr or "").strip()
+            # Inside a claim/health probe, a TRANSIENT control-plane answer is UNKNOWN, not failure:
+            # otherwise a throttle (which exits 255, never TimeoutExpired) is read as a dead worker
+            # and the slot is terminated — the most likely brownout of all (issue #77).
+            if (getattr(self._tls, "probe_deadline", None) is not None
+                    and _is_transient_aws_error(stderr)):
+                raise AwsProbeTimeout(f"aws {service} {op}: transient (rc={cp.returncode}): {stderr[:200]}")
+            raise AwsWorkerError(f"aws {service} {op} failed (rc={cp.returncode}): {stderr[:400]}")
         out = (cp.stdout or "").strip()
         if not out:
             return {}

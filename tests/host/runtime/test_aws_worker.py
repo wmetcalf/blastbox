@@ -1493,3 +1493,34 @@ def test_subclass_config_positional_binding_survives_the_new_base_field():
     assert cfg.image_identifier == "arn:img", "the new base field rebound a subclass field"
     assert cfg.max_duration_s == 3600.0
     assert cfg.claim_probe_timeout_s == 5.0
+
+
+def test_transient_control_plane_answer_is_unknown_not_dead():
+    # issue #77 sweep: bounding the call by TIME missed the most likely brownout of all — a throttle
+    # ANSWERS. The aws CLI exits 255 (never TimeoutExpired) for ThrottlingException /
+    # RequestLimitExceeded / 503 / "Could not connect to the endpoint", so those landed in
+    # `alive = False` and the health tick terminated the whole tier.
+    import subprocess
+
+    for stderr in ("An error occurred (ThrottlingException) ... Rate exceeded",
+                   "An error occurred (RequestLimitExceeded)",
+                   "Could not connect to the endpoint URL: https://ec2.us-east-1.amazonaws.com/",
+                   "An error occurred (ServiceUnavailable) ... 503"):
+        runner = lambda argv, timeout, _e=stderr: subprocess.CompletedProcess(  # noqa: E731
+            list(argv), 255, "", _e)
+        rt = LambdaMicroVmRuntime(
+            LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:x",
+                                allow_default_egress=True),
+            aws_runner=runner)
+        slot = AwsWorkerSlot(slot_id="s1", resource_id="mv-1")
+        assert rt.is_alive_for_claim(slot) is None, f"{stderr!r} read as DEAD at claim"
+        assert rt.is_alive(slot) is True, f"{stderr!r} read as DEAD on the health tick"
+        assert not rt._live_cache, f"{stderr!r} poisoned the liveness cache"
+
+    # ...while a DEFINITIVE negative is still definitive
+    gone = lambda argv, timeout: subprocess.CompletedProcess(  # noqa: E731
+        list(argv), 255, "", "An error occurred (ResourceNotFoundException): microvm not found")
+    rt2 = LambdaMicroVmRuntime(
+        LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:x", allow_default_egress=True),
+        aws_runner=gone)
+    assert rt2.is_alive_for_claim(AwsWorkerSlot(slot_id="s2", resource_id="mv-2")) is False
