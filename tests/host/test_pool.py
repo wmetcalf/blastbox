@@ -2225,105 +2225,6 @@ def test_f10_a_reaper_retired_while_wedged_does_not_rejoin_the_drain():
     assert len(reaped) == 3, f"a live reaper must drain the queue, got {reaped}"
 
 
-def test_f12_a_slot_under_maintenance_cannot_be_claimed():
-    """The hibernate tier re-parks a running-but-should-be-parked slot with stop --hibernate. Doing
-    that from is_alive() raced claim(): a 'stopping' instance still reads ALIVE at claim time, so a
-    dispatcher would resume and POST to a worker on its way down and the job would fail. The pool
-    must hold the slot exclusively for the whole maintenance call."""
-    from blastbox.host.pool import SlotState, WarmPool
-
-    claimed_during: list = []
-
-    class _Rt:
-        kind = "test"
-
-        def spawn(self):
-            raise AssertionError("no spawning in this test")
-
-        def is_ready(self, slot):  # noqa: ANN001
-            return True
-
-        def is_alive(self, slot):  # noqa: ANN001
-            return True
-
-        def needs_maintenance(self, slot):  # noqa: ANN001
-            return True
-
-        def maintain(self, slot):  # noqa: ANN001
-            # Re-entrant probe: while we are working on this slot, can anyone else claim it?
-            claimed_during.append(pool.claim(timeout_s=0))
-
-        def reap(self, slot):  # noqa: ANN001
-            pass
-
-    pool = WarmPool(runtime=_Rt(), warm_size=0)
-    slot = _slot("s1", SlotState.IDLE)
-    pool._slots["s1"] = slot
-    pool._maintain_idle()
-    assert claimed_during == [None], (
-        f"the slot was claimable mid-maintenance: {claimed_during}")
-    assert slot.state == SlotState.IDLE, "the slot must be handed back after maintenance"
-
-
-def test_f12_maintenance_hands_the_slot_back_even_when_it_raises():
-    """A maintenance failure must not strand the slot as ASSIGNED -- that would silently shrink the
-    warm tier by one slot per failure."""
-    from blastbox.host.pool import SlotState, WarmPool
-
-    class _Rt:
-        kind = "test"
-
-        def spawn(self):
-            raise AssertionError("no spawning in this test")
-
-        def is_ready(self, slot):  # noqa: ANN001
-            return True
-
-        def is_alive(self, slot):  # noqa: ANN001
-            return True
-
-        def needs_maintenance(self, slot):  # noqa: ANN001
-            return True
-
-        def maintain(self, slot):  # noqa: ANN001
-            raise RuntimeError("stop --hibernate failed")
-
-        def reap(self, slot):  # noqa: ANN001
-            pass
-
-    pool = WarmPool(runtime=_Rt(), warm_size=0)
-    slot = _slot("s1", SlotState.IDLE)
-    pool._slots["s1"] = slot
-    pool._maintain_idle()
-    assert slot.state == SlotState.IDLE
-
-
-def test_f12_a_runtime_without_the_hooks_is_untouched():
-    """Optional protocol: file/libvirt/snapstart tiers have no maintenance and must be unaffected."""
-    from blastbox.host.pool import SlotState, WarmPool
-
-    class _Rt:
-        kind = "test"
-
-        def spawn(self):
-            raise AssertionError("no spawning in this test")
-
-        def is_ready(self, slot):  # noqa: ANN001
-            return True
-
-        def is_alive(self, slot):  # noqa: ANN001
-            return True
-
-        def reap(self, slot):  # noqa: ANN001
-            pass
-
-    pool = WarmPool(runtime=_Rt(), warm_size=0)
-    slot = _slot("s1", SlotState.IDLE)
-    pool._slots["s1"] = slot
-    pool._maintain_idle()      # must not raise
-    assert slot.state == SlotState.IDLE
-
-
 def test_f10_the_spawner_retires_a_reaper_that_has_stopped_making_progress():
     """The other half of F10: something must SET the retired flag. A reaper whose last progress is
     older than _REAPER_WEDGED_AFTER_S stops counting toward _MAX_REAPERS so replacements can spawn;
@@ -2362,3 +2263,38 @@ def test_f10_the_spawner_retires_a_reaper_that_has_stopped_making_progress():
     finally:
         release.set()
         t.join(timeout=5)
+
+
+def test_f26_an_unknown_slot_is_probed_once_per_claim_not_once_per_scan():
+    """The unprobeable set was rebuilt every scan, so a runtime that answers UNKNOWN *fast* (a
+    throttle returns in milliseconds) was re-probed on every rescan of the same claim -- multiplying
+    aws CLI subprocesses per dispatcher thread during exactly the brownout the budget exists for."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    probes: list[str] = []
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
+            probes.append(slot.slot_id)
+            return None            # fast UNKNOWN, exactly like a throttled describe
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    for i in range(3):
+        s = _slot(f"s{i}", SlotState.IDLE)
+        pool._slots[s.slot_id] = s
+    assert pool.claim(timeout_s=0.3) is None       # every slot unknown -> no claim
+    assert len(probes) == 3, f"expected one probe per slot for the whole claim, got {probes}"

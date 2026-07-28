@@ -1309,3 +1309,52 @@ def test_f7_a_confirmed_dead_slot_is_still_released_dirty():
     got = _claim_resumable_slot(pool, 5.0, clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0])
     assert got is b
     assert pool.released == ["A"], "a confirmed-dead slot must still be retired dirty"
+
+
+def test_f23_a_slot_returned_after_the_deadline_is_handed_back_untouched():
+    """WarmPool's scan grace can return a slot just AFTER the dispatcher's deadline (its liveness
+    probe consumed the remaining time). Starting a resume there passes a 0s budget: the AWS loop
+    runs zero iterations and raises with last_exc=None, which reads as a hard failure -- so a
+    healthy parked worker was terminated without ever being probed. Don't start what we can't pay
+    for; hand it back and let the next claim try it."""
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.vm_dispatch import _claim_resumable_slot
+
+    t = [0.0]
+
+    def clock():
+        t[0] += 0.05
+        return t[0]
+
+    class _SlowProbePool:
+        """claim() burns the rest of the window (as a real liveness probe does) before returning."""
+
+        def __init__(self):
+            self.slot = SimpleNamespace(slot_id="A")
+            self.resume_calls = []
+            self.released = []
+            self.unclaimed = []
+            self.handed_out = False
+            self.runtime = SimpleNamespace(resume=lambda s: self.resume_calls.append(s.slot_id))
+
+        def claim(self, *, timeout_s):  # noqa: ANN001
+            if self.handed_out:
+                return None
+            self.handed_out = True
+            for _ in range(40):        # the probe eats the remaining claim window
+                clock()
+            return self.slot
+
+        def unclaim(self, slot):  # noqa: ANN001
+            self.unclaimed.append(slot.slot_id)
+
+        def release(self, slot, dirty=False):  # noqa: ANN001
+            self.released.append(slot.slot_id)
+
+    pool = _SlowProbePool()
+    got = _claim_resumable_slot(pool, 1.0, clock=clock)
+    assert got is None, "no slot could be resumed inside the window"
+    assert pool.resume_calls == [], "a resume was started with no budget left to pay for it"
+    assert pool.released == [], "a healthy, never-probed slot was destroyed"
+    assert pool.unclaimed == ["A"], "the slot must be handed back for the next claim"

@@ -875,6 +875,10 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
     # the base Lambda runtime's running aliases (active/ready) so a MicroVM the base considers alive
     # isn't reaped by the SnapStart health check, plus the parked (suspended) states.
     _ALIVE_STATES = ("pending", "running", "active", "ready", "suspending", "suspended")
+    # Deliberately NARROWER than _ALIVE_STATES: a parked (suspended) or still-booting (pending) slot
+    # is alive but NOT expected to serve, so a failing agent probe against one proves nothing. Only
+    # these states make "the VM is up but its agent is dead" a confirmed verdict (issue #77 round 5).
+    _RUNNING_STATES = ("running", "active", "ready")
 
     def __init__(self, cfg: LambdaSnapStartConfig, **kw: Any) -> None:
         super().__init__(cfg, **kw)   # inherits the image-required + fail-closed egress guards + _desc_cache
@@ -988,6 +992,13 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # healthy slots behind it (issue #77 round 4).
         budget = self.cfg.resume_timeout_s if budget_s is None else min(self.cfg.resume_timeout_s,
                                                                         max(0.0, float(budget_s)))
+        if budget <= 0:
+            # We were handed no time at all (the pool's scan grace can return a slot just past the
+            # dispatcher's deadline). We have not probed this worker even ONCE, so we know nothing
+            # about it -- and a plain error here reads as a confirmed failure and destroys a healthy
+            # parked slot, which is the precise bug this whole change exists to prevent (#77 round 5).
+            raise AwsUnknownState(
+                f"{self.kind} slot {slot.slot_id}: no claim budget left to attempt a resume")
         deadline = self._clock() + budget
         last_exc: Exception | None = None
         while self._clock() < deadline:
@@ -1003,8 +1014,12 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
             except (AwsWorkerError, OSError) as exc:
                 iter_exc = exc      # not-yet-RUNNING mint/probe failures -> keep trying to wake it
             # probe failed -> the slot isn't serving. Confirm it's not dead, then nudge it awake.
+            confirmed_up = False
             try:
                 cur = self._state(slot)
+                # The control plane ANSWERED and says the microVM is up. Combined with a failing
+                # agent probe that is a CONFIRMED bad worker, not an unknown one.
+                confirmed_up = cur in self._RUNNING_STATES
             except (AwsWorkerError, OSError) as exc:
                 iter_exc, cur = exc, ""
             if cur in self._DEAD_STATES:
@@ -1017,7 +1032,15 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
                 # with the pre-resume token until the deadline. On success the awake-minted token survives.
                 slot.auth_token = None
             except AwsWorkerError as exc:
-                iter_exc = exc      # already-running / eventual-consistency wrong-state -> fine, probe is the gate
+                # ResumeMicrovm requires a SUSPENDED target and answers ConflictException for a
+                # RUNNING one -- which the inverted classifier (correctly, in general) calls
+                # UNKNOWN. But when the state query just CONFIRMED the microVM is up, that conflict
+                # tells us nothing new, and letting it become the verdict masks a dead agent as a
+                # brownout forever: the slot is handed back every claim, never replaced, and a
+                # warm_size=1 tier requeues jobs indefinitely (issue #77 round 5). This is the
+                # cost-side of the inversion, and it is paid here rather than by weakening it.
+                if not confirmed_up:
+                    iter_exc = exc  # already-running / eventual-consistency wrong-state -> probe is the gate
             last_exc = iter_exc     # this pass's verdict supersedes every earlier one
             time.sleep(self.cfg.resume_poll_s)
         # The deadline expiring does NOT upgrade an unknown to a confirmed death: if every
@@ -1337,56 +1360,6 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         self._hib_started[slot.slot_id] = now
         return True
 
-    def needs_maintenance(self, slot: AwsWorkerSlot) -> bool:
-        """True iff this warm slot is RUNNING when it ought to be parked (issue #77 round 3).
-
-        Keyed on OBSERVED state, never on our own phase map: resume() can have its start-instances
-        ACCEPTED by AWS and still lose the response to a CLI timeout, which leaves the map reading
-        "parked" while the instance runs — and the bookkeeping is precisely what a lost response
-        corrupts, so it cannot also be the thing that detects the corruption. Reads the cached
-        describe the health tick just refreshed, so this costs no extra API call."""
-        try:
-            # Under the HEALTH budget: this runs on the single tick thread, and _running() uses the
-            # UNCACHED _state path so _desc_cache is usually empty here -- without this the describe
-            # would get cli_timeout_s (120s) and one brownout would stall the whole pool per slot
-            # (issue #77 round 4).
-            with self._health_probe_budget():
-                st = str(self._describe_cached(slot, self._liveness_cache_s)
-                         .get("State", {}).get("Name", "")).lower()
-        except (AwsWorkerError, OSError):
-            return False            # unknown -> do nothing (issue #77's whole point)
-        if self._phase.get(slot.slot_id) == "hibernating":
-            # A park is in flight. is_ready owns this transition for WARMING slots but never runs
-            # for IDLE ones, so advance it here -- otherwise a slot re-parked by maintenance stays
-            # "hibernating" forever and is_alive_for_claim skips it for good.
-            if st == "stopped":
-                self._phase[slot.slot_id] = "parked"
-            return False
-        return st == "running"
-
-    def is_alive_for_claim(self, slot: AwsWorkerSlot, *, budget_s: float | None = None) -> "bool | None":
-        """Skip a slot whose hibernation is IN FLIGHT (issue #77 round 4).
-
-        maintain() returns as soon as stop --hibernate is ACCEPTED; the instance then spends a while
-        "stopping", which the tier deliberately counts as ALIVE (a parked slot is alive) and whose
-        agent still answers a health probe. So without this a dispatcher could claim it, resume()
-        would succeed against the still-live agent, and the job would lose its worker mid-run when
-        the pending hibernation landed. UNKNOWN (skip), not dead: it is a perfectly good warm slot
-        a moment later."""
-        if self._phase.get(slot.slot_id) == "hibernating":
-            return None
-        return super().is_alive_for_claim(slot, budget_s=budget_s)
-
-    def maintain(self, slot: AwsWorkerSlot) -> None:
-        """Re-park a warm slot that is running when it should be hibernated.
-
-        MUST NOT be called off is_alive(): stop --hibernate is state-changing, and an IDLE slot can
-        be claimed at any instant — the stop would then land on a slot a job is starting on, and
-        because a "stopping" instance still reads as ALIVE at claim time the dispatcher would
-        happily resume + POST to a worker that is on its way down, failing the job. Only the pool
-        can exclude a claim, so the POOL drives this and holds the slot ASSIGNED throughout."""
-        self._try_park(slot)
-
     def is_ready(self, slot: AwsWorkerSlot) -> bool:
         # Per-slot state machine, polled by the pool during WARMING: boot -> warm -> hibernate -> parked.
         try:
@@ -1445,6 +1418,13 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # healthy slots behind it (issue #77 round 4).
         budget = self.cfg.resume_timeout_s if budget_s is None else min(self.cfg.resume_timeout_s,
                                                                         max(0.0, float(budget_s)))
+        if budget <= 0:
+            # We were handed no time at all (the pool's scan grace can return a slot just past the
+            # dispatcher's deadline). We have not probed this worker even ONCE, so we know nothing
+            # about it -- and a plain error here reads as a confirmed failure and destroys a healthy
+            # parked slot, which is the precise bug this whole change exists to prevent (#77 round 5).
+            raise AwsUnknownState(
+                f"{self.kind} slot {slot.slot_id}: no claim budget left to attempt a resume")
         deadline = self._clock() + budget
         last_exc: Exception | None = None
         while self._clock() < deadline:

@@ -430,40 +430,6 @@ def test_cascade_forwards_unknown_liveness_unchanged():
     assert rt.is_alive_for_claim(slot) is None, "cascade collapsed UNKNOWN into a bool"
 
 
-def test_cascade_forwards_the_maintenance_protocol():
-    """issue #77 round 4: WarmPool disables reconciliation unless BOTH hooks exist on the runtime it
-    holds -- which in production is the CASCADE, not the tier. Without this passthrough the EC2
-    hibernate re-park never runs when cascaded, so a lost start-instances response leaves a real
-    instance running and billed."""
-    class MaintRuntime(FakeRuntime):
-        def __init__(self, name):
-            super().__init__(name)
-            self.maintained = []
-            self.needs = True
-
-        def needs_maintenance(self, slot):
-            return self.needs
-
-        def maintain(self, slot):
-            self.maintained.append(slot.slot_id)
-
-    m, plain = MaintRuntime("hib"), FakeRuntime("fc")
-    rt = CascadingRuntime([Tier("hib", m, 1), Tier("fc", plain, 1)])
-    s_m = rt.spawn()      # owned by the maintenance-capable tier
-    s_p = rt.spawn()      # owned by the plain tier
-
-    assert rt.needs_maintenance(s_m) is True
-    rt.maintain(s_m)
-    assert m.maintained == [s_m.slot_id], "maintenance was not delegated to the owning tier"
-
-    m.needs = False
-    assert rt.needs_maintenance(s_m) is False
-
-    # a tier without the hooks is simply never maintained (and must not raise)
-    assert rt.needs_maintenance(s_p) is False
-    rt.maintain(s_p)
-
-
 def test_cascade_forwards_the_resume_budget():
     """The claim window's remaining time must reach the owning tier, or a slow resume still burns
     the whole window in the production (cascaded) shape."""

@@ -988,8 +988,18 @@ def _claim_resumable_slot(pool: Any, timeout_s: float, *,
                 continue
             if sid is not None:
                 tried.add(sid)
+            remaining_for_resume = deadline - clock()
+            if remaining_for_resume <= 0:
+                # The window closed while we were probing. Hand the slot back untouched rather than
+                # starting a resume we cannot afford -- attempting one with no budget is how a
+                # never-probed healthy slot got destroyed (issue #77 round 5).
+                unclaim = getattr(pool, "unclaim", None)
+                if callable(unclaim):
+                    with contextlib.suppress(Exception):
+                        unclaim(slot)
+                break
             try:
-                _resume_on_claim(pool, slot, budget_s=max(0.0, deadline - clock()))
+                _resume_on_claim(pool, slot, budget_s=remaining_for_resume)
                 return slot
             except Exception as exc:  # noqa: BLE001 -- dead slots are already retired dirty by
                 last_exc = exc        # _resume_on_claim; UNKNOWN ones were handed back. Try another.

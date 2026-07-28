@@ -400,8 +400,15 @@ class WarmPool:
         # holding the caller's warm-gate reservation.
         scan_deadline = max(deadline, self._clock() + self._SCAN_GRACE_S)
 
+        # Carried across rescans, not rebuilt per scan (issue #77 round 5): a runtime that answers
+        # UNKNOWN *fast* (a throttle returns in milliseconds) otherwise gets re-probed on every
+        # rescan of the same claim -- ~5x the aws CLI subprocesses per claim, per dispatcher thread,
+        # during precisely the brownout the probe budget exists to ride out. One UNKNOWN verdict per
+        # slot per claim is all the information there is to get.
+        unprobeable: set[str] = set()
+
         while True:
-            slot = self._try_claim_one(deadline, scan_deadline)
+            slot = self._try_claim_one(deadline, scan_deadline, unprobeable)
             if slot is not None:
                 return slot
 
@@ -536,7 +543,6 @@ class WarmPool:
         ready = self._runtime_ready()
         self._promote_warming()
         self._health_check()
-        self._maintain_idle()
         # Kick the deferred reaper EARLY so its (asynchronous) disposal overlaps the rest of the
         # tick. NOTE: it does NOT free `concurrent_ceiling` headroom for this tick's
         # _spawn_to_deficit — the husk stays tracked until the reaper thread actually disposes it,
@@ -647,46 +653,6 @@ class WarmPool:
             if entry_box:
                 with self._lock:
                     entry_box[0][1] = self._clock()
-
-    def _maintain_idle(self) -> None:
-        """Give the runtime an EXCLUSIVE window to reconcile an IDLE slot with its real state.
-
-        A runtime cannot safely do this from is_alive(): claim() may flip an IDLE slot to ASSIGNED
-        at any instant, so a state-changing call already in flight (the hibernate tier's
-        ``stop --hibernate``) lands on a slot a job is starting on — and since a "stopping" instance
-        still reads as alive at claim time, the dispatcher resumes and POSTs to a worker on its way
-        down, failing the job (issue #77 round 3). Only the pool can exclude a claim, so the pool
-        drives it: CAS IDLE->ASSIGNED under the lock, run the runtime's maintenance OUTSIDE it (it
-        is a remote call and must not hold the tick lock), then hand the slot back.
-
-        Optional protocol: runtimes without both hooks are untouched."""
-        needs = getattr(self._runtime, "needs_maintenance", None)
-        maintain = getattr(self._runtime, "maintain", None)
-        if not callable(needs) or not callable(maintain):
-            return
-        with self._lock:
-            candidates = [s for s in self._slots.values() if s.state == SlotState.IDLE]
-        for slot in candidates:
-            try:
-                if not needs(slot):
-                    continue
-            except Exception:
-                logger.exception("pool.needs_maintenance_error slot_id=%s — skipping", slot.slot_id)
-                continue
-            with self._lock:
-                # Re-check UNDER the lock: it may have been claimed or reaped since the probe above.
-                if self._slots.get(slot.slot_id) is not slot or slot.state != SlotState.IDLE:
-                    continue
-                slot.state = SlotState.ASSIGNED     # claim() cannot take it while we work on it
-            try:
-                maintain(slot)
-            except Exception:
-                logger.exception("pool.maintain_error slot_id=%s", slot.slot_id)
-            finally:
-                with self._lock:
-                    # Only hand back what we still own: maintain() may legitimately have retired it.
-                    if self._slots.get(slot.slot_id) is slot and slot.state == SlotState.ASSIGNED:
-                        slot.state = SlotState.IDLE
 
     def _reap_surplus(self) -> None:
         """Reap IDLE slots above the (possibly just-lowered) effective target, so a
@@ -971,7 +937,8 @@ class WarmPool:
         return None if alive is None else bool(alive)
 
     def _try_claim_one(self, deadline: float | None = None,
-                       scan_deadline: float | None = None) -> Slot | None:
+                       scan_deadline: float | None = None,
+                       unprobeable: "set[str] | None" = None) -> Slot | None:
         """Scan for an IDLE slot, flip to ASSIGNED inside the lock.
 
         If the chosen slot is dead: demote to DRAINING and DEFER its disposal to the background
@@ -990,7 +957,10 @@ class WarmPool:
             # grace floor is applied ONCE per claim, not re-armed on every rescan (which let a scan
             # starting just before the deadline get a fresh 1s and overrun the caller's timeout).
             scan_deadline = max(deadline, self._clock() + self._SCAN_GRACE_S)
-        unprobeable: set[str] = set()   # runtime couldn't answer in its budget THIS scan (issue #77)
+        # Slots whose runtime couldn't answer within its budget. Owned by claim() across rescans
+        # when it passes one in; a direct caller gets a per-scan set as before (issue #77).
+        if unprobeable is None:
+            unprobeable = set()
         while True:
             # Shutdown in progress: hand out NOTHING. stop() reaps every slot after its joins, so a
             # slot claimed during that window would be destroyed mid-job; and a dead slot deferred

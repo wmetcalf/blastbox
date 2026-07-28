@@ -193,27 +193,6 @@ class CascadingRuntime:
                 pass
         return fresh(slot)
 
-    def needs_maintenance(self, slot: Any) -> bool:
-        """Forward the pool's maintenance probe to the owning tier (issue #77 round 4).
-
-        WarmPool disables reconciliation entirely unless BOTH hooks are present on the runtime it
-        holds — which in production is this cascade, not the tier. Without these the EC2 hibernate
-        tier's re-park never runs when cascaded, and a lost start-instances response leaves a real
-        instance running and billed."""
-        tier = self._tier_of(slot)
-        if tier is None:
-            return False
-        hook = getattr(tier.runtime, "needs_maintenance", None)
-        return bool(hook(slot)) if callable(hook) else False
-
-    def maintain(self, slot: Any) -> None:
-        tier = self._tier_of(slot)
-        if tier is None:
-            return
-        hook = getattr(tier.runtime, "maintain", None)
-        if callable(hook):
-            hook(slot)
-
     def reap(self, slot: Any, dirty: bool = False) -> None:
         with self._lock:
             i = self._owner.get(slot.slot_id)
