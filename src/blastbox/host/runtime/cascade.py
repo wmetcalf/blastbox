@@ -170,7 +170,7 @@ class CascadingRuntime:
         tier = self._tier_of(slot)
         return tier is not None and tier.runtime.is_alive(slot)
 
-    def is_alive_for_claim(self, slot: Any) -> bool:
+    def is_alive_for_claim(self, slot: Any) -> "bool | None":
         """Claim-time FRESH liveness, delegated to the owning tier's cache-bypassing hook when it has one
         (AWS tiers) -- else the tier's is_alive (file/libvirt, already fresh). Without this the pool's
         getattr(runtime, "is_alive_for_claim") finds nothing on the cascade and falls back to the cascade's
