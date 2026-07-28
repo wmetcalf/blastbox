@@ -565,6 +565,21 @@ class LibvirtVmRuntime:
             return True
         return "running" in cp.stdout
 
+    def is_alive_for_claim(self, slot: VmSlot) -> "bool | None":
+        """Claim-time check: UNKNOWN (None) when libvirt cannot be queried (issue #77).
+
+        ``is_alive`` keeps such a slot (a virsh/libvirtd blip is not evidence the domain died, and
+        destroying healthy warm VMs over it is the worse failure). But the pool falls back to
+        ``is_alive`` for the HAND-OUT probe when a runtime has no fresh hook, and there "keep" would
+        mean "give this slot to a job" — handing out a VM we cannot confirm is running. Split the
+        two: background = keep, hand-out = skip this slot and try another."""
+        cp = self._virsh("domstate", slot.domain)
+        if cp.returncode != 0:
+            logger.warning("libvirt.domstate_failed_at_claim domain=%s rc=%s — skipping slot "
+                           "(unknown, not dead)", slot.domain, cp.returncode)
+            return None
+        return "running" in cp.stdout
+
     def reap(self, slot: VmSlot) -> None:
         slot.state = SlotState.DRAINING
         # Destroy the guest FIRST, while its egress filter is still in place — so there is never a

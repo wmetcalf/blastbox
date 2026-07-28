@@ -1524,3 +1524,16 @@ def test_transient_control_plane_answer_is_unknown_not_dead():
         LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:x", allow_default_egress=True),
         aws_runner=gone)
     assert rt2.is_alive_for_claim(AwsWorkerSlot(slot_id="s2", resource_id="mv-2")) is False
+
+
+def test_every_tier_clamps_non_positive_probe_budgets():
+    # issue #77 (codex): the clamp had landed on LambdaMicroVmConfig, and that class's own
+    # __post_init__ never chained to the base — so EC2 never got it and the lambda tiers only got
+    # it by accident. A 0 makes the probe deadline already-expired: every claim reports UNKNOWN,
+    # no AWS slot is ever claimable, and the tier stays green in metrics. Check ALL tiers.
+    for cls, kw in ((LambdaMicroVmConfig, {"image_identifier": "i"}),
+                    (LambdaSnapStartConfig, {"image_identifier": "i"}),
+                    (Ec2Config, {"image_id": "ami-0"})):
+        cfg = cls(region="us-east-1", claim_probe_timeout_s=0, health_probe_timeout_s=-5, **kw)
+        assert cfg.claim_probe_timeout_s > 0, f"{cls.__name__} would brick: claim budget 0"
+        assert cfg.health_probe_timeout_s > 0, f"{cls.__name__} health budget non-positive"

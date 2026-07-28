@@ -25,6 +25,7 @@ Invariants enforced:
 """
 from __future__ import annotations
 
+import functools
 import logging
 import threading
 import time
@@ -590,7 +591,10 @@ class WarmPool:
                 return                      # queue empty, or every reaper slot is busy/wedged
             for _ in range(want):
                 entry_box: list = []
-                t = threading.Thread(target=lambda: self._drain_deferred_reaps(entry_box),
+                # functools.partial, NOT a closure: a lambda captures the VARIABLE, so with
+                # want > 1 every thread would resolve entry_box to the LAST iteration's list —
+                # all reapers stamping one entry while the others looked wedged and over-spawned.
+                t = threading.Thread(target=functools.partial(self._drain_deferred_reaps, entry_box),
                                      name="blastbox-pool-reaper", daemon=True)
                 entry = [t, now]
                 entry_box.append(entry)          # let the thread stamp its own progress

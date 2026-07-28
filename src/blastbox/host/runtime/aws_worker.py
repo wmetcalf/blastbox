@@ -154,6 +154,16 @@ class AwsWorkerConfig:
     # brownout can't stall the tick thread for cli_timeout_s per IDLE slot.
     health_probe_timeout_s: float = dc_field(default=30.0, kw_only=True)
 
+    def __post_init__(self) -> None:
+        # issue #77: a mistyped 0/negative would make the probe deadline already-expired, so EVERY
+        # claim reports UNKNOWN and no AWS slot is ever claimable — silently, tier green in metrics.
+        # (0 used to mean "disable the bound"; it must not brick instead.) On the BASE so every tier
+        # inherits it; subclasses with their own __post_init__ MUST chain to this.
+        if self.claim_probe_timeout_s <= 0:
+            object.__setattr__(self, "claim_probe_timeout_s", 5.0)
+        if self.health_probe_timeout_s <= 0:
+            object.__setattr__(self, "health_probe_timeout_s", 30.0)
+
     def aws_argv(self, service: str, op: str, *args: str) -> list[str]:
         argv = ["aws", service, op, "--region", self.region, "--output", "json"]
         if self.profile:
@@ -181,14 +191,7 @@ class LambdaMicroVmConfig(AwsWorkerConfig):
     allow_default_egress: bool = False
 
     def __post_init__(self) -> None:
-        # issue #77: a mistyped 0/negative here would make the probe deadline already-expired, so
-        # EVERY claim reports UNKNOWN and no AWS slot is ever claimable — silently, with the tier
-        # green in metrics. (0 used to mean "disable the bound"; it must not brick instead.) Clamp
-        # to a small positive, matching how the other numeric knobs on this config are handled.
-        if self.claim_probe_timeout_s <= 0:
-            object.__setattr__(self, "claim_probe_timeout_s", 5.0)
-        if self.health_probe_timeout_s <= 0:
-            object.__setattr__(self, "health_probe_timeout_s", 30.0)
+        super().__post_init__()   # keep the base's probe-budget clamps (issue #77)
         # Clamp to the AWS bounds so a mistyped env can't turn every call into an opaque reject:
         # run-microvm --maximum-duration-in-seconds <= 28800 (8h); create-microvm-auth-token
         # --expiration-in-minutes in [1, 60]. (SnapStart's __post_init__ chains to this via super().)

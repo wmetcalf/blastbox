@@ -2036,3 +2036,39 @@ def test_all_unknown_claim_terminates_promptly_without_destroying_anything() -> 
         assert all(s.state == SlotState.IDLE for s in pool._slots.values())
         assert not pool._deferred_reap
     assert not rt.reaped
+
+
+def test_each_reaper_stamps_its_OWN_progress_entry() -> None:
+    # issue #77 (agy/codex, HIGH): the thread target was a lambda closing over `entry_box`, which
+    # captures the VARIABLE — so with more than one reaper every thread resolved it to the LAST
+    # iteration's list. All reapers stamped one entry while the others were never stamped, looked
+    # wedged, and triggered over-spawning. functools.partial binds the value.
+    gate = threading.Event()
+
+    class _Slow(_FakeRuntime):
+        def reap(self, slot: Slot) -> None:
+            gate.wait(5)
+            super().reap(slot)
+
+    rt = _Slow()
+    pool = WarmPool(runtime=rt, warm_size=6, concurrent_ceiling=6, spawn_rate_limit=10000.0)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    with pool._lock:
+        for sid, slot in pool._slots.items():
+            slot.state = SlotState.DRAINING
+            pool._deferred_reap.add(sid)
+    try:
+        pool._reap_deferred()                      # starts _MAX_REAPERS threads
+        time.sleep(0.2)
+        with pool._lock:
+            entries = list(pool._reaper_threads)
+        assert len(entries) >= 2, "need multiple reapers to expose the capture bug"
+        # every entry must belong to a DISTINCT thread — a shared box would leave duplicates
+        threads = [e[0] for e in entries]
+        assert len(set(id(t) for t in threads)) == len(threads)
+        # and each entry object must be distinct (not all reapers pointing at one list slot)
+        assert len(set(id(e) for e in entries)) == len(entries)
+    finally:
+        gate.set()
+        _join_reaper(pool, timeout=10)
