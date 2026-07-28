@@ -193,6 +193,27 @@ class CascadingRuntime:
                 pass
         return fresh(slot)
 
+    def needs_maintenance(self, slot: Any) -> bool:
+        """Forward the pool's maintenance probe to the owning tier (issue #77 round 4).
+
+        WarmPool disables reconciliation entirely unless BOTH hooks are present on the runtime it
+        holds — which in production is this cascade, not the tier. Without these the EC2 hibernate
+        tier's re-park never runs when cascaded, and a lost start-instances response leaves a real
+        instance running and billed."""
+        tier = self._tier_of(slot)
+        if tier is None:
+            return False
+        hook = getattr(tier.runtime, "needs_maintenance", None)
+        return bool(hook(slot)) if callable(hook) else False
+
+    def maintain(self, slot: Any) -> None:
+        tier = self._tier_of(slot)
+        if tier is None:
+            return
+        hook = getattr(tier.runtime, "maintain", None)
+        if callable(hook):
+            hook(slot)
+
     def reap(self, slot: Any, dirty: bool = False) -> None:
         with self._lock:
             i = self._owner.get(slot.slot_id)
@@ -255,7 +276,7 @@ class CascadingRuntime:
     def materialize_warm_output(self, slot: Any) -> None:
         self._delegate(slot, "materialize_warm_output")(slot)
 
-    def resume(self, slot: Any) -> None:
+    def resume(self, slot: Any, *, budget_s: float | None = None) -> None:
         """Delegate the OPTIONAL per-claim resume seam (aws-ec2-hibernate / aws-lambda-snapstart) to the
         slot's OWNING tier. Unlike the file-handshake warm hooks above, resume is optional -- a tier
         without it (file/disposable) is a NO-OP, so a mixed or all-non-resume cascade is unaffected.
@@ -266,8 +287,19 @@ class CascadingRuntime:
         if tier is None:
             raise CascadeExhausted(f"cascade: no owning tier for slot {getattr(slot, 'slot_id', slot)!r}")
         fn = getattr(tier.runtime, "resume", None)
-        if callable(fn):
-            fn(slot)
+        if not callable(fn):
+            return
+        # Forward the dispatcher's remaining claim window when the tier accepts one. In production
+        # the pool holds the CASCADE, so without this passthrough the budget stops here and a slow
+        # resume can still consume the whole claim window (issue #77 round 4).
+        if budget_s is not None:
+            try:
+                if "budget_s" in inspect.signature(fn).parameters:
+                    fn(slot, budget_s=budget_s)
+                    return
+            except (TypeError, ValueError):
+                pass
+        fn(slot)
 
 
 # ---------------------------------------------------------------------------

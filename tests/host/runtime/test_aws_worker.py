@@ -530,13 +530,27 @@ def test_lambda_is_alive_for_claim_refreshes_token():
 def test_lambda_claim_fails_when_token_unrefreshable():
     # O2: at CLAIM time an un-refreshable JWE means /detonate would 403 -> the claim check must FAIL so the
     # pool drops the slot, rather than hand out a known-bad credential (unlike the best-effort background poll).
+    # issue #77 round 4: split by WHAT the mint failure proves. An unrecognised error does not
+    # establish the token is un-refreshable, so the slot is SKIPPED (None) -- never handed out (the
+    # 403 this test exists to prevent) but never destroyed either. Only a confirmed-dead answer
+    # costs the slot.
     rt, _ = _lambda_rt({"lambda-microvms run-microvm": {"microvmId": "mv-1"},
                         "lambda-microvms get-microvm": {"state": "running", "endpoint": "vm.example"},
                         "lambda-microvms create-microvm-auth-token": _cp(rc=254, stderr="mint failed")})
     slot = rt._launch()
     slot.auth_token = "AGED"
     slot.token_minted_at = -1e9        # far past half-TTL -> _ensure_token re-mints (and fails)
-    assert rt.is_alive_for_claim(slot) is False   # un-refreshable token -> unusable slot
+    assert rt.is_alive_for_claim(slot) is not True, "a slot with an unmintable token must not be handed out"
+    assert rt.is_alive_for_claim(slot) is None, "an UNRECOGNISED mint failure is unknown, not death"
+
+    rt2, _ = _lambda_rt({"lambda-microvms run-microvm": {"microvmId": "mv-2"},
+                         "lambda-microvms get-microvm": {"state": "running", "endpoint": "vm.example"},
+                         "lambda-microvms create-microvm-auth-token":
+                             _cp(rc=254, stderr="ResourceNotFoundException: microvm not found")})
+    slot2 = rt2._launch()
+    slot2.auth_token = "AGED"
+    slot2.token_minted_at = -1e9
+    assert rt2.is_alive_for_claim(slot2) is False, "a CONFIRMED dead resource must still drop the slot"
 
 
 def test_snapstart_claim_does_not_fail_on_parked_token():
@@ -1603,16 +1617,16 @@ def test_f1_a_confirmed_dead_verdict_is_still_dead():
     "An error occurred (500) when calling: Internal Server Error",
 ])
 def test_f2_internal_server_exception_is_transient(stderr):
-    """AWS's 5xx spellings did not match any marker: 'internalserverexception' does not contain
-    'internalerror', and 'internal server error' does not contain 'internal error'."""
-    from blastbox.host.runtime.aws_worker import _is_transient_aws_error
-    assert _is_transient_aws_error(stderr)
+    """AWS 5xx must never read as a dead worker. Round 2 fixed this by ADDING spellings to a
+    denylist; round 4 inverted the default so no spelling is required at all."""
+    from blastbox.host.runtime.aws_worker import _is_confirmed_dead_aws_error
+    assert not _is_confirmed_dead_aws_error(stderr)
 
 
 def test_f2_resource_not_found_is_not_transient():
-    """Guard the widening: a terminal 4xx must stay terminal."""
-    from blastbox.host.runtime.aws_worker import _is_transient_aws_error
-    assert not _is_transient_aws_error("ResourceNotFoundException: Function not found")
+    """Guard: a definitive "no such resource" must STILL cost the slot, or husks leak forever."""
+    from blastbox.host.runtime.aws_worker import _is_confirmed_dead_aws_error
+    assert _is_confirmed_dead_aws_error("ResourceNotFoundException: Function not found")
 
 
 def test_f4_health_path_token_mint_honours_the_health_budget():
@@ -1765,6 +1779,13 @@ def test_f8_a_resume_that_exhausts_its_deadline_on_timeouts_is_still_unknown():
         rt.resume(slot)
     assert _is_unknown_not_dead(ei.value), (
         "a resume that only ever saw timeouts is UNKNOWN, not a confirmed dead worker")
+    # Pin BOTH mechanisms independently: the raised TYPE, and (via _is_unknown_not_dead above) the
+    # chained cause. Either alone would keep the classification correct, so without this assertion
+    # a regression in the type is invisible -- redundancy that no test can see is redundancy that rots.
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+    assert isinstance(ei.value, AwsUnknownState), (
+        f"resume flattened its own verdict to {type(ei.value).__name__}")
+    assert isinstance(ei.value.__cause__, AwsUnknownState), "the originating cause was not chained"
 
 
 def test_f8_a_resume_that_fails_on_a_healthy_control_plane_is_still_a_real_failure():
@@ -1796,14 +1817,14 @@ def test_f9_a_definitive_error_carrying_503_digits_is_not_transient(stderr):
     instance ids and must be anchored. A definitive NotFound for an id containing those digits was
     therefore read as a brownout: the slot is never reaped, keeps counting against the warm target,
     and the tier never refills -- the same 'dead read as unknown' failure as the libvirt one."""
-    from blastbox.host.runtime.aws_worker import _is_transient_aws_error
-    assert not _is_transient_aws_error(stderr)
+    from blastbox.host.runtime.aws_worker import _is_confirmed_dead_aws_error
+    assert _is_confirmed_dead_aws_error(stderr), "a definitive NotFound must be read as dead"
 
 
 def test_f9_a_real_503_is_still_transient():
-    from blastbox.host.runtime.aws_worker import _is_transient_aws_error
-    assert _is_transient_aws_error("An error occurred (503) when calling the GetMicrovm operation")
-    assert _is_transient_aws_error("ServiceUnavailable: please retry")
+    from blastbox.host.runtime.aws_worker import _is_confirmed_dead_aws_error
+    assert not _is_confirmed_dead_aws_error("An error occurred (503) when calling the GetMicrovm operation")
+    assert not _is_confirmed_dead_aws_error("ServiceUnavailable: please retry")
 
 
 def test_f11_a_start_whose_response_is_lost_is_still_reconciled():
@@ -1846,3 +1867,168 @@ def test_f11_a_start_whose_response_is_lost_is_still_reconciled():
     slot.state = SlotState.IDLE
     assert rt.needs_maintenance(slot) is True, (
         "a RUNNING instance the pool believes is parked must be reconciled regardless of phase")
+
+
+# ------------------------------- issue #77 round 4: the inverted classifier + its fallout --------
+
+@pytest.mark.parametrize("stderr", [
+    "An error occurred (TooManyRequestsException) when calling the InvokeMicrovm operation",
+    "An error occurred (RequestTimeout): Request timed out",
+    "An error occurred (SlowDown) when calling the GetMicrovm operation",
+    "An error occurred (502) when calling the GetMicrovm operation",
+    "An error occurred (504) when calling the GetMicrovm operation",
+    "An error occurred (RequestTimeoutException) when calling",
+    "An error occurred (SomethingAwsHasNotInventedYet) when calling",
+])
+def test_f15_retryable_and_unrecognised_aws_errors_are_never_death(stderr):
+    """TooManyRequestsException is LAMBDA'S OWN THROTTLE NAME -- the likeliest brownout signal on
+    the primary tier -- and the denylist read it as death. Four rounds each added the strings the
+    previous round missed, which is why the default is now inverted: anything not positively
+    confirmed dead is UNKNOWN, including errors AWS has not invented yet."""
+    from blastbox.host.runtime.aws_worker import _is_confirmed_dead_aws_error
+    assert not _is_confirmed_dead_aws_error(stderr)
+
+
+@pytest.mark.parametrize("stderr", [
+    "An error occurred (ResourceNotFoundException) when calling GetMicrovm",
+    "An error occurred (InvalidInstanceID.NotFound) when calling DescribeInstances",
+    "error: microvm mv-1 does not exist",
+])
+def test_f15_confirmed_dead_answers_still_cost_the_slot(stderr):
+    """The inversion must not strand husks: a positive "no such resource" is still death, else a
+    dead slot keeps counting against the warm target and the tier never refills."""
+    from blastbox.host.runtime.aws_worker import _is_confirmed_dead_aws_error
+    assert _is_confirmed_dead_aws_error(stderr)
+
+
+def test_f15_an_unrecognised_cli_failure_raises_unknown_not_error():
+    """End-to-end through _aws: the default path must produce AwsUnknownState."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm":
+                           _cp(rc=255, stderr="An error occurred (TooManyRequestsException)")})
+    with pytest.raises(AwsUnknownState):
+        rt._aws("lambda-microvms", "get-microvm", "--microvm-identifier", "mv-1")
+
+
+def test_f14_a_throttled_token_mint_does_not_kill_the_worker():
+    """_health_ok caught AwsUnknownState as a generic error and returned False, so resume()'s loop
+    never recorded it: last_exc stayed None and the final raise was a plain AwsWorkerError -> read
+    as death -> a healthy resumed microVM terminated over a throttled mint."""
+    from blastbox.host.runtime.vm_dispatch import _is_unknown_not_dead
+
+    tick = [100.0]
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "RUNNING", "endpoint": "vm.example"},
+                           "lambda-microvms resume-microvm": {},
+                           "lambda-microvms create-microvm-auth-token":
+                               _cp(rc=255, stderr="An error occurred (TooManyRequestsException)")},
+                          probe=lambda u, h, t: True,
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
+                          resume_timeout_s=5.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsWorkerError) as ei:
+        rt.resume(slot)
+    assert _is_unknown_not_dead(ei.value), "a throttled mint is not evidence the worker is dead"
+
+
+def test_f19_a_recovered_control_plane_clears_a_stale_unknown():
+    """The final classification keyed off last_exc, which a LATER success never cleared. One early
+    timeout could therefore mark a full-window AGENT failure as UNKNOWN, so an unusable slot went
+    back to IDLE instead of being retired -- still counted, and eligible for more jobs."""
+    from blastbox.host.runtime.vm_dispatch import _is_unknown_not_dead
+
+    calls = {"n": 0}
+
+    def flaky_describe(argv):  # noqa: ANN001
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise subprocess.TimeoutExpired(cmd="aws", timeout=120)   # one early blip ...
+        return _cp(stdout=json.dumps({"state": "RUNNING", "endpoint": "vm.example"}))  # ... then fine
+
+    tick = [100.0]
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": flaky_describe,
+                           "lambda-microvms resume-microvm": {},
+                           "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                          probe=lambda u, h, t: False,          # agent never comes up
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
+                          resume_timeout_s=5.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsWorkerError) as ei:
+        rt.resume(slot)
+    assert not _is_unknown_not_dead(ei.value), (
+        "the control plane recovered and the agent still never answered -- that is a real failure")
+
+
+def test_f16_a_slot_mid_hibernation_is_not_handed_out():
+    """maintain() returns as soon as stop --hibernate is ACCEPTED. The instance then spends a while
+    "stopping" -- which this tier counts as ALIVE, and whose agent still answers -- so a claim could
+    take it, resume() would succeed, and the job would lose its worker when hibernation landed."""
+    from blastbox.host.runtime.aws_worker import Ec2HibernateConfig, Ec2HibernateRuntime
+
+    rt = Ec2HibernateRuntime(Ec2HibernateConfig(region="us-east-1", image_id="ami-0abc"),
+                             aws_runner=lambda argv, timeout: _cp(stdout=json.dumps(
+                                 {"Reservations": [{"Instances": [
+                                     {"InstanceId": "i-1", "State": {"Name": "stopping"},
+                                      "PrivateIpAddress": "10.0.0.5"}]}]})),
+                             http_probe=lambda u, h, to: True, clock=lambda: 100.0)
+    slot = AwsWorkerSlot(slot_id="h1", resource_id="i-1", state=SlotState.IDLE, ip="10.0.0.5")
+    rt._phase["h1"] = "hibernating"
+    assert rt.is_alive_for_claim(slot) is None, "a slot mid-park must be skipped, not handed out"
+
+
+def test_f16_the_park_transition_completes_for_idle_slots():
+    """is_ready owns phase transitions but only runs while WARMING. A slot re-parked by maintenance
+    is IDLE, so without advancing the phase here it would stay "hibernating" -- and therefore
+    permanently unclaimable -- forever."""
+    from blastbox.host.runtime.aws_worker import Ec2HibernateConfig, Ec2HibernateRuntime
+
+    rt = Ec2HibernateRuntime(Ec2HibernateConfig(region="us-east-1", image_id="ami-0abc"),
+                             aws_runner=lambda argv, timeout: _cp(stdout=json.dumps(
+                                 {"Reservations": [{"Instances": [
+                                     {"InstanceId": "i-1", "State": {"Name": "stopped"},
+                                      "PrivateIpAddress": "10.0.0.5"}]}]})),
+                             http_probe=lambda u, h, to: True, clock=lambda: 100.0)
+    slot = AwsWorkerSlot(slot_id="h1", resource_id="i-1", state=SlotState.IDLE, ip="10.0.0.5")
+    rt._phase["h1"] = "hibernating"
+    assert rt.needs_maintenance(slot) is False
+    assert rt._phase["h1"] == "parked", "the completed park was never observed; slot stays unclaimable"
+    assert rt.is_alive_for_claim(slot) is True
+
+
+def test_f21_resume_honours_a_shorter_claim_budget():
+    """resume_timeout_s is the runtime's own ceiling; when the dispatcher's remaining claim window
+    is shorter, one unreachable slot would otherwise burn the whole window and the healthy slots
+    behind it would never be tried."""
+    tick = [100.0]
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "RUNNING", "endpoint": "vm.example"},
+                           "lambda-microvms resume-microvm": {},
+                           "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                          probe=lambda u, h, t: False,
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.01) or tick[0],
+                          resume_timeout_s=100.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED)
+    start = tick[0]
+    with pytest.raises(AwsWorkerError):
+        rt.resume(slot, budget_s=0.5)
+    spent = tick[0] - start
+    assert spent < 50.0, f"resume ignored the 0.5s claim budget and ran for {spent} clock-seconds"
+
+
+def test_f14_health_ok_propagates_an_unknown_mint_rather_than_returning_false():
+    """The contract, pinned directly. resume() reads only what ESCAPES _health_ok, so collapsing an
+    unconfirmed mint failure into a bare False loses the verdict on that pass. (The mint back-off
+    re-raises it on later passes, which is why an end-to-end resume test alone cannot detect this:
+    a single-pass resume would still be misclassified.) is_ready() catches it and returns False,
+    exactly as before."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "RUNNING", "endpoint": "vm.example"},
+                           "lambda-microvms create-microvm-auth-token":
+                               _cp(rc=255, stderr="An error occurred (TooManyRequestsException)")},
+                          probe=lambda u, h, t: True)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsUnknownState):
+        rt._health_ok(slot)          # first call: nothing suppressed yet, so this is the raise site
+    assert rt.is_ready(slot) is False, "is_ready must still absorb it and report not-ready"

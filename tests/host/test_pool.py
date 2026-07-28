@@ -2115,7 +2115,45 @@ def test_f5_claim_passes_its_remaining_budget_to_the_runtimes_claim_probe():
     got = pool.claim(timeout_s=0.5)
     assert got is slot
     assert seen and seen[0] is not None, "the runtime was given no claim budget at all"
-    assert seen[0] <= 0.5, f"probe was handed {seen[0]}s against a 0.5s claim contract"
+    # Bounded by the pool's SCAN deadline (caller deadline, floored at _SCAN_GRACE_S) -- that grace
+    # is deliberate and is what keeps a non-blocking claim(timeout_s=0) able to take a ready slot
+    # (issue #77 round 4). The point of the finding stands: the probe must be bounded by the POOL's
+    # deadline, never left to the runtime's own much larger claim_probe_timeout_s.
+    assert seen[0] <= pool._SCAN_GRACE_S + 1e-6, (
+        f"probe was handed {seen[0]}s, beyond the scan deadline")
+
+
+def test_f20_a_nonblocking_claim_can_still_take_a_ready_slot():
+    """The round-2 budget plumbing passed the caller's RAW deadline, so claim(timeout_s=0) handed
+    the runtime a 0s probe budget; it correctly reported an exhausted probe, the pool read UNKNOWN,
+    and every AWS slot was skipped. A non-blocking claim could never succeed again."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    budgets: list = []
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
+            budgets.append(budget_s)
+            return None if (budget_s is not None and budget_s <= 0) else True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    slot = _slot("s1", SlotState.IDLE)
+    pool._slots["s1"] = slot
+    assert pool.claim(timeout_s=0) is slot, f"non-blocking claim failed; budgets={budgets}"
 
 
 def test_f5_a_runtime_without_the_budget_kwarg_still_works():

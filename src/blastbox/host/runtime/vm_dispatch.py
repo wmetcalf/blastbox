@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import contextlib
+import inspect
 import logging
 import os
 import shutil
@@ -881,29 +882,39 @@ class VmJobDispatcher:
         self._stop.set()
 
 
+def _accepts_budget_kwarg(fn: "Callable[..., Any]") -> bool:
+    """Whether a runtime's resume() takes the optional budget_s kwarg (external runtimes may not)."""
+    try:
+        return "budget_s" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _is_unknown_not_dead(exc: BaseException) -> bool:
     """True if this failure means "the control plane didn't tell us", not "the worker is gone".
 
     issue #77: resume() destroying a PARKED warm slot — already booted and engine-warmed, the most
     expensive kind — because a describe was throttled for a minute is the worst trade in the system.
-    Only a CONFIRMED dead state should cost the slot."""
-    # Type first: the AWS runtime now raises AwsUnknownState (and its AwsProbeTimeout subclass)
-    # for every "the control plane didn't answer" failure, in or out of a probe budget. The string
-    # pass below stays as a fallback for errors that crossed a module/process boundary.
-    if any(c.__name__ in ("AwsUnknownState", "AwsProbeTimeout") for c in type(exc).__mro__):
-        return True
-    try:
-        from blastbox.host.runtime.aws_worker import _is_transient_aws_error
-    except Exception:      # noqa: BLE001 -- aws extra not installed; nothing to classify
-        return False
-    msg = str(exc)
-    # A confirmed verdict ("slot is 'terminated'; cannot resume") must NOT be softened.
-    if "cannot resume" in msg:
-        return False
-    return _is_transient_aws_error(msg)
+    Only a CONFIRMED dead state should cost the slot.
+
+    The TYPE is now authoritative and no string matching is left here. The AWS runtime classifies at
+    the point of failure against an allowlist of confirmed-dead answers and raises AwsUnknownState
+    for everything else, so anything that reaches us as a plain AwsWorkerError has already been
+    judged a real verdict (a definitive "no such resource", or a local failure like an agent that
+    never came up). Re-deciding that here from the message text is what let four review rounds each
+    find another retryable error read as death (issue #77 round 4). The cause chain is walked
+    because resume() re-raises its own summary error over the last one it saw."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if any(c.__name__ in ("AwsUnknownState", "AwsProbeTimeout") for c in type(cur).__mro__):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
-def _resume_on_claim(pool: Any, slot: Any) -> None:
+def _resume_on_claim(pool: Any, slot: Any, *, budget_s: float | None = None) -> None:
     """Optional per-claim resume seam (aws-lambda-snapstart): wake a parked/suspended warm slot and
     block until its agent answers BEFORE the transport POSTs (which has no retry). The runtime
     repopulates slot.url/auth_token in place; slot_base_url + the POST read them dynamically after claim,
@@ -913,7 +924,13 @@ def _resume_on_claim(pool: Any, slot: Any) -> None:
     if not callable(resume):
         return
     try:
-        resume(slot)
+        # Hand the runtime the claim window's REMAINING time when it accepts one, so a single
+        # unreachable slot cannot burn the whole window (its own resume_timeout_s may be far
+        # larger) and starve the healthy slots behind it (issue #77 round 4).
+        if budget_s is not None and _accepts_budget_kwarg(resume):
+            resume(slot, budget_s=budget_s)
+        else:
+            resume(slot)
     except Exception as exc:
         # UNKNOWN (the control plane never answered) is NOT "un-resumable": handing the slot back
         # unused keeps a healthy PARKED worker alive through a brownout, where release(dirty=True)
@@ -972,7 +989,7 @@ def _claim_resumable_slot(pool: Any, timeout_s: float, *,
             if sid is not None:
                 tried.add(sid)
             try:
-                _resume_on_claim(pool, slot)
+                _resume_on_claim(pool, slot, budget_s=max(0.0, deadline - clock()))
                 return slot
             except Exception as exc:  # noqa: BLE001 -- dead slots are already retired dirty by
                 last_exc = exc        # _resume_on_claim; UNKNOWN ones were handed back. Try another.

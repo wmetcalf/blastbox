@@ -1015,7 +1015,14 @@ class WarmPool:
             # (AWS throttles the control-plane describe), so a slot terminated since the last tick could
             # otherwise be handed out and fail the user's job. Falls back to is_alive() for file/libvirt
             # tiers whose is_alive() is already a fresh check.
-            probe_budget = None if deadline is None else max(0.0, deadline - self._clock())
+            # Bound the probe by the SCAN deadline, not the caller's raw deadline: claim() grants a
+            # scan grace precisely so a non-blocking claim(timeout_s=0) can still take an
+            # immediately-available slot. Passing the (already expired) raw deadline handed the
+            # runtime a 0s budget, which it correctly reported as an exhausted probe -> UNKNOWN ->
+            # every AWS slot skipped, so claim(timeout_s=0) could never succeed (issue #77 round 4,
+            # a regression from the round-2 budget plumbing).
+            probe_budget = (None if scan_deadline is None
+                            else max(0.0, scan_deadline - self._clock()))
             alive = self._probe_alive(candidate, probe_budget)
 
             if alive is None:

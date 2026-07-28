@@ -56,43 +56,41 @@ class AwsWorkerError(RuntimeError):
 
 
 
-# Control-plane responses that mean "ask again later", NOT "this worker is gone". The aws CLI
-# exits 255 for all of these AFTER its own internal retries, so they are NOT TimeoutExpired — which
-# is why bounding the call by time alone missed the most common brownout of all (issue #77).
-_TRANSIENT_AWS_MARKERS = (
-    "throttl",                 # ThrottlingException / Throttling / RequestThrottled
-    "requestlimitexceeded",
-    "rate exceeded",
-    "serviceunavailable",
-    "service unavailable",
-    "internalerror",
-    "internal error",
-    "internalfailure",
-    "internalserverexception",  # the microvm/lambda control plane's own 5xx name; contains
-    "internal server error",    # neither "internalerror" nor "internal error" as a substring
-    "internalservererror",
-    "(500)",                    # "An error occurred (500) when calling ..." -- ANCHORED: a bare
-    "(503)",                    # "503"/"500" matches instance ids and arns (i-0503deadbeef...), and
-                                # misreading a definitive NotFound as a brownout strands the slot
-                                # forever: never reaped, still counted, tier never refills.
-    "could not connect to the endpoint",
-    "endpoint url",
-    "connection was closed",
-    "connection reset",
-    "temporarily unavailable",
-    "requestexpired",
-    "expiredtoken",            # an IMDS credential-refresh stall, not a dead worker
-    "credentials",
+# Which aws-cli failures are evidence that a WORKER IS GONE?
+#
+# This list is deliberately an ALLOWLIST of confirmed-dead answers, and everything else defaults to
+# UNKNOWN. It started life the other way round -- an ever-growing denylist of "transient" markers,
+# with DEAD as the default -- and four consecutive review rounds each found another retryable error
+# missing from it. The last one was decisive: TooManyRequestsException is Lambda's OWN throttle
+# name, i.e. the single likeliest brownout signal on the primary production tier, and it read as
+# death. A denylist of everything AWS can transiently say is unbounded and cannot be completed by
+# inspection; the set of answers that genuinely PROVE a resource is gone is small and enumerable.
+#
+# The two failure modes are not symmetric, which is what settles the direction:
+#   miss a transient marker  -> terminate a healthy, warmed worker (and, because control-plane
+#                               faults are CORRELATED, every other slot in the tier on the same tick)
+#   miss a dead marker       -> keep a husk one extra tick; the claim probe skips it, /detonate
+#                               fails it, and it is reaped there instead
+# So: fail SAFE. Only a definitive "no such resource" costs a slot (issue #77 round 4).
+_CONFIRMED_DEAD_AWS_MARKERS = (
+    "resourcenotfound",             # ResourceNotFoundException -- lambda / lambda-microvms
+    "invalidinstanceid.notfound",   # EC2: no such instance
+    "invalidinstanceid.malformed",  # EC2: our recorded id cannot even name an instance
+    "invalidinstanceid",            # (any other InvalidInstanceID.* -- all mean "not this instance")
+    "does not exist",
+    "no such microvm",
+    "has been terminated",
 )
 
 
-def _is_transient_aws_error(stderr: str) -> bool:
-    """True if this aws-cli failure says 'retry later' rather than 'the resource is gone'.
+def _is_confirmed_dead_aws_error(stderr: str) -> bool:
+    """True ONLY if AWS positively told us the resource is gone.
 
-    A throttle/5xx/endpoint blip must never be read as a dead worker: the control plane ANSWERED,
-    it just refused to tell us anything. Treated exactly like a probe timeout (issue #77)."""
+    Everything else -- throttles, 5xx, timeouts, auth/IMDS stalls, validation errors, and anything
+    AWS invents next -- is UNKNOWN by default. See the list above for why the default is that way
+    round: an unrecognised error must never be read as a dead worker."""
     low = (stderr or "").lower()
-    return any(marker in low for marker in _TRANSIENT_AWS_MARKERS)
+    return any(marker in low for marker in _CONFIRMED_DEAD_AWS_MARKERS)
 
 
 class AwsUnknownState(AwsWorkerError):
@@ -414,6 +412,7 @@ class AwsDisposableRuntime:
         # #77). Thread-local so the background tick's concurrent calls keep the full cli_timeout_s.
         self._tls = threading.local()
         self._mint_fail_at: dict[str, float] = {}   # slot_id -> last failed-token-mint time (throttle)
+        self._mint_fail_exc: dict[str, Exception] = {}   # ... and WHY, so the back-off stays honest
         # cache the READINESS get-microvm/describe-instances too (is_ready is polled ~10Hz during WARMING,
         # and its endpoint-resolution describe is uncached) so a booting slot doesn't spam the control plane.
         self._desc_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -509,10 +508,11 @@ class AwsDisposableRuntime:
             # Inside a claim/health probe, a TRANSIENT control-plane answer is UNKNOWN, not failure:
             # otherwise a throttle (which exits 255, never TimeoutExpired) is read as a dead worker
             # and the slot is terminated — the most likely brownout of all (issue #77).
-            if _is_transient_aws_error(stderr):
-                # Also UNKNOWN in every scope, for the same reason as the timeout above.
-                raise AwsUnknownState(f"aws {service} {op}: transient (rc={cp.returncode}): {stderr[:200]}")
-            raise AwsWorkerError(f"aws {service} {op} failed (rc={cp.returncode}): {stderr[:400]}")
+            if _is_confirmed_dead_aws_error(stderr):
+                raise AwsWorkerError(f"aws {service} {op} failed (rc={cp.returncode}): {stderr[:400]}")
+            # DEFAULT: we did not get a confirmed answer, so we do not have one. Never death.
+            raise AwsUnknownState(
+                f"aws {service} {op}: unconfirmed failure (rc={cp.returncode}): {stderr[:200]}")
         out = (cp.stdout or "").strip()
         if not out:
             return {}
@@ -606,6 +606,7 @@ class AwsDisposableRuntime:
         self._live_cache.pop(slot.slot_id, None)
         self._desc_cache.pop(slot.slot_id, None)
         self._mint_fail_at.pop(slot.slot_id, None)
+        self._mint_fail_exc.pop(slot.slot_id, None)
         if slot.resource_id is None:
             return
         self._terminate(slot)
@@ -926,11 +927,28 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # AWS and would otherwise storm the mint API every tick. Skip re-minting + probing within the window.
         throttle = max(self.cfg.resume_poll_s, 1.0)
         if (self._clock() - self._mint_fail_at.get(slot.slot_id, -1e18)) < throttle:
+            # We are deliberately NOT retrying the mint right now, so this pass learns nothing. If
+            # the failure we are backing off from was UNCONFIRMED, our knowledge is still
+            # "unknown" — returning a bare False here would let the caller record a clean pass and
+            # conclude the worker is dead purely because we declined to ask (issue #77 round 4).
+            suppressed = self._mint_fail_exc.get(slot.slot_id)
+            if isinstance(suppressed, AwsUnknownState):
+                raise suppressed
             return False
         try:
             token = self._ensure_token(slot)
-        except (AwsWorkerError, OSError):
+        except AwsUnknownState as exc:
+            # Back off the mint API, but do NOT collapse "the control plane didn't answer" into
+            # "this slot isn't ready" (issue #77 round 4): resume() reads only the exceptions that
+            # escape here, so swallowing this left last_exc=None and its final raise was a plain
+            # AwsWorkerError -> read as death -> a healthy warmed microVM terminated over a
+            # throttled token mint. is_ready() still catches it and returns False, as before.
+            self._mint_fail_at[slot.slot_id] = self._clock()
+            self._mint_fail_exc[slot.slot_id] = exc
+            raise
+        except (AwsWorkerError, OSError) as exc:
             self._mint_fail_at[slot.slot_id] = self._clock()   # not runnable yet -> back off the mint API
+            self._mint_fail_exc[slot.slot_id] = exc if isinstance(exc, Exception) else None
             return False
         url = slot.url.rstrip("/") + self.cfg.agent_health_path
         headers = {"X-aws-proxy-auth": token, "X-aws-proxy-port": str(self.cfg.agent_port)}
@@ -954,7 +972,7 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         self._desc_cache.pop(slot.slot_id, None)
         super().reap(slot)
 
-    def resume(self, slot: AwsWorkerSlot) -> None:
+    def resume(self, slot: AwsWorkerSlot, *, budget_s: float | None = None) -> None:
         """Wake a (possibly parked) slot and block until its agent answers, BEFORE the job POSTs. Called
         by the dispatcher's claim seam. Raises on failure so the claim retires the slot dirty.
 
@@ -965,19 +983,30 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         import time
         self._resolve_url(slot)     # stable endpoint, addressable even while transitioning
         slot.auth_token = None      # a JWE minted while suspended is invalid; force a fresh mint once awake
-        deadline = self._clock() + self.cfg.resume_timeout_s
+        # The runtime's resume_timeout_s is a CEILING; the dispatcher's remaining claim window wins
+        # when it is shorter, so one unreachable slot cannot burn the whole window and starve the
+        # healthy slots behind it (issue #77 round 4).
+        budget = self.cfg.resume_timeout_s if budget_s is None else min(self.cfg.resume_timeout_s,
+                                                                        max(0.0, float(budget_s)))
+        deadline = self._clock() + budget
         last_exc: Exception | None = None
         while self._clock() < deadline:
+            # Per-ITERATION, not per-call: the final classification must reflect the latest state of
+            # the world (issue #77 round 4). Keeping the first error forever let one early blip mark
+            # a full-window agent failure as UNKNOWN; clearing on any single success was worse -- it
+            # wiped a throttled mint the moment the describe in the SAME pass succeeded, and that
+            # mint failure is exactly what says "we still don't know if this worker is fine".
+            iter_exc: Exception | None = None
             try:
                 if self._health_ok(slot):
                     return
             except (AwsWorkerError, OSError) as exc:
-                last_exc = exc      # not-yet-RUNNING mint/probe failures -> keep trying to wake it
+                iter_exc = exc      # not-yet-RUNNING mint/probe failures -> keep trying to wake it
             # probe failed -> the slot isn't serving. Confirm it's not dead, then nudge it awake.
             try:
                 cur = self._state(slot)
             except (AwsWorkerError, OSError) as exc:
-                last_exc, cur = exc, ""
+                iter_exc, cur = exc, ""
             if cur in self._DEAD_STATES:
                 raise AwsWorkerError(f"snapstart slot {slot.slot_id} is {cur!r}; cannot resume")
             try:
@@ -988,7 +1017,8 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
                 # with the pre-resume token until the deadline. On success the awake-minted token survives.
                 slot.auth_token = None
             except AwsWorkerError as exc:
-                last_exc = exc      # already-running / eventual-consistency wrong-state -> fine, probe is the gate
+                iter_exc = exc      # already-running / eventual-consistency wrong-state -> fine, probe is the gate
+            last_exc = iter_exc     # this pass's verdict supersedes every earlier one
             time.sleep(self.cfg.resume_poll_s)
         # The deadline expiring does NOT upgrade an unknown to a confirmed death: if every
         # answer we got was "the control plane did not answer", that is still all we know
@@ -1315,14 +1345,37 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         "parked" while the instance runs — and the bookkeeping is precisely what a lost response
         corrupts, so it cannot also be the thing that detects the corruption. Reads the cached
         describe the health tick just refreshed, so this costs no extra API call."""
-        if self._phase.get(slot.slot_id) == "hibernating":
-            return False            # a park is already in flight; _try_park's throttle owns it
         try:
-            st = str(self._describe_cached(slot, self._liveness_cache_s)
-                     .get("State", {}).get("Name", "")).lower()
+            # Under the HEALTH budget: this runs on the single tick thread, and _running() uses the
+            # UNCACHED _state path so _desc_cache is usually empty here -- without this the describe
+            # would get cli_timeout_s (120s) and one brownout would stall the whole pool per slot
+            # (issue #77 round 4).
+            with self._health_probe_budget():
+                st = str(self._describe_cached(slot, self._liveness_cache_s)
+                         .get("State", {}).get("Name", "")).lower()
         except (AwsWorkerError, OSError):
             return False            # unknown -> do nothing (issue #77's whole point)
+        if self._phase.get(slot.slot_id) == "hibernating":
+            # A park is in flight. is_ready owns this transition for WARMING slots but never runs
+            # for IDLE ones, so advance it here -- otherwise a slot re-parked by maintenance stays
+            # "hibernating" forever and is_alive_for_claim skips it for good.
+            if st == "stopped":
+                self._phase[slot.slot_id] = "parked"
+            return False
         return st == "running"
+
+    def is_alive_for_claim(self, slot: AwsWorkerSlot, *, budget_s: float | None = None) -> "bool | None":
+        """Skip a slot whose hibernation is IN FLIGHT (issue #77 round 4).
+
+        maintain() returns as soon as stop --hibernate is ACCEPTED; the instance then spends a while
+        "stopping", which the tier deliberately counts as ALIVE (a parked slot is alive) and whose
+        agent still answers a health probe. So without this a dispatcher could claim it, resume()
+        would succeed against the still-live agent, and the job would lose its worker mid-run when
+        the pending hibernation landed. UNKNOWN (skip), not dead: it is a perfectly good warm slot
+        a moment later."""
+        if self._phase.get(slot.slot_id) == "hibernating":
+            return None
+        return super().is_alive_for_claim(slot, budget_s=budget_s)
 
     def maintain(self, slot: AwsWorkerSlot) -> None:
         """Re-park a warm slot that is running when it should be hibernated.
@@ -1373,7 +1426,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             _log.debug("ec2-hibernate: is_ready(%s) error: %s", slot.slot_id, exc)
             return False
 
-    def resume(self, slot: AwsWorkerSlot) -> None:
+    def resume(self, slot: AwsWorkerSlot, *, budget_s: float | None = None) -> None:
         """Start a hibernated slot and block until its agent answers, BEFORE the job POSTs. Called by the
         dispatcher's claim seam. Raises on failure so the claim retires the slot dirty."""
         import time
@@ -1387,18 +1440,24 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             # re-parks it -- which it cannot do while the map still claims the slot is "parked".
             self._phase[slot.slot_id] = "warming"
         self._resolve_ip(slot, refresh=True)   # private IP is retained, but re-describe to be safe
-        deadline = self._clock() + self.cfg.resume_timeout_s
+        # The runtime's resume_timeout_s is a CEILING; the dispatcher's remaining claim window wins
+        # when it is shorter, so one unreachable slot cannot burn the whole window and starve the
+        # healthy slots behind it (issue #77 round 4).
+        budget = self.cfg.resume_timeout_s if budget_s is None else min(self.cfg.resume_timeout_s,
+                                                                        max(0.0, float(budget_s)))
+        deadline = self._clock() + budget
         last_exc: Exception | None = None
         while self._clock() < deadline:
+            iter_exc: Exception | None = None      # see the snapstart loop: per-PASS verdict
             try:
                 if self._agent_healthy(slot):
                     return
             except (AwsWorkerError, OSError) as exc:
-                last_exc = exc
+                iter_exc = exc
             try:
                 cur = self._state(slot)
             except (AwsWorkerError, OSError) as exc:
-                last_exc, cur = exc, ""
+                iter_exc, cur = exc, ""
             if cur in self._DEAD_STATES:
                 raise AwsWorkerError(f"ec2-hibernate slot {slot.slot_id} is {cur!r}; cannot resume")
             if cur == "stopped":   # not yet starting (or slid back) -> (re)issue start
@@ -1406,8 +1465,12 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                     self._aws("ec2", "start-instances", "--instance-ids", str(slot.resource_id))
                     self._phase[slot.slot_id] = "warming"   # running again; see above
                 except AwsWorkerError as exc:
-                    last_exc = exc
-            self._resolve_ip(slot, refresh=True)
+                    iter_exc = exc
+            try:
+                self._resolve_ip(slot, refresh=True)
+            except (AwsWorkerError, OSError) as exc:
+                iter_exc = exc
+            last_exc = iter_exc     # this pass's verdict supersedes every earlier one
             time.sleep(self.cfg.resume_poll_s)
         # The deadline expiring does NOT upgrade an unknown to a confirmed death: if every
         # answer we got was "the control plane did not answer", that is still all we know
