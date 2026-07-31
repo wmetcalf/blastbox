@@ -562,7 +562,7 @@ class LibvirtVmRuntime:
         self.reap(slot)
         raise RuntimeError(f"{slot.domain}: not ready within {self.cfg.boot_timeout_s:.0f}s")
 
-    def is_alive(self, slot: VmSlot) -> bool:
+    def is_alive(self, slot: VmSlot) -> "bool | None":
         """True iff libvirt CONFIRMS the domain is running.
 
         issue #77: this used to test the stdout substring alone. ``_virsh`` never raises — a
@@ -582,10 +582,13 @@ class LibvirtVmRuntime:
                 logger.warning("libvirt.domain_absent domain=%s — reaping slot (confirmed gone)",
                                slot.domain)
                 return False
-            logger.warning("libvirt.domstate_failed domain=%s rc=%s stderr=%s — keeping slot "
-                         "(unknown, not dead)", slot.domain, cp.returncode,
-                         (cp.stderr or "").strip()[:160])
-            return True
+            # UNKNOWN, not True: the pool keeps an unknown slot exactly as before, but reporting
+            # it honestly is what lets the pool bound how long that may last. Claiming "alive" here
+            # meant a permanently unqueryable libvirtd (a sudoers change, a missing binary) kept a
+            # slot alive forever -- never claimable, never replaced (issue #77 marla-loop).
+            logger.warning("libvirt.domstate_failed domain=%s rc=%s stderr=%s — reporting UNKNOWN",
+                         slot.domain, cp.returncode, (cp.stderr or "").strip()[:160])
+            return None
         return "running" in cp.stdout
 
     def is_alive_for_claim(self, slot: VmSlot, *, budget_s: float | None = None) -> "bool | None":

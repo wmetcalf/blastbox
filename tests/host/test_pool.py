@@ -2298,3 +2298,140 @@ def test_f26_an_unknown_slot_is_probed_once_per_claim_not_once_per_scan():
         pool._slots[s.slot_id] = s
     assert pool.claim(timeout_s=0.3) is None       # every slot unknown -> no claim
     assert len(probes) == 3, f"expected one probe per slot for the whole claim, got {probes}"
+
+
+# ---------------- marla loop (run-41): UNKNOWN must be survivable, not permanent -----------------
+
+def _unknown_rt(reaped: list):
+    """A runtime whose probes never give a definitive answer (a persistent host/control-plane fault)."""
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            from blastbox.host.pool import SlotState
+            return _slot(f"new{len(reaped)}", SlotState.IDLE)
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            raise OSError("[Errno 24] Too many open files: 'aws'")
+
+        def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
+            return None
+
+        def reap(self, slot):  # noqa: ANN001
+            reaped.append(slot.slot_id)
+    return _Rt()
+
+
+def test_a_transient_unknown_does_not_cost_the_slot():
+    """The whole point of #77: a correlated control-plane brownout must NOT destroy warm workers."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    reaped: list[str] = []
+    clock = [1000.0]
+    pool = WarmPool(runtime=_unknown_rt(reaped), warm_size=1, clock=lambda: clock[0])
+    slot = _slot("s1", SlotState.IDLE)
+    pool._slots["s1"] = slot
+    for _ in range(20):
+        clock[0] += 1.0          # 20 seconds of solid UNKNOWN
+        pool._health_check()
+    assert reaped == [], f"a transient brownout destroyed a healthy warm worker: {reaped}"
+    assert pool._slots.get("s1") is slot
+
+
+def test_a_PERSISTENT_unknown_eventually_escalates_to_dead():
+    """The half of the inversion that was missing. Before this, UNKNOWN was permanent: the slot was
+    never claimable, never reaped and never replaced, _spawn_to_deficit counted it as active, and
+    is_healthy() still returned True -- a tier silently wedged at zero capacity. On main a probe
+    error set alive=False, so this case SELF-HEALED; keeping the slot forever is strictly worse than
+    the bug #77 fixes. UNKNOWN is a reason to WAIT, never a reason to wait indefinitely."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    reaped: list[str] = []
+    clock = [1000.0]
+    pool = WarmPool(runtime=_unknown_rt(reaped), warm_size=1, clock=lambda: clock[0])
+    slot = _slot("s1", SlotState.IDLE)
+    pool._slots["s1"] = slot
+    for _ in range(400):
+        clock[0] += 5.0          # well past any sane grace
+        pool._health_check()
+    assert reaped == ["s1"], (
+        f"a PERMANENTLY unknown slot was never escalated: reaped={reaped} "
+        f"(tier wedged at zero capacity -- the pre-#77 self-heal that was removed)")
+
+
+def test_a_definitive_answer_resets_the_unknown_clock():
+    """A slot that flickers unknown/alive must never accumulate its way to a reap."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    reaped: list[str] = []
+    answers = iter([None, True] * 500)
+
+    class _Flaky:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            if next(answers) is None:
+                raise OSError("transient")
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            reaped.append(slot.slot_id)
+
+    clock = [1000.0]
+    pool = WarmPool(runtime=_Flaky(), warm_size=1, clock=lambda: clock[0])
+    pool._slots["s1"] = _slot("s1", SlotState.IDLE)
+    for _ in range(400):
+        clock[0] += 5.0
+        pool._health_check()
+    assert reaped == [], f"a recovering slot was escalated to dead: {reaped}"
+
+
+def test_an_unknown_slot_is_re_probed_later_in_the_same_claim():
+    """Suppressing an UNKNOWN slot for the WHOLE claim was the opposite error to re-probing it every
+    scan: a throttle answers in milliseconds, so every slot was suppressed within the first second
+    of a 60s window and never asked again -- claim() then span on demand misses and tripped burst
+    spawning mid-brownout. It must be a cooldown, so a slot recovering mid-window is still usable."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    probes: list[float] = []
+    clock = [1000.0]
+    recovered = {"v": False}
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
+            probes.append(clock[0])
+            return True if recovered["v"] else None
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0])
+    pool._slots["s1"] = _slot("s1", SlotState.IDLE)
+    unprobeable: dict[str, float] = {}
+    assert pool._try_claim_one(clock[0] + 1, clock[0] + 1, unprobeable) is None   # unknown -> skip
+    assert len(probes) == 1
+    clock[0] += pool._UNPROBEABLE_COOLDOWN_S + 0.1                                # cooldown elapses
+    recovered["v"] = True                                                          # control plane back
+    got = pool._try_claim_one(clock[0] + 1, clock[0] + 1, unprobeable)
+    assert got is not None, f"a recovered slot was never re-probed within the claim: probes={probes}"
+    assert len(probes) == 2

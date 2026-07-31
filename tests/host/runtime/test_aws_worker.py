@@ -1422,10 +1422,19 @@ def test_claim_probe_timeout_reports_unknown_not_dead():
     slot = rt._launch()
     rt._run_aws = _timeout_runner           # type: ignore[method-assign]
     assert rt.is_alive_for_claim(slot) is None, "a probe timeout must be UNKNOWN, not dead"
-    # ...while a genuine non-timeout failure is still a definite False
+
+    # An OSError is the HOST failing to start `aws` (missing binary, EMFILE, ENOMEM) -- it is not a
+    # verdict about the worker at all, and it hits every slot and thread at once, so reading it as
+    # death wipes the tier. This assertion used to demand exactly that (issue #77 marla-loop).
     def _boom(argv, timeout):               # noqa: ANN001
         raise OSError("no such binary")
     rt._run_aws = _boom                     # type: ignore[method-assign]
+    assert rt.is_alive_for_claim(slot) is None, "a host-side exec failure is UNKNOWN, not death"
+
+    # ...while a CONFIRMED answer from AWS is still a definite False.
+    def _gone(argv, timeout):               # noqa: ANN001
+        return _cp(rc=254, stderr="An error occurred (ResourceNotFoundException): no such microvm")
+    rt._run_aws = _gone                     # type: ignore[method-assign]
     assert rt.is_alive_for_claim(slot) is False
 
 
@@ -1528,8 +1537,17 @@ def test_transient_control_plane_answer_is_unknown_not_dead():
             aws_runner=runner)
         slot = AwsWorkerSlot(slot_id="s1", resource_id="mv-1")
         assert rt.is_alive_for_claim(slot) is None, f"{stderr!r} read as DEAD at claim"
-        assert rt.is_alive(slot) is True, f"{stderr!r} read as DEAD on the health tick"
-        assert not rt._live_cache, f"{stderr!r} poisoned the liveness cache"
+        # UNKNOWN, not True (issue #77 marla-loop): the pool still KEEPS the slot -- that is the
+        # #77 guarantee and it is unchanged -- but reporting honestly is what lets the pool bound
+        # how long "we can't tell" may keep a slot alive. Masking it as True made that impossible.
+        assert rt.is_alive(slot) is None, f"{stderr!r} read as a definitive verdict on the health tick"
+        assert rt.is_alive(slot) is not False, f"{stderr!r} read as DEAD on the health tick"
+        # The cache may hold the UNKNOWN verdict -- that is what throttles re-probing to once per
+        # _liveness_cache_s instead of once per ~0.1s tick (measured: 20 aws invocations where 1 was
+        # expected, for the whole brownout, on every slot). What it must NEVER hold is a DEFINITIVE
+        # verdict manufactured from a transient failure; that is the poisoning this guards.
+        assert all(v is None for _ts, v in rt._live_cache.values()), (
+            f"{stderr!r} poisoned the liveness cache with a definitive verdict: {rt._live_cache}")
 
     # ...while a DEFINITIVE negative is still definitive
     gone = lambda argv, timeout: subprocess.CompletedProcess(  # noqa: E731
@@ -1767,7 +1785,7 @@ def test_f15_retryable_and_unrecognised_aws_errors_are_never_death(stderr):
 @pytest.mark.parametrize("stderr", [
     "An error occurred (ResourceNotFoundException) when calling GetMicrovm",
     "An error occurred (InvalidInstanceID.NotFound) when calling DescribeInstances",
-    "error: microvm mv-1 does not exist",
+    "An error occurred (InvalidInstanceID.Malformed) when calling DescribeInstances",
 ])
 def test_f15_confirmed_dead_answers_still_cost_the_slot(stderr):
     """The inversion must not strand husks: a positive "no such resource" is still death, else a
@@ -1933,3 +1951,42 @@ def test_f24_a_suspended_slot_conflict_is_still_unknown():
     with pytest.raises(AwsWorkerError) as ei:
         rt.resume(slot)
     assert _is_unknown_not_dead(ei.value)
+
+
+def test_credential_errors_are_never_confirmed_worker_death():
+    """A bare "does not exist" lived in the confirmed-dead allowlist for one round and matched
+    AWS's InvalidAccessKeyId text -- so rotating an access key marked the ENTIRE fleet dead, and
+    terminate failed under the same credentials, quarantining every slot as DRAINING. Allowlist
+    entries must be AWS ERROR CODES, never English prose."""
+    from blastbox.host.runtime.aws_worker import _is_confirmed_dead_aws_error as dead
+
+    assert not dead("An error occurred (InvalidAccessKeyId) when calling DescribeInstances: "
+                    "The AWS Access Key Id you provided does not exist in our records.")
+    assert not dead("An error occurred (AuthFailure): AWS was not able to validate the credentials")
+    assert not dead("An error occurred (UnauthorizedOperation) when calling DescribeInstances")
+    # ...while the real codes still are:
+    assert dead("An error occurred (ResourceNotFoundException) when calling GetMicrovm")
+    assert dead("An error occurred (InvalidInstanceID.NotFound) when calling DescribeInstances")
+
+
+def test_a_truncated_positive_claim_budget_is_unknown_not_failure():
+    """Only an exactly-zero budget raised UNKNOWN. With 10ms of a 2s window left, a perfectly
+    healthy warming microVM cannot answer -- and calling that a confirmed failure destroys it."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+    from blastbox.host.runtime.vm_dispatch import _is_unknown_not_dead
+
+    tick = [100.0]
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "RUNNING", "endpoint": "vm.x"},
+                           "lambda-microvms resume-microvm": {},
+                           "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                          probe=lambda u, h, t: False,          # agent not up YET
+                          # a tiny per-call step so every aws call COMPLETES well inside the
+                          # budget: the window simply runs out, nothing times out. That isolates
+                          # the verdict rule from the inner-call bound.
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.0005) or tick[0],
+                          resume_timeout_s=60.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsUnknownState) as ei:
+        rt.resume(slot, budget_s=0.2)      # positive, but a fraction of the real resume budget
+    assert _is_unknown_not_dead(ei.value), "a window we truncated ourselves is not a worker verdict"

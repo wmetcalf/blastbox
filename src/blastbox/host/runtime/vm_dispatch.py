@@ -952,6 +952,9 @@ def _resume_on_claim(pool: Any, slot: Any, *, budget_s: float | None = None) -> 
         raise
 
 
+_RETRY_SLOT_COOLDOWN_S = 3.0   # how long a slot that just failed to resume is passed over
+
+
 def _claim_resumable_slot(pool: Any, timeout_s: float, *,
                           clock: "Callable[[], float]" = time.monotonic) -> Any:
     """Claim a warm slot and resume it, trying OTHER slots when one can't be woken.
@@ -968,7 +971,7 @@ def _claim_resumable_slot(pool: Any, timeout_s: float, *,
     """
     deadline = clock() + timeout_s
     last_exc: Exception | None = None
-    tried: set[str] = set()
+    tried: dict[str, float] = {}
     held: list[Any] = []
     try:
         while True:
@@ -979,15 +982,17 @@ def _claim_resumable_slot(pool: Any, timeout_s: float, *,
             if slot is None:
                 break
             sid = getattr(slot, "slot_id", None)
-            if sid is not None and sid in tried:
-                # Already failed this window and handed back. Keep it ASSIGNED for the rest of the
-                # window so the next claim reaches the slots behind it. This costs one extra claim
-                # per bad slot and briefly withholds it from other dispatch threads — both far
-                # cheaper than burning the whole claim window on one unreachable worker.
+            if sid is not None and (clock() - tried.get(sid, -1e18)) < _RETRY_SLOT_COOLDOWN_S:
+                # Failed RECENTLY and handed back. Hold it ASSIGNED so the scan reaches the slots
+                # behind it -- but only for a cooldown, not the rest of the window. Holding to the
+                # end meant one transient resume failure made a warm_size=1 tier unclaimable for the
+                # remaining ~58s, for this thread AND its peers, with no replacement spawned because
+                # _spawn_to_deficit counts ASSIGNED as active (issue #77 marla-loop). The comment
+                # here used to claim it withheld the slot "briefly"; it did not.
                 held.append(slot)
                 continue
             if sid is not None:
-                tried.add(sid)
+                tried[sid] = clock()
             remaining_for_resume = deadline - clock()
             if remaining_for_resume <= 0:
                 # The window closed while we were probing. Hand the slot back untouched rather than

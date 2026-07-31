@@ -446,3 +446,21 @@ def test_cascade_forwards_the_resume_budget():
     slot = rt.spawn()
     rt.resume(slot, budget_s=1.25)
     assert r.budgets == [1.25], f"claim budget did not reach the tier: {r.budgets}"
+
+
+def test_cascade_does_not_retry_resume_when_the_tier_itself_raises():
+    """The try guarding inspect.signature used to wrap the CALL too, so a TypeError raised INSIDE
+    resume() was mistaken for an introspection failure and resume -- which issues resume-microvm /
+    start-instances and clears auth_token -- ran a SECOND time, unbudgeted."""
+    calls = []
+
+    class BoomBudgetResume(FakeRuntime):
+        def resume(self, slot, *, budget_s=None):
+            calls.append(budget_s)
+            raise TypeError("bug while parsing the resume response")
+
+    rt = CascadingRuntime([Tier("hib", BoomBudgetResume("hib"), 1)])
+    slot = rt.spawn()
+    with pytest.raises(TypeError):
+        rt.resume(slot, budget_s=0.5)
+    assert calls == [0.5], f"a side-effecting resume was retried unbudgeted: {calls}"

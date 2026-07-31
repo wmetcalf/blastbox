@@ -601,7 +601,13 @@ def test_f3_an_unqueryable_control_plane_is_still_unknown_not_dead(monkeypatch, 
     monkeypatch.setattr(rt, "_virsh", lambda *a, **k: _cp(1, "", stderr))
     slot = VmSlot(slot_id="w1", domain="bb-w1", overlay="/tmp/w1.qcow2", agent_port=8765,
                    state=SlotState.IDLE)
-    assert rt.is_alive(slot) is True, "an unreachable libvirtd must NOT be read as a dead domain"
+    # UNKNOWN, not True. The #77 guarantee is unchanged -- the POOL keeps an unknown slot, so an
+    # unreachable libvirtd still does not destroy the tier. But this assertion previously pinned
+    # the runtime to claiming "alive", which made the wedge permanent: a persistently unqueryable
+    # libvirtd (sudoers change, missing binary) kept a slot that was never claimable and never
+    # replaced, forever. Reporting UNKNOWN lets the pool bound it (issue #77 marla-loop).
+    assert rt.is_alive(slot) is None, "an unqueryable control plane is UNKNOWN, not a verdict"
+    assert rt.is_alive(slot) is not False, "an unreachable libvirtd must NOT be read as a dead domain"
     assert rt.is_alive_for_claim(slot) is None, "unknown at hand-out means skip, not destroy"
 
 

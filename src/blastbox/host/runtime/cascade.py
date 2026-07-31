@@ -46,6 +46,15 @@ class Tier:
     capacity: int
 
 
+def _takes_budget(fn: Any) -> bool:
+    """Whether ``fn`` accepts the optional budget_s kwarg. Introspection only — deliberately
+    separate from the call site so a failure INSIDE the call can never be mistaken for one here."""
+    try:
+        return "budget_s" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 class CascadingRuntime:
     """SlotRuntime that routes each spawn to the first non-full tier, in declared order.
 
@@ -167,9 +176,11 @@ class CascadingRuntime:
         tier = self._tier_of(slot)
         return tier is not None and tier.runtime.is_ready(slot)
 
-    def is_alive(self, slot: Any) -> bool:
+    def is_alive(self, slot: Any) -> "bool | None":
         tier = self._tier_of(slot)
-        return tier is not None and tier.runtime.is_alive(slot)
+        if tier is None:
+            return False
+        return tier.runtime.is_alive(slot)   # may be None = UNKNOWN; the pool owns that policy
 
     def is_alive_for_claim(self, slot: Any, *, budget_s: float | None = None) -> "bool | None":
         """Claim-time FRESH liveness, delegated to the owning tier's cache-bypassing hook when it has one
@@ -185,12 +196,9 @@ class CascadingRuntime:
         # Forward the caller's remaining claim budget to the owning tier when it takes one. Without
         # this a cascade-wrapped AWS tier -- the common production shape -- never sees the pool's
         # deadline and probes at its own full bound (issue #77 round 2).
-        if budget_s is not None:
-            try:
-                if "budget_s" in inspect.signature(fresh).parameters:
-                    return fresh(slot, budget_s=budget_s)
-            except (TypeError, ValueError):
-                pass
+        # Same defect as resume(): wrapping the call made a probe error re-probe unbudgeted.
+        if budget_s is not None and _takes_budget(fresh):
+            return fresh(slot, budget_s=budget_s)
         return fresh(slot)
 
     def reap(self, slot: Any, dirty: bool = False) -> None:
@@ -271,13 +279,13 @@ class CascadingRuntime:
         # Forward the dispatcher's remaining claim window when the tier accepts one. In production
         # the pool holds the CASCADE, so without this passthrough the budget stops here and a slow
         # resume can still consume the whole claim window (issue #77 round 4).
-        if budget_s is not None:
-            try:
-                if "budget_s" in inspect.signature(fn).parameters:
-                    fn(slot, budget_s=budget_s)
-                    return
-            except (TypeError, ValueError):
-                pass
+        # The try guards ONLY inspect.signature. It used to wrap the CALL too, so a TypeError or
+        # ValueError raised INSIDE resume() was mistaken for an introspection failure and resume --
+        # which issues resume-microvm / start-instances and clears auth_token -- was invoked a
+        # SECOND time, unbudgeted (issue #77 round 6; observed [('resume', 0.5), ('resume', None)]).
+        if budget_s is not None and _takes_budget(fn):
+            fn(slot, budget_s=budget_s)
+            return
         fn(slot)
 
 
