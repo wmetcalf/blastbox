@@ -2104,3 +2104,106 @@ def test_a_probe_we_could_not_issue_never_convicts_the_worker():
     with pytest.raises(AwsWorkerError) as ei:
         rt2.resume(slot2)
     assert not isinstance(ei.value, AwsUnknownState)
+
+
+# ------------- marla loop 3 (run-43): the two findings that survived dedup --------------------
+
+def test_the_http_probe_honours_the_remaining_resume_budget():
+    """_call_budget bounds the aws SUBPROCESS calls via a thread-local deadline, but the agent
+    health probe was handed a flat probe_timeout_s and sailed straight past it. With a nearly
+    exhausted window the probe could still block for its full timeout, overrunning the claim."""
+    seen: list[float] = []
+
+    def _probe(url, headers, timeout):  # noqa: ANN001
+        seen.append(timeout)
+        return False
+
+    tick = [100.0]
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "RUNNING", "endpoint": "vm.x"},
+                           "lambda-microvms resume-microvm": {},
+                           "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                          probe=_probe,
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
+                          resume_timeout_s=60.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsWorkerError):
+        rt.resume(slot, budget_s=1.0)
+    assert seen, "the probe never ran"
+    over = [t for t in seen if t > 1.0]
+    assert not over, f"probe was given {over[:3]}s against a 1.0s remaining window"
+
+
+def test_hibernate_resume_does_not_grant_a_second_full_budget():
+    """The prelude (describe + start-instances + describe) opened its own budget scope, which CLOSED
+    before the loop opened another -- so a resume could consume up to TWICE the window it was
+    given. One deadline must cover the whole call."""
+    from blastbox.host.runtime.aws_worker import Ec2HibernateConfig, Ec2HibernateRuntime
+
+    # Only WORK advances the clock -- reading it is free. A clock that ticked on every read made
+    # the budget be consumed by the act of checking it, which is not what this test is about.
+    tick = [100.0]
+
+    def clock():
+        return tick[0]
+
+    def runner(argv, timeout):   # noqa: ANN001
+        argv = list(argv)
+        op = f"{argv[1]} {argv[2]}"
+        tick[0] += 0.25          # each aws call costs a quarter second
+        if op == "sts get-caller-identity":
+            return _cp(stdout=json.dumps({"Account": "1", "Arn": "arn:aws:iam::1:user/x"}))
+        if op == "ec2 describe-instances":
+            return _cp(stdout=json.dumps({"Reservations": [{"Instances": [
+                {"InstanceId": "i-1", "State": {"Name": "stopped"}, "PrivateIpAddress": "10.0.0.5"}]}]}))
+        return _cp(stdout="{}")
+
+    def probe(url, headers, timeout):   # noqa: ANN001
+        tick[0] += 0.25          # ...and so does each agent probe
+        return False
+
+    rt = Ec2HibernateRuntime(Ec2HibernateConfig(region="us-east-1", image_id="ami-0abc",
+                                                resume_timeout_s=180.0, resume_poll_s=0.0),
+                             aws_runner=runner, http_probe=probe, clock=clock)
+    slot = AwsWorkerSlot(slot_id="h1", resource_id="i-1", state=SlotState.ASSIGNED, ip="10.0.0.5")
+    start = tick[0]
+    with pytest.raises(AwsWorkerError):
+        rt.resume(slot, budget_s=4.0)
+    spent = tick[0] - start
+    assert spent <= 4.0 * 1.15, (
+        f"resume consumed {spent:.1f} clock-seconds against a 4.0s budget — the prelude and the "
+        f"loop each got their own full window")
+
+
+def test_hibernate_rejects_a_zero_claim_budget_before_touching_the_instance():
+    """The entry guard is on what the CALLER gave us. With no window at all we have not probed the
+    worker even once, so an expiry is not evidence about it -- and start-instances must not fire
+    either, or a slot handed back as UNKNOWN is left running (issue #77 round 5 / marla-loop 3)."""
+    from blastbox.host.runtime.aws_worker import (
+        AwsUnknownState,
+        Ec2HibernateConfig,
+        Ec2HibernateRuntime,
+    )
+
+    ops: list[str] = []
+
+    def runner(argv, timeout):  # noqa: ANN001
+        argv = list(argv)
+        ops.append(f"{argv[1]} {argv[2]}")
+        return _cp(stdout=json.dumps({"Reservations": [{"Instances": [
+            {"InstanceId": "i-1", "State": {"Name": "stopped"}, "PrivateIpAddress": "10.0.0.5"}]}]}))
+
+    rt = Ec2HibernateRuntime(Ec2HibernateConfig(region="us-east-1", image_id="ami-0abc"),
+                             aws_runner=runner, http_probe=lambda u, h, to: False,
+                             clock=lambda: 100.0)
+    slot = AwsWorkerSlot(slot_id="h1", resource_id="i-1", state=SlotState.ASSIGNED, ip="10.0.0.5")
+    with pytest.raises(AwsUnknownState) as ei:
+        rt.resume(slot, budget_s=0.0)
+    assert "ec2 start-instances" not in ops, f"the instance was started with no budget to wake it: {ops}"
+    assert ops == [], f"a doomed call was issued with no budget: {ops}"
+    # The _call_budget(0) scope would also produce an UNKNOWN here, so the guard's real contribution
+    # is the DIAGNOSTIC: an operator reading "claim probe budget exhausted" would hunt a slow control
+    # plane, when in fact the dispatcher simply had no window left to give. Pin the message, or the
+    # guard is untested redundancy that will rot.
+    assert "no claim budget left" in str(ei.value), (
+        f"lost the explicit no-budget diagnostic: {ei.value}")

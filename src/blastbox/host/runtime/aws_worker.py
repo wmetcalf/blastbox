@@ -508,6 +508,19 @@ class AwsDisposableRuntime:
         finally:
             self._tls.probe_deadline = prev
 
+    def _probe_timeout(self) -> float:
+        """The agent-probe timeout, clamped to whatever call budget is in scope on this thread.
+
+        _call_budget bounds the aws SUBPROCESS calls through a thread-local deadline that ``_aws``
+        reads, but the HTTP probe is not an aws call and was handed a flat probe_timeout_s -- so it
+        sailed straight past the window and could block for its full timeout with the claim already
+        nearly exhausted (issue #77 marla-loop 3)."""
+        timeout = float(self.cfg.probe_timeout_s)
+        deadline = getattr(self._tls, "probe_deadline", None)
+        if deadline is not None:
+            timeout = min(timeout, max(0.0, deadline - self._clock()))
+        return timeout
+
     @contextlib.contextmanager
     def _claim_probe_budget(self, budget_s: float | None = None):
         """Apply the SHORT claim-probe budget to every aws call made on THIS thread inside the
@@ -794,7 +807,7 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
         token = self._ensure_token(slot)   # reuse a fresh token across rapid readiness ticks
         url = slot.url.rstrip("/") + self.cfg.agent_health_path
         headers = {"X-aws-proxy-auth": token, "X-aws-proxy-port": str(self.cfg.agent_port)}
-        return self._probe(url, headers, self.cfg.probe_timeout_s)
+        return self._probe(url, headers, self._probe_timeout())
 
     def is_alive(self, slot: AwsWorkerSlot) -> "bool | None":
         """Refresh the JWE past half its TTL so an IDLE warm slot's token can't expire before its job
@@ -1023,7 +1036,7 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
             return False
         url = slot.url.rstrip("/") + self.cfg.agent_health_path
         headers = {"X-aws-proxy-auth": token, "X-aws-proxy-port": str(self.cfg.agent_port)}
-        return self._probe(url, headers, self.cfg.probe_timeout_s)
+        return self._probe(url, headers, self._probe_timeout())
 
     def is_alive(self, slot: AwsWorkerSlot) -> "bool | None":
         # Skip the LambdaMicroVmRuntime JWE-refresh: minting a token requires RUNNING, so it would fail
@@ -1292,7 +1305,7 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
         scheme = "https" if self.ssl_context else "http"
         url = f"{scheme}://{slot.ip}:{self.cfg.agent_port}{self.cfg.agent_health_path}"
         headers = {"X-aws-proxy-auth": self.cfg.agent_token} if self.cfg.agent_token else {}
-        return self._probe(url, headers, self.cfg.probe_timeout_s)
+        return self._probe(url, headers, self._probe_timeout())
 
     def _extra_launch_args(self) -> list[str]:
         """Extra `run-instances` args a subclass appends (base: none). The hibernate tier adds
@@ -1442,7 +1455,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         scheme = "https" if self.ssl_context else "http"
         url = f"{scheme}://{slot.ip}:{self.cfg.agent_port}{self.cfg.agent_health_path}"
         headers = {"X-aws-proxy-auth": self.cfg.agent_token} if self.cfg.agent_token else {}
-        return self._probe(url, headers, self.cfg.probe_timeout_s)
+        return self._probe(url, headers, self._probe_timeout())
 
     def _try_park(self, slot: AwsWorkerSlot) -> bool:
         """Issue the THROTTLED ``stop --hibernate`` that parks a warmed slot. True iff it was accepted.
@@ -1513,10 +1526,21 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # describe each ran at the full cli_timeout_s (120s) before any budget applied, so a claim
         # with 0.25s left could block for minutes (issue #77 marla-loop 2). Computed here so the
         # scope covers everything this method does.
-        _pre = (self.cfg.resume_timeout_s if budget_s is None
-                else min(self.cfg.resume_timeout_s, max(0.0, float(budget_s))))
-        with (self._call_budget(_pre) if _pre < self.cfg.resume_timeout_s
-              else contextlib.nullcontext()):
+        # ONE budget for the whole call. The prelude used to open its own scope, which CLOSED
+        # before the loop opened another -- so a resume could consume up to TWICE the window it was
+        # given (issue #77 marla-loop 3). Compute the deadline once, here, and carve everything
+        # (prelude AND poll loop) out of it.
+        _total = (self.cfg.resume_timeout_s if budget_s is None
+                  else min(self.cfg.resume_timeout_s, max(0.0, float(budget_s))))
+        if _total <= 0:
+            # The caller handed us no time at all (the pool's scan grace can return a slot just past
+            # the dispatcher's deadline). We have not probed this worker even ONCE, so we know
+            # nothing about it -- and a plain error here reads as a confirmed failure and destroys a
+            # healthy parked slot (issue #77 round 5).
+            raise AwsUnknownState(
+                f"{self.kind} slot {slot.slot_id}: no claim budget left to attempt a resume")
+        _hard_deadline = self._clock() + _total
+        with self._call_budget(_total):
             st = self._state(slot)
             if st in self._DEAD_STATES:
                 raise AwsWorkerError(f"ec2-hibernate slot {slot.slot_id} is {st!r}; cannot resume")
@@ -1531,15 +1555,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # The runtime's resume_timeout_s is a CEILING; the dispatcher's remaining claim window wins
         # when it is shorter, so one unreachable slot cannot burn the whole window and starve the
         # healthy slots behind it (issue #77 round 4).
-        budget = self.cfg.resume_timeout_s if budget_s is None else min(self.cfg.resume_timeout_s,
-                                                                        max(0.0, float(budget_s)))
-        if budget <= 0:
-            # We were handed no time at all (the pool's scan grace can return a slot just past the
-            # dispatcher's deadline). We have not probed this worker even ONCE, so we know nothing
-            # about it -- and a plain error here reads as a confirmed failure and destroys a healthy
-            # parked slot, which is the precise bug this whole change exists to prevent (#77 round 5).
-            raise AwsUnknownState(
-                f"{self.kind} slot {slot.slot_id}: no claim budget left to attempt a resume")
+        budget = max(0.0, _hard_deadline - self._clock())   # whatever the prelude LEFT us
         deadline = self._clock() + budget
         last_exc: Exception | None = None
         # Did the worker get a FAIR chance to answer? Not "was the budget trimmed at all" -- the
