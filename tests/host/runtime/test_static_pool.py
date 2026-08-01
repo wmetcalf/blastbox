@@ -253,3 +253,25 @@ def test_pool_config_registers_static_runtime(monkeypatch):
 def test_unslotted_worker_endpoint_is_none_for_url():
     slot = StaticWorkerSlot(slot_id="x", worker_index=0, url="https://w", ip=None)
     assert slot.endpoint is None
+
+
+def test_static_local_probe_failure_is_unknown_not_fleet_wide_death():
+    """A LOCAL failure to even attempt the probe (OSError: EMFILE, ENOMEM, host networking being
+    reconfigured) says nothing about the box -- and it hits every worker on the same tick, so a
+    plain False marked the entire tier dead at once. That is the exact fault `_aws` was hardened
+    against, left in place on this tier (issue #77 marla-loop 2)."""
+    def _boom(*a, **k):
+        raise OSError("[Errno 24] Too many open files")
+
+    # spawn() probes too, so claim the box while the fleet is healthy, THEN break the local probe
+    # exactly as an exhausted fd table would mid-run.
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765"), http_probe=FakeProbe(all_ok=True))
+    slot = rt.spawn()
+    rt._probe = _boom                       # type: ignore[assignment]
+    assert rt.is_alive(slot) is None, "a host-side probe failure must be UNKNOWN, not a verdict"
+
+    # ...while a box that ANSWERS unhealthy is still a real verdict.
+    rt2 = StaticPoolRuntime(_cfg("10.0.0.1:8765"), http_probe=FakeProbe(all_ok=True))
+    slot2 = rt2.spawn()
+    rt2._probe = FakeProbe(healthy=set())   # type: ignore[assignment]
+    assert rt2.is_alive(slot2) is False

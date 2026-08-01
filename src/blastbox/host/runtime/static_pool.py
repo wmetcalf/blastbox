@@ -180,19 +180,26 @@ class StaticPoolRuntime:
         scheme = "https" if self._tls else "http"  # host:port workers follow the pool's TLS mode
         return f"{scheme}://{w.host}:{w.port}"
 
-    def _health_ok(self, w: StaticWorker) -> bool:
+    def _health_ok(self, w: StaticWorker) -> "bool | None":
+        """Tri-state reachability: True/False are real answers, None = we could not ASK.
+
+        An OSError here is the local side failing (EMFILE, ENOMEM, the host's own networking being
+        reconfigured) -- it is not the box's verdict, and it hits every worker on the same tick.
+        Callers that need a plain bool coerce with ``is True``; only is_alive() forwards the
+        UNKNOWN, so the pool can keep the slot and bound how long it stays that way rather than
+        marking the whole tier dead at once (issue #77 marla-loop 2)."""
         url = self._base_url(w) + self.cfg.health_path
         headers = {"X-aws-proxy-auth": w.token} if w.token else {}
         try:
             return bool(self._probe(url, headers, self.cfg.probe_timeout_s))
         except OSError as exc:
-            _log.debug("static: health probe %s failed: %s", url, exc)
-            return False
+            _log.debug("static: health probe %s could not be attempted: %s", url, exc)
+            return None
 
     # -- fail-closed availability ------------------------------------------
     def available(self) -> bool:
         """True iff at least one registered worker answers /healthz (fail-closed)."""
-        return any(self._health_ok(w) for w in self.cfg.workers)
+        return any(self._health_ok(w) is True for w in self.cfg.workers)
 
     # -- SlotRuntime protocol ----------------------------------------------
     def spawn(self) -> StaticWorkerSlot:
@@ -213,7 +220,7 @@ class StaticPoolRuntime:
                 _log.info("static: worker[%d] cooling down (%.0fs left), skipping for this claim",
                           idx, cool - now)
                 continue
-            if not self._health_ok(self.cfg.workers[idx]):
+            if self._health_ok(self.cfg.workers[idx]) is not True:
                 _log.warning("static: worker[%d] unhealthy, skipping for this claim", idx)
                 continue
             with self._lock:
@@ -236,10 +243,16 @@ class StaticPoolRuntime:
         raise StaticPoolExhausted("no free static worker is currently healthy")
 
     def is_ready(self, slot: StaticWorkerSlot) -> bool:
-        return self._health_ok(self.cfg.workers[slot.worker_index])
+        return self._health_ok(self.cfg.workers[slot.worker_index]) is True
 
-    def is_alive(self, slot: StaticWorkerSlot) -> bool:
-        # always-on boxes: "alive" == reachable
+    def is_alive(self, slot: StaticWorkerSlot) -> "bool | None":
+        """always-on boxes: "alive" == reachable. Tri-state (issue #77 marla-loop 2).
+
+        A LOCAL failure to even attempt the probe -- OSError from the socket layer: EMFILE, ENOMEM,
+        no route because the host's own networking is being reconfigured -- says nothing about the
+        box and hits every worker in the fleet on the same tick. Returning a plain False there
+        marked the whole tier dead at once, the exact fault `_aws` was hardened against. An HTTP
+        answer (or a clean connection refusal) is still a real verdict."""
         return self._health_ok(self.cfg.workers[slot.worker_index])
 
     def reap(self, slot: StaticWorkerSlot, dirty: bool = False) -> None:

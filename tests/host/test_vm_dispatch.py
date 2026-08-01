@@ -1358,3 +1358,35 @@ def test_f23_a_slot_returned_after_the_deadline_is_handed_back_untouched():
     assert pool.resume_calls == [], "a resume was started with no budget left to pay for it"
     assert pool.released == [], "a healthy, never-probed slot was destroyed"
     assert pool.unclaimed == ["A"], "the slot must be handed back for the next claim"
+
+
+def test_a_passed_over_slot_is_released_when_its_cooldown_expires():
+    """The cooldown gated only the RETRY DECISION; once a slot landed in `held` it stayed ASSIGNED
+    until the finally at end-of-window. So the behaviour the previous fix claimed to correct --
+    one transient resume failure making a warm_size=1 tier unclaimable for the whole window, with
+    no replacement spawned because _spawn_to_deficit counts ASSIGNED as active -- was unchanged."""
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+    from blastbox.host.runtime.vm_dispatch import _RETRY_SLOT_COOLDOWN_S, _claim_resumable_slot
+
+    a = SimpleNamespace(slot_id="A")
+    attempts = {"n": 0}
+
+    def resume(slot):  # noqa: ANN001
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise AwsUnknownState("transient (rc=255): Rate exceeded")   # first try browns out
+
+    t = [0.0]
+
+    def clock():
+        t[0] += 0.25
+        return t[0]
+
+    pool = _RetryPool([a], resume)
+    got = _claim_resumable_slot(pool, _RETRY_SLOT_COOLDOWN_S * 4, clock=clock)
+    assert got is a, (
+        f"the only warm slot was never retried inside the window (attempts={attempts['n']}); "
+        f"held slots must be released when their cooldown expires, not at end-of-window")
+    assert pool.assigned == {"A"}

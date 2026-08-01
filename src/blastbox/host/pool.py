@@ -1244,6 +1244,11 @@ class WarmPool:
         now = self._clock()
         with self._lock:
             idle_slots = [s for s in self._slots.values() if s.state == SlotState.IDLE]
+            # Drop bookkeeping for slots that have left the pool. One entry per reaped slot is a
+            # slow leak on a tier that churns a slot per job (measured: 50 entries, 0 slots).
+            if self._unknown_since:
+                for gone in [k for k in self._unknown_since if k not in self._slots]:
+                    self._unknown_since.pop(gone, None)
             stuck_warming = [
                 s for s in self._slots.values()
                 if s.state == SlotState.WARMING
@@ -1252,6 +1257,10 @@ class WarmPool:
             ]
 
         dead: list[Slot] = list(stuck_warming)
+        # Slots we escalated because we could not TELL, as opposed to ones AWS/libvirt confirmed
+        # dead. If disposing of a merely-suspected slot also fails, we have learned nothing and must
+        # not strand it (see the reap loop below).
+        suspected: set[str] = set()
         for slot in stuck_warming:
             logger.warning(
                 "pool.warming_timeout_evict slot_id=%s age=%.1fs", slot.slot_id, now - slot.spawned_at
@@ -1287,6 +1296,7 @@ class WarmPool:
                                    "(> %.0fs) — treating as dead so the slot is replaced",
                                    slot.slot_id, stuck_for, self._unknown_grace_s)
                     self._unknown_since.pop(slot.slot_id, None)
+                    suspected.add(slot.slot_id)   # escalated on suspicion, not on a verdict
                     dead.append(slot)
                 else:
                     logger.debug("pool.health_unknown slot_id=%s unknown_for=%.0fs — keeping slot",
@@ -1323,6 +1333,21 @@ class WarmPool:
                 # reap raised (worker not disposed — may still run): quarantine, don't pop (like
                 # release()), so a live worker isn't orphaned off pool accounting.
                 logger.exception("pool.health_reap_error slot_id=%s — quarantining", slot.slot_id)
+                if slot.slot_id in suspected:
+                    # ...unless this slot was only SUSPECTED (escalated after a long UNKNOWN). The
+                    # disposal runs through the SAME control plane that made it unknown, so during
+                    # a brownout it fails too — and a quarantined DRAINING slot is retried by
+                    # nothing, keeps counting against concurrent_ceiling, and never recovers. That
+                    # is strictly worse than the wedge escalation exists to fix: the wedge healed
+                    # when the brownout ended, this does not. We could not confirm it dead and could
+                    # not dispose of it, so we know nothing: put it back and let the cycle resume
+                    # (issue #77 marla-loop 2).
+                    with self._lock:
+                        cur = self._slots.get(slot.slot_id)
+                        if cur is not None and cur.state == SlotState.DRAINING:
+                            cur.state = SlotState.IDLE
+                    logger.warning("pool.health_escalation_undone slot_id=%s — could not dispose a "
+                                   "merely-suspected slot; returning it to IDLE", slot.slot_id)
             finally:
                 if reaped:
                     with self._lock:

@@ -1990,3 +1990,45 @@ def test_a_truncated_positive_claim_budget_is_unknown_not_failure():
     with pytest.raises(AwsUnknownState) as ei:
         rt.resume(slot, budget_s=0.2)      # positive, but a fraction of the real resume budget
     assert _is_unknown_not_dead(ei.value), "a window we truncated ourselves is not a worker verdict"
+
+
+# ------------- marla loop 2 (run-42): the "shortened" heuristic was always true -----------------
+
+def _resume_rt(probe_ok, tick_step=0.05, **cfgkw):
+    tick = [100.0]
+    return _snapstart_rt({"lambda-microvms get-microvm": {"state": "RUNNING", "endpoint": "vm.x"},
+                          "lambda-microvms resume-microvm": {},
+                          "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                         probe=lambda u, h, t: probe_ok,
+                         clock=lambda: tick.__setitem__(0, tick[0] + tick_step) or tick[0],
+                         **cfgkw)[0]
+
+
+def test_a_near_full_budget_still_yields_a_REAL_verdict():
+    """`shortened = budget < resume_timeout_s` was true for ANY shortening -- and the dispatcher
+    always passes the claim window's remainder, so any time consumed by claim() made it true. In
+    production it was therefore ALWAYS true, so the verdict was unconditionally UNKNOWN and the
+    dead-agent fix became unreachable: a microVM whose agent had crashed was handed back on every
+    claim, never retired, and jobs requeued forever. What matters is whether the worker got a FAIR
+    chance to answer, not whether the budget was trimmed at all."""
+    from blastbox.host.runtime.vm_dispatch import _is_unknown_not_dead
+
+    rt = _resume_rt(False, resume_timeout_s=60.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsWorkerError) as ei:
+        rt.resume(slot, budget_s=59.0)      # trimmed by 1s -- a full, fair chance
+    assert not _is_unknown_not_dead(ei.value), (
+        "a near-full window that a CONFIRMED-running microVM never answered is a real failure")
+
+
+def test_a_genuinely_tiny_budget_is_still_unknown():
+    """The other half: with a fraction of a second left, a healthy warming microVM cannot answer,
+    so that expiry is not evidence about the worker (issue #77 round 6)."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+
+    rt = _resume_rt(False, tick_step=0.0005, resume_timeout_s=60.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsUnknownState):
+        rt.resume(slot, budget_s=0.2)

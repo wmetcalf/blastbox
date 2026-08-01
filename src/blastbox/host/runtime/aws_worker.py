@@ -96,6 +96,12 @@ def _is_confirmed_dead_aws_error(stderr: str) -> bool:
     return any(marker in low for marker in _CONFIRMED_DEAD_AWS_MARKERS)
 
 
+# The shortest resume window in which a HEALTHY warm worker could plausibly answer. Below this we
+# refuse to draw any conclusion from an expiry; at or above it, an unanswered probe against a
+# control-plane-CONFIRMED-running worker is a real failure (issue #77 marla-loop 2).
+_FAIR_RESUME_FLOOR_S = 5.0
+
+
 class AwsUnknownState(AwsWorkerError):
     """The control plane did not give us an answer about this worker (issue #77).
 
@@ -1033,12 +1039,18 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
                 f"{self.kind} slot {slot.slot_id}: no claim budget left to attempt a resume")
         deadline = self._clock() + budget
         last_exc: Exception | None = None
-        shortened = budget_s is not None and budget < self.cfg.resume_timeout_s
+        # Did the worker get a FAIR chance to answer? Not "was the budget trimmed at all" -- the
+        # dispatcher always passes the claim window's remainder, so ANY time consumed by claim()
+        # made the old `budget < resume_timeout_s` test true, in every production resume. The
+        # verdict was therefore unconditionally UNKNOWN and the dead-agent path became unreachable
+        # (issue #77 marla-loop 2). A window shorter than the fairness floor is not evidence about
+        # the worker; anything at or above it is.
+        unfair = budget < min(self.cfg.resume_timeout_s, _FAIR_RESUME_FLOOR_S)
         # Bound the inner calls ONLY when a caller actually shortened the window. Applying it
         # unconditionally made the deadline itself manufacture an AwsProbeTimeout on the last call,
         # which then became the verdict -- turning a HEALTHY control plane plus a dead agent into
         # "unknown" and leaking the husk. Unshortened resumes keep cli_timeout_s exactly as before.
-        scope = self._call_budget(budget) if budget_s is not None else contextlib.nullcontext()
+        scope = self._call_budget(budget) if unfair else contextlib.nullcontext()
         with scope:
           while self._clock() < deadline:
             # Per-ITERATION, not per-call: the final classification must reflect the latest state of
@@ -1092,7 +1104,7 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # verdict on the worker: with 10ms left a perfectly healthy warming microVM cannot possibly
         # answer, and calling that a failure destroys it (issue #77 round 6).
         exc_type = (AwsUnknownState
-                    if isinstance(last_exc, AwsUnknownState) or shortened
+                    if isinstance(last_exc, AwsUnknownState) or unfair
                     else AwsWorkerError)
         raise exc_type(
             f"snapstart slot {slot.slot_id} not ready within {self.cfg.resume_timeout_s:.0f}s: {last_exc}"
@@ -1447,17 +1459,25 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         """Start a hibernated slot and block until its agent answers, BEFORE the job POSTs. Called by the
         dispatcher's claim seam. Raises on failure so the claim retires the slot dirty."""
         import time
-        st = self._state(slot)
-        if st in self._DEAD_STATES:
-            raise AwsWorkerError(f"ec2-hibernate slot {slot.slot_id} is {st!r}; cannot resume")
-        if st == "stopped":
-            self._aws("ec2", "start-instances", "--instance-ids", str(slot.resource_id))
+        # Bound the PRE-loop calls by the caller's window as well: describe + start-instances +
+        # describe each ran at the full cli_timeout_s (120s) before any budget applied, so a claim
+        # with 0.25s left could block for minutes (issue #77 marla-loop 2). Computed here so the
+        # scope covers everything this method does.
+        _pre = (self.cfg.resume_timeout_s if budget_s is None
+                else min(self.cfg.resume_timeout_s, max(0.0, float(budget_s))))
+        with (self._call_budget(_pre) if _pre < self.cfg.resume_timeout_s
+              else contextlib.nullcontext()):
+            st = self._state(slot)
+            if st in self._DEAD_STATES:
+                raise AwsWorkerError(f"ec2-hibernate slot {slot.slot_id} is {st!r}; cannot resume")
+            if st == "stopped":
+                self._aws("ec2", "start-instances", "--instance-ids", str(slot.resource_id))
             # NOTE: no phase bookkeeping here. An earlier revision set _phase="warming" so an
             # is_alive() reconciler could re-park a slot whose resume browned out after the start
             # was accepted -- but that reconciler was removed from this branch (see issue #80), and
             # _phase is read only by is_ready(), which the pool calls for WARMING slots only. So the
             # write had no reader and only advertised machinery that is not here.
-        self._resolve_ip(slot, refresh=True)   # private IP is retained, but re-describe to be safe
+            self._resolve_ip(slot, refresh=True)   # private IP retained, but re-describe to be safe
         # The runtime's resume_timeout_s is a CEILING; the dispatcher's remaining claim window wins
         # when it is shorter, so one unreachable slot cannot burn the whole window and starve the
         # healthy slots behind it (issue #77 round 4).
@@ -1472,12 +1492,18 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 f"{self.kind} slot {slot.slot_id}: no claim budget left to attempt a resume")
         deadline = self._clock() + budget
         last_exc: Exception | None = None
-        shortened = budget_s is not None and budget < self.cfg.resume_timeout_s
+        # Did the worker get a FAIR chance to answer? Not "was the budget trimmed at all" -- the
+        # dispatcher always passes the claim window's remainder, so ANY time consumed by claim()
+        # made the old `budget < resume_timeout_s` test true, in every production resume. The
+        # verdict was therefore unconditionally UNKNOWN and the dead-agent path became unreachable
+        # (issue #77 marla-loop 2). A window shorter than the fairness floor is not evidence about
+        # the worker; anything at or above it is.
+        unfair = budget < min(self.cfg.resume_timeout_s, _FAIR_RESUME_FLOOR_S)
         # Bound the inner calls ONLY when a caller actually shortened the window. Applying it
         # unconditionally made the deadline itself manufacture an AwsProbeTimeout on the last call,
         # which then became the verdict -- turning a HEALTHY control plane plus a dead agent into
         # "unknown" and leaking the husk. Unshortened resumes keep cli_timeout_s exactly as before.
-        scope = self._call_budget(budget) if budget_s is not None else contextlib.nullcontext()
+        scope = self._call_budget(budget) if unfair else contextlib.nullcontext()
         with scope:
           while self._clock() < deadline:
             iter_exc: Exception | None = None      # see the snapstart loop: per-PASS verdict
@@ -1513,7 +1539,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # verdict on the worker: with 10ms left a perfectly healthy warming microVM cannot possibly
         # answer, and calling that a failure destroys it (issue #77 round 6).
         exc_type = (AwsUnknownState
-                    if isinstance(last_exc, AwsUnknownState) or shortened
+                    if isinstance(last_exc, AwsUnknownState) or unfair
                     else AwsWorkerError)
         raise exc_type(
             f"ec2-hibernate slot {slot.slot_id} not ready within {self.cfg.resume_timeout_s:.0f}s: {last_exc}"

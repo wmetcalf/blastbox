@@ -971,25 +971,44 @@ def _claim_resumable_slot(pool: Any, timeout_s: float, *,
     """
     deadline = clock() + timeout_s
     last_exc: Exception | None = None
-    tried: dict[str, float] = {}
-    held: list[Any] = []
+    tried: dict[str, float] = {}     # slot_id -> when its resume last failed
+    held: dict[str, Any] = {}        # slot_id -> slot, withheld (ASSIGNED) during its cooldown
+
+    def _release(sid: str) -> None:
+        slot_ = held.pop(sid, None)
+        if slot_ is None:
+            return
+        unclaim_ = getattr(pool, "unclaim", None)
+        if callable(unclaim_):
+            with contextlib.suppress(Exception):
+                unclaim_(slot_)
+
     try:
         while True:
+            # Release anything whose cooldown has expired FIRST, so it is claimable again this pass.
+            # Holding to the end of the window was the bug the cooldown was meant to fix but didn't:
+            # the cooldown gated only the retry DECISION, while `held` stayed ASSIGNED until the
+            # finally -- so one transient failure made a warm_size=1 tier unclaimable for the whole
+            # window, and _spawn_to_deficit counts ASSIGNED as active so nothing replaced it either.
+            for sid_h in [s for s, _ in list(held.items())
+                          if clock() - tried.get(s, -1e18) >= _RETRY_SLOT_COOLDOWN_S]:
+                _release(sid_h)
+
             remaining = deadline - clock()
             if remaining <= 0:
                 break
             slot = pool.claim(timeout_s=remaining)
             if slot is None:
+                # Nothing claimable right now. If we are withholding slots, their cooldown is the
+                # only thing that will change that, so keep looping until one frees up.
+                if held and deadline - clock() > 0:
+                    continue
                 break
             sid = getattr(slot, "slot_id", None)
             if sid is not None and (clock() - tried.get(sid, -1e18)) < _RETRY_SLOT_COOLDOWN_S:
-                # Failed RECENTLY and handed back. Hold it ASSIGNED so the scan reaches the slots
-                # behind it -- but only for a cooldown, not the rest of the window. Holding to the
-                # end meant one transient resume failure made a warm_size=1 tier unclaimable for the
-                # remaining ~58s, for this thread AND its peers, with no replacement spawned because
-                # _spawn_to_deficit counts ASSIGNED as active (issue #77 marla-loop). The comment
-                # here used to claim it withheld the slot "briefly"; it did not.
-                held.append(slot)
+                # Failed recently: withhold it so the scan reaches the slots behind it, and release
+                # it again as soon as its cooldown expires (above).
+                held[sid] = slot
                 continue
             if sid is not None:
                 tried[sid] = clock()
@@ -1008,12 +1027,12 @@ def _claim_resumable_slot(pool: Any, timeout_s: float, *,
                 return slot
             except Exception as exc:  # noqa: BLE001 -- dead slots are already retired dirty by
                 last_exc = exc        # _resume_on_claim; UNKNOWN ones were handed back. Try another.
+                if sid is not None:
+                    tried[sid] = clock()
     finally:
-        unclaim = getattr(pool, "unclaim", None)
-        if callable(unclaim):
-            for s in held:
-                with contextlib.suppress(Exception):
-                    unclaim(s)
+        for sid_h in list(held):
+            _release(sid_h)
+
     if last_exc is not None:
         raise NoWarmSlot("no resumable warm slot within claim timeout") from last_exc
     return None

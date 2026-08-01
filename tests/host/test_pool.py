@@ -2435,3 +2435,81 @@ def test_an_unknown_slot_is_re_probed_later_in_the_same_claim():
     got = pool._try_claim_one(clock[0] + 1, clock[0] + 1, unprobeable)
     assert got is not None, f"a recovered slot was never re-probed within the claim: probes={probes}"
     assert len(probes) == 2
+
+
+def test_escalation_that_cannot_dispose_returns_the_slot_instead_of_quarantining_it():
+    """The escalation reaps through the SAME control plane that made the slot unknown, so during a
+    long brownout terminate fails too -- and the slot was quarantined DRAINING, which nothing ever
+    retries and which still counts against concurrent_ceiling. That is strictly WORSE than the
+    UNKNOWN wedge it replaced: the wedge recovered when the brownout ended, the quarantine never
+    does. An escalated slot is only SUSPECTED dead; if we cannot dispose of it we know nothing, so
+    it goes back to IDLE and the normal cycle resumes."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    brownout = {"v": True}
+    reap_calls: list[str] = []
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return None if brownout["v"] else True
+
+        def reap(self, slot):  # noqa: ANN001
+            reap_calls.append(slot.slot_id)
+            if brownout["v"]:
+                raise RuntimeError("terminate failed: throttled")
+
+    clock = [1000.0]
+    pool = WarmPool(runtime=_Rt(), warm_size=1, clock=lambda: clock[0], unknown_grace_s=60.0)
+    pool._slots["s1"] = _slot("s1", SlotState.IDLE)
+    for _ in range(40):                       # ride out a brownout longer than the grace
+        clock[0] += 5.0
+        pool._health_check()
+    assert reap_calls, "escalation never even attempted a disposal"
+
+    brownout["v"] = False                     # control plane recovers
+    clock[0] += 5.0
+    pool._health_check()
+    s = pool._slots.get("s1")
+    assert s is not None, "the slot vanished despite never being disposed of"
+    assert s.state == SlotState.IDLE, (
+        f"slot stuck in {s.state} after the brownout ended — permanently zero capacity")
+
+
+def test_unknown_since_leak_is_pruned_when_slots_leave():
+    """One bookkeeping entry per reaped slot is a slow leak on a tier that churns a slot per job
+    (measured: 50 entries against 0 live slots)."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return None            # always UNKNOWN -> stamps _unknown_since
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    clock = [1000.0]
+    pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0])
+    for i in range(5):
+        pool._slots[f"s{i}"] = _slot(f"s{i}", SlotState.IDLE)
+        clock[0] += 1.0
+        pool._health_check()                 # stamps an entry for each
+        pool._slots.pop(f"s{i}")             # ...and the slot then leaves the pool
+    clock[0] += 1.0
+    pool._health_check()
+    assert pool._unknown_since == {}, f"bookkeeping leaked for departed slots: {pool._unknown_since}"
