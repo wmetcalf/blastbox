@@ -27,6 +27,7 @@ Design notes:
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -49,7 +50,10 @@ _log = logging.getLogger("blastbox.host.runtime.aws_worker")
 
 # Injectable seams (defaults do the real thing; tests pass fakes).
 AwsRunner = Callable[[Sequence[str], float], subprocess.CompletedProcess]
-HttpProbe = Callable[[str, dict[str, str], float], bool]
+# None = "we could not even ask" (local resource exhaustion), distinct from False = "the box
+# answered, and the answer was no". Only the health/liveness paths forward the None; everything
+# that needs a plain yes/no coerces with `is True` (issue #77 marla-loop 3).
+HttpProbe = Callable[[str, dict[str, str], float], "bool | None"]
 
 class AwsWorkerError(RuntimeError):
     """An AWS CLI call failed or returned an unusable response."""
@@ -130,8 +134,24 @@ def _default_aws_runner(argv: Sequence[str], timeout: float) -> subprocess.Compl
     return subprocess.run(list(argv), capture_output=True, text=True, timeout=timeout, env=env)  # noqa: S603
 
 
-def _default_http_probe(url: str, headers: dict[str, str], timeout: float) -> bool:
-    """GET ``url`` with ``headers``; True iff a 2xx comes back within ``timeout``."""
+def _is_local_resource_error(exc: BaseException) -> bool:
+    """True if this failure is OUR side running out of resources, not the peer answering.
+
+    ConnectionRefused/Reset and timeouts are OSErrors too, but they are real answers about the
+    worker -- only the local-exhaustion errnos mean we never got to ask."""
+    inner = exc.__cause__ if isinstance(exc, urllib.error.URLError) and exc.__cause__ else exc
+    return isinstance(inner, OSError) and inner.errno in (
+        errno.EMFILE,    # process fd table full
+        errno.ENFILE,    # system-wide fd table full
+        errno.ENOMEM,    # cannot allocate for the socket
+        errno.ENOBUFS,
+    )
+
+
+def _default_http_probe(url: str, headers: dict[str, str], timeout: float) -> "bool | None":
+    """GET ``url`` with ``headers``. True iff a 2xx comes back within ``timeout``; False if the box
+    ANSWERED otherwise (non-2xx, refused, reset, timed out); None if we could not even ask because
+    the LOCAL side ran out of resources (issue #77 marla-loop 3)."""
     from blastbox.host.runtime.remote_http import _default_open   # no-redirect opener (no import cycle)
     req = urllib.request.Request(url, headers=headers, method="GET")  # noqa: S310 (url is host-built)
     try:
@@ -140,7 +160,14 @@ def _default_http_probe(url: str, headers: dict[str, str], timeout: float) -> bo
         # falsely mark the slot READY. A redirect -> HTTPError -> not-ready (False) below.
         with _default_open(req, timeout) as resp:
             return 200 <= resp.status < 300
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        # Distinguish "the box gave us an answer" from "we could not even ASK". A refusal, reset or
+        # timeout IS a verdict about the worker. Local resource exhaustion is not: it is the HOST
+        # failing, it hits every worker on the same tick, and reading it as death evicts the whole
+        # fleet in one health pass (issue #77 marla-loop 3 -- reproduced: one _health_check tick
+        # evicted a 2-box fleet). Callers that want a plain bool coerce with `is True`.
+        if _is_local_resource_error(exc):
+            return None
         return False
 
 
@@ -576,7 +603,9 @@ class AwsDisposableRuntime:
 
     def is_ready(self, slot: AwsWorkerSlot) -> bool:
         try:
-            return self._health_ok(slot)
+            # "could not ask" is not-ready-yet here; the pool retries next tick. Only resume() and
+            # the liveness paths care about the difference (issue #77 marla-loop 3).
+            return self._health_ok(slot) is True
         except (AwsWorkerError, OSError) as exc:
             _log.debug("%s: is_ready(%s) probe error: %s", self.kind, slot.slot_id, exc)
             return False
@@ -654,7 +683,7 @@ class AwsDisposableRuntime:
     def _launch(self) -> AwsWorkerSlot:
         raise NotImplementedError
 
-    def _health_ok(self, slot: AwsWorkerSlot) -> bool:
+    def _health_ok(self, slot: AwsWorkerSlot) -> "bool | None":
         raise NotImplementedError
 
     def _running(self, slot: AwsWorkerSlot) -> bool:
@@ -751,7 +780,7 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
         slot.token_minted_at = self._clock()
         return slot.auth_token
 
-    def _health_ok(self, slot: AwsWorkerSlot) -> bool:
+    def _health_ok(self, slot: AwsWorkerSlot) -> "bool | None":
         # Resolve the per-VM URL once the microVM is running, then probe the agent with a fresh JWE.
         if slot.url is None:
             desc = self._describe_cached(slot, self._liveness_cache_s)   # throttle the ~10Hz warming poll
@@ -953,7 +982,7 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # get-microvm error (microvm gone) still raises -> is_alive() catches -> False -> reaped.
         return self._state(slot) in self._ALIVE_STATES
 
-    def _health_ok(self, slot: AwsWorkerSlot) -> bool:
+    def _health_ok(self, slot: AwsWorkerSlot) -> "bool | None":
         # SnapStart-specific: resolve the STABLE endpoint independent of state (a parked slot is
         # addressable) via the cached describe, then mint+probe. The base _health_ok gates URL resolution
         # on state==running and does an UNCACHED get-microvm per call -- both wrong for a parked warm slot.
@@ -1070,9 +1099,14 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
             # mint failure is exactly what says "we still don't know if this worker is fine".
             iter_exc: Exception | None = None
             try:
-                if self._health_ok(slot):
+                _ok = self._health_ok(slot)
+                if _ok:
                     return
-                saw_agent_silent = True     # mint + probe both ran; the agent simply did not answer
+                # Only a DEFINITIVE negative counts as evidence. None means we never got to ask --
+                # the local side ran out of resources -- and convicting on that would evict the
+                # fleet on a host hiccup, one level below the probe fix (issue #77 marla-loop 3).
+                if _ok is False:
+                    saw_agent_silent = True
             except (AwsWorkerError, OSError) as exc:
                 iter_exc = exc      # not-yet-RUNNING mint/probe failures -> keep trying to wake it
             # probe failed -> the slot isn't serving. Confirm it's not dead, then nudge it awake.
@@ -1247,7 +1281,7 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
     def _running(self, slot: AwsWorkerSlot) -> bool:
         return str(self._describe(slot).get("State", {}).get("Name", "")) == "running"
 
-    def _health_ok(self, slot: AwsWorkerSlot) -> bool:
+    def _health_ok(self, slot: AwsWorkerSlot) -> "bool | None":
         if slot.ip is None:
             inst = self._describe_cached(slot, self._liveness_cache_s)   # throttle the ~10Hz warming poll
             if str(inst.get("State", {}).get("Name", "")) != "running":
@@ -1401,7 +1435,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         if ip:
             slot.ip = str(ip)
 
-    def _agent_healthy(self, slot: AwsWorkerSlot) -> bool:
+    def _agent_healthy(self, slot: AwsWorkerSlot) -> "bool | None":
         self._resolve_ip(slot)
         if slot.ip is None:
             return False
@@ -1534,9 +1568,11 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
           while self._clock() < deadline:
             iter_exc: Exception | None = None      # see the snapstart loop: per-PASS verdict
             try:
-                if self._agent_healthy(slot):
+                _ok = self._agent_healthy(slot)
+                if _ok:
                     return
-                saw_agent_silent = True     # the probe ran; the agent simply did not answer
+                if _ok is False:
+                    saw_agent_silent = True     # the probe ran; the agent did not answer
             except (AwsWorkerError, OSError) as exc:
                 iter_exc = exc
             try:

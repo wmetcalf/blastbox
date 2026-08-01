@@ -275,3 +275,32 @@ def test_static_local_probe_failure_is_unknown_not_fleet_wide_death():
     slot2 = rt2.spawn()
     rt2._probe = FakeProbe(healthy=set())   # type: ignore[assignment]
     assert rt2.is_alive(slot2) is False
+
+
+def test_local_exhaustion_reaches_is_alive_through_the_REAL_probe(monkeypatch):
+    """The earlier test for this monkeypatched rt._probe with a raiser, so it never exercised the
+    production probe -- which caught OSError and returned False before _health_ok could see it.
+    The tri-state was therefore unreachable in production and one health tick evicted the whole
+    fleet. Drive the REAL _default_http_probe and assert the verdict reaches is_alive."""
+    import errno as _errno
+
+    import blastbox.host.runtime.aws_worker as awsmod
+    from blastbox.host.runtime.aws_worker import _default_http_probe
+
+    def _exhausted(req, timeout):  # noqa: ANN001
+        raise OSError(_errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(awsmod, "_default_open", lambda *a, **k: _exhausted(*a, **k), raising=False)
+    monkeypatch.setattr("blastbox.host.runtime.remote_http._default_open",
+                        lambda *a, **k: _exhausted(*a, **k), raising=False)
+    assert _default_http_probe("http://10.0.0.1:8765/healthz", {}, 1.0) is None, (
+        "local fd exhaustion must not be reported as a worker verdict"
+    )
+
+    # ...while a refusal IS a real answer about the box.
+    def _refused(req, timeout):  # noqa: ANN001
+        raise ConnectionRefusedError(_errno.ECONNREFUSED, "Connection refused")
+
+    monkeypatch.setattr("blastbox.host.runtime.remote_http._default_open",
+                        lambda *a, **k: _refused(*a, **k), raising=False)
+    assert _default_http_probe("http://10.0.0.1:8765/healthz", {}, 1.0) is False

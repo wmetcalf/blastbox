@@ -183,8 +183,10 @@ class StaticPoolRuntime:
     def _health_ok(self, w: StaticWorker) -> "bool | None":
         """Tri-state reachability: True/False are real answers, None = we could not ASK.
 
-        An OSError here is the local side failing (EMFILE, ENOMEM, the host's own networking being
-        reconfigured) -- it is not the box's verdict, and it hits every worker on the same tick.
+        A LOCAL-EXHAUSTION failure (EMFILE/ENFILE/ENOMEM) is our side failing, not the box's
+        verdict, and it hits every worker on the same tick. NB a refusal or reset is NOT that: those
+        are real answers about the box and still return False -- an earlier version of this
+        docstring had that backwards.
         Callers that need a plain bool coerce with ``is True``; only is_alive() forwards the
         UNKNOWN, so the pool can keep the slot and bound how long it stays that way rather than
         marking the whole tier dead at once (issue #77 marla-loop 2)."""

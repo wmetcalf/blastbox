@@ -1428,3 +1428,43 @@ def test_a_foreign_exception_wrapping_an_unknown_is_still_unknown():
         assert _is_unknown_not_dead(exc), "a wrapped UNKNOWN was read as a confirmed death"
 
     assert not _is_unknown_not_dead(RuntimeError("something unrelated entirely"))
+
+
+def test_held_slot_is_retried_against_a_REAL_warmpool():
+    """The previous test for this used a fake pool whose claim() returns None instantly, which is
+    the ONLY reason the release loop ran. The real WarmPool.claim blocks until its deadline, so the
+    loop never regained control and the held slot sat ASSIGNED for the whole window -- the bug this
+    was supposed to fix, passing its own test. Exercise the real pool."""
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+    from blastbox.host.runtime.vm_dispatch import _RETRY_SLOT_COOLDOWN_S, _claim_resumable_slot
+
+    attempts = {"n": 0}
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+        def resume(self, slot):  # noqa: ANN001
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise AwsUnknownState("transient (rc=255): Rate exceeded")
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    pool._slots["s1"] = Slot(slot_id="s1", control_dir="/tmp/c", input_dir="/tmp/i",
+                             output_dir="/tmp/o", state=SlotState.IDLE)
+    got = _claim_resumable_slot(pool, _RETRY_SLOT_COOLDOWN_S * 3)
+    assert got is not None, (
+        f"the only warm slot was never retried against a real pool (attempts={attempts['n']})")
+    assert attempts["n"] >= 2

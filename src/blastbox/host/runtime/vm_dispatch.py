@@ -1008,7 +1008,16 @@ def _claim_resumable_slot(pool: Any, timeout_s: float, *,
             remaining = deadline - clock()
             if remaining <= 0:
                 break
-            slot = pool.claim(timeout_s=remaining)
+            # Cap the wait at the next cooldown expiry. WarmPool.claim BLOCKS until its deadline and
+            # never returns early, so waiting the whole remaining window meant the release loop above
+            # never regained control and a held slot stayed ASSIGNED for the entire claim -- the very
+            # bug the cooldown exists to prevent (issue #77 marla-loop 3). Only a fake pool that
+            # returns None instantly ever exercised the release path.
+            wait = remaining
+            if held:
+                next_free = min(tried.get(s, -1e18) + _RETRY_SLOT_COOLDOWN_S for s in held)
+                wait = min(wait, max(0.0, next_free - clock()))
+            slot = pool.claim(timeout_s=wait)
             if slot is None:
                 # Nothing claimable right now. If we are withholding slots, their cooldown is the
                 # only thing that will change that, so keep looping until one frees up.

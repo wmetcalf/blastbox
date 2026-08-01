@@ -2070,3 +2070,37 @@ def test_a_trailing_budget_expiry_does_not_erase_a_confirmed_verdict():
         rt.resume(slot, budget_s=30.0)
     assert not _is_unknown_not_dead(ei.value), (
         "a confirmed-running microVM whose agent never answered a fair window must be retired")
+
+
+def test_a_probe_we_could_not_issue_never_convicts_the_worker():
+    """Local fd exhaustion makes the health probe return None -- we never got to ask the agent
+    anything. The control plane still says RUNNING and the mint still works, so every other signal
+    looks like the dead-agent case; convicting here would evict the whole fleet on a host hiccup,
+    one level below the probe fix itself (issue #77 marla-loop 3)."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+
+    tick = [100.0]
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "RUNNING", "endpoint": "vm.x"},
+                           "lambda-microvms resume-microvm": {},
+                           "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                          probe=lambda u, h, t: None,      # could not even ask
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
+                          resume_timeout_s=5.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsUnknownState):
+        rt.resume(slot)
+
+    # ...while a probe that ANSWERS no, against a confirmed-running VM, is still a real failure.
+    tick2 = [100.0]
+    rt2, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "RUNNING", "endpoint": "vm.x"},
+                            "lambda-microvms resume-microvm": {},
+                            "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                           probe=lambda u, h, t: False,
+                           clock=lambda: tick2.__setitem__(0, tick2[0] + 0.05) or tick2[0],
+                           resume_timeout_s=5.0)
+    slot2 = AwsWorkerSlot(slot_id="p2", resource_id="mv-2", state=SlotState.ASSIGNED,
+                          url="http://10.0.0.1:8080")
+    with pytest.raises(AwsWorkerError) as ei:
+        rt2.resume(slot2)
+    assert not isinstance(ei.value, AwsUnknownState)
