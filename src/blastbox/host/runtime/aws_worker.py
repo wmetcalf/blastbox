@@ -1046,11 +1046,21 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # (issue #77 marla-loop 2). A window shorter than the fairness floor is not evidence about
         # the worker; anything at or above it is.
         unfair = budget < min(self.cfg.resume_timeout_s, _FAIR_RESUME_FLOOR_S)
+        saw_up = False      # did the control plane ever CONFIRM this worker up during the window?
+        # ...and did we ever actually GET TO ASK the agent? A probe that RAN and came back silent is
+        # positive evidence the worker is bad. A probe we could never even issue -- because the
+        # token mint was throttled, say -- teaches us nothing about the agent, however healthy the
+        # control plane looked (issue #77 marla-loop 3).
+        saw_agent_silent = False
         # Bound the inner calls ONLY when a caller actually shortened the window. Applying it
         # unconditionally made the deadline itself manufacture an AwsProbeTimeout on the last call,
         # which then became the verdict -- turning a HEALTHY control plane plus a dead agent into
         # "unknown" and leaking the husk. Unshortened resumes keep cli_timeout_s exactly as before.
-        scope = self._call_budget(budget) if unfair else contextlib.nullcontext()
+        # ALWAYS bound the calls by the window we actually have. Gating this on `unfair` left the
+        # common case (a near-full window) runningper call at cli_timeout_s, so one describe could
+        # block 120s inside a 59s claim -- the round-6 finding, reintroduced. The bound and the
+        # verdict are independent questions (issue #77 marla-loop 3).
+        scope = self._call_budget(budget)
         with scope:
           while self._clock() < deadline:
             # Per-ITERATION, not per-call: the final classification must reflect the latest state of
@@ -1062,6 +1072,7 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
             try:
                 if self._health_ok(slot):
                     return
+                saw_agent_silent = True     # mint + probe both ran; the agent simply did not answer
             except (AwsWorkerError, OSError) as exc:
                 iter_exc = exc      # not-yet-RUNNING mint/probe failures -> keep trying to wake it
             # probe failed -> the slot isn't serving. Confirm it's not dead, then nudge it awake.
@@ -1071,6 +1082,7 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
                 # The control plane ANSWERED and says the microVM is up. Combined with a failing
                 # agent probe that is a CONFIRMED bad worker, not an unknown one.
                 confirmed_up = cur in self._RUNNING_STATES
+                saw_up = saw_up or confirmed_up
             except (AwsWorkerError, OSError) as exc:
                 iter_exc, cur = exc, ""
             if cur in self._DEAD_STATES:
@@ -1103,8 +1115,12 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # A CALLER-shortened window expiring is "we ran out of the time we were given", not a
         # verdict on the worker: with 10ms left a perfectly healthy warming microVM cannot possibly
         # answer, and calling that a failure destroys it (issue #77 round 6).
-        exc_type = (AwsUnknownState
-                    if isinstance(last_exc, AwsUnknownState) or unfair
+        # A trailing AwsUnknownState is usually the bound above expiring on the last call -- that
+        # says nothing once we have ALREADY seen the control plane confirm this worker running and
+        # watched its agent stay silent for a fair window. Keep the observation.
+        exc_type = (AwsWorkerError
+                    if (saw_up and saw_agent_silent and not unfair)
+                    else AwsUnknownState if (unfair or isinstance(last_exc, AwsUnknownState))
                     else AwsWorkerError)
         raise exc_type(
             f"snapstart slot {slot.slot_id} not ready within {self.cfg.resume_timeout_s:.0f}s: {last_exc}"
@@ -1499,21 +1515,33 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # (issue #77 marla-loop 2). A window shorter than the fairness floor is not evidence about
         # the worker; anything at or above it is.
         unfair = budget < min(self.cfg.resume_timeout_s, _FAIR_RESUME_FLOOR_S)
+        saw_up = False      # did the control plane ever CONFIRM this worker up during the window?
+        # ...and did we ever actually GET TO ASK the agent? A probe that RAN and came back silent is
+        # positive evidence the worker is bad. A probe we could never even issue -- because the
+        # token mint was throttled, say -- teaches us nothing about the agent, however healthy the
+        # control plane looked (issue #77 marla-loop 3).
+        saw_agent_silent = False
         # Bound the inner calls ONLY when a caller actually shortened the window. Applying it
         # unconditionally made the deadline itself manufacture an AwsProbeTimeout on the last call,
         # which then became the verdict -- turning a HEALTHY control plane plus a dead agent into
         # "unknown" and leaking the husk. Unshortened resumes keep cli_timeout_s exactly as before.
-        scope = self._call_budget(budget) if unfair else contextlib.nullcontext()
+        # ALWAYS bound the calls by the window we actually have. Gating this on `unfair` left the
+        # common case (a near-full window) runningper call at cli_timeout_s, so one describe could
+        # block 120s inside a 59s claim -- the round-6 finding, reintroduced. The bound and the
+        # verdict are independent questions (issue #77 marla-loop 3).
+        scope = self._call_budget(budget)
         with scope:
           while self._clock() < deadline:
             iter_exc: Exception | None = None      # see the snapstart loop: per-PASS verdict
             try:
                 if self._agent_healthy(slot):
                     return
+                saw_agent_silent = True     # the probe ran; the agent simply did not answer
             except (AwsWorkerError, OSError) as exc:
                 iter_exc = exc
             try:
                 cur = self._state(slot)
+                saw_up = saw_up or cur == "running"
             except (AwsWorkerError, OSError) as exc:
                 iter_exc, cur = exc, ""
             if cur in self._DEAD_STATES:
@@ -1538,8 +1566,12 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # A CALLER-shortened window expiring is "we ran out of the time we were given", not a
         # verdict on the worker: with 10ms left a perfectly healthy warming microVM cannot possibly
         # answer, and calling that a failure destroys it (issue #77 round 6).
-        exc_type = (AwsUnknownState
-                    if isinstance(last_exc, AwsUnknownState) or unfair
+        # A trailing AwsUnknownState is usually the bound above expiring on the last call -- that
+        # says nothing once we have ALREADY seen the control plane confirm this worker running and
+        # watched its agent stay silent for a fair window. Keep the observation.
+        exc_type = (AwsWorkerError
+                    if (saw_up and saw_agent_silent and not unfair)
+                    else AwsUnknownState if (unfair or isinstance(last_exc, AwsUnknownState))
                     else AwsWorkerError)
         raise exc_type(
             f"ec2-hibernate slot {slot.slot_id} not ready within {self.cfg.resume_timeout_s:.0f}s: {last_exc}"

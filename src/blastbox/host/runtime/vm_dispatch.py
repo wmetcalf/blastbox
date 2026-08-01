@@ -904,8 +904,19 @@ def _is_unknown_not_dead(exc: BaseException) -> bool:
     never came up). Re-deciding that here from the message text is what let four review rounds each
     find another retryable error read as death (issue #77 round 4). The cause chain is walked
     because resume() re-raises its own summary error over the last one it saw."""
+    names = {c.__name__ for c in type(exc).__mro__}
+    if "AwsUnknownState" in names or "AwsProbeTimeout" in names:
+        return True
+    if "AwsWorkerError" in names:
+        # OUR type, chosen deliberately at the raise site: a definitive verdict. Do NOT walk the
+        # cause chain here -- resume() chains the last error it saw for debuggability, and that is
+        # often a trailing budget expiry. Letting the chain win would flip a verdict we established
+        # by observation ("the control plane confirmed it running and its agent stayed silent for a
+        # fair window") back into UNKNOWN, leaking the husk forever (issue #77 marla-loop 3).
+        return False
+    # A FOREIGN exception: it carries no verdict of its own, so look for one it may be wrapping.
     seen: set[int] = set()
-    cur: BaseException | None = exc
+    cur: BaseException | None = exc.__cause__ or exc.__context__
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
         if any(c.__name__ in ("AwsUnknownState", "AwsProbeTimeout") for c in type(cur).__mro__):

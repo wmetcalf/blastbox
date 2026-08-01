@@ -2032,3 +2032,41 @@ def test_a_genuinely_tiny_budget_is_still_unknown():
                          url="http://10.0.0.1:8080")
     with pytest.raises(AwsUnknownState):
         rt.resume(slot, budget_s=0.2)
+
+
+def test_a_fair_budget_still_bounds_the_calls_inside_resume():
+    """Two INDEPENDENT questions were fused into one flag: (a) how long may a call block, and
+    (b) does an expiry mean the worker is bad. Tying the call bound to the fairness flag meant that
+    in the COMMON case (a near-full window, unfair=False) the inner aws calls ran at cli_timeout_s
+    -- so a single describe could block 120s inside a 59s claim window, the round-6 finding
+    reintroduced. The bound must ALWAYS apply; only the VERDICT depends on fairness."""
+    cfg = LambdaSnapStartConfig(region="us-east-1", image_identifier="arn:x", allow_default_egress=True,
+                                resume_poll_s=0.0, resume_timeout_s=60.0, cli_timeout_s=120.0)
+    fake = RecordingAws({**_IDENT,
+                         "lambda-microvms get-microvm": {"state": "RUNNING", "endpoint": "vm.x"},
+                         "lambda-microvms resume-microvm": {},
+                         "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}})
+    tick = [100.0]
+    rt = LambdaSnapStartRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: False,
+                                clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0])
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsWorkerError):
+        rt.resume(slot, budget_s=10.0)          # fair (>= floor), so the verdict is real...
+    over = [(k, t) for k, t in fake.timeouts if t > 10.0]
+    assert not over, f"calls exceeded the 10s claim budget and ran at cli_timeout_s: {over[:3]}"
+
+
+def test_a_trailing_budget_expiry_does_not_erase_a_confirmed_verdict():
+    """Bounding the calls means the LAST one can expire as UNKNOWN. That must not overwrite what we
+    already observed: the control plane CONFIRMED the microVM running and its agent never answered
+    across a fair window -- that is a real, replaceable failure."""
+    from blastbox.host.runtime.vm_dispatch import _is_unknown_not_dead
+
+    rt = _resume_rt(False, resume_timeout_s=60.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsWorkerError) as ei:
+        rt.resume(slot, budget_s=30.0)
+    assert not _is_unknown_not_dead(ei.value), (
+        "a confirmed-running microVM whose agent never answered a fair window must be retired")

@@ -1390,3 +1390,41 @@ def test_a_passed_over_slot_is_released_when_its_cooldown_expires():
         f"the only warm slot was never retried inside the window (attempts={attempts['n']}); "
         f"held slots must be released when their cooldown expires, not at end-of-window")
     assert pool.assigned == {"A"}
+
+
+def test_our_own_verdict_type_is_authoritative_over_its_cause_chain():
+    """resume() chains the last error it saw for debuggability, and that is often a trailing budget
+    expiry. Letting the chain win would flip a verdict established by OBSERVATION -- the control
+    plane confirmed the worker running and its agent stayed silent across a fair window -- back into
+    UNKNOWN, so the husk is handed back on every claim and never replaced."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState, AwsWorkerError
+    from blastbox.host.runtime.vm_dispatch import _is_unknown_not_dead
+
+    try:
+        try:
+            raise AwsUnknownState("aws lambda-microvms resume-microvm: claim probe budget exhausted")
+        except AwsUnknownState as cause:
+            raise AwsWorkerError("snapstart slot p1 not ready within 60s") from cause
+    except AwsWorkerError as exc:
+        assert not _is_unknown_not_dead(exc), (
+            "a deliberately-chosen definitive verdict was overridden by its own debug cause")
+
+    # ...and the unknown verdict is of course still unknown.
+    assert _is_unknown_not_dead(AwsUnknownState("transient (rc=255): Rate exceeded"))
+
+
+def test_a_foreign_exception_wrapping_an_unknown_is_still_unknown():
+    """A non-blastbox exception carries no verdict of its own, so a wrapped UNKNOWN must still be
+    honoured -- otherwise an error crossing a module boundary silently becomes a death sentence."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+    from blastbox.host.runtime.vm_dispatch import _is_unknown_not_dead
+
+    try:
+        try:
+            raise AwsUnknownState("aws ec2 describe-instances: transient (rc=255): Rate exceeded")
+        except AwsUnknownState as cause:
+            raise RuntimeError("wrapped by some intermediate layer") from cause
+    except RuntimeError as exc:
+        assert _is_unknown_not_dead(exc), "a wrapped UNKNOWN was read as a confirmed death"
+
+    assert not _is_unknown_not_dead(RuntimeError("something unrelated entirely"))
