@@ -105,6 +105,10 @@ def _is_confirmed_dead_aws_error(stderr: str) -> bool:
 # control-plane-CONFIRMED-running worker is a real failure (issue #77 marla-loop 2).
 _FAIR_RESUME_FLOOR_S = 5.0
 
+# The shortest agent probe worth issuing. Below this we decline and report UNKNOWN rather than
+# manufacture a verdict from a socket we never really gave a chance (issue #77 marla-loop 4).
+_MIN_PROBE_S = 0.25
+
 
 class AwsUnknownState(AwsWorkerError):
     """The control plane did not give us an answer about this worker (issue #77).
@@ -508,7 +512,7 @@ class AwsDisposableRuntime:
         finally:
             self._tls.probe_deadline = prev
 
-    def _probe_timeout(self) -> float:
+    def _probe_timeout(self) -> "float | None":
         """The agent-probe timeout, clamped to whatever call budget is in scope on this thread.
 
         _call_budget bounds the aws SUBPROCESS calls through a thread-local deadline that ``_aws``
@@ -519,6 +523,14 @@ class AwsDisposableRuntime:
         deadline = getattr(self._tls, "probe_deadline", None)
         if deadline is not None:
             timeout = min(timeout, max(0.0, deadline - self._clock()))
+        if timeout < _MIN_PROBE_S:
+            # None = "there is not enough window left to ask meaningfully". Do NOT hand a zero (or
+            # near-zero) timeout to the socket layer: zero is not "fail fast", it switches the
+            # socket to NON-BLOCKING, so connect raises BlockingIOError(EINPROGRESS) at once. That
+            # errno is not local exhaustion, so it read as "the box answered no" and became evidence
+            # against a worker we never actually asked (issue #77 marla-loop 4). A near-zero timeout
+            # is just as bad: a perfectly healthy agent would "time out" and be convicted.
+            return None
         return timeout
 
     @contextlib.contextmanager
@@ -807,7 +819,8 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
         token = self._ensure_token(slot)   # reuse a fresh token across rapid readiness ticks
         url = slot.url.rstrip("/") + self.cfg.agent_health_path
         headers = {"X-aws-proxy-auth": token, "X-aws-proxy-port": str(self.cfg.agent_port)}
-        return self._probe(url, headers, self._probe_timeout())
+        _t = self._probe_timeout()
+        return None if _t is None else self._probe(url, headers, _t)
 
     def is_alive(self, slot: AwsWorkerSlot) -> "bool | None":
         """Refresh the JWE past half its TTL so an IDLE warm slot's token can't expire before its job
@@ -1036,7 +1049,8 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
             return False
         url = slot.url.rstrip("/") + self.cfg.agent_health_path
         headers = {"X-aws-proxy-auth": token, "X-aws-proxy-port": str(self.cfg.agent_port)}
-        return self._probe(url, headers, self._probe_timeout())
+        _t = self._probe_timeout()
+        return None if _t is None else self._probe(url, headers, _t)
 
     def is_alive(self, slot: AwsWorkerSlot) -> "bool | None":
         # Skip the LambdaMicroVmRuntime JWE-refresh: minting a token requires RUNNING, so it would fail
@@ -1305,7 +1319,8 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
         scheme = "https" if self.ssl_context else "http"
         url = f"{scheme}://{slot.ip}:{self.cfg.agent_port}{self.cfg.agent_health_path}"
         headers = {"X-aws-proxy-auth": self.cfg.agent_token} if self.cfg.agent_token else {}
-        return self._probe(url, headers, self._probe_timeout())
+        _t = self._probe_timeout()
+        return None if _t is None else self._probe(url, headers, _t)
 
     def _extra_launch_args(self) -> list[str]:
         """Extra `run-instances` args a subclass appends (base: none). The hibernate tier adds
@@ -1455,7 +1470,8 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         scheme = "https" if self.ssl_context else "http"
         url = f"{scheme}://{slot.ip}:{self.cfg.agent_port}{self.cfg.agent_health_path}"
         headers = {"X-aws-proxy-auth": self.cfg.agent_token} if self.cfg.agent_token else {}
-        return self._probe(url, headers, self._probe_timeout())
+        _t = self._probe_timeout()
+        return None if _t is None else self._probe(url, headers, _t)
 
     def _try_park(self, slot: AwsWorkerSlot) -> bool:
         """Issue the THROTTLED ``stop --hibernate`` that parks a warmed slot. True iff it was accepted.

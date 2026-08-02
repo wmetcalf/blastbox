@@ -2207,3 +2207,31 @@ def test_hibernate_rejects_a_zero_claim_budget_before_touching_the_instance():
     # guard is untested redundancy that will rot.
     assert "no claim budget left" in str(ei.value), (
         f"lost the explicit no-budget diagnostic: {ei.value}")
+
+
+def test_an_exhausted_window_skips_the_probe_instead_of_issuing_a_zero_timeout():
+    """Clamping the probe to the remaining window can yield ZERO. A zero socket timeout is not
+    "fail fast" -- it puts the socket in NON-BLOCKING mode, so connect raises BlockingIOError
+    (EINPROGRESS) immediately. That is not one of the local-exhaustion errnos, so it was classified
+    as "the box answered no" and became evidence against a worker we never actually asked
+    (issue #77 marla-loop 4). Below a meaningful floor we must decline to probe and report UNKNOWN."""
+    asked: list[float] = []
+
+    def _probe(url, headers, timeout):  # noqa: ANN001
+        asked.append(timeout)
+        return False
+
+    # The EC2 path probes DIRECTLY -- no token mint in front of it to trip the budget first -- so
+    # this is where a zero timeout actually reaches urllib.
+    rt, _ = _ec2_rt({"ec2 describe-instances": {"Reservations": [{"Instances": [
+        {"InstanceId": "i-1", "State": {"Name": "running"}, "PrivateIpAddress": "10.0.0.5"}]}]}},
+        probe=_probe)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="i-1", state=SlotState.ASSIGNED, ip="10.0.0.5")
+    # pin the thread-local budget to "already exhausted"
+    rt._tls.probe_deadline = rt._clock()
+    try:
+        assert rt._health_ok(slot) is None, "an unaskable probe must report UNKNOWN, not not-healthy"
+        assert not [t for t in asked if t <= 0.0], (
+            f"a zero/negative timeout was handed to the probe: {asked}")
+    finally:
+        rt._tls.probe_deadline = None
