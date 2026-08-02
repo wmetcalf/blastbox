@@ -2627,3 +2627,44 @@ def test_a_successful_claim_probe_resets_the_unknown_grace():
     assert got is not None
     assert "s1" not in pool._unknown_since, (
         "a slot that answered at claim time still carried its unknown clock toward escalation")
+
+
+def test_a_definitive_probe_lifts_the_demand_suppression():
+    """A slot that answered UNKNOWN once stayed in `unprobeable` for the whole claim, so the
+    demand-miss suppression stayed on even after the control plane recovered -- and a lone queued
+    job could never trip burst capacity again inside that window (upstream P2)."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    answers = {"v": None}
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
+            return answers["v"]
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    clock = [1000.0]
+    pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0])
+    pool._slots["s1"] = _slot("s1", SlotState.IDLE)
+    unprobeable: dict[str, float] = {}
+    assert pool._try_claim_one(None, None, unprobeable) is None      # UNKNOWN -> suppressed
+    assert "s1" in unprobeable
+
+    answers["v"] = True                                             # control plane recovers
+    clock[0] += pool._UNPROBEABLE_COOLDOWN_S + 0.1                   # ...and the cooldown elapses
+    got = pool._try_claim_one(None, None, unprobeable)
+    assert got is not None
+    assert "s1" not in unprobeable, (
+        "a definitively-answered slot stayed suppressed, muting demand for the rest of the claim")

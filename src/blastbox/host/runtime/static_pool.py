@@ -188,7 +188,7 @@ class StaticPoolRuntime:
         scheme = "https" if self._tls else "http"  # host:port workers follow the pool's TLS mode
         return f"{scheme}://{w.host}:{w.port}"
 
-    def _health_ok(self, w: StaticWorker) -> "bool | None":
+    def _health_ok(self, w: StaticWorker, timeout: float | None = None) -> "bool | None":
         """Tri-state reachability: True/False are real answers, None = we could not ASK.
 
         A LOCAL-EXHAUSTION failure (EMFILE/ENFILE/ENOMEM) is our side failing, not the box's
@@ -201,7 +201,9 @@ class StaticPoolRuntime:
         url = self._base_url(w) + self.cfg.health_path
         headers = {"X-aws-proxy-auth": w.token} if w.token else {}
         try:
-            answer = self._probe(url, headers, max(_MIN_PROBE_S, float(self.cfg.probe_timeout_s)))
+            answer = self._probe(
+                url, headers,
+                max(_MIN_PROBE_S, float(self.cfg.probe_timeout_s) if timeout is None else timeout))
             # NOT bool(): bool(None) is False, which would silently convert the UNKNOWN this method
             # promises to forward into a confirmed "dead" (issue #77 marla-loop 4).
             return None if answer is None else bool(answer)
@@ -267,6 +269,22 @@ class StaticPoolRuntime:
         marked the whole tier dead at once, the exact fault `_aws` was hardened against. An HTTP
         answer (or a clean connection refusal) is still a real verdict."""
         return self._health_ok(self.cfg.workers[slot.worker_index])
+
+    def is_alive_for_claim(self, slot: StaticWorkerSlot, *,
+                           budget_s: float | None = None) -> "bool | None":
+        """Hand-out liveness, bounded by the CALLER's remaining claim window.
+
+        Without this hook WarmPool._probe_alive falls back to is_alive(), which always grants the
+        full configured probe_timeout_s -- so a claim(timeout_s=0.1) could block five seconds (or
+        arbitrarily longer) while holding the dispatcher's warm-gate reservation, even though the
+        AWS and libvirt tiers already honour the remaining-budget contract (upstream P2)."""
+        w = self.cfg.workers[slot.worker_index]
+        timeout = float(self.cfg.probe_timeout_s)
+        if budget_s is not None:
+            timeout = min(timeout, max(0.0, float(budget_s)))
+        if timeout < _MIN_PROBE_S:
+            return None      # no window left to ask meaningfully -> UNKNOWN, never a verdict
+        return self._health_ok(w, timeout=timeout)
 
     def reap(self, slot: StaticWorkerSlot, dirty: bool = False) -> None:
         """Return the box to the free pool (nothing is torn down). On a DIRTY release (timeout/trust-

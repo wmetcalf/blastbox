@@ -137,6 +137,12 @@ def _default_aws_runner(argv: Sequence[str], timeout: float) -> subprocess.Compl
     return subprocess.run(list(argv), capture_output=True, text=True, timeout=timeout, env=env)  # noqa: S603
 
 
+# Resolver failures that mean "ask again", as opposed to "this name does not exist".
+_TRANSIENT_RESOLVER_ERRORS = frozenset(
+    getattr(socket, n) for n in ("EAI_AGAIN", "EAI_SYSTEM", "EAI_MEMORY") if hasattr(socket, n)
+)
+
+
 def _is_local_resource_error(exc: BaseException) -> bool:
     """True if this failure is OUR side running out of resources, not the peer answering.
 
@@ -164,7 +170,12 @@ def _is_local_resource_error(exc: BaseException) -> bool:
     # Failing to look a name up says nothing about the worker's health -- and one resolver outage
     # hits every hostname-based worker on the same tick, which is the fleet-wipe shape (upstream P1).
     if isinstance(inner, socket.gaierror):
-        return True
+        # Only TEMPORARY resolver failures are "we could not ask". A definitive NXDOMAIN
+        # (EAI_NONAME/EAI_NODATA) says the name does not resolve -- for an existing worker that is a
+        # real reachability verdict, and treating it as unknown left the slot IDLE and "healthy"
+        # for the whole 300s grace while every claim skipped it, when capacity used to be replaced
+        # at once (upstream P2). Blanket-unknown was my over-correction.
+        return inner.errno in _TRANSIENT_RESOLVER_ERRORS
     return isinstance(inner, OSError) and inner.errno in (
         errno.EMFILE,    # process fd table full
         errno.ENFILE,    # system-wide fd table full
@@ -696,7 +707,11 @@ class AwsDisposableRuntime:
             # brownout (measured: 20 aws invocations where 1 was expected).
             _log.warning("aws.health_probe_unknown slot_id=%s — reporting UNKNOWN to the pool",
                          slot.slot_id)
-            self._live_cache[slot.slot_id] = (now, None)
+            # Stamped at COMPLETION: a probe that stalled longer than _liveness_cache_s would
+            # otherwise be written already-expired, so the next tick re-probes immediately and the
+            # sole tick thread burns health_probe_timeout_s per idle slot for the whole outage
+            # (upstream P2).
+            self._live_cache[slot.slot_id] = (self._clock(), None)
             return None
         except (AwsWorkerError, OSError):
             alive = False
@@ -862,18 +877,21 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
     def is_alive(self, slot: AwsWorkerSlot) -> "bool | None":
         """Refresh the JWE past half its TTL so an IDLE warm slot's token can't expire before its job
         (the transport reuses ``slot.auth_token`` for /detonate without re-minting)."""
-        alive = super().is_alive(slot)
-        if alive and slot.auth_token:
+        with self._health_probe_budget():
+            alive = super().is_alive(slot)
+            if alive and slot.auth_token:
             # The base's health-probe scope ends when super() returns, so this mint ran at the full
             # cli_timeout_s (120s) instead of health_probe_timeout_s — on the SINGLE pool tick
             # thread, stalling promotion/reaping/metrics for minutes across a slow-mint brownout.
             # is_alive_for_claim already holds its budget across the whole probe for this exact
             # reason (issue #77); the health path needs the same treatment.
-            try:
-                with self._health_probe_budget():
+                # NB inside the SAME budget as the describe above, not a fresh one: opening a
+                # second full window let one is_alive() occupy the sole tick thread for nearly
+                # twice health_probe_timeout_s, multiplied across idle slots (upstream P2).
+                try:
                     self._ensure_token(slot)   # refresh only past half-TTL (cached otherwise)
-            except (AwsWorkerError, OSError):
-                pass   # best-effort; a real failure surfaces at readiness/detonate
+                except (AwsWorkerError, OSError):
+                    pass   # best-effort; a real failure surfaces at readiness/detonate
         return alive
 
     def is_alive_for_claim(self, slot: AwsWorkerSlot, *, budget_s: float | None = None) -> "bool | None":

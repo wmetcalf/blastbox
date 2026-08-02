@@ -1051,6 +1051,10 @@ class WarmPool:
                 # successfully could still age out and be escalated to dead (upstream P2).
                 with self._lock:
                     self._unknown_since.pop(candidate.slot_id, None)
+                # ...and it is no longer "unprobeable" for this claim. Leaving it there kept the
+                # demand-miss suppression on for the rest of the window, so once the control plane
+                # recovered a lone queued job still could not trip burst capacity (upstream P2).
+                unprobeable.pop(candidate.slot_id, None)
 
             if alive is None:
                 # UNKNOWN (the runtime's own probe budget expired). Leave the slot IDLE and skip it
@@ -1318,7 +1322,13 @@ class WarmPool:
                 # never replaced (_spawn_to_deficit counts it as active) — the tier silently wedges
                 # at ZERO capacity while is_healthy() still reports True. So: ride out a brownout,
                 # but escalate a fault that outlasts any plausible one.
-                since = self._unknown_since.setdefault(slot.slot_id, now)
+                # Under the lock: the claim path pops this entry, and an in-flight health probe
+                # that started BEFORE that pop would otherwise write a stale timestamp after it.
+                # On a reusable slot the stale stamp keeps ageing while the slot is ASSIGNED, so the
+                # first UNKNOWN after release can exceed the grace at once and evict a worker that
+                # has been serving jobs the whole time (upstream P2).
+                with self._lock:
+                    since = self._unknown_since.setdefault(slot.slot_id, now)
                 stuck_for = now - since
                 if self._unknown_grace_s > 0 and stuck_for > self._unknown_grace_s:
                     logger.warning("pool.health_unknown_escalated slot_id=%s unknown_for=%.0fs "

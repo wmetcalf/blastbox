@@ -384,3 +384,24 @@ def test_env_probe_timeout_below_the_floor_cannot_brick_the_tier():
     assert _cfg(probe_timeout_s=0.0).probe_timeout_s >= _MIN_PROBE_S
     assert _cfg(probe_timeout_s=0.01).probe_timeout_s >= _MIN_PROBE_S
     assert _cfg(probe_timeout_s=7.5).probe_timeout_s == 7.5      # a sane value is untouched
+
+
+def test_static_hand_out_probe_honours_the_claim_deadline():
+    """Without a claim hook the pool falls back to is_alive(), which always grants the full
+    configured probe_timeout_s -- so a claim(timeout_s=0.1) could block five seconds while holding
+    the dispatcher's warm-gate reservation, even though AWS and libvirt already honour the
+    remaining-budget contract (upstream P2)."""
+    seen: list[float] = []
+
+    def _probe(url, headers, timeout):  # noqa: ANN001
+        seen.append(timeout)
+        return True
+
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765"), http_probe=FakeProbe(all_ok=True))
+    slot = rt.spawn()
+    rt._probe = _probe                       # type: ignore[assignment]
+    assert rt.is_alive_for_claim(slot, budget_s=0.4) is True
+    assert seen and seen[-1] <= 0.4, f"probe ignored the 0.4s claim budget: {seen}"
+
+    # no window left to ask meaningfully -> UNKNOWN, never a verdict
+    assert rt.is_alive_for_claim(slot, budget_s=0.0) is None

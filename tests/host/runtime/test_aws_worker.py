@@ -2331,9 +2331,15 @@ def test_dns_failures_are_unknown_not_a_worker_verdict():
 
     from blastbox.host.runtime.aws_worker import _is_local_resource_error
 
-    for code, label in ((socket.EAI_AGAIN, "EAI_AGAIN"), (socket.EAI_NONAME, "EAI_NONAME")):
-        wrapped = urllib.error.URLError(socket.gaierror(code, f"[{label}] Name resolution failure"))
-        assert _is_local_resource_error(wrapped), f"{label} read as a verdict about the worker"
+    # TEMPORARY resolver failure -> we could not ask.
+    wrapped = urllib.error.URLError(socket.gaierror(socket.EAI_AGAIN, "[EAI_AGAIN] Temporary failure"))
+    assert _is_local_resource_error(wrapped), "a temporary resolver failure is not a worker verdict"
+
+    # ...but a DEFINITIVE NXDOMAIN is a real reachability answer about an existing worker. Treating
+    # every gaierror as unknown (my over-correction) left such a slot IDLE and reported healthy for
+    # the whole 300s grace while every claim skipped it, when capacity used to be replaced at once.
+    nxdomain = urllib.error.URLError(socket.gaierror(socket.EAI_NONAME, "[EAI_NONAME] Name unknown"))
+    assert not _is_local_resource_error(nxdomain), "NXDOMAIN must stay a real verdict"
 
     # a refusal is still the box answering
     assert not _is_local_resource_error(
@@ -2376,3 +2382,30 @@ def test_a_window_of_only_UNKNOWN_probes_never_convicts():
                          url="http://10.0.0.1:8080")
     with pytest.raises(AwsUnknownState):
         rt.resume(slot)
+
+
+def test_an_unknown_verdict_is_cached_at_COMPLETION_not_at_start():
+    """If the health call itself stalls longer than _liveness_cache_s before ending UNKNOWN, a
+    timestamp captured BEFORE the call is already expired by the time it is written -- so the next
+    tick re-probes immediately and the sole tick thread burns the full health budget per idle slot
+    for the whole outage, instead of honouring the cache (upstream P2)."""
+    tick = [100.0]
+
+    def _stalling_runner(argv, timeout):  # noqa: ANN001
+        tick[0] += 30.0                    # the call itself takes far longer than the cache TTL
+        raise subprocess.TimeoutExpired(cmd=list(argv), timeout=timeout)
+
+    cfg = LambdaSnapStartConfig(region="us-east-1", image_identifier="arn:x",
+                                allow_default_egress=True, resume_poll_s=0.0)
+    rt = LambdaSnapStartRuntime(cfg, aws_runner=_stalling_runner, http_probe=lambda u, h, t: True,
+                                clock=lambda: tick[0])
+    slot = AwsWorkerSlot(slot_id="s1", resource_id="mv-1", state=SlotState.IDLE,
+                         url="http://10.0.0.1:8080")
+    started = tick[0]
+    assert rt.is_alive(slot) is None
+    stamped, verdict = rt._live_cache["s1"]
+    assert verdict is None
+    assert stamped > started, (
+        f"UNKNOWN cached with a pre-call timestamp ({stamped} <= {started}); the entry is born "
+        f"expired and the next tick re-probes immediately")
+    assert stamped >= tick[0] - 1e-6
