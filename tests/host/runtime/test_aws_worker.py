@@ -2349,3 +2349,30 @@ def test_an_unparseable_aws_response_is_unknown_not_death():
     rt, _ = _snapstart_rt({"lambda-microvms get-microvm": _cp(stdout="<html>502 Bad Gateway</html>")})
     with pytest.raises(AwsUnknownState):
         rt._aws("lambda-microvms", "get-microvm", "--microvm-identifier", "mv-1")
+
+
+def test_a_window_of_only_UNKNOWN_probes_never_convicts():
+    """Every HTTP probe returns None (local exhaustion the whole time) while AWS keeps confirming
+    the instance RUNNING. saw_agent_silent therefore stays False, last_exc stays None -- and the
+    classifier's FALLBACK was AwsWorkerError, so a worker we never once got to ask was convicted
+    and terminated. Conviction must require positive evidence; everything else is UNKNOWN, which
+    the pool's unknown-escalation already bounds (escalated codex, loop 4)."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+
+    # ONLY the probe advances the clock, so no aws call ever hits its budget and last_exc stays
+    # None -- otherwise a trailing budget expiry supplies the UNKNOWN and the fallback under test is
+    # never reached (this test passed for that reason before the clock was isolated).
+    tick = [100.0]
+
+    def _unaskable(url, headers, timeout):  # noqa: ANN001
+        tick[0] += 1.0
+        return None
+
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "RUNNING", "endpoint": "vm.x"},
+                           "lambda-microvms resume-microvm": {},
+                           "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                          probe=_unaskable, clock=lambda: tick[0], resume_timeout_s=5.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsUnknownState):
+        rt.resume(slot)

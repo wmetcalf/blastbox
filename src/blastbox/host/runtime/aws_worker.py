@@ -1222,10 +1222,19 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # A trailing AwsUnknownState is usually the bound above expiring on the last call -- that
         # says nothing once we have ALREADY seen the control plane confirm this worker running and
         # watched its agent stay silent for a fair window. Keep the observation.
+        # Convict ONLY on positive evidence: a fair window, the control plane confirming the worker
+        # up, and a probe that actually RAN and came back silent. Everything else is UNKNOWN.
+        #
+        # The previous form fell back to AwsWorkerError when none of its branches matched -- so a
+        # window in which every probe returned "could not ask" while AWS kept confirming the
+        # instance RUNNING would CONVICT a worker we never once questioned. That case is only
+        # unreachable today because the always-on call budget makes the next aws call raise UNKNOWN
+        # first; it was a latent hazard resting on an unrelated interaction, not on the rule. I
+        # could not construct a reaching test, so this is stated as a single positive-evidence rule
+        # rather than guarded by a branch no test can hold honest (escalated codex, loop 4).
         exc_type = (AwsWorkerError
                     if (saw_up and saw_agent_silent and not unfair)
-                    else AwsUnknownState if (unfair or isinstance(last_exc, AwsUnknownState))
-                    else AwsWorkerError)
+                    else AwsUnknownState)
         raise exc_type(
             f"snapstart slot {slot.slot_id} not ready within {self.cfg.resume_timeout_s:.0f}s: {last_exc}"
         ) from last_exc
@@ -1686,10 +1695,19 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # A trailing AwsUnknownState is usually the bound above expiring on the last call -- that
         # says nothing once we have ALREADY seen the control plane confirm this worker running and
         # watched its agent stay silent for a fair window. Keep the observation.
+        # Convict ONLY on positive evidence: a fair window, the control plane confirming the worker
+        # up, and a probe that actually RAN and came back silent. Everything else is UNKNOWN.
+        #
+        # The previous form fell back to AwsWorkerError when none of its branches matched -- so a
+        # window in which every probe returned "could not ask" while AWS kept confirming the
+        # instance RUNNING would CONVICT a worker we never once questioned. That case is only
+        # unreachable today because the always-on call budget makes the next aws call raise UNKNOWN
+        # first; it was a latent hazard resting on an unrelated interaction, not on the rule. I
+        # could not construct a reaching test, so this is stated as a single positive-evidence rule
+        # rather than guarded by a branch no test can hold honest (escalated codex, loop 4).
         exc_type = (AwsWorkerError
                     if (saw_up and saw_agent_silent and not unfair)
-                    else AwsUnknownState if (unfair or isinstance(last_exc, AwsUnknownState))
-                    else AwsWorkerError)
+                    else AwsUnknownState)
         raise exc_type(
             f"ec2-hibernate slot {slot.slot_id} not ready within {self.cfg.resume_timeout_s:.0f}s: {last_exc}"
         ) from last_exc
