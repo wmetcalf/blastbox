@@ -2555,3 +2555,75 @@ def test_escalated_disposals_do_not_block_the_tick_thread():
         pool._health_check()                # must not raise: nothing reaped inline
     assert reaping["n"] == 0, "an escalated disposal ran synchronously on the tick thread"
     assert pool._deferred_reap, "escalated slots were not handed to the bounded deferred reapers"
+
+
+def test_a_brownout_is_not_recorded_as_demand():
+    """When every slot is skipped because its runtime could not ANSWER, the shortage is a brownout,
+    not load. Recording it as a demand miss trips burst-spawning during the outage -- adding
+    control-plane calls to a control plane that is already failing (upstream P2)."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
+            return None                     # fast UNKNOWN, like a throttled describe
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    pool._slots["s1"] = _slot("s1", SlotState.IDLE)
+    misses: list[int] = []
+    pool._record_demand_miss = lambda: misses.append(1)   # type: ignore[method-assign]
+    assert pool.claim(timeout_s=0.2) is None
+    assert misses == [], f"a control-plane brownout was billed as demand pressure: {len(misses)}"
+
+
+def test_a_successful_claim_probe_resets_the_unknown_grace():
+    """The unknown clock was reset only by the HEALTH tick. A slot answering fine at CLAIM time --
+    i.e. being handed out and used -- could still age out and be escalated to dead (upstream P2)."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    answers = {"v": None}
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return answers["v"]
+
+        def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
+            return answers["v"]
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    clock = [1000.0]
+    pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0], unknown_grace_s=50.0)
+    pool._slots["s1"] = _slot("s1", SlotState.IDLE)
+
+    clock[0] += 10.0
+    pool._health_check()                       # UNKNOWN -> clock starts
+    assert "s1" in pool._unknown_since
+
+    answers["v"] = True                        # control plane recovers, and a CLAIM succeeds
+    got = pool.claim(timeout_s=0.2)
+    assert got is not None
+    assert "s1" not in pool._unknown_since, (
+        "a slot that answered at claim time still carried its unknown clock toward escalation")

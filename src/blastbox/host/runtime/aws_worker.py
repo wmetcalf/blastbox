@@ -636,7 +636,10 @@ class AwsDisposableRuntime:
         try:
             return json.loads(out)
         except json.JSONDecodeError as exc:
-            raise AwsWorkerError(f"aws {service} {op}: non-JSON response") from exc
+            # We could not PARSE the answer -- a truncated pipe, a CLI upgraded mid-flight, a
+            # proxy's error page. That is not the worker telling us it is gone, and whatever caused
+            # it applies to every call on this host at once (upstream P2).
+            raise AwsUnknownState(f"aws {service} {op}: unparseable response") from exc
 
     # -- fail-closed availability ------------------------------------------
     def available(self) -> bool:
@@ -1158,55 +1161,55 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # verdict are independent questions (issue #77 marla-loop 3).
         scope = self._call_budget(budget)
         with scope:
-          while self._clock() < deadline:
-            # Per-ITERATION, not per-call: the final classification must reflect the latest state of
-            # the world (issue #77 round 4). Keeping the first error forever let one early blip mark
-            # a full-window agent failure as UNKNOWN; clearing on any single success was worse -- it
-            # wiped a throttled mint the moment the describe in the SAME pass succeeded, and that
-            # mint failure is exactly what says "we still don't know if this worker is fine".
-            iter_exc: Exception | None = None
-            try:
-                _ok = self._health_ok(slot)
-                if _ok:
-                    return
-                # Only a DEFINITIVE negative counts as evidence. None means we never got to ask --
-                # the local side ran out of resources -- and convicting on that would evict the
-                # fleet on a host hiccup, one level below the probe fix (issue #77 marla-loop 3).
-                if _ok is False:
-                    saw_agent_silent = True
-            except (AwsWorkerError, OSError) as exc:
-                iter_exc = exc      # not-yet-RUNNING mint/probe failures -> keep trying to wake it
-            # probe failed -> the slot isn't serving. Confirm it's not dead, then nudge it awake.
-            confirmed_up = False
-            try:
-                cur = self._state(slot)
-                # The control plane ANSWERED and says the microVM is up. Combined with a failing
-                # agent probe that is a CONFIRMED bad worker, not an unknown one.
-                confirmed_up = cur in self._RUNNING_STATES
-                saw_up = saw_up or confirmed_up
-            except (AwsWorkerError, OSError) as exc:
-                iter_exc, cur = exc, ""
-            if cur in self._DEAD_STATES:
-                raise AwsWorkerError(f"snapstart slot {slot.slot_id} is {cur!r}; cannot resume")
-            try:
-                self._aws("lambda-microvms", "resume-microvm",
-                          "--microvm-identifier", str(slot.resource_id))
-                # discard any JWE minted while the slot was still suspended (invalid): the NEXT probe must
-                # re-mint an awake token, else an AUTO_RESUME=off slot woken here keeps probing/detonating
-                # with the pre-resume token until the deadline. On success the awake-minted token survives.
-                slot.auth_token = None
-            except AwsWorkerError as exc:
-                # ResumeMicrovm requires a SUSPENDED target and answers ConflictException for a
-                # RUNNING one -- which the inverted classifier (correctly, in general) calls
-                # UNKNOWN. But when the state query just CONFIRMED the microVM is up, that conflict
-                # tells us nothing new, and letting it become the verdict masks a dead agent as a
-                # brownout forever: the slot is handed back every claim, never replaced, and a
-                # warm_size=1 tier requeues jobs indefinitely (issue #77 round 5). This is the
-                # cost-side of the inversion, and it is paid here rather than by weakening it.
-                if not confirmed_up:
-                    iter_exc = exc  # already-running / eventual-consistency wrong-state -> probe is the gate
-            last_exc = iter_exc     # this pass's verdict supersedes every earlier one
-            time.sleep(min(self.cfg.resume_poll_s, max(0.0, deadline - self._clock())))
+            while self._clock() < deadline:
+                # Per-ITERATION, not per-call: the final classification must reflect the latest state of
+                # the world (issue #77 round 4). Keeping the first error forever let one early blip mark
+                # a full-window agent failure as UNKNOWN; clearing on any single success was worse -- it
+                # wiped a throttled mint the moment the describe in the SAME pass succeeded, and that
+                # mint failure is exactly what says "we still don't know if this worker is fine".
+                iter_exc: Exception | None = None
+                try:
+                    _ok = self._health_ok(slot)
+                    if _ok:
+                        return
+                    # Only a DEFINITIVE negative counts as evidence. None means we never got to ask --
+                    # the local side ran out of resources -- and convicting on that would evict the
+                    # fleet on a host hiccup, one level below the probe fix (issue #77 marla-loop 3).
+                    if _ok is False:
+                        saw_agent_silent = True
+                except (AwsWorkerError, OSError) as exc:
+                    iter_exc = exc      # not-yet-RUNNING mint/probe failures -> keep trying to wake it
+                # probe failed -> the slot isn't serving. Confirm it's not dead, then nudge it awake.
+                confirmed_up = False
+                try:
+                    cur = self._state(slot)
+                    # The control plane ANSWERED and says the microVM is up. Combined with a failing
+                    # agent probe that is a CONFIRMED bad worker, not an unknown one.
+                    confirmed_up = cur in self._RUNNING_STATES
+                    saw_up = saw_up or confirmed_up
+                except (AwsWorkerError, OSError) as exc:
+                    iter_exc, cur = exc, ""
+                if cur in self._DEAD_STATES:
+                    raise AwsWorkerError(f"snapstart slot {slot.slot_id} is {cur!r}; cannot resume")
+                try:
+                    self._aws("lambda-microvms", "resume-microvm",
+                              "--microvm-identifier", str(slot.resource_id))
+                    # discard any JWE minted while the slot was still suspended (invalid): the NEXT probe must
+                    # re-mint an awake token, else an AUTO_RESUME=off slot woken here keeps probing/detonating
+                    # with the pre-resume token until the deadline. On success the awake-minted token survives.
+                    slot.auth_token = None
+                except AwsWorkerError as exc:
+                    # ResumeMicrovm requires a SUSPENDED target and answers ConflictException for a
+                    # RUNNING one -- which the inverted classifier (correctly, in general) calls
+                    # UNKNOWN. But when the state query just CONFIRMED the microVM is up, that conflict
+                    # tells us nothing new, and letting it become the verdict masks a dead agent as a
+                    # brownout forever: the slot is handed back every claim, never replaced, and a
+                    # warm_size=1 tier requeues jobs indefinitely (issue #77 round 5). This is the
+                    # cost-side of the inversion, and it is paid here rather than by weakening it.
+                    if not confirmed_up:
+                        iter_exc = exc  # already-running / eventual-consistency wrong-state -> probe is the gate
+                last_exc = iter_exc     # this pass's verdict supersedes every earlier one
+                time.sleep(min(self.cfg.resume_poll_s, max(0.0, deadline - self._clock())))
         # The deadline expiring does NOT upgrade an unknown to a confirmed death: if every
         # answer we got was "the control plane did not answer", that is still all we know
         # (issue #77 round 3). Round 2 fixed the raise site but this RE-raise flattened the
@@ -1643,34 +1646,34 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # verdict are independent questions (issue #77 marla-loop 3).
         scope = self._call_budget(budget)
         with scope:
-          while self._clock() < deadline:
-            iter_exc: Exception | None = None      # see the snapstart loop: per-PASS verdict
-            try:
-                _ok = self._agent_healthy(slot)
-                if _ok:
-                    return
-                if _ok is False:
-                    saw_agent_silent = True     # the probe ran; the agent did not answer
-            except (AwsWorkerError, OSError) as exc:
-                iter_exc = exc
-            try:
-                cur = self._state(slot)
-                saw_up = saw_up or cur == "running"
-            except (AwsWorkerError, OSError) as exc:
-                iter_exc, cur = exc, ""
-            if cur in self._DEAD_STATES:
-                raise AwsWorkerError(f"ec2-hibernate slot {slot.slot_id} is {cur!r}; cannot resume")
-            if cur == "stopped":   # not yet starting (or slid back) -> (re)issue start
+            while self._clock() < deadline:
+                iter_exc: Exception | None = None      # see the snapstart loop: per-PASS verdict
                 try:
-                    self._aws("ec2", "start-instances", "--instance-ids", str(slot.resource_id))
-                except AwsWorkerError as exc:
+                    _ok = self._agent_healthy(slot)
+                    if _ok:
+                        return
+                    if _ok is False:
+                        saw_agent_silent = True     # the probe ran; the agent did not answer
+                except (AwsWorkerError, OSError) as exc:
                     iter_exc = exc
-            try:
-                self._resolve_ip(slot, refresh=True)
-            except (AwsWorkerError, OSError) as exc:
-                iter_exc = exc
-            last_exc = iter_exc     # this pass's verdict supersedes every earlier one
-            time.sleep(min(self.cfg.resume_poll_s, max(0.0, deadline - self._clock())))
+                try:
+                    cur = self._state(slot)
+                    saw_up = saw_up or cur == "running"
+                except (AwsWorkerError, OSError) as exc:
+                    iter_exc, cur = exc, ""
+                if cur in self._DEAD_STATES:
+                    raise AwsWorkerError(f"ec2-hibernate slot {slot.slot_id} is {cur!r}; cannot resume")
+                if cur == "stopped":   # not yet starting (or slid back) -> (re)issue start
+                    try:
+                        self._aws("ec2", "start-instances", "--instance-ids", str(slot.resource_id))
+                    except AwsWorkerError as exc:
+                        iter_exc = exc
+                try:
+                    self._resolve_ip(slot, refresh=True)
+                except (AwsWorkerError, OSError) as exc:
+                    iter_exc = exc
+                last_exc = iter_exc     # this pass's verdict supersedes every earlier one
+                time.sleep(min(self.cfg.resume_poll_s, max(0.0, deadline - self._clock())))
         # The deadline expiring does NOT upgrade an unknown to a confirmed death: if every
         # answer we got was "the control plane did not answer", that is still all we know
         # (issue #77 round 3). Round 2 fixed the raise site but this RE-raise flattened the

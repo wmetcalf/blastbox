@@ -435,8 +435,12 @@ class WarmPool:
             if slot is not None:
                 return slot
 
-            # No IDLE slot — record demand miss, wait for idle_event or timeout
-            self._record_demand_miss()
+            # No IDLE slot. Only count that as DEMAND if we actually had nothing to give: when
+            # slots were skipped because their runtime could not answer, the shortage is a
+            # brownout, not load, and recording it trips burst-spawning DURING the outage --
+            # adding control-plane calls to a control plane already failing (upstream P2).
+            if not unprobeable:
+                self._record_demand_miss()
             remaining = deadline - self._clock()
             if remaining <= 0:
                 return None
@@ -1041,6 +1045,12 @@ class WarmPool:
             probe_budget = (None if scan_deadline is None
                             else max(0.0, scan_deadline - self._clock()))
             alive = self._probe_alive(candidate, probe_budget)
+            if alive is not None:
+                # The control plane ANSWERED about this slot. That resets the unknown clock exactly
+                # as a health-tick answer does -- otherwise a slot being claimed and used
+                # successfully could still age out and be escalated to dead (upstream P2).
+                with self._lock:
+                    self._unknown_since.pop(candidate.slot_id, None)
 
             if alive is None:
                 # UNKNOWN (the runtime's own probe budget expired). Leave the slot IDLE and skip it

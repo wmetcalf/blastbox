@@ -1243,7 +1243,7 @@ class _RetryPool:
     def release(self, slot, dirty=False):  # noqa: ANN001
         self.released.append(slot.slot_id)
         self.assigned.discard(slot.slot_id)
-        self.slots = [s for s in self.slots if s.slot_id is not slot.slot_id]
+        self.slots = [s for s in self.slots if s.slot_id != slot.slot_id]
 
 
 def test_f7_claim_retry_advances_to_a_healthy_slot_after_an_unknown_resume():

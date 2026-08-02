@@ -2338,3 +2338,14 @@ def test_dns_failures_are_unknown_not_a_worker_verdict():
     # a refusal is still the box answering
     assert not _is_local_resource_error(
         urllib.error.URLError(ConnectionRefusedError(errno.ECONNREFUSED, "refused")))
+
+
+def test_an_unparseable_aws_response_is_unknown_not_death():
+    """A truncated pipe, a CLI upgraded mid-flight, a proxy error page -- we could not PARSE the
+    answer, which is not the worker telling us it is gone. Whatever caused it applies to every call
+    on this host at once, so reading it as death is another fleet-wide eviction (upstream P2)."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": _cp(stdout="<html>502 Bad Gateway</html>")})
+    with pytest.raises(AwsUnknownState):
+        rt._aws("lambda-microvms", "get-microvm", "--microvm-identifier", "mv-1")
