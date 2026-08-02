@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from blastbox.host.pool import SlotState
-from blastbox.host.runtime.aws_worker import HttpProbe, _default_http_probe
+from blastbox.host.runtime.aws_worker import _MIN_PROBE_S, HttpProbe, _default_http_probe
 
 _log = logging.getLogger("blastbox.host.runtime.static_pool")
 
@@ -74,6 +74,14 @@ class StaticPoolConfig:
     # after a DIRTY release (timeout/trust-fail/agent error) a box is held out of the free set this
     # long, so a stale request still executing in the long-lived agent has time to drain before reuse.
     dirty_cooldown_s: float = 60.0
+    def __post_init__(self) -> None:
+        # BLASTBOX_STATIC_PROBE_TIMEOUT_S is operator-settable, and this is the ONLY tier where it
+        # is -- a 0 there put the socket in NON-BLOCKING mode, so connect raised EINPROGRESS and the
+        # whole fleet was convicted in one health tick (issue #77 marla-loop 4). Every AWS config
+        # clamps its probe budgets in __post_init__; this one had none at all.
+        if self.probe_timeout_s < _MIN_PROBE_S:
+            object.__setattr__(self, "probe_timeout_s", _MIN_PROBE_S)
+
 
     @classmethod
     def from_env(cls, get: Callable[[str], str | None], **overrides: Any) -> StaticPoolConfig:
@@ -193,7 +201,10 @@ class StaticPoolRuntime:
         url = self._base_url(w) + self.cfg.health_path
         headers = {"X-aws-proxy-auth": w.token} if w.token else {}
         try:
-            return bool(self._probe(url, headers, self.cfg.probe_timeout_s))
+            answer = self._probe(url, headers, max(_MIN_PROBE_S, float(self.cfg.probe_timeout_s)))
+            # NOT bool(): bool(None) is False, which would silently convert the UNKNOWN this method
+            # promises to forward into a confirmed "dead" (issue #77 marla-loop 4).
+            return None if answer is None else bool(answer)
         except OSError as exc:
             _log.debug("static: health probe %s could not be attempted: %s", url, exc)
             return None

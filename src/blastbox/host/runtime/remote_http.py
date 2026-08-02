@@ -199,10 +199,10 @@ def dispatch_ssl_context_from_env(get: Callable[[str], str | None] = os.environ.
     return client_ssl_context(ca, cert_file=cert, key_file=key)
 
 
-def make_tls_probe(ssl_context: ssl.SSLContext | None) -> Callable[[str, dict, float], bool]:
-    """A health-probe (``(url, headers, timeout) -> bool``) that carries the client (m)TLS context, so a
+def make_tls_probe(ssl_context: ssl.SSLContext | None) -> "Callable[[str, dict, float], bool | None]":
+    """A health-probe (``(url, headers, timeout) -> bool | None``; None = could not ask) that carries the client (m)TLS context, so a
     pool's ``/healthz`` check works against ``https://`` workers. Matches the ``HttpProbe`` seam shape."""
-    def probe(url: str, headers: dict, timeout: float) -> bool:
+    def probe(url: str, headers: dict, timeout: float) -> "bool | None":
         req = urllib.request.Request(url, headers=headers, method="GET")  # noqa: S310 (host-built url)
         try:
             # no-redirect opener: a worker answering /healthz with a 3xx must NOT be followed (it would
@@ -210,7 +210,14 @@ def make_tls_probe(ssl_context: ssl.SSLContext | None) -> Callable[[str, dict, f
             # wouldn't apply, so the token would go out in the clear). A 3xx -> HTTPError -> False below.
             with _default_open(req, timeout, context=ssl_context) as resp:
                 return 200 <= resp.status < 300
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            # Same tri-state as _default_http_probe: None = we could not even ASK (local resource
+            # exhaustion), False = the box answered and the answer was no. This probe is the DEFAULT
+            # whenever BLASTBOX_DISPATCH_TLS_CA is set, so leaving it bool-only kept the fleet-wide
+            # eviction live even with the plain-HTTP path fixed (issue #77 marla-loop 4).
+            from blastbox.host.runtime.aws_worker import _is_local_resource_error
+            if _is_local_resource_error(exc):
+                return None
             return False
     return probe
 

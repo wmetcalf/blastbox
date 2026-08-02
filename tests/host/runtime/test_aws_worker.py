@@ -7,6 +7,7 @@ fail-closed availability probe, config from_env, and pool_config registration.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -2235,3 +2236,86 @@ def test_an_exhausted_window_skips_the_probe_instead_of_issuing_a_zero_timeout()
             f"a zero/negative timeout was handed to the probe: {asked}")
     finally:
         rt._tls.probe_deadline = None
+
+
+def test_local_exhaustion_is_unknown_through_the_SHAPE_urllib_ACTUALLY_RAISES():
+    """The previous guard for this passed against a BARE OSError(EMFILE) -- a shape the real opener
+    never produces. urllib's do_open does `raise URLError(err)`: __cause__ stays None, __context__
+    holds the original, and URLError (an OSError subclass that never calls OSError.__init__) has
+    .errno None. A __cause__-only lookup was therefore UNREACHABLE in production, and real fd
+    exhaustion reaped whole fleets while this test stayed green (issue #77 marla-loop 4)."""
+    import errno as _errno
+    import urllib.error
+
+    from blastbox.host.runtime.aws_worker import _is_local_resource_error
+
+    real_shape = urllib.error.URLError(OSError(_errno.EMFILE, "Too many open files"))
+    assert real_shape.__cause__ is None and getattr(real_shape, "errno", None) is None
+    assert _is_local_resource_error(real_shape), (
+        "the branch is unreachable through the shape urllib actually raises")
+
+    # ...and a refusal wrapped the same way is still a real verdict about the box.
+    refused = urllib.error.URLError(ConnectionRefusedError(_errno.ECONNREFUSED, "refused"))
+    assert not _is_local_resource_error(refused)
+
+
+def test_a_small_configured_probe_timeout_does_not_brick_the_tier():
+    """_probe_timeout() declines below _MIN_PROBE_S, so a probe_timeout_s configured beneath that
+    floor would decline unconditionally and no slot would ever ready -- the same brick
+    __post_init__ already guards claim/health_probe_timeout_s against."""
+    from blastbox.host.runtime.aws_worker import _MIN_PROBE_S
+    cfg = LambdaSnapStartConfig(region="us-east-1", image_identifier="arn:x",
+                                allow_default_egress=True, probe_timeout_s=0.01)
+    assert cfg.probe_timeout_s >= _MIN_PROBE_S, "a sub-floor probe timeout bricks the tier"
+
+
+def test_a_healthy_slow_agent_survives_a_SQUEEZED_probe():
+    """The measured cliff: a healthy agent needing ~300ms against probe_timeout_s=5.0. Squeezing the
+    probe into 0.26s makes it answer 'no', and that was recorded as evidence and the instance
+    terminated. Picking a floor only moved the cliff (0.24 declined and SPARED the slot; clamping it
+    to 0.25 made it REAP the slot instead). The rule is about provenance: a negative answer from a
+    probe we cut short is not evidence about the worker (issue #77 marla-loop 4)."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+
+    # probe_timeout_s deliberately != the old magic 5.0 floor, so this test can tell the derived
+    # rule apart from the constant it replaced.
+    AGENT_NEEDS = 8.0
+
+    def _slow_agent(url, headers, timeout):  # noqa: ANN001
+        return timeout >= AGENT_NEEDS        # answers only if given enough time
+
+    tick = [100.0]
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "RUNNING", "endpoint": "vm.x"},
+                           "lambda-microvms resume-microvm": {},
+                           "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                          probe=_slow_agent,
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.01) or tick[0],
+                          resume_timeout_s=60.0, probe_timeout_s=10.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    # A window that cannot afford one FULL probe (7 < probe_timeout_s=10). The old fixed 5.0s floor
+    # called this "fair" and convicted the agent; the derived rule knows we squeezed it.
+    with pytest.raises(AwsUnknownState):
+        rt.resume(slot, budget_s=7.0)
+
+
+@pytest.mark.parametrize(("name", "code", "is_local"), [
+    ("EADDRNOTAVAIL", errno.EADDRNOTAVAIL, True),   # ephemeral ports exhausted -- purely OUR side,
+    ("ENETUNREACH", errno.ENETUNREACH, True),       # and both hit every worker on the same tick
+    ("EINPROGRESS", errno.EINPROGRESS, True),
+    ("EAGAIN", errno.EAGAIN, True),
+    ("EMFILE", errno.EMFILE, True),
+    ("ETIMEDOUT", errno.ETIMEDOUT, False),          # ...these ARE answers about the worker
+    ("ECONNREFUSED", errno.ECONNREFUSED, False),
+    ("ECONNRESET", errno.ECONNRESET, False),
+    ("EHOSTUNREACH", errno.EHOSTUNREACH, False),
+])
+def test_local_errnos_are_separated_from_real_verdicts(name, code, is_local):
+    """Which side of "did the box answer?" each errno falls on. The local ones are fleet-wide by
+    nature -- ephemeral-port exhaustion and a missing route hit every worker at once -- so
+    misfiling one of them is a whole-tier eviction, not a single bad slot (issue #77 marla-loop 4)."""
+    import urllib.error
+
+    from blastbox.host.runtime.aws_worker import _is_local_resource_error
+    wrapped = urllib.error.URLError(OSError(code, name))   # the shape urllib actually raises
+    assert _is_local_resource_error(wrapped) is is_local, f"{name} is on the wrong side"

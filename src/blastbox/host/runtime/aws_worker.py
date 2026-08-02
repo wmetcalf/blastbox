@@ -103,8 +103,6 @@ def _is_confirmed_dead_aws_error(stderr: str) -> bool:
 # The shortest resume window in which a HEALTHY warm worker could plausibly answer. Below this we
 # refuse to draw any conclusion from an expiry; at or above it, an unanswered probe against a
 # control-plane-CONFIRMED-running worker is a real failure (issue #77 marla-loop 2).
-_FAIR_RESUME_FLOOR_S = 5.0
-
 # The shortest agent probe worth issuing. Below this we decline and report UNKNOWN rather than
 # manufacture a verdict from a socket we never really gave a chance (issue #77 marla-loop 4).
 _MIN_PROBE_S = 0.25
@@ -143,13 +141,37 @@ def _is_local_resource_error(exc: BaseException) -> bool:
 
     ConnectionRefused/Reset and timeouts are OSErrors too, but they are real answers about the
     worker -- only the local-exhaustion errnos mean we never got to ask."""
-    inner = exc.__cause__ if isinstance(exc, urllib.error.URLError) and exc.__cause__ else exc
+    # urllib's do_open does a BARE `raise URLError(err)`, which sets __context__ (not __cause__)
+    # and stores the original in .reason. URLError is itself an OSError subclass but never calls
+    # OSError.__init__, so its .errno is None -- meaning a __cause__-only lookup made this branch
+    # UNREACHABLE through the real opener, and local fd exhaustion reaped whole fleets while the
+    # guarding test passed against a bare OSError the opener never produces (issue #77 marla-loop 4).
+    inner: BaseException = exc
+    for _ in range(4):      # bounded: reason/cause/context chains are short and may self-reference
+        if isinstance(inner, urllib.error.URLError) and isinstance(inner.reason, BaseException):
+            inner = inner.reason
+        elif inner.__cause__ is not None:
+            inner = inner.__cause__
+        elif inner.__context__ is not None and inner.__context__ is not inner:
+            inner = inner.__context__
+        else:
+            break
+        if isinstance(inner, OSError) and inner.errno is not None:
+            break
     return isinstance(inner, OSError) and inner.errno in (
         errno.EMFILE,    # process fd table full
         errno.ENFILE,    # system-wide fd table full
         errno.ENOMEM,    # cannot allocate for the socket
         errno.ENOBUFS,
+        errno.EADDRNOTAVAIL,  # ephemeral ports exhausted -- purely LOCAL, and it hits every worker
+                              # on the same tick, which is the fleet-wipe shape exactly
+        errno.ENETUNREACH,    # no route from THIS host: our networking, not the worker's health
+        errno.EINPROGRESS,    # non-blocking connect in flight -- we never waited for an answer
+        errno.EAGAIN,         # (== EWOULDBLOCK) same: no answer was ever collected
     )
+    # Deliberately NOT here -- these ARE answers about the worker: ETIMEDOUT (it did not respond in
+    # time), ECONNREFUSED / ECONNRESET (nothing is listening / it hung up), EHOSTUNREACH (the host
+    # itself is unreachable, which for a warm worker is indistinguishable from being down).
 
 
 def _default_http_probe(url: str, headers: dict[str, str], timeout: float) -> "bool | None":
@@ -217,6 +239,11 @@ class AwsWorkerConfig:
             object.__setattr__(self, "claim_probe_timeout_s", 5.0)
         if self.health_probe_timeout_s <= 0:
             object.__setattr__(self, "health_probe_timeout_s", 30.0)
+        # Same class of brick, one floor below: _probe_timeout() DECLINES to probe under
+        # _MIN_PROBE_S, so a configured probe_timeout_s beneath it would decline unconditionally and
+        # no slot would ever become ready (issue #77 marla-loop 4). Guard it beside its siblings.
+        if self.probe_timeout_s < _MIN_PROBE_S:
+            object.__setattr__(self, "probe_timeout_s", _MIN_PROBE_S)
 
     def aws_argv(self, service: str, op: str, *args: str) -> list[str]:
         argv = ["aws", service, op, "--region", self.region, "--output", "json"]
@@ -1101,7 +1128,13 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # verdict was therefore unconditionally UNKNOWN and the dead-agent path became unreachable
         # (issue #77 marla-loop 2). A window shorter than the fairness floor is not evidence about
         # the worker; anything at or above it is.
-        unfair = budget < min(self.cfg.resume_timeout_s, _FAIR_RESUME_FLOOR_S)
+        # A window is FAIR iff it can afford at least one FULL agent probe. Derived from
+        # probe_timeout_s rather than a magic constant, which makes the guarantee explicit: when
+        # fair, the first probe is never squeezed, so a negative answer is genuinely about the
+        # worker. An earlier revision carried a separate "was this probe truncated" rule alongside a
+        # fixed 5.0s floor -- with the default probe_timeout_s also 5.0 that rule could never fire,
+        # i.e. it was dead code guarding a case this single condition already covers.
+        unfair = budget < min(self.cfg.resume_timeout_s, float(self.cfg.probe_timeout_s))
         saw_up = False      # did the control plane ever CONFIRM this worker up during the window?
         # ...and did we ever actually GET TO ASK the agent? A probe that RAN and came back silent is
         # positive evidence the worker is bad. A probe we could never even issue -- because the
@@ -1580,7 +1613,13 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # verdict was therefore unconditionally UNKNOWN and the dead-agent path became unreachable
         # (issue #77 marla-loop 2). A window shorter than the fairness floor is not evidence about
         # the worker; anything at or above it is.
-        unfair = budget < min(self.cfg.resume_timeout_s, _FAIR_RESUME_FLOOR_S)
+        # A window is FAIR iff it can afford at least one FULL agent probe. Derived from
+        # probe_timeout_s rather than a magic constant, which makes the guarantee explicit: when
+        # fair, the first probe is never squeezed, so a negative answer is genuinely about the
+        # worker. An earlier revision carried a separate "was this probe truncated" rule alongside a
+        # fixed 5.0s floor -- with the default probe_timeout_s also 5.0 that rule could never fire,
+        # i.e. it was dead code guarding a case this single condition already covers.
+        unfair = budget < min(self.cfg.resume_timeout_s, float(self.cfg.probe_timeout_s))
         saw_up = False      # did the control plane ever CONFIRM this worker up during the window?
         # ...and did we ever actually GET TO ASK the agent? A probe that RAN and came back silent is
         # positive evidence the worker is bad. A probe we could never even issue -- because the

@@ -304,3 +304,83 @@ def test_local_exhaustion_reaches_is_alive_through_the_REAL_probe(monkeypatch):
     monkeypatch.setattr("blastbox.host.runtime.remote_http._default_open",
                         lambda *a, **k: _refused(*a, **k), raising=False)
     assert _default_http_probe("http://10.0.0.1:8765/healthz", {}, 1.0) is False
+
+
+def test_real_fd_exhaustion_does_not_reap_the_fleet(monkeypatch):
+    """END TO END against real objects, because every previous guard for this passed against a fake
+    that behaved differently from the production opener. Under real fd exhaustion the probe must
+    report UNKNOWN and the pool must KEEP both boxes -- previously one _health_check tick evicted
+    the entire fleet."""
+    import errno as _errno
+    import urllib.error
+
+    from blastbox.host.pool import SlotState, WarmPool
+
+    exhausted = {"v": False}
+
+    def _opener(req, timeout):  # noqa: ANN001
+        if exhausted["v"]:
+            # EXACTLY what urllib.request.AbstractHTTPHandler.do_open raises on a socket failure.
+            raise urllib.error.URLError(OSError(_errno.EMFILE, "Too many open files"))
+        class _R:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        return _R()
+
+    monkeypatch.setattr("blastbox.host.runtime.remote_http._default_open", _opener, raising=False)
+
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"))   # REAL probe, not a fake
+    pool = WarmPool(runtime=rt, warm_size=2)
+    for _ in range(2):
+        s = rt.spawn()
+        s.state = SlotState.IDLE
+        pool._slots[s.slot_id] = s
+    assert len(pool._slots) == 2
+
+    exhausted["v"] = True
+    pool._health_check()
+    alive = [rt.is_alive(s) for s in pool._slots.values()]
+    assert all(a is None for a in alive), f"local fd exhaustion read as a verdict: {alive}"
+    assert len(pool._slots) == 2, "the entire fleet was reaped by one health tick"
+
+    exhausted["v"] = False                       # pressure clears
+    assert all(rt.is_alive(s) is True for s in pool._slots.values())
+
+
+def test_the_mTLS_probe_reports_unknown_on_local_exhaustion(monkeypatch):
+    """make_tls_probe is the DEFAULT probe whenever BLASTBOX_DISPATCH_TLS_CA is set, so leaving it
+    bool-only kept the fleet-wide eviction live even with the plain-HTTP path fixed. Three separate
+    seals guarded the same failure; any one left open re-opens it."""
+    import errno as _errno
+    import urllib.error
+
+    from blastbox.host.runtime.remote_http import make_tls_probe
+
+    probe = make_tls_probe(None)
+
+    def _boom(req, timeout, context=None):  # noqa: ANN001
+        raise urllib.error.URLError(OSError(_errno.ENOMEM, "Cannot allocate memory"))
+
+    monkeypatch.setattr("blastbox.host.runtime.remote_http._default_open", _boom, raising=False)
+    assert probe("https://10.0.0.1:8765/healthz", {}, 1.0) is None, (
+        "the mTLS probe convicted a worker on local resource exhaustion")
+
+    def _refused(req, timeout, context=None):  # noqa: ANN001
+        raise urllib.error.URLError(ConnectionRefusedError(_errno.ECONNREFUSED, "refused"))
+
+    monkeypatch.setattr("blastbox.host.runtime.remote_http._default_open", _refused, raising=False)
+    assert probe("https://10.0.0.1:8765/healthz", {}, 1.0) is False, (
+        "a refusal is a real answer about the box and must stay False")
+
+
+def test_env_probe_timeout_below_the_floor_cannot_brick_the_tier():
+    """BLASTBOX_STATIC_PROBE_TIMEOUT_S is operator-settable and this is the ONLY tier where the
+    probe timeout is -- a 0 there put the socket in NON-BLOCKING mode, so connect raised
+    EINPROGRESS and the whole fleet was convicted in one health tick. Every AWS config clamps its
+    probe budgets in __post_init__; this one had none at all (issue #77 marla-loop 4)."""
+    from blastbox.host.runtime.aws_worker import _MIN_PROBE_S
+
+    assert _cfg(probe_timeout_s=0.0).probe_timeout_s >= _MIN_PROBE_S
+    assert _cfg(probe_timeout_s=0.01).probe_timeout_s >= _MIN_PROBE_S
+    assert _cfg(probe_timeout_s=7.5).probe_timeout_s == 7.5      # a sane value is untouched
