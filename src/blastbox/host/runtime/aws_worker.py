@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import errno
 import json
+import socket
 import logging
 import os
 import contextlib
@@ -158,6 +159,12 @@ def _is_local_resource_error(exc: BaseException) -> bool:
             break
         if isinstance(inner, OSError) and inner.errno is not None:
             break
+    # A RESOLVER failure is its own namespace: socket.gaierror carries EAI_* codes (typically
+    # NEGATIVE) which are not errno values at all, so an errno allowlist silently never matched them.
+    # Failing to look a name up says nothing about the worker's health -- and one resolver outage
+    # hits every hostname-based worker on the same tick, which is the fleet-wipe shape (upstream P1).
+    if isinstance(inner, socket.gaierror):
+        return True
     return isinstance(inner, OSError) and inner.errno in (
         errno.EMFILE,    # process fd table full
         errno.ENFILE,    # system-wide fd table full

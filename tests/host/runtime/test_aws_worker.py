@@ -2319,3 +2319,22 @@ def test_local_errnos_are_separated_from_real_verdicts(name, code, is_local):
     from blastbox.host.runtime.aws_worker import _is_local_resource_error
     wrapped = urllib.error.URLError(OSError(code, name))   # the shape urllib actually raises
     assert _is_local_resource_error(wrapped) is is_local, f"{name} is on the wrong side"
+
+
+def test_dns_failures_are_unknown_not_a_worker_verdict():
+    """socket.gaierror is how a resolver failure arrives, wrapped in URLError.reason. Its codes are
+    a SEPARATE namespace from errno -- EAI_AGAIN is typically NEGATIVE and is not errno.EAGAIN -- so
+    an errno allowlist never matched it and a resolver blip convicted every hostname-based worker at
+    once. A name we could not resolve tells us nothing about the worker's health (upstream P1)."""
+    import socket
+    import urllib.error
+
+    from blastbox.host.runtime.aws_worker import _is_local_resource_error
+
+    for code, label in ((socket.EAI_AGAIN, "EAI_AGAIN"), (socket.EAI_NONAME, "EAI_NONAME")):
+        wrapped = urllib.error.URLError(socket.gaierror(code, f"[{label}] Name resolution failure"))
+        assert _is_local_resource_error(wrapped), f"{label} read as a verdict about the worker"
+
+    # a refusal is still the box answering
+    assert not _is_local_resource_error(
+        urllib.error.URLError(ConnectionRefusedError(errno.ECONNREFUSED, "refused")))

@@ -2357,6 +2357,9 @@ def test_a_PERSISTENT_unknown_eventually_escalates_to_dead():
     for _ in range(400):
         clock[0] += 5.0          # well past any sane grace
         pool._health_check()
+    # Disposal is ASYNCHRONOUS: an escalated slot is handed to the bounded deferred reapers rather
+    # than terminated inline, so a tier's worth of 120s AWS terminates cannot stall the tick thread.
+    pool._drain_deferred_reaps()
     assert reaped == ["s1"], (
         f"a PERMANENTLY unknown slot was never escalated: reaped={reaped} "
         f"(tier wedged at zero capacity -- the pre-#77 self-heal that was removed)")
@@ -2472,11 +2475,13 @@ def test_escalation_that_cannot_dispose_returns_the_slot_instead_of_quarantining
     for _ in range(40):                       # ride out a brownout longer than the grace
         clock[0] += 5.0
         pool._health_check()
+        pool._drain_deferred_reaps()      # disposal is asynchronous now (bounded reapers)
     assert reap_calls, "escalation never even attempted a disposal"
 
     brownout["v"] = False                     # control plane recovers
     clock[0] += 5.0
     pool._health_check()
+    pool._drain_deferred_reaps()
     s = pool._slots.get("s1")
     assert s is not None, "the slot vanished despite never being disposed of"
     assert s.state == SlotState.IDLE, (
@@ -2513,3 +2518,40 @@ def test_unknown_since_leak_is_pruned_when_slots_leave():
     clock[0] += 1.0
     pool._health_check()
     assert pool._unknown_since == {}, f"bookkeeping leaked for departed slots: {pool._unknown_since}"
+
+
+def test_escalated_disposals_do_not_block_the_tick_thread():
+    """The escalation routed suspected-dead slots into the SYNCHRONOUS reap path, so a whole tier's
+    terminates ran serially on the sole tick thread with no budget -- during the very outage that
+    made them unknown, each AWS terminate can burn its full CLI timeout. That is exactly the wedge
+    issue #77 exists to fix, reintroduced on the health path (upstream P1). They must go through the
+    bounded deferred reapers instead."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    reaping = {"n": 0}
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return None                     # permanently UNKNOWN -> escalation fires
+
+        def reap(self, slot):  # noqa: ANN001
+            reaping["n"] += 1
+            raise AssertionError("reap must NOT run inline on the tick thread")
+
+    clock = [1000.0]
+    pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0], unknown_grace_s=10.0)
+    for i in range(3):
+        pool._slots[f"s{i}"] = _slot(f"s{i}", SlotState.IDLE)
+    for _ in range(6):
+        clock[0] += 5.0
+        pool._health_check()                # must not raise: nothing reaped inline
+    assert reaping["n"] == 0, "an escalated disposal ran synchronously on the tick thread"
+    assert pool._deferred_reap, "escalated slots were not handed to the bounded deferred reapers"

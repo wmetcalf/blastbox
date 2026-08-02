@@ -240,6 +240,10 @@ class WarmPool:
         # slot_id -> when it FIRST went UNKNOWN and stayed that way (cleared by any definitive
         # answer). Bounds how long "we can't tell" may keep a slot alive; see _health_check.
         self._unknown_since: dict[str, float] = {}
+        # Slots escalated on SUSPICION (a long UNKNOWN) rather than a confirmed verdict. Disposal is
+        # asynchronous now, so this must outlive the tick that queued it -- the reaper needs to know
+        # not to strand a slot it merely could not dispose of.
+        self._suspected_unknown: set[str] = set()
         # Bounded pool of disposal threads. Parallel because a MASS slot death (spot reclamation /
         # AZ event terminating the fleet inside is_alive()'s cache window) is exactly what this path
         # exists for: draining N husks serially would stall a ceiling-bound tier for N x reap
@@ -669,8 +673,23 @@ class WarmPool:
                 # pop_on_success untracks it in the same critical section that releases ownership,
                 # so there is nothing for this caller to do with the result.
                 self._reap_and_count(slot, require_tracked=True, pop_on_success=True)
+                with self._lock:
+                    self._suspected_unknown.discard(slot.slot_id)
             except Exception:
                 logger.exception("pool.reap_deferred_error slot_id=%s — quarantining", slot.slot_id)
+                with self._lock:
+                    if slot.slot_id in self._suspected_unknown:
+                        # Only SUSPECTED, and we could not dispose of it either -- so we know
+                        # nothing. Quarantining it as DRAINING is retried by nothing and keeps
+                        # counting against the ceiling, which is worse than the wedge escalation
+                        # exists to fix (that one healed when the brownout ended). Put it back.
+                        cur = self._slots.get(slot.slot_id)
+                        if cur is not None and cur.state == SlotState.DRAINING:
+                            cur.state = SlotState.IDLE
+                            logger.warning("pool.deferred_escalation_undone slot_id=%s — could not "
+                                           "dispose a suspected slot; returning it to IDLE",
+                                           slot.slot_id)
+                    self._suspected_unknown.discard(slot.slot_id)
             # Stamp PROGRESS: this reaper just finished a disposal, so it is working, not wedged.
             if entry_box:
                 with self._lock:
@@ -1322,7 +1341,17 @@ class WarmPool:
                 cur = self._slots.get(slot.slot_id)
                 if cur is not None and cur.state in (SlotState.IDLE, SlotState.WARMING):
                     cur.state = SlotState.DRAINING
-                    to_reap.append(slot)
+                    if slot.slot_id in suspected:
+                        self._suspected_unknown.add(slot.slot_id)
+                        # SUSPECTED (escalated after a long UNKNOWN), not confirmed. Its disposal
+                        # runs through the SAME control plane that is not answering, so each
+                        # terminate can burn its full CLI timeout -- and doing a tier's worth of
+                        # them serially here would stall promotion, spawning and reaping on the sole
+                        # tick thread for minutes. That is the wedge #77 exists to fix, and #76
+                        # already built the bounded reapers for exactly this. Hand it to them.
+                        self._deferred_reap.add(slot.slot_id)
+                    else:
+                        to_reap.append(slot)
 
         for slot in to_reap:
             logger.warning("pool.health_evicted_dead_slot slot_id=%s", slot.slot_id)
