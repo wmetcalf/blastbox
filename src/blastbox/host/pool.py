@@ -1327,9 +1327,16 @@ class WarmPool:
                 # On a reusable slot the stale stamp keeps ageing while the slot is ASSIGNED, so the
                 # first UNKNOWN after release can exceed the grace at once and evict a worker that
                 # has been serving jobs the whole time (upstream P2).
+                # Read the clock HERE, not the `now` sampled before the pass began. Probes run
+                # serially, so a tier's worth of slow ones means the last slot is reached minutes
+                # after `now` -- and stamping it with that stale value charges it for time spent
+                # probing the slots ahead of it. On the next pass it is already most of the way
+                # through its grace and escalates on what is really its FIRST unknown (escalated
+                # codex, loop 5).
+                probed_at = self._clock()
                 with self._lock:
-                    since = self._unknown_since.setdefault(slot.slot_id, now)
-                stuck_for = now - since
+                    since = self._unknown_since.setdefault(slot.slot_id, probed_at)
+                stuck_for = probed_at - since
                 if self._unknown_grace_s > 0 and stuck_for > self._unknown_grace_s:
                     logger.warning("pool.health_unknown_escalated slot_id=%s unknown_for=%.0fs "
                                    "(> %.0fs) — treating as dead so the slot is replaced",

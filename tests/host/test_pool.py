@@ -2668,3 +2668,54 @@ def test_a_definitive_probe_lifts_the_demand_suppression():
     assert got is not None
     assert "s1" not in unprobeable, (
         "a definitively-answered slot stayed suppressed, muting demand for the rest of the claim")
+
+
+def test_the_unknown_clock_is_not_backdated_across_a_slow_health_pass():
+    """_health_check samples `now` ONCE and then probes every idle slot serially. Stamping each
+    slot's first UNKNOWN with that stale value charges later slots for the time spent probing
+    earlier ones -- so on a big tier with slow probes a slot can be born already most of the way
+    through its grace and escalate on its very first unknown (escalated codex, loop 5)."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    clock = [1000.0]
+    reaped: list[str] = []
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            clock[0] += 40.0        # each probe is SLOW, as during a real brownout
+            return None
+
+        def reap(self, slot):  # noqa: ANN001
+            reaped.append(slot.slot_id)
+
+    # One pass costs 4 x 40s = 160s, so every slot is legitimately re-probed 160s apart. The grace
+    # sits ABOVE that but BELOW 160 + the backdating error (up to a full pass), so only a backdated
+    # clock can push a slot over it.
+    pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0], unknown_grace_s=200.0)
+    for i in range(4):
+        pool._slots[f"s{i}"] = _slot(f"s{i}", SlotState.IDLE)
+
+    # Pass 1 stamps each slot. The LAST slot is not actually probed until ~160s in, but a single
+    # `now` sampled at the top stamps it as though it went unknown at t=0.
+    pool._health_check()
+    pool._drain_deferred_reaps()
+    assert reaped == [], f"escalated on the FIRST unknown: {reaped}"
+    stamps = dict(pool._unknown_since)
+    assert len(stamps) == 4
+    assert max(stamps.values()) > min(stamps.values()), (
+        f"all four slots share one timestamp, so the later ones are backdated: {stamps}")
+
+    # Pass 2: the last slot has genuinely been unknown for only one pass, far inside the 100s grace.
+    pool._health_check()
+    pool._drain_deferred_reaps()
+    assert reaped == [], (
+        f"escalated on backdated time: every slot has been unknown for one 160s pass, inside the "
+        f"200s grace, yet these were reaped: {reaped}")
