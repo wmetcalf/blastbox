@@ -225,6 +225,10 @@ class LibvirtVmConfig:
 # benign set, minus "not running" — that is a live domain in a different STATE, not an absent one.
 # NB "does not exist"/"failed to get domain", never a bare "not found": `sudo virsh` with virsh
 # missing from root's PATH says "virsh: command not found", which is a broken control plane.
+# The shortest virsh call worth making. Below this we decline and report UNKNOWN rather than
+# rounding the caller's remaining window UP and overrunning it (issue #77 upstream P2).
+_MIN_VIRSH_S = 0.5
+
 _DOMAIN_ABSENT_MARKERS = ("domain not found", "failed to get domain", "does not exist")
 
 
@@ -602,7 +606,17 @@ class LibvirtVmRuntime:
         # Bound virsh by whatever the caller has left on its claim deadline (issue #77 round 2):
         # a wedged libvirtd otherwise blocks the default 90s inside a claim(timeout_s=2). _run maps
         # a timeout to rc=124, which is not an absent-domain marker -> UNKNOWN -> skip, exactly right.
-        kw = {} if budget_s is None else {"timeout": max(1.0, float(budget_s))}
+        if budget_s is None:
+            kw: dict = {}
+        elif float(budget_s) < _MIN_VIRSH_S:
+            # Too little left to ask meaningfully. Rounding UP to a floor let a wedged virsh run
+            # past the pool's scan_deadline and blow the hand-out bound; declining is the honest
+            # answer and costs only a skipped candidate (upstream P2).
+            logger.debug("libvirt.claim_budget_too_small domain=%s budget=%.3fs — reporting UNKNOWN",
+                         slot.domain, float(budget_s))
+            return None
+        else:
+            kw = {"timeout": float(budget_s)}
         cp = self._virsh("domstate", slot.domain, **kw)
         if cp.returncode != 0:
             if _domain_is_absent(cp.stderr):

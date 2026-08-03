@@ -2510,3 +2510,70 @@ def test_early_silence_while_parked_cannot_convict_a_later_running_instance():
     with pytest.raises(AwsUnknownState):
         rt.resume(slot)
     assert probes, "the agent was never probed at all"
+
+
+def test_a_confirmed_dead_verdict_survives_a_later_budget_timeout():
+    """`confirmed_dead` was derived from last_exc, which holds only the LATEST pass's error -- so a
+    trailing budget exhaustion masked an earlier ResourceNotFoundException and the husk was handed
+    back as UNKNOWN. AWS answering that the resource is gone does not stop being true because a
+    later call ran out of time (upstream P2)."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+
+    calls = {"n": 0}
+
+    def flaky(argv):  # noqa: ANN001
+        calls["n"] += 1
+        if calls["n"] <= 2:      # AWS confirms it is GONE early on...
+            return _cp(rc=254, stderr="An error occurred (ResourceNotFoundException)")
+        raise subprocess.TimeoutExpired(cmd="aws", timeout=120)   # ...then everything times out
+
+    tick = [100.0]
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": flaky,
+                           "lambda-microvms resume-microvm": flaky,
+                           "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                          probe=lambda u, h, t: False,
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
+                          resume_timeout_s=60.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsWorkerError) as ei:
+        rt.resume(slot)
+    assert not isinstance(ei.value, AwsUnknownState), (
+        "a trailing timeout masked AWS's confirmed-dead answer and the husk was handed back")
+
+
+def test_snapstart_resume_does_not_grant_a_second_full_budget():
+    """The EC2 path was given one hard deadline across prelude and loop; the Lambda path was left
+    resetting it, so _resolve_url could consume most of a shortened budget and the loop would then
+    open a FRESH window with the original value -- nearly twice the dispatcher's remaining claim
+    window, delaying attempts on healthy slots behind it (upstream P2)."""
+    tick = [100.0]
+
+    def clock():
+        return tick[0]                      # only WORK advances time
+
+    def runner(argv, timeout):  # noqa: ANN001
+        tick[0] += 0.25
+        argv = list(argv)
+        if f"{argv[1]} {argv[2]}" == "sts get-caller-identity":
+            return _cp(stdout=json.dumps({"Account": "1", "Arn": "arn:aws:iam::1:user/x"}))
+        return _cp(stdout=json.dumps({"state": "SUSPENDED", "endpoint": "vm.x"}))
+
+    def probe(url, headers, timeout):  # noqa: ANN001
+        tick[0] += 0.25
+        return False
+
+    cfg = LambdaSnapStartConfig(region="us-east-1", image_identifier="arn:x",
+                                allow_default_egress=True, resume_poll_s=0.0,
+                                resume_timeout_s=180.0)
+    rt = LambdaSnapStartRuntime(cfg, aws_runner=runner, http_probe=probe, clock=clock)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED)
+    # A SMALL budget, so the one-describe prelude is a meaningful fraction of it: with 4s the
+    # prelude is ~6% and a second full window hides inside any sane tolerance.
+    start = tick[0]
+    with pytest.raises(AwsWorkerError):
+        rt.resume(slot, budget_s=1.0)
+    spent = tick[0] - start
+    assert spent <= 1.0 * 1.1, (
+        f"resume consumed {spent:.2f} clock-seconds against a 1.0s budget — the prelude and the "
+        f"loop each got their own window")

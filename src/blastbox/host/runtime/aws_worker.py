@@ -143,6 +143,11 @@ _TRANSIENT_RESOLVER_ERRORS = frozenset(
 )
 
 
+def _is_confirmed_dead_exc(exc: BaseException | None) -> bool:
+    """True iff this error is a CONFIRMED verdict from AWS rather than "we could not tell"."""
+    return isinstance(exc, AwsWorkerError) and not isinstance(exc, AwsUnknownState)
+
+
 def _is_local_resource_error(exc: BaseException) -> bool:
     """True if this failure is OUR side running out of resources, not the peer answering.
 
@@ -1154,18 +1159,21 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         it is tolerant of a wrong-state target (already running / stale state), so a genuinely-parked slot
         that get-microvm still misreports is actually woken even with autoResumeEnabled=false."""
         import time
-        # _resolve_url does a describe. Outside the budget it ran at the full cli_timeout_s before
-        # any window applied -- the same prelude leak already fixed on the hibernate tier.
-        with self._call_budget(self.cfg.resume_timeout_s if budget_s is None
-                               else min(self.cfg.resume_timeout_s, max(0.0, float(budget_s)))):
+        # ONE hard deadline across the prelude AND the poll loop. Bounding only the prelude let its
+        # scope close and the loop open a FRESH window with the original budget, so a resume could
+        # still take nearly twice the dispatcher's remaining claim window -- the EC2 path was fixed
+        # this way earlier today and the Lambda path was left resetting it (upstream P2).
+        _total = (self.cfg.resume_timeout_s if budget_s is None
+                  else min(self.cfg.resume_timeout_s, max(0.0, float(budget_s))))
+        _hard_deadline = self._clock() + _total
+        with self._call_budget(_total):
             self._resolve_url(slot)   # stable endpoint, addressable even while transitioning
         slot.auth_token = None      # a JWE minted while suspended is invalid; force a fresh mint once awake
         # The runtime's resume_timeout_s is a CEILING; the dispatcher's remaining claim window wins
         # when it is shorter, so one unreachable slot cannot burn the whole window and starve the
         # healthy slots behind it (issue #77 round 4).
-        budget = self.cfg.resume_timeout_s if budget_s is None else min(self.cfg.resume_timeout_s,
-                                                                        max(0.0, float(budget_s)))
-        if budget <= 0:
+        budget = max(0.0, _hard_deadline - self._clock())   # whatever the prelude LEFT us
+        if _total <= 0:
             # We were handed no time at all (the pool's scan grace can return a slot just past the
             # dispatcher's deadline). We have not probed this worker even ONCE, so we know nothing
             # about it -- and a plain error here reads as a confirmed failure and destroys a healthy
@@ -1192,6 +1200,10 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # probe after starting (upstream P2).
         state_says_up = False   # what the MOST RECENT state observation said
         silent_while_up = False # a FULL-duration probe came back silent while it was known up
+        # STICKY, unlike the per-pass verdict: once AWS answers that the resource is gone, that does
+        # not stop being true because a later call ran out of budget. Deriving it from last_exc let
+        # a trailing timeout mask it and the husk was handed back as UNKNOWN (upstream P2).
+        saw_confirmed_dead = False
 
         # Bound the inner calls ONLY when a caller actually shortened the window. Applying it
         # unconditionally made the deadline itself manufacture an AwsProbeTimeout on the last call,
@@ -1224,6 +1236,7 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
                         silent_while_up = True
                 except (AwsWorkerError, OSError) as exc:
                     iter_exc = exc      # not-yet-RUNNING mint/probe failures -> keep trying to wake it
+                    saw_confirmed_dead |= _is_confirmed_dead_exc(exc)
                 # probe failed -> the slot isn't serving. Confirm it's not dead, then nudge it awake.
                 confirmed_up = False
                 try:
@@ -1234,6 +1247,7 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
                     state_says_up = confirmed_up
                 except (AwsWorkerError, OSError) as exc:
                     iter_exc, cur = exc, ""
+                    saw_confirmed_dead |= _is_confirmed_dead_exc(exc)
                 if cur in self._DEAD_STATES:
                     raise AwsWorkerError(f"snapstart slot {slot.slot_id} is {cur!r}; cannot resume")
                 try:
@@ -1244,6 +1258,7 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
                     # with the pre-resume token until the deadline. On success the awake-minted token survives.
                     slot.auth_token = None
                 except AwsWorkerError as exc:
+                    saw_confirmed_dead |= _is_confirmed_dead_exc(exc)
                     # ResumeMicrovm requires a SUSPENDED target and answers ConflictException for a
                     # RUNNING one -- which the inverted classifier (correctly, in general) calls
                     # UNKNOWN. But when the state query just CONFIRMED the microVM is up, that conflict
@@ -1282,8 +1297,7 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # (ResourceNotFoundException -> a plain AwsWorkerError from _aws). That was being swallowed
         # into UNKNOWN, so a husk AWS had confirmed dead was unclaimed and retried forever instead
         # of retired and replaced (upstream P2).
-        confirmed_dead = (isinstance(last_exc, AwsWorkerError)
-                          and not isinstance(last_exc, AwsUnknownState))
+        confirmed_dead = saw_confirmed_dead or _is_confirmed_dead_exc(last_exc)
         # No separate fairness term: silence is only recorded by a FULL-duration probe, so a
         # window too small to issue one can never convict. That is what "unfair" was approximating
         # with a threshold, and it kept landing on the wrong side of the cliff.
@@ -1719,6 +1733,10 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # probe after starting (upstream P2).
         state_says_up = False   # what the MOST RECENT state observation said
         silent_while_up = False # a FULL-duration probe came back silent while it was known up
+        # STICKY, unlike the per-pass verdict: once AWS answers that the resource is gone, that does
+        # not stop being true because a later call ran out of budget. Deriving it from last_exc let
+        # a trailing timeout mask it and the husk was handed back as UNKNOWN (upstream P2).
+        saw_confirmed_dead = False
 
         # Bound the inner calls ONLY when a caller actually shortened the window. Applying it
         # unconditionally made the deadline itself manufacture an AwsProbeTimeout on the last call,
@@ -1745,17 +1763,20 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                     state_says_up = cur == "running"
                 except (AwsWorkerError, OSError) as exc:
                     iter_exc, cur = exc, ""
+                    saw_confirmed_dead |= _is_confirmed_dead_exc(exc)
                 if cur in self._DEAD_STATES:
                     raise AwsWorkerError(f"ec2-hibernate slot {slot.slot_id} is {cur!r}; cannot resume")
                 if cur == "stopped":   # not yet starting (or slid back) -> (re)issue start
                     try:
                         self._aws("ec2", "start-instances", "--instance-ids", str(slot.resource_id))
                     except AwsWorkerError as exc:
+                        saw_confirmed_dead |= _is_confirmed_dead_exc(exc)
                         iter_exc = exc
                 try:
                     self._resolve_ip(slot, refresh=True)
                 except (AwsWorkerError, OSError) as exc:
                     iter_exc = exc
+                    saw_confirmed_dead |= _is_confirmed_dead_exc(exc)
                 last_exc = iter_exc     # this pass's verdict supersedes every earlier one
                 time.sleep(min(self.cfg.resume_poll_s, max(0.0, deadline - self._clock())))
         # The deadline expiring does NOT upgrade an unknown to a confirmed death: if every
@@ -1785,8 +1806,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # (ResourceNotFoundException -> a plain AwsWorkerError from _aws). That was being swallowed
         # into UNKNOWN, so a husk AWS had confirmed dead was unclaimed and retried forever instead
         # of retired and replaced (upstream P2).
-        confirmed_dead = (isinstance(last_exc, AwsWorkerError)
-                          and not isinstance(last_exc, AwsUnknownState))
+        confirmed_dead = saw_confirmed_dead or _is_confirmed_dead_exc(last_exc)
         # No separate fairness term: silence is only recorded by a FULL-duration probe, so a
         # window too small to issue one can never convict. That is what "unfair" was approximating
         # with a threshold, and it kept landing on the wrong side of the cliff.

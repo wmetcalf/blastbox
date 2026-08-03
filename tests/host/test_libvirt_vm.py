@@ -618,3 +618,28 @@ def test_f3_a_running_domain_is_unaffected(monkeypatch):
                    state=SlotState.IDLE)
     assert rt.is_alive(slot) is True
     assert rt.is_alive_for_claim(slot) is True
+
+
+def test_a_sub_second_claim_budget_declines_instead_of_rounding_up(monkeypatch):
+    """The claim budget was floored at 1.0s, so a candidate reached late in a scan -- with only a
+    few hundred ms of the pool's grace left -- got MORE time than the caller had. A wedged virsh
+    could then run past scan_deadline and blow the hand-out bound. Declining is honest and costs
+    only a skipped candidate (upstream P2)."""
+    rt = _rt()
+    seen: list = []
+
+    def _virsh(*a, **k):  # noqa: ANN001
+        seen.append(k.get("timeout"))
+        return _cp(0, "running\n", "")
+
+    monkeypatch.setattr(rt, "_virsh", _virsh)
+    slot = VmSlot(slot_id="w1", domain="bb-w1", overlay="/tmp/w1.qcow2", agent_port=8765,
+                  state=SlotState.IDLE)
+
+    assert rt.is_alive_for_claim(slot, budget_s=0.2) is None, (
+        "a sub-second budget was rounded up instead of declining")
+    assert seen == [], "virsh was invoked despite there being no window for it"
+
+    # a workable budget is passed through EXACTLY, not floored upward
+    assert rt.is_alive_for_claim(slot, budget_s=3.0) is True
+    assert seen == [3.0], f"budget was not passed through verbatim: {seen}"
