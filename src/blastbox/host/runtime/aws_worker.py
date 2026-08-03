@@ -1185,12 +1185,14 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # it landed on the wrong side of the cliff for some config. The probe itself now answers
         # that question directly: _health_ok only reports a negative when it got its configured
         # duration, so a window too small to issue one simply never produces convicting evidence.
-        saw_up = False      # did the control plane ever CONFIRM this worker up during the window?
-        # ...and did we ever actually GET TO ASK the agent? A probe that RAN and came back silent is
-        # positive evidence the worker is bad. A probe we could never even issue -- because the
-        # token mint was throttled, say -- teaches us nothing about the agent, however healthy the
-        # control plane looked (issue #77 marla-loop 3).
-        saw_agent_silent = False
+        # CORRELATED evidence, not two independent tallies. Silence only convicts when we already
+        # knew the worker was UP at the moment we probed it: a resume that begins from `stopped`
+        # legitimately fails its first probes, and pairing that early silence with a much later
+        # "it is running now" observation terminated healthy instances that were never given a full
+        # probe after starting (upstream P2).
+        state_says_up = False   # what the MOST RECENT state observation said
+        silent_while_up = False # a FULL-duration probe came back silent while it was known up
+
         # Bound the inner calls ONLY when a caller actually shortened the window. Applying it
         # unconditionally made the deadline itself manufacture an AwsProbeTimeout on the last call,
         # which then became the verdict -- turning a HEALTHY control plane plus a dead agent into
@@ -1212,11 +1214,14 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
                     _ok = self._health_ok(slot)
                     if _ok:
                         return
-                    # Only a DEFINITIVE negative counts as evidence. None means we never got to ask --
-                    # the local side ran out of resources -- and convicting on that would evict the
-                    # fleet on a host hiccup, one level below the probe fix (issue #77 marla-loop 3).
-                    if _ok is False:
-                        saw_agent_silent = True
+                    # A DEFINITIVE negative -- None means we never got to ask (local exhaustion),
+                    # and _health_ok already softens a SQUEEZED probe to None -- observed while we
+                    # already knew the worker was up. Correlation matters: a resume beginning from
+                    # a parked state legitimately fails its first probes, and pairing that early
+                    # silence with a much later "it is running now" convicted healthy workers that
+                    # were never given a full probe after starting (upstream P2).
+                    if _ok is False and state_says_up:
+                        silent_while_up = True
                 except (AwsWorkerError, OSError) as exc:
                     iter_exc = exc      # not-yet-RUNNING mint/probe failures -> keep trying to wake it
                 # probe failed -> the slot isn't serving. Confirm it's not dead, then nudge it awake.
@@ -1226,7 +1231,7 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
                     # The control plane ANSWERED and says the microVM is up. Combined with a failing
                     # agent probe that is a CONFIRMED bad worker, not an unknown one.
                     confirmed_up = cur in self._RUNNING_STATES
-                    saw_up = saw_up or confirmed_up
+                    state_says_up = confirmed_up
                 except (AwsWorkerError, OSError) as exc:
                     iter_exc, cur = exc, ""
                 if cur in self._DEAD_STATES:
@@ -1279,11 +1284,11 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # of retired and replaced (upstream P2).
         confirmed_dead = (isinstance(last_exc, AwsWorkerError)
                           and not isinstance(last_exc, AwsUnknownState))
-        # No separate fairness term: saw_agent_silent is only set by a FULL-duration probe, so a
+        # No separate fairness term: silence is only recorded by a FULL-duration probe, so a
         # window too small to issue one can never convict. That is what "unfair" was approximating
         # with a threshold, and it kept landing on the wrong side of the cliff.
         exc_type = (AwsWorkerError
-                    if (confirmed_dead or (saw_up and saw_agent_silent))
+                    if (confirmed_dead or silent_while_up)
                     else AwsUnknownState)
         raise exc_type(
             f"snapstart slot {slot.slot_id} not ready within {self.cfg.resume_timeout_s:.0f}s: {last_exc}"
@@ -1707,12 +1712,14 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # it landed on the wrong side of the cliff for some config. The probe itself now answers
         # that question directly: _health_ok only reports a negative when it got its configured
         # duration, so a window too small to issue one simply never produces convicting evidence.
-        saw_up = False      # did the control plane ever CONFIRM this worker up during the window?
-        # ...and did we ever actually GET TO ASK the agent? A probe that RAN and came back silent is
-        # positive evidence the worker is bad. A probe we could never even issue -- because the
-        # token mint was throttled, say -- teaches us nothing about the agent, however healthy the
-        # control plane looked (issue #77 marla-loop 3).
-        saw_agent_silent = False
+        # CORRELATED evidence, not two independent tallies. Silence only convicts when we already
+        # knew the worker was UP at the moment we probed it: a resume that begins from `stopped`
+        # legitimately fails its first probes, and pairing that early silence with a much later
+        # "it is running now" observation terminated healthy instances that were never given a full
+        # probe after starting (upstream P2).
+        state_says_up = False   # what the MOST RECENT state observation said
+        silent_while_up = False # a FULL-duration probe came back silent while it was known up
+
         # Bound the inner calls ONLY when a caller actually shortened the window. Applying it
         # unconditionally made the deadline itself manufacture an AwsProbeTimeout on the last call,
         # which then became the verdict -- turning a HEALTHY control plane plus a dead agent into
@@ -1729,13 +1736,13 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                     _ok = self._agent_healthy(slot)
                     if _ok:
                         return
-                    if _ok is False:
-                        saw_agent_silent = True     # the probe ran; the agent did not answer
+                    if _ok is False and state_says_up:
+                        silent_while_up = True      # a full probe, while it was known up
                 except (AwsWorkerError, OSError) as exc:
                     iter_exc = exc
                 try:
                     cur = self._state(slot)
-                    saw_up = saw_up or cur == "running"
+                    state_says_up = cur == "running"
                 except (AwsWorkerError, OSError) as exc:
                     iter_exc, cur = exc, ""
                 if cur in self._DEAD_STATES:
@@ -1780,11 +1787,11 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # of retired and replaced (upstream P2).
         confirmed_dead = (isinstance(last_exc, AwsWorkerError)
                           and not isinstance(last_exc, AwsUnknownState))
-        # No separate fairness term: saw_agent_silent is only set by a FULL-duration probe, so a
+        # No separate fairness term: silence is only recorded by a FULL-duration probe, so a
         # window too small to issue one can never convict. That is what "unfair" was approximating
         # with a threshold, and it kept landing on the wrong side of the cliff.
         exc_type = (AwsWorkerError
-                    if (confirmed_dead or (saw_up and saw_agent_silent))
+                    if (confirmed_dead or silent_while_up)
                     else AwsUnknownState)
         raise exc_type(
             f"ec2-hibernate slot {slot.slot_id} not ready within {self.cfg.resume_timeout_s:.0f}s: {last_exc}"

@@ -2460,3 +2460,53 @@ def test_a_squeezed_probe_cannot_record_the_agent_as_silent():
     # squeezed below its configured 5s, so none of them may convict.
     with pytest.raises(AwsUnknownState):
         rt.resume(slot, budget_s=4.5)
+
+
+def test_early_silence_while_parked_cannot_convict_a_later_running_instance():
+    """The two evidence flags were CUMULATIVE across the whole resume, so they could be satisfied by
+    different phases. A hibernate resume that begins from `stopped` legitimately fails its first
+    full-duration probes; if the instance only reaches `running` near the deadline, that early
+    silence paired with the late running-observation raised a hard error and terminated a healthy
+    instance which was never given a full probe after it started (upstream P2)."""
+    from blastbox.host.runtime.aws_worker import (
+        AwsUnknownState,
+        Ec2HibernateConfig,
+        Ec2HibernateRuntime,
+    )
+
+    tick = [100.0]
+    state = {"name": "stopped"}
+    probes: list[bool] = []
+
+    def clock():
+        return tick[0]
+
+    def runner(argv, timeout):  # noqa: ANN001
+        argv = list(argv); op = f"{argv[1]} {argv[2]}"
+        tick[0] += 1.0
+        if op == "sts get-caller-identity":
+            return _cp(stdout=json.dumps({"Account": "1", "Arn": "arn:aws:iam::1:user/x"}))
+        if op == "ec2 describe-instances":
+            # it only comes up near the very end of the window
+            if tick[0] > 126.0:      # up only in the last few seconds of the 30s window
+                state["name"] = "running"
+            return _cp(stdout=json.dumps({"Reservations": [{"Instances": [
+                {"InstanceId": "i-1", "State": {"Name": state["name"]},
+                 "PrivateIpAddress": "10.0.0.5"}]}]}))
+        return _cp(stdout="{}")
+
+    def probe(url, headers, timeout):  # noqa: ANN001
+        probes.append(state["name"] == "running")
+        return False              # never answers -- but it was parked for almost all of them
+
+    rt = Ec2HibernateRuntime(Ec2HibernateConfig(region="us-east-1", image_id="ami-0abc",
+                                                # a 5s probe cannot fit in the <4s that remains
+                                                # once it finally comes up, so every probe after
+                                                # that point is squeezed -> UNKNOWN, not silence
+                                                resume_timeout_s=30.0, resume_poll_s=0.0,
+                                                probe_timeout_s=5.0),
+                             aws_runner=runner, http_probe=probe, clock=clock)
+    slot = AwsWorkerSlot(slot_id="h1", resource_id="i-1", state=SlotState.ASSIGNED, ip="10.0.0.5")
+    with pytest.raises(AwsUnknownState):
+        rt.resume(slot)
+    assert probes, "the agent was never probed at all"
