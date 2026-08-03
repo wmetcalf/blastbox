@@ -1736,7 +1736,7 @@ def test_f8_a_resume_that_fails_on_a_healthy_control_plane_is_still_a_real_failu
                            "lambda-microvms resume-microvm": {}},
                           probe=lambda u, h, t: False,
                           clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
-                          resume_timeout_s=5.0)
+                          resume_timeout_s=60.0)
     slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
                          url="http://10.0.0.1:8080")
     with pytest.raises(AwsWorkerError) as ei:
@@ -1845,7 +1845,7 @@ def test_f19_a_recovered_control_plane_clears_a_stale_unknown():
                            "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
                           probe=lambda u, h, t: False,          # agent never comes up
                           clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
-                          resume_timeout_s=5.0)
+                          resume_timeout_s=60.0)
     slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
                          url="http://10.0.0.1:8080")
     with pytest.raises(AwsWorkerError) as ei:
@@ -1925,7 +1925,7 @@ def test_f24_a_running_microvm_with_a_dead_agent_is_a_confirmed_failure():
                                _cp(rc=255, stderr="An error occurred (ConflictException): not SUSPENDED")},
                           probe=lambda u, h, t: False,          # the agent is dead
                           clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
-                          resume_timeout_s=5.0)
+                          resume_timeout_s=60.0)
     slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
                          url="http://10.0.0.1:8080")
     with pytest.raises(AwsWorkerError) as ei:
@@ -2086,7 +2086,7 @@ def test_a_probe_we_could_not_issue_never_convicts_the_worker():
                            "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
                           probe=lambda u, h, t: None,      # could not even ask
                           clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
-                          resume_timeout_s=5.0)
+                          resume_timeout_s=60.0)
     slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
                          url="http://10.0.0.1:8080")
     with pytest.raises(AwsUnknownState):
@@ -2099,7 +2099,7 @@ def test_a_probe_we_could_not_issue_never_convicts_the_worker():
                             "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
                            probe=lambda u, h, t: False,
                            clock=lambda: tick2.__setitem__(0, tick2[0] + 0.05) or tick2[0],
-                           resume_timeout_s=5.0)
+                           resume_timeout_s=60.0)
     slot2 = AwsWorkerSlot(slot_id="p2", resource_id="mv-2", state=SlotState.ASSIGNED,
                           url="http://10.0.0.1:8080")
     with pytest.raises(AwsWorkerError) as ei:
@@ -2409,3 +2409,54 @@ def test_an_unknown_verdict_is_cached_at_COMPLETION_not_at_start():
         f"UNKNOWN cached with a pre-call timestamp ({stamped} <= {started}); the entry is born "
         f"expired and the next tick re-probes immediately")
     assert stamped >= tick[0] - 1e-6
+
+
+def test_a_confirmed_dead_microvm_is_retired_not_handed_back():
+    """The strongest evidence of all is AWS saying the resource is GONE. Simplifying the classifier
+    to "agent silent on a fair window" swallowed that into UNKNOWN, so a husk AWS had explicitly
+    confirmed dead was unclaimed and retried forever instead of retired and replaced (upstream P2)."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+
+    tick = [100.0]
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm":
+                               _cp(rc=254, stderr="An error occurred (ResourceNotFoundException)"),
+                           "lambda-microvms resume-microvm": {},
+                           "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                          probe=lambda u, h, t: False,
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
+                          resume_timeout_s=60.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsWorkerError) as ei:
+        rt.resume(slot)
+    assert not isinstance(ei.value, AwsUnknownState), (
+        "a microVM AWS confirmed GONE was handed back as unknown instead of retired")
+
+
+def test_a_squeezed_probe_cannot_record_the_agent_as_silent():
+    """Fairness was decided before the forced token mint and describes consumed part of the window,
+    so a window fair at the top could still squeeze the probe below probe_timeout_s -- and a healthy
+    agent 'timing out' purely from that truncation was recorded as silent and its slot terminated.
+    Only a FULL-duration probe may convict (upstream P2)."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+
+    # The probe must NOT consume the window itself, or it starves the describe that sets saw_up and
+    # the test passes for that reason instead of the one under test.
+    AGENT_NEEDS = 4.8
+    tick = [100.0]
+
+    def _slow_agent(url, headers, timeout):  # noqa: ANN001
+        return timeout >= AGENT_NEEDS
+
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "RUNNING", "endpoint": "vm.x"},
+                           "lambda-microvms resume-microvm": {},
+                           "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                          probe=_slow_agent,
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
+                          resume_timeout_s=60.0, probe_timeout_s=5.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    # ~4.5s left: the control plane still answers (saw_up becomes True), but every agent probe is
+    # squeezed below its configured 5s, so none of them may convict.
+    with pytest.raises(AwsUnknownState):
+        rt.resume(slot, budget_s=4.5)

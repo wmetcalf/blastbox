@@ -2719,3 +2719,72 @@ def test_the_unknown_clock_is_not_backdated_across_a_slow_health_pass():
     assert reaped == [], (
         f"escalated on backdated time: every slot has been unknown for one 160s pass, inside the "
         f"200s grace, yet these were reaped: {reaped}")
+
+
+def test_a_stale_health_result_is_dropped_when_a_claim_took_the_slot():
+    """Taking the lock only SERIALISES the writes, it does not ORDER them: a probe that began while
+    the slot was IDLE could still stamp _unknown_since after a concurrent claim cleared it. That
+    stale stamp then ages untouched for the whole job, so the first UNKNOWN after release exceeds
+    the grace at once and evicts a worker that has been serving the entire time (upstream P2)."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            # simulate the claim landing WHILE this probe is in flight
+            slot.state = SlotState.ASSIGNED
+            return None
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    clock = [1000.0]
+    pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0])
+    pool._slots["s1"] = _slot("s1", SlotState.IDLE)
+    pool._health_check()
+    assert "s1" not in pool._unknown_since, (
+        "a health result that lost the race to a claim was written anyway, and will age while the "
+        "slot is ASSIGNED")
+
+
+def test_the_wedged_after_threshold_exceeds_one_reap_call():
+    """A disposal is a remote call bounded by the runtime's cli_timeout_s (120s by default). A flat
+    60s threshold declares a perfectly healthy slow reap wedged and spawns a replacement beside it,
+    so _MAX_REAPERS stops bounding concurrency during exactly the control-plane slowdown where
+    extra CLI calls amplify the outage (upstream P2)."""
+    from types import SimpleNamespace
+
+    from blastbox.host.pool import WarmPool
+
+    class _Rt:
+        kind = "test"
+        cfg = SimpleNamespace(cli_timeout_s=120.0)
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    assert pool._reaper_wedged_after_s() > 120.0, (
+        "a legitimate 120s disposal would be declared wedged and replaced mid-flight")
+
+    class _NoCfg(_Rt):
+        cfg = None
+
+    assert WarmPool(runtime=_NoCfg(), warm_size=0)._reaper_wedged_after_s() == \
+        WarmPool._REAPER_WEDGED_AFTER_S      # runtimes without a cfg keep the floor

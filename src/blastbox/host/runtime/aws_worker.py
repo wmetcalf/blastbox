@@ -872,7 +872,17 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
         url = slot.url.rstrip("/") + self.cfg.agent_health_path
         headers = {"X-aws-proxy-auth": token, "X-aws-proxy-port": str(self.cfg.agent_port)}
         _t = self._probe_timeout()
-        return None if _t is None else self._probe(url, headers, _t)
+        if _t is None:
+            return None
+        answer = self._probe(url, headers, _t)
+        # A NEGATIVE answer only counts when the probe got its CONFIGURED duration. Fairness is
+        # decided before the forced token mint and the describes consume part of the window, so a
+        # window that was fair at the top can still squeeze the probe below probe_timeout_s -- and a
+        # healthy agent that "times out" purely because of that truncation would be recorded as
+        # silent and the slot terminated (upstream P2). A POSITIVE answer is proof either way.
+        if answer is False and _t < float(self.cfg.probe_timeout_s):
+            return None
+        return answer
 
     def is_alive(self, slot: AwsWorkerSlot) -> "bool | None":
         """Refresh the JWE past half its TTL so an IDLE warm slot's token can't expire before its job
@@ -1105,7 +1115,17 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         url = slot.url.rstrip("/") + self.cfg.agent_health_path
         headers = {"X-aws-proxy-auth": token, "X-aws-proxy-port": str(self.cfg.agent_port)}
         _t = self._probe_timeout()
-        return None if _t is None else self._probe(url, headers, _t)
+        if _t is None:
+            return None
+        answer = self._probe(url, headers, _t)
+        # A NEGATIVE answer only counts when the probe got its CONFIGURED duration. Fairness is
+        # decided before the forced token mint and the describes consume part of the window, so a
+        # window that was fair at the top can still squeeze the probe below probe_timeout_s -- and a
+        # healthy agent that "times out" purely because of that truncation would be recorded as
+        # silent and the slot terminated (upstream P2). A POSITIVE answer is proof either way.
+        if answer is False and _t < float(self.cfg.probe_timeout_s):
+            return None
+        return answer
 
     def is_alive(self, slot: AwsWorkerSlot) -> "bool | None":
         # Skip the LambdaMicroVmRuntime JWE-refresh: minting a token requires RUNNING, so it would fail
@@ -1134,7 +1154,11 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         it is tolerant of a wrong-state target (already running / stale state), so a genuinely-parked slot
         that get-microvm still misreports is actually woken even with autoResumeEnabled=false."""
         import time
-        self._resolve_url(slot)     # stable endpoint, addressable even while transitioning
+        # _resolve_url does a describe. Outside the budget it ran at the full cli_timeout_s before
+        # any window applied -- the same prelude leak already fixed on the hibernate tier.
+        with self._call_budget(self.cfg.resume_timeout_s if budget_s is None
+                               else min(self.cfg.resume_timeout_s, max(0.0, float(budget_s)))):
+            self._resolve_url(slot)   # stable endpoint, addressable even while transitioning
         slot.auth_token = None      # a JWE minted while suspended is invalid; force a fresh mint once awake
         # The runtime's resume_timeout_s is a CEILING; the dispatcher's remaining claim window wins
         # when it is shorter, so one unreachable slot cannot burn the whole window and starve the
@@ -1156,13 +1180,11 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # verdict was therefore unconditionally UNKNOWN and the dead-agent path became unreachable
         # (issue #77 marla-loop 2). A window shorter than the fairness floor is not evidence about
         # the worker; anything at or above it is.
-        # A window is FAIR iff it can afford at least one FULL agent probe. Derived from
-        # probe_timeout_s rather than a magic constant, which makes the guarantee explicit: when
-        # fair, the first probe is never squeezed, so a negative answer is genuinely about the
-        # worker. An earlier revision carried a separate "was this probe truncated" rule alongside a
-        # fixed 5.0s floor -- with the default probe_timeout_s also 5.0 that rule could never fire,
-        # i.e. it was dead code guarding a case this single condition already covers.
-        unfair = budget < min(self.cfg.resume_timeout_s, float(self.cfg.probe_timeout_s))
+        # NB there is deliberately no "was this window fair" term any more. Fairness was a
+        # threshold standing in for "could a full-duration agent probe fit", and every version of
+        # it landed on the wrong side of the cliff for some config. The probe itself now answers
+        # that question directly: _health_ok only reports a negative when it got its configured
+        # duration, so a window too small to issue one simply never produces convicting evidence.
         saw_up = False      # did the control plane ever CONFIRM this worker up during the window?
         # ...and did we ever actually GET TO ASK the agent? A probe that RAN and came back silent is
         # positive evidence the worker is bad. A probe we could never even issue -- because the
@@ -1250,8 +1272,18 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # first; it was a latent hazard resting on an unrelated interaction, not on the rule. I
         # could not construct a reaching test, so this is stated as a single positive-evidence rule
         # rather than guarded by a branch no test can hold honest (escalated codex, loop 4).
+        # Two kinds of positive evidence, not one. Simplifying to "agent silent on a fair window"
+        # dropped the strongest signal there is: AWS explicitly answering that the resource is GONE
+        # (ResourceNotFoundException -> a plain AwsWorkerError from _aws). That was being swallowed
+        # into UNKNOWN, so a husk AWS had confirmed dead was unclaimed and retried forever instead
+        # of retired and replaced (upstream P2).
+        confirmed_dead = (isinstance(last_exc, AwsWorkerError)
+                          and not isinstance(last_exc, AwsUnknownState))
+        # No separate fairness term: saw_agent_silent is only set by a FULL-duration probe, so a
+        # window too small to issue one can never convict. That is what "unfair" was approximating
+        # with a threshold, and it kept landing on the wrong side of the cliff.
         exc_type = (AwsWorkerError
-                    if (saw_up and saw_agent_silent and not unfair)
+                    if (confirmed_dead or (saw_up and saw_agent_silent))
                     else AwsUnknownState)
         raise exc_type(
             f"snapstart slot {slot.slot_id} not ready within {self.cfg.resume_timeout_s:.0f}s: {last_exc}"
@@ -1390,7 +1422,17 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
         url = f"{scheme}://{slot.ip}:{self.cfg.agent_port}{self.cfg.agent_health_path}"
         headers = {"X-aws-proxy-auth": self.cfg.agent_token} if self.cfg.agent_token else {}
         _t = self._probe_timeout()
-        return None if _t is None else self._probe(url, headers, _t)
+        if _t is None:
+            return None
+        answer = self._probe(url, headers, _t)
+        # A NEGATIVE answer only counts when the probe got its CONFIGURED duration. Fairness is
+        # decided before the forced token mint and the describes consume part of the window, so a
+        # window that was fair at the top can still squeeze the probe below probe_timeout_s -- and a
+        # healthy agent that "times out" purely because of that truncation would be recorded as
+        # silent and the slot terminated (upstream P2). A POSITIVE answer is proof either way.
+        if answer is False and _t < float(self.cfg.probe_timeout_s):
+            return None
+        return answer
 
     def _extra_launch_args(self) -> list[str]:
         """Extra `run-instances` args a subclass appends (base: none). The hibernate tier adds
@@ -1541,7 +1583,17 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         url = f"{scheme}://{slot.ip}:{self.cfg.agent_port}{self.cfg.agent_health_path}"
         headers = {"X-aws-proxy-auth": self.cfg.agent_token} if self.cfg.agent_token else {}
         _t = self._probe_timeout()
-        return None if _t is None else self._probe(url, headers, _t)
+        if _t is None:
+            return None
+        answer = self._probe(url, headers, _t)
+        # A NEGATIVE answer only counts when the probe got its CONFIGURED duration. Fairness is
+        # decided before the forced token mint and the describes consume part of the window, so a
+        # window that was fair at the top can still squeeze the probe below probe_timeout_s -- and a
+        # healthy agent that "times out" purely because of that truncation would be recorded as
+        # silent and the slot terminated (upstream P2). A POSITIVE answer is proof either way.
+        if answer is False and _t < float(self.cfg.probe_timeout_s):
+            return None
+        return answer
 
     def _try_park(self, slot: AwsWorkerSlot) -> bool:
         """Issue the THROTTLED ``stop --hibernate`` that parks a warmed slot. True iff it was accepted.
@@ -1650,13 +1702,11 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # verdict was therefore unconditionally UNKNOWN and the dead-agent path became unreachable
         # (issue #77 marla-loop 2). A window shorter than the fairness floor is not evidence about
         # the worker; anything at or above it is.
-        # A window is FAIR iff it can afford at least one FULL agent probe. Derived from
-        # probe_timeout_s rather than a magic constant, which makes the guarantee explicit: when
-        # fair, the first probe is never squeezed, so a negative answer is genuinely about the
-        # worker. An earlier revision carried a separate "was this probe truncated" rule alongside a
-        # fixed 5.0s floor -- with the default probe_timeout_s also 5.0 that rule could never fire,
-        # i.e. it was dead code guarding a case this single condition already covers.
-        unfair = budget < min(self.cfg.resume_timeout_s, float(self.cfg.probe_timeout_s))
+        # NB there is deliberately no "was this window fair" term any more. Fairness was a
+        # threshold standing in for "could a full-duration agent probe fit", and every version of
+        # it landed on the wrong side of the cliff for some config. The probe itself now answers
+        # that question directly: _health_ok only reports a negative when it got its configured
+        # duration, so a window too small to issue one simply never produces convicting evidence.
         saw_up = False      # did the control plane ever CONFIRM this worker up during the window?
         # ...and did we ever actually GET TO ASK the agent? A probe that RAN and came back silent is
         # positive evidence the worker is bad. A probe we could never even issue -- because the
@@ -1723,8 +1773,18 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # first; it was a latent hazard resting on an unrelated interaction, not on the rule. I
         # could not construct a reaching test, so this is stated as a single positive-evidence rule
         # rather than guarded by a branch no test can hold honest (escalated codex, loop 4).
+        # Two kinds of positive evidence, not one. Simplifying to "agent silent on a fair window"
+        # dropped the strongest signal there is: AWS explicitly answering that the resource is GONE
+        # (ResourceNotFoundException -> a plain AwsWorkerError from _aws). That was being swallowed
+        # into UNKNOWN, so a husk AWS had confirmed dead was unclaimed and retried forever instead
+        # of retired and replaced (upstream P2).
+        confirmed_dead = (isinstance(last_exc, AwsWorkerError)
+                          and not isinstance(last_exc, AwsUnknownState))
+        # No separate fairness term: saw_agent_silent is only set by a FULL-duration probe, so a
+        # window too small to issue one can never convict. That is what "unfair" was approximating
+        # with a threshold, and it kept landing on the wrong side of the cliff.
         exc_type = (AwsWorkerError
-                    if (saw_up and saw_agent_silent and not unfair)
+                    if (confirmed_dead or (saw_up and saw_agent_silent))
                     else AwsUnknownState)
         raise exc_type(
             f"ec2-hibernate slot {slot.slot_id} not ready within {self.cfg.resume_timeout_s:.0f}s: {last_exc}"

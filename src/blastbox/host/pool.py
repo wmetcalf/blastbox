@@ -591,6 +591,10 @@ class WarmPool:
     # _MAX_REAPERS, so four stuck disposals can't permanently stop the queue draining (issue #77).
     # The thread is abandoned, not killed — Python cannot interrupt a blocking call — but its slot
     # in the pool is freed so healthy husks keep getting disposed.
+    # Must exceed ONE legitimate disposal, or a merely-slow reap is declared wedged and replaced --
+    # so _MAX_REAPERS stops bounding concurrency during exactly the control-plane slowdown where
+    # extra CLI calls and threads amplify the outage (upstream P2). Derived from the runtime's own
+    # call timeout where it exposes one, with this as the floor.
     _REAPER_WEDGED_AFTER_S = 60.0
     # HARD ceiling on live reaper threads, wedged ones INCLUDED. Without it the watchdog above
     # removes the only bound: a wedged reaper stops counting toward _MAX_REAPERS but never exits and
@@ -619,9 +623,10 @@ class WarmPool:
             # Count only reapers that are still making progress. One wedged in a hung terminate is
             # abandoned (Python can't interrupt it) but must not hold a slot in the pool forever,
             # or four stuck disposals stop the queue draining for the life of the pool (issue #77).
+            wedged_after = self._reaper_wedged_after_s()
             live = 0
             for entry in self._reaper_threads:
-                if now - entry[1] < self._REAPER_WEDGED_AFTER_S:
+                if now - entry[1] < wedged_after:
                     live += 1
                 else:
                     # RETIRE it. Dropping a wedged reaper from the progress count lets replacements
@@ -653,6 +658,18 @@ class WarmPool:
                 # reapers and over-spawn past _MAX_REAPERS. start() does not take _lock — the new
                 # thread just blocks on its first acquisition until we release here.
                 t.start()
+
+    def _reaper_wedged_after_s(self) -> float:
+        """How long a reaper may make no progress before it is presumed wedged.
+
+        A disposal is a remote call: the AWS tiers bound theirs at cli_timeout_s (120s by default),
+        so a flat 60s threshold declares a perfectly healthy slow reap wedged and spawns a
+        replacement beside it. Give one call room to finish, twice over."""
+        cfg = getattr(self._runtime, "cfg", None)
+        per_call = getattr(cfg, "cli_timeout_s", None) if cfg is not None else None
+        if per_call is None:
+            return self._REAPER_WEDGED_AFTER_S
+        return max(self._REAPER_WEDGED_AFTER_S, 2.0 * float(per_call))
 
     def _drain_deferred_reaps(self, entry_box: "list | None" = None) -> None:
         """Dispose every queued husk, one at a time, off the tick + claim paths.
@@ -1335,6 +1352,15 @@ class WarmPool:
                 # codex, loop 5).
                 probed_at = self._clock()
                 with self._lock:
+                    # DROP the result if a claim took this slot while we were probing. Taking the
+                    # lock only serialises the writes; it does not ORDER them, so a probe that
+                    # started when the slot was IDLE could still stamp it after a concurrent claim
+                    # cleared the entry -- and that stale stamp then ages untouched for the whole
+                    # job, so the first UNKNOWN after release exceeds the grace at once and evicts a
+                    # worker that has been serving the entire time (upstream P2).
+                    cur = self._slots.get(slot.slot_id)
+                    if cur is not slot or cur.state != SlotState.IDLE:
+                        continue
                     since = self._unknown_since.setdefault(slot.slot_id, probed_at)
                 stuck_for = probed_at - since
                 if self._unknown_grace_s > 0 and stuck_for > self._unknown_grace_s:
