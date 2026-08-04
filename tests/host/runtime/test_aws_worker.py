@@ -2577,3 +2577,34 @@ def test_snapstart_resume_does_not_grant_a_second_full_budget():
     assert spent <= 1.0 * 1.1, (
         f"resume consumed {spent:.2f} clock-seconds against a 1.0s budget — the prelude and the "
         f"loop each got their own window")
+
+
+def test_a_slot_that_suspends_between_passes_is_not_convicted():
+    """Correlating the probe against `state_says_up` used the PREVIOUS pass's observation. A Lambda
+    that auto-suspends between iterations fails its next probe perfectly normally -- and that was
+    banked as silence-while-up before the same pass's describe reported "suspended". The flag is
+    sticky, so the healthy slot was convicted anyway. Silence must be corroborated by the state
+    query that FOLLOWS it in the same pass (upstream P2)."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+
+    # Pass 1: we cannot ASK (probe unknown) but the describe confirms RUNNING -> state is "up".
+    # Between passes the platform auto-suspends. Pass 2: the probe fails -- entirely normal for a
+    # suspended VM -- and the OLD code banked that against pass 1's stale "up" before this pass's
+    # describe reported SUSPENDED.
+    states = iter(["RUNNING"] + ["SUSPENDED"] * 60)
+    probe_answers = iter([None] + [False] * 60)
+    tick = [100.0]
+
+    def describe(argv):  # noqa: ANN001
+        return _cp(stdout=json.dumps({"state": next(states, "SUSPENDED"), "endpoint": "vm.x"}))
+
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": describe,
+                           "lambda-microvms resume-microvm": {},
+                           "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                          probe=lambda u, h, t: next(probe_answers, False),
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
+                          resume_timeout_s=60.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsUnknownState):
+        rt.resume(slot)
