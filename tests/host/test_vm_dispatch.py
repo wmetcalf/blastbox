@@ -1468,3 +1468,41 @@ def test_held_slot_is_retried_against_a_REAL_warmpool():
     assert got is not None, (
         f"the only warm slot was never retried against a real pool (attempts={attempts['n']})")
     assert attempts["n"] >= 2
+
+
+def test_the_release_seam_forwards_the_fault_attribution(tmp_path, monkeypatch):
+    """The transport decides whose failure it was; the pool decides what to do about it. The seam
+    between them must carry the attribution -- dropping it here silently restores the conflated
+    signal, and job failures start counting as evidence against the worker again."""
+    import blastbox.host.runtime.remote_http as rh
+    import blastbox.host.runtime.vm_dispatch as vd
+
+    captured: dict = {}
+
+    def _fake_make_remote_validate(claim, release, **kw):  # noqa: ANN001
+        captured["release"] = release
+        return lambda *a, **k: None
+
+    # imported INSIDE build_remote_vm_dispatcher, so patch it at the source module
+    monkeypatch.setattr(rh, "make_remote_validate", _fake_make_remote_validate)
+
+    seen: list[tuple] = []
+
+    class _Pool:
+        runtime = type("R", (), {"ssl_context": None})()
+
+        def claim(self, *, timeout_s):  # noqa: ANN001
+            return None
+
+        def release(self, slot, *, dirty=False, fault=None):  # noqa: ANN001
+            seen.append((dirty, fault))
+
+    vd.build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _Pool(),
+                                  tier="static", engine="clippyshot", limits=_FAKE_LIMITS)
+    release = captured.get("release")
+    assert release is not None, "the dispatcher never handed its release seam to the transport"
+
+    release(object(), True, "worker")
+    release(object(), True, "job")
+    assert seen == [(True, "worker"), (True, "job")], (
+        f"the seam dropped the attribution on its way to the pool: {seen}")

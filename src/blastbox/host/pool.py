@@ -184,6 +184,8 @@ class WarmPool:
         jobs_per_recycle: int = 1,
         max_jobs_per_slot: int = 0,
         max_consecutive_failures: int = 2,
+        max_evictions_per_window: int | None = None,
+        eviction_window_s: float = 600.0,
         snapshot_rebuild_after: int = 0,
         base_rebuild_cooldown_s: float = 300.0,
     ) -> None:
@@ -211,6 +213,18 @@ class WarmPool:
         # dirty releases gives the pool a way to notice without a liveness probe it does not have:
         # after N in a row, stop trusting the slot and reap it so a genuinely fresh one replaces it.
         self._max_consecutive_failures = max(0, max_consecutive_failures)
+        # (3) Blast radius. Wedge detection is a HEURISTIC over a signal the pool cannot fully
+        # verify, and this file's history is of predicates that looked right in review and then
+        # took whole tiers. Whatever the predicate decides, never let it evict more than this many
+        # slots per window: a wrong signal then costs some churn instead of the warm pool.
+        # Default scales with the tier: you may churn through the warm set ONCE inside a window,
+        # but not over and over. An absolute constant is wrong at both ends -- 2 starves a large
+        # pool's legitimate replacement, and is far too permissive for a warm_size of 1.
+        self._max_evictions_per_window = (
+            max(2, int(warm_size)) if max_evictions_per_window is None
+            else max(0, int(max_evictions_per_window)))
+        self._eviction_window_s = max(0.0, eviction_window_s)
+        self._evictions: list[float] = []
         # Reaping cannot help when the persisted warm BASE is what is poisoned -- every replacement
         # restores the same bad state. After this many dirty releases pool-wide with no intervening
         # success, ask the runtime to discard its base so the next spawn rebuilds it. 0 disables;
@@ -485,7 +499,26 @@ class WarmPool:
             if self._clock() >= deadline:
                 return None
 
-    def release(self, slot: Slot, *, dirty: bool = False) -> None:
+    def _eviction_allowed(self) -> bool:
+        """True if the wedge heuristic may still evict a slot inside the current window.
+
+        Wedge detection is a heuristic over a signal the pool cannot verify. This module's history
+        is of predicates that read correctly in review and then took whole tiers, so the corrective
+        action is bounded independently of how confident the predicate is."""
+        if self._max_evictions_per_window <= 0 or self._eviction_window_s <= 0:
+            return True                     # cap disabled
+        now = self._clock()
+        with self._lock:
+            self._evictions = [ts for ts in self._evictions
+                               if now - ts < self._eviction_window_s]
+            return len(self._evictions) < self._max_evictions_per_window
+
+    def _record_eviction(self) -> None:
+        with self._lock:
+            self._evictions.append(self._clock())
+
+    def release(self, slot: Slot, *, dirty: bool = False,
+                fault: "str | None" = None) -> None:
         """Finish a job on ``slot``.
 
         Default (no ``recycle`` on the runtime): ASSIGNED → DRAINING → reap (warm ≠ reuse); the
@@ -499,14 +532,36 @@ class WarmPool:
         the ``jobs_per_recycle`` boundary) in REUSE mode, so the next job never inherits a wedged or
         contaminated warm worker. In non-reuse mode the slot is reaped anyway, which is already a
         full reset.
+
+        ``fault`` says WHOSE failure it was, and only ``"worker"`` counts toward wedge eviction:
+
+          "worker"  the WORKER is suspect -- a hung validate (dead in-guest agent), a transport
+                    error, a busy-lock held by a stale detonation. Evidence about this slot.
+          "job"     the ENGINE ran and reported a failure on this INPUT. Says nothing about the
+                    worker: on a malware corpus, samples that crash the engine are the workload.
+          "unknown" we cannot attribute it. Treated like "job" -- never destroy a warm worker on a
+                    failure we could not attribute (the invariant this whole module is built on).
+
+        Omitting ``fault`` on a dirty release therefore force-resets the slot exactly as before but
+        does NOT advance it toward eviction. That default is deliberate: a caller that has not been
+        taught to attribute must not be able to reap warm capacity by accident.
         """
+        fault = (fault or "unknown") if dirty else None
         with self._lock:
             slot.jobs += 1
             jobs = slot.jobs
             tracked = slot.slot_id in self._slots
-            if dirty:
+            if dirty and fault == "worker":
+                # ONLY worker-attributed failures are evidence about the slot. Counting job faults
+                # here is what let two bad samples in a row destroy a warm worker with a hundred
+                # clean jobs behind it -- and on this workload two bad samples in a row is routine,
+                # not exceptional.
                 self._slot_failures[slot.slot_id] = self._slot_failures.get(slot.slot_id, 0) + 1
                 self._pool_consecutive_failures += 1
+            elif dirty:
+                # A job/unknown fault still forces a recycle (the slot may be contaminated) but must
+                # not advance it toward eviction, and must not reset its success record either.
+                pass
             else:
                 self._slot_failures.pop(slot.slot_id, None)
                 self._slot_last_success[slot.slot_id] = self._clock()
@@ -523,13 +578,32 @@ class WarmPool:
             and slot_failures >= self._max_consecutive_failures
         )
         if burned_out:
+            # The base-rebuild decision is POOL-wide and belongs to the signal, not to the eviction
+            # budget: refusing to destroy more slots must not also suppress the one action that
+            # fixes a poisoned warm base. Ordered before the cap for exactly that reason.
+            self._maybe_rebuild_base(pool_failures)
+        if burned_out and not self._eviction_allowed():
+            # (3) The heuristic wants this slot gone, but the window's budget is spent. Refuse, and
+            # say so loudly: if the wedge is real the slot keeps failing and the next window takes
+            # it, while a WRONG signal costs some churn instead of the warm tier. No predicate over
+            # a signal the pool cannot verify should be able to empty the pool.
+            logger.error(
+                "pool.eviction_capped slot_id=%s consecutive_worker_failures=%d limit=%d -- "
+                "%d evictions already in the last %.0fs; recycling instead of reaping. If this "
+                "repeats the wedge is real; if it repeats across MANY slots at once, suspect a "
+                "shared cause (inputs, disk, base image) rather than the workers.",
+                slot.slot_id, slot_failures, self._max_consecutive_failures,
+                self._max_evictions_per_window, self._eviction_window_s,
+            )
+            burned_out = False
+        if burned_out:
+            self._record_eviction()
             logger.warning(
-                "pool.slot_burned_out slot_id=%s consecutive_failures=%d limit=%d "
+                "pool.slot_burned_out slot_id=%s fault=worker consecutive_failures=%d limit=%d "
                 "jobs=%d last_success_age=%s -- reaping instead of recycling",
                 slot.slot_id, slot_failures, self._max_consecutive_failures, jobs,
                 ("never" if not last_success else "%.1fs" % (self._clock() - last_success)),
             )
-            self._maybe_rebuild_base(pool_failures)
 
         if callable(self._recycle) and tracked and not burned_out and not (
             self._max_jobs_per_slot and jobs >= self._max_jobs_per_slot
@@ -1400,7 +1474,7 @@ class WarmPool:
                 "pool.base_rebuild_suppressed pool_consecutive_failures=%d since_last_rebuild=%.1fs "
                 "cooldown=%.1fs -- sustained failure that a base rebuild did NOT fix; the cause is "
                 "likely NOT the warm base (check inputs/disk/dependencies)",
-                pool_failures, now - float(last), self._base_rebuild_cooldown_s,
+                pool_failures, now - float(last or now), self._base_rebuild_cooldown_s,
             )
             with self._lock:
                 self._pool_consecutive_failures = 0

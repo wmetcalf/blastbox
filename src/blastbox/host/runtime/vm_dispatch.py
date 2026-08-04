@@ -957,7 +957,12 @@ def _resume_on_claim(pool: Any, slot: Any, *, budget_s: float | None = None) -> 
                     unclaim(slot)
                 raise
         try:
-            pool.release(slot, dirty=True)
+            # A CONFIRMED-dead resume verdict (AWS says the resource is gone / the state is
+            # terminal) is evidence about the WORKER, so it counts toward wedge eviction.
+            try:
+                pool.release(slot, dirty=True, fault="worker")
+            except TypeError:                      # release seam predating fault attribution
+                pool.release(slot, dirty=True)
         except Exception:   # noqa: BLE001 -- release failure must not mask the resume error
             logger.warning("vm_dispatch: releasing un-resumable slot failed", exc_info=True)
         raise
@@ -1161,8 +1166,10 @@ def build_remote_vm_dispatcher(
             raise NoWarmSlot("no warm slot available within claim timeout")   # capacity -> REQUEUE
         return slot
 
-    def _release(slot: Any, dirty: bool = False) -> None:
-        pool.release(slot, dirty=dirty)
+    def _release(slot: Any, dirty: bool = False, fault: str | None = None) -> None:
+        # Forward the transport's attribution through to the pool -- dropping it here would put the
+        # conflated signal straight back (job failures counting as worker evidence).
+        pool.release(slot, dirty=dirty, fault=fault)
 
     sanitize: Callable[[dict[str, str]], dict[str, str]] | None = None
     # the RESOLVED policy the worker's egress is actually provisioned to (None = enforcement opt-out, i.e.

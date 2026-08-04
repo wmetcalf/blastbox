@@ -472,6 +472,9 @@ def make_remote_validate(
             return {"error": _sanitized_failure(exc)}, False
         slot = claim()
         dirty = True  # only a clean, successful round-trip releases the slot as reusable
+        # WHOSE failure was it? "unknown" is the safe default: an unattributed dirty release still
+        # force-resets the slot but never advances it toward eviction (see WarmPool.release).
+        fault = "unknown"
         try:
             base = slot_base_url(slot, tls=ssl_context is not None)
             out_dir = output_dir_for(input_path)
@@ -511,16 +514,19 @@ def make_remote_validate(
                 if sealed.exists():
                     meta = json.loads(sealed.read_text())
             elif meta.get("status") == "engine_error":
+                fault = "job"        # the engine RAN and reported on this input; not the worker
                 # no trust gate to validate the envelope (direct callers / tests) -> can't tell a genuine
                 # engine_error from a faked one, so fail CONSERVATIVELY (dirty).
                 return {"error": "remote engine error"}, False
             dirty = False
             return meta, True
         except WorkerBusy:
+            fault = "worker"         # its lock is held by a stale detonation -> the WORKER is stuck
             # NOT a job failure -- the worker's lock is held by a stale detonation. Propagate so the
             # dispatcher requeues the job (like NoWarmSlot); the finally releases this slot dirty (cooldown).
             raise
         except Exception as exc:  # noqa: BLE001
+            fault = "worker"         # transport failed -> evidence about this worker, not the input
             # transport error after the request may have reached the worker -> the box could still be
             # busy; keep dirty=True so the pool retires/recycles it instead of re-offering immediately.
             _log.warning("remote_http: validate failed: %s", exc)
@@ -529,8 +535,14 @@ def make_remote_validate(
             return {"error": _sanitized_failure(exc)}, False
         finally:
             try:
-                release(slot, dirty=dirty)
-            except TypeError:            # release seam that doesn't accept dirty (legacy callers/tests)
-                release(slot)
+                release(slot, dirty=dirty, fault=fault)
+            except TypeError:
+                # Older release seams accept neither fault nor dirty. Degrade in order, and never
+                # invent an attribution a caller cannot carry: an unattributed dirty release
+                # force-resets the slot but does not advance it toward eviction.
+                try:
+                    release(slot, dirty=dirty)
+                except TypeError:
+                    release(slot)
 
     return validate
