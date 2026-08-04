@@ -183,6 +183,8 @@ class WarmPool:
         unknown_grace_s: float = 300.0,
         jobs_per_recycle: int = 1,
         max_jobs_per_slot: int = 0,
+        max_consecutive_failures: int = 2,
+        snapshot_rebuild_after: int = 0,
     ) -> None:
         self._runtime = runtime
         # Some runtimes (static pool) reuse a long-lived box on reap and care whether the just-finished
@@ -200,6 +202,28 @@ class WarmPool:
         self._recycle = getattr(runtime, "recycle", None)
         self._jobs_per_recycle = max(1, jobs_per_recycle)
         self._max_jobs_per_slot = max_jobs_per_slot
+        # A wedged warm worker is INVISIBLE to is_alive(): the sandbox process is healthy, only the
+        # in-guest agent has stopped answering. release(dirty=True) therefore recycled it (a
+        # snapshot-revert, which restores the SAME persisted base) and republished it to IDLE, so it
+        # took the next job and failed again -- observed as a pool failing 100% of jobs for days,
+        # curable only by restarting the dispatcher (which rebuilds the base). Counting consecutive
+        # dirty releases gives the pool a way to notice without a liveness probe it does not have:
+        # after N in a row, stop trusting the slot and reap it so a genuinely fresh one replaces it.
+        self._max_consecutive_failures = max(0, max_consecutive_failures)
+        # Reaping cannot help when the persisted warm BASE is what is poisoned -- every replacement
+        # restores the same bad state. After this many dirty releases pool-wide with no intervening
+        # success, ask the runtime to discard its base so the next spawn rebuilds it. 0 disables;
+        # default derives from warm_size so it scales with the pool.
+        self._snapshot_rebuild_after = (
+            snapshot_rebuild_after if snapshot_rebuild_after > 0 else max(4, 2 * max(1, warm_size))
+        )
+        self._pool_consecutive_failures = 0
+        self._base_rebuilds = 0
+        # Keyed by slot_id, NOT stored on the slot: runtimes supply their own slot types (e.g.
+        # AwsWorkerSlot) that duck-type the Slot protocol without inheriting its dataclass fields,
+        # so attributes added to Slot are not universally present.
+        self._slot_failures: dict[str, int] = {}
+        self._slot_last_success: dict[str, float] = {}
         self._warm_size = warm_size
         self._concurrent_ceiling = concurrent_ceiling
         self._poll_interval = poll_interval
@@ -395,6 +419,7 @@ class WarmPool:
                 if disposed:   # skip-because-another-thread-owns-it (False) -> leave it for that thread
                     with self._lock:
                         self._slots.pop(slot.slot_id, None)
+                        self._forget_slot_health(slot.slot_id)
 
         # Whatever remains in _slots failed to reap (or is owned by another thread mid-dispose) —
         # a still-live VM the caller must keep reserving for. A wedged background thread means an
@@ -470,8 +495,34 @@ class WarmPool:
             slot.jobs += 1
             jobs = slot.jobs
             tracked = slot.slot_id in self._slots
+            if dirty:
+                self._slot_failures[slot.slot_id] = self._slot_failures.get(slot.slot_id, 0) + 1
+                self._pool_consecutive_failures += 1
+            else:
+                self._slot_failures.pop(slot.slot_id, None)
+                self._slot_last_success[slot.slot_id] = self._clock()
+                self._pool_consecutive_failures = 0
+            slot_failures = self._slot_failures.get(slot.slot_id, 0)
+            pool_failures = self._pool_consecutive_failures
+            last_success = self._slot_last_success.get(slot.slot_id, 0.0)
 
-        if callable(self._recycle) and tracked and not (
+        # A wedged in-guest agent is invisible to is_alive(), so consecutive dirty releases are the
+        # only signal the pool gets. Once a slot hits the limit, do NOT recycle-and-republish it:
+        # fall through to the reap path so the slot is destroyed and genuinely respawned.
+        burned_out = (
+            self._max_consecutive_failures > 0
+            and slot_failures >= self._max_consecutive_failures
+        )
+        if burned_out:
+            logger.warning(
+                "pool.slot_burned_out slot_id=%s consecutive_failures=%d limit=%d "
+                "jobs=%d last_success_age=%s -- reaping instead of recycling",
+                slot.slot_id, slot_failures, self._max_consecutive_failures, jobs,
+                ("never" if not last_success else "%.1fs" % (self._clock() - last_success)),
+            )
+            self._maybe_rebuild_base(pool_failures)
+
+        if callable(self._recycle) and tracked and not burned_out and not (
             self._max_jobs_per_slot and jobs >= self._max_jobs_per_slot
         ):
             try:
@@ -521,6 +572,7 @@ class WarmPool:
             with self._lock:
                 if reaped:
                     self._slots.pop(slot.slot_id, None)
+                    self._forget_slot_health(slot.slot_id)
 
     def unclaim(self, slot: Slot) -> None:
         """Hand an ASSIGNED slot back UNUSED, without disposing it (issue #77).
@@ -559,6 +611,7 @@ class WarmPool:
         with self._lock:
             if reaped:
                 self._slots.pop(slot.slot_id, None)
+                self._forget_slot_health(slot.slot_id)
 
     def tick(self) -> None:
         """One maintenance step: promote WARMING→IDLE, health-check, burst, spawn to deficit.
@@ -751,6 +804,7 @@ class WarmPool:
             if reaped:
                 with self._lock:
                     self._slots.pop(slot.slot_id, None)
+                    self._forget_slot_health(slot.slot_id)
 
     def _runtime_ready(self) -> bool:
         """Kick the warm runtime's async prepare (if any) and report whether it can spawn this
@@ -806,6 +860,7 @@ class WarmPool:
                 # running — exactly the orphan the quarantine policy exists to prevent.
                 if pop_on_success and disposed:
                     self._slots.pop(slot.slot_id, None)
+                    self._forget_slot_health(slot.slot_id)
                 self._reaping.discard(slot.slot_id)
         return True
 
@@ -817,6 +872,24 @@ class WarmPool:
                 counts[s.state] = counts.get(s.state, 0) + 1
             target = self._effective_target_unlocked()
             burst = self._burst_active
+            # Wedged-slot visibility: a slot whose in-guest agent has stopped answering looks
+            # identical to a healthy IDLE one in every other gauge, which is why a 100%-failing
+            # pool went unnoticed for days. Surface the failure state directly.
+            live = set(self._slots)
+            failing = sum(1 for sid, n in self._slot_failures.items() if sid in live and n > 0)
+            worst = max((n for sid, n in self._slot_failures.items() if sid in live), default=0)
+            never_ok = sum(
+                1 for sid, s in self._slots.items()
+                if s.jobs > 0 and not self._slot_last_success.get(sid)
+            )
+            pool_failures = self._pool_consecutive_failures
+            rebuilds = self._base_rebuilds
+        if failing or pool_failures:
+            logger.info(
+                "pool.health slots_failing=%d worst_consecutive=%d never_succeeded=%d "
+                "pool_consecutive_failures=%d base_rebuilds=%d",
+                failing, worst, never_ok, pool_failures, rebuilds,
+            )
         record_pool_state(
             spawning=counts[SlotState.SPAWNING],
             warming=counts[SlotState.WARMING],
@@ -1156,6 +1229,7 @@ class WarmPool:
                 with self._lock:
                     if reaped:
                         self._slots.pop(slot.slot_id, None)
+                        self._forget_slot_health(slot.slot_id)
 
         if newly_idle:
             with self._lock:
@@ -1281,6 +1355,49 @@ class WarmPool:
                     self._first_miss_at = None
                     self._last_miss_at = None
                     logger.info("pool.burst_drained")
+
+    def _forget_slot_health(self, slot_id: str) -> None:
+        """Drop per-slot failure bookkeeping for a slot that has left the pool.
+
+        Called wherever a slot is popped from ``_slots`` so the tracking dicts cannot grow without
+        bound over a long-lived dispatcher (slot ids are per-spawn UUIDs).
+        """
+        self._slot_failures.pop(slot_id, None)
+        self._slot_last_success.pop(slot_id, None)
+
+    def _maybe_rebuild_base(self, pool_failures: int) -> None:
+        """Discard the runtime's persisted warm base after sustained pool-wide failure.
+
+        Reaping a burned-out slot only helps if a FRESH slot would be healthy. When the persisted
+        base itself captured a bad guest state, every replacement restores the same wedge and the
+        tier stays dead until an operator restarts the dispatcher. If the runtime exposes a way to
+        drop that base (``invalidate_base``/``invalidate_snapshot``), call it once the pool has
+        failed ``snapshot_rebuild_after`` times in a row with no intervening success.
+        """
+        if self._snapshot_rebuild_after <= 0 or pool_failures < self._snapshot_rebuild_after:
+            return
+        drop = (getattr(self._runtime, "invalidate_base", None)
+                or getattr(self._runtime, "invalidate_snapshot", None))
+        if not callable(drop):
+            logger.error(
+                "pool.base_rebuild_unavailable pool_consecutive_failures=%d -- runtime %s exposes no "
+                "invalidate_base(); the warm base may be poisoned and only a dispatcher restart can "
+                "rebuild it", pool_failures, type(self._runtime).__name__,
+            )
+            return
+        try:
+            drop()
+        except Exception:
+            logger.exception("pool.base_rebuild_error pool_consecutive_failures=%d", pool_failures)
+            return
+        with self._lock:
+            self._pool_consecutive_failures = 0
+            self._base_rebuilds += 1
+            rebuilds = self._base_rebuilds
+        logger.warning(
+            "pool.base_invalidated pool_consecutive_failures=%d rebuilds=%d -- next spawn rebuilds "
+            "the warm base", pool_failures, rebuilds,
+        )
 
     def _health_check(self) -> None:
         """Evict dead IDLE slots AND stuck WARMING slots so the spawn loop replaces them.
@@ -1434,6 +1551,7 @@ class WarmPool:
                 if reaped:
                     with self._lock:
                         self._slots.pop(slot.slot_id, None)
+                        self._forget_slot_health(slot.slot_id)
 
     def _background_loop(self) -> None:
         """Run tick() repeatedly until stop() is called."""

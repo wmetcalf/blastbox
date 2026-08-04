@@ -145,6 +145,26 @@ class SnapshotManager:
         self._artifact = artifact
         return artifact
 
+    def invalidate(self) -> bool:
+        """Discard the built artifact so the next ``build()`` captures a fresh one.
+
+        The warm base is checkpointed from a live sandbox, so it can capture a guest that was
+        already wedged. Every restore then reproduces that wedge, and because the artifact is
+        cached here forever, reaping and respawning slots cannot recover -- only restarting the
+        process would. Dropping the artifact gives the pool a way to rebuild in place.
+
+        Returns True if a built artifact was actually discarded. Never raises: a failed
+        invalidation must not take down the caller's failure-handling path.
+        """
+        with self._build_lock:
+            had = self._artifact is not None
+            self._artifact = None
+            self._build_error = None
+            # Do not reuse the previous failure backoff: this is a deliberate rebuild request,
+            # not a retry of a build that just failed.
+            self._retry_not_before = 0.0
+        return had
+
     def restore(self, slot_id: object) -> RestoreHandle:
         """Restore the warm snapshot into a fresh per-slot sandbox and return its
         handle. Raises :class:`SnapshotRestoreError` if the snapshot isn't built

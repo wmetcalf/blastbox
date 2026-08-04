@@ -189,6 +189,22 @@ class SnapshotSlotRuntime:
         handle = self._get(slot.slot_id)
         return handle is not None and self._proc_alive(handle)
 
+    def invalidate_base(self) -> None:
+        """Drop the persisted warm snapshot so the next spawn rebuilds it.
+
+        Called by the pool after sustained pool-wide dirty releases: at that point the shared
+        base -- not the individual slots -- is the likely culprit, and slots restored from it are
+        born wedged. ``reap()`` deliberately preserves ``warm.snapshot``/``warm.mem``, so without
+        this the only cure is a dispatcher restart.
+        """
+        drop = getattr(self._manager, "invalidate", None)
+        if not callable(drop):
+            _log.warning("snapshot.invalidate_unsupported manager=%s", type(self._manager).__name__)
+            return
+        discarded = drop()
+        _log.warning("snapshot.base_invalidated had_artifact=%s -- next spawn rebuilds the base",
+                     bool(discarded))
+
     def reap(self, slot: Slot) -> None:
         """Kill the restored microVM (if alive) and remove its per-slot workdir.
 
