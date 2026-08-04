@@ -1268,9 +1268,11 @@ def build_remote_vm_dispatcher(
         logger.warning(
             "vm_dispatch: warm_claim_timeout_s=%.0fs cannot honour the %s tier's declared "
             "resume_timeout_s=%.0fs -- a slot that legitimately takes longer than the claim window "
-            "will be judged on a window it was never given. Raise warm_claim_timeout_s to >= %.0fs "
-            "or lower the tier's resume_timeout_s (issue #81).",
-            float(warm_claim_timeout_s), tier, float(_tier_resume), float(_tier_resume),
+            "is judged on a window it was never given. NOTE the resume budget is "
+            "min(resume_timeout_s, remaining claim window), so RAISING warm_claim_timeout_s alone "
+            "does not close the gap: the tier's own resume_timeout_s must come down to at or below "
+            "the claim window, or the claim path must stop truncating it. Tracking in issue #81.",
+            float(warm_claim_timeout_s), tier, float(_tier_resume),
         )
 
     validate = make_remote_validate(

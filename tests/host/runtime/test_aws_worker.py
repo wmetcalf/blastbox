@@ -2649,3 +2649,67 @@ def test_a_mint_unknown_reaches_the_pool_from_the_HEALTH_path_too():
                          url="http://10.0.0.1:8080", auth_token="aged")
     slot.token_minted_at = -1e9        # far past half-TTL -> forces a re-mint, which is throttled
     assert rt.is_alive(slot) is None, "a throttled mint was reported as a healthy slot"
+
+
+def test_hibernate_can_still_convict_a_dead_agent():
+    """Guards a REGRESSION I shipped: a `starved` guard meant to protect slow thaws was a tautology
+    (budget = min(resume_timeout_s, budget_s) - prelude, so it was true for EVERY budget including
+    None), and it cleared silence unconditionally -- the hibernate tier could not convict a dead
+    agent at all. It survived a revert that removed only the snapstart copy, which is exactly the
+    fix-one-tier-skip-the-sibling shape this branch keeps producing."""
+    from blastbox.host.runtime.aws_worker import (
+        AwsUnknownState,
+        Ec2HibernateConfig,
+        Ec2HibernateRuntime,
+    )
+
+    tick = [100.0]
+
+    def runner(argv, timeout):  # noqa: ANN001
+        tick[0] += 0.5
+        argv = list(argv)
+        if f"{argv[1]} {argv[2]}" == "sts get-caller-identity":
+            return _cp(stdout=json.dumps({"Account": "1", "Arn": "arn:aws:iam::1:user/x"}))
+        return _cp(stdout=json.dumps({"Reservations": [{"Instances": [
+            {"InstanceId": "i-1", "State": {"Name": "running"},
+             "PrivateIpAddress": "10.0.0.5"}]}]}))
+
+    def probe(url, headers, timeout):  # noqa: ANN001
+        tick[0] += 1.0
+        return False                    # the instance is up; its agent is genuinely dead
+
+    rt = Ec2HibernateRuntime(Ec2HibernateConfig(region="us-east-1", image_id="ami-0abc",
+                                                resume_timeout_s=20.0, resume_poll_s=0.0,
+                                                probe_timeout_s=1.0),
+                             aws_runner=runner, http_probe=probe, clock=lambda: tick[0])
+    slot = AwsWorkerSlot(slot_id="h1", resource_id="i-1", state=SlotState.ASSIGNED, ip="10.0.0.5")
+    with pytest.raises(AwsWorkerError) as ei:
+        rt.resume(slot)
+    assert not isinstance(ei.value, AwsUnknownState), (
+        "a RUNNING instance whose agent never answers a full-duration probe must be retired")
+
+
+def test_snapstart_unresolved_endpoint_is_unknown_with_zero_probes():
+    """The sibling of the EC2 no-IP fix, on the DEFAULT warm tier. _health_ok returned a bare False
+    when the endpoint had not surfaced -- no probe issued at all -- and same-pass corroboration
+    promoted that to a conviction, terminating a healthy RUNNING microVM with ZERO agent probes
+    ever sent."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+
+    probes = [0]
+    tick = [100.0]
+
+    def probe(url, headers, timeout):  # noqa: ANN001
+        probes[0] += 1
+        return False
+
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "RUNNING"},   # no endpoint yet
+                           "lambda-microvms resume-microvm": {},
+                           "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                          probe=probe,
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
+                          resume_timeout_s=5.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED)
+    with pytest.raises(AwsUnknownState):
+        rt.resume(slot)
+    assert probes[0] == 0, f"convicted after issuing {probes[0]} probes — it issued none"
