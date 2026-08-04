@@ -242,6 +242,12 @@ class WarmPool:
         # boot storm. 0 disables the cooldown.
         self._base_rebuild_cooldown_s = max(0.0, base_rebuild_cooldown_s)
         self._last_base_rebuild_at: float | None = None
+        # Consecutive runtime.spawn() failures. A base broken badly enough that RESTORES fail never
+        # produces a slot, so no job is ever dispatched and no dirty release happens -- the
+        # job-failure counter stays at zero while the tier sits at zero capacity forever. Spawn
+        # failures must feed base invalidation too: "cannot restore the base" is even stronger
+        # evidence the base is bad than "jobs restored from it fail".
+        self._spawn_consecutive_failures = 0
         # Keyed by slot_id, NOT stored on the slot: runtimes supply their own slot types (e.g.
         # AwsWorkerSlot) that duck-type the Slot protocol without inheriting its dataclass fields,
         # so attributes added to Slot are not universally present.
@@ -1358,11 +1364,17 @@ class WarmPool:
 
             try:
                 slot = self._runtime.spawn()
+                with self._lock:
+                    self._spawn_consecutive_failures = 0
                 slot.state = SlotState.WARMING
                 slot.spawned_at = self._clock()
                 record_slot_spawned()
             except Exception:
                 logger.exception("pool.spawn_failed")
+                with self._lock:
+                    self._spawn_consecutive_failures += 1
+                    spawn_failures = self._spawn_consecutive_failures
+                self._maybe_rebuild_base(spawn_failures, reason="spawn")
                 continue
 
             # Publish under the lock, BUT only if shutdown hasn't begun AND we're still under
@@ -1448,7 +1460,7 @@ class WarmPool:
         self._slot_failures.pop(slot_id, None)
         self._slot_last_success.pop(slot_id, None)
 
-    def _maybe_rebuild_base(self, pool_failures: int) -> None:
+    def _maybe_rebuild_base(self, pool_failures: int, *, reason: str = "job") -> None:
         """Discard the runtime's persisted warm base after sustained pool-wide failure.
 
         Reaping a burned-out slot only helps if a FRESH slot would be healthy. When the persisted
@@ -1477,7 +1489,10 @@ class WarmPool:
                 pool_failures, now - float(last or now), self._base_rebuild_cooldown_s,
             )
             with self._lock:
-                self._pool_consecutive_failures = 0
+                if reason == "spawn":
+                    self._spawn_consecutive_failures = 0
+                else:
+                    self._pool_consecutive_failures = 0
             return
         drop = (getattr(self._runtime, "invalidate_base", None)
                 or getattr(self._runtime, "invalidate_snapshot", None))
@@ -1494,13 +1509,16 @@ class WarmPool:
             logger.exception("pool.base_rebuild_error pool_consecutive_failures=%d", pool_failures)
             return
         with self._lock:
-            self._pool_consecutive_failures = 0
+            if reason == "spawn":
+                self._spawn_consecutive_failures = 0
+            else:
+                self._pool_consecutive_failures = 0
             self._base_rebuilds += 1
             self._last_base_rebuild_at = now
             rebuilds = self._base_rebuilds
         logger.warning(
-            "pool.base_invalidated pool_consecutive_failures=%d rebuilds=%d -- next spawn rebuilds "
-            "the warm base", pool_failures, rebuilds,
+            "pool.base_invalidated reason=%s consecutive_failures=%d rebuilds=%d -- next spawn "
+            "rebuilds the warm base", reason, pool_failures, rebuilds,
         )
 
     def _health_check(self) -> None:

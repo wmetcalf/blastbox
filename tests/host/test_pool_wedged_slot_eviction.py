@@ -331,3 +331,67 @@ def test_evictions_are_capped_per_window():
             if got is None:
                 break
     assert len(reaped) <= 1, f"the eviction cap did not hold: {reaped}"
+
+
+def test_repeated_restore_failures_invalidate_the_base() -> None:
+    """A base too broken to RESTORE must still get rebuilt.
+
+    Job-failure counting cannot see this case: if spawn() raises, no slot ever reaches IDLE, so
+    no job is dispatched and no dirty release happens. The tier sits at zero capacity, logging
+    pool.spawn_failed forever, while the counter that would trigger a rebuild stays at zero --
+    even though "cannot restore the base" is stronger evidence the base is bad than "jobs
+    restored from it fail". Discovered while fault-injecting a corrupted snapshot on a real host.
+    """
+    class _BrokenRestore(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.spawn_attempts = 0
+
+        def spawn(self) -> Slot:
+            self.spawn_attempts += 1
+            raise RuntimeError("snapshot restore failed: corrupt warm.mem")
+
+    rt = _BrokenRestore()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4,
+        max_consecutive_failures=2, snapshot_rebuild_after=3,
+        base_rebuild_cooldown_s=0.0,   # isolate the trigger from the cooldown
+    )
+
+    for _ in range(12):
+        pool.tick()
+
+    assert rt.spawn_attempts >= 3, "expected the pool to keep retrying spawns"
+    assert rt.base_invalidations >= 1, (
+        "repeated restore failures must invalidate the base -- otherwise a corrupt base leaves "
+        "the tier at zero capacity indefinitely and only a process restart recovers it"
+    )
+
+
+def test_a_successful_spawn_resets_the_restore_failure_streak() -> None:
+    """Transient restore failures must not accumulate into a needless rebuild."""
+    class _FlakyRestore(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def spawn(self) -> Slot:
+            self.calls += 1
+            if self.calls % 2 == 1:      # fail, succeed, fail, succeed, ...
+                raise RuntimeError("transient restore failure")
+            return super().spawn()
+
+    rt = _FlakyRestore()
+    pool = WarmPool(
+        runtime=rt, warm_size=1, concurrent_ceiling=4,
+        max_consecutive_failures=2, snapshot_rebuild_after=3,
+        base_rebuild_cooldown_s=0.0,
+    )
+
+    for _ in range(12):
+        pool.tick()
+
+    assert rt.base_invalidations == 0, (
+        "alternating failure/success never reaches the consecutive threshold, so the base must "
+        f"not be rebuilt (got {rt.base_invalidations})"
+    )
