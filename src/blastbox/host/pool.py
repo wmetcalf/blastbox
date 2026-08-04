@@ -185,6 +185,7 @@ class WarmPool:
         max_jobs_per_slot: int = 0,
         max_consecutive_failures: int = 2,
         snapshot_rebuild_after: int = 0,
+        base_rebuild_cooldown_s: float = 300.0,
     ) -> None:
         self._runtime = runtime
         # Some runtimes (static pool) reuse a long-lived box on reap and care whether the just-finished
@@ -219,6 +220,14 @@ class WarmPool:
         )
         self._pool_consecutive_failures = 0
         self._base_rebuilds = 0
+        # Rebuilding the base is a full sandbox BOOT (seconds), unlike a slot respawn which is a
+        # cheap snapshot restore. Slot respawn churn is already bounded by the spawn token bucket;
+        # rebuilds are not, so a systemic failure unrelated to the base (bad input class, full disk,
+        # a sick dependency) would otherwise trigger a boot every snapshot_rebuild_after failures
+        # forever. Cool down between rebuilds so a wrong guess costs one boot per window, not a
+        # boot storm. 0 disables the cooldown.
+        self._base_rebuild_cooldown_s = max(0.0, base_rebuild_cooldown_s)
+        self._last_base_rebuild_at: float | None = None
         # Keyed by slot_id, NOT stored on the slot: runtimes supply their own slot types (e.g.
         # AwsWorkerSlot) that duck-type the Slot protocol without inheriting its dataclass fields,
         # so attributes added to Slot are not universally present.
@@ -1376,6 +1385,26 @@ class WarmPool:
         """
         if self._snapshot_rebuild_after <= 0 or pool_failures < self._snapshot_rebuild_after:
             return
+        now = self._clock()
+        with self._lock:
+            last = self._last_base_rebuild_at
+            cooling = (
+                self._base_rebuild_cooldown_s > 0
+                and last is not None
+                and (now - last) < self._base_rebuild_cooldown_s
+            )
+        if cooling:
+            # Keep failing loudly, but do not boot again yet: if the base were the problem, the
+            # previous rebuild would have fixed it, so continued failure points elsewhere.
+            logger.error(
+                "pool.base_rebuild_suppressed pool_consecutive_failures=%d since_last_rebuild=%.1fs "
+                "cooldown=%.1fs -- sustained failure that a base rebuild did NOT fix; the cause is "
+                "likely NOT the warm base (check inputs/disk/dependencies)",
+                pool_failures, now - float(last), self._base_rebuild_cooldown_s,
+            )
+            with self._lock:
+                self._pool_consecutive_failures = 0
+            return
         drop = (getattr(self._runtime, "invalidate_base", None)
                 or getattr(self._runtime, "invalidate_snapshot", None))
         if not callable(drop):
@@ -1393,6 +1422,7 @@ class WarmPool:
         with self._lock:
             self._pool_consecutive_failures = 0
             self._base_rebuilds += 1
+            self._last_base_rebuild_at = now
             rebuilds = self._base_rebuilds
         logger.warning(
             "pool.base_invalidated pool_consecutive_failures=%d rebuilds=%d -- next spawn rebuilds "

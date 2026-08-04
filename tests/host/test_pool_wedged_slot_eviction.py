@@ -179,3 +179,59 @@ def test_base_is_not_invalidated_while_jobs_are_succeeding() -> None:
     assert rt.reaped == [] or all(s in rt.recycled for s in rt.reaped), (
         "healthy slots should be recycled/reused, not reaped for failure"
     )
+
+
+# ---------------------------------------------------------------------------
+# Churn safety: the eviction path must not become a boot storm
+# ---------------------------------------------------------------------------
+
+
+def test_sustained_unrelated_failure_does_not_cause_a_base_rebuild_storm() -> None:
+    """Eviction must not turn a systemic failure into repeated full base boots.
+
+    A base rebuild is a full sandbox boot, unlike a slot respawn (a cheap snapshot restore
+    already bounded by the spawn token bucket). If jobs fail for a reason that has nothing to
+    do with the base -- a bad input class, a full disk, a sick dependency -- the pool would
+    otherwise rebuild every ``snapshot_rebuild_after`` failures indefinitely, which is more
+    damaging than the wedge this eviction exists to fix. One rebuild per cooldown window is
+    enough: if the base were at fault, the first rebuild would have fixed it.
+    """
+    rt = _WedgeableRuntime()
+    now = [1000.0]
+    pool = WarmPool(
+        runtime=rt, warm_size=1, concurrent_ceiling=4,
+        clock=lambda: now[0],
+        max_consecutive_failures=2,
+        snapshot_rebuild_after=2,
+        base_rebuild_cooldown_s=300.0,
+    )
+
+    # 40 consecutive failures inside one cooldown window (clock barely advances).
+    for _ in range(40):
+        pool.tick()
+        pool.tick()
+        slot = pool.claim(timeout_s=0)
+        if slot is None:
+            now[0] += 0.1
+            continue
+        pool.release(slot, dirty=True)
+        now[0] += 0.1
+
+    assert rt.base_invalidations == 1, (
+        "sustained failure inside one cooldown window must rebuild the base at most ONCE, "
+        f"got {rt.base_invalidations} rebuilds (each is a full boot)"
+    )
+
+    # Past the cooldown, a genuinely new episode may rebuild again.
+    now[0] += 301.0
+    for _ in range(4):
+        pool.tick()
+        pool.tick()
+        slot = pool.claim(timeout_s=0)
+        if slot is None:
+            continue
+        pool.release(slot, dirty=True)
+
+    assert rt.base_invalidations == 2, (
+        "after the cooldown elapses a fresh failure episode should be allowed one more rebuild"
+    )
