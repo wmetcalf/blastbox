@@ -2608,3 +2608,44 @@ def test_a_slot_that_suspends_between_passes_is_not_convicted():
                          url="http://10.0.0.1:8080")
     with pytest.raises(AwsUnknownState):
         rt.resume(slot)
+
+
+def test_an_unaddressable_instance_is_unknown_not_silent():
+    """With use_public_ip a just-started instance has no address yet, so NO probe is issued.
+    Reporting False recorded it as agent silence the moment the state query said "running", and a
+    shortened window then terminated a healthy instance that simply was not addressable (P2)."""
+    from blastbox.host.runtime.aws_worker import Ec2HibernateConfig, Ec2HibernateRuntime
+
+    def runner(argv, timeout):  # noqa: ANN001
+        argv = list(argv)
+        if f"{argv[1]} {argv[2]}" == "sts get-caller-identity":
+            return _cp(stdout=json.dumps({"Account": "1", "Arn": "arn:aws:iam::1:user/x"}))
+        return _cp(stdout=json.dumps({"Reservations": [{"Instances": [
+            {"InstanceId": "i-1", "State": {"Name": "running"}}]}]}))   # NO PublicIpAddress yet
+
+    rt = Ec2HibernateRuntime(Ec2HibernateConfig(region="us-east-1", image_id="ami-0abc",
+                                                use_public_ip=True,
+                                                allow_plaintext_public=True),
+                             aws_runner=runner, http_probe=lambda u, h, t: False,
+                             clock=lambda: 100.0)
+    slot = AwsWorkerSlot(slot_id="h1", resource_id="i-1", state=SlotState.ASSIGNED)
+    assert rt._agent_healthy(slot) is None, "no address yet was reported as the agent being silent"
+
+
+def test_a_mint_unknown_reaches_the_pool_from_the_HEALTH_path_too():
+    """The claim hook reports a throttled mint as UNKNOWN so the slot is skipped non-destructively.
+    The health path swallowed the same error and said alive=True, so the pool never started its
+    unknown clock while _spawn_to_deficit kept counting the unclaimable slot -- a warm_size=1 tier
+    requeued jobs indefinitely once the token aged (P2)."""
+    cfg = LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:aws:lambda:us-east-1:aws:x",
+                              allow_default_egress=True)
+    fake = FakeAws({**_IDENT,
+                    "lambda-microvms get-microvm": {"state": "RUNNING"},
+                    "lambda-microvms create-microvm-auth-token":
+                        _cp(rc=255, stderr="An error occurred (ThrottlingException): Rate exceeded")})
+    rt = LambdaMicroVmRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True,
+                              clock=lambda: 100.0)
+    slot = AwsWorkerSlot(slot_id="s1", state=SlotState.IDLE, resource_id="mv-1",
+                         url="http://10.0.0.1:8080", auth_token="aged")
+    slot.token_minted_at = -1e9        # far past half-TTL -> forces a re-mint, which is throttled
+    assert rt.is_alive(slot) is None, "a throttled mint was reported as a healthy slot"

@@ -905,6 +905,15 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
                 # twice health_probe_timeout_s, multiplied across idle slots (upstream P2).
                 try:
                     self._ensure_token(slot)   # refresh only past half-TTL (cached otherwise)
+                except AwsUnknownState:
+                    # The claim hook already reports this as UNKNOWN so the slot is skipped
+                    # non-destructively -- but reporting alive=True here meant the pool never
+                    # started its unknown clock while _spawn_to_deficit kept counting the
+                    # unclaimable slot, so a warm_size=1 tier requeued jobs indefinitely once the
+                    # token aged. Same answer on both paths (upstream P2).
+                    _log.warning("aws.health_mint_unknown slot_id=%s — reporting UNKNOWN",
+                                 slot.slot_id)
+                    return None
                 except (AwsWorkerError, OSError):
                     pass   # best-effort; a real failure surfaces at readiness/detonate
         return alive
@@ -1605,7 +1614,11 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
     def _agent_healthy(self, slot: AwsWorkerSlot) -> "bool | None":
         self._resolve_ip(slot)
         if slot.ip is None:
-            return False
+            # UNKNOWN, not silent: with use_public_ip a just-started instance has no address yet,
+            # so NO probe was issued. Reporting False recorded it as agent silence the moment the
+            # state query said "running", and a shortened window then terminated a healthy instance
+            # that simply was not addressable yet (upstream P2).
+            return None
         scheme = "https" if self.ssl_context else "http"
         url = f"{scheme}://{slot.ip}:{self.cfg.agent_port}{self.cfg.agent_health_path}"
         headers = {"X-aws-proxy-auth": self.cfg.agent_token} if self.cfg.agent_token else {}
@@ -1821,6 +1834,20 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # into UNKNOWN, so a husk AWS had confirmed dead was unclaimed and retried forever instead
         # of retired and replaced (upstream P2).
         confirmed_dead = saw_confirmed_dead or _is_confirmed_dead_exc(last_exc)
+        # We may only convict on silence if the worker got the time ITS OWN TIER says it needs.
+        # The hibernate tier declares resume_timeout_s=180 while the default claim window is 60, so
+        # a 90s thaw accumulates full-duration failed probes for 60s and is terminated -- even
+        # though the tier budgeted 180 and the watchdog reserves it (issue #81, upstream P2).
+        # NB an earlier revision expressed this as `budget < resume_timeout_s` and it was ALWAYS
+        # true, which read as a bug in the rule; it was really this misconfiguration showing
+        # through. build_remote_vm_dispatcher now warns when the window cannot honour a tier.
+        starved = budget + 1e-9 < float(self.cfg.resume_timeout_s)
+        if starved and silent_while_up:
+            _log.warning("%s: resume window %.0fs < the tier's own resume_timeout_s %.0fs -- "
+                         "declining to convict slot %s on silence observed inside a window it was "
+                         "never given (issue #81)", self.kind, budget,
+                         float(self.cfg.resume_timeout_s), slot.slot_id)
+            silent_while_up = False
         # No separate fairness term: silence is only recorded by a FULL-duration probe, so a
         # window too small to issue one can never convict. That is what "unfair" was approximating
         # with a threshold, and it kept landing on the wrong side of the cliff.

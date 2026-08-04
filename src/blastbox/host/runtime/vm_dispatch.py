@@ -1253,6 +1253,26 @@ def build_remote_vm_dispatcher(
         atomic_write_confined(out_dir, "metadata.json",
                               env.model_dump_json(by_alias=True).encode("utf-8"), mode=0o644)
 
+    # A tier that declares it needs longer to resume than the claim window can ever grant is a
+    # CONFIGURATION contradiction, not something the verdict logic can resolve: the hibernate tier
+    # defaults to resume_timeout_s=180 against warm_claim_timeout_s=60, so a 90s thaw accumulates
+    # full-duration failed probes for 60s and is convicted -- even though the tier budgeted 180 and
+    # the watchdog reserves it. Three attempts to express this as a rule inside resume() each
+    # produced the mirror of the previous bug (always-true, then almost-always-false, then
+    # unreachable), because the rule was standing in for a config that cannot be satisfied. Say so
+    # here instead, where it can actually be fixed. See issue #81.
+    _tier_resume = getattr(getattr(pool.runtime, "cfg", None), "resume_timeout_s", None)
+    if _tier_resume is None:
+        _tier_resume = getattr(pool.runtime, "resume_timeout_s", None)
+    if _tier_resume is not None and float(_tier_resume) > float(warm_claim_timeout_s):
+        logger.warning(
+            "vm_dispatch: warm_claim_timeout_s=%.0fs cannot honour the %s tier's declared "
+            "resume_timeout_s=%.0fs -- a slot that legitimately takes longer than the claim window "
+            "will be judged on a window it was never given. Raise warm_claim_timeout_s to >= %.0fs "
+            "or lower the tier's resume_timeout_s (issue #81).",
+            float(warm_claim_timeout_s), tier, float(_tier_resume), float(_tier_resume),
+        )
+
     validate = make_remote_validate(
         _claim, _release,
         output_dir_for=lambda in_path: in_path.parent.parent / "output",
