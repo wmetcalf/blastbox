@@ -25,6 +25,8 @@ Invariants enforced:
 """
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
 import threading
 import time
@@ -32,7 +34,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from blastbox.observability.metrics import (
     record_pool_state,
@@ -80,8 +82,14 @@ class SlotRuntime(Protocol):
         """True once the worker has signalled ready (control_dir/ready)."""
         ...
 
-    def is_alive(self, slot: Slot) -> bool:
-        """True if the underlying process/container is still running."""
+    def is_alive(self, slot: Slot) -> "bool | None":
+        """Tri-state liveness: True = alive, False = CONFIRMED dead, None = UNKNOWN.
+
+        UNKNOWN is not death (issue #77). A runtime that cannot reach its control plane must say
+        None rather than guess: the pool keeps such a slot and asks again, and bounds how long that
+        may last via ``unknown_grace_s`` -- a runtime masking UNKNOWN as True made that impossible
+        and wedged tiers at zero capacity. Local tiers whose check is a process poll always know,
+        and may keep returning a plain bool."""
         ...
 
     def reap(self, slot: Slot) -> None:
@@ -172,6 +180,7 @@ class WarmPool:
         burst_drain_s: float = 60.0,
         warmup_grace_s: float = 30.0,
         warming_timeout_s: float = 120.0,
+        unknown_grace_s: float = 300.0,
         jobs_per_recycle: int = 1,
         max_jobs_per_slot: int = 0,
     ) -> None:
@@ -200,6 +209,11 @@ class WarmPool:
         self._burst_drain_s = burst_drain_s
         self._warmup_grace_s = warmup_grace_s
         self._warming_timeout_s = warming_timeout_s
+        # How long a slot may stay CONTINUOUSLY unknown before the health check gives up on it and
+        # lets it be replaced. Must comfortably outlast a real control-plane brownout (minutes) --
+        # too short and it becomes the destroy-healthy-workers bug #77 fixes; 0 disables escalation
+        # entirely (a slot can then be unknown forever, which wedges the tier -- see _health_check).
+        self._unknown_grace_s = unknown_grace_s
 
         # slot_id → Slot; all mutations under _lock
         self._slots: dict[str, Slot] = {}
@@ -222,12 +236,27 @@ class WarmPool:
         # cached is_alive), so putting the disposal on the tick thread would trade a one-thread
         # stall for a whole-tier outage (no promote/spawn/health-check while a reap hangs).
         self._deferred_reap: set[str] = set()
+        self._budget_kwarg_cache: dict[str, bool] = {}
+        # slot_id -> when it FIRST went UNKNOWN and stayed that way (cleared by any definitive
+        # answer). Bounds how long "we can't tell" may keep a slot alive; see _health_check.
+        self._unknown_since: dict[str, float] = {}
+        # Slots escalated on SUSPICION (a long UNKNOWN) rather than a confirmed verdict. Disposal is
+        # asynchronous now, so this must outlive the tick that queued it -- the reaper needs to know
+        # not to strand a slot it merely could not dispose of.
+        self._suspected_unknown: set[str] = set()
         # Bounded pool of disposal threads. Parallel because a MASS slot death (spot reclamation /
         # AZ event terminating the fleet inside is_alive()'s cache window) is exactly what this path
         # exists for: draining N husks serially would stall a ceiling-bound tier for N x reap
         # latency, whereas pre-#75 each claim thread reaped its own dead slot concurrently. Bounded
         # so a mass death can't spawn an unbounded thread fan-out.
-        self._reaper_threads: list[threading.Thread] = []
+        # [thread, last_progress_at] — MUTABLE so a draining reaper can stamp progress. "Wedged"
+        # means NO PROGRESS for _REAPER_WEDGED_AFTER_S, not merely old: a reaper steadily disposing
+        # a long queue (40s per terminate x N) is working, and counting it as wedged would spawn
+        # redundant reapers against the same queue (issue #77).
+        self._reaper_threads: list[list] = []
+        # Wall-clock bound for the hand-out liveness probe. Short ON PURPOSE: it sits on
+        # job-dispatch latency and holds the caller's warm-gate reservation (#72), so a slot that
+        # can't be described in a few seconds is better skipped than waited on (issue #77).
         self._thread: threading.Thread | None = None
 
         # Burst demand tracking — all access under _lock
@@ -315,7 +344,10 @@ class WarmPool:
         # below CANNOT cover that slot — _reap_and_count's ownership guard makes it skip whatever the
         # reaper already owns — so waiting here is the only thing that disposes it. Past the budget we
         # log and proceed, exactly like the wedged-spawn case above.
-        for reaper in list(self._reaper_threads):
+        with self._lock:
+            _entries = list(self._reaper_threads)   # snapshot under the lock: the tick thread
+        for entry in _entries:                      # rebinds/appends to this list concurrently
+            reaper = entry[0]                    # [thread, last_progress_at, retired]
             if not reaper.is_alive():
                 continue
             reaper.join(timeout=max(0.0, stop_deadline - self._clock()))
@@ -384,14 +416,31 @@ class WarmPool:
         concurrent callers cannot pick the same slot.
         """
         deadline = self._clock() + timeout_s
+        # Arm the scan grace ONCE for the whole claim (issue #77 review): re-arming it per rescan
+        # gave a scan starting near the deadline a fresh floor, so claim() overran timeout_s while
+        # holding the caller's warm-gate reservation.
+        scan_deadline = max(deadline, self._clock() + self._SCAN_GRACE_S)
+
+        # slot_id -> when it last answered UNKNOWN. A short COOLDOWN, not a blacklist: rebuilding
+        # this per scan re-probed every slot on every 50ms rescan (~5x the aws subprocesses per
+        # claim, per thread, during the brownout the budget exists to ride out), but suppressing for
+        # the WHOLE window was the opposite error -- during a throttle that answers in milliseconds
+        # every slot was suppressed within the first second of a 60s claim and never re-probed, so
+        # claim() span on demand misses and tripped burst-spawning mid-brownout (issue #77
+        # marla-loop). Re-ask, but no faster than the cooldown.
+        unprobeable: dict[str, float] = {}
 
         while True:
-            slot = self._try_claim_one(deadline)
+            slot = self._try_claim_one(deadline, scan_deadline, unprobeable)
             if slot is not None:
                 return slot
 
-            # No IDLE slot — record demand miss, wait for idle_event or timeout
-            self._record_demand_miss()
+            # No IDLE slot. Only count that as DEMAND if we actually had nothing to give: when
+            # slots were skipped because their runtime could not answer, the shortage is a
+            # brownout, not load, and recording it trips burst-spawning DURING the outage --
+            # adding control-plane calls to a control plane already failing (upstream P2).
+            if not unprobeable:
+                self._record_demand_miss()
             remaining = deadline - self._clock()
             if remaining <= 0:
                 return None
@@ -433,7 +482,10 @@ class WarmPool:
                     # (_promote_warming only touches WARMING) — so the background tick cannot hand
                     # this slot out mid-reset. Flip to IDLE only once the reset completes.
                     self._recycle(slot)  # e.g. VM snapshot-revert (seconds-long)
-                if self._runtime.is_alive(slot):
+                # `is not False`: an UNKNOWN post-job liveness answer must not destroy the slot
+                # either. Republish it -- the claim-time fresh probe still gates hand-out, and the
+                # unknown-escalation clock bounds how long it can stay that way.
+                if self._runtime.is_alive(slot) is not False:
                     with self._lock:
                         # Only publish to IDLE if the slot is STILL the ASSIGNED one we're recycling.
                         # A concurrent stop() flips slots to DRAINING under the lock before reaping; if
@@ -469,6 +521,22 @@ class WarmPool:
             with self._lock:
                 if reaped:
                     self._slots.pop(slot.slot_id, None)
+
+    def unclaim(self, slot: Slot) -> None:
+        """Hand an ASSIGNED slot back UNUSED, without disposing it (issue #77).
+
+        ``release()`` reaps on every non-recycle runtime, so a caller that claimed a slot and then
+        could not tell whether it was usable — a resume whose describes were merely throttled — had
+        no way to give it back except by destroying it. That is how a control-plane brownout
+        terminated healthy PARKED warm slots, the most expensive kind. This returns it to IDLE so
+        the next claim (or the next tick's health check) can decide with better information."""
+        with self._lock:
+            cur = self._slots.get(slot.slot_id)
+            if cur is None or cur.state != SlotState.ASSIGNED:
+                return                      # already disposed/reclaimed by another path
+            cur.state = SlotState.IDLE
+            self._last_idle_at = self._clock()
+        self._idle_event.set()
 
     def retire(self, slot: Slot) -> None:
         """Permanently dispose ``slot`` WITHOUT recycling it — for a worker that may STILL be in use
@@ -519,6 +587,21 @@ class WarmPool:
         self._sample_metrics()
 
     _MAX_REAPERS = 4          # concurrent disposal threads (bounds a mass-death fan-out)
+    # A reaper still running after this long is treated as WEDGED and stops counting against
+    # _MAX_REAPERS, so four stuck disposals can't permanently stop the queue draining (issue #77).
+    # The thread is abandoned, not killed — Python cannot interrupt a blocking call — but its slot
+    # in the pool is freed so healthy husks keep getting disposed.
+    # Must exceed ONE legitimate disposal, or a merely-slow reap is declared wedged and replaced --
+    # so _MAX_REAPERS stops bounding concurrency during exactly the control-plane slowdown where
+    # extra CLI calls and threads amplify the outage (upstream P2). Derived from the runtime's own
+    # call timeout where it exposes one, with this as the floor.
+    _REAPER_WEDGED_AFTER_S = 60.0
+    # HARD ceiling on live reaper threads, wedged ones INCLUDED. Without it the watchdog above
+    # removes the only bound: a wedged reaper stops counting toward _MAX_REAPERS but never exits and
+    # is never removed, so every tick could start 4 more — measured 64 live threads against a cap of
+    # 4 on a permanently-hung terminate. Past this we stop starting reapers; the queue waits rather
+    # than melting the host, and stop() still disposes everything it can.
+    _MAX_REAPER_THREADS = 32
 
     def _reap_deferred(self) -> None:
         """Kick the DEDICATED reaper thread for slots claim() found dead and deferred (issue #75).
@@ -535,21 +618,78 @@ class WarmPool:
         queued and are drained when it finishes. stop() reaps every tracked slot regardless, so a
         wedged reaper can never leak a live worker past shutdown."""
         with self._lock:
-            self._reaper_threads = [t for t in self._reaper_threads if t.is_alive()]
-            want = min(len(self._deferred_reap), self._MAX_REAPERS - len(self._reaper_threads))
+            now = self._clock()
+            self._reaper_threads = [e for e in self._reaper_threads if e[0].is_alive()]
+            # Count only reapers that are still making progress. One wedged in a hung terminate is
+            # abandoned (Python can't interrupt it) but must not hold a slot in the pool forever,
+            # or four stuck disposals stop the queue draining for the life of the pool (issue #77).
+            wedged_after = self._reaper_wedged_after_s()
+            live = 0
+            for entry in self._reaper_threads:
+                if now - entry[1] < wedged_after:
+                    live += 1
+                else:
+                    # RETIRE it. Dropping a wedged reaper from the progress count lets replacements
+                    # spawn, but nothing stopped the original: if its terminate finally returns it
+                    # resumes draining alongside them, so the "4 concurrent" bound silently became
+                    # _MAX_REAPER_THREADS (issue #77 round 3). It cannot be interrupted, but it can
+                    # be told to stop after its current disposal.
+                    entry[2] = True
+            # Two bounds: _MAX_REAPERS caps CONCURRENT PROGRESS (wedged ones don't count, so a stuck
+            # disposal can't halt the queue), and _MAX_REAPER_THREADS caps TOTAL live threads
+            # (wedged ones DO count, so a permanently-hung runtime can't spawn threads forever).
+            headroom = min(self._MAX_REAPERS - live,
+                           self._MAX_REAPER_THREADS - len(self._reaper_threads))
+            want = min(len(self._deferred_reap), headroom)
             if want <= 0:
                 return                      # queue empty, or every reaper slot is busy/wedged
             for _ in range(want):
-                t = threading.Thread(target=self._drain_deferred_reaps,
+                entry_box: list = []
+                # functools.partial, NOT a closure: a lambda captures the VARIABLE, so with
+                # want > 1 every thread would resolve entry_box to the LAST iteration's list —
+                # all reapers stamping one entry while the others looked wedged and over-spawned.
+                t = threading.Thread(target=functools.partial(self._drain_deferred_reaps, entry_box),
                                      name="blastbox-pool-reaper", daemon=True)
-                self._reaper_threads.append(t)
+                entry = [t, now, False]   # [thread, last_progress_at, retired]
+                entry_box.append(entry)          # let the thread stamp its own progress
+                self._reaper_threads.append(entry)
                 # START INSIDE the lock: a created-but-not-yet-started thread reports
                 # is_alive()==False, so releasing first would let a concurrent tick see fewer live
                 # reapers and over-spawn past _MAX_REAPERS. start() does not take _lock — the new
                 # thread just blocks on its first acquisition until we release here.
                 t.start()
 
-    def _drain_deferred_reaps(self) -> None:
+    def _reaper_wedged_after_s(self) -> float:
+        """How long a reaper may make no progress before it is presumed wedged.
+
+        A disposal is a remote call: the AWS tiers bound theirs at cli_timeout_s (120s by default),
+        so a flat 60s threshold declares a perfectly healthy slow reap wedged and spawns a
+        replacement beside it. Give one call room to finish, twice over."""
+        per_call = self._runtime_call_timeout_s()
+        if per_call is None:
+            return self._REAPER_WEDGED_AFTER_S
+        return max(self._REAPER_WEDGED_AFTER_S, 2.0 * float(per_call))
+
+    def _runtime_call_timeout_s(self) -> "float | None":
+        """The longest single remote call the runtime can make, or None if it does not say.
+
+        A CascadingRuntime -- the PRODUCTION shape -- has no cfg of its own, so reading
+        ``self._runtime.cfg`` silently fell back to the floor and the derived threshold never
+        applied where it was needed. Any wrapped tier could own the slot being reaped, so take the
+        maximum across them (upstream P2)."""
+        cfg = getattr(self._runtime, "cfg", None)
+        direct = getattr(cfg, "cli_timeout_s", None) if cfg is not None else None
+        if direct is not None:
+            return float(direct)
+        vals: list[float] = []
+        for tier in getattr(self._runtime, "tiers", None) or ():
+            tcfg = getattr(getattr(tier, "runtime", None), "cfg", None)
+            v = getattr(tcfg, "cli_timeout_s", None) if tcfg is not None else None
+            if v is not None:
+                vals.append(float(v))
+        return max(vals) if vals else None
+
+    def _drain_deferred_reaps(self, entry_box: "list | None" = None) -> None:
         """Dispose every queued husk, one at a time, off the tick + claim paths.
 
         Scoped to ids claim() deferred, so DRAINING slots owned by release()/stop()/_reap_surplus —
@@ -558,6 +698,8 @@ class WarmPool:
         re-terminate a resource whose disposal already failed."""
         while True:
             with self._lock:
+                if entry_box and entry_box[0][2]:
+                    return          # retired while wedged: a replacement owns the queue now
                 if not self._deferred_reap:
                     return
                 slot_id = next(iter(self._deferred_reap))
@@ -570,8 +712,27 @@ class WarmPool:
                 # pop_on_success untracks it in the same critical section that releases ownership,
                 # so there is nothing for this caller to do with the result.
                 self._reap_and_count(slot, require_tracked=True, pop_on_success=True)
+                with self._lock:
+                    self._suspected_unknown.discard(slot.slot_id)
             except Exception:
                 logger.exception("pool.reap_deferred_error slot_id=%s — quarantining", slot.slot_id)
+                with self._lock:
+                    if slot.slot_id in self._suspected_unknown:
+                        # Only SUSPECTED, and we could not dispose of it either -- so we know
+                        # nothing. Quarantining it as DRAINING is retried by nothing and keeps
+                        # counting against the ceiling, which is worse than the wedge escalation
+                        # exists to fix (that one healed when the brownout ended). Put it back.
+                        cur = self._slots.get(slot.slot_id)
+                        if cur is not None and cur.state == SlotState.DRAINING:
+                            cur.state = SlotState.IDLE
+                            logger.warning("pool.deferred_escalation_undone slot_id=%s — could not "
+                                           "dispose a suspected slot; returning it to IDLE",
+                                           slot.slot_id)
+                    self._suspected_unknown.discard(slot.slot_id)
+            # Stamp PROGRESS: this reaper just finished a disposal, so it is working, not wedged.
+            if entry_box:
+                with self._lock:
+                    entry_box[0][1] = self._clock()
 
     def _reap_surplus(self) -> None:
         """Reap IDLE slots above the (possibly just-lowered) effective target, so a
@@ -800,8 +961,68 @@ class WarmPool:
     # long to step past dead slots and find a healthy one behind them. Small enough that a stalled
     # remote probe can't hold the caller (or its warm-gate reservation) for long.
     _SCAN_GRACE_S = 1.0
+    # How long a slot that answered UNKNOWN is passed over before this claim asks it again. Long
+    # enough that a fast-failing control plane can't be re-probed per 50ms rescan; short enough
+    # that a slot recovering mid-window is still reachable inside the claim.
+    _UNPROBEABLE_COOLDOWN_S = 2.0
 
-    def _try_claim_one(self, deadline: float | None = None) -> Slot | None:
+    def _accepts_budget(self, fn: "Callable[..., Any]") -> bool:
+        """Whether a runtime's is_alive_for_claim takes the budget_s kwarg (cached per callable)."""
+        key = getattr(fn, "__qualname__", repr(fn))
+        cached = self._budget_kwarg_cache.get(key)
+        if cached is None:
+            try:
+                cached = "budget_s" in inspect.signature(fn).parameters
+            except (TypeError, ValueError):   # builtins / C callables have no introspectable sig
+                cached = False
+            self._budget_kwarg_cache[key] = cached
+        return cached
+
+    def _probe_alive(self, slot: "Slot", budget_s: float | None = None) -> "bool | None":
+        """Hand-out liveness probe (issue #77).
+
+        Called INLINE — deliberately no watchdog thread. The bound belongs in the runtime, not
+        here: a thread can't cancel a blocking call, only abandon it, and abandoning one per probe
+        under a control-plane brownout produced unbounded threads (and, on the cloud tiers, one
+        live ``aws`` CLI subprocess each) during exactly the incident the bound exists to ride out.
+        A wrapper also can't see through ``cascade``, whose ``is_alive_for_claim`` delegates to the
+        owning tier, so it threaded LOCAL claims too.
+
+        So the cloud runtimes bound their own claim-time describe (``claim_probe_timeout_s`` on the
+        AWS config) and on timeout report **None = UNKNOWN — never False**: a slow control plane is
+        not evidence of death, and the caller must skip such a slot rather than destroy it. The
+        local tiers were never the problem — their ``is_alive`` is a process poll. A probe that
+        RAISES is treated as not-alive, as before.
+        """
+        fresh_check = getattr(self._runtime, "is_alive_for_claim", None)
+        try:
+            if callable(fresh_check):
+                # Tell the runtime how long the CALLER actually has left, so its own probe bound is
+                # a CEILING rather than an entitlement (issue #77 round 2): claim(timeout_s=0.5)
+                # against a 5s claim_probe_timeout_s otherwise blocked ~5s while holding the
+                # dispatcher's warm-gate reservation. Only when it accepts the kwarg, so an external
+                # runtime predating it keeps working.
+                if budget_s is not None and self._accepts_budget(fresh_check):
+                    alive = fresh_check(slot, budget_s=budget_s)
+                else:
+                    alive = fresh_check(slot)
+            else:
+                # No fresh hook: fall back to the background contract, which takes no budget.
+                alive = self._runtime.is_alive(slot)
+        except Exception:
+            # UNKNOWN, not dead (issue #77). A runtime's exception enumeration is never complete —
+            # an http.client.HTTPException from the static tier, a TypeError from a slot-shape
+            # mismatch — and none of those are evidence the worker is gone. Skip the slot instead
+            # of terminating it; a genuinely dead one still fails at detonate and is reaped there.
+            logger.exception("pool.is_alive_error slot_id=%s — treating as unknown", slot.slot_id)
+            return None
+        # None = the runtime bounded its own probe and the control plane didn't answer. UNKNOWN,
+        # NOT dead — a brownout must not get healthy workers destroyed (issue #77).
+        return None if alive is None else bool(alive)
+
+    def _try_claim_one(self, deadline: float | None = None,
+                       scan_deadline: float | None = None,
+                       unprobeable: "dict[str, float] | None" = None) -> Slot | None:
         """Scan for an IDLE slot, flip to ASSIGNED inside the lock.
 
         If the chosen slot is dead: demote to DRAINING and DEFER its disposal to the background
@@ -815,7 +1036,15 @@ class WarmPool:
         Deferring keeps claim bounded; the slot is already DRAINING so it is unclaimable meanwhile,
         and ``_spawn_to_deficit`` (which ignores DRAINING) still spawns its replacement.
         """
-        scan_deadline = None if deadline is None else max(deadline, self._clock() + self._SCAN_GRACE_S)
+        if scan_deadline is None and deadline is not None:
+            # Fallback for direct callers/tests. claim() passes an ALREADY-ARMED deadline so the
+            # grace floor is applied ONCE per claim, not re-armed on every rescan (which let a scan
+            # starting just before the deadline get a fresh 1s and overrun the caller's timeout).
+            scan_deadline = max(deadline, self._clock() + self._SCAN_GRACE_S)
+        # Slots whose runtime couldn't answer within its budget, mapped to when they said so.
+        # Owned by claim() across rescans when it passes one in; a direct caller gets a fresh map.
+        if unprobeable is None:
+            unprobeable = {}
         while True:
             # Shutdown in progress: hand out NOTHING. stop() reaps every slot after its joins, so a
             # slot claimed during that window would be destroyed mid-job; and a dead slot deferred
@@ -827,7 +1056,9 @@ class WarmPool:
             with self._lock:
                 candidate: Slot | None = None
                 for s in self._slots.values():
-                    if s.state == SlotState.IDLE:
+                    if s.state == SlotState.IDLE and (
+                            self._clock() - unprobeable.get(s.slot_id, -1e18)
+                            >= self._UNPROBEABLE_COOLDOWN_S):
                         candidate = s
                         break
                 if candidate is None:
@@ -840,14 +1071,38 @@ class WarmPool:
             # (AWS throttles the control-plane describe), so a slot terminated since the last tick could
             # otherwise be handed out and fail the user's job. Falls back to is_alive() for file/libvirt
             # tiers whose is_alive() is already a fresh check.
-            claim_check = getattr(self._runtime, "is_alive_for_claim", None)
-            if not callable(claim_check):
-                claim_check = self._runtime.is_alive
-            alive = False
-            try:
-                alive = claim_check(candidate)
-            except Exception:
-                logger.exception("pool.is_alive_error slot_id=%s", candidate.slot_id)
+            # Bound the probe by the SCAN deadline, not the caller's raw deadline: claim() grants a
+            # scan grace precisely so a non-blocking claim(timeout_s=0) can still take an
+            # immediately-available slot. Passing the (already expired) raw deadline handed the
+            # runtime a 0s budget, which it correctly reported as an exhausted probe -> UNKNOWN ->
+            # every AWS slot skipped, so claim(timeout_s=0) could never succeed (issue #77 round 4,
+            # a regression from the round-2 budget plumbing).
+            probe_budget = (None if scan_deadline is None
+                            else max(0.0, scan_deadline - self._clock()))
+            alive = self._probe_alive(candidate, probe_budget)
+            if alive is not None:
+                # The control plane ANSWERED about this slot. That resets the unknown clock exactly
+                # as a health-tick answer does -- otherwise a slot being claimed and used
+                # successfully could still age out and be escalated to dead (upstream P2).
+                with self._lock:
+                    self._unknown_since.pop(candidate.slot_id, None)
+                # ...and it is no longer "unprobeable" for this claim. Leaving it there kept the
+                # demand-miss suppression on for the rest of the window, so once the control plane
+                # recovered a lone queued job still could not trip burst capacity (upstream P2).
+                unprobeable.pop(candidate.slot_id, None)
+
+            if alive is None:
+                # UNKNOWN (the runtime's own probe budget expired). Leave the slot IDLE and skip it
+                # for THIS scan — never defer it for disposal: a slow control plane is not evidence
+                # of death, and destroying healthy workers during a brownout is far worse than a
+                # missed claim. It stays claimable on the next scan.
+                with self._lock:
+                    if candidate.state == SlotState.ASSIGNED:
+                        candidate.state = SlotState.IDLE
+                unprobeable[candidate.slot_id] = self._clock()
+                if scan_deadline is not None and self._clock() >= scan_deadline:
+                    return None
+                continue
 
             if alive:
                 return candidate
@@ -860,7 +1115,14 @@ class WarmPool:
                            candidate.slot_id)
             with self._lock:
                 candidate.state = SlotState.DRAINING
-                self._deferred_reap.add(candidate.slot_id)
+                if self._stop_event.is_set():
+                    # stop() already drained the queue; re-adding here (the probe above takes
+                    # seconds, so stop() can land mid-probe) resurrects a husk stop() quarantined
+                    # after a failed reap, and the next drain terminates it a SECOND time -- the
+                    # contract _drain_deferred_reaps documents as forbidden (issue #77 marla-loop).
+                    logger.debug("pool.defer_reap_skipped_after_stop slot_id=%s", candidate.slot_id)
+                else:
+                    self._deferred_reap.add(candidate.slot_id)
 
             # Loop: try to find another IDLE slot. Every iteration returns, or moves one slot out
             # of IDLE (→DRAINING), so the rescan is bounded by the IDLE-slot count — but NOT in
@@ -1050,6 +1312,11 @@ class WarmPool:
         now = self._clock()
         with self._lock:
             idle_slots = [s for s in self._slots.values() if s.state == SlotState.IDLE]
+            # Drop bookkeeping for slots that have left the pool. One entry per reaped slot is a
+            # slow leak on a tier that churns a slot per job (measured: 50 entries, 0 slots).
+            if self._unknown_since:
+                for gone in [k for k in self._unknown_since if k not in self._slots]:
+                    self._unknown_since.pop(gone, None)
             stuck_warming = [
                 s for s in self._slots.values()
                 if s.state == SlotState.WARMING
@@ -1058,16 +1325,75 @@ class WarmPool:
             ]
 
         dead: list[Slot] = list(stuck_warming)
+        # Slots we escalated because we could not TELL, as opposed to ones AWS/libvirt confirmed
+        # dead. If disposing of a merely-suspected slot also fails, we have learned nothing and must
+        # not strand it (see the reap loop below).
+        suspected: set[str] = set()
         for slot in stuck_warming:
             logger.warning(
                 "pool.warming_timeout_evict slot_id=%s age=%.1fs", slot.slot_id, now - slot.spawned_at
             )
         for slot in idle_slots:
+            # TRI-STATE, same contract as the claim probe (_probe_alive): True = alive,
+            # False = CONFIRMED dead, None = UNKNOWN. Only a CONFIRMED negative may evict — the
+            # background path was the structural hole that let every runtime-level fix be undone
+            # one tick later (issue #77): it read a falsy None as dead, so a runtime had no way to
+            # say "the control plane didn't answer" here, and an unenumerated exception was a death
+            # sentence. An UNKNOWN slot is simply left alone; the next tick asks again, and the
+            # claim-time fresh probe is still the gate before any job is handed to it.
             try:
                 alive = self._runtime.is_alive(slot)
             except Exception:
-                logger.exception("pool.health_is_alive_error slot_id=%s", slot.slot_id)
-                alive = False
+                # An exception is NOT evidence of death — it is evidence we could not tell. Killing
+                # a healthy worker over an unanticipated error is the worse failure.
+                logger.exception("pool.health_is_alive_error slot_id=%s — treating as unknown",
+                                 slot.slot_id)
+                alive = None
+            if alive is None:
+                # UNKNOWN is a reason to WAIT — never a reason to wait FOREVER. Left unbounded this
+                # is strictly worse than the bug #77 fixes: on main a probe error set alive=False,
+                # so a persistent fault self-healed (reap -> respawn). Keeping the slot instead
+                # means it is never claimable (the claim probe skips UNKNOWN), never reaped, and
+                # never replaced (_spawn_to_deficit counts it as active) — the tier silently wedges
+                # at ZERO capacity while is_healthy() still reports True. So: ride out a brownout,
+                # but escalate a fault that outlasts any plausible one.
+                # Under the lock: the claim path pops this entry, and an in-flight health probe
+                # that started BEFORE that pop would otherwise write a stale timestamp after it.
+                # On a reusable slot the stale stamp keeps ageing while the slot is ASSIGNED, so the
+                # first UNKNOWN after release can exceed the grace at once and evict a worker that
+                # has been serving jobs the whole time (upstream P2).
+                # Read the clock HERE, not the `now` sampled before the pass began. Probes run
+                # serially, so a tier's worth of slow ones means the last slot is reached minutes
+                # after `now` -- and stamping it with that stale value charges it for time spent
+                # probing the slots ahead of it. On the next pass it is already most of the way
+                # through its grace and escalates on what is really its FIRST unknown (escalated
+                # codex, loop 5).
+                probed_at = self._clock()
+                with self._lock:
+                    # DROP the result if a claim took this slot while we were probing. Taking the
+                    # lock only serialises the writes; it does not ORDER them, so a probe that
+                    # started when the slot was IDLE could still stamp it after a concurrent claim
+                    # cleared the entry -- and that stale stamp then ages untouched for the whole
+                    # job, so the first UNKNOWN after release exceeds the grace at once and evicts a
+                    # worker that has been serving the entire time (upstream P2).
+                    cur = self._slots.get(slot.slot_id)
+                    if cur is not slot or cur.state != SlotState.IDLE:
+                        continue
+                    since = self._unknown_since.setdefault(slot.slot_id, probed_at)
+                stuck_for = probed_at - since
+                if self._unknown_grace_s > 0 and stuck_for > self._unknown_grace_s:
+                    logger.warning("pool.health_unknown_escalated slot_id=%s unknown_for=%.0fs "
+                                   "(> %.0fs) — treating as dead so the slot is replaced",
+                                   slot.slot_id, stuck_for, self._unknown_grace_s)
+                    self._unknown_since.pop(slot.slot_id, None)
+                    suspected.add(slot.slot_id)   # escalated on suspicion, not on a verdict
+                    dead.append(slot)
+                else:
+                    logger.debug("pool.health_unknown slot_id=%s unknown_for=%.0fs — keeping slot",
+                                 slot.slot_id, stuck_for)
+                continue
+            # A DEFINITIVE answer (either way) means the control plane is talking to us again.
+            self._unknown_since.pop(slot.slot_id, None)
             if not alive:
                 dead.append(slot)
 
@@ -1086,7 +1412,17 @@ class WarmPool:
                 cur = self._slots.get(slot.slot_id)
                 if cur is not None and cur.state in (SlotState.IDLE, SlotState.WARMING):
                     cur.state = SlotState.DRAINING
-                    to_reap.append(slot)
+                    if slot.slot_id in suspected:
+                        self._suspected_unknown.add(slot.slot_id)
+                        # SUSPECTED (escalated after a long UNKNOWN), not confirmed. Its disposal
+                        # runs through the SAME control plane that is not answering, so each
+                        # terminate can burn its full CLI timeout -- and doing a tier's worth of
+                        # them serially here would stall promotion, spawning and reaping on the sole
+                        # tick thread for minutes. That is the wedge #77 exists to fix, and #76
+                        # already built the bounded reapers for exactly this. Hand it to them.
+                        self._deferred_reap.add(slot.slot_id)
+                    else:
+                        to_reap.append(slot)
 
         for slot in to_reap:
             logger.warning("pool.health_evicted_dead_slot slot_id=%s", slot.slot_id)
@@ -1097,6 +1433,21 @@ class WarmPool:
                 # reap raised (worker not disposed — may still run): quarantine, don't pop (like
                 # release()), so a live worker isn't orphaned off pool accounting.
                 logger.exception("pool.health_reap_error slot_id=%s — quarantining", slot.slot_id)
+                if slot.slot_id in suspected:
+                    # ...unless this slot was only SUSPECTED (escalated after a long UNKNOWN). The
+                    # disposal runs through the SAME control plane that made it unknown, so during
+                    # a brownout it fails too — and a quarantined DRAINING slot is retried by
+                    # nothing, keeps counting against concurrent_ceiling, and never recovers. That
+                    # is strictly worse than the wedge escalation exists to fix: the wedge healed
+                    # when the brownout ended, this does not. We could not confirm it dead and could
+                    # not dispose of it, so we know nothing: put it back and let the cycle resume
+                    # (issue #77 marla-loop 2).
+                    with self._lock:
+                        cur = self._slots.get(slot.slot_id)
+                        if cur is not None and cur.state == SlotState.DRAINING:
+                            cur.state = SlotState.IDLE
+                    logger.warning("pool.health_escalation_undone slot_id=%s — could not dispose a "
+                                   "merely-suspected slot; returning it to IDLE", slot.slot_id)
             finally:
                 if reaped:
                     with self._lock:

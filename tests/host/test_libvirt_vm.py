@@ -561,3 +561,85 @@ def test_finalize_fails_closed_without_mac(monkeypatch):
                   ip="192.168.122.5", mac=None)  # domiflist missed the MAC
     assert rt.is_ready(slot) is False    # an under-firewalled finalize is rejected...
     assert reaped == ["bbvm-m"]          # ...and the VM is reaped (fail-closed)
+
+
+# ------------------------------------------------ issue #77 round 2: escalated-review regressions
+
+def _cp(rc: int, stdout: str = "", stderr: str = ""):
+    return type("C", (), {"returncode": rc, "stdout": stdout, "stderr": stderr})()
+
+
+@pytest.mark.parametrize("stderr", [
+    "error: failed to get domain 'bb-w1'",
+    "error: Domain not found: no domain with matching name 'bb-w1'",
+    "error: domain 'bb-w1' does not exist",
+])
+def test_f3_a_confirmed_missing_domain_is_dead_not_unknown(monkeypatch, stderr):
+    """Fixing "unknown read as dead" produced its mirror image: EVERY non-zero virsh rc became
+    "keep the slot". virsh uses rc=1 for BOTH "libvirtd is down" (genuinely unknown) and "domain
+    not found" (confirmed gone), so an externally-deleted domain was kept as a warm slot forever --
+    never claimable (is_alive_for_claim says UNKNOWN), never reaped, and still counted against the
+    warm target, so spawn-to-deficit never replaced it. A warm_size=1 tier stayed dead until restart."""
+    rt = _rt()
+    monkeypatch.setattr(rt, "_virsh", lambda *a, **k: _cp(1, "", stderr))
+    slot = VmSlot(slot_id="w1", domain="bb-w1", overlay="/tmp/w1.qcow2", agent_port=8765,
+                   state=SlotState.IDLE)
+    assert rt.is_alive(slot) is False, "a confirmed-absent domain must be reaped + replaced"
+    assert rt.is_alive_for_claim(slot) is False, "and must not be handed out"
+
+
+@pytest.mark.parametrize("stderr", [
+    "error: failed to connect to the hypervisor",
+    "error: Cannot recv data: Connection reset by peer",
+    "virsh: command not found",
+])
+def test_f3_an_unqueryable_control_plane_is_still_unknown_not_dead(monkeypatch, stderr):
+    """The original #77 guard must survive the fix: libvirtd being unreachable is correlated across
+    EVERY slot at once, so reading it as death would wipe the whole tier in one tick. Note
+    "command not found" is deliberately NOT an absent domain (sudo virsh with a bad PATH)."""
+    rt = _rt()
+    monkeypatch.setattr(rt, "_virsh", lambda *a, **k: _cp(1, "", stderr))
+    slot = VmSlot(slot_id="w1", domain="bb-w1", overlay="/tmp/w1.qcow2", agent_port=8765,
+                   state=SlotState.IDLE)
+    # UNKNOWN, not True. The #77 guarantee is unchanged -- the POOL keeps an unknown slot, so an
+    # unreachable libvirtd still does not destroy the tier. But this assertion previously pinned
+    # the runtime to claiming "alive", which made the wedge permanent: a persistently unqueryable
+    # libvirtd (sudoers change, missing binary) kept a slot that was never claimable and never
+    # replaced, forever. Reporting UNKNOWN lets the pool bound it (issue #77 marla-loop).
+    assert rt.is_alive(slot) is None, "an unqueryable control plane is UNKNOWN, not a verdict"
+    assert rt.is_alive(slot) is not False, "an unreachable libvirtd must NOT be read as a dead domain"
+    assert rt.is_alive_for_claim(slot) is None, "unknown at hand-out means skip, not destroy"
+
+
+def test_f3_a_running_domain_is_unaffected(monkeypatch):
+    rt = _rt()
+    monkeypatch.setattr(rt, "_virsh", lambda *a, **k: _cp(0, "running\n", ""))
+    slot = VmSlot(slot_id="w1", domain="bb-w1", overlay="/tmp/w1.qcow2", agent_port=8765,
+                   state=SlotState.IDLE)
+    assert rt.is_alive(slot) is True
+    assert rt.is_alive_for_claim(slot) is True
+
+
+def test_a_sub_second_claim_budget_declines_instead_of_rounding_up(monkeypatch):
+    """The claim budget was floored at 1.0s, so a candidate reached late in a scan -- with only a
+    few hundred ms of the pool's grace left -- got MORE time than the caller had. A wedged virsh
+    could then run past scan_deadline and blow the hand-out bound. Declining is honest and costs
+    only a skipped candidate (upstream P2)."""
+    rt = _rt()
+    seen: list = []
+
+    def _virsh(*a, **k):  # noqa: ANN001
+        seen.append(k.get("timeout"))
+        return _cp(0, "running\n", "")
+
+    monkeypatch.setattr(rt, "_virsh", _virsh)
+    slot = VmSlot(slot_id="w1", domain="bb-w1", overlay="/tmp/w1.qcow2", agent_port=8765,
+                  state=SlotState.IDLE)
+
+    assert rt.is_alive_for_claim(slot, budget_s=0.2) is None, (
+        "a sub-second budget was rounded up instead of declining")
+    assert seen == [], "virsh was invoked despite there being no window for it"
+
+    # a workable budget is passed through EXACTLY, not floored upward
+    assert rt.is_alive_for_claim(slot, budget_s=3.0) is True
+    assert seen == [3.0], f"budget was not passed through verbatim: {seen}"

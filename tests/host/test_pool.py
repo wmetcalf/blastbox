@@ -1355,8 +1355,8 @@ def test_stop_disposes_a_deferred_husk() -> None:
 
 def _join_reaper(pool, timeout: float = 5.0) -> None:
     """Wait for the dedicated deferred-reap thread (issue #75 disposal is asynchronous)."""
-    for t in list(getattr(pool, "_reaper_threads", [])):
-        t.join(timeout)
+    for entry in list(getattr(pool, "_reaper_threads", [])):
+        entry[0].join(timeout)   # entry = [thread, last_progress_at, retired]
 
 
 class _CachedLivenessRuntime(_FakeRuntime):
@@ -1829,3 +1829,997 @@ def test_promote_warming_passes_both_reap_guards() -> None:
     seen = _spy_reap_kwargs(pool)
     pool._promote_warming()
     _assert_guarded(seen, "_promote_warming()")
+def test_wedged_reapers_stop_counting_so_the_queue_keeps_draining() -> None:
+    # issue #77: a wedged runtime.reap can't be killed, but it must not hold a slot in the reaper
+    # pool forever — _MAX_REAPERS stuck disposals would otherwise stop the queue draining for the
+    # life of the pool. A reaper older than _REAPER_WEDGED_AFTER_S stops counting against the cap.
+    # ORDERING MATTERS: the wedged ids are queued and picked up FIRST, so every reaper is blocked
+    # before the healthy ids arrive. Draining them then REQUIRES the watchdog to free pool slots
+    # (otherwise an initial reaper could have drained them incidentally and the test would pass
+    # even with the watchdog removed).
+    hang = threading.Event()
+    rt = _CachedLivenessRuntime(hang=hang)
+    pool = WarmPool(runtime=rt, warm_size=8, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    pool._REAPER_WEDGED_AFTER_S = 0.2                 # shrink the watchdog for the test
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    slots = list(pool._slots.values())
+    wedged = slots[:pool._MAX_REAPERS]
+    healthy = slots[pool._MAX_REAPERS:]
+    assert healthy, "need slots beyond the reaper cap"
+    rt.fresh_dead = {s.slot_id for s in wedged}       # ONLY these block inside reap()
+
+    try:
+        for s in wedged:                              # queue the wedging ones FIRST
+            with pool._lock:
+                s.state = SlotState.DRAINING
+                pool._deferred_reap.add(s.slot_id)
+        pool._reap_deferred()
+        time.sleep(0.35)                              # all reapers now blocked, past the watchdog
+
+        for s in healthy:                             # now the ones that must still get disposed
+            with pool._lock:
+                s.state = SlotState.DRAINING
+                pool._deferred_reap.add(s.slot_id)
+
+        want = {s.slot_id for s in healthy}
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not want.issubset(set(rt.reaped)):
+            pool._reap_deferred()                     # must be ALLOWED to start more reapers
+            time.sleep(0.05)
+        assert want.issubset(set(rt.reaped)), (
+            f"queue stalled behind {len(wedged)} wedged reapers: "
+            f"{len(set(rt.reaped) & want)}/{len(want)} disposed")
+    finally:
+        hang.set()
+        _join_reaper(pool)
+
+
+def test_hand_out_probe_is_always_inline_never_threaded() -> None:
+    # issue #77: the claim probe must never be wrapped in a watchdog thread — for ANY runtime,
+    # seam or not. A thread cannot cancel a blocking call, only abandon it, and one abandoned
+    # thread (plus its aws CLI subprocess) per probe under a control-plane brownout is a resource
+    # storm during exactly the incident the bound exists to survive. The bound belongs in the
+    # runtime (see AwsWorkerConfig.claim_probe_timeout_s), which can actually cancel its own call.
+    import blastbox.host.pool as pool_mod
+
+    made: list[str] = []
+    real_thread = threading.Thread
+
+    class _CountingThread(real_thread):     # type: ignore[misc,valid-type]
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            made.append(k.get("name") or "")
+
+    for rt in (_FakeRuntime(), _CachedLivenessRuntime()):   # without AND with the remote seam
+        pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+        pool._spawn_to_deficit(ready=True)
+        pool._promote_warming()
+        made.clear()
+        pool_mod.threading.Thread = _CountingThread
+        try:
+            assert pool._try_claim_one() is not None
+        finally:
+            pool_mod.threading.Thread = real_thread
+        # Assert on the PROPERTY (no thread at all), not on a name — a watchdog reintroduced
+        # under any other thread name would otherwise slip past this regression test.
+        assert made == [], f"_try_claim_one created thread(s) for {type(rt).__name__}: {made}"
+
+
+def test_total_reaper_threads_are_hard_capped_even_when_all_are_wedged() -> None:
+    # issue #77 (review): the wedged-reaper watchdog frees pool slots so a stuck disposal can't halt
+    # the queue — but on its own it removed the ONLY bound, because a wedged reaper never exits and
+    # is never pruned, so every tick could start _MAX_REAPERS more (measured: 64 live threads
+    # against a cap of 4). _MAX_REAPER_THREADS is the hard ceiling, wedged ones included.
+    hang = threading.Event()
+
+    class _NeverReaps(_FakeRuntime):
+        def reap(self, slot: Slot) -> None:
+            hang.wait(300)
+
+    rt = _NeverReaps()
+    n = 80
+    pool = WarmPool(runtime=rt, warm_size=n, concurrent_ceiling=n, spawn_rate_limit=10000.0)
+    pool._REAPER_WEDGED_AFTER_S = 0.02        # every reaper counts as wedged almost immediately
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    with pool._lock:
+        for sid, slot in pool._slots.items():
+            slot.state = SlotState.DRAINING
+            pool._deferred_reap.add(sid)
+    try:
+        for _ in range(60):                    # hammer the kick; watchdog keeps freeing slots
+            pool._reap_deferred()
+            time.sleep(0.02)
+        alive = sum(1 for t in threading.enumerate() if t.name == "blastbox-pool-reaper")
+        assert alive <= pool._MAX_REAPER_THREADS, (
+            f"{alive} live reapers exceeds the hard cap of {pool._MAX_REAPER_THREADS}")
+    finally:
+        hang.set()
+        _join_reaper(pool, timeout=10)
+
+
+def test_a_reaper_making_progress_is_not_treated_as_wedged() -> None:
+    # issue #77 (review): "wedged" must mean NO PROGRESS, not merely old. A reaper steadily draining
+    # a long queue (slow-but-working terminates) would otherwise be reclassified as wedged the
+    # moment it aged past the watchdog, spawning redundant reapers against the same queue.
+    # The reap must be SLOW so the queue is still non-empty at the second kick — with instant reaps
+    # the queue drains first and the test passes even with progress-tracking removed.
+    class _SlowButWorking(_FakeRuntime):
+        def reap(self, slot: Slot) -> None:
+            time.sleep(0.05)                    # working, just not instant
+            super().reap(slot)
+
+    rt = _SlowButWorking()
+    n = 40
+    pool = WarmPool(runtime=rt, warm_size=n, concurrent_ceiling=n, spawn_rate_limit=10000.0)
+    pool._MAX_REAPERS = 1                       # exactly ONE reaper may make progress
+    # Watchdog LONGER than one reap (0.05s) but far shorter than the whole drain (40 x 0.05 = 2s):
+    # a progressing reaper stamps every ~0.05s so it never looks stalled, while age-based detection
+    # would flag it after 0.3s. (A watchdog shorter than one reap would flag even a working reaper
+    # mid-disposal — progress is only observable BETWEEN disposals.)
+    pool._REAPER_WEDGED_AFTER_S = 0.3
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    with pool._lock:
+        for sid, slot in pool._slots.items():
+            slot.state = SlotState.DRAINING
+            pool._deferred_reap.add(sid)
+
+    try:
+        pool._reap_deferred()                   # start the single reaper
+        for _ in range(12):                     # keep kicking well past the watchdog window
+            time.sleep(0.1)
+            pool._reap_deferred()
+            with pool._lock:
+                assert len(pool._reaper_threads) <= 1, (
+                    f"a progressing reaper was misread as wedged: "
+                    f"{len(pool._reaper_threads)} reapers for _MAX_REAPERS=1")
+    finally:
+        _join_reaper(pool, timeout=15)
+
+
+class _UnknownProbeRuntime(_FakeRuntime):
+    """A cloud-shaped runtime whose hand-out probe reports UNKNOWN (None) — the tri-state the
+    redesign turns on. Nothing else in the suite ever returns None, so the pool's whole UNKNOWN
+    branch was dead code under test (mutations that deleted or inverted it all survived)."""
+
+    def __init__(self) -> None:            # noqa: D107
+        super().__init__()
+        self.unknown: set[str] = set()
+        self.probe_delay = 0.0
+
+    def is_alive_for_claim(self, slot: Slot) -> "bool | None":
+        if slot.slot_id in self.unknown:
+            if self.probe_delay:
+                time.sleep(self.probe_delay)   # a REAL brownout probe is slow, not instant
+            return None
+        return True
+
+
+def test_unknown_probe_never_destroys_and_serves_a_healthy_slot_behind_it() -> None:
+    # issue #77: UNKNOWN must be skipped NON-DESTRUCTIVELY — left IDLE, never deferred for reap —
+    # and a healthy slot behind it must still be served.
+    rt = _UnknownProbeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=3, spawn_rate_limit=1000.0)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    slots = list(pool._slots.values())
+    rt.unknown = {slots[0].slot_id, slots[1].slot_id}       # first two can't be probed
+
+    got = pool.claim(timeout_s=2.0)
+    assert got is not None and got.slot_id == slots[2].slot_id, "healthy slot behind UNKNOWN not served"
+    with pool._lock:
+        for s in slots[:2]:
+            assert s.state == SlotState.IDLE, f"UNKNOWN slot left in {s.state}, must stay IDLE"
+            assert s.slot_id not in pool._deferred_reap, "UNKNOWN slot queued for disposal"
+    assert not rt.reaped, f"UNKNOWN destroyed a worker: {rt.reaped}"
+
+
+def test_all_unknown_claim_terminates_promptly_without_destroying_anything() -> None:
+    # issue #77: with EVERY slot UNKNOWN the scan must not spin — it returns None within the
+    # caller's budget and leaves the whole (possibly healthy) pool intact.
+    rt = _UnknownProbeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=8, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    with pool._lock:
+        rt.unknown = set(pool._slots)
+    rt.probe_delay = 0.3                  # 8 slots x 0.3s = 2.4s if the scan ignores its deadline
+
+    t0 = time.monotonic()
+    assert pool.claim(timeout_s=0.1) is None
+    elapsed = time.monotonic() - t0
+    # bounded by the grace floor + one in-flight probe, NOT by probing every slot
+    assert elapsed < pool._SCAN_GRACE_S + 0.9, f"all-UNKNOWN scan ran away: {elapsed:.2f}s"
+    with pool._lock:
+        assert all(s.state == SlotState.IDLE for s in pool._slots.values())
+        assert not pool._deferred_reap
+    assert not rt.reaped
+
+
+def test_each_reaper_stamps_its_OWN_progress_entry() -> None:
+    # issue #77 (agy/codex, HIGH): the thread target was a lambda closing over `entry_box`, which
+    # captures the VARIABLE — so with more than one reaper every thread resolved it to the LAST
+    # iteration's list. All reapers stamped one entry while the others were never stamped, looked
+    # wedged, and triggered over-spawning. functools.partial binds the value.
+    gate = threading.Event()
+
+    class _Slow(_FakeRuntime):
+        def reap(self, slot: Slot) -> None:
+            gate.wait(5)
+            super().reap(slot)
+
+    rt = _Slow()
+    pool = WarmPool(runtime=rt, warm_size=6, concurrent_ceiling=6, spawn_rate_limit=10000.0)
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+    with pool._lock:
+        for sid, slot in pool._slots.items():
+            slot.state = SlotState.DRAINING
+            pool._deferred_reap.add(sid)
+    try:
+        pool._reap_deferred()                      # starts _MAX_REAPERS threads
+        time.sleep(0.2)
+        with pool._lock:
+            entries = list(pool._reaper_threads)
+        assert len(entries) >= 2, "need multiple reapers to expose the capture bug"
+        # every entry must belong to a DISTINCT thread — a shared box would leave duplicates
+        threads = [e[0] for e in entries]
+        assert len(set(id(t) for t in threads)) == len(threads)
+        # and each entry object must be distinct (not all reapers pointing at one list slot)
+        assert len(set(id(e) for e in entries)) == len(entries)
+    finally:
+        gate.set()
+        _join_reaper(pool, timeout=10)
+
+
+# ------------------------------------------------ issue #77 round 2: escalated-review regressions
+
+def _slot(slot_id: str, state):  # noqa: ANN001
+    from blastbox.host.pool import Slot
+    return Slot(slot_id=slot_id, control_dir="/tmp/c", input_dir="/tmp/i", output_dir="/tmp/o",
+                state=state)
+
+
+def test_f5_claim_passes_its_remaining_budget_to_the_runtimes_claim_probe():
+    """The runtime bounds its own claim probe (claim_probe_timeout_s), but nothing told it how long
+    the CALLER actually had. claim(timeout_s=0.5) against a 5s probe bound blocked ~5s -- a 10x
+    violation of the claim contract that also pinned the dispatcher's warm-gate reservation."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    seen: list[float | None] = []
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
+            seen.append(budget_s)
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    slot = _slot("s1", SlotState.IDLE)
+    pool._slots["s1"] = slot
+    got = pool.claim(timeout_s=0.5)
+    assert got is slot
+    assert seen and seen[0] is not None, "the runtime was given no claim budget at all"
+    # Bounded by the pool's SCAN deadline (caller deadline, floored at _SCAN_GRACE_S) -- that grace
+    # is deliberate and is what keeps a non-blocking claim(timeout_s=0) able to take a ready slot
+    # (issue #77 round 4). The point of the finding stands: the probe must be bounded by the POOL's
+    # deadline, never left to the runtime's own much larger claim_probe_timeout_s.
+    assert seen[0] <= pool._SCAN_GRACE_S + 1e-6, (
+        f"probe was handed {seen[0]}s, beyond the scan deadline")
+
+
+def test_f20_a_nonblocking_claim_can_still_take_a_ready_slot():
+    """The round-2 budget plumbing passed the caller's RAW deadline, so claim(timeout_s=0) handed
+    the runtime a 0s probe budget; it correctly reported an exhausted probe, the pool read UNKNOWN,
+    and every AWS slot was skipped. A non-blocking claim could never succeed again."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    budgets: list = []
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
+            budgets.append(budget_s)
+            return None if (budget_s is not None and budget_s <= 0) else True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    slot = _slot("s1", SlotState.IDLE)
+    pool._slots["s1"] = slot
+    assert pool.claim(timeout_s=0) is slot, f"non-blocking claim failed; budgets={budgets}"
+
+
+def test_f5_a_runtime_without_the_budget_kwarg_still_works():
+    """Back-compat: an external runtime whose is_alive_for_claim predates the kwarg must not break."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    class _OldRt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive_for_claim(self, slot):  # noqa: ANN001 -- no budget_s
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_OldRt(), warm_size=0)
+    slot = _slot("s1", SlotState.IDLE)
+    pool._slots["s1"] = slot
+    assert pool.claim(timeout_s=0.5) is slot
+
+
+# ------------------------- issue #77 round 3: the escalated review of the round-2 fixes ----------
+
+def test_f10_a_reaper_retired_while_wedged_does_not_rejoin_the_drain():
+    """Dropping a wedged reaper from the progress count is what lets replacements spawn -- but
+    nothing STOPPED the original. If its terminate ever returned it resumed draining alongside its
+    replacements, so the _MAX_REAPERS=4 concurrency bound silently became _MAX_REAPER_THREADS=32.
+    It can't be interrupted, but it can be told to stop after its current disposal."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    reaped: list[str] = []
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            reaped.append(slot.slot_id)
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    for i in range(3):
+        s = _slot(f"s{i}", SlotState.DRAINING)
+        pool._slots[s.slot_id] = s
+        pool._deferred_reap.add(s.slot_id)
+
+    retired_box = [[None, 0.0, True]]      # this reaper was declared wedged and retired
+    pool._drain_deferred_reaps(retired_box)
+    assert reaped == [], f"a retired reaper kept draining the queue: {reaped}"
+
+    live_box = [[None, 0.0, False]]        # a healthy one still drains it
+    pool._drain_deferred_reaps(live_box)
+    assert len(reaped) == 3, f"a live reaper must drain the queue, got {reaped}"
+
+
+def test_f10_the_spawner_retires_a_reaper_that_has_stopped_making_progress():
+    """The other half of F10: something must SET the retired flag. A reaper whose last progress is
+    older than _REAPER_WEDGED_AFTER_S stops counting toward _MAX_REAPERS so replacements can spawn;
+    that same decision must mark it retired, or it rejoins the drain if its terminate ever returns."""
+    import threading
+
+    from blastbox.host.pool import SlotState, WarmPool
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    release = threading.Event()
+    t = threading.Thread(target=release.wait, daemon=True)   # a real, still-alive thread
+    t.start()
+    try:
+        stale = [t, pool._clock() - (pool._REAPER_WEDGED_AFTER_S + 1.0), False]
+        pool._reaper_threads.append(stale)
+        s = _slot("s0", SlotState.DRAINING)          # give it a reason to look at the queue
+        pool._slots["s0"] = s
+        pool._deferred_reap.add("s0")
+        pool._reap_deferred()
+        assert stale[2] is True, "a wedged reaper was abandoned but never told to stop"
+    finally:
+        release.set()
+        t.join(timeout=5)
+
+
+def test_f26_an_unknown_slot_is_probed_once_per_claim_not_once_per_scan():
+    """The unprobeable set was rebuilt every scan, so a runtime that answers UNKNOWN *fast* (a
+    throttle returns in milliseconds) was re-probed on every rescan of the same claim -- multiplying
+    aws CLI subprocesses per dispatcher thread during exactly the brownout the budget exists for."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    probes: list[str] = []
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
+            probes.append(slot.slot_id)
+            return None            # fast UNKNOWN, exactly like a throttled describe
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    for i in range(3):
+        s = _slot(f"s{i}", SlotState.IDLE)
+        pool._slots[s.slot_id] = s
+    assert pool.claim(timeout_s=0.3) is None       # every slot unknown -> no claim
+    assert len(probes) == 3, f"expected one probe per slot for the whole claim, got {probes}"
+
+
+# ---------------- marla loop (run-41): UNKNOWN must be survivable, not permanent -----------------
+
+def _unknown_rt(reaped: list):
+    """A runtime whose probes never give a definitive answer (a persistent host/control-plane fault)."""
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            from blastbox.host.pool import SlotState
+            return _slot(f"new{len(reaped)}", SlotState.IDLE)
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            raise OSError("[Errno 24] Too many open files: 'aws'")
+
+        def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
+            return None
+
+        def reap(self, slot):  # noqa: ANN001
+            reaped.append(slot.slot_id)
+    return _Rt()
+
+
+def test_a_transient_unknown_does_not_cost_the_slot():
+    """The whole point of #77: a correlated control-plane brownout must NOT destroy warm workers."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    reaped: list[str] = []
+    clock = [1000.0]
+    pool = WarmPool(runtime=_unknown_rt(reaped), warm_size=1, clock=lambda: clock[0])
+    slot = _slot("s1", SlotState.IDLE)
+    pool._slots["s1"] = slot
+    for _ in range(20):
+        clock[0] += 1.0          # 20 seconds of solid UNKNOWN
+        pool._health_check()
+    assert reaped == [], f"a transient brownout destroyed a healthy warm worker: {reaped}"
+    assert pool._slots.get("s1") is slot
+
+
+def test_a_PERSISTENT_unknown_eventually_escalates_to_dead():
+    """The half of the inversion that was missing. Before this, UNKNOWN was permanent: the slot was
+    never claimable, never reaped and never replaced, _spawn_to_deficit counted it as active, and
+    is_healthy() still returned True -- a tier silently wedged at zero capacity. On main a probe
+    error set alive=False, so this case SELF-HEALED; keeping the slot forever is strictly worse than
+    the bug #77 fixes. UNKNOWN is a reason to WAIT, never a reason to wait indefinitely."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    reaped: list[str] = []
+    clock = [1000.0]
+    pool = WarmPool(runtime=_unknown_rt(reaped), warm_size=1, clock=lambda: clock[0])
+    slot = _slot("s1", SlotState.IDLE)
+    pool._slots["s1"] = slot
+    for _ in range(400):
+        clock[0] += 5.0          # well past any sane grace
+        pool._health_check()
+    # Disposal is ASYNCHRONOUS: an escalated slot is handed to the bounded deferred reapers rather
+    # than terminated inline, so a tier's worth of 120s AWS terminates cannot stall the tick thread.
+    pool._drain_deferred_reaps()
+    assert reaped == ["s1"], (
+        f"a PERMANENTLY unknown slot was never escalated: reaped={reaped} "
+        f"(tier wedged at zero capacity -- the pre-#77 self-heal that was removed)")
+
+
+def test_a_definitive_answer_resets_the_unknown_clock():
+    """A slot that flickers unknown/alive must never accumulate its way to a reap."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    reaped: list[str] = []
+    answers = iter([None, True] * 500)
+
+    class _Flaky:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            if next(answers) is None:
+                raise OSError("transient")
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            reaped.append(slot.slot_id)
+
+    clock = [1000.0]
+    pool = WarmPool(runtime=_Flaky(), warm_size=1, clock=lambda: clock[0])
+    pool._slots["s1"] = _slot("s1", SlotState.IDLE)
+    for _ in range(400):
+        clock[0] += 5.0
+        pool._health_check()
+    assert reaped == [], f"a recovering slot was escalated to dead: {reaped}"
+
+
+def test_an_unknown_slot_is_re_probed_later_in_the_same_claim():
+    """Suppressing an UNKNOWN slot for the WHOLE claim was the opposite error to re-probing it every
+    scan: a throttle answers in milliseconds, so every slot was suppressed within the first second
+    of a 60s window and never asked again -- claim() then span on demand misses and tripped burst
+    spawning mid-brownout. It must be a cooldown, so a slot recovering mid-window is still usable."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    probes: list[float] = []
+    clock = [1000.0]
+    recovered = {"v": False}
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
+            probes.append(clock[0])
+            return True if recovered["v"] else None
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0])
+    pool._slots["s1"] = _slot("s1", SlotState.IDLE)
+    unprobeable: dict[str, float] = {}
+    assert pool._try_claim_one(clock[0] + 1, clock[0] + 1, unprobeable) is None   # unknown -> skip
+    assert len(probes) == 1
+    clock[0] += pool._UNPROBEABLE_COOLDOWN_S + 0.1                                # cooldown elapses
+    recovered["v"] = True                                                          # control plane back
+    got = pool._try_claim_one(clock[0] + 1, clock[0] + 1, unprobeable)
+    assert got is not None, f"a recovered slot was never re-probed within the claim: probes={probes}"
+    assert len(probes) == 2
+
+
+def test_escalation_that_cannot_dispose_returns_the_slot_instead_of_quarantining_it():
+    """The escalation reaps through the SAME control plane that made the slot unknown, so during a
+    long brownout terminate fails too -- and the slot was quarantined DRAINING, which nothing ever
+    retries and which still counts against concurrent_ceiling. That is strictly WORSE than the
+    UNKNOWN wedge it replaced: the wedge recovered when the brownout ended, the quarantine never
+    does. An escalated slot is only SUSPECTED dead; if we cannot dispose of it we know nothing, so
+    it goes back to IDLE and the normal cycle resumes."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    brownout = {"v": True}
+    reap_calls: list[str] = []
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return None if brownout["v"] else True
+
+        def reap(self, slot):  # noqa: ANN001
+            reap_calls.append(slot.slot_id)
+            if brownout["v"]:
+                raise RuntimeError("terminate failed: throttled")
+
+    clock = [1000.0]
+    pool = WarmPool(runtime=_Rt(), warm_size=1, clock=lambda: clock[0], unknown_grace_s=60.0)
+    pool._slots["s1"] = _slot("s1", SlotState.IDLE)
+    for _ in range(40):                       # ride out a brownout longer than the grace
+        clock[0] += 5.0
+        pool._health_check()
+        pool._drain_deferred_reaps()      # disposal is asynchronous now (bounded reapers)
+    assert reap_calls, "escalation never even attempted a disposal"
+
+    brownout["v"] = False                     # control plane recovers
+    clock[0] += 5.0
+    pool._health_check()
+    pool._drain_deferred_reaps()
+    s = pool._slots.get("s1")
+    assert s is not None, "the slot vanished despite never being disposed of"
+    assert s.state == SlotState.IDLE, (
+        f"slot stuck in {s.state} after the brownout ended — permanently zero capacity")
+
+
+def test_unknown_since_leak_is_pruned_when_slots_leave():
+    """One bookkeeping entry per reaped slot is a slow leak on a tier that churns a slot per job
+    (measured: 50 entries against 0 live slots)."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return None            # always UNKNOWN -> stamps _unknown_since
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    clock = [1000.0]
+    pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0])
+    for i in range(5):
+        pool._slots[f"s{i}"] = _slot(f"s{i}", SlotState.IDLE)
+        clock[0] += 1.0
+        pool._health_check()                 # stamps an entry for each
+        pool._slots.pop(f"s{i}")             # ...and the slot then leaves the pool
+    clock[0] += 1.0
+    pool._health_check()
+    assert pool._unknown_since == {}, f"bookkeeping leaked for departed slots: {pool._unknown_since}"
+
+
+def test_escalated_disposals_do_not_block_the_tick_thread():
+    """The escalation routed suspected-dead slots into the SYNCHRONOUS reap path, so a whole tier's
+    terminates ran serially on the sole tick thread with no budget -- during the very outage that
+    made them unknown, each AWS terminate can burn its full CLI timeout. That is exactly the wedge
+    issue #77 exists to fix, reintroduced on the health path (upstream P1). They must go through the
+    bounded deferred reapers instead."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    reaping = {"n": 0}
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return None                     # permanently UNKNOWN -> escalation fires
+
+        def reap(self, slot):  # noqa: ANN001
+            reaping["n"] += 1
+            raise AssertionError("reap must NOT run inline on the tick thread")
+
+    clock = [1000.0]
+    pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0], unknown_grace_s=10.0)
+    for i in range(3):
+        pool._slots[f"s{i}"] = _slot(f"s{i}", SlotState.IDLE)
+    for _ in range(6):
+        clock[0] += 5.0
+        pool._health_check()                # must not raise: nothing reaped inline
+    assert reaping["n"] == 0, "an escalated disposal ran synchronously on the tick thread"
+    assert pool._deferred_reap, "escalated slots were not handed to the bounded deferred reapers"
+
+
+def test_a_brownout_is_not_recorded_as_demand():
+    """When every slot is skipped because its runtime could not ANSWER, the shortage is a brownout,
+    not load. Recording it as a demand miss trips burst-spawning during the outage -- adding
+    control-plane calls to a control plane that is already failing (upstream P2)."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
+            return None                     # fast UNKNOWN, like a throttled describe
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    pool._slots["s1"] = _slot("s1", SlotState.IDLE)
+    misses: list[int] = []
+    pool._record_demand_miss = lambda: misses.append(1)   # type: ignore[method-assign]
+    assert pool.claim(timeout_s=0.2) is None
+    assert misses == [], f"a control-plane brownout was billed as demand pressure: {len(misses)}"
+
+
+def test_a_successful_claim_probe_resets_the_unknown_grace():
+    """The unknown clock was reset only by the HEALTH tick. A slot answering fine at CLAIM time --
+    i.e. being handed out and used -- could still age out and be escalated to dead (upstream P2)."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    answers = {"v": None}
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return answers["v"]
+
+        def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
+            return answers["v"]
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    clock = [1000.0]
+    pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0], unknown_grace_s=50.0)
+    pool._slots["s1"] = _slot("s1", SlotState.IDLE)
+
+    clock[0] += 10.0
+    pool._health_check()                       # UNKNOWN -> clock starts
+    assert "s1" in pool._unknown_since
+
+    answers["v"] = True                        # control plane recovers, and a CLAIM succeeds
+    got = pool.claim(timeout_s=0.2)
+    assert got is not None
+    assert "s1" not in pool._unknown_since, (
+        "a slot that answered at claim time still carried its unknown clock toward escalation")
+
+
+def test_a_definitive_probe_lifts_the_demand_suppression():
+    """A slot that answered UNKNOWN once stayed in `unprobeable` for the whole claim, so the
+    demand-miss suppression stayed on even after the control plane recovered -- and a lone queued
+    job could never trip burst capacity again inside that window (upstream P2)."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    answers = {"v": None}
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
+            return answers["v"]
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    clock = [1000.0]
+    pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0])
+    pool._slots["s1"] = _slot("s1", SlotState.IDLE)
+    unprobeable: dict[str, float] = {}
+    assert pool._try_claim_one(None, None, unprobeable) is None      # UNKNOWN -> suppressed
+    assert "s1" in unprobeable
+
+    answers["v"] = True                                             # control plane recovers
+    clock[0] += pool._UNPROBEABLE_COOLDOWN_S + 0.1                   # ...and the cooldown elapses
+    got = pool._try_claim_one(None, None, unprobeable)
+    assert got is not None
+    assert "s1" not in unprobeable, (
+        "a definitively-answered slot stayed suppressed, muting demand for the rest of the claim")
+
+
+def test_the_unknown_clock_is_not_backdated_across_a_slow_health_pass():
+    """_health_check samples `now` ONCE and then probes every idle slot serially. Stamping each
+    slot's first UNKNOWN with that stale value charges later slots for the time spent probing
+    earlier ones -- so on a big tier with slow probes a slot can be born already most of the way
+    through its grace and escalate on its very first unknown (escalated codex, loop 5)."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    clock = [1000.0]
+    reaped: list[str] = []
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            clock[0] += 40.0        # each probe is SLOW, as during a real brownout
+            return None
+
+        def reap(self, slot):  # noqa: ANN001
+            reaped.append(slot.slot_id)
+
+    # One pass costs 4 x 40s = 160s, so every slot is legitimately re-probed 160s apart. The grace
+    # sits ABOVE that but BELOW 160 + the backdating error (up to a full pass), so only a backdated
+    # clock can push a slot over it.
+    pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0], unknown_grace_s=200.0)
+    for i in range(4):
+        pool._slots[f"s{i}"] = _slot(f"s{i}", SlotState.IDLE)
+
+    # Pass 1 stamps each slot. The LAST slot is not actually probed until ~160s in, but a single
+    # `now` sampled at the top stamps it as though it went unknown at t=0.
+    pool._health_check()
+    pool._drain_deferred_reaps()
+    assert reaped == [], f"escalated on the FIRST unknown: {reaped}"
+    stamps = dict(pool._unknown_since)
+    assert len(stamps) == 4
+    assert max(stamps.values()) > min(stamps.values()), (
+        f"all four slots share one timestamp, so the later ones are backdated: {stamps}")
+
+    # Pass 2: the last slot has genuinely been unknown for only one pass, far inside the 100s grace.
+    pool._health_check()
+    pool._drain_deferred_reaps()
+    assert reaped == [], (
+        f"escalated on backdated time: every slot has been unknown for one 160s pass, inside the "
+        f"200s grace, yet these were reaped: {reaped}")
+
+
+def test_a_stale_health_result_is_dropped_when_a_claim_took_the_slot():
+    """Taking the lock only SERIALISES the writes, it does not ORDER them: a probe that began while
+    the slot was IDLE could still stamp _unknown_since after a concurrent claim cleared it. That
+    stale stamp then ages untouched for the whole job, so the first UNKNOWN after release exceeds
+    the grace at once and evicts a worker that has been serving the entire time (upstream P2)."""
+    from blastbox.host.pool import SlotState, WarmPool
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            # simulate the claim landing WHILE this probe is in flight
+            slot.state = SlotState.ASSIGNED
+            return None
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    clock = [1000.0]
+    pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0])
+    pool._slots["s1"] = _slot("s1", SlotState.IDLE)
+    pool._health_check()
+    assert "s1" not in pool._unknown_since, (
+        "a health result that lost the race to a claim was written anyway, and will age while the "
+        "slot is ASSIGNED")
+
+
+def test_the_wedged_after_threshold_exceeds_one_reap_call():
+    """A disposal is a remote call bounded by the runtime's cli_timeout_s (120s by default). A flat
+    60s threshold declares a perfectly healthy slow reap wedged and spawns a replacement beside it,
+    so _MAX_REAPERS stops bounding concurrency during exactly the control-plane slowdown where
+    extra CLI calls amplify the outage (upstream P2)."""
+    from types import SimpleNamespace
+
+    from blastbox.host.pool import WarmPool
+
+    class _Rt:
+        kind = "test"
+        cfg = SimpleNamespace(cli_timeout_s=120.0)
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0)
+    assert pool._reaper_wedged_after_s() > 120.0, (
+        "a legitimate 120s disposal would be declared wedged and replaced mid-flight")
+
+    class _NoCfg(_Rt):
+        cfg = None
+
+    assert WarmPool(runtime=_NoCfg(), warm_size=0)._reaper_wedged_after_s() == \
+        WarmPool._REAPER_WEDGED_AFTER_S      # runtimes without a cfg keep the floor
+
+
+def test_the_wedge_threshold_sees_through_a_cascade():
+    """PRODUCTION wraps tiers in a CascadingRuntime, which has no cfg of its own -- so reading
+    self._runtime.cfg silently fell back to the 60s floor and the derived threshold never applied
+    where it was actually needed. Any wrapped tier could own the slot being reaped (upstream P2)."""
+    from types import SimpleNamespace
+
+    from blastbox.host.pool import WarmPool
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    slow = _Rt(); slow.cfg = SimpleNamespace(cli_timeout_s=120.0)      # type: ignore[attr-defined]
+    fast = _Rt(); fast.cfg = SimpleNamespace(cli_timeout_s=30.0)       # type: ignore[attr-defined]
+
+    class _Cascade(_Rt):
+        tiers = [SimpleNamespace(runtime=fast), SimpleNamespace(runtime=slow)]
+
+    pool = WarmPool(runtime=_Cascade(), warm_size=1)
+    assert pool._reaper_wedged_after_s() > 120.0, (
+        "behind a cascade the threshold fell back to the floor, so a legitimate 120s disposal is "
+        "declared wedged and replaced mid-flight")

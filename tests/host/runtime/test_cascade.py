@@ -396,3 +396,71 @@ def test_pool_config_registers_cascade(monkeypatch):
     cfg = pool_config.PoolConfig.from_env()
     with pytest.raises(CascadeMisconfigured):
         pool_config.build_warm_pool(cfg=cfg)
+
+
+def test_cascade_forwards_unknown_liveness_unchanged():
+    # issue #77: cascade is the wrapper the AWS tiers actually run under, so it is the real path
+    # the UNKNOWN tri-state travels. It must forward None unchanged — collapsing it to a bool would
+    # turn "the control plane didn't answer" into "destroy this healthy worker".
+    class _UnknownTier:
+        kind = "aws-lambda-microvm"
+
+        def __init__(self):
+            self.n = 0
+
+        def spawn(self):
+            self.n += 1
+            return FakeSlot(f"unknown-{self.n}")
+
+        def is_ready(self, slot):
+            return True
+
+        def is_alive(self, slot):
+            return True                      # the CACHED view still says alive
+
+        def is_alive_for_claim(self, slot):
+            return None                      # the FRESH view couldn't answer
+
+        def reap(self, slot):
+            pass
+
+    tier_rt = _UnknownTier()
+    rt = CascadingRuntime([Tier("aws-lambda-microvm", tier_rt, 1)])
+    slot = rt.spawn()                        # cascade records tier ownership on spawn
+    assert rt.is_alive_for_claim(slot) is None, "cascade collapsed UNKNOWN into a bool"
+
+
+def test_cascade_forwards_the_resume_budget():
+    """The claim window's remaining time must reach the owning tier, or a slow resume still burns
+    the whole window in the production (cascaded) shape."""
+    class BudgetResume(FakeRuntime):
+        def __init__(self, name):
+            super().__init__(name)
+            self.budgets = []
+
+        def resume(self, slot, *, budget_s=None):
+            self.budgets.append(budget_s)
+
+    r = BudgetResume("hib")
+    rt = CascadingRuntime([Tier("hib", r, 1)])
+    slot = rt.spawn()
+    rt.resume(slot, budget_s=1.25)
+    assert r.budgets == [1.25], f"claim budget did not reach the tier: {r.budgets}"
+
+
+def test_cascade_does_not_retry_resume_when_the_tier_itself_raises():
+    """The try guarding inspect.signature used to wrap the CALL too, so a TypeError raised INSIDE
+    resume() was mistaken for an introspection failure and resume -- which issues resume-microvm /
+    start-instances and clears auth_token -- ran a SECOND time, unbudgeted."""
+    calls = []
+
+    class BoomBudgetResume(FakeRuntime):
+        def resume(self, slot, *, budget_s=None):
+            calls.append(budget_s)
+            raise TypeError("bug while parsing the resume response")
+
+    rt = CascadingRuntime([Tier("hib", BoomBudgetResume("hib"), 1)])
+    slot = rt.spawn()
+    with pytest.raises(TypeError):
+        rt.resume(slot, budget_s=0.5)
+    assert calls == [0.5], f"a side-effecting resume was retried unbudgeted: {calls}"
