@@ -1168,8 +1168,14 @@ def build_remote_vm_dispatcher(
 
     def _release(slot: Any, dirty: bool = False, fault: str | None = None) -> None:
         # Forward the transport's attribution through to the pool -- dropping it here would put the
-        # conflated signal straight back (job failures counting as worker evidence).
-        pool.release(slot, dirty=dirty, fault=fault)
+        # conflated signal straight back (job failures counting as worker evidence). But degrade
+        # HERE rather than making the caller retry: this seam always passed fault= through, so
+        # against a pool predating fault attribution EVERY retry in remote_http's fallback ladder
+        # raised TypeError again and the slot was never released at all (upstream, PR #82).
+        try:
+            pool.release(slot, dirty=dirty, fault=fault)
+        except TypeError:
+            pool.release(slot, dirty=dirty)
 
     sanitize: Callable[[dict[str, str]], dict[str, str]] | None = None
     # the RESOLVED policy the worker's egress is actually provisioned to (None = enforcement opt-out, i.e.

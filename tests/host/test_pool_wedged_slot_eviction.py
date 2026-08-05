@@ -395,3 +395,92 @@ def test_a_successful_spawn_resets_the_restore_failure_streak() -> None:
         "alternating failure/success never reaches the consecutive threshold, so the base must "
         f"not be rebuilt (got {rt.base_invalidations})"
     )
+
+
+def test_a_release_seam_degrades_against_a_pool_without_fault_attribution(tmp_path, monkeypatch):
+    """The seam always forwarded fault=, so against a pool predating attribution EVERY rung of
+    remote_http's fallback ladder raised TypeError again -- and the slot was never released at all.
+    Degrade at the seam instead of making the caller retry (upstream, PR #82)."""
+    import blastbox.host.runtime.remote_http as rh
+    import blastbox.host.runtime.vm_dispatch as vd
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    from tests.host.test_vm_dispatch import _FAKE_LIMITS
+
+    captured: dict = {}
+
+    def _fake(claim, release, **kw):  # noqa: ANN001
+        captured["release"] = release
+        return lambda *a, **k: None
+
+    monkeypatch.setattr(rh, "make_remote_validate", _fake)
+
+    seen: list = []
+
+    class _OldPool:                        # no `fault` parameter at all
+        runtime = type("R", (), {"ssl_context": None})()
+
+        def claim(self, *, timeout_s):  # noqa: ANN001
+            return None
+
+        def release(self, slot, *, dirty=False):  # noqa: ANN001
+            seen.append(dirty)
+
+    vd.build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _OldPool(),
+                                  tier="static", engine="clippyshot", limits=_FAKE_LIMITS)
+    captured["release"](object(), True, "worker")
+    assert seen == [True], f"the slot was never released against an old pool: {seen}"
+
+
+def test_a_late_release_for_an_untracked_slot_books_nothing():
+    """stop()/eviction can remove a slot while a job is still finishing. Recording health state
+    then leaks an entry keyed on a dead slot_id and moves the POOL-wide counter on evidence from a
+    slot that is no longer in the pool -- which can tip a base rebuild (upstream, PR #82)."""
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=1, max_consecutive_failures=2)
+    orphan = Slot(slot_id="gone", control_dir="/c", input_dir="/i", output_dir="/o",
+                  state=SlotState.ASSIGNED)          # never in _slots: already removed
+    pool.release(orphan, dirty=True, fault="worker")
+    assert "gone" not in pool._slot_failures, "leaked bookkeeping for an untracked slot"
+    assert pool._pool_consecutive_failures == 0, (
+        "a slot no longer in the pool moved the pool-wide failure counter")
+
+
+def test_snapshot_rebuild_after_zero_actually_disables():
+    """The comment said 0 disables while the code treated <=0 as 'derive a default', so rebuilds
+    were on by default and could not be turned off at all (upstream, PR #82)."""
+    from blastbox.host.pool import WarmPool
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    assert WarmPool(runtime=_Rt(), warm_size=4, snapshot_rebuild_after=0)._snapshot_rebuild_after == 0
+    assert WarmPool(runtime=_Rt(), warm_size=4, snapshot_rebuild_after=7)._snapshot_rebuild_after == 7
+    assert WarmPool(runtime=_Rt(), warm_size=4)._snapshot_rebuild_after > 0      # None -> derived

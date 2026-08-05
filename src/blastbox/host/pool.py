@@ -186,7 +186,7 @@ class WarmPool:
         max_consecutive_failures: int = 2,
         max_evictions_per_window: int | None = None,
         eviction_window_s: float = 600.0,
-        snapshot_rebuild_after: int = 0,
+        snapshot_rebuild_after: int | None = None,
         base_rebuild_cooldown_s: float = 300.0,
     ) -> None:
         self._runtime = runtime
@@ -227,10 +227,16 @@ class WarmPool:
         self._evictions: list[float] = []
         # Reaping cannot help when the persisted warm BASE is what is poisoned -- every replacement
         # restores the same bad state. After this many dirty releases pool-wide with no intervening
-        # success, ask the runtime to discard its base so the next spawn rebuilds it. 0 disables;
-        # default derives from warm_size so it scales with the pool.
+        # success, ask the runtime to discard its base so the next spawn rebuilds it.
+        #   None -> derive from warm_size, so it scales with the pool
+        #   0    -> DISABLED
+        #   >0   -> exactly that many
+        # The previous form said "0 disables" in the comment while treating <=0 as "use the derived
+        # default", so rebuilds were on by default and there was no way to turn them off at all
+        # (upstream, PR #82). Same sentinel convention as max_evictions_per_window above.
         self._snapshot_rebuild_after = (
-            snapshot_rebuild_after if snapshot_rebuild_after > 0 else max(4, 2 * max(1, warm_size))
+            max(4, 2 * max(1, warm_size)) if snapshot_rebuild_after is None
+            else max(0, int(snapshot_rebuild_after))
         )
         self._pool_consecutive_failures = 0
         self._base_rebuilds = 0
@@ -557,7 +563,14 @@ class WarmPool:
             slot.jobs += 1
             jobs = slot.jobs
             tracked = slot.slot_id in self._slots
-            if dirty and fault == "worker":
+            if not tracked:
+                # A late release for a slot stop()/eviction already removed. Recording anything
+                # here leaks an entry keyed on a dead slot_id AND moves the POOL-wide counter on
+                # evidence from a slot that is no longer in the pool -- which can tip a base
+                # rebuild (upstream, PR #82).
+                slot_failures = pool_failures = 0
+                last_success = 0.0
+            elif dirty and fault == "worker":
                 # ONLY worker-attributed failures are evidence about the slot. Counting job faults
                 # here is what let two bad samples in a row destroy a warm worker with a hundred
                 # clean jobs behind it -- and on this workload two bad samples in a row is routine,
@@ -572,9 +585,10 @@ class WarmPool:
                 self._slot_failures.pop(slot.slot_id, None)
                 self._slot_last_success[slot.slot_id] = self._clock()
                 self._pool_consecutive_failures = 0
-            slot_failures = self._slot_failures.get(slot.slot_id, 0)
-            pool_failures = self._pool_consecutive_failures
-            last_success = self._slot_last_success.get(slot.slot_id, 0.0)
+            if tracked:
+                slot_failures = self._slot_failures.get(slot.slot_id, 0)
+                pool_failures = self._pool_consecutive_failures
+                last_success = self._slot_last_success.get(slot.slot_id, 0.0)
 
         # A wedged in-guest agent is invisible to is_alive(), so consecutive dirty releases are the
         # only signal the pool gets. Once a slot hits the limit, do NOT recycle-and-republish it:
