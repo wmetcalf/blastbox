@@ -905,6 +905,15 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
                 # twice health_probe_timeout_s, multiplied across idle slots (upstream P2).
                 try:
                     self._ensure_token(slot)   # refresh only past half-TTL (cached otherwise)
+                except AwsUnknownState:
+                    # The claim hook already reports this as UNKNOWN so the slot is skipped
+                    # non-destructively -- but reporting alive=True here meant the pool never
+                    # started its unknown clock while _spawn_to_deficit kept counting the
+                    # unclaimable slot, so a warm_size=1 tier requeued jobs indefinitely once the
+                    # token aged. Same answer on both paths (upstream P2).
+                    _log.warning("aws.health_mint_unknown slot_id=%s — reporting UNKNOWN",
+                                 slot.slot_id)
+                    return None
                 except (AwsWorkerError, OSError):
                     pass   # best-effort; a real failure surfaces at readiness/detonate
         return alive
@@ -1084,7 +1093,12 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # on state==running and does an UNCACHED get-microvm per call -- both wrong for a parked warm slot.
         self._resolve_url(slot)
         if slot.url is None:
-            return False
+            # UNKNOWN, not silent: NO probe was issued. The same-pass corroboration promotes a bare
+            # False to a conviction, so a RUNNING microVM whose endpoint has not surfaced yet was
+            # terminated with ZERO agent probes ever sent. This is the sibling of the EC2 no-IP fix
+            # in the same commit -- fixing one tier and skipping the other is the recurring shape
+            # of this branch's bugs, and snapstart is the DEFAULT warm tier (upstream/opus round).
+            return None
         # THROTTLE re-minting after a failed mint: AWS can surface the stable endpoint while the microVM is
         # still pending, but create-microvm-auth-token needs a RUNNING VM -> it fails. Without this the
         # ~10Hz WARMING readiness poll would re-mint (and fail) every tick, storming the control plane. Skip
@@ -1116,6 +1130,13 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         except (AwsWorkerError, OSError) as exc:
             self._mint_fail_at[slot.slot_id] = self._clock()   # not runnable yet -> back off the mint API
             self._mint_fail_exc[slot.slot_id] = exc if isinstance(exc, Exception) else None
+            if _is_confirmed_dead_exc(exc):
+                # A mint that fails with ResourceNotFoundException is AWS telling us the microVM is
+                # GONE. Swallowing it into a backoff meant the resume loop never saw it, so
+                # saw_confirmed_dead stayed False and a later throttle produced UNKNOWN -- the
+                # dispatcher then unclaimed a microVM AWS had already said does not exist. Back off
+                # unconfirmed mint failures; propagate confirmed ones (upstream P2).
+                raise
             return False
         url = slot.url.rstrip("/") + self.cfg.agent_health_path
         headers = {"X-aws-proxy-auth": token, "X-aws-proxy-port": str(self.cfg.agent_port)}
@@ -1198,7 +1219,6 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         # legitimately fails its first probes, and pairing that early silence with a much later
         # "it is running now" observation terminated healthy instances that were never given a full
         # probe after starting (upstream P2).
-        state_says_up = False   # what the MOST RECENT state observation said
         silent_while_up = False # a FULL-duration probe came back silent while it was known up
         # STICKY, unlike the per-pass verdict: once AWS answers that the resource is gone, that does
         # not stop being true because a later call ran out of budget. Deriving it from last_exc let
@@ -1222,6 +1242,7 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
                 # wiped a throttled mint the moment the describe in the SAME pass succeeded, and that
                 # mint failure is exactly what says "we still don't know if this worker is fine".
                 iter_exc: Exception | None = None
+                probe_was_silent = False   # this pass's probe result, pending same-pass corroboration
                 try:
                     _ok = self._health_ok(slot)
                     if _ok:
@@ -1232,8 +1253,13 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
                     # a parked state legitimately fails its first probes, and pairing that early
                     # silence with a much later "it is running now" convicted healthy workers that
                     # were never given a full probe after starting (upstream P2).
-                    if _ok is False and state_says_up:
-                        silent_while_up = True
+                    # PENDING, not recorded: correlating against state_says_up here uses the
+                    # PREVIOUS pass's observation. A Lambda that auto-suspends between iterations
+                    # fails its next probe perfectly normally, and that would be banked as
+                    # silence-while-up before this pass's describe reports "suspended" -- sticky,
+                    # so the healthy slot is convicted anyway (upstream P2).
+                    if _ok is False:
+                        probe_was_silent = True
                 except (AwsWorkerError, OSError) as exc:
                     iter_exc = exc      # not-yet-RUNNING mint/probe failures -> keep trying to wake it
                     saw_confirmed_dead |= _is_confirmed_dead_exc(exc)
@@ -1244,7 +1270,10 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
                     # The control plane ANSWERED and says the microVM is up. Combined with a failing
                     # agent probe that is a CONFIRMED bad worker, not an unknown one.
                     confirmed_up = cur in self._RUNNING_STATES
-                    state_says_up = confirmed_up
+                    # Corroborated IN THIS PASS: the probe came back silent AND the state query that
+                    # followed it still says the worker is up.
+                    if probe_was_silent and confirmed_up:
+                        silent_while_up = True
                 except (AwsWorkerError, OSError) as exc:
                     iter_exc, cur = exc, ""
                     saw_confirmed_dead |= _is_confirmed_dead_exc(exc)
@@ -1597,7 +1626,11 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
     def _agent_healthy(self, slot: AwsWorkerSlot) -> "bool | None":
         self._resolve_ip(slot)
         if slot.ip is None:
-            return False
+            # UNKNOWN, not silent: with use_public_ip a just-started instance has no address yet,
+            # so NO probe was issued. Reporting False recorded it as agent silence the moment the
+            # state query said "running", and a shortened window then terminated a healthy instance
+            # that simply was not addressable yet (upstream P2).
+            return None
         scheme = "https" if self.ssl_context else "http"
         url = f"{scheme}://{slot.ip}:{self.cfg.agent_port}{self.cfg.agent_health_path}"
         headers = {"X-aws-proxy-auth": self.cfg.agent_token} if self.cfg.agent_token else {}
@@ -1731,7 +1764,6 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # legitimately fails its first probes, and pairing that early silence with a much later
         # "it is running now" observation terminated healthy instances that were never given a full
         # probe after starting (upstream P2).
-        state_says_up = False   # what the MOST RECENT state observation said
         silent_while_up = False # a FULL-duration probe came back silent while it was known up
         # STICKY, unlike the per-pass verdict: once AWS answers that the resource is gone, that does
         # not stop being true because a later call ran out of budget. Deriving it from last_exc let
@@ -1750,17 +1782,24 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         with scope:
             while self._clock() < deadline:
                 iter_exc: Exception | None = None      # see the snapstart loop: per-PASS verdict
+                probe_was_silent = False   # this pass's probe result, pending same-pass corroboration
                 try:
                     _ok = self._agent_healthy(slot)
                     if _ok:
                         return
-                    if _ok is False and state_says_up:
-                        silent_while_up = True      # a full probe, while it was known up
+                    # PENDING, not recorded: correlating against state_says_up here uses the
+                    # PREVIOUS pass's observation. A Lambda that auto-suspends between iterations
+                    # fails its next probe perfectly normally, and that would be banked as
+                    # silence-while-up before this pass's describe reports "suspended" -- sticky,
+                    # so the healthy slot is convicted anyway (upstream P2).
+                    if _ok is False:
+                        probe_was_silent = True      # a full probe, while it was known up
                 except (AwsWorkerError, OSError) as exc:
                     iter_exc = exc
                 try:
                     cur = self._state(slot)
-                    state_says_up = cur == "running"
+                    if probe_was_silent and cur == "running":
+                        silent_while_up = True      # corroborated in THIS pass
                 except (AwsWorkerError, OSError) as exc:
                     iter_exc, cur = exc, ""
                     saw_confirmed_dead |= _is_confirmed_dead_exc(exc)

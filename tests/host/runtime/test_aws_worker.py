@@ -2577,3 +2577,167 @@ def test_snapstart_resume_does_not_grant_a_second_full_budget():
     assert spent <= 1.0 * 1.1, (
         f"resume consumed {spent:.2f} clock-seconds against a 1.0s budget — the prelude and the "
         f"loop each got their own window")
+
+
+def test_a_slot_that_suspends_between_passes_is_not_convicted():
+    """Correlating the probe against `state_says_up` used the PREVIOUS pass's observation. A Lambda
+    that auto-suspends between iterations fails its next probe perfectly normally -- and that was
+    banked as silence-while-up before the same pass's describe reported "suspended". The flag is
+    sticky, so the healthy slot was convicted anyway. Silence must be corroborated by the state
+    query that FOLLOWS it in the same pass (upstream P2)."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+
+    # Pass 1: we cannot ASK (probe unknown) but the describe confirms RUNNING -> state is "up".
+    # Between passes the platform auto-suspends. Pass 2: the probe fails -- entirely normal for a
+    # suspended VM -- and the OLD code banked that against pass 1's stale "up" before this pass's
+    # describe reported SUSPENDED.
+    states = iter(["RUNNING"] + ["SUSPENDED"] * 60)
+    probe_answers = iter([None] + [False] * 60)
+    tick = [100.0]
+
+    def describe(argv):  # noqa: ANN001
+        return _cp(stdout=json.dumps({"state": next(states, "SUSPENDED"), "endpoint": "vm.x"}))
+
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": describe,
+                           "lambda-microvms resume-microvm": {},
+                           "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                          probe=lambda u, h, t: next(probe_answers, False),
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
+                          resume_timeout_s=60.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsUnknownState):
+        rt.resume(slot)
+
+
+def test_an_unaddressable_instance_is_unknown_not_silent():
+    """With use_public_ip a just-started instance has no address yet, so NO probe is issued.
+    Reporting False recorded it as agent silence the moment the state query said "running", and a
+    shortened window then terminated a healthy instance that simply was not addressable (P2)."""
+    from blastbox.host.runtime.aws_worker import Ec2HibernateConfig, Ec2HibernateRuntime
+
+    def runner(argv, timeout):  # noqa: ANN001
+        argv = list(argv)
+        if f"{argv[1]} {argv[2]}" == "sts get-caller-identity":
+            return _cp(stdout=json.dumps({"Account": "1", "Arn": "arn:aws:iam::1:user/x"}))
+        return _cp(stdout=json.dumps({"Reservations": [{"Instances": [
+            {"InstanceId": "i-1", "State": {"Name": "running"}}]}]}))   # NO PublicIpAddress yet
+
+    rt = Ec2HibernateRuntime(Ec2HibernateConfig(region="us-east-1", image_id="ami-0abc",
+                                                use_public_ip=True,
+                                                allow_plaintext_public=True),
+                             aws_runner=runner, http_probe=lambda u, h, t: False,
+                             clock=lambda: 100.0)
+    slot = AwsWorkerSlot(slot_id="h1", resource_id="i-1", state=SlotState.ASSIGNED)
+    assert rt._agent_healthy(slot) is None, "no address yet was reported as the agent being silent"
+
+
+def test_a_mint_unknown_reaches_the_pool_from_the_HEALTH_path_too():
+    """The claim hook reports a throttled mint as UNKNOWN so the slot is skipped non-destructively.
+    The health path swallowed the same error and said alive=True, so the pool never started its
+    unknown clock while _spawn_to_deficit kept counting the unclaimable slot -- a warm_size=1 tier
+    requeued jobs indefinitely once the token aged (P2)."""
+    cfg = LambdaMicroVmConfig(region="us-east-1", image_identifier="arn:aws:lambda:us-east-1:aws:x",
+                              allow_default_egress=True)
+    fake = FakeAws({**_IDENT,
+                    "lambda-microvms get-microvm": {"state": "RUNNING"},
+                    "lambda-microvms create-microvm-auth-token":
+                        _cp(rc=255, stderr="An error occurred (ThrottlingException): Rate exceeded")})
+    rt = LambdaMicroVmRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True,
+                              clock=lambda: 100.0)
+    slot = AwsWorkerSlot(slot_id="s1", state=SlotState.IDLE, resource_id="mv-1",
+                         url="http://10.0.0.1:8080", auth_token="aged")
+    slot.token_minted_at = -1e9        # far past half-TTL -> forces a re-mint, which is throttled
+    assert rt.is_alive(slot) is None, "a throttled mint was reported as a healthy slot"
+
+
+def test_hibernate_can_still_convict_a_dead_agent():
+    """Guards a REGRESSION I shipped: a `starved` guard meant to protect slow thaws was a tautology
+    (budget = min(resume_timeout_s, budget_s) - prelude, so it was true for EVERY budget including
+    None), and it cleared silence unconditionally -- the hibernate tier could not convict a dead
+    agent at all. It survived a revert that removed only the snapstart copy, which is exactly the
+    fix-one-tier-skip-the-sibling shape this branch keeps producing."""
+    from blastbox.host.runtime.aws_worker import (
+        AwsUnknownState,
+        Ec2HibernateConfig,
+        Ec2HibernateRuntime,
+    )
+
+    tick = [100.0]
+
+    def runner(argv, timeout):  # noqa: ANN001
+        tick[0] += 0.5
+        argv = list(argv)
+        if f"{argv[1]} {argv[2]}" == "sts get-caller-identity":
+            return _cp(stdout=json.dumps({"Account": "1", "Arn": "arn:aws:iam::1:user/x"}))
+        return _cp(stdout=json.dumps({"Reservations": [{"Instances": [
+            {"InstanceId": "i-1", "State": {"Name": "running"},
+             "PrivateIpAddress": "10.0.0.5"}]}]}))
+
+    def probe(url, headers, timeout):  # noqa: ANN001
+        tick[0] += 1.0
+        return False                    # the instance is up; its agent is genuinely dead
+
+    rt = Ec2HibernateRuntime(Ec2HibernateConfig(region="us-east-1", image_id="ami-0abc",
+                                                resume_timeout_s=20.0, resume_poll_s=0.0,
+                                                probe_timeout_s=1.0),
+                             aws_runner=runner, http_probe=probe, clock=lambda: tick[0])
+    slot = AwsWorkerSlot(slot_id="h1", resource_id="i-1", state=SlotState.ASSIGNED, ip="10.0.0.5")
+    with pytest.raises(AwsWorkerError) as ei:
+        rt.resume(slot)
+    assert not isinstance(ei.value, AwsUnknownState), (
+        "a RUNNING instance whose agent never answers a full-duration probe must be retired")
+
+
+def test_snapstart_unresolved_endpoint_is_unknown_with_zero_probes():
+    """The sibling of the EC2 no-IP fix, on the DEFAULT warm tier. _health_ok returned a bare False
+    when the endpoint had not surfaced -- no probe issued at all -- and same-pass corroboration
+    promoted that to a conviction, terminating a healthy RUNNING microVM with ZERO agent probes
+    ever sent."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+
+    probes = [0]
+    tick = [100.0]
+
+    def probe(url, headers, timeout):  # noqa: ANN001
+        probes[0] += 1
+        return False
+
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "RUNNING"},   # no endpoint yet
+                           "lambda-microvms resume-microvm": {},
+                           "lambda-microvms create-microvm-auth-token": {"authToken": "jwe"}},
+                          probe=probe,
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
+                          resume_timeout_s=5.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED)
+    with pytest.raises(AwsUnknownState):
+        rt.resume(slot)
+    assert probes[0] == 0, f"convicted after issuing {probes[0]} probes — it issued none"
+
+
+def test_a_confirmed_dead_mint_error_is_not_swallowed_into_a_backoff():
+    """A mint failing with ResourceNotFoundException is AWS saying the microVM is GONE. Swallowing
+    it into the backoff meant the resume loop never saw it, saw_confirmed_dead stayed False, and a
+    later throttle produced UNKNOWN -- so the dispatcher unclaimed a microVM AWS had already said
+    does not exist, and retried it forever (upstream P2)."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+
+    # The state call is THROTTLED, so nothing corroborates silence and the only route to a hard
+    # verdict is the confirmed-dead mint itself. Without that route the classifier says UNKNOWN.
+    tick = [100.0]
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm":
+                               _cp(rc=255, stderr="An error occurred (ThrottlingException)"),
+                           "lambda-microvms resume-microvm":
+                               _cp(rc=255, stderr="An error occurred (ThrottlingException)"),
+                           "lambda-microvms create-microvm-auth-token":
+                               _cp(rc=254, stderr="An error occurred (ResourceNotFoundException)")},
+                          probe=lambda u, h, t: False,
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
+                          resume_timeout_s=60.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsWorkerError) as ei:
+        rt.resume(slot)
+    assert not isinstance(ei.value, AwsUnknownState), (
+        "a microVM AWS confirmed GONE was handed back as unknown because the confirmed-dead mint "
+        "error was swallowed into a backoff and the later throttles decided the verdict")
