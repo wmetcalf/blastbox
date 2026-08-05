@@ -2713,3 +2713,31 @@ def test_snapstart_unresolved_endpoint_is_unknown_with_zero_probes():
     with pytest.raises(AwsUnknownState):
         rt.resume(slot)
     assert probes[0] == 0, f"convicted after issuing {probes[0]} probes — it issued none"
+
+
+def test_a_confirmed_dead_mint_error_is_not_swallowed_into_a_backoff():
+    """A mint failing with ResourceNotFoundException is AWS saying the microVM is GONE. Swallowing
+    it into the backoff meant the resume loop never saw it, saw_confirmed_dead stayed False, and a
+    later throttle produced UNKNOWN -- so the dispatcher unclaimed a microVM AWS had already said
+    does not exist, and retried it forever (upstream P2)."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState
+
+    # The state call is THROTTLED, so nothing corroborates silence and the only route to a hard
+    # verdict is the confirmed-dead mint itself. Without that route the classifier says UNKNOWN.
+    tick = [100.0]
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm":
+                               _cp(rc=255, stderr="An error occurred (ThrottlingException)"),
+                           "lambda-microvms resume-microvm":
+                               _cp(rc=255, stderr="An error occurred (ThrottlingException)"),
+                           "lambda-microvms create-microvm-auth-token":
+                               _cp(rc=254, stderr="An error occurred (ResourceNotFoundException)")},
+                          probe=lambda u, h, t: False,
+                          clock=lambda: tick.__setitem__(0, tick[0] + 0.05) or tick[0],
+                          resume_timeout_s=60.0)
+    slot = AwsWorkerSlot(slot_id="p1", resource_id="mv-1", state=SlotState.ASSIGNED,
+                         url="http://10.0.0.1:8080")
+    with pytest.raises(AwsWorkerError) as ei:
+        rt.resume(slot)
+    assert not isinstance(ei.value, AwsUnknownState), (
+        "a microVM AWS confirmed GONE was handed back as unknown because the confirmed-dead mint "
+        "error was swallowed into a backoff and the later throttles decided the verdict")

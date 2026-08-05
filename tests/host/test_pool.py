@@ -2788,3 +2788,38 @@ def test_the_wedged_after_threshold_exceeds_one_reap_call():
 
     assert WarmPool(runtime=_NoCfg(), warm_size=0)._reaper_wedged_after_s() == \
         WarmPool._REAPER_WEDGED_AFTER_S      # runtimes without a cfg keep the floor
+
+
+def test_the_wedge_threshold_sees_through_a_cascade():
+    """PRODUCTION wraps tiers in a CascadingRuntime, which has no cfg of its own -- so reading
+    self._runtime.cfg silently fell back to the 60s floor and the derived threshold never applied
+    where it was actually needed. Any wrapped tier could own the slot being reaped (upstream P2)."""
+    from types import SimpleNamespace
+
+    from blastbox.host.pool import WarmPool
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    slow = _Rt(); slow.cfg = SimpleNamespace(cli_timeout_s=120.0)      # type: ignore[attr-defined]
+    fast = _Rt(); fast.cfg = SimpleNamespace(cli_timeout_s=30.0)       # type: ignore[attr-defined]
+
+    class _Cascade(_Rt):
+        tiers = [SimpleNamespace(runtime=fast), SimpleNamespace(runtime=slow)]
+
+    pool = WarmPool(runtime=_Cascade(), warm_size=1)
+    assert pool._reaper_wedged_after_s() > 120.0, (
+        "behind a cascade the threshold fell back to the floor, so a legitimate 120s disposal is "
+        "declared wedged and replaced mid-flight")

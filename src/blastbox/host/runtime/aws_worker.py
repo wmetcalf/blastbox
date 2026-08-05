@@ -1130,6 +1130,13 @@ class LambdaSnapStartRuntime(LambdaMicroVmRuntime):
         except (AwsWorkerError, OSError) as exc:
             self._mint_fail_at[slot.slot_id] = self._clock()   # not runnable yet -> back off the mint API
             self._mint_fail_exc[slot.slot_id] = exc if isinstance(exc, Exception) else None
+            if _is_confirmed_dead_exc(exc):
+                # A mint that fails with ResourceNotFoundException is AWS telling us the microVM is
+                # GONE. Swallowing it into a backoff meant the resume loop never saw it, so
+                # saw_confirmed_dead stayed False and a later throttle produced UNKNOWN -- the
+                # dispatcher then unclaimed a microVM AWS had already said does not exist. Back off
+                # unconfirmed mint failures; propagate confirmed ones (upstream P2).
+                raise
             return False
         url = slot.url.rstrip("/") + self.cfg.agent_health_path
         headers = {"X-aws-proxy-auth": token, "X-aws-proxy-port": str(self.cfg.agent_port)}

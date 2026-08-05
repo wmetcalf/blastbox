@@ -665,11 +665,29 @@ class WarmPool:
         A disposal is a remote call: the AWS tiers bound theirs at cli_timeout_s (120s by default),
         so a flat 60s threshold declares a perfectly healthy slow reap wedged and spawns a
         replacement beside it. Give one call room to finish, twice over."""
-        cfg = getattr(self._runtime, "cfg", None)
-        per_call = getattr(cfg, "cli_timeout_s", None) if cfg is not None else None
+        per_call = self._runtime_call_timeout_s()
         if per_call is None:
             return self._REAPER_WEDGED_AFTER_S
         return max(self._REAPER_WEDGED_AFTER_S, 2.0 * float(per_call))
+
+    def _runtime_call_timeout_s(self) -> "float | None":
+        """The longest single remote call the runtime can make, or None if it does not say.
+
+        A CascadingRuntime -- the PRODUCTION shape -- has no cfg of its own, so reading
+        ``self._runtime.cfg`` silently fell back to the floor and the derived threshold never
+        applied where it was needed. Any wrapped tier could own the slot being reaped, so take the
+        maximum across them (upstream P2)."""
+        cfg = getattr(self._runtime, "cfg", None)
+        direct = getattr(cfg, "cli_timeout_s", None) if cfg is not None else None
+        if direct is not None:
+            return float(direct)
+        vals: list[float] = []
+        for tier in getattr(self._runtime, "tiers", None) or ():
+            tcfg = getattr(getattr(tier, "runtime", None), "cfg", None)
+            v = getattr(tcfg, "cli_timeout_s", None) if tcfg is not None else None
+            if v is not None:
+                vals.append(float(v))
+        return max(vals) if vals else None
 
     def _drain_deferred_reaps(self, entry_box: "list | None" = None) -> None:
         """Dispose every queued husk, one at a time, off the tick + claim paths.
