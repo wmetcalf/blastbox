@@ -142,22 +142,26 @@ def test_boot_base_handle_checkpoint_writes_artifact_under_base_and_mem_dir(tmp_
     from blastbox.host.runtime.fc_snapshot_backend import FcSnapshotArtifact
 
     assert isinstance(art, FcSnapshotArtifact)
-    assert art.snapshot_path == dest / "warm.snapshot"
-    assert art.mem_path == memdir / "warm.mem"  # mem on the launcher's mem_dir
+    # Generation-stamped, NOT fixed: a rebuild must never overwrite files that live restored
+    # microVMs are still using as memory backing (upstream, PR #82).
+    assert art.snapshot_path.parent == dest
+    assert art.snapshot_path.name.startswith("warm-") and art.snapshot_path.suffix == ".snapshot"
+    assert art.mem_path.parent == memdir            # mem on the launcher's mem_dir
+    assert art.mem_path.name.startswith("warm-") and art.mem_path.suffix == ".mem"
     # The boot PUTs ran first; checkpoint appended PATCH /vm Paused + PUT create Full.
     assert ("/vm", {"state": "Paused"}) in handle.api.calls
     assert (
         "/snapshot/create",
         {
             "snapshot_type": "Full",
-            "snapshot_path": str(dest / "warm.snapshot"),
-            "mem_file_path": str(memdir / "warm.mem"),
+            "snapshot_path": str(art.snapshot_path),
+            "mem_file_path": str(art.mem_path),
         },
     ) in handle.api.calls
 
 
 def test_boot_base_handle_checkpoint_defaults_mem_to_base_dir(tmp_path):
-    """No mem_dir given → the boot handle's checkpoint writes warm.mem under base_dir."""
+    """No mem_dir given → the boot handle's checkpoint writes its mem file under base_dir."""
     base = tmp_path / "snap"
     launcher = FcSnapshotLauncher(
         FakeCfg(),
@@ -169,7 +173,8 @@ def test_boot_base_handle_checkpoint_defaults_mem_to_base_dir(tmp_path):
     )
     handle = launcher.boot_base()
     art = handle.checkpoint(base / "base")
-    assert art.mem_path == base / "warm.mem"  # defaults to base_dir
+    assert art.mem_path.parent == base           # defaults to base_dir
+    assert art.mem_path.name.startswith("warm-") and art.mem_path.suffix == ".mem"
 
 
 def test_restore_in_spawns_in_slot_cwd_and_copies_base_outdisk(tmp_path):

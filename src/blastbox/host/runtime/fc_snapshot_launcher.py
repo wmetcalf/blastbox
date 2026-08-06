@@ -17,6 +17,7 @@ the full snapshot→restore→convert round-trip works pixel-identically (see th
 from __future__ import annotations
 
 import shutil
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -126,8 +127,16 @@ class _Handle:
         dest = Path(dest_dir)
         dest.mkdir(parents=True, exist_ok=True)
         self._mem_dir.mkdir(parents=True, exist_ok=True)
-        snap = dest / "warm.snapshot"
-        mem = self._mem_dir / "warm.mem"
+        # GENERATION-STAMPED, never fixed names. invalidate_base() drops the in-memory artifact
+        # and the next build() checkpoints again -- into these same paths if they are constant. But
+        # restored microVMs keep using the memory file as their backing store for as long as they
+        # live, so rewriting it under them can SIGBUS or silently corrupt every old-generation VM,
+        # including slots that are mid-job. A fresh generation per build means a rebuild can never
+        # touch a file another VM is still mapping; the old files are reclaimed when their last
+        # user is reaped (upstream, PR #82).
+        gen = f"{os.getpid()}-{time.monotonic_ns():019d}"
+        snap = dest / f"warm-{gen}.snapshot"
+        mem = self._mem_dir / f"warm-{gen}.mem"
         _create_snapshot(self.api, str(snap), str(mem))
         return FcSnapshotArtifact(snap, mem)
 

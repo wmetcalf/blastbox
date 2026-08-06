@@ -21,6 +21,7 @@ available is logged and skipped, so local capacity still comes up if the cloud t
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 import threading
@@ -200,6 +201,19 @@ class CascadingRuntime:
         if budget_s is not None and _takes_budget(fresh):
             return fresh(slot, budget_s=budget_s)
         return fresh(slot)
+
+    def invalidate_base(self) -> None:
+        """Forward base invalidation to every wrapped tier that supports it.
+
+        In production the pool holds THIS object, not the snapshot runtime, so without this the
+        pool's getattr lookup fails and a poisoned base is never rebuilt (upstream, PR #82). Which
+        tier owns the bad base is not knowable here -- invalidating a healthy one costs a rebuild,
+        leaving a poisoned one costs the tier, so ask all of them."""
+        for tier in getattr(self, "tiers", None) or ():
+            drop = getattr(getattr(tier, "runtime", None), "invalidate_base", None)
+            if callable(drop):
+                with contextlib.suppress(Exception):
+                    drop()
 
     def reap(self, slot: Any, dirty: bool = False) -> None:
         with self._lock:

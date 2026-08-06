@@ -97,6 +97,17 @@ class GvisorSnapshotSlotRuntime:
         alive = getattr(handle, "alive", None)
         return alive() if callable(alive) else True
 
+    def invalidate_base(self) -> None:
+        """Drop the persisted warm snapshot so the next spawn rebuilds it.
+
+        The FC snapshot runtime has had this since the wedge work landed; this one did not, so the
+        pool's lookup always failed here and sustained failures merely logged
+        pool.base_rebuild_unavailable while every replacement kept restoring the poisoned snapshot
+        until a dispatcher restart (upstream, PR #82). Same SnapshotManager underneath."""
+        drop = getattr(self._mgr, "invalidate", None)
+        if callable(drop):
+            drop()
+
     def reap(self, slot: Slot) -> None:
         with self._lock:
             handle = self._handles.pop(slot.slot_id, None)

@@ -513,6 +513,12 @@ def make_remote_validate(
                 sealed = out_dir / "metadata.json"
                 if sealed.exists():
                     meta = json.loads(sealed.read_text())
+            elif not meta:
+                # An EMPTY metadata object is abnormal worker output -- the engine did not report
+                # anything at all. Leaving the "unknown" default meant this never advanced slot
+                # burnout or base rebuilding, so a recycle-capable worker could be reset and
+                # re-offered indefinitely (upstream, PR #82).
+                fault = "worker"
             elif meta.get("status") == "engine_error":
                 fault = "job"        # the engine RAN and reported on this input; not the worker
                 # no trust gate to validate the envelope (direct callers / tests) -> can't tell a genuine

@@ -569,9 +569,14 @@ def test_file_ipc_warm_failures_are_attributed_to_the_worker():
     # sits between the match and the call, so a narrow window missed a fix that was present.
     src = inspect.getsource(Dispatcher)
     assert "dirty=not warm_clean" in src, "the warm file-IPC release path moved; retarget this test"
-    assert 'fault=None if warm_clean else "worker"' in src, (
+    assert "fault=None if warm_clean else warm_fault" in src, (
         "the warm file-IPC release path does not attribute its failures, so wedge detection and "
         "base invalidation are dead for the snapshot runtimes")
+    # ...and the attribution must DISCRIMINATE: a validated engine_error is the engine reporting on
+    # the INPUT, so a run of malformed samples must not invalidate a healthy snapshot.
+    assert 'warm_fault = "job"' in src, (
+        "every non-DONE outcome is attributed to the worker, so bad samples advance the pool "
+        "streak and can invalidate a healthy base")
 
 
 def test_the_failure_streak_is_read_under_the_lock():
@@ -623,3 +628,123 @@ def test_the_failure_streak_is_read_under_the_lock():
             "release that is mid-update")
     assert done.wait(2), "the read never completed after the lock was released"
     t.join(timeout=2)
+
+
+def _snapshot_pool(**kw):
+    """A pool whose runtime exposes invalidate_base, so rebuild decisions are observable."""
+    from blastbox.host.pool import WarmPool
+
+    dropped: list[int] = []
+
+    class _Rt:
+        kind = "test"
+        spawns = 0
+
+        def spawn(self):
+            from blastbox.host.pool import Slot, SlotState
+            _Rt.spawns += 1
+            raise RuntimeError("restore failed")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+        def invalidate_base(self):
+            dropped.append(1)
+
+    return WarmPool(runtime=_Rt(), **kw), dropped, _Rt
+
+
+def test_gvisor_invalidate_base_reaches_the_snapshot_manager():
+    """Only the direct FC runtime implemented invalidate_base, so for gVisor the pool's lookup
+    always failed and sustained failures merely logged base_rebuild_unavailable while every
+    replacement restored the poisoned snapshot until restart (upstream, PR #82)."""
+    from blastbox.host.runtime.gvisor_snapshot_runtime import GvisorSnapshotSlotRuntime
+
+    dropped: list[int] = []
+
+    class _Mgr:
+        def invalidate(self):
+            dropped.append(1)
+
+        def ensure_build_started(self):
+            pass
+
+    rt = GvisorSnapshotSlotRuntime(_Mgr())
+    assert hasattr(rt, "invalidate_base"), "gVisor has no invalidation seam at all"
+    rt.invalidate_base()
+    assert dropped == [1], "invalidate_base did not reach the snapshot manager"
+
+
+def test_cascade_invalidate_base_reaches_every_wrapped_tier():
+    """In production the pool holds the CASCADE, not the snapshot runtime, so without delegation
+    the lookup fails and a poisoned base is never rebuilt (upstream, PR #82)."""
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.cascade import CascadingRuntime
+
+    dropped: list[str] = []
+
+    class _Tier:
+        def __init__(self, name):
+            self.name = name
+
+        def invalidate_base(self):
+            dropped.append(self.name)
+
+    rt = object.__new__(CascadingRuntime)
+    rt.tiers = [SimpleNamespace(runtime=_Tier("fc")), SimpleNamespace(runtime=_Tier("gvisor")),
+                SimpleNamespace(runtime=object())]      # a tier with no seam must be skipped
+    CascadingRuntime.invalidate_base(rt)
+    assert dropped == ["fc", "gvisor"], f"delegation missed a tier: {dropped}"
+
+
+def test_the_eviction_cap_follows_resize():
+    """The derived budget was computed once from the constructor's warm_size, but the autosizer
+    calls resize() in production -- a pool started at 16 and downsized to 1 still permitted 16
+    evictions per window, when the cap is meant to bound damage to roughly one warm set."""
+    from blastbox.host.pool import WarmPool
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=16)
+    assert pool._max_evictions_per_window == 16
+    pool.resize(warm_size=1)
+    assert pool._max_evictions_per_window == 2, (
+        "the cap kept the pool's ORIGINAL size after a downsize")
+
+    explicit = WarmPool(runtime=_Rt(), warm_size=16, max_evictions_per_window=3)
+    explicit.resize(warm_size=1)
+    assert explicit._max_evictions_per_window == 3, "an EXPLICIT cap must not be overwritten"
+
+
+def test_the_spawn_batch_halts_after_invalidating_the_base():
+    """With the artifact dropped, the very next runtime.spawn() runs SnapshotManager.build()
+    SYNCHRONOUSLY and blocks the maintenance thread for a full base boot -- promotion, health
+    checks and deferred reaping all stall behind it (upstream, PR #82)."""
+    pool, dropped, rt = _snapshot_pool(warm_size=8, snapshot_rebuild_after=2,
+                                       base_rebuild_cooldown_s=0.0)
+    rt.spawns = 0
+    pool._spawn_to_deficit(ready=True)
+    assert dropped, "the base was never invalidated despite repeated spawn failures"
+    assert rt.spawns <= 3, (
+        f"the batch kept spawning after the rebuild ({rt.spawns} attempts) — the next one runs a "
+        f"synchronous base build on the maintenance thread")

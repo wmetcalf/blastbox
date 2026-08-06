@@ -220,6 +220,11 @@ class WarmPool:
         # Default scales with the tier: you may churn through the warm set ONCE inside a window,
         # but not over and over. An absolute constant is wrong at both ends -- 2 starves a large
         # pool's legitimate replacement, and is far too permissive for a warm_size of 1.
+        # None => DERIVED, and re-derived whenever resize() moves the warm target. Computing it
+        # once from the constructor's warm_size meant a pool started at 16 and downsized to 1 by
+        # the autosizer still permitted 16 evictions per window -- the cap is meant to bound damage
+        # to roughly one warm set, so it has to track the live set (upstream, PR #82).
+        self._eviction_cap_explicit = max_evictions_per_window is not None
         self._max_evictions_per_window = (
             max(2, int(warm_size)) if max_evictions_per_window is None
             else max(0, int(max_evictions_per_window)))
@@ -1084,6 +1089,10 @@ class WarmPool:
                 if warm_size < 0:
                     raise ValueError("warm_size must be >= 0")
                 self._warm_size = warm_size
+                if not self._eviction_cap_explicit:
+                    # Re-derive: the cap bounds damage to roughly ONE warm set, so it has to follow
+                    # the live target rather than the size the pool happened to start at.
+                    self._max_evictions_per_window = max(2, int(warm_size))
             # keep warm within the ceiling
             if self._warm_size > self._concurrent_ceiling:
                 self._warm_size = self._concurrent_ceiling
@@ -1412,7 +1421,15 @@ class WarmPool:
                 with self._lock:
                     self._spawn_consecutive_failures += 1
                     spawn_failures = self._spawn_consecutive_failures
-                self._maybe_rebuild_base(spawn_failures, reason="spawn")
+                rebuilt = self._maybe_rebuild_base(spawn_failures, reason="spawn")
+                if rebuilt:
+                    # STOP the batch. The artifact is gone, so the very next runtime.spawn() would
+                    # run SnapshotManager.build() synchronously and block this maintenance thread
+                    # for a full base boot + readiness timeout -- promotion, health checks and
+                    # deferred reaping all stall behind it. The next tick spawns against the fresh
+                    # base instead (upstream, PR #82).
+                    logger.info("pool.spawn_batch_halted_for_rebuild reason=base_invalidated")
+                    break
                 continue
 
             # Publish under the lock, BUT only if shutdown hasn't begun AND we're still under
@@ -1507,7 +1524,7 @@ class WarmPool:
         with self._lock:
             return self._pool_consecutive_failures
 
-    def _maybe_rebuild_base(self, streak: "int | None" = None, *, reason: str = "job") -> None:
+    def _maybe_rebuild_base(self, streak: "int | None" = None, *, reason: str = "job") -> bool:
         """Discard the runtime's persisted warm base after sustained pool-wide failure.
 
         Reaping a burned-out slot only helps if a FRESH slot would be healthy. When the persisted
@@ -1524,7 +1541,7 @@ class WarmPool:
         # restore failures are a different signal from consecutive job failures.
         pool_failures = self._current_failure_streak() if streak is None else streak
         if self._snapshot_rebuild_after <= 0 or pool_failures < self._snapshot_rebuild_after:
-            return
+            return False
         now = self._clock()
         with self._lock:
             last = self._last_base_rebuild_at
@@ -1547,7 +1564,7 @@ class WarmPool:
                     self._spawn_consecutive_failures = 0
                 else:
                     self._pool_consecutive_failures = 0
-            return
+            return False
         drop = (getattr(self._runtime, "invalidate_base", None)
                 or getattr(self._runtime, "invalidate_snapshot", None))
         if not callable(drop):
@@ -1556,12 +1573,12 @@ class WarmPool:
                 "invalidate_base(); the warm base may be poisoned and only a dispatcher restart can "
                 "rebuild it", pool_failures, type(self._runtime).__name__,
             )
-            return
+            return False
         try:
             drop()
         except Exception:
             logger.exception("pool.base_rebuild_error pool_consecutive_failures=%d", pool_failures)
-            return
+            return False
         with self._lock:
             if reason == "spawn":
                 self._spawn_consecutive_failures = 0
@@ -1574,6 +1591,7 @@ class WarmPool:
             "pool.base_invalidated reason=%s consecutive_failures=%d rebuilds=%d -- next spawn "
             "rebuilds the warm base", reason, pool_failures, rebuilds,
         )
+        return True
 
     def _health_check(self) -> None:
         """Evict dead IDLE slots AND stuck WARMING slots so the spawn loop replaces them.

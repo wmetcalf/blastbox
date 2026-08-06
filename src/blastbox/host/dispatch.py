@@ -1027,6 +1027,13 @@ class Dispatcher:
         warm_clean = False  # set True ONLY on the clean DONE path; every _fail_job/timeout/error path
         #                     leaves it False so the slot is released DIRTY (force-recycled, never
         #                     returned to IDLE with a wedged/contaminated worker for the next job).
+        # ...and WHOSE failure it was. Dirty means "reset before reuse" either way; the fault only
+        # decides whether it counts as evidence AGAINST THE WORKER. A validated engine_error is the
+        # engine successfully running and reporting an input-specific failure, so a run of
+        # malformed samples must not advance the pool streak and invalidate a healthy snapshot
+        # (upstream, PR #82). Attributing everything non-DONE to the worker was my over-correction
+        # for the opposite bug one round earlier.
+        warm_fault = "worker"
         try:
             # ------------------------------------------------------------------
             # Step 1: Engine lookup (security: engine spec is operator-configured)
@@ -1208,6 +1215,7 @@ class Dispatcher:
             # so it stays DONE.
             if envelope.status == "engine_error":
                 detail = envelope.warnings[0].message if envelope.warnings else "engine_error"
+                warm_fault = "job"      # the engine RAN and reported on this input
                 self._fail_job(job, f"engine_error: {detail}")
                 return
 
@@ -1312,7 +1320,7 @@ class Dispatcher:
             # warm_clean covers only the clean DONE path.
             try:
                 self._pool.release(slot, dirty=not warm_clean,      # type: ignore[union-attr]
-                                   fault=None if warm_clean else "worker")
+                                   fault=None if warm_clean else warm_fault)
             except TypeError:                                        # seam predating attribution
                 self._pool.release(slot, dirty=not warm_clean)      # type: ignore[union-attr]
 
