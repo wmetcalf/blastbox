@@ -484,3 +484,142 @@ def test_snapshot_rebuild_after_zero_actually_disables():
     assert WarmPool(runtime=_Rt(), warm_size=4, snapshot_rebuild_after=0)._snapshot_rebuild_after == 0
     assert WarmPool(runtime=_Rt(), warm_size=4, snapshot_rebuild_after=7)._snapshot_rebuild_after == 7
     assert WarmPool(runtime=_Rt(), warm_size=4)._snapshot_rebuild_after > 0      # None -> derived
+
+
+def test_the_eviction_cap_holds_under_concurrent_burnouts():
+    """The cap CHECKED the count and RECORDED it later, so two threads could both observe "under the
+    limit" before either wrote. With max_evictions_per_window=1 a concurrent burnout reaped two
+    slots. A cap that is not a cap is worse than none, because it is trusted (upstream, PR #82)."""
+    import threading
+
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    reaped: list[str] = []
+    lock = threading.Lock()
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            with lock:
+                reaped.append(slot.slot_id)
+
+        def recycle(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=0, max_consecutive_failures=1,
+                    max_evictions_per_window=1, eviction_window_s=10_000.0)
+    slots = []
+    for i in range(8):
+        s = Slot(slot_id=f"s{i}", control_dir="/c", input_dir="/i", output_dir="/o",
+                 state=SlotState.ASSIGNED)
+        pool._slots[s.slot_id] = s
+        slots.append(s)
+
+    barrier = threading.Barrier(len(slots))
+
+    def burn(s):
+        barrier.wait()                      # all threads hit the cap check together
+        pool.release(s, dirty=True, fault="worker")
+
+    threads = [threading.Thread(target=burn, args=(s,)) for s in slots]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert len(reaped) <= 1, f"the cap was exceeded under concurrency: {reaped}"
+
+
+def test_a_claim_lost_is_not_a_worker_wedge():
+    """ClaimLost means a PEER already reclaimed or finished the job -- our claim outlived itself.
+    Attributing it as a wedge let two stale attempts burn out a healthy slot (upstream, PR #82)."""
+    import inspect
+
+    import blastbox.host.runtime.remote_http as rh
+
+    src = inspect.getsource(rh.make_remote_validate)
+    claim_idx = src.index("except ClaimLost")
+    # rindex, not index: an EARLIER try block handles local validation failures before any slot is
+    # claimed, and matching that one compares against an unrelated handler.
+    broad_idx = src.rindex("except Exception as exc")
+    assert claim_idx < broad_idx, "ClaimLost must be handled BEFORE the broad worker attribution"
+    tail = src[claim_idx:broad_idx]
+    assert 'fault = "unknown"' in tail, "a lost claim was still attributed to the worker"
+
+
+def test_file_ipc_warm_failures_are_attributed_to_the_worker():
+    """The file-IPC warm dispatcher released without a fault, which defaults to "unknown" and never
+    advances a slot toward eviction -- so FC/gVisor snapshot workers that time out or return
+    unusable output were invisible to wedge detection entirely, and a poisoned base was never
+    invalidated. Only the REMOTE path had been attributed (upstream, PR #82)."""
+    import inspect
+
+    from blastbox.host.dispatch import Dispatcher
+
+    # Scan the whole class, not a character window around the first match: an explanatory comment
+    # sits between the match and the call, so a narrow window missed a fix that was present.
+    src = inspect.getsource(Dispatcher)
+    assert "dirty=not warm_clean" in src, "the warm file-IPC release path moved; retarget this test"
+    assert 'fault=None if warm_clean else "worker"' in src, (
+        "the warm file-IPC release path does not attribute its failures, so wedge detection and "
+        "base invalidation are dead for the snapshot runtimes")
+
+
+def test_the_failure_streak_is_read_under_the_lock():
+    """The release path must read the pool-wide streak LIVE and under the lock, not carry a value
+    captured earlier: another slot can release cleanly and reset it in between, and the stale
+    reading still invalidates the shared base, dropping a healthy warm snapshot after the pool has
+    already recovered (upstream, PR #82).
+
+    NB the remaining difference between a live read and a stale one is the lock itself, which only
+    has an effect under real concurrency -- so this asserts the lock is genuinely taken rather than
+    trying to stage the instruction-level race, which no deterministic test can reach."""
+    import threading
+
+    from blastbox.host.pool import WarmPool
+
+    class _Rt:
+        kind = "test"
+
+        def spawn(self):
+            raise AssertionError("no spawning in this test")
+
+        def is_ready(self, slot):  # noqa: ANN001
+            return True
+
+        def is_alive(self, slot):  # noqa: ANN001
+            return True
+
+        def reap(self, slot):  # noqa: ANN001
+            pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=1)
+    pool._pool_consecutive_failures = 7
+    assert pool._current_failure_streak() == 7        # reads the CURRENT value
+
+    entered = threading.Event()
+    done = threading.Event()
+
+    def reader():
+        entered.set()
+        pool._current_failure_streak()
+        done.set()
+
+    with pool._lock:                                   # hold it, so a locked read must block
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+        assert entered.wait(2), "reader thread never started"
+        assert not done.wait(0.3), (
+            "the streak was read WITHOUT taking the lock, so it can tear against a concurrent "
+            "release that is mid-update")
+    assert done.wait(2), "the read never completed after the lock was released"
+    t.join(timeout=2)

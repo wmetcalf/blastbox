@@ -525,6 +525,12 @@ def make_remote_validate(
             # NOT a job failure -- the worker's lock is held by a stale detonation. Propagate so the
             # dispatcher requeues the job (like NoWarmSlot); the finally releases this slot dirty (cooldown).
             raise
+        except ClaimLost:
+            # A PEER already reclaimed or finished this job -- our claim simply outlived itself.
+            # The worker did nothing wrong, so attributing it as a wedge let two stale attempts
+            # burn out a healthy slot and feed base invalidation (upstream, PR #82).
+            fault = "unknown"
+            raise
         except Exception as exc:  # noqa: BLE001
             fault = "worker"         # transport failed -> evidence about this worker, not the input
             # transport error after the request may have reached the worker -> the box could still be

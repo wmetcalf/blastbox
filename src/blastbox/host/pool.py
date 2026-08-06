@@ -523,11 +523,14 @@ class WarmPool:
         with self._lock:
             self._evictions = [ts for ts in self._evictions
                                if now - ts < self._eviction_window_s]
-            return len(self._evictions) < self._max_evictions_per_window
-
-    def _record_eviction(self) -> None:
-        with self._lock:
-            self._evictions.append(self._clock())
+            if len(self._evictions) >= self._max_evictions_per_window:
+                return False
+            # RESERVE inside the same critical section. Checking here and appending in a separate
+            # _record_eviction() let two threads both observe "under the cap" before either wrote,
+            # so with max_evictions_per_window=1 a concurrent burnout could reap two slots -- a cap
+            # that is not a cap is worse than none, because it is trusted (upstream, PR #82).
+            self._evictions.append(now)
+            return True
 
     def release(self, slot: Slot, *, dirty: bool = False,
                 fault: "str | None" = None) -> None:
@@ -568,7 +571,7 @@ class WarmPool:
                 # here leaks an entry keyed on a dead slot_id AND moves the POOL-wide counter on
                 # evidence from a slot that is no longer in the pool -- which can tip a base
                 # rebuild (upstream, PR #82).
-                slot_failures = pool_failures = 0
+                slot_failures = 0
                 last_success = 0.0
             elif dirty and fault == "worker":
                 # ONLY worker-attributed failures are evidence about the slot. Counting job faults
@@ -587,7 +590,6 @@ class WarmPool:
                 self._pool_consecutive_failures = 0
             if tracked:
                 slot_failures = self._slot_failures.get(slot.slot_id, 0)
-                pool_failures = self._pool_consecutive_failures
                 last_success = self._slot_last_success.get(slot.slot_id, 0.0)
 
         # A wedged in-guest agent is invisible to is_alive(), so consecutive dirty releases are the
@@ -597,11 +599,15 @@ class WarmPool:
             self._max_consecutive_failures > 0
             and slot_failures >= self._max_consecutive_failures
         )
-        if burned_out:
-            # The base-rebuild decision is POOL-wide and belongs to the signal, not to the eviction
-            # budget: refusing to destroy more slots must not also suppress the one action that
-            # fixes a poisoned warm base. Ordered before the cap for exactly that reason.
-            self._maybe_rebuild_base(pool_failures)
+        # POOL-wide, and deliberately NOT gated on this slot burning out. Disposable snapshot
+        # runtimes (FC/gVisor) have no recycle(), so every dirty release reaps the restored VM and
+        # _forget_slot_health() clears its counter -- no individual slot ever reaches the
+        # consecutive-failure limit, so hanging the rebuild off `burned_out` meant a poisoned base
+        # could restore into fresh slot after fresh slot forever without ever being invalidated
+        # (upstream, PR #82). It is also ordered before the eviction cap: refusing to destroy more
+        # slots must not suppress the one action that fixes the base.
+        if dirty and fault == "worker":
+            self._maybe_rebuild_base()
         if burned_out and not self._eviction_allowed():
             # (3) The heuristic wants this slot gone, but the window's budget is spent. Refuse, and
             # say so loudly: if the wedge is real the slot keeps failing and the next window takes
@@ -617,7 +623,7 @@ class WarmPool:
             )
             burned_out = False
         if burned_out:
-            self._record_eviction()
+            pass                            # the token was reserved by _eviction_allowed()
             logger.warning(
                 "pool.slot_burned_out slot_id=%s fault=worker consecutive_failures=%d limit=%d "
                 "jobs=%d last_success_age=%s -- reaping instead of recycling",
@@ -1492,7 +1498,16 @@ class WarmPool:
         self._slot_failures.pop(slot_id, None)
         self._slot_last_success.pop(slot_id, None)
 
-    def _maybe_rebuild_base(self, pool_failures: int, *, reason: str = "job") -> None:
+    def _current_failure_streak(self) -> int:
+        """The pool-wide consecutive-failure streak, read NOW under the lock.
+
+        Carrying a value captured earlier in release() meant another slot could release cleanly and
+        reset the streak before this ran, and the stale reading still invalidated the shared base --
+        dropping a healthy warm snapshot after the pool had already recovered (upstream, PR #82)."""
+        with self._lock:
+            return self._pool_consecutive_failures
+
+    def _maybe_rebuild_base(self, streak: "int | None" = None, *, reason: str = "job") -> None:
         """Discard the runtime's persisted warm base after sustained pool-wide failure.
 
         Reaping a burned-out slot only helps if a FRESH slot would be healthy. When the persisted
@@ -1501,6 +1516,13 @@ class WarmPool:
         drop that base (``invalidate_base``/``invalidate_snapshot``), call it once the pool has
         failed ``snapshot_rebuild_after`` times in a row with no intervening success.
         """
+        # streak=None means "read the JOB streak live, under the lock, right now". The release
+        # path must use that: it computed a value earlier in release(), and another slot could
+        # release cleanly -- resetting the streak -- before the call ran, so a stale reading still
+        # invalidated the base and dropped a healthy warm snapshot after the pool had recovered
+        # (upstream, PR #82). The SPAWN path passes its own counter explicitly, because consecutive
+        # restore failures are a different signal from consecutive job failures.
+        pool_failures = self._current_failure_streak() if streak is None else streak
         if self._snapshot_rebuild_after <= 0 or pool_failures < self._snapshot_rebuild_after:
             return
         now = self._clock()

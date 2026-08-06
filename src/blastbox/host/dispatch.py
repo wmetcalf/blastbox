@@ -1304,7 +1304,17 @@ class Dispatcher:
                 except OSError:
                     pass
             # dirty=not warm_clean → a failed run force-recycles the slot before reuse.
-            self._pool.release(slot, dirty=not warm_clean)  # type: ignore[union-attr]  # non-None here
+            # ATTRIBUTED: without a fault this defaults to "unknown", which never advances a slot
+            # toward eviction -- so FC/gVisor snapshot workers that time out or return unusable
+            # output were invisible to wedge detection entirely, and a poisoned base was never
+            # invalidated (upstream, PR #82). A warm run that failed AGAINST this worker is worker
+            # evidence; the engine reporting a bad sample is not, and is already excluded because
+            # warm_clean covers only the clean DONE path.
+            try:
+                self._pool.release(slot, dirty=not warm_clean,      # type: ignore[union-attr]
+                                   fault=None if warm_clean else "worker")
+            except TypeError:                                        # seam predating attribution
+                self._pool.release(slot, dirty=not warm_clean)      # type: ignore[union-attr]
 
     def _dispatch_inner(
         self, job: Job, input_path: Path, output_dir: Path,
