@@ -415,14 +415,17 @@ def test_a_partial_checkpoint_whose_cleanup_fails_is_retried(tmp_path, monkeypat
         handle.checkpoint(base)
     assert any(p.exists() for p in created), "sanity: cleanup failed, files remain"
 
-    # The next checkpoint retries them rather than leaving them stranded forever.
+    # A NEW handle, as production does: SnapshotManager kills and abandons the failed one, so a
+    # retry list recorded on the handle would go with it. Reusing the same handle here is why the
+    # first version of this test passed against that bug.
     unlink_broken["on"] = False
     monkeypatch.undo()
     monkeypatch.setattr(
         "blastbox.host.runtime.fc_snapshot_backend._create_snapshot",
         lambda api, snap, mem: (Path(snap).write_bytes(b"s"), Path(mem).write_bytes(b"m")),
     )
-    handle.checkpoint(base)
+    handle2 = launcher.boot_base()
+    handle2.checkpoint(base)
 
     assert not any(p.exists() for p in created), (
         f"stranded partials were never retried: {[p for p in created if p.exists()]}"

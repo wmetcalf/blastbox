@@ -315,6 +315,28 @@ class CascadingRuntime:
                 self._tier_failures[index] = max(self._tier_failures[index], streak)
             _log.warning("cascade: tier %r base invalidation failed: %s", tier.name, exc)
 
+    def blame_tier_for_slot(self, slot_id: str) -> bool:
+        """Attribute a post-spawn failure to the tier that produced ``slot_id``.
+
+        A slot that spawned fine, reached IDLE and then died before its first job leaves
+        _tier_failures empty -- the spawn SUCCEEDED -- so the pool's repair found no guilty tier
+        and the empty-guilt fallback invalidated EVERY tier, destroying healthy siblings for
+        deaths confined to one of them. The owning tier is already tracked per slot; this is the
+        one caller that knows the failure happened after the spawn (PR #82).
+
+        Returns True when the slot was attributable.
+        """
+        with self._lock:
+            idx = self._owner.get(str(slot_id))
+            if idx is None:
+                return False
+            self._tier_failures[idx] += 1
+            self._recently_guilty.add(idx)
+            streak = self._tier_failures[idx]
+            tier = self.tiers[idx]
+        self._maybe_repair_tier(idx, tier, streak)
+        return True
+
     def invalidate_base(self, *, reason: str | None = None) -> None:
         """Forward base invalidation to every wrapped tier that supports it.
 

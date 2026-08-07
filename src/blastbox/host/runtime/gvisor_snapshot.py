@@ -253,10 +253,12 @@ class GvisorBootHandle:
         base_dir: Path,
         ctrl_dir: Path,
         ready_wait: Callable[[Path, float], None],
+        stranded: list[str] | None = None,
     ) -> None:
-        # Partial checkpoint directories whose cleanup failed. No artifact is returned for them,
-        # so nothing else can rediscover them; retried on the next checkpoint.
-        self._stranded_partials: list[str] = []
+        # Partial checkpoint directories whose cleanup failed. OWNED BY THE BACKEND and shared in:
+        # SnapshotManager kills and abandons this handle after a failed checkpoint, so a list held
+        # here alone is discarded with it and the retry never fires (PR #82).
+        self._stranded_partials: list[str] = stranded if stranded is not None else []
         self._cfg = cfg
         self._run = run
         self._cid = cid
@@ -412,6 +414,9 @@ class GvisorSnapshotBackend:
         self._ready = ready_wait
         self._probe = probe
         self._cr_capable = cr_capable
+        # Durable across boot handles: SnapshotManager kills and abandons a handle after a failed
+        # checkpoint, so a retry list held on the handle is discarded with it (PR #82).
+        self._stranded_partials: list[str] = []
 
     def available(self) -> bool:
         # `probe` is a full override (tests/embedders); honor it verbatim.
@@ -447,7 +452,7 @@ class GvisorSnapshotBackend:
             _best_effort_delete(self._cfg, self._run, cid)
             shutil.rmtree(base, ignore_errors=True)
             raise
-        return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready)
+        return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready, stranded=self._stranded_partials)
 
     def restore_in(self, slot_workdir: Path, artifact: object) -> GvisorRestoreHandle:
         wd = Path(slot_workdir)

@@ -2189,3 +2189,152 @@ def test_a_partially_failed_repair_does_not_re_invalidate_the_tiers_it_fixed() -
         "in-flight replacement build would be rejected each time"
     )
     assert bad.invalidated == 2, "the still-failing tier must keep being retried"
+
+
+def test_a_claim_time_death_counts_toward_snapshot_repair() -> None:
+    """Demand can reach a newly promoted slot before the health tick does.
+
+    _try_claim_one confirms it dead and defers reaping, but that path advanced no streak and
+    consumed no marker — _forget_slot_health then discarded it silently. A poisoned base whose
+    restores briefly pass is_ready() was therefore never repaired when claims got there first.
+    """
+    class _PromotesThenDiesOnClaim(_WedgeableRuntime):
+        def is_ready(self, slot: Slot) -> bool:
+            return True
+
+        def is_alive_for_claim(self, slot: Slot, budget_s=None):
+            return False          # the claim's own probe confirms death
+
+        def is_alive(self, slot: Slot):
+            return True           # the health tick would still say alive
+
+    rt = _PromotesThenDiesOnClaim()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4,
+        snapshot_rebuild_after=2, base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    for _ in range(6):
+        pool.tick()
+        pool.claim(timeout_s=0.05)     # every claim finds its slot dead
+
+    assert rt.base_invalidations >= 1, (
+        "claim-time deaths of never-used slots never reached the rebuild threshold "
+        f"(got {rt.base_invalidations} invalidations)"
+    )
+
+
+def test_a_post_promotion_death_is_blamed_on_its_own_tier() -> None:
+    """The spawn SUCCEEDED, so the cascade has no guilt recorded.
+
+    Without attribution the pool's repair finds an empty guilty set and the fallback invalidates
+    EVERY tier — destroying healthy siblings for deaths confined to one of them.
+    """
+    class _Tier:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.invalidated = 0
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            self.n += 1
+            return SimpleNamespace(slot_id=f"{self.name}{self.n}")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    fc, overflow = _Tier("fc"), _Tier("ov")
+    casc = CascadingRuntime(
+        tiers=[Tier(name="fc", runtime=fc, capacity=1), Tier(name="ov", runtime=overflow, capacity=8)],
+        tier_rebuild_after=2,
+    )
+    slot = casc.spawn()               # lands on the FIRST tier
+    assert slot.slot_id.startswith("fc")
+
+    # Two post-promotion deaths of fc's slots must repair fc, and only fc.
+    assert casc.blame_tier_for_slot(slot.slot_id) is True
+    slot2 = casc.spawn()              # fc is full (capacity 1) -> overflow
+    assert casc.blame_tier_for_slot(slot.slot_id) is True
+
+    assert fc.invalidated >= 1, "the tier that produced the dying slots must be repaired"
+    assert overflow.invalidated == 0, (
+        "a healthy sibling tier was invalidated for deaths confined to another tier"
+    )
+
+
+def test_a_validated_engine_error_also_clears_the_restore_evidence() -> None:
+    """It proves the RESTORED BASE is responsive, not just the slot.
+
+    The branch cleared only the per-slot and job streaks, so restore deaths separated by a
+    successfully validated engine run still counted as consecutive against the base.
+    """
+    rt = _WedgeableRuntime()
+    pool = WarmPool(
+        runtime=rt, warm_size=3, concurrent_ceiling=6,
+        snapshot_rebuild_after=2, base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    pool.tick()
+    pool.tick()
+    with pool._lock:
+        pool._spawn_consecutive_failures = 1     # one restore death already recorded
+
+    slot = [s for s in pool._slots.values() if s.state == SlotState.IDLE][0]
+    pool.release(slot, dirty=True, fault="job")   # the worker RAN and reported
+
+    with pool._lock:
+        streak = pool._spawn_consecutive_failures
+    assert streak == 0, (
+        f"a validated engine error left the restore-failure streak at {streak}: two deaths "
+        "separated by proof the base works would still count as consecutive"
+    )
+
+
+def test_the_explicit_streak_path_also_honours_the_success_token() -> None:
+    """The caller captured its count earlier, so a clean release can land before the decision.
+
+    Skipping the token on this path meant it invalidated a base that had just produced a valid
+    result — the very case the token exists to prevent, avoided on one path and not the other.
+    """
+    import threading
+
+    rt = _WedgeableRuntime()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4,
+        snapshot_rebuild_after=2, base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    pool.tick()
+    pool.tick()
+    good = [s for s in pool._slots.values() if s.state == SlotState.IDLE][0]
+
+    released = threading.Event()
+    real_lock = pool._lock
+
+    class _GatedLock:
+        def __init__(self) -> None:
+            self._armed = True
+
+        def __enter__(self):
+            return real_lock.__enter__()
+
+        def __exit__(self, *a):
+            r = real_lock.__exit__(*a)
+            if self._armed:
+                self._armed = False
+                th = threading.Thread(
+                    target=lambda: (pool.release(good, dirty=False), released.set()), daemon=True
+                )
+                th.start()
+                released.wait(5.0)
+            return r
+
+    pool._lock = _GatedLock()  # type: ignore[assignment]
+    rebuilt = pool._maybe_rebuild_base(5, reason="spawn")   # EXPLICIT streak
+    pool._lock = real_lock
+
+    assert released.is_set(), "the racing clean release never ran — the test proved nothing"
+    assert rebuilt is False and rt.base_invalidations == 0, (
+        "the explicit-streak path rebuilt a base that had just produced a valid result "
+        f"(invalidations={rt.base_invalidations})"
+    )

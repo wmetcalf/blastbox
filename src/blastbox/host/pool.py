@@ -676,6 +676,12 @@ class WarmPool:
                 self._slot_failures.pop(slot.slot_id, None)
                 self._pool_consecutive_failures = 0
                 slot_failures = 0
+                # ...and it proves the RESTORED BASE is responsive too, so it must clear the
+                # restore-side evidence as well. Leaving these meant restore deaths separated by
+                # a successfully validated engine run still counted as consecutive (PR #82).
+                self._spawn_consecutive_failures = 0
+                self._promoted_unproven.discard(slot.slot_id)
+                self._clean_release_count += 1
             elif dirty and fault == "worker":
                 # ONLY worker-attributed failures are evidence about the slot. Counting job faults
                 # here is what let two bad samples in a row destroy a warm worker with a hundred
@@ -1479,8 +1485,20 @@ class WarmPool:
             # while this husk is awaiting its (possibly slow) reap.
             logger.warning("pool.claim_found_dead_slot slot_id=%s (reap deferred to tick)",
                            candidate.slot_id)
+            claim_unproven_death = False
             with self._lock:
                 candidate.state = SlotState.DRAINING
+                # CONFIRMED dead, and it never served a job: its promotion was the only evidence
+                # the base yields a usable worker, and that is now refuted. Demand can reach a
+                # newly promoted slot before the health tick does, and this path neither advanced
+                # the restore-failure streak nor consumed the marker -- _forget_slot_health then
+                # discarded it silently, so a poisoned base whose restores briefly pass is_ready()
+                # was never repaired when claims got there first (PR #82).
+                if candidate.slot_id in self._promoted_unproven:
+                    self._promoted_unproven.discard(candidate.slot_id)
+                    self._spawn_consecutive_failures += 1
+                    claim_unproven_death = True
+                    warm_failures = self._spawn_consecutive_failures
                 if self._stop_event.is_set():
                     # stop() already drained the queue; re-adding here (the probe above takes
                     # seconds, so stop() can land mid-probe) resurrects a husk stop() quarantined
@@ -1489,6 +1507,10 @@ class WarmPool:
                     logger.debug("pool.defer_reap_skipped_after_stop slot_id=%s", candidate.slot_id)
                 else:
                     self._deferred_reap.add(candidate.slot_id)
+
+            if claim_unproven_death:
+                # Outside the lock: _maybe_rebuild_base takes it itself.
+                self._maybe_rebuild_base(warm_failures, reason="spawn")
 
             # Loop: try to find another IDLE slot. Every iteration returns, or moves one slot out
             # of IDLE (→DRAINING), so the rescan is bounded by the IDLE-slot count — but NOT in
@@ -1811,9 +1833,14 @@ class WarmPool:
                 success_token = self._clean_release_count
         else:
             pool_failures = streak
-            success_token = None
             if pool_failures < self._snapshot_rebuild_after:
                 return False
+            # Take the episode token even on the explicit-streak path. The caller captured its
+            # count earlier, so a concurrent clean release can land between then and here -- and
+            # skipping the token meant that path invalidated a base which had just produced a
+            # valid result, the very case the token was added to prevent (PR #82).
+            with self._lock:
+                success_token = self._clean_release_count
         now = self._clock()
         with self._lock:
             last = self._last_base_rebuild_at
@@ -1924,6 +1951,10 @@ class WarmPool:
         # see _promote_warming. Collected here so the streak reflects them before the rebuild
         # decision below.
         unproven_deaths = 0
+        # Slot ids whose post-promotion death should be attributed to their owning tier: the
+        # spawn SUCCEEDED, so the cascade has no guilt recorded and would otherwise fall back to
+        # invalidating every tier (PR #82).
+        blamed: list[str] = []
         # Slots we escalated because we could not TELL, as opposed to ones AWS/libvirt confirmed
         # dead. If disposing of a merely-suspected slot also fails, we have learned nothing and must
         # not strand it (see the reap loop below).
@@ -2064,6 +2095,7 @@ class WarmPool:
                     if cur.slot_id in self._promoted_unproven:
                         self._promoted_unproven.discard(cur.slot_id)
                         unproven_deaths += 1
+                        blamed.append(cur.slot_id)
                     if slot.slot_id in suspected:
                         self._suspected_unknown.add(slot.slot_id)
                         # SUSPECTED (escalated after a long UNKNOWN), not confirmed. Its disposal
@@ -2079,6 +2111,14 @@ class WarmPool:
 
         # Counted AFTER the demotion loop, which is the step that wins the race against a
         # concurrent claim -- so only deaths we actually acted on feed the restore-failure streak.
+        for slot_id in blamed:
+            blame = getattr(self._runtime, "blame_tier_for_slot", None)
+            if callable(blame):
+                try:
+                    blame(slot_id)
+                except Exception as exc:  # noqa: BLE001 -- attribution must never break the tick
+                    logger.warning("pool.tier_blame_failed slot_id=%s: %s", slot_id, exc)
+
         if unproven_deaths:
             with self._lock:
                 self._spawn_consecutive_failures += unproven_deaths

@@ -444,10 +444,12 @@ def test_a_partial_checkpoint_whose_cleanup_fails_is_retried(tmp_path: Path) -> 
             boot.checkpoint(dest)
         assert made and made[0].exists(), "sanity: cleanup failed, the partial remains"
 
-        # The next checkpoint must retry it rather than leave it stranded forever.
+        # A NEW handle, as production does: SnapshotManager kills and abandons the failed one,
+        # so a retry list recorded on the handle would go with it.
         broken["on"] = False
+        boot2 = be.boot_base()
         with pytest.raises(Exception):
-            boot.checkpoint(dest)
+            boot2.checkpoint(dest)
         assert not made[0].exists(), (
             f"a partial whose cleanup failed was never retried: {made[0]}"
         )

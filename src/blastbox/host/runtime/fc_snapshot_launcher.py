@@ -126,7 +126,7 @@ def _pid_alive(pid: int) -> bool:
 class _Handle:
     def __init__(
         self, proc, api, vsock_uds: str, ready_check=None, mem_dir: Path | None = None,
-        base_outdisk: Path | None = None,
+        base_outdisk: Path | None = None, stranded: list[str] | None = None,
     ) -> None:
         self.proc = proc
         self.api = api
@@ -137,9 +137,10 @@ class _Handle:
         self._mem_dir = mem_dir
         # The snapshot-time ext4 image this base booted with; frozen per generation at checkpoint.
         self._base_outdisk = Path(base_outdisk) if base_outdisk is not None else None
-        # Partial-checkpoint files whose cleanup failed. Retried on the next checkpoint; nothing
-        # else can discover them, because no artifact was ever returned for them.
-        self._stranded_partials: list[str] = []
+        # Partial-checkpoint files whose cleanup failed. This list is OWNED BY THE LAUNCHER and
+        # shared in, because SnapshotManager kills and abandons this handle after a failed
+        # checkpoint -- anything recorded here alone would be discarded with it (PR #82).
+        self._stranded_partials: list[str] = stranded if stranded is not None else []
 
     def wait_ready(self, timeout_s: float) -> None:
         if self._ready_check is not None:
@@ -307,6 +308,8 @@ class FcSnapshotLauncher:
     ) -> None:
         self._cfg = cfg
         self._base_dir = Path(base_dir)
+        # Durable across boot handles: a handle is abandoned after a failed checkpoint.
+        self._stranded_partials: list[str] = []
         # Where the snapshot mem file (~guest RAM) is written at checkpoint time. The
         # base handle carries this so its checkpoint() places mem on the right dir
         # (tmpfs /dev/shm when the RAM-preload toggle is on). Defaults to base_dir.
@@ -368,6 +371,10 @@ class FcSnapshotLauncher:
             ready_check=ready,
             mem_dir=self._mem_dir,
             base_outdisk=workdir / REL_OUTDISK,
+            # SHARED list owned by the launcher: SnapshotManager kills and abandons this handle
+            # after a failed checkpoint, so anything recorded on the handle itself is discarded
+            # with it and the next build starts empty -- the retry could never fire (PR #82).
+            stranded=self._stranded_partials,
         )
 
     def sweep_orphan_generations(self) -> int:
