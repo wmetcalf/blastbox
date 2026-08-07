@@ -9,6 +9,8 @@ once its LAST user is reaped.
 """
 from __future__ import annotations
 
+import pytest
+
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -127,3 +129,84 @@ def test_release_of_an_unknown_slot_is_a_no_op(tmp_path):
     mgr.release("slot-a")     # double reap
     mgr.release("never-seen")
     assert _gens(tmp_path) == {"warm-gen1.mem"}
+
+
+def test_a_generation_is_pinned_before_the_slow_restore_not_after(tmp_path):
+    """The pin must cover the ENTIRE restore, not just the moment after it.
+
+    restore_in() reads the snapshot and memory files for its whole duration. Pinning only after
+    it returns leaves that window unprotected: a pool-triggered invalidate() racing it sees zero
+    references, discards the generation, and unlinks the files out from under a restore that is
+    still loading them — so a perfectly valid artifact produces a failed restore.
+    """
+    mgr, be = _mgr(tmp_path)
+    mgr.build()
+    gen1 = tmp_path / "snap" / "warm-gen1.mem"
+    assert gen1.exists()
+
+    seen: dict[str, bool] = {}
+
+    real_restore = be.restore_in
+
+    def _restore_racing_an_invalidate(slot_workdir, artifact):
+        # mid-restore: the pool decides the base is bad and rebuilds
+        mgr.invalidate()
+        mgr.build()
+        seen["files_present_during_restore"] = gen1.exists()
+        return real_restore(slot_workdir, artifact)
+
+    be.restore_in = _restore_racing_an_invalidate  # type: ignore[assignment]
+    mgr.restore("slot-a")
+
+    assert seen["files_present_during_restore"], (
+        "the generation being restored was unlinked mid-restore — the pin came too late"
+    )
+
+
+def test_a_failed_restore_does_not_strand_the_pin(tmp_path):
+    """Rolling the reservation back matters as much as taking it.
+
+    A restore that raises never yields a handle, so its slot is never reaped and nothing would
+    ever release the pin — the generation would be held forever, turning the leak fix into a
+    permanent leak.
+    """
+    mgr, be = _mgr(tmp_path)
+    mgr.build()
+
+    def _boom(slot_workdir, artifact):
+        raise RuntimeError("restore failed")
+
+    be.restore_in = _boom  # type: ignore[assignment]
+    with pytest.raises(Exception):
+        mgr.restore("slot-a")
+
+    # the generation is now unreferenced, so superseding it must reclaim it
+    mgr.invalidate()
+    assert _gens(tmp_path) == set(), (
+        f"a failed restore stranded its pin — generation never reclaimed: {_gens(tmp_path)}"
+    )
+
+
+def test_a_restore_failing_with_a_SnapshotError_also_releases_its_pin(tmp_path):
+    """Both failure handlers must roll the reservation back.
+
+    restore() has two: one preserving the SnapshotError taxonomy, one wrapping everything else.
+    A rollback added to only one leaves the other stranding pins forever — and mutation testing
+    is the only thing that distinguishes them, since either alone makes the generic test pass.
+    """
+    from blastbox.host.runtime.fc_snapshot import SnapshotRestoreError
+
+    mgr, be = _mgr(tmp_path)
+    mgr.build()
+
+    def _boom(slot_workdir, artifact):
+        raise SnapshotRestoreError("restore failed inside the backend")
+
+    be.restore_in = _boom  # type: ignore[assignment]
+    with pytest.raises(SnapshotRestoreError):
+        mgr.restore("slot-a")
+
+    mgr.invalidate()
+    assert _gens(tmp_path) == set(), (
+        f"the SnapshotError path stranded its pin: {_gens(tmp_path)}"
+    )

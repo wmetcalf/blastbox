@@ -234,20 +234,51 @@ class SnapshotManager:
             raise SnapshotRestoreError(f"unsafe slot_id: {sid!r}")
         slot_workdir = self._base_dir / "slots" / sid
         slot_workdir.mkdir(parents=True, exist_ok=True)
+        # RESERVE THE PIN BEFORE THE SLOW RESTORE. restore_in() reads the snapshot and memory
+        # files for its whole duration; pinning only afterwards leaves that entire window
+        # unprotected, so a pool-triggered invalidate() racing it sees zero references, calls
+        # discard(), and unlinks the files out from under a restore that is still loading them --
+        # the restore then fails even though the artifact was perfectly valid.
+        #
+        # Pin the exact generation used here, NOT self._artifact at the end, which a concurrent
+        # invalidate+build may already have replaced.
         artifact = self._artifact
+        with self._build_lock:
+            self._pins[sid] = artifact
+            self._refs[id(artifact)] = self._refs.get(id(artifact), 0) + 1
         try:
-            handle = self._backend.restore_in(slot_workdir, artifact)
-            with self._build_lock:
-                # Pin the exact generation this slot mapped -- NOT self._artifact, which a
-                # concurrent invalidate+build may already have replaced.
-                self._pins[sid] = artifact
-                self._refs[id(artifact)] = self._refs.get(id(artifact), 0) + 1
-            return handle
+            return self._backend.restore_in(slot_workdir, artifact)
         except SnapshotError:
             # A failed restore never yields a handle, so the slot is never reaped —
             # remove the just-created (empty) workdir so it doesn't leak on the host.
+            self._unpin(sid, artifact)
             shutil.rmtree(slot_workdir, ignore_errors=True)
             raise
-        except Exception as exc:
+        except BaseException as exc:
+            # BaseException, not Exception: a KeyboardInterrupt or a cancellation landing mid
+            # restore must not strand the pin either -- this slot will never be reaped, so
+            # nothing else would ever release it and the generation would be pinned forever,
+            # turning the leak fix into a permanent leak.
+            self._unpin(sid, artifact)
             shutil.rmtree(slot_workdir, ignore_errors=True)
-            raise SnapshotRestoreError(f"restore failed: {exc}") from exc
+            if isinstance(exc, Exception):
+                raise SnapshotRestoreError(f"restore failed: {exc}") from exc
+            raise
+
+    def _unpin(self, sid: str, artifact: object) -> None:
+        """Undo a reservation whose restore never produced a handle.
+
+        Collects the generation if this was its last user AND it was retired while we held it.
+        """
+        with self._build_lock:
+            if self._pins.get(sid) is artifact:
+                self._pins.pop(sid, None)
+            key = id(artifact)
+            self._refs[key] = self._refs.get(key, 1) - 1
+            if self._refs[key] <= 0:
+                self._refs.pop(key, None)
+                retired = self._retired.pop(key, None)
+            else:
+                retired = None
+        if retired is not None:
+            self._discard(retired)

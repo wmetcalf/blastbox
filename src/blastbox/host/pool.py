@@ -1465,6 +1465,15 @@ class WarmPool:
             # Never exceed concurrent_ceiling
             headroom = self._concurrent_ceiling - len(self._slots)
             to_spawn = max(0, min(deficit, headroom))
+            if to_spawn == 0:
+                # NOT starving -- we are not asking for anything. The episode clock is cleared
+                # only by a successful spawn otherwise, so a pool whose target the autosizer
+                # shrank to zero keeps a stale timestamp for however long it idles; the first
+                # capacity miss after a later scale-up then fires pool.spawn_capacity_starved
+                # citing that whole unrelated idle interval. The alert must measure CONTINUOUS
+                # starvation, not the gap between two autosizer epochs (upstream, PR #82).
+                self._capacity_miss_since = None
+                self._capacity_starved_logged = False
 
         for _ in range(to_spawn):
             # Rate-limit: consume one token per spawn

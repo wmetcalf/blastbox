@@ -196,3 +196,63 @@ def test_build_pool_firecracker_unavailable_raises(monkeypatch):
     cfg = PoolConfig(runtime=RUNTIME_FIRECRACKER)
     with pytest.raises(FCUnavailable):
         build_warm_pool(cfg)
+
+
+def test_the_safety_controls_are_reachable_from_the_environment(monkeypatch):
+    """Production pools are built by build_warm_pool() from PoolConfig.from_env().
+
+    These knobs decide when the pool evicts a slot or destroys and rebuilds a snapshot base.
+    Reachable only from the constructor, they were untunable in every real deployment.
+    """
+    monkeypatch.setenv("BLASTBOX_POOL_MAX_CONSECUTIVE_FAILURES", "7")
+    monkeypatch.setenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", "9")
+    monkeypatch.setenv("BLASTBOX_POOL_MAX_EVICTIONS_PER_WINDOW", "5")
+    monkeypatch.setenv("BLASTBOX_POOL_UNKNOWN_GRACE_S", "42.5")
+    monkeypatch.setenv("BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S", "77.5")
+
+    cfg = PoolConfig.from_env()
+    assert cfg.max_consecutive_failures == 7
+    assert cfg.snapshot_rebuild_after == 9
+    assert cfg.max_evictions_per_window == 5
+    assert cfg.unknown_grace_s == 42.5
+    assert cfg.capacity_starved_after_s == 77.5
+
+
+def test_the_rebuild_escape_hatch_survives_env_parsing(monkeypatch):
+    """`snapshot_rebuild_after=0` disables automatic base invalidation — documented, and the
+    thing an operator reaches for during an incident. It must not be swallowed as "unset": 0 is
+    falsy, so the usual "empty means default" shortcut silently re-enables the behaviour the
+    operator just turned off."""
+    monkeypatch.setenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", "0")
+    assert PoolConfig.from_env().snapshot_rebuild_after == 0
+
+    # and unset still means "derive from warm_size", not 0
+    monkeypatch.delenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", raising=False)
+    assert PoolConfig.from_env().snapshot_rebuild_after is None
+
+
+def test_build_warm_pool_forwards_the_safety_controls(monkeypatch):
+    """Declaring the fields is only half of it — the factory must actually pass them.
+
+    A config field that is parsed but never forwarded looks correct in every config test while
+    the running pool quietly keeps its defaults.
+    """
+    monkeypatch.setenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", "9")
+    monkeypatch.setenv("BLASTBOX_POOL_MAX_EVICTIONS_PER_WINDOW", "5")
+    monkeypatch.setenv("BLASTBOX_POOL_MAX_CONSECUTIVE_FAILURES", "7")
+    monkeypatch.setenv("BLASTBOX_POOL_UNKNOWN_GRACE_S", "42.5")
+    monkeypatch.setenv("BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S", "77.5")
+
+    class _Rt:
+        def spawn(self): raise RuntimeError("not used")
+        def is_ready(self, slot): return True
+        def is_alive(self, slot): return True
+        def reap(self, slot): return None
+
+    pool = build_warm_pool(PoolConfig.from_env(runtime="none"), runtime=_Rt())
+    assert pool is not None
+    assert pool._snapshot_rebuild_after == 9
+    assert pool._max_evictions_per_window == 5
+    assert pool._max_consecutive_failures == 7
+    assert pool._unknown_grace_s == 42.5
+    assert pool._capacity_starved_after_s == 77.5

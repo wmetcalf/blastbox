@@ -44,6 +44,22 @@ class PoolConfig:
     # Warm-snapshot tier (firecracker only): spawn = restore-from-warm-snapshot
     # instead of cold-boot. Opt-in; default OFF (cold FC boot per slot).
     warm_snapshot: bool = False
+    # --- safety controls -------------------------------------------------------------------
+    # These decide when the pool evicts a slot or destroys and rebuilds a snapshot base. They
+    # were reachable only from the constructor, so an env-configured deployment (which is every
+    # production one) could not tune them -- and could not use the documented
+    # snapshot_rebuild_after=0 escape hatch to disable automatic base invalidation at all.
+    # None = derive from warm_size, matching the WarmPool defaults exactly.
+    max_consecutive_failures: int = 3
+    # 0 disables automatic base invalidation entirely; None derives 2*warm_size.
+    snapshot_rebuild_after: int | None = None
+    # None derives max(2, warm_size).
+    max_evictions_per_window: int | None = None
+    # How long a slot may stay CONTINUOUSLY unknown before it can be replaced; 0 disables.
+    unknown_grace_s: float = 300.0
+    # How long the pool may be unable to spawn for capacity reasons before that is an outage
+    # rather than backpressure; 0 disables the alert.
+    capacity_starved_after_s: float = 300.0
 
     @classmethod
     def from_env(cls, **overrides: object) -> "PoolConfig":
@@ -71,7 +87,27 @@ class PoolConfig:
                 return default
             return raw not in ("0", "false", "no", "off")
 
+        def _opt_int(key: str, default: int | None) -> int | None:
+            """None means "derive from warm_size"; an explicit 0 must survive as 0, so this
+            cannot use the falsy-means-default shortcut."""
+            raw = os.environ.get(key, "").strip()
+            if not raw:
+                return default
+            try:
+                return int(raw)
+            except ValueError as exc:
+                raise ValueError(f"invalid integer for {key}={raw!r}: {exc}") from exc
+
         values: dict[str, object] = {
+            "max_consecutive_failures": _int(
+                "BLASTBOX_POOL_MAX_CONSECUTIVE_FAILURES", cls.max_consecutive_failures),
+            "snapshot_rebuild_after": _opt_int(
+                "BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", cls.snapshot_rebuild_after),
+            "max_evictions_per_window": _opt_int(
+                "BLASTBOX_POOL_MAX_EVICTIONS_PER_WINDOW", cls.max_evictions_per_window),
+            "unknown_grace_s": _float("BLASTBOX_POOL_UNKNOWN_GRACE_S", cls.unknown_grace_s),
+            "capacity_starved_after_s": _float(
+                "BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S", cls.capacity_starved_after_s),
             "runtime": os.environ.get("BLASTBOX_POOL_RUNTIME", cls.runtime).strip().lower(),
             "warm_size": _int("BLASTBOX_POOL_WARM_SIZE", cls.warm_size),
             "concurrent_ceiling": _int("BLASTBOX_POOL_CEILING", cls.concurrent_ceiling),
@@ -170,6 +206,11 @@ def build_warm_pool(
         concurrent_ceiling=cfg.concurrent_ceiling,
         spawn_rate_limit=cfg.spawn_rate_limit,
         burst_size=cfg.burst_size,
+        max_consecutive_failures=cfg.max_consecutive_failures,
+        snapshot_rebuild_after=cfg.snapshot_rebuild_after,
+        max_evictions_per_window=cfg.max_evictions_per_window,
+        unknown_grace_s=cfg.unknown_grace_s,
+        capacity_starved_after_s=cfg.capacity_starved_after_s,
     )
     _log.info(
         "warm_pool_built runtime=%s warm_size=%d ceiling=%d warm_snapshot=%s",

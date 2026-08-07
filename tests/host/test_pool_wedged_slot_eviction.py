@@ -29,6 +29,7 @@ import threading
 from pathlib import Path
 from uuid import uuid4
 
+import contextlib
 import logging
 
 
@@ -1156,3 +1157,60 @@ def test_intermittent_tier_failures_do_not_accumulate_into_a_rebuild() -> None:
         "intermittent failures interleaved with successes must never reach the rebuild "
         f"threshold (got {flaky.base_invalidations} invalidations)"
     )
+
+
+@contextlib.contextmanager
+def caplog_at_error():
+    """Collect ERROR+ records from the pool logger (caplog is awkward across resize/tick)."""
+    records: list[logging.LogRecord] = []
+
+    class _Grab(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    lg = logging.getLogger("blastbox.host.pool")
+    h = _Grab(level=logging.ERROR)
+    lg.addHandler(h)
+    try:
+        yield records
+    finally:
+        lg.removeHandler(h)
+
+
+def test_an_idle_pool_does_not_bank_starvation_time() -> None:
+    """The alert must measure CONTINUOUS starvation, not two unrelated autosizer epochs.
+
+    The episode clock was cleared only by a successful spawn, so a pool whose target the
+    autosizer shrank to zero kept a stale timestamp for however long it idled — and the first
+    capacity miss after a later scale-up fired immediately, citing that entire idle interval as
+    if the pool had been starving through it.
+    """
+    clock = _FakeClock()
+
+    class _AlwaysFull(_WedgeableRuntime):
+        def spawn(self) -> Slot:
+            raise CascadeExhausted("cascade: every tier is at capacity")
+
+    pool = WarmPool(
+        runtime=_AlwaysFull(), warm_size=2, concurrent_ceiling=4,
+        clock=clock, capacity_starved_after_s=300.0,
+        base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+
+    with caplog_at_error() as records:
+        pool.tick()                 # a brief miss opens an episode
+        pool.resize(warm_size=0)    # autosizer removes the deficit: nothing is being asked for
+        clock.advance(4000.0)       # ...and the pool idles for over an hour
+        pool.tick()
+        pool.resize(warm_size=2)    # scale back up
+        pool.tick()                 # first miss of a NEW episode
+
+        assert not [r for r in records if "spawn_capacity_starved" in r.getMessage()], (
+            "an idle interval was banked as starvation — the alert fired on its first miss"
+        )
+
+        clock.advance(301.0)        # now genuinely starving, continuously
+        pool.tick()
+        assert [r for r in records if "spawn_capacity_starved" in r.getMessage()], (
+            "real continuous starvation must still alert"
+        )
