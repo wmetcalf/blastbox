@@ -875,14 +875,24 @@ class WarmPool:
         # headroom + the quarantine comments) rather than risk over-committing the node.
         self._reap_deferred()
         self._update_burst(ready)
-        if self._rebuilt_this_tick:
-            # _health_check invalidated the base during THIS tick. `ready` was captured before it
-            # ran, so spawning now would call build() synchronously on this thread. Skip to the
-            # next tick, which re-reads readiness and spawns against the fresh base.
+        # CONSUME the flag and commit to the decision in one locked step. Checking it here and
+        # spawning afterwards left a window in which a job thread's _maybe_rebuild_base() could
+        # invalidate the base: `ready` then still described the discarded artifact, and the
+        # snapshot runtime's spawn() ran SnapshotManager.build() synchronously on this thread --
+        # the sole maintenance thread -- for a full boot plus readiness timeout. That is exactly
+        # the stall this flag exists to prevent, reintroduced by reading it non-atomically
+        # (PR #82).
+        with self._lock:
+            rebuilt = self._rebuilt_this_tick
             self._rebuilt_this_tick = False
+            spawn_generation = self._base_rebuilds
+        if rebuilt:
+            # _health_check or a racing release invalidated the base during THIS tick. `ready` was
+            # captured before that, so spawning now would build synchronously. The next tick
+            # re-reads readiness and spawns against the fresh base.
             logger.info("pool.tick_spawn_deferred reason=base_invalidated_this_tick")
         else:
-            self._spawn_to_deficit(ready)
+            self._spawn_to_deficit(ready, expect_generation=spawn_generation)
         self._reap_surplus()
         self._sample_metrics()
 
@@ -1592,7 +1602,8 @@ class WarmPool:
                 self._last_idle_at = self._clock()
             self._idle_event.set()
 
-    def _spawn_to_deficit(self, ready: bool = True) -> None:
+    def _spawn_to_deficit(self, ready: bool = True, *,
+                          expect_generation: int | None = None) -> None:
         """Spawn new slots to fill the deficit, respecting ceiling + rate limit.
 
         ``ready`` is the warm runtime's per-tick readiness (resolved once in tick()). When False
@@ -1672,6 +1683,15 @@ class WarmPool:
                 if len(self._slots) >= self._concurrent_ceiling:
                     break
 
+            if expect_generation is not None:
+                with self._lock:
+                    if self._base_rebuilds != expect_generation:
+                        # A rebuild landed after tick() committed. Abandon the batch rather than
+                        # call spawn() -- it would build the new base synchronously here.
+                        logger.info(
+                            "pool.spawn_batch_abandoned reason=base_rebuilt_mid_batch"
+                        )
+                        break
             try:
                 slot = self._runtime.spawn()
                 with self._lock:

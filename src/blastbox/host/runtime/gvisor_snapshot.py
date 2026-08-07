@@ -487,11 +487,15 @@ class GvisorSnapshotBackend:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        except Exception:
+        except Exception as exc:
             # A partially-failed `runsc restore` can leave registered container state (with
             # its sandbox/gofer processes) under -root. No handle is returned on failure, and
             # the manager only knows the slot dir — not this cid — so tear it down here before
             # re-raising, or it orphans an unmanaged sandbox.
-            _best_effort_delete(self._cfg, self._run, cid)
+            if not _best_effort_delete(self._cfg, self._run, cid):
+                # Signal it on the ORIGINAL error: SnapshotManager reads this to decide whether
+                # the checkpoint may be reclaimed. Ignoring the result meant the manager unpinned
+                # even though an unmanaged sandbox might still be using the generation (PR #82).
+                exc.kill_failed = True  # type: ignore[attr-defined]
             raise
         return GvisorRestoreHandle(self._cfg, self._run, cid, wd, self._run_text)

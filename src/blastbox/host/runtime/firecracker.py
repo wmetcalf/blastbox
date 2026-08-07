@@ -37,6 +37,7 @@ Hard-won lessons from RedTusk FirecrackerWorkerRuntime (ported + adapted):
 """
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -76,6 +77,11 @@ __all__ = [
     "VsockReadySignal",
     "VsockHostWarmControl",
 ]
+
+# Errnos that mean THIS HOST is out of resources, as opposed to the guest/transport failing.
+_HOST_RESOURCE_ERRNOS = frozenset({
+    errno.EMFILE, errno.ENFILE, errno.ENOMEM, errno.EIO, errno.ENOSPC, errno.EDQUOT, errno.EROFS,
+})
 
 _log = logging.getLogger("blastbox.host.runtime.firecracker")
 
@@ -838,6 +844,19 @@ class VsockHostWarmControl:
         can't pin the dispatcher during the send (the send runs BEFORE wait_for_done's timeout
         starts, so without this it would otherwise be unbounded).
         """
+        # HOST-LOCAL work happens here as well as the transport: creating the Unix socket can
+        # fail with EMFILE/ENOMEM, and streaming the staged input stat()s, opens and reads a HOST
+        # file, which can fail with EIO. signal_is_transport marks this seam as worker evidence,
+        # so without the split a dispatcher outage burned out healthy FC slots and could
+        # invalidate their base (PR #82). Connection/protocol failures stay the worker's.
+        try:
+            return self._signal_go_inner(spec, deadline=deadline)
+        except OSError as exc:
+            if exc.errno in _HOST_RESOURCE_ERRNOS:
+                exc.host_io = True  # type: ignore[attr-defined]
+            raise
+
+    def _signal_go_inner(self, spec: "WarmJobSpec", *, deadline: float | None = None) -> None:
         path = Path(spec.input_path)
         header = json.dumps(
             {"filename": path.name, "params": dict(spec.params)}

@@ -20,6 +20,7 @@ Security properties (review will check):
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import logging
 import os
@@ -76,6 +77,12 @@ def _guest_seam_errors() -> tuple[type[BaseException], ...]:
 
 
 _GUEST_SEAM_ERRORS: tuple[type[BaseException], ...] = _guest_seam_errors()
+
+# Errnos that mean THIS HOST is out of resources rather than the worker having written something
+# we refuse to follow. Shared meaning with trust._HOST_RESOURCE_ERRNOS.
+_HOST_RESOURCE_ERRNOS = frozenset({
+    errno.EMFILE, errno.ENFILE, errno.ENOMEM, errno.EIO, errno.ENOSPC, errno.EDQUOT, errno.EROFS,
+})
 
 _log = logging.getLogger("blastbox.host.dispatch")
 
@@ -1180,7 +1187,8 @@ class Dispatcher:
                 # dispatcher-disk failure that would burn out the whole healthy pool. Same
                 # opt-in shape as staging, and asked of the CONTROL object because that is what
                 # differs -- the runtime may offer both (upstream, PR #82).
-                if getattr(control, "signal_is_transport", False):
+                if (getattr(control, "signal_is_transport", False)
+                        and not getattr(exc, "host_io", False)):
                     warm_fault = "worker"
                 self._fail_job(job, f"failed to signal go to warm worker: {exc}")
                 return
@@ -2449,8 +2457,15 @@ class Dispatcher:
                     f"declared artifact {a.id} vanished or changed type during materialization"
                 ) from exc
             except OSError as exc:
-                # ...but a host-resource failure (EMFILE/ENOMEM/EIO) is OUR limit, not the
-                # worker's doing, and must stay unattributed.
+                # ELOOP/ENOTDIR come from the CONFINEMENT check: the worker swapped the artifact
+                # for a symlink, or put a symlink/non-directory in the path. That is a violation,
+                # and calling it unknown meant repeated malicious swaps never advanced burnout.
+                # Only a host-resource errno is ours (PR #82) -- the same split just applied to
+                # the validation path, missing from this one.
+                if exc.errno not in _HOST_RESOURCE_ERRNOS:
+                    raise OutputTrustError(
+                        f"declared artifact {a.id} failed the confinement check ({exc})"
+                    ) from exc
                 raise OutputTrustUnknown(
                     f"could not open declared artifact {a.id} ({exc})"
                 ) from exc

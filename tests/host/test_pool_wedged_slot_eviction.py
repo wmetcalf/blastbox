@@ -2518,3 +2518,55 @@ def test_a_failed_spawn_repair_does_not_poison_the_job_streak() -> None:
         f"a failed SPAWN repair left {job_streak} in the job-failure counter — one later worker "
         "fault would then trigger an unattributed job-driven rebuild"
     )
+
+
+def test_a_rebuild_racing_the_tick_does_not_spawn_against_the_old_base() -> None:
+    """Reading the fence flag non-atomically reintroduced the stall it exists to prevent.
+
+    A job thread can invalidate the base AFTER the tick read the flag, so `ready` still describes
+    the discarded artifact and every remaining spawn in the batch runs SnapshotManager.build()
+    synchronously on the sole maintenance thread. Deferring on the flag alone cannot cover this;
+    only re-checking the rebuild generation inside the batch can.
+    """
+    import threading
+
+    class _InvalidateMidBatch(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pool: WarmPool | None = None
+            self.spawns_after_invalidate = 0
+            self._fired = False
+
+        def spawn(self) -> Slot:
+            if self.base_invalidations:
+                self.spawns_after_invalidate += 1
+            slot = super().spawn()
+            if not self._fired and self.pool is not None:
+                # Fire ONCE, from another thread, in the middle of the batch: exactly the window
+                # between the flag read and the remaining spawns.
+                self._fired = True
+                th = threading.Thread(target=self.pool.invalidate_base_for_test, daemon=True)
+                th.start()
+                th.join(5.0)
+            return slot
+
+    rt = _InvalidateMidBatch()
+    pool = WarmPool(
+        runtime=rt, warm_size=4, concurrent_ceiling=8,
+        snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    rt.pool = pool
+    pool.invalidate_base_for_test = lambda: (  # type: ignore[attr-defined]
+        rt.invalidate_base(), pool._note_rebuild_for_test()
+    )
+    pool._note_rebuild_for_test = lambda: pool.__dict__.__setitem__(  # type: ignore[attr-defined]
+        "_base_rebuilds", pool._base_rebuilds + 1
+    )
+
+    pool.tick()
+
+    assert rt.base_invalidations >= 1, "sanity: the base was invalidated mid-batch"
+    assert rt.spawns_after_invalidate == 0, (
+        f"{rt.spawns_after_invalidate} slots were spawned against a base invalidated mid-batch — "
+        "each of those calls builds synchronously and stalls the maintenance thread"
+    )

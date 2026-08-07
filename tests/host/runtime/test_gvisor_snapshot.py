@@ -533,3 +533,26 @@ def test_the_retry_list_stays_shared_across_handles(tmp_path: Path) -> None:
         f"only {len(be._stranded_partials)} of 2 stranded directories reached the backend's "
         "durable list — the handle rebound to a private copy after the first sweep"
     )
+
+
+def test_a_failed_restore_signals_an_unconfirmed_teardown(tmp_path: Path) -> None:
+    """The manager reads this flag to decide whether the checkpoint may be reclaimed.
+
+    restore_in() called the teardown helper but ignored its result, so when both commands failed
+    the original exception carried no signal — the manager unpinned the generation even though an
+    unmanaged sandbox might still be using it, and a later invalidation could reclaim it
+    underneath.
+    """
+    def _run(argv, *a, **kw):
+        # The restore itself fails, and so does every teardown command.
+        raise RuntimeError("runsc failure")
+
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=_run, ready_wait=lambda d, t: None)
+
+    with pytest.raises(Exception) as ei:
+        be.restore_in(tmp_path / "slot", str(tmp_path / "checkpoint-1-1"))
+
+    assert getattr(ei.value, "kill_failed", False) is True, (
+        "a restore whose teardown could not be confirmed must flag it, or the manager reclaims "
+        "the checkpoint while a sandbox may still be using it"
+    )

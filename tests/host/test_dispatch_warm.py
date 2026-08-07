@@ -1983,6 +1983,10 @@ def test_a_host_disk_failure_reading_output_is_not_worker_evidence(tmp_path):
     )
 
 
+def _errno_oserror(code: int) -> OSError:
+    return OSError(code, "confinement violation")
+
+
 def test_an_artifact_swapped_during_materialization_convicts_the_worker(tmp_path):
     """On the gVisor tier /out is a live 0o777 bind mount, so a worker can swap what it declared.
 
@@ -2020,6 +2024,18 @@ def test_an_artifact_swapped_during_materialization_convicts_the_worker(tmp_path
                        lambda *a, **kw: (_ for _ in ()).throw(OSError(24, "Too many open files")))
         with pytest.raises(OutputTrustUnknown):
             dispatcher._materialize_sealed_warm_output(env, tmp_path / "src", tmp_path / "dst")
+
+        # ...and a SYMLINK SWAP surfaces as ELOOP from the confinement check, which is a verdict:
+        # classifying it as unknown let repeated malicious swaps escape burnout entirely.
+        import errno as _errno
+
+        monkey.setattr("blastbox.host.dispatch.open_confined_regular_fd",
+                       lambda *a, **kw: (_ for _ in ()).throw(_errno_oserror(_errno.ELOOP)))
+        with pytest.raises(OutputTrustError) as ei2:
+            dispatcher._materialize_sealed_warm_output(env, tmp_path / "src", tmp_path / "dst")
+        assert not isinstance(ei2.value, OutputTrustUnknown), (
+            "a worker symlink swap is a verdict, not a host failure"
+        )
     finally:
         monkey.undo()
 
@@ -2165,4 +2181,42 @@ def test_a_host_disk_failure_inside_rdump_is_not_worker_evidence(tmp_path):
     assert store.get(job.job_id).status == JobStatus.FAILED
     assert pool.release_fault == ["unknown"], (
         f"a host disk failure inside rdump is not worker evidence (got {pool.release_fault})"
+    )
+
+
+def test_a_host_side_vsock_setup_failure_is_not_worker_evidence(tmp_path):
+    """signal_go does HOST-local work as well as transport.
+
+    Creating the Unix socket can fail with EMFILE/ENOMEM, and streaming the staged input reads a
+    HOST file. signal_is_transport marks the seam as worker evidence, so without the errno split
+    a dispatcher outage burned out healthy FC slots and could invalidate their base.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    runtime = _FakeVsockRuntime()
+
+    class _HostIoControl(_RecordingVsockControl):
+        signal_is_transport = True          # a real transport seam...
+
+        def signal_go(self, spec, *, deadline=None):
+            err = OSError(24, "Too many open files")
+            err.host_io = True              # ...whose failure was OURS
+            raise err
+
+    runtime.host_warm_control = lambda s: _HostIoControl(s)  # type: ignore[assignment]
+    pool = FakeWarmPool(slot, runtime=runtime)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+
+    dispatcher.dispatch_once()
+
+    assert store.get(job.job_id).status == JobStatus.FAILED
+    assert pool.release_fault == ["unknown"], (
+        f"a host-side vsock setup failure is not worker evidence (got {pool.release_fault})"
     )
