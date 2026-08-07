@@ -1781,3 +1781,30 @@ def test_the_pool_forwards_the_repair_trigger_to_the_runtime() -> None:
     pool.release(slot, dirty=True, fault="worker")     # a JOB-path failure
 
     assert seen == ["job"], f"the pool must forward the trigger it acted on (got {seen})"
+
+
+def test_a_failed_invalidation_keeps_its_episode() -> None:
+    """The streak is consumed to make the decision, so a failed repair must give it back.
+
+    Otherwise a transient backend/cleanup error makes the poisoned base wait for another full
+    snapshot_rebuild_after worker failures before retrying — every one of which is a failed job.
+    """
+    class _InvalidateFails(_WedgeableRuntime):
+        def invalidate_base(self, *, reason=None) -> None:  # type: ignore[override]
+            raise RuntimeError("snapshot cleanup failed")
+
+    rt = _InvalidateFails()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4,
+        snapshot_rebuild_after=2, base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    with pool._lock:
+        pool._pool_consecutive_failures = 2
+
+    assert pool._maybe_rebuild_base(reason="job") is False
+    with pool._lock:
+        streak = pool._pool_consecutive_failures
+    assert streak >= 2, (
+        f"a repair that did not happen consumed its episode anyway — the base now waits for a "
+        f"whole new streak (got {streak})"
+    )

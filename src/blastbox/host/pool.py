@@ -1827,6 +1827,15 @@ class WarmPool:
                 drop()
         except Exception:
             logger.exception("pool.base_rebuild_error pool_consecutive_failures=%d", pool_failures)
+            # RESTORE the consumed episode. The streak was consumed to make the decision, but the
+            # repair did not happen -- so making the poisoned base wait for another full
+            # snapshot_rebuild_after failures before retrying just fails that many more jobs. Only
+            # restore what we took, and never below what has accumulated since.
+            if success_token is not None:
+                with self._lock:
+                    self._pool_consecutive_failures = max(
+                        self._pool_consecutive_failures, pool_failures
+                    )
             return False
         with self._lock:
             if reason == "spawn":

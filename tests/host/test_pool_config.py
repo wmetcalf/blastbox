@@ -349,3 +349,30 @@ def test_a_resolved_config_override_reaches_cascade_tier_repair(monkeypatch):
     assert captured["tier_rebuild_after"] == 0, (
         "a resolved 0 must disable per-tier repair, not fall back to the env/default"
     )
+
+
+def test_the_cascade_threshold_is_derived_the_same_way_as_the_pools(monkeypatch):
+    """One policy, two consumers.
+
+    With nothing configured — the documented default — cfg.snapshot_rebuild_after is None.
+    Forwarding that None made build_cascade_runtime substitute a fixed 4 while WarmPool derived
+    max(4, 2*warm_size), so a cascade with warm_size > 2 invalidated tier bases far earlier than
+    the pool-wide policy it is meant to follow.
+    """
+    captured: dict[str, object] = {}
+
+    def _fake_cascade(get=None, *, warm_snapshot=False, tier_rebuild_after=None):
+        captured["tier_rebuild_after"] = tier_rebuild_after
+        return type("R", (), {"spawn": lambda s: None, "is_ready": lambda s, x: True,
+                              "is_alive": lambda s, x: True, "reap": lambda s, x: None})()
+
+    monkeypatch.setattr("blastbox.host.runtime.cascade.build_cascade_runtime", _fake_cascade)
+    monkeypatch.delenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", raising=False)
+
+    cfg = PoolConfig.from_env(runtime="cascade", warm_size=8, concurrent_ceiling=16)
+    pool = build_warm_pool(cfg)
+    assert pool is not None
+    assert captured["tier_rebuild_after"] == pool._snapshot_rebuild_after == 16, (
+        f"cascade got {captured['tier_rebuild_after']}, pool derived "
+        f"{pool._snapshot_rebuild_after} — they must be one policy"
+    )

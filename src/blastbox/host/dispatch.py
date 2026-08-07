@@ -2416,7 +2416,24 @@ class Dispatcher:
         shutil.rmtree(dst_dir, ignore_errors=True)
         dst_dir.mkdir(parents=True, exist_ok=True)
         for a in envelope.artifacts:
-            fd = open_confined_regular_fd(src_dir, a.path)
+            try:
+                fd = open_confined_regular_fd(src_dir, a.path)
+            except (FileNotFoundError, ValueError) as exc:
+                # The worker DELETED or SWAPPED a declared artifact between validation and this
+                # copy -- on the gVisor tier /out is a live 0o777 bind mount, so it can. Those
+                # come out of the confinement check as FileNotFoundError/ValueError rather than
+                # OutputTrustError, so they bypassed the trust handler upstream and left the
+                # failure unattributed: repeated untrusted-output races never advanced burnout or
+                # rebuild detection even though the worker caused every one (upstream, PR #82).
+                raise OutputTrustError(
+                    f"declared artifact {a.id} vanished or changed type during materialization"
+                ) from exc
+            except OSError as exc:
+                # ...but a host-resource failure (EMFILE/ENOMEM/EIO) is OUR limit, not the
+                # worker's doing, and must stay unattributed.
+                raise OutputTrustUnknown(
+                    f"could not open declared artifact {a.id} ({exc})"
+                ) from exc
             digest = hashlib.sha256()
             n = 0
             try:

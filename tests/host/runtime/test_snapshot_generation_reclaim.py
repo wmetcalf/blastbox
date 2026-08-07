@@ -623,3 +623,53 @@ def test_the_restore_rollback_path_also_keeps_failed_discards_retryable(tmp_path
     assert not gen1.exists(), (
         "a rollback whose discard failed forgot the generation — it is leaked forever"
     )
+
+
+def test_a_build_invalidated_while_running_does_not_publish(tmp_path):
+    """A repair request must not be silently lost to a slow build.
+
+    invalidate() arriving while the (async) build is in flight found _artifact None, recorded
+    nothing, and the build then published the very artifact the repair meant to reject — so
+    old-generation slots kept failing against a base that had already been condemned.
+    """
+    from blastbox.host.runtime.fc_snapshot import SnapshotBuildError
+
+    mgr, be = _mgr(tmp_path)
+
+    class _BootThatGetsInvalidated(_FakeBoot):
+        def wait_ready(self, timeout_s: float) -> None:
+            mgr.invalidate()      # the repair lands mid-build
+
+    be.boot_base = lambda: _BootThatGetsInvalidated(be)  # type: ignore[assignment]
+
+    with pytest.raises(SnapshotBuildError):
+        mgr.build()
+
+    assert mgr.artifact is None, "a rejected build must not become the active artifact"
+    assert _gens(tmp_path) == set(), (
+        f"the discarded build left its files behind: {_gens(tmp_path)}"
+    )
+
+
+def test_an_interrupted_build_still_tears_down_its_base(tmp_path):
+    """BaseException must not escape without teardown.
+
+    Replacing the original `finally: boot.kill()` with typed handlers let a KeyboardInterrupt or
+    cancellation during wait_ready()/checkpoint() leave a Firecracker VM or gVisor base container
+    running — interrupting the dispatcher mid-build leaked one every time.
+    """
+    mgr, be = _mgr(tmp_path)
+    killed: list[bool] = []
+
+    class _BootInterrupted(_FakeBoot):
+        def wait_ready(self, timeout_s: float) -> None:
+            raise KeyboardInterrupt("operator interrupted the dispatcher")
+
+        def kill(self):
+            killed.append(True)
+
+    be.boot_base = lambda: _BootInterrupted(be)  # type: ignore[assignment]
+
+    with pytest.raises(KeyboardInterrupt):
+        mgr.build()
+    assert killed, "an interrupted build must still tear its base down"

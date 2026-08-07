@@ -178,6 +178,18 @@ def select_runtime_by_name(
     raise ValueError(f"unknown pool runtime: {name!r}")
 
 
+def _resolved_rebuild_after(cfg: PoolConfig) -> int:
+    """The rebuild threshold BOTH the pool and its cascade must use.
+
+    None means "derive from the feasible warm size" -- the same formula WarmPool applies -- not
+    "let each consumer pick its own default".
+    """
+    if cfg.snapshot_rebuild_after is not None:
+        return max(0, int(cfg.snapshot_rebuild_after))
+    feasible = min(cfg.warm_size, cfg.concurrent_ceiling)
+    return max(4, 2 * max(1, feasible))
+
+
 def _configured_only(cfg: PoolConfig) -> dict[str, Any]:
     """Only the knobs the operator actually set.
 
@@ -223,7 +235,12 @@ def build_warm_pool(
             # bases (upstream, PR #82).
             runtime = build_cascade_runtime(
                 warm_snapshot=cfg.warm_snapshot,
-                tier_rebuild_after=cfg.snapshot_rebuild_after,
+                # DERIVE it here rather than forwarding None. build_cascade_runtime
+                # substitutes a fixed 4, while WarmPool derives max(4, 2*warm_size) -- so on the
+                # documented default (nothing configured) a cascade with warm_size > 2
+                # invalidated tier bases far earlier than the pool-wide policy it is supposed to
+                # follow. One resolved value, both paths (upstream, PR #82).
+                tier_rebuild_after=_resolved_rebuild_after(cfg),
             )
         else:
             runtime = select_runtime_by_name(cfg.runtime, warm_snapshot=cfg.warm_snapshot)

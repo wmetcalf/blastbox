@@ -18,6 +18,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -1980,3 +1981,44 @@ def test_a_host_disk_failure_reading_output_is_not_worker_evidence(tmp_path):
     assert pool.release_fault == ["unknown"], (
         f"a full dispatcher disk is not worker evidence (got {pool.release_fault})"
     )
+
+
+def test_an_artifact_swapped_during_materialization_convicts_the_worker(tmp_path):
+    """On the gVisor tier /out is a live 0o777 bind mount, so a worker can swap what it declared.
+
+    Those violations surface from the confinement check as FileNotFoundError/ValueError, not
+    OutputTrustError, so they bypassed the trust handler and left the failure unattributed —
+    repeated untrusted-output races never advanced burnout even though the worker caused each one.
+    A host-resource failure on the same call must still stay unattributed.
+    """
+    from blastbox.errors import OutputTrustError, OutputTrustUnknown
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+
+    env = SimpleNamespace(artifacts=[SimpleNamespace(id="a1", path="a.bin", bytes=4)])
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        # A worker DELETING its declared artifact -> conviction.
+        monkey.setattr("blastbox.host.dispatch.open_confined_regular_fd",
+                       lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError("gone")))
+        with pytest.raises(OutputTrustError) as ei:
+            dispatcher._materialize_sealed_warm_output(env, tmp_path / "src", tmp_path / "dst")
+        assert not isinstance(ei.value, OutputTrustUnknown), "a swap IS the worker's doing"
+
+        # A host limit on the same call -> unattributed.
+        monkey.setattr("blastbox.host.dispatch.open_confined_regular_fd",
+                       lambda *a, **kw: (_ for _ in ()).throw(OSError(24, "Too many open files")))
+        with pytest.raises(OutputTrustUnknown):
+            dispatcher._materialize_sealed_warm_output(env, tmp_path / "src", tmp_path / "dst")
+    finally:
+        monkey.undo()

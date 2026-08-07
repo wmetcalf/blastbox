@@ -71,6 +71,12 @@ class SnapshotManager:
         self._pins: dict[str, object] = {}          # slot_id -> the artifact it mapped
         self._refs: dict[int, int] = {}             # id(artifact) -> live restores
         self._retired: dict[int, object] = {}       # id(artifact) -> superseded, awaiting drain
+        # Build epoch. invalidate() bumps it; a build that started under an older epoch has been
+        # REJECTED while it was still running and must not publish. Without this, an invalidate
+        # arriving while the (slow, async) build was in flight found _artifact None, recorded
+        # nothing, and the build then published the very artifact the repair meant to reject --
+        # so the second repair request was silently lost (upstream, PR #82).
+        self._build_epoch = 0
         # Async-build state (used by ensure_build_started so the up-to-ready_timeout_s build
         # never runs on the pool's single tick thread). _build_lock guards only the cheap
         # bookkeeping below, never the slow boot/checkpoint inside build().
@@ -136,6 +142,8 @@ class SnapshotManager:
         # SnapshotBuildError (as documented), not propagated raw. boot_base already
         # tears down its own sandbox on partial failure, so no handle/finally is
         # needed here — there is nothing to kill until it returns a BootHandle.
+        with self._build_lock:
+            epoch = self._build_epoch
         try:
             boot = self._backend.boot_base()
         except SnapshotError:
@@ -151,10 +159,30 @@ class SnapshotManager:
             with contextlib.suppress(Exception):
                 boot.kill()
             raise
-        except Exception as exc:  # readiness / checkpoint failure
+        except BaseException as exc:
+            # BaseException, not Exception. Replacing the original `finally: boot.kill()` with
+            # typed handlers let a KeyboardInterrupt, SystemExit or task cancellation during
+            # wait_ready()/checkpoint() escape WITHOUT tearing the base down, leaving a
+            # Firecracker VM or gVisor base container running -- interrupting the dispatcher
+            # mid-build leaked one every time. Every unsuccessful exit tears down; only the
+            # success path below publishes first (upstream, PR #82).
             with contextlib.suppress(Exception):
                 boot.kill()
-            raise SnapshotBuildError(f"warm snapshot build failed: {exc}") from exc
+            if isinstance(exc, Exception):   # readiness / checkpoint failure
+                raise SnapshotBuildError(f"warm snapshot build failed: {exc}") from exc
+            raise
+
+        with self._build_lock:
+            rejected = epoch != self._build_epoch
+        if rejected:
+            # invalidate() landed while this build was running. Publishing now would install the
+            # artifact the repair explicitly rejected; discard it instead and let the next build
+            # produce a fresh one.
+            _log.info("snapshot.build_discarded reason=invalidated_while_building")
+            with contextlib.suppress(Exception):
+                boot.kill()
+            self._discard(artifact)
+            raise SnapshotBuildError("snapshot invalidated while it was being built")
 
         # PUBLISH BEFORE TEARDOWN. If boot.kill() raised, the artifact was never assigned, so
         # nothing could ever discover it: not invalidate(), not the reference counting. Every
@@ -184,6 +212,7 @@ class SnapshotManager:
         """
         with self._build_lock:
             had = self._artifact is not None
+            self._build_epoch += 1        # reject any build already in flight
             collect = None
             if self._artifact is not None:
                 key = id(self._artifact)
