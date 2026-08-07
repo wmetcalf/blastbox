@@ -304,7 +304,7 @@ class CascadingRuntime:
         except Exception as exc:  # noqa: BLE001
             _log.warning("cascade: tier %r base invalidation failed: %s", tier.name, exc)
 
-    def invalidate_base(self) -> None:
+    def invalidate_base(self, *, reason: str | None = None) -> None:
         """Forward base invalidation to every wrapped tier that supports it.
 
         Every tier is attempted even if an earlier one fails -- one poisoned tier must not stop
@@ -319,9 +319,18 @@ class CascadingRuntime:
         # destroys the healthy tier's snapshot during ordinary saturation despite it producing no
         # failure evidence at all. With no per-tier evidence (a job-failure-driven rebuild, which
         # carries no tier attribution) fall back to every tier (upstream, PR #82).
-        with self._lock:
-            guilty = {i for i, n in enumerate(self._tier_failures) if n > 0} | self._recently_guilty
-        targets = [t for i, t in enumerate(self.tiers) if i in guilty] or list(self.tiers)
+        # Only a SPAWN-triggered repair carries tier attribution. A job-triggered one does not:
+        # the failures came from whichever tier served those jobs, which the cascade cannot know.
+        # Filtering it through a spawn marker meant tier A's stale guilt selected A while the
+        # actual offender B kept its poisoned base -- and the pool recorded a rebuild and started
+        # its cooldown regardless (upstream, PR #82).
+        if reason == "spawn":
+            with self._lock:
+                guilty = ({i for i, n in enumerate(self._tier_failures) if n > 0}
+                          | self._recently_guilty)
+            targets = [t for i, t in enumerate(self.tiers) if i in guilty] or list(self.tiers)
+        else:
+            targets = list(self.tiers)
 
         with self._lock:
             self._recently_guilty.clear()   # consumed by this repair

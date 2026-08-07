@@ -71,6 +71,17 @@ class Slot:
     jobs: int = 0            # cumulative jobs served (reuse mode: drives recycle/reprovision)
 
 
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    """Whether ``fn`` declares ``name`` (or absorbs it via **kwargs). Introspection only."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def release_kwargs(fn: Any, *, dirty: bool, fault: str | None = None) -> dict[str, Any]:
     """The subset of ``dirty``/``fault`` that this ``release`` callable actually accepts.
 
@@ -1484,6 +1495,9 @@ class WarmPool:
                     if slot.slot_id in self._slots and slot.state == SlotState.WARMING:
                         slot.state = SlotState.IDLE
                         newly_idle.append(slot.slot_id)
+                        # PROOF the base yields a usable worker — the only thing that should
+                        # clear the restore-failure streak.
+                        self._spawn_consecutive_failures = 0
             elif slot.state == SlotState.DRAINING and not raised:
                 # is_ready returned False AND the slot is DRAINING. Usually the runtime's finalize
                 # failed closed and reaped the VM ITSELF; but DRAINING can ALSO be set EXTERNALLY (a
@@ -1591,7 +1605,13 @@ class WarmPool:
             try:
                 slot = self._runtime.spawn()
                 with self._lock:
-                    self._spawn_consecutive_failures = 0
+                    # NOT the failure streak. A spawn that merely RETURNS says nothing about
+                    # whether the base can produce a usable worker: with warm_size=1 each
+                    # timed-out WARMING slot bumped the streak to 1 and its replacement's spawn
+                    # immediately cleared it, so a base that consistently restores but never
+                    # becomes ready cycled at a streak of one and never reached the rebuild
+                    # threshold. Only reaching IDLE is proof (upstream, PR #82).
+                    #
                     # Capacity came back: reset the starvation clock AND the latch, so a later
                     # outage escalates again rather than being permanently silenced by the first.
                     self._capacity_miss_since = None
@@ -1798,7 +1818,13 @@ class WarmPool:
             )
             return False
         try:
-            drop()
+            # Pass the trigger through when the runtime accepts it: a cascade can only attribute a
+            # SPAWN-driven repair to a tier. Introspection, not except-TypeError -- a TypeError
+            # from inside drop() must never be mistaken for an older signature.
+            if _accepts_kwarg(drop, "reason"):
+                drop(reason=reason)
+            else:
+                drop()
         except Exception:
             logger.exception("pool.base_rebuild_error pool_consecutive_failures=%d", pool_failures)
             return False

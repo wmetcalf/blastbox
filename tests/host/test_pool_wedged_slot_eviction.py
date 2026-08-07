@@ -30,6 +30,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import contextlib
+from types import SimpleNamespace
 
 import pytest
 import logging
@@ -1431,7 +1432,7 @@ def test_a_healthy_but_full_tier_keeps_its_base_when_a_sibling_fails() -> None:
         casc.spawn()               # records failure evidence against 'fc' only
 
     with contextlib.suppress(Exception):
-        casc.invalidate_base()
+        casc.invalidate_base(reason="spawn")   # spawn-driven: the trigger IS attributable
 
     assert broken.invalidated >= 1, "the tier that actually failed must be repaired"
     assert full.invalidated == 0, (
@@ -1614,7 +1615,7 @@ def test_a_repaired_tier_stays_attributable_for_the_pools_own_repair() -> None:
 
     # The pool now makes its own global decision, with the tier streak already reset to 0.
     with contextlib.suppress(Exception):
-        casc.invalidate_base()
+        casc.invalidate_base(reason="spawn")   # spawn-driven: the trigger IS attributable
 
     assert full.invalidated == 0, (
         "a healthy, merely-saturated tier lost its base because the guilty marker was cleared "
@@ -1675,3 +1676,108 @@ def test_a_success_during_the_decision_abandons_the_rebuild() -> None:
         "the base produced a valid result while the failure was being judged, and was rebuilt "
         f"anyway (invalidations={rt.base_invalidations})"
     )
+
+
+def test_a_job_driven_repair_is_not_narrowed_by_stale_spawn_guilt() -> None:
+    """Only a SPAWN-triggered repair carries tier attribution.
+
+    A job-triggered one does not: the failures came from whichever tier served those jobs, which
+    the cascade cannot know. Filtering it through a spawn marker meant tier A's stale guilt
+    selected A while the actual offender B kept its poisoned base — and the pool recorded a
+    rebuild and started its cooldown regardless, delaying the next attempt.
+    """
+    class _Tier:
+        def __init__(self) -> None:
+            self.invalidated = 0
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            # B must SUCCEED, or it gets marked guilty by the same spawn and the assertion below
+            # becomes meaningless.
+            self.n += 1
+            return SimpleNamespace(slot_id=f"b{self.n}")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    class _BrokenSpawn(_Tier):
+        def spawn(self):
+            raise RuntimeError("snapshot restore failed")
+
+    a, b = _BrokenSpawn(), _Tier()
+    casc = CascadingRuntime(
+        tiers=[Tier(name="a", runtime=a, capacity=4), Tier(name="b", runtime=b, capacity=4)],
+        tier_rebuild_after=1,
+    )
+    casc.spawn()                           # A fails and is marked guilty; B serves the request
+    assert a.invalidated == 1, "sanity: per-tier repair marked A"
+    assert b.invalidated == 0, "sanity: B succeeded and is not guilty"
+
+    # Now a JOB-driven repair: the failing jobs ran on B, which the cascade cannot know.
+    casc.invalidate_base(reason="job")
+
+    assert b.invalidated == 1, (
+        "a job-driven repair has no tier attribution and must not be narrowed to a tier whose "
+        "guilt came from an unrelated SPAWN failure — B's poisoned base was left untouched"
+    )
+
+
+def test_sequential_warmup_failures_still_reach_the_rebuild_threshold() -> None:
+    """The one-slot pool is where the previous fix silently did nothing.
+
+    Counting timed-out warmups only helps if the count SURVIVES. A spawn that merely returns was
+    clearing the streak, so with warm_size=1 each failure bumped it to 1 and the replacement's
+    spawn immediately reset it: a base that consistently restores but never yields a ready worker
+    cycled at a streak of one forever and never reached snapshot_rebuild_after. Only reaching
+    IDLE is proof the base works.
+    """
+    clock = _FakeClock()
+
+    class _RestoresButNeverReady(_WedgeableRuntime):
+        def is_ready(self, slot: Slot) -> bool:
+            return False
+
+    rt = _RestoresButNeverReady()
+    pool = WarmPool(
+        runtime=rt, warm_size=1, concurrent_ceiling=2, clock=clock,
+        warming_timeout_s=10.0, snapshot_rebuild_after=3,
+        base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+
+    for _ in range(8):
+        pool.tick()
+        clock.advance(11.0)     # one slot, one timeout, one replacement, each tick
+
+    assert rt.base_invalidations >= 1, (
+        "sequential warmup failures on a one-slot pool never accumulated — the replacement "
+        f"spawn kept clearing the streak (got {rt.base_invalidations} invalidations)"
+    )
+
+
+def test_the_pool_forwards_the_repair_trigger_to_the_runtime() -> None:
+    """The cascade can only attribute a repair if the pool tells it what triggered one.
+
+    Testing the cascade directly proves the filter works; it does not prove the pool passes the
+    trigger at all. Without that, every repair looks unattributed and the guilty-set filter is
+    dead code.
+    """
+    seen: list[object] = []
+
+    class _RecordingRuntime(_WedgeableRuntime):
+        def invalidate_base(self, *, reason=None) -> None:  # type: ignore[override]
+            seen.append(reason)
+            super().invalidate_base()
+
+    rt = _RecordingRuntime()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4,
+        snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    pool.tick()
+    slot = list(pool._slots.values())[0]
+    pool.release(slot, dirty=True, fault="worker")     # a JOB-path failure
+
+    assert seen == ["job"], f"the pool must forward the trigger it acted on (got {seen})"
