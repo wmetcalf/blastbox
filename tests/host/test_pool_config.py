@@ -335,7 +335,8 @@ def test_a_resolved_config_override_reaches_cascade_tier_repair(monkeypatch):
     """
     captured: dict[str, object] = {}
 
-    def _fake_cascade(get=None, *, warm_snapshot=False, tier_rebuild_after=None):
+    def _fake_cascade(get=None, *, warm_snapshot=False, tier_rebuild_after=None,
+                      tier_rebuild_after_explicit=None):
         captured["tier_rebuild_after"] = tier_rebuild_after
         return type("R", (), {"spawn": lambda s: None, "is_ready": lambda s, x: True,
                               "is_alive": lambda s, x: True, "reap": lambda s, x: None})()
@@ -361,7 +362,8 @@ def test_the_cascade_threshold_is_derived_the_same_way_as_the_pools(monkeypatch)
     """
     captured: dict[str, object] = {}
 
-    def _fake_cascade(get=None, *, warm_snapshot=False, tier_rebuild_after=None):
+    def _fake_cascade(get=None, *, warm_snapshot=False, tier_rebuild_after=None,
+                      tier_rebuild_after_explicit=None):
         captured["tier_rebuild_after"] = tier_rebuild_after
         return type("R", (), {"spawn": lambda s: None, "is_ready": lambda s, x: True,
                               "is_alive": lambda s, x: True, "reap": lambda s, x: None})()
@@ -426,3 +428,58 @@ def test_an_explicit_cascade_threshold_is_never_retuned():
     pool = WarmPool(runtime=casc, warm_size=4, concurrent_ceiling=32)
     pool.resize(warm_size=16)
     assert casc.tier_rebuild_after == 7, "a pinned threshold must survive every resize"
+
+
+def test_a_derived_cascade_threshold_is_still_retunable(monkeypatch):
+    """Resolving the derived default to an int made the cascade call it EXPLICIT.
+
+    _retune_runtime_thresholds then refused to update it, so an autosized cascade resizing 4 -> 16
+    moved the pool-wide threshold to 32 while per-tier repair stayed pinned at 8 — two fixes of
+    mine cancelling each other out. The factory has to say where its number CAME FROM, not just
+    what it is.
+    """
+    captured: dict[str, object] = {}
+
+    def _fake_cascade(get=None, *, warm_snapshot=False, tier_rebuild_after=None,
+                      tier_rebuild_after_explicit=None):
+        captured["after"] = tier_rebuild_after
+        captured["explicit"] = tier_rebuild_after_explicit
+        return type("R", (), {"spawn": lambda s: None, "is_ready": lambda s, x: True,
+                              "is_alive": lambda s, x: True, "reap": lambda s, x: None})()
+
+    monkeypatch.setattr("blastbox.host.runtime.cascade.build_cascade_runtime", _fake_cascade)
+    monkeypatch.delenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", raising=False)
+
+    # Nothing configured: the 16 below is DERIVED from warm_size and must stay retunable.
+    cfg = PoolConfig.from_env(runtime="cascade", warm_size=8, concurrent_ceiling=16)
+    build_warm_pool(cfg)
+    assert captured["after"] == 16
+    assert captured["explicit"] is False, (
+        "a value derived from warm_size must not be recorded as an operator's choice — "
+        "_retune_runtime_thresholds skips explicit values, so the autosizer could never move it"
+    )
+
+    # An operator's number stays pinned.
+    cfg = PoolConfig.from_env(runtime="cascade", warm_size=8, concurrent_ceiling=16,
+                              snapshot_rebuild_after=7)
+    build_warm_pool(cfg)
+    assert captured["after"] == 7
+    assert captured["explicit"] is True
+
+
+def test_build_cascade_runtime_honours_the_explicit_flag(monkeypatch):
+    """The other half of the fix: the factory must actually forward what it was told."""
+    from blastbox.host.runtime.cascade import build_cascade_runtime
+
+    # build_cascade_runtime imports this lazily from pool_config, so patch it there.
+    monkeypatch.setattr("blastbox.host.pool_config.select_runtime_by_name",
+                        lambda name, **kw: type("R", (), {"spawn": lambda s: None})())
+    env = {"BLASTBOX_POOL_TIERS": "stub:2"}
+    getter = lambda k: env.get(k) or os.environ.get(k)  # noqa: E731
+
+    derived = build_cascade_runtime(getter, tier_rebuild_after=8,
+                                    tier_rebuild_after_explicit=False)
+    assert derived.tier_rebuild_after_explicit is False
+    pinned = build_cascade_runtime(getter, tier_rebuild_after=7,
+                                   tier_rebuild_after_explicit=True)
+    assert pinned.tier_rebuild_after_explicit is True

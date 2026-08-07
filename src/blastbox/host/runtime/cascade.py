@@ -524,6 +524,7 @@ def build_cascade_runtime(
     *,
     warm_snapshot: bool = False,
     tier_rebuild_after: int | None = None,
+    tier_rebuild_after_explicit: bool | None = None,
 ) -> CascadingRuntime:
     """Build a CascadingRuntime from ``BLASTBOX_POOL_TIERS``. The primary (first) tier must be
     available -- otherwise ``CascadeMisconfigured``; overflow tiers that aren't available are skipped
@@ -569,4 +570,9 @@ def build_cascade_runtime(
     if not tiers:
         raise CascadeMisconfigured("no cascade tier is available")
     _log.info("cascade: %s", ", ".join(f"{t.name}:{t.capacity}" for t in tiers))
-    return CascadingRuntime(tiers, tier_rebuild_after=tier_rebuild_after)
+    casc = CascadingRuntime(tiers, tier_rebuild_after=tier_rebuild_after)
+    if tier_rebuild_after_explicit is not None:
+        # The caller knows whether its number came from an operator or from a derived default;
+        # only the former should be immune to retuning.
+        casc.tier_rebuild_after_explicit = tier_rebuild_after_explicit
+    return casc

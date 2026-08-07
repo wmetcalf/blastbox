@@ -134,6 +134,19 @@ def validate_worker_output(
             # declared artifact had already been opened + hashed).
             max_artifacts=limits.max_artifacts,
         )
+    except ValueError as exc:
+        # seal_envelope catches an OSError from open_confined_regular_fd and re-raises it as
+        # ValueError, so a host EMFILE/ENFILE/ENOMEM/EIO never reached the OSError handler below
+        # and the generic branch convicted the worker for a host-wide incident. Look through the
+        # wrapper at the cause rather than trusting the outer type (PR #82).
+        cause = exc.__cause__ or exc.__context__
+        if isinstance(cause, OSError) and cause.errno in HOST_RESOURCE_ERRNOS:
+            raise OutputTrustUnknown(
+                sanitize_public_error(f"could not re-seal worker output: {exc}")
+            ) from exc
+        raise OutputTrustError(
+            sanitize_public_error(f"re-seal failed: {exc}")
+        ) from exc
     except OSError as exc:
         # HOST I/O while opening/stat-ing/hashing a declared artifact. seal_envelope surfaces
         # these as OSError (and open failures as ValueError, handled below), and wrapping both as

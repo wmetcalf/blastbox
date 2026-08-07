@@ -241,6 +241,12 @@ def build_warm_pool(
                 # invalidated tier bases far earlier than the pool-wide policy it is supposed to
                 # follow. One resolved value, both paths (upstream, PR #82).
                 tier_rebuild_after=_resolved_rebuild_after(cfg),
+                # ...and say whether that number was DERIVED. Resolving it to an int made the
+                # cascade record it as explicit, so _retune_runtime_thresholds refused to update
+                # it: an autosized cascade resizing 4 -> 16 moved the pool to 32 while per-tier
+                # repair stayed pinned at 8, invalidating healthy tier bases far earlier than the
+                # documented live-size policy. Two of my own fixes cancelling out (PR #82).
+                tier_rebuild_after_explicit=cfg.snapshot_rebuild_after is not None,
             )
         else:
             runtime = select_runtime_by_name(cfg.runtime, warm_snapshot=cfg.warm_snapshot)

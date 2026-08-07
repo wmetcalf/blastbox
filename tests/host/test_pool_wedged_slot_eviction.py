@@ -2611,3 +2611,51 @@ def test_the_eviction_token_is_timestamped_when_it_is_reserved() -> None:
         f"a token was stamped {pass_started - min(stamps):.1f}s before its own probe finished — "
         "reserved with the pre-probe clock, so a short window expires it a whole pass early"
     )
+
+
+def test_no_spawn_happens_while_an_invalidation_is_in_flight() -> None:
+    """The generation must mark work IN PROGRESS, not work finished.
+
+    _base_rebuilds was incremented only after drop() returned, so throughout the call -- which is
+    where the artifact is actually cleared -- the spawn batch's re-check still saw the generation
+    tick() had captured and happily spawned against a base the manager had already discarded,
+    rebuilding it synchronously on the sole maintenance thread. Drive the real fence: run a spawn
+    batch carrying the pre-invalidation generation from INSIDE drop(), exactly as a batch already
+    in flight would.
+    """
+    spawns_during_drop: list[int] = []
+
+    class _SlowInvalidate(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pool: WarmPool | None = None
+            self.gen_before = 0
+
+        def invalidate_base(self) -> None:
+            pool = self.pool
+            assert pool is not None
+            before = len(self.spawned)
+            # A spawn batch committed BEFORE this invalidation began, still running.
+            pool._spawn_to_deficit(True, expect_generation=self.gen_before)
+            spawns_during_drop.append(len(self.spawned) - before)
+            super().invalidate_base()
+
+    rt = _SlowInvalidate()
+    pool = WarmPool(
+        runtime=rt, warm_size=3, concurrent_ceiling=6,
+        snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0,
+    )
+    rt.pool = pool
+    with pool._lock:
+        rt.gen_before = pool._base_rebuilds
+    slot = pool._runtime.spawn()
+    pool._slots[slot.slot_id] = slot
+    slot.state = SlotState.ASSIGNED
+
+    pool.release(slot, dirty=True, fault="worker")
+
+    assert rt.base_invalidations == 1, "sanity: the invalidation actually ran"
+    assert spawns_during_drop == [0], (
+        f"{spawns_during_drop} slots were spawned while the base was being discarded -- each of "
+        "those spawn() calls rebuilds the base synchronously on the maintenance thread"
+    )

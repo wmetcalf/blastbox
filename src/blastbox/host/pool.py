@@ -1932,6 +1932,14 @@ class WarmPool:
                 "produced a valid result while this failure was being judged"
             )
             return False
+        # Bump the generation BEFORE drop() runs. It was incremented only after drop() returned,
+        # so throughout the call -- which is where the artifact is actually cleared -- the spawn
+        # batch's re-check still saw the old value and spawned against a base the manager had
+        # already discarded, rebuilding it synchronously on the maintenance thread. The generation
+        # must mark "an invalidation is IN PROGRESS", not "one finished" (PR #82).
+        with self._lock:
+            self._base_rebuilds += 1
+            self._rebuilt_this_tick = True
         try:
             # Pass the trigger through when the runtime accepts it: a cascade can only attribute a
             # SPAWN-driven repair to a tier. Introspection, not except-TypeError -- a TypeError
@@ -1962,7 +1970,8 @@ class WarmPool:
                 self._spawn_consecutive_failures = 0
             else:
                 self._pool_consecutive_failures = 0
-            self._base_rebuilds += 1
+            # NB _base_rebuilds was already bumped before drop(); only the timestamp is
+            # recorded here.
             self._last_base_rebuild_at = now
             # Defer this tick's spawning wherever the rebuild came from. tick() captured `ready`
             # before release() could run, and a JOB-triggered rebuild races it: both snapshot

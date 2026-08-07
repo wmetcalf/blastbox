@@ -703,3 +703,44 @@ def test_a_worker_symlink_is_a_verdict_not_an_unknown(tmp_path, monkeypatch):
     with pytest.raises(OutputTrustUnknown):
         validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
                                limits=_limits())
+
+
+def test_a_host_error_wrapped_by_seal_envelope_is_still_not_a_verdict(tmp_path, monkeypatch):
+    """seal_envelope re-raises an OSError from the confinement open as ValueError.
+
+    So a host EMFILE/ENOMEM/EIO never reached the OSError handler, and the generic branch
+    convicted the worker for a host-wide incident. The classification has to look through the
+    wrapper at the cause, not trust the outer type.
+    """
+    import errno as _errno
+
+    from blastbox.errors import OutputTrustUnknown
+
+    out, _ = _make_output_dir(tmp_path, artifact_content=b"payload")
+
+    def _wrapped_host_error(**kw):
+        try:
+            raise OSError(_errno.EMFILE, "Too many open files")
+        except OSError as inner:
+            raise ValueError(f"cannot open artifact: {inner}") from inner
+
+    monkeypatch.setattr("blastbox.host.trust.seal_envelope", _wrapped_host_error)
+    with pytest.raises(OutputTrustUnknown):
+        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())
+
+
+def test_a_genuine_reseal_value_error_is_still_a_verdict(tmp_path, monkeypatch):
+    """The carve-out stays narrow: a ValueError with no host cause is real evidence."""
+    from blastbox.errors import OutputTrustUnknown
+
+    out, _ = _make_output_dir(tmp_path, artifact_content=b"payload")
+
+    def _bad(**kw):
+        raise ValueError("declared artifact hash mismatch")
+
+    monkeypatch.setattr("blastbox.host.trust.seal_envelope", _bad)
+    with pytest.raises(OutputTrustError) as ei:
+        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())
+    assert not isinstance(ei.value, OutputTrustUnknown)
