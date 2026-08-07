@@ -365,3 +365,38 @@ def test_a_partial_checkpoint_cleans_up_its_own_directory(tmp_path: Path) -> Non
 
     leftovers = list(dest.glob("checkpoint-*")) if dest.exists() else []
     assert leftovers == [], f"partial checkpoints accumulated: {leftovers}"
+
+
+def test_discard_reports_removal_failures(tmp_path: Path) -> None:
+    """ignore_errors=True made a failed removal look like confirmed cleanup.
+
+    SnapshotManager._discard drops the artifact from _retired on a normal return, so a transient
+    EIO/EROFS meant that checkpoint directory was never retried and rebuilds accumulated them
+    until the filesystem filled — the same swallowing the FC backend's unlink had.
+    """
+    rec = _Rec()
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=rec, ready_wait=lambda d, t: None)
+    boot = be.boot_base()
+    boot.wait_ready(5.0)
+    art = boot.checkpoint(tmp_path / "ckpt")
+    img = Path(str(art))
+    (img / "state").write_bytes(b"payload")
+
+    import shutil as _shutil
+
+    real_rmtree = _shutil.rmtree
+
+    def _boom(path, *a, **kw):
+        onerror = kw.get("onerror")
+        if onerror is not None:
+            onerror(None, str(path), (OSError, OSError(5, "Input/output error"), None))
+            return
+        return real_rmtree(path, *a, **kw)
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr("blastbox.host.runtime.gvisor_snapshot.shutil.rmtree", _boom)
+    try:
+        with pytest.raises(OSError):
+            be.discard(art)
+    finally:
+        mp.undo()

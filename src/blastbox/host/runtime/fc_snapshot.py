@@ -53,6 +53,24 @@ class SnapshotRestoreError(SnapshotError):
     """Restoring a slot from the snapshot failed (caller reaps + cold-boots the job)."""
 
 
+def _restore_left_process_running(exc: BaseException) -> bool:
+    """Whether a failed restore may have left its firecracker process alive.
+
+    The backend raises SnapshotRestoreError after trying to kill the process it spawned; when
+    that kill ALSO failed it chains the kill error, which is the only signal available here.
+    Conservative by design: an unconfirmed teardown retains the pin, because retaining a
+    generation costs disk while unlinking one under a live mapping corrupts it.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if getattr(cur, "kill_failed", False) is True:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 class SnapshotManager:
     """Builds the warm snapshot once (first-boot), then serves restores to the pool.
 
@@ -356,10 +374,21 @@ class SnapshotManager:
             self._refs[id(artifact)] = self._refs.get(id(artifact), 0) + 1
         try:
             return self._backend.restore_in(slot_workdir, artifact)
-        except SnapshotError:
+        except SnapshotError as exc:
             # A failed restore never yields a handle, so the slot is never reaped —
             # remove the just-created (empty) workdir so it doesn't leak on the host.
-            self._unpin(sid, artifact)
+            #
+            # ...but only unpin if the backend CONFIRMS the spawned firecracker is gone. If
+            # /snapshot/load failed and the subsequent kill ALSO failed, that process may still be
+            # alive with the memory file mapped, and a later invalidation would unlink the
+            # generation underneath it. Same rule as reap() and the spawn-cleanup path (PR #82).
+            if not _restore_left_process_running(exc):
+                self._unpin(sid, artifact)
+            else:
+                _log.warning(
+                    "snapshot.restore_cleanup_unconfirmed sid=%s: could not confirm the "
+                    "firecracker process is gone; retaining its generation pin", sid,
+                )
             shutil.rmtree(slot_workdir, ignore_errors=True)
             raise
         except BaseException as exc:

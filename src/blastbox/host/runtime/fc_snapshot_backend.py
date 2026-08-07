@@ -249,8 +249,16 @@ class FcSnapshotBackend:
             _restore_from_snapshot(
                 handle.api, str(artifact.snapshot_path), str(artifact.mem_path)
             )
-        except Exception:
+        except Exception as exc:
             # Don't leak the spawned firecracker if load/resume fails.
-            handle.kill()
+            try:
+                handle.kill()
+            except Exception as kill_exc:  # noqa: BLE001
+                # The process may STILL BE ALIVE with the memory file mapped. Flag it so the
+                # manager retains this generation's pin: a later invalidation must not unlink
+                # files a live firecracker is still using (PR #82).
+                _log.warning("fc_snapshot: could not kill firecracker after a failed restore: %s",
+                             kill_exc)
+                exc.kill_failed = True  # type: ignore[attr-defined]
             raise
         return handle

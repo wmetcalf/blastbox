@@ -840,3 +840,33 @@ def test_a_rejected_build_whose_cleanup_fails_is_retained(tmp_path):
     assert _gens(tmp_path) == set(), (
         f"a rejected build whose cleanup failed was never retried: {_gens(tmp_path)}"
     )
+
+
+def test_a_restore_whose_cleanup_cannot_kill_firecracker_keeps_its_pin(tmp_path):
+    """An unconfirmed teardown must retain the generation.
+
+    When /snapshot/load fails and the subsequent kill ALSO fails, that firecracker may still be
+    alive with the memory file mapped. Unpinning regardless let a later invalidation unlink the
+    generation underneath it — defeating the mapping-safety guarantee the pin exists for. Same
+    rule as reap() and the spawn-cleanup path.
+    """
+    from blastbox.host.runtime.fc_snapshot import SnapshotRestoreError
+
+    mgr, be = _mgr(tmp_path)
+    mgr.build()
+    gen1 = tmp_path / "snap" / "warm-gen1.mem"
+
+    def _restore_fails_and_kill_fails(slot_workdir, artifact):
+        exc = SnapshotRestoreError("load failed")
+        exc.kill_failed = True        # the backend could not confirm the process is gone
+        raise exc
+
+    be.restore_in = _restore_fails_and_kill_fails  # type: ignore[assignment]
+
+    with pytest.raises(SnapshotRestoreError):
+        mgr.restore("slot-a")
+
+    mgr.invalidate()
+    assert gen1.exists(), (
+        "the generation was reclaimed while a firecracker process may still map its memory file"
+    )

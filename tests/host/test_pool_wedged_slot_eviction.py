@@ -2071,3 +2071,37 @@ def test_the_promotion_ledger_does_not_grow_without_bound() -> None:
         f"the promotion ledger retained {leaked} entries for slots that are long gone "
         f"(live slots: {len(pool._slots)})"
     )
+
+
+def test_a_job_triggered_rebuild_also_defers_spawning() -> None:
+    """Both rebuild triggers must defer the tick, not just the health-check one.
+
+    tick() captures `ready` before release() can run, so a job-triggered rebuild racing it left
+    ready=True stale — and both snapshot runtimes call SnapshotManager.build() synchronously from
+    spawn(), blocking the sole maintenance thread for a full boot plus readiness timeout.
+    """
+    class _CountingSpawns(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.spawns_after_invalidate = 0
+
+        def spawn(self) -> Slot:
+            if self.base_invalidations:
+                self.spawns_after_invalidate += 1
+            return super().spawn()
+
+    rt = _CountingSpawns()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4,
+        snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    pool.tick()
+    slot = list(pool._slots.values())[0]
+    pool.release(slot, dirty=True, fault="worker")   # JOB-triggered rebuild, outside _health_check
+    assert rt.base_invalidations >= 1, "sanity: the rebuild fired from the release path"
+
+    pool.tick()      # must NOT spawn against the just-invalidated base
+    assert rt.spawns_after_invalidate == 0, (
+        "the pool spawned in the same tick a job-triggered rebuild invalidated the base — that "
+        "call runs build() synchronously and stalls the maintenance thread"
+    )

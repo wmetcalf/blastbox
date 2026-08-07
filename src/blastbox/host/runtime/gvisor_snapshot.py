@@ -366,7 +366,14 @@ class GvisorSnapshotBackend:
             # an unexpected artifact shape must never turn into an rmtree of something else.
             _log.warning("gvisor_snapshot: refusing to discard unexpected artifact %r", artifact)
             return
-        shutil.rmtree(path, ignore_errors=True)
+        # NOT ignore_errors: SnapshotManager._discard treats a normal return as CONFIRMED
+        # cleanup and drops the artifact from _retired, so silently swallowing a transient
+        # EIO/EROFS here means this checkpoint directory is never retried and rebuilds accumulate
+        # them until the filesystem fills. Same fix as the FC backend's unlink (PR #82).
+        errors: list[str] = []
+        shutil.rmtree(path, onerror=lambda fn, p, exc: errors.append(f"{p}: {exc[1]}"))
+        if errors:
+            raise OSError("could not remove checkpoint generation: " + "; ".join(errors))
 
     def __init__(
         self,

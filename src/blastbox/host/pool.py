@@ -1860,6 +1860,13 @@ class WarmPool:
                 self._pool_consecutive_failures = 0
             self._base_rebuilds += 1
             self._last_base_rebuild_at = now
+            # Defer this tick's spawning wherever the rebuild came from. tick() captured `ready`
+            # before release() could run, and a JOB-triggered rebuild races it: both snapshot
+            # runtimes call SnapshotManager.build() synchronously from spawn(), so spawning on a
+            # stale ready=True blocks the sole maintenance thread for a full boot + readiness
+            # timeout. Setting the flag only in _health_check covered one of the two triggers
+            # (PR #82).
+            self._rebuilt_this_tick = True
             rebuilds = self._base_rebuilds
         logger.warning(
             "pool.base_invalidated reason=%s consecutive_failures=%d rebuilds=%d -- next spawn "
@@ -1996,22 +2003,11 @@ class WarmPool:
             self._unknown_since.pop(slot.slot_id, None)
             if not alive:
                 dead.append(slot)
-                # CONFIRMED dead, and it never served a job: its promotion was the only evidence
-                # that the base yields a usable worker, and that evidence has just been refuted.
-                # Without this a poisoned snapshot restores a process that passes is_ready() and
-                # then dies IDLE, promoting/dying/being replaced forever while the restore-failure
-                # streak stays at zero and invalidate_base() is never reached (upstream, PR #82).
-                with self._lock:
-                    if slot.slot_id in self._promoted_unproven:
-                        self._promoted_unproven.discard(slot.slot_id)
-                        unproven_deaths += 1
-
-        if unproven_deaths:
-            with self._lock:
-                self._spawn_consecutive_failures += unproven_deaths
-                warm_failures = self._spawn_consecutive_failures
-            if self._maybe_rebuild_base(warm_failures, reason="spawn"):
-                self._rebuilt_this_tick = True
+                # Bookkeeping is deferred to the DEMOTION below, which is the step that
+                # actually wins the race against a concurrent claim. Recording it here let a
+                # stale death verdict advance the restore-failure streak for a slot a claimant
+                # had just taken -- and whose own fresher probe had accepted the worker -- so a
+                # perfectly good shared base could be invalidated on it (PR #82).
 
         if not dead:
             return
@@ -2028,6 +2024,11 @@ class WarmPool:
                 cur = self._slots.get(slot.slot_id)
                 if cur is not None and cur.state in (SlotState.IDLE, SlotState.WARMING):
                     cur.state = SlotState.DRAINING
+                    # We won the race, so this death is real evidence. A slot that never served a
+                    # job had only its promotion vouching for the base, and that is now refuted.
+                    if cur.slot_id in self._promoted_unproven:
+                        self._promoted_unproven.discard(cur.slot_id)
+                        unproven_deaths += 1
                     if slot.slot_id in suspected:
                         self._suspected_unknown.add(slot.slot_id)
                         # SUSPECTED (escalated after a long UNKNOWN), not confirmed. Its disposal
@@ -2040,6 +2041,15 @@ class WarmPool:
                     else:
                         to_reap.append(slot)
 
+
+        # Counted AFTER the demotion loop, which is the step that wins the race against a
+        # concurrent claim -- so only deaths we actually acted on feed the restore-failure streak.
+        if unproven_deaths:
+            with self._lock:
+                self._spawn_consecutive_failures += unproven_deaths
+                warm_failures = self._spawn_consecutive_failures
+            if self._maybe_rebuild_base(warm_failures, reason="spawn"):
+                self._rebuilt_this_tick = True
         for slot in to_reap:
             logger.warning("pool.health_evicted_dead_slot slot_id=%s", slot.slot_id)
             reaped = False
