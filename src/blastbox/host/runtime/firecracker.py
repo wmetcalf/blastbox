@@ -37,7 +37,6 @@ Hard-won lessons from RedTusk FirecrackerWorkerRuntime (ported + adapted):
 """
 from __future__ import annotations
 
-import errno
 import json
 import logging
 import os
@@ -55,7 +54,7 @@ from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from blastbox.worker.warm import WarmJobSpec
 
-from blastbox.errors import SandboxError, WarmTimeout
+from blastbox.errors import HOST_RESOURCE_ERRNOS, SandboxError, WarmTimeout
 from blastbox.host.pool import Slot, SlotState
 from blastbox.worker.fc_guest import (
     MAX_STATUS_BYTES,
@@ -78,10 +77,6 @@ __all__ = [
     "VsockHostWarmControl",
 ]
 
-# Errnos that mean THIS HOST is out of resources, as opposed to the guest/transport failing.
-_HOST_RESOURCE_ERRNOS = frozenset({
-    errno.EMFILE, errno.ENFILE, errno.ENOMEM, errno.EIO, errno.ENOSPC, errno.EDQUOT, errno.EROFS,
-})
 
 _log = logging.getLogger("blastbox.host.runtime.firecracker")
 
@@ -852,7 +847,7 @@ class VsockHostWarmControl:
         try:
             return self._signal_go_inner(spec, deadline=deadline)
         except OSError as exc:
-            if exc.errno in _HOST_RESOURCE_ERRNOS:
+            if exc.errno in HOST_RESOURCE_ERRNOS:
                 exc.host_io = True  # type: ignore[attr-defined]
             raise
 

@@ -2142,7 +2142,13 @@ class WarmPool:
                     # Reserve INLINE: we already hold self._lock, and _eviction_allowed takes
                     # it -- calling it here deadlocks on a non-reentrant Lock (it hung the whole
                     # suite before this was caught).
-                    if slot.slot_id in suspected and not self._reserve_eviction_unlocked(now):
+                    # A FRESH clock read: `now` was sampled before any probe ran, and a pass
+                    # over a large static/cloud tier probes serially. Reserving with that stale
+                    # value backdates the token by the whole pass, so on a short window the next
+                    # pass expires every token immediately and evicts another full capped batch --
+                    # defeating max_evictions_per_window exactly when it matters (PR #82).
+                    if (slot.slot_id in suspected
+                            and not self._reserve_eviction_unlocked(self._clock())):
                         logger.warning(
                             "pool.health_unknown_escalation_capped slot_id=%s — budget exhausted "
                             "at demotion; leaving the slot in place", slot.slot_id,

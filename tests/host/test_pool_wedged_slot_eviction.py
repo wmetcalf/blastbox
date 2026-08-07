@@ -2570,3 +2570,44 @@ def test_a_rebuild_racing_the_tick_does_not_spawn_against_the_old_base() -> None
         f"{rt.spawns_after_invalidate} slots were spawned against a base invalidated mid-batch — "
         "each of those calls builds synchronously and stalls the maintenance thread"
     )
+
+
+def test_the_eviction_token_is_timestamped_when_it_is_reserved() -> None:
+    """A pass over a large tier probes serially, so `now` is stale by the time it evicts.
+
+    Reserving with the pre-probe timestamp backdates the token by the whole pass: on a short
+    window the NEXT pass expires every token immediately and evicts another full capped batch,
+    defeating max_evictions_per_window exactly when it matters.
+    """
+    clock = _FakeClock()
+
+    class _SlowUnknownProbe(_WedgeableRuntime):
+        def is_ready(self, slot: Slot) -> bool:
+            return True
+
+        def is_alive(self, slot: Slot):
+            clock.advance(5.0)      # each probe takes real time, as a cloud tier does
+            return None
+
+    rt = _SlowUnknownProbe()
+    pool = WarmPool(
+        runtime=rt, warm_size=4, concurrent_ceiling=8, clock=clock,
+        unknown_grace_s=1.0, max_evictions_per_window=2, eviction_window_s=10.0,
+        spawn_rate_limit=1000.0,
+    )
+    pool.tick()
+    pool.tick()
+    pool._health_check()            # opens the unknown episode
+    clock.advance(2.0)
+    pass_started = clock()          # exactly what _health_check samples as `now`
+    pool._health_check()            # escalates; probes advance the clock as they go
+
+    with pool._lock:
+        stamps = list(pool._evictions)
+    assert stamps, "sanity: some tokens were reserved"
+    # Compare against THIS pass's start, not an absolute number: the clock has already advanced a
+    # long way from the earlier passes, so any fixed threshold passes trivially.
+    assert min(stamps) > pass_started, (
+        f"a token was stamped {pass_started - min(stamps):.1f}s before its own probe finished — "
+        "reserved with the pre-probe clock, so a short window expires it a whole pass early"
+    )

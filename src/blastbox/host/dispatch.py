@@ -20,7 +20,6 @@ Security properties (review will check):
 """
 from __future__ import annotations
 
-import errno
 import hashlib
 import logging
 import os
@@ -41,7 +40,7 @@ from blastbox.contract.envelope import (
     confined_atomic_writer,
     open_confined_regular_fd,
 )
-from blastbox.errors import OutputTrustError, OutputTrustUnknown, WarmTimeout, sanitize_public_error
+from blastbox.errors import HOST_RESOURCE_ERRNOS, OutputTrustError, OutputTrustUnknown, WarmTimeout, sanitize_public_error
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.runtime.docker import (
@@ -78,11 +77,6 @@ def _guest_seam_errors() -> tuple[type[BaseException], ...]:
 
 _GUEST_SEAM_ERRORS: tuple[type[BaseException], ...] = _guest_seam_errors()
 
-# Errnos that mean THIS HOST is out of resources rather than the worker having written something
-# we refuse to follow. Shared meaning with trust._HOST_RESOURCE_ERRNOS.
-_HOST_RESOURCE_ERRNOS = frozenset({
-    errno.EMFILE, errno.ENFILE, errno.ENOMEM, errno.EIO, errno.ENOSPC, errno.EDQUOT, errno.EROFS,
-})
 
 _log = logging.getLogger("blastbox.host.dispatch")
 
@@ -2462,7 +2456,7 @@ class Dispatcher:
                 # and calling it unknown meant repeated malicious swaps never advanced burnout.
                 # Only a host-resource errno is ours (PR #82) -- the same split just applied to
                 # the validation path, missing from this one.
-                if exc.errno not in _HOST_RESOURCE_ERRNOS:
+                if exc.errno not in HOST_RESOURCE_ERRNOS:
                     raise OutputTrustError(
                         f"declared artifact {a.id} failed the confinement check ({exc})"
                     ) from exc

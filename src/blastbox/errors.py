@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import re
 
 
@@ -82,6 +83,17 @@ class ValidationError(BlastboxError):
 
 class OutputTrustError(BlastboxError):
     """Worker output failed the host-side trust validation."""
+
+
+# Errnos that mean THIS HOST is out of resources, as opposed to the worker having produced
+# something we refuse to follow. The distinction decides ATTRIBUTION everywhere it is used: a
+# host-resource failure hits every job at once and must never burn out workers, while a path-shape
+# error (ELOOP/ENOTDIR from a confinement check on a worker-writable directory) is a concrete
+# violation that must. Defined once because four copies had already accumulated in four modules
+# under two names -- agreeing today is precisely the state that precedes an unnoticed drift.
+HOST_RESOURCE_ERRNOS = frozenset({
+    errno.EMFILE, errno.ENFILE, errno.ENOMEM, errno.EIO, errno.ENOSPC, errno.EDQUOT, errno.EROFS,
+})
 
 
 class OutputTrustUnknown(OutputTrustError):

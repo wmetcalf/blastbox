@@ -2220,3 +2220,39 @@ def test_a_host_side_vsock_setup_failure_is_not_worker_evidence(tmp_path):
     assert pool.release_fault == ["unknown"], (
         f"a host-side vsock setup failure is not worker evidence (got {pool.release_fault})"
     )
+
+
+def test_a_worker_symlink_at_done_is_a_verdict_not_host_io(tmp_path):
+    """ctrl/ is WORKER-WRITABLE on the gVisor tier (bind-mounted 0o777).
+
+    A worker-created symlink or non-directory at `done` raises ELOOP/ENOTDIR from the confinement
+    check. Flagging every OSError as host_io meant repeated concrete violations failed jobs but
+    never advanced burnout or snapshot-repair detection.
+    """
+    import errno as _errno
+
+    from blastbox.worker.warm import HostWarmControl, WarmTimeout
+
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    control = HostWarmControl(ctrl)
+
+    mp = pytest.MonkeyPatch()
+    try:
+        for bad, expect_host_io in ((_errno.ELOOP, False), (_errno.ENOTDIR, False),
+                                    (_errno.EMFILE, True), (_errno.EIO, True)):
+            def _boom(*a, _e=bad, **kw):
+                raise OSError(_e, "done-file failure")
+
+            # The function is imported INSIDE wait_for_done, so patch it at its source module.
+            # No raising=False: a wrong target must fail loudly, not silently leave the real code
+            # running and let the test time out into a false pass.
+            mp.setattr("blastbox.contract.envelope.read_confined_regular_bytes", _boom)
+            with pytest.raises(WarmTimeout) as ei:
+                control.wait_for_done(timeout_s=0.05)
+            assert getattr(ei.value, "host_io", False) is expect_host_io, (
+                f"errno {bad}: host_io should be {expect_host_io} — a path-shape error is the "
+                "worker's doing, a resource error is ours"
+            )
+    finally:
+        mp.undo()

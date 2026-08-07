@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import io
 import json
-import errno
 import socket
 import logging
 import os
@@ -29,7 +28,7 @@ from typing import Any, Protocol
 from urllib.parse import quote
 
 from blastbox.host.pool import release_kwargs
-from blastbox.errors import OutputTrustUnknown, EngineErrorEnvelope
+from blastbox.errors import HOST_RESOURCE_ERRNOS, OutputTrustUnknown, EngineErrorEnvelope
 
 
 _log = logging.getLogger("blastbox.host.runtime.remote_http")
@@ -278,11 +277,6 @@ def _empty_dir(d: Path) -> None:
                 pass
 
 
-# Errno values that mean THIS HOST is out of resources, as opposed to the worker having written
-# something we refuse to follow. Only the former is evidence about the dispatcher.
-_LOCAL_EXHAUSTION_ERRNOS = frozenset({
-    errno.EMFILE, errno.ENFILE, errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS, errno.ENOMEM,
-})
 
 
 def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: int | None = None,
@@ -338,7 +332,7 @@ def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: i
                 # it instead of silently returning an empty extraction: during an EMFILE/ENOSPC
                 # incident every job would otherwise advance burnout and base-rebuild streaks
                 # (PR #82). EACCES/ELOOP stay a skip -- those ARE the worker's doing.
-                if exc.errno in _LOCAL_EXHAUSTION_ERRNOS:
+                if exc.errno in HOST_RESOURCE_ERRNOS:
                     raise
                 continue
             rel = str(resolved.relative_to(dest))
