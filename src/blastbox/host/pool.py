@@ -1206,6 +1206,22 @@ class WarmPool:
                 starved_for, self._capacity_starved_after_s, reason,
             )
 
+    def _retune_runtime_thresholds(self, rebuild_after: int) -> None:
+        """Push a re-derived rebuild threshold into a runtime that keeps its own copy.
+
+        Optional seam (hasattr-guarded): only CascadingRuntime has a per-tier threshold today,
+        and a runtime without one is unaffected.
+        """
+        runtime = getattr(self, "_runtime", None)
+        if runtime is None or not hasattr(runtime, "tier_rebuild_after"):
+            return
+        if getattr(runtime, "tier_rebuild_after_explicit", False):
+            return          # the caller pinned it; a derived policy must not stomp that
+        try:
+            runtime.tier_rebuild_after = max(0, int(rebuild_after))
+        except Exception as exc:  # noqa: BLE001 -- retuning must never break a resize
+            logger.warning("pool.retune_runtime_threshold_failed: %s", exc)
+
     def _rederive_warm_size_thresholds(self) -> None:
         """Recompute every threshold derived from the LIVE warm target, preserving explicit
         operator values. Called from __init__ and resize() so the two can never disagree."""
@@ -1214,6 +1230,11 @@ class WarmPool:
             self._max_evictions_per_window = max(2, int(self._warm_size))
         if not self._rebuild_after_explicit:
             self._snapshot_rebuild_after = max(4, 2 * max(1, self._warm_size))
+            # ...and tell a cascade, which keeps its OWN per-tier copy. The autosizer moves the
+            # target in production, so after a 4->16 resize per-tier repair still fired at 8
+            # while the pool-wide policy had moved to 32 (and downsizing gave the reverse
+            # delay). One policy, both consumers -- at construction AND at resize (PR #82).
+            self._retune_runtime_thresholds(self._snapshot_rebuild_after)
 
     def resize(self, *, warm_size: int | None = None, concurrent_ceiling: int | None = None,
                mark_autosized: bool = True) -> None:
@@ -1989,6 +2010,20 @@ class WarmPool:
                     )
                     if escalate:
                         self._unknown_since.pop(slot.slot_id, None)
+                if escalate and not self._eviction_allowed():
+                    # The cap exists for exactly this: escalation here is SUSPICION, not a
+                    # verdict, and a prolonged control-plane brownout makes every probe unknown at
+                    # once. Without the cap an operator who set
+                    # BLASTBOX_POOL_MAX_EVICTIONS_PER_WINDOW=2 still watched a large pool of
+                    # healthy workers be terminated wholesale, then churned again as the outage
+                    # continued. Confirmed-dead eviction stays uncapped -- that IS a verdict.
+                    logger.warning(
+                        "pool.health_unknown_escalation_capped slot_id=%s — eviction budget "
+                        "exhausted this window; leaving the slot in place", slot.slot_id,
+                    )
+                    with self._lock:
+                        self._unknown_since.setdefault(slot.slot_id, probed_at)
+                    escalate = False
                 if escalate:
                     logger.warning("pool.health_unknown_escalated slot_id=%s unknown_for=%.0fs "
                                    "(> %.0fs) — treating as dead so the slot is replaced",

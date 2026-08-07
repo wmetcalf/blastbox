@@ -17,6 +17,7 @@ the full snapshot→restore→convert round-trip works pixel-identically (see th
 from __future__ import annotations
 
 import shutil
+import logging
 import os
 import subprocess
 import time
@@ -24,6 +25,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from blastbox.host.runtime.fc_api import FcApiClient
+from blastbox.host.runtime.fc_snapshot import SnapshotBuildError
+
+_log = logging.getLogger("blastbox.host.runtime.fc_snapshot_launcher")
 
 # Relative per-slot resource names (resolved against each firecracker's cwd).
 REL_VSOCK = "vsock.sock"
@@ -98,7 +102,8 @@ def api_boot_sequence(
 
 class _Handle:
     def __init__(
-        self, proc, api, vsock_uds: str, ready_check=None, mem_dir: Path | None = None
+        self, proc, api, vsock_uds: str, ready_check=None, mem_dir: Path | None = None,
+        base_outdisk: Path | None = None,
     ) -> None:
         self.proc = proc
         self.api = api
@@ -107,6 +112,11 @@ class _Handle:
         # Only the base (boot) handle carries a mem_dir — it's the one that gets
         # checkpoint()ed. Restore handles don't snapshot, so they leave it None.
         self._mem_dir = mem_dir
+        # The snapshot-time ext4 image this base booted with; frozen per generation at checkpoint.
+        self._base_outdisk = Path(base_outdisk) if base_outdisk is not None else None
+        # Partial-checkpoint files whose cleanup failed. Retried on the next checkpoint; nothing
+        # else can discover them, because no artifact was ever returned for them.
+        self._stranded_partials: list[str] = []
 
     def wait_ready(self, timeout_s: float) -> None:
         if self._ready_check is not None:
@@ -134,6 +144,16 @@ class _Handle:
         # including slots that are mid-job. A fresh generation per build means a rebuild can never
         # touch a file another VM is still mapping; the old files are reclaimed when their last
         # user is reaped (upstream, PR #82).
+        # Retry anything a previous failed checkpoint could not remove.
+        if self._stranded_partials:
+            still: list[str] = []
+            for leftover in self._stranded_partials:
+                try:
+                    Path(leftover).unlink(missing_ok=True)
+                except OSError:
+                    still.append(leftover)
+            self._stranded_partials = still
+
         gen = f"{os.getpid()}-{time.monotonic_ns():019d}"
         snap = dest / f"warm-{gen}.snapshot"
         mem = self._mem_dir / f"warm-{gen}.mem"
@@ -144,11 +164,20 @@ class _Handle:
             # workdir's outdisk on every build, so copying it at RESTORE time would pair a rebuilt
             # disk with a retired memory snapshot. `dest` is the manager's base_dir, so the
             # snapshot-time image is dest/base/outdisk.ext4.
-            base_outdisk = dest / "base" / REL_OUTDISK
-            if base_outdisk.exists() and outdisk is not None:
-                shutil.copy2(base_outdisk, outdisk)
-            else:
-                outdisk = None
+            # From the handle's OWN workdir, not derived from `dest`: boot_base knows exactly
+            # where it made the disk, while `dest` is the caller's artifact directory and the two
+            # only coincide in production. Inferring it made this depend on a caller convention.
+            base_outdisk = self._base_outdisk
+            if base_outdisk is None or not base_outdisk.exists() or outdisk is None:
+                # FAIL the build. Publishing with outdisk_path=None makes restore_in() fall back
+                # to the fixed shared base/outdisk.ext4 -- which is either still missing (every
+                # restore fails) or gets recreated by a later build, pairing THIS generation's
+                # memory with a different disk. That is exactly the ext4 checksum corruption
+                # generation-stamping exists to prevent (PR #82).
+                raise SnapshotBuildError(
+                    f"snapshot-time base outdisk missing after checkpoint: {base_outdisk}"
+                )
+            shutil.copy2(base_outdisk, outdisk)
         except BaseException:
             # /snapshot/create can write EITHER file and then report an error (a lost response
             # after Firecracker already committed the snapshot is the obvious way). No artifact
@@ -156,13 +185,21 @@ class _Handle:
             # discard them. Because every retry now picks a unique generation name, repeated
             # build failures accumulate full RAM-sized .mem files instead of overwriting the
             # previous attempt, until /dev/shm or the disk is exhausted (upstream, PR #82).
+            stranded: list[str] = []
             for path in (snap, mem, outdisk):
                 if path is None:
                     continue
                 try:
                     path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                except OSError as unlink_exc:
+                    stranded.append(str(path))
+                    _log.warning("fc_snapshot: could not remove partial %s: %s", path, unlink_exc)
+            if stranded:
+                # No artifact is returned, so the manager never learns these paths exist -- and the
+                # unique generation name means no later build or sweep can rediscover them. A
+                # RAM-sized memory file would be stranded on /dev/shm on every such failure, so
+                # record them for the launcher's own retry rather than dropping them (PR #82).
+                self._stranded_partials.extend(stranded)
             raise
         return FcSnapshotArtifact(snap, mem, outdisk)
 
@@ -307,6 +344,7 @@ class FcSnapshotLauncher:
             str(workdir / REL_VSOCK),
             ready_check=ready,
             mem_dir=self._mem_dir,
+            base_outdisk=workdir / REL_OUTDISK,
         )
 
     def restore_in(self, slot_workdir: Path, *, outdisk_src: Path | None = None):

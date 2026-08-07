@@ -2105,3 +2105,87 @@ def test_a_job_triggered_rebuild_also_defers_spawning() -> None:
         "the pool spawned in the same tick a job-triggered rebuild invalidated the base — that "
         "call runs build() synchronously and stalls the maintenance thread"
     )
+
+
+def test_unknown_escalation_respects_the_eviction_cap() -> None:
+    """Escalating on SUSPICION must obey the operator's blast-radius cap.
+
+    A prolonged control-plane brownout makes every probe UNKNOWN at once, so without the cap an
+    operator who set BLASTBOX_POOL_MAX_EVICTIONS_PER_WINDOW=2 still watched a whole pool of
+    healthy workers be terminated, then churned again while the outage continued. Confirmed-dead
+    eviction stays uncapped — that is a verdict, not a suspicion.
+    """
+    clock = _FakeClock()
+
+    class _AllUnknown(_WedgeableRuntime):
+        def is_alive(self, slot: Slot):
+            return None
+
+    rt = _AllUnknown()
+    pool = WarmPool(
+        runtime=rt, warm_size=6, concurrent_ceiling=8, clock=clock,
+        unknown_grace_s=10.0, max_evictions_per_window=2, spawn_rate_limit=1000.0,
+    )
+    pool.tick()
+    pool.tick()                       # promote to IDLE
+    idle = [s for s in pool._slots.values() if s.state == SlotState.IDLE]
+    assert len(idle) >= 4, f"need several IDLE slots to test the cap (got {len(idle)})"
+
+    pool._health_check()              # opens the unknown episode
+    clock.advance(11.0)
+    pool._health_check()              # would escalate ALL of them
+
+    drained = [s for s in pool._slots.values() if s.state == SlotState.DRAINING]
+    assert len(drained) <= 2, (
+        f"the eviction cap was ignored for suspicion-based escalation: {len(drained)} slots "
+        "were marked for disposal during a control-plane brownout"
+    )
+
+
+def test_a_partially_failed_repair_does_not_re_invalidate_the_tiers_it_fixed() -> None:
+    """Successful tiers have already dropped their artifacts before the failure is raised.
+
+    The pool treats CascadeInvalidateFailed as a wholly failed repair and restores the consumed
+    streak, so the next worker failure retries every target — invalidating the successful tiers
+    again. Their replacement builds may be in flight, and each redundant invalidate bumps the
+    build epoch and rejects them, so one persistently failing tier can keep healthy siblings
+    permanently rebuilding.
+    """
+    from blastbox.host.runtime.cascade import CascadeInvalidateFailed
+
+    class _Tier:
+        def __init__(self, fail: bool) -> None:
+            self.fail = fail
+            self.invalidated = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            raise RuntimeError("restore failed")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+            if self.fail:
+                raise RuntimeError("cleanup failed")
+
+    ok, bad = _Tier(fail=False), _Tier(fail=True)
+    casc = CascadingRuntime(
+        tiers=[Tier(name="ok", runtime=ok, capacity=4), Tier(name="bad", runtime=bad, capacity=4)],
+        tier_rebuild_after=1000,      # isolate from per-tier repair
+    )
+    with contextlib.suppress(Exception):
+        casc.spawn()                  # both tiers attempted and failed -> both guilty
+
+    with pytest.raises(CascadeInvalidateFailed):
+        casc.invalidate_base(reason="spawn")
+    assert ok.invalidated == 1 and bad.invalidated == 1
+
+    # The retry must skip the tier that was already repaired.
+    with pytest.raises(CascadeInvalidateFailed):
+        casc.invalidate_base(reason="spawn")
+    assert ok.invalidated == 1, (
+        f"a tier that was already repaired was invalidated again ({ok.invalidated}x) — its "
+        "in-flight replacement build would be rejected each time"
+    )
+    assert bad.invalidated == 2, "the still-failing tier must keep being retried"

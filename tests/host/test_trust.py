@@ -628,3 +628,42 @@ def test_a_malformed_metadata_file_is_still_a_trust_verdict(tmp_path, monkeypatc
     assert not isinstance(ei.value, OutputTrustUnknown), (
         "a worker writing a non-regular file is a real verdict"
     )
+
+
+def test_host_io_during_reseal_is_also_not_a_verdict(tmp_path, monkeypatch):
+    """The unknown classification must survive the RE-SEAL, not just the metadata read.
+
+    seal_envelope opens, stats and hashes every declared artifact, so a host-wide EMFILE/EIO
+    incident surfaces there too — and wrapping it as a plain OutputTrustError convicted every
+    worker at once, exactly what the distinction drawn one step earlier exists to prevent.
+    """
+    from blastbox.errors import OutputTrustError, OutputTrustUnknown
+
+    out, _ = _make_output_dir(tmp_path, artifact_content=b"payload")
+
+    def _boom(**kw):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr("blastbox.host.trust.seal_envelope", _boom)
+
+    with pytest.raises(OutputTrustUnknown) as ei:
+        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())
+    assert isinstance(ei.value, OutputTrustError), "must still fail the job closed"
+
+
+def test_a_genuine_reseal_violation_is_still_a_verdict(tmp_path, monkeypatch):
+    """The carve-out stays narrow: a non-OSError from the re-seal is real evidence."""
+    from blastbox.errors import OutputTrustUnknown
+
+    out, _ = _make_output_dir(tmp_path, artifact_content=b"payload")
+
+    def _bad(**kw):
+        raise ValueError("declared artifact hash mismatch")
+
+    monkeypatch.setattr("blastbox.host.trust.seal_envelope", _bad)
+
+    with pytest.raises(OutputTrustError) as ei:
+        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())
+    assert not isinstance(ei.value, OutputTrustUnknown)

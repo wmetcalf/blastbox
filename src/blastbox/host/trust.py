@@ -125,7 +125,16 @@ def validate_worker_output(
             # declared artifact had already been opened + hashed).
             max_artifacts=limits.max_artifacts,
         )
-    except (ValueError, Exception) as exc:
+    except OSError as exc:
+        # HOST I/O while opening/stat-ing/hashing a declared artifact. seal_envelope surfaces
+        # these as OSError (and open failures as ValueError, handled below), and wrapping both as
+        # a plain OutputTrustError meant a host-wide EMFILE/EIO/ENOMEM incident convicted every
+        # worker at once -- the same distinction already drawn when READING metadata.json, missing
+        # from the re-seal that follows it (PR #82).
+        raise OutputTrustUnknown(
+            sanitize_public_error(f"could not re-seal worker output: {exc}")
+        ) from exc
+    except Exception as exc:
         raise OutputTrustError(
             sanitize_public_error(f"re-seal failed: {exc}")
         ) from exc

@@ -157,14 +157,18 @@ class CascadingRuntime:
         ]
         return max(vals) if vals else None
 
-    def __init__(self, tiers: list[Tier], *, tier_rebuild_after: int = 4) -> None:
+    def __init__(self, tiers: list[Tier], *, tier_rebuild_after: int | None = None) -> None:
         if not tiers:
             raise CascadeMisconfigured("cascade needs at least one tier")
         self.tiers = tiers
         # Consecutive per-tier spawn failures before that tier's base is invalidated. 0 disables
         # per-tier repair (the tier then stays broken until something else notices, which behind
         # a working fallback is "never").
-        self.tier_rebuild_after = max(0, int(tier_rebuild_after))
+        # An EXPLICIT value is the operator's (or the caller's) decision and is never retuned by
+        # the pool's derived policy -- the same rule the pool applies to its own explicit
+        # snapshot_rebuild_after. Only a derived default follows the live warm target.
+        self.tier_rebuild_after_explicit = tier_rebuild_after is not None
+        self.tier_rebuild_after = 4 if tier_rebuild_after is None else max(0, int(tier_rebuild_after))
         self._counts = [0] * len(tiers)          # live slots per tier
         self._owner: dict[str, int] = {}          # slot_id -> tier index
         self._lock = threading.Lock()
@@ -354,6 +358,16 @@ class CascadingRuntime:
             except Exception as exc:  # noqa: BLE001 -- try every tier, report at the end
                 failures.append(f"{tier.name}: {exc}")
                 _log.warning("cascade: tier %r base invalidation failed: %s", tier.name, exc)
+            else:
+                # This tier IS repaired. Clear its guilt so a retry of the partially-failed
+                # repair does not invalidate it a second time: its replacement build may be in
+                # flight, and each redundant invalidate bumps the build epoch and rejects it, so
+                # one persistently failing tier could keep healthy siblings permanently rebuilding
+                # (PR #82).
+                with self._lock:
+                    idx = self.tiers.index(tier)
+                    self._tier_failures[idx] = 0
+                    self._recently_guilty.discard(idx)
         if failures:
             raise CascadeInvalidateFailed(
                 "cascade: base invalidation failed for " + "; ".join(failures)

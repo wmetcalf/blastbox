@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from blastbox.host.runtime.fc_snapshot_launcher import (
     REL_OUTDISK,
     REL_VSOCK,
@@ -83,6 +85,15 @@ class FakeProc:
         return 0
 
 
+def _make_outdisk_file(p) -> None:
+    """Stand-in for mkfs: the base outdisk must EXIST for checkpoint to freeze it."""
+    from pathlib import Path as _P
+
+    path = _P(p)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"ext4")
+
+
 def test_boot_base_uses_api_socket_and_runs_full_config(tmp_path):
     spawned = []
     launcher = FcSnapshotLauncher(
@@ -91,7 +102,10 @@ def test_boot_base_uses_api_socket_and_runs_full_config(tmp_path):
         popen=lambda argv, cwd=None: spawned.append((argv, cwd)) or FakeProc(),
         api_factory=FakeApi,
         wait_socket=lambda p: None,
-        make_outdisk=lambda p: None,
+        # Actually create it: checkpoint now REFUSES to publish an artifact without its
+        # generation disk, because a None outdisk makes restore fall back to the shared
+        # fixed path and can pair this memory snapshot with a disk another build made.
+        make_outdisk=_make_outdisk_file,
     )
     handle = launcher.boot_base()
 
@@ -133,7 +147,10 @@ def test_boot_base_handle_checkpoint_writes_artifact_under_base_and_mem_dir(tmp_
         popen=lambda argv, cwd=None: FakeProc(),
         api_factory=FakeApiPatch,
         wait_socket=lambda p: None,
-        make_outdisk=lambda p: None,
+        # Actually create it: checkpoint now REFUSES to publish an artifact without its
+        # generation disk, because a None outdisk makes restore fall back to the shared
+        # fixed path and can pair this memory snapshot with a disk another build made.
+        make_outdisk=_make_outdisk_file,
     )
     handle = launcher.boot_base()
     dest = base / "base"
@@ -169,7 +186,10 @@ def test_boot_base_handle_checkpoint_defaults_mem_to_base_dir(tmp_path):
         popen=lambda argv, cwd=None: FakeProc(),
         api_factory=FakeApiPatch,
         wait_socket=lambda p: None,
-        make_outdisk=lambda p: None,
+        # Actually create it: checkpoint now REFUSES to publish an artifact without its
+        # generation disk, because a None outdisk makes restore fall back to the shared
+        # fixed path and can pair this memory snapshot with a disk another build made.
+        make_outdisk=_make_outdisk_file,
     )
     handle = launcher.boot_base()
     art = handle.checkpoint(base / "base")
@@ -229,7 +249,10 @@ def test_spawn_kills_proc_when_api_socket_never_appears(tmp_path):
         popen=lambda argv, cwd=None: proc,
         api_factory=FakeApi,
         wait_socket=never_ready,
-        make_outdisk=lambda p: None,
+        # Actually create it: checkpoint now REFUSES to publish an artifact without its
+        # generation disk, because a None outdisk makes restore fall back to the shared
+        # fixed path and can pair this memory snapshot with a disk another build made.
+        make_outdisk=_make_outdisk_file,
     )
     import pytest
     with pytest.raises(TimeoutError):
@@ -290,7 +313,10 @@ def test_restore_in_kills_proc_when_copy_fails(tmp_path):
         popen=lambda argv, cwd=None: proc,
         api_factory=FakeApi,
         wait_socket=lambda p: None,
-        make_outdisk=lambda p: None,
+        # Actually create it: checkpoint now REFUSES to publish an artifact without its
+        # generation disk, because a None outdisk makes restore fall back to the shared
+        # fixed path and can pair this memory snapshot with a disk another build made.
+        make_outdisk=_make_outdisk_file,
         copy_outdisk=boom,
     )
     with pytest.raises(OSError):
@@ -308,9 +334,96 @@ def test_restore_in_raises_and_does_not_spawn_when_base_outdisk_missing(tmp_path
         popen=lambda argv, cwd=None: spawned.append(1) or _TrackProc(),
         api_factory=FakeApi,
         wait_socket=lambda p: None,
-        make_outdisk=lambda p: None,
+        # Actually create it: checkpoint now REFUSES to publish an artifact without its
+        # generation disk, because a None outdisk makes restore fall back to the shared
+        # fixed path and can pair this memory snapshot with a disk another build made.
+        make_outdisk=_make_outdisk_file,
         copy_outdisk=lambda s, d: None,
     )
     with pytest.raises(FileNotFoundError):
         launcher.restore_in(tmp_path / "snap" / "slots" / "s1")
     assert spawned == []  # never spawned FC since the source is missing
+
+
+def test_checkpoint_fails_when_its_generation_disk_is_missing(tmp_path):
+    """Publishing without the snapshot-time disk reintroduces the corruption stamping prevents.
+
+    An artifact with outdisk_path=None makes restore_in() fall back to the fixed shared
+    base/outdisk.ext4 — which is either still absent (every restore fails) or gets recreated by a
+    later build, pairing THIS generation's memory with a different disk: the "EXT4-fs error:
+    Directory block failed checksum" case.
+    """
+    from blastbox.host.runtime.fc_snapshot import SnapshotBuildError
+
+    base = tmp_path / "snap"
+    launcher = FcSnapshotLauncher(
+        FakeCfg(),
+        base,
+        mem_dir=tmp_path / "ram",
+        popen=lambda argv, cwd=None: FakeProc(),
+        api_factory=FakeApiPatch,
+        wait_socket=lambda p: None,
+        make_outdisk=lambda p: None,      # deliberately does NOT create it
+    )
+    handle = launcher.boot_base()
+
+    with pytest.raises(SnapshotBuildError):
+        handle.checkpoint(base)
+
+
+def test_a_partial_checkpoint_whose_cleanup_fails_is_retried(tmp_path, monkeypatch):
+    """Stranded partials are invisible to the manager, so the launcher must retry them itself.
+
+    No artifact is returned for a failed checkpoint, and the unique generation name means no
+    later build or sweep can rediscover the files — a RAM-sized memory file would be stranded on
+    /dev/shm on every such failure.
+    """
+    base = tmp_path / "snap"
+    memdir = tmp_path / "ram"
+    launcher = FcSnapshotLauncher(
+        FakeCfg(), base, mem_dir=memdir,
+        popen=lambda argv, cwd=None: FakeProc(),
+        api_factory=FakeApiPatch,
+        wait_socket=lambda p: None,
+        make_outdisk=_make_outdisk_file,
+    )
+    handle = launcher.boot_base()
+
+    created: list[Path] = []
+
+    def _create_then_fail(api, snap, mem):
+        for s in (snap, mem):
+            Path(s).parent.mkdir(parents=True, exist_ok=True)
+            Path(s).write_bytes(b"partial")
+            created.append(Path(s))
+        raise RuntimeError("snapshot create failed after writing")
+
+    monkeypatch.setattr(
+        "blastbox.host.runtime.fc_snapshot_backend._create_snapshot", _create_then_fail
+    )
+
+    unlink_broken = {"on": True}
+    real_unlink = Path.unlink
+
+    def _flaky_unlink(self, *a, **kw):
+        if unlink_broken["on"] and self.name.startswith("warm-"):
+            raise OSError(5, "Input/output error")
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", _flaky_unlink)
+    with pytest.raises(Exception):
+        handle.checkpoint(base)
+    assert any(p.exists() for p in created), "sanity: cleanup failed, files remain"
+
+    # The next checkpoint retries them rather than leaving them stranded forever.
+    unlink_broken["on"] = False
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        "blastbox.host.runtime.fc_snapshot_backend._create_snapshot",
+        lambda api, snap, mem: (Path(snap).write_bytes(b"s"), Path(mem).write_bytes(b"m")),
+    )
+    handle.checkpoint(base)
+
+    assert not any(p.exists() for p in created), (
+        f"stranded partials were never retried: {[p for p in created if p.exists()]}"
+    )

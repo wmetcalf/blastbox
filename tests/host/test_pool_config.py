@@ -376,3 +376,53 @@ def test_the_cascade_threshold_is_derived_the_same_way_as_the_pools(monkeypatch)
         f"cascade got {captured['tier_rebuild_after']}, pool derived "
         f"{pool._snapshot_rebuild_after} — they must be one policy"
     )
+
+
+def test_resize_retunes_the_cascade_threshold(monkeypatch):
+    """One policy, both consumers — at resize as well as construction.
+
+    The autosizer moves warm_size in production. The cascade keeps its OWN per-tier copy, so
+    after a 4->16 resize per-tier repair still fired at 8 while the pool-wide policy had moved to
+    32 (and downsizing gave the reverse delay).
+    """
+    from blastbox.host.runtime.cascade import CascadingRuntime, Tier
+
+    class _Rt:
+        def prepare(self): return True
+        def spawn(self): raise RuntimeError("unused")
+        def is_ready(self, slot): return True
+        def is_alive(self, slot): return True
+        def reap(self, slot): return None
+
+    casc = CascadingRuntime(tiers=[Tier(name="a", runtime=_Rt(), capacity=4)])
+    assert casc.tier_rebuild_after == 4, "derived default"
+
+    pool = WarmPool(runtime=casc, warm_size=4, concurrent_ceiling=32)
+    assert casc.tier_rebuild_after == pool._snapshot_rebuild_after
+
+    pool.resize(warm_size=16)
+    assert casc.tier_rebuild_after == pool._snapshot_rebuild_after == 32, (
+        f"cascade kept {casc.tier_rebuild_after} while the pool moved to "
+        f"{pool._snapshot_rebuild_after}"
+    )
+
+    pool.resize(warm_size=1)
+    assert casc.tier_rebuild_after == pool._snapshot_rebuild_after == 4
+
+
+def test_an_explicit_cascade_threshold_is_never_retuned():
+    """An explicitly pinned value is the caller's decision, exactly as for the pool's own."""
+    from blastbox.host.runtime.cascade import CascadingRuntime, Tier
+
+    class _Rt:
+        def prepare(self): return True
+        def spawn(self): raise RuntimeError("unused")
+        def is_ready(self, slot): return True
+        def is_alive(self, slot): return True
+        def reap(self, slot): return None
+
+    casc = CascadingRuntime(tiers=[Tier(name="a", runtime=_Rt(), capacity=4)],
+                            tier_rebuild_after=7)
+    pool = WarmPool(runtime=casc, warm_size=4, concurrent_ceiling=32)
+    pool.resize(warm_size=16)
+    assert casc.tier_rebuild_after == 7, "a pinned threshold must survive every resize"
