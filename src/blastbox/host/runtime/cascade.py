@@ -303,8 +303,18 @@ class CascadingRuntime:
         untouched, so the next repair attempt was delayed for the whole cooldown and the tier
         kept failing (upstream, PR #82).
         """
+        # Prefer the tiers that actually FAILED. The pool's global streak cannot attribute:
+        # when one snapshot tier throws repeatedly while a later healthy tier is merely FULL, the
+        # spawn still ends as CascadeSpawnFailed, and invalidating every wrapped base then
+        # destroys the healthy tier's snapshot during ordinary saturation despite it producing no
+        # failure evidence at all. With no per-tier evidence (a job-failure-driven rebuild, which
+        # carries no tier attribution) fall back to every tier (upstream, PR #82).
+        with self._lock:
+            guilty = {i for i, n in enumerate(self._tier_failures) if n > 0}
+        targets = [t for i, t in enumerate(self.tiers) if i in guilty] or list(self.tiers)
+
         failures: list[str] = []
-        for tier in self.tiers:
+        for tier in targets:
             fn = getattr(tier.runtime, "invalidate_base", None)
             if not callable(fn):
                 continue

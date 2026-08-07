@@ -719,10 +719,18 @@ def test_cascade_invalidate_base_reaches_every_wrapped_tier():
         def invalidate_base(self):
             dropped.append(self.name)
 
-    rt = object.__new__(CascadingRuntime)
-    rt.tiers = [SimpleNamespace(runtime=_Tier("fc")), SimpleNamespace(runtime=_Tier("gvisor")),
-                SimpleNamespace(runtime=object())]      # a tier with no seam must be skipped
-    CascadingRuntime.invalidate_base(rt)
+    from blastbox.host.runtime.cascade import Tier
+
+    # Construct it for real rather than object.__new__: invalidate_base now consults per-tier
+    # failure evidence, and a half-built instance would only prove that a bypassed __init__
+    # raises AttributeError.
+    rt = CascadingRuntime(tiers=[
+        Tier(name="fc", runtime=_Tier("fc"), capacity=1),
+        Tier(name="gvisor", runtime=_Tier("gvisor"), capacity=1),
+        Tier(name="seamless", runtime=object(), capacity=1),   # no seam -> skipped
+    ])
+    rt.invalidate_base()
+    # No tier has recorded a failure, so there is nothing to attribute and every tier is repaired.
     assert dropped == ["fc", "gvisor"], f"delegation missed a tier: {dropped}"
 
 
@@ -1376,3 +1384,56 @@ def test_no_headroom_with_a_real_deficit_still_counts_as_starvation() -> None:
             "a pool whose ceiling is full of DRAINING slots has zero usable capacity and must "
             "report it, not silently reset its own clock every tick"
         )
+
+
+def test_a_healthy_but_full_tier_keeps_its_base_when_a_sibling_fails() -> None:
+    """Repair must follow the evidence, not the blast radius.
+
+    When one snapshot tier throws repeatedly while a later healthy tier is merely FULL, the spawn
+    still ends as CascadeSpawnFailed, so the pool's global streak asks the cascade to invalidate —
+    and invalidating every wrapped base destroys the healthy tier's snapshot during ordinary
+    saturation, despite it producing no failure evidence at all. The failing tier is already
+    tracked and repaired per-tier.
+    """
+    class _Broken:
+        def __init__(self) -> None:
+            self.invalidated = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            raise RuntimeError("snapshot restore failed: corrupt warm.mem")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    class _HealthyButFull:
+        def __init__(self) -> None:
+            self.invalidated = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            raise StaticPoolExhausted("every worker is claimed")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    broken, full = _Broken(), _HealthyButFull()
+    casc = CascadingRuntime(
+        tiers=[Tier(name="fc", runtime=broken, capacity=4),
+               Tier(name="static", runtime=full, capacity=4)],
+        tier_rebuild_after=1000,   # isolate from per-tier repair; test the cascade-level call
+    )
+    with contextlib.suppress(Exception):
+        casc.spawn()               # records failure evidence against 'fc' only
+
+    with contextlib.suppress(Exception):
+        casc.invalidate_base()
+
+    assert broken.invalidated >= 1, "the tier that actually failed must be repaired"
+    assert full.invalidated == 0, (
+        "a tier that was merely FULL produced no failure evidence and must keep its base"
+    )

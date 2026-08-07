@@ -337,3 +337,31 @@ def test_discard_refuses_an_artifact_that_is_not_a_generation_dir(tmp_path: Path
 
     be.discard(str(precious))
     assert precious.exists(), "discard must refuse anything that is not one of our checkpoint dirs"
+
+
+def test_a_partial_checkpoint_cleans_up_its_own_directory(tmp_path: Path) -> None:
+    """runsc can write part of a checkpoint and then fail.
+
+    No artifact is returned, so SnapshotManager never learns the directory exists and can never
+    retire or discard it — and because every attempt now gets a unique name, each async retry
+    leaves another partial checkpoint behind instead of overwriting the last.
+    """
+    def _run_that_fails(argv, *a, **kw):
+        if "checkpoint" in argv:
+            img = Path(argv[argv.index("-image-path") + 1])
+            img.mkdir(parents=True, exist_ok=True)
+            (img / "partial").write_bytes(b"half a checkpoint")
+            raise RuntimeError("runsc checkpoint failed")
+        return 0
+
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=_run_that_fails, ready_wait=lambda d, t: None)
+    dest = tmp_path / "ckpt"
+
+    for _ in range(3):                          # repeated retries
+        boot = be.boot_base()
+        boot.wait_ready(5.0)
+        with pytest.raises(Exception):
+            boot.checkpoint(dest)
+
+    leftovers = list(dest.glob("checkpoint-*")) if dest.exists() else []
+    assert leftovers == [], f"partial checkpoints accumulated: {leftovers}"

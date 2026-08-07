@@ -779,6 +779,10 @@ class VsockHostWarmControl:
     ``read_output_disk`` after DONE.
     """
 
+    # Signalling here writes to the guest OVER VSOCK, so a failure is evidence about the worker.
+    # The file handshake's equivalent is a host-side write and deliberately does NOT set this.
+    signal_is_transport = True
+
     def __init__(
         self,
         vsock_uds: Path,

@@ -428,3 +428,30 @@ def test_cooldown_only_misses_are_capacity_not_a_broken_fleet():
     assert not isinstance(ei.value, StaticPoolUnhealthy), (
         "a cooling fleet is at capacity, not broken"
     )
+
+
+def test_an_unknown_health_probe_is_capacity_not_a_broken_fleet():
+    """`None` from _health_ok means the probe could not be ATTEMPTED, not that the worker failed.
+
+    EMFILE, ENOMEM or a local networking reconfiguration all produce None — a dispatcher-side
+    outage. Counting it as unhealthy turns our own resource exhaustion into a tier spawn FAULT
+    that advances rebuild streaks and can invalidate snapshot bases in a cascade: the same
+    "a slow or erroring control plane must never read as dead" invariant as issue #77.
+    """
+    cfg = _cfg("a:8765", "b:8765")
+    rt = StaticPoolRuntime(cfg, http_probe=lambda *a, **kw: None)   # UNKNOWN, not False
+
+    with pytest.raises(StaticPoolExhausted) as ei:
+        rt.spawn()
+    assert not isinstance(ei.value, StaticPoolUnhealthy), (
+        "an unknown probe is not a verdict on the fleet"
+    )
+
+
+def test_a_genuinely_failing_probe_is_still_unhealthy():
+    """The carve-out must stay narrow: False is a real verdict and must keep reporting a fault."""
+    cfg = _cfg("a:8765", "b:8765")
+    rt = StaticPoolRuntime(cfg, http_probe=FakeProbe(healthy=set()))   # explicit False
+
+    with pytest.raises(StaticPoolUnhealthy):
+        rt.spawn()

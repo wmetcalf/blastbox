@@ -1162,7 +1162,14 @@ class Dispatcher:
             try:
                 control.signal_go(spec, deadline=warm_deadline)
             except Exception as exc:  # noqa: BLE001
-                warm_fault = "worker"   # the worker could not be signalled -- transport to it is bad
+                # Only if signalling really does reach the worker. FC's control writes over
+                # vsock (worker evidence); the FILE handshake used by gVisor is a host-side
+                # atomic_write_confined() into the bind-mounted ctrl dir, where ENOSPC/EROFS is a
+                # dispatcher-disk failure that would burn out the whole healthy pool. Same
+                # opt-in shape as staging, and asked of the CONTROL object because that is what
+                # differs -- the runtime may offer both (upstream, PR #82).
+                if getattr(control, "signal_is_transport", False):
+                    warm_fault = "worker"
                 self._fail_job(job, f"failed to signal go to warm worker: {exc}")
                 return
 

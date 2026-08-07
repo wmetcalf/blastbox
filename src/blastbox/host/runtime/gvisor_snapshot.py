@@ -274,7 +274,15 @@ class GvisorBootHandle:
         gen = f"{os.getpid()}-{time.monotonic_ns():019d}"
         img = Path(dest_dir) / f"checkpoint-{gen}"
         img.mkdir(parents=True, exist_ok=True)
-        self._run([*_runsc(self._cfg), "checkpoint", "-image-path", str(img), self._cid])
+        try:
+            self._run([*_runsc(self._cfg), "checkpoint", "-image-path", str(img), self._cid])
+        except BaseException:
+            # runsc can write part of the checkpoint and then fail. No artifact is returned, so
+            # SnapshotManager never learns this directory exists and can never retire or discard
+            # it -- and because every attempt now gets a unique name, each async retry leaves
+            # another partial checkpoint behind instead of overwriting the last (upstream, PR #82).
+            shutil.rmtree(img, ignore_errors=True)
+            raise
         return str(img)
 
     def kill(self) -> None:

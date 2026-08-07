@@ -252,9 +252,18 @@ class StaticPoolRuntime:
                 _log.info("static: worker[%d] cooling down (%.0fs left), skipping for this claim",
                           idx, cool - now)
                 continue
-            if self._health_ok(self.cfg.workers[idx]) is not True:
-                _log.warning("static: worker[%d] unhealthy, skipping for this claim", idx)
-                saw_unhealthy = True
+            verdict = self._health_ok(self.cfg.workers[idx])
+            if verdict is not True:
+                # TRI-STATE. _health_ok returns None when this host could not even ATTEMPT the
+                # probe (EMFILE, ENOMEM, a local networking reconfiguration) -- that is a
+                # dispatcher-side outage, not a verdict on the worker. Counting it as unhealthy
+                # turns our own resource exhaustion into a tier spawn FAULT that advances rebuild
+                # streaks and can invalidate snapshot bases in a cascade: the same "a slow or
+                # erroring control plane must never read as dead" invariant as issue #77.
+                if verdict is False:
+                    saw_unhealthy = True
+                _log.warning("static: worker[%d] %s, skipping for this claim",
+                             idx, "unhealthy" if verdict is False else "health UNKNOWN")
                 continue
             with self._lock:
                 if idx not in self._free:

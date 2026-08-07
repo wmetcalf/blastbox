@@ -1749,8 +1749,14 @@ def test_trust_validation_failure_convicts_the_worker(tmp_path):
     )
 
 
-def test_a_signal_failure_convicts_the_worker(tmp_path):
-    """The worker could not be signalled — transport to it is bad."""
+def test_a_signal_failure_is_unattributed_unless_signalling_is_a_transport(tmp_path):
+    """Signalling is not automatically worker evidence.
+
+    FC's control writes over vsock, so a failure there IS about the worker. The FILE handshake
+    used by gVisor is a host-side atomic_write_confined() into the bind-mounted ctrl dir, where
+    ENOSPC/EROFS is a dispatcher-disk failure that would burn out the whole healthy pool. The
+    control object declares which it is.
+    """
     store = InMemoryJobStore()
     job = _make_job()
     job.input_sha256 = _INPUT_SHA
@@ -1773,8 +1779,28 @@ def test_a_signal_failure_convicts_the_worker(tmp_path):
     dispatcher.dispatch_once()
 
     assert store.get(job.job_id).status == JobStatus.FAILED, "the signal failure must be reached"
-    assert pool.release_fault == ["worker"], (
-        f"a worker that cannot be signalled IS worker evidence (got {pool.release_fault})"
+    assert pool.release_fault == ["unknown"], (
+        f"a host-side control write is not worker evidence (got {pool.release_fault})"
+    )
+
+    # ...and a control that genuinely transports DOES convict.
+    class _DeafTransport(_DeafControl):
+        signal_is_transport = True
+
+    runtime.host_warm_control = lambda s: _DeafTransport(s)  # type: ignore[assignment]
+    store2 = InMemoryJobStore()
+    job2 = _make_job()
+    job2.input_sha256 = _INPUT_SHA
+    store2.create(job2)
+    _setup_job_dirs(tmp_path / "jobs2", job2)
+    slot2 = _make_slot(tmp_path / "s2")
+    pool2 = FakeWarmPool(slot2, runtime=runtime)
+    d2 = _make_dispatcher_with_pool(
+        store2, job_root=tmp_path / "jobs2", pool=pool2, worker_timeout_s=10,
+    )
+    d2.dispatch_once()
+    assert pool2.release_fault == ["worker"], (
+        f"a failed vsock signal IS worker evidence (got {pool2.release_fault})"
     )
 
 
