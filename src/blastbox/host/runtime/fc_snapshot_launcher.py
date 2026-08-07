@@ -433,6 +433,7 @@ class FcSnapshotLauncher:
         whose name does not parse are left alone.
         """
         removed = 0
+        failed: list[str] = []
         for directory in {self._base_dir, self._mem_dir}:
             if directory is None or not directory.exists():
                 continue
@@ -442,14 +443,27 @@ class FcSnapshotLauncher:
                     continue
                 try:
                     if path.is_dir():
-                        shutil.rmtree(path, ignore_errors=True)
+                        # NOT ignore_errors: it would report success for a tree this call could
+                        # not actually remove, and the caller latches "swept" on a clean return.
+                        errs: list[str] = []
+                        shutil.rmtree(path, onerror=lambda fn, p, e: errs.append(f"{p}: {e[1]}"))
+                        if errs:
+                            raise OSError("; ".join(errs))
                     else:
                         path.unlink(missing_ok=True)
                     removed += 1
                 except OSError as exc:
+                    # REPORT, don't just log. SnapshotManager runs this once per process and
+                    # latches the flag on a clean return, so swallowing a transient EIO/EROFS here
+                    # meant the orphan -- a RAM-sized .mem -- was never retried for the life of
+                    # the dispatcher. Same reasoning as discard() above: the layer that decides
+                    # whether cleanup happened must not lie about it (upstream, PR #82).
+                    failed.append(f"{path}: {exc}")
                     _log.warning("fc_snapshot: could not sweep orphan %s: %s", path, exc)
         if removed:
             _log.info("fc_snapshot.swept_orphan_generations count=%d", removed)
+        if failed:
+            raise OSError("could not sweep orphan generations: " + "; ".join(failed))
         return removed
 
     def restore_in(self, slot_workdir: Path, *, outdisk_src: Path | None = None):

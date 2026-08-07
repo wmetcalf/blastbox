@@ -599,3 +599,48 @@ def test_the_retry_list_stays_shared_across_handles(tmp_path, monkeypatch):
         f"only {len(launcher._stranded_partials)} of {len(created)} stranded files reached the "
         "shared list"
     )
+
+
+def test_a_sweep_that_could_not_remove_an_orphan_reports_it(tmp_path, monkeypatch):
+    """The launcher logged per-path unlink failures and returned a success count anyway.
+
+    SnapshotManager latches "swept" on a clean return, so a swallowed EIO/EROFS meant the orphan
+    was never retried for the life of the dispatcher. The layer that decides whether cleanup
+    happened must not lie about it — same rule as discard().
+    """
+    import errno as _errno
+
+    from blastbox.host.runtime import fc_snapshot_launcher as mod
+
+    base = tmp_path / "base"; base.mkdir()
+    mem = tmp_path / "mem"; mem.mkdir()
+    # An orphan owned by a token whose process is gone.
+    orphan = mem / "warm-999999_1234-000000000000000001.mem"
+    orphan.write_bytes(b"x" * 8)
+
+    monkeypatch.setattr(mod, "_owner_alive", lambda token: False)
+
+    def _boom(self, missing_ok=False):
+        raise OSError(_errno.EIO, "unlink failed")
+
+    monkeypatch.setattr(Path, "unlink", _boom)
+
+    launcher = FcSnapshotLauncher(FakeCfg(), base, mem_dir=mem)
+    with pytest.raises(OSError) as ei:
+        launcher.sweep_orphan_generations()
+    assert "warm-999999_1234" in str(ei.value)
+
+
+def test_a_clean_sweep_still_reports_success(tmp_path, monkeypatch):
+    """The carve-out stays narrow: an orphan that IS removed reports normally."""
+    from blastbox.host.runtime import fc_snapshot_launcher as mod
+
+    base = tmp_path / "base"; base.mkdir()
+    mem = tmp_path / "mem"; mem.mkdir()
+    orphan = mem / "warm-999999_1234-000000000000000001.mem"
+    orphan.write_bytes(b"x" * 8)
+    monkeypatch.setattr(mod, "_owner_alive", lambda token: False)
+
+    launcher = FcSnapshotLauncher(FakeCfg(), base, mem_dir=mem)
+    assert launcher.sweep_orphan_generations() == 1
+    assert not orphan.exists()

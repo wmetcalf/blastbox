@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import errno
 import re
+import socket
+import ssl
+import urllib.error
 
 
 # Strip internal filesystem paths from public-facing error messages.
@@ -94,6 +97,29 @@ class OutputTrustError(BlastboxError):
 HOST_RESOURCE_ERRNOS = frozenset({
     errno.EMFILE, errno.ENFILE, errno.ENOMEM, errno.EIO, errno.ENOSPC, errno.EDQUOT, errno.EROFS,
 })
+
+
+def is_transport_error(exc: BaseException) -> bool:
+    """Whether an OSError came from the WIRE rather than the local filesystem.
+
+    urllib.error.URLError (and thus HTTPError), socket.timeout and ConnectionError all subclass
+    OSError, so separating "the disk is full" from "the worker is unreachable" has to be
+    explicit: an `except OSError` written for ENOSPC otherwise captures every connection failure
+    too, and silently stops attributing the wedges this exists to catch.
+
+    ssl.SSLError is an OSError but NOT a URLError, socket.timeout or ConnectionError, so an HTTPS
+    read that fails on a TLS protocol error or a mid-stream disconnect was landing in the
+    local-filesystem branch -- a worker with a broken TLS stack could never be detected, because
+    every failure it produced was attributed to this dispatcher's disk.
+
+    Lives HERE, beside HOST_RESOURCE_ERRNOS, because more than one seam decides worker-vs-host
+    attribution from an exception: it started private to remote_http, and vm_compose's
+    slot-bound validate needed the same rule. A second copy is how a rule drifts -- the errno set
+    above was four divergent copies under two names before it was consolidated (PR #82).
+    """
+    return isinstance(
+        exc, (urllib.error.URLError, socket.timeout, ConnectionError, ssl.SSLError)
+    )
 
 
 class OutputTrustUnknown(OutputTrustError):

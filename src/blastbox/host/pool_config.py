@@ -252,6 +252,28 @@ def build_warm_pool(
             runtime = select_runtime_by_name(cfg.runtime, warm_snapshot=cfg.warm_snapshot)
 
     assert runtime is not None  # narrowed: every branch above returned/raised/assigned
+    # The per-tier repair threshold is a property of the RUNTIME, not of how it was obtained, so
+    # apply the config to an INJECTED one too. The block above only reaches a cascade this
+    # function built; a caller using the supported runtime= injection with a CascadingRuntime kept
+    # the cascade's own default of 4. That is not merely drift: an explicit cfg value makes
+    # WarmPool record its own threshold as explicit, and _retune_runtime_thresholds then declines
+    # to push anything down -- so PoolConfig(snapshot_rebuild_after=0), the documented incident
+    # escape hatch, disabled pool-wide invalidation while the injected cascade went on
+    # invalidating tier bases every four spawn failures. The hatch has to close EVERY rebuild
+    # path (upstream, PR #82).
+    if hasattr(runtime, "tier_rebuild_after"):
+        _explicit = cfg.snapshot_rebuild_after is not None
+        # An operator's value always wins. With nothing configured the number is DERIVED, and a
+        # runtime the caller deliberately pinned keeps its own -- the same precedence the pool
+        # applies to itself, rather than stomping an injected object's configuration.
+        if _explicit or not getattr(runtime, "tier_rebuild_after_explicit", False):
+            try:
+                # setattr, not attribute syntax: this is an OPTIONAL runtime seam (only a cascade
+                # carries it today), so the SlotRuntime protocol deliberately does not declare it.
+                setattr(runtime, "tier_rebuild_after", _resolved_rebuild_after(cfg))  # noqa: B010
+                setattr(runtime, "tier_rebuild_after_explicit", _explicit)            # noqa: B010
+            except Exception as exc:  # noqa: BLE001 -- a read-only knob must not fail pool build
+                _log.warning("pool_config.tier_rebuild_after_not_applied: %s", exc)
     # A slow-booting runtime (aws-ec2 first boot commonly >120s) declares its own readiness budget.
     # If the operator DIDN'T explicitly set the pool warming timeout, raise it to that budget so a
     # healthy-but-slow cloud slot isn't evicted + churned. An explicit env value always wins.

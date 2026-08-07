@@ -483,3 +483,69 @@ def test_build_cascade_runtime_honours_the_explicit_flag(monkeypatch):
     pinned = build_cascade_runtime(getter, tier_rebuild_after=7,
                                    tier_rebuild_after_explicit=True)
     assert pinned.tier_rebuild_after_explicit is True
+
+
+def test_an_injected_cascade_gets_the_configured_rebuild_threshold(monkeypatch):
+    """The escape hatch has to close EVERY rebuild path.
+
+    The threshold plumbing lived inside the `runtime is None` branch, so a caller using the
+    supported runtime= injection with a CascadingRuntime kept the cascade's own default of 4.
+    An explicit cfg value also makes WarmPool record its threshold as explicit, and
+    _retune_runtime_thresholds then declines to push anything down — so
+    PoolConfig(snapshot_rebuild_after=0) disabled pool-wide invalidation while the injected
+    cascade went on invalidating tier bases every four spawn failures.
+    """
+    class _InjectedCascade:
+        tier_rebuild_after = 4                     # the cascade's own default
+        tier_rebuild_after_explicit = False
+
+        def spawn(self): return None
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): return None
+
+    rt = _InjectedCascade()
+    monkeypatch.delenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", raising=False)
+    cfg = PoolConfig.from_env(snapshot_rebuild_after=0)
+    pool = build_warm_pool(cfg, runtime=rt)
+    assert pool is not None
+    assert pool._snapshot_rebuild_after == 0       # the hatch closed the pool-wide path...
+    assert rt.tier_rebuild_after == 0, (
+        "...but the injected cascade kept invalidating tier bases every 4 spawn failures"
+    )
+    assert rt.tier_rebuild_after_explicit is True
+
+
+def test_an_injected_cascade_the_caller_pinned_is_not_stomped(monkeypatch):
+    """With nothing configured the number is DERIVED — it must not overwrite a caller's own."""
+    class _PinnedCascade:
+        tier_rebuild_after = 7
+        tier_rebuild_after_explicit = True
+
+        def spawn(self): return None
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): return None
+
+    rt = _PinnedCascade()
+    monkeypatch.delenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", raising=False)
+    build_warm_pool(PoolConfig.from_env(warm_size=8, concurrent_ceiling=16), runtime=rt)
+    assert rt.tier_rebuild_after == 7
+
+
+def test_an_unpinned_injected_cascade_follows_the_derived_policy(monkeypatch):
+    """One policy, both consumers — the injected path included."""
+    class _UnpinnedCascade:
+        tier_rebuild_after = 4
+        tier_rebuild_after_explicit = False
+
+        def spawn(self): return None
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): return None
+
+    rt = _UnpinnedCascade()
+    monkeypatch.delenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", raising=False)
+    pool = build_warm_pool(PoolConfig.from_env(warm_size=8, concurrent_ceiling=16), runtime=rt)
+    assert pool is not None
+    assert rt.tier_rebuild_after == pool._snapshot_rebuild_after == 16

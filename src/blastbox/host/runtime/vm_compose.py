@@ -32,8 +32,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from blastbox.errors import is_transport_error
 from blastbox.host.netwire import parse_egress_ports
-from blastbox.host.pool import Slot, WarmPool
+from blastbox.host.pool import Slot, WarmPool, release_kwargs
 from blastbox.host.runtime.libvirt_egress import ExitRouting, VmEgressPolicy
 from blastbox.host.runtime.libvirt_vm import LibvirtVmConfig, LibvirtVmRuntime
 
@@ -383,7 +384,20 @@ def slot_bound_validate(
                 else:
                     v = result.get("v")
                     clean = bool(isinstance(v, tuple) and len(v) == 2 and v[1])
-                    pool.release(slot, dirty=not clean)
+                    # ATTRIBUTE the failure. Releasing dirty with no fault leaves it "unknown",
+                    # which force-recycles the slot but advances neither the per-slot nor the
+                    # pool-wide streak -- so a broken VM agent failing every request was
+                    # snapshot-reverted and offered again indefinitely, never reaching burnout
+                    # protection or a base rebuild. Convict only on POSITIVE evidence that the
+                    # WORKER, not the sample, misbehaved: a transport failure (VM unreachable,
+                    # TLS broken, connection dropped). An engine that ran and returned ok=False
+                    # judged the INPUT, and any other exception is ambiguous at this seam --
+                    # both stay unattributed (upstream, PR #82).
+                    exc = result.get("e")
+                    fault = ("worker" if isinstance(exc, BaseException) and is_transport_error(exc)
+                             else None)
+                    pool.release(slot, **release_kwargs(
+                        pool.release, dirty=not clean, fault=fault))
             except Exception:  # noqa: BLE001 — slot return must never mask the validate result/error
                 _log.exception("slot_bound_validate: slot return failed for slot %s", slot.slot_id)
     return _validate

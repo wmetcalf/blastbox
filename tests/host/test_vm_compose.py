@@ -398,3 +398,72 @@ def test_build_image_needs_recipe():
     spec = VmWorkerSpec(name="x", image=VmImageSpec(golden="/no/such.qcow2", builder="qemu"))
     with pytest.raises(ValueError):  # qemu builder with no base_qcow2
         spec.build_image()
+
+
+class _FaultPool(_FakePool):
+    """A pool whose release() ACCEPTS attribution (the current WarmPool shape)."""
+
+    def __init__(self, slot=None) -> None:
+        super().__init__(slot)
+        self.faults: list[str | None] = []
+
+    def release(self, slot, *, dirty=False, fault=None):
+        self.released.append(dirty)
+        self.faults.append(fault)
+
+
+def test_a_transport_failure_convicts_the_worker():
+    """Releasing dirty with no fault leaves it 'unknown' — force-recycled, streak unmoved.
+
+    A broken VM agent that fails every request was therefore snapshot-reverted and offered again
+    indefinitely, never reaching burnout protection or a base rebuild.
+    """
+    import ssl
+
+    pool = _FaultPool()
+
+    def unreachable(slot, p):
+        raise ssl.SSLError("worker TLS stack is broken")
+
+    with pytest.raises(ssl.SSLError):
+        slot_bound_validate(pool, unreachable)("/in")
+    assert pool.released == [True]
+    assert pool.faults == ["worker"], (
+        "a transport failure is positive evidence the WORKER misbehaved; without it the wedge "
+        "never advances toward eviction"
+    )
+
+
+def test_an_engine_verdict_on_the_sample_is_not_a_worker_fault():
+    """ok=False means the engine RAN and judged the input. Convicting the worker there would
+    burn out healthy slots on a run of malformed samples."""
+    pool = _FaultPool()
+    assert slot_bound_validate(pool, lambda slot, p: ({}, False))("/in") == ({}, False)
+    assert pool.released == [True] and pool.faults == [None]
+
+
+def test_an_ambiguous_exception_stays_unattributed():
+    """Positive-evidence conviction: anything that isn't demonstrably the worker fails OPEN."""
+    pool = _FaultPool()
+
+    def boom(slot, p):
+        raise ValueError("engine could not parse this sample")
+
+    with pytest.raises(ValueError):
+        slot_bound_validate(pool, boom)("/in")
+    assert pool.released == [True] and pool.faults == [None]
+
+
+def test_attribution_degrades_on_a_pool_that_predates_it():
+    """_FakePool.release() takes no fault=; the seam must drop it, not raise TypeError and leak
+    the slot (that ladder-of-except-TypeError bug is why release_kwargs exists)."""
+    import ssl
+
+    pool = _FakePool()
+
+    def unreachable(slot, p):
+        raise ssl.SSLError("broken")
+
+    with pytest.raises(ssl.SSLError):
+        slot_bound_validate(pool, unreachable)("/in")
+    assert pool.released == [True]        # still released, just unattributed

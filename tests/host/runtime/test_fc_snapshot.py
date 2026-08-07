@@ -317,3 +317,44 @@ def test_a_failed_retirement_is_retried_by_the_next_build(tmp_path):
         "the retired generation was never retried: only a restored-and-reaped slot could have "
         "swept it, and a build that fails for lack of space never produces one"
     )
+
+
+def test_a_failed_orphan_sweep_is_retried_on_the_next_build(tmp_path):
+    """The latch was set BEFORE the sweep ran, so one transient EIO disabled it for the process.
+
+    Startup orphan reclamation removes generations left by a dispatcher that is gone. Its RAM-
+    sized .mem is itself a reason the replacement build fails for want of space, so a sweep that
+    failed once and never ran again could leave the tier blocked long after the filesystem
+    recovered.
+    """
+    import errno as _errno
+
+    class _FlakySweep(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.sweeps = 0
+            self.fail_sweep = True
+
+        def sweep_orphan_generations(self):
+            self.sweeps += 1
+            if self.fail_sweep:
+                raise OSError(_errno.EIO, "could not sweep orphan generations")
+            return 0
+
+    backend = _FlakySweep()
+    mgr = SnapshotManager(tmp_path, backend)
+    mgr.build()
+    assert backend.sweeps == 1                      # tried, and failed
+
+    mgr.invalidate()                                # force the next build to run for real
+    backend.fail_sweep = False                      # the filesystem recovers
+    mgr.build()
+    assert backend.sweeps == 2, (
+        "the orphan sweep never ran again: the latch was set before the call, so a single "
+        "transient failure disabled reclamation for the life of the dispatcher"
+    )
+
+    # ...and once it SUCCEEDS the latch holds — no re-sweeping on every later build.
+    mgr.invalidate()
+    mgr.build()
+    assert backend.sweeps == 2, "a successful sweep must latch; this is a once-per-process job"

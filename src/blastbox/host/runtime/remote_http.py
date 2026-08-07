@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import io
 import json
-import socket
 import logging
 import os
 import ssl
@@ -27,6 +26,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
 
+from blastbox.errors import is_transport_error
 from blastbox.host.pool import release_kwargs
 from blastbox.errors import HOST_RESOURCE_ERRNOS, OutputTrustUnknown, EngineErrorEnvelope
 
@@ -446,21 +446,9 @@ def detonate_remote(
     return {}
 
 
-def _is_transport_error(exc: BaseException) -> bool:
-    """Whether an OSError came from the WIRE rather than the local filesystem.
-
-    urllib.error.URLError (and thus HTTPError), socket.timeout and ConnectionError all subclass
-    OSError, so separating "the disk is full" from "the worker is unreachable" has to be
-    explicit: an `except OSError` written for ENOSPC otherwise captures every connection failure
-    too, and silently stops attributing the wedges this exists to catch.
-    """
-    # ssl.SSLError is an OSError but NOT a URLError, socket.timeout or ConnectionError, so an
-    # HTTPS read that fails on a TLS protocol error or a mid-stream disconnect was landing in the
-    # local-filesystem branch -- a worker with a broken TLS stack could never be detected, because
-    # every failure it produced was attributed to this dispatcher's disk (upstream, PR #82).
-    return isinstance(
-        exc, (urllib.error.URLError, socket.timeout, ConnectionError, ssl.SSLError)
-    )
+# Re-exported from blastbox.errors so this module's callers keep the local name while the RULE
+# has exactly one definition (vm_compose classifies the same way).
+_is_transport_error = is_transport_error
 
 
 def make_remote_validate(

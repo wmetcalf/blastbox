@@ -184,16 +184,28 @@ class SnapshotManager:
         # path is the one thing guaranteed to run on every retry (upstream, PR #82).
         self._sweep_retired()
         # Reclaim generations left by a dispatcher that is gone. Done here rather than at import
-        # or construction so it runs exactly once, on the first real build, with the directories
-        # already created. Best-effort: a failed sweep must never block bringing the tier up.
+        # or construction so it runs on the first real build, with the directories already
+        # created. Best-effort: a failed sweep must never block bringing the tier up.
         if not self._swept_orphans:
-            self._swept_orphans = True
             sweep = getattr(self._backend, "sweep_orphan_generations", None)
-            if callable(sweep):
+            if not callable(sweep):
+                self._swept_orphans = True          # nothing to retry on this backend
+            else:
                 try:
                     sweep()
                 except Exception as exc:  # noqa: BLE001
-                    _log.warning("snapshot.orphan_sweep_failed: %s", exc)
+                    # LATCH ONLY ON SUCCESS. The flag was set before the call, so a transient
+                    # EIO/EROFS during startup reclamation left the orphan in place and the sweep
+                    # never ran again for the life of the process. That orphan is a RAM-sized .mem
+                    # -- itself a reason the replacement build fails for want of space -- so the
+                    # tier could stay blocked long after the filesystem recovered. Leaving the
+                    # flag clear costs one extra directory scan per retry and is idempotent
+                    # (unlink is missing_ok) (upstream, PR #82).
+                    _log.warning(
+                        "snapshot.orphan_sweep_failed (retrying on the next build): %s", exc
+                    )
+                else:
+                    self._swept_orphans = True
         # boot_base() is its own try so a base-boot failure is wrapped as
         # SnapshotBuildError (as documented), not propagated raw. boot_base already
         # tears down its own sandbox on partial failure, so no handle/finally is
