@@ -1565,3 +1565,58 @@ def test_a_warmup_triggered_rebuild_defers_spawning_to_the_next_tick() -> None:
         "the pool spawned in the same tick it invalidated the base — that call runs build() "
         "synchronously and stalls the maintenance thread"
     )
+
+
+def test_a_repaired_tier_stays_attributable_for_the_pools_own_repair() -> None:
+    """Per-tier repair must not erase the evidence the pool is about to consult.
+
+    _maybe_repair_tier resets that tier's streak to give the rebuild a window. The pool reaches
+    its own threshold a moment later and calls invalidate_base(), which filters on the guilty
+    set — so clearing the only marker first left that set empty, the global repair fell back to
+    every tier, and healthy merely-saturated siblings lost their bases. Exactly what the
+    guilty-set filter was added to prevent.
+    """
+    class _Broken:
+        def __init__(self) -> None:
+            self.invalidated = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            raise RuntimeError("snapshot restore failed: corrupt warm.mem")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    class _HealthyButFull:
+        def __init__(self) -> None:
+            self.invalidated = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            raise StaticPoolExhausted("every worker is claimed")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    broken, full = _Broken(), _HealthyButFull()
+    casc = CascadingRuntime(
+        tiers=[Tier(name="fc", runtime=broken, capacity=4),
+               Tier(name="static", runtime=full, capacity=4)],
+        tier_rebuild_after=1,      # repair (and reset the streak) on the FIRST failure
+    )
+    with contextlib.suppress(Exception):
+        casc.spawn()
+    assert broken.invalidated == 1, "sanity: per-tier repair fired and cleared the streak"
+
+    # The pool now makes its own global decision, with the tier streak already reset to 0.
+    with contextlib.suppress(Exception):
+        casc.invalidate_base()
+
+    assert full.invalidated == 0, (
+        "a healthy, merely-saturated tier lost its base because the guilty marker was cleared "
+        "by the per-tier repair before the pool's own repair consulted it"
+    )

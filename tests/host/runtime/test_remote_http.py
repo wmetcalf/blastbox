@@ -910,3 +910,49 @@ def test_local_host_io_is_unattributed_but_transport_still_convicts(tmp_path):
     assert _run(urllib.error.URLError("connection refused")) == "worker"
     assert _run(socket.timeout("timed out")) == "worker"
     assert _run(ConnectionResetError("peer reset")) == "worker"
+
+
+def test_worker_busy_and_incomplete_validation_are_not_worker_evidence(tmp_path):
+    """Two conditions that reach the remote path's generic handler but are not failures.
+
+    409/WorkerBusy means the worker ANSWERED and its single-flight lock is held — capacity
+    pressure, and the job is requeued rather than failed. OutputTrustUnknown means the HOST could
+    not complete validation; validate_worker_output wraps the OSError, so it is no longer an
+    OSError and the generic branch would convict, defeating the type's whole purpose on this path.
+    """
+    from blastbox.errors import OutputTrustUnknown
+    from blastbox.host.runtime.remote_http import WorkerBusy
+
+    out = tmp_path / "out"
+    out.mkdir()
+    inp = tmp_path / "in.bin"
+    inp.write_bytes(b"sample")
+    slot = SimpleNamespace(slot_id="s1", url="http://worker.invalid", ip=None)
+
+    def _run(err, expect_raise):
+        calls: list[tuple[bool, str | None]] = []
+
+        def release(s, *, dirty: bool = False, fault: str | None = None) -> None:
+            calls.append((dirty, fault))
+
+        def boom(*a, **kw):
+            raise err
+
+        validate = make_remote_validate(
+            lambda: slot, release, output_dir_for=lambda p: out, http_open=boom,
+        )
+        if expect_raise:
+            with contextlib.suppress(Exception):
+                validate(inp)
+        else:
+            validate(inp)
+        return calls[0] if calls else (None, None)
+
+    dirty, fault = _run(WorkerBusy("worker busy (409)"), expect_raise=True)
+    assert fault == "unknown", f"a 409 is capacity pressure, not failure evidence (got {fault})"
+    assert dirty is True, "still quarantine the box so it is not immediately re-offered"
+
+    _, fault = _run(OutputTrustUnknown("EMFILE hashing metadata.json"), expect_raise=False)
+    assert fault == "unknown", (
+        f"a check the HOST could not complete is not worker evidence (got {fault})"
+    )

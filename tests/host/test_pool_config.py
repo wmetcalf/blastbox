@@ -324,3 +324,28 @@ def test_the_rebuild_escape_hatch_also_disables_cascade_tier_repair(monkeypatch)
 
     monkeypatch.delenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", raising=False)
     assert build_cascade_runtime(getter).tier_rebuild_after == 4, "unset keeps the default"
+
+
+def test_a_resolved_config_override_reaches_cascade_tier_repair(monkeypatch):
+    """The factory must pass the RESOLVED value, not let the cascade re-read the environment.
+
+    PoolConfig.from_env(snapshot_rebuild_after=0) is the supported override, and a PoolConfig can
+    be constructed directly — in both cases the outer pool honoured 0 while per-tier repair fell
+    back to its own default and kept invalidating bases.
+    """
+    captured: dict[str, object] = {}
+
+    def _fake_cascade(get=None, *, warm_snapshot=False, tier_rebuild_after=None):
+        captured["tier_rebuild_after"] = tier_rebuild_after
+        return type("R", (), {"spawn": lambda s: None, "is_ready": lambda s, x: True,
+                              "is_alive": lambda s, x: True, "reap": lambda s, x: None})()
+
+    monkeypatch.setattr("blastbox.host.runtime.cascade.build_cascade_runtime", _fake_cascade)
+    monkeypatch.delenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", raising=False)
+
+    # Explicit override, NOT via the environment — this is the case that used to be lost.
+    cfg = PoolConfig.from_env(runtime="cascade", snapshot_rebuild_after=0)
+    build_warm_pool(cfg)
+    assert captured["tier_rebuild_after"] == 0, (
+        "a resolved 0 must disable per-tier repair, not fall back to the env/default"
+    )

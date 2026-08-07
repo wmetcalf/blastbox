@@ -216,7 +216,15 @@ def build_warm_pool(
         if cfg.runtime == RUNTIME_CASCADE:
             from blastbox.host.runtime.cascade import build_cascade_runtime
 
-            runtime = build_cascade_runtime(warm_snapshot=cfg.warm_snapshot)
+            # Pass the RESOLVED value, not "let it re-read the environment". A caller using
+            # PoolConfig.from_env(snapshot_rebuild_after=0) — the supported override — or
+            # constructing a PoolConfig directly would otherwise have the outer pool honour 0
+            # while per-tier repair silently fell back to its own default and kept invalidating
+            # bases (upstream, PR #82).
+            runtime = build_cascade_runtime(
+                warm_snapshot=cfg.warm_snapshot,
+                tier_rebuild_after=cfg.snapshot_rebuild_after,
+            )
         else:
             runtime = select_runtime_by_name(cfg.runtime, warm_snapshot=cfg.warm_snapshot)
 

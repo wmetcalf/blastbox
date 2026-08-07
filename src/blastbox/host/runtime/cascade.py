@@ -175,6 +175,9 @@ class CascadingRuntime:
         # permanently on the lower-priority tier, at its cost/performance, with nothing above
         # a per-attempt warning to say so (upstream, PR #82).
         self._tier_failures = [0] * len(tiers)
+        # Tiers whose streak was reset BY A REPAIR, not by a success. They stay attributable for
+        # the pool's own (slightly later) global repair decision; a successful spawn clears them.
+        self._recently_guilty: set[int] = set()
 
     # -- SlotRuntime protocol ----------------------------------------------
     def spawn(self) -> Any:
@@ -221,6 +224,7 @@ class CascadingRuntime:
                 # Only THIS tier's streak clears: a success here says nothing about the tiers
                 # above it that were skipped or that just failed.
                 self._tier_failures[i] = 0
+                self._recently_guilty.discard(i)   # a real success clears the mark
             _log.info("cascade: spawned on tier %r (%d/%d) slot=%s",
                       tier.name, self._counts[i], tier.capacity, slot.slot_id)
             return slot
@@ -284,6 +288,12 @@ class CascadingRuntime:
             return
         with self._lock:
             self._tier_failures[index] = 0   # give the rebuild a full window before trying again
+            # ...but REMEMBER that this tier is the guilty one. The pool reaches its own threshold
+            # a moment later and calls invalidate_base(), which filters on the guilty set: clearing
+            # the only marker first meant that set was empty, so a global repair fell back to
+            # every tier and destroyed the bases of healthy, merely-saturated siblings -- exactly
+            # what the guilty-set filter was added to prevent (upstream, PR #82).
+            self._recently_guilty.add(index)
         _log.error(
             "cascade: tier %r failed %d consecutive spawns — invalidating its base so it can be "
             "rebuilt. Fallback tiers have been absorbing this, so the pool saw only successes.",
@@ -310,8 +320,11 @@ class CascadingRuntime:
         # failure evidence at all. With no per-tier evidence (a job-failure-driven rebuild, which
         # carries no tier attribution) fall back to every tier (upstream, PR #82).
         with self._lock:
-            guilty = {i for i, n in enumerate(self._tier_failures) if n > 0}
+            guilty = {i for i, n in enumerate(self._tier_failures) if n > 0} | self._recently_guilty
         targets = [t for i, t in enumerate(self.tiers) if i in guilty] or list(self.tiers)
+
+        with self._lock:
+            self._recently_guilty.clear()   # consumed by this repair
 
         failures: list[str] = []
         for tier in targets:
@@ -446,6 +459,7 @@ def build_cascade_runtime(
     get: Callable[[str], str | None] | None = None,
     *,
     warm_snapshot: bool = False,
+    tier_rebuild_after: int | None = None,
 ) -> CascadingRuntime:
     """Build a CascadingRuntime from ``BLASTBOX_POOL_TIERS``. The primary (first) tier must be
     available -- otherwise ``CascadeMisconfigured``; overflow tiers that aren't available are skipped
@@ -460,14 +474,18 @@ def build_cascade_runtime(
     # the pool's. Per-tier repair is a second, independently-triggered invalidation route, so an
     # operator who turned rebuilds off during an incident would still have had tier bases
     # destroyed under them (upstream, PR #82).
-    raw_rebuild = (get("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER") or "").strip()
-    tier_rebuild_after = 4
-    if raw_rebuild:
-        try:
-            tier_rebuild_after = max(0, int(raw_rebuild))
-        except ValueError:
-            _log.warning("cascade: invalid BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER=%r; using %d",
-                         raw_rebuild, tier_rebuild_after)
+    # An explicitly RESOLVED value from the caller wins; only fall back to reading the
+    # environment when nobody resolved one (direct callers, tests).
+    if tier_rebuild_after is None:
+        raw_rebuild = (get("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER") or "").strip()
+        tier_rebuild_after = 4
+        if raw_rebuild:
+            try:
+                tier_rebuild_after = max(0, int(raw_rebuild))
+            except ValueError:
+                _log.warning("cascade: invalid BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER=%r; using %d",
+                             raw_rebuild, tier_rebuild_after)
+    tier_rebuild_after = max(0, int(tier_rebuild_after))
     spec = get("BLASTBOX_POOL_TIERS") or ""
     parsed = _parse_tiers(spec)
     if not parsed:

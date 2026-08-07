@@ -28,7 +28,7 @@ from typing import Any, Protocol
 from urllib.parse import quote
 
 from blastbox.host.pool import release_kwargs
-from blastbox.errors import EngineErrorEnvelope
+from blastbox.errors import OutputTrustUnknown, EngineErrorEnvelope
 
 
 _log = logging.getLogger("blastbox.host.runtime.remote_http")
@@ -541,9 +541,14 @@ def make_remote_validate(
             dirty = False
             return meta, True
         except WorkerBusy:
-            fault = "worker"         # its lock is held by a stale detonation -> the WORKER is stuck
-            # NOT a job failure -- the worker's lock is held by a stale detonation. Propagate so the
-            # dispatcher requeues the job (like NoWarmSlot); the finally releases this slot dirty (cooldown).
+            # 409 means the worker ANSWERED and its single-flight lock is held: capacity pressure,
+            # and the job is REQUEUED rather than failed, so it is not failure evidence at all.
+            # Recording it advanced the pool-wide rebuild streak on nothing but load, and a
+            # job-driven repair carries no guilty-tier attribution, so in a cascade it could
+            # invalidate unrelated healthy snapshot tiers (upstream, PR #82).
+            fault = "unknown"
+            # Propagate so the dispatcher requeues the job (like NoWarmSlot); the finally still
+            # releases this slot DIRTY, quarantining the box so it is not immediately re-offered.
             raise
         except ClaimLost:
             # A PEER already reclaimed or finished this job -- our claim simply outlived itself.
@@ -551,6 +556,13 @@ def make_remote_validate(
             # burn out a healthy slot and feed base invalidation (upstream, PR #82).
             fault = "unknown"
             raise
+        except OutputTrustUnknown as exc:
+            # The host could not COMPLETE validation (EMFILE/EIO/ENOMEM). validate_worker_output
+            # wraps the OSError, so this is no longer an OSError and the generic branch below
+            # would convict -- defeating the whole point of the type on this path.
+            fault = "unknown"
+            _log.warning("remote_http: could not complete output validation: %s", exc)
+            return {"error": _sanitized_failure(exc)}, False
         except Exception as exc:  # noqa: BLE001
             if isinstance(exc, OSError) and not _is_transport_error(exc):
                 # LOCAL HOST I/O: input_path.stat(), output_dir.mkdir(), _empty_dir(), tar
