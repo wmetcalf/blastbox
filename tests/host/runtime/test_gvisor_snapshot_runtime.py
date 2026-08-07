@@ -366,3 +366,49 @@ def test_secure_snapshot_base_refuses_symlink(tmp_path):
         _secure_snapshot_base(link)
     # The victim's perms must be untouched (no fchmod-through-symlink).
     assert (victim.stat().st_mode & 0o777) == 0o755
+
+
+def test_reap_releases_the_slots_generation_pin(tmp_path):
+    """The gVisor reap must drop its pin, exactly as the FC one does.
+
+    Nothing covered this, which is how a botched edit could move the release out of reap() (or
+    look as though it had) without a single test noticing. It is also the only thing that lets a
+    superseded gVisor checkpoint be reclaimed once its last sandbox is gone.
+    """
+    released: list[str] = []
+
+    class _Mgr:
+        def release(self, slot_id):
+            released.append(slot_id)
+
+        def invalidate(self):
+            return True
+
+    rt = GvisorSnapshotSlotRuntime(_Mgr(), settle_s=0.0)
+
+    out = tmp_path / "slot" / "out"
+    out.mkdir(parents=True)
+
+    class _Slot:
+        slot_id = "s1"
+        output_dir = str(out)
+
+    rt.reap(_Slot())
+
+    assert released == ["s1"], (
+        f"reap did not release the slot's generation pin (got {released}) — superseded "
+        "checkpoints would accumulate until the filesystem fills"
+    )
+
+
+def test_the_module_imports_cleanly():
+    """A guard against exactly the failure mode the reviewer suspected.
+
+    An edit that lands a statement at class scope makes this module raise NameError on import, so
+    BLASTBOX_POOL_RUNTIME=gvisor (and any cascade containing it) fails before a runtime can even
+    be selected. Cheap to assert, and nothing else in the suite imports this module directly.
+    """
+    import importlib
+
+    mod = importlib.import_module("blastbox.host.runtime.gvisor_snapshot_runtime")
+    assert hasattr(mod, "GvisorSnapshotSlotRuntime")
