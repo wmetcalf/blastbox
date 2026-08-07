@@ -256,3 +256,37 @@ def test_build_warm_pool_forwards_the_safety_controls(monkeypatch):
     assert pool._max_consecutive_failures == 7
     assert pool._unknown_grace_s == 42.5
     assert pool._capacity_starved_after_s == 77.5
+
+
+def test_unset_knobs_do_not_override_the_pools_own_defaults(monkeypatch):
+    """A config default that COPIES the pool's default is a drift bug waiting to happen.
+
+    It already happened: this config said max_consecutive_failures=3 while WarmPool said 2, so
+    every env-configured deployment silently sent a third job to a repeatedly failing slot —
+    with an adjacent comment asserting the two matched. Compare against the constructor itself,
+    so the test fails if either side moves rather than encoding a third copy of the number.
+    """
+    import inspect
+
+    for var in ("BLASTBOX_POOL_MAX_CONSECUTIVE_FAILURES",
+                "BLASTBOX_POOL_UNKNOWN_GRACE_S",
+                "BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S"):
+        monkeypatch.delenv(var, raising=False)
+
+    class _Rt:
+        def spawn(self): raise RuntimeError("not used")
+        def is_ready(self, slot): return True
+        def is_alive(self, slot): return True
+        def reap(self, slot): return None
+
+    pool = build_warm_pool(PoolConfig.from_env(runtime="none"), runtime=_Rt())
+    assert pool is not None
+
+    params = inspect.signature(WarmPool.__init__).parameters
+    for attr, arg in (("_max_consecutive_failures", "max_consecutive_failures"),
+                      ("_unknown_grace_s", "unknown_grace_s"),
+                      ("_capacity_starved_after_s", "capacity_starved_after_s")):
+        assert getattr(pool, attr) == params[arg].default, (
+            f"{arg}: an unconfigured knob must leave WarmPool's own default "
+            f"({params[arg].default}) alone, got {getattr(pool, attr)}"
+        )

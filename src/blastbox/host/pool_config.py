@@ -49,17 +49,20 @@ class PoolConfig:
     # were reachable only from the constructor, so an env-configured deployment (which is every
     # production one) could not tune them -- and could not use the documented
     # snapshot_rebuild_after=0 escape hatch to disable automatic base invalidation at all.
-    # None = derive from warm_size, matching the WarmPool defaults exactly.
-    max_consecutive_failures: int = 3
+    # None everywhere means "not configured — let WarmPool's own default stand". Copying the
+    # literals here is what created the last bug: this field said 3 while WarmPool said 2, so
+    # every env-configured deployment silently sent a third job to a repeatedly failing slot
+    # while the comment claimed the defaults matched. A sentinel cannot drift.
+    max_consecutive_failures: int | None = None
     # 0 disables automatic base invalidation entirely; None derives 2*warm_size.
     snapshot_rebuild_after: int | None = None
     # None derives max(2, warm_size).
     max_evictions_per_window: int | None = None
     # How long a slot may stay CONTINUOUSLY unknown before it can be replaced; 0 disables.
-    unknown_grace_s: float = 300.0
+    unknown_grace_s: float | None = None
     # How long the pool may be unable to spawn for capacity reasons before that is an outage
     # rather than backpressure; 0 disables the alert.
-    capacity_starved_after_s: float = 300.0
+    capacity_starved_after_s: float | None = None
 
     @classmethod
     def from_env(cls, **overrides: object) -> "PoolConfig":
@@ -98,15 +101,25 @@ class PoolConfig:
             except ValueError as exc:
                 raise ValueError(f"invalid integer for {key}={raw!r}: {exc}") from exc
 
+        def _opt_float(key: str, default: float | None) -> float | None:
+            raw = os.environ.get(key, "").strip()
+            if not raw:
+                return default
+            try:
+                return float(raw)
+            except ValueError as exc:
+                raise ValueError(f"invalid float for {key}={raw!r}: {exc}") from exc
+
         values: dict[str, object] = {
-            "max_consecutive_failures": _int(
+            "max_consecutive_failures": _opt_int(
                 "BLASTBOX_POOL_MAX_CONSECUTIVE_FAILURES", cls.max_consecutive_failures),
             "snapshot_rebuild_after": _opt_int(
                 "BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", cls.snapshot_rebuild_after),
             "max_evictions_per_window": _opt_int(
                 "BLASTBOX_POOL_MAX_EVICTIONS_PER_WINDOW", cls.max_evictions_per_window),
-            "unknown_grace_s": _float("BLASTBOX_POOL_UNKNOWN_GRACE_S", cls.unknown_grace_s),
-            "capacity_starved_after_s": _float(
+            "unknown_grace_s": _opt_float(
+                "BLASTBOX_POOL_UNKNOWN_GRACE_S", cls.unknown_grace_s),
+            "capacity_starved_after_s": _opt_float(
                 "BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S", cls.capacity_starved_after_s),
             "runtime": os.environ.get("BLASTBOX_POOL_RUNTIME", cls.runtime).strip().lower(),
             "warm_size": _int("BLASTBOX_POOL_WARM_SIZE", cls.warm_size),
@@ -165,6 +178,21 @@ def select_runtime_by_name(
     raise ValueError(f"unknown pool runtime: {name!r}")
 
 
+def _configured_only(cfg: PoolConfig) -> dict[str, Any]:
+    """Only the knobs the operator actually set.
+
+    An unset knob must not be forwarded at all: copying WarmPool's default into this config is
+    exactly how the two drifted once already (config said 3, the pool said 2, and every
+    env-configured deployment silently changed behaviour while a comment claimed they matched).
+    """
+    candidates: dict[str, Any] = {
+        "max_consecutive_failures": cfg.max_consecutive_failures,
+        "unknown_grace_s": cfg.unknown_grace_s,
+        "capacity_starved_after_s": cfg.capacity_starved_after_s,
+    }
+    return {k: v for k, v in candidates.items() if v is not None}
+
+
 def build_warm_pool(
     cfg: PoolConfig | None = None,
     *,
@@ -206,11 +234,13 @@ def build_warm_pool(
         concurrent_ceiling=cfg.concurrent_ceiling,
         spawn_rate_limit=cfg.spawn_rate_limit,
         burst_size=cfg.burst_size,
-        max_consecutive_failures=cfg.max_consecutive_failures,
+        # snapshot_rebuild_after / max_evictions_per_window take None natively (it means
+        # "derive from warm_size"), so they always forward. The rest use None as "unset", and an
+        # unset knob must not be forwarded at all -- passing a copied literal is exactly how this
+        # config drifted from the pool's own default once already.
         snapshot_rebuild_after=cfg.snapshot_rebuild_after,
         max_evictions_per_window=cfg.max_evictions_per_window,
-        unknown_grace_s=cfg.unknown_grace_s,
-        capacity_starved_after_s=cfg.capacity_starved_after_s,
+        **_configured_only(cfg),
     )
     _log.info(
         "warm_pool_built runtime=%s warm_size=%d ceiling=%d warm_snapshot=%s",

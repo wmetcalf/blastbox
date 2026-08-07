@@ -829,3 +829,40 @@ def test_a_broken_release_is_not_laddered_into_a_clean_release(tmp_path):
 
     assert len(calls) == 1, f"one slot, one release -- got {len(calls)}: {calls}"
     assert calls[0][0] is True, "a failed detonation must stay DIRTY, never fall back to clean"
+
+
+def test_empty_metadata_is_attributed_to_the_worker(tmp_path):
+    """Empty metadata is abnormal worker output — and the attribution must be REACHABLE.
+
+    The first attempt added this as an `elif not meta` placed AFTER the `if not meta: return`
+    that already exits, so it could never execute: malformed worker output still never advanced
+    burnout or base rebuilding, and a recycle-capable worker could be reset and re-offered
+    forever. A test that only asserts the failure result would have passed throughout.
+    """
+    calls: list[tuple[bool, str | None]] = []
+
+    def release(s, *, dirty: bool = False, fault: str | None = None) -> None:
+        calls.append((dirty, fault))
+
+    slot = SimpleNamespace(slot_id="s1", url="http://worker.invalid", ip=None)
+    out = tmp_path / "out"
+    out.mkdir()
+    inp = tmp_path / "in.bin"
+    inp.write_bytes(b"sample")
+    validate = make_remote_validate(
+        lambda: slot, release, output_dir_for=lambda p: out,
+        http_open=_opener(_tar({"metadata.json": b"{}"})),
+    )
+
+    meta, ok = validate(inp)
+
+    assert ok is False
+    # Pin WHICH branch produced the fault. The generic transport handler also sets "worker", so
+    # an assertion on the fault alone passes even when this branch is never reached — the first
+    # version of this test did exactly that, and the mutant survived because of it.
+    assert meta == {"error": "remote worker returned no metadata"}, (
+        f"the empty-metadata branch was not reached; got {meta}"
+    )
+    assert calls and calls[0][1] == "worker", (
+        f"empty metadata must advance worker burnout, got fault={calls[0][1] if calls else None}"
+    )

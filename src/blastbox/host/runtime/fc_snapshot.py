@@ -242,8 +242,14 @@ class SnapshotManager:
         #
         # Pin the exact generation used here, NOT self._artifact at the end, which a concurrent
         # invalidate+build may already have replaced.
-        artifact = self._artifact
         with self._build_lock:
+            # SELECT and pin under the SAME lock. Reading self._artifact outside it left a
+            # window where invalidate() could see no reference, discard that generation, and
+            # then this code would pin an ALREADY-DELETED artifact and hand it to restore_in().
+            # Taking the lock around only the pin protects the counter, not the choice it counts.
+            artifact = self._artifact
+            if artifact is None:
+                raise SnapshotRestoreError("snapshot not built; call build() first")
             self._pins[sid] = artifact
             self._refs[id(artifact)] = self._refs.get(id(artifact), 0) + 1
         try:

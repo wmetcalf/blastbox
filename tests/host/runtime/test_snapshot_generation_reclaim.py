@@ -9,6 +9,8 @@ once its LAST user is reaped.
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from pathlib import Path
@@ -207,4 +209,71 @@ def test_a_restore_failing_with_a_SnapshotError_also_releases_its_pin(tmp_path):
     mgr.invalidate()
     assert _gens(tmp_path) == set(), (
         f"the SnapshotError path stranded its pin: {_gens(tmp_path)}"
+    )
+
+
+def test_the_generation_is_selected_and_pinned_under_one_lock(tmp_path):
+    """Selecting the artifact outside the lock leaves it discardable before it is pinned.
+
+    Taking the lock around only the pin protects the COUNTER, not the choice it counts: an
+    invalidate() landing between an unlocked read and the lock sees no reference, discards that
+    generation, and restore() then pins an already-deleted artifact and hands it to restore_in().
+
+    The window exists only in the broken version, so it cannot be observed single-threaded. This
+    forces the interleaving with EVENTS rather than sleeps — a timing-based version of this test
+    caught the bug in isolation and missed it under load, which is worse than no test at all.
+    """
+    import threading
+
+    mgr, be = _mgr(tmp_path)
+    mgr.build()
+
+    restored_with: list[Path] = []
+    real_restore = be.restore_in
+
+    def _record(slot_workdir, artifact):
+        restored_with.append(Path(artifact.mem_path))
+        return real_restore(slot_workdir, artifact)
+
+    be.restore_in = _record  # type: ignore[assignment]
+
+    entered = threading.Event()
+    racer_done = threading.Event()
+
+    class _GatedLock:
+        """Delegates to the real lock, but the FIRST acquisition waits until the racer has
+        finished invalidating. Only the first — otherwise the racer's own invalidate() would
+        deadlock on this same wrapper."""
+
+        def __init__(self, inner):
+            self._inner = inner
+            self._armed = True
+
+        def __enter__(self):
+            if self._armed:
+                self._armed = False
+                entered.set()
+                racer_done.wait(5.0)      # deterministic: no sleeps, no timing assumptions
+            return self._inner.__enter__()
+
+        def __exit__(self, *a):
+            return self._inner.__exit__(*a)
+
+    def _racer():
+        entered.wait(5.0)
+        mgr.invalidate()          # discards any generation nothing has pinned yet
+        mgr.build()
+        racer_done.set()
+
+    mgr._build_lock = _GatedLock(mgr._build_lock)  # type: ignore[assignment]
+    th = threading.Thread(target=_racer, daemon=True)
+    th.start()
+    mgr.restore("slot-a")
+    th.join(10.0)
+    assert racer_done.is_set(), "the racing invalidate never ran — the test proved nothing"
+
+    assert restored_with, "restore_in must have been reached"
+    assert restored_with[0].exists(), (
+        f"restore_in() was handed a generation deleted out from under it: {restored_with[0]} — "
+        "the artifact was selected before the lock that protects the pin"
     )
