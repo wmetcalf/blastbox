@@ -213,7 +213,12 @@ class SnapshotManager:
             _log.info("snapshot.build_discarded reason=invalidated_while_building")
             with contextlib.suppress(Exception):
                 boot.kill()
-            self._discard(artifact)
+            if not self._discard(artifact):
+                # Never published and never in _retired, so nothing else can rediscover it: a
+                # failed cleanup here leaks a generation-stamped snapshot AND its RAM-sized memory
+                # file, permanently. Park it with the other retirements so the sweep retries.
+                with self._build_lock:
+                    self._retired[id(artifact)] = artifact
             raise SnapshotBuildInvalidated("snapshot invalidated while it was being built")
         try:
             boot.kill()

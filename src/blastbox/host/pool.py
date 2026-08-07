@@ -1738,6 +1738,10 @@ class WarmPool:
         """
         self._slot_failures.pop(slot_id, None)
         self._slot_last_success.pop(slot_id, None)
+        # ...and the promotion ledger. Disposable runtimes mint a new slot_id per replacement, so a
+        # workload with recurring failures or resizes grows this set without bound, and none of its
+        # entries can ever be consulted again (PR #82).
+        self._promoted_unproven.discard(slot_id)
 
     def _current_failure_streak(self) -> int:
         """The pool-wide consecutive-failure streak, read NOW under the lock.

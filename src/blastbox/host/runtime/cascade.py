@@ -343,10 +343,12 @@ class CascadingRuntime:
             self._recently_guilty.clear()   # consumed by this repair
 
         failures: list[str] = []
+        attempted = 0
         for tier in targets:
             fn = getattr(tier.runtime, "invalidate_base", None)
             if not callable(fn):
                 continue
+            attempted += 1
             try:
                 fn()
             except Exception as exc:  # noqa: BLE001 -- try every tier, report at the end
@@ -355,6 +357,16 @@ class CascadingRuntime:
         if failures:
             raise CascadeInvalidateFailed(
                 "cascade: base invalidation failed for " + "; ".join(failures)
+            )
+        if attempted == 0:
+            # NOTHING was repaired. When a spawn-driven repair attributes the failures to a
+            # static/AWS tier that has no base to invalidate, every target is skipped and a silent
+            # success made the pool reset its streak, count a rebuild and start the cooldown --
+            # so the tier stayed broken AND further diagnosis was delayed by the full cooldown
+            # (upstream, PR #82).
+            raise CascadeInvalidateFailed(
+                "cascade: no selected tier supports base invalidation "
+                f"({[t.name for t in targets]}) — nothing was repaired"
             )
 
 

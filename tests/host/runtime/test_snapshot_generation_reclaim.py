@@ -10,6 +10,7 @@ once its LAST user is reaped.
 from __future__ import annotations
 
 import contextlib
+import pathlib
 import time
 
 import pytest
@@ -773,3 +774,69 @@ def test_an_invalidated_build_retries_at_once(tmp_path):
         f"a deliberate rejection armed the failure backoff (retry gate={mgr._retry_not_before})"
     )
     assert mgr.build_error is None, "an intentional rejection is not a build error"
+
+
+def test_the_backend_reports_unlink_failures_so_they_stay_retryable(tmp_path):
+    """The one place that decides whether cleanup happened must not lie.
+
+    _discard treats a normal return as CONFIRMED, dropping the artifact from _retired — so a
+    backend that logged a transient EIO/EROFS and returned normally defeated the whole retryable
+    machinery built over the last several rounds.
+    """
+    from blastbox.host.runtime.fc_snapshot_backend import FcSnapshotArtifact, FcSnapshotBackend
+
+    snap = tmp_path / "warm-x.snapshot"
+    mem = tmp_path / "warm-x.mem"
+    snap.write_bytes(b"s")
+    mem.write_bytes(b"m")
+    art = FcSnapshotArtifact(snap, mem, None)
+
+    real_unlink = pathlib.Path.unlink
+
+    def _boom(self, *a, **kw):
+        if self.name.startswith("warm-x"):
+            raise OSError(5, "Input/output error")
+        return real_unlink(self, *a, **kw)
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(pathlib.Path, "unlink", _boom)
+    try:
+        with pytest.raises(OSError):
+            FcSnapshotBackend.discard(object(), art)   # type: ignore[arg-type]
+    finally:
+        mp.undo()
+
+
+def test_a_rejected_build_whose_cleanup_fails_is_retained(tmp_path):
+    """Never published, never retired — so a failed cleanup here leaks forever.
+
+    The rejected-build path is the one discard site that had no retention, because its artifact
+    was never in _retired to begin with.
+    """
+    mgr, be = _mgr(tmp_path)
+
+    class _BootThatGetsInvalidated(_FakeBoot):
+        def wait_ready(self, timeout_s: float) -> None:
+            mgr.invalidate()
+
+    broken = {"on": True}
+    real_discard = be.discard
+
+    def _flaky(artifact):
+        if broken["on"]:
+            raise OSError("EBUSY unlinking the rejected generation")
+        real_discard(artifact)
+
+    be.boot_base = lambda: _BootThatGetsInvalidated(be)  # type: ignore[assignment]
+    be.discard = _flaky  # type: ignore[assignment]
+
+    with pytest.raises(Exception):
+        mgr.build()
+    assert _gens(tmp_path), "sanity: the failed cleanup left the generation on disk"
+
+    # It must still be RETRYABLE rather than forgotten.
+    broken["on"] = False
+    mgr._sweep_retired()
+    assert _gens(tmp_path) == set(), (
+        f"a rejected build whose cleanup failed was never retried: {_gens(tmp_path)}"
+    )

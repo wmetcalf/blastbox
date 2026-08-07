@@ -1975,7 +1975,15 @@ def test_slots_that_promote_then_die_before_serving_count_toward_repair() -> Non
 def test_a_slot_that_serves_a_job_keeps_its_promotion_credit() -> None:
     """The over-correction guard: a slot that DID serve a job is proof, and dying later is
     ordinary attrition — it must not be charged back against the base."""
-    rt = _WedgeableRuntime()
+    # A RECYCLE-capable runtime: a clean release returns the slot to IDLE instead of reaping it.
+    # On a disposable runtime the slot is reaped and the centralized removal cleanup would clear
+    # the mark anyway, so only a reusable slot can show that the clean-release path does its own
+    # job — the same "a second net hides the first" trap as the cascade repair.
+    class _Reusable(_WedgeableRuntime):
+        def recycle(self, slot: Slot) -> None:
+            return None
+
+    rt = _Reusable()
     pool = WarmPool(
         runtime=rt, warm_size=2, concurrent_ceiling=4,
         snapshot_rebuild_after=2, base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
@@ -1990,10 +1998,76 @@ def test_a_slot_that_serves_a_job_keeps_its_promotion_credit() -> None:
         "ever ran, so its assertion was trivially true"
     )
 
-    for s in list(pool._slots.values()):
-        pool.release(s, dirty=False)      # each serves a job cleanly
+    # CLAIM then release: the ASSIGNED -> IDLE reuse path is the one that keeps the slot in the
+    # pool, so the clean-release discard is the only thing that can clear its mark.
+    served = []
+    for _ in range(2):
+        got = pool.claim(timeout_s=1.0)
+        if got is None:
+            break
+        served.append(got)
+    assert served, "no slot could be claimed — the reuse path was never exercised"
+    for s in served:
+        pool.release(s, dirty=False)      # each serves a job cleanly and is RECYCLED
 
+    assert any(s.slot_id in pool._slots for s in served), (
+        "every slot was reaped, so the centralized cleanup would clear the mark regardless — "
+        "this test cannot distinguish the clean-release path"
+    )
     with pool._lock:
         remaining = set(pool._promoted_unproven)
     assert remaining == set(), f"a slot that served a job is still marked unproven: {remaining}"
     assert rt.base_invalidations == 0
+
+
+def test_a_no_op_cascade_invalidation_is_not_reported_as_a_repair() -> None:
+    """Repairing nothing is not a repair.
+
+    When a spawn-driven repair attributes the failures to a static/AWS tier that has no base to
+    invalidate, every target is skipped. A silent success made the pool reset its streak, count a
+    rebuild and start the cooldown — so the tier stayed broken AND further diagnosis was delayed
+    by the whole cooldown.
+    """
+    from blastbox.host.runtime.cascade import CascadeInvalidateFailed
+
+    class _NoBase:
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            raise RuntimeError("static worker unreachable")
+
+    casc = CascadingRuntime(tiers=[Tier(name="static", runtime=_NoBase(), capacity=2)],
+                            tier_rebuild_after=1000)
+    with contextlib.suppress(Exception):
+        casc.spawn()
+
+    with pytest.raises(CascadeInvalidateFailed):
+        casc.invalidate_base(reason="spawn")
+
+
+def test_the_promotion_ledger_does_not_grow_without_bound() -> None:
+    """Disposable runtimes mint a new slot_id per replacement.
+
+    A slot that leaves the pool without a clean completion — engine error, timeout, failed first
+    job, surplus reap — left its UUID in _promoted_unproven forever, so a workload with recurring
+    failures or resizes grew the set without bound while none of its entries could ever be
+    consulted again.
+    """
+    rt = _WedgeableRuntime()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4,
+        max_consecutive_failures=1, base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    for _ in range(12):
+        pool.tick()                       # spawn + promote
+        for s in list(pool._slots.values()):
+            if s.state == SlotState.IDLE:
+                pool.release(s, dirty=True, fault="worker")   # leaves WITHOUT a clean completion
+
+    with pool._lock:
+        leaked = len(pool._promoted_unproven)
+    assert leaked <= len(pool._slots), (
+        f"the promotion ledger retained {leaked} entries for slots that are long gone "
+        f"(live slots: {len(pool._slots)})"
+    )

@@ -171,13 +171,21 @@ class FcSnapshotBackend:
             _log.warning("fc_snapshot: refusing to discard unknown artifact type %r",
                          type(artifact).__name__)
             return
+        failed: list[str] = []
         for path in (artifact.snapshot_path, artifact.mem_path, artifact.outdisk_path):
             if path is None:
                 continue
             try:
                 Path(path).unlink(missing_ok=True)
             except OSError as exc:
+                # PROPAGATE. SnapshotManager._discard treats a normal return as CONFIRMED cleanup
+                # and drops the artifact from _retired, so swallowing a transient EIO/EROFS here
+                # meant these files were never retried -- the retryable-retirement machinery was
+                # defeated by the one place that decides whether cleanup happened (PR #82).
+                failed.append(f"{path}: {exc}")
                 _log.warning("fc_snapshot: could not unlink %s: %s", path, exc)
+        if failed:
+            raise OSError("could not unlink generation files: " + "; ".join(failed))
 
     def __init__(
         self,
