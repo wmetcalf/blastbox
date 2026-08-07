@@ -22,12 +22,15 @@ snapshot→restore→convert round-trip is pixel-identical to cold (see the spec
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from blastbox.host.runtime.fc_snapshot import SnapshotBuildError, SnapshotRestoreError
+
+_log = logging.getLogger("blastbox.host.runtime.fc_snapshot_backend")
 
 # RAM-preload toggle (see resolve_mem_dir). Default tmpfs mount on Linux.
 _DEFAULT_TMPFS_MEM_DIR = Path("/dev/shm")
@@ -66,6 +69,7 @@ def resolve_mem_dir() -> Path | None:
 
 
 @runtime_checkable
+
 class FcApi(Protocol):
     """The subset of the Firecracker API client the orchestration uses."""
 
@@ -141,6 +145,21 @@ class FcSnapshotBackend:
     handle (it needs the launcher's mem-dir), so this backend's role on the build
     side is simply to hand the boot handle back to the manager.
     """
+
+    def discard(self, artifact: object) -> None:
+        """Unlink a fully drained generation's files.
+
+        Only ever called once the manager's refcount for this artifact reaches zero, i.e. no
+        live microVM still maps the memory file. Unlinking one that is still mapped would
+        SIGBUS or silently corrupt the VMs using it.
+        """
+        for path in (getattr(artifact, "snapshot", None), getattr(artifact, "mem", None)):
+            if path is None:
+                continue
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError as exc:
+                _log.warning("fc_snapshot: could not unlink %s: %s", path, exc)
 
     def __init__(
         self,

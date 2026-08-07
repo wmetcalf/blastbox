@@ -26,6 +26,8 @@ import pytest
 from blastbox.contract.envelope import DeclaredArtifact, seal_envelope
 from blastbox.contract.leaf import Detection
 from blastbox.contract.nodes import ExtractedText
+from dataclasses import replace
+
 from blastbox.errors import OutputTrustError
 from blastbox.host.dispatch import Dispatcher, EngineSpec
 from blastbox.host.jobs.base import Job, JobStatus
@@ -1573,4 +1575,282 @@ def test_a_blob_fetch_failure_is_not_blamed_on_the_warm_slot(tmp_path):
     assert pool.release_calls == [slot]
     assert pool.release_fault == ["unknown"], (
         f"a blob-store failure is host connectivity, not worker evidence (got {pool.release_fault})"
+    )
+
+
+def test_an_upload_failure_is_not_blamed_on_the_worker(tmp_path):
+    """The exit NOBODY enumerated — which is the point of the inverted default.
+
+    This worker ran, produced valid output, and passed trust validation; the result upload then
+    failed against the host's blob store. There is no explicit acquittal at this exit: it is
+    protected only by warm_fault defaulting to "unknown". That is exactly the property worth
+    pinning — six review rounds each found another exit that had been left blaming the worker,
+    because enumerating the innocents fails open. If the default is ever flipped back, this test
+    is what notices.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)
+    _start_fake_worker(
+        slot,
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
+    )
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+    # The blob store rejects the upload; the worker did nothing wrong.
+    dispatcher._upload_output = lambda job, output_dir: False  # type: ignore[method-assign]
+
+    dispatcher.dispatch_once()
+
+    assert pool.release_calls == [slot]
+    assert pool.release_fault == ["unknown"], (
+        f"a host-side upload failure is not worker evidence (got {pool.release_fault})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Convictions. The inverted default (unattributed unless proven) is only safe if the
+# positive-evidence sites still FIRE — otherwise wedge detection silently dies, which is the
+# bug the attribution was built for. One test per conviction site; each was found unguarded by
+# mutation testing after the inversion.
+# ---------------------------------------------------------------------------
+
+
+def _warm_case(tmp_path, store=None, **kw):
+    """Shared setup: a job, a slot, a recording pool and a dispatcher over them."""
+    store = store or InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, **kw
+    )
+    return store, job, slot, pool, dispatcher
+
+
+def test_a_staging_failure_convicts_the_worker(tmp_path):
+    """Staging INTO the slot failed -- its IO seam is bad, which is evidence about the SLOT.
+
+    Driven through the runtime seam the dispatcher actually consults
+    (`getattr(runtime, "stage_warm_input")`), not a dispatcher attribute that does not exist --
+    patching the wrong name makes the job succeed and the test assert nothing.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    runtime = _FakeVsockRuntime()
+
+    def _boom(s, src):
+        raise RuntimeError("cannot stage into the slot")
+
+    runtime.stage_warm_input = _boom  # type: ignore[assignment]
+    pool = FakeWarmPool(slot, runtime=runtime)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+
+    with contextlib.suppress(RuntimeError):
+        dispatcher.dispatch_once()
+
+    assert pool.release_calls == [slot], "the slot must still be released on this path"
+    assert pool.release_fault == ["worker"], (
+        f"a slot whose IO seam failed IS worker evidence (got {pool.release_fault})"
+    )
+
+
+def test_a_timeout_convicts_the_worker(tmp_path):
+    """It never answered within its deadline."""
+    _, _, slot, pool, dispatcher = _warm_case(tmp_path, worker_timeout_s=0.5)
+    # no fake worker started -> the done signal never arrives
+    dispatcher.dispatch_once()
+
+    assert pool.release_dirty == [True]
+    assert pool.release_fault == ["worker"], (
+        f"a worker that never answered IS worker evidence (got {pool.release_fault})"
+    )
+
+
+def test_unreadable_output_convicts_the_worker(tmp_path):
+    """Its output could not be read back (rdump failed) -- the guest/seam is bad."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    runtime = _FakeVsockRuntime()
+
+    def _boom(s):
+        raise RuntimeError("rdump failed: cannot read the slot's output disk")
+
+    runtime.materialize_warm_output = _boom  # type: ignore[assignment]
+    pool = FakeWarmPool(slot, runtime=runtime)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+
+    dispatcher.dispatch_once()
+
+    assert store.get(job.job_id).status == JobStatus.FAILED, "the materialize failure must be reached"
+    assert pool.release_fault == ["worker"], (
+        f"output that cannot be read back IS worker evidence (got {pool.release_fault})"
+    )
+
+
+def test_trust_validation_failure_convicts_the_worker(tmp_path):
+    """It produced output that failed trust validation."""
+    _, _, slot, pool, dispatcher = _warm_case(tmp_path, worker_timeout_s=10)
+
+    def _bad_output(output_dir: Path) -> None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "..evil").write_text("traversal artifact")
+        (output_dir / "done").write_text("1")
+
+    _start_fake_worker(slot, output_fn=_bad_output)
+    dispatcher.dispatch_once()
+
+    assert pool.release_dirty == [True]
+    assert pool.release_fault == ["worker"], (
+        f"untrustworthy output IS worker evidence (got {pool.release_fault})"
+    )
+
+
+def test_a_signal_failure_convicts_the_worker(tmp_path):
+    """The worker could not be signalled — transport to it is bad."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    runtime = _FakeVsockRuntime()
+
+    class _DeafControl(_RecordingVsockControl):
+        def signal_go(self, spec, *, deadline=None):
+            raise RuntimeError("vsock write failed: worker not listening")
+
+    runtime.host_warm_control = lambda s: _DeafControl(s)  # type: ignore[assignment]
+    pool = FakeWarmPool(slot, runtime=runtime)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+
+    dispatcher.dispatch_once()
+
+    assert store.get(job.job_id).status == JobStatus.FAILED, "the signal failure must be reached"
+    assert pool.release_fault == ["worker"], (
+        f"a worker that cannot be signalled IS worker evidence (got {pool.release_fault})"
+    )
+
+
+def test_a_file_ipc_staging_failure_convicts_the_worker(tmp_path, monkeypatch):
+    """The FILE-IPC sibling of the vsock staging conviction.
+
+    Two staging branches, two convictions; a mutant that removes only the copy2 one survived
+    while the vsock test passed. Per-branch coverage is the only thing that catches that.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)          # no runtime seam -> the copy2 file path
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+
+    def _boom(src, dst, **kw):
+        raise OSError("ENOSPC writing into the slot")
+
+    monkeypatch.setattr("blastbox.host.dispatch.shutil.copy2", _boom)
+
+    dispatcher.dispatch_once()
+
+    assert store.get(job.job_id).status == JobStatus.FAILED
+    assert pool.release_fault == ["worker"], (
+        f"a slot that cannot be written to IS worker evidence (got {pool.release_fault})"
+    )
+
+
+def test_oversize_output_convicts_the_worker(tmp_path):
+    """It emitted more than the declared bound — undeclared bytes are the worker's doing."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)
+
+    def _fat_output(output_dir: Path) -> None:
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        (output_dir / "undeclared.bin").write_bytes(b"x" * 8192)
+
+    _start_fake_worker(slot, output_fn=_fat_output)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+    # The cap lives on Limits, not on the dispatcher; shrink it so a small fake output trips it.
+    dispatcher._limits = replace(dispatcher._limits, max_total_artifact_bytes=1024)
+
+    dispatcher.dispatch_once()
+
+    assert store.get(job.job_id).status == JobStatus.FAILED, "the size cap must be reached"
+    assert pool.release_fault == ["worker"], (
+        f"output beyond the declared bound IS worker evidence (got {pool.release_fault})"
+    )
+
+
+def test_a_deadline_consumed_before_waiting_convicts_the_worker(tmp_path):
+    """The OTHER timeout branch: the budget is gone before we ever wait.
+
+    Two timeout sites share one message — `remaining <= 0` (signalling consumed the whole
+    deadline) and the real wait timeout. A mutant removing the first survived while the second
+    stayed covered, so a slot that burned its entire budget in signal_go went unattributed.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    runtime = _FakeVsockRuntime()
+
+    class _SlowControl(_RecordingVsockControl):
+        def signal_go(self, spec, *, deadline=None):
+            # Must exceed the WHOLE deadline. worker_timeout_s is coerced to int, so 1s is the
+            # smallest budget available -- a sub-second sleep silently leaves time on the clock
+            # and the job completes, testing nothing.
+            time.sleep(1.25)
+
+    runtime.host_warm_control = lambda s: _SlowControl(s)  # type: ignore[assignment]
+    pool = FakeWarmPool(slot, runtime=runtime)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=1,
+    )
+
+    dispatcher.dispatch_once()
+
+    assert store.get(job.job_id).status == JobStatus.FAILED
+    assert pool.release_fault == ["worker"], (
+        f"a slot that consumed its whole deadline IS worker evidence (got {pool.release_fault})"
     )

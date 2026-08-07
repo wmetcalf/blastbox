@@ -1037,7 +1037,18 @@ class Dispatcher:
         # malformed samples must not advance the pool streak and invalidate a healthy snapshot
         # (upstream, PR #82). Attributing everything non-DONE to the worker was my over-correction
         # for the opposite bug one round earlier.
-        warm_fault = "worker"
+        # UNATTRIBUTED until this worker is positively observed to be at fault. This used to
+        # default to "worker" and be walked back exit by exit; six review rounds found six
+        # different exits that needed acquitting (four claim races, blob fetch, result upload),
+        # because an enumerate-the-innocents design fails OPEN -- every exit anyone forgets
+        # silently burns healthy slots and can invalidate a good base. Positive-evidence
+        # conviction is the posture the pool already takes on liveness (issue #77): a slow or
+        # erroring control plane must never be read as "this worker is dead".
+        #
+        # Set to "worker" ONLY where the worker itself demonstrably misbehaved: its IO seam
+        # failed, it never answered, or it produced output we cannot trust. Host-side failures
+        # (blob store, local disk) and lost claims stay unattributed by construction.
+        warm_fault = "unknown"
         try:
             # ------------------------------------------------------------------
             # Step 1: Engine lookup (security: engine spec is operator-configured)
@@ -1096,12 +1107,21 @@ class Dispatcher:
             # Step 3: Stage input — over the wire (vsock) or into slot.input_dir
             # ------------------------------------------------------------------
             if callable(stage_fn):
-                input_path = stage_fn(slot, staged_input_path)
+                try:
+                    input_path = stage_fn(slot, staged_input_path)
+                except Exception:
+                    # Symmetric with the file branch below: staging INTO the slot failing is
+                    # evidence about the SLOT either way. Only the copy2 path convicted, so a
+                    # vsock seam that could not be written left its wedged slot unattributed --
+                    # the same file/vsock asymmetry that keeps producing these bugs.
+                    warm_fault = "worker"
+                    raise
             else:
                 slot_input_copy = slot.input_dir / staged_input_path.name
                 try:
                     shutil.copy2(staged_input_path, slot_input_copy)
                 except OSError as exc:
+                    warm_fault = "worker"   # staging INTO the slot failed -- its IO seam is bad
                     self._fail_job(job, f"failed to stage input to warm slot: {exc}")
                     return
                 input_path = slot_input_copy
@@ -1132,6 +1152,7 @@ class Dispatcher:
             try:
                 control.signal_go(spec, deadline=warm_deadline)
             except Exception as exc:  # noqa: BLE001
+                warm_fault = "worker"   # the worker could not be signalled -- transport to it is bad
                 self._fail_job(job, f"failed to signal go to warm worker: {exc}")
                 return
 
@@ -1140,6 +1161,7 @@ class Dispatcher:
             # ------------------------------------------------------------------
             remaining = warm_deadline - time.monotonic()
             if remaining <= 0:
+                warm_fault = "worker"   # it never answered within its deadline
                 self._fail_job(
                     job, f"warm worker timed out after {self._worker_timeout_s}s"
                 )
@@ -1147,6 +1169,7 @@ class Dispatcher:
             try:
                 control.wait_for_done(timeout_s=remaining)
             except WarmTimeout:
+                warm_fault = "worker"   # it never answered within its deadline
                 self._fail_job(
                     job,
                     f"warm worker timed out after {self._worker_timeout_s}s",
@@ -1185,6 +1208,7 @@ class Dispatcher:
                 try:
                     materialize_fn(slot)
                 except Exception as exc:  # noqa: BLE001
+                    warm_fault = "worker"   # its output could not be read back -- the guest/seam is bad
                     self._fail_job(job, f"failed to read warm worker output: {exc}")
                     return
 
@@ -1206,6 +1230,7 @@ class Dispatcher:
             try:
                 self._enforce_output_size_cap(slot.output_dir)
             except OutputTrustError as exc:
+                warm_fault = "worker"   # it emitted more than the declared bound
                 self._fail_job(job, f"warm output too large: {exc}")
                 return
 
@@ -1221,6 +1246,7 @@ class Dispatcher:
                     limits=self._limits,
                 )
             except OutputTrustError as exc:
+                warm_fault = "worker"   # it produced output that failed trust validation
                 self._fail_job(job, f"output trust validation failed: {exc}")
                 return
             except Exception as exc:  # noqa: BLE001
@@ -1249,6 +1275,7 @@ class Dispatcher:
             try:
                 self._materialize_sealed_warm_output(envelope, slot.output_dir, output_dir)
             except OutputTrustError as exc:
+                warm_fault = "worker"   # its output could not be materialized
                 self._fail_job(job, f"failed to materialize warm output: {exc}")
                 return
 

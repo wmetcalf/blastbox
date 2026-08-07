@@ -62,6 +62,14 @@ class SnapshotManager:
         self._ready_timeout_s = ready_timeout_s
         self._build_retry_backoff_s = build_retry_backoff_s
         self._artifact: object | None = None
+        # Generation reference counting. Restored microVMs keep the memory file mapped as their
+        # backing store for as long as they live, so a superseded generation cannot be unlinked
+        # until its LAST user is reaped. Without this the files simply accumulate: each rebuild
+        # leaves a .mem roughly the size of guest RAM (gigabytes, often on /dev/shm), so repeated
+        # rebuild episodes exhaust the tmpfs and every later build fails on ENOSPC.
+        self._pins: dict[str, object] = {}          # slot_id -> the artifact it mapped
+        self._refs: dict[int, int] = {}             # id(artifact) -> live restores
+        self._retired: dict[int, object] = {}       # id(artifact) -> superseded, awaiting drain
         # Async-build state (used by ensure_build_started so the up-to-ready_timeout_s build
         # never runs on the pool's single tick thread). _build_lock guards only the cheap
         # bookkeeping below, never the slow boot/checkpoint inside build().
@@ -158,12 +166,58 @@ class SnapshotManager:
         """
         with self._build_lock:
             had = self._artifact is not None
+            collect = None
+            if self._artifact is not None:
+                key = id(self._artifact)
+                if self._refs.get(key, 0) > 0:
+                    # RETIRE, don't unlink: slots restored from this generation are still mapping
+                    # its memory file, and pulling it out from under a live microVM SIGBUSes or
+                    # silently corrupts it. release() collects it when the last user is reaped.
+                    self._retired[key] = self._artifact
+                else:
+                    # Already fully drained -- and this is the COMMON ordering, not the rare one:
+                    # slots are usually reaped before the rebuild that supersedes their
+                    # generation. Retiring it here instead would leave nothing to trigger the
+                    # collection (no pins remain to release), and it would leak forever.
+                    collect = self._artifact
             self._artifact = None
             self._build_error = None
             # Do not reuse the previous failure backoff: this is a deliberate rebuild request,
             # not a retry of a build that just failed.
             self._retry_not_before = 0.0
+        if collect is not None:
+            self._discard(collect)
         return had
+
+    def release(self, slot_id: object) -> None:
+        """Called when a restored slot is reaped: drop its pin and reclaim drained generations.
+
+        Never raises -- reap must not be taken down by cleanup.
+        """
+        with self._build_lock:
+            artifact = self._pins.pop(str(slot_id), None)
+            if artifact is None:
+                return
+            key = id(artifact)
+            self._refs[key] = self._refs.get(key, 1) - 1
+            if self._refs[key] <= 0:
+                self._refs.pop(key, None)
+                retired = self._retired.pop(key, None)
+            else:
+                retired = None
+        if retired is not None:
+            self._discard(retired)
+
+    def _discard(self, artifact: object) -> None:
+        """Ask the backend to unlink a fully drained generation. Optional hook: a backend that
+        does not implement it simply keeps its artifacts, exactly as before."""
+        discard = getattr(self._backend, "discard", None)
+        if not callable(discard):
+            return
+        try:
+            discard(artifact)
+        except Exception as exc:  # noqa: BLE001 -- reclamation must never raise into reap
+            _log.warning("snapshot.discard_failed artifact=%r: %s", artifact, exc)
 
     def restore(self, slot_id: object) -> RestoreHandle:
         """Restore the warm snapshot into a fresh per-slot sandbox and return its
@@ -180,8 +234,15 @@ class SnapshotManager:
             raise SnapshotRestoreError(f"unsafe slot_id: {sid!r}")
         slot_workdir = self._base_dir / "slots" / sid
         slot_workdir.mkdir(parents=True, exist_ok=True)
+        artifact = self._artifact
         try:
-            return self._backend.restore_in(slot_workdir, self._artifact)
+            handle = self._backend.restore_in(slot_workdir, artifact)
+            with self._build_lock:
+                # Pin the exact generation this slot mapped -- NOT self._artifact, which a
+                # concurrent invalidate+build may already have replaced.
+                self._pins[sid] = artifact
+                self._refs[id(artifact)] = self._refs.get(id(artifact), 0) + 1
+            return handle
         except SnapshotError:
             # A failed restore never yields a handle, so the slot is never reaped —
             # remove the just-created (empty) workdir so it doesn't leak on the host.

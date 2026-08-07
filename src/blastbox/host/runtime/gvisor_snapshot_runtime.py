@@ -121,7 +121,12 @@ class GvisorSnapshotSlotRuntime:
         if slot_workdir.exists():
             shutil.rmtree(slot_workdir, ignore_errors=True)
 
-    # --- warm-path seam (file-trigger control; output already on the bind mount) ---
+    # --- warm-path seam (file-trigger control; output already on the bind mount) ---        # Mirror the FC runtime: drop this slot's pin so a superseded generation can be
+        # reclaimed once its last user is gone.
+        release = getattr(self._mgr, "release", None)
+        if callable(release):
+            release(slot.slot_id)
+
     def host_warm_control(self, slot: Slot) -> GvisorHostWarmControl:
         return GvisorHostWarmControl(slot.control_dir)
 

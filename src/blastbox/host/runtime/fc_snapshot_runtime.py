@@ -225,6 +225,12 @@ class SnapshotSlotRuntime:
         if slot_workdir.exists():
             shutil.rmtree(slot_workdir, ignore_errors=True)
             _log.debug("snapshot.reap_cleaned slot_id=%s", slot.slot_id)
+        # Drop this slot's pin on its snapshot generation; if it was the last user of a
+        # SUPERSEDED generation, its files are unlinked now. Without this every rebuild leaks a
+        # memory file the size of guest RAM until the tmpfs fills.
+        release = getattr(self._manager, "release", None)
+        if callable(release):
+            release(slot.slot_id)
 
     # ------------------------------------------------------------------
     # Warm-path seam (mirrors FirecrackerSlotRuntime so the dispatcher's per-slot
