@@ -400,3 +400,56 @@ def test_discard_reports_removal_failures(tmp_path: Path) -> None:
             be.discard(art)
     finally:
         mp.undo()
+
+
+def test_a_partial_checkpoint_whose_cleanup_fails_is_retried(tmp_path: Path) -> None:
+    """No artifact is returned for a failed checkpoint, so nothing else can rediscover it.
+
+    ignore_errors=True suppressed any EIO/EROFS from the cleanup before re-raising, and every
+    retry uses a NEW directory — so partial checkpoint data accumulated permanently. The same
+    hole the FC launcher's partial files had.
+    """
+    made: list[Path] = []
+
+    def _run(argv, *a, **kw):
+        if "checkpoint" in argv:
+            img = Path(argv[argv.index("-image-path") + 1])
+            img.mkdir(parents=True, exist_ok=True)
+            (img / "partial").write_bytes(b"half")
+            made.append(img)
+            raise RuntimeError("runsc checkpoint failed")
+        return 0
+
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=_run, ready_wait=lambda d, t: None)
+    dest = tmp_path / "ckpt"
+
+    import shutil as _shutil
+
+    real_rmtree = _shutil.rmtree
+    broken = {"on": True}
+
+    def _flaky(path, *a, **kw):
+        onerror = kw.get("onerror")
+        if broken["on"] and onerror is not None:
+            onerror(None, str(path), (OSError, OSError(5, "Input/output error"), None))
+            return
+        return real_rmtree(path, *a, **{k: v for k, v in kw.items() if k != "onerror"})
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr("blastbox.host.runtime.gvisor_snapshot.shutil.rmtree", _flaky)
+    try:
+        boot = be.boot_base()
+        boot.wait_ready(5.0)
+        with pytest.raises(Exception):
+            boot.checkpoint(dest)
+        assert made and made[0].exists(), "sanity: cleanup failed, the partial remains"
+
+        # The next checkpoint must retry it rather than leave it stranded forever.
+        broken["on"] = False
+        with pytest.raises(Exception):
+            boot.checkpoint(dest)
+        assert not made[0].exists(), (
+            f"a partial whose cleanup failed was never retried: {made[0]}"
+        )
+    finally:
+        mp.undo()

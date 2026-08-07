@@ -100,6 +100,29 @@ def api_boot_sequence(
     ]
 
 
+def _generation_pid(name: str) -> int | None:
+    """The pid embedded in a ``warm-<pid>-<ns>...`` generation filename, or None if it is not one."""
+    if not name.startswith("warm-"):
+        return None
+    rest = name[len("warm-"):]
+    head = rest.split("-", 1)[0]
+    return int(head) if head.isdigit() else None
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether a process exists. A pid we cannot signal is treated as ALIVE: refusing to delete is
+    always the safe error here."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # exists, owned by someone else
+    except OSError:
+        return True          # unknown -> assume alive and keep the files
+    return True
+
+
 class _Handle:
     def __init__(
         self, proc, api, vsock_uds: str, ready_check=None, mem_dir: Path | None = None,
@@ -346,6 +369,39 @@ class FcSnapshotLauncher:
             mem_dir=self._mem_dir,
             base_outdisk=workdir / REL_OUTDISK,
         )
+
+    def sweep_orphan_generations(self) -> int:
+        """Remove generation files left behind by a dispatcher that is no longer running.
+
+        Generation names are ``warm-<pid>-<monotonic_ns>.*``. Nothing retires the CURRENT artifact
+        at shutdown and no startup path looked for older ones, so every restart -- clean or not --
+        left its .snapshot, RAM-sized .mem and copied outdisk behind, and repeated deployments
+        filled the scratch filesystem or /dev/shm (upstream, PR #82).
+
+        Deliberately conservative: a file is removed ONLY when its owning pid is not a live
+        process. Deleting a generation belonging to another RUNNING dispatcher would pull the
+        backing store out from under its live microVMs, which is far worse than the leak. Files
+        whose name does not parse are left alone.
+        """
+        removed = 0
+        for directory in {self._base_dir, self._mem_dir}:
+            if directory is None or not directory.exists():
+                continue
+            for path in directory.glob("warm-*"):
+                pid = _generation_pid(path.name)
+                if pid is None or pid == os.getpid() or _pid_alive(pid):
+                    continue
+                try:
+                    if path.is_dir():
+                        shutil.rmtree(path, ignore_errors=True)
+                    else:
+                        path.unlink(missing_ok=True)
+                    removed += 1
+                except OSError as exc:
+                    _log.warning("fc_snapshot: could not sweep orphan %s: %s", path, exc)
+        if removed:
+            _log.info("fc_snapshot.swept_orphan_generations count=%d", removed)
+        return removed
 
     def restore_in(self, slot_workdir: Path, *, outdisk_src: Path | None = None):
         """Spawn a fresh firecracker in ``slot_workdir`` for a snapshot restore. The

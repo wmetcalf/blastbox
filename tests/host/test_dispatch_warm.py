@@ -2093,3 +2093,41 @@ def test_trust_handlers_respect_the_non_verdict_subtype_end_to_end(tmp_path):
     assert _run_materialize(OutputTrustError("artifact vanished")) == "worker", (
         "a real swap must still convict at the materialize handler"
     )
+
+
+def test_a_host_side_done_file_failure_is_not_worker_evidence(tmp_path):
+    """The file handshake turns a host OSError into a WarmTimeout.
+
+    On the gVisor path, reading ctrl/done can fail with EMFILE/EIO/ENOMEM — this dispatcher's
+    problem, not the worker's, and it hits every job at once. Convicting on it advanced slot
+    burnout and rebuild streaks against workers that may have completed perfectly.
+    """
+    from blastbox.worker.warm import WarmTimeout
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    runtime = _FakeVsockRuntime()
+
+    class _HostIoControl(_RecordingVsockControl):
+        def wait_for_done(self, *, timeout_s: float) -> str:
+            err = WarmTimeout("could not read done file: [Errno 24] Too many open files")
+            err.host_io = True
+            raise err
+
+    runtime.host_warm_control = lambda s: _HostIoControl(s)  # type: ignore[assignment]
+    pool = FakeWarmPool(slot, runtime=runtime)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+
+    dispatcher.dispatch_once()
+
+    assert store.get(job.job_id).status == JobStatus.FAILED
+    assert pool.release_fault == ["unknown"], (
+        f"a host-side done-file failure is not worker evidence (got {pool.release_fault})"
+    )

@@ -109,6 +109,7 @@ class SnapshotManager:
         # nothing, and the build then published the very artifact the repair meant to reject --
         # so the second repair request was silently lost (upstream, PR #82).
         self._build_epoch = 0
+        self._swept_orphans = False
         # Async-build state (used by ensure_build_started so the up-to-ready_timeout_s build
         # never runs on the pool's single tick thread). _build_lock guards only the cheap
         # bookkeeping below, never the slow boot/checkpoint inside build().
@@ -174,6 +175,17 @@ class SnapshotManager:
         if self._artifact is not None:
             return self._artifact
         self._base_dir.mkdir(parents=True, exist_ok=True)
+        # Reclaim generations left by a dispatcher that is gone. Done here rather than at import
+        # or construction so it runs exactly once, on the first real build, with the directories
+        # already created. Best-effort: a failed sweep must never block bringing the tier up.
+        if not self._swept_orphans:
+            self._swept_orphans = True
+            sweep = getattr(self._backend, "sweep_orphan_generations", None)
+            if callable(sweep):
+                try:
+                    sweep()
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("snapshot.orphan_sweep_failed: %s", exc)
         # boot_base() is its own try so a base-boot failure is wrapped as
         # SnapshotBuildError (as documented), not propagated raw. boot_base already
         # tears down its own sandbox on partial failure, so no handle/finally is

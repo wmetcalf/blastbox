@@ -254,6 +254,9 @@ class GvisorBootHandle:
         ctrl_dir: Path,
         ready_wait: Callable[[Path, float], None],
     ) -> None:
+        # Partial checkpoint directories whose cleanup failed. No artifact is returned for them,
+        # so nothing else can rediscover them; retried on the next checkpoint.
+        self._stranded_partials: list[str] = []
         self._cfg = cfg
         self._run = run
         self._cid = cid
@@ -265,6 +268,17 @@ class GvisorBootHandle:
         self._ready(self._ctrl, timeout_s)
 
     def checkpoint(self, dest_dir: Path) -> object:
+        # Retry anything a previous failed checkpoint could not remove; no artifact was returned
+        # for those, so nothing else can discover them.
+        if self._stranded_partials:
+            still: list[str] = []
+            for leftover in self._stranded_partials:
+                retry_errs: list[str] = []
+                shutil.rmtree(leftover, onerror=lambda fn, p, exc: retry_errs.append(str(p)))
+                if retry_errs:
+                    still.append(leftover)
+            self._stranded_partials = still
+
         # GENERATION-STAMPED, never a fixed "checkpoint" path. restore_in() reads this directory
         # for the whole life of a `runsc restore`, so a rebuild writing the SAME path can
         # overwrite files an in-flight restore is still consuming -- it fails, or worse observes
@@ -281,7 +295,14 @@ class GvisorBootHandle:
             # SnapshotManager never learns this directory exists and can never retire or discard
             # it -- and because every attempt now gets a unique name, each async retry leaves
             # another partial checkpoint behind instead of overwriting the last (upstream, PR #82).
-            shutil.rmtree(img, ignore_errors=True)
+            errs: list[str] = []
+            shutil.rmtree(img, onerror=lambda fn, p, exc: errs.append(str(p)))
+            if errs:
+                # ...and if the cleanup ITSELF fails, nothing can rediscover the directory either.
+                # Record it for the next checkpoint's sweep rather than dropping it, exactly as the
+                # FC launcher does for its partial files.
+                self._stranded_partials.append(str(img))
+                _log.warning("gvisor_snapshot: could not remove partial checkpoint %s", img)
             raise
         return str(img)
 

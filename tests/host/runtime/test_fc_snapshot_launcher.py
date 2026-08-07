@@ -427,3 +427,61 @@ def test_a_partial_checkpoint_whose_cleanup_fails_is_retried(tmp_path, monkeypat
     assert not any(p.exists() for p in created), (
         f"stranded partials were never retried: {[p for p in created if p.exists()]}"
     )
+
+
+def test_orphan_generations_from_a_dead_dispatcher_are_swept(tmp_path):
+    """Nothing reclaimed generations across a restart.
+
+    The current artifact is never retired at shutdown and no startup path looked for older ones,
+    so every restart — clean or not — left its .snapshot, RAM-sized .mem and copied outdisk
+    behind, and repeated deployments filled the scratch filesystem or /dev/shm.
+    """
+    import os
+
+    base = tmp_path / "snap"
+    memdir = tmp_path / "ram"
+    base.mkdir()
+    memdir.mkdir()
+
+    dead_pid = 999_999_999          # not a live process
+    mine = os.getpid()
+
+    orphan_snap = base / f"warm-{dead_pid}-000000000000000001.snapshot"
+    orphan_mem = memdir / f"warm-{dead_pid}-000000000000000001.mem"
+    ours = base / f"warm-{mine}-000000000000000002.snapshot"
+    unrelated = base / "warm.snapshot"       # legacy fixed name, not a generation
+    for f in (orphan_snap, orphan_mem, ours, unrelated):
+        f.write_bytes(b"x")
+
+    launcher = FcSnapshotLauncher(
+        FakeCfg(), base, mem_dir=memdir,
+        popen=lambda argv, cwd=None: FakeProc(),
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
+        make_outdisk=_make_outdisk_file,
+    )
+    removed = launcher.sweep_orphan_generations()
+
+    assert removed == 2, f"expected the two dead-pid files to be swept (got {removed})"
+    assert not orphan_snap.exists() and not orphan_mem.exists()
+    assert ours.exists(), "a generation owned by THIS process must never be swept"
+    assert unrelated.exists(), "an unparseable name must be left alone"
+
+
+def test_the_sweep_never_touches_a_live_dispatchers_generation(tmp_path):
+    """Deleting a running dispatcher's generation pulls the backing store out from under its live
+    microVMs — far worse than the leak. A pid we cannot signal counts as alive."""
+    import os
+
+    base = tmp_path / "snap"
+    base.mkdir()
+    live = base / f"warm-{os.getpid()}-000000000000000003.mem"
+    live.write_bytes(b"x")
+
+    launcher = FcSnapshotLauncher(
+        FakeCfg(), base, mem_dir=base,
+        popen=lambda argv, cwd=None: FakeProc(),
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
+        make_outdisk=_make_outdisk_file,
+    )
+    assert launcher.sweep_orphan_generations() == 0
+    assert live.exists()

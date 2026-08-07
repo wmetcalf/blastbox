@@ -1197,8 +1197,13 @@ class Dispatcher:
                 return
             try:
                 control.wait_for_done(timeout_s=remaining)
-            except WarmTimeout:
-                warm_fault = "worker"   # it never answered within its deadline
+            except WarmTimeout as exc:
+                # ...unless the timeout came from OUR filesystem. The FILE handshake turns an
+                # EMFILE/EIO/ENOMEM reading ctrl/done into a WarmTimeout, which would otherwise
+                # convict a worker that may have completed perfectly -- and a host outage hits
+                # every job at once (upstream, PR #82).
+                if not getattr(exc, "host_io", False):
+                    warm_fault = "worker"   # it never answered within its deadline
                 self._fail_job(
                     job,
                     f"warm worker timed out after {self._worker_timeout_s}s",

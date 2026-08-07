@@ -332,8 +332,16 @@ class HostWarmControl:
                 return raw.decode("utf-8", "replace").strip()
             except FileNotFoundError:
                 pass  # not signalled yet → keep polling
-            except (OSError, ValueError) as exc:
+            except ValueError as exc:
+                # The worker wrote something unreadable: a verdict about IT.
                 raise WarmTimeout(f"invalid done file: {exc}") from exc
+            except OSError as exc:
+                # ...but EMFILE/EIO/ENOMEM reading ctrl/done is THIS HOST failing, and the
+                # dispatcher convicts on WarmTimeout. Flag it so a host-side failure is not
+                # charged to a worker that may have completed perfectly (upstream, PR #82).
+                err = WarmTimeout(f"could not read done file: {exc}")
+                err.host_io = True  # type: ignore[attr-defined]
+                raise err from exc
 
             if time.monotonic() >= deadline:
                 raise WarmTimeout(

@@ -153,6 +153,11 @@ class FcSnapshotBackend:
     side is simply to hand the boot handle back to the manager.
     """
 
+    def sweep_orphan_generations(self) -> int:
+        """Delegate to the launcher, which owns the on-disk layout."""
+        sweep = getattr(self._launcher, "sweep_orphan_generations", None)
+        return sweep() if callable(sweep) else 0
+
     def discard(self, artifact: object) -> None:
         """Unlink a fully drained generation's files.
 
