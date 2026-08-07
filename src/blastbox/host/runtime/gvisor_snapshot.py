@@ -18,7 +18,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from blastbox.host.runtime.fc_snapshot_launcher import owner_token
+from blastbox.host.runtime.snapshot_backend import (
+    generation_owner,
+    owner_alive,
+    owner_token,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -393,6 +397,49 @@ class GvisorRestoreHandle:
 
 
 class GvisorSnapshotBackend:
+    def sweep_orphan_generations(self, base_dir: Path) -> int:
+        """Reclaim ``checkpoint-<gen>`` dirs left behind by a dispatcher that is gone.
+
+        gVisor got generation stamping (so a rebuild can never overwrite a checkpoint an
+        in-flight restore is still reading) and reference-counted reclamation for the
+        generations it supersedes IN THIS PROCESS -- but nothing swept the ones a PREVIOUS
+        process left. Nothing retires the current artifact at shutdown, so every restart, clean
+        or not, stranded a whole runsc checkpoint directory that no code path could ever
+        rediscover. The FC tier has swept its ``warm-*`` files since generations were introduced;
+        this side only ever got the other half (upstream, PR #82).
+
+        ``base_dir`` is the manager's checkpoint root -- the same dir it hands ``checkpoint()``.
+        This backend only learns that path at checkpoint time, which is far too late for a sweep
+        that has to run BEFORE the first build consumes the space.
+
+        Deliberately conservative, exactly as the FC sweep is: a directory is removed ONLY when
+        its owning process is provably gone. Deleting a generation a LIVE dispatcher is still
+        restoring from is far worse than the leak, so unknown ownership counts as alive.
+        """
+        root = Path(base_dir)
+        if not root.exists():
+            return 0
+        removed = 0
+        failed: list[str] = []
+        for path in root.glob("checkpoint-*"):
+            token = generation_owner(path.name, prefix="checkpoint-")
+            if token is None or token == owner_token() or owner_alive(token):
+                continue
+            # NOT ignore_errors: SnapshotManager latches "swept" on a clean return, so reporting
+            # success for a tree we could not remove disables reclamation for the whole process.
+            errs: list[str] = []
+            shutil.rmtree(path, onerror=lambda fn, p, exc: errs.append(f"{p}: {exc[1]}"))
+            if errs:
+                failed.append("; ".join(errs))
+                _log.warning("gvisor_snapshot: could not sweep orphan checkpoint %s", path)
+            else:
+                removed += 1
+        if removed:
+            _log.info("gvisor_snapshot.swept_orphan_generations count=%d", removed)
+        if failed:
+            raise OSError("could not sweep orphan checkpoints: " + "; ".join(failed))
+        return removed
+
     def discard(self, artifact: object) -> None:
         """Remove a fully drained checkpoint generation.
 

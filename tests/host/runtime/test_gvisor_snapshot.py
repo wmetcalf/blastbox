@@ -556,3 +556,76 @@ def test_a_failed_restore_signals_an_unconfirmed_teardown(tmp_path: Path) -> Non
         "a restore whose teardown could not be confirmed must flag it, or the manager reclaims "
         "the checkpoint while a sandbox may still be using it"
     )
+
+
+# --- orphan reclamation across dispatcher restarts --------------------------
+
+
+def _mk_checkpoint(root, token, ns="0000000000000000001"):
+    d = root / f"checkpoint-{token}-{ns}"
+    d.mkdir(parents=True)
+    (d / "pages.img").write_bytes(b"x" * 64)
+    return d
+
+
+def test_a_dead_dispatchers_checkpoint_is_reclaimed(tmp_path, monkeypatch):
+    """gVisor stamped generations but had NO sweep at all.
+
+    Nothing retires the current artifact at shutdown, so every restart -- clean or not --
+    stranded a whole runsc checkpoint directory that no code path could rediscover. FC has swept
+    its warm-* files since generations were introduced; this side only got the other half.
+    """
+    from blastbox.host.runtime import gvisor_snapshot as mod
+    from blastbox.host.runtime.snapshot_backend import owner_token
+
+    dead = _mk_checkpoint(tmp_path, "999999_4242")
+    mine = _mk_checkpoint(tmp_path, owner_token(), "0000000000000000002")
+    monkeypatch.setattr(mod, "owner_alive", lambda token: False)
+
+    backend = GvisorSnapshotBackend(_cfg(tmp_path), run=lambda *a, **k: 0)
+    assert backend.sweep_orphan_generations(tmp_path) == 1
+    assert not dead.exists(), "a checkpoint whose owner is gone must be reclaimed"
+    assert mine.exists(), "never sweep THIS process's own generation"
+
+
+def test_a_live_dispatchers_checkpoint_is_never_touched(tmp_path, monkeypatch):
+    """Deleting a generation a live dispatcher is still restoring from is worse than the leak."""
+    from blastbox.host.runtime import gvisor_snapshot as mod
+
+    theirs = _mk_checkpoint(tmp_path, "999999_4242")
+    monkeypatch.setattr(mod, "owner_alive", lambda token: True)
+
+    backend = GvisorSnapshotBackend(_cfg(tmp_path), run=lambda *a, **k: 0)
+    assert backend.sweep_orphan_generations(tmp_path) == 0
+    assert theirs.exists()
+
+
+def test_an_unparseable_name_is_left_alone(tmp_path, monkeypatch):
+    """Only OUR generation names are candidates — this deletes trees."""
+    from blastbox.host.runtime import gvisor_snapshot as mod
+
+    stray = tmp_path / "checkpoint-not-a-generation"
+    stray.mkdir()
+    monkeypatch.setattr(mod, "owner_alive", lambda token: False)
+
+    backend = GvisorSnapshotBackend(_cfg(tmp_path), run=lambda *a, **k: 0)
+    assert backend.sweep_orphan_generations(tmp_path) == 0
+    assert stray.exists()
+
+
+def test_a_checkpoint_it_could_not_remove_is_reported(tmp_path, monkeypatch):
+    """SnapshotManager latches 'swept' on a clean return, so a swallowed EIO would disable
+    reclamation for the whole process."""
+    from blastbox.host.runtime import gvisor_snapshot as mod
+
+    _mk_checkpoint(tmp_path, "999999_4242")
+    monkeypatch.setattr(mod, "owner_alive", lambda token: False)
+
+    def _boom(path, onerror=None, **kw):
+        onerror(None, str(path), (OSError, OSError(5, "EIO"), None))
+
+    monkeypatch.setattr(mod.shutil, "rmtree", _boom)
+    backend = GvisorSnapshotBackend(_cfg(tmp_path), run=lambda *a, **k: 0)
+    with pytest.raises(OSError) as ei:
+        backend.sweep_orphan_generations(tmp_path)
+    assert "checkpoint-999999_4242" in str(ei.value)

@@ -358,3 +358,60 @@ def test_a_failed_orphan_sweep_is_retried_on_the_next_build(tmp_path):
     mgr.invalidate()
     mgr.build()
     assert backend.sweeps == 2, "a successful sweep must latch; this is a once-per-process job"
+
+
+def test_the_manager_hands_its_checkpoint_root_to_a_backend_that_asks(tmp_path):
+    """The wiring is where a sweep silently does nothing.
+
+    FC's launcher owns its own base/mem dirs, so its sweep takes no argument. gVisor's backend
+    only learns the checkpoint root at checkpoint() time -- far too late for a sweep that must
+    run BEFORE the first build consumes the space -- so it declares base_dir and the manager has
+    to pass it. Introspection, not except-TypeError: a TypeError raised INSIDE a sweep must never
+    be read as an older signature.
+    """
+    class _WantsDir(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.got = None
+
+        def sweep_orphan_generations(self, base_dir):
+            self.got = base_dir
+            return 0
+
+    backend = _WantsDir()
+    SnapshotManager(tmp_path, backend).build()
+    assert backend.got == tmp_path, "the backend never received the checkpoint root"
+
+
+def test_a_no_argument_sweep_still_works(tmp_path):
+    """A backend that owns its layout takes no argument; the manager must not force one on it."""
+    class _NoArgs(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.swept = 0
+
+        def sweep_orphan_generations(self):
+            self.swept += 1
+            return 0
+
+    backend = _NoArgs()
+    SnapshotManager(tmp_path, backend).build()
+    assert backend.swept == 1
+
+
+def test_a_typeerror_from_inside_a_sweep_is_not_read_as_an_old_signature(tmp_path):
+    """It must be reported as a failed sweep (and retried), never silently re-called bare."""
+    class _Explodes(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def sweep_orphan_generations(self, base_dir):
+            self.calls += 1
+            raise TypeError("a real bug inside the sweep")
+
+    backend = _Explodes()
+    mgr = SnapshotManager(tmp_path, backend)
+    mgr.build()
+    assert backend.calls == 1, "the sweep must not be retried bare as a compatibility fallback"
+    assert mgr._swept_orphans is False, "a failed sweep must stay retryable"

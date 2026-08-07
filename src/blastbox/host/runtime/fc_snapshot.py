@@ -22,7 +22,10 @@ import threading
 import time
 from pathlib import Path
 
-from blastbox.host.pool import RuntimeAtCapacity
+# _accepts_kwarg is the ONE definition of "does this callable declare that parameter" --
+# imported rather than copied, which is how the same optional-hook check drifted before.
+# pool.py imports nothing from runtime/, so this direction cannot cycle.
+from blastbox.host.pool import RuntimeAtCapacity, _accepts_kwarg
 from blastbox.host.runtime.snapshot_backend import RestoreHandle, SnapshotBackend
 
 _log = logging.getLogger("blastbox.host.runtime.fc_snapshot")
@@ -192,7 +195,16 @@ class SnapshotManager:
                 self._swept_orphans = True          # nothing to retry on this backend
             else:
                 try:
-                    sweep()
+                    # Hand over the checkpoint root when the backend asks for it. FC's launcher
+                    # already owns its own base/mem dirs, but gVisor's backend only learns the
+                    # path at checkpoint() time -- far too late for a sweep that must run BEFORE
+                    # the first build consumes the space. Introspection, not except-TypeError: a
+                    # TypeError raised INSIDE a sweep must never be mistaken for an older
+                    # signature (same reasoning as _accepts_kwarg in pool.py).
+                    if _accepts_kwarg(sweep, "base_dir"):
+                        sweep(base_dir=self._base_dir)
+                    else:
+                        sweep()
                 except Exception as exc:  # noqa: BLE001
                     # LATCH ONLY ON SUCCESS. The flag was set before the call, so a transient
                     # EIO/EROFS during startup reclamation left the orphan in place and the sweep
