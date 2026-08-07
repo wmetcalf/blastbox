@@ -22,6 +22,7 @@ import threading
 import time
 from pathlib import Path
 
+from blastbox.host.pool import RuntimeAtCapacity
 from blastbox.host.runtime.snapshot_backend import RestoreHandle, SnapshotBackend
 
 _log = logging.getLogger("blastbox.host.runtime.fc_snapshot")
@@ -29,6 +30,19 @@ _log = logging.getLogger("blastbox.host.runtime.fc_snapshot")
 
 class SnapshotError(RuntimeError):
     """Base class for snapshot/restore failures."""
+
+
+class SnapshotBuildInvalidated(SnapshotError, RuntimeAtCapacity):
+    """The build completed but was REJECTED because invalidate() landed while it ran.
+
+    Also a ``RuntimeAtCapacity``: if this surfaces through a synchronous spawn, the pool must
+    read it as "no artifact right this instant, retry" rather than as a restore failure. A
+    deliberate repair is the one thing that must never advance the restore-failure streak that
+    triggers further repairs.
+
+    Deliberately not a SnapshotBuildError: nothing failed, so arming the failure backoff would
+    leave the tier cold for build_retry_backoff_s after a repair the operator (or the pool) just
+    asked for -- the replacement build should start immediately (upstream, PR #82)."""
 
 
 class SnapshotBuildError(SnapshotError):
@@ -118,6 +132,10 @@ class SnapshotManager:
     def _build_worker(self) -> None:
         try:
             self.build()
+        except SnapshotBuildInvalidated:
+            # A repair landed mid-build. Nothing is broken, so do NOT arm the failure backoff:
+            # the next tick should start the replacement build straight away.
+            _log.info("snapshot.build_rejected reason=invalidated_mid_build; retrying at once")
         except Exception as exc:  # noqa: BLE001 — surface + back off; the pool falls back to cold
             with self._build_lock:
                 self._build_error = exc
@@ -196,7 +214,7 @@ class SnapshotManager:
             with contextlib.suppress(Exception):
                 boot.kill()
             self._discard(artifact)
-            raise SnapshotBuildError("snapshot invalidated while it was being built")
+            raise SnapshotBuildInvalidated("snapshot invalidated while it was being built")
         try:
             boot.kill()
         except Exception as exc:  # noqa: BLE001 -- a live base VM is a leak, not a bad snapshot

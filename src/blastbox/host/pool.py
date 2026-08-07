@@ -350,6 +350,9 @@ class WarmPool:
         # Monotonic count of CLEAN releases. Read as an episode token so a rebuild decision can
         # be abandoned if a slot succeeded while it was being made.
         self._clean_release_count = 0
+        # Slots promoted to IDLE that have not yet completed a job. Their promotion cleared the
+        # restore-failure streak provisionally; a confirmed death before first use revokes that.
+        self._promoted_unproven: set[str] = set()
         # Set by _health_check when it invalidates the base, read and cleared by tick(): the next
         # spawn would run a synchronous rebuild on this thread.
         self._rebuilt_this_tick = False
@@ -691,6 +694,10 @@ class WarmPool:
                 # Episode token: a rebuild decision taken before this point is abandoned, because
                 # the base demonstrably just produced a valid result.
                 self._clean_release_count += 1
+                # A served job is the only conclusive proof that the base yields a usable worker,
+                # so it — not promotion — is what clears the restore-failure streak.
+                self._spawn_consecutive_failures = 0
+                self._promoted_unproven.discard(slot.slot_id)
             if tracked:
                 slot_failures = self._slot_failures.get(slot.slot_id, 0)
                 last_success = self._slot_last_success.get(slot.slot_id, 0.0)
@@ -1495,9 +1502,14 @@ class WarmPool:
                     if slot.slot_id in self._slots and slot.state == SlotState.WARMING:
                         slot.state = SlotState.IDLE
                         newly_idle.append(slot.slot_id)
-                        # PROOF the base yields a usable worker — the only thing that should
-                        # clear the restore-failure streak.
-                        self._spawn_consecutive_failures = 0
+                        # Promotion is EVIDENCE, not proof, so it does NOT clear the
+                        # restore-failure streak. A poisoned snapshot can restore a process that
+                        # survives long enough to pass is_ready() and then dies while IDLE:
+                        # clearing here let it promote, die and be replaced forever, with each new
+                        # promotion wiping the evidence the previous death had just produced, so
+                        # the streak oscillated and invalidate_base() was never reached. A SERVED
+                        # JOB is the proof, and that is where the reset lives (upstream, PR #82).
+                        self._promoted_unproven.add(slot.slot_id)
             elif slot.state == SlotState.DRAINING and not raised:
                 # is_ready returned False AND the slot is DRAINING. Usually the runtime's finalize
                 # failed closed and reaped the VM ITSELF; but DRAINING can ALSO be set EXTERNALLY (a
@@ -1876,6 +1888,10 @@ class WarmPool:
             ]
 
         dead: list[Slot] = list(stuck_warming)
+        # Deaths of slots that were promoted but never served a job are restore failures too:
+        # see _promote_warming. Collected here so the streak reflects them before the rebuild
+        # decision below.
+        unproven_deaths = 0
         # Slots we escalated because we could not TELL, as opposed to ones AWS/libvirt confirmed
         # dead. If disposing of a merely-suspected slot also fails, we have learned nothing and must
         # not strand it (see the reap loop below).
@@ -1976,6 +1992,22 @@ class WarmPool:
             self._unknown_since.pop(slot.slot_id, None)
             if not alive:
                 dead.append(slot)
+                # CONFIRMED dead, and it never served a job: its promotion was the only evidence
+                # that the base yields a usable worker, and that evidence has just been refuted.
+                # Without this a poisoned snapshot restores a process that passes is_ready() and
+                # then dies IDLE, promoting/dying/being replaced forever while the restore-failure
+                # streak stays at zero and invalidate_base() is never reached (upstream, PR #82).
+                with self._lock:
+                    if slot.slot_id in self._promoted_unproven:
+                        self._promoted_unproven.discard(slot.slot_id)
+                        unproven_deaths += 1
+
+        if unproven_deaths:
+            with self._lock:
+                self._spawn_consecutive_failures += unproven_deaths
+                warm_failures = self._spawn_consecutive_failures
+            if self._maybe_rebuild_base(warm_failures, reason="spawn"):
+                self._rebuilt_this_tick = True
 
         if not dead:
             return

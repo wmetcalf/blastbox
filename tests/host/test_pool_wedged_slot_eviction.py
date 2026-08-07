@@ -1930,3 +1930,70 @@ def test_a_slot_claimed_during_escalation_is_not_disposed() -> None:
         f"a slot handed to a job was drained mid-flight (state={got.state})"
     )
     assert got.slot_id in pool._slots, "the claimed slot was disposed while serving a job"
+
+
+def test_slots_that_promote_then_die_before_serving_count_toward_repair() -> None:
+    """Promotion is evidence, not proof.
+
+    A poisoned snapshot can restore a process that survives long enough to pass is_ready() and
+    then dies while IDLE. Clearing the restore-failure streak on promotion alone let it promote,
+    die and be replaced forever without ever reaching invalidate_base() — the WARMING-timeout fix
+    does not cover this, because these slots do reach IDLE.
+    """
+    clock = _FakeClock()
+
+    class _PromotesThenDies(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self._seen: set[str] = set()
+
+        def is_ready(self, slot: Slot) -> bool:
+            return True             # passes readiness...
+
+        def is_alive(self, slot: Slot):
+            # ...then is confirmed dead on the very next health pass, before serving anything.
+            if slot.slot_id in self._seen:
+                return False
+            self._seen.add(slot.slot_id)
+            return True
+
+    rt = _PromotesThenDies()
+    pool = WarmPool(
+        runtime=rt, warm_size=1, concurrent_ceiling=2, clock=clock,
+        snapshot_rebuild_after=3, base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    for _ in range(10):
+        pool.tick()
+        clock.advance(1.0)
+
+    assert rt.base_invalidations >= 1, (
+        "a base whose workers promote and then die before serving a job was never repaired "
+        f"(got {rt.base_invalidations} invalidations)"
+    )
+
+
+def test_a_slot_that_serves_a_job_keeps_its_promotion_credit() -> None:
+    """The over-correction guard: a slot that DID serve a job is proof, and dying later is
+    ordinary attrition — it must not be charged back against the base."""
+    rt = _WedgeableRuntime()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4,
+        snapshot_rebuild_after=2, base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    pool.tick()          # spawn
+    pool.tick()          # promote to IDLE
+
+    with pool._lock:
+        pending = set(pool._promoted_unproven)
+    assert pending, (
+        "no slot was marked unproven — the first version of this test released before promotion "
+        "ever ran, so its assertion was trivially true"
+    )
+
+    for s in list(pool._slots.values()):
+        pool.release(s, dirty=False)      # each serves a job cleanly
+
+    with pool._lock:
+        remaining = set(pool._promoted_unproven)
+    assert remaining == set(), f"a slot that served a job is still marked unproven: {remaining}"
+    assert rt.base_invalidations == 0

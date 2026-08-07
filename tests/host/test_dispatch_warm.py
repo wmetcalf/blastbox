@@ -2022,3 +2022,74 @@ def test_an_artifact_swapped_during_materialization_convicts_the_worker(tmp_path
             dispatcher._materialize_sealed_warm_output(env, tmp_path / "src", tmp_path / "dst")
     finally:
         monkey.undo()
+
+
+def test_trust_handlers_respect_the_non_verdict_subtype_end_to_end(tmp_path):
+    """Driven through dispatch_once, not by calling the helper.
+
+    OutputTrustUnknown is a SUBCLASS of OutputTrustError by design, so every handler that catches
+    the parent and convicts must guard. Testing the raise site proves the type is produced; only
+    driving the dispatcher proves the handler that CONSUMES it respects the distinction — and
+    three separate handlers catch it in the warm path.
+    """
+    from blastbox.errors import OutputTrustError, OutputTrustUnknown
+
+    def _run(err):
+        store = InMemoryJobStore()
+        job = _make_job()
+        job.input_sha256 = _INPUT_SHA
+        store.create(job)
+        _setup_job_dirs(tmp_path / f"jobs-{id(err)}", job)
+        slot = _make_slot(tmp_path / f"s-{id(err)}")
+        pool = FakeWarmPool(slot)
+        _start_fake_worker(
+            slot,
+            output_fn=lambda out: _make_valid_output_dir(out, input_sha256=_INPUT_SHA),
+        )
+        d = _make_dispatcher_with_pool(
+            store, job_root=tmp_path / f"jobs-{id(err)}", pool=pool, worker_timeout_s=10,
+        )
+        mp = pytest.MonkeyPatch()
+        mp.setattr("blastbox.host.dispatch.validate_worker_output",
+                   lambda *a, **kw: (_ for _ in ()).throw(err))
+        try:
+            d.dispatch_once()
+        finally:
+            mp.undo()
+        return pool.release_fault[0] if pool.release_fault else None
+
+    assert _run(OutputTrustUnknown("EMFILE hashing metadata.json")) == "unknown", (
+        "a check the HOST could not complete must not advance burnout"
+    )
+    assert _run(OutputTrustError("artifact hash mismatch")) == "worker", (
+        "a real trust violation must still convict"
+    )
+
+    # ...and the MATERIALIZE handler is a third, separate catch of the same parent type. Patching
+    # validate_worker_output only exercises the trust-gate one; this reaches the other.
+    def _run_materialize(err):
+        store = InMemoryJobStore()
+        job = _make_job()
+        job.input_sha256 = _INPUT_SHA
+        store.create(job)
+        root = tmp_path / f"m-{id(err)}"
+        _setup_job_dirs(root, job)
+        slot = _make_slot(tmp_path / f"ms-{id(err)}")
+        pool = FakeWarmPool(slot)
+        _start_fake_worker(
+            slot,
+            output_fn=lambda out: _make_valid_output_dir(out, input_sha256=_INPUT_SHA),
+        )
+        d = _make_dispatcher_with_pool(store, job_root=root, pool=pool, worker_timeout_s=10)
+        d._materialize_sealed_warm_output = (  # type: ignore[method-assign]
+            lambda *a, **kw: (_ for _ in ()).throw(err)
+        )
+        d.dispatch_once()
+        return pool.release_fault[0] if pool.release_fault else None
+
+    assert _run_materialize(OutputTrustUnknown("EMFILE opening the artifact")) == "unknown", (
+        "the materialize handler must respect the non-verdict subtype too"
+    )
+    assert _run_materialize(OutputTrustError("artifact vanished")) == "worker", (
+        "a real swap must still convict at the materialize handler"
+    )

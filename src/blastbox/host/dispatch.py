@@ -1265,7 +1265,11 @@ class Dispatcher:
             try:
                 self._enforce_output_size_cap(slot.output_dir)
             except OutputTrustError as exc:
-                warm_fault = "worker"   # it emitted more than the declared bound
+                # Same guard as its siblings. The size cap raises a verdict today, but this
+                # handler catches the PARENT type, so a future non-verdict subtype arriving here
+                # must not silently become a conviction.
+                if not isinstance(exc, OutputTrustUnknown):
+                    warm_fault = "worker"   # it emitted more than the declared bound
                 self._fail_job(job, f"warm output too large: {exc}")
                 return
 
@@ -1315,7 +1319,14 @@ class Dispatcher:
             try:
                 self._materialize_sealed_warm_output(envelope, slot.output_dir, output_dir)
             except OutputTrustError as exc:
-                warm_fault = "worker"   # its output could not be materialized
+                # OutputTrustUnknown is a SUBCLASS by design, so catching the parent here and
+                # convicting unconditionally undoes the distinction at the point that consumes
+                # it: a host EMFILE/ENOMEM/EIO opening the declared artifact would advance slot
+                # burnout and the rebuild streak with no worker verdict at all. Guarded at the
+                # trust-gate handler above and not here -- the same sibling omission this series
+                # keeps producing (upstream, PR #82).
+                if not isinstance(exc, OutputTrustUnknown):
+                    warm_fault = "worker"   # its output could not be materialized
                 self._fail_job(job, f"failed to materialize warm output: {exc}")
                 return
 

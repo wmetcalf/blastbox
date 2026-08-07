@@ -633,7 +633,7 @@ def test_a_build_invalidated_while_running_does_not_publish(tmp_path):
     nothing, and the build then published the very artifact the repair meant to reject — so
     old-generation slots kept failing against a base that had already been condemned.
     """
-    from blastbox.host.runtime.fc_snapshot import SnapshotBuildError
+    from blastbox.host.runtime.fc_snapshot import SnapshotBuildInvalidated
 
     mgr, be = _mgr(tmp_path)
 
@@ -643,7 +643,7 @@ def test_a_build_invalidated_while_running_does_not_publish(tmp_path):
 
     be.boot_base = lambda: _BootThatGetsInvalidated(be)  # type: ignore[assignment]
 
-    with pytest.raises(SnapshotBuildError):
+    with pytest.raises(SnapshotBuildInvalidated):
         mgr.build()
 
     assert mgr.artifact is None, "a rejected build must not become the active artifact"
@@ -685,7 +685,7 @@ def test_an_invalidate_racing_publication_still_rejects_the_build(tmp_path):
     """
     import threading
 
-    from blastbox.host.runtime.fc_snapshot import SnapshotBuildError
+    from blastbox.host.runtime.fc_snapshot import SnapshotError
 
     mgr, be = _mgr(tmp_path)
 
@@ -737,7 +737,7 @@ def test_an_invalidate_racing_publication_still_rejects_the_build(tmp_path):
 
     th = threading.Thread(target=_racer, daemon=True)
     th.start()
-    with contextlib.suppress(SnapshotBuildError):
+    with contextlib.suppress(SnapshotError):
         mgr.build()
     th.join(10.0)
 
@@ -750,3 +750,26 @@ def test_an_invalidate_racing_publication_still_rejects_the_build(tmp_path):
     assert mgr.artifact is None, (
         "the repair was lost: an artifact rejected mid-build ended up installed as the active one"
     )
+
+
+def test_an_invalidated_build_retries_at_once(tmp_path):
+    """A repair requested mid-build must not leave the tier cold for the failure backoff.
+
+    The rejection raises through the same path as a genuine build failure, so _build_worker armed
+    the normal retry gate — the snapshot tier stayed unavailable for build_retry_backoff_s after a
+    repair the pool had just asked for. Nothing failed; the replacement build should start at once.
+    """
+    mgr, be = _mgr(tmp_path)
+
+    class _BootThatGetsInvalidated(_FakeBoot):
+        def wait_ready(self, timeout_s: float) -> None:
+            mgr.invalidate()
+
+    be.boot_base = lambda: _BootThatGetsInvalidated(be)  # type: ignore[assignment]
+
+    mgr._build_worker()          # the worker swallows the rejection
+
+    assert mgr._retry_not_before == 0.0, (
+        f"a deliberate rejection armed the failure backoff (retry gate={mgr._retry_not_before})"
+    )
+    assert mgr.build_error is None, "an intentional rejection is not a build error"
