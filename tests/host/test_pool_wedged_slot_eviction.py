@@ -1620,3 +1620,58 @@ def test_a_repaired_tier_stays_attributable_for_the_pools_own_repair() -> None:
         "a healthy, merely-saturated tier lost its base because the guilty marker was cleared "
         "by the per-tier repair before the pool's own repair consulted it"
     )
+
+
+def test_a_success_during_the_decision_abandons_the_rebuild() -> None:
+    """A base that just produced a valid result must not be destroyed.
+
+    Consuming the streak closed the read/decide gap, but drop() still runs outside the lock. A
+    clean release landing in THAT window is proof the base works, so rebuilding it is an
+    unnecessary outage during recovery. The gate is an episode token captured with the decision.
+
+    The barrier forces the interleaving deterministically: the decision thread waits inside the
+    window for a clean release to complete.
+    """
+    import threading
+
+    rt = _WedgeableRuntime()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4,
+        snapshot_rebuild_after=2, base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    pool.tick()
+    good = list(pool._slots.values())[0]
+    with pool._lock:
+        pool._pool_consecutive_failures = 2      # at the threshold
+
+    released = threading.Event()
+    real_lock = pool._lock
+
+    class _GatedLock:
+        """After the decision's locked section exits, let a clean release land before drop()."""
+
+        def __init__(self) -> None:
+            self._armed = True
+
+        def __enter__(self):
+            return real_lock.__enter__()
+
+        def __exit__(self, *a):
+            r = real_lock.__exit__(*a)
+            if self._armed:
+                self._armed = False
+                threading.Thread(
+                    target=lambda: (pool.release(good, dirty=False), released.set()),
+                    daemon=True,
+                ).start()
+                released.wait(5.0)
+            return r
+
+    pool._lock = _GatedLock()  # type: ignore[assignment]
+    rebuilt = pool._maybe_rebuild_base(reason="job")
+
+    assert released.is_set(), "the racing clean release never ran — the test proved nothing"
+    assert rebuilt is False and rt.base_invalidations == 0, (
+        "the base produced a valid result while the failure was being judged, and was rebuilt "
+        f"anyway (invalidations={rt.base_invalidations})"
+    )

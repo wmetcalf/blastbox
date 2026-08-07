@@ -445,7 +445,13 @@ def _is_transport_error(exc: BaseException) -> bool:
     explicit: an `except OSError` written for ENOSPC otherwise captures every connection failure
     too, and silently stops attributing the wedges this exists to catch.
     """
-    return isinstance(exc, (urllib.error.URLError, socket.timeout, ConnectionError))
+    # ssl.SSLError is an OSError but NOT a URLError, socket.timeout or ConnectionError, so an
+    # HTTPS read that fails on a TLS protocol error or a mid-stream disconnect was landing in the
+    # local-filesystem branch -- a worker with a broken TLS stack could never be detected, because
+    # every failure it produced was attributed to this dispatcher's disk (upstream, PR #82).
+    return isinstance(
+        exc, (urllib.error.URLError, socket.timeout, ConnectionError, ssl.SSLError)
+    )
 
 
 def make_remote_validate(

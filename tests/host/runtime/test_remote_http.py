@@ -956,3 +956,36 @@ def test_worker_busy_and_incomplete_validation_are_not_worker_evidence(tmp_path)
     assert fault == "unknown", (
         f"a check the HOST could not complete is not worker evidence (got {fault})"
     )
+
+
+def test_a_tls_failure_is_transport_not_local_disk(tmp_path):
+    """ssl.SSLError is an OSError but none of the other transport types.
+
+    So an HTTPS read failing on a TLS protocol error or a mid-stream disconnect landed in the
+    local-filesystem branch: a worker with a broken TLS stack could never be detected, because
+    every failure it produced was attributed to this dispatcher's disk.
+    """
+    import ssl
+
+    out = tmp_path / "out"
+    out.mkdir()
+    inp = tmp_path / "in.bin"
+    inp.write_bytes(b"sample")
+    slot = SimpleNamespace(slot_id="s1", url="https://worker.invalid", ip=None)
+
+    calls: list[tuple[bool, str | None]] = []
+
+    def release(s, *, dirty: bool = False, fault: str | None = None) -> None:
+        calls.append((dirty, fault))
+
+    def boom(*a, **kw):
+        raise ssl.SSLError(1, "[SSL: DECRYPTION_FAILED] protocol error")
+
+    validate = make_remote_validate(
+        lambda: slot, release, output_dir_for=lambda p: out, http_open=boom,
+    )
+    validate(inp)
+
+    assert calls and calls[0][1] == "worker", (
+        f"a TLS failure is evidence about the worker, not our disk (got {calls[0][1]})"
+    )

@@ -336,6 +336,9 @@ class WarmPool:
         self._capacity_starved_after_s = capacity_starved_after_s
         self._capacity_miss_since: float | None = None
         self._capacity_starved_logged = False
+        # Monotonic count of CLEAN releases. Read as an episode token so a rebuild decision can
+        # be abandoned if a slot succeeded while it was being made.
+        self._clean_release_count = 0
         # Set by _health_check when it invalidates the base, read and cleared by tick(): the next
         # spawn would run a synchronous rebuild on this thread.
         self._rebuilt_this_tick = False
@@ -674,6 +677,9 @@ class WarmPool:
                 self._slot_failures.pop(slot.slot_id, None)
                 self._slot_last_success[slot.slot_id] = self._clock()
                 self._pool_consecutive_failures = 0
+                # Episode token: a rebuild decision taken before this point is abandoned, because
+                # the base demonstrably just produced a valid result.
+                self._clean_release_count += 1
             if tracked:
                 slot_failures = self._slot_failures.get(slot.slot_id, 0)
                 last_success = self._slot_last_success.get(slot.slot_id, 0.0)
@@ -1727,6 +1733,7 @@ class WarmPool:
         # restore failures are a different signal from consecutive job failures.
         if self._snapshot_rebuild_after <= 0:
             return False
+        success_token: int | None = None
         if streak is None:
             # CHECK-AND-CONSUME in one locked step. Reading the streak under the lock and then
             # deciding outside it still leaves a window: a clean release from another dispatch
@@ -1740,8 +1747,14 @@ class WarmPool:
                     return False
                 pool_failures = self._pool_consecutive_failures
                 self._pool_consecutive_failures = 0
+                # Token captured WITH the decision. Consuming the streak closed the read/decide
+                # gap, but drop() still runs outside the lock: a clean release landing in that
+                # window is proof the base just produced a valid result, and rebuilding it then
+                # is an unnecessary outage during recovery (upstream, PR #82).
+                success_token = self._clean_release_count
         else:
             pool_failures = streak
+            success_token = None
             if pool_failures < self._snapshot_rebuild_after:
                 return False
         now = self._clock()
@@ -1774,6 +1787,14 @@ class WarmPool:
                 "pool.base_rebuild_unavailable pool_consecutive_failures=%d -- runtime %s exposes no "
                 "invalidate_base(); the warm base may be poisoned and only a dispatcher restart can "
                 "rebuild it", pool_failures, type(self._runtime).__name__,
+            )
+            return False
+        with self._lock:
+            stale = success_token is not None and success_token != self._clean_release_count
+        if stale:
+            logger.info(
+                "pool.base_rebuild_skipped reason=slot_succeeded_during_decision — the base "
+                "produced a valid result while this failure was being judged"
             )
             return False
         try:
