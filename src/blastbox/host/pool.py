@@ -40,6 +40,7 @@ from blastbox.observability.metrics import (
     record_pool_state,
     record_slot_reaped,
     record_slot_spawned,
+    record_spawn_capacity_miss,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,19 @@ class Slot:
     container_id: str | None = None
     spawned_at: float = 0.0
     jobs: int = 0            # cumulative jobs served (reuse mode: drives recycle/reprovision)
+
+
+class RuntimeAtCapacity(RuntimeError):
+    """``spawn()`` has no room right now — a NORMAL condition, not a fault.
+
+    Part of the :class:`SlotRuntime` contract. A runtime that can be legitimately full
+    (a cascade whose ready tiers are saturated while a snapshot tier still builds; a static
+    pool with every worker busy) raises this instead of a generic error, so the pool can tell
+    "no capacity this instant" apart from "spawning is broken". The distinction matters: the
+    latter feeds the consecutive-failure streak that eventually invalidates the snapshot base,
+    so counting a routine capacity miss there slowly destroys a perfectly good base under load
+    — exactly when the pool is busiest and can least afford a rebuild.
+    """
 
 
 @runtime_checkable
@@ -239,6 +253,7 @@ class WarmPool:
         # The previous form said "0 disables" in the comment while treating <=0 as "use the derived
         # default", so rebuilds were on by default and there was no way to turn them off at all
         # (upstream, PR #82). Same sentinel convention as max_evictions_per_window above.
+        self._rebuild_after_explicit = snapshot_rebuild_after is not None
         self._snapshot_rebuild_after = (
             max(4, 2 * max(1, warm_size)) if snapshot_rebuild_after is None
             else max(0, int(snapshot_rebuild_after))
@@ -1089,10 +1104,16 @@ class WarmPool:
                 if warm_size < 0:
                     raise ValueError("warm_size must be >= 0")
                 self._warm_size = warm_size
+                # EVERY value derived from warm_size has to follow resize, not just the one that
+                # was reported. The autosizer moves the target in production: a pool created at 16
+                # and shrunk to 1 otherwise waits 32 consecutive failures instead of 4 before
+                # repairing a poisoned base, and one grown 1 -> 16 invalidates far too eagerly
+                # (upstream, PR #82).
                 if not self._eviction_cap_explicit:
-                    # Re-derive: the cap bounds damage to roughly ONE warm set, so it has to follow
-                    # the live target rather than the size the pool happened to start at.
+                    # Bounds damage to roughly ONE warm set, so it follows the live target.
                     self._max_evictions_per_window = max(2, int(warm_size))
+                if not self._rebuild_after_explicit:
+                    self._snapshot_rebuild_after = max(4, 2 * max(1, warm_size))
             # keep warm within the ceiling
             if self._warm_size > self._concurrent_ceiling:
                 self._warm_size = self._concurrent_ceiling
@@ -1416,6 +1437,15 @@ class WarmPool:
                 slot.state = SlotState.WARMING
                 slot.spawned_at = self._clock()
                 record_slot_spawned()
+            except RuntimeAtCapacity as exc:
+                # NOT a restore failure, so it must NOT touch the streak. prepare() reports ready
+                # when ANY tier is, so spawn() legitimately raises this while the ready tiers are
+                # full and a snapshot tier is still building. Break rather than continue: capacity
+                # will not appear later in the SAME batch, and each further attempt is a wasted
+                # spawn. The next tick retries (upstream, PR #82).
+                logger.debug("pool.spawn_capacity_miss reason=%s", exc)
+                record_spawn_capacity_miss()
+                break
             except Exception:
                 logger.exception("pool.spawn_failed")
                 with self._lock:

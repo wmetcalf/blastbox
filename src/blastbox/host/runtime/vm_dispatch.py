@@ -63,6 +63,18 @@ MAX_MATERIALISE_ATTEMPTS = 3
 PUT_OUTPUT_MAX_ATTEMPTS = 3
 PUT_OUTPUT_RETRY_BACKOFF_S = 1.0
 
+
+def _takes_fault(fn: Any) -> bool:
+    """Whether a pool's ``release`` accepts the ``fault`` kwarg. Introspection ONLY, deliberately
+    separate from the call: wrapping ``release(...)`` itself in ``except TypeError`` means a
+    genuine TypeError raised INSIDE a real pool's release is misread as "old seam" and the slot is
+    released a SECOND time -- a double reap of one slot, from a bug that was only ever meant to be
+    a compatibility shim. Same reasoning as ``_takes_budget`` in cascade.py."""
+    try:
+        return "fault" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
 logger = logging.getLogger(__name__)
 
 
@@ -959,9 +971,9 @@ def _resume_on_claim(pool: Any, slot: Any, *, budget_s: float | None = None) -> 
         try:
             # A CONFIRMED-dead resume verdict (AWS says the resource is gone / the state is
             # terminal) is evidence about the WORKER, so it counts toward wedge eviction.
-            try:
+            if _takes_fault(pool.release):
                 pool.release(slot, dirty=True, fault="worker")
-            except TypeError:                      # release seam predating fault attribution
+            else:                                  # release seam predating fault attribution
                 pool.release(slot, dirty=True)
         except Exception:   # noqa: BLE001 -- release failure must not mask the resume error
             logger.warning("vm_dispatch: releasing un-resumable slot failed", exc_info=True)
@@ -1172,9 +1184,9 @@ def build_remote_vm_dispatcher(
         # HERE rather than making the caller retry: this seam always passed fault= through, so
         # against a pool predating fault attribution EVERY retry in remote_http's fallback ladder
         # raised TypeError again and the slot was never released at all (upstream, PR #82).
-        try:
+        if _takes_fault(pool.release):
             pool.release(slot, dirty=dirty, fault=fault)
-        except TypeError:
+        else:
             pool.release(slot, dirty=dirty)
 
     sanitize: Callable[[dict[str, str]], dict[str, str]] | None = None

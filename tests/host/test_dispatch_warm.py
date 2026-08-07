@@ -10,6 +10,7 @@ Fixtures:
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -158,7 +159,8 @@ class FakeWarmPool:
     def __init__(self, slot: Slot | None, runtime: object | None = None) -> None:
         self._slot = slot
         self.release_calls: list[Slot] = []
-        self.release_dirty: list[bool] = []  # parallel to release_calls: the dirty flag per release
+        self.release_dirty: list[bool] = []
+        self.release_fault: list[str | None] = []  # parallel to release_calls: the dirty flag per release
         # Default: a file-based warm runtime that deliberately lacks the vsock
         # warm-path seam (stage_warm_input / host_warm_control /
         # materialize_warm_output), so the dispatcher falls back to the
@@ -179,9 +181,13 @@ class FakeWarmPool:
     def claim(self, *, timeout_s: float) -> Slot | None:
         return self._slot
 
-    def release(self, slot: Slot, *, dirty: bool = False) -> None:
+    def release(self, slot: Slot, *, dirty: bool = False, fault: str | None = None) -> None:
         self.release_calls.append(slot)
         self.release_dirty.append(dirty)
+        # Recording the ATTRIBUTION, not just the dirty bit: dirty says "recycle this slot",
+        # fault says "hold this slot responsible". Only the latter advances wedge eviction and
+        # can invalidate the snapshot base, so it is the field worth asserting on.
+        self.release_fault.append(fault)
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +632,199 @@ def test_warm_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(tmp
     assert len(pool.release_calls) == 1
     assert pool.release_calls[0] is slot
     assert pool.release_dirty == [True]
+    # ...and NOT blamed on the worker. It produced valid output and merely lost a race; a peer
+    # owns the job now. Blaming it means a busy queue (where reclaim races are common) steadily
+    # burns out healthy slots and can invalidate a good base. Upstream, PR #82.
+    assert pool.release_fault == [None] or pool.release_fault == ["unknown"], (
+        f"a reclaim race is not worker evidence (got {pool.release_fault})"
+    )
+
+
+def test_warm_claim_lost_before_staging_is_not_blamed_on_the_worker(tmp_path):
+    """The SIBLING claim-loss exit: the pre-staging CAS.
+
+    Same defect as the DONE-CAS path above, one branch earlier -- and the one that survived when
+    the equivalent fix landed on the remote path. Here the worker has not even been handed the
+    job yet, so attributing the abort to it is not merely unfair, it is evidence-free.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+
+    # The peer must reclaim AFTER this dispatcher takes its own claim -- flipping it up front
+    # only makes dispatch_once() re-claim and the CAS then SUCCEEDS, so the job runs normally and
+    # times out, and the test would be asserting on a timeout rather than on claim loss.
+    # pool.claim() is the seam that sits between the claim and the pre-staging CAS.
+    real_claim = pool.claim
+
+    def _claim_then_peer_reclaims(*a, **kw):
+        got = real_claim(*a, **kw)
+        store.update(job.job_id, claim_id="peer-claim-id-not-ours")
+        return got
+
+    pool.claim = _claim_then_peer_reclaims  # type: ignore[method-assign]
+
+    dispatcher.dispatch_once()
+
+    stored = store.get(job.job_id)
+    assert stored.claim_id == "peer-claim-id-not-ours", "the peer must still own the job"
+
+    assert pool.release_calls == [slot], "the slot must still be released exactly once"
+    assert pool.release_fault == [None] or pool.release_fault == ["unknown"], (
+        f"a claim lost BEFORE staging cannot be the worker's fault (got {pool.release_fault})"
+    )
+
+
+def test_a_genuine_warm_failure_is_still_blamed_on_the_worker(tmp_path):
+    """The carve-out must stay narrow.
+
+    Guards the over-correction: de-attributing claim loss so broadly that real warm failures stop
+    advancing wedge eviction -- which is the bug the attribution was added to fix.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)
+    # No fake worker started -> the run times out against this slot: real worker evidence.
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=0.5,
+    )
+
+    dispatcher.dispatch_once()
+
+    assert pool.release_dirty == [True]
+    assert pool.release_fault == ["worker"], (
+        f"a warm run that failed against this slot IS worker evidence (got {pool.release_fault})"
+    )
+
+
+def test_warm_claim_lost_before_sealing_is_not_blamed_on_the_worker(tmp_path):
+    """Third claim-loss exit: the pre-SEAL CAS.
+
+    The worker has already run and written its output here; the abort only skips the seal. Found
+    by mutation testing -- the other three exits were guarded and this one silently was not.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)
+
+    # Flip the claim as the worker writes its output: that lands after staging (so the
+    # pre-staging CAS passes) and before the dispatcher's pre-seal CAS.
+    def _output_then_peer_reclaims(out_dir):
+        _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA)
+        store.update(job.job_id, claim_id="peer-claim-id-not-ours")
+
+    _start_fake_worker(slot, output_fn=_output_then_peer_reclaims)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+
+    dispatcher.dispatch_once()
+
+    assert pool.release_calls == [slot]
+    assert pool.release_fault == [None] or pool.release_fault == ["unknown"], (
+        f"a claim lost before sealing is not worker evidence (got {pool.release_fault})"
+    )
+
+
+def test_warm_claim_lost_at_the_done_write_is_not_blamed_on_the_worker(tmp_path):
+    """Fourth claim-loss exit: the terminal DONE CAS.
+
+    The most costly one to misattribute -- this worker did everything right, produced valid
+    output, uploaded it, and lost only the final race. Also found by mutation testing.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)
+    _start_fake_worker(
+        slot,
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
+    )
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+
+    # Let the pre-upload ownership check SUCCEED (it reads the store before the flip), then flip
+    # so the terminal DONE CAS is the exit taken. Without this ordering the test would land on
+    # the pre-upload exit instead and silently prove nothing about the DONE write.
+    real_check = dispatcher._claim_is_still_ours
+
+    def _check_then_peer_reclaims(j):
+        ours = real_check(j)
+        store.update(job.job_id, claim_id="peer-claim-id-not-ours")
+        return ours
+
+    dispatcher._claim_is_still_ours = _check_then_peer_reclaims  # type: ignore[method-assign]
+
+    dispatcher.dispatch_once()
+
+    stored = store.get(job.job_id)
+    assert stored.status == JobStatus.RUNNING, "the peer's state must be left untouched"
+    assert pool.release_calls == [slot]
+    assert pool.release_fault == [None] or pool.release_fault == ["unknown"], (
+        f"losing only the DONE race is not worker evidence (got {pool.release_fault})"
+    )
+
+
+def test_a_broken_release_is_not_retried_as_a_compatibility_fallback(tmp_path):
+    """A TypeError from INSIDE release() must not be mistaken for an old release() signature.
+
+    The fault kwarg was introduced with a `try: release(fault=...) except TypeError: release(...)`
+    shim. That shim cannot tell "this pool predates fault=" from "release() itself raised
+    TypeError", so a genuine bug inside release made the dispatcher release the SAME slot twice --
+    a double reap, caused by a compatibility shim. Signature introspection cannot confuse the two.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+
+    class _BrokenRelease(FakeWarmPool):
+        def release(self, slot: Slot, *, dirty: bool = False, fault: str | None = None) -> None:
+            super().release(slot, dirty=dirty, fault=fault)
+            raise TypeError("bug inside release(), NOT an old signature")
+
+    pool = _BrokenRelease(slot)
+    _start_fake_worker(
+        slot,
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
+    )
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+
+    with contextlib.suppress(TypeError):
+        dispatcher.dispatch_once()
+
+    assert len(pool.release_calls) == 1, (
+        f"the slot must be released exactly once, not re-released as a fallback "
+        f"(got {len(pool.release_calls)} releases)"
+    )
 
 
 def test_warm_dispatch_stamps_worker_tier(tmp_path):

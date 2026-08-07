@@ -21,6 +21,7 @@ Security properties (review will check):
 from __future__ import annotations
 
 import hashlib
+import inspect
 import logging
 import os
 import re
@@ -60,6 +61,18 @@ if TYPE_CHECKING:
     from blastbox.host.concurrency_gate import DynamicConcurrencyGate
     from blastbox.host.pool import Slot, WarmPool
 
+
+
+def _takes_fault(fn: Any) -> bool:
+    """Whether a pool's ``release`` accepts the ``fault`` kwarg. Introspection ONLY, deliberately
+    separate from the call: wrapping ``release(...)`` itself in ``except TypeError`` means a
+    genuine TypeError raised INSIDE a real pool's release is misread as "old seam" and the slot is
+    released a SECOND time -- a double reap of one slot, from a bug that was only ever meant to be
+    a compatibility shim. Same reasoning as ``_takes_budget`` in cascade.py."""
+    try:
+        return "fault" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
 
 _log = logging.getLogger("blastbox.host.dispatch")
 
@@ -1060,6 +1073,11 @@ class Dispatcher:
                 # "warm"): self._tier is "firecracker"/"gvisor" on a warm dispatcher.
                 worker_tier=self._tier,
             ):
+                # RECLAIM RACE, not a bad worker: a peer owns the job now, so this worker either
+                # never ran or already finished cleanly. Attributing it burns out healthy slots and
+                # can invalidate a good base (upstream, PR #82). Same reasoning as ClaimLost on the
+                # remote path -- which I fixed while leaving this one.
+                warm_fault = "unknown"
                 _log.warning(
                     "warm job %s lost its claim before staging (requeued/recovered by another "
                     "dispatcher); aborting", job.job_id,
@@ -1151,6 +1169,11 @@ class Dispatcher:
                 expect_claim_id=job.claim_id,
                 started_at=time.time(),
             ):
+                # RECLAIM RACE, not a bad worker: a peer owns the job now, so this worker either
+                # never ran or already finished cleanly. Attributing it burns out healthy slots and
+                # can invalidate a good base (upstream, PR #82). Same reasoning as ClaimLost on the
+                # remote path -- which I fixed while leaving this one.
+                warm_fault = "unknown"
                 _log.warning(
                     "warm job %s lost its claim before sealing (recovered/reclaimed by another "
                     "dispatcher); aborting", job.job_id,
@@ -1252,6 +1275,10 @@ class Dispatcher:
             # longer ours to terminalize; the peer's own state is left untouched.
             # ------------------------------------------------------------------
             if not self._claim_is_still_ours(job):
+                # Fourth and last claim-loss exit in this function. Like the other three, a peer
+                # owning the job says nothing about this worker -- which here has already produced
+                # and sealed valid output (upstream, PR #82).
+                warm_fault = "unknown"
                 _log.info(
                     "warm job %s reclaimed before upload; skipping put_output (peer owns "
                     "it now)", job.job_id,
@@ -1291,6 +1318,12 @@ class Dispatcher:
                 error=None,
             )
             if not applied:
+                # This worker RAN AND PRODUCED VALID OUTPUT -- it merely lost the terminal race.
+                # Leaving the default "worker" attribution here is the worst of the three
+                # claim-loss sites: reclaim races cluster exactly when the queue is deep, so a
+                # busy fleet would steadily burn out its healthiest, fastest slots and eventually
+                # invalidate a perfectly good base (upstream, PR #82).
+                warm_fault = "unknown"
                 _log.warning(
                     "warm job %s no longer our RUNNING claim at DONE write (recovered/reclaimed "
                     "by another dispatcher); leaving its terminal state untouched",
@@ -1318,11 +1351,11 @@ class Dispatcher:
             # invalidated (upstream, PR #82). A warm run that failed AGAINST this worker is worker
             # evidence; the engine reporting a bad sample is not, and is already excluded because
             # warm_clean covers only the clean DONE path.
-            try:
-                self._pool.release(slot, dirty=not warm_clean,      # type: ignore[union-attr]
+            if _takes_fault(self._pool.release):                     # type: ignore[union-attr]
+                self._pool.release(slot, dirty=not warm_clean,        # type: ignore[union-attr]
                                    fault=None if warm_clean else warm_fault)
-            except TypeError:                                        # seam predating attribution
-                self._pool.release(slot, dirty=not warm_clean)      # type: ignore[union-attr]
+            else:                                                    # seam predating attribution
+                self._pool.release(slot, dirty=not warm_clean)       # type: ignore[union-attr]
 
     def _dispatch_inner(
         self, job: Job, input_path: Path, output_dir: Path,

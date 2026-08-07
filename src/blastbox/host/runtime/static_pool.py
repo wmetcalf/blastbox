@@ -24,13 +24,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from blastbox.host.pool import SlotState
+from blastbox.host.pool import RuntimeAtCapacity, SlotState
 from blastbox.host.runtime.aws_worker import _MIN_PROBE_S, HttpProbe, _default_http_probe
 
 _log = logging.getLogger("blastbox.host.runtime.static_pool")
 
 
-class StaticPoolExhausted(RuntimeError):
+class StaticPoolExhausted(RuntimeAtCapacity):
     """All registered workers are already claimed (pool ceiling exceeds the fleet size)."""
 
 

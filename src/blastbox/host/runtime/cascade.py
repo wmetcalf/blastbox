@@ -29,6 +29,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from blastbox.host.pool import RuntimeAtCapacity
+
 _log = logging.getLogger("blastbox.host.runtime.cascade")
 
 
@@ -36,8 +38,18 @@ class CascadeMisconfigured(RuntimeError):
     """No usable tier (empty ``BLASTBOX_POOL_TIERS`` or the primary tier is unavailable)."""
 
 
-class CascadeExhausted(RuntimeError):
-    """Every tier is at capacity (or failed to spawn) -- the whole cascade is full."""
+class CascadeExhausted(RuntimeAtCapacity):
+    """Every tier is at capacity (or failed to spawn) -- the whole cascade is full.
+
+    ``RuntimeAtCapacity`` (which is a ``RuntimeError``, so existing handlers are unaffected)
+    tells the pool this is a routine capacity miss, not a spawn fault."""
+
+
+class CascadeSlotUnknown(RuntimeError):
+    """A slot was handed to the cascade that no tier owns -- a ROUTING BUG, not capacity.
+
+    Deliberately NOT a ``RuntimeAtCapacity``: it used to reuse ``CascadeExhausted``, which
+    would now quietly read as "the pool is full" and get swallowed by the capacity handler."""
 
 
 @dataclass
@@ -259,7 +271,7 @@ class CascadingRuntime:
     def _delegate(self, slot: Any, name: str) -> Any:
         tier = self._tier_of(slot)
         if tier is None:
-            raise CascadeExhausted(f"cascade: no owning tier for slot {getattr(slot, 'slot_id', slot)!r}")
+            raise CascadeSlotUnknown(f"cascade: no owning tier for slot {getattr(slot, 'slot_id', slot)!r}")
         fn = getattr(tier.runtime, name, None)
         if fn is None:
             raise CascadeMisconfigured(
@@ -286,7 +298,7 @@ class CascadingRuntime:
         slot dirty."""
         tier = self._tier_of(slot)
         if tier is None:
-            raise CascadeExhausted(f"cascade: no owning tier for slot {getattr(slot, 'slot_id', slot)!r}")
+            raise CascadeSlotUnknown(f"cascade: no owning tier for slot {getattr(slot, 'slot_id', slot)!r}")
         fn = getattr(tier.runtime, "resume", None)
         if not callable(fn):
             return

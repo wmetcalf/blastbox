@@ -29,6 +29,8 @@ import threading
 from pathlib import Path
 from uuid import uuid4
 
+from blastbox.host.runtime.cascade import CascadeExhausted
+from blastbox.host.runtime.static_pool import StaticPoolExhausted
 from blastbox.host.pool import Slot, SlotState, WarmPool
 
 
@@ -748,3 +750,149 @@ def test_the_spawn_batch_halts_after_invalidating_the_base():
     assert rt.spawns <= 3, (
         f"the batch kept spawning after the rebuild ({rt.spawns} attempts) — the next one runs a "
         f"synchronous base build on the maintenance thread")
+
+
+def test_a_capacity_miss_is_not_a_restore_failure() -> None:
+    """A FULL pool must never be mistaken for a BROKEN one.
+
+    CascadingRuntime.prepare() reports ready when ANY tier is ready, so spawn() legitimately
+    raises CascadeExhausted while the ready tiers are saturated and a snapshot tier is still
+    building. Counting that routine capacity miss toward the restore-failure streak invalidates
+    a perfectly good base -- and does it precisely under sustained load, when a rebuild is the
+    most expensive thing the pool could possibly do. Upstream, PR #82.
+    """
+    class _AlwaysFull(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.spawn_attempts = 0
+
+        def spawn(self) -> Slot:
+            self.spawn_attempts += 1
+            raise CascadeExhausted("cascade: every tier is at capacity")
+
+    rt = _AlwaysFull()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4,
+        max_consecutive_failures=2, snapshot_rebuild_after=3,
+        base_rebuild_cooldown_s=0.0,
+    )
+
+    for _ in range(12):
+        pool.tick()
+
+    assert rt.spawn_attempts >= 3, "the pool must keep retrying -- capacity comes back"
+    assert rt.base_invalidations == 0, (
+        "a capacity miss must not invalidate the base; a busy pool would destroy and rebuild "
+        f"its own base under load (got {rt.base_invalidations} invalidations)"
+    )
+
+
+def test_a_real_spawn_failure_still_invalidates_after_a_capacity_miss() -> None:
+    """The capacity carve-out must not become a blanket amnesty.
+
+    Guards the obvious over-correction: swallowing CascadeExhausted so broadly (or resetting the
+    streak on it) that a genuinely corrupt base stops being repaired. Capacity misses are
+    ignored; the real failures around them must still accumulate.
+    """
+    class _FullThenBroken(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.spawn_attempts = 0
+
+        def spawn(self) -> Slot:
+            self.spawn_attempts += 1
+            # alternate: capacity miss, then a real restore failure
+            if self.spawn_attempts % 2 == 1:
+                raise CascadeExhausted("cascade: every tier is at capacity")
+            raise RuntimeError("snapshot restore failed: corrupt warm.mem")
+
+    rt = _FullThenBroken()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4,
+        # NOT 2: a capacity miss BREAKS the batch, so only one real failure lands per tick and
+        # the spawn circuit-breaker would trip before the rebuild threshold is ever reachable --
+        # the test would then pass for the wrong reason (no spawns at all, not "no rebuild").
+        max_consecutive_failures=50, snapshot_rebuild_after=3,
+        base_rebuild_cooldown_s=0.0,
+        # Alternating means 6 attempts to reach a streak of 3, and the default token bucket only
+        # holds ~4 -- the loop runs in microseconds so nothing refills. Without this the pool
+        # simply stops spawning and the assertion measures the rate limiter, not the fix.
+        spawn_rate_limit=1000.0,
+    )
+
+    for _ in range(24):
+        pool.tick()
+
+    assert rt.base_invalidations >= 1, (
+        "interleaved capacity misses must not stop a genuinely corrupt base from being repaired"
+    )
+
+
+def test_resize_re_derives_every_threshold_computed_from_warm_size() -> None:
+    """Both derived thresholds must follow the live target, not the constructor's.
+
+    The node autosizer moves warm_size at runtime. A pool created at 16 and shrunk to 1 kept a
+    rebuild threshold of 32 -- so a poisoned base on a now-tiny pool needed 32 consecutive
+    failures instead of 4, i.e. effectively never. The eviction cap already re-derived; this is
+    the sibling that did not. Upstream, PR #82.
+    """
+    pool = WarmPool(runtime=_WedgeableRuntime(), warm_size=16, concurrent_ceiling=32)
+    assert pool._snapshot_rebuild_after == 32
+    assert pool._max_evictions_per_window == 16
+
+    pool.resize(warm_size=1)
+    assert pool._snapshot_rebuild_after == 4, (
+        "shrinking must lower the rebuild threshold -- otherwise a poisoned base on a 1-slot "
+        f"pool is never repaired (got {pool._snapshot_rebuild_after})"
+    )
+    assert pool._max_evictions_per_window == 2
+
+    pool.resize(warm_size=16)
+    assert pool._snapshot_rebuild_after == 32, "growing must raise it back"
+
+
+def test_an_explicit_rebuild_threshold_survives_resize() -> None:
+    """Re-deriving must only touch values the pool derived ITSELF.
+
+    An operator who pinned the threshold means it; silently recomputing over their value on the
+    next autosizer tick is worse than the bug being fixed.
+    """
+    pool = WarmPool(
+        runtime=_WedgeableRuntime(), warm_size=16, concurrent_ceiling=32,
+        snapshot_rebuild_after=7, max_evictions_per_window=3,
+    )
+    pool.resize(warm_size=1)
+    assert pool._snapshot_rebuild_after == 7, "an explicitly configured threshold must be kept"
+    assert pool._max_evictions_per_window == 3
+
+
+def test_a_static_pool_at_capacity_is_not_a_restore_failure() -> None:
+    """The capacity contract must cover EVERY runtime that can legitimately be full.
+
+    StaticPoolExhausted is the sibling of CascadeExhausted: all static workers busy is routine
+    backpressure, not a broken base. Caught by mutation testing -- retyping it was a one-word
+    change that nothing verified.
+    """
+    class _AllBusy(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.spawn_attempts = 0
+
+        def spawn(self) -> Slot:
+            self.spawn_attempts += 1
+            raise StaticPoolExhausted("no free static worker is currently healthy")
+
+    rt = _AllBusy()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4,
+        max_consecutive_failures=2, snapshot_rebuild_after=3,
+        base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    for _ in range(12):
+        pool.tick()
+
+    assert rt.spawn_attempts >= 3
+    assert rt.base_invalidations == 0, (
+        "a static pool with every worker busy must not invalidate the base "
+        f"(got {rt.base_invalidations} invalidations)"
+    )
