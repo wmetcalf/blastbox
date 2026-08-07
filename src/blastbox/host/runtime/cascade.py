@@ -21,7 +21,6 @@ available is logged and skipped, so local capacity still comes up if the cloud t
 
 from __future__ import annotations
 
-import contextlib
 import inspect
 import logging
 import threading
@@ -52,6 +51,11 @@ class CascadeExhausted(RuntimeAtCapacity):
     never advanced, and the tier sat at zero capacity until someone restarted the process.
     Do not re-merge these two.
     """
+
+
+class CascadeInvalidateFailed(RuntimeError):
+    """At least one tier's base invalidation failed. Raised AFTER every tier was attempted, so
+    the pool cannot record a repair that did not happen and start a cooldown on it."""
 
 
 class CascadeSpawnFailed(RuntimeError):
@@ -293,15 +297,27 @@ class CascadingRuntime:
     def invalidate_base(self) -> None:
         """Forward base invalidation to every wrapped tier that supports it.
 
-        In production the pool holds THIS object, not the snapshot runtime, so without this the
-        pool's getattr lookup fails and a poisoned base is never rebuilt (upstream, PR #82). Which
-        tier owns the bad base is not knowable here -- invalidating a healthy one costs a rebuild,
-        leaving a poisoned one costs the tier, so ask all of them."""
-        for tier in getattr(self, "tiers", None) or ():
-            drop = getattr(getattr(tier, "runtime", None), "invalidate_base", None)
-            if callable(drop):
-                with contextlib.suppress(Exception):
-                    drop()
+        Every tier is attempted even if an earlier one fails -- one poisoned tier must not stop
+        the others being repaired -- but a failure is then PROPAGATED. Swallowing it made the
+        pool record a successful rebuild and start its cooldown while the poisoned tier was
+        untouched, so the next repair attempt was delayed for the whole cooldown and the tier
+        kept failing (upstream, PR #82).
+        """
+        failures: list[str] = []
+        for tier in self.tiers:
+            fn = getattr(tier.runtime, "invalidate_base", None)
+            if not callable(fn):
+                continue
+            try:
+                fn()
+            except Exception as exc:  # noqa: BLE001 -- try every tier, report at the end
+                failures.append(f"{tier.name}: {exc}")
+                _log.warning("cascade: tier %r base invalidation failed: %s", tier.name, exc)
+        if failures:
+            raise CascadeInvalidateFailed(
+                "cascade: base invalidation failed for " + "; ".join(failures)
+            )
+
 
     def reap(self, slot: Any, dirty: bool = False) -> None:
         with self._lock:

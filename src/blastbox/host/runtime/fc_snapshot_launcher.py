@@ -137,7 +137,21 @@ class _Handle:
         gen = f"{os.getpid()}-{time.monotonic_ns():019d}"
         snap = dest / f"warm-{gen}.snapshot"
         mem = self._mem_dir / f"warm-{gen}.mem"
-        _create_snapshot(self.api, str(snap), str(mem))
+        try:
+            _create_snapshot(self.api, str(snap), str(mem))
+        except BaseException:
+            # /snapshot/create can write EITHER file and then report an error (a lost response
+            # after Firecracker already committed the snapshot is the obvious way). No artifact
+            # is returned, so SnapshotManager never learns these paths exist and can never
+            # discard them. Because every retry now picks a unique generation name, repeated
+            # build failures accumulate full RAM-sized .mem files instead of overwriting the
+            # previous attempt, until /dev/shm or the disk is exhausted (upstream, PR #82).
+            for path in (snap, mem):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
         return FcSnapshotArtifact(snap, mem)
 
     def kill(self) -> None:

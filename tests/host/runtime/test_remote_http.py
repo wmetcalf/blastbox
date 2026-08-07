@@ -866,3 +866,47 @@ def test_empty_metadata_is_attributed_to_the_worker(tmp_path):
     assert calls and calls[0][1] == "worker", (
         f"empty metadata must advance worker burnout, got fault={calls[0][1] if calls else None}"
     )
+
+
+def test_local_host_io_is_unattributed_but_transport_still_convicts(tmp_path):
+    """The two must be told apart EXPLICITLY, because Python's hierarchy conflates them.
+
+    urllib's URLError/HTTPError and socket.timeout are all OSError subclasses, so an
+    `except OSError` written for ENOSPC silently swallows every connection failure too. Fixing
+    the reported half (host I/O wrongly convicting) without this guard would have killed wedge
+    detection for the transport failures the attribution exists for — so both directions are
+    asserted here.
+    """
+    import socket
+    import urllib.error
+
+    out = tmp_path / "out"
+    out.mkdir()
+    inp = tmp_path / "in.bin"
+    inp.write_bytes(b"sample")
+    slot = SimpleNamespace(slot_id="s1", url="http://worker.invalid", ip=None)
+
+    def _run(err):
+        calls: list[tuple[bool, str | None]] = []
+
+        def release(s, *, dirty: bool = False, fault: str | None = None) -> None:
+            calls.append((dirty, fault))
+
+        def boom(*a, **kw):
+            raise err
+
+        validate = make_remote_validate(
+            lambda: slot, release, output_dir_for=lambda p: out, http_open=boom,
+        )
+        validate(inp)
+        return calls[0][1] if calls else None
+
+    # LOCAL disk failure: the request never went out — not this worker's fault.
+    assert _run(OSError(28, "No space left on device")) == "unknown", (
+        "a dispatcher-disk failure must not burn out healthy slots"
+    )
+
+    # TRANSPORT failures still convict, despite also being OSErrors.
+    assert _run(urllib.error.URLError("connection refused")) == "worker"
+    assert _run(socket.timeout("timed out")) == "worker"
+    assert _run(ConnectionResetError("peer reset")) == "worker"

@@ -517,3 +517,40 @@ def test_spawn_raises_a_FAULT_when_attempted_tiers_fail_and_CAPACITY_when_merely
     assert isinstance(ei2.value, RuntimeAtCapacity), (
         "a merely-full cascade is backpressure and must not advance any failure streak"
     )
+
+
+def test_a_failed_tier_invalidation_is_reported_not_swallowed():
+    """A rebuild the pool believes happened, but didn't, is worse than a loud failure.
+
+    Swallowing a tier's invalidate_base() error made CascadingRuntime.invalidate_base() return
+    normally, so WarmPool recorded a successful rebuild and started its cooldown while the
+    poisoned tier was untouched — delaying the next repair attempt for the whole cooldown while
+    that tier kept failing. Every tier is still attempted; the failure is raised at the end.
+    """
+    from blastbox.host.runtime.cascade import (
+        CascadeInvalidateFailed,
+        CascadingRuntime,
+        Tier,
+    )
+
+    invalidated: list[str] = []
+
+    class _Ok:
+        def __init__(self, name): self.name = name
+        def invalidate_base(self): invalidated.append(self.name)
+
+    class _Broken:
+        def invalidate_base(self): raise RuntimeError("snapshot cleanup failed")
+
+    casc = CascadingRuntime(tiers=[
+        Tier(name="a", runtime=_Ok("a"), capacity=1),
+        Tier(name="broken", runtime=_Broken(), capacity=1),
+        Tier(name="c", runtime=_Ok("c"), capacity=1),
+    ])
+
+    with pytest.raises(CascadeInvalidateFailed):
+        casc.invalidate_base()
+
+    assert invalidated == ["a", "c"], (
+        f"one failing tier must not stop the others being repaired (got {invalidated})"
+    )

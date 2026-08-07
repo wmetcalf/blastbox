@@ -157,10 +157,20 @@ class SnapshotSlotRuntime:
             for d in (output_dir, input_dir, control_dir):
                 d.mkdir(parents=True, exist_ok=True)
         except BaseException:
-            with contextlib.suppress(Exception):
+            vm_gone = True
+            try:
                 handle.kill()  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                # Identical rule to reap(): a kill() that raised leaves the microVM possibly
+                # ALIVE and still mapping this generation. Releasing the pin anyway lets a later
+                # invalidation unlink its backing files underneath. This cleanup path was added
+                # in the same commit that guarded reap() and repeated the very bug it fixed.
+                vm_gone = False
+                _log.warning(
+                    "snapshot.spawn_cleanup_kill_error slot_id=%s: %s", slot_id, exc
+                )
             release = getattr(self._manager, "release", None)
-            if callable(release):
+            if callable(release) and vm_gone:
                 with contextlib.suppress(Exception):
                     release(slot_id)
             raise

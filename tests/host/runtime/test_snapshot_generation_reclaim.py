@@ -431,3 +431,87 @@ def test_a_build_failing_with_a_SnapshotError_also_tears_down_its_base(tmp_path)
     with pytest.raises(SnapshotBuildError):
         mgr.build()
     assert killed, "the SnapshotError path must still tear its base down"
+
+
+def test_a_failed_checkpoint_removes_the_files_it_wrote(tmp_path):
+    """A checkpoint that wrote files and THEN failed leaves nothing that can discard them.
+
+    /snapshot/create can write either file and then report an error — a lost response after
+    Firecracker already committed is the obvious way. No artifact is returned, so SnapshotManager
+    never learns those paths exist. Because every retry now picks a unique generation name,
+    repeated build failures accumulate full RAM-sized .mem files instead of overwriting the
+    previous attempt, until /dev/shm or the disk is exhausted.
+    """
+    from blastbox.host.runtime import fc_snapshot_launcher as launcher
+
+    dest = tmp_path / "dest"
+    mem_dir = tmp_path / "mem"
+    dest.mkdir()
+    mem_dir.mkdir()
+
+    def _create_then_fail(api, snap, mem):
+        Path(snap).write_bytes(b"partial")
+        Path(mem).write_bytes(b"m" * 4096)     # a RAM-sized file, in miniature
+        raise RuntimeError("snapshot create reported an error after committing")
+
+    handle = launcher._Handle(None, object(), "vsock.sock", mem_dir=mem_dir)  # type: ignore[arg-type]
+
+    for _ in range(3):                          # repeated build retries
+        with pytest.raises(Exception):
+            with _patched(launcher, "_create_snapshot", _create_then_fail):
+                handle.checkpoint(dest)
+
+    leftovers = list(dest.glob("warm-*")) + list(mem_dir.glob("warm-*"))
+    assert leftovers == [], f"failed checkpoints leaked their files: {leftovers}"
+
+
+import contextlib as _contextlib
+
+
+@_contextlib.contextmanager
+def _patched(mod, name, value):
+    """Patch a name that the code under test imports lazily inside the function."""
+    import blastbox.host.runtime.fc_snapshot_backend as backend
+    old = getattr(backend, name)
+    setattr(backend, name, value)
+    try:
+        yield
+    finally:
+        setattr(backend, name, old)
+
+
+def test_spawn_cleanup_retains_the_pin_when_it_cannot_kill_the_vm(tmp_path):
+    """The spawn-cleanup path owes the same guarantee as reap().
+
+    When post-restore slot construction fails AND handle.kill() also raises, the microVM may
+    still be alive and mapping this generation. Releasing the pin anyway lets a later
+    invalidation unlink its backing files underneath. This cleanup path was added in the same
+    commit that guarded reap(), and reproduced the exact bug that commit fixed.
+    """
+    from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
+
+    mgr, be = _mgr(tmp_path)
+
+    class _UnkillableAndUnusable:
+        @property
+        def vsock_uds(self):
+            raise OSError("ENOSPC reading the restored handle")
+
+        def kill(self):
+            raise RuntimeError("SIGKILL failed; the microVM may still be running")
+
+    be.restore_in = lambda w, a: _UnkillableAndUnusable()  # type: ignore[assignment]
+
+    class _Cfg:
+        max_extracted_bytes = 1 << 20
+
+    rt = SnapshotSlotRuntime(_Cfg(), mgr, settle_s=0.0)
+    gen1 = tmp_path / "snap" / "warm-gen1.mem"
+
+    with pytest.raises(Exception):
+        rt.spawn()
+
+    mgr.invalidate()
+    assert gen1.exists(), (
+        "the generation was reclaimed while its microVM could not be confirmed dead"
+    )

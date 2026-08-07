@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 import logging
 import os
 import ssl
@@ -436,6 +437,17 @@ def detonate_remote(
     return {}
 
 
+def _is_transport_error(exc: BaseException) -> bool:
+    """Whether an OSError came from the WIRE rather than the local filesystem.
+
+    urllib.error.URLError (and thus HTTPError), socket.timeout and ConnectionError all subclass
+    OSError, so separating "the disk is full" from "the worker is unreachable" has to be
+    explicit: an `except OSError` written for ENOSPC otherwise captures every connection failure
+    too, and silently stops attributing the wedges this exists to catch.
+    """
+    return isinstance(exc, (urllib.error.URLError, socket.timeout, ConnectionError))
+
+
 def make_remote_validate(
     claim: Callable[[], _Slot],
     release: Callable[..., None],
@@ -540,6 +552,21 @@ def make_remote_validate(
             fault = "unknown"
             raise
         except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, OSError) and not _is_transport_error(exc):
+                # LOCAL HOST I/O: input_path.stat(), output_dir.mkdir(), _empty_dir(), tar
+                # extraction. These fail on ENOSPC/EROFS/EMFILE with the request never sent, so
+                # they are evidence about THIS DISPATCHER, not the worker -- and a dispatcher
+                # disk outage hits every job at once, which would burn out every healthy slot
+                # and invalidate healthy bases (upstream, PR #82).
+                #
+                # Decided INSIDE this handler deliberately. A separate `except OSError:` fails
+                # twice over: urllib's URLError/HTTPError and socket.timeout are all OSError
+                # SUBCLASSES, so it would swallow every transport failure as host I/O; and
+                # re-raising from one handler does not fall through to a sibling handler, it
+                # escapes the try entirely.
+                fault = "unknown"
+                _log.warning("remote_http: local preparation failed: %s", exc)
+                return {"error": _sanitized_failure(exc)}, False
             fault = "worker"         # transport failed -> evidence about this worker, not the input
             # transport error after the request may have reached the worker -> the box could still be
             # busy; keep dirty=True so the pool retires/recycles it instead of re-offering immediately.
