@@ -1246,7 +1246,11 @@ class Dispatcher:
                     # slot.output_dir, so an ENOSPC/EROFS here is a DISPATCHER-disk outage -- which
                     # hits every job at once -- and the guest's output disk may be perfectly valid.
                     # Only a guest/seam failure (FCError: rdump/vsock) is worker evidence.
-                    host_io = isinstance(exc, OSError) and not isinstance(exc, _GUEST_SEAM_ERRORS)
+                    # rdump_ext4 converts a host OSError into ValueError, so the type alone is
+                    # not enough -- check the flag it carries as well (PR #82).
+                    host_io = getattr(exc, "host_io", False) or (
+                        isinstance(exc, OSError) and not isinstance(exc, _GUEST_SEAM_ERRORS)
+                    )
                     if not host_io:
                         warm_fault = "worker"   # the guest/seam failed to hand its output back
                     self._fail_job(job, f"failed to read warm worker output: {exc}")

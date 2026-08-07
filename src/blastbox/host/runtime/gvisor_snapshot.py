@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 import subprocess
 import time
@@ -18,6 +17,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+
+from blastbox.host.runtime.fc_snapshot_launcher import owner_token
 
 _log = logging.getLogger(__name__)
 
@@ -231,17 +232,26 @@ def _default_ready_wait(ctrl_dir: Path, timeout_s: float) -> None:
     raise TimeoutError(f"warm base not READY within {timeout_s}s ({ctrl_dir})")
 
 
-def _best_effort_delete(cfg: GvisorConfig, run: Callable[..., int], cid: str) -> None:
+def _best_effort_delete(cfg: GvisorConfig, run: Callable[..., int], cid: str) -> bool:
     """Tear down a (possibly half-created) runsc container: kill then force-delete,
     swallowing errors. Used on failure + reap paths where the container may or may not
     exist — a `runsc run`/`restore` that fails partway can still register container state
     under ``-root`` (with its sandbox/gofer processes), which would otherwise leak because
-    the caller never gets a handle to reap it."""
+    the caller never gets a handle to reap it.
+
+    Returns True when at least one teardown command SUCCEEDED. Callers that must not reclaim
+    resources a live sandbox still uses check this rather than assuming a clean return."""
+    ok = False
     for argv in (["kill", cid, "KILL"], ["delete", "-force", cid]):
         try:
             run([*_runsc(cfg), *argv])
+            ok = True
         except Exception:
             pass
+    # REPORT it. Swallowing every failure made kill() return normally even when both the kill and
+    # the force-delete failed, so the reap's `sandbox_gone` guard stayed True and released the
+    # generation pin anyway -- the guard was defeated by the layer beneath it (PR #82).
+    return ok
 
 
 class GvisorBootHandle:
@@ -287,7 +297,7 @@ class GvisorBootHandle:
         # a mix of two checkpoints. A pin stops the old generation being DELETED; only a distinct
         # path stops it being OVERWRITTEN. FC's mem/snapshot pair got this; gVisor did not
         # (upstream, PR #82).
-        gen = f"{os.getpid()}-{time.monotonic_ns():019d}"
+        gen = f"{owner_token()}-{time.monotonic_ns():019d}"
         img = Path(dest_dir) / f"checkpoint-{gen}"
         img.mkdir(parents=True, exist_ok=True)
         try:
@@ -309,7 +319,10 @@ class GvisorBootHandle:
         return str(img)
 
     def kill(self) -> None:
-        _best_effort_delete(self._cfg, self._run, self._cid)
+        if not _best_effort_delete(self._cfg, self._run, self._cid):
+            # The sandbox may still exist. Raise so the caller's guard retains the generation pin
+            # instead of reclaiming a checkpoint a live sandbox may still be restoring from.
+            raise RuntimeError(f"could not confirm teardown of runsc container {self._cid}")
         shutil.rmtree(self._base, ignore_errors=True)  # don't leave the base bundle dir behind
 
 
@@ -369,7 +382,10 @@ class GvisorRestoreHandle:
             return False
 
     def kill(self) -> None:
-        _best_effort_delete(self._cfg, self._run, self._cid)
+        if not _best_effort_delete(self._cfg, self._run, self._cid):
+            # The sandbox may still exist. Raise so the caller's guard retains the generation pin
+            # instead of reclaiming a checkpoint a live sandbox may still be restoring from.
+            raise RuntimeError(f"could not confirm teardown of runsc container {self._cid}")
 
 
 class GvisorSnapshotBackend:

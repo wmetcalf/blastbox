@@ -488,3 +488,60 @@ def test_the_sweep_never_touches_a_live_dispatchers_generation(tmp_path):
     )
     assert launcher.sweep_orphan_generations() == 0
     assert live.exists()
+
+
+def test_generation_ownership_survives_pid_reuse(tmp_path):
+    """A pid ALONE is not an identity.
+
+    A dispatcher running as PID 1 in a container — the normal case — sees every replacement
+    container reuse PID 1, so a pid-only check treated each prior container's generations as its
+    own and swept nothing, while every deployment added another RAM-sized .mem.
+    """
+    import os
+
+    from blastbox.host.runtime.fc_snapshot_launcher import (
+        _generation_owner,
+        _owner_alive,
+        owner_token,
+    )
+
+    mine = owner_token()
+    assert "_" in mine, "the token must carry more than a pid"
+    assert _owner_alive(mine) is True
+
+    # SAME pid, different start time: a recycled pid is a different process.
+    recycled = f"{os.getpid()}_1"
+    assert _owner_alive(recycled) is False, (
+        "a reused pid with a different start time must not be treated as the live owner"
+    )
+
+    assert _generation_owner(f"warm-{mine}-0000000000000000001.mem") == mine
+    # A legacy pid-only name is still parseable, or a rolling upgrade strands every pre-upgrade
+    # generation forever.
+    assert _generation_owner("warm-999999999-0000000000000000001.mem") == "999999999"
+    assert _generation_owner("warm.snapshot") is None
+
+
+def test_a_generation_from_a_reused_pid_is_swept(tmp_path):
+    """The end-to-end consequence of the identity fix."""
+    import os
+
+    from blastbox.host.runtime.fc_snapshot_launcher import owner_token
+
+    base = tmp_path / "snap"
+    base.mkdir()
+
+    stale = base / f"warm-{os.getpid()}_1-0000000000000000001.mem"   # our pid, old start time
+    ours = base / f"warm-{owner_token()}-0000000000000000002.mem"
+    stale.write_bytes(b"x")
+    ours.write_bytes(b"x")
+
+    launcher = FcSnapshotLauncher(
+        FakeCfg(), base, mem_dir=base,
+        popen=lambda argv, cwd=None: FakeProc(),
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
+        make_outdisk=_make_outdisk_file,
+    )
+    assert launcher.sweep_orphan_generations() == 1
+    assert not stale.exists(), "a prior container's generation must be reclaimed"
+    assert ours.exists(), "our own generation must never be swept"

@@ -2338,3 +2338,35 @@ def test_the_explicit_streak_path_also_honours_the_success_token() -> None:
         "the explicit-streak path rebuilt a base that had just produced a valid result "
         f"(invalidations={rt.base_invalidations})"
     )
+
+
+def test_an_unknown_escalation_is_not_restore_evidence() -> None:
+    """Escalating from UNKNOWN is a SUSPICION, not a verdict.
+
+    During a prolonged control-plane brownout every slot escalates, so counting those toward the
+    restore-failure streak would invalidate a healthy base on no verdict at all — and the count
+    would stand even when the disposal then failed and the slot was returned to IDLE.
+    """
+    clock = _FakeClock()
+
+    class _AlwaysUnknown(_WedgeableRuntime):
+        def is_ready(self, slot: Slot) -> bool:
+            return True
+
+        def is_alive(self, slot: Slot):
+            return None            # never a verdict
+
+    rt = _AlwaysUnknown()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4, clock=clock,
+        unknown_grace_s=10.0, snapshot_rebuild_after=2,
+        base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    for _ in range(8):
+        pool.tick()
+        clock.advance(11.0)
+
+    assert rt.base_invalidations == 0, (
+        "a control-plane brownout invalidated the snapshot base on suspicion alone "
+        f"(got {rt.base_invalidations} rebuilds)"
+    )

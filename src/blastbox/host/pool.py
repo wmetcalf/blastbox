@@ -2092,7 +2092,13 @@ class WarmPool:
                     cur.state = SlotState.DRAINING
                     # We won the race, so this death is real evidence. A slot that never served a
                     # job had only its promotion vouching for the base, and that is now refuted.
-                    if cur.slot_id in self._promoted_unproven:
+                    # ONLY a confirmed death is restore evidence. A slot escalated from
+                    # UNKNOWN entered `dead` on suspicion, and during a prolonged control-plane
+                    # brownout every slot does -- counting those would invalidate a healthy base
+                    # on no verdict at all, and the count would stand even when the disposal then
+                    # failed and the slot was restored to IDLE (PR #82).
+                    if (cur.slot_id in self._promoted_unproven
+                            and cur.slot_id not in suspected):
                         self._promoted_unproven.discard(cur.slot_id)
                         unproven_deaths += 1
                         blamed.append(cur.slot_id)

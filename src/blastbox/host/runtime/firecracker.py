@@ -482,7 +482,13 @@ def rdump_ext4(
             f.seek(0x438)
             magic = f.read(2)
     except OSError as exc:
-        raise ValueError(f"cannot read ext4 image {image}: {exc}") from exc
+        # Keep the HOST-I/O nature visible through the wrapper. EMFILE/EIO/ENOMEM opening the
+        # per-slot image is this dispatcher failing, not the guest -- and the warm path convicts
+        # on a materialization failure, so flattening it to a bare ValueError blamed healthy
+        # guests during a host outage that hits every job at once (PR #82).
+        err = ValueError(f"cannot read ext4 image {image}: {exc}")
+        err.host_io = True  # type: ignore[attr-defined]
+        raise err from exc
 
     if magic != b"\x53\xef":
         raise ValueError(

@@ -100,27 +100,65 @@ def api_boot_sequence(
     ]
 
 
-def _generation_pid(name: str) -> int | None:
-    """The pid embedded in a ``warm-<pid>-<ns>...`` generation filename, or None if it is not one."""
+def _proc_starttime(pid: int) -> str | None:
+    """Field 22 of /proc/<pid>/stat: the process start time in clock ticks since boot.
+
+    A pid ALONE is not an identity. A dispatcher running as PID 1 in a container -- the normal
+    case -- sees every replacement container reuse PID 1, so a pid-only check treats every prior
+    container's generations as its own and sweeps nothing, while each deployment adds another
+    RAM-sized .mem (PR #82). (pid, starttime) is unique for the life of the boot.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    # The comm field can contain spaces and parentheses; everything after the LAST ')' is safe.
+    tail = data.rsplit(b")", 1)[-1].split()
+    return tail[19].decode() if len(tail) > 19 else None
+
+
+def owner_token() -> str:
+    """This process's generation-ownership token: ``<pid>_<starttime>``."""
+    pid = os.getpid()
+    return f"{pid}_{_proc_starttime(pid) or '0'}"
+
+
+def _generation_owner(name: str) -> str | None:
+    """The owner token in a ``warm-<pid>_<start>-<ns>...`` filename, or None if it is not one."""
     if not name.startswith("warm-"):
         return None
-    rest = name[len("warm-"):]
-    head = rest.split("-", 1)[0]
-    return int(head) if head.isdigit() else None
+    head = name[len("warm-"):].split("-", 1)[0]
+    if "_" in head and head.split("_", 1)[0].isdigit():
+        return head
+    # LEGACY pid-only name from a build before ownership carried a start time. Still sweepable on
+    # a pid check alone; a rolling upgrade would otherwise strand every pre-upgrade generation.
+    return head if head.isdigit() else None
 
 
-def _pid_alive(pid: int) -> bool:
-    """Whether a process exists. A pid we cannot signal is treated as ALIVE: refusing to delete is
-    always the safe error here."""
+def _owner_alive(token: str) -> bool:
+    """Whether the process that created a generation is still running.
+
+    Unknown counts as ALIVE: refusing to delete is always the safe error, because removing a
+    generation a live dispatcher is still using pulls the backing store from under its microVMs.
+    """
+    pid_s, _, start = token.partition("_")
+    try:
+        pid = int(pid_s)
+    except ValueError:
+        return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    except PermissionError:
-        return True          # exists, owned by someone else
     except OSError:
-        return True          # unknown -> assume alive and keep the files
-    return True
+        return True
+    # The pid exists -- but is it the SAME process? A recycled pid with a different start time is
+    # a different process, and the generation belongs to the one that is gone.
+    cur = _proc_starttime(pid)
+    if cur is None or not start:
+        return True
+    return cur == start
 
 
 class _Handle:
@@ -178,7 +216,7 @@ class _Handle:
                     still.append(leftover)
             self._stranded_partials = still
 
-        gen = f"{os.getpid()}-{time.monotonic_ns():019d}"
+        gen = f"{owner_token()}-{time.monotonic_ns():019d}"
         snap = dest / f"warm-{gen}.snapshot"
         mem = self._mem_dir / f"warm-{gen}.mem"
         outdisk: Path | None = dest / f"warm-{gen}.outdisk.ext4"
@@ -395,8 +433,8 @@ class FcSnapshotLauncher:
             if directory is None or not directory.exists():
                 continue
             for path in directory.glob("warm-*"):
-                pid = _generation_pid(path.name)
-                if pid is None or pid == os.getpid() or _pid_alive(pid):
+                token = _generation_owner(path.name)
+                if token is None or token == owner_token() or _owner_alive(token):
                     continue
                 try:
                     if path.is_dir():

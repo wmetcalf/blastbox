@@ -455,3 +455,31 @@ def test_a_partial_checkpoint_whose_cleanup_fails_is_retried(tmp_path: Path) -> 
         )
     finally:
         mp.undo()
+
+
+def test_kill_reports_an_unconfirmed_teardown(tmp_path: Path) -> None:
+    """_best_effort_delete swallowed every failure, defeating the caller's pin guard.
+
+    When both `runsc kill` and `runsc delete -force` fail, kill() returned normally, so the reap's
+    `sandbox_gone` check stayed True and released the generation pin — a later invalidation could
+    then reclaim a checkpoint a live sandbox was still restoring from.
+    """
+    def _teardown_fails(argv, *a, **kw):
+        # Boot must SUCCEED, or we never get a handle to test; only the teardown commands fail.
+        if any(x in argv for x in ("kill", "delete")):
+            raise RuntimeError("runsc unavailable")
+        return 0
+
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=_teardown_fails, ready_wait=lambda d, t: None)
+    handle = be.boot_base()
+
+    with pytest.raises(Exception):
+        handle.kill()
+
+
+def test_kill_is_quiet_when_teardown_succeeds(tmp_path: Path) -> None:
+    """The carve-out stays narrow: a successful teardown must not raise."""
+    rec = _Rec()
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=rec, ready_wait=lambda d, t: None)
+    handle = be.boot_base()
+    handle.kill()          # must not raise

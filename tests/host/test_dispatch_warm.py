@@ -2131,3 +2131,38 @@ def test_a_host_side_done_file_failure_is_not_worker_evidence(tmp_path):
     assert pool.release_fault == ["unknown"], (
         f"a host-side done-file failure is not worker evidence (got {pool.release_fault})"
     )
+
+
+def test_a_host_disk_failure_inside_rdump_is_not_worker_evidence(tmp_path):
+    """rdump_ext4 converts a host OSError into ValueError, so the type alone is not enough.
+
+    EMFILE/EIO opening the per-slot image is this dispatcher failing, not the guest — and the
+    warm path convicts on a materialization failure, so flattening it to a bare ValueError blamed
+    healthy guests during a host outage that hits every job at once.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    runtime = _FakeVsockRuntime()
+
+    def _rdump_host_failure(s):
+        err = ValueError("cannot read ext4 image /slots/x/outdisk.ext4: [Errno 24] EMFILE")
+        err.host_io = True          # exactly what rdump_ext4 now attaches
+        raise err
+
+    runtime.materialize_warm_output = _rdump_host_failure  # type: ignore[assignment]
+    pool = FakeWarmPool(slot, runtime=runtime)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+
+    dispatcher.dispatch_once()
+
+    assert store.get(job.job_id).status == JobStatus.FAILED
+    assert pool.release_fault == ["unknown"], (
+        f"a host disk failure inside rdump is not worker evidence (got {pool.release_fault})"
+    )
