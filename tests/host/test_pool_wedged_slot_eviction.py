@@ -1808,3 +1808,42 @@ def test_a_failed_invalidation_keeps_its_episode() -> None:
         f"a repair that did not happen consumed its episode anyway — the base now waits for a "
         f"whole new streak (got {streak})"
     )
+
+
+def test_a_failed_tier_repair_keeps_its_streak() -> None:
+    """The streak is cleared to give a successful rebuild a window — so a FAILED one must give it back.
+
+    Behind a working fallback tier the broken tier may be attempted rarely, so demanding another
+    full threshold after a transient invalidation error can mean never retrying at all. The pool's
+    own repair already restores its episode; this is the sibling that did not.
+    """
+    class _BrokenAndUnrepairable:
+        def __init__(self) -> None:
+            self.attempts = 0
+            self.invalidate_attempts = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            self.attempts += 1
+            raise RuntimeError("snapshot restore failed")
+
+        def invalidate_base(self) -> None:
+            self.invalidate_attempts += 1
+            raise RuntimeError("snapshot cleanup failed")
+
+    rt = _BrokenAndUnrepairable()
+    casc = CascadingRuntime(tiers=[Tier(name="fc", runtime=rt, capacity=4)],
+                            tier_rebuild_after=2)
+
+    for _ in range(4):
+        with contextlib.suppress(Exception):
+            casc.spawn()
+
+    # With the streak restored, EVERY subsequent failure re-attempts the repair. Without it, the
+    # tier would need two more failures before trying again.
+    assert rt.invalidate_attempts >= 3, (
+        f"a failed repair discarded its streak, so the broken tier waits a whole new threshold "
+        f"before retrying (repair attempts: {rt.invalidate_attempts} over {rt.attempts} spawns)"
+    )

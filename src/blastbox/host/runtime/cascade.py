@@ -302,6 +302,13 @@ class CascadingRuntime:
         try:
             invalidate()
         except Exception as exc:  # noqa: BLE001
+            # RESTORE the streak. It was cleared to give a successful rebuild a full window, but
+            # no rebuild happened -- and behind a working fallback tier this tier may be attempted
+            # rarely or not at all, so demanding another full threshold can mean never retrying.
+            # Same rule the pool's own repair now follows for its episode; this sibling did not
+            # inherit it (upstream, PR #82).
+            with self._lock:
+                self._tier_failures[index] = max(self._tier_failures[index], streak)
             _log.warning("cascade: tier %r base invalidation failed: %s", tier.name, exc)
 
     def invalidate_base(self, *, reason: str | None = None) -> None:
