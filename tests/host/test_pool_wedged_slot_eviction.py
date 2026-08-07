@@ -1847,3 +1847,86 @@ def test_a_failed_tier_repair_keeps_its_streak() -> None:
         f"a failed repair discarded its streak, so the broken tier waits a whole new threshold "
         f"before retrying (repair attempts: {rt.invalidate_attempts} over {rt.attempts} spawns)"
     )
+
+
+def test_a_slot_claimed_during_escalation_is_not_disposed() -> None:
+    """The load-bearing guard is the DRAIN re-check, and it was untested.
+
+    Sweeping for "decide under the lock, act outside it" turned up the unknown-escalation path:
+    it read the stamp under the lock and escalated after releasing it, so a claim() could take the
+    slot in that window and the pass would still add it to `dead`. That shape is now tightened —
+    but it was never observable, because the drain step re-checks state under the lock and only
+    transitions slots still IDLE/WARMING. This test pins THAT guard, which is what actually keeps
+    a job-serving slot alive, and which nothing covered.
+    """
+    import threading
+
+    clock = _FakeClock()
+
+    class _UnknownRuntime(_WedgeableRuntime):
+        def is_alive(self, slot: Slot):
+            return None            # the BACKGROUND probe cannot tell — UNKNOWN, never a verdict
+
+        def is_alive_for_claim(self, slot: Slot, budget_s=None):
+            # ...but the claim path's own fresh probe says the worker is fine. That asymmetry is
+            # the realistic case: a control-plane brownout makes the sweep unknown while the box
+            # itself answers.
+            return True
+
+    rt = _UnknownRuntime()
+    pool = WarmPool(
+        runtime=rt, warm_size=1, concurrent_ceiling=2, clock=clock,
+        unknown_grace_s=10.0, spawn_rate_limit=1000.0,
+    )
+    pool.tick()
+    for s in pool._slots.values():
+        s.state = SlotState.IDLE
+
+    pool._health_check()          # opens the unknown episode
+    clock.advance(11.0)           # past the grace: this pass escalates
+
+    claimed: list[object] = []
+    real_lock = pool._lock
+
+    class _GatedLock:
+        """Let a claim land in the escalation window. Armed by the setdefault below rather than
+        on the first exit: _health_check takes this lock several times, and arming on the first
+        fires long before the window."""
+
+        def __init__(self) -> None:
+            self.armed = False
+
+        def __enter__(self):
+            return real_lock.__enter__()
+
+        def __exit__(self, *a):
+            r = real_lock.__exit__(*a)
+            if self.armed:
+                self.armed = False
+                th = threading.Thread(
+                    target=lambda: claimed.append(pool.claim(timeout_s=1.0)), daemon=True
+                )
+                th.start()
+                th.join(5.0)
+            return r
+
+    gate = _GatedLock()
+
+    class _ArmingStamps(dict):
+        def setdefault(self, *a, **kw):
+            gate.armed = True
+            return super().setdefault(*a, **kw)
+
+    pool._unknown_since = _ArmingStamps(pool._unknown_since)  # type: ignore[assignment]
+    pool._lock = gate  # type: ignore[assignment]
+    pool._health_check()
+    pool._lock = real_lock
+
+    assert claimed and claimed[0] is not None, (
+        "the racing claim never took the slot — the test proved nothing"
+    )
+    got = claimed[0]
+    assert got.state == SlotState.ASSIGNED, (
+        f"a slot handed to a job was drained mid-flight (state={got.state})"
+    )
+    assert got.slot_id in pool._slots, "the claimed slot was disposed while serving a job"

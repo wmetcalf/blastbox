@@ -1950,12 +1950,22 @@ class WarmPool:
                     if cur is not slot or cur.state != SlotState.IDLE:
                         continue
                     since = self._unknown_since.setdefault(slot.slot_id, probed_at)
-                stuck_for = probed_at - since
-                if self._unknown_grace_s > 0 and stuck_for > self._unknown_grace_s:
+                    # DECIDE under the same lock that verified the state. Computing stuck_for and
+                    # escalating after releasing it left a window in which a concurrent claim()
+                    # could take this slot -- and we would still mark it dead and dispose of it
+                    # WHILE IT WAS SERVING A JOB. Locking the check but not the decision is the
+                    # same mistake as reading the failure streak under the lock and deciding
+                    # outside it, and as comparing the build epoch before publishing (PR #82).
+                    stuck_for = probed_at - since
+                    escalate = (
+                        self._unknown_grace_s > 0 and stuck_for > self._unknown_grace_s
+                    )
+                    if escalate:
+                        self._unknown_since.pop(slot.slot_id, None)
+                if escalate:
                     logger.warning("pool.health_unknown_escalated slot_id=%s unknown_for=%.0fs "
                                    "(> %.0fs) — treating as dead so the slot is replaced",
                                    slot.slot_id, stuck_for, self._unknown_grace_s)
-                    self._unknown_since.pop(slot.slot_id, None)
                     suspected.add(slot.slot_id)   # escalated on suspicion, not on a verdict
                     dead.append(slot)
                 else:

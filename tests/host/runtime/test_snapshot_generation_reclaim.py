@@ -9,6 +9,7 @@ once its LAST user is reaped.
 """
 from __future__ import annotations
 
+import contextlib
 import time
 
 import pytest
@@ -673,3 +674,79 @@ def test_an_interrupted_build_still_tears_down_its_base(tmp_path):
     with pytest.raises(KeyboardInterrupt):
         mgr.build()
     assert killed, "an interrupted build must still tear its base down"
+
+
+def test_an_invalidate_racing_publication_still_rejects_the_build(tmp_path):
+    """Comparing the epoch and publishing must be ONE locked step.
+
+    invalidate() landing between the comparison and the assignment bumps the epoch, sees
+    _artifact is None (so it retires nothing), and the build then publishes the very artifact
+    that repair rejected — the request is lost silently and restores keep reproducing the wedge.
+    """
+    import threading
+
+    from blastbox.host.runtime.fc_snapshot import SnapshotBuildError
+
+    mgr, be = _mgr(tmp_path)
+
+    entered = threading.Event()
+    invalidated = threading.Event()
+    real_lock = mgr._build_lock
+
+    class _GatedLock:
+        """Stall the FIRST acquisition taken after the build produces its artifact, so an
+        invalidate can land in the compare/publish window if one exists."""
+
+        def __init__(self) -> None:
+            self._armed = False
+
+        def arm(self) -> None:
+            self._armed = True
+
+        def __enter__(self):
+            return real_lock.__enter__()
+
+        def __exit__(self, *a):
+            r = real_lock.__exit__(*a)
+            # Fire on EXIT, not entry: the window is between the epoch COMPARISON and the
+            # publication. Gating entry only lets the racer land before the comparison, which
+            # even the broken version rejects correctly — the test would prove nothing.
+            if self._armed:
+                self._armed = False
+                entered.set()
+                invalidated.wait(5.0)
+            return r
+
+    gate = _GatedLock()
+
+    class _BootThatArms(_FakeBoot):
+        def checkpoint(self, dest_dir):
+            art = super().checkpoint(dest_dir)
+            gate.arm()            # the next lock taken is the compare/publish one
+            return art
+
+    be.boot_base = lambda: _BootThatArms(be)  # type: ignore[assignment]
+    mgr._build_lock = gate  # type: ignore[assignment]
+
+    def _racer():
+        entered.wait(5.0)
+        mgr._build_lock = real_lock      # invalidate must not deadlock on the gate
+        mgr.invalidate()
+        mgr._build_lock = gate
+        invalidated.set()
+
+    th = threading.Thread(target=_racer, daemon=True)
+    th.start()
+    with contextlib.suppress(SnapshotBuildError):
+        mgr.build()
+    th.join(10.0)
+
+    assert invalidated.is_set(), "the racing invalidate never ran — the test proved nothing"
+    # TWO orderings are correct, and the invariant spans both: either the build loses and is
+    # discarded, or it publishes and the (serialized) invalidate then retires what it published.
+    # Asserting one specific outcome would encode a scheduling accident rather than the rule.
+    # What must NEVER happen is the third case — the compare says "keep", the invalidate finds
+    # nothing to retire, and the publish then installs the artifact that repair rejected.
+    assert mgr.artifact is None, (
+        "the repair was lost: an artifact rejected mid-build ended up installed as the active one"
+    )

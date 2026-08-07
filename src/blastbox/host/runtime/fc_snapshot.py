@@ -172,8 +172,22 @@ class SnapshotManager:
                 raise SnapshotBuildError(f"warm snapshot build failed: {exc}") from exc
             raise
 
+        # COMPARE AND PUBLISH UNDER ONE LOCK. Checking the epoch and then releasing before
+        # assigning left a window in which invalidate() could bump the epoch, observe
+        # _artifact is None (so it retires nothing), and this build would then publish the very
+        # artifact that repair had just rejected -- losing the request silently and letting
+        # restores keep reproducing the wedge. Locking the CHECK but not the ACT is the same
+        # mistake as reading the failure streak under the lock and deciding outside it, and as
+        # selecting the artifact outside the lock that pins it (upstream, PR #82).
+        #
+        # PUBLISH BEFORE TEARDOWN: if boot.kill() raised, an unassigned artifact could never be
+        # discovered by invalidate() or the reference counting, and every async retry left another
+        # generation-stamped, RAM-sized .mem behind. The snapshot is complete and usable here --
+        # a failure tearing the BASE down says nothing about it.
         with self._build_lock:
             rejected = epoch != self._build_epoch
+            if not rejected:
+                self._artifact = artifact
         if rejected:
             # invalidate() landed while this build was running. Publishing now would install the
             # artifact the repair explicitly rejected; discard it instead and let the next build
@@ -183,13 +197,6 @@ class SnapshotManager:
                 boot.kill()
             self._discard(artifact)
             raise SnapshotBuildError("snapshot invalidated while it was being built")
-
-        # PUBLISH BEFORE TEARDOWN. If boot.kill() raised, the artifact was never assigned, so
-        # nothing could ever discover it: not invalidate(), not the reference counting. Every
-        # async build retry then left another generation-stamped, RAM-sized .mem behind until the
-        # disk or tmpfs was exhausted. The snapshot itself is complete and usable at this point --
-        # a failure tearing the BASE down says nothing about it (upstream, PR #82).
-        self._artifact = artifact
         try:
             boot.kill()
         except Exception as exc:  # noqa: BLE001 -- a live base VM is a leak, not a bad snapshot
