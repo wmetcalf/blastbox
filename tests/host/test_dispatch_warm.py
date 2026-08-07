@@ -1637,12 +1637,14 @@ def _warm_case(tmp_path, store=None, **kw):
     return store, job, slot, pool, dispatcher
 
 
-def test_a_staging_failure_convicts_the_worker(tmp_path):
-    """Staging INTO the slot failed -- its IO seam is bad, which is evidence about the SLOT.
+def test_a_staging_failure_is_unattributed_unless_the_runtime_opts_in(tmp_path):
+    """Staging is NOT worker evidence by default, and today never is.
 
-    Driven through the runtime seam the dispatcher actually consults
-    (`getattr(runtime, "stage_warm_input")`), not a dispatcher attribute that does not exist --
-    patching the wrong name makes the job succeed and the test assert nothing.
+    No runtime's stage_warm_input actually talks to the worker: FC returns the host path
+    unchanged (bytes move later, at signal_go) and gVisor does a host-side shutil.copyfile into a
+    bind mount. An earlier version convicted this branch outright on the premise that the hook
+    meant vsock, so a full dispatcher disk would have burned out the entire healthy gVisor pool.
+    A runtime must opt in via warm_staging_is_transport.
     """
     store = InMemoryJobStore()
     job = _make_job()
@@ -1666,8 +1668,26 @@ def test_a_staging_failure_convicts_the_worker(tmp_path):
         dispatcher.dispatch_once()
 
     assert pool.release_calls == [slot], "the slot must still be released on this path"
-    assert pool.release_fault == ["worker"], (
-        f"a slot whose IO seam failed IS worker evidence (got {pool.release_fault})"
+    assert pool.release_fault == ["unknown"], (
+        f"host-side staging is not worker evidence by default (got {pool.release_fault})"
+    )
+
+    # ...and a runtime that genuinely transports at staging CAN opt in.
+    runtime.warm_staging_is_transport = True  # type: ignore[attr-defined]
+    store2 = InMemoryJobStore()
+    job2 = _make_job()
+    job2.input_sha256 = _INPUT_SHA
+    store2.create(job2)
+    _setup_job_dirs(tmp_path / "jobs2", job2)
+    slot2 = _make_slot(tmp_path / "s2")
+    pool2 = FakeWarmPool(slot2, runtime=runtime)
+    d2 = _make_dispatcher_with_pool(
+        store2, job_root=tmp_path / "jobs2", pool=pool2, worker_timeout_s=10,
+    )
+    with contextlib.suppress(RuntimeError):
+        d2.dispatch_once()
+    assert pool2.release_fault == ["worker"], (
+        f"an opted-in transport failure IS worker evidence (got {pool2.release_fault})"
     )
 
 

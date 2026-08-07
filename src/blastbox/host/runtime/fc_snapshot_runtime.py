@@ -19,6 +19,7 @@ host-side via ``rdump_ext4`` (no mount, no root).
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import shutil
@@ -143,12 +144,26 @@ class SnapshotSlotRuntime:
         # its parent IS the per-slot workdir (vsock.sock + outdisk.ext4 + fc-api.sock).
         # vsock_uds is a concrete-FC-handle accessor not on the generic RestoreHandle
         # seam (kill-only) — the FC backend's handle always provides it.
-        slot_workdir = Path(handle.vsock_uds).parent  # type: ignore[attr-defined]
-        output_dir = slot_workdir / "out"
-        input_dir = slot_workdir / "in"
-        control_dir = slot_workdir / "ctrl"
-        for d in (output_dir, input_dir, control_dir):
-            d.mkdir(parents=True, exist_ok=True)
+        # EVERYTHING between a successful restore and publishing the handle must clean up after
+        # itself. restore() has already pinned this generation, but no Slot exists yet, so the
+        # pool can never reap it and nothing would ever call release(slot_id): a failure here
+        # (reading vsock_uds, or mkdir hitting ENOSPC) would strand the pin AND leak a running
+        # microVM, permanently, until the process restarts.
+        try:
+            slot_workdir = Path(handle.vsock_uds).parent  # type: ignore[attr-defined]
+            output_dir = slot_workdir / "out"
+            input_dir = slot_workdir / "in"
+            control_dir = slot_workdir / "ctrl"
+            for d in (output_dir, input_dir, control_dir):
+                d.mkdir(parents=True, exist_ok=True)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                handle.kill()  # type: ignore[attr-defined]
+            release = getattr(self._manager, "release", None)
+            if callable(release):
+                with contextlib.suppress(Exception):
+                    release(slot_id)
+            raise
 
         with self._lock:
             self._handles[slot_id] = handle
@@ -213,10 +228,14 @@ class SnapshotSlotRuntime:
         with self._lock:
             handle = self._handles.pop(slot.slot_id, None)
             self._restored_at.pop(slot.slot_id, None)
+        vm_gone = True
         if handle is not None:
             try:
                 handle.kill()  # type: ignore[attr-defined]
             except Exception as exc:  # noqa: BLE001 — reap must never raise
+                # The microVM may still be RUNNING and still mapping this generation's memory
+                # file. Releasing the pin anyway can unlink it under a live VM.
+                vm_gone = False
                 _log.warning(
                     "snapshot.reap_kill_error slot_id=%s: %s", slot.slot_id, exc
                 )
@@ -228,9 +247,20 @@ class SnapshotSlotRuntime:
         # Drop this slot's pin on its snapshot generation; if it was the last user of a
         # SUPERSEDED generation, its files are unlinked now. Without this every rebuild leaks a
         # memory file the size of guest RAM until the tmpfs fills.
+        # ...but ONLY once the VM is provably gone. The whole guarantee of generation stamping
+        # is that a file is never removed while something still maps it; a kill() that raised
+        # leaves that unproven, so the pin is deliberately retained. Retaining a generation costs
+        # disk until the process restarts; unlinking one under a live VM corrupts it.
         release = getattr(self._manager, "release", None)
         if callable(release):
-            release(slot.slot_id)
+            if vm_gone:
+                release(slot.slot_id)
+            else:
+                _log.warning(
+                    "snapshot.generation_retained slot_id=%s: could not confirm the microVM is "
+                    "gone, so its snapshot generation is kept rather than risk unlinking a file "
+                    "a live VM still maps", slot.slot_id,
+                )
 
     # ------------------------------------------------------------------
     # Warm-path seam (mirrors FirecrackerSlotRuntime so the dispatcher's per-slot

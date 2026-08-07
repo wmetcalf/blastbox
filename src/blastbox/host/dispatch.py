@@ -1110,11 +1110,16 @@ class Dispatcher:
                 try:
                     input_path = stage_fn(slot, staged_input_path)
                 except Exception:
-                    # Symmetric with the file branch below: staging INTO the slot failing is
-                    # evidence about the SLOT either way. Only the copy2 path convicted, so a
-                    # vsock seam that could not be written left its wedged slot unattributed --
-                    # the same file/vsock asymmetry that keeps producing these bugs.
-                    warm_fault = "worker"
+                    # Convict ONLY if this runtime's staging really does talk to the worker.
+                    # "There is a stage_warm_input hook" does not mean "this is a transport" --
+                    # today NO runtime's does: FC returns the host path unchanged (the bytes go
+                    # over vsock later, at signal_go) and gVisor does a host-side shutil.copyfile
+                    # into a bind mount, where an ENOSPC/EROFS on the DISPATCHER disk would
+                    # otherwise burn out the entire healthy gVisor pool. An earlier version
+                    # convicted this branch outright on the mistaken premise that the hook meant
+                    # vsock. Runtimes opt IN, so a new one is safe by default, not dangerous.
+                    if getattr(runtime, "warm_staging_is_transport", False):
+                        warm_fault = "worker"
                     raise
             else:
                 slot_input_copy = slot.input_dir / staged_input_path.name

@@ -1655,9 +1655,25 @@ class WarmPool:
         # invalidated the base and dropped a healthy warm snapshot after the pool had recovered
         # (upstream, PR #82). The SPAWN path passes its own counter explicitly, because consecutive
         # restore failures are a different signal from consecutive job failures.
-        pool_failures = self._current_failure_streak() if streak is None else streak
-        if self._snapshot_rebuild_after <= 0 or pool_failures < self._snapshot_rebuild_after:
+        if self._snapshot_rebuild_after <= 0:
             return False
+        if streak is None:
+            # CHECK-AND-CONSUME in one locked step. Reading the streak under the lock and then
+            # deciding outside it still leaves a window: a clean release from another dispatch
+            # thread resets the counter to zero in between, and this stale failing release goes
+            # on to destroy a base that a job has just succeeded against. Consuming the episode
+            # here also stops several concurrent failures from each triggering their own rebuild
+            # off the same streak. (The spawn path passes its own counter and is single-threaded
+            # in the maintenance tick, so it opts out.)
+            with self._lock:
+                if self._pool_consecutive_failures < self._snapshot_rebuild_after:
+                    return False
+                pool_failures = self._pool_consecutive_failures
+                self._pool_consecutive_failures = 0
+        else:
+            pool_failures = streak
+            if pool_failures < self._snapshot_rebuild_after:
+                return False
         now = self._clock()
         with self._lock:
             last = self._last_base_rebuild_at

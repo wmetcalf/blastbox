@@ -1216,3 +1216,61 @@ def test_an_idle_pool_does_not_bank_starvation_time() -> None:
         assert [r for r in records if "spawn_capacity_starved" in r.getMessage()], (
             "real continuous starvation must still alert"
         )
+
+
+def test_concurrent_failures_cannot_each_rebuild_off_one_streak() -> None:
+    """The decision must be CONSUMED under the same lock that reads it.
+
+    Reading the streak under the lock and deciding outside it leaves a window where two dispatch
+    threads both see the same above-threshold value and each destroys the base — and a clean
+    release landing in that window is ignored entirely, so a base a job just succeeded against
+    is rebuilt anyway. Sequentially the two versions look identical (the rebuild path resets the
+    counter afterwards either way), so only a concurrent test can tell them apart.
+
+    The barrier is what forces the interleaving: with the fix the lock serialises the two
+    threads, so the second never reaches the barrier and it times out; without it, both reach it
+    holding the same stale value.
+    """
+    import threading
+
+    rt = _WedgeableRuntime()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4,
+        snapshot_rebuild_after=2, base_rebuild_cooldown_s=0.0,
+        spawn_rate_limit=1000.0,
+    )
+    with pool._lock:
+        pool._pool_consecutive_failures = 2
+
+    barrier = threading.Barrier(2, timeout=1.0)
+    real_lock = pool._lock
+
+    class _BarrieredLock:
+        """Rendezvous on the way OUT of the streak read — reachable by both threads only if the
+        decision is made outside the lock."""
+
+        def __enter__(self):
+            return real_lock.__enter__()
+
+        def __exit__(self, *a):
+            r = real_lock.__exit__(*a)
+            with contextlib.suppress(threading.BrokenBarrierError):
+                barrier.wait()
+            return r
+
+    pool._lock = _BarrieredLock()  # type: ignore[assignment]
+
+    def _decide():
+        with contextlib.suppress(Exception):
+            pool._maybe_rebuild_base(reason="job")
+
+    ts = [threading.Thread(target=_decide, daemon=True) for _ in range(2)]
+    for th in ts:
+        th.start()
+    for th in ts:
+        th.join(10.0)
+
+    assert rt.base_invalidations == 1, (
+        f"one failure episode must destroy the base at most once, got "
+        f"{rt.base_invalidations} rebuilds off the same streak"
+    )

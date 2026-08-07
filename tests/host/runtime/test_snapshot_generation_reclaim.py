@@ -277,3 +277,80 @@ def test_the_generation_is_selected_and_pinned_under_one_lock(tmp_path):
         f"restore_in() was handed a generation deleted out from under it: {restored_with[0]} — "
         "the artifact was selected before the lock that protects the pin"
     )
+
+
+def test_a_spawn_that_cannot_publish_its_slot_releases_the_pin(tmp_path):
+    """A restore that never becomes a Slot must not strand its generation.
+
+    restore() pins before restore_in(), but the runtime then reads handle.vsock_uds and mkdirs
+    the per-slot dirs. If any of that fails — a full host disk is the obvious way — spawn()
+    raises without returning a Slot, so the pool can never reap it and nothing will ever call
+    release(slot_id): the pin, and the running microVM behind it, are retained until the process
+    restarts.
+    """
+    from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
+
+    mgr, be = _mgr(tmp_path)
+
+    killed: list[bool] = []
+
+    class _HandleWithBadUds:
+        @property
+        def vsock_uds(self):
+            raise OSError("ENOSPC reading the restored handle")
+
+        def kill(self):
+            killed.append(True)
+
+    be.restore_in = lambda w, a: _HandleWithBadUds()  # type: ignore[assignment]
+    class _Cfg:
+        max_extracted_bytes = 1 << 20
+
+    rt = SnapshotSlotRuntime(_Cfg(), mgr, settle_s=0.0)
+
+    with pytest.raises(Exception):
+        rt.spawn()
+
+    assert killed, "the un-publishable microVM must be killed, not leaked"
+    # the pin must be gone: superseding the generation now reclaims it
+    mgr.invalidate()
+    assert _gens(tmp_path) == set(), (
+        f"spawn stranded its pin — generation never reclaimed: {_gens(tmp_path)}"
+    )
+
+
+def test_a_generation_is_retained_when_the_vm_cannot_be_confirmed_dead(tmp_path):
+    """Never unlink a file a live VM may still map.
+
+    reap() swallows a kill() failure so it can finish cleaning up — but the microVM may still be
+    running and still mapping this generation's memory file. Releasing the pin anyway can unlink
+    it underneath. Retaining costs disk until restart; unlinking corrupts a live VM.
+    """
+    from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
+
+    mgr, be = _mgr(tmp_path)
+
+    class _UnkillableHandle:
+        vsock_uds = str(tmp_path / "slots" / "x" / "vsock.sock")
+
+        def kill(self):
+            raise RuntimeError("SIGKILL failed; the microVM may still be running")
+
+    (tmp_path / "slots" / "x").mkdir(parents=True, exist_ok=True)
+    be.restore_in = lambda w, a: _UnkillableHandle()  # type: ignore[assignment]
+    class _Cfg:
+        max_extracted_bytes = 1 << 20
+
+    rt = SnapshotSlotRuntime(_Cfg(), mgr, settle_s=0.0)
+
+    slot = rt.spawn()
+    gen1 = tmp_path / "snap" / "warm-gen1.mem"
+    assert gen1.exists()
+
+    mgr.invalidate()      # supersede it while the slot is live
+    mgr.build()
+    rt.reap(slot)         # kill() raises -> the VM is NOT provably gone
+
+    assert gen1.exists(), (
+        "a generation was unlinked while its microVM could not be confirmed dead"
+    )
