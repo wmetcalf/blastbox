@@ -667,3 +667,39 @@ def test_a_genuine_reseal_violation_is_still_a_verdict(tmp_path, monkeypatch):
         validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
                                limits=_limits())
     assert not isinstance(ei.value, OutputTrustUnknown)
+
+
+def test_a_worker_symlink_is_a_verdict_not_an_unknown(tmp_path, monkeypatch):
+    """ELOOP/ENOTDIR come from the confinement check, not from host exhaustion.
+
+    A worker that replaces metadata.json with a symlink, or puts a symlink/non-directory in the
+    path, produces those errnos — a concrete violation. Classifying them as unknown meant
+    recurring malformed output never advanced burnout, so a reusable broken worker could be
+    recycled indefinitely.
+    """
+    import errno as _errno
+
+    from blastbox.errors import OutputTrustUnknown
+
+    out, _ = _make_output_dir(tmp_path, artifact_content=b"payload")
+
+    for bad in (_errno.ELOOP, _errno.ENOTDIR):
+        def _boom(*a, _e=bad, **kw):
+            raise OSError(_e, "confinement violation")
+
+        monkeypatch.setattr("blastbox.host.trust.read_confined_regular_bytes", _boom)
+        with pytest.raises(OutputTrustError) as ei:
+            validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                                   limits=_limits())
+        assert not isinstance(ei.value, OutputTrustUnknown), (
+            f"errno {bad} is a worker confinement violation, not a host failure"
+        )
+
+    # ...and a genuine host-resource errno is still unknown.
+    def _emfile(*a, **kw):
+        raise OSError(_errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr("blastbox.host.trust.read_confined_regular_bytes", _emfile)
+    with pytest.raises(OutputTrustUnknown):
+        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())

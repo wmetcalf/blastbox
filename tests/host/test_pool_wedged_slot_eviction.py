@@ -2330,7 +2330,9 @@ def test_the_explicit_streak_path_also_honours_the_success_token() -> None:
             return r
 
     pool._lock = _GatedLock()  # type: ignore[assignment]
-    rebuilt = pool._maybe_rebuild_base(5, reason="spawn")   # EXPLICIT streak
+    # reason="job": the spawn path is now short-circuited by the usable-workers gate, which would
+    # return False before the token was ever consulted and make this pass for the wrong reason.
+    rebuilt = pool._maybe_rebuild_base(5, reason="job")     # EXPLICIT streak
     pool._lock = real_lock
 
     assert released.is_set(), "the racing clean release never ran — the test proved nothing"
@@ -2452,4 +2454,67 @@ def test_a_claim_race_does_not_consume_the_eviction_budget() -> None:
     assert spent == 0, (
         f"{spent} eviction tokens were consumed for slots that were never evicted — enough "
         "claim races would exhaust the cap and block genuine replacements"
+    )
+
+
+def test_intermittent_restore_failures_do_not_rebuild_while_workers_are_idle() -> None:
+    """A base with LIVE, IDLE workers is not poisoned.
+
+    With warm_size > 1 and intermittent restores, fail/succeed/fail/succeed/fail reached the
+    threshold and rebuilt a base whose workers were sitting healthy and IDLE. Resetting on every
+    promotion is the opposite error — promote/die/promote/die then never accumulates at all, since
+    each new promotion wipes the previous death. Asking whether the base is CURRENTLY producing
+    usable workers separates the two directly.
+    """
+    class _Flaky(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.n = 0
+
+        def spawn(self) -> Slot:
+            self.n += 1
+            if self.n % 2 == 1:
+                raise RuntimeError("transient restore failure")
+            return super().spawn()
+
+    rt = _Flaky()
+    pool = WarmPool(
+        runtime=rt, warm_size=3, concurrent_ceiling=6,
+        snapshot_rebuild_after=3, base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    for _ in range(10):
+        pool.tick()
+
+    idle = [s for s in pool._slots.values() if s.state == SlotState.IDLE]
+    assert idle, "sanity: some restores succeeded and their workers are IDLE"
+    assert rt.base_invalidations == 0, (
+        f"the base was rebuilt with {len(idle)} healthy IDLE workers from it "
+        f"({rt.base_invalidations} invalidations)"
+    )
+
+
+def test_a_failed_spawn_repair_does_not_poison_the_job_streak() -> None:
+    """Only a JOB episode is consumed from the job counter, so only that one is restored.
+
+    A spawn episode lives in its own counter and is already retained by its caller. Copying its
+    count into _pool_consecutive_failures meant one later worker fault triggered an immediate
+    job-driven rebuild — and in a cascade that repair carries no tier attribution, so it hits
+    every tier.
+    """
+    class _InvalidateFails(_WedgeableRuntime):
+        def invalidate_base(self, *, reason=None) -> None:  # type: ignore[override]
+            raise RuntimeError("cleanup failed")
+
+    rt = _InvalidateFails()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4,
+        snapshot_rebuild_after=2, base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    assert pool._maybe_rebuild_base(5, reason="spawn") is False
+
+    with pool._lock:
+        job_streak = pool._pool_consecutive_failures
+    assert job_streak == 0, (
+        f"a failed SPAWN repair left {job_streak} in the job-failure counter — one later worker "
+        "fault would then trigger an unattributed job-driven rebuild"
     )

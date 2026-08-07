@@ -1879,6 +1879,22 @@ class WarmPool:
                 else:
                     self._pool_consecutive_failures = 0
             return False
+        if reason == "spawn":
+            with self._lock:
+                usable = sum(1 for s in self._slots.values() if s.state == SlotState.IDLE)
+            if usable:
+                # A base with LIVE, IDLE workers is not poisoned. Counting restore failures alone
+                # made fail/succeed/fail/succeed/fail reach the threshold with healthy workers
+                # sitting right there, while resetting on every promotion went the other way and
+                # let promote/die/promote/die never accumulate at all. "Is it currently producing
+                # usable workers?" separates the two directly, which a consecutive count of one
+                # side of the story cannot (PR #82).
+                logger.info(
+                    "pool.base_rebuild_skipped reason=usable_workers_present idle=%d "
+                    "restore_failures=%d", usable, pool_failures,
+                )
+                return False
+
         drop = (getattr(self._runtime, "invalidate_base", None)
                 or getattr(self._runtime, "invalidate_snapshot", None))
         if not callable(drop):
@@ -1910,7 +1926,12 @@ class WarmPool:
             # repair did not happen -- so making the poisoned base wait for another full
             # snapshot_rebuild_after failures before retrying just fails that many more jobs. Only
             # restore what we took, and never below what has accumulated since.
-            if success_token is not None:
+            if success_token is not None and reason != "spawn":
+                # Only a JOB episode is consumed from _pool_consecutive_failures, so only that one
+                # is restored here. A spawn episode lives in _spawn_consecutive_failures and is
+                # already retained by its own caller -- copying its count into the job counter
+                # meant one later worker fault could trigger an immediate job-driven rebuild, and
+                # in a cascade that repair carries no tier attribution and hits every tier (PR #82).
                 with self._lock:
                     self._pool_consecutive_failures = max(
                         self._pool_consecutive_failures, pool_failures

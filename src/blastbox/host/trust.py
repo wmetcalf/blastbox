@@ -10,6 +10,7 @@ is scrubbed through ``sanitize_public_error`` before being surfaced.
 """
 from __future__ import annotations
 
+import errno
 import logging
 from pathlib import Path
 
@@ -25,6 +26,13 @@ from blastbox.errors import OutputTrustError, OutputTrustUnknown, sanitize_publi
 from blastbox.limits import Limits
 
 _log = logging.getLogger("blastbox.host.trust")
+
+
+# Errnos that mean THIS HOST is out of resources, as opposed to the worker having written
+# something we refuse to follow. Only the former is evidence about the dispatcher.
+_HOST_RESOURCE_ERRNOS = frozenset({
+    errno.EMFILE, errno.ENFILE, errno.ENOMEM, errno.EIO, errno.ENOSPC, errno.EDQUOT, errno.EROFS,
+})
 
 
 def validate_worker_output(
@@ -74,8 +82,15 @@ def validate_worker_output(
             )
         ) from exc
     except OSError as exc:
-        # ...but an OSError is OUR failure to read it (EMFILE/EIO/ENOMEM), not proof the output
-        # is bad. Attributing it convicts every worker at once during a host outage.
+        # ...but only a HOST-RESOURCE errno is unknown. A worker that replaces metadata.json with
+        # a symlink, or puts a symlink/non-directory in the path, produces ELOOP/ENOTDIR from the
+        # confinement check -- a concrete violation, and classifying it as unknown meant recurring
+        # malformed output never advanced burnout and a reusable broken worker could be recycled
+        # forever (PR #82).
+        if exc.errno not in _HOST_RESOURCE_ERRNOS:
+            raise OutputTrustError(
+                sanitize_public_error(f"metadata.json failed the confinement check ({exc})")
+            ) from exc
         raise OutputTrustUnknown(
             sanitize_public_error(f"could not read metadata.json ({exc})")
         ) from exc
