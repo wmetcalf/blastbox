@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import time
@@ -264,7 +265,14 @@ class GvisorBootHandle:
         self._ready(self._ctrl, timeout_s)
 
     def checkpoint(self, dest_dir: Path) -> object:
-        img = Path(dest_dir) / "checkpoint"
+        # GENERATION-STAMPED, never a fixed "checkpoint" path. restore_in() reads this directory
+        # for the whole life of a `runsc restore`, so a rebuild writing the SAME path can
+        # overwrite files an in-flight restore is still consuming -- it fails, or worse observes
+        # a mix of two checkpoints. A pin stops the old generation being DELETED; only a distinct
+        # path stops it being OVERWRITTEN. FC's mem/snapshot pair got this; gVisor did not
+        # (upstream, PR #82).
+        gen = f"{os.getpid()}-{time.monotonic_ns():019d}"
+        img = Path(dest_dir) / f"checkpoint-{gen}"
         img.mkdir(parents=True, exist_ok=True)
         self._run([*_runsc(self._cfg), "checkpoint", "-image-path", str(img), self._cid])
         return str(img)

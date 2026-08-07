@@ -15,6 +15,7 @@ toggle, the FcSnapshotArtifact) live in
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import shutil
 import threading
@@ -145,12 +146,29 @@ class SnapshotManager:
             boot.wait_ready(self._ready_timeout_s)
             artifact = boot.checkpoint(self._base_dir)
         except SnapshotError:
+            # FAILURE paths still tear the base down unconditionally -- there is no artifact to
+            # protect here, and leaving the base microVM running is a straight leak.
+            with contextlib.suppress(Exception):
+                boot.kill()
             raise
         except Exception as exc:  # readiness / checkpoint failure
+            with contextlib.suppress(Exception):
+                boot.kill()
             raise SnapshotBuildError(f"warm snapshot build failed: {exc}") from exc
-        finally:
-            boot.kill()
+
+        # PUBLISH BEFORE TEARDOWN. If boot.kill() raised, the artifact was never assigned, so
+        # nothing could ever discover it: not invalidate(), not the reference counting. Every
+        # async build retry then left another generation-stamped, RAM-sized .mem behind until the
+        # disk or tmpfs was exhausted. The snapshot itself is complete and usable at this point --
+        # a failure tearing the BASE down says nothing about it (upstream, PR #82).
         self._artifact = artifact
+        try:
+            boot.kill()
+        except Exception as exc:  # noqa: BLE001 -- a live base VM is a leak, not a bad snapshot
+            _log.warning(
+                "snapshot.base_teardown_failed: the base microVM may still be running; its "
+                "snapshot is registered and usable. %s", exc,
+            )
         return artifact
 
     def invalidate(self) -> bool:

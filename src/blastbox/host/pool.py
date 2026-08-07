@@ -336,6 +336,15 @@ class WarmPool:
         self._capacity_starved_after_s = capacity_starved_after_s
         self._capacity_miss_since: float | None = None
         self._capacity_starved_logged = False
+        # Derive from the FEASIBLE target, not the requested one. PoolConfig permits
+        # warm_size > concurrent_ceiling, and the pool can then only ever run at the ceiling --
+        # so warm_size=16 with ceiling=1 waited 32 consecutive failures before repairing a
+        # poisoned base and allowed 16 evictions per window on a ONE-slot pool. resize() already
+        # clamps and then re-derives; construction did neither, so the two disagreed until some
+        # later resize happened to correct it (upstream, PR #82).
+        if self._warm_size > self._concurrent_ceiling:
+            self._warm_size = self._concurrent_ceiling
+        self._rederive_warm_size_thresholds()
 
         # slot_id → Slot; all mutations under _lock
         self._slots: dict[str, Slot] = {}

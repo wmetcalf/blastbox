@@ -354,3 +354,80 @@ def test_a_generation_is_retained_when_the_vm_cannot_be_confirmed_dead(tmp_path)
     assert gen1.exists(), (
         "a generation was unlinked while its microVM could not be confirmed dead"
     )
+
+
+def test_a_build_whose_base_teardown_fails_still_registers_its_artifact(tmp_path):
+    """An artifact nobody can discover is a permanent leak.
+
+    build() tore the base VM down in a finally BEFORE assigning self._artifact, so a kill() that
+    raised meant the artifact was never registered — invisible to invalidate() and to the
+    reference counting alike. With generation-stamped names, every async retry after such a
+    failure left another RAM-sized .mem behind until the disk filled. The snapshot itself is
+    complete and usable at that point; a failure tearing the BASE down says nothing about it.
+    """
+    mgr, be = _mgr(tmp_path)
+
+    class _BootThatWontDie(_FakeBoot):
+        def kill(self):
+            raise RuntimeError("could not kill the base microVM")
+
+    be.boot_base = lambda: _BootThatWontDie(be)  # type: ignore[assignment]
+
+    art = mgr.build()
+    assert art is not None
+    assert mgr.artifact is art, "the artifact must be registered despite the teardown failure"
+
+    # ...and being registered, it is now reclaimable like any other generation
+    mgr.invalidate()
+    assert _gens(tmp_path) == set(), (
+        f"an orphaned generation was left behind: {_gens(tmp_path)}"
+    )
+
+
+def test_a_failed_build_still_tears_down_its_base(tmp_path):
+    """Publishing before teardown must not stop failures from killing the base.
+
+    There is no artifact to protect on a failure path, and leaving the base microVM running is a
+    straight leak — the guard this replaced existed for exactly that.
+    """
+    mgr, be = _mgr(tmp_path)
+    killed: list[bool] = []
+
+    class _BootThatFails(_FakeBoot):
+        def checkpoint(self, dest_dir):
+            raise RuntimeError("checkpoint failed")
+
+        def kill(self):
+            killed.append(True)
+
+    be.boot_base = lambda: _BootThatFails(be)  # type: ignore[assignment]
+
+    with pytest.raises(Exception):
+        mgr.build()
+    assert killed, "a failed build must still tear its base down"
+
+
+def test_a_build_failing_with_a_SnapshotError_also_tears_down_its_base(tmp_path):
+    """Both failure handlers must kill the base.
+
+    build() has two: one preserving the SnapshotError taxonomy, one wrapping everything else.
+    A teardown added to only one leaks a base microVM on the other — and mutation testing is the
+    only thing that tells them apart, since either alone makes the generic test pass.
+    """
+    from blastbox.host.runtime.fc_snapshot import SnapshotBuildError
+
+    mgr, be = _mgr(tmp_path)
+    killed: list[bool] = []
+
+    class _BootThatFailsTyped(_FakeBoot):
+        def checkpoint(self, dest_dir):
+            raise SnapshotBuildError("checkpoint failed (typed)")
+
+        def kill(self):
+            killed.append(True)
+
+    be.boot_base = lambda: _BootThatFailsTyped(be)  # type: ignore[assignment]
+
+    with pytest.raises(SnapshotBuildError):
+        mgr.build()
+    assert killed, "the SnapshotError path must still tear its base down"

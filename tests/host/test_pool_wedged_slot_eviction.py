@@ -30,12 +30,14 @@ from pathlib import Path
 from uuid import uuid4
 
 import contextlib
+
+import pytest
 import logging
 
 
 from blastbox.host.runtime.cascade import CascadeExhausted, CascadingRuntime, Tier
 from blastbox.host.runtime.static_pool import StaticPoolExhausted
-from blastbox.host.pool import Slot, SlotState, WarmPool
+from blastbox.host.pool import RuntimeAtCapacity, Slot, SlotState, WarmPool
 
 
 class _FakeClock:
@@ -1274,3 +1276,67 @@ def test_concurrent_failures_cannot_each_rebuild_off_one_streak() -> None:
         f"one failure episode must destroy the base at most once, got "
         f"{rt.base_invalidations} rebuilds off the same streak"
     )
+
+
+def test_a_tier_at_capacity_does_not_become_a_cascade_spawn_failure() -> None:
+    """A tier reporting CAPACITY must stay capacity all the way out of the cascade.
+
+    The tier loop's broad handler caught RuntimeAtCapacity (a static fleet inside
+    dirty_cooldown_s, a nested cascade that is full) and turned it into a tier failure —
+    advancing the per-tier rebuild streak and, once every tier was exhausted, promoting the whole
+    spawn to CascadeSpawnFailed. Routine backpressure would then invalidate healthy bases.
+    """
+    class _Full(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self) -> Slot:
+            self.attempts += 1
+            raise StaticPoolExhausted("all workers are within dirty_cooldown_s")
+
+    tier_rt = _Full()
+    casc = CascadingRuntime(tiers=[Tier(name="static", runtime=tier_rt, capacity=4)],
+                            tier_rebuild_after=2)
+
+    with pytest.raises(RuntimeAtCapacity):
+        casc.spawn()          # must NOT be promoted to CascadeSpawnFailed
+
+    pool = WarmPool(
+        runtime=casc, warm_size=2, concurrent_ceiling=4,
+        snapshot_rebuild_after=2, base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    for _ in range(12):
+        pool.tick()
+
+    assert tier_rt.attempts >= 3, "the pool must keep retrying — capacity comes back"
+    assert tier_rt.base_invalidations == 0, (
+        f"a cooling tier must not destroy any base (got {tier_rt.base_invalidations})"
+    )
+
+
+def test_construction_derives_thresholds_from_the_feasible_target() -> None:
+    """warm_size above the ceiling is a target the pool can never reach.
+
+    PoolConfig permits it, and the pool then runs at the ceiling — so warm_size=16 with
+    ceiling=1 waited 32 consecutive failures before repairing a poisoned base and allowed 16
+    evictions per window on a ONE-slot pool. resize() clamped and re-derived; construction did
+    neither, so the two disagreed until some later resize happened to correct it.
+    """
+    pool = WarmPool(runtime=_WedgeableRuntime(), warm_size=16, concurrent_ceiling=1)
+    assert pool._warm_size == 1
+    assert pool._snapshot_rebuild_after == 4, (
+        f"must derive from the feasible target (1), not the requested 16 "
+        f"(got {pool._snapshot_rebuild_after})"
+    )
+    assert pool._max_evictions_per_window == 2
+
+    # and construction must agree with resize for the same effective target
+    other = WarmPool(runtime=_WedgeableRuntime(), warm_size=16, concurrent_ceiling=32)
+    other.resize(warm_size=16, concurrent_ceiling=1)
+    assert (other._snapshot_rebuild_after, other._max_evictions_per_window) == (
+        pool._snapshot_rebuild_after, pool._max_evictions_per_window
+    ), "construction and resize must derive identically for the same effective target"

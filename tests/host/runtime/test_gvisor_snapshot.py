@@ -35,7 +35,9 @@ def test_boot_base_runs_then_checkpoint(tmp_path: Path) -> None:
     joined = [" ".join(c) for c in rec.calls]
     assert any("run" in c and "-detach" in c for c in joined)
     assert any("checkpoint" in c and "-image-path" in c for c in joined)
-    assert Path(str(art)).name == "checkpoint"
+    # Generation-stamped: a rebuild must never write the directory an in-flight restore is
+    # still reading, so the name carries a per-build suffix rather than being fixed.
+    assert Path(str(art)).name.startswith("checkpoint-")
 
 
 def test_restore_in_creates_dirs_and_restores(tmp_path: Path) -> None:
@@ -275,3 +277,27 @@ def test_restore_handle_alive_runsc_error(tmp_path: Path) -> None:
     )
     # alive() must be False (not raise) when run_text raises
     assert handle.alive() is False
+
+
+def test_each_checkpoint_gets_its_own_generation_directory(tmp_path: Path) -> None:
+    """A rebuild must never write the directory an in-flight restore is still reading.
+
+    restore_in() reads the checkpoint dir for the whole life of a `runsc restore`, so a fixed
+    <base>/checkpoint path lets a rebuild overwrite files that restore is consuming — it fails,
+    or worse observes a mix of two checkpoints. A pin stops the old generation being DELETED;
+    only a distinct path stops it being OVERWRITTEN. FC's mem/snapshot pair got this; gVisor's
+    checkpoint dir did not.
+    """
+    rec = _Rec()
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=rec, ready_wait=lambda d, t: None)
+
+    seen: set[str] = set()
+    for _ in range(3):
+        boot = be.boot_base()
+        boot.wait_ready(5.0)
+        art = boot.checkpoint(tmp_path / "ckpt")
+        name = Path(str(art)).name
+        assert name.startswith("checkpoint-"), name
+        seen.add(name)
+
+    assert len(seen) == 3, f"checkpoint dirs collided across builds: {sorted(seen)}"

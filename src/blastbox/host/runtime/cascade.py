@@ -191,6 +191,17 @@ class CascadingRuntime:
                 self._counts[i] += 1          # reserve before the (slow) spawn
             try:
                 slot = tier.runtime.spawn()
+            except RuntimeAtCapacity as exc:
+                # This tier is FULL, not broken (a static fleet inside dirty_cooldown_s, a nested
+                # cascade at capacity). Counting it as a tier failure would both advance the
+                # per-tier rebuild streak and, once every tier is exhausted, promote the whole
+                # spawn to CascadeSpawnFailed -- so routine backpressure would invalidate healthy
+                # bases. Try the next tier and leave last_exc alone so the final raise stays a
+                # capacity type (upstream, PR #82).
+                with self._lock:
+                    self._counts[i] -= 1
+                _log.debug("cascade: tier %r at capacity, trying next: %s", tier.name, exc)
+                continue
             except Exception as exc:  # noqa: BLE001 -- try the next tier, don't fail the whole spawn
                 with self._lock:
                     self._counts[i] -= 1
