@@ -112,20 +112,33 @@ class GvisorSnapshotSlotRuntime:
         with self._lock:
             handle = self._handles.pop(slot.slot_id, None)
             self._restored_at.pop(slot.slot_id, None)
+        sandbox_gone = True
         if handle is not None:
             try:
                 handle.kill()  # type: ignore[attr-defined]
             except Exception as exc:  # noqa: BLE001 — reap must never raise
+                # The sandbox may still be RUNNING and still reading this checkpoint directory.
+                sandbox_gone = False
                 _log.warning("gvisor_snapshot.reap_kill_error slot_id=%s: %s", slot.slot_id, exc)
         slot_workdir = Path(slot.output_dir).parent
         if slot_workdir.exists():
             shutil.rmtree(slot_workdir, ignore_errors=True)
 
         # Mirror the FC runtime: drop this slot's pin so a superseded generation can be
-        # reclaimed once its last user is gone.
+        # reclaimed once its last user is gone -- but ONLY once the sandbox is provably gone.
+        # Found by sweeping every generation-release site rather than by a report: the FC reap,
+        # the FC spawn-cleanup and both FC restore-cleanup paths all carry this guard, and this
+        # one did not. Retaining a checkpoint costs disk; removing one a live sandbox is still
+        # restoring from breaks it (PR #82).
         release = getattr(self._mgr, "release", None)
         if callable(release):
-            release(slot.slot_id)
+            if sandbox_gone:
+                release(slot.slot_id)
+            else:
+                _log.warning(
+                    "gvisor_snapshot.generation_retained slot_id=%s: could not confirm the "
+                    "sandbox is gone, so its checkpoint generation is kept", slot.slot_id,
+                )
 
     # --- warm-path seam (file-trigger control; output already on the bind mount) ---
 

@@ -870,3 +870,31 @@ def test_a_restore_whose_cleanup_cannot_kill_firecracker_keeps_its_pin(tmp_path)
     assert gen1.exists(), (
         "the generation was reclaimed while a firecracker process may still map its memory file"
     )
+
+
+def test_a_cancelled_restore_keeps_its_pin_when_teardown_is_unconfirmed(tmp_path):
+    """The sibling handler in the SAME function.
+
+    A KeyboardInterrupt/SystemExit landing after the spawn skipped the backend's cleanup (it
+    caught only Exception), leaving an unmanaged firecracker with the memory file mapped — and
+    the manager unpinned regardless, so a later invalidation could unlink it underneath. Guarding
+    one handler and not its sibling is how this class of bug keeps recurring.
+    """
+    mgr, be = _mgr(tmp_path)
+    mgr.build()
+    gen1 = tmp_path / "snap" / "warm-gen1.mem"
+
+    def _cancelled_with_live_process(slot_workdir, artifact):
+        exc = KeyboardInterrupt("operator interrupted mid-restore")
+        exc.kill_failed = True        # the process could not be confirmed gone
+        raise exc
+
+    be.restore_in = _cancelled_with_live_process  # type: ignore[assignment]
+
+    with pytest.raises(KeyboardInterrupt):
+        mgr.restore("slot-a")
+
+    mgr.invalidate()
+    assert gen1.exists(), (
+        "a cancelled restore released its pin while a firecracker may still map the memory file"
+    )

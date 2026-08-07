@@ -408,7 +408,18 @@ class SnapshotManager:
             # restore must not strand the pin either -- this slot will never be reaped, so
             # nothing else would ever release it and the generation would be pinned forever,
             # turning the leak fix into a permanent leak.
-            self._unpin(sid, artifact)
+            #
+            # ...but the SAME confirmation rule applies here as on the SnapshotError path above.
+            # Guarding one handler and not its sibling in the same function is how this class of
+            # bug keeps recurring: an unconfirmed teardown retains the pin, because retaining a
+            # generation costs disk while unlinking one under a live mapping corrupts it.
+            if not _restore_left_process_running(exc):
+                self._unpin(sid, artifact)
+            else:
+                _log.warning(
+                    "snapshot.restore_cleanup_unconfirmed sid=%s (cancelled): could not confirm "
+                    "the firecracker process is gone; retaining its generation pin", sid,
+                )
             shutil.rmtree(slot_workdir, ignore_errors=True)
             if isinstance(exc, Exception):
                 raise SnapshotRestoreError(f"restore failed: {exc}") from exc

@@ -412,3 +412,40 @@ def test_the_module_imports_cleanly():
 
     mod = importlib.import_module("blastbox.host.runtime.gvisor_snapshot_runtime")
     assert hasattr(mod, "GvisorSnapshotSlotRuntime")
+
+
+def test_reap_retains_the_generation_when_the_sandbox_cannot_be_killed(tmp_path):
+    """Found by sweeping every generation-release site, not by a report.
+
+    The FC reap, the FC spawn-cleanup and both FC restore-cleanup paths all refuse to release a
+    pin when the process cannot be confirmed gone; this one released unconditionally. Removing a
+    checkpoint a live sandbox is still restoring from breaks it, while retaining one costs disk.
+    """
+    released: list[str] = []
+
+    class _Mgr:
+        def release(self, slot_id):
+            released.append(slot_id)
+
+        def invalidate(self):
+            return True
+
+    class _UnkillableHandle:
+        def kill(self):
+            raise RuntimeError("runsc delete failed; the sandbox may still be running")
+
+    rt = GvisorSnapshotSlotRuntime(_Mgr(), settle_s=0.0)
+    out = tmp_path / "slot" / "out"
+    out.mkdir(parents=True)
+
+    class _Slot:
+        slot_id = "s1"
+        output_dir = str(out)
+
+    slot = _Slot()
+    rt._handles[slot.slot_id] = _UnkillableHandle()   # type: ignore[index]
+    rt.reap(slot)
+
+    assert released == [], (
+        "the generation pin was released while the sandbox could not be confirmed gone"
+    )

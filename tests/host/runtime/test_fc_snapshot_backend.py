@@ -289,3 +289,44 @@ def test_restore_in_kills_handle_on_load_failure(tmp_path):
 def test_available_is_true(tmp_path):
     backend = FcSnapshotBackend(tmp_path, FakeLauncher(tmp_path, tmp_path))
     assert backend.available() is True
+
+
+def test_restore_tears_down_firecracker_on_cancellation(tmp_path):
+    """A cancellation must not leave an unmanaged microVM behind.
+
+    The cleanup caught only Exception, so a KeyboardInterrupt/SystemExit landing after the spawn
+    skipped it entirely — leaving firecracker running with the memory file mapped, while the
+    manager unpinned the generation and a later invalidation could unlink it underneath.
+    """
+    from blastbox.host.runtime.fc_snapshot_backend import FcSnapshotArtifact
+
+    killed: list[bool] = []
+
+    class _Handle:
+        api = object()
+        vsock_uds = str(tmp_path / "vsock.sock")
+
+        def kill(self):
+            killed.append(True)
+
+    class _Launcher:
+        def restore_in(self, slot_workdir, *, outdisk_src=None):
+            return _Handle()
+
+    be = FcSnapshotBackend.__new__(FcSnapshotBackend)
+    be._launcher = _Launcher()  # type: ignore[attr-defined]
+
+    art = FcSnapshotArtifact(tmp_path / "s.snapshot", tmp_path / "m.mem", None)
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(
+        "blastbox.host.runtime.fc_snapshot_backend._restore_from_snapshot",
+        lambda *a, **kw: (_ for _ in ()).throw(KeyboardInterrupt("cancelled")),
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            be.restore_in(tmp_path / "slot", art)
+    finally:
+        mp.undo()
+
+    assert killed, "a cancelled restore must still terminate the firecracker it spawned"

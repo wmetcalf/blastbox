@@ -254,8 +254,11 @@ class FcSnapshotBackend:
             _restore_from_snapshot(
                 handle.api, str(artifact.snapshot_path), str(artifact.mem_path)
             )
-        except Exception as exc:
-            # Don't leak the spawned firecracker if load/resume fails.
+        except BaseException as exc:
+            # BaseException, not Exception: a KeyboardInterrupt, SystemExit or task cancellation
+            # landing after the spawn skipped this cleanup entirely, leaving an unmanaged
+            # firecracker running with the memory file mapped -- and the manager then unpinned the
+            # generation, so a later invalidation could unlink it underneath (PR #82).
             try:
                 handle.kill()
             except Exception as kill_exc:  # noqa: BLE001
