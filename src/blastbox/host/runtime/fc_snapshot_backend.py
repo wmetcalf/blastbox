@@ -153,9 +153,18 @@ class FcSnapshotBackend:
         live microVM still maps the memory file. Unlinking one that is still mapped would
         SIGBUS or silently corrupt the VMs using it.
         """
-        for path in (getattr(artifact, "snapshot", None), getattr(artifact, "mem", None)):
-            if path is None:
-                continue
+        # Attribute access, NOT getattr-with-default. The first version of this read
+        # `artifact.snapshot` / `artifact.mem` -- fields that do not exist on
+        # FcSnapshotArtifact (they are snapshot_path / mem_path) -- so both lookups returned
+        # None, every file was skipped, and the whole reclamation was a silent no-op in
+        # production while its tests passed against a fake that had invented the same wrong
+        # names. A getattr default turns "this type changed" into "quietly leak gigabytes";
+        # an AttributeError turns it into a test failure. Prefer the crash.
+        if not isinstance(artifact, FcSnapshotArtifact):
+            _log.warning("fc_snapshot: refusing to discard unknown artifact type %r",
+                         type(artifact).__name__)
+            return
+        for path in (artifact.snapshot_path, artifact.mem_path):
             try:
                 Path(path).unlink(missing_ok=True)
             except OSError as exc:

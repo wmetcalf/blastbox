@@ -33,6 +33,11 @@ import contextlib
 import logging
 
 
+from blastbox.host.runtime.cascade import CascadeExhausted, CascadingRuntime, Tier
+from blastbox.host.runtime.static_pool import StaticPoolExhausted
+from blastbox.host.pool import Slot, SlotState, WarmPool
+
+
 class _FakeClock:
     """Local copy -- cross-test-module imports don't resolve under this layout."""
     def __init__(self, t: float = 0.0) -> None:
@@ -45,9 +50,6 @@ class _FakeClock:
         self._t += delta
 
 
-from blastbox.host.runtime.cascade import CascadeExhausted, CascadingRuntime, Tier
-from blastbox.host.runtime.static_pool import StaticPoolExhausted
-from blastbox.host.pool import Slot, SlotState, WarmPool
 
 
 class _WedgeableRuntime:

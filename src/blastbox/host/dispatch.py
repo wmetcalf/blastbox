@@ -1121,7 +1121,12 @@ class Dispatcher:
                 try:
                     shutil.copy2(staged_input_path, slot_input_copy)
                 except OSError as exc:
-                    warm_fault = "worker"   # staging INTO the slot failed -- its IO seam is bad
+                    # UNATTRIBUTED. This is a local shutil.copy2 on the dispatcher host; ENOSPC,
+                    # EROFS or a failing disk here says nothing about the worker, which has not
+                    # been contacted at all yet. A host-wide filesystem outage hits every job at
+                    # once, so convicting here burns the whole warm set and invalidates a healthy
+                    # base during an incident the workers had no part in. The vsock staging seam
+                    # above IS a transport to the worker and stays convicted (upstream, PR #82).
                     self._fail_job(job, f"failed to stage input to warm slot: {exc}")
                     return
                 input_path = slot_input_copy

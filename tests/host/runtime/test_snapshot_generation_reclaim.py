@@ -11,16 +11,10 @@ from __future__ import annotations
 
 import pytest
 
-from dataclasses import dataclass
 from pathlib import Path
 
 from blastbox.host.runtime.fc_snapshot import SnapshotManager
-
-
-@dataclass
-class _Artifact:
-    snapshot: Path
-    mem: Path
+from blastbox.host.runtime.fc_snapshot_backend import FcSnapshotArtifact, FcSnapshotBackend
 
 
 class _FakeBoot:
@@ -30,14 +24,14 @@ class _FakeBoot:
     def wait_ready(self, timeout_s: float) -> None:
         return None
 
-    def checkpoint(self, dest_dir: Path) -> _Artifact:
+    def checkpoint(self, dest_dir: Path) -> FcSnapshotArtifact:
         """Write a generation-stamped pair, like the real FC backend."""
         self._be.n += 1
         snap = self._be.root / f"warm-gen{self._be.n}.snapshot"
         mem = self._be.root / f"warm-gen{self._be.n}.mem"
         snap.write_bytes(b"snap")
         mem.write_bytes(b"m" * 1024)
-        return _Artifact(snap, mem)
+        return FcSnapshotArtifact(snap, mem)
 
     def kill(self) -> None:
         return None
@@ -47,8 +41,7 @@ class _FakeBackend:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.n = 0
-        self.discarded: list[_Artifact] = []
-
+    
     def available(self) -> bool:
         return True
 
@@ -58,10 +51,15 @@ class _FakeBackend:
     def restore_in(self, slot_workdir: Path, artifact: object) -> object:
         return object()
 
-    def discard(self, artifact: object) -> None:
-        self.discarded.append(artifact)   # type: ignore[arg-type]
-        Path(artifact.snapshot).unlink(missing_ok=True)  # type: ignore[attr-defined]
-        Path(artifact.mem).unlink(missing_ok=True)       # type: ignore[attr-defined]
+    # NOT a hand-written discard: delegate to the REAL backend implementation. The first
+    # version of this fake invented `snapshot`/`mem` field names, the production discard()
+    # read those same wrong names via getattr-with-default, and the pair agreed with each
+    # other while unlinking nothing at all in production. A fake that reimplements the code
+    # under test can only ever prove the fake works.
+    discard = FcSnapshotBackend.discard
+
+    def __getattr__(self, name: str):
+        raise AttributeError(name)
 
 
 def _mgr(tmp_path: Path) -> tuple[SnapshotManager, _FakeBackend]:

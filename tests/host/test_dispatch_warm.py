@@ -1758,11 +1758,14 @@ def test_a_signal_failure_convicts_the_worker(tmp_path):
     )
 
 
-def test_a_file_ipc_staging_failure_convicts_the_worker(tmp_path, monkeypatch):
-    """The FILE-IPC sibling of the vsock staging conviction.
+def test_a_file_ipc_staging_failure_is_NOT_blamed_on_the_worker(tmp_path, monkeypatch):
+    """The two staging branches are NOT symmetric, and that is the point.
 
-    Two staging branches, two convictions; a mutant that removes only the copy2 one survived
-    while the vsock test passed. Per-branch coverage is the only thing that catches that.
+    The vsock branch writes THROUGH the worker's transport, so a failure there is evidence about
+    the worker. This branch is a local shutil.copy2 on the dispatcher host: ENOSPC, EROFS or a
+    dying disk says nothing about a worker that has not been contacted yet — and a host-wide
+    filesystem outage hits every job at once, so convicting here burns the entire warm set and
+    invalidates a healthy base during an incident the workers had no part in.
     """
     store = InMemoryJobStore()
     job = _make_job()
@@ -1784,8 +1787,8 @@ def test_a_file_ipc_staging_failure_convicts_the_worker(tmp_path, monkeypatch):
     dispatcher.dispatch_once()
 
     assert store.get(job.job_id).status == JobStatus.FAILED
-    assert pool.release_fault == ["worker"], (
-        f"a slot that cannot be written to IS worker evidence (got {pool.release_fault})"
+    assert pool.release_fault == ["unknown"], (
+        f"a host-side copy failure is not worker evidence (got {pool.release_fault})"
     )
 
 
