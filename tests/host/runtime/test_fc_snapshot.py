@@ -271,3 +271,49 @@ def test_restore_preserves_snapshot_error_subclasses(tmp_path):
     with pytest.raises(SnapshotRestoreError, match="backend already chose"):
         mgr.restore("slot-x")
     assert not (tmp_path / "slots" / "slot-x").exists()  # cleanup on the SnapshotError path too
+
+
+def test_a_failed_retirement_is_retried_by_the_next_build(tmp_path):
+    """_sweep_retired ran only from release() and _unpin() — both need a restored, reaped slot.
+
+    When cleanup of a retired generation fails, its RAM-sized memory file stays on the snapshot
+    filesystem, which is itself a reason the replacement build fails before producing any slot.
+    Neither trigger could then ever fire, so the tier stayed wedged even after the transient
+    unlink problem cleared. The build/retry path has to sweep too.
+    """
+    import errno as _errno
+
+    class _FlakyDiscard(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.fail_discard = True
+            self._n = 0
+
+        def boot_base(self):
+            self._n += 1
+            self.artifact = tmp_path / f"gen{self._n}.mem"
+            self.artifact.write_bytes(b"x" * 16)
+            return super().boot_base()
+
+        def discard(self, artifact):
+            if self.fail_discard:
+                raise OSError(_errno.EIO, "unlink failed")
+            artifact.unlink()
+
+    backend = _FlakyDiscard()
+    mgr = SnapshotManager(tmp_path, backend)
+    gen1 = mgr.build()
+    assert gen1.exists()
+
+    # Nothing was ever restored from gen1, so no release()/_unpin() will follow.
+    assert mgr.invalidate() is True
+    assert gen1.exists(), "sanity: the failed discard left the generation on disk"
+
+    # The transient problem clears, and the pool retries the build.
+    backend.fail_discard = False
+    mgr.build()
+
+    assert not gen1.exists(), (
+        "the retired generation was never retried: only a restored-and-reaped slot could have "
+        "swept it, and a build that fails for lack of space never produces one"
+    )

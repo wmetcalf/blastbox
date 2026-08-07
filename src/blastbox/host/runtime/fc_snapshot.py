@@ -175,6 +175,14 @@ class SnapshotManager:
         if self._artifact is not None:
             return self._artifact
         self._base_dir.mkdir(parents=True, exist_ok=True)
+        # Retry retirements whose cleanup failed, BEFORE consuming space for a new generation.
+        # _sweep_retired() was reachable only from release() and _unpin(), both of which need a
+        # slot that was actually restored and then reaped. When cleanup of a retired generation
+        # fails, its RAM-sized .mem stays on the snapshot filesystem -- which is itself a reason
+        # the next build fails before producing any slot. Neither trigger could then ever fire,
+        # so the tier stayed wedged even after the transient unlink problem cleared. The build
+        # path is the one thing guaranteed to run on every retry (upstream, PR #82).
+        self._sweep_retired()
         # Reclaim generations left by a dispatcher that is gone. Done here rather than at import
         # or construction so it runs exactly once, on the first real build, with the directories
         # already created. Best-effort: a failed sweep must never block bringing the tier up.
