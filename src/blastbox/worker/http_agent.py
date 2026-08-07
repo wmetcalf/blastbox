@@ -436,7 +436,20 @@ def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
     httpd = ThreadingHTTPServer((bind, port), handler)
     if tls_cert and tls_key:
         from blastbox.tls import server_ssl_context
-        ctx = server_ssl_context(tls_cert, tls_key, client_ca_file=client_ca)
+        try:
+            # OSError covers a missing/unreadable file (PermissionError, FileNotFoundError) AND a
+            # malformed cert/key (ssl.SSLError subclasses OSError). Turn the raw traceback into an
+            # actionable message -- the common trap is a 0600 key owned by root that the agent's
+            # non-root image USER can't read over a read-only mount, which otherwise crash-loops
+            # the container with an opaque error.
+            ctx = server_ssl_context(tls_cert, tls_key, client_ca_file=client_ca)
+        except OSError as exc:
+            httpd.socket.close()
+            raise SystemExit(
+                f"http_agent: cannot load TLS material (cert={tls_cert!r} key={tls_key!r} "
+                f"client_ca={client_ca!r}): {exc}. The files must exist and be READABLE by the agent "
+                f"uid ({os.getuid()}) -- a 0600 key owned by root is unreadable when the image runs as "
+                f"a non-root USER; chown the key to the agent uid or loosen its mode.") from exc
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
     _log.info("http_agent: serving engine=%s on %s:%d (tls=%s mtls=%s allowlist=%s)",
               engine.name, bind, port, bool(tls_cert), bool(client_ca), bool(allow_cidrs))

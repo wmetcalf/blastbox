@@ -179,3 +179,105 @@ def test_client_rejects_wrong_server_san(tmp_path):
     client_ctx = client_ssl_context(str(tmp_path / "ca.crt"), cert_file=str(ccrt), key_file=str(ckey))
     res = _handshake(server_ctx, client_ctx, "127.0.0.1")
     assert res.get("client_ok") is not True      # SAN mismatch -> client refuses the server
+
+
+def test_client_skip_hostname_accepts_ca_signed_wrong_san(tmp_path):
+    # verify_hostname=False: a cert our CA signed is trusted even though its SAN (10.9.9.9) does not
+    # match the dialed address -- the dynamic-IP / disposable-pool case where one baked server cert is
+    # shared by every worker. Contrast test_client_rejects_wrong_server_san (the default, hostname ON).
+    ca = ensure_ca(tmp_path / "pki")
+    srv = ca.issue_server(["10.9.9.9"])          # cert is NOT for 127.0.0.1
+    scrt, skey = srv.write(tmp_path, "server")
+    (tmp_path / "ca.crt").write_bytes(ca.cert_pem)
+    server_ctx = server_ssl_context(str(scrt), str(skey))
+    cli = ca.issue_client()
+    ccrt, ckey = cli.write(tmp_path, "client")
+    client_ctx = client_ssl_context(
+        str(tmp_path / "ca.crt"), cert_file=str(ccrt), key_file=str(ckey), verify_hostname=False,
+    )
+    res = _handshake(server_ctx, client_ctx, "127.0.0.1")
+    assert res.get("client_ok") is True          # SAN mismatch tolerated; CA-chain trust intact
+
+
+def test_client_skip_hostname_still_rejects_untrusted_ca(tmp_path):
+    # SECURITY: dropping the hostname check must NOT weaken CA-chain verification. A server cert signed
+    # by a CA we don't trust is rejected even with verify_hostname=False (verify_mode stays
+    # CERT_REQUIRED) -- so "any address is fine" never degrades to "any cert is fine".
+    ca = ensure_ca(tmp_path / "pki")
+    rogue = _generate_ca("rogue-ca")
+    srv = rogue.issue_server(["127.0.0.1"])      # correct SAN, but signed by an UNtrusted CA
+    scrt, skey = srv.write(tmp_path, "server")
+    (tmp_path / "ca.crt").write_bytes(ca.cert_pem)   # we trust ONLY the real ca
+    server_ctx = server_ssl_context(str(scrt), str(skey))
+    cli = ca.issue_client()
+    ccrt, ckey = cli.write(tmp_path, "client")
+    client_ctx = client_ssl_context(
+        str(tmp_path / "ca.crt"), cert_file=str(ccrt), key_file=str(ckey), verify_hostname=False,
+    )
+    res = _handshake(server_ctx, client_ctx, "127.0.0.1")
+    assert res.get("client_ok") is not True      # untrusted CA rejected despite hostname check off
+    assert res.get("client_error") == "SSLCertVerificationError"
+
+
+# --------------------------------------------------------------- import a pre-generated CA
+
+def test_import_ca_installs_and_reloads(tmp_path):
+    from blastbox.host.pki import ensure_ca, import_ca
+    src = _generate_ca()                              # a CA generated elsewhere (offline/central)
+    ca = import_ca(tmp_path, src.cert_pem, src.key_pem)
+    assert (tmp_path / "ca.crt").exists()
+    assert oct((tmp_path / "ca.key").stat().st_mode)[-3:] == "600"
+    assert ca.cert_pem == src.cert_pem                # it IS the imported CA, not a fresh one
+    assert ensure_ca(tmp_path).cert_pem == src.cert_pem   # later ensure_ca loads it, doesn't regenerate
+
+
+def test_import_ca_rejects_key_cert_mismatch(tmp_path):
+    from blastbox.host.pki import import_ca
+    a, b = _generate_ca(), _generate_ca()
+    with pytest.raises(ValueError):
+        import_ca(tmp_path, a.cert_pem, b.key_pem)    # b's key does not match a's cert
+
+
+def test_import_ca_rejects_non_ca_cert(tmp_path):
+    from blastbox.host.pki import import_ca
+    ca = _generate_ca()
+    leaf = ca.issue_server(["127.0.0.1"])             # a leaf (BasicConstraints ca=False)
+    with pytest.raises(ValueError):
+        import_ca(tmp_path, leaf.cert_pem, leaf.key_pem)
+
+
+def test_import_ca_refuses_overwriting_a_different_ca(tmp_path):
+    from blastbox.host.pki import import_ca
+    a, b = _generate_ca(), _generate_ca()
+    import_ca(tmp_path, a.cert_pem, a.key_pem)
+    import_ca(tmp_path, a.cert_pem, a.key_pem)        # idempotent: re-importing the SAME CA is fine
+    with pytest.raises(RuntimeError):
+        import_ca(tmp_path, b.cert_pem, b.key_pem)    # a DIFFERENT CA -> refuse the silent rotation
+
+
+def test_import_ca_refuses_partial_state(tmp_path):
+    from blastbox.host.pki import import_ca
+    a = _generate_ca()
+    (tmp_path / "ca.key").write_bytes(a.key_pem)      # orphan key, no ca.crt -> partial state
+    with pytest.raises(RuntimeError):
+        import_ca(tmp_path, a.cert_pem, a.key_pem)    # mirror ensure_ca: refuse, don't complete silently
+
+
+def test_shared_imported_ca_interoperates_across_hosts(tmp_path):
+    # The failover shape: one CA generated centrally, imported on two separate hosts. A client cert
+    # issued on host A and a server cert issued on host B share one root, so they complete mTLS --
+    # which is what lets multiple dispatchers feed (and trust) the same worker pool.
+    from blastbox.host.pki import import_ca
+    root = _generate_ca()
+    host_a = import_ca(tmp_path / "a", root.cert_pem, root.key_pem)   # a dispatcher host
+    host_b = import_ca(tmp_path / "b", root.cert_pem, root.key_pem)   # the worker-cert issuing host
+    srv = host_b.issue_server(["127.0.0.1"])
+    scrt, skey = srv.write(tmp_path, "server")
+    (tmp_path / "ca.crt").write_bytes(root.cert_pem)
+    server_ctx = server_ssl_context(str(scrt), str(skey), client_ca_file=str(tmp_path / "ca.crt"))
+    cli = host_a.issue_client("dispatcher")
+    ccrt, ckey = cli.write(tmp_path, "client")
+    client_ctx = client_ssl_context(str(tmp_path / "ca.crt"), cert_file=str(ccrt), key_file=str(ckey))
+    res = _handshake(server_ctx, client_ctx, "127.0.0.1")
+    assert res.get("client_ok") is True
+    assert res.get("peer_cert")                       # mutual auth: server accepted host A's client cert

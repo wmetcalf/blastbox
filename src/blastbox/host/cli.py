@@ -658,9 +658,17 @@ def _version_cmd(_: argparse.Namespace) -> int:
 def _pki_cmd(args: argparse.Namespace) -> int:
     from pathlib import Path
 
-    from blastbox.host.pki import ensure_ca
+    from blastbox.host.pki import ensure_ca, import_ca
 
     pki_dir = Path(args.dir)
+    if args.pki_action == "import-ca":
+        # install a pre-generated CA (BEFORE ensure_ca, which would otherwise mint a fresh one) so
+        # several hosts / a shared worker pool trust one root -- the multi-dispatcher failover case.
+        import_ca(pki_dir, Path(args.ca_cert).read_bytes(), Path(args.ca_key).read_bytes())
+        print(f"imported CA into {pki_dir}")
+        print(f"  ca.crt  (public trust anchor -> bake into worker images)      : {pki_dir / 'ca.crt'}")
+        print(f"  ca.key  (issuing key -- keep on issuing hosts only, 0600)      : {pki_dir / 'ca.key'}")
+        return 0
     ca = ensure_ca(pki_dir)  # generate-or-load the CA
     if args.pki_action == "init":
         crt, key = ca.issue_client("dispatcher", days=args.days).write(pki_dir, "dispatcher")
@@ -757,6 +765,10 @@ def build_parser() -> argparse.ArgumentParser:
     pk_csr.add_argument("--out", default=None, help="output cert path (default: <csr>.crt)")
     pk_csr.add_argument("--days", type=int, default=30)
     pks.add_parser("show-ca", help="print the CA cert (public trust anchor)")
+    pk_imp = pks.add_parser(
+        "import-ca", help="install a pre-generated CA (share one root across hosts / a worker pool)")
+    pk_imp.add_argument("--ca-cert", required=True, help="path to the pre-generated CA cert PEM")
+    pk_imp.add_argument("--ca-key", required=True, help="path to the pre-generated CA private key PEM")
     pk.set_defaults(func=_pki_cmd)
 
     # version
