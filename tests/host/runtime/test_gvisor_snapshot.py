@@ -453,6 +453,7 @@ def test_a_partial_checkpoint_whose_cleanup_fails_is_retried(tmp_path: Path) -> 
         assert not made[0].exists(), (
             f"a partial whose cleanup failed was never retried: {made[0]}"
         )
+
     finally:
         mp.undo()
 
@@ -483,3 +484,52 @@ def test_kill_is_quiet_when_teardown_succeeds(tmp_path: Path) -> None:
     be = GvisorSnapshotBackend(_cfg(tmp_path), run=rec, ready_wait=lambda d, t: None)
     handle = be.boot_base()
     handle.kill()          # must not raise
+
+
+def test_the_retry_list_stays_shared_across_handles(tmp_path: Path) -> None:
+    """Rebinding detaches the handle from the backend's list.
+
+    After one failed cleanup the sweep did `self._stranded_partials = still`, pointing the HANDLE
+    at a private copy — every later append lands there, and the next handle (still holding the
+    original) never sees those directories. The FC launcher had the identical bug.
+    """
+    def _run(argv, *a, **kw):
+        if "checkpoint" in argv:
+            img = Path(argv[argv.index("-image-path") + 1])
+            img.mkdir(parents=True, exist_ok=True)
+            (img / "partial").write_bytes(b"half")
+            raise RuntimeError("runsc checkpoint failed")
+        return 0
+
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=_run, ready_wait=lambda d, t: None)
+    dest = tmp_path / "ckpt"
+
+    import shutil as _shutil
+
+    def _always_fails(path, *a, **kw):
+        onerror = kw.get("onerror")
+        if onerror is not None:
+            onerror(None, str(path), (OSError, OSError(5, "Input/output error"), None))
+            return
+        return _shutil.rmtree(path, *a, **kw)
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr("blastbox.host.runtime.gvisor_snapshot.shutil.rmtree", _always_fails)
+    try:
+        boot = be.boot_base()
+        boot.wait_ready(5.0)
+        # TWO failures on one handle: the first populates the list, the second appends AFTER the
+        # sweep has run once, which is where the rebinding took effect.
+        for _ in range(2):
+            with pytest.raises(Exception):
+                boot.checkpoint(dest)
+    finally:
+        mp.undo()
+
+    # BOTH failures must be recorded on the backend. With the rebinding, the first one lands
+    # there (before the sweep runs) and only the SECOND goes to the private copy — so asserting
+    # merely "non-empty" passes against the bug.
+    assert len(be._stranded_partials) >= 2, (
+        f"only {len(be._stranded_partials)} of 2 stranded directories reached the backend's "
+        "durable list — the handle rebound to a private copy after the first sweep"
+    )

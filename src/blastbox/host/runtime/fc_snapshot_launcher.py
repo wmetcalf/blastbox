@@ -214,7 +214,11 @@ class _Handle:
                     Path(leftover).unlink(missing_ok=True)
                 except OSError:
                     still.append(leftover)
-            self._stranded_partials = still
+            # IN PLACE. Rebinding detaches this handle from the launcher/backend list it was
+            # given, so every later extend() lands on a private copy and the next handle -- which
+            # still holds the original -- never sees those files. That silently undid the
+            # durability fix this list exists for (PR #82).
+            self._stranded_partials[:] = still
 
         gen = f"{owner_token()}-{time.monotonic_ns():019d}"
         snap = dest / f"warm-{gen}.snapshot"

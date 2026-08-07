@@ -545,3 +545,57 @@ def test_a_generation_from_a_reused_pid_is_swept(tmp_path):
     assert launcher.sweep_orphan_generations() == 1
     assert not stale.exists(), "a prior container's generation must be reclaimed"
     assert ours.exists(), "our own generation must never be swept"
+
+
+def test_the_retry_list_stays_shared_across_handles(tmp_path, monkeypatch):
+    """Rebinding the reference detaches the handle from the owner's list.
+
+    After one failed cleanup the sweep did `self._stranded_partials = still`, which points the
+    HANDLE at a private copy — every later extend() lands there, and the next handle (still
+    holding the original) never sees those files. That silently undid the durability fix.
+    """
+    base = tmp_path / "snap"
+    memdir = tmp_path / "ram"
+    launcher = FcSnapshotLauncher(
+        FakeCfg(), base, mem_dir=memdir,
+        popen=lambda argv, cwd=None: FakeProc(),
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
+        make_outdisk=_make_outdisk_file,
+    )
+    handle = launcher.boot_base()
+
+    created: list[Path] = []
+
+    def _create_then_fail(api, snap, mem):
+        for s in (snap, mem):
+            Path(s).parent.mkdir(parents=True, exist_ok=True)
+            Path(s).write_bytes(b"partial")
+            created.append(Path(s))
+        raise RuntimeError("create failed")
+
+    monkeypatch.setattr(
+        "blastbox.host.runtime.fc_snapshot_backend._create_snapshot", _create_then_fail
+    )
+    real_unlink = Path.unlink
+
+    def _always_fails(self, *a, **kw):
+        if self.name.startswith("warm-"):
+            raise OSError(5, "Input/output error")
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", _always_fails)
+
+    # TWO failed checkpoints on the same handle: the first populates the list, the second appends
+    # after the sweep has run once -- which is where the rebinding took effect.
+    for _ in range(2):
+        with pytest.raises(Exception):
+            handle.checkpoint(base)
+
+    assert launcher._stranded_partials, (
+        "the launcher's durable list is empty — the handle rebound to a private copy, so the "
+        "next build would never retry these files"
+    )
+    assert len(launcher._stranded_partials) >= len(created), (
+        f"only {len(launcher._stranded_partials)} of {len(created)} stranded files reached the "
+        "shared list"
+    )

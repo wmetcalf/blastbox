@@ -603,6 +603,21 @@ class WarmPool:
             if self._clock() >= deadline:
                 return None
 
+    def _reserve_eviction_unlocked(self, now: float) -> bool:
+        """Check-and-reserve one eviction token. CALLER MUST HOLD ``self._lock``.
+
+        Split out because the demotion step -- the only place that truly evicts -- already holds
+        the lock, and the locking variant would deadlock there.
+        """
+        if self._max_evictions_per_window <= 0 or self._eviction_window_s <= 0:
+            return True
+        self._evictions = [ts for ts in self._evictions
+                           if now - ts < self._eviction_window_s]
+        if len(self._evictions) >= self._max_evictions_per_window:
+            return False
+        self._evictions.append(now)
+        return True
+
     def _eviction_allowed(self) -> bool:
         """True if the wedge heuristic may still evict a slot inside the current window.
 
@@ -2041,20 +2056,11 @@ class WarmPool:
                     )
                     if escalate:
                         self._unknown_since.pop(slot.slot_id, None)
-                if escalate and not self._eviction_allowed():
-                    # The cap exists for exactly this: escalation here is SUSPICION, not a
-                    # verdict, and a prolonged control-plane brownout makes every probe unknown at
-                    # once. Without the cap an operator who set
-                    # BLASTBOX_POOL_MAX_EVICTIONS_PER_WINDOW=2 still watched a large pool of
-                    # healthy workers be terminated wholesale, then churned again as the outage
-                    # continued. Confirmed-dead eviction stays uncapped -- that IS a verdict.
-                    logger.warning(
-                        "pool.health_unknown_escalation_capped slot_id=%s — eviction budget "
-                        "exhausted this window; leaving the slot in place", slot.slot_id,
-                    )
-                    with self._lock:
-                        self._unknown_since.setdefault(slot.slot_id, probed_at)
-                    escalate = False
+                # NB the eviction cap is NOT consulted here. It is enforced at the demotion
+                # below -- the step that actually evicts -- because a claimant can take this slot
+                # in between and the budget must not be spent on an eviction that never happens.
+                # A peek here as well was pure duplication: removing it changed no behaviour,
+                # which is exactly what a surviving mutant told me (PR #82).
                 if escalate:
                     logger.warning("pool.health_unknown_escalated slot_id=%s unknown_for=%.0fs "
                                    "(> %.0fs) — treating as dead so the slot is replaced",
@@ -2089,6 +2095,19 @@ class WarmPool:
             for slot in dead:
                 cur = self._slots.get(slot.slot_id)
                 if cur is not None and cur.state in (SlotState.IDLE, SlotState.WARMING):
+                    # RESERVE here: this is the step that actually evicts. A slot a claimant took
+                    # between the escalation decision and now is skipped by the guard above, and
+                    # must not have consumed budget on the way past.
+                    # Reserve INLINE: we already hold self._lock, and _eviction_allowed takes
+                    # it -- calling it here deadlocks on a non-reentrant Lock (it hung the whole
+                    # suite before this was caught).
+                    if slot.slot_id in suspected and not self._reserve_eviction_unlocked(now):
+                        logger.warning(
+                            "pool.health_unknown_escalation_capped slot_id=%s — budget exhausted "
+                            "at demotion; leaving the slot in place", slot.slot_id,
+                        )
+                        self._unknown_since.setdefault(slot.slot_id, now)
+                        continue
                     cur.state = SlotState.DRAINING
                     # We won the race, so this death is real evidence. A slot that never served a
                     # job had only its promotion vouching for the base, and that is now refuted.

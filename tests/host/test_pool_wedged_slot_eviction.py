@@ -2370,3 +2370,86 @@ def test_an_unknown_escalation_is_not_restore_evidence() -> None:
         "a control-plane brownout invalidated the snapshot base on suspicion alone "
         f"(got {rt.base_invalidations} rebuilds)"
     )
+
+
+def test_a_claim_race_does_not_consume_the_eviction_budget() -> None:
+    """Budget must be spent where the eviction happens, not where it is decided.
+
+    A claimant can take an UNKNOWN-escalated slot between the decision and the demotion. The
+    state guard correctly leaves the active slot alone — but the token had already been reserved,
+    so enough claim races exhausted a small cap and left genuinely unclaimable UNKNOWN slots
+    unreplaceable.
+    """
+    clock = _FakeClock()
+
+    class _AllUnknown(_WedgeableRuntime):
+        def is_ready(self, slot: Slot) -> bool:
+            return True
+
+        def is_alive(self, slot: Slot):
+            return None
+
+        def is_alive_for_claim(self, slot: Slot, budget_s=None):
+            return True          # claims still succeed
+
+    rt = _AllUnknown()
+    pool = WarmPool(
+        runtime=rt, warm_size=4, concurrent_ceiling=8, clock=clock,
+        unknown_grace_s=10.0, max_evictions_per_window=2, spawn_rate_limit=1000.0,
+    )
+    pool.tick()
+    pool.tick()
+    pool._health_check()          # opens the unknown episode
+    clock.advance(11.0)
+
+    # The claim must land BETWEEN the escalation decision and the demotion -- claiming up front
+    # just makes the slots ASSIGNED, so no escalation fires and the test proves nothing.
+    import threading
+
+    claimed: list[object] = []
+    real_lock = pool._lock
+
+    class _GatedLock:
+        """Armed by the stamp read, so the claim lands inside the escalation window."""
+
+        def __init__(self) -> None:
+            self.armed = False
+
+        def __enter__(self):
+            return real_lock.__enter__()
+
+        def __exit__(self, *a):
+            r = real_lock.__exit__(*a)
+            if self.armed:
+                self.armed = False
+                th = threading.Thread(
+                    target=lambda: claimed.extend(
+                        [pool.claim(timeout_s=0.5) for _ in range(4)]
+                    ),
+                    daemon=True,
+                )
+                th.start()
+                th.join(5.0)
+            return r
+
+    gate = _GatedLock()
+
+    class _ArmingStamps(dict):
+        def setdefault(self, *a, **kw):
+            gate.armed = True
+            return super().setdefault(*a, **kw)
+
+    pool._unknown_since = _ArmingStamps(pool._unknown_since)  # type: ignore[assignment]
+    pool._lock = gate  # type: ignore[assignment]
+    pool._health_check()
+    pool._lock = real_lock
+
+    assert any(c is not None for c in claimed), (
+        "the racing claim never took a slot — the test proved nothing"
+    )
+    with pool._lock:
+        spent = len(pool._evictions)
+    assert spent == 0, (
+        f"{spent} eviction tokens were consumed for slots that were never evicted — enough "
+        "claim races would exhaust the cap and block genuine replacements"
+    )

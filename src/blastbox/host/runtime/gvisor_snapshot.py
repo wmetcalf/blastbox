@@ -289,7 +289,11 @@ class GvisorBootHandle:
                 shutil.rmtree(leftover, onerror=lambda fn, p, exc: retry_errs.append(str(p)))
                 if retry_errs:
                     still.append(leftover)
-            self._stranded_partials = still
+            # IN PLACE. Rebinding detaches this handle from the launcher/backend list it was
+            # given, so every later extend() lands on a private copy and the next handle -- which
+            # still holds the original -- never sees those files. That silently undid the
+            # durability fix this list exists for (PR #82).
+            self._stranded_partials[:] = still
 
         # GENERATION-STAMPED, never a fixed "checkpoint" path. restore_in() reads this directory
         # for the whole life of a `runsc restore`, so a rebuild writing the SAME path can
