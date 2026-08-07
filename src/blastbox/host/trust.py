@@ -21,7 +21,7 @@ from blastbox.contract.envelope import (
     seal_envelope,
     validate_envelope,
 )
-from blastbox.errors import OutputTrustError, sanitize_public_error
+from blastbox.errors import OutputTrustError, OutputTrustUnknown, sanitize_public_error
 from blastbox.limits import Limits
 
 _log = logging.getLogger("blastbox.host.trust")
@@ -64,12 +64,20 @@ def validate_worker_output(
         )
     except FileNotFoundError as exc:
         raise OutputTrustError("metadata.json not found in output directory") from exc
-    except (OSError, ValueError) as exc:
+    except ValueError as exc:
+        # A ValueError here IS a verdict: the worker wrote something that is not a regular file
+        # inside the output dir, or exceeded the declared size.
         raise OutputTrustError(
             sanitize_public_error(
                 "metadata.json must be a regular file inside the output dir within the size "
                 f"limit ({exc})"
             )
+        ) from exc
+    except OSError as exc:
+        # ...but an OSError is OUR failure to read it (EMFILE/EIO/ENOMEM), not proof the output
+        # is bad. Attributing it convicts every worker at once during a host outage.
+        raise OutputTrustUnknown(
+            sanitize_public_error(f"could not read metadata.json ({exc})")
         ) from exc
 
     # ------------------------------------------------------------------

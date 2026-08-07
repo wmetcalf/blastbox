@@ -217,7 +217,7 @@ class FakeLauncher:
         self.boots.append(h)
         return h
 
-    def restore_in(self, slot_workdir):
+    def restore_in(self, slot_workdir, *, outdisk_src=None):
         h = FakeRestoreHandle(slot_workdir, fail_load=self._fail_load)
         self.restores.append(h)
         return h

@@ -1235,7 +1235,8 @@ def build_remote_vm_dispatcher(
     def output_trust(input_path: Path, out_dir: Path, expected_sha: str | None,
                      owns: Callable[[], bool] | None = None) -> None:
         from blastbox.errors import EngineErrorEnvelope
-        from blastbox.host.trust import OutputTrustError, validate_worker_output
+        from blastbox.host.runtime.remote_http import ClaimLost
+        from blastbox.host.trust import validate_worker_output
         # Compare the worker's sealed envelope against the AUTHORITATIVE ingress-recorded input SHA
         # (job.input_sha256), matching the cold/file-warm paths -- so a staged input that was
         # corrupted/replaced after submission is caught (the worker hashed different bytes). Fall
@@ -1260,7 +1261,10 @@ def build_remote_vm_dispatcher(
         # metadata.json in the shared output dir. Raise -> job fails for this stale attempt, slot
         # retired dirty. Checked immediately before the write to shrink the TOCTOU to ~nothing.
         if owns is not None and not owns():
-            raise OutputTrustError("claim lost before host metadata write (peer recovered the job)")
+            # ClaimLost, NOT OutputTrustError: a peer owning the job says nothing about this
+            # worker's output, which validated fine. Raising a trust error routed it into the
+            # generic handler and convicted a healthy slot on every reclaim race (upstream, PR #82).
+            raise ClaimLost("claim lost before host metadata write (peer recovered the job)")
         atomic_write_confined(out_dir, "metadata.json",
                               env.model_dump_json(by_alias=True).encode("utf-8"), mode=0o644)
 

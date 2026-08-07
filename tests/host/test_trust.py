@@ -584,3 +584,47 @@ def test_missing_payload_raises(tmp_path):
             engine=_ENGINE,
             limits=_limits(),
         )
+
+
+def test_a_host_io_failure_reading_metadata_is_not_a_trust_verdict(tmp_path, monkeypatch):
+    """OutputTrustError conflated "the output is bad" with "we could not read it".
+
+    An OSError here (EMFILE, EIO, ENOMEM) is this dispatcher's failure, not proof the worker
+    produced anything invalid — and a host I/O outage hits every job at once, so convicting on it
+    burns out the whole warm set. OutputTrustUnknown subclasses OutputTrustError, so the job still
+    fails closed; only the ATTRIBUTION changes.
+    """
+    from blastbox.errors import OutputTrustError, OutputTrustUnknown
+
+    out = tmp_path / "out"
+    out.mkdir()
+
+    def _boom(*a, **kw):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr("blastbox.host.trust.read_confined_regular_bytes", _boom)
+
+    with pytest.raises(OutputTrustUnknown) as ei:
+        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())
+    assert isinstance(ei.value, OutputTrustError), "must still fail the job closed"
+
+
+def test_a_malformed_metadata_file_is_still_a_trust_verdict(tmp_path, monkeypatch):
+    """The carve-out must stay narrow: a ValueError IS a verdict about the worker's output."""
+    from blastbox.errors import OutputTrustUnknown
+
+    out = tmp_path / "out"
+    out.mkdir()
+
+    def _bad(*a, **kw):
+        raise ValueError("not a regular file inside the output dir")
+
+    monkeypatch.setattr("blastbox.host.trust.read_confined_regular_bytes", _bad)
+
+    with pytest.raises(OutputTrustError) as ei:
+        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())
+    assert not isinstance(ei.value, OutputTrustUnknown), (
+        "a worker writing a non-regular file is a real verdict"
+    )

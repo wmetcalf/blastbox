@@ -554,3 +554,30 @@ def test_a_generation_whose_discard_fails_stays_retryable(tmp_path):
     assert not gen1.exists(), (
         "a generation whose discard failed was never retried — it is leaked forever"
     )
+
+
+def test_the_base_outdisk_is_versioned_with_its_generation(tmp_path):
+    """Stamping two of three artifacts still corrupts.
+
+    The guest's ext4 metadata (superblock, journal, dir checksums) lives in the captured guest
+    RAM, so the disk and the memory snapshot are ONE unit. restore_in() copied a fixed
+    base/outdisk.ext4 that boot_base() recreates on every build — so an in-flight restore could
+    pair generation N's memory with generation N+1's disk, producing exactly the
+    "EXT4-fs error: Directory block failed checksum" corruption the versioning exists to prevent.
+    """
+    from blastbox.host.runtime.fc_snapshot_backend import FcSnapshotArtifact
+
+    art = FcSnapshotArtifact(tmp_path / "s.snapshot", tmp_path / "m.mem",
+                             tmp_path / "warm-gen1.outdisk.ext4")
+    assert art.outdisk_path is not None, "the artifact must carry its own disk"
+
+    # ...and discard() must remove all three, or the versioning just leaks a third file.
+    for p in (art.snapshot_path, art.mem_path, art.outdisk_path):
+        p.write_bytes(b"x")
+
+    from blastbox.host.runtime.fc_snapshot_backend import FcSnapshotBackend
+    FcSnapshotBackend.discard(object(), art)   # type: ignore[arg-type]
+
+    assert not any(p.exists() for p in (art.snapshot_path, art.mem_path, art.outdisk_path)), (
+        "every file of a drained generation must be reclaimed, including the disk"
+    )

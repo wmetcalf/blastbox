@@ -40,7 +40,7 @@ from blastbox.contract.envelope import (
     confined_atomic_writer,
     open_confined_regular_fd,
 )
-from blastbox.errors import OutputTrustError, WarmTimeout, sanitize_public_error
+from blastbox.errors import OutputTrustError, OutputTrustUnknown, WarmTimeout, sanitize_public_error
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.runtime.docker import (
@@ -1263,7 +1263,12 @@ class Dispatcher:
                     limits=self._limits,
                 )
             except OutputTrustError as exc:
-                warm_fault = "worker"   # it produced output that failed trust validation
+                # ...only when validation reached a VERDICT. OutputTrustUnknown means the host
+                # could not complete the check (EMFILE/EIO/ENOMEM reading or hashing), which is
+                # evidence about this dispatcher, not the worker -- and a host I/O outage hits
+                # every job at once (upstream, PR #82).
+                if not isinstance(exc, OutputTrustUnknown):
+                    warm_fault = "worker"   # it produced output that failed trust validation
                 self._fail_job(job, f"output trust validation failed: {exc}")
                 return
             except Exception as exc:  # noqa: BLE001

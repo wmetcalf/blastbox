@@ -84,6 +84,18 @@ class OutputTrustError(BlastboxError):
     """Worker output failed the host-side trust validation."""
 
 
+class OutputTrustUnknown(OutputTrustError):
+    """Validation could not be COMPLETED -- not a verdict that the output is bad.
+
+    The host hit its own limits while reading or hashing (EMFILE, EIO, ENOMEM). Subclasses
+    OutputTrustError so every existing ``except OutputTrustError`` still fails the job closed,
+    but callers attributing blame can tell "the worker produced invalid output" (evidence about
+    the worker) from "we could not check" (evidence about this dispatcher). A host I/O outage
+    hits every job at once, so conflating them burns out the whole warm set and rebuilds healthy
+    snapshot bases during an incident the workers had no part in (upstream, PR #82).
+    """
+
+
 class EngineErrorEnvelope(OutputTrustError):
     """The worker returned a VALIDATED sealed envelope whose status is ``engine_error`` (structure/hashes/
     input-sha all checked out -- the box is healthy, the SAMPLE failed). The job fails, but the slot may be

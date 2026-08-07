@@ -133,6 +133,13 @@ class FcSnapshotArtifact:
 
     snapshot_path: Path
     mem_path: Path
+    # The snapshot-time ext4 image, versioned WITH the pair above. The guest's ext4 metadata
+    # (superblock, journal, dir checksums) lives in the captured guest RAM, so the disk and the
+    # memory snapshot are one unit: restoring generation N's memory against generation N+1's disk
+    # gives "EXT4-fs error: Directory block failed checksum". Leaving this at a fixed base path
+    # while stamping the other two meant a rebuild could rewrite it under an in-flight restore --
+    # the exact corruption the stamping was introduced to prevent (upstream, PR #82).
+    outdisk_path: Path | None = None
 
 
 class FcSnapshotBackend:
@@ -164,7 +171,9 @@ class FcSnapshotBackend:
             _log.warning("fc_snapshot: refusing to discard unknown artifact type %r",
                          type(artifact).__name__)
             return
-        for path in (artifact.snapshot_path, artifact.mem_path):
+        for path in (artifact.snapshot_path, artifact.mem_path, artifact.outdisk_path):
+            if path is None:
+                continue
             try:
                 Path(path).unlink(missing_ok=True)
             except OSError as exc:
@@ -227,7 +236,7 @@ class FcSnapshotBackend:
                 f"FcSnapshotBackend.restore_in expected FcSnapshotArtifact, "
                 f"got {type(artifact).__name__}"
             )
-        handle = self._launcher.restore_in(slot_workdir)
+        handle = self._launcher.restore_in(slot_workdir, outdisk_src=artifact.outdisk_path)
         try:
             _restore_from_snapshot(
                 handle.api, str(artifact.snapshot_path), str(artifact.mem_path)

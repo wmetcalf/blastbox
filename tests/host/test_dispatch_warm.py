@@ -1903,3 +1903,47 @@ def test_a_deadline_consumed_before_waiting_convicts_the_worker(tmp_path):
     assert pool.release_fault == ["worker"], (
         f"a slot that consumed its whole deadline IS worker evidence (got {pool.release_fault})"
     )
+
+
+def test_a_trust_check_the_host_could_not_complete_is_not_worker_evidence(tmp_path):
+    """OutputTrustError means two different things and only one is a verdict.
+
+    validate_worker_output() wraps a host-side OSError (EMFILE, EIO, ENOMEM opening or hashing
+    metadata.json) in the same exception as a genuine trust violation. Convicting on both means a
+    host I/O outage — which hits every job at once — burns out the whole warm set and rebuilds
+    healthy snapshot bases, even though no worker produced anything proven invalid.
+    """
+    from blastbox.errors import OutputTrustUnknown
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)
+    _start_fake_worker(
+        slot,
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
+    )
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+
+    def _cannot_check(*a, **kw):
+        raise OutputTrustUnknown("EMFILE opening metadata.json")
+
+    # Patch the symbol the dispatcher actually calls. A previous version patched a method that
+    # does not exist, so the job simply succeeded and the assertion measured nothing.
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr("blastbox.host.dispatch.validate_worker_output", _cannot_check)
+    try:
+        dispatcher.dispatch_once()
+    finally:
+        monkey.undo()
+
+    assert store.get(job.job_id).status == JobStatus.FAILED, "the trust path must be reached"
+    assert pool.release_fault == ["unknown"], (
+        f"a check the HOST could not complete is not worker evidence (got {pool.release_fault})"
+    )

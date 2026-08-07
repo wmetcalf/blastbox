@@ -137,8 +137,18 @@ class _Handle:
         gen = f"{os.getpid()}-{time.monotonic_ns():019d}"
         snap = dest / f"warm-{gen}.snapshot"
         mem = self._mem_dir / f"warm-{gen}.mem"
+        outdisk: Path | None = dest / f"warm-{gen}.outdisk.ext4"
         try:
             _create_snapshot(self.api, str(snap), str(mem))
+            # Freeze THIS generation's disk alongside its memory. boot_base() recreates the base
+            # workdir's outdisk on every build, so copying it at RESTORE time would pair a rebuilt
+            # disk with a retired memory snapshot. `dest` is the manager's base_dir, so the
+            # snapshot-time image is dest/base/outdisk.ext4.
+            base_outdisk = dest / "base" / REL_OUTDISK
+            if base_outdisk.exists() and outdisk is not None:
+                shutil.copy2(base_outdisk, outdisk)
+            else:
+                outdisk = None
         except BaseException:
             # /snapshot/create can write EITHER file and then report an error (a lost response
             # after Firecracker already committed the snapshot is the obvious way). No artifact
@@ -146,13 +156,15 @@ class _Handle:
             # discard them. Because every retry now picks a unique generation name, repeated
             # build failures accumulate full RAM-sized .mem files instead of overwriting the
             # previous attempt, until /dev/shm or the disk is exhausted (upstream, PR #82).
-            for path in (snap, mem):
+            for path in (snap, mem, outdisk):
+                if path is None:
+                    continue
                 try:
                     path.unlink(missing_ok=True)
                 except OSError:
                     pass
             raise
-        return FcSnapshotArtifact(snap, mem)
+        return FcSnapshotArtifact(snap, mem, outdisk)
 
     def kill(self) -> None:
         if self.proc is None or self.proc.poll() is not None:
@@ -297,7 +309,7 @@ class FcSnapshotLauncher:
             mem_dir=self._mem_dir,
         )
 
-    def restore_in(self, slot_workdir: Path):
+    def restore_in(self, slot_workdir: Path, *, outdisk_src: Path | None = None):
         """Spawn a fresh firecracker in ``slot_workdir`` for a snapshot restore. The
         caller (SnapshotManager) issues load+resume; the relative vsock/outdisk
         resolve under this cwd → per-slot uniqueness.
@@ -309,7 +321,9 @@ class FcSnapshotLauncher:
         → ``EXT4-fs error: Directory block failed checksum`` corruption. Copying the
         snapshot-time base image (empty at READY) keeps the (disk, guest-RAM) pair
         consistent; writes still land on the isolated per-slot copy (one job per slot)."""
-        base_outdisk = self._base_dir / "base" / REL_OUTDISK
+        # Prefer THIS generation's frozen disk; fall back to the shared base only for artifacts
+        # built before the disk was versioned.
+        base_outdisk = outdisk_src if outdisk_src is not None else self._base_dir / "base" / REL_OUTDISK
         if not base_outdisk.exists():
             # The base outdisk (the snapshot-time ext4 image) MUST survive for the life
             # of the manager — it is the per-slot copy source. Fail clearly rather than
