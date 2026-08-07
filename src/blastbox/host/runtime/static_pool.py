@@ -239,6 +239,12 @@ class StaticPoolRuntime:
         # claim the first free box that actually answers /healthz -- don't hand out a dead one
         # (probe outside the lock; re-check under it in case another thread claimed it meanwhile).
         now = self._clock()
+        # WHY each candidate was skipped decides which exception this raises, and that decides
+        # whether the pool treats the miss as backpressure or as a fault worth repairing a base
+        # over. A worker inside dirty_cooldown_s is perfectly healthy and will come back on its
+        # own -- no probe failed -- so a fleet that is merely cooling must not be reported as
+        # broken (upstream, PR #82).
+        saw_unhealthy = False
         for idx in candidates:
             with self._lock:
                 cool = self._cooldown_until.get(idx, 0.0)
@@ -248,6 +254,7 @@ class StaticPoolRuntime:
                 continue
             if self._health_ok(self.cfg.workers[idx]) is not True:
                 _log.warning("static: worker[%d] unhealthy, skipping for this claim", idx)
+                saw_unhealthy = True
                 continue
             with self._lock:
                 if idx not in self._free:
@@ -266,6 +273,13 @@ class StaticPoolRuntime:
             )
             _log.info("static: claimed worker[%d] %s for slot=%s", idx, self._base_url(w), slot.slot_id)
             return slot
+        if not saw_unhealthy:
+            # Every free worker was skipped ONLY for cooldown: routine backpressure, and it
+            # clears itself. Reporting a fault here would advance the pool's spawn-failure
+            # streak on every tick and could invalidate an unrelated snapshot base.
+            raise StaticPoolExhausted(
+                "all free static workers are within dirty_cooldown_s (transient)"
+            )
         raise StaticPoolUnhealthy("no free static worker is currently healthy")
 
     def is_ready(self, slot: StaticWorkerSlot) -> bool:

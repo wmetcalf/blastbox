@@ -136,7 +136,7 @@ def test_dirty_reap_quarantines_box_until_cooldown():
     rt = StaticPoolRuntime(cfg, http_probe=FakeProbe(all_ok=True), clock=lambda: now[0])
     s1 = rt.spawn()
     rt.reap(s1, dirty=True)                       # box goes into cooldown
-    with pytest.raises(StaticPoolUnhealthy):
+    with pytest.raises(StaticPoolExhausted):
         rt.spawn()                                # still cooling -> not claimable
     now[0] += 31.0                                # cooldown expires
     s2 = rt.spawn()
@@ -406,3 +406,25 @@ def test_static_hand_out_probe_honours_the_claim_deadline():
 
     # no window left to ask meaningfully -> UNKNOWN, never a verdict
     assert rt.is_alive_for_claim(slot, budget_s=0.0) is None
+
+
+def test_cooldown_only_misses_are_capacity_not_a_broken_fleet():
+    """A cooling worker is HEALTHY — it just is not claimable this instant.
+
+    One raise site served both "every free worker failed its probe" (the fleet is broken) and
+    "every free worker is inside dirty_cooldown_s" (routine, self-clearing). Reporting the
+    latter as a fault advances the pool's spawn-failure streak every tick and, behind a cascade,
+    can invalidate an unrelated healthy snapshot base.
+    """
+    cfg = _cfg("a:8765", "b:8765", dirty_cooldown_s=30.0)
+    rt = StaticPoolRuntime(cfg, http_probe=FakeProbe(all_ok=True))   # both answer /healthz
+    a = rt.spawn()
+    b = rt.spawn()
+    rt.reap(a, dirty=True)      # both quarantined, neither unhealthy
+    rt.reap(b, dirty=True)
+
+    with pytest.raises(StaticPoolExhausted) as ei:
+        rt.spawn()
+    assert not isinstance(ei.value, StaticPoolUnhealthy), (
+        "a cooling fleet is at capacity, not broken"
+    )

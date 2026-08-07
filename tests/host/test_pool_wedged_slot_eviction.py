@@ -1048,3 +1048,111 @@ def test_a_ceiling_only_resize_also_re_derives_the_thresholds() -> None:
         f"must derive from the clamped target (8), not the requested 64 "
         f"(got {pool._snapshot_rebuild_after})"
     )
+
+
+def test_a_broken_primary_tier_is_repaired_even_when_fallback_succeeds() -> None:
+    """Fallback is exactly what HIDES tier-level breakage.
+
+    A snapshot primary whose base is poisoned raises on every spawn; a healthy overflow tier then
+    satisfies the request, so CascadingRuntime.spawn() RETURNS a slot and the pool records a
+    success — resetting the very streak that would have repaired the primary. The deployment then
+    runs permanently on the lower-priority tier, at its cost and performance, with nothing above a
+    per-attempt warning to say so. Only per-tier evidence can see this.
+    """
+    class _PoisonedPrimary(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self) -> Slot:
+            self.attempts += 1
+            raise RuntimeError("snapshot restore failed: corrupt warm.mem")
+
+    class _HealthyOverflow(_WedgeableRuntime):
+        def prepare(self) -> bool:
+            return True
+
+    primary, overflow = _PoisonedPrimary(), _HealthyOverflow()
+    casc = CascadingRuntime(
+        tiers=[Tier(name="fc", runtime=primary, capacity=8),
+               Tier(name="overflow", runtime=overflow, capacity=8)],
+        tier_rebuild_after=4,
+    )
+    pool = WarmPool(
+        runtime=casc, warm_size=4, concurrent_ceiling=8,
+        base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    for _ in range(6):
+        pool.tick()
+
+    assert primary.attempts >= 4, "the primary must keep being tried"
+    assert primary.base_invalidations >= 1, (
+        "a primary that fails every spawn must be repaired even though the overflow tier kept "
+        "serving — otherwise the fallback silently becomes permanent"
+    )
+    assert overflow.base_invalidations == 0, "the HEALTHY tier's base must never be touched"
+
+
+def test_a_healthy_tier_that_merely_loses_the_race_is_not_repaired() -> None:
+    """The over-correction guard: per-tier repair must key on that tier's OWN failures."""
+    class _Fine(_WedgeableRuntime):
+        def prepare(self) -> bool:
+            return True
+
+    a, b = _Fine(), _Fine()
+    casc = CascadingRuntime(
+        tiers=[Tier(name="fc", runtime=a, capacity=1), Tier(name="overflow", runtime=b, capacity=8)],
+        tier_rebuild_after=2,
+    )
+    pool = WarmPool(
+        runtime=casc, warm_size=6, concurrent_ceiling=8,
+        base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    for _ in range(6):
+        pool.tick()
+
+    assert a.base_invalidations == 0 and b.base_invalidations == 0, (
+        "a tier that is merely FULL has produced no failure evidence at all"
+    )
+
+
+def test_intermittent_tier_failures_do_not_accumulate_into_a_rebuild() -> None:
+    """A tier's own successes must clear its own streak.
+
+    Per-tier repair is only safe if the counter measures a SUSTAINED fault. Without the reset, a
+    tier that fails occasionally — a transient restore hiccup, a brief resource pinch — slowly
+    accumulates unrelated failures and eventually gets its perfectly good base destroyed, which
+    is a strictly worse outage than the one per-tier repair exists to fix.
+    """
+    class _Flaky(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self) -> Slot:
+            self.n += 1
+            if self.n % 2 == 1:          # fail, succeed, fail, succeed …
+                raise RuntimeError("transient restore hiccup")
+            return super().spawn()
+
+    flaky = _Flaky()
+    casc = CascadingRuntime(tiers=[Tier(name="fc", runtime=flaky, capacity=8)],
+                            tier_rebuild_after=3)
+    pool = WarmPool(
+        runtime=casc, warm_size=4, concurrent_ceiling=8,
+        base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    for _ in range(10):
+        pool.tick()
+
+    assert flaky.n >= 6, "the tier must actually have been exercised"
+    assert flaky.base_invalidations == 0, (
+        "intermittent failures interleaved with successes must never reach the rebuild "
+        f"threshold (got {flaky.base_invalidations} invalidations)"
+    )

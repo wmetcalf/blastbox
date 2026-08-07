@@ -153,13 +153,24 @@ class CascadingRuntime:
         ]
         return max(vals) if vals else None
 
-    def __init__(self, tiers: list[Tier]) -> None:
+    def __init__(self, tiers: list[Tier], *, tier_rebuild_after: int = 4) -> None:
         if not tiers:
             raise CascadeMisconfigured("cascade needs at least one tier")
         self.tiers = tiers
+        # Consecutive per-tier spawn failures before that tier's base is invalidated. 0 disables
+        # per-tier repair (the tier then stays broken until something else notices, which behind
+        # a working fallback is "never").
+        self.tier_rebuild_after = max(0, int(tier_rebuild_after))
         self._counts = [0] * len(tiers)          # live slots per tier
         self._owner: dict[str, int] = {}          # slot_id -> tier index
         self._lock = threading.Lock()
+        # Consecutive spawn failures PER TIER. The pool's own streak cannot see these: a tier
+        # whose base is poisoned raises here, the cascade falls through to a healthy overflow
+        # tier, and spawn() RETURNS a slot -- so the pool records a success and resets its
+        # streak. The broken tier is then never repaired and the deployment silently runs
+        # permanently on the lower-priority tier, at its cost/performance, with nothing above
+        # a per-attempt warning to say so (upstream, PR #82).
+        self._tier_failures = [0] * len(tiers)
 
     # -- SlotRuntime protocol ----------------------------------------------
     def spawn(self) -> Any:
@@ -183,11 +194,18 @@ class CascadingRuntime:
             except Exception as exc:  # noqa: BLE001 -- try the next tier, don't fail the whole spawn
                 with self._lock:
                     self._counts[i] -= 1
+                    self._tier_failures[i] += 1
+                    streak = self._tier_failures[i]
                 last_exc = exc
-                _log.warning("cascade: tier %r spawn failed, trying next: %s", tier.name, exc)
+                _log.warning("cascade: tier %r spawn failed (streak=%d), trying next: %s",
+                             tier.name, streak, exc)
+                self._maybe_repair_tier(i, tier, streak)
                 continue
             with self._lock:
                 self._owner[slot.slot_id] = i
+                # Only THIS tier's streak clears: a success here says nothing about the tiers
+                # above it that were skipped or that just failed.
+                self._tier_failures[i] = 0
             _log.info("cascade: spawned on tier %r (%d/%d) slot=%s",
                       tier.name, self._counts[i], tier.capacity, slot.slot_id)
             return slot
@@ -236,6 +254,30 @@ class CascadingRuntime:
         if budget_s is not None and _takes_budget(fresh):
             return fresh(slot, budget_s=budget_s)
         return fresh(slot)
+
+    def _maybe_repair_tier(self, index: int, tier: "Tier", streak: int) -> None:
+        """Invalidate ONE tier's base after it fails to spawn repeatedly, independent of whether
+        a later tier went on to satisfy the request.
+
+        Without this, tier-level breakage is invisible to the pool by construction: fallback is
+        exactly what hides it. Never raises -- a failed repair must not break the spawn path.
+        """
+        if self.tier_rebuild_after <= 0 or streak < self.tier_rebuild_after:
+            return
+        invalidate = getattr(tier.runtime, "invalidate_base", None)
+        if not callable(invalidate):
+            return
+        with self._lock:
+            self._tier_failures[index] = 0   # give the rebuild a full window before trying again
+        _log.error(
+            "cascade: tier %r failed %d consecutive spawns — invalidating its base so it can be "
+            "rebuilt. Fallback tiers have been absorbing this, so the pool saw only successes.",
+            tier.name, streak,
+        )
+        try:
+            invalidate()
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("cascade: tier %r base invalidation failed: %s", tier.name, exc)
 
     def invalidate_base(self) -> None:
         """Forward base invalidation to every wrapped tier that supports it.
