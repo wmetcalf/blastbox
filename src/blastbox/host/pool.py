@@ -1135,6 +1135,32 @@ class WarmPool:
         with self._lock:
             return self._concurrent_ceiling
 
+    def _note_capacity_miss(self, reason: str) -> None:
+        """Record that the pool wanted capacity and could not get any, and escalate a SUSTAINED
+        episode exactly once. Shared by the two ways this happens: a tier reporting itself full,
+        and a deficit with no headroom to even try."""
+        record_spawn_capacity_miss()
+        now = self._clock()
+        with self._lock:
+            if self._capacity_miss_since is None:
+                self._capacity_miss_since = now
+            starved_for = now - self._capacity_miss_since
+            # Latched so a sustained outage logs once, not once per tick.
+            escalate = (
+                self._capacity_starved_after_s > 0
+                and starved_for > self._capacity_starved_after_s
+                and not self._capacity_starved_logged
+            )
+            if escalate:
+                self._capacity_starved_logged = True
+        if escalate:
+            logger.error(
+                "pool.spawn_capacity_starved: no capacity for %.0fs (>%.0fs) — this is no longer "
+                "backpressure. Check ceiling vs fleet size, a snapshot tier stuck building, or "
+                "leaked capacity reservations. reason=%s",
+                starved_for, self._capacity_starved_after_s, reason,
+            )
+
     def _rederive_warm_size_thresholds(self) -> None:
         """Recompute every threshold derived from the LIVE warm target, preserving explicit
         operator values. Called from __init__ and resize() so the two can never disagree."""
@@ -1474,8 +1500,15 @@ class WarmPool:
             # Never exceed concurrent_ceiling
             headroom = self._concurrent_ceiling - len(self._slots)
             to_spawn = max(0, min(deficit, headroom))
-            if to_spawn == 0:
-                # NOT starving -- we are not asking for anything. The episode clock is cleared
+            starved_without_headroom = deficit > 0 and to_spawn == 0
+            if deficit == 0:
+                # NOT starving -- we are not asking for anything. Keyed on DEFICIT, not on
+                # to_spawn: to_spawn is also zero when there IS a deficit but no headroom, which
+                # happens when failed reaps leave DRAINING slots occupying concurrent_ceiling.
+                # That is a pool with zero usable capacity -- precisely what the alert exists to
+                # report -- and clearing the episode there meant it could never fire.
+                #
+                # The episode clock is cleared
                 # only by a successful spawn otherwise, so a pool whose target the autosizer
                 # shrank to zero keeps a stale timestamp for however long it idles; the first
                 # capacity miss after a later scale-up then fires pool.spawn_capacity_starved
@@ -1483,6 +1516,17 @@ class WarmPool:
                 # starvation, not the gap between two autosizer epochs (upstream, PR #82).
                 self._capacity_miss_since = None
                 self._capacity_starved_logged = False
+
+        if starved_without_headroom:
+            # A deficit we cannot even ATTEMPT to fill. The spawn loop below never runs, so the
+            # capacity handler inside it — the only thing that used to open a starvation episode —
+            # is unreachable here. That is how a pool whose ceiling is entirely occupied by
+            # DRAINING slots (failed reaps, leaked reservations) sat at zero usable capacity
+            # without ever reporting it: not merely clearing the clock, but never starting it.
+            self._note_capacity_miss(
+                "a deficit exists but no headroom: the ceiling is full of slots that are not "
+                "usable (DRAINING/leaked reservations)"
+            )
 
         for _ in range(to_spawn):
             # Rate-limit: consume one token per spawn
@@ -1519,27 +1563,7 @@ class WarmPool:
                 # will not appear later in the SAME batch, and each further attempt is a wasted
                 # spawn. The next tick retries (upstream, PR #82).
                 logger.debug("pool.spawn_capacity_miss reason=%s", exc)
-                record_spawn_capacity_miss()
-                now = self._clock()
-                with self._lock:
-                    if self._capacity_miss_since is None:
-                        self._capacity_miss_since = now
-                    starved_for = now - self._capacity_miss_since
-                    # Latched so a sustained outage logs once, not once per tick.
-                    escalate = (
-                        self._capacity_starved_after_s > 0
-                        and starved_for > self._capacity_starved_after_s
-                        and not self._capacity_starved_logged
-                    )
-                    if escalate:
-                        self._capacity_starved_logged = True
-                if escalate:
-                    logger.error(
-                        "pool.spawn_capacity_starved: no tier has had room for %.0fs (>%.0fs) — "
-                        "this is no longer backpressure. Check ceiling vs fleet size, a snapshot "
-                        "tier stuck building, or leaked capacity reservations. reason=%s",
-                        starved_for, self._capacity_starved_after_s, exc,
-                    )
+                self._note_capacity_miss(str(exc))
                 break
             except Exception:
                 logger.exception("pool.spawn_failed")

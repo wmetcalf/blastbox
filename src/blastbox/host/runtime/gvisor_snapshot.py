@@ -342,6 +342,24 @@ class GvisorRestoreHandle:
 
 
 class GvisorSnapshotBackend:
+    def discard(self, artifact: object) -> None:
+        """Remove a fully drained checkpoint generation.
+
+        Generation stamping and reclamation are two halves of one mechanism: stamping alone just
+        turns "one directory that gets overwritten" into "a new directory every rebuild that
+        nothing ever deletes". SnapshotManager reclaims retired artifacts only through this hook,
+        so without it every superseded runsc checkpoint stayed on disk until the filesystem
+        filled (upstream, PR #82). Called only once the refcount for this artifact reaches zero,
+        i.e. no live sandbox is still restoring from it.
+        """
+        path = Path(str(artifact))
+        if not path.name.startswith("checkpoint-"):
+            # Refuse anything that is not one of OUR generation dirs: this deletes a tree, and
+            # an unexpected artifact shape must never turn into an rmtree of something else.
+            _log.warning("gvisor_snapshot: refusing to discard unexpected artifact %r", artifact)
+            return
+        shutil.rmtree(path, ignore_errors=True)
+
     def __init__(
         self,
         cfg: GvisorConfig,

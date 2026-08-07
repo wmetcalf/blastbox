@@ -301,3 +301,39 @@ def test_each_checkpoint_gets_its_own_generation_directory(tmp_path: Path) -> No
         seen.add(name)
 
     assert len(seen) == 3, f"checkpoint dirs collided across builds: {sorted(seen)}"
+
+
+def test_a_superseded_checkpoint_generation_is_reclaimed(tmp_path: Path) -> None:
+    """Stamping without reclamation is not a fix, it is a slower leak.
+
+    Generation-stamped names stop a rebuild overwriting a checkpoint an in-flight restore is
+    reading — but SnapshotManager can only reclaim retired artifacts through a backend discard()
+    hook. Without one, every superseded runsc checkpoint stayed on disk until the filesystem
+    filled: the exact same half-a-mechanism as the FC artifact whose discard read fields that did
+    not exist.
+    """
+    rec = _Rec()
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=rec, ready_wait=lambda d, t: None)
+
+    boot = be.boot_base()
+    boot.wait_ready(5.0)
+    art = boot.checkpoint(tmp_path / "ckpt")
+    img = Path(str(art))
+    (img / "state").write_bytes(b"checkpoint payload")
+    assert img.exists()
+
+    be.discard(art)
+    assert not img.exists(), "a drained checkpoint generation must be removed"
+
+
+def test_discard_refuses_an_artifact_that_is_not_a_generation_dir(tmp_path: Path) -> None:
+    """discard() removes a TREE, so an unexpected artifact shape must never become an rmtree."""
+    rec = _Rec()
+    be = GvisorSnapshotBackend(_cfg(tmp_path), run=rec, ready_wait=lambda d, t: None)
+
+    precious = tmp_path / "not-a-generation"
+    precious.mkdir()
+    (precious / "keep").write_bytes(b"important")
+
+    be.discard(str(precious))
+    assert precious.exists(), "discard must refuse anything that is not one of our checkpoint dirs"

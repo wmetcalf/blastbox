@@ -1340,3 +1340,39 @@ def test_construction_derives_thresholds_from_the_feasible_target() -> None:
     assert (other._snapshot_rebuild_after, other._max_evictions_per_window) == (
         pool._snapshot_rebuild_after, pool._max_evictions_per_window
     ), "construction and resize must derive identically for the same effective target"
+
+
+def test_no_headroom_with_a_real_deficit_still_counts_as_starvation() -> None:
+    """Zero usable capacity is exactly what the alert is for.
+
+    to_spawn is zero in two very different situations: there is no deficit (fine), and there IS a
+    deficit but no headroom — which is what happens when failed reaps leave DRAINING slots
+    occupying concurrent_ceiling. Keying the episode reset on to_spawn cleared the clock on every
+    tick in the second case, so a pool with no usable capacity could never report it.
+    """
+    clock = _FakeClock()
+
+    class _UnreapableRuntime(_WedgeableRuntime):
+        def reap(self, slot: Slot) -> None:
+            raise RuntimeError("reap failed; the slot stays DRAINING")
+
+    rt = _UnreapableRuntime()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=2, clock=clock,
+        capacity_starved_after_s=300.0, base_rebuild_cooldown_s=0.0,
+        spawn_rate_limit=1000.0,
+    )
+    pool.tick()
+    # wedge every slot into DRAINING: they still occupy the ceiling but do not count as active
+    for s in list(pool._slots.values()):
+        s.state = SlotState.DRAINING
+
+    with caplog_at_error() as records:
+        pool.tick()
+        clock.advance(301.0)
+        pool.tick()
+        starved = [r for r in records if "spawn_capacity_starved" in r.getMessage()]
+        assert starved, (
+            "a pool whose ceiling is full of DRAINING slots has zero usable capacity and must "
+            "report it, not silently reset its own clock every tick"
+        )
