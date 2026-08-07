@@ -26,7 +26,9 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
 
+from blastbox.host.pool import release_kwargs
 from blastbox.errors import EngineErrorEnvelope
+
 
 _log = logging.getLogger("blastbox.host.runtime.remote_http")
 
@@ -546,15 +548,12 @@ def make_remote_validate(
             # job carries an actionable error the API can show -- without leaking hosts/paths/internals.
             return {"error": _sanitized_failure(exc)}, False
         finally:
-            try:
-                release(slot, dirty=dirty, fault=fault)
-            except TypeError:
-                # Older release seams accept neither fault nor dirty. Degrade in order, and never
-                # invent an attribution a caller cannot carry: an unattributed dirty release
-                # force-resets the slot but does not advance it toward eviction.
-                try:
-                    release(slot, dirty=dirty)
-                except TypeError:
-                    release(slot)
+            # Introspect ONCE rather than laddering down `except TypeError` around the CALL.
+            # The ladder could not tell an old seam from a real TypeError inside release, so one
+            # genuine bug released the SAME slot three times -- and its last rung dropped `dirty`,
+            # returning a worker that had just failed a detonation straight to IDLE with no forced
+            # recycle. Never invent an attribution a caller cannot carry: an unattributed dirty
+            # release still force-resets the slot, it just does not advance it toward eviction.
+            release(slot, **release_kwargs(release, dirty=dirty, fault=fault))
 
     return validate

@@ -71,6 +71,38 @@ class Slot:
     jobs: int = 0            # cumulative jobs served (reuse mode: drives recycle/reprovision)
 
 
+def release_kwargs(fn: Any, *, dirty: bool, fault: str | None = None) -> dict[str, Any]:
+    """The subset of ``dirty``/``fault`` that this ``release`` callable actually accepts.
+
+    Introspection ONLY, deliberately separate from the call. Every seam here used to degrade with
+    a ladder of ``except TypeError`` wrapped around ``release(...)`` itself, which cannot tell
+    "this pool predates the kwarg" from "release() raised TypeError for a real reason". One
+    genuine bug inside release was therefore retried as a compatibility fallback: the same slot
+    was released two or three times, and the longest ladder's final rung dropped ``dirty``
+    entirely -- returning a worker that had just failed a detonation to IDLE with no forced
+    recycle, to be handed the next untrusted sample. Same reasoning as ``_takes_budget`` in
+    cascade.py.
+
+    A ``**kwargs`` release counts as accepting everything: the ladders passed those through, and
+    reporting otherwise would silently drop the attribution -- no exception, no log, and the
+    conflated worker/job signal quietly returns.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return {"dirty": dirty, "fault": fault}
+    out: dict[str, Any] = {}
+    if "dirty" in params:
+        out["dirty"] = dirty
+    # Never invent an attribution a caller cannot carry: an unattributed dirty release still
+    # force-resets the slot, it just does not advance it toward eviction.
+    if "fault" in params:
+        out["fault"] = fault
+    return out
+
+
 class RuntimeAtCapacity(RuntimeError):
     """``spawn()`` has no room right now — a NORMAL condition, not a fault.
 
@@ -195,6 +227,7 @@ class WarmPool:
         warmup_grace_s: float = 30.0,
         warming_timeout_s: float = 120.0,
         unknown_grace_s: float = 300.0,
+        capacity_starved_after_s: float = 300.0,
         jobs_per_recycle: int = 1,
         max_jobs_per_slot: int = 0,
         max_consecutive_failures: int = 2,
@@ -293,6 +326,16 @@ class WarmPool:
         # too short and it becomes the destroy-healthy-workers bug #77 fixes; 0 disables escalation
         # entirely (a slot can then be unknown forever, which wedges the tier -- see _health_check).
         self._unknown_grace_s = unknown_grace_s
+        # How long the pool may be CONTINUOUSLY unable to spawn for capacity reasons before that
+        # stops being backpressure and becomes an outage. Capacity misses are deliberately not
+        # faults -- they must not invalidate the base -- but "not a fault" must not mean
+        # "unbounded and silent": with no floor here, a permanently full or misconfigured cascade
+        # (ceiling above the fleet, a snapshot tier whose build never finishes) sits at zero warm
+        # capacity forever emitting nothing above DEBUG, and the only symptom is a sagging warm-hit
+        # rate. Same reasoning as _unknown_grace_s above; 0 disables the escalation.
+        self._capacity_starved_after_s = capacity_starved_after_s
+        self._capacity_miss_since: float | None = None
+        self._capacity_starved_logged = False
 
         # slot_id → Slot; all mutations under _lock
         self._slots: dict[str, Slot] = {}
@@ -1083,6 +1126,15 @@ class WarmPool:
         with self._lock:
             return self._concurrent_ceiling
 
+    def _rederive_warm_size_thresholds(self) -> None:
+        """Recompute every threshold derived from the LIVE warm target, preserving explicit
+        operator values. Called from __init__ and resize() so the two can never disagree."""
+        if not self._eviction_cap_explicit:
+            # Bounds damage to roughly ONE warm set, so it follows the live target.
+            self._max_evictions_per_window = max(2, int(self._warm_size))
+        if not self._rebuild_after_explicit:
+            self._snapshot_rebuild_after = max(4, 2 * max(1, self._warm_size))
+
     def resize(self, *, warm_size: int | None = None, concurrent_ceiling: int | None = None,
                mark_autosized: bool = True) -> None:
         """Retune the warm target / hard ceiling on a live pool. Used by an external
@@ -1104,19 +1156,20 @@ class WarmPool:
                 if warm_size < 0:
                     raise ValueError("warm_size must be >= 0")
                 self._warm_size = warm_size
-                # EVERY value derived from warm_size has to follow resize, not just the one that
-                # was reported. The autosizer moves the target in production: a pool created at 16
-                # and shrunk to 1 otherwise waits 32 consecutive failures instead of 4 before
-                # repairing a poisoned base, and one grown 1 -> 16 invalidates far too eagerly
-                # (upstream, PR #82).
-                if not self._eviction_cap_explicit:
-                    # Bounds damage to roughly ONE warm set, so it follows the live target.
-                    self._max_evictions_per_window = max(2, int(warm_size))
-                if not self._rebuild_after_explicit:
-                    self._snapshot_rebuild_after = max(4, 2 * max(1, warm_size))
             # keep warm within the ceiling
             if self._warm_size > self._concurrent_ceiling:
                 self._warm_size = self._concurrent_ceiling
+            # EVERY value derived from warm_size has to follow resize, not just the one that was
+            # reported. The autosizer moves the target in production: a pool created at 16 and
+            # shrunk to 1 otherwise waits 32 consecutive failures instead of 4 before repairing a
+            # poisoned base, and one grown 1 -> 16 invalidates far too eagerly (upstream, PR #82).
+            #
+            # Derived AFTER the clamp and from self._warm_size, NOT from the warm_size argument,
+            # and OUTSIDE the `warm_size is not None` branch. Both matter: a ceiling-only resize
+            # silently lowers the live target (so it must re-derive too), and a warm_size above
+            # the ceiling would otherwise derive thresholds for a size the pool never runs at --
+            # reintroducing the very "waits 32 failures instead of 4" defect this fixes.
+            self._rederive_warm_size_thresholds()
             # This pool is now under external (autosizer) control → eager surplus reaping
             # is enabled so a downsize frees node RAM promptly instead of draining lazily.
             # Skipped for provisional moves (mark_autosized=False) so an opt-in that never
@@ -1434,6 +1487,10 @@ class WarmPool:
                 slot = self._runtime.spawn()
                 with self._lock:
                     self._spawn_consecutive_failures = 0
+                    # Capacity came back: reset the starvation clock AND the latch, so a later
+                    # outage escalates again rather than being permanently silenced by the first.
+                    self._capacity_miss_since = None
+                    self._capacity_starved_logged = False
                 slot.state = SlotState.WARMING
                 slot.spawned_at = self._clock()
                 record_slot_spawned()
@@ -1445,6 +1502,26 @@ class WarmPool:
                 # spawn. The next tick retries (upstream, PR #82).
                 logger.debug("pool.spawn_capacity_miss reason=%s", exc)
                 record_spawn_capacity_miss()
+                now = self._clock()
+                with self._lock:
+                    if self._capacity_miss_since is None:
+                        self._capacity_miss_since = now
+                    starved_for = now - self._capacity_miss_since
+                    # Latched so a sustained outage logs once, not once per tick.
+                    escalate = (
+                        self._capacity_starved_after_s > 0
+                        and starved_for > self._capacity_starved_after_s
+                        and not self._capacity_starved_logged
+                    )
+                    if escalate:
+                        self._capacity_starved_logged = True
+                if escalate:
+                    logger.error(
+                        "pool.spawn_capacity_starved: no tier has had room for %.0fs (>%.0fs) — "
+                        "this is no longer backpressure. Check ceiling vs fleet size, a snapshot "
+                        "tier stuck building, or leaked capacity reservations. reason=%s",
+                        starved_for, self._capacity_starved_after_s, exc,
+                    )
                 break
             except Exception:
                 logger.exception("pool.spawn_failed")

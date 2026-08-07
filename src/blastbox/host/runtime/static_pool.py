@@ -31,7 +31,18 @@ _log = logging.getLogger("blastbox.host.runtime.static_pool")
 
 
 class StaticPoolExhausted(RuntimeAtCapacity):
-    """All registered workers are already claimed (pool ceiling exceeds the fleet size)."""
+    """All registered workers are already CLAIMED (pool ceiling exceeds the fleet size).
+
+    Routine backpressure. See StaticPoolUnhealthy for the case where workers are free but none
+    of them is healthy -- conflating the two hides a dead fleet behind a "we're busy" counter."""
+
+
+class StaticPoolUnhealthy(RuntimeError):
+    """Free workers exist but NONE passed its health probe -- the fleet is broken, not busy.
+
+    Deliberately NOT a RuntimeAtCapacity: as capacity this is logged at debug and counted on the
+    capacity-miss meter, so a fleet-wide agent death would be indistinguishable from saturation
+    and the only symptom would be a sagging warm-hit rate."""
 
 
 class StaticPoolUnavailable(RuntimeError):
@@ -255,7 +266,7 @@ class StaticPoolRuntime:
             )
             _log.info("static: claimed worker[%d] %s for slot=%s", idx, self._base_url(w), slot.slot_id)
             return slot
-        raise StaticPoolExhausted("no free static worker is currently healthy")
+        raise StaticPoolUnhealthy("no free static worker is currently healthy")
 
     def is_ready(self, slot: StaticWorkerSlot) -> bool:
         return self._health_ok(self.cfg.workers[slot.worker_index]) is True

@@ -21,7 +21,6 @@ Security properties (review will check):
 from __future__ import annotations
 
 import hashlib
-import inspect
 import logging
 import os
 import re
@@ -34,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping
 
+from blastbox.host.pool import release_kwargs
 from blastbox.contract.envelope import (
     Artifact,
     atomic_write_confined,
@@ -63,16 +63,7 @@ if TYPE_CHECKING:
 
 
 
-def _takes_fault(fn: Any) -> bool:
-    """Whether a pool's ``release`` accepts the ``fault`` kwarg. Introspection ONLY, deliberately
-    separate from the call: wrapping ``release(...)`` itself in ``except TypeError`` means a
-    genuine TypeError raised INSIDE a real pool's release is misread as "old seam" and the slot is
-    released a SECOND time -- a double reap of one slot, from a bug that was only ever meant to be
-    a compatibility shim. Same reasoning as ``_takes_budget`` in cascade.py."""
-    try:
-        return "fault" in inspect.signature(fn).parameters
-    except (TypeError, ValueError):
-        return False
+
 
 _log = logging.getLogger("blastbox.host.dispatch")
 
@@ -1093,6 +1084,12 @@ class Dispatcher:
             # staged_input_path on the host, and the file-based seam shutil.copy2's it.
             # ------------------------------------------------------------------
             if not self._materialise_sample(job, staged_input_path):
+                # THIS HOST could not fetch the sample (blob store unreachable / integrity
+                # failure) and the claim has been released back to QUEUED. Nothing was ever
+                # handed to the slot, so blaming it means a MinIO/S3 outage marches every node
+                # to a base rebuild while evicting healthy slots -- a far more common trigger
+                # than any of the claim races.
+                warm_fault = "unknown"
                 return
 
             # ------------------------------------------------------------------
@@ -1275,7 +1272,8 @@ class Dispatcher:
             # longer ours to terminalize; the peer's own state is left untouched.
             # ------------------------------------------------------------------
             if not self._claim_is_still_ours(job):
-                # Fourth and last claim-loss exit in this function. Like the other three, a peer
+                # Third of the four claim-loss exits (file order: pre-staging, pre-seal, here,
+                # terminal DONE CAS). Like the other three, a peer
                 # owning the job says nothing about this worker -- which here has already produced
                 # and sealed valid output (upstream, PR #82).
                 warm_fault = "unknown"
@@ -1319,7 +1317,7 @@ class Dispatcher:
             )
             if not applied:
                 # This worker RAN AND PRODUCED VALID OUTPUT -- it merely lost the terminal race.
-                # Leaving the default "worker" attribution here is the worst of the three
+                # Leaving the default "worker" attribution here is the worst of the four
                 # claim-loss sites: reclaim races cluster exactly when the queue is deep, so a
                 # busy fleet would steadily burn out its healthiest, fastest slots and eventually
                 # invalidate a perfectly good base (upstream, PR #82).
@@ -1351,11 +1349,11 @@ class Dispatcher:
             # invalidated (upstream, PR #82). A warm run that failed AGAINST this worker is worker
             # evidence; the engine reporting a bad sample is not, and is already excluded because
             # warm_clean covers only the clean DONE path.
-            if _takes_fault(self._pool.release):                     # type: ignore[union-attr]
-                self._pool.release(slot, dirty=not warm_clean,        # type: ignore[union-attr]
-                                   fault=None if warm_clean else warm_fault)
-            else:                                                    # seam predating attribution
-                self._pool.release(slot, dirty=not warm_clean)       # type: ignore[union-attr]
+            self._pool.release(slot, **release_kwargs(          # type: ignore[union-attr]
+                self._pool.release,                                # type: ignore[union-attr]
+                dirty=not warm_clean,
+                fault=None if warm_clean else warm_fault,
+            ))
 
     def _dispatch_inner(
         self, job: Job, input_path: Path, output_dir: Path,

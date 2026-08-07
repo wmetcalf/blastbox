@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import io
 import json
 import os
@@ -797,3 +799,33 @@ def test_make_remote_validate_failure_releases_slot(tmp_path):
     assert ok is False
     assert meta == {"error": "remote worker transport error"}   # sanitized reason surfaced
     assert released == [slot]   # released even on failure
+
+
+def test_a_broken_release_is_not_laddered_into_a_clean_release(tmp_path):
+    """A TypeError from INSIDE release() must not walk the compatibility ladder.
+
+    The old three-rung `except TypeError` ladder could not tell "this seam predates the kwarg"
+    from "release() raised TypeError for a real reason", so one genuine bug released the SAME
+    slot three times -- and the final rung dropped `dirty`, returning a worker that had just
+    failed a detonation to IDLE with no forced recycle, ready to take the next untrusted sample.
+    """
+    calls: list[tuple[bool, str | None]] = []
+    slot = SimpleNamespace(slot_id="s1", url="http://worker.invalid", ip=None)
+
+    def release(s, *, dirty: bool = False, fault: str | None = None) -> None:
+        calls.append((dirty, fault))
+        raise TypeError("bug inside release(), NOT an old signature")
+
+    def boom(*a, **kw):
+        raise OSError("transport down")
+
+    validate = make_remote_validate(
+        lambda: slot, release, output_dir_for=lambda p: tmp_path, http_open=boom,
+    )
+
+    (tmp_path / "in.bin").write_bytes(b"sample")
+    with contextlib.suppress(TypeError):
+        validate(tmp_path / "in.bin")
+
+    assert len(calls) == 1, f"one slot, one release -- got {len(calls)}: {calls}"
+    assert calls[0][0] is True, "a failed detonation must stay DIRTY, never fall back to clean"

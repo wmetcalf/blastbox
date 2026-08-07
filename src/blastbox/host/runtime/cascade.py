@@ -39,10 +39,26 @@ class CascadeMisconfigured(RuntimeError):
 
 
 class CascadeExhausted(RuntimeAtCapacity):
-    """Every tier is at capacity (or failed to spawn) -- the whole cascade is full.
+    """Every tier is FULL or still building -- routine backpressure, nothing is broken.
 
-    ``RuntimeAtCapacity`` (which is a ``RuntimeError``, so existing handlers are unaffected)
-    tells the pool this is a routine capacity miss, not a spawn fault."""
+    Raised only when no tier was even attempted (all skipped on capacity/not-ready).
+    ``RuntimeAtCapacity`` (a ``RuntimeError``, so existing handlers are unaffected) tells the
+    pool to retry next tick without counting a failure.
+
+    NB the split below is load-bearing. This class used to cover BOTH "everything is full" and
+    "every tier tried and threw", which is fine while both are merely logged -- but the moment
+    the pool started treating capacity as a non-fault, that conflation silently disabled base
+    repair for every cascaded deployment: an unrestorable base raised from here, the streak
+    never advanced, and the tier sat at zero capacity until someone restarted the process.
+    Do not re-merge these two.
+    """
+
+
+class CascadeSpawnFailed(RuntimeError):
+    """Every tier that was ATTEMPTED raised -- a real fault, deliberately NOT RuntimeAtCapacity.
+
+    Chained from the last tier exception so the cause survives. The pool counts this toward the
+    restore-failure streak, which is what eventually invalidates and rebuilds a poisoned base."""
 
 
 class CascadeSlotUnknown(RuntimeError):
@@ -175,6 +191,13 @@ class CascadingRuntime:
             _log.info("cascade: spawned on tier %r (%d/%d) slot=%s",
                       tier.name, self._counts[i], tier.capacity, slot.slot_id)
             return slot
+        if last_exc is not None:
+            # At least one tier actually ATTEMPTED a spawn and threw: that is evidence something
+            # is broken (a corrupt base restores nowhere), not that we are busy. Must not be a
+            # capacity type or the pool will never repair the base.
+            raise CascadeSpawnFailed(
+                f"all attempted cascade tiers failed to spawn; last error: {last_exc}"
+            ) from last_exc
         raise CascadeExhausted(
             f"all {len(self.tiers)} cascade tiers full/unavailable "
             f"(capacities {[t.capacity for t in self.tiers]})"

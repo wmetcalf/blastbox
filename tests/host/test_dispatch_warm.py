@@ -635,7 +635,12 @@ def test_warm_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(tmp
     # ...and NOT blamed on the worker. It produced valid output and merely lost a race; a peer
     # owns the job now. Blaming it means a busy queue (where reclaim races are common) steadily
     # burns out healthy slots and can invalidate a good base. Upstream, PR #82.
-    assert pool.release_fault == [None] or pool.release_fault == ["unknown"], (
+    assert pool.release_dirty == [True], (
+        "a claim-loss abort must still release the slot DIRTY -- fault=None is reachable only "
+        f"via warm_clean=True, which returns a possibly-contaminated slot to IDLE unreset "
+        f"(got dirty={pool.release_dirty})"
+    )
+    assert pool.release_fault == ["unknown"], (
         f"a reclaim race is not worker evidence (got {pool.release_fault})"
     )
 
@@ -678,7 +683,12 @@ def test_warm_claim_lost_before_staging_is_not_blamed_on_the_worker(tmp_path):
     assert stored.claim_id == "peer-claim-id-not-ours", "the peer must still own the job"
 
     assert pool.release_calls == [slot], "the slot must still be released exactly once"
-    assert pool.release_fault == [None] or pool.release_fault == ["unknown"], (
+    assert pool.release_dirty == [True], (
+        "a claim-loss abort must still release the slot DIRTY -- fault=None is reachable only "
+        f"via warm_clean=True, which returns a possibly-contaminated slot to IDLE unreset "
+        f"(got dirty={pool.release_dirty})"
+    )
+    assert pool.release_fault == ["unknown"], (
         f"a claim lost BEFORE staging cannot be the worker's fault (got {pool.release_fault})"
     )
 
@@ -739,7 +749,12 @@ def test_warm_claim_lost_before_sealing_is_not_blamed_on_the_worker(tmp_path):
     dispatcher.dispatch_once()
 
     assert pool.release_calls == [slot]
-    assert pool.release_fault == [None] or pool.release_fault == ["unknown"], (
+    assert pool.release_dirty == [True], (
+        "a claim-loss abort must still release the slot DIRTY -- fault=None is reachable only "
+        f"via warm_clean=True, which returns a possibly-contaminated slot to IDLE unreset "
+        f"(got dirty={pool.release_dirty})"
+    )
+    assert pool.release_fault == ["unknown"], (
         f"a claim lost before sealing is not worker evidence (got {pool.release_fault})"
     )
 
@@ -783,7 +798,12 @@ def test_warm_claim_lost_at_the_done_write_is_not_blamed_on_the_worker(tmp_path)
     stored = store.get(job.job_id)
     assert stored.status == JobStatus.RUNNING, "the peer's state must be left untouched"
     assert pool.release_calls == [slot]
-    assert pool.release_fault == [None] or pool.release_fault == ["unknown"], (
+    assert pool.release_dirty == [True], (
+        "a claim-loss abort must still release the slot DIRTY -- fault=None is reachable only "
+        f"via warm_clean=True, which returns a possibly-contaminated slot to IDLE unreset "
+        f"(got dirty={pool.release_dirty})"
+    )
+    assert pool.release_fault == ["unknown"], (
         f"losing only the DONE race is not worker evidence (got {pool.release_fault})"
     )
 
@@ -1523,3 +1543,34 @@ def test_warm_reservation_released_if_predispatch_raises(tmp_path):
     with pytest.raises(TypeError):
         d._dispatch_claimed_job(bad, warm_reserved=True)
     assert d._warm_slot_reservations == 0    # released despite the exception (RED before the fix)
+
+
+def test_a_blob_fetch_failure_is_not_blamed_on_the_warm_slot(tmp_path):
+    """A blob-store outage must not march every node into a base rebuild.
+
+    _materialise_sample returning False means THIS HOST could not fetch the sample and the claim
+    went back to QUEUED -- nothing was ever handed to the slot. Blaming it is worse than any of
+    the claim races: an outage hits every job at once, so each slot is evicted after
+    max_consecutive_failures jobs and the pool-wide streak invalidates a perfectly healthy base
+    during an incident that had nothing to do with the workers.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+    # The host cannot materialise the sample (blob store unreachable).
+    dispatcher._materialise_sample = lambda job, path: False  # type: ignore[method-assign]
+
+    dispatcher.dispatch_once()
+
+    assert pool.release_calls == [slot]
+    assert pool.release_fault == ["unknown"], (
+        f"a blob-store failure is host connectivity, not worker evidence (got {pool.release_fault})"
+    )

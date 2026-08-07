@@ -29,7 +29,22 @@ import threading
 from pathlib import Path
 from uuid import uuid4
 
-from blastbox.host.runtime.cascade import CascadeExhausted
+import logging
+
+
+class _FakeClock:
+    """Local copy -- cross-test-module imports don't resolve under this layout."""
+    def __init__(self, t: float = 0.0) -> None:
+        self._t = t
+
+    def __call__(self) -> float:
+        return self._t
+
+    def advance(self, delta: float) -> None:
+        self._t += delta
+
+
+from blastbox.host.runtime.cascade import CascadeExhausted, CascadingRuntime, Tier
 from blastbox.host.runtime.static_pool import StaticPoolExhausted
 from blastbox.host.pool import Slot, SlotState, WarmPool
 
@@ -775,12 +790,16 @@ def test_a_capacity_miss_is_not_a_restore_failure() -> None:
         runtime=rt, warm_size=2, concurrent_ceiling=4,
         max_consecutive_failures=2, snapshot_rebuild_after=3,
         base_rebuild_cooldown_s=0.0,
+        # The default token bucket allows only ~4 spawns before the loop runs dry, leaving the
+        # assertion a margin of 4-vs-3 over the rebuild threshold -- it would measure the rate
+        # limiter, not the fix, the moment either number moved.
+        spawn_rate_limit=1000.0,
     )
 
     for _ in range(12):
         pool.tick()
 
-    assert rt.spawn_attempts >= 3, "the pool must keep retrying -- capacity comes back"
+    assert rt.spawn_attempts >= 12, "the pool must keep retrying -- capacity comes back"
     assert rt.base_invalidations == 0, (
         "a capacity miss must not invalidate the base; a busy pool would destroy and rebuild "
         f"its own base under load (got {rt.base_invalidations} invalidations)"
@@ -895,4 +914,137 @@ def test_a_static_pool_at_capacity_is_not_a_restore_failure() -> None:
     assert rt.base_invalidations == 0, (
         "a static pool with every worker busy must not invalidate the base "
         f"(got {rt.base_invalidations} invalidations)"
+    )
+
+
+def test_a_corrupt_base_behind_a_REAL_cascade_is_still_repaired() -> None:
+    """The production topology, not a hand-rolled fake.
+
+    Every other capacity test hands the pool a fake that raises CascadeExhausted directly, so
+    none of them can see this: CascadingRuntime.spawn() swallows each tier's exception and
+    re-raises CascadeExhausted for BOTH "all tiers full" and "every tier threw". Once the pool
+    began treating capacity as a non-fault, that conflation silently disabled base repair for
+    every cascaded deployment -- an unrestorable base sat at zero capacity until someone
+    restarted the process, which is the outage the rebuild streak exists to prevent.
+
+    Drives a real CascadingRuntime so the regression cannot come back through the fake.
+    """
+    class _CorruptBase(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.spawn_attempts = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self) -> Slot:
+            self.spawn_attempts += 1
+            raise RuntimeError("snapshot restore failed: corrupt warm.mem")
+
+    inner = _CorruptBase()
+    pool = WarmPool(
+        runtime=CascadingRuntime(tiers=[Tier(name="fc", runtime=inner, capacity=4)]),
+        warm_size=2, concurrent_ceiling=4,
+        max_consecutive_failures=50, snapshot_rebuild_after=3,
+        base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    for _ in range(24):
+        pool.tick()
+
+    assert inner.spawn_attempts >= 3
+    assert inner.base_invalidations >= 1, (
+        "a corrupt base behind a cascade must still be repaired -- otherwise the tier sits at "
+        "zero capacity until the process is restarted"
+    )
+
+
+def test_a_genuinely_full_cascade_is_still_not_a_failure() -> None:
+    """The other half of the split: a cascade whose tiers are FULL (nothing attempted, nothing
+    threw) must remain a routine capacity miss."""
+    class _Fine(_WedgeableRuntime):
+        def prepare(self) -> bool:
+            return True
+
+    inner = _Fine()
+    casc = CascadingRuntime(tiers=[Tier(name="fc", runtime=inner, capacity=1)])
+    pool = WarmPool(
+        runtime=casc, warm_size=8, concurrent_ceiling=8,
+        max_consecutive_failures=50, snapshot_rebuild_after=3,
+        base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    for _ in range(24):
+        pool.tick()
+
+    assert inner.base_invalidations == 0, (
+        "a cascade that is merely FULL must never invalidate the base "
+        f"(got {inner.base_invalidations})"
+    )
+
+
+def test_sustained_capacity_starvation_escalates_above_debug(caplog) -> None:
+    """"Not a fault" must not mean "unbounded and silent".
+
+    Treating capacity as a non-fault removed the only operator-visible signal a starved pool ever
+    produced (spawn_failed at ERROR). Without a floor, a permanently full or misconfigured cascade
+    sits at zero warm capacity forever emitting nothing above DEBUG, and the only symptom is a
+    sagging warm-hit rate. Mirrors how unknown_grace_s bounds the analogous UNKNOWN state.
+    """
+    clock = _FakeClock()
+
+    class _AlwaysFull(_WedgeableRuntime):
+        def spawn(self) -> Slot:
+            raise CascadeExhausted("cascade: every tier is at capacity")
+
+    pool = WarmPool(
+        runtime=_AlwaysFull(), warm_size=2, concurrent_ceiling=4,
+        clock=clock, capacity_starved_after_s=300.0,
+        base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="blastbox.host.pool"):
+        pool.tick()
+        assert not caplog.records, "brief backpressure must stay quiet"
+
+        clock.advance(301.0)
+        pool.tick()
+        starved = [r for r in caplog.records if "spawn_capacity_starved" in r.getMessage()]
+        assert len(starved) == 1, (
+            f"sustained starvation must escalate above DEBUG (got {[r.getMessage() for r in caplog.records]})"
+        )
+        assert starved[0].levelno >= logging.ERROR
+
+        # ...and must NOT repeat every tick, or it becomes noise an operator learns to ignore.
+        clock.advance(600.0)
+        pool.tick()
+        pool.tick()
+        assert len([r for r in caplog.records if "spawn_capacity_starved" in r.getMessage()]) == 1
+
+
+def test_a_ceiling_only_resize_also_re_derives_the_thresholds() -> None:
+    """The autosizer lowers the CEILING, not just warm_size.
+
+    Deriving inside the `warm_size is not None` branch, and from the ARGUMENT rather than the
+    clamped live value, left both holes open: a ceiling-only resize silently lowers the live warm
+    target while the thresholds keep their old (much larger) values, and a warm_size above the
+    ceiling derives for a size the pool never runs at. Either way a 1-slot pool waits 32
+    consecutive failures to repair a poisoned base -- verbatim the defect this was meant to fix.
+    """
+    pool = WarmPool(runtime=_WedgeableRuntime(), warm_size=16, concurrent_ceiling=32)
+    assert pool._snapshot_rebuild_after == 32
+
+    # ceiling only -- warm_size is not passed at all
+    pool.resize(concurrent_ceiling=1)
+    assert pool._warm_size == 1, "the ceiling clamps the live warm target"
+    assert pool._snapshot_rebuild_after == 4, (
+        "a ceiling-only resize must re-derive too -- the live target moved "
+        f"(got {pool._snapshot_rebuild_after})"
+    )
+    assert pool._max_evictions_per_window == 2
+
+    # warm_size ABOVE the ceiling: derive from what the pool will actually run at, not the ask
+    pool.resize(warm_size=64, concurrent_ceiling=8)
+    assert pool._warm_size == 8
+    assert pool._snapshot_rebuild_after == 16, (
+        f"must derive from the clamped target (8), not the requested 64 "
+        f"(got {pool._snapshot_rebuild_after})"
     )

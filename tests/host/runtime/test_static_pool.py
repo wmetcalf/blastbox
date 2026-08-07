@@ -9,6 +9,7 @@ from blastbox.host.runtime.remote_http import slot_base_url
 from blastbox.host.runtime.static_pool import (
     StaticPoolConfig,
     StaticPoolExhausted,
+    StaticPoolUnhealthy,
     StaticPoolRuntime,
     StaticPoolUnavailable,
     StaticWorker,
@@ -117,7 +118,7 @@ def test_spawn_skips_unhealthy_worker():
 
 def test_spawn_raises_when_no_free_worker_healthy():
     rt = StaticPoolRuntime(_cfg("a:8765", "b:8765"), http_probe=FakeProbe(healthy=set()))
-    with pytest.raises(StaticPoolExhausted):
+    with pytest.raises(StaticPoolUnhealthy):
         rt.spawn()
 
 
@@ -135,7 +136,7 @@ def test_dirty_reap_quarantines_box_until_cooldown():
     rt = StaticPoolRuntime(cfg, http_probe=FakeProbe(all_ok=True), clock=lambda: now[0])
     s1 = rt.spawn()
     rt.reap(s1, dirty=True)                       # box goes into cooldown
-    with pytest.raises(StaticPoolExhausted):
+    with pytest.raises(StaticPoolUnhealthy):
         rt.spawn()                                # still cooling -> not claimable
     now[0] += 31.0                                # cooldown expires
     s2 = rt.spawn()
