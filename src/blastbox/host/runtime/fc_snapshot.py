@@ -329,5 +329,11 @@ class SnapshotManager:
                 retired = self._retired.pop(key, None)
             else:
                 retired = None
-        if retired is not None:
-            self._discard(retired)
+        if retired is not None and not self._discard(retired):
+            # Same rule as release(): an unconfirmed cleanup must stay RETRYABLE. This rollback
+            # path was added alongside the retryable release and did not inherit it, so a
+            # transient unlink failure here forgot the generation permanently -- the leak this
+            # mechanism exists to prevent, reintroduced through its own error handling.
+            with self._build_lock:
+                self._retired[id(retired)] = retired
+        self._sweep_retired()

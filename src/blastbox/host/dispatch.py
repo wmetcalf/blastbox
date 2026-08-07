@@ -65,6 +65,18 @@ if TYPE_CHECKING:
 
 
 
+# Errors that mean the GUEST or its seam failed, as opposed to our own filesystem. FCError covers
+# rdump/vsock faults; both are OSError subclasses in places, so the distinction must be explicit.
+def _guest_seam_errors() -> tuple[type[BaseException], ...]:
+    try:
+        from blastbox.host.runtime.firecracker import FCError
+    except Exception:  # noqa: BLE001 -- FC not installed; nothing guest-specific to distinguish
+        return ()
+    return (FCError,)
+
+
+_GUEST_SEAM_ERRORS: tuple[type[BaseException], ...] = _guest_seam_errors()
+
 _log = logging.getLogger("blastbox.host.dispatch")
 
 # Maximum length for a validated env-var value derived from job.params.
@@ -1225,7 +1237,13 @@ class Dispatcher:
                 try:
                     materialize_fn(slot)
                 except Exception as exc:  # noqa: BLE001
-                    warm_fault = "worker"   # its output could not be read back -- the guest/seam is bad
+                    # materialize_warm_output ends in a host-side rdump_ext4() extraction into
+                    # slot.output_dir, so an ENOSPC/EROFS here is a DISPATCHER-disk outage -- which
+                    # hits every job at once -- and the guest's output disk may be perfectly valid.
+                    # Only a guest/seam failure (FCError: rdump/vsock) is worker evidence.
+                    host_io = isinstance(exc, OSError) and not isinstance(exc, _GUEST_SEAM_ERRORS)
+                    if not host_io:
+                        warm_fault = "worker"   # the guest/seam failed to hand its output back
                     self._fail_job(job, f"failed to read warm worker output: {exc}")
                     return
 

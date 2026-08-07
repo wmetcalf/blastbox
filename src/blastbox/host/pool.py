@@ -336,6 +336,9 @@ class WarmPool:
         self._capacity_starved_after_s = capacity_starved_after_s
         self._capacity_miss_since: float | None = None
         self._capacity_starved_logged = False
+        # Set by _health_check when it invalidates the base, read and cleared by tick(): the next
+        # spawn would run a synchronous rebuild on this thread.
+        self._rebuilt_this_tick = False
         # Derive from the FEASIBLE target, not the requested one. PoolConfig permits
         # warm_size > concurrent_ceiling, and the pool can then only ever run at the ceiling --
         # so warm_size=16 with ceiling=1 waited 32 consecutive failures before repairing a
@@ -645,6 +648,17 @@ class WarmPool:
                 # rebuild (upstream, PR #82).
                 slot_failures = 0
                 last_success = 0.0
+            elif dirty and fault == "job":
+                # POSITIVE evidence: the worker RAN and returned a structurally valid
+                # engine_error, so it is demonstrably responsive and so is the base it restored
+                # from. "Consecutive" has to mean consecutive -- leaving the streaks untouched
+                # meant a timeout, then any number of valid engine errors, then another timeout
+                # read as two CONSECUTIVE worker failures, evicting a healthy slot or invalidating
+                # a good base on two unrelated events an hour apart. The slot is still
+                # force-recycled (dirty); only the HEALTH streaks reset (upstream, PR #82).
+                self._slot_failures.pop(slot.slot_id, None)
+                self._pool_consecutive_failures = 0
+                slot_failures = 0
             elif dirty and fault == "worker":
                 # ONLY worker-attributed failures are evidence about the slot. Counting job faults
                 # here is what let two bad samples in a row destroy a warm worker with a hundred
@@ -816,7 +830,14 @@ class WarmPool:
         # headroom + the quarantine comments) rather than risk over-committing the node.
         self._reap_deferred()
         self._update_burst(ready)
-        self._spawn_to_deficit(ready)
+        if self._rebuilt_this_tick:
+            # _health_check invalidated the base during THIS tick. `ready` was captured before it
+            # ran, so spawning now would call build() synchronously on this thread. Skip to the
+            # next tick, which re-reads readiness and spawns against the fresh base.
+            self._rebuilt_this_tick = False
+            logger.info("pool.tick_spawn_deferred reason=base_invalidated_this_tick")
+        else:
+            self._spawn_to_deficit(ready)
         self._reap_surplus()
         self._sample_metrics()
 
@@ -1817,7 +1838,15 @@ class WarmPool:
             with self._lock:
                 self._spawn_consecutive_failures += len(stuck_warming)
                 warm_failures = self._spawn_consecutive_failures
-            self._maybe_rebuild_base(warm_failures, reason="spawn")
+            if self._maybe_rebuild_base(warm_failures, reason="spawn"):
+                # HALT THE TICK. The artifact is gone, so the very next runtime.spawn() runs
+                # SnapshotManager.build() synchronously and blocks this thread -- the pool's only
+                # maintenance thread -- for a full base boot plus readiness timeout, stalling
+                # promotion, health checks and deferred reaping behind it. tick() captured
+                # ready=True before _health_check ran, so without this it walks straight into
+                # exactly that. The spawn-failure path already halts its batch for this reason;
+                # this newer trigger did not inherit it (upstream, PR #82).
+                self._rebuilt_this_tick = True
         for slot in idle_slots:
             # TRI-STATE, same contract as the claim probe (_probe_alive): True = alive,
             # False = CONFIRMED dead, None = UNKNOWN. Only a CONFIRMED negative may evict — the

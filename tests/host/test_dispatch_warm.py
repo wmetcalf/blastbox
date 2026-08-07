@@ -1947,3 +1947,36 @@ def test_a_trust_check_the_host_could_not_complete_is_not_worker_evidence(tmp_pa
     assert pool.release_fault == ["unknown"], (
         f"a check the HOST could not complete is not worker evidence (got {pool.release_fault})"
     )
+
+
+def test_a_host_disk_failure_reading_output_is_not_worker_evidence(tmp_path):
+    """materialize_warm_output ends in a host-side rdump extraction into slot.output_dir.
+
+    An ENOSPC/EROFS there is a DISPATCHER-disk outage — which hits every job at once — and the
+    guest's output disk may be perfectly valid. Only a guest/seam failure is worker evidence, and
+    the sibling test above covers that direction.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    runtime = _FakeVsockRuntime()
+
+    def _enospc(s):
+        raise OSError(28, "No space left on device")
+
+    runtime.materialize_warm_output = _enospc  # type: ignore[assignment]
+    pool = FakeWarmPool(slot, runtime=runtime)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+
+    dispatcher.dispatch_once()
+
+    assert store.get(job.job_id).status == JobStatus.FAILED
+    assert pool.release_fault == ["unknown"], (
+        f"a full dispatcher disk is not worker evidence (got {pool.release_fault})"
+    )

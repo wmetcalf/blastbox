@@ -1493,3 +1493,75 @@ def test_slots_that_never_become_ready_count_toward_base_repair() -> None:
         "a base that restores but never yields a ready worker must still be repaired "
         f"(got {rt.base_invalidations} invalidations)"
     )
+
+
+def test_a_validated_engine_error_clears_the_worker_streaks() -> None:
+    """"Consecutive" has to mean consecutive.
+
+    A structurally valid engine_error is POSITIVE evidence: the worker ran, and the base it
+    restored from is responsive. Leaving the streaks untouched meant a timeout, then any number of
+    valid engine errors, then another timeout read as two CONSECUTIVE worker failures — evicting a
+    healthy slot or invalidating a good base on two unrelated events an hour apart. The slot is
+    still force-recycled; only the health streaks reset.
+    """
+    rt = _WedgeableRuntime()
+    pool = WarmPool(
+        runtime=rt, warm_size=3, concurrent_ceiling=6,
+        max_consecutive_failures=2, snapshot_rebuild_after=2,
+        base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    pool.tick()
+    slots = list(pool._slots.values())
+    assert len(slots) >= 3
+
+    pool.release(slots[0], dirty=True, fault="worker")     # one genuine worker failure
+    pool.release(slots[1], dirty=True, fault="job")        # the worker demonstrably RAN
+    pool.tick()
+    fresh = [s for s in pool._slots.values() if s.slot_id not in
+             {slots[0].slot_id, slots[1].slot_id}]
+    pool.release(fresh[0], dirty=True, fault="worker")     # a later, unrelated failure
+
+    assert rt.base_invalidations == 0, (
+        "two worker failures separated by proof the worker was healthy are not consecutive "
+        f"(got {rt.base_invalidations} rebuilds)"
+    )
+
+
+def test_a_warmup_triggered_rebuild_defers_spawning_to_the_next_tick() -> None:
+    """A synchronous build() on the maintenance thread stalls everything behind it.
+
+    tick() captures `ready` BEFORE _health_check runs, so a rebuild triggered by timed-out
+    warmups would walk straight into spawn() -> SnapshotManager.build(), blocking the pool's only
+    maintenance thread for a full base boot plus readiness timeout — promotion, health checks and
+    deferred reaping all stall. The spawn-failure path already halts its batch for this reason.
+    """
+    clock = _FakeClock()
+
+    class _RestoresButNeverReady(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.spawns_after_invalidate = 0
+
+        def is_ready(self, slot: Slot) -> bool:
+            return False
+
+        def spawn(self) -> Slot:
+            if self.base_invalidations:
+                self.spawns_after_invalidate += 1
+            return super().spawn()
+
+    rt = _RestoresButNeverReady()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4, clock=clock,
+        warming_timeout_s=10.0, snapshot_rebuild_after=2,
+        base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+    pool.tick()
+    clock.advance(11.0)
+    pool.tick()                     # warmups time out -> streak -> invalidate
+
+    assert rt.base_invalidations >= 1, "sanity: the rebuild must have been triggered"
+    assert rt.spawns_after_invalidate == 0, (
+        "the pool spawned in the same tick it invalidated the base — that call runs build() "
+        "synchronously and stalls the maintenance thread"
+    )

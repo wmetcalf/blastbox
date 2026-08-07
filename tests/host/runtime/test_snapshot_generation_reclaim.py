@@ -581,3 +581,45 @@ def test_the_base_outdisk_is_versioned_with_its_generation(tmp_path):
     assert not any(p.exists() for p in (art.snapshot_path, art.mem_path, art.outdisk_path)), (
         "every file of a drained generation must be reclaimed, including the disk"
     )
+
+
+def test_the_restore_rollback_path_also_keeps_failed_discards_retryable(tmp_path):
+    """release() and _unpin() must obey the same rule.
+
+    When a restore raises after its generation was retired mid-flight, the rollback drops the last
+    reference and tries to clean up. That path was added alongside the retryable release and did
+    not inherit it, so a transient unlink failure there forgot the generation permanently.
+    """
+    mgr, be = _mgr(tmp_path)
+    mgr.build()
+    gen1 = tmp_path / "snap" / "warm-gen1.mem"
+
+    broken = {"on": True}
+    real_discard = be.discard
+
+    def _flaky_discard(artifact):
+        if broken["on"]:
+            raise OSError("EBUSY unlinking the memory file")
+        real_discard(artifact)
+
+    be.discard = _flaky_discard  # type: ignore[assignment]
+
+    def _retire_then_fail(slot_workdir, artifact):
+        mgr.invalidate()          # retire the generation we are holding
+        mgr.build()
+        raise RuntimeError("restore failed after the generation was retired")
+
+    be.restore_in = _retire_then_fail  # type: ignore[assignment]
+
+    with pytest.raises(Exception):
+        mgr.restore("slot-a")
+    assert gen1.exists(), "sanity: the failed unlink left the file in place"
+
+    # It must still be RETRYABLE, not forgotten.
+    broken["on"] = False
+    be.restore_in = lambda w, a: object()  # type: ignore[assignment]
+    mgr.restore("slot-b")
+    mgr.release("slot-b")
+    assert not gen1.exists(), (
+        "a rollback whose discard failed forgot the generation — it is leaked forever"
+    )
