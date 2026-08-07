@@ -515,3 +515,42 @@ def test_spawn_cleanup_retains_the_pin_when_it_cannot_kill_the_vm(tmp_path):
     assert gen1.exists(), (
         "the generation was reclaimed while its microVM could not be confirmed dead"
     )
+
+
+def test_a_generation_whose_discard_fails_stays_retryable(tmp_path):
+    """A single failed unlink must not lose a generation forever.
+
+    release() popped the artifact from _retired BEFORE attempting cleanup, and _discard swallowed
+    errors — so one transient EBUSY/EACCES meant no later release or invalidation could ever
+    rediscover it, and repeated rebuilds accumulated RAM-sized files again. That is precisely the
+    leak this whole mechanism exists to stop.
+    """
+    mgr, be = _mgr(tmp_path)
+    mgr.build()
+    mgr.restore("slot-a")
+    gen1 = tmp_path / "snap" / "warm-gen1.mem"
+
+    mgr.invalidate()
+    mgr.build()
+
+    broken = {"on": True}
+    real_discard = be.discard
+
+    def _flaky_discard(artifact):
+        if broken["on"]:
+            raise OSError("EBUSY unlinking the memory file")
+        real_discard(artifact)
+
+    be.discard = _flaky_discard  # type: ignore[assignment]
+
+    mgr.release("slot-a")                    # cleanup fails, and the immediate retry fails too
+    assert gen1.exists(), "sanity: the failed unlink left the file in place"
+
+    # The generation must still be RETRYABLE once the underlying problem clears — the point is
+    # that it was not silently forgotten by the first failure.
+    broken["on"] = False
+    mgr.restore("slot-b")
+    mgr.release("slot-b")
+    assert not gen1.exists(), (
+        "a generation whose discard failed was never retried — it is leaked forever"
+    )

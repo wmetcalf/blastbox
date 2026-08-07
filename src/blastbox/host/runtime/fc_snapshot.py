@@ -203,8 +203,9 @@ class SnapshotManager:
             # Do not reuse the previous failure backoff: this is a deliberate rebuild request,
             # not a retry of a build that just failed.
             self._retry_not_before = 0.0
-        if collect is not None:
-            self._discard(collect)
+        if collect is not None and not self._discard(collect):
+            with self._build_lock:
+                self._retired[id(collect)] = collect     # retryable, not forgotten
         return had
 
     def release(self, slot_id: object) -> None:
@@ -223,19 +224,43 @@ class SnapshotManager:
                 retired = self._retired.pop(key, None)
             else:
                 retired = None
-        if retired is not None:
-            self._discard(retired)
+        if retired is not None and not self._discard(retired):
+            # Cleanup failed (or no hook). Keep it RETRYABLE: popping it from _retired before
+            # confirming meant a single failed unlink lost the generation forever -- no later
+            # release or invalidation could rediscover it, so repeated rebuilds accumulated
+            # RAM-sized files again, which is the leak this whole mechanism exists to stop.
+            with self._build_lock:
+                self._retired[id(retired)] = retired
+        # Opportunistically retry anything whose cleanup failed earlier. Without this a
+        # generation held back by one transient unlink error is never attempted again, and the
+        # retention becomes the very leak it was meant to prevent.
+        self._sweep_retired()
 
-    def _discard(self, artifact: object) -> None:
-        """Ask the backend to unlink a fully drained generation. Optional hook: a backend that
-        does not implement it simply keeps its artifacts, exactly as before."""
+    def _sweep_retired(self) -> None:
+        """Re-attempt cleanup for retired generations that nothing pins any more."""
+        with self._build_lock:
+            pending = [a for k, a in self._retired.items() if self._refs.get(k, 0) <= 0]
+        for artifact in pending:
+            if self._discard(artifact):
+                with self._build_lock:
+                    self._retired.pop(id(artifact), None)
+
+    def _discard(self, artifact: object) -> bool:
+        """Ask the backend to unlink a fully drained generation.
+
+        Returns True when cleanup is CONFIRMED. Optional hook: a backend that does not implement
+        it simply keeps its artifacts, exactly as before -- reported as False so the caller keeps
+        the artifact retryable rather than forgetting it.
+        """
         discard = getattr(self._backend, "discard", None)
         if not callable(discard):
-            return
+            return False
         try:
             discard(artifact)
+            return True
         except Exception as exc:  # noqa: BLE001 -- reclamation must never raise into reap
             _log.warning("snapshot.discard_failed artifact=%r: %s", artifact, exc)
+            return False
 
     def restore(self, slot_id: object) -> RestoreHandle:
         """Restore the warm snapshot into a fresh per-slot sandbox and return its

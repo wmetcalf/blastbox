@@ -455,6 +455,19 @@ def build_cascade_runtime(
     from blastbox.host.pool_config import select_runtime_by_name
 
     get = get or os.environ.get
+    # The advertised incident escape hatch (BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER=0 disables
+    # automatic base invalidation) must disable EVERY path that can invalidate a base, not just
+    # the pool's. Per-tier repair is a second, independently-triggered invalidation route, so an
+    # operator who turned rebuilds off during an incident would still have had tier bases
+    # destroyed under them (upstream, PR #82).
+    raw_rebuild = (get("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER") or "").strip()
+    tier_rebuild_after = 4
+    if raw_rebuild:
+        try:
+            tier_rebuild_after = max(0, int(raw_rebuild))
+        except ValueError:
+            _log.warning("cascade: invalid BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER=%r; using %d",
+                         raw_rebuild, tier_rebuild_after)
     spec = get("BLASTBOX_POOL_TIERS") or ""
     parsed = _parse_tiers(spec)
     if not parsed:
@@ -474,4 +487,4 @@ def build_cascade_runtime(
     if not tiers:
         raise CascadeMisconfigured("no cascade tier is available")
     _log.info("cascade: %s", ", ".join(f"{t.name}:{t.capacity}" for t in tiers))
-    return CascadingRuntime(tiers)
+    return CascadingRuntime(tiers, tier_rebuild_after=tier_rebuild_after)

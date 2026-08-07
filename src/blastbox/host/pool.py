@@ -1489,6 +1489,22 @@ class WarmPool:
         _health_check already ran, and dispatch falls back to cold until the snapshot is ready.
         """
         if not ready:
+            # A stuck or repeatedly-failing snapshot build keeps prepare() False forever. Bailing
+            # out here meant the pool could sit at a positive target with ZERO slots and never
+            # touch the capacity meter or the starvation clock -- even though "a snapshot tier
+            # stuck building" is one of the causes the alert message itself names (upstream,
+            # PR #82).
+            with self._lock:
+                active = sum(
+                    1 for s in self._slots.values() if s.state != SlotState.DRAINING
+                )
+                deficit = max(0, self._effective_target_unlocked() - active)
+            if deficit > 0:
+                self._note_capacity_miss("the warm snapshot is not ready (build stuck or failing)")
+            else:
+                with self._lock:
+                    self._capacity_miss_since = None
+                    self._capacity_starved_logged = False
             return
         with self._lock:
             # Deficit = effective_target minus everything not DRAINING
@@ -1791,6 +1807,17 @@ class WarmPool:
             logger.warning(
                 "pool.warming_timeout_evict slot_id=%s age=%.1fs", slot.slot_id, now - slot.spawned_at
             )
+        if stuck_warming:
+            # A spawn that RETURNED a slot reset the spawn-failure streak, but a slot that never
+            # reached IDLE produced no usable worker at all. Without counting these, a base
+            # poisoned just enough to restore-and-then-die cycles restore -> warmup timeout ->
+            # replace forever, and invalidate_base() is never reached: the tier stays at zero
+            # capacity until the process restarts, which is exactly the outage the restore-failure
+            # streak exists to end (upstream, PR #82).
+            with self._lock:
+                self._spawn_consecutive_failures += len(stuck_warming)
+                warm_failures = self._spawn_consecutive_failures
+            self._maybe_rebuild_base(warm_failures, reason="spawn")
         for slot in idle_slots:
             # TRI-STATE, same contract as the claim probe (_probe_alive): True = alive,
             # False = CONFIRMED dead, None = UNKNOWN. Only a CONFIRMED negative may evict — the

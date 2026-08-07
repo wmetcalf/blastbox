@@ -1,6 +1,8 @@
 """Tests for the warm-pool config + factory (host/pool_config.py)."""
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from blastbox.host.pool import Slot, WarmPool
@@ -290,3 +292,35 @@ def test_unset_knobs_do_not_override_the_pools_own_defaults(monkeypatch):
             f"{arg}: an unconfigured knob must leave WarmPool's own default "
             f"({params[arg].default}) alone, got {getattr(pool, attr)}"
         )
+
+
+def test_the_rebuild_escape_hatch_also_disables_cascade_tier_repair(monkeypatch):
+    """The escape hatch must disable EVERY path that can invalidate a base.
+
+    Per-tier cascade repair is a second, independently-triggered invalidation route. An operator
+    who set BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER=0 during an incident would still have had tier
+    bases destroyed under them, because build_cascade_runtime() hard-coded its own threshold.
+    """
+    from blastbox.host.runtime.cascade import build_cascade_runtime
+
+    # Resolve any tier name to a stub: this test is about the CONFIG reaching the cascade, not
+    # about which runtimes happen to be installed on the test host.
+    monkeypatch.setattr(
+        "blastbox.host.pool_config.select_runtime_by_name",
+        lambda name, **kw: object(),
+    )
+    env = {"BLASTBOX_POOL_TIERS": "stub:1"}
+    getter = lambda k: env.get(k) or os.environ.get(k)  # noqa: E731
+
+    monkeypatch.setenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", "0")
+    assert build_cascade_runtime(getter).tier_rebuild_after == 0, (
+        "0 must disable per-tier repair too"
+    )
+
+    monkeypatch.setenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", "9")
+    assert build_cascade_runtime(getter).tier_rebuild_after == 9, (
+        "an explicit threshold must reach the cascade"
+    )
+
+    monkeypatch.delenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", raising=False)
+    assert build_cascade_runtime(getter).tier_rebuild_after == 4, "unset keeps the default"

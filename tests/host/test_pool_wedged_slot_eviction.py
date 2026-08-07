@@ -1437,3 +1437,59 @@ def test_a_healthy_but_full_tier_keeps_its_base_when_a_sibling_fails() -> None:
     assert full.invalidated == 0, (
         "a tier that was merely FULL produced no failure evidence and must keep its base"
     )
+
+
+def test_a_stalled_snapshot_build_still_reports_starvation() -> None:
+    """"Not ready" is not a reason to stop watching.
+
+    A stuck or repeatedly-failing snapshot build keeps prepare() False forever, and the spawn
+    path bailed out before any starvation bookkeeping — so a pool with a positive target and zero
+    slots never touched the capacity meter or the clock, even though "a snapshot tier stuck
+    building" is one of the causes the alert message itself names.
+    """
+    clock = _FakeClock()
+    rt = _WedgeableRuntime()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4, clock=clock,
+        capacity_starved_after_s=300.0, base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+
+    with caplog_at_error() as records:
+        pool._spawn_to_deficit(ready=False)          # build not ready
+        assert not [r for r in records if "spawn_capacity_starved" in r.getMessage()]
+
+        clock.advance(301.0)
+        pool._spawn_to_deficit(ready=False)
+        assert [r for r in records if "spawn_capacity_starved" in r.getMessage()], (
+            "a pool at zero capacity behind a stalled build must report it"
+        )
+
+
+def test_slots_that_never_become_ready_count_toward_base_repair() -> None:
+    """A spawn that returns a slot which then dies produced no usable worker.
+
+    The successful spawn reset the failure streak, and _health_check reaped the timed-out WARMING
+    slot without incrementing anything — so a base poisoned just enough to restore-and-then-die
+    cycled restore, warmup timeout and replace forever, and invalidate_base() was never reached.
+    """
+    clock = _FakeClock()
+
+    class _RestoresButNeverReady(_WedgeableRuntime):
+        def is_ready(self, slot: Slot) -> bool:
+            return False          # restores fine, never becomes usable
+
+    rt = _RestoresButNeverReady()
+    pool = WarmPool(
+        runtime=rt, warm_size=2, concurrent_ceiling=4, clock=clock,
+        warming_timeout_s=10.0, snapshot_rebuild_after=2,
+        base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+    )
+
+    for _ in range(6):
+        pool.tick()
+        clock.advance(11.0)       # every warmup times out
+
+    assert rt.base_invalidations >= 1, (
+        "a base that restores but never yields a ready worker must still be repaired "
+        f"(got {rt.base_invalidations} invalidations)"
+    )
