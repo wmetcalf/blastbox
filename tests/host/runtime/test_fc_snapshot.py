@@ -514,3 +514,56 @@ def test_a_retained_base_is_retried_even_once_the_artifact_exists(tmp_path):
         "of the process"
     )
     assert mgr._undead_bases == []
+
+
+def test_acquire_built_reads_the_artifact_under_the_build_lock(tmp_path):
+    """It must be ATOMIC against invalidate(), which clears the artifact under _build_lock.
+
+    Asking is_built() and then building is a check-then-act: a job thread invalidating in that gap
+    leaves build() with no artifact, so it performs the full synchronous base boot on the pool's
+    ONLY maintenance thread — the very stall the check exists to prevent.
+    """
+    backend = FakeBackend()
+    mgr = SnapshotManager(tmp_path, backend)
+    mgr.build()
+    assert mgr.is_built()
+
+    acquisitions = []
+    real = mgr._build_lock
+
+    class _Watched:
+        def __enter__(self):
+            acquisitions.append(1)
+            return real.__enter__()
+
+        def __exit__(self, *a):
+            return real.__exit__(*a)
+
+    mgr._build_lock = _Watched()  # type: ignore[assignment]
+    try:
+        got = mgr.acquire_built()
+    finally:
+        mgr._build_lock = real
+
+    assert got is backend.artifact
+    assert acquisitions, (
+        "the artifact was read WITHOUT _build_lock, so invalidate() can clear it in the gap and "
+        "the caller proceeds to build inline on the maintenance thread"
+    )
+
+
+def test_acquire_built_refuses_and_kicks_the_async_build(tmp_path):
+    """Not built: report capacity and start the build OFF this thread — never build inline."""
+    class _Counting(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.boots = []
+
+    backend = _Counting()
+    mgr = SnapshotManager(tmp_path, backend)
+    assert not mgr.is_built()
+
+    from blastbox.host.runtime.fc_snapshot import SnapshotBuildInvalidated
+
+    with pytest.raises(SnapshotBuildInvalidated):
+        mgr.acquire_built()

@@ -4340,3 +4340,51 @@ def test_a_slot_spawned_after_a_repair_is_stamped_current() -> None:
         f"now looks retired, so every failure it reports is thrown away and its base can never "
         f"be repaired again"
     )
+
+
+def test_a_locally_repaired_episode_repairs_nothing_further() -> None:
+    """Three states, not two: already-discharged is neither "guilty" nor "no evidence".
+
+    Keeping the marker made the pool re-invalidate the just-repaired tier -- which on a snapshot
+    tier bumps the build epoch and REJECTS the replacement already being built. Dropping it made
+    the pool fall back to every tier and destroy healthy siblings. Neither: there is nothing left
+    to do.
+    """
+    class _Tier:
+        def __init__(self, name: str, broken: bool = False) -> None:
+            self.name = name
+            self.broken = broken
+            self.invalidated = 0
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            if self.broken:
+                raise RuntimeError("snapshot restore failed")
+            self.n += 1
+            return SimpleNamespace(slot_id=f"{self.name}{self.n}")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    broken, healthy = _Tier("fc", broken=True), _Tier("ok")
+    casc = CascadingRuntime(
+        tiers=[Tier(name="fc", runtime=broken, capacity=4),
+               Tier(name="ok", runtime=healthy, capacity=4)],
+        tier_rebuild_after=1,          # repair on the FIRST failure
+    )
+    casc.spawn()                        # fc fails and repairs itself; ok absorbs the spawn
+    assert broken.invalidated == 1, "sanity: the per-tier repair fired"
+
+    repaired = casc.invalidate_base(reason="spawn")
+
+    assert broken.invalidated == 1, (
+        "the just-repaired tier was invalidated AGAIN -- on a snapshot tier that bumps the build "
+        "epoch and rejects the replacement already being built"
+    )
+    assert healthy.invalidated == 0, (
+        "a healthy sibling lost its base because the discharged episode read as 'no evidence'"
+    )
+    assert repaired == ["fc"], "the pool must still learn which base was replaced"

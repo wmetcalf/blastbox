@@ -204,6 +204,28 @@ class SnapshotManager:
                     self._undead_bases.append(boot)
                 _log.warning("snapshot.base_teardown_retry_failed: %s", exc)
 
+    def acquire_built(self) -> object:
+        """Return the built artifact, or refuse -- ATOMICALLY against invalidate().
+
+        The runtimes previously asked is_built() and then called build(): a job thread
+        invalidating between those two steps left build() with no artifact, so it performed the
+        full synchronous base boot on the pool's ONLY maintenance thread and stalled promotion,
+        health checks and deferred reaping for up to the readiness timeout. That is the very
+        stall the check exists to prevent, reintroduced by splitting it in two.
+
+        invalidate() takes ``_build_lock`` to clear the artifact, so reading it under the same
+        lock closes the gap: either we hold a real artifact or the repair already happened and we
+        report capacity (upstream, PR #82).
+        """
+        with self._build_lock:
+            artifact = self._artifact
+        if artifact is not None:
+            return artifact
+        self.ensure_build_started()
+        raise SnapshotBuildInvalidated(
+            "warm snapshot is not built; refusing to build inline on the maintenance thread"
+        )
+
     def build(self) -> object:
         """Build the warm snapshot. Idempotent — a second call returns the same
         artifact without rebuilding. Raises :class:`SnapshotBuildError` on failure

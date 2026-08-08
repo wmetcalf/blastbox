@@ -479,6 +479,16 @@ def test_spawn_refuses_to_build_inline(tmp_path):
         def ensure_build_started(self):
             self.kicked += 1
 
+        def acquire_built(self):
+            # The manager's ATOMIC seam: hand back the artifact, or refuse and kick the async
+            # build -- never build inline on the caller's thread.
+            from blastbox.host.runtime.fc_snapshot import SnapshotBuildInvalidated
+
+            if self._built:
+                return object()
+            self.ensure_build_started()
+            raise SnapshotBuildInvalidated("not built")
+
         def build(self):
             self.builds += 1
 

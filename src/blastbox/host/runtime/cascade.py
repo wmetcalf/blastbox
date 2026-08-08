@@ -182,6 +182,11 @@ class CascadingRuntime:
         # Tier names repaired on the SPAWN path (invisible to the pool, because a healthy fallback
         # absorbs the spawn) and not yet reported to it, so it can retire those slots.
         self._repaired_unreported: set[str] = set()
+        # Tiers repaired LOCALLY since the last pool-driven repair. Distinguishes "no guilty tier
+        # because this episode was already handled" from "no guilty tier because we have no
+        # evidence" -- the first must repair NOTHING, the second must fall back to every tier.
+        # Collapsing them re-invalidated a just-repaired tier, or destroyed healthy siblings.
+        self._repaired_this_episode: set[int] = set()
         self._lock = threading.Lock()
         # Consecutive spawn failures PER TIER. The pool's own streak cannot see these: a tier
         # whose base is poisoned raises here, the cascade falls through to a healthy overflow
@@ -318,12 +323,14 @@ class CascadingRuntime:
             return
         with self._lock:
             self._tier_failures[index] = 0   # give the rebuild a full window before trying again
-            # ...but REMEMBER that this tier is the guilty one. The pool reaches its own threshold
-            # a moment later and calls invalidate_base(), which filters on the guilty set: clearing
-            # the only marker first meant that set was empty, so a global repair fell back to
-            # every tier and destroyed the bases of healthy, merely-saturated siblings -- exactly
-            # what the guilty-set filter was added to prevent (upstream, PR #82).
-            self._recently_guilty.add(index)
+            # No _recently_guilty marker here any more, and deliberately so. It was added because
+            # clearing the streak first left the pool's repair with an empty guilty set, which
+            # fell back to every tier and destroyed healthy siblings. Both outcomes are now
+            # decided explicitly: a SUCCESSFUL repair records _repaired_this_episode, so the pool
+            # repairs nothing further; a FAILED one restores _tier_failures below, which puts the
+            # tier back in the guilty set on its own. The marker had become a third copy of the
+            # same fact -- and a mutation run proved nothing could tell whether it was still
+            # there (upstream, PR #82).
         _log.error(
             "cascade: tier %r failed %d consecutive spawns — invalidating its base so it can be "
             "rebuilt. Fallback tiers have been absorbing this, so the pool saw only successes.",
@@ -348,6 +355,12 @@ class CascadingRuntime:
             # the new base and can invalidate the replacement immediately (upstream, PR #82).
             with self._lock:
                 self._repaired_unreported.add(tier.name)
+                # _repaired_this_episode is what stops the pool repairing this tier AGAIN: the
+                # CascadeSpawnFailed that follows drives WarmPool to the same threshold, and
+                # invalidating a just-repaired snapshot tier bumps its build epoch and REJECTS
+                # the replacement already being built. No _recently_guilty bookkeeping is needed
+                # for that -- nothing adds the marker on this path any more (upstream, PR #82).
+                self._repaired_this_episode.add(index)
 
     def take_repaired_tiers(self) -> "list[str]":
         """Drain the tiers repaired since the last call -- the pool advances their generations.
@@ -477,13 +490,29 @@ class CascadingRuntime:
             with self._lock:
                 guilty = ({i for i, n in enumerate(self._tier_failures) if n > 0}
                           | self._recently_guilty)
-            targets = [t for i, t in enumerate(self.tiers) if i in guilty] or list(self.tiers)
+                already = set(self._repaired_this_episode)
+            if guilty:
+                targets = [t for i, t in enumerate(self.tiers) if i in guilty]
+            elif already:
+                # This episode was ALREADY discharged by the per-tier repair. Falling back to
+                # every tier here destroyed healthy siblings; keeping the guilt instead
+                # re-invalidated the repaired tier, which on a snapshot tier bumps the build epoch
+                # and REJECTS the replacement already being built. Neither: there is nothing left
+                # to do (upstream, PR #82).
+                _log.info("cascade: spawn repair already satisfied by per-tier repair of %s",
+                          ",".join(sorted(self.tiers[i].name for i in already)))
+                with self._lock:
+                    self._repaired_this_episode.clear()
+                return sorted(self.tiers[i].name for i in already)
+            else:
+                targets = list(self.tiers)
         else:
             # No names and no spawn attribution: every tier is the only safe target.
             targets = list(self.tiers)
 
         with self._lock:
             self._recently_guilty.clear()   # consumed by this repair
+            self._repaired_this_episode.clear()
             # _job_guilty is NOT cleared here. Discarding it before the outcomes are known lost
             # the naming for tiers whose invalidation then FAILED: the pool restores the consumed
             # episode after CascadeInvalidateFailed, but its retry had no guilty tiers left and

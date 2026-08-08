@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
-from blastbox.host.pool import RuntimeAtCapacity, Slot, SlotState
+from blastbox.host.pool import Slot, SlotState
 from blastbox.host.runtime.fc_snapshot import SnapshotError
 
 _log = logging.getLogger(__name__)
@@ -56,14 +56,14 @@ class GvisorSnapshotSlotRuntime:
         # NEVER build INLINE -- see the FC sibling. A job thread can invalidate between the pool's
         # generation check and this call, and a synchronous build then blocks the pool's only
         # maintenance thread for a full boot plus readiness timeout (upstream, PR #82).
-        _is_built = getattr(self._mgr, "is_built", None)
-        _ensure = getattr(self._mgr, "ensure_build_started", None)
-        if callable(_is_built) and callable(_ensure) and not _is_built():
-            _ensure()
-            raise RuntimeAtCapacity(
-                "warm checkpoint is still building; not blocking the maintenance thread"
-            )
-        self._mgr.build()  # idempotent and instant once built
+        # ATOMIC against invalidate(): asking "is it built?" and then building is a
+        # check-then-act, and a job thread invalidating in that gap sends build() down the full
+        # synchronous boot on the pool's only maintenance thread (upstream, PR #82).
+        _acquire = getattr(self._mgr, "acquire_built", None)
+        if callable(_acquire):
+            _acquire()
+        else:
+            self._mgr.build()   # a manager without the seam (a test double)
         slot_id = str(uuid.uuid4())
         handle = self._mgr.restore(slot_id)
         wd = Path(handle.slot_workdir)  # type: ignore[attr-defined]
