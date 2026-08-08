@@ -439,18 +439,23 @@ def test_orphan_generations_from_a_dead_dispatcher_are_swept(tmp_path):
     so every restart — clean or not — left its .snapshot, RAM-sized .mem and copied outdisk
     behind, and repeated deployments filled the scratch filesystem or /dev/shm.
     """
-    import os
 
     base = tmp_path / "snap"
     memdir = tmp_path / "ram"
     base.mkdir()
     memdir.mkdir()
 
-    dead_pid = 999_999_999          # not a live process
-    mine = os.getpid()
+    from blastbox.host.runtime.snapshot_backend import owner_lease_path, owner_token
 
-    orphan_snap = base / f"warm-{dead_pid}-000000000000000001.snapshot"
-    orphan_mem = memdir / f"warm-{dead_pid}-000000000000000001.mem"
+    # A dead owner is one whose LEASE nobody holds -- provable across PID namespaces, unlike a
+    # pid check. Create the lease file and leave it unlocked: that is what the kernel leaves
+    # behind when the holder dies.
+    dead = "999999999_4242"
+    owner_lease_path(base, dead).write_bytes(b"")
+    mine = owner_token()
+
+    orphan_snap = base / f"warm-{dead}-000000000000000001.snapshot"
+    orphan_mem = memdir / f"warm-{dead}-000000000000000001.mem"
     ours = base / f"warm-{mine}-000000000000000002.snapshot"
     unrelated = base / "warm.snapshot"       # legacy fixed name, not a generation
     for f in (orphan_snap, orphan_mem, ours, unrelated):
@@ -473,11 +478,21 @@ def test_orphan_generations_from_a_dead_dispatcher_are_swept(tmp_path):
 def test_the_sweep_never_touches_a_live_dispatchers_generation(tmp_path):
     """Deleting a running dispatcher's generation pulls the backing store out from under its live
     microVMs — far worse than the leak. A pid we cannot signal counts as alive."""
-    import os
+
+    import fcntl
+
+    from blastbox.host.runtime.snapshot_backend import owner_lease_path
 
     base = tmp_path / "snap"
     base.mkdir()
-    live = base / f"warm-{os.getpid()}-000000000000000003.mem"
+    # A DIFFERENT owner -- one whose lease is genuinely held, as a live dispatcher in another PID
+    # namespace would hold it. The pid rule called this one dead; the flock cannot.
+    other = "999999999_4242"
+    lease = owner_lease_path(base, other)
+    lease.write_bytes(b"")
+    holder = open(lease, "a+b")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    live = base / f"warm-{other}-000000000000000003.mem"
     live.write_bytes(b"x")
 
     launcher = FcSnapshotLauncher(
@@ -486,8 +501,11 @@ def test_the_sweep_never_touches_a_live_dispatchers_generation(tmp_path):
         api_factory=FakeApiPatch, wait_socket=lambda p: None,
         make_outdisk=_make_outdisk_file,
     )
-    assert launcher.sweep_orphan_generations() == 0
-    assert live.exists()
+    try:
+        assert launcher.sweep_orphan_generations() == 0
+        assert live.exists(), "a live owner's generation was swept -- its microVMs map that file"
+    finally:
+        holder.close()
 
 
 def test_generation_ownership_survives_pid_reuse(tmp_path):
@@ -523,10 +541,16 @@ def test_generation_ownership_survives_pid_reuse(tmp_path):
 
 
 def test_a_generation_from_a_reused_pid_is_swept(tmp_path):
-    """The end-to-end consequence of the identity fix."""
+    """The end-to-end consequence of the identity fix — now gated on a LEASE.
+
+    "Our pid with a different start time" is precisely what a still-running dispatcher in another
+    PID namespace looks like from here, so the pid rule alone must no longer authorise deletion:
+    it is the rolling-deployment shape that unlinked a live owner's memory file. Only an unheld
+    lease proves death.
+    """
     import os
 
-    from blastbox.host.runtime.fc_snapshot_launcher import owner_token
+    from blastbox.host.runtime.snapshot_backend import owner_lease_path, owner_token
 
     base = tmp_path / "snap"
     base.mkdir()
@@ -542,6 +566,14 @@ def test_a_generation_from_a_reused_pid_is_swept(tmp_path):
         api_factory=FakeApiPatch, wait_socket=lambda p: None,
         make_outdisk=_make_outdisk_file,
     )
+    assert launcher.sweep_orphan_generations() == 0, (
+        "with no lease its death is unprovable -- that pid may be a LIVE dispatcher in another "
+        "namespace, and unlinking its .mem corrupts the microVMs mapping it"
+    )
+    assert stale.exists()
+
+    # Its lease, released (what the kernel leaves behind when the owner dies).
+    owner_lease_path(base, f"{os.getpid()}_1").write_bytes(b"")
     assert launcher.sweep_orphan_generations() == 1
     assert not stale.exists(), "a prior container's generation must be reclaimed"
     assert ours.exists(), "our own generation must never be swept"
@@ -610,15 +642,17 @@ def test_a_sweep_that_could_not_remove_an_orphan_reports_it(tmp_path, monkeypatc
     """
     import errno as _errno
 
-    from blastbox.host.runtime import fc_snapshot_launcher as mod
 
-    base = tmp_path / "base"; base.mkdir()
-    mem = tmp_path / "mem"; mem.mkdir()
+    base = tmp_path / "base"
+    base.mkdir()
+    mem = tmp_path / "mem"
+    mem.mkdir()
     # An orphan owned by a token whose process is gone.
     orphan = mem / "warm-999999_1234-000000000000000001.mem"
     orphan.write_bytes(b"x" * 8)
 
-    monkeypatch.setattr(mod, "_owner_alive", lambda token: False)
+    from blastbox.host.runtime.snapshot_backend import owner_lease_path
+    owner_lease_path(base, "999999_1234").write_bytes(b"")
 
     def _boom(self, missing_ok=False):
         raise OSError(_errno.EIO, "unlink failed")
@@ -633,13 +667,15 @@ def test_a_sweep_that_could_not_remove_an_orphan_reports_it(tmp_path, monkeypatc
 
 def test_a_clean_sweep_still_reports_success(tmp_path, monkeypatch):
     """The carve-out stays narrow: an orphan that IS removed reports normally."""
-    from blastbox.host.runtime import fc_snapshot_launcher as mod
 
-    base = tmp_path / "base"; base.mkdir()
-    mem = tmp_path / "mem"; mem.mkdir()
+    base = tmp_path / "base"
+    base.mkdir()
+    mem = tmp_path / "mem"
+    mem.mkdir()
     orphan = mem / "warm-999999_1234-000000000000000001.mem"
     orphan.write_bytes(b"x" * 8)
-    monkeypatch.setattr(mod, "_owner_alive", lambda token: False)
+    from blastbox.host.runtime.snapshot_backend import owner_lease_path
+    owner_lease_path(base, "999999_1234").write_bytes(b"")
 
     launcher = FcSnapshotLauncher(FakeCfg(), base, mem_dir=mem)
     assert launcher.sweep_orphan_generations() == 1

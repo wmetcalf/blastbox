@@ -28,6 +28,12 @@ from blastbox.host.runtime.snapshot_backend import (
     generation_owner as _generation_owner,
 )
 from blastbox.host.runtime.snapshot_backend import (
+    hold_owner_lease as _hold_owner_lease,
+)
+from blastbox.host.runtime.snapshot_backend import (
+    prune_owner_lease as _prune_owner_lease,
+)
+from blastbox.host.runtime.snapshot_backend import (
     owner_alive as _owner_alive,
 )
 from blastbox.host.runtime.snapshot_backend import (
@@ -167,6 +173,11 @@ class _Handle:
             # durability fix this list exists for (PR #82).
             self._stranded_partials[:] = still
 
+        # Take the lease BEFORE the first generation exists, so nothing is ever on disk
+        # uncovered. `dest` is the manager's base dir -- the very directory the launcher's sweep
+        # consults, and deliberately NOT mem_dir, which is usually a separate tmpfs. Best-effort:
+        # an unleased generation is only ever leaked, never corrupted.
+        _hold_owner_lease(dest)
         gen = f"{owner_token()}-{time.monotonic_ns():019d}"
         snap = dest / f"warm-{gen}.snapshot"
         mem = self._mem_dir / f"warm-{gen}.mem"
@@ -381,13 +392,22 @@ class FcSnapshotLauncher:
         """
         removed = 0
         failed: list[str] = []
+        reclaimed_owners: set[str] = set()
         for directory in {self._base_dir, self._mem_dir}:
             if directory is None or not directory.exists():
                 continue
             for path in directory.glob("warm-*"):
                 token = _generation_owner(path.name)
-                if token is None or token == owner_token() or _owner_alive(token):
+                # lease_dir: ownership must be proved by a flock on the SHARED filesystem, not by
+                # a pid. Two dispatcher containers overlapping through a rolling deployment both
+                # see themselves as pid 1, so the /proc rule declares the live one dead and this
+                # sweep would unlink the .mem its microVMs are still mapping (upstream, PR #82).
+                # The lease lives beside the base dir for BOTH sweeps -- mem_dir is often a
+                # separate tmpfs, so it cannot be the canonical location.
+                if (token is None or token == owner_token()
+                        or _owner_alive(token, lease_dir=self._base_dir)):
                     continue
+                reclaimed_owners.add(token)
                 try:
                     if path.is_dir():
                         # NOT ignore_errors: it would report success for a tree this call could
@@ -407,6 +427,10 @@ class FcSnapshotLauncher:
                     # whether cleanup happened must not lie about it (upstream, PR #82).
                     failed.append(f"{path}: {exc}")
                     _log.warning("fc_snapshot: could not sweep orphan %s: %s", path, exc)
+        # AFTER the loop: an owner's lease must outlive the proof, or its other generations --
+        # the .mem in the second directory, the outdisk -- lose theirs mid-sweep.
+        for token in reclaimed_owners:
+            _prune_owner_lease(self._base_dir, token)
         if removed:
             _log.info("fc_snapshot.swept_orphan_generations count=%d", removed)
         if failed:

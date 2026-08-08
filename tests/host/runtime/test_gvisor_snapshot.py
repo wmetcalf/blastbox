@@ -575,12 +575,15 @@ def test_a_dead_dispatchers_checkpoint_is_reclaimed(tmp_path, monkeypatch):
     stranded a whole runsc checkpoint directory that no code path could rediscover. FC has swept
     its warm-* files since generations were introduced; this side only got the other half.
     """
-    from blastbox.host.runtime import gvisor_snapshot as mod
     from blastbox.host.runtime.snapshot_backend import owner_token
+
+    from blastbox.host.runtime.snapshot_backend import owner_lease_path
 
     dead = _mk_checkpoint(tmp_path, "999999_4242")
     mine = _mk_checkpoint(tmp_path, owner_token(), "0000000000000000002")
-    monkeypatch.setattr(mod, "owner_alive", lambda token: False)
+    # Death is proved by an UNHELD lease -- what the kernel leaves when the holder dies -- not by
+    # a pid, which is invisible from another PID namespace.
+    owner_lease_path(tmp_path, "999999_4242").write_bytes(b"")
 
     backend = GvisorSnapshotBackend(_cfg(tmp_path), run=lambda *a, **k: 0)
     assert backend.sweep_orphan_generations(tmp_path) == 1
@@ -590,23 +593,30 @@ def test_a_dead_dispatchers_checkpoint_is_reclaimed(tmp_path, monkeypatch):
 
 def test_a_live_dispatchers_checkpoint_is_never_touched(tmp_path, monkeypatch):
     """Deleting a generation a live dispatcher is still restoring from is worse than the leak."""
-    from blastbox.host.runtime import gvisor_snapshot as mod
+
+    import fcntl
+
+    from blastbox.host.runtime.snapshot_backend import owner_lease_path
 
     theirs = _mk_checkpoint(tmp_path, "999999_4242")
-    monkeypatch.setattr(mod, "owner_alive", lambda token: True)
+    lease = owner_lease_path(tmp_path, "999999_4242")
+    lease.write_bytes(b"")
+    holder = open(lease, "a+b")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     backend = GvisorSnapshotBackend(_cfg(tmp_path), run=lambda *a, **k: 0)
-    assert backend.sweep_orphan_generations(tmp_path) == 0
-    assert theirs.exists()
+    try:
+        assert backend.sweep_orphan_generations(tmp_path) == 0
+        assert theirs.exists(), "a live owner's checkpoint was swept out from under its sandboxes"
+    finally:
+        holder.close()
 
 
 def test_an_unparseable_name_is_left_alone(tmp_path, monkeypatch):
     """Only OUR generation names are candidates — this deletes trees."""
-    from blastbox.host.runtime import gvisor_snapshot as mod
 
     stray = tmp_path / "checkpoint-not-a-generation"
     stray.mkdir()
-    monkeypatch.setattr(mod, "owner_alive", lambda token: False)
 
     backend = GvisorSnapshotBackend(_cfg(tmp_path), run=lambda *a, **k: 0)
     assert backend.sweep_orphan_generations(tmp_path) == 0
@@ -618,8 +628,10 @@ def test_a_checkpoint_it_could_not_remove_is_reported(tmp_path, monkeypatch):
     reclamation for the whole process."""
     from blastbox.host.runtime import gvisor_snapshot as mod
 
+    from blastbox.host.runtime.snapshot_backend import owner_lease_path
+
     _mk_checkpoint(tmp_path, "999999_4242")
-    monkeypatch.setattr(mod, "owner_alive", lambda token: False)
+    owner_lease_path(tmp_path, "999999_4242").write_bytes(b"")
 
     def _boom(path, onerror=None, **kw):
         onerror(None, str(path), (OSError, OSError(5, "EIO"), None))

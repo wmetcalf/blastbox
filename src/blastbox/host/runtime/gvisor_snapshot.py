@@ -20,7 +20,9 @@ from typing import Any, Callable
 
 from blastbox.host.runtime.snapshot_backend import (
     generation_owner,
+    hold_owner_lease,
     owner_alive,
+    prune_owner_lease,
     owner_token,
 )
 
@@ -305,6 +307,9 @@ class GvisorBootHandle:
         # a mix of two checkpoints. A pin stops the old generation being DELETED; only a distinct
         # path stops it being OVERWRITTEN. FC's mem/snapshot pair got this; gVisor did not
         # (upstream, PR #82).
+        # Take the lease BEFORE the first generation exists, so nothing is ever on disk
+        # uncovered. Best-effort: an unleased generation is only ever leaked, never corrupted.
+        hold_owner_lease(dest_dir)
         gen = f"{owner_token()}-{time.monotonic_ns():019d}"
         img = Path(dest_dir) / f"checkpoint-{gen}"
         img.mkdir(parents=True, exist_ok=True)
@@ -421,10 +426,16 @@ class GvisorSnapshotBackend:
             return 0
         removed = 0
         failed: list[str] = []
+        reclaimed_owners: set[str] = set()
         for path in root.glob("checkpoint-*"):
             token = generation_owner(path.name, prefix="checkpoint-")
-            if token is None or token == owner_token() or owner_alive(token):
+            # lease_dir: proved by a flock on the shared filesystem, never by a pid -- two
+            # dispatcher containers overlapping through a rolling deployment both see themselves
+            # as pid 1, and the /proc rule would call the live one dead (upstream, PR #82).
+            if (token is None or token == owner_token()
+                    or owner_alive(token, lease_dir=root)):
                 continue
+            reclaimed_owners.add(token)
             # NOT ignore_errors: SnapshotManager latches "swept" on a clean return, so reporting
             # success for a tree we could not remove disables reclamation for the whole process.
             errs: list[str] = []
@@ -434,6 +445,10 @@ class GvisorSnapshotBackend:
                 _log.warning("gvisor_snapshot: could not sweep orphan checkpoint %s", path)
             else:
                 removed += 1
+        # AFTER the loop -- one owner can have several checkpoint generations, and pruning its
+        # lease mid-sweep leaves the rest unprovable.
+        for token in reclaimed_owners:
+            prune_owner_lease(root, token)
         if removed:
             _log.info("gvisor_snapshot.swept_orphan_generations count=%d", removed)
         if failed:
