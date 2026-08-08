@@ -580,3 +580,40 @@ def test_a_cascade_over_a_disposable_tier_reports_no_identity():
                             tier_rebuild_after=99)
     slot = casc.spawn()
     assert casc.worker_identity(slot) is None
+
+
+def test_a_job_fault_clears_the_boxs_failures_not_the_slots():
+    """A valid engine_error proves the box responsive, so its failure record must reset.
+
+    The clear popped slot.slot_id while the record is filed under the physical worker, so the
+    box's prior failure survived and the lookup right below — correctly keyed — read it straight
+    back. A failure / valid engine_error / failure sequence then counted as CONSECUTIVE and could
+    burn out a healthy box or spend eviction budget on it.
+    """
+    from blastbox.host.pool import WarmPool
+
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"),
+                           http_probe=FakeProbe(all_ok=True))
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
+                    max_consecutive_failures=2, eviction_window_s=10_000.0,
+                    max_evictions_per_window=10)
+
+    slot = rt.spawn()
+    pool._slots[slot.slot_id] = slot
+    key = pool._health_key(slot)
+
+    pool.release(slot, dirty=True, fault="worker")
+    assert pool._slot_failures.get(key) == 1
+
+    # A valid engine_error on the SAME physical box, through a FRESH slot -- the production
+    # shape, since a static runtime reaps the slot and mints a new id for the next assignment.
+    again = rt.spawn()
+    again.worker_index = slot.worker_index
+    pool._slots[again.slot_id] = again
+    assert pool._health_key(again) == key, "sanity: same box, same health key"
+
+    pool.release(again, dirty=True, fault="job")
+    assert pool._slot_failures.get(key, 0) == 0, (
+        "the box's failure record survived a valid engine response, so two unrelated failures "
+        "an hour apart count as consecutive"
+    )

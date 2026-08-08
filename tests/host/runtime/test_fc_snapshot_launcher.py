@@ -775,3 +775,27 @@ def test_stranded_partials_are_retried_before_the_base_boots(tmp_path):
         "the boot fails before checkpoint() and the retry is unreachable forever"
     )
     assert launcher._stranded_partials == []
+
+
+def test_no_generation_is_written_without_a_lease(tmp_path, monkeypatch):
+    """Not best-effort. The sweep's whole rule is that a lease nobody holds proves its owner
+    dead, so a generation with no lease can be reclaimed by another dispatcher while this
+    process's microVMs are still mapping it. Failing the build leaves the tier cold; proceeding
+    risks corrupting live guests."""
+    from blastbox.host.runtime import fc_snapshot_launcher as mod
+    from blastbox.host.runtime.fc_snapshot import SnapshotBuildError
+
+    monkeypatch.setattr(mod, "_hold_owner_lease", lambda d: False)
+
+    base = tmp_path / "snap"
+    base.mkdir()
+    launcher = FcSnapshotLauncher(
+        FakeCfg(), base, mem_dir=base,
+        popen=lambda argv, cwd=None: FakeProc(),
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
+        make_outdisk=_make_outdisk_file,
+    )
+    handle = launcher.boot_base()
+    with pytest.raises(SnapshotBuildError):
+        handle.checkpoint(base)
+    assert not list(base.glob("warm-*")), "a generation was written with no lease covering it"

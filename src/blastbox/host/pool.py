@@ -36,6 +36,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from blastbox.errors import is_host_resource_failure
 from blastbox.observability.metrics import (
     record_pool_state,
     record_slot_reaped,
@@ -330,6 +331,12 @@ class WarmPool:
         # produced it. A slot restored from generation A can still be mid-job long after A was
         # invalidated and B built in its place.
         self._slot_base_generation: dict[str, int] = {}
+        # COMMITTED base generation, advanced only when an invalidation actually succeeded.
+        # Deliberately not _base_rebuilds, which is bumped BEFORE drop() so an in-flight spawn
+        # batch can be fenced: a drop() that RAISED still advanced it, so slots whose tier was
+        # never repaired were stamped with a "retired" generation and their later failures were
+        # discarded -- leaving the un-repaired tier unable to reach the rebuild threshold at all.
+        self._base_generation = 0
         self._warm_size = warm_size
         self._concurrent_ceiling = concurrent_ceiling
         self._poll_interval = poll_interval
@@ -711,7 +718,14 @@ class WarmPool:
                 # read as two CONSECUTIVE worker failures, evicting a healthy slot or invalidating
                 # a good base on two unrelated events an hour apart. The slot is still
                 # force-recycled (dirty); only the HEALTH streaks reset (upstream, PR #82).
-                self._slot_failures.pop(slot.slot_id, None)
+                # hkey, not slot_id. With a reusing runtime the record is filed under the
+                # physical worker while slot_id is minted fresh for every assignment, so popping
+                # the slot id left the box's prior failure intact -- and the lookup below,
+                # correctly keyed, read it straight back. A failure / valid engine_error /
+                # failure sequence was then treated as CONSECUTIVE and could burn out a healthy
+                # box or spend eviction budget on it. The clean-release branch already had this
+                # right (upstream, PR #82).
+                self._slot_failures.pop(hkey, None)
                 self._pool_consecutive_failures = 0
                 slot_failures = 0
                 # ...and it proves the RESTORED BASE is responsive too, so it must clear the
@@ -737,13 +751,13 @@ class WarmPool:
                 # over. slot_ids carries cascade-TIER attribution; it says nothing about which
                 # snapshot generation restored the slot (upstream, PR #82).
                 _gen = self._slot_base_generation.get(slot.slot_id)
-                if _gen is None or _gen == self._base_rebuilds:
+                if _gen is None or _gen == self._base_generation:
                     self._pool_consecutive_failures += 1
                 else:
                     logger.info(
                         "pool.failure_from_retired_generation slot_id=%s spawned_generation=%d "
                         "current_generation=%d -- not counted against the base now installed",
-                        slot.slot_id, _gen, self._base_rebuilds,
+                        slot.slot_id, _gen, self._base_generation,
                     )
             elif dirty:
                 # A job/unknown fault still forces a recycle (the slot may be contaminated) but must
@@ -1769,7 +1783,18 @@ class WarmPool:
                 logger.debug("pool.spawn_capacity_miss reason=%s", exc)
                 self._note_capacity_miss(str(exc))
                 break
-            except Exception:
+            except Exception as exc:
+                if is_host_resource_failure(exc):
+                    # THIS HOST is out of space/fds/inodes. Spawning creates a slot workdir and
+                    # copies a per-slot disk, so it says nothing about the base -- and the cascade
+                    # deliberately leaves its per-tier guilt EMPTY for these, so counting it here
+                    # produced a spawn-driven repair with no guilty tier, whose empty-guilt
+                    # fallback invalidates every healthy tier. An all-local cascade sharing one
+                    # full filesystem hits exactly that (upstream, PR #82).
+                    logger.warning("pool.spawn_host_resource_failure (not counted against the "
+                                   "base): %s", exc)
+                    self._note_capacity_miss(f"host resources exhausted: {exc}")
+                    break
                 logger.exception("pool.spawn_failed")
                 with self._lock:
                     self._spawn_consecutive_failures += 1
@@ -1803,7 +1828,7 @@ class WarmPool:
                     # STAMP the generation this slot came from, under the same lock that
                     # publishes it, so a later failure can be told apart from one produced by
                     # the base currently installed.
-                    self._slot_base_generation[slot.slot_id] = self._base_rebuilds
+                    self._slot_base_generation[slot.slot_id] = self._base_generation
             if drop:
                 reaped = False
                 try:
@@ -2074,8 +2099,11 @@ class WarmPool:
                 self._spawn_consecutive_failures = 0
             else:
                 self._pool_consecutive_failures = 0
-            # NB _base_rebuilds was already bumped before drop(); only the timestamp is
-            # recorded here.
+            # NB _base_rebuilds was already bumped before drop() (it is the in-flight fence).
+            # The COMMITTED generation advances only here, on the success path: a drop() that
+            # raised leaves the tier's artifact in place, and stamping its live slots as retired
+            # would discard the very failures that must repair it.
+            self._base_generation += 1
             self._last_base_rebuild_at = now
             # Defer this tick's spawning wherever the rebuild came from. tick() captured `ready`
             # before release() could run, and a JOB-triggered rebuild races it: both snapshot

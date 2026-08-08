@@ -297,9 +297,15 @@ class GvisorBootHandle:
         # a mix of two checkpoints. A pin stops the old generation being DELETED; only a distinct
         # path stops it being OVERWRITTEN. FC's mem/snapshot pair got this; gVisor did not
         # (upstream, PR #82).
-        # Take the lease BEFORE the first generation exists, so nothing is ever on disk
-        # uncovered. Best-effort: an unleased generation is only ever leaked, never corrupted.
-        hold_owner_lease(dest_dir)
+        # Take the lease BEFORE the first generation exists, and REFUSE to write one without it.
+        # Not best-effort: the sweep's rule is that a lease nobody holds proves its owner dead, so
+        # an uncovered checkpoint can be reclaimed by another dispatcher while this process's
+        # sandboxes are still restoring from it (upstream, PR #82).
+        if not hold_owner_lease(dest_dir):
+            raise RuntimeError(
+                f"refusing to write a checkpoint generation without a lease in {dest_dir}: "
+                f"another dispatcher could reclaim it while this one is still using it"
+            )
         gen = f"{owner_token()}-{time.monotonic_ns():019d}"
         img = Path(dest_dir) / f"checkpoint-{gen}"
         img.mkdir(parents=True, exist_ok=True)

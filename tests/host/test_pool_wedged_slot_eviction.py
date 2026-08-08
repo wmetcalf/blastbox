@@ -3135,9 +3135,12 @@ def test_failures_from_a_retired_generation_do_not_condemn_the_new_base() -> Non
     assert old is not None
     spawned_gen = pool._slot_base_generation[old.slot_id]
 
-    # The base is replaced while this slot is still mid-job.
+    # The base is replaced while this slot is still mid-job. _base_generation, not
+    # _base_rebuilds: the latter is the in-flight spawn FENCE and is bumped before drop() even
+    # when the drop goes on to fail, so stamping against it would retire slots whose tier was
+    # never actually repaired.
     with pool._lock:
-        pool._base_rebuilds += 1
+        pool._base_generation += 1
     assert pool._slot_base_generation[old.slot_id] == spawned_gen
 
     before = rt.invalidated
@@ -3347,4 +3350,186 @@ def test_job_guilt_is_consumed_by_the_repair_it_drove() -> None:
     assert b.invalidated == 1, (
         "stale job guilt narrowed the next repair to a tier that had already been fixed, so the "
         "tier that actually needed it was skipped"
+    )
+
+
+def test_a_failed_invalidation_does_not_retire_its_slots() -> None:
+    """An unsuccessful drop() still advanced the in-flight fence.
+
+    In a cascade where one tier's invalidation raises, that tier keeps its current artifact while
+    all of its live slots are now stamped with the previous generation — so once a clean release
+    resets the episode, every later failure from those still-current slots is discarded as
+    `failure_from_retired_generation` and the un-repaired tier can never reach the threshold
+    again.
+    """
+    from blastbox.host.pool import WarmPool
+
+    class _BrokenInvalidate(_WedgeableRuntime):
+        def invalidate_base(self, *, reason=None) -> None:
+            raise RuntimeError("tier 'a' invalidation failed")
+
+    rt = _BrokenInvalidate()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0,
+                    max_consecutive_failures=99)
+    before = pool._base_generation
+
+    assert pool._maybe_rebuild_base(99, reason="spawn") is False, "sanity: the repair failed"
+    assert pool._base_generation == before, (
+        "a FAILED invalidation advanced the committed generation, so every live slot of the tier "
+        "it did not repair now looks retired and its failures are thrown away"
+    )
+    assert pool._base_rebuilds > before, (
+        "the in-flight fence must still move -- it exists to stop a spawn batch racing the drop"
+    )
+
+
+def test_a_host_wide_spawn_failure_does_not_reach_the_restore_streak() -> None:
+    """The cascade deliberately leaves its per-tier guilt EMPTY for host-resource failures.
+
+    So counting one here produced a spawn-driven repair with no guilty tier, and the empty-guilt
+    fallback invalidates every healthy tier. An all-local cascade sharing one full filesystem
+    hits exactly that: no tier can spawn, the aggregate surfaces as CascadeSpawnFailed, and the
+    repair destroys every base on the box.
+    """
+    import errno as _errno
+
+    from blastbox.host.pool import WarmPool
+
+    class _HostFull(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.invalidated = 0
+
+        def spawn(self):
+            try:
+                raise OSError(_errno.ENOSPC, "No space left on device")
+            except OSError as inner:
+                raise RuntimeError("all attempted cascade tiers failed to spawn") from inner
+
+        def invalidate_base(self, *, reason=None) -> None:
+            self.invalidated += 1
+
+    rt = _HostFull()
+    pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=4,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0)
+    for _ in range(4):
+        pool.tick()
+
+    assert pool._spawn_consecutive_failures == 0, (
+        "a host-wide storage failure advanced the restore streak that judges the BASE"
+    )
+    assert rt.invalidated == 0, (
+        "every healthy tier's base was invalidated because this host ran out of disk"
+    )
+
+
+def test_a_genuine_spawn_failure_still_reaches_the_streak() -> None:
+    """The carve-out stays narrow: a base that restores nowhere must still be repaired."""
+    from blastbox.host.pool import WarmPool
+
+    class _Broken(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.invalidated = 0
+
+        def spawn(self):
+            raise RuntimeError("snapshot restore failed: corrupt mem file")
+
+        def invalidate_base(self, *, reason=None) -> None:
+            self.invalidated += 1
+
+    rt = _Broken()
+    pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=4,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0)
+    pool.tick()
+    assert rt.invalidated >= 1
+
+
+def test_slots_of_a_tier_whose_repair_failed_keep_counting() -> None:
+    """End-to-end for the fence/generation split.
+
+    A drop() that RAISES leaves the artifact in place, but it still advances the in-flight spawn
+    fence. Stamping slots against that fence marked every live slot of the un-repaired tier as
+    retired, so their later failures were discarded and the tier could never reach the threshold
+    again — it stayed broken forever with the evidence being thrown away.
+    """
+    from blastbox.host.pool import WarmPool
+
+    class _RepairFails(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        def invalidate_base(self, *, reason=None) -> None:
+            self.attempts += 1
+            raise RuntimeError("invalidation failed: the tier keeps its artifact")
+
+    rt = _RepairFails()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0,
+                    max_consecutive_failures=99)
+    pool.tick()
+    pool.tick()
+
+    slot = pool.claim(timeout_s=0.5)
+    assert slot is not None
+    pool.release(slot, dirty=True, fault="worker")
+    assert rt.attempts >= 1, "sanity: a repair was attempted and failed"
+
+    # A later failure from a slot spawned AFTER the failed repair must still count. It has to be
+    # a NEW slot: re-claiming the original one proves nothing, because that slot predates the
+    # fence bump and would compare equal either way.
+    known = set(pool._slots)
+    for s in list(pool._slots.values()):
+        pool.retire(s)               # force a replacement rather than reusing the recycled slot
+    pool.tick()
+    pool.tick()
+    fresh = [s for sid, s in pool._slots.items() if sid not in known]
+    assert fresh, "sanity: a replacement slot was spawned after the failed repair"
+    again = fresh[0]
+
+    # The fence has moved (it is bumped before every drop attempt, including the one that
+    # raised); the COMMITTED generation has not, because nothing was actually repaired.
+    assert pool._base_rebuilds != pool._base_generation, (
+        "sanity: the two counters must genuinely differ here, or the assertion below is vacuous"
+    )
+    assert pool._slot_base_generation[again.slot_id] == pool._base_generation, (
+        "the replacement slot was stamped against the in-flight FENCE, so every failure it "
+        "reports is discarded as coming from a retired generation — but its tier was never "
+        "repaired, so the evidence that would repair it is thrown away forever"
+    )
+
+    again.state = SlotState.ASSIGNED
+    before = rt.attempts
+    pool.release(again, dirty=True, fault="worker")
+    assert rt.attempts > before, "the tier must still be repairable"
+
+
+def test_a_successful_repair_does_advance_the_generation() -> None:
+    """The other half: when the repair works, its slots really are retired."""
+    from blastbox.host.pool import WarmPool
+
+    class _RepairWorks(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        def invalidate_base(self, *, reason=None) -> None:
+            self.attempts += 1
+
+    rt = _RepairWorks()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0,
+                    max_consecutive_failures=99)
+    before = pool._base_generation
+    pool.tick()
+    pool.tick()
+    slot = pool.claim(timeout_s=0.5)
+    assert slot is not None
+    pool.release(slot, dirty=True, fault="worker")
+
+    assert rt.attempts == 1
+    assert pool._base_generation == before + 1, (
+        "a successful repair must retire the artifact its live slots were restored from"
     )

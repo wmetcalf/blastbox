@@ -95,3 +95,27 @@ def test_our_own_lease_is_held_for_the_life_of_the_process(tmp_path):
         "this process's own lease was dropped; another dispatcher would sweep our live generations"
     )
     assert hold_owner_lease(tmp_path) is True          # idempotent
+
+
+def test_a_lease_that_could_not_be_locked_leaves_nothing_behind(tmp_path, monkeypatch):
+    """Opening CREATES the file, so a transient flock failure left an UNLOCKED lease on disk.
+
+    That is strictly worse than no lease: another dispatcher's sweep acquires it, concludes this
+    still-running process is dead, and unlinks the memory files its live microVMs are mapping. An
+    absent lease merely refuses to sweep.
+    """
+    import errno as _errno
+
+    from blastbox.host.runtime import snapshot_backend as mod
+
+    def _boom(fd, op):
+        raise OSError(_errno.ENOLCK, "no locks available")
+
+    monkeypatch.setattr(mod.fcntl, "flock", _boom)
+    assert hold_owner_lease(tmp_path) is False
+    assert not owner_lease_path(tmp_path, owner_token()).exists(), (
+        "an unlocked lease file was left behind — another dispatcher will read it as proof this "
+        "process is dead and delete the files its live VMs are using"
+    )
+    # ...and with no lease on disk, ownership is UNPROVABLE, so nothing may be swept.
+    assert owner_alive(owner_token(), lease_dir=tmp_path) is True

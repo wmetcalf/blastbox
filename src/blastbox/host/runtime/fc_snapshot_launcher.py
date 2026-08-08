@@ -183,11 +183,20 @@ class _Handle:
         # are what filled the filesystem.
         _retry_stranded_partials(self._stranded_partials)
 
-        # Take the lease BEFORE the first generation exists, so nothing is ever on disk
-        # uncovered. `dest` is the manager's base dir -- the very directory the launcher's sweep
-        # consults, and deliberately NOT mem_dir, which is usually a separate tmpfs. Best-effort:
-        # an unleased generation is only ever leaked, never corrupted.
-        _hold_owner_lease(dest)
+        # Take the lease BEFORE the first generation exists, and REFUSE to write one without it.
+        # `dest` is the manager's base dir -- the very directory the launcher's sweep consults,
+        # and deliberately NOT mem_dir, which is usually a separate tmpfs.
+        #
+        # Not best-effort. An uncovered generation is not merely leaked: the sweep's whole rule is
+        # that a lease nobody holds proves its owner dead, so a generation with no lease can be
+        # reclaimed by another dispatcher while this process's microVMs are still mapping it.
+        # Failing the build leaves the tier cold; proceeding risks corrupting live guests
+        # (upstream, PR #82).
+        if not _hold_owner_lease(dest):
+            raise SnapshotBuildError(
+                f"refusing to write a snapshot generation without a lease in {dest}: another "
+                f"dispatcher could reclaim it while this one is still using it"
+            )
         gen = f"{owner_token()}-{time.monotonic_ns():019d}"
         snap = dest / f"warm-{gen}.snapshot"
         mem = self._mem_dir / f"warm-{gen}.mem"

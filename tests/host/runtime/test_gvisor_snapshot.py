@@ -661,3 +661,19 @@ def test_stranded_checkpoints_are_retried_before_the_base_boots(tmp_path):
         "fails before checkpoint() and the retry is unreachable forever"
     )
     assert backend._stranded_partials == []
+
+
+def test_no_checkpoint_is_written_without_a_lease(tmp_path, monkeypatch):
+    """The FC rule in its twin: an uncovered checkpoint can be reclaimed by another dispatcher
+    while this process's sandboxes are still restoring from it."""
+    from blastbox.host.runtime import gvisor_snapshot as mod
+
+    monkeypatch.setattr(mod, "hold_owner_lease", lambda d: False)
+    backend = GvisorSnapshotBackend(_cfg(tmp_path), run=lambda *a, **k: 0,
+                                    ready_wait=lambda d, t: None)
+    handle = backend.boot_base()
+    with pytest.raises(RuntimeError):
+        handle.checkpoint(tmp_path)
+    assert not list(tmp_path.glob("checkpoint-*")), (
+        "a checkpoint generation was written with no lease covering it"
+    )

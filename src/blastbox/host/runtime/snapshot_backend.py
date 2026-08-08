@@ -88,12 +88,22 @@ def hold_owner_lease(lease_dir: "Path | str") -> bool:
     key = str(Path(lease_dir))
     if key in _held_leases:
         return True
+    path = owner_lease_path(lease_dir, owner_token())
+    fh = None
     try:
-        path = owner_lease_path(lease_dir, owner_token())
         path.parent.mkdir(parents=True, exist_ok=True)
         fh = open(path, "a+b")                             # noqa: SIM115 -- held for the process
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
+        # LEAVE NOTHING BEHIND. Opening creates the file, so a flock that failed transiently left
+        # an UNLOCKED lease on disk -- which is strictly worse than no lease at all: another
+        # dispatcher's _lease_state() acquires it, concludes this still-running process is dead,
+        # and unlinks the memory files its live microVMs are mapping. An absent lease merely
+        # refuses to sweep (upstream, PR #82).
+        if fh is not None:
+            fh.close()
+            with contextlib.suppress(OSError):
+                path.unlink()
         _log.warning("snapshot: could not take the generation lease in %s: %s", lease_dir, exc)
         return False
     _held_leases[key] = fh

@@ -122,6 +122,28 @@ def is_transport_error(exc: BaseException) -> bool:
     )
 
 
+def is_host_resource_failure(exc: BaseException) -> bool:
+    """Whether a spawn failure is THIS HOST running out, rather than the tier being broken.
+
+    Walks the cause chain: the OSError is nearly always wrapped -- a launcher raises
+    SnapshotBuildError, a cascade raises CascadeSpawnFailed `from last_exc` -- so the errno is
+    rarely on the outermost exception. Same rule as everywhere else: only a host-resource errno
+    is ours, anything else belongs to the thing that failed.
+
+    Lives here, beside HOST_RESOURCE_ERRNOS and is_transport_error, because BOTH the cascade's
+    per-tier streak and the pool's pool-wide restore streak must exclude these, and a second copy
+    is how that rule drifts (upstream, PR #82).
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, OSError) and cur.errno in HOST_RESOURCE_ERRNOS:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 class OutputTrustUnknown(OutputTrustError):
     """Validation could not be COMPLETED -- not a verdict that the output is bad.
 
