@@ -481,7 +481,7 @@ def test_a_late_release_for_an_untracked_slot_books_nothing():
                   state=SlotState.ASSIGNED)          # never in _slots: already removed
     pool.release(orphan, dirty=True, fault="worker")
     assert "gone" not in pool._slot_failures, "leaked bookkeeping for an untracked slot"
-    assert pool._pool_consecutive_failures == 0, (
+    assert pool._pool_consecutive_failures.get("", 0) == 0, (
         "a slot no longer in the pool moved the pool-wide failure counter")
 
 
@@ -632,7 +632,7 @@ def test_the_failure_streak_is_read_under_the_lock():
             pass
 
     pool = WarmPool(runtime=_Rt(), warm_size=1)
-    pool._pool_consecutive_failures = 7
+    pool._pool_consecutive_failures[""] = 7
     assert pool._current_failure_streak() == 7        # reads the CURRENT value
 
     entered = threading.Event()
@@ -1252,7 +1252,7 @@ def test_concurrent_failures_cannot_each_rebuild_off_one_streak() -> None:
         spawn_rate_limit=1000.0,
     )
     with pool._lock:
-        pool._pool_consecutive_failures = 2
+        pool._pool_consecutive_failures[""] = 2
 
     barrier = threading.Barrier(2, timeout=1.0)
     real_lock = pool._lock
@@ -1644,7 +1644,7 @@ def test_a_success_during_the_decision_abandons_the_rebuild() -> None:
     pool.tick()
     good = list(pool._slots.values())[0]
     with pool._lock:
-        pool._pool_consecutive_failures = 2      # at the threshold
+        pool._pool_consecutive_failures[""] = 2      # at the threshold
 
     released = threading.Event()
     real_lock = pool._lock
@@ -1804,11 +1804,11 @@ def test_a_failed_invalidation_keeps_its_episode() -> None:
         snapshot_rebuild_after=2, base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
     )
     with pool._lock:
-        pool._pool_consecutive_failures = 2
+        pool._pool_consecutive_failures[""] = 2
 
     assert pool._maybe_rebuild_base(reason="job") is False
     with pool._lock:
-        streak = pool._pool_consecutive_failures
+        streak = pool._pool_consecutive_failures.get("", 0)
     assert streak >= 2, (
         f"a repair that did not happen consumed its episode anyway — the base now waits for a "
         f"whole new streak (got {streak})"
@@ -2525,7 +2525,7 @@ def test_a_failed_spawn_repair_does_not_poison_the_job_streak() -> None:
     assert pool._maybe_rebuild_base(5, reason="spawn") is False
 
     with pool._lock:
-        job_streak = pool._pool_consecutive_failures
+        job_streak = pool._pool_consecutive_failures.get("", 0)
     assert job_streak == 0, (
         f"a failed SPAWN repair left {job_streak} in the job-failure counter — one later worker "
         "fault would then trigger an unattributed job-driven rebuild"
@@ -3162,7 +3162,7 @@ def test_failures_from_a_retired_generation_do_not_condemn_the_new_base() -> Non
         "failures from a slot restored from a RETIRED generation invalidated the base that "
         "replaced it — a rebuild it did not earn"
     )
-    assert pool._pool_consecutive_failures == 0, (
+    assert pool._pool_consecutive_failures.get("", 0) == 0, (
         "the pool-wide streak judges the BASE, so evidence about a discarded artifact must not "
         "leave it elevated for the next failure from the new one"
     )
@@ -3222,13 +3222,13 @@ def test_an_unstamped_slot_still_counts_toward_a_rebuild() -> None:
     assert rt.invalidated >= 1, "an unstamped slot's failure was discarded, so nothing repairs"
 
 
-def test_a_rebuild_names_every_tier_the_episode_implicated() -> None:
-    """The rebuild CONSUMES the whole streak, so it must repair everything that fed it.
+def test_each_tier_accumulates_its_own_failure_episode() -> None:
+    """One shared episode let a healthy tier reset the evidence a poisoned one was accumulating.
 
-    A cascade gives named slots precedence over its accumulated guilty set, so passing only the
-    slot that crossed the threshold made an A,A,B,B episode repair B alone — leaving A's failing
-    base active while the pool reset the episode and started its cooldown, putting the next
-    chance to repair A a whole cooldown away.
+    With a single pool-wide counter, alternating healthy A jobs and failing B jobs kept B below
+    the threshold forever -- and since blame_tier_for_slot no longer repairs on its own, nothing
+    else would ever fix it. Episodes are per base identity now, so each tier reaches its own
+    threshold on its own failures and a sibling's successes cannot wipe them.
     """
     from blastbox.host.pool import Slot, SlotState, WarmPool
 
@@ -3246,24 +3246,20 @@ def test_a_rebuild_names_every_tier_the_episode_implicated() -> None:
             return Slot(slot_id=f"{self.name}{self.n}", control_dir="/c", input_dir="/i",
                         output_dir="/o", state=SlotState.IDLE)
 
-        def is_ready(self, slot):
-            return True
-        def is_alive(self, slot):
-            return True
-        def reap(self, slot):
-            pass
-        def recycle(self, slot):
-            pass
+        def is_ready(self, slot): return True
+        def is_alive(self, slot): return True
+        def reap(self, slot): pass
+        def recycle(self, slot): pass
         def invalidate_base(self) -> None:
             self.invalidated += 1
 
     a, b = _Tier("a"), _Tier("b")
     casc = CascadingRuntime(
         tiers=[Tier(name="a", runtime=a, capacity=2), Tier(name="b", runtime=b, capacity=2)],
-        tier_rebuild_after=99,                 # keep per-tier repair out of the picture
+        tier_rebuild_after=99,                 # keep per-tier spawn repair out of the picture
     )
     pool = WarmPool(runtime=casc, warm_size=4, concurrent_ceiling=4,
-                    snapshot_rebuild_after=4, base_rebuild_cooldown_s=0.0,
+                    snapshot_rebuild_after=2, base_rebuild_cooldown_s=0.0,
                     max_consecutive_failures=99)
     pool.tick()
     pool.tick()
@@ -3273,15 +3269,17 @@ def test_a_rebuild_names_every_tier_the_episode_implicated() -> None:
         by_tier.setdefault(casc._owner[str(sid)], []).append(slot)
     assert len(by_tier) == 2, "sanity: both tiers served slots"
 
-    # A, A, B, B -- the fourth failure crosses the threshold.
-    episode = by_tier[0][:2] + by_tier[1][:2]
-    for slot in episode:
-        pool.release(slot, dirty=True, fault="worker")
+    # A HEALTHY job on tier a, interleaved with tier b's failures. Under one shared counter the
+    # clean release wiped b's episode every time and b never reached the threshold.
+    pool.release(by_tier[1][0], dirty=True, fault="worker")
+    pool.release(by_tier[0][0], dirty=False)
+    pool.release(by_tier[1][1], dirty=True, fault="worker")
 
-    assert a.invalidated >= 1 and b.invalidated >= 1, (
-        f"the episode spanned both tiers but only some were repaired "
-        f"(a={a.invalidated}, b={b.invalidated})"
+    assert b.invalidated >= 1, (
+        "tier b's poisoned base never reached its threshold: a healthy sibling's success kept "
+        "resetting the episode b was accumulating"
     )
+    assert a.invalidated == 0, "the healthy tier was repaired for its sibling's failures"
 
 
 def test_a_resolved_episode_stops_naming_its_tiers() -> None:
@@ -4019,4 +4017,134 @@ def test_a_partially_failed_cascade_repair_names_what_it_replaced() -> None:
     assert getattr(ei.value, "repaired", None) == ["good"], (
         "the tier that WAS replaced is not named on the failure, so the pool cannot retire its "
         "slots and their next failure invalidates the replacement that just arrived"
+    )
+
+
+def test_an_undone_eviction_refunds_its_token() -> None:
+    """The demotion spends a token, then the deferred reap fails and the slot goes back to IDLE.
+
+    During a brownout every disposal runs through the same unresponsive control plane and fails,
+    so the window's whole allowance could be consumed without a single eviction — blocking the
+    replacement of a slot that IS confirmed dead for the rest of the window.
+    """
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    class _Rt:
+        def spawn(self):
+            raise RuntimeError("not used")
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s):
+            raise RuntimeError("control plane brownout: cannot dispose")
+
+    pool = WarmPool(runtime=_Rt(), warm_size=1, concurrent_ceiling=2,
+                    max_evictions_per_window=1, eviction_window_s=10_000.0)
+    slot = Slot(slot_id="s", control_dir="/c", input_dir="/i", output_dir="/o",
+                state=SlotState.DRAINING)
+    pool._slots[slot.slot_id] = slot
+
+    with pool._lock:
+        assert pool._reserve_eviction_unlocked(pool._clock()) is True   # the demotion's token
+        assert pool._reserve_eviction_unlocked(pool._clock()) is False  # budget now spent
+
+    # The disposal fails and the merely-SUSPECTED slot is returned to IDLE. This is the deferred
+    # reaper's path -- the common one during a brownout.
+    with pool._lock:
+        pool._suspected_unknown.add(slot.slot_id)
+        pool._deferred_reap.add(slot.slot_id)
+    pool._drain_deferred_reaps()
+
+    assert slot.state is SlotState.IDLE, "sanity: the escalation was undone"
+    with pool._lock:
+        assert pool._reserve_eviction_unlocked(pool._clock()) is True, (
+            "the token was not refunded, so a budget that evicted NOTHING still blocks the next "
+            "eviction for the whole window"
+        )
+
+
+def test_a_tier_local_repair_retires_its_slots() -> None:
+    """A cascade repairs a tier whose spawns keep failing behind a healthy fallback.
+
+    The pool never sees that — the fallback makes every spawn succeed — so unreported, the retired
+    artifact's slots and the replacement's slots share a generation stamp, and a late failure from
+    an old slot is charged to the new base and can invalidate it at once.
+    """
+    from blastbox.host.pool import WarmPool
+
+    class _Reporting:
+        def __init__(self) -> None:
+            self.taken = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            raise RuntimeError("not used")
+
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): pass
+
+        def take_repaired_tiers(self):
+            self.taken += 1
+            return ["fc"] if self.taken == 1 else []
+
+    rt = _Reporting()
+    pool = WarmPool(runtime=rt, warm_size=0, concurrent_ceiling=2)
+    before = pool._base_generation.get("fc", 0)
+
+    pool.tick()
+
+    assert pool._base_generation.get("fc", 0) == before + 1, (
+        "a tier repaired on the spawn path never reached the pool's ledger, so its old slots and "
+        "its replacement's slots carry the same stamp"
+    )
+    pool.tick()
+    assert pool._base_generation.get("fc", 0) == before + 1, (
+        "the report must be DRAINED -- each repair retires its slots exactly once"
+    )
+
+
+def test_a_cascade_reports_the_tiers_it_repaired_on_the_spawn_path() -> None:
+    """The other half: the CASCADE must publish it, not just the pool drain it.
+
+    This repair happens on the spawn path, which the pool never sees — a healthy fallback absorbs
+    the spawn, so the pool records only successes. Asserting the pool honours a report proves
+    nothing about whether anything ever produces one.
+    """
+    class _Tier:
+        def __init__(self, name: str, broken: bool = False) -> None:
+            self.name = name
+            self.broken = broken
+            self.invalidated = 0
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            if self.broken:
+                raise RuntimeError("snapshot restore failed")
+            self.n += 1
+            return SimpleNamespace(slot_id=f"{self.name}{self.n}")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    bad, fallback = _Tier("bad", broken=True), _Tier("ok")
+    casc = CascadingRuntime(
+        tiers=[Tier(name="bad", runtime=bad, capacity=4),
+               Tier(name="ok", runtime=fallback, capacity=4)],
+        tier_rebuild_after=2,
+    )
+    casc.spawn()          # bad fails, ok absorbs it -- the pool sees a SUCCESS
+    casc.spawn()          # ...again: bad's streak reaches 2 and it repairs itself
+    assert bad.invalidated == 1, "sanity: the tier-local repair fired"
+
+    assert casc.take_repaired_tiers() == ["bad"], (
+        "the tier repaired behind a healthy fallback was never published, so the pool cannot "
+        "retire its slots and a late failure from one is charged to the replacement"
+    )
+    assert casc.take_repaired_tiers() == [], (
+        "the report must be DRAINED -- each repair retires its slots exactly once"
     )

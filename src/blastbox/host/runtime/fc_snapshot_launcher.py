@@ -375,7 +375,14 @@ class FcSnapshotLauncher:
         # the retired-generation sweep: a retry is worthless if the condition it fixes is what
         # stops you reaching it (upstream, PR #82).
         _retry_stranded_partials(self._stranded_partials)
-        workdir = self._base_dir / "base"
+        # A BUILD-UNIQUE base workdir, never the fixed base/. Two dispatchers sharing scratch_root
+        # -- the rolling-deployment overlap this whole module is hardened for -- both booted from
+        # base/outdisk.ext4 and both RECREATED it. If B remade that path after A booted but before
+        # A copied it at checkpoint, A published its memory snapshot paired with B's different
+        # ext4 image, and restoring that generation produces exactly the metadata/checksum
+        # corruption generation stamping exists to prevent. The gVisor builder already uses a
+        # per-build bundle dir; this side did not (upstream, PR #82).
+        workdir = self._base_dir / f"base-{owner_token()}-{time.monotonic_ns():019d}"
         proc, api = self._spawn(workdir)
         # Everything after _spawn must kill the FC process on failure — the caller only
         # gets a _Handle (and its kill()) if boot_base RETURNS, so a raise here would
@@ -425,8 +432,16 @@ class FcSnapshotLauncher:
         for directory in {self._base_dir, self._mem_dir}:
             if directory is None or not directory.exists():
                 continue
-            for path in directory.glob("warm-*"):
-                token = _generation_owner(path.name)
+            # base-* too: each build now gets its OWN base workdir (so two dispatchers cannot
+            # pair one's memory snapshot with the other's ext4), which means they accumulate one
+            # per build unless the same lease-proved sweep reclaims them. Its outdisk is only a
+            # copy SOURCE until checkpoint freezes the generation's own copy, so a dead owner's
+            # base dir is as safe to remove as its warm-* files -- and as unsafe to remove while
+            # its owner lives (upstream, PR #82).
+            for path in sorted(directory.glob("warm-*")) + sorted(directory.glob("base-*")):
+                token = _generation_owner(
+                    path.name, prefix="base-" if path.name.startswith("base-") else "warm-"
+                )
                 # lease_dir: ownership must be proved by a flock on the SHARED filesystem, not by
                 # a pid. Two dispatcher containers overlapping through a rolling deployment both
                 # see themselves as pid 1, so the /proc rule declares the live one dead and this
@@ -540,6 +555,9 @@ class FcSnapshotLauncher:
         consistent; writes still land on the isolated per-slot copy (one job per slot)."""
         # Prefer THIS generation's frozen disk; fall back to the shared base only for artifacts
         # built before the disk was versioned.
+        # No fixed-path fallback. Every generation carries its OWN frozen disk (checkpoint fails
+        # the build otherwise), and borrowing whatever sits at a shared path is how a memory
+        # snapshot gets paired with another build's ext4 image (upstream, PR #82).
         base_outdisk = outdisk_src if outdisk_src is not None else self._base_dir / "base" / REL_OUTDISK
         if not base_outdisk.exists():
             # The base outdisk (the snapshot-time ext4 image) MUST survive for the life

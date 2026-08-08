@@ -113,7 +113,10 @@ def test_boot_base_uses_api_socket_and_runs_full_config(tmp_path):
     assert argv[0] == "/opt/kata/bin/firecracker"
     assert "--api-sock" in argv
     assert "--no-api" not in argv and "--config-file" not in argv
-    assert cwd == str(tmp_path / "snap" / "base")
+    # Build-UNIQUE, not the fixed base/: two dispatchers sharing scratch_root both recreated that
+    # one path, so one could publish its memory snapshot paired with the other's ext4 image.
+    assert cwd.startswith(str(tmp_path / "snap" / "base-")), cwd
+    assert cwd != str(tmp_path / "snap" / "base")
     assert [p for p, _ in handle.api.calls] == [
         "/boot-source",
         "/drives/rootfs",
@@ -123,7 +126,7 @@ def test_boot_base_uses_api_socket_and_runs_full_config(tmp_path):
         "/entropy",
         "/actions",
     ]
-    assert handle.vsock_uds == str(tmp_path / "snap" / "base" / REL_VSOCK)
+    assert handle.vsock_uds == str(Path(cwd) / REL_VSOCK)   # the build's OWN workdir
 
 
 class FakeApiPatch(FakeApi):
@@ -850,3 +853,30 @@ def test_legacy_artifacts_are_reclaimed_only_on_an_explicit_opt_in(tmp_path, mon
     assert keep.exists(), (
         "a generation-stamped file was reclaimed by the LEGACY path, which has no lease check"
     )
+
+
+def test_a_dead_dispatchers_base_workdir_is_reclaimed(tmp_path):
+    """Each build now gets its OWN base workdir, so they accumulate one per build.
+
+    The same lease-proved rule must reclaim them: its outdisk is only a copy SOURCE until
+    checkpoint freezes the generation's own copy, so a dead owner's base dir is as safe to remove
+    as its warm-* files — and as unsafe to remove while its owner lives.
+    """
+    from blastbox.host.runtime.snapshot_backend import owner_lease_path, owner_token
+
+    base = tmp_path / "snap"
+    base.mkdir()
+    dead = base / "base-999999_4242-0000000000000000001"
+    dead.mkdir()
+    (dead / "outdisk.ext4").write_bytes(b"x" * 8)
+    owner_lease_path(base, "999999_4242").write_bytes(b"")     # released: owner provably gone
+    mine = base / f"base-{owner_token()}-0000000000000000002"
+    mine.mkdir()
+
+    launcher = FcSnapshotLauncher(FakeCfg(), base, mem_dir=base)
+    launcher.sweep_orphan_generations()
+
+    assert not dead.exists(), (
+        "per-build base workdirs are never reclaimed, so they accumulate one per build forever"
+    )
+    assert mine.exists(), "this process's own base workdir must never be swept"

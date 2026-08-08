@@ -179,6 +179,9 @@ class CascadingRuntime:
         # release reaps the slot, so an episode spanning four slots has three of them already
         # unmapped when the fourth crosses the threshold (upstream, PR #82).
         self._job_guilty: set[int] = set()
+        # Tier names repaired on the SPAWN path (invisible to the pool, because a healthy fallback
+        # absorbs the spawn) and not yet reported to it, so it can retire those slots.
+        self._repaired_unreported: set[str] = set()
         self._lock = threading.Lock()
         # Consecutive spawn failures PER TIER. The pool's own streak cannot see these: a tier
         # whose base is poisoned raises here, the cascade falls through to a healthy overflow
@@ -337,6 +340,24 @@ class CascadingRuntime:
             with self._lock:
                 self._tier_failures[index] = max(self._tier_failures[index], streak)
             _log.warning("cascade: tier %r base invalidation failed: %s", tier.name, exc)
+        else:
+            # PUBLISH it. This repair happens on the SPAWN path, which the pool never sees -- a
+            # healthy fallback absorbs the spawn, so the pool records only successes. Without
+            # telling it, slots from the retired artifact and slots restored from its replacement
+            # carry the SAME generation stamp, so a late failure from an old slot is charged to
+            # the new base and can invalidate the replacement immediately (upstream, PR #82).
+            with self._lock:
+                self._repaired_unreported.add(tier.name)
+
+    def take_repaired_tiers(self) -> "list[str]":
+        """Drain the tiers repaired since the last call -- the pool advances their generations.
+
+        Drained, not read: each repair must retire its slots exactly once.
+        """
+        with self._lock:
+            out = sorted(self._repaired_unreported)
+            self._repaired_unreported.clear()
+        return out
 
     def clear_job_guilt(self) -> None:
         """Forget which tiers a job-failure EPISODE implicated, because it recovered.
