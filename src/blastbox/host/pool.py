@@ -326,6 +326,10 @@ class WarmPool:
         # slot_id -> the key its failure history is filed under. Usually the slot_id itself; a
         # runtime that REUSES a physical worker across slots reports a stable identity instead.
         self._health_key_by_slot: dict[str, str] = {}
+        # slot_id -> the value of _base_rebuilds when this slot was spawned, i.e. WHICH warm base
+        # produced it. A slot restored from generation A can still be mid-job long after A was
+        # invalidated and B built in its place.
+        self._slot_base_generation: dict[str, int] = {}
         self._warm_size = warm_size
         self._concurrent_ceiling = concurrent_ceiling
         self._poll_interval = poll_interval
@@ -722,7 +726,25 @@ class WarmPool:
                 # clean jobs behind it -- and on this workload two bad samples in a row is routine,
                 # not exceptional.
                 self._slot_failures[hkey] = self._slot_failures.get(hkey, 0) + 1
-                self._pool_consecutive_failures += 1
+                # The SLOT counter always moves -- this worker really did fail. The POOL-wide
+                # counter judges the BASE, and it is the only evidence _maybe_rebuild_base
+                # consults, so a slot restored from a generation that has since been RETIRED must
+                # not feed it. Generation A is invalidated while A-backed slots are still
+                # assigned; those jobs run for minutes, and their later failures kept accumulating
+                # here. With the cooldown elapsed (or configured to zero) and no intervening clean
+                # release from B, enough long-running A failures invalidated the freshly built B
+                # artifact -- which produced none of them -- and the tier rebuilt cold over and
+                # over. slot_ids carries cascade-TIER attribution; it says nothing about which
+                # snapshot generation restored the slot (upstream, PR #82).
+                _gen = self._slot_base_generation.get(slot.slot_id)
+                if _gen is None or _gen == self._base_rebuilds:
+                    self._pool_consecutive_failures += 1
+                else:
+                    logger.info(
+                        "pool.failure_from_retired_generation slot_id=%s spawned_generation=%d "
+                        "current_generation=%d -- not counted against the base now installed",
+                        slot.slot_id, _gen, self._base_rebuilds,
+                    )
             elif dirty:
                 # A job/unknown fault still forces a recycle (the slot may be contaminated) but must
                 # not advance it toward eviction, and must not reset its success record either.
@@ -764,6 +786,9 @@ class WarmPool:
             # this is the one place that knows the failure was worker-attributed (upstream,
             # PR #82).
             self._blame_tiers([slot.slot_id])
+            # The generation check lives on the STREAK (see the counter above), which is the
+            # single thing this call consults -- a second guard here would be unreachable, and an
+            # unreachable guard is one nobody can prove still works.
             self._maybe_rebuild_base(slot_ids=[slot.slot_id])
         if burned_out and not self._eviction_allowed():
             # (3) The heuristic wants this slot gone, but the window's budget is spent. Refuse, and
@@ -1775,6 +1800,10 @@ class WarmPool:
                 drop = self._stop_event.is_set() or len(self._slots) >= self._concurrent_ceiling
                 if not drop:
                     self._slots[slot.slot_id] = slot
+                    # STAMP the generation this slot came from, under the same lock that
+                    # publishes it, so a later failure can be told apart from one produced by
+                    # the base currently installed.
+                    self._slot_base_generation[slot.slot_id] = self._base_rebuilds
             if drop:
                 reaped = False
                 try:
@@ -1878,6 +1907,7 @@ class WarmPool:
         # physical box, which outlives every slot handed to it -- dropping its record on reap is
         # exactly how its failures could never accumulate. Bounded either way: a reused identity
         # is one entry per registered worker.
+        self._slot_base_generation.pop(slot_id, None)
         key = self._health_key_by_slot.pop(slot_id, slot_id)
         if key == slot_id:
             self._slot_failures.pop(slot_id, None)

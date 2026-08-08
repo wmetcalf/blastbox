@@ -745,3 +745,33 @@ def test_a_lease_is_pruned_once_every_generation_is_gone(tmp_path):
     launcher = FcSnapshotLauncher(FakeCfg(), base, mem_dir=mem)
     assert launcher.sweep_orphan_generations() == 2
     assert not lease.exists()
+
+
+def test_stranded_partials_are_retried_before_the_base_boots(tmp_path):
+    """The retry ran only in checkpoint(), which happens AFTER a successful boot.
+
+    boot_base() creates the outdisk in the same base_dir, so when the stranded leftovers were
+    themselves what filled the filesystem, the boot failed on ENOSPC and the cleanup that would
+    have freed the space was never reached — the tier stayed cold permanently, long after the
+    transient unlink problem cleared.
+    """
+    base = tmp_path / "snap"
+    base.mkdir()
+    leftover = base / "warm-old-000000000000000001.snapshot"
+    leftover.write_bytes(b"x" * 32)
+
+    launcher = FcSnapshotLauncher(
+        FakeCfg(), base, mem_dir=base,
+        popen=lambda argv, cwd=None: FakeProc(),
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
+        make_outdisk=_make_outdisk_file,
+    )
+    launcher._stranded_partials.append(str(leftover))
+
+    launcher.boot_base()
+
+    assert not leftover.exists(), (
+        "the leftover was still on disk after the boot -- if it is what filled the filesystem, "
+        "the boot fails before checkpoint() and the retry is unreachable forever"
+    )
+    assert launcher._stranded_partials == []

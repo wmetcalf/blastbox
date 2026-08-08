@@ -287,19 +287,9 @@ class GvisorBootHandle:
 
     def checkpoint(self, dest_dir: Path) -> object:
         # Retry anything a previous failed checkpoint could not remove; no artifact was returned
-        # for those, so nothing else can discover them.
-        if self._stranded_partials:
-            still: list[str] = []
-            for leftover in self._stranded_partials:
-                retry_errs: list[str] = []
-                shutil.rmtree(leftover, onerror=lambda fn, p, exc: retry_errs.append(str(p)))
-                if retry_errs:
-                    still.append(leftover)
-            # IN PLACE. Rebinding detaches this handle from the launcher/backend list it was
-            # given, so every later extend() lands on a private copy and the next handle -- which
-            # still holds the original -- never sees those files. That silently undid the
-            # durability fix this list exists for (PR #82).
-            self._stranded_partials[:] = still
+        # for those, so nothing else can discover them. Also attempted BEFORE the base boots (see
+        # boot_base) -- reaching only this point is too late when the leftovers filled the disk.
+        _retry_stranded_partials(self._stranded_partials)
 
         # GENERATION-STAMPED, never a fixed "checkpoint" path. restore_in() reads this directory
         # for the whole life of a `runsc restore`, so a rebuild writing the SAME path can
@@ -399,6 +389,23 @@ class GvisorRestoreHandle:
             # The sandbox may still exist. Raise so the caller's guard retains the generation pin
             # instead of reclaiming a checkpoint a live sandbox may still be restoring from.
             raise RuntimeError(f"could not confirm teardown of runsc container {self._cid}")
+
+
+def _retry_stranded_partials(stranded: "list[str]") -> None:
+    """Re-attempt removal of partial checkpoints a previous failed attempt could not delete.
+
+    MUTATED IN PLACE: rebinding would detach the caller from the backend-owned list, so later
+    appends land on a private copy the next handle never sees.
+    """
+    if not stranded:
+        return
+    still: list[str] = []
+    for leftover in stranded:
+        errs: list[str] = []
+        shutil.rmtree(leftover, onerror=lambda fn, p, exc: errs.append(str(p)))
+        if errs:
+            still.append(leftover)
+    stranded[:] = still
 
 
 class GvisorSnapshotBackend:
@@ -515,6 +522,12 @@ class GvisorSnapshotBackend:
         return self._cr_capable(self._cfg.runsc_bin)
 
     def boot_base(self) -> GvisorBootHandle:
+        # BEFORE the bundle dir is written. The retry used to run only in checkpoint(), which
+        # happens after a successful boot -- so a stranded checkpoint big enough to fill the
+        # filesystem blocked the boot that would have reached the cleanup, and the tier stayed
+        # cold permanently. Same fix as the FC launcher; a retry is worthless if the condition it
+        # fixes is what stops you reaching it (upstream, PR #82).
+        _retry_stranded_partials(self._stranded_partials)
         # Unique per build so two pool processes sharing this -root parent (e.g. a
         # restart-overlap: the old process still tearing down while the new one boots)
         # don't collide on a fixed base bundle dir / cid and stomp each other's base.

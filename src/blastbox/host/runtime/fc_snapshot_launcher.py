@@ -114,6 +114,25 @@ def api_boot_sequence(
     ]
 
 
+def _retry_stranded_partials(stranded: "list[str]") -> None:
+    """Re-attempt deletion of partial checkpoints a previous failed attempt could not remove.
+
+    MUTATED IN PLACE. Rebinding detaches the caller from the launcher/backend list it was given,
+    so every later extend() lands on a private copy and the next handle -- still holding the
+    original -- never sees those files. That silently undid the durability this list exists for
+    (PR #82).
+    """
+    if not stranded:
+        return
+    still: list[str] = []
+    for leftover in stranded:
+        try:
+            Path(leftover).unlink(missing_ok=True)
+        except OSError:
+            still.append(leftover)
+    stranded[:] = still
+
+
 class _Handle:
     def __init__(
         self, proc, api, vsock_uds: str, ready_check=None, mem_dir: Path | None = None,
@@ -159,19 +178,10 @@ class _Handle:
         # including slots that are mid-job. A fresh generation per build means a rebuild can never
         # touch a file another VM is still mapping; the old files are reclaimed when their last
         # user is reaped (upstream, PR #82).
-        # Retry anything a previous failed checkpoint could not remove.
-        if self._stranded_partials:
-            still: list[str] = []
-            for leftover in self._stranded_partials:
-                try:
-                    Path(leftover).unlink(missing_ok=True)
-                except OSError:
-                    still.append(leftover)
-            # IN PLACE. Rebinding detaches this handle from the launcher/backend list it was
-            # given, so every later extend() lands on a private copy and the next handle -- which
-            # still holds the original -- never sees those files. That silently undid the
-            # durability fix this list exists for (PR #82).
-            self._stranded_partials[:] = still
+        # Retry anything a previous failed checkpoint could not remove. Also attempted BEFORE the
+        # base boots (see boot_base) -- reaching only this point is too late when the leftovers
+        # are what filled the filesystem.
+        _retry_stranded_partials(self._stranded_partials)
 
         # Take the lease BEFORE the first generation exists, so nothing is ever on disk
         # uncovered. `dest` is the manager's base dir -- the very directory the launcher's sweep
@@ -347,6 +357,14 @@ class FcSnapshotLauncher:
 
     def boot_base(self):
         """Boot the base microVM (fresh) for snapshotting."""
+        # BEFORE _make_outdisk, which writes into this same base_dir. The retry used to live only
+        # in checkpoint(), which runs after a successful boot -- so when the stranded leftovers
+        # were themselves what filled the filesystem, boot_base failed on ENOSPC creating the
+        # outdisk and the cleanup that would have freed the space was never reached. The tier
+        # stayed cold permanently, long after the transient unlink problem cleared. Same shape as
+        # the retired-generation sweep: a retry is worthless if the condition it fixes is what
+        # stops you reaching it (upstream, PR #82).
+        _retry_stranded_partials(self._stranded_partials)
         workdir = self._base_dir / "base"
         proc, api = self._spawn(workdir)
         # Everything after _spawn must kill the FC process on failure — the caller only

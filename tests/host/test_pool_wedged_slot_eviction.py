@@ -3101,3 +3101,105 @@ def test_a_genuine_tier_failure_is_still_counted() -> None:
     )
     casc.spawn()
     assert a.invalidated == 1
+
+
+def test_failures_from_a_retired_generation_do_not_condemn_the_new_base() -> None:
+    """Generation A is invalidated while A-backed slots are still assigned.
+
+    Those jobs run for minutes and their later failures kept feeding the pool-wide streak. With
+    the cooldown elapsed (or configured to zero) and no intervening clean release from B, enough
+    long-running A failures invalidated the freshly built B artifact — which produced none of
+    them — and the tier rebuilt cold over and over. slot_ids carries cascade-TIER attribution; it
+    says nothing about which snapshot generation restored the slot.
+    """
+    from blastbox.host.pool import WarmPool
+
+    class _Rt(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.invalidated = 0
+
+        def invalidate_base(self, *, reason=None) -> None:
+            self.invalidated += 1
+
+    rt = _Rt()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=4,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0,
+                    max_consecutive_failures=99)
+    pool.tick()
+    pool.tick()                       # promote out of WARMING
+    old = pool.claim(timeout_s=0.5)
+    assert old is not None
+    spawned_gen = pool._slot_base_generation[old.slot_id]
+
+    # The base is replaced while this slot is still mid-job.
+    with pool._lock:
+        pool._base_rebuilds += 1
+    assert pool._slot_base_generation[old.slot_id] == spawned_gen
+
+    before = rt.invalidated
+    for _ in range(5):
+        pool.release(old, dirty=True, fault="worker")
+
+    assert rt.invalidated == before, (
+        "failures from a slot restored from a RETIRED generation invalidated the base that "
+        "replaced it — a rebuild it did not earn"
+    )
+    assert pool._pool_consecutive_failures == 0, (
+        "the pool-wide streak judges the BASE, so evidence about a discarded artifact must not "
+        "leave it elevated for the next failure from the new one"
+    )
+
+
+def test_a_failure_from_the_current_generation_still_rebuilds() -> None:
+    """The carve-out stays narrow: the base actually installed must still be repairable."""
+    from blastbox.host.pool import WarmPool
+
+    class _Rt(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.invalidated = 0
+
+        def invalidate_base(self, *, reason=None) -> None:
+            self.invalidated += 1
+
+    rt = _Rt()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=4,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0,
+                    max_consecutive_failures=99)
+    pool.tick()
+    pool.tick()                       # promote out of WARMING
+    slot = pool.claim(timeout_s=0.5)
+    assert slot is not None
+    pool.release(slot, dirty=True, fault="worker")
+    assert rt.invalidated >= 1
+
+
+def test_an_unstamped_slot_still_counts_toward_a_rebuild() -> None:
+    """Unknown generation must fail OPEN, toward repairability.
+
+    A slot the pool did not publish itself carries no stamp. Reading that as "retired" would make
+    the base unrepairable through any path that hands the pool a slot directly — the failure mode
+    is silent, because nothing ever rebuilds and the tier just stays broken.
+    """
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    class _Rt(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.invalidated = 0
+
+        def invalidate_base(self, *, reason=None) -> None:
+            self.invalidated += 1
+
+    rt = _Rt()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=4,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0,
+                    max_consecutive_failures=99)
+    slot = Slot(slot_id="unstamped", control_dir="/c", input_dir="/i", output_dir="/o",
+                state=SlotState.IDLE)
+    pool._slots[slot.slot_id] = slot            # published directly: no generation recorded
+    assert slot.slot_id not in pool._slot_base_generation
+
+    pool.release(slot, dirty=True, fault="worker")
+    assert rt.invalidated >= 1, "an unstamped slot's failure was discarded, so nothing repairs"

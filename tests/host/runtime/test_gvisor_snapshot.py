@@ -641,3 +641,23 @@ def test_a_checkpoint_it_could_not_remove_is_reported(tmp_path, monkeypatch):
     with pytest.raises(OSError) as ei:
         backend.sweep_orphan_generations(tmp_path)
     assert "checkpoint-999999_4242" in str(ei.value)
+
+
+def test_stranded_checkpoints_are_retried_before_the_base_boots(tmp_path):
+    """The FC sibling's fix, in its twin: a stranded checkpoint big enough to fill the filesystem
+    blocked the boot that would have reached the cleanup."""
+    leftover = tmp_path / "checkpoint-old-000000000000000001"
+    leftover.mkdir(parents=True)
+    (leftover / "pages.img").write_bytes(b"x" * 32)
+
+    backend = GvisorSnapshotBackend(_cfg(tmp_path), run=lambda *a, **k: 0,
+                                    ready_wait=lambda d, t: None)
+    backend._stranded_partials.append(str(leftover))
+
+    backend.boot_base()
+
+    assert not leftover.exists(), (
+        "the stranded checkpoint survived the boot -- if it is what filled the disk, the boot "
+        "fails before checkpoint() and the retry is unreachable forever"
+    )
+    assert backend._stranded_partials == []
