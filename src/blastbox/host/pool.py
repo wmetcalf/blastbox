@@ -288,7 +288,11 @@ class WarmPool:
             max(2, int(warm_size)) if max_evictions_per_window is None
             else max(0, int(max_evictions_per_window)))
         self._eviction_window_s = max(0.0, eviction_window_s)
-        self._evictions: list[float] = []
+        # (timestamp, owner) -- the owner is the slot the token was reserved FOR. Refunding by
+        # popping the newest entry gave back whichever thread reserved LAST, so a concurrent
+        # reservation was cancelled while the failed attempt stayed charged: the cap could then be
+        # exceeded (upstream, PR #82).
+        self._evictions: list[tuple[float, str]] = []
         # Reaping cannot help when the persisted warm BASE is what is poisoned -- every replacement
         # restores the same bad state. After this many dirty releases pool-wide with no intervening
         # success, ask the runtime to discard its base so the next spawn rebuilds it.
@@ -349,6 +353,13 @@ class WarmPool:
         # not a cascade). Advanced only when an invalidation actually succeeded, and only for the
         # bases it actually repaired.
         self._base_generation: dict[str, int] = {}
+        # ONE invalidation at a time, whatever base triggered it. Two identities reaching the
+        # threshold concurrently -- worker failures from two cascade tiers -- each consumed their
+        # own episode, saw the same pre-cooldown state and both called invalidate_base(). Both
+        # calls can target the same guilty tiers, so the second discards the first's replacement
+        # or bumps its build epoch and the replacement build is REJECTED, while the pool advances
+        # that generation twice. Not _lock: drop() is slow and must never run under it (PR #82).
+        self._invalidation_lock = threading.Lock()
         self._warm_size = warm_size
         self._concurrent_ceiling = concurrent_ceiling
         self._poll_interval = poll_interval
@@ -629,16 +640,21 @@ class WarmPool:
             if self._clock() >= deadline:
                 return None
 
-    def _refund_eviction_unlocked(self) -> None:
-        """Give back one eviction token. CALLER MUST HOLD ``self._lock``.
+    def _refund_eviction_unlocked(self, owner: str) -> None:
+        """Give back the token reserved FOR ``owner``. CALLER MUST HOLD ``self._lock``.
 
-        Reservations are taken at the DECISION and the eviction can still be undone afterwards;
-        a token that bought nothing must not count against the window.
+        Reservations are taken at the DECISION and the eviction can still be undone afterwards; a
+        token that bought nothing must not count against the window. It must be the RIGHT token:
+        popping the newest entry refunded whichever thread reserved last, leaving the failed
+        attempt charged and a real eviction uncounted, so later releases could exceed the cap
+        (upstream, PR #82).
         """
-        if self._evictions:
-            self._evictions.pop()
+        for i in range(len(self._evictions) - 1, -1, -1):
+            if self._evictions[i][1] == owner:
+                del self._evictions[i]
+                return
 
-    def _reserve_eviction_unlocked(self, now: float) -> bool:
+    def _reserve_eviction_unlocked(self, now: float, owner: str = "") -> bool:
         """Check-and-reserve one eviction token. CALLER MUST HOLD ``self._lock``.
 
         Split out because the demotion step -- the only place that truly evicts -- already holds
@@ -648,14 +664,14 @@ class WarmPool:
             return False        # 0 = evict NOTHING; see _eviction_allowed
         if self._eviction_window_s <= 0:
             return True         # no window to rate-limit over
-        self._evictions = [ts for ts in self._evictions
-                           if now - ts < self._eviction_window_s]
+        self._evictions = [e for e in self._evictions
+                           if now - e[0] < self._eviction_window_s]
         if len(self._evictions) >= self._max_evictions_per_window:
             return False
-        self._evictions.append(now)
+        self._evictions.append((now, owner))
         return True
 
-    def _eviction_allowed(self) -> bool:
+    def _eviction_allowed(self, owner: str = "") -> bool:
         """True if the wedge heuristic may still evict a slot inside the current window.
 
         Wedge detection is a heuristic over a signal the pool cannot verify. This module's history
@@ -676,15 +692,15 @@ class WarmPool:
             return True
         now = self._clock()
         with self._lock:
-            self._evictions = [ts for ts in self._evictions
-                               if now - ts < self._eviction_window_s]
+            self._evictions = [e for e in self._evictions
+                               if now - e[0] < self._eviction_window_s]
             if len(self._evictions) >= self._max_evictions_per_window:
                 return False
             # RESERVE inside the same critical section. Checking here and appending in a separate
             # _record_eviction() let two threads both observe "under the cap" before either wrote,
             # so with max_evictions_per_window=1 a concurrent burnout could reap two slots -- a cap
             # that is not a cap is worse than none, because it is trusted (upstream, PR #82).
-            self._evictions.append(now)
+            self._evictions.append((now, owner))
             return True
 
     def release(self, slot: Slot, *, dirty: bool = False,
@@ -840,7 +856,7 @@ class WarmPool:
             # single thing this call consults -- a second guard here would be unreachable, and an
             # unreachable guard is one nobody can prove still works.
             self._maybe_rebuild_base()
-        if burned_out and not self._eviction_allowed():
+        if burned_out and not self._eviction_allowed(slot.slot_id):
             # (3) The heuristic wants this slot gone, but the window's budget is spent. Refuse, and
             # say so loudly: if the wedge is real the slot keeps failing and the next window takes
             # it, while a WRONG signal costs some churn instead of the warm tier. No predicate over
@@ -1168,7 +1184,7 @@ class WarmPool:
                             # every disposal goes through the same unresponsive control plane, so
                             # the window's whole allowance can be consumed without evicting
                             # anything (upstream, PR #82).
-                            self._refund_eviction_unlocked()
+                            self._refund_eviction_unlocked(slot.slot_id)
                             logger.warning("pool.deferred_escalation_undone slot_id=%s — could not "
                                            "dispose a suspected slot; returning it to IDLE",
                                            slot.slot_id)
@@ -2086,6 +2102,9 @@ class WarmPool:
         if self._snapshot_rebuild_after <= 0:
             return False
         success_token: int | None = None
+        # "" is the whole-runtime base: the SPAWN path passes its own counter and does not consume
+        # a per-identity episode, so it has no identity of its own to restore on failure.
+        episode_ident = ""
         if streak is None:
             # CHECK-AND-CONSUME in one locked step. Reading the streak under the lock and then
             # deciding outside it still leaves a window: a clean release from another dispatch
@@ -2190,6 +2209,25 @@ class WarmPool:
         with self._lock:
             self._base_rebuilds += 1
             self._rebuilt_this_tick = True
+        # SERIALISE. Held across the whole drop() so a second repair cannot land mid-rebuild; the
+        # cooldown check above is re-read inside so the loser of the race sees the winner's result
+        # instead of repeating it.
+        with self._invalidation_lock:
+            with self._lock:
+                _last = self._last_base_rebuild_at
+            if (self._base_rebuild_cooldown_s > 0 and _last
+                    and (now - float(_last)) < self._base_rebuild_cooldown_s):
+                logger.info(
+                    "pool.base_rebuild_skipped reason=another_repair_just_completed "
+                    "reason_kind=%s", reason,
+                )
+                return False
+            return self._invalidate_now(drop, reason, pool_failures, success_token, now,
+                                        episode_ident)
+
+    def _invalidate_now(self, drop, reason, pool_failures, success_token, now,
+                        episode_ident):  # noqa: ANN001, ANN201
+        """Perform the invalidation. CALLER MUST HOLD ``self._invalidation_lock``."""
         try:
             # Pass the trigger through when the runtime accepts it: a cascade can only attribute a
             # SPAWN-driven repair to a tier. Introspection, not except-TypeError -- a TypeError
@@ -2348,7 +2386,7 @@ class WarmPool:
             # loop does not charge these slots a second time.
             with self._lock:
                 for s in stuck_warming:
-                    if self._reserve_eviction_unlocked(self._clock()):
+                    if self._reserve_eviction_unlocked(self._clock(), s.slot_id):
                         budgeted.add(s.slot_id)
             capped = [s for s in stuck_warming if s.slot_id not in budgeted]
             if capped:
@@ -2488,7 +2526,7 @@ class WarmPool:
                     heuristic = (slot.slot_id in suspected
                                  or cur.state == SlotState.WARMING)
                     if (heuristic and slot.slot_id not in budgeted
-                            and not self._reserve_eviction_unlocked(self._clock())):
+                            and not self._reserve_eviction_unlocked(self._clock(), slot.slot_id)):
                         logger.warning(
                             "pool.health_unknown_escalation_capped slot_id=%s — budget exhausted "
                             "at demotion; leaving the slot in place", slot.slot_id,
@@ -2559,7 +2597,7 @@ class WarmPool:
                             # plane and fails, so the window's whole allowance could be consumed
                             # without a single eviction, blocking the replacement of a slot that
                             # IS confirmed dead for the rest of the window (upstream, PR #82).
-                            self._refund_eviction_unlocked()
+                            self._refund_eviction_unlocked(slot.slot_id)
                     logger.warning("pool.health_escalation_undone slot_id=%s — could not dispose a "
                                    "merely-suspected slot; returning it to IDLE", slot.slot_id)
             finally:

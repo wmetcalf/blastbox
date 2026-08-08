@@ -2615,7 +2615,7 @@ def test_the_eviction_token_is_timestamped_when_it_is_reserved() -> None:
     pool._health_check()            # escalates; probes advance the clock as they go
 
     with pool._lock:
-        stamps = list(pool._evictions)
+        stamps = [e[0] for e in pool._evictions]
     assert stamps, "sanity: some tokens were reserved"
     # Compare against THIS pass's start, not an absolute number: the clock has already advanced a
     # long way from the earlier passes, so any fixed threshold passes trivially.
@@ -4044,8 +4044,10 @@ def test_an_undone_eviction_refunds_its_token() -> None:
     pool._slots[slot.slot_id] = slot
 
     with pool._lock:
-        assert pool._reserve_eviction_unlocked(pool._clock()) is True   # the demotion's token
-        assert pool._reserve_eviction_unlocked(pool._clock()) is False  # budget now spent
+        # Reserved FOR this slot, exactly as the demotion does -- a refund has to give back its
+        # own token, not whichever one happens to be newest.
+        assert pool._reserve_eviction_unlocked(pool._clock(), slot.slot_id) is True
+        assert pool._reserve_eviction_unlocked(pool._clock(), "other") is False
 
     # The disposal fails and the merely-SUSPECTED slot is returned to IDLE. This is the deferred
     # reaper's path -- the common one during a brownout.
@@ -4056,7 +4058,7 @@ def test_an_undone_eviction_refunds_its_token() -> None:
 
     assert slot.state is SlotState.IDLE, "sanity: the escalation was undone"
     with pool._lock:
-        assert pool._reserve_eviction_unlocked(pool._clock()) is True, (
+        assert pool._reserve_eviction_unlocked(pool._clock(), "next") is True, (
             "the token was not refunded, so a budget that evicted NOTHING still blocks the next "
             "eviction for the whole window"
         )
@@ -4147,4 +4149,76 @@ def test_a_cascade_reports_the_tiers_it_repaired_on_the_spawn_path() -> None:
     )
     assert casc.take_repaired_tiers() == [], (
         "the report must be DRAINED -- each repair retires its slots exactly once"
+    )
+
+
+def test_a_refund_returns_the_failed_slots_own_token() -> None:
+    """Popping the newest reservation refunded whichever thread reserved LAST.
+
+    So a concurrent reservation was cancelled while the failed attempt stayed charged, and later
+    releases could exceed max_evictions_per_window — the cap silently stopped being a cap.
+    """
+    from blastbox.host.pool import WarmPool
+
+    class _Rt:
+        def spawn(self):
+            raise RuntimeError("not used")
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=1, concurrent_ceiling=4,
+                    max_evictions_per_window=2, eviction_window_s=10_000.0)
+    with pool._lock:
+        assert pool._reserve_eviction_unlocked(pool._clock(), "failing") is True
+        assert pool._reserve_eviction_unlocked(pool._clock(), "other") is True
+        assert pool._reserve_eviction_unlocked(pool._clock(), "third") is False   # cap reached
+
+        # "failing" is undone: only ITS token comes back.
+        pool._refund_eviction_unlocked("failing")
+        owners = [o for _, o in pool._evictions]
+
+    assert owners == ["other"], (
+        f"the wrong reservation was refunded (left {owners}) -- the concurrent eviction is now "
+        f"uncounted and the cap can be exceeded"
+    )
+
+
+def test_only_one_base_invalidation_runs_at_a_time() -> None:
+    """Two identities reaching the threshold concurrently both called invalidate_base().
+
+    Both calls can target the same guilty tiers, so the second discards the first's replacement --
+    or bumps its build epoch so the replacement build is REJECTED -- while the pool advances that
+    generation twice.
+    """
+    import threading
+
+    from blastbox.host.pool import WarmPool
+
+    overlap: list[int] = []
+    inside = [0]
+
+    class _Rt(_WedgeableRuntime):
+        def invalidate_base(self, *, reason=None) -> None:
+            inside[0] += 1
+            overlap.append(inside[0])
+            time.sleep(0.05)
+            inside[0] -= 1
+
+    pool = WarmPool(runtime=_Rt(), warm_size=1, concurrent_ceiling=4,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0)
+    with pool._lock:
+        pool._pool_consecutive_failures["a"] = 5
+        pool._pool_consecutive_failures["b"] = 5
+
+    threads = [threading.Thread(target=lambda: pool._maybe_rebuild_base()) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert overlap, "sanity: at least one invalidation ran"
+    assert max(overlap) == 1, (
+        f"two invalidations overlapped ({overlap}) -- the second can discard the first's "
+        f"replacement, or bump its build epoch so the replacement build is rejected"
     )

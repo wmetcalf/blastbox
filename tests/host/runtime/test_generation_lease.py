@@ -119,3 +119,34 @@ def test_a_lease_that_could_not_be_locked_leaves_nothing_behind(tmp_path, monkey
     )
     # ...and with no lease on disk, ownership is UNPROVABLE, so nothing may be swept.
     assert owner_alive(owner_token(), lease_dir=tmp_path) is True
+
+
+def test_two_builders_racing_for_one_lease_do_not_unlink_it(tmp_path):
+    """Two snapshot tiers can share a checkpoint root and call this concurrently.
+
+    One file description wins the flock; the LOSER used to unlink the shared pathname on its way
+    out, leaving the winner holding a lock on an unlinked inode — so every generation it wrote had
+    no lease anyone could find, and after the process exited nothing could prove those files
+    reclaimable.
+    """
+    import threading
+
+    results: list[bool] = []
+    barrier = threading.Barrier(8)
+
+    def _race():
+        barrier.wait()
+        results.append(hold_owner_lease(tmp_path))
+
+    threads = [threading.Thread(target=_race) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(results), f"a concurrent caller failed to take the process lease: {results}"
+    assert owner_lease_path(tmp_path, owner_token()).exists(), (
+        "the lease file was unlinked by a loser of the race, so the winner holds a lock on an "
+        "unlinked inode and its generations are unprovable"
+    )
+    assert owner_alive(owner_token(), lease_dir=tmp_path) is True

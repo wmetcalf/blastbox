@@ -148,6 +148,8 @@ class _Handle:
         self._mem_dir = mem_dir
         # The snapshot-time ext4 image this base booted with; frozen per generation at checkpoint.
         self._base_outdisk = Path(base_outdisk) if base_outdisk is not None else None
+        # This build's OWN base workdir (base handles only); removed once its VM is provably gone.
+        self._base_workdir = Path(base_outdisk).parent if base_outdisk is not None else None
         # Partial-checkpoint files whose cleanup failed. This list is OWNED BY THE LAUNCHER and
         # shared in, because SnapshotManager kills and abandons this handle after a failed
         # checkpoint -- anything recorded here alone would be discarded with it (PR #82).
@@ -248,14 +250,46 @@ class _Handle:
         return FcSnapshotArtifact(snap, mem, outdisk)
 
     def kill(self) -> None:
-        if self.proc is None or self.proc.poll() is not None:
+        gone = True
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                try:
+                    self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    gone = False
+        self._remove_base_workdir(confirmed=gone)
+
+    def _remove_base_workdir(self, *, confirmed: bool) -> None:
+        """Drop this build's own base workdir once its VM is provably gone.
+
+        Every rebuild now gets a UNIQUE base-<owner>-<ns> dir (so two dispatchers cannot pair one's
+        memory snapshot with the other's ext4), and each holds a default 600 MiB outdisk. The
+        orphan sweep deliberately skips paths owned by THIS process, so repeated in-process
+        invalidations accumulated one of those per rebuild until the snapshot filesystem filled.
+        Its outdisk is only a copy SOURCE -- checkpoint has already frozen the generation's own
+        copy by the time the manager kills the base -- so once the VM is gone the directory is
+        dead weight.
+
+        RETAINED when teardown is unconfirmed: a firecracker we could not reap may still be
+        writing to it, and the next sweep reclaims it once this process is gone (upstream, PR #82).
+        """
+        if self._base_workdir is None:
             return
-        self.proc.terminate()
-        try:
-            self.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait()
+        if not confirmed:
+            _log.warning(
+                "fc_snapshot: base workdir %s retained -- its microVM could not be confirmed "
+                "gone", self._base_workdir,
+            )
+            return
+        errs: list[str] = []
+        shutil.rmtree(self._base_workdir, onerror=lambda fn, p, exc: errs.append(str(p)))
+        if errs:
+            _log.warning("fc_snapshot: could not remove base workdir %s", self._base_workdir)
+        self._base_workdir = None
 
 
 def _terminate_proc(proc: "subprocess.Popen | None") -> None:

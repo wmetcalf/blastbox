@@ -1,5 +1,6 @@
 """Unit tests for the FC snapshot launcher (Phase 2 orchestration)."""
 from __future__ import annotations
+import subprocess
 
 from pathlib import Path
 
@@ -880,3 +881,62 @@ def test_a_dead_dispatchers_base_workdir_is_reclaimed(tmp_path):
         "per-build base workdirs are never reclaimed, so they accumulate one per build forever"
     )
     assert mine.exists(), "this process's own base workdir must never be swept"
+
+
+def test_a_completed_base_workdir_is_removed(tmp_path):
+    """Each rebuild gets its OWN base dir, holding a 600 MiB outdisk.
+
+    The orphan sweep deliberately skips paths owned by THIS process, so repeated in-process
+    invalidations accumulated one per rebuild until the snapshot filesystem filled. Its outdisk is
+    only a copy SOURCE — checkpoint has frozen the generation's own copy by the time the manager
+    kills the base.
+    """
+    base = tmp_path / "snap"
+    base.mkdir()
+    launcher = FcSnapshotLauncher(
+        FakeCfg(), base, mem_dir=base,
+        popen=lambda argv, cwd=None: FakeProc(),
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
+        make_outdisk=_make_outdisk_file,
+    )
+    handle = launcher.boot_base()
+    workdir = Path(handle.vsock_uds).parent
+    assert workdir.exists() and workdir.name.startswith("base-")
+
+    handle.kill()
+
+    assert not workdir.exists(), (
+        "the finished base workdir was kept, so every in-process rebuild leaves another 600 MiB "
+        "behind and the sweep will not touch it (it belongs to a LIVE owner)"
+    )
+
+
+def test_a_base_workdir_is_retained_when_its_vm_will_not_die(tmp_path):
+    """The carve-out: a firecracker we could not reap may still be writing to it."""
+    base = tmp_path / "snap"
+    base.mkdir()
+
+    class _Undead(FakeProc):
+        def poll(self):
+            return None                      # never exits
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("fc", timeout or 5)
+
+        def kill(self):
+            pass                             # SIGKILL lands, but the process still will not reap
+
+    launcher = FcSnapshotLauncher(
+        FakeCfg(), base, mem_dir=base,
+        popen=lambda argv, cwd=None: _Undead(),
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
+        make_outdisk=_make_outdisk_file,
+    )
+    handle = launcher.boot_base()
+    workdir = Path(handle.vsock_uds).parent
+
+    handle.kill()
+
+    assert workdir.exists(), (
+        "the workdir was removed under a microVM that could not be confirmed gone"
+    )

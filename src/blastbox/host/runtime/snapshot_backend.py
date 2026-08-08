@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import threading
 import logging
 import os
 from pathlib import Path
@@ -75,6 +76,12 @@ def owner_lease_path(lease_dir: "Path | str", token: str) -> Path:
 # the open file description is closed, so letting this be garbage-collected would silently drop
 # the lease and invite exactly the sweep this exists to prevent.
 _held_leases: dict[str, object] = {}
+# Serialises acquisition. Two snapshot tiers sharing one checkpoint root can call this
+# concurrently for the same directory before _held_leases is populated: one file description wins
+# the flock, the LOSER then unlinks the shared pathname on its way out, and the winner is left
+# holding a lock on an unlinked inode -- so every generation it writes has no lease anyone can
+# find, and after the process exits nothing can ever prove those files reclaimable (PR #82).
+_lease_lock = threading.Lock()
 
 
 def hold_owner_lease(lease_dir: "Path | str") -> bool:
@@ -86,8 +93,14 @@ def hold_owner_lease(lease_dir: "Path | str") -> bool:
     the build over.
     """
     key = str(Path(lease_dir))
-    if key in _held_leases:
-        return True
+    with _lease_lock:
+        if key in _held_leases:
+            return True
+        return _take_lease_locked(key, lease_dir)
+
+
+def _take_lease_locked(key: str, lease_dir: "Path | str") -> bool:
+    """Acquire and record the lease. CALLER MUST HOLD ``_lease_lock``."""
     path = owner_lease_path(lease_dir, owner_token())
     fh = None
     try:
