@@ -435,11 +435,16 @@ def test_a_transport_failure_convicts_the_worker():
 
 
 def test_an_engine_verdict_on_the_sample_is_not_a_worker_fault():
-    """ok=False means the engine RAN and judged the input. Convicting the worker there would
-    burn out healthy slots on a run of malformed samples."""
+    """ok=False means the engine RAN and judged the input.
+
+    Convicting the worker there would burn out healthy slots on a run of malformed samples -- and
+    leaving it UNATTRIBUTED is not enough either: unknown preserves both streaks, so a transport
+    failure on either side of a successful run counted as consecutive. A completed run is
+    positive proof the VM is responsive, so it must RESET them.
+    """
     pool = _FaultPool()
     assert slot_bound_validate(pool, lambda slot, p: ({}, False))("/in") == ({}, False)
-    assert pool.released == [True] and pool.faults == [None]
+    assert pool.released == [True] and pool.faults == ["job"]
 
 
 def test_an_ambiguous_exception_stays_unattributed():

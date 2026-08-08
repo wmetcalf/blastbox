@@ -1626,6 +1626,14 @@ class WarmPool:
                     self._deferred_reap.add(candidate.slot_id)
 
             if claim_unproven_death:
+                # ATTRIBUTE FIRST, while the cascade still owns this slot's mapping -- the reap is
+                # deferred, so the ownership is still there right now. spawn() returned and the
+                # slot even reached IDLE, so the cascade's per-tier streak is empty, and a repair
+                # with no guilty tier falls back to invalidating EVERY snapshot-capable tier:
+                # healthy sibling bases discarded for deaths confined to one. The warming-timeout
+                # and background-health paths already blame here; this third one, the claim-time
+                # probe, did not (upstream, PR #82).
+                self._blame_tiers([candidate.slot_id])
                 # Outside the lock: _maybe_rebuild_base takes it itself.
                 self._maybe_rebuild_base(warm_failures, reason="spawn")
 

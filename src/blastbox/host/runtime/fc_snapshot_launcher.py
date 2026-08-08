@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import shutil
 import logging
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -466,9 +467,64 @@ class FcSnapshotLauncher:
             _prune_owner_lease(self._base_dir, token)
         if removed:
             _log.info("fc_snapshot.swept_orphan_generations count=%d", removed)
+        self._report_legacy_artifacts()
         if failed:
             raise OSError("could not sweep orphan generations: " + "; ".join(failed))
         return removed
+
+    # Pre-generation names from the parent implementation. A build BEFORE generation stamping
+    # wrote these fixed paths; every build since writes warm-<gen>.* and nothing overwrites or
+    # retires them.
+    _LEGACY_NAMES = ("warm.snapshot", "warm.mem")
+
+    def _report_legacy_artifacts(self) -> None:
+        """Surface -- and, only on an explicit opt-in, reclaim -- pre-generation artifacts.
+
+        On an upgrade the old warm.mem is guest-RAM-sized and typically sits on the very tmpfs the
+        replacement generation needs, so the upgraded tier can fail EVERY build with ENOSPC while
+        the new per-build sweep skips those files entirely (they carry no generation, so they have
+        no owner to prove dead).
+
+        Deleting them on a guess is the one thing this module refuses to do: their owner predates
+        leases, so there is no way to prove an overlapping old dispatcher is not still mapping
+        them -- and unlinking a live one corrupts its microVMs, which is exactly the hazard the
+        lease mechanism exists to remove. So: say plainly what is there, how much space it holds
+        and how to reclaim it, and act only when an operator says to
+        (BLASTBOX_SNAPSHOT_RECLAIM_LEGACY=1) (upstream, PR #82).
+        """
+        found: list[tuple[Path, int]] = []
+        for directory in {self._base_dir, self._mem_dir}:
+            if directory is None:
+                continue
+            for name in self._LEGACY_NAMES:
+                path = directory / name
+                try:
+                    if path.is_file():
+                        found.append((path, path.stat().st_size))
+                except OSError:
+                    continue
+        if not found:
+            return
+        total = sum(size for _, size in found)
+        names = ", ".join(f"{p} ({size / (1 << 20):.0f} MiB)" for p, size in found)
+        if os.environ.get("BLASTBOX_SNAPSHOT_RECLAIM_LEGACY", "").strip().lower() not in {
+            "1", "true", "yes", "on",
+        }:
+            _log.warning(
+                "fc_snapshot.legacy_artifacts_present total=%.0fMiB [%s] -- written by a build "
+                "that predates generation stamping. Nothing reclaims them automatically: their "
+                "owner predates leases, so an overlapping old dispatcher may still be mapping "
+                "them and unlinking one corrupts its microVMs. If no pre-upgrade dispatcher is "
+                "running, remove them or set BLASTBOX_SNAPSHOT_RECLAIM_LEGACY=1.",
+                total / (1 << 20), names,
+            )
+            return
+        for path, _size in found:
+            try:
+                path.unlink(missing_ok=True)
+                _log.info("fc_snapshot.legacy_artifact_reclaimed path=%s", path)
+            except OSError as exc:
+                _log.warning("fc_snapshot: could not reclaim legacy artifact %s: %s", path, exc)
 
     def restore_in(self, slot_workdir: Path, *, outdisk_src: Path | None = None):
         """Spawn a fresh firecracker in ``slot_workdir`` for a snapshot restore. The

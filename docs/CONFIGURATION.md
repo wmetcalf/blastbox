@@ -205,6 +205,7 @@ counts cheap.
 | `BLASTBOX_FC_MEM_MIB` | `512` | Guest RAM (compose sets 2048 for LibreOffice). |
 | `BLASTBOX_FC_OUTDISK_MIB` | — | Size of the per-slot ext4 output disk the host reads via `debugfs`. |
 | `BLASTBOX_SNAPSHOT_MEM_DIR` / `BLASTBOX_SNAPSHOT_MEM_TMPFS` | — | Where the warm memory-snapshot base lives; `_TMPFS` pins the CoW base in RAM (per-host toggle). |
+| `BLASTBOX_SNAPSHOT_RECLAIM_LEGACY` | unset (off) | Delete pre-generation snapshot artifacts (`warm.snapshot` / `warm.mem`) left by a build older than generation stamping. **Set this only once no pre-upgrade dispatcher is still running**: those files carry no owner lease, so nothing can prove an overlapping old process is not still mapping them, and unlinking a live one corrupts its microVMs. Left off, the tier logs `fc_snapshot.legacy_artifacts_present` with the paths and size — the RAM-sized `warm.mem` often occupies the very tmpfs the replacement generation needs, so it is a common cause of an upgraded tier failing every build with ENOSPC. |
 | `BLASTBOX_SNAPSHOT_SETTLE_S` | `""` | Settle delay before snapshotting a freshly-warmed guest. |
 
 ## Runtime: gVisor C/R (runsc checkpoint/restore)

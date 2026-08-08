@@ -799,3 +799,54 @@ def test_no_generation_is_written_without_a_lease(tmp_path, monkeypatch):
     with pytest.raises(SnapshotBuildError):
         handle.checkpoint(base)
     assert not list(base.glob("warm-*")), "a generation was written with no lease covering it"
+
+
+def test_legacy_pre_generation_artifacts_are_surfaced(tmp_path, monkeypatch, caplog):
+    """The sweep only visits warm-*, so pre-generation names are invisible to it.
+
+    On an upgrade the old warm.mem is guest-RAM-sized and typically sits on the very tmpfs the
+    replacement generation needs, so the tier can fail EVERY build with ENOSPC while the new
+    per-build sweep skips those files entirely.
+    """
+    import logging as _logging
+
+    monkeypatch.delenv("BLASTBOX_SNAPSHOT_RECLAIM_LEGACY", raising=False)
+    base = tmp_path / "snap"
+    base.mkdir()
+    mem = tmp_path / "ram"
+    mem.mkdir()
+    legacy_snap = base / "warm.snapshot"
+    legacy_mem = mem / "warm.mem"
+    legacy_snap.write_bytes(b"x" * 16)
+    legacy_mem.write_bytes(b"y" * 32)
+
+    launcher = FcSnapshotLauncher(FakeCfg(), base, mem_dir=mem)
+    with caplog.at_level(_logging.WARNING, logger="blastbox.host.runtime.fc_snapshot_launcher"):
+        launcher.sweep_orphan_generations()
+
+    assert "legacy_artifacts_present" in caplog.text, (
+        "an upgraded tier failing every build with ENOSPC had nothing pointing at the cause"
+    )
+    assert legacy_snap.exists() and legacy_mem.exists(), (
+        "they were deleted on a guess -- their owner predates leases, so an overlapping old "
+        "dispatcher may still be mapping them"
+    )
+
+
+def test_legacy_artifacts_are_reclaimed_only_on_an_explicit_opt_in(tmp_path, monkeypatch):
+    """...and the operator, who alone knows the old dispatcher is gone, can say so."""
+    monkeypatch.setenv("BLASTBOX_SNAPSHOT_RECLAIM_LEGACY", "1")
+    base = tmp_path / "snap"
+    base.mkdir()
+    legacy = base / "warm.mem"
+    legacy.write_bytes(b"y" * 32)
+    keep = base / "warm-999999_1-000000000000000001.mem"   # a real generation, not legacy
+    keep.write_bytes(b"z")
+
+    launcher = FcSnapshotLauncher(FakeCfg(), base, mem_dir=base)
+    launcher.sweep_orphan_generations()
+
+    assert not legacy.exists()
+    assert keep.exists(), (
+        "a generation-stamped file was reclaimed by the LEGACY path, which has no lease check"
+    )

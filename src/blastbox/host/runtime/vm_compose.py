@@ -394,16 +394,23 @@ def slot_bound_validate(
                     # judged the INPUT, and any other exception is ambiguous at this seam --
                     # both stay unattributed (upstream, PR #82).
                     exc = result.get("e")
-                    fault = (
-                        "worker"
-                        if isinstance(exc, BaseException)
-                        and is_transport_error(exc)
-                        # ...but NOT a 4xx. HTTPError is a URLError, so an agent that ANSWERED
-                        # and rejected the request looked identical to an unreachable box here.
-                        # The HTTP transport learned this; its sibling did not (PR #82).
-                        and not is_answered_http_rejection(exc)
-                        else None
-                    )
+                    if isinstance(exc, BaseException):
+                        # A transport failure is evidence about this worker...
+                        fault = (
+                            "worker"
+                            # ...but NOT a 4xx. HTTPError is a URLError, so an agent that ANSWERED
+                            # and rejected the request looked identical to an unreachable box
+                            # here. The HTTP transport learned this; its sibling did not (PR #82).
+                            if is_transport_error(exc) and not is_answered_http_rejection(exc)
+                            else None          # ambiguous: never convict on a failure we can't
+                        )                      # attribute
+                    else:
+                        # NO exception: the run COMPLETED and the engine returned ok=False -- a
+                        # verdict on the INPUT, and positive proof this VM is responsive. Leaving
+                        # it unattributed made release() preserve both streaks, so a transport
+                        # failure on either side of a successful run counted as consecutive and
+                        # could evict the VM or rebuild its base (upstream, PR #82).
+                        fault = "job"
                     pool.release(slot, **release_kwargs(
                         pool.release, dirty=not clean, fault=fault))
             except Exception:  # noqa: BLE001 — slot return must never mask the validate result/error

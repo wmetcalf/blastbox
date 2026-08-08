@@ -3887,3 +3887,45 @@ def test_a_capped_warming_timeout_is_not_counted_as_a_restore_failure() -> None:
     assert rt.invalidated == 0, (
         "a healthy snapshot was invalidated because one slow slot was re-counted every poll"
     )
+
+
+def test_a_claim_time_death_is_attributed_to_its_tier() -> None:
+    """The third post-spawn failure path, and the one that still blamed nobody.
+
+    A slot reaches IDLE and is then CONFIRMED dead by the claim-time probe before serving its
+    first job. spawn() returned and the slot even promoted, so the cascade's per-tier streak is
+    empty — and a repair with no guilty tier falls back to invalidating EVERY snapshot-capable
+    tier, discarding healthy sibling bases for deaths confined to one. The warming-timeout and
+    background-health paths already blamed here.
+    """
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    blamed: list[str] = []
+
+    class _DeadOnClaim:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def spawn(self):
+            self.n += 1
+            return Slot(slot_id=f"d{self.n}", control_dir="/c", input_dir="/i",
+                        output_dir="/o", state=SlotState.IDLE)
+
+        def is_ready(self, slot): return True
+        def is_alive(self, slot): return True
+        def is_alive_for_claim(self, slot): return False      # CONFIRMED dead at hand-out
+        def reap(self, slot): pass
+        def blame_tier_for_slot(self, slot_id):
+            blamed.append(slot_id)
+            return True
+        def invalidate_base(self, *, reason=None): pass
+
+    pool = WarmPool(runtime=_DeadOnClaim(), warm_size=1, concurrent_ceiling=2,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0)
+    pool.tick()
+    pool.tick()
+    pool.claim(timeout_s=0.2)      # the probe confirms the slot dead
+
+    assert blamed, (
+        "the claim-time death blamed no tier, so its repair invalidates every sibling base"
+    )
