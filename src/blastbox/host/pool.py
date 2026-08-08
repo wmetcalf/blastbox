@@ -748,6 +748,14 @@ class WarmPool:
                 # here leaks an entry keyed on a dead slot_id AND moves the POOL-wide counter on
                 # evidence from a slot that is no longer in the pool -- which can tip a base
                 # rebuild (upstream, PR #82).
+                #
+                # ...including the identity caches _health_key/_base_identity just populated.
+                # retire() or an eviction can remove a slot while its timed-out validation is
+                # still running, and that validation reaches release() afterwards --
+                # _forget_slot_health has already run, so nothing else would ever drop the fresh
+                # entries and every such late completion grew both dicts forever.
+                self._health_key_by_slot.pop(slot.slot_id, None)
+                self._slot_base.pop(slot.slot_id, None)
                 slot_failures = 0
                 last_success = 0.0
             elif dirty and fault == "job":
@@ -1857,6 +1865,14 @@ class WarmPool:
                             "pool.spawn_batch_abandoned reason=base_rebuilt_mid_batch"
                         )
                         break
+            # SNAPSHOT the generation ledger BEFORE the restore starts. spawn() can take a long
+            # time, and a job thread can invalidate while it runs: the manager keeps the retired
+            # artifact pinned long enough for the restore to finish, so the slot really is from
+            # the OLD generation -- but publication below read the already-advanced counter and
+            # stamped it as CURRENT. A later worker failure from that slot then passed the
+            # retired-generation guard and could invalidate the replacement base (PR #82).
+            with self._lock:
+                _gen_at_spawn = dict(self._base_generation)
             try:
                 slot = self._runtime.spawn()
                 with self._lock:
@@ -1929,8 +1945,9 @@ class WarmPool:
                     # publishes it, so a later failure can be told apart from one produced by
                     # the base currently installed.
                     _ident = self._base_identity(slot)
+                    # ...from the ledger as it was when this restore STARTED, not as it is now.
                     self._slot_base[slot.slot_id] = (
-                        _ident, self._base_generation.get(_ident, 0)
+                        _ident, _gen_at_spawn.get(_ident, 0)
                     )
             if drop:
                 reaped = False

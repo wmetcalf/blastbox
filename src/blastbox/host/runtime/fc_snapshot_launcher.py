@@ -40,7 +40,7 @@ from blastbox.host.runtime.snapshot_backend import (
 from blastbox.host.runtime.snapshot_backend import (
     owner_token,
 )
-from blastbox.host.runtime.fc_snapshot import SnapshotBuildError
+from blastbox.host.runtime.fc_snapshot import SnapshotBuildError, SnapshotError
 
 _log = logging.getLogger("blastbox.host.runtime.fc_snapshot_launcher")
 
@@ -262,6 +262,17 @@ class _Handle:
                 except subprocess.TimeoutExpired:
                     gone = False
         self._remove_base_workdir(confirmed=gone)
+        if not gone:
+            # RAISE. Recording `gone=False` and returning normally told both callers the teardown
+            # was CONFIRMED: FcSnapshotRuntime.reap() then releases the generation pin and lets
+            # the pool forget the slot, so a later invalidation can unlink snapshot memory beneath
+            # a still-running microVM; and SnapshotManager._kill_base() drops the only handle to
+            # the base process, so replacement capacity is launched beside an untracked one. Both
+            # callers already treat an exception as "unconfirmed" -- this one just never told
+            # them (upstream, PR #82).
+            raise SnapshotError(
+                "firecracker did not exit after SIGKILL; its microVM may still be running"
+            )
 
     def _remove_base_workdir(self, *, confirmed: bool) -> None:
         """Drop this build's own base workdir once its VM is provably gone.

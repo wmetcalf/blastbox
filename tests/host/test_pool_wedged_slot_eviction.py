@@ -4222,3 +4222,121 @@ def test_only_one_base_invalidation_runs_at_a_time() -> None:
         f"two invalidations overlapped ({overlap}) -- the second can discard the first's "
         f"replacement, or bump its build epoch so the replacement build is rejected"
     )
+
+
+def test_a_late_release_does_not_grow_the_identity_caches() -> None:
+    """retire() can remove a slot while its timed-out validation is still running.
+
+    That validation reaches release() afterwards, and _health_key()/_base_identity() populate
+    their caches BEFORE the tracked check. _forget_slot_health has already run, so nothing else
+    would ever drop the fresh entries — every such late completion grew both dicts forever.
+    """
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    class _Rt:
+        def spawn(self):
+            raise RuntimeError("not used")
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): pass
+        def worker_identity(self, s): return "box:0"
+
+    pool = WarmPool(runtime=_Rt(), warm_size=1, concurrent_ceiling=2)
+    ghost = Slot(slot_id="already-retired", control_dir="/c", input_dir="/i", output_dir="/o",
+                 state=SlotState.DRAINING)
+    assert ghost.slot_id not in pool._slots, "sanity: the slot is already gone"
+
+    for _ in range(50):
+        pool.release(ghost, dirty=True, fault="worker")
+
+    assert ghost.slot_id not in pool._health_key_by_slot, (
+        "a late release for an untracked slot left its identity cached, so every such completion "
+        "grows the dict for the life of the dispatcher"
+    )
+    assert ghost.slot_id not in pool._slot_base
+
+
+def test_a_slot_restored_from_the_old_artifact_is_stamped_old() -> None:
+    """spawn() can be slow, and a job thread can invalidate while it runs.
+
+    The manager keeps the retired artifact pinned long enough for the restore to finish, so the
+    slot really is from the OLD generation — but publication read the already-advanced counter
+    and stamped it CURRENT. A later worker failure from that slot then passed the
+    retired-generation guard and could invalidate the replacement base.
+    """
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    class _SlowSpawn:
+        def __init__(self) -> None:
+            self.pool: WarmPool | None = None
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            self.n += 1
+            # A job thread invalidates WHILE this restore is in flight.
+            if self.n == 1 and self.pool is not None:
+                with self.pool._lock:
+                    self.pool._base_generation[""] = (
+                        self.pool._base_generation.get("", 0) + 1)
+            return Slot(slot_id=f"s{self.n}", control_dir="/c", input_dir="/i",
+                        output_dir="/o", state=SlotState.IDLE)
+
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): pass
+
+    rt = _SlowSpawn()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2)
+    rt.pool = pool
+    before = pool._base_generation.get("", 0)
+
+    pool.tick()
+
+    stamped = pool._slot_base["s1"][1]
+    assert stamped == before, (
+        f"the slot was restored from generation {before} but stamped {stamped} -- it now looks "
+        f"CURRENT, so its failures are charged to the base that replaced it"
+    )
+    assert pool._base_generation.get("", 0) == before + 1, "sanity: the ledger did advance"
+
+
+def test_a_slot_spawned_after_a_repair_is_stamped_current() -> None:
+    """The other direction: the pre-spawn snapshot must carry the REAL ledger, not an empty one.
+
+    An empty snapshot reads as generation 0 for every base, which happens to match a fresh pool --
+    so a slot restored from the replacement artifact would be stamped as belonging to the base
+    that was already retired, and its failures discarded as coming from a dead generation. The
+    tier would then never be repairable again.
+    """
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    class _Rt:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            self.n += 1
+            return Slot(slot_id=f"s{self.n}", control_dir="/c", input_dir="/i",
+                        output_dir="/o", state=SlotState.IDLE)
+
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): pass
+
+    pool = WarmPool(runtime=_Rt(), warm_size=1, concurrent_ceiling=2)
+    with pool._lock:
+        pool._base_generation[""] = 3          # three repairs have already happened
+
+    pool.tick()
+
+    assert pool._slot_base["s1"] == ("", 3), (
+        f"a slot restored from the CURRENT artifact was stamped {pool._slot_base['s1']} -- it "
+        f"now looks retired, so every failure it reports is thrown away and its base can never "
+        f"be repaired again"
+    )

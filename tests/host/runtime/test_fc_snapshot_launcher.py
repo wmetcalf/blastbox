@@ -935,7 +935,13 @@ def test_a_base_workdir_is_retained_when_its_vm_will_not_die(tmp_path):
     handle = launcher.boot_base()
     workdir = Path(handle.vsock_uds).parent
 
-    handle.kill()
+    # ...and it must SAY SO. Returning normally told both callers the teardown was confirmed:
+    # reap() then releases the generation pin and the pool forgets the slot, so a later
+    # invalidation can unlink snapshot memory beneath a still-running microVM.
+    from blastbox.host.runtime.fc_snapshot import SnapshotError
+
+    with pytest.raises(SnapshotError):
+        handle.kill()
 
     assert workdir.exists(), (
         "the workdir was removed under a microVM that could not be confirmed gone"
