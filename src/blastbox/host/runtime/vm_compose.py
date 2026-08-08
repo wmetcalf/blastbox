@@ -402,6 +402,13 @@ def slot_bound_validate(
                             # and rejected the request looked identical to an unreachable box
                             # here. The HTTP transport learned this; its sibling did not (PR #82).
                             if is_transport_error(exc) and not is_answered_http_rejection(exc)
+                            # An ANSWERED 4xx is not merely un-convictable: the agent replied, so
+                            # it and the base it restored from are demonstrably responsive.
+                            # "unknown" only stops the rejection incrementing the streak; it does
+                            # not CLEAR the failure before it, so a transport failure, then a 413,
+                            # then another transport failure still counted as consecutive. The
+                            # HTTP transport learned this; its sibling did not (PR #82).
+                            else "job" if is_answered_http_rejection(exc)
                             else None          # ambiguous: never convict on a failure we can't
                         )                      # attribute
                     else:

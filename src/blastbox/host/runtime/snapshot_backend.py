@@ -8,6 +8,7 @@ artifact is a {snapshot, mem} file pair; gVisor's is a runsc image-path dir.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import threading
 import logging
@@ -84,6 +85,15 @@ _held_leases: dict[str, object] = {}
 _lease_lock = threading.Lock()
 
 
+def _lease_key(lease_dir: "Path | str") -> str:
+    """One identity per DIRECTORY, whatever spelling reached us."""
+    p = Path(lease_dir)
+    try:
+        return str(p.resolve())
+    except OSError:
+        return str(p.absolute())
+
+
 def hold_owner_lease(lease_dir: "Path | str") -> bool:
     """Take this process's generation lease in ``lease_dir``, and keep it for the process's life.
 
@@ -92,7 +102,13 @@ def hold_owner_lease(lease_dir: "Path | str") -> bool:
     a caller must treat as "my generations are not protected", never as an error worth failing
     the build over.
     """
-    key = str(Path(lease_dir))
+    # CANONICAL key. Two managers can reference one checkpoint directory through different
+    # spellings -- a relative path, its absolute form, a symlinked parent -- which produced
+    # different cache keys even though open() reaches the SAME lease file. The second acquisition
+    # then failed its flock and unlinked the pathname, leaving the first holding an unlinked
+    # inode: its generations had no discoverable lease and could never be reclaimed after exit
+    # (upstream, PR #82).
+    key = _lease_key(lease_dir)
     with _lease_lock:
         if key in _held_leases:
             return True
@@ -108,6 +124,15 @@ def _take_lease_locked(key: str, lease_dir: "Path | str") -> bool:
         fh = open(path, "a+b")                             # noqa: SIM115 -- held for the process
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
+        # ...but NEVER unlink one another holder is using. EAGAIN/EWOULDBLOCK means the lock is
+        # held right now -- by definition not ours to remove -- and deleting it strands that
+        # holder's generations exactly as the key-mismatch above did.
+        held = isinstance(exc, BlockingIOError) or exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK)
+        if held:
+            if fh is not None:
+                fh.close()
+            _log.warning("snapshot: the generation lease in %s is held by another owner", lease_dir)
+            return False
         # LEAVE NOTHING BEHIND. Opening creates the file, so a flock that failed transiently left
         # an UNLOCKED lease on disk -- which is strictly worse than no lease at all: another
         # dispatcher's _lease_state() acquires it, concludes this still-running process is dead,

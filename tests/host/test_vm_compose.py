@@ -494,7 +494,10 @@ def test_an_http_rejection_is_not_a_worker_fault():
 
         with pytest.raises(urllib.error.HTTPError):
             slot_bound_validate(pool, rejected)("/in")
-        assert pool.faults == [None], f"HTTP {code} convicted the worker"
+        assert pool.faults == ["job"], (
+            f"HTTP {code} must RESET the streaks, not merely avoid incrementing them: the agent "
+            f"answered, so it and its base are demonstrably responsive (got {pool.faults})"
+        )
 
 
 def test_a_5xx_from_the_vm_agent_is_still_a_worker_fault():

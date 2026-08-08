@@ -121,7 +121,7 @@ def test_a_lease_that_could_not_be_locked_leaves_nothing_behind(tmp_path, monkey
     assert owner_alive(owner_token(), lease_dir=tmp_path) is True
 
 
-def test_two_builders_racing_for_one_lease_do_not_unlink_it(tmp_path):
+def test_two_builders_racing_for_one_lease_do_not_unlink_it(tmp_path, monkeypatch):
     """Two snapshot tiers can share a checkpoint root and call this concurrently.
 
     One file description wins the flock; the LOSER used to unlink the shared pathname on its way
@@ -130,6 +130,20 @@ def test_two_builders_racing_for_one_lease_do_not_unlink_it(tmp_path):
     reclaimable.
     """
     import threading
+    import time as _time
+
+    from blastbox.host.runtime import snapshot_backend as mod
+
+    # WIDEN the window deterministically. Without this the dict write lands so quickly that the
+    # losers usually observe it anyway, and the test passes with or without the lock -- it was
+    # measuring scheduling luck, not the invariant.
+    real_flock = mod.fcntl.flock
+
+    def _slow_flock(fd, op):
+        _time.sleep(0.05)
+        return real_flock(fd, op)
+
+    monkeypatch.setattr(mod.fcntl, "flock", _slow_flock)
 
     results: list[bool] = []
     barrier = threading.Barrier(8)
@@ -150,3 +164,56 @@ def test_two_builders_racing_for_one_lease_do_not_unlink_it(tmp_path):
         "unlinked inode and its generations are unprovable"
     )
     assert owner_alive(owner_token(), lease_dir=tmp_path) is True
+
+
+def test_one_directory_spelled_two_ways_is_one_lease(tmp_path):
+    """Different spellings of the same directory produced different cache keys.
+
+    The second acquisition then opened the SAME lease file, failed its flock, and unlinked the
+    pathname — leaving the first holding an unlinked inode whose generations no sweep could ever
+    discover.
+    """
+    import os
+
+    nested = tmp_path / "a" / "b"
+    nested.mkdir(parents=True)
+
+    assert hold_owner_lease(nested) is True
+    lease = owner_lease_path(nested, owner_token())
+    assert lease.exists()
+
+    # The SAME directory, spelled differently: via a relative path and via a symlink.
+    link = tmp_path / "link"
+    link.symlink_to(nested)
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        assert hold_owner_lease("a/b") is True, "a relative spelling was treated as a new lease"
+        assert hold_owner_lease(link) is True, "a symlinked spelling was treated as a new lease"
+    finally:
+        os.chdir(cwd)
+
+    assert lease.exists(), (
+        "a second spelling unlinked the lease, so the holder's generations became undiscoverable"
+    )
+    assert owner_alive(owner_token(), lease_dir=nested) is True
+
+
+def test_a_lease_held_by_another_owner_is_never_unlinked(tmp_path, monkeypatch):
+    """EAGAIN means somebody holds it right now — by definition not ours to remove."""
+    import errno as _errno
+
+    from blastbox.host.runtime import snapshot_backend as mod
+
+    lease = owner_lease_path(tmp_path, owner_token())
+    lease.write_bytes(b"")
+
+    def _busy(fd, op):
+        raise BlockingIOError(_errno.EAGAIN, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(mod.fcntl, "flock", _busy)
+    assert hold_owner_lease(tmp_path) is False
+    assert lease.exists(), (
+        "a lease another owner is holding was deleted, stranding its generations exactly as the "
+        "key mismatch did"
+    )
