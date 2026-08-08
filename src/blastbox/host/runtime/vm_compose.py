@@ -34,7 +34,7 @@ from pathlib import Path
 
 from blastbox.errors import is_answered_http_rejection, is_transport_error
 from blastbox.host.netwire import parse_egress_ports
-from blastbox.host.pool import Slot, WarmPool, release_kwargs
+from blastbox.host.pool import Slot, WarmPool, _accepts_kwarg, release_kwargs
 from blastbox.host.runtime.libvirt_egress import ExitRouting, VmEgressPolicy
 from blastbox.host.runtime.libvirt_vm import LibvirtVmConfig, LibvirtVmRuntime
 
@@ -380,7 +380,16 @@ def slot_bound_validate(
             # contaminated worker; clean → reuse per the pool's recycle policy).
             try:
                 if t.is_alive():
-                    pool.retire(slot)
+                    # ATTRIBUTE it. A hung VM agent is the most direct worker fault there is, but
+                    # retiring recorded nothing: if every VM restored from a poisoned snapshot
+                    # hangs, each is destroyed and replaced from that SAME snapshot forever and
+                    # the base-rebuild protection is never reached. The hard retire stays -- the
+                    # abandoned thread may still be talking to this VM, so it must not be
+                    # recycled and re-offered (upstream, PR #82).
+                    if _accepts_kwarg(pool.retire, "fault"):
+                        pool.retire(slot, fault="worker")
+                    else:
+                        pool.retire(slot)
                 else:
                     v = result.get("v")
                     clean = bool(isinstance(v, tuple) and len(v) == 2 and v[1])

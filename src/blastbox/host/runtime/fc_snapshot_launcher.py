@@ -459,6 +459,17 @@ class FcSnapshotLauncher:
             )
         except Exception:
             _terminate_proc(proc)
+            # The workdir is UNIQUE per build now, and _make_outdisk may already have written a
+            # 600 MiB image into it. No handle is returned on failure, so nothing else knows this
+            # directory exists -- and the orphan sweep deliberately skips base-* paths owned by
+            # THIS process, so every async build retry left another one behind until the snapshot
+            # filesystem filled. Remove it, and park it for retry if that fails (upstream, PR #82).
+            errs: list[str] = []
+            shutil.rmtree(workdir, onerror=lambda fn, p, exc: errs.append(str(p)))
+            if errs:
+                self._stranded_partials.append(str(workdir))
+                _log.warning("fc_snapshot: could not remove failed base workdir %s "
+                             "(retained for retry)", workdir)
             raise
         return _Handle(
             proc,

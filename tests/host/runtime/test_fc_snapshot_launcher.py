@@ -989,3 +989,32 @@ def test_a_base_workdir_that_could_not_be_removed_is_retried(tmp_path, monkeypat
     launcher.boot_base()
     assert not workdir.exists(), "the retained workdir was never retried"
     assert str(workdir) not in launcher._stranded_partials
+
+
+def test_a_failed_base_boot_removes_its_unique_workdir(tmp_path):
+    """_make_outdisk may already have written 600 MiB before a later boot step raises.
+
+    No handle is returned on failure, so nothing else knows the directory exists — and the sweep
+    skips base-* paths owned by THIS process, so every async build retry left another one behind
+    until the snapshot filesystem filled.
+    """
+    class _BoomApi(FakeApiPatch):
+        def put(self, path, body):
+            raise RuntimeError("boot sequence failed")
+
+    base = tmp_path / "snap"
+    base.mkdir()
+    launcher = FcSnapshotLauncher(
+        FakeCfg(), base, mem_dir=base,
+        popen=lambda argv, cwd=None: FakeProc(),
+        api_factory=_BoomApi, wait_socket=lambda p: None,
+        make_outdisk=_make_outdisk_file,
+    )
+    with pytest.raises(RuntimeError):
+        launcher.boot_base()
+
+    leftovers = list(base.glob("base-*"))
+    assert leftovers == [], (
+        f"a failed boot left its unique workdir behind: {leftovers} -- nothing else can ever "
+        f"reclaim it, so every retry adds another"
+    )

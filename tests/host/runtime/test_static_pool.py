@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from types import SimpleNamespace
 
 from blastbox.host.pool import SlotRuntime
 from blastbox.host.runtime.remote_http import slot_base_url
@@ -616,4 +617,79 @@ def test_a_job_fault_clears_the_boxs_failures_not_the_slots():
     assert pool._slot_failures.get(key, 0) == 0, (
         "the box's failure record survived a valid engine response, so two unrelated failures "
         "an hour apart count as consecutive"
+    )
+
+
+def test_a_burned_out_static_box_leaves_the_rotation():
+    """Reaching the threshold changed nothing for a REUSING runtime.
+
+    reap() returns the same worker_index to the free list after a cooldown, so an agent that
+    still answers /healthz while every job transport wedges kept receiving and failing jobs
+    forever — each crossing logged, and charged against the eviction budget for an eviction that
+    never happened.
+    """
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"),
+                           http_probe=FakeProbe(all_ok=True))
+    doomed = rt.spawn()
+    idx = doomed.worker_index
+
+    rt.burn_out(doomed)
+    # dirty=False deliberately: a DIRTY reap parks the box in dirty_cooldown_s anyway, which
+    # would hide it from spawn() for reasons that have nothing to do with burnout.
+    rt.reap(doomed, dirty=False)
+
+    seen = set()
+    for _ in range(6):
+        try:
+            s = rt.spawn()
+        except Exception:
+            break
+        seen.add(s.worker_index)
+        rt.reap(s, dirty=False)
+
+    # ...and a box burned out while it is ALREADY sitting in the free list must come out of it,
+    # not merely be blocked from re-entering: nothing re-appends it, so the reap guard alone
+    # never sees it.
+    other = next(i for i in range(len(rt.cfg.workers)) if i != idx)
+    with rt._lock:
+        if other not in rt._free:
+            rt._free.append(other)
+    rt.burn_out(SimpleNamespace(worker_index=other, slot_id="s-other"))
+    with rt._lock:
+        assert other not in rt._free, (
+            "a box convicted while idle stayed in the free list, so spawn() hands it straight out"
+        )
+
+    assert idx not in seen, (
+        f"the convicted box {idx} was handed out again -- the burnout threshold is reached, "
+        f"logged and charged, but the wedged endpoint keeps taking jobs"
+    )
+    assert seen, "sanity: the healthy sibling is still served"
+
+
+def test_the_pool_tells_a_reusing_runtime_about_burnout():
+    """End-to-end: the seam is only worth anything if the pool actually calls it."""
+    from blastbox.host.pool import WarmPool
+
+    burned: list[int] = []
+
+    class _Reusing(StaticPoolRuntime):
+        def burn_out(self, slot):
+            burned.append(slot.worker_index)
+            super().burn_out(slot)
+
+    rt = _Reusing(_cfg("10.0.0.1:8765", "10.0.0.2:8765"), http_probe=FakeProbe(all_ok=True))
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
+                    max_consecutive_failures=2, eviction_window_s=10_000.0,
+                    max_evictions_per_window=10)
+
+    for _ in range(2):                     # two worker faults on the SAME physical box
+        slot = rt.spawn()
+        slot.worker_index = 0
+        pool._slots[slot.slot_id] = slot
+        pool.release(slot, dirty=True, fault="worker")
+
+    assert burned == [0], (
+        f"the pool convicted the box but never told the runtime, so it stays in rotation "
+        f"(burn_out calls: {burned})"
     )

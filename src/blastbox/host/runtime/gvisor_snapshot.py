@@ -557,7 +557,15 @@ class GvisorSnapshotBackend:
             #
             # Nothing reaps the base — drop any registered runsc state for this cid AND remove
             # the bundle dir so neither leaks.
-            _best_effort_delete(self._cfg, self._run, cid)
+            if not _best_effort_delete(self._cfg, self._run, cid):
+                # UNCONFIRMED: both teardown commands failed, so the sandbox/gofer processes may
+                # still be live. Ignoring that result and removing the bundle anyway forgot the
+                # only cid anything could retry, and every later build retry leaked another base.
+                # Keep both for the next attempt (upstream, PR #82).
+                self._stranded_partials.append(str(base))
+                _log.warning("gvisor_snapshot: base %s could not be confirmed deleted; retaining "
+                             "its bundle for retry", cid)
+                raise
             shutil.rmtree(base, ignore_errors=True)
             raise
         return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready, stranded=self._stranded_partials)

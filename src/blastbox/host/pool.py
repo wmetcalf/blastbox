@@ -879,7 +879,17 @@ class WarmPool:
             )
             burned_out = False
         if burned_out:
-            pass                            # the token was reserved by _eviction_allowed()
+            # TELL THE RUNTIME. On a disposable tier reaping IS the eviction, but a REUSING one
+            # (a static pool) just returns the same physical box to its free list, so the
+            # threshold was reached, logged and charged against the eviction budget while the
+            # wedged endpoint kept receiving and failing jobs forever. Optional seam,
+            # hasattr-guarded (upstream, PR #82).
+            _burn = getattr(self._runtime, "burn_out", None)
+            if callable(_burn):
+                try:
+                    _burn(slot)
+                except Exception as exc:  # noqa: BLE001 -- must never break the release path
+                    logger.warning("pool.burn_out_failed slot_id=%s: %s", slot.slot_id, exc)
             logger.warning(
                 "pool.slot_burned_out slot_id=%s fault=worker consecutive_failures=%d limit=%d "
                 "jobs=%d last_success_age=%s -- reaping instead of recycling",
@@ -955,7 +965,7 @@ class WarmPool:
             self._last_idle_at = self._clock()
         self._idle_event.set()
 
-    def retire(self, slot: Slot) -> None:
+    def retire(self, slot: Slot, *, fault: "str | None" = None) -> None:
         """Permanently dispose ``slot`` WITHOUT recycling it — for a worker that may STILL be in use
         by an abandoned/hung thread (e.g. a validate that timed out). Unlike ``release(dirty=True)``,
         which on a recycle-capable runtime snapshot-reverts and returns the SAME endpoint to IDLE
@@ -963,6 +973,22 @@ class WarmPool:
         the worker — severing the hung interaction — and removes the slot. On a reap failure the slot
         is quarantined (kept tracked/DRAINING, never reused). The replacement spawns on the next tick.
         """
+        if fault == "worker":
+            # A hard retire still has to leave EVIDENCE. The compose seam retires a slot whose
+            # agent hung, which is the most direct worker fault there is -- but retiring recorded
+            # nothing, so if every VM restored from a poisoned snapshot hangs, each is destroyed
+            # and replaced from that same snapshot forever and the base-rebuild protection is
+            # unreachable. Attribute first, then retire as before (upstream, PR #82).
+            hkey = self._health_key(slot)
+            bident = self._base_identity(slot)
+            with self._lock:
+                self._slot_failures[hkey] = self._slot_failures.get(hkey, 0) + 1
+                stamp = self._slot_base.get(slot.slot_id)
+                if stamp is None or stamp[1] == self._base_generation.get(stamp[0], 0):
+                    self._pool_consecutive_failures[bident] = (
+                        self._pool_consecutive_failures.get(bident, 0) + 1)
+            self._blame_tiers([slot.slot_id])
+            self._maybe_rebuild_base()
         with self._lock:
             if slot.slot_id not in self._slots:
                 return  # already removed/reaped concurrently — don't double-reap

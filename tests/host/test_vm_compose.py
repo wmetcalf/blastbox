@@ -515,3 +515,40 @@ def test_a_5xx_from_the_vm_agent_is_still_a_worker_fault():
         with pytest.raises(urllib.error.HTTPError):
             slot_bound_validate(pool, broken)("/in")
         assert pool.faults == ["worker"], f"HTTP {code} is the agent failing, not our request"
+
+
+def test_a_hung_agent_is_attributed_even_though_the_slot_is_retired():
+    """The work thread is still alive after work_timeout_s — a wedged VM agent.
+
+    Retiring recorded nothing, so if every VM restored from a poisoned snapshot hangs, each is
+    destroyed and replaced from that SAME snapshot forever and the base-rebuild protection is
+    never reached. The hard retire must stay: the abandoned thread may still be talking to this
+    VM, so it must not be recycled and re-offered.
+    """
+    import threading
+
+    class _RetirePool(_FaultPool):
+        def __init__(self) -> None:
+            super().__init__()
+            self.retire_faults: list[str | None] = []
+
+        def retire(self, slot, *, fault=None):
+            self.retired.append(slot.slot_id)
+            self.retire_faults.append(fault)
+
+    pool = _RetirePool()
+    started = threading.Event()
+
+    def hangs(slot, p):
+        started.set()
+        threading.Event().wait(5.0)        # never returns within the work timeout
+
+    with pytest.raises(TimeoutError):
+        slot_bound_validate(pool, hangs, work_timeout_s=0.05)("/in")
+
+    assert pool.retired, "sanity: the hung slot was hard-retired"
+    assert pool.retire_faults == ["worker"], (
+        f"a wedged agent recorded no evidence (got {pool.retire_faults}) -- a poisoned snapshot "
+        f"that hangs every VM would be rebuilt into forever"
+    )
+    assert pool.released == [], "a hung slot must NOT be released for reuse"

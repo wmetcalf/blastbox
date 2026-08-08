@@ -17,6 +17,7 @@ Fail-closed: ``available()`` returns False unless at least one configured box an
 from __future__ import annotations
 
 import itertools
+import contextlib
 import logging
 import threading
 import time
@@ -184,6 +185,7 @@ class StaticPoolRuntime:
         self._ids = _Counter()
         # worker_index -> monotonic time until which a DIRTY-released box stays quarantined (a stale,
         # possibly-still-running request must be given time to drain before the box is re-offered).
+        self._burned_out: set[int] = set()   # boxes the pool convicted; never re-offered
         self._cooldown_until: dict[int, float] = {}
         self._dirty_cooldown_s = cfg.dirty_cooldown_s
 
@@ -334,6 +336,24 @@ class StaticPoolRuntime:
             return None      # no window left to ask meaningfully -> UNKNOWN, never a verdict
         return self._health_ok(w, timeout=timeout)
 
+    def burn_out(self, slot: StaticWorkerSlot) -> None:
+        """Take this physical box OUT of rotation -- the pool has convicted it.
+
+        reap() returns the same worker_index to the free list after a cooldown, so reaching the
+        burnout threshold changed nothing: an agent that still answers /healthz while every job
+        transport wedges kept receiving and failing jobs forever, with each crossing logged and
+        charged against the eviction budget for an eviction that never happened. Excluded until
+        an operator restarts the dispatcher -- a box the pool has convicted should not silently
+        re-enter service on a timer (upstream, PR #82).
+        """
+        with self._lock:
+            self._burned_out.add(slot.worker_index)
+            with contextlib.suppress(ValueError):
+                self._free.remove(slot.worker_index)
+        _log.error("static: worker[%d] BURNED OUT -- removed from rotation; %d of %d boxes remain",
+                   slot.worker_index, len(self.cfg.workers) - len(self._burned_out),
+                   len(self.cfg.workers))
+
     def reap(self, slot: StaticWorkerSlot, dirty: bool = False) -> None:
         """Return the box to the free pool (nothing is torn down). On a DIRTY release (timeout/trust-
         fail/agent error) QUARANTINE it for ``dirty_cooldown_s`` first -- a stale request may still be
@@ -345,7 +365,8 @@ class StaticPoolRuntime:
                 self._cooldown_until[slot.worker_index] = self._clock() + self._dirty_cooldown_s
             else:
                 self._cooldown_until.pop(slot.worker_index, None)   # clean release clears any cooldown
-            if slot.worker_index not in self._free:
+            if (slot.worker_index not in self._free
+                    and slot.worker_index not in self._burned_out):
                 self._free.append(slot.worker_index)
         _log.info("static: released worker[%d] from slot=%s (dirty=%s)",
                   slot.worker_index, slot.slot_id, dirty)

@@ -4433,3 +4433,61 @@ def test_duplicate_backends_get_separate_base_identities() -> None:
     repaired = casc.invalidate_base(reason="job")
     assert repaired == [id1], f"the repair named {repaired}, not the tier it actually replaced"
     assert first.invalidated == 0 and second.invalidated == 1
+
+
+def test_retire_with_a_worker_fault_records_the_evidence() -> None:
+    """The compose seam asks for it; the POOL has to honour it.
+
+    Asserting that a fake pool records the fault proves only that fakes record faults. A hard
+    retire still has to leave evidence, or a poisoned snapshot that hangs every VM is rebuilt
+    into forever.
+    """
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    class _Rt(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.invalidated = 0
+
+        def invalidate_base(self, *, reason=None) -> None:
+            self.invalidated += 1
+
+    rt = _Rt()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0,
+                    max_consecutive_failures=99)
+    slot = Slot(slot_id="hung", control_dir="/c", input_dir="/i", output_dir="/o",
+                state=SlotState.ASSIGNED)
+    pool._slots[slot.slot_id] = slot
+
+    pool.retire(slot, fault="worker")
+
+    assert rt.invalidated >= 1, (
+        "a hard retire recorded no evidence, so a base that hangs every VM restored from it is "
+        "destroyed and replaced from that same base forever"
+    )
+    assert slot.slot_id not in pool._slots, "sanity: the slot was still retired"
+
+
+def test_retire_without_a_fault_records_nothing() -> None:
+    """The carve-out stays narrow: an ordinary retire is not a worker conviction."""
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    class _Rt(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.invalidated = 0
+
+        def invalidate_base(self, *, reason=None) -> None:
+            self.invalidated += 1
+
+    rt = _Rt()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0)
+    slot = Slot(slot_id="ordinary", control_dir="/c", input_dir="/i", output_dir="/o",
+                state=SlotState.ASSIGNED)
+    pool._slots[slot.slot_id] = slot
+
+    pool.retire(slot)
+
+    assert rt.invalidated == 0

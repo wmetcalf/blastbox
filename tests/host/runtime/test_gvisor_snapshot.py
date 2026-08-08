@@ -720,3 +720,34 @@ def test_a_cancelled_base_boot_still_tears_down(tmp_path):
     with pytest.raises(KeyboardInterrupt):
         backend.boot_base()
     assert deleted, "a cancelled base boot leaked its registered container"
+
+
+def test_an_unconfirmed_base_deletion_retains_its_bundle(tmp_path):
+    """Both teardown commands failed, so the sandbox/gofer processes may still be live.
+
+    Ignoring that result and removing the bundle anyway forgot the only cid anything could retry,
+    and every later build retry leaked another base.
+    """
+    def _run(argv, **kw):
+        if "run" in argv:
+            raise RuntimeError("runsc run failed after registering the container")
+        # BOTH teardown commands must fail: _best_effort_delete reports success if EITHER the
+        # kill or the force-delete lands, so failing only one still counts as confirmed.
+        if "delete" in argv or "kill" in argv:
+            raise RuntimeError("teardown failed too")
+        return 0
+
+    backend = GvisorSnapshotBackend(_cfg(tmp_path), run=_run, ready_wait=lambda d, t: None)
+    with pytest.raises(RuntimeError):
+        backend.boot_base()
+
+    assert backend._stranded_partials, (
+        "an unconfirmed base deletion forgot its bundle, so nothing can retry the teardown and "
+        "every build retry leaks another sandbox"
+    )
+    # Assert on the path it actually recorded, not on a guess about where the bundle lives.
+    retained = Path(backend._stranded_partials[0])
+    assert retained.name.startswith("gvisor-base-")
+    assert retained.exists(), (
+        "the bundle was removed anyway, so the retained path has nothing left to clean up"
+    )
