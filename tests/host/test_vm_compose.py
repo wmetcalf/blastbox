@@ -467,3 +467,43 @@ def test_attribution_degrades_on_a_pool_that_predates_it():
     with pytest.raises(ssl.SSLError):
         slot_bound_validate(pool, unreachable)("/in")
     assert pool.released == [True]        # still released, just unattributed
+
+
+def test_an_http_rejection_is_not_a_worker_fault():
+    """HTTPError subclasses URLError, so a 4xx looked identical to an unreachable box.
+
+    The remote_http transport learned that 413 (sample over the agent's own max_bytes), 401/403
+    (token skew) and 404 (version skew) are verdicts on the REQUEST — and fail identically on
+    every box. Its sibling here did not, so repeated rejections advanced burnout and base
+    rebuilding against perfectly healthy slots.
+    """
+    import io as _io
+    import urllib.error
+
+    for code in (400, 401, 403, 404, 413, 422):
+        pool = _FaultPool()
+
+        def rejected(slot, p, _c=code):
+            raise urllib.error.HTTPError("https://vm.invalid/x", _c, "rejected", {},
+                                         _io.BytesIO(b"{}"))
+
+        with pytest.raises(urllib.error.HTTPError):
+            slot_bound_validate(pool, rejected)("/in")
+        assert pool.faults == [None], f"HTTP {code} convicted the worker"
+
+
+def test_a_5xx_from_the_vm_agent_is_still_a_worker_fault():
+    """The carve-out stays narrow: the agent itself breaking IS about this box."""
+    import io as _io
+    import urllib.error
+
+    for code in (500, 502, 503):
+        pool = _FaultPool()
+
+        def broken(slot, p, _c=code):
+            raise urllib.error.HTTPError("https://vm.invalid/x", _c, "boom", {},
+                                         _io.BytesIO(b"{}"))
+
+        with pytest.raises(urllib.error.HTTPError):
+            slot_bound_validate(pool, broken)("/in")
+        assert pool.faults == ["worker"], f"HTTP {code} is the agent failing, not our request"

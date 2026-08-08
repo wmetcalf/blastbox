@@ -1482,3 +1482,58 @@ class TestFirecrackerLiveBoot:
             assert len(envelope.artifacts) == 1
         finally:
             rt.reap(slot)
+
+
+def test_a_host_disk_failure_in_debugfs_is_not_the_guests_fault(tmp_path, monkeypatch):
+    """The host output filesystem fills DURING rdump, after the image-open guard.
+
+    debugfs then exits nonzero and the recovery retry raises CalledProcessError — neither an
+    OSError nor carrying host_io — so the materialization failure was attributed to the worker.
+    The same host-wide outage hits every job at once, so it burned out healthy slots and
+    invalidated healthy Firecracker bases.
+    """
+    import subprocess as _sp
+
+    from blastbox.host.runtime.firecracker import rdump_ext4
+
+    image = tmp_path / "outdisk.ext4"
+    image.write_bytes(b"\x00" * 0x438 + b"\x53\xef" + b"\x00" * 64)   # valid ext4 magic
+    dest = tmp_path / "out"
+
+    def _run(argv, **kw):
+        if argv and argv[0] == "debugfs" and kw.get("check"):
+            raise _sp.CalledProcessError(
+                1, argv, output=b"", stderr=b"rdump: No space left on device while writing",
+            )
+        return _sp.CompletedProcess(argv, 1, b"", b"Filesystem not open")
+
+    monkeypatch.setattr(_sp, "run", _run)
+    with pytest.raises(_sp.CalledProcessError) as ei:
+        rdump_ext4(image, dest, 1 << 20)
+    assert getattr(ei.value, "host_io", False) is True, (
+        "a host disk failure inside debugfs was left unattributed, so the warm path convicts the "
+        "worker for this dispatcher's full filesystem"
+    )
+
+
+def test_a_corrupt_image_is_still_the_guests_fault(tmp_path, monkeypatch):
+    """The carve-out stays narrow: only the tool's OWN host-disk diagnosis is ours."""
+    import subprocess as _sp
+
+    from blastbox.host.runtime.firecracker import rdump_ext4
+
+    image = tmp_path / "outdisk.ext4"
+    image.write_bytes(b"\x00" * 0x438 + b"\x53\xef" + b"\x00" * 64)
+    dest = tmp_path / "out"
+
+    def _run(argv, **kw):
+        if argv and argv[0] == "debugfs" and kw.get("check"):
+            raise _sp.CalledProcessError(
+                1, argv, output=b"", stderr=b"Corrupt superblock; filesystem is unusable",
+            )
+        return _sp.CompletedProcess(argv, 1, b"", b"Filesystem not open")
+
+    monkeypatch.setattr(_sp, "run", _run)
+    with pytest.raises(_sp.CalledProcessError) as ei:
+        rdump_ext4(image, dest, 1 << 20)
+    assert getattr(ei.value, "host_io", False) is False

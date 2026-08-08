@@ -338,6 +338,12 @@ class CascadingRuntime:
                 self._tier_failures[index] = max(self._tier_failures[index], streak)
             _log.warning("cascade: tier %r base invalidation failed: %s", tier.name, exc)
 
+    def base_identity(self, slot: object) -> str | None:
+        """Which TIER's base produced this slot -- a cascade has one per tier, not one overall."""
+        with self._lock:
+            idx = self._owner.get(str(getattr(slot, "slot_id", "") or ""))
+        return None if idx is None else self.tiers[idx].name
+
     def worker_identity(self, slot: object) -> str | None:
         """Delegate to the tier that produced this slot, TIER-QUALIFIED.
 
@@ -392,7 +398,7 @@ class CascadingRuntime:
         # see (upstream, PR #82).
         return True
 
-    def invalidate_base(self, *, reason: str | None = None) -> None:
+    def invalidate_base(self, *, reason: str | None = None) -> "list[str]":
         """Forward base invalidation to every wrapped tier that supports it.
 
         Every tier is attempted even if an earlier one fails -- one poisoned tier must not stop
@@ -452,6 +458,7 @@ class CascadingRuntime:
             # when its own invalidation succeeds (upstream, PR #82).
 
         failures: list[str] = []
+        repaired: list[str] = []
         attempted = 0
         for tier in targets:
             fn = getattr(tier.runtime, "invalidate_base", None)
@@ -469,6 +476,7 @@ class CascadingRuntime:
                 # flight, and each redundant invalidate bumps the build epoch and rejects it, so
                 # one persistently failing tier could keep healthy siblings permanently rebuilding
                 # (PR #82).
+                repaired.append(tier.name)
                 with self._lock:
                     idx = self.tiers.index(tier)
                     self._tier_failures[idx] = 0
@@ -488,6 +496,10 @@ class CascadingRuntime:
                 "cascade: no selected tier supports base invalidation "
                 f"({[t.name for t in targets]}) — nothing was repaired"
             )
+        # Name what was ACTUALLY repaired. The pool retires only the slots of these bases: a
+        # sibling tier whose artifact this repair never touched must keep producing usable
+        # failure evidence (upstream, PR #82).
+        return repaired
 
 
     def reap(self, slot: Any, dirty: bool = False) -> None:

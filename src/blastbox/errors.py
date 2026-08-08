@@ -144,6 +144,21 @@ def is_host_resource_failure(exc: BaseException) -> bool:
     return False
 
 
+def is_answered_http_rejection(exc: BaseException) -> bool:
+    """A 4xx RESPONSE: the agent answered and rejected what we sent.
+
+    HTTPError subclasses URLError, so every transport check treats a 4xx as a wire failure unless
+    told otherwise -- and the agent replies 413 when a sample exceeds its own max_bytes, 401/403
+    on token skew, 404 on version skew. All of those are verdicts on the REQUEST and all of them
+    fail identically on every box, which is exactly the correlated signal that must never reach
+    burnout. 5xx is excluded deliberately: the agent itself breaking IS about that worker.
+
+    Defined here so the HTTP transport and the compose seam cannot disagree -- the latter was
+    missed when the former learned this rule (upstream, PR #82).
+    """
+    return isinstance(exc, urllib.error.HTTPError) and 400 <= exc.code < 500
+
+
 class OutputTrustUnknown(OutputTrustError):
     """Validation could not be COMPLETED -- not a verdict that the output is bad.
 

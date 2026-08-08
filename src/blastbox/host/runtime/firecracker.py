@@ -447,6 +447,17 @@ def make_ext4(path: Path, size_mib: int) -> None:
     )
 
 
+# What debugfs/e2fsck say when the HOST filesystem -- not the image -- is the problem. Matched
+# on the tool's own diagnosis because a CalledProcessError carries no errno.
+_HOST_DISK_MARKERS = (
+    b"no space left on device",
+    b"read-only file system",
+    b"input/output error",
+    b"disk quota exceeded",
+    b"too many open files",
+    b"cannot allocate memory",
+)
+
 _RDUMP_TIMEOUT_S = 300.0  # debugfs rdump over a fixed-size (<=512 MiB) image completes in seconds;
 #                           bound it so a crafted image can't hang the dispatcher indefinitely.
 
@@ -537,7 +548,22 @@ def rdump_ext4(
         dest.mkdir(parents=True, exist_ok=True)
         # After recovery a failure IS fatal (check=True) — surface it loudly rather than
         # silently producing empty output that becomes an opaque "metadata.json not found".
-        _debugfs_rdump(check=True)
+        try:
+            _debugfs_rdump(check=True)
+        except subprocess.CalledProcessError as exc:
+            # debugfs WRITES the extracted tree to the host, so it fails on ENOSPC/EROFS/EIO
+            # here -- after the image-open guard above, and as a CalledProcessError, which is
+            # neither an OSError nor carries host_io. The warm path convicts on a materialization
+            # failure, so a host output filesystem filling up burned out healthy slots and
+            # invalidated healthy FC bases, on an outage that hits every job at once. Look at
+            # what the tool SAID: only its own diagnosis can distinguish "the host disk failed"
+            # from "this image is corrupt" (upstream, PR #82).
+            blob = b" ".join(
+                x for x in (exc.stderr, exc.stdout) if isinstance(x, (bytes, bytearray))
+            ).lower()
+            if any(m in blob for m in _HOST_DISK_MARKERS):
+                exc.host_io = True  # type: ignore[attr-defined]
+            raise
 
     # debugfs rdump always creates lost+found; remove it so it isn't mistaken
     # for an artifact.

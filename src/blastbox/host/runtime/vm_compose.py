@@ -32,7 +32,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from blastbox.errors import is_transport_error
+from blastbox.errors import is_answered_http_rejection, is_transport_error
 from blastbox.host.netwire import parse_egress_ports
 from blastbox.host.pool import Slot, WarmPool, release_kwargs
 from blastbox.host.runtime.libvirt_egress import ExitRouting, VmEgressPolicy
@@ -394,8 +394,16 @@ def slot_bound_validate(
                     # judged the INPUT, and any other exception is ambiguous at this seam --
                     # both stay unattributed (upstream, PR #82).
                     exc = result.get("e")
-                    fault = ("worker" if isinstance(exc, BaseException) and is_transport_error(exc)
-                             else None)
+                    fault = (
+                        "worker"
+                        if isinstance(exc, BaseException)
+                        and is_transport_error(exc)
+                        # ...but NOT a 4xx. HTTPError is a URLError, so an agent that ANSWERED
+                        # and rejected the request looked identical to an unreachable box here.
+                        # The HTTP transport learned this; its sibling did not (PR #82).
+                        and not is_answered_http_rejection(exc)
+                        else None
+                    )
                     pool.release(slot, **release_kwargs(
                         pool.release, dirty=not clean, fault=fault))
             except Exception:  # noqa: BLE001 — slot return must never mask the validate result/error

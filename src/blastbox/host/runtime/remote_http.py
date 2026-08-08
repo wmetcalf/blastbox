@@ -28,7 +28,12 @@ from urllib.parse import quote
 
 from blastbox.errors import is_transport_error
 from blastbox.host.pool import release_kwargs
-from blastbox.errors import HOST_RESOURCE_ERRNOS, OutputTrustUnknown, EngineErrorEnvelope
+from blastbox.errors import (
+    HOST_RESOURCE_ERRNOS,
+    EngineErrorEnvelope,
+    OutputTrustUnknown,
+    is_answered_http_rejection,
+)
 
 
 _log = logging.getLogger("blastbox.host.runtime.remote_http")
@@ -605,7 +610,7 @@ def make_remote_validate(
                 fault = "unknown"
                 _log.warning("remote_http: local preparation failed: %s", exc)
                 return {"error": _sanitized_failure(exc)}, False
-            if isinstance(exc, urllib.error.HTTPError) and 400 <= exc.code < 500:
+            if is_answered_http_rejection(exc):
                 # The agent ANSWERED and rejected what we SENT. A 4xx is a verdict on the request,
                 # not evidence the box is sick: the agent replies 413 when a sample exceeds its
                 # own max_bytes, so raising BLASTBOX_MAX_INPUT on the dispatcher while a
@@ -617,7 +622,7 @@ def make_remote_validate(
                 # arrives here; it is WorkerBusy (capacity) further up (upstream, PR #82).
                 fault = "unknown"
                 _log.warning("remote_http: worker rejected the request (HTTP %s): %s",
-                             exc.code, exc)
+                             getattr(exc, "code", "?"), exc)
                 return {"error": _sanitized_failure(exc)}, False
             fault = "worker"         # transport failed -> evidence about this worker, not the input
             # transport error after the request may have reached the worker -> the box could still be

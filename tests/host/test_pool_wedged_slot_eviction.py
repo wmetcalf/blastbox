@@ -3144,15 +3144,15 @@ def test_failures_from_a_retired_generation_do_not_condemn_the_new_base() -> Non
     pool.tick()                       # promote out of WARMING
     old = pool.claim(timeout_s=0.5)
     assert old is not None
-    spawned_gen = pool._slot_base_generation[old.slot_id]
+    spawned_gen = pool._slot_base[old.slot_id]
 
     # The base is replaced while this slot is still mid-job. _base_generation, not
     # _base_rebuilds: the latter is the in-flight spawn FENCE and is bumped before drop() even
     # when the drop goes on to fail, so stamping against it would retire slots whose tier was
     # never actually repaired.
     with pool._lock:
-        pool._base_generation += 1
-    assert pool._slot_base_generation[old.slot_id] == spawned_gen
+        pool._base_generation[""] = pool._base_generation.get("", 0) + 1
+    assert pool._slot_base[old.slot_id] == spawned_gen
 
     before = rt.invalidated
     for _ in range(5):
@@ -3216,7 +3216,7 @@ def test_an_unstamped_slot_still_counts_toward_a_rebuild() -> None:
     slot = Slot(slot_id="unstamped", control_dir="/c", input_dir="/i", output_dir="/o",
                 state=SlotState.IDLE)
     pool._slots[slot.slot_id] = slot            # published directly: no generation recorded
-    assert slot.slot_id not in pool._slot_base_generation
+    assert slot.slot_id not in pool._slot_base
 
     pool.release(slot, dirty=True, fault="worker")
     assert rt.invalidated >= 1, "an unstamped slot's failure was discarded, so nothing repairs"
@@ -3383,14 +3383,14 @@ def test_a_failed_invalidation_does_not_retire_its_slots() -> None:
     pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
                     snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0,
                     max_consecutive_failures=99)
-    before = pool._base_generation
+    before = dict(pool._base_generation)
 
     assert pool._maybe_rebuild_base(99, reason="spawn") is False, "sanity: the repair failed"
     assert pool._base_generation == before, (
         "a FAILED invalidation advanced the committed generation, so every live slot of the tier "
         "it did not repair now looks retired and its failures are thrown away"
     )
-    assert pool._base_rebuilds > before, (
+    assert pool._base_rebuilds > 0, (
         "the in-flight fence must still move -- it exists to stop a spawn batch racing the drop"
     )
 
@@ -3502,10 +3502,10 @@ def test_slots_of_a_tier_whose_repair_failed_keep_counting() -> None:
 
     # The fence has moved (it is bumped before every drop attempt, including the one that
     # raised); the COMMITTED generation has not, because nothing was actually repaired.
-    assert pool._base_rebuilds != pool._base_generation, (
+    assert pool._base_rebuilds != pool._base_generation.get("", 0), (
         "sanity: the two counters must genuinely differ here, or the assertion below is vacuous"
     )
-    assert pool._slot_base_generation[again.slot_id] == pool._base_generation, (
+    assert pool._slot_base[again.slot_id][1] == pool._base_generation.get("", 0), (
         "the replacement slot was stamped against the in-flight FENCE, so every failure it "
         "reports is discarded as coming from a retired generation — but its tier was never "
         "repaired, so the evidence that would repair it is thrown away forever"
@@ -3533,7 +3533,7 @@ def test_a_successful_repair_does_advance_the_generation() -> None:
     pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
                     snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0,
                     max_consecutive_failures=99)
-    before = pool._base_generation
+    before = pool._base_generation.get("", 0)
     pool.tick()
     pool.tick()
     slot = pool.claim(timeout_s=0.5)
@@ -3541,7 +3541,7 @@ def test_a_successful_repair_does_advance_the_generation() -> None:
     pool.release(slot, dirty=True, fault="worker")
 
     assert rt.attempts == 1
-    assert pool._base_generation == before + 1, (
+    assert pool._base_generation.get("", 0) == before + 1, (
         "a successful repair must retire the artifact its live slots were restored from"
     )
 
@@ -3709,4 +3709,75 @@ def test_a_failed_tier_repair_keeps_its_guilt_for_the_retry() -> None:
     )
     assert bystander.invalidated == 0, (
         "an unrelated healthy tier was invalidated because the retry lost its naming"
+    )
+
+
+def test_repairing_one_tier_does_not_retire_a_siblings_live_slots() -> None:
+    """A cascade has one base PER TIER, but the pool kept a single generation.
+
+    A job-driven repair targeting only tier A left tier B's artifact untouched, yet the
+    successful outer call advanced that one counter — so every live B slot looked retired and its
+    later worker failures were discarded as evidence about a base that had in fact never been
+    replaced. For a reusable B slot that suppressed the evidence until it was finally replaced.
+    """
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    class _Tier:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.invalidated = 0
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            self.n += 1
+            return Slot(slot_id=f"{self.name}{self.n}", control_dir="/c", input_dir="/i",
+                        output_dir="/o", state=SlotState.IDLE)
+
+        def is_ready(self, slot): return True
+        def is_alive(self, slot): return True
+        def reap(self, slot): pass
+        def recycle(self, slot): pass
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    a, b = _Tier("a"), _Tier("b")
+    casc = CascadingRuntime(
+        tiers=[Tier(name="a", runtime=a, capacity=1), Tier(name="b", runtime=b, capacity=1)],
+        tier_rebuild_after=99,
+    )
+    pool = WarmPool(runtime=casc, warm_size=2, concurrent_ceiling=4,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0,
+                    max_consecutive_failures=99)
+    pool.tick()
+    pool.tick()
+
+    by_tier: dict[int, list] = {}
+    for sid, slot in pool._slots.items():
+        by_tier.setdefault(casc._owner[str(sid)], []).append(slot)
+    assert len(by_tier) == 2, "sanity: both tiers served slots"
+    slot_a, slot_b = by_tier[0][0], by_tier[1][0]
+    assert pool._slot_base[slot_a.slot_id][0] == "a"
+    assert pool._slot_base[slot_b.slot_id][0] == "b"
+
+    stamp_a = pool._slot_base[slot_a.slot_id]
+
+    # A failure on A's slot repairs A only.
+    pool.release(slot_a, dirty=True, fault="worker")
+    assert (a.invalidated, b.invalidated) == (1, 0), "sanity: only tier a was repaired"
+
+    # The tier that WAS repaired must be retired -- otherwise nothing is retired at all and the
+    # whole mechanism is inert.
+    assert stamp_a[1] != pool._base_generation.get("a", 0), (
+        "tier a's artifact was replaced but its old slots were not retired, so their failures "
+        "still count against the base that replaced it"
+    )
+
+    # B's slot was NOT restored from a retired base, so its failure must still count.
+    stamp = pool._slot_base[slot_b.slot_id]
+    assert stamp[1] == pool._base_generation.get("b", 0), (
+        "tier b's live slot was retired by a repair that never touched b's artifact, so every "
+        "failure it reports is thrown away"
     )

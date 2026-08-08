@@ -330,13 +330,20 @@ class WarmPool:
         # slot_id -> the value of _base_rebuilds when this slot was spawned, i.e. WHICH warm base
         # produced it. A slot restored from generation A can still be mid-job long after A was
         # invalidated and B built in its place.
-        self._slot_base_generation: dict[str, int] = {}
+        # slot_id -> (base identity, generation) it was restored from. The IDENTITY matters:
+        # a cascade has one base PER TIER, and a job-driven repair may touch only tier A while
+        # tier B's artifact stays current. A single pool-wide counter retired B's live slots too,
+        # discarding their failures as coming from a base that was in fact never replaced.
+        self._slot_base: dict[str, tuple[str, int]] = {}
         # COMMITTED base generation, advanced only when an invalidation actually succeeded.
         # Deliberately not _base_rebuilds, which is bumped BEFORE drop() so an in-flight spawn
         # batch can be fenced: a drop() that RAISED still advanced it, so slots whose tier was
         # never repaired were stamped with a "retired" generation and their later failures were
         # discarded -- leaving the un-repaired tier unable to reach the rebuild threshold at all.
-        self._base_generation = 0
+        # base identity -> committed generation. "" is the whole-runtime base (anything that is
+        # not a cascade). Advanced only when an invalidation actually succeeded, and only for the
+        # bases it actually repaired.
+        self._base_generation: dict[str, int] = {}
         self._warm_size = warm_size
         self._concurrent_ceiling = concurrent_ceiling
         self._poll_interval = poll_interval
@@ -750,14 +757,14 @@ class WarmPool:
                 # artifact -- which produced none of them -- and the tier rebuilt cold over and
                 # over. slot_ids carries cascade-TIER attribution; it says nothing about which
                 # snapshot generation restored the slot (upstream, PR #82).
-                _gen = self._slot_base_generation.get(slot.slot_id)
-                if _gen is None or _gen == self._base_generation:
+                _stamp = self._slot_base.get(slot.slot_id)
+                if _stamp is None or _stamp[1] == self._base_generation.get(_stamp[0], 0):
                     self._pool_consecutive_failures += 1
                 else:
                     logger.info(
                         "pool.failure_from_retired_generation slot_id=%s spawned_generation=%d "
                         "current_generation=%d -- not counted against the base now installed",
-                        slot.slot_id, _gen, self._base_generation,
+                        slot.slot_id, _stamp[1], self._base_generation.get(_stamp[0], 0),
                     )
             elif dirty:
                 # A job/unknown fault still forces a recycle (the slot may be contaminated) but must
@@ -1835,7 +1842,10 @@ class WarmPool:
                     # STAMP the generation this slot came from, under the same lock that
                     # publishes it, so a later failure can be told apart from one produced by
                     # the base currently installed.
-                    self._slot_base_generation[slot.slot_id] = self._base_generation
+                    _ident = self._base_identity(slot)
+                    self._slot_base[slot.slot_id] = (
+                        _ident, self._base_generation.get(_ident, 0)
+                    )
             if drop:
                 reaped = False
                 try:
@@ -1895,6 +1905,22 @@ class WarmPool:
                     self._last_miss_at = None
                     logger.info("pool.burst_drained")
 
+    def _base_identity(self, slot: "Slot") -> str:
+        """Which BASE produced this slot: a cascade tier name, or "" for a single-base runtime.
+
+        Optional seam, hasattr-guarded, exactly like worker_identity.
+        """
+        fn = getattr(self._runtime, "base_identity", None)
+        if callable(fn):
+            try:
+                got = fn(slot)
+            except Exception as exc:  # noqa: BLE001 -- attribution must never break a release
+                logger.warning("pool.base_identity_failed slot_id=%s: %s", slot.slot_id, exc)
+            else:
+                if got:
+                    return str(got)
+        return ""
+
     def _health_key(self, slot: "Slot") -> str:
         """The identity this slot's failure history belongs to.
 
@@ -1939,7 +1965,7 @@ class WarmPool:
         # physical box, which outlives every slot handed to it -- dropping its record on reap is
         # exactly how its failures could never accumulate. Bounded either way: a reused identity
         # is one entry per registered worker.
-        self._slot_base_generation.pop(slot_id, None)
+        self._slot_base.pop(slot_id, None)
         key = self._health_key_by_slot.pop(slot_id, slot_id)
         if key == slot_id:
             self._slot_failures.pop(slot_id, None)
@@ -2081,9 +2107,9 @@ class WarmPool:
             # SPAWN-driven repair to a tier. Introspection, not except-TypeError -- a TypeError
             # from inside drop() must never be mistaken for an older signature.
             if _accepts_kwarg(drop, "reason"):
-                drop(reason=reason)
+                repaired = drop(reason=reason)
             else:
-                drop()
+                repaired = drop()
         except Exception:
             logger.exception("pool.base_rebuild_error pool_consecutive_failures=%d", pool_failures)
             # RESTORE the consumed episode. The streak was consumed to make the decision, but the
@@ -2110,7 +2136,17 @@ class WarmPool:
             # The COMMITTED generation advances only here, on the success path: a drop() that
             # raised leaves the tier's artifact in place, and stamping its live slots as retired
             # would discard the very failures that must repair it.
-            self._base_generation += 1
+            # Advance ONLY the bases actually repaired. A cascade reports the tier names it
+            # invalidated; anything else repaired its single base. Bumping one pool-wide counter
+            # retired the live slots of tiers this repair never touched, so their failures --
+            # about a base that is still current -- were discarded, and for reusable slots that
+            # suppressed the evidence until the slot was eventually replaced (upstream, PR #82).
+            if isinstance(repaired, (list, tuple, set, frozenset)):
+                names = {str(n) for n in repaired}
+            else:
+                names = {ident for ident, _ in self._slot_base.values()} | {""}
+            for _name in names:
+                self._base_generation[_name] = self._base_generation.get(_name, 0) + 1
             self._last_base_rebuild_at = now
             # Defer this tick's spawning wherever the rebuild came from. tick() captured `ready`
             # before release() could run, and a JOB-triggered rebuild races it: both snapshot
