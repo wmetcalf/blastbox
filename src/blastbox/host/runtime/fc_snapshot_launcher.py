@@ -319,11 +319,17 @@ class _Handle:
         self._base_workdir = None
 
 
-def _terminate_proc(proc: "subprocess.Popen | None") -> None:
-    """Best-effort kill of a spawned firecracker so partial-failure paths don't leak
-    an orphaned microVM. Safe on None / already-exited procs."""
+def _terminate_proc(proc: "subprocess.Popen | None") -> bool:
+    """Kill a spawned firecracker so partial-failure paths don't leak an orphaned microVM.
+
+    Returns True when exit is CONFIRMED. It used to swallow the second TimeoutExpired and return
+    nothing, so a caller could not tell a dead process from a live one -- and the failed-boot
+    cleanup then unlinked a LIVE microVM's workdir (its disk and sockets) and dropped the only
+    process handle, leaving an untracked VM per retry (upstream, PR #82). Safe on None /
+    already-exited procs.
+    """
     if proc is None or proc.poll() is not None:
-        return
+        return True
     proc.terminate()
     try:
         proc.wait(timeout=5)
@@ -332,7 +338,8 @@ def _terminate_proc(proc: "subprocess.Popen | None") -> None:
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            pass
+            return False
+    return True
 
 
 def _default_wait_socket(path: Path, timeout_s: float = 10.0) -> None:
@@ -458,7 +465,14 @@ class FcSnapshotLauncher:
                 else None
             )
         except Exception:
-            _terminate_proc(proc)
+            if not _terminate_proc(proc):
+                # UNCONFIRMED: the microVM may still be running with this workdir's disk and
+                # sockets open. Removing it now would pull them out from under a live VM, and the
+                # process handle would be gone too -- so retain both and let the next build retry.
+                self._stranded_partials.append(str(workdir))
+                _log.warning("fc_snapshot: firecracker for base workdir %s could not be confirmed "
+                             "gone; retaining it for retry", workdir)
+                raise
             # The workdir is UNIQUE per build now, and _make_outdisk may already have written a
             # 600 MiB image into it. No handle is returned on failure, so nothing else knows this
             # directory exists -- and the orphan sweep deliberately skips base-* paths owned by

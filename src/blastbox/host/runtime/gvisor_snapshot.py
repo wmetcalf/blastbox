@@ -601,5 +601,13 @@ class GvisorSnapshotBackend:
                 # the checkpoint may be reclaimed. Ignoring the result meant the manager unpinned
                 # even though an unmanaged sandbox might still be using the generation (PR #82).
                 exc.kill_failed = True  # type: ignore[attr-defined]
+                # ...and RETAIN it. kill_failed keeps the generation pinned, but the manager then
+                # discards the cid and removes the slot workdir, so nothing could ever retry the
+                # teardown OR release that pin: repeated restores leaked sandbox/gofer processes
+                # and the checkpoint could never be reclaimed. Same retention the base-boot path
+                # now does (upstream, PR #82).
+                self._stranded_partials.append(str(wd))
+                _log.warning("gvisor_snapshot: restore sandbox %s could not be confirmed deleted; "
+                             "retaining its bundle for retry", cid)
             raise
         return GvisorRestoreHandle(self._cfg, self._run, cid, wd, self._run_text)

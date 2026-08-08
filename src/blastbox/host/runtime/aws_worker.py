@@ -27,9 +27,7 @@ Design notes:
 
 from __future__ import annotations
 
-import errno
 import json
-import socket
 import logging
 import os
 import contextlib
@@ -40,6 +38,8 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+
+from blastbox.errors import is_local_resource_error as _is_local_resource_error
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dc_field
@@ -138,63 +138,14 @@ def _default_aws_runner(argv: Sequence[str], timeout: float) -> subprocess.Compl
 
 
 # Resolver failures that mean "ask again", as opposed to "this name does not exist".
-_TRANSIENT_RESOLVER_ERRORS = frozenset(
-    getattr(socket, n) for n in ("EAI_AGAIN", "EAI_SYSTEM", "EAI_MEMORY") if hasattr(socket, n)
-)
-
-
 def _is_confirmed_dead_exc(exc: BaseException | None) -> bool:
     """True iff this error is a CONFIRMED verdict from AWS rather than "we could not tell"."""
     return isinstance(exc, AwsWorkerError) and not isinstance(exc, AwsUnknownState)
 
 
-def _is_local_resource_error(exc: BaseException) -> bool:
-    """True if this failure is OUR side running out of resources, not the peer answering.
 
-    ConnectionRefused/Reset and timeouts are OSErrors too, but they are real answers about the
-    worker -- only the local-exhaustion errnos mean we never got to ask."""
-    # urllib's do_open does a BARE `raise URLError(err)`, which sets __context__ (not __cause__)
-    # and stores the original in .reason. URLError is itself an OSError subclass but never calls
-    # OSError.__init__, so its .errno is None -- meaning a __cause__-only lookup made this branch
-    # UNREACHABLE through the real opener, and local fd exhaustion reaped whole fleets while the
-    # guarding test passed against a bare OSError the opener never produces (issue #77 marla-loop 4).
-    inner: BaseException = exc
-    for _ in range(4):      # bounded: reason/cause/context chains are short and may self-reference
-        if isinstance(inner, urllib.error.URLError) and isinstance(inner.reason, BaseException):
-            inner = inner.reason
-        elif inner.__cause__ is not None:
-            inner = inner.__cause__
-        elif inner.__context__ is not None and inner.__context__ is not inner:
-            inner = inner.__context__
-        else:
-            break
-        if isinstance(inner, OSError) and inner.errno is not None:
-            break
-    # A RESOLVER failure is its own namespace: socket.gaierror carries EAI_* codes (typically
-    # NEGATIVE) which are not errno values at all, so an errno allowlist silently never matched them.
-    # Failing to look a name up says nothing about the worker's health -- and one resolver outage
-    # hits every hostname-based worker on the same tick, which is the fleet-wipe shape (upstream P1).
-    if isinstance(inner, socket.gaierror):
-        # Only TEMPORARY resolver failures are "we could not ask". A definitive NXDOMAIN
-        # (EAI_NONAME/EAI_NODATA) says the name does not resolve -- for an existing worker that is a
-        # real reachability verdict, and treating it as unknown left the slot IDLE and "healthy"
-        # for the whole 300s grace while every claim skipped it, when capacity used to be replaced
-        # at once (upstream P2). Blanket-unknown was my over-correction.
-        return inner.errno in _TRANSIENT_RESOLVER_ERRORS
-    return isinstance(inner, OSError) and inner.errno in (
-        errno.EMFILE,    # process fd table full
-        errno.ENFILE,    # system-wide fd table full
-        errno.ENOMEM,    # cannot allocate for the socket
-        errno.ENOBUFS,
-        errno.EADDRNOTAVAIL,  # ephemeral ports exhausted -- purely LOCAL, and it hits every worker
-                              # on the same tick, which is the fleet-wipe shape exactly
-        errno.ENETUNREACH,    # no route from THIS host: our networking, not the worker's health
-        errno.EINPROGRESS,    # non-blocking connect in flight -- we never waited for an answer
-        errno.EAGAIN,         # (== EWOULDBLOCK) same: no answer was ever collected
-    )
-    # Deliberately NOT here -- these ARE answers about the worker: ETIMEDOUT (it did not respond in
-    # time), ECONNREFUSED / ECONNRESET (nothing is listening / it hung up), EHOSTUNREACH (the host
-    # itself is unreachable, which for a warm worker is indistinguishable from being down).
+# _is_local_resource_error lives in blastbox.errors now: is_transport_error must ask the same
+# question, and two copies of THIS rule is how a fleet-wipe returns (upstream, PR #82).
 
 
 def _default_http_probe(url: str, headers: dict[str, str], timeout: float) -> "bool | None":

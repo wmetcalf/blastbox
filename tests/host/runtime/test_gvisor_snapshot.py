@@ -751,3 +751,28 @@ def test_an_unconfirmed_base_deletion_retains_its_bundle(tmp_path):
     assert retained.exists(), (
         "the bundle was removed anyway, so the retained path has nothing left to clean up"
     )
+
+
+def test_an_unconfirmed_restore_teardown_retains_its_bundle(tmp_path):
+    """kill_failed keeps the generation PINNED, but the manager then discards the cid.
+
+    So nothing could ever retry the teardown or release that pin: repeated restores leaked
+    sandbox/gofer processes and the checkpoint could never be reclaimed. The base-boot path
+    already retains; this is its sibling.
+    """
+    def _run(argv, **kw):
+        if "restore" in argv:
+            raise RuntimeError("runsc restore failed after registering the sandbox")
+        if "delete" in argv or "kill" in argv:
+            raise RuntimeError("teardown failed too")
+        return 0
+
+    backend = GvisorSnapshotBackend(_cfg(tmp_path), run=_run, ready_wait=lambda d, t: None)
+    with pytest.raises(RuntimeError) as ei:
+        backend.restore_in(tmp_path / "slot", str(tmp_path / "checkpoint-x"))
+
+    assert getattr(ei.value, "kill_failed", False) is True, "sanity: the pin must be retained"
+    assert backend._stranded_partials, (
+        "the bundle was forgotten, so nothing can retry the teardown and the checkpoint stays "
+        "pinned for the life of the dispatcher"
+    )

@@ -1018,3 +1018,45 @@ def test_a_failed_base_boot_removes_its_unique_workdir(tmp_path):
         f"a failed boot left its unique workdir behind: {leftovers} -- nothing else can ever "
         f"reclaim it, so every retry adds another"
     )
+
+
+def test_a_failed_boot_retains_the_workdir_of_a_live_microvm(tmp_path):
+    """_terminate_proc used to swallow the second TimeoutExpired and return nothing.
+
+    So the failed-boot cleanup could not tell a dead process from a live one: it unlinked a LIVE
+    microVM's workdir — its disk and sockets — and dropped the only process handle, leaving an
+    untracked VM per retry.
+    """
+    class _Undead(FakeProc):
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("fc", timeout or 5)
+
+        def kill(self):
+            pass
+
+    class _BoomApi(FakeApiPatch):
+        def put(self, path, body):
+            raise RuntimeError("boot sequence failed")
+
+    base = tmp_path / "snap"
+    base.mkdir()
+    launcher = FcSnapshotLauncher(
+        FakeCfg(), base, mem_dir=base,
+        popen=lambda argv, cwd=None: _Undead(),
+        api_factory=_BoomApi, wait_socket=lambda p: None,
+        make_outdisk=_make_outdisk_file,
+    )
+    with pytest.raises(RuntimeError):
+        launcher.boot_base()
+
+    leftovers = list(base.glob("base-*"))
+    assert leftovers, (
+        "the workdir of a microVM that could NOT be confirmed gone was removed -- its disk and "
+        "sockets pulled out from under a live VM"
+    )
+    assert str(leftovers[0]) in launcher._stranded_partials, (
+        "...and it was not retained for retry either, so nothing can ever reclaim it"
+    )

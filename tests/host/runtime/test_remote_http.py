@@ -1114,3 +1114,36 @@ def test_a_claim_lost_after_validation_records_the_demonstrated_success(tmp_path
 def test_a_claim_lost_before_validation_stays_unattributed(tmp_path):
     """The carve-out stays narrow: before the gate, nothing about this worker was demonstrated."""
     assert _fault_for_claim_loss(tmp_path, validated=False) == "unknown"
+
+
+def test_local_fd_exhaustion_is_not_a_transport_fault():
+    """urllib's do_open does a bare `raise URLError(err)`.
+
+    So an EMFILE/ENFILE/ENOMEM from creating the socket arrives as a URLError whose .errno is
+    None — and an outer-type check called it transport, so the remote handler skipped its
+    host-I/O branch and a host-wide exhaustion event advanced every affected slot's worker and
+    base streaks at once. That is the fleet-wipe shape.
+    """
+    import errno as _errno
+    import urllib.error
+
+    from blastbox.errors import is_transport_error
+
+    for code in (_errno.EMFILE, _errno.ENFILE, _errno.ENOMEM, _errno.EADDRNOTAVAIL):
+        wrapped = urllib.error.URLError(OSError(code, "local exhaustion"))
+        assert is_transport_error(wrapped) is False, (
+            f"errno {code} is OUR side running out, not the worker answering -- treating it as "
+            f"transport convicts every slot on the same tick"
+        )
+
+
+def test_a_real_wire_failure_is_still_a_transport_fault():
+    """The carve-out stays narrow: a refused/reset connection IS an answer about the worker."""
+    import errno as _errno
+    import urllib.error
+
+    from blastbox.errors import is_transport_error
+
+    assert is_transport_error(urllib.error.URLError(ConnectionRefusedError(
+        _errno.ECONNREFUSED, "refused"))) is True
+    assert is_transport_error(ConnectionResetError(_errno.ECONNRESET, "reset")) is True
