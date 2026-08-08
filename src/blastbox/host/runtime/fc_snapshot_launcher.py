@@ -127,8 +127,16 @@ def _retry_stranded_partials(stranded: "list[str]") -> None:
         return
     still: list[str] = []
     for leftover in stranded:
+        p = Path(leftover)
         try:
-            Path(leftover).unlink(missing_ok=True)
+            if p.is_dir():
+                # base-* workdirs land here too: a failed cleanup parks the whole directory.
+                errs: list[str] = []
+                shutil.rmtree(p, onerror=lambda fn, q, exc: errs.append(str(q)))
+                if errs:
+                    still.append(leftover)
+            else:
+                p.unlink(missing_ok=True)
         except OSError:
             still.append(leftover)
     stranded[:] = still
@@ -299,7 +307,15 @@ class _Handle:
         errs: list[str] = []
         shutil.rmtree(self._base_workdir, onerror=lambda fn, p, exc: errs.append(str(p)))
         if errs:
-            _log.warning("fc_snapshot: could not remove base workdir %s", self._base_workdir)
+            # RETRYABLE, not forgotten. Discarding the only handle after a transient EIO / RO
+            # mount / permission failure left up to a 600 MiB outdisk per rebuild that nothing
+            # could ever reclaim: sweep_orphan_generations skips base-* paths owned by THIS
+            # process, so the leak outlives the problem that caused it. The stranded list is the
+            # existing durable mechanism -- it is owned by the launcher and retried before every
+            # boot and every checkpoint (upstream, PR #82).
+            self._stranded_partials.append(str(self._base_workdir))
+            _log.warning("fc_snapshot: could not remove base workdir %s (retained for retry)",
+                         self._base_workdir)
         self._base_workdir = None
 
 

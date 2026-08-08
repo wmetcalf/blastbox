@@ -354,7 +354,7 @@ class CascadingRuntime:
             # carry the SAME generation stamp, so a late failure from an old slot is charged to
             # the new base and can invalidate the replacement immediately (upstream, PR #82).
             with self._lock:
-                self._repaired_unreported.add(tier.name)
+                self._repaired_unreported.add(self._tier_identity(index))
                 # _repaired_this_episode is what stops the pool repairing this tier AGAIN: the
                 # CascadeSpawnFailed that follows drives WarmPool to the same threshold, and
                 # invalidating a just-repaired snapshot tier bumps its build epoch and REJECTS
@@ -385,11 +385,22 @@ class CascadingRuntime:
         with self._lock:
             self._job_guilty.clear()
 
+    def _tier_identity(self, idx: int) -> str:
+        """A UNIQUE identity per tier position, not per backend name.
+
+        BLASTBOX_POOL_TIERS accepts a repeated backend (``firecracker:2,firecracker:2``) and
+        _parse_tiers builds two runtimes with SEPARATE snapshot bases -- but the name is the same
+        for both. Keyed on the name alone, repairing either advanced the one shared generation
+        entry, so live slots of the untouched sibling looked retired and their failure evidence
+        was thrown away; locally reported repairs collapsed the same way (upstream, PR #82).
+        """
+        return f"{self.tiers[idx].name}#{idx}"
+
     def base_identity(self, slot: object) -> str | None:
         """Which TIER's base produced this slot -- a cascade has one per tier, not one overall."""
         with self._lock:
             idx = self._owner.get(str(getattr(slot, "slot_id", "") or ""))
-        return None if idx is None else self.tiers[idx].name
+        return None if idx is None else self._tier_identity(idx)
 
     def worker_identity(self, slot: object) -> str | None:
         """Delegate to the tier that produced this slot, TIER-QUALIFIED.
@@ -415,7 +426,7 @@ class CascadingRuntime:
             _log.warning("cascade: worker_identity failed for tier %r: %s",
                          self.tiers[idx].name, exc)
             return None
-        return None if not got else f"{self.tiers[idx].name}:{got}"
+        return None if not got else f"{self._tier_identity(idx)}:{got}"
 
     def blame_tier_for_slot(self, slot_id: str) -> bool:
         """Attribute a post-spawn failure to the tier that produced ``slot_id``.
@@ -500,10 +511,10 @@ class CascadingRuntime:
                 # and REJECTS the replacement already being built. Neither: there is nothing left
                 # to do (upstream, PR #82).
                 _log.info("cascade: spawn repair already satisfied by per-tier repair of %s",
-                          ",".join(sorted(self.tiers[i].name for i in already)))
+                          ",".join(sorted(self._tier_identity(i) for i in already)))
                 with self._lock:
                     self._repaired_this_episode.clear()
-                return sorted(self.tiers[i].name for i in already)
+                return sorted(self._tier_identity(i) for i in already)
             else:
                 targets = list(self.tiers)
         else:
@@ -539,7 +550,7 @@ class CascadingRuntime:
                 # flight, and each redundant invalidate bumps the build epoch and rejects it, so
                 # one persistently failing tier could keep healthy siblings permanently rebuilding
                 # (PR #82).
-                repaired.append(tier.name)
+                repaired.append(self._tier_identity(self.tiers.index(tier)))
                 with self._lock:
                     idx = self.tiers.index(tier)
                     self._tier_failures[idx] = 0

@@ -556,9 +556,9 @@ def test_a_static_tier_under_a_cascade_keeps_its_worker_identity():
         "the cascade did not forward the tier's worker identity, so the box is keyed by a "
         "per-spawn slot_id again"
     )
-    assert key.startswith("boxes:"), (
-        f"the key must be TIER-QUALIFIED — two tiers can each report 'static:0' for different "
-        f"physical boxes (got {key})"
+    assert key.startswith("boxes#0:"), (
+        f"the key must be TIER-QUALIFIED and POSITION-unique — two tiers can share a backend "
+        f"name and each report 'static:0' for different boxes (got {key})"
     )
     assert f"static:{slot.worker_index}" in key
 

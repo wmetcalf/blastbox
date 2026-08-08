@@ -946,3 +946,46 @@ def test_a_base_workdir_is_retained_when_its_vm_will_not_die(tmp_path):
     assert workdir.exists(), (
         "the workdir was removed under a microVM that could not be confirmed gone"
     )
+
+
+def test_a_base_workdir_that_could_not_be_removed_is_retried(tmp_path, monkeypatch):
+    """Discarding the handle after a transient failure leaked up to 600 MiB per rebuild.
+
+    sweep_orphan_generations skips base-* paths owned by THIS process, so nothing else can ever
+    reclaim it — the leak outlives the problem that caused it.
+    """
+    from blastbox.host.runtime import fc_snapshot_launcher as mod
+
+    base = tmp_path / "snap"
+    base.mkdir()
+    launcher = FcSnapshotLauncher(
+        FakeCfg(), base, mem_dir=base,
+        popen=lambda argv, cwd=None: FakeProc(),
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
+        make_outdisk=_make_outdisk_file,
+    )
+    handle = launcher.boot_base()
+    workdir = Path(handle.vsock_uds).parent
+
+    failing = {"on": True}
+    real_rmtree = mod.shutil.rmtree
+
+    def _rmtree(path, onerror=None, **kw):
+        if failing["on"] and onerror is not None:
+            onerror(None, str(path), (OSError, OSError(5, "EIO"), None))
+            return
+        return real_rmtree(path, **kw)
+
+    monkeypatch.setattr(mod.shutil, "rmtree", _rmtree)
+    handle.kill()
+
+    assert workdir.exists(), "sanity: the cleanup really did fail"
+    assert str(workdir) in launcher._stranded_partials, (
+        "the only retry handle was discarded, so nothing can ever reclaim this workdir"
+    )
+
+    # ...and the next build retries it once the problem clears.
+    failing["on"] = False
+    launcher.boot_base()
+    assert not workdir.exists(), "the retained workdir was never retried"
+    assert str(workdir) not in launcher._stranded_partials

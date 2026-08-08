@@ -217,6 +217,13 @@ class SnapshotManager:
         lock closes the gap: either we hold a real artifact or the repair already happened and we
         report capacity (upstream, PR #82).
         """
+        # Retry here too, NOT only in build(). A checkpoint that succeeds but whose kill() fails
+        # retains the base -- and from then on the artifact exists, so ensure_build_started()
+        # returns immediately and production spawn() calls THIS method rather than build(). No
+        # later call reached the retry while the artifact stayed installed, so the base VM and its
+        # host RAM lived as long as the dispatcher. This is the per-spawn path and the list is
+        # almost always empty (upstream, PR #82).
+        self._retry_undead_bases()
         with self._build_lock:
             artifact = self._artifact
         if artifact is not None:

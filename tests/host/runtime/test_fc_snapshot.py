@@ -528,27 +528,22 @@ def test_acquire_built_reads_the_artifact_under_the_build_lock(tmp_path):
     mgr.build()
     assert mgr.is_built()
 
-    acquisitions = []
-    real = mgr._build_lock
+    # Counting _build_lock acquisitions does NOT work here: _retry_undead_bases takes the same
+    # lock on the way in, so a check-then-act implementation would look protected. What separates
+    # them is the unlocked helper -- is_built() reads the artifact with no lock at all.
+    def _forbidden():
+        raise AssertionError("acquire_built used the UNLOCKED is_built() read")
 
-    class _Watched:
-        def __enter__(self):
-            acquisitions.append(1)
-            return real.__enter__()
-
-        def __exit__(self, *a):
-            return real.__exit__(*a)
-
-    mgr._build_lock = _Watched()  # type: ignore[assignment]
+    mgr.is_built = _forbidden  # type: ignore[method-assign]
     try:
         got = mgr.acquire_built()
     finally:
-        mgr._build_lock = real
+        del mgr.is_built
 
-    assert got is backend.artifact
-    assert acquisitions, (
-        "the artifact was read WITHOUT _build_lock, so invalidate() can clear it in the gap and "
-        "the caller proceeds to build inline on the maintenance thread"
+    assert got is backend.artifact, (
+        "the artifact must come back from a read taken under _build_lock -- invalidate() holds "
+        "that lock to clear it, and any gap sends the caller into an inline build on the "
+        "maintenance thread"
     )
 
 
@@ -567,3 +562,45 @@ def test_acquire_built_refuses_and_kicks_the_async_build(tmp_path):
 
     with pytest.raises(SnapshotBuildInvalidated):
         mgr.acquire_built()
+
+
+def test_an_undead_base_is_retried_on_the_per_spawn_path(tmp_path):
+    """build() is no longer reached once an artifact exists.
+
+    A checkpoint that succeeds but whose kill() fails retains the base — and from then on
+    ensure_build_started() returns immediately and production spawn() calls acquire_built()
+    rather than build(). No later call reached the retry while the artifact stayed installed, so
+    the base VM and its host RAM lived as long as the dispatcher.
+    """
+    class _Unkillable(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.kills = 0
+            self.fail_kill = True
+
+        def boot_base(self):
+            boot = super().boot_base()
+            outer = self
+
+            def _kill():
+                outer.kills += 1
+                if outer.fail_kill:
+                    raise RuntimeError("teardown unconfirmed")
+
+            boot.kill = _kill
+            return boot
+
+    backend = _Unkillable()
+    mgr = SnapshotManager(tmp_path, backend)
+    mgr.build()
+    assert len(mgr._undead_bases) == 1 and mgr.is_built()
+
+    backend.fail_kill = False
+    before = backend.kills
+    mgr.acquire_built()          # the ONLY call production makes once an artifact exists
+
+    assert backend.kills > before, (
+        "the retained base was never retried: build() is not called again while the artifact is "
+        "installed, so the VM and its host RAM live as long as the dispatcher"
+    )
+    assert mgr._undead_bases == []

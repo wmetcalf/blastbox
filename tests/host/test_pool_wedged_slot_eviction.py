@@ -3759,8 +3759,9 @@ def test_repairing_one_tier_does_not_retire_a_siblings_live_slots() -> None:
         by_tier.setdefault(casc._owner[str(sid)], []).append(slot)
     assert len(by_tier) == 2, "sanity: both tiers served slots"
     slot_a, slot_b = by_tier[0][0], by_tier[1][0]
-    assert pool._slot_base[slot_a.slot_id][0] == "a"
-    assert pool._slot_base[slot_b.slot_id][0] == "b"
+    # "<name>#<index>": two tiers can share a backend NAME, and they have separate bases.
+    assert pool._slot_base[slot_a.slot_id][0] == "a#0"
+    assert pool._slot_base[slot_b.slot_id][0] == "b#1"
 
     stamp_a = pool._slot_base[slot_a.slot_id]
 
@@ -3770,14 +3771,14 @@ def test_repairing_one_tier_does_not_retire_a_siblings_live_slots() -> None:
 
     # The tier that WAS repaired must be retired -- otherwise nothing is retired at all and the
     # whole mechanism is inert.
-    assert stamp_a[1] != pool._base_generation.get("a", 0), (
+    assert stamp_a[1] != pool._base_generation.get("a#0", 0), (
         "tier a's artifact was replaced but its old slots were not retired, so their failures "
         "still count against the base that replaced it"
     )
 
     # B's slot was NOT restored from a retired base, so its failure must still count.
     stamp = pool._slot_base[slot_b.slot_id]
-    assert stamp[1] == pool._base_generation.get("b", 0), (
+    assert stamp[1] == pool._base_generation.get("b#1", 0), (
         "tier b's live slot was retired by a repair that never touched b's artifact, so every "
         "failure it reports is thrown away"
     )
@@ -4014,7 +4015,7 @@ def test_a_partially_failed_cascade_repair_names_what_it_replaced() -> None:
     with pytest.raises(CascadeInvalidateFailed) as ei:
         casc.invalidate_base(reason="job")
 
-    assert getattr(ei.value, "repaired", None) == ["good"], (
+    assert getattr(ei.value, "repaired", None) == ["good#0"], (
         "the tier that WAS replaced is not named on the failure, so the pool cannot retire its "
         "slots and their next failure invalidates the replacement that just arrived"
     )
@@ -4143,7 +4144,7 @@ def test_a_cascade_reports_the_tiers_it_repaired_on_the_spawn_path() -> None:
     casc.spawn()          # ...again: bad's streak reaches 2 and it repairs itself
     assert bad.invalidated == 1, "sanity: the tier-local repair fired"
 
-    assert casc.take_repaired_tiers() == ["bad"], (
+    assert casc.take_repaired_tiers() == ["bad#0"], (
         "the tier repaired behind a healthy fallback was never published, so the pool cannot "
         "retire its slots and a late failure from one is charged to the replacement"
     )
@@ -4387,4 +4388,48 @@ def test_a_locally_repaired_episode_repairs_nothing_further() -> None:
     assert healthy.invalidated == 0, (
         "a healthy sibling lost its base because the discharged episode read as 'no evidence'"
     )
-    assert repaired == ["fc"], "the pool must still learn which base was replaced"
+    assert repaired == ["fc#0"], "the pool must still learn which base was replaced"
+
+
+def test_duplicate_backends_get_separate_base_identities() -> None:
+    """BLASTBOX_POOL_TIERS accepts a repeated backend: `firecracker:2,firecracker:2`.
+
+    _parse_tiers builds two runtimes with SEPARATE snapshot bases, but both carry the same
+    backend name. Keyed on the name alone, repairing either advanced the one shared generation
+    entry — so live slots of the untouched sibling looked retired and their failure evidence was
+    thrown away, and locally reported repairs collapsed the same way.
+    """
+    class _Tier:
+        def __init__(self) -> None:
+            self.invalidated = 0
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            self.n += 1
+            return SimpleNamespace(slot_id=f"{id(self)}-{self.n}")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    first, second = _Tier(), _Tier()
+    casc = CascadingRuntime(
+        tiers=[Tier(name="firecracker", runtime=first, capacity=1),
+               Tier(name="firecracker", runtime=second, capacity=1)],   # SAME name
+        tier_rebuild_after=99,
+    )
+    s0, s1 = casc.spawn(), casc.spawn()
+
+    id0 = casc.base_identity(s0)
+    id1 = casc.base_identity(s1)
+    assert id0 != id1, (
+        f"two tiers sharing a backend name got the same base identity ({id0}) -- repairing one "
+        f"retires the other's live slots and discards the evidence that would repair it"
+    )
+
+    casc.blame_tier_for_slot(str(s1.slot_id))
+    repaired = casc.invalidate_base(reason="job")
+    assert repaired == [id1], f"the repair named {repaired}, not the tier it actually replaced"
+    assert first.invalidated == 0 and second.invalidated == 1
