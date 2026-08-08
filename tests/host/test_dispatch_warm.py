@@ -2256,3 +2256,72 @@ def test_a_worker_symlink_at_done_is_a_verdict_not_host_io(tmp_path):
             )
     finally:
         mp.undo()
+
+
+def test_a_worker_made_path_conflict_on_the_file_handshake_is_a_verdict(tmp_path):
+    """ctrl/ is WORKER-WRITABLE on the gVisor tier, and its handshake is a FILE, not a transport.
+
+    A poisoned worker can put a directory where go.json belongs; atomic_write_confined()'s
+    os.replace() then raises EISDIR/ENOTEMPTY. GvisorHostWarmControl carries no
+    signal_is_transport marker, so the failure stayed `unknown` and repeated restores from the
+    poisoned checkpoint never advanced burnout or base-rebuild detection.
+    """
+    import errno as _errno
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    runtime = _FakeVsockRuntime()
+
+    class _FileControl(_RecordingVsockControl):
+        # NO signal_is_transport: this is the file handshake, exactly like gVisor's.
+        def signal_go(self, spec, *, deadline=None):
+            raise OSError(_errno.EISDIR, "Is a directory")
+
+    runtime.host_warm_control = lambda s: _FileControl(s)  # type: ignore[assignment]
+    pool = FakeWarmPool(slot, runtime=runtime)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+
+    dispatcher.dispatch_once()
+
+    assert store.get(job.job_id).status == JobStatus.FAILED
+    assert pool.release_fault == ["worker"], (
+        f"a worker-created path conflict in ctrl/ is a concrete violation (got "
+        f"{pool.release_fault})"
+    )
+
+
+def test_a_host_resource_failure_on_the_file_handshake_is_still_ours(tmp_path):
+    """The carve-out stays narrow: ENOSPC writing go.json is this dispatcher's disk, and it hits
+    every job at once."""
+    import errno as _errno
+
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path / "jobs", job)
+
+    slot = _make_slot(tmp_path)
+    runtime = _FakeVsockRuntime()
+
+    class _FullDisk(_RecordingVsockControl):
+        def signal_go(self, spec, *, deadline=None):
+            raise OSError(_errno.ENOSPC, "No space left on device")
+
+    runtime.host_warm_control = lambda s: _FullDisk(s)  # type: ignore[assignment]
+    pool = FakeWarmPool(slot, runtime=runtime)
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
+    )
+
+    dispatcher.dispatch_once()
+    assert pool.release_fault == ["unknown"], (
+        f"a host disk failure must never burn out a healthy worker (got {pool.release_fault})"
+    )

@@ -1038,3 +1038,35 @@ def test_a_5xx_is_still_evidence_about_this_worker(tmp_path):
         assert _fault_for_http(tmp_path, code) == "worker", (
             f"HTTP {code} is the agent failing, not a verdict on our request"
         )
+
+
+def test_a_malformed_worker_archive_is_the_workers_fault(tmp_path):
+    """A tar with a regular file `a` and a later member `a/b` cannot be laid out.
+
+    `a` must be both a file and a directory, so resolving/creating the second member's parent
+    raises FileExistsError/ENOTDIR — BEFORE the guarded os.open() that already classifies
+    correctly. It escaped into the blanket OSError branch and was filed under this dispatcher's
+    disk, so a reusable static worker could repeat the violation forever without advancing
+    burnout or snapshot repair.
+    """
+    import io as _io
+    import tarfile
+
+    from blastbox.host.runtime.remote_http import _safe_extract_tar
+
+    buf = _io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for name, data in (("a", b"x"), ("a/b", b"y")):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, _io.BytesIO(data))
+    buf.seek(0)
+
+    out = tmp_path / "out"
+    out.mkdir()
+    with pytest.raises(Exception) as ei:
+        _safe_extract_tar(buf.getvalue(), out)
+    assert not isinstance(ei.value, OSError), (
+        "a worker-authored archive that cannot be laid out must not surface as an OSError — that "
+        "is the shape the caller reads as this dispatcher's disk"
+    )

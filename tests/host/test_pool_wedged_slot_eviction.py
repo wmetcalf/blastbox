@@ -2927,3 +2927,177 @@ def test_the_pool_names_the_failing_slot_when_it_asks_for_a_repair() -> None:
         "the healthy sibling tier's base was invalidated too -- the pool did not pass the slot "
         "through, so the cascade had nothing to target and fell back to every tier"
     )
+
+
+def test_a_claimed_healthy_worker_still_protects_its_base() -> None:
+    """The usable-worker guard recognised IDLE alone, and a CLAIM erased its own evidence.
+
+    A slot only reaches ASSIGNED by being claimed, which is stronger proof the base produces
+    usable workers than sitting idle. But with one healthy slot the guard postponed the rebuild
+    and RETAINED the streak; the moment that slot was handed a job the next failed restore saw
+    zero usable slots and invalidated the base out from under a demonstrably-live worker
+    mid-job. The protection was lost to nothing but normal traffic.
+    """
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    class _Rt(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.invalidated = 0
+
+        def invalidate_base(self, *, reason=None) -> None:
+            self.invalidated += 1
+
+    rt = _Rt()
+    pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=4,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0)
+    healthy = Slot(slot_id="healthy", control_dir="/c", input_dir="/i", output_dir="/o",
+                   state=SlotState.ASSIGNED)          # claimed, i.e. PROVEN live
+    pool._slots["healthy"] = healthy
+
+    assert pool._maybe_rebuild_base(99, reason="spawn") is False, (
+        "a base with a claimed, live worker is not poisoned — invalidating it destroys the "
+        "artifact that worker is running on, mid-job"
+    )
+    assert rt.invalidated == 0
+
+
+def test_an_idle_worker_still_protects_its_base() -> None:
+    """The original case must keep working."""
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    rt = _WedgeableRuntime()
+    pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=4,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0)
+    pool._slots["idle"] = Slot(slot_id="idle", control_dir="/c", input_dir="/i",
+                               output_dir="/o", state=SlotState.IDLE)
+    assert pool._maybe_rebuild_base(99, reason="spawn") is False
+
+
+def test_with_no_usable_worker_the_base_is_still_rebuilt() -> None:
+    """The guard must not become a blanket refusal: a tier at zero capacity is the outage the
+    restore-failure streak exists to end."""
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    class _Rt(_WedgeableRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.invalidated = 0
+
+        def invalidate_base(self, *, reason=None) -> None:
+            self.invalidated += 1
+
+    rt = _Rt()
+    pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=4,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0)
+    pool._slots["dying"] = Slot(slot_id="dying", control_dir="/c", input_dir="/i",
+                                output_dir="/o", state=SlotState.WARMING)
+    assert pool._maybe_rebuild_base(99, reason="spawn") is True
+    assert rt.invalidated == 1
+
+
+def test_a_host_storage_failure_is_not_a_cascade_tiers_fault() -> None:
+    """A snapshot spawn creates a slot workdir and copies a per-slot disk.
+
+    So ENOSPC/EROFS/EMFILE/EIO there says nothing whatever about the tier's artifact. Counting it
+    invalidated a perfectly good snapshot during a host storage incident — and because a healthy
+    fallback absorbs the spawn, the pool sees only successes and the misattribution stays
+    invisible until the primary tier has destroyed its usable base.
+    """
+    import errno as _errno
+
+    class _Tier:
+        def __init__(self, boom: BaseException | None = None) -> None:
+            self.boom = boom
+            self.invalidated = 0
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            if self.boom is not None:
+                raise self.boom
+            self.n += 1
+            return SimpleNamespace(slot_id=f"ok{self.n}")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    host_full = OSError(_errno.ENOSPC, "No space left on device")
+    a, b = _Tier(boom=host_full), _Tier()
+    casc = CascadingRuntime(
+        tiers=[Tier(name="a", runtime=a, capacity=4), Tier(name="b", runtime=b, capacity=4)],
+        tier_rebuild_after=1,
+    )
+    for _ in range(3):
+        casc.spawn()                      # b absorbs each one; the pool sees only successes
+
+    assert a.invalidated == 0, (
+        "a healthy snapshot was invalidated because THIS HOST ran out of disk"
+    )
+
+
+def test_a_wrapped_host_error_is_seen_through_too() -> None:
+    """Launchers wrap the OSError (SnapshotBuildError, a failed copy), so the errno is rarely on
+    the outermost exception."""
+    import errno as _errno
+
+    class _Tier:
+        def __init__(self, boom=None) -> None:
+            self.boom = boom
+            self.invalidated = 0
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            if self.boom is not None:
+                try:
+                    raise OSError(_errno.EROFS, "Read-only file system")
+                except OSError as inner:
+                    raise RuntimeError("snapshot restore failed") from inner
+            self.n += 1
+            return SimpleNamespace(slot_id=f"ok{self.n}")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    a, b = _Tier(boom=True), _Tier()
+    casc = CascadingRuntime(
+        tiers=[Tier(name="a", runtime=a, capacity=4), Tier(name="b", runtime=b, capacity=4)],
+        tier_rebuild_after=1,
+    )
+    for _ in range(3):
+        casc.spawn()
+    assert a.invalidated == 0
+
+
+def test_a_genuine_tier_failure_is_still_counted() -> None:
+    """The carve-out stays narrow: a broken artifact must still be repaired."""
+    class _Tier:
+        def __init__(self, boom=False) -> None:
+            self.boom = boom
+            self.invalidated = 0
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            if self.boom:
+                raise RuntimeError("snapshot restore failed: corrupt mem file")
+            self.n += 1
+            return SimpleNamespace(slot_id=f"ok{self.n}")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    a, b = _Tier(boom=True), _Tier()
+    casc = CascadingRuntime(
+        tiers=[Tier(name="a", runtime=a, capacity=4), Tier(name="b", runtime=b, capacity=4)],
+        tier_rebuild_after=1,
+    )
+    casc.spawn()
+    assert a.invalidated == 1

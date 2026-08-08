@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import inspect
 import logging
+
+from blastbox.errors import HOST_RESOURCE_ERRNOS
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -86,6 +88,23 @@ def _takes_budget(fn: Any) -> bool:
         return "budget_s" in inspect.signature(fn).parameters
     except (TypeError, ValueError):
         return False
+
+
+def _is_host_resource_failure(exc: BaseException) -> bool:
+    """Whether a spawn failure is THIS HOST running out, rather than the tier being broken.
+
+    Walks the cause chain: a launcher wraps the OSError (SnapshotBuildError, FileNotFoundError
+    from a copy) so the errno is rarely on the outermost exception. Same rule as everywhere else
+    -- only a host-resource errno is ours; anything else is the tier's (upstream, PR #82).
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, OSError) and cur.errno in HOST_RESOURCE_ERRNOS:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 class CascadingRuntime:
@@ -214,6 +233,21 @@ class CascadingRuntime:
                 _log.debug("cascade: tier %r at capacity, trying next: %s", tier.name, exc)
                 continue
             except Exception as exc:  # noqa: BLE001 -- try the next tier, don't fail the whole spawn
+                if _is_host_resource_failure(exc):
+                    # THIS HOST is out of space/fds/inodes, or its filesystem went read-only:
+                    # a snapshot spawn creates the slot workdir and copies a per-slot disk, so
+                    # ENOSPC/EROFS/EMFILE/EIO here says nothing whatever about the tier's
+                    # artifact. Counting it invalidated a perfectly good snapshot during a host
+                    # storage incident -- and because a healthy fallback tier absorbs the spawn,
+                    # the pool sees only successes and the misattribution stays invisible until
+                    # the primary tier has destroyed its usable base. Try the next tier without
+                    # marking this one (upstream, PR #82).
+                    with self._lock:
+                        self._counts[i] -= 1
+                    last_exc = exc
+                    _log.warning("cascade: tier %r spawn hit a HOST resource failure (not "
+                                 "counted against the tier), trying next: %s", tier.name, exc)
+                    continue
                 with self._lock:
                     self._counts[i] -= 1
                     self._tier_failures[i] += 1

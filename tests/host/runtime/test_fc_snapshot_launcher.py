@@ -680,3 +680,68 @@ def test_a_clean_sweep_still_reports_success(tmp_path, monkeypatch):
     launcher = FcSnapshotLauncher(FakeCfg(), base, mem_dir=mem)
     assert launcher.sweep_orphan_generations() == 1
     assert not orphan.exists()
+
+
+def test_a_lease_survives_an_owner_whose_deletion_failed(tmp_path, monkeypatch):
+    """The retry was enabled and then made ineffective by its own cleanup.
+
+    The owner went into reclaimed_owners before the unlink was attempted, so a transient EIO
+    pruned its lease anyway. On the next build the retry finds no lease, reads the owner as
+    conservatively alive, and skips that RAM-sized artifact permanently.
+    """
+    import errno as _errno
+
+    from blastbox.host.runtime.snapshot_backend import owner_lease_path
+
+    base = tmp_path / "base"
+    base.mkdir()
+    mem = tmp_path / "mem"
+    mem.mkdir()
+    # ONE owner, SEVERAL generations -- the real FC shape (.snapshot + .mem + outdisk, across two
+    # directories). The first is removed, the second is not: that is the case where the guard is
+    # load-bearing, because the owner is both reclaimed AND failed.
+    ok = base / "warm-999999_1234-000000000000000001.snapshot"
+    ok.write_bytes(b"x")
+    orphan = mem / "warm-999999_1234-000000000000000002.mem"
+    orphan.write_bytes(b"x" * 8)
+    lease = owner_lease_path(base, "999999_1234")
+    lease.write_bytes(b"")
+
+    # Fail ONLY the .mem unlink. Breaking every unlink would also break the lease prune, so the
+    # assertion below would hold no matter what the code did.
+    real_unlink = Path.unlink
+
+    def _boom(self, missing_ok=False):
+        if self.name.endswith(".mem"):
+            raise OSError(_errno.EIO, "unlink failed")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", _boom)
+
+    launcher = FcSnapshotLauncher(FakeCfg(), base, mem_dir=mem)
+    with pytest.raises(OSError):
+        launcher.sweep_orphan_generations()
+
+    assert orphan.exists(), "sanity: the .mem really did survive"
+    assert lease.exists(), (
+        "the lease was pruned for an owner whose generation is still on disk — the next sweep "
+        "has nothing left to prove death with, so it skips that file forever"
+    )
+
+
+def test_a_lease_is_pruned_once_every_generation_is_gone(tmp_path):
+    """...and it must still be cleaned up on success, or leases accumulate per deployment."""
+    from blastbox.host.runtime.snapshot_backend import owner_lease_path
+
+    base = tmp_path / "base"
+    base.mkdir()
+    mem = tmp_path / "mem"
+    mem.mkdir()
+    (mem / "warm-999999_1234-000000000000000001.mem").write_bytes(b"x")
+    (base / "warm-999999_1234-000000000000000001.snapshot").write_bytes(b"x")
+    lease = owner_lease_path(base, "999999_1234")
+    lease.write_bytes(b"")
+
+    launcher = FcSnapshotLauncher(FakeCfg(), base, mem_dir=mem)
+    assert launcher.sweep_orphan_generations() == 2
+    assert not lease.exists()

@@ -323,6 +323,9 @@ class WarmPool:
         # so attributes added to Slot are not universally present.
         self._slot_failures: dict[str, int] = {}
         self._slot_last_success: dict[str, float] = {}
+        # slot_id -> the key its failure history is filed under. Usually the slot_id itself; a
+        # runtime that REUSES a physical worker across slots reports a stable identity instead.
+        self._health_key_by_slot: dict[str, str] = {}
         self._warm_size = warm_size
         self._concurrent_ceiling = concurrent_ceiling
         self._poll_interval = poll_interval
@@ -682,6 +685,9 @@ class WarmPool:
         taught to attribute must not be able to reap warm capacity by accident.
         """
         fault = (fault or "unknown") if dirty else None
+        # Resolved OUTSIDE the lock: the optional worker_identity() hook belongs to the runtime
+        # and must not run under the pool lock.
+        hkey = self._health_key(slot)
         with self._lock:
             slot.jobs += 1
             jobs = slot.jobs
@@ -715,15 +721,15 @@ class WarmPool:
                 # here is what let two bad samples in a row destroy a warm worker with a hundred
                 # clean jobs behind it -- and on this workload two bad samples in a row is routine,
                 # not exceptional.
-                self._slot_failures[slot.slot_id] = self._slot_failures.get(slot.slot_id, 0) + 1
+                self._slot_failures[hkey] = self._slot_failures.get(hkey, 0) + 1
                 self._pool_consecutive_failures += 1
             elif dirty:
                 # A job/unknown fault still forces a recycle (the slot may be contaminated) but must
                 # not advance it toward eviction, and must not reset its success record either.
                 pass
             else:
-                self._slot_failures.pop(slot.slot_id, None)
-                self._slot_last_success[slot.slot_id] = self._clock()
+                self._slot_failures.pop(hkey, None)
+                self._slot_last_success[hkey] = self._clock()
                 self._pool_consecutive_failures = 0
                 # Episode token: a rebuild decision taken before this point is abandoned, because
                 # the base demonstrably just produced a valid result.
@@ -733,8 +739,8 @@ class WarmPool:
                 self._spawn_consecutive_failures = 0
                 self._promoted_unproven.discard(slot.slot_id)
             if tracked:
-                slot_failures = self._slot_failures.get(slot.slot_id, 0)
-                last_success = self._slot_last_success.get(slot.slot_id, 0.0)
+                slot_failures = self._slot_failures.get(hkey, 0)
+                last_success = self._slot_last_success.get(hkey, 0.0)
 
         # A wedged in-guest agent is invisible to is_alive(), so consecutive dirty releases are the
         # only signal the pool gets. Once a slot hits the limit, do NOT recycle-and-republish it:
@@ -1828,14 +1834,54 @@ class WarmPool:
                     self._last_miss_at = None
                     logger.info("pool.burst_drained")
 
+    def _health_key(self, slot: "Slot") -> str:
+        """The identity this slot's failure history belongs to.
+
+        A disposable runtime mints a fresh slot per worker, so the slot_id IS the worker and the
+        default is right. A STATIC pool does the opposite: every spawn() hands a new slot_id to
+        the same long-lived box and reap() just returns that box to the free list. Keyed by
+        slot_id, its counter reached one, the non-recycle release path removed the slot,
+        _forget_slot_health() erased the history, and the next request to the SAME endpoint
+        started from zero -- so the default threshold of two could never burn out a static box,
+        even for correctly attributed transport failures. And a static tier has no snapshot base
+        to invalidate, so burnout is the only protection it has (upstream, PR #82).
+
+        Optional seam, hasattr-guarded: a runtime that does not reuse workers is unaffected.
+        """
+        # No lock: dict get/set are atomic, the value for a given slot is deterministic, and a
+        # concurrent double-fill therefore stores the same key twice. Taking _lock here would put
+        # a runtime callout inside it and invite the lock-ordering hazard this module has already
+        # produced once.
+        cached = self._health_key_by_slot.get(slot.slot_id)
+        if cached is not None:
+            return cached
+        key = slot.slot_id
+        identity = getattr(self._runtime, "worker_identity", None)
+        if callable(identity):
+            try:
+                got = identity(slot)
+            except Exception as exc:  # noqa: BLE001 -- attribution must never break a release
+                logger.warning("pool.worker_identity_failed slot_id=%s: %s", slot.slot_id, exc)
+            else:
+                if got:
+                    key = str(got)
+        self._health_key_by_slot[slot.slot_id] = key
+        return key
+
     def _forget_slot_health(self, slot_id: str) -> None:
         """Drop per-slot failure bookkeeping for a slot that has left the pool.
 
         Called wherever a slot is popped from ``_slots`` so the tracking dicts cannot grow without
         bound over a long-lived dispatcher (slot ids are per-spawn UUIDs).
         """
-        self._slot_failures.pop(slot_id, None)
-        self._slot_last_success.pop(slot_id, None)
+        # ...but only when the history belongs to THIS SLOT. On a static pool the key is the
+        # physical box, which outlives every slot handed to it -- dropping its record on reap is
+        # exactly how its failures could never accumulate. Bounded either way: a reused identity
+        # is one entry per registered worker.
+        key = self._health_key_by_slot.pop(slot_id, slot_id)
+        if key == slot_id:
+            self._slot_failures.pop(slot_id, None)
+            self._slot_last_success.pop(slot_id, None)
         # ...and the promotion ledger. Disposable runtimes mint a new slot_id per replacement, so a
         # workload with recurring failures or resizes grows this set without bound, and none of its
         # entries can ever be consulted again (PR #82).
@@ -1922,7 +1968,15 @@ class WarmPool:
             return False
         if reason == "spawn":
             with self._lock:
-                usable = sum(1 for s in self._slots.values() if s.state == SlotState.IDLE)
+                # ASSIGNED counts too. A slot only reaches ASSIGNED by being CLAIMED, which is
+                # stronger proof the base produces usable workers than sitting IDLE -- yet the
+                # guard recognised IDLE alone, so an ordinary claim erased its own evidence: with
+                # one healthy worker the streak was retained, the worker was handed a job, and
+                # the next failed restore saw zero usable slots and invalidated the base out from
+                # under a demonstrably-live worker mid-job. The protection was lost to nothing
+                # more than normal traffic (upstream, PR #82).
+                usable = sum(1 for s in self._slots.values()
+                             if s.state in (SlotState.IDLE, SlotState.ASSIGNED))
             if usable:
                 # A base with LIVE, IDLE workers is not poisoned. Counting restore failures alone
                 # made fail/succeed/fail/succeed/fail reach the threshold with healthy workers
@@ -1931,7 +1985,7 @@ class WarmPool:
                 # usable workers?" separates the two directly, which a consecutive count of one
                 # side of the story cannot (PR #82).
                 logger.info(
-                    "pool.base_rebuild_skipped reason=usable_workers_present idle=%d "
+                    "pool.base_rebuild_skipped reason=usable_workers_present usable=%d "
                     "restore_failures=%d", usable, pool_failures,
                 )
                 return False

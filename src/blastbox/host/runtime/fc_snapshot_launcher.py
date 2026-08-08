@@ -393,6 +393,7 @@ class FcSnapshotLauncher:
         removed = 0
         failed: list[str] = []
         reclaimed_owners: set[str] = set()
+        failed_owners: set[str] = set()
         for directory in {self._base_dir, self._mem_dir}:
             if directory is None or not directory.exists():
                 continue
@@ -407,7 +408,6 @@ class FcSnapshotLauncher:
                 if (token is None or token == owner_token()
                         or _owner_alive(token, lease_dir=self._base_dir)):
                     continue
-                reclaimed_owners.add(token)
                 try:
                     if path.is_dir():
                         # NOT ignore_errors: it would report success for a tree this call could
@@ -419,6 +419,7 @@ class FcSnapshotLauncher:
                     else:
                         path.unlink(missing_ok=True)
                     removed += 1
+                    reclaimed_owners.add(token)
                 except OSError as exc:
                     # REPORT, don't just log. SnapshotManager runs this once per process and
                     # latches the flag on a clean return, so swallowing a transient EIO/EROFS here
@@ -426,10 +427,15 @@ class FcSnapshotLauncher:
                     # the dispatcher. Same reasoning as discard() above: the layer that decides
                     # whether cleanup happened must not lie about it (upstream, PR #82).
                     failed.append(f"{path}: {exc}")
+                    failed_owners.add(token)
                     _log.warning("fc_snapshot: could not sweep orphan %s: %s", path, exc)
-        # AFTER the loop: an owner's lease must outlive the proof, or its other generations --
-        # the .mem in the second directory, the outdisk -- lose theirs mid-sweep.
-        for token in reclaimed_owners:
+        # AFTER the loop, and ONLY for owners whose every generation is actually gone.
+        #
+        # The lease is what proves this owner dead. Pruning it for an owner whose unlink FAILED
+        # means the retry -- the whole point of raising below -- finds no lease next build, reads
+        # the owner as conservatively alive, and skips that RAM-sized file forever. The retry was
+        # enabled and then made ineffective by its own cleanup (upstream, PR #82).
+        for token in reclaimed_owners - failed_owners:
             _prune_owner_lease(self._base_dir, token)
         if removed:
             _log.info("fc_snapshot.swept_orphan_generations count=%d", removed)

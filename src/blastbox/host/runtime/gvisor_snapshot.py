@@ -427,6 +427,7 @@ class GvisorSnapshotBackend:
         removed = 0
         failed: list[str] = []
         reclaimed_owners: set[str] = set()
+        failed_owners: set[str] = set()
         for path in root.glob("checkpoint-*"):
             token = generation_owner(path.name, prefix="checkpoint-")
             # lease_dir: proved by a flock on the shared filesystem, never by a pid -- two
@@ -435,19 +436,21 @@ class GvisorSnapshotBackend:
             if (token is None or token == owner_token()
                     or owner_alive(token, lease_dir=root)):
                 continue
-            reclaimed_owners.add(token)
             # NOT ignore_errors: SnapshotManager latches "swept" on a clean return, so reporting
             # success for a tree we could not remove disables reclamation for the whole process.
             errs: list[str] = []
             shutil.rmtree(path, onerror=lambda fn, p, exc: errs.append(f"{p}: {exc[1]}"))
             if errs:
                 failed.append("; ".join(errs))
+                failed_owners.add(token)
                 _log.warning("gvisor_snapshot: could not sweep orphan checkpoint %s", path)
             else:
                 removed += 1
-        # AFTER the loop -- one owner can have several checkpoint generations, and pruning its
-        # lease mid-sweep leaves the rest unprovable.
-        for token in reclaimed_owners:
+                reclaimed_owners.add(token)
+        # AFTER the loop, and only for owners whose every checkpoint is actually gone: pruning
+        # the lease of an owner whose rmtree FAILED leaves the retry with nothing to prove death
+        # with, so it skips that checkpoint forever (upstream, PR #82).
+        for token in reclaimed_owners - failed_owners:
             prune_owner_lease(root, token)
         if removed:
             _log.info("gvisor_snapshot.swept_orphan_generations count=%d", removed)

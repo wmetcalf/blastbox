@@ -455,3 +455,77 @@ def test_a_genuinely_failing_probe_is_still_unhealthy():
 
     with pytest.raises(StaticPoolUnhealthy):
         rt.spawn()
+
+
+def test_a_static_workers_failures_survive_its_slot():
+    """Per-slot bookkeeping cannot burn out a REUSED box.
+
+    Every spawn() hands a fresh slot_id to the same registered worker and reap() just returns it
+    to the free list, so the counter reached one, the slot was removed, _forget_slot_health()
+    erased the history, and the next request to the same endpoint started from zero — the default
+    threshold of two was unreachable however many correctly-attributed transport failures that
+    box produced. A static tier has no snapshot base to invalidate either, so burnout is its only
+    protection.
+    """
+    from blastbox.host.pool import WarmPool
+
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"),
+                           http_probe=FakeProbe(all_ok=True))
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
+                    max_consecutive_failures=2, eviction_window_s=10_000.0,
+                    max_evictions_per_window=10)
+
+    slot1 = rt.spawn()
+    pool._slots[slot1.slot_id] = slot1
+    key1 = pool._health_key(slot1)
+    assert key1 == f"static:{slot1.worker_index}", "the physical box must be the identity"
+
+    pool.release(slot1, dirty=True, fault="worker")
+    assert pool._slot_failures.get(key1) == 1
+
+    # The slot goes away; the BOX does not.
+    pool._slots.pop(slot1.slot_id, None)
+    pool._forget_slot_health(slot1.slot_id)
+    assert pool._slot_failures.get(key1) == 1, (
+        "the box's failure history was erased with its slot, so a static worker could never "
+        "reach the burnout threshold"
+    )
+
+    # A second failure on the SAME box, through a brand-new slot, now reaches the threshold.
+    slot2 = rt.spawn()
+    slot2.worker_index = slot1.worker_index
+    pool._slots[slot2.slot_id] = slot2
+    pool.release(slot2, dirty=True, fault="worker")
+    assert pool._slot_failures.get(pool._health_key(slot2)) == 2
+
+
+def test_a_disposable_runtimes_history_is_still_dropped_with_its_slot():
+    """The carve-out stays narrow: without a stable identity the slot IS the worker, and keeping
+    its record would grow unboundedly over a long-lived dispatcher."""
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    from uuid import uuid4
+
+    class _Disposable:
+        def spawn(self):
+            return Slot(slot_id=str(uuid4()), control_dir="/c", input_dir="/i",
+                        output_dir="/o", state=SlotState.IDLE)
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): pass
+
+    pool = WarmPool(runtime=_Disposable(), warm_size=1, concurrent_ceiling=2)
+    slot = pool._runtime.spawn()
+    pool._slots[slot.slot_id] = slot
+    assert pool._health_key(slot) == slot.slot_id, (
+        "with no stable identity the slot IS the worker"
+    )
+
+    # A disposable runtime has no recycle(), so a dirty release reaps the slot outright and its
+    # record goes with it. Nothing may be retained under a dead slot_id: those ids are per-spawn
+    # UUIDs, so keeping them grows without bound over a long-lived dispatcher.
+    pool.release(slot, dirty=True, fault="worker")
+    pool._forget_slot_health(slot.slot_id)
+    assert slot.slot_id not in pool._slot_failures
+    assert slot.slot_id not in pool._slot_last_success
+    assert slot.slot_id not in pool._health_key_by_slot

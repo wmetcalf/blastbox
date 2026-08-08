@@ -228,6 +228,20 @@ class StaticPoolRuntime:
         return any(self._health_ok(w) is True for w in self.cfg.workers)
 
     # -- SlotRuntime protocol ----------------------------------------------
+    def worker_identity(self, slot: object) -> str | None:
+        """The PHYSICAL box behind this slot, so failure history follows the worker.
+
+        Every spawn() hands a fresh slot_id to the same registered box and reap() just returns it
+        to the free list, so per-slot bookkeeping resets on each job: a static worker's counter
+        reached one, the slot was removed, its history erased, and the next request to the same
+        endpoint started from zero -- the default threshold of two was unreachable no matter how
+        many correctly-attributed transport failures that box produced. A static tier has no
+        snapshot base to invalidate either, so burnout is the only protection it has
+        (upstream, PR #82).
+        """
+        idx = getattr(slot, "worker_index", None)
+        return None if idx is None else f"static:{idx}"
+
     def spawn(self) -> StaticWorkerSlot:
         with self._lock:
             candidates = list(self._free)

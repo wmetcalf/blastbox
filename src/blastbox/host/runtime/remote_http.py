@@ -66,6 +66,17 @@ class RemoteOutputTooLarge(RuntimeError):
     """A remote worker returned more output than the configured cap allows (DoS guard)."""
 
 
+class RemoteOutputMalformed(RuntimeError):
+    """The worker's tar is internally inconsistent -- a WORKER verdict, not a host failure.
+
+    Deliberately NOT an OSError. The blanket handler in the validate path splits OSError into
+    "this dispatcher's disk" vs "the wire", and a worker-authored archive that cannot be laid out
+    (a regular file ``a`` followed by a member ``a/b``, so ``a`` must be both) surfaced there as
+    FileExistsError/ENOTDIR and was filed under the dispatcher's disk. A reusable static worker
+    could then repeat the violation forever without advancing burnout or repair (upstream, PR #82).
+    """
+
+
 class ClaimLost(RuntimeError):
     """This attempt outlived its claim (a peer reclaimed the job) before a destructive output op -- abort
     so we don't clobber the new owner's result in the shared output dir."""
@@ -308,11 +319,23 @@ def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: i
                 continue
             raw = dest / m.name
             # bounds check on the FULLY-RESOLVED path (catches leaf + intermediate-dir symlink escapes).
-            resolved = raw.resolve()
-            if resolved != dest and not str(resolved).startswith(str(dest) + os.sep):
-                _log.warning("remote_http: dropping traversal member %r", m.name)
-                continue
-            _make_traversable(raw.parent, dest)   # 0755 intermediates so a different API UID can read
+            # resolve() and the parent mkdir happen BEFORE the guarded open below, and they are
+            # just as worker-controlled: with a regular file `a` and a later member `a/b`, `a`
+            # must be both a file and a directory, so this raises FileExistsError/ENOTDIR and
+            # escapes the loop into the caller's OSError branch -- which reads it as this
+            # dispatcher's disk. Split it here, where we still know the member that caused it.
+            try:
+                resolved = raw.resolve()
+                if resolved != dest and not str(resolved).startswith(str(dest) + os.sep):
+                    _log.warning("remote_http: dropping traversal member %r", m.name)
+                    continue
+                _make_traversable(raw.parent, dest)   # 0755 so a different API UID can read
+            except OSError as exc:
+                if exc.errno in HOST_RESOURCE_ERRNOS:
+                    raise                              # ours: stays unattributed upstream
+                raise RemoteOutputMalformed(
+                    f"remote output member {m.name!r} cannot be laid out ({exc})"
+                ) from exc
             src = tf.extractfile(m)
             if src is None:
                 continue

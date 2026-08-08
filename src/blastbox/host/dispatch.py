@@ -1184,6 +1184,16 @@ class Dispatcher:
                 if (getattr(control, "signal_is_transport", False)
                         and not getattr(exc, "host_io", False)):
                     warm_fault = "worker"
+                elif isinstance(exc, OSError) and exc.errno not in HOST_RESOURCE_ERRNOS:
+                    # ...and the FILE handshake has its own worker evidence. ctrl/ is
+                    # WORKER-WRITABLE (the gVisor tier bind-mounts it 0o777), so a poisoned
+                    # worker can put a directory or a symlink where go.json belongs and
+                    # atomic_write_confined()'s os.replace() raises EISDIR/ENOTEMPTY/ENOTDIR.
+                    # That is a concrete violation, not our disk failing -- and leaving it
+                    # unknown meant repeated restores from a poisoned checkpoint never advanced
+                    # burnout or base-rebuild detection. Only a host-resource errno is ours; the
+                    # same split ctrl/done already carries on the worker side (upstream, PR #82).
+                    warm_fault = "worker"
                 self._fail_job(job, f"failed to signal go to warm worker: {exc}")
                 return
 
