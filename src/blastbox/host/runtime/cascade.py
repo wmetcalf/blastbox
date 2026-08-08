@@ -337,7 +337,8 @@ class CascadingRuntime:
         self._maybe_repair_tier(idx, tier, streak)
         return True
 
-    def invalidate_base(self, *, reason: str | None = None) -> None:
+    def invalidate_base(self, *, reason: str | None = None,
+                        slot_ids: "list[str] | None" = None) -> None:
         """Forward base invalidation to every wrapped tier that supports it.
 
         Every tier is attempted even if an earlier one fails -- one poisoned tier must not stop
@@ -357,12 +358,28 @@ class CascadingRuntime:
         # Filtering it through a spawn marker meant tier A's stale guilt selected A while the
         # actual offender B kept its poisoned base -- and the pool recorded a rebuild and started
         # its cooldown regardless (upstream, PR #82).
-        if reason == "spawn":
+        # NAMED SLOTS BEAT INFERENCE. A job-driven repair used to hit every tier because the
+        # cascade could not know which one served the failing jobs -- and it must not be narrowed
+        # by _tier_failures, whose spawn guilt is DURABLE and therefore stale here: that selected
+        # tier A on an old spawn failure while the actual offender B kept its poisoned base.
+        # But the caller does know. WarmPool.release() has the slot in hand, and this cascade
+        # still holds its tier in _owner, so an episode that names its slots is attributed
+        # exactly -- no inference, no stale state. Invalidating every tier over failures confined
+        # to one discards healthy sibling snapshots and removes usable fallback capacity
+        # (upstream, PR #82).
+        named: set[int] = set()
+        if slot_ids:
+            with self._lock:
+                named = {i for i in (self._owner.get(str(s)) for s in slot_ids) if i is not None}
+        if named:
+            targets = [t for i, t in enumerate(self.tiers) if i in named]
+        elif reason == "spawn":
             with self._lock:
                 guilty = ({i for i, n in enumerate(self._tier_failures) if n > 0}
                           | self._recently_guilty)
             targets = [t for i, t in enumerate(self.tiers) if i in guilty] or list(self.tiers)
         else:
+            # No names and no spawn attribution: every tier is the only safe target.
             targets = list(self.tiers)
 
         with self._lock:

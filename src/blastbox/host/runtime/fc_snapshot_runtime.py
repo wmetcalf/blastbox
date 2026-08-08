@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Callable
 
 from blastbox.host.pool import Slot, SlotState
-from blastbox.host.runtime.fc_snapshot import SnapshotManager
+from blastbox.host.runtime.fc_snapshot import SnapshotError, SnapshotManager
 from blastbox.host.runtime.fc_snapshot_launcher import REL_OUTDISK, REL_VSOCK
 
 _log = logging.getLogger(__name__)
@@ -271,6 +271,22 @@ class SnapshotSlotRuntime:
                     "gone, so its snapshot generation is kept rather than risk unlinking a file "
                     "a live VM still maps", slot.slot_id,
                 )
+        if not vm_gone:
+            # PROPAGATE, and put the handle back. Retaining the pin stops the backing file being
+            # deleted under a VM that may still be running -- but returning NORMALLY told the pool
+            # the disposal SUCCEEDED, so _reap_and_count removed the slot and allowed a
+            # replacement. That left a live microVM and its now-permanent pin outside pool
+            # accounting entirely: nothing tracks it, nothing ever retries the kill, and its
+            # generation is held until the process restarts. Raising makes the pool quarantine the
+            # slot instead (kept tracked, DRAINING, never reused), which is exactly what an
+            # unconfirmed teardown means. The handle goes back so a later reap can retry the kill
+            # (upstream, PR #82).
+            with self._lock:
+                self._handles.setdefault(slot.slot_id, handle)
+            raise SnapshotError(
+                f"could not confirm the microVM for slot {slot.slot_id} is gone; "
+                f"quarantining the slot rather than replacing it"
+            )
 
     # ------------------------------------------------------------------
     # Warm-path seam (mirrors FirecrackerSlotRuntime so the dispatcher's per-slot

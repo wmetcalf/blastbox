@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 
+from blastbox.host.runtime.fc_snapshot import SnapshotError
+
 from blastbox.host.runtime.gvisor_snapshot_runtime import (
     GvisorHostWarmControl,
     GvisorSnapshotSlotRuntime,
@@ -444,8 +446,15 @@ def test_reap_retains_the_generation_when_the_sandbox_cannot_be_killed(tmp_path)
 
     slot = _Slot()
     rt._handles[slot.slot_id] = _UnkillableHandle()   # type: ignore[index]
-    rt.reap(slot)
+    # ...and it must PROPAGATE: returning normally told the pool the disposal succeeded, so the
+    # slot was removed and replaced while a possibly-live sandbox held its pin outside pool
+    # accounting. Raising quarantines the slot instead.
+    with pytest.raises(SnapshotError):
+        rt.reap(slot)
 
     assert released == [], (
         "the generation pin was released while the sandbox could not be confirmed gone"
+    )
+    assert slot.slot_id in rt._handles, (
+        "the handle was dropped, so nothing can ever try to kill this sandbox again"
     )

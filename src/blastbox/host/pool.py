@@ -751,7 +751,14 @@ class WarmPool:
         # (upstream, PR #82). It is also ordered before the eviction cap: refusing to destroy more
         # slots must not suppress the one action that fixes the base.
         if dirty and fault == "worker":
-            self._maybe_rebuild_base()
+            # ATTRIBUTE FIRST. A job-triggered repair carried no tier evidence, so a cascade fell
+            # back to invalidating EVERY tier -- discarding healthy siblings and removing usable
+            # fallback capacity because one tier's workers were failing jobs. The cascade still
+            # knows which tier served this slot (it is in _owner until the slot is reaped), and
+            # this is the one place that knows the failure was worker-attributed (upstream,
+            # PR #82).
+            self._blame_tiers([slot.slot_id])
+            self._maybe_rebuild_base(slot_ids=[slot.slot_id])
         if burned_out and not self._eviction_allowed():
             # (3) The heuristic wants this slot gone, but the window's budget is spent. Refuse, and
             # say so loudly: if the wedge is real the slot keeps failing and the next window takes
@@ -1843,7 +1850,8 @@ class WarmPool:
         with self._lock:
             return self._pool_consecutive_failures
 
-    def _maybe_rebuild_base(self, streak: "int | None" = None, *, reason: str = "job") -> bool:
+    def _maybe_rebuild_base(self, streak: "int | None" = None, *, reason: str = "job",
+                            slot_ids: "list[str] | None" = None) -> bool:
         """Discard the runtime's persisted warm base after sustained pool-wide failure.
 
         Reaping a burned-out slot only helps if a FRESH slot would be healthy. When the persisted
@@ -1957,10 +1965,15 @@ class WarmPool:
             # Pass the trigger through when the runtime accepts it: a cascade can only attribute a
             # SPAWN-driven repair to a tier. Introspection, not except-TypeError -- a TypeError
             # from inside drop() must never be mistaken for an older signature.
+            # slot_ids: name the slots this episode implicates so a cascade can repair exactly
+            # the tier that served them instead of every tier. Introspection per kwarg, so a
+            # runtime that takes reason= but not slot_ids= still gets reason=.
+            kw: dict[str, Any] = {}
             if _accepts_kwarg(drop, "reason"):
-                drop(reason=reason)
-            else:
-                drop()
+                kw["reason"] = reason
+            if slot_ids and _accepts_kwarg(drop, "slot_ids"):
+                kw["slot_ids"] = list(slot_ids)
+            drop(**kw)
         except Exception:
             logger.exception("pool.base_rebuild_error pool_consecutive_failures=%d", pool_failures)
             # RESTORE the consumed episode. The streak was consumed to make the decision, but the

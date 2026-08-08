@@ -163,7 +163,17 @@ def test_reap_is_safe_on_unknown_slot(tmp_path):
     rt.reap(slot)  # double reap must not raise
 
 
-def test_reap_swallows_kill_errors(tmp_path):
+def test_an_unconfirmed_teardown_quarantines_the_slot(tmp_path):
+    """reap() used to swallow a failed kill() and return normally.
+
+    _reap_and_count then recorded a SUCCESSFUL disposal, removed the slot and allowed a
+    replacement -- leaving a possibly-live microVM and its now-permanent generation pin outside
+    pool accounting entirely: nothing tracked it, nothing would ever retry the kill, and the
+    generation was held until the process restarted. Raising is what makes the pool quarantine
+    the slot instead (kept tracked, DRAINING, never reused).
+    """
+    from blastbox.host.runtime.fc_snapshot import SnapshotError
+
     rt, mgr = _runtime(tmp_path)
     slot = rt.spawn()
 
@@ -171,8 +181,22 @@ def test_reap_swallows_kill_errors(tmp_path):
         raise RuntimeError("kill failed")
 
     mgr.handles[slot.slot_id].kill = boom  # type: ignore[method-assign]
-    rt.reap(slot)  # must not propagate
+    with pytest.raises(SnapshotError):
+        rt.reap(slot)
+    # The workdir is still cleaned, and the HANDLE goes back so a later reap can retry the kill.
     assert not slot.output_dir.parent.exists()
+    assert slot.slot_id in rt._handles, (
+        "the handle was dropped, so nothing can ever try to kill this microVM again"
+    )
+
+
+def test_a_confirmed_teardown_still_returns_quietly(tmp_path):
+    """The carve-out stays narrow: a kill that works is an ordinary reap."""
+    rt, _ = _runtime(tmp_path)
+    slot = rt.spawn()
+    rt.reap(slot)
+    assert not slot.output_dir.parent.exists()
+    assert slot.slot_id not in rt._handles
 
 
 # --- warm-path seam --------------------------------------------------------

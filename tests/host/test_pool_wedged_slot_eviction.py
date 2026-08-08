@@ -2802,3 +2802,128 @@ def test_the_blame_happens_before_the_repair_decision() -> None:
     assert events.index("blame") < events.index("invalidate"), (
         f"blame must precede the repair; got {events}"
     )
+
+
+def test_a_job_repair_targets_only_the_tier_that_served_the_failing_slot() -> None:
+    """Invalidating every tier over failures confined to one destroys healthy siblings.
+
+    A job-driven repair carried no attribution, so it hit every wrapped base — discarding
+    perfectly good snapshots and removing the fallback capacity the cascade exists to provide.
+    The caller knows: WarmPool.release() has the slot, and the cascade still holds its tier in
+    _owner. Naming the slot beats inferring from stale counters.
+    """
+    class _Tier:
+        def __init__(self) -> None:
+            self.invalidated = 0
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            self.n += 1
+            return SimpleNamespace(slot_id=f"{id(self)}-{self.n}")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    a, b = _Tier(), _Tier()
+    casc = CascadingRuntime(
+        tiers=[Tier(name="a", runtime=a, capacity=1), Tier(name="b", runtime=b, capacity=1)],
+        tier_rebuild_after=99,           # keep per-tier repair out of the way
+    )
+    slot_a = casc.spawn()                # tier a (capacity 1)
+    slot_b = casc.spawn()                # tier b
+    assert casc._owner[str(slot_b.slot_id)] == 1, "sanity: b served the second slot"
+
+    casc.invalidate_base(reason="job", slot_ids=[str(slot_b.slot_id)])
+
+    assert b.invalidated == 1, "the tier that served the failing job must be repaired"
+    assert a.invalidated == 0, (
+        "a healthy sibling's snapshot was discarded over failures confined to the other tier"
+    )
+    assert slot_a is not None
+
+
+def test_an_unnamed_job_repair_still_falls_back_to_every_tier() -> None:
+    """No names and no spawn attribution: every tier is the only safe target."""
+    class _Tier:
+        def __init__(self) -> None:
+            self.invalidated = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            return SimpleNamespace(slot_id="x")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    a, b = _Tier(), _Tier()
+    casc = CascadingRuntime(
+        tiers=[Tier(name="a", runtime=a, capacity=1), Tier(name="b", runtime=b, capacity=1)],
+        tier_rebuild_after=99,
+    )
+    casc.invalidate_base(reason="job")
+    assert (a.invalidated, b.invalidated) == (1, 1)
+
+
+def test_the_pool_names_the_failing_slot_when_it_asks_for_a_repair() -> None:
+    """End-to-end: the cascade can only target a tier if the POOL passes the slot through.
+
+    Asserting on CascadingRuntime.invalidate_base directly proves the cascade honours names it is
+    given; it proves nothing about whether anything ever gives them. This drives the real
+    release path.
+    """
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    class _Tier:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.invalidated = 0
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            self.n += 1
+            return Slot(slot_id=f"{self.name}{self.n}", control_dir="/c", input_dir="/i",
+                        output_dir="/o", state=SlotState.IDLE)
+
+        def is_ready(self, slot):
+            return True
+        def is_alive(self, slot):
+            return True
+        def reap(self, slot):
+            pass
+        def recycle(self, slot):
+            pass
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    a, b = _Tier("a"), _Tier("b")
+    casc = CascadingRuntime(
+        tiers=[Tier(name="a", runtime=a, capacity=1), Tier(name="b", runtime=b, capacity=4)],
+        tier_rebuild_after=99,           # keep per-tier repair from muddying the signal
+    )
+    pool = WarmPool(runtime=casc, warm_size=2, concurrent_ceiling=4,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0,
+                    max_consecutive_failures=99)   # isolate the REPAIR, not burnout
+    pool.tick()                          # a fills (capacity 1), then b serves the rest
+    pool.tick()                          # ...and a second tick promotes them out of WARMING
+
+    got = pool.claim(timeout_s=0.5)
+    assert got is not None, "sanity: no slot to claim"
+    owner = casc._owner.get(str(got.slot_id))
+    assert owner is not None, "sanity: the cascade knows which tier served this slot"
+    served, sibling = (a, b) if owner == 0 else (b, a)
+
+    pool.release(got, dirty=True, fault="worker")
+
+    assert served.invalidated >= 1, "the tier that served the failing job was never repaired"
+    assert sibling.invalidated == 0, (
+        "the healthy sibling tier's base was invalidated too -- the pool did not pass the slot "
+        "through, so the cascade had nothing to target and fell back to every tier"
+    )

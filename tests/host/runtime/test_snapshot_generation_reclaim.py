@@ -17,7 +17,7 @@ import pytest
 
 from pathlib import Path
 
-from blastbox.host.runtime.fc_snapshot import SnapshotManager
+from blastbox.host.runtime.fc_snapshot import SnapshotError, SnapshotManager
 from blastbox.host.runtime.fc_snapshot_backend import FcSnapshotArtifact, FcSnapshotBackend
 
 
@@ -351,7 +351,10 @@ def test_a_generation_is_retained_when_the_vm_cannot_be_confirmed_dead(tmp_path)
 
     mgr.invalidate()      # supersede it while the slot is live
     mgr.build()
-    rt.reap(slot)         # kill() raises -> the VM is NOT provably gone
+    # kill() raises -> the VM is NOT provably gone. reap propagates so the pool quarantines the
+    # slot rather than recording a successful disposal and replacing it.
+    with pytest.raises(SnapshotError):
+        rt.reap(slot)
 
     assert gen1.exists(), (
         "a generation was unlinked while its microVM could not be confirmed dead"

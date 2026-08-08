@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable
 
 from blastbox.host.pool import Slot, SlotState
+from blastbox.host.runtime.fc_snapshot import SnapshotError
 
 _log = logging.getLogger(__name__)
 
@@ -139,6 +140,20 @@ class GvisorSnapshotSlotRuntime:
                     "gvisor_snapshot.generation_retained slot_id=%s: could not confirm the "
                     "sandbox is gone, so its checkpoint generation is kept", slot.slot_id,
                 )
+        if not sandbox_gone:
+            # PROPAGATE, and put the handle back -- the same hole as the FC reap, in its twin.
+            # Retaining the pin protects the checkpoint files, but returning NORMALLY told the
+            # pool the disposal succeeded, so it removed the slot and allowed a replacement while
+            # a live sandbox and its permanent pin sat outside pool accounting: untracked, never
+            # retried, holding its generation until the process restarts. Raising quarantines the
+            # slot (kept tracked, DRAINING, never reused), which is what an unconfirmed teardown
+            # actually means (upstream, PR #82).
+            with self._lock:
+                self._handles.setdefault(slot.slot_id, handle)
+            raise SnapshotError(
+                f"could not confirm the gVisor sandbox for slot {slot.slot_id} is gone; "
+                f"quarantining the slot rather than replacing it"
+            )
 
     # --- warm-path seam (file-trigger control; output already on the bind mount) ---
 
