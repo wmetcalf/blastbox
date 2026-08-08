@@ -338,6 +338,19 @@ class CascadingRuntime:
                 self._tier_failures[index] = max(self._tier_failures[index], streak)
             _log.warning("cascade: tier %r base invalidation failed: %s", tier.name, exc)
 
+    def clear_job_guilt(self) -> None:
+        """Forget which tiers a job-failure EPISODE implicated, because it recovered.
+
+        The set is otherwise consumed only by a successful invalidation, so a tier blamed in an
+        episode that then ended in a validated clean release stayed guilty indefinitely -- and the
+        next independent episode, on a different tier, invalidated BOTH: discarding a healthy
+        snapshot and the fallback capacity it provides for a failure it had nothing to do with.
+        The pool calls this wherever it resets the pool-wide streak on demonstrated worker
+        success, which is exactly what "this episode is over" means (upstream, PR #82).
+        """
+        with self._lock:
+            self._job_guilty.clear()
+
     def base_identity(self, slot: object) -> str | None:
         """Which TIER's base produced this slot -- a cascade has one per tier, not one overall."""
         with self._lock:

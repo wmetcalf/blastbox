@@ -3648,9 +3648,11 @@ def test_warming_timeouts_spend_the_eviction_budget() -> None:
     time.sleep(0.05)
     pool.tick()                        # they all blow the timeout at once
 
-    assert len(reaped) <= 1, (
-        f"the whole warm set was churned past a cap of 1: {reaped}. Only a runtime-CONFIRMED "
-        f"death may bypass the eviction budget"
+    assert len(reaped) == 1, (
+        f"expected EXACTLY the budget to be spent, got {reaped}. More than one means the whole "
+        f"warm set was churned past a cap of 1 -- only a runtime-CONFIRMED death may bypass the "
+        f"budget. FEWER means a slot that was granted a token was then charged a second time at "
+        f"the demotion and refused, so the operator's cap silently evicts nothing at all."
     )
 
 
@@ -3780,4 +3782,108 @@ def test_repairing_one_tier_does_not_retire_a_siblings_live_slots() -> None:
     assert stamp[1] == pool._base_generation.get("b", 0), (
         "tier b's live slot was retired by a repair that never touched b's artifact, so every "
         "failure it reports is thrown away"
+    )
+
+
+def test_a_recovered_episode_releases_its_tier_guilt() -> None:
+    """Guilt is otherwise consumed only by a successful invalidation.
+
+    So a tier blamed in an episode that then ended in a validated clean release stayed guilty
+    indefinitely, and the next INDEPENDENT episode on a different tier invalidated both —
+    discarding a healthy snapshot and the fallback capacity it provides, for a failure it had
+    nothing to do with.
+    """
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    class _Tier:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.invalidated = 0
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            self.n += 1
+            return Slot(slot_id=f"{self.name}{self.n}", control_dir="/c", input_dir="/i",
+                        output_dir="/o", state=SlotState.IDLE)
+
+        def is_ready(self, slot): return True
+        def is_alive(self, slot): return True
+        def reap(self, slot): pass
+        def recycle(self, slot): pass
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    a, b = _Tier("a"), _Tier("b")
+    casc = CascadingRuntime(
+        tiers=[Tier(name="a", runtime=a, capacity=1), Tier(name="b", runtime=b, capacity=1)],
+        tier_rebuild_after=99,
+    )
+    pool = WarmPool(runtime=casc, warm_size=2, concurrent_ceiling=4,
+                    snapshot_rebuild_after=2, base_rebuild_cooldown_s=0.0,
+                    max_consecutive_failures=99)
+    pool.tick()
+    pool.tick()
+    by_tier: dict[int, list] = {}
+    for sid, slot in pool._slots.items():
+        by_tier.setdefault(casc._owner[str(sid)], []).append(slot)
+    slot_a, slot_b = by_tier[0][0], by_tier[1][0]
+
+    pool.release(slot_a, dirty=True, fault="worker")      # episode starts, tier a blamed
+    assert casc._job_guilty == {0}
+
+    # The clean release comes from a slot that is STILL LIVE: a cascade has no recycle(), so the
+    # dirty release above reaped slot_a and releasing it again would take the untracked
+    # early-return. Any validated success ends the pool-wide episode, whichever tier served it.
+    pool.release(slot_b, dirty=False)                     # ...and the episode RECOVERS
+    assert casc._job_guilty == set(), (
+        "tier a stayed guilty after its episode recovered, so the next unrelated episode will "
+        "discard a's healthy snapshot too"
+    )
+
+
+def test_a_capped_warming_timeout_is_not_counted_as_a_restore_failure() -> None:
+    """The streak advanced for every timed-out slot BEFORE the budget decision.
+
+    A slot the cap refused to evict stayed WARMING and was counted again by every later tick, so
+    one healthy-but-slow capped slot reached the rebuild threshold within a few poll cycles and
+    invalidated a healthy snapshot on no additional restore failure. With
+    max_evictions_per_window=0 — the operator's "stop evicting" — it counted forever.
+    """
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    class _NeverReady:
+        def __init__(self) -> None:
+            self.n = 0
+            self.invalidated = 0
+
+        def spawn(self):
+            self.n += 1
+            return Slot(slot_id=f"w{self.n}", control_dir="/c", input_dir="/i",
+                        output_dir="/o", state=SlotState.WARMING, spawned_at=0.0)
+
+        def is_ready(self, slot): return False
+        def is_alive(self, slot): return True
+        def reap(self, slot): pass
+        def invalidate_base(self, *, reason=None) -> None:
+            self.invalidated += 1
+
+    rt = _NeverReady()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
+                    warming_timeout_s=0.01, max_evictions_per_window=0,
+                    eviction_window_s=10_000.0, snapshot_rebuild_after=2,
+                    base_rebuild_cooldown_s=0.0)
+    pool.tick()
+    time.sleep(0.05)
+    for _ in range(6):
+        pool.tick()
+
+    assert pool._spawn_consecutive_failures == 0, (
+        f"a slot the cap refused to evict was counted as a restore failure on every tick "
+        f"(streak={pool._spawn_consecutive_failures})"
+    )
+    assert rt.invalidated == 0, (
+        "a healthy snapshot was invalidated because one slow slot was re-counted every poll"
     )

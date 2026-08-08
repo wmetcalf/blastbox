@@ -706,6 +706,8 @@ class WarmPool:
         # Resolved OUTSIDE the lock: the optional worker_identity() hook belongs to the runtime
         # and must not run under the pool lock.
         hkey = self._health_key(slot)
+        # Set under the lock by either recovery branch; the runtime hook runs outside it.
+        episode_recovered = False
         with self._lock:
             slot.jobs += 1
             jobs = slot.jobs
@@ -734,6 +736,7 @@ class WarmPool:
                 # right (upstream, PR #82).
                 self._slot_failures.pop(hkey, None)
                 self._pool_consecutive_failures = 0
+                episode_recovered = True
                 slot_failures = 0
                 # ...and it proves the RESTORED BASE is responsive too, so it must clear the
                 # restore-side evidence as well. Leaving these meant restore deaths separated by
@@ -774,6 +777,7 @@ class WarmPool:
                 self._slot_failures.pop(hkey, None)
                 self._slot_last_success[hkey] = self._clock()
                 self._pool_consecutive_failures = 0
+                episode_recovered = True
                 # Episode token: a rebuild decision taken before this point is abandoned, because
                 # the base demonstrably just produced a valid result.
                 self._clean_release_count += 1
@@ -792,6 +796,15 @@ class WarmPool:
             self._max_consecutive_failures > 0
             and slot_failures >= self._max_consecutive_failures
         )
+        if episode_recovered:
+            # The pool-wide episode is over, so the per-tier attribution it accumulated is over
+            # too. A cascade otherwise consumes _job_guilty only on a successful invalidation, so
+            # a tier blamed in an episode that then RECOVERED stayed guilty -- and the next,
+            # independent episode on a different tier invalidated both, discarding a healthy
+            # snapshot and its fallback capacity for a failure it had nothing to do with
+            # (upstream, PR #82).
+            self._clear_runtime_job_guilt()
+
         # POOL-wide, and deliberately NOT gated on this slot burning out. Disposable snapshot
         # runtimes (FC/gVisor) have no recycle(), so every dirty release reaps the restored VM and
         # _forget_slot_health() clears its counter -- no individual slot ever reaches the
@@ -1921,6 +1934,20 @@ class WarmPool:
                     return str(got)
         return ""
 
+    def _clear_runtime_job_guilt(self) -> None:
+        """Tell a runtime that keeps per-tier job attribution that the episode recovered.
+
+        Optional seam, hasattr-guarded: only a cascade tracks this. MUST NOT be called under
+        _lock -- it takes the runtime's own lock.
+        """
+        fn = getattr(self._runtime, "clear_job_guilt", None)
+        if not callable(fn):
+            return
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001 -- attribution must never break a release
+            logger.warning("pool.clear_job_guilt_failed: %s", exc)
+
     def _health_key(self, slot: "Slot") -> str:
         """The identity this slot's failure history belongs to.
 
@@ -2223,6 +2250,9 @@ class WarmPool:
         # dead. If disposing of a merely-suspected slot also fails, we have learned nothing and must
         # not strand it (see the reap loop below).
         suspected: set[str] = set()
+        # Slots that already hold an eviction token (reserved when their timeout was detected),
+        # so the demotion loop must not charge them again.
+        budgeted: set[str] = set()
         for slot in stuck_warming:
             logger.warning(
                 "pool.warming_timeout_evict slot_id=%s age=%.1fs", slot.slot_id, now - slot.spawned_at
@@ -2238,9 +2268,28 @@ class WarmPool:
             # spawn() returned successfully, so the cascade's per-tier streak is empty and a
             # repair would fall back to invalidating every tier -- destroying healthy siblings
             # because one tier hands back slots that never reach IDLE (upstream, PR #82).
-            self._blame_tiers([s.slot_id for s in stuck_warming])
+            # RESERVE FIRST, then count only what is actually being evicted. The streak was
+            # advanced for every timed-out slot before the budget decision, so a slot the cap
+            # REFUSED to evict stayed WARMING and was counted again by every later tick: one
+            # healthy-but-slow capped slot reached the rebuild threshold within a few poll cycles
+            # and invalidated a healthy snapshot on no additional restore failure at all. With
+            # max_evictions_per_window=0 -- the operator's "stop evicting" -- it counted forever
+            # (upstream, PR #82). The tokens taken here are carried in `budgeted` so the demotion
+            # loop does not charge these slots a second time.
             with self._lock:
-                self._spawn_consecutive_failures += len(stuck_warming)
+                for s in stuck_warming:
+                    if self._reserve_eviction_unlocked(self._clock()):
+                        budgeted.add(s.slot_id)
+            capped = [s for s in stuck_warming if s.slot_id not in budgeted]
+            if capped:
+                logger.warning(
+                    "pool.warming_timeout_capped count=%d -- the eviction budget is spent; these "
+                    "slots stay WARMING and are NOT counted as restore failures", len(capped),
+                )
+            evicting = [s for s in stuck_warming if s.slot_id in budgeted]
+            self._blame_tiers([s.slot_id for s in evicting])
+            with self._lock:
+                self._spawn_consecutive_failures += len(evicting)
                 warm_failures = self._spawn_consecutive_failures
             if self._maybe_rebuild_base(warm_failures, reason="spawn"):
                 # HALT THE TICK. The artifact is gone, so the very next runtime.spawn() runs
@@ -2368,7 +2417,8 @@ class WarmPool:
                     # cap purely because it was never added to `suspected` (upstream, PR #82).
                     heuristic = (slot.slot_id in suspected
                                  or cur.state == SlotState.WARMING)
-                    if heuristic and not self._reserve_eviction_unlocked(self._clock()):
+                    if (heuristic and slot.slot_id not in budgeted
+                            and not self._reserve_eviction_unlocked(self._clock())):
                         logger.warning(
                             "pool.health_unknown_escalation_capped slot_id=%s — budget exhausted "
                             "at demotion; leaving the slot in place", slot.slot_id,
