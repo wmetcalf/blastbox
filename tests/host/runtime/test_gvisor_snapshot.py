@@ -677,3 +677,46 @@ def test_no_checkpoint_is_written_without_a_lease(tmp_path, monkeypatch):
     assert not list(tmp_path.glob("checkpoint-*")), (
         "a checkpoint generation was written with no lease covering it"
     )
+
+
+def test_a_cancelled_restore_still_tears_its_sandbox_down(tmp_path):
+    """`except Exception` skipped an interrupt entirely.
+
+    A KeyboardInterrupt/SystemExit during `runsc restore` still leaves registered container state
+    with live sandbox/gofer processes — and SnapshotManager.restore() then saw an escaping
+    exception with no kill_failed marker and UNPINNED the checkpoint, so a later invalidation
+    could delete a generation that untracked sandbox was still using.
+    """
+    deleted: list[str] = []
+
+    def _run(argv, **kw):
+        if "restore" in argv:
+            raise KeyboardInterrupt("operator interrupted the dispatcher")
+        if "delete" in argv:
+            deleted.append(argv[-1])
+        return 0
+
+    backend = GvisorSnapshotBackend(_cfg(tmp_path), run=_run, ready_wait=lambda d, t: None)
+    with pytest.raises(KeyboardInterrupt):
+        backend.restore_in(tmp_path / "slot", str(tmp_path / "checkpoint-x"))
+    assert deleted, (
+        "a cancelled restore left its registered container behind: nothing else knows the cid, "
+        "so nothing can ever reap it"
+    )
+
+
+def test_a_cancelled_base_boot_still_tears_down(tmp_path):
+    """The boot_base sibling, same rule."""
+    deleted: list[str] = []
+
+    def _run(argv, **kw):
+        if "run" in argv:
+            raise KeyboardInterrupt("interrupted")
+        if "delete" in argv:
+            deleted.append(argv[-1])
+        return 0
+
+    backend = GvisorSnapshotBackend(_cfg(tmp_path), run=_run, ready_wait=lambda d, t: None)
+    with pytest.raises(KeyboardInterrupt):
+        backend.boot_base()
+    assert deleted, "a cancelled base boot leaked its registered container"

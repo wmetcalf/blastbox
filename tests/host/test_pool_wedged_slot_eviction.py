@@ -1746,6 +1746,10 @@ def test_sequential_warmup_failures_still_reach_the_rebuild_threshold() -> None:
         runtime=rt, warm_size=1, concurrent_ceiling=2, clock=clock,
         warming_timeout_s=10.0, snapshot_rebuild_after=3,
         base_rebuild_cooldown_s=0.0, spawn_rate_limit=1000.0,
+        # Warming timeouts now spend eviction budget (they are a heuristic like any other), and
+        # the default cap of max(2, warm_size) would stop the churn this test is ABOUT after two
+        # ticks -- masking the very regression it exists to catch.
+        max_evictions_per_window=1000,
     )
 
     for _ in range(8):
@@ -2254,12 +2258,19 @@ def test_a_post_promotion_death_is_blamed_on_its_own_tier() -> None:
     slot = casc.spawn()               # lands on the FIRST tier
     assert slot.slot_id.startswith("fc")
 
-    # Two post-promotion deaths of fc's slots must repair fc, and only fc.
+    # Two post-promotion deaths of fc's slots must attribute to fc, and only fc.
     assert casc.blame_tier_for_slot(slot.slot_id) is True
     slot2 = casc.spawn()              # fc is full (capacity 1) -> overflow
     assert casc.blame_tier_for_slot(slot.slot_id) is True
+    assert slot2 is not None
 
-    assert fc.invalidated >= 1, "the tier that produced the dying slots must be repaired"
+    # Blaming does NOT repair on its own: doing so invalidated the tier the moment its own
+    # streak hit the threshold, ahead of the pool's base_rebuild_cooldown_s, and then again via
+    # the pool-wide repair on the same release. The pool owns the WHEN; this owns the WHO.
+    assert fc.invalidated == 0, "the job path must not repair behind the pool's cooldown"
+
+    casc.invalidate_base(reason="job")        # what the pool does once it decides
+    assert fc.invalidated == 1, "the tier that produced the dying slots must be repaired"
     assert overflow.invalidated == 0, (
         "a healthy sibling tier was invalidated for deaths confined to another tier"
     )
@@ -3532,4 +3543,170 @@ def test_a_successful_repair_does_advance_the_generation() -> None:
     assert rt.attempts == 1
     assert pool._base_generation == before + 1, (
         "a successful repair must retire the artifact its live slots were restored from"
+    )
+
+
+import contextlib as _contextlib
+
+
+@_contextlib.contextmanager
+def _capture_pool_logs():
+    """Collect formatted blastbox.host.pool log lines emitted inside the block."""
+    out: list[str] = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record):
+            out.append(record.getMessage())   # already interpolates record.args
+
+    lg = logging.getLogger("blastbox.host.pool")
+    h = _Sink()
+    lg.addHandler(h)
+    prev = lg.level
+    lg.setLevel(logging.INFO)
+    try:
+        yield out
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(prev)
+
+
+def test_the_wedge_log_counts_a_reusing_runtimes_failures() -> None:
+    """The visibility log matched slot ids against health keys.
+
+    With a reusing runtime the record is filed under the physical worker while `live` holds
+    per-assignment slot ids, so it reported slots_failing=0 while a box walked toward burnout —
+    defeating this log for the one runtime that needed stable identities in the first place.
+    """
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    class _Reusing(_WedgeableRuntime):
+        def worker_identity(self, slot):
+            return "box:0"
+
+    rt = _Reusing()
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
+                    max_consecutive_failures=99)
+    slot = Slot(slot_id="assignment-17", control_dir="/c", input_dir="/i", output_dir="/o",
+                state=SlotState.IDLE)
+    pool._slots[slot.slot_id] = slot
+    key = pool._health_key(slot)
+    assert key == "box:0"
+
+    pool.release(slot, dirty=True, fault="worker")
+    # The release reaps the slot on this runtime; a reusing runtime hands the SAME box out again
+    # under a fresh assignment id, which is exactly the shape the log has to see through.
+    again = Slot(slot_id="assignment-18", control_dir="/c", input_dir="/i", output_dir="/o",
+                 state=SlotState.IDLE)
+    pool._slots[again.slot_id] = again
+    assert pool._health_key(again) == key
+    assert pool._slot_failures.get(key) == 1, "sanity: the box carries a failure"
+
+    # Drive the REAL aggregation, not a copy of it.
+    with _capture_pool_logs() as records:
+        pool._sample_metrics()
+    health = [r for r in records if "pool.health" in r]
+    assert health, "the wedge-visibility log did not fire at all"
+    assert "slots_failing=1" in health[0], (
+        f"a box walking toward burnout was invisible: {health[0]}. `live` held per-assignment "
+        f"slot ids while the record is filed under the physical worker."
+    )
+
+
+def test_warming_timeouts_spend_the_eviction_budget() -> None:
+    """A warming timeout is a HEURISTIC too, and it bypassed the cap entirely.
+
+    "Healthy but slower than the configured budget" looks identical to "never coming up", so a
+    low timeout on a cloud tier churns the whole warm set — repeatedly, even when the operator
+    set max_evictions_per_window specifically to bound heuristic eviction. It escaped only
+    because a timed-out WARMING slot was never added to `suspected`.
+    """
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    reaped: list[str] = []
+
+    class _NeverReady:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def spawn(self):
+            self.n += 1
+            return Slot(slot_id=f"w{self.n}", control_dir="/c", input_dir="/i",
+                        output_dir="/o", state=SlotState.WARMING, spawned_at=0.0)
+
+        def is_ready(self, slot):
+            return False
+        def is_alive(self, slot):
+            return True
+        def reap(self, slot):
+            reaped.append(slot.slot_id)
+
+    pool = WarmPool(runtime=_NeverReady(), warm_size=4, concurrent_ceiling=8,
+                    warming_timeout_s=0.01, max_evictions_per_window=1,
+                    eviction_window_s=10_000.0, snapshot_rebuild_after=999,
+                    base_rebuild_cooldown_s=0.0)
+    pool.tick()                        # four WARMING slots
+    time.sleep(0.05)
+    pool.tick()                        # they all blow the timeout at once
+
+    assert len(reaped) <= 1, (
+        f"the whole warm set was churned past a cap of 1: {reaped}. Only a runtime-CONFIRMED "
+        f"death may bypass the eviction budget"
+    )
+
+
+def test_a_failed_tier_repair_keeps_its_guilt_for_the_retry() -> None:
+    """The clears discarded the whole job-guilt set before any outcome was known.
+
+    WarmPool restores the consumed episode after CascadeInvalidateFailed, but the retry then had
+    no named tiers and fell back to invalidating EVERY tier — including the siblings the first
+    attempt had just repaired successfully, and unrelated healthy ones.
+    """
+    from blastbox.host.runtime.cascade import CascadeInvalidateFailed
+
+    class _Tier:
+        def __init__(self, name: str, broken: bool = False) -> None:
+            self.name = name
+            self.broken = broken
+            self.invalidated = 0
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            self.n += 1
+            return SimpleNamespace(slot_id=f"{self.name}{self.n}")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+            if self.broken:
+                raise RuntimeError(f"tier {self.name} invalidation failed")
+
+    good, bad, bystander = _Tier("good"), _Tier("bad", broken=True), _Tier("by")
+    casc = CascadingRuntime(
+        tiers=[Tier(name="good", runtime=good, capacity=1),
+               Tier(name="bad", runtime=bad, capacity=1),
+               Tier(name="by", runtime=bystander, capacity=1)],
+        tier_rebuild_after=99,
+    )
+    s_good = casc.spawn()
+    s_bad = casc.spawn()
+    casc.spawn()
+    casc.blame_tier_for_slot(str(s_good.slot_id))
+    casc.blame_tier_for_slot(str(s_bad.slot_id))
+
+    with pytest.raises(CascadeInvalidateFailed):
+        casc.invalidate_base(reason="job")
+    assert (good.invalidated, bad.invalidated, bystander.invalidated) == (1, 1, 0)
+
+    # The pool restores the episode and retries. Only the tier that FAILED is still guilty.
+    with pytest.raises(CascadeInvalidateFailed):
+        casc.invalidate_base(reason="job")
+    assert bad.invalidated == 2, "the failing tier was not retried"
+    assert good.invalidated == 1, (
+        "a tier repaired successfully in the first attempt was invalidated again -- its "
+        "replacement build may be in flight, and each redundant invalidate rejects it"
+    )
+    assert bystander.invalidated == 0, (
+        "an unrelated healthy tier was invalidated because the retry lost its naming"
     )

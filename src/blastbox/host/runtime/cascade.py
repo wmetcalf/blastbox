@@ -382,9 +382,14 @@ class CascadingRuntime:
             self._tier_failures[idx] += 1
             self._recently_guilty.add(idx)
             self._job_guilty.add(idx)
-            streak = self._tier_failures[idx]
-            tier = self.tiers[idx]
-        self._maybe_repair_tier(idx, tier, streak)
+        # NO immediate repair here. This is the JOB path, and repairing from it invalidated the
+        # tier the moment its own streak hit the threshold -- before WarmPool._maybe_rebuild_base
+        # could apply base_rebuild_cooldown_s, and then again through the pool-wide repair on the
+        # same release. Continued job failures could therefore rebuild a tier every
+        # threshold-sized batch inside the advertised cooldown. Recording the guilt is this
+        # method's whole job; the pool decides WHEN, and invalidate_base() then targets exactly
+        # the tiers named here. _maybe_repair_tier stays on the spawn path, which the pool cannot
+        # see (upstream, PR #82).
         return True
 
     def invalidate_base(self, *, reason: str | None = None) -> None:
@@ -439,7 +444,12 @@ class CascadingRuntime:
 
         with self._lock:
             self._recently_guilty.clear()   # consumed by this repair
-            self._job_guilty.clear()
+            # _job_guilty is NOT cleared here. Discarding it before the outcomes are known lost
+            # the naming for tiers whose invalidation then FAILED: the pool restores the consumed
+            # episode after CascadeInvalidateFailed, but its retry had no guilty tiers left and
+            # fell back to invalidating EVERY tier -- including the siblings this attempt had
+            # just repaired successfully. Each tier's guilt is discarded below, individually,
+            # when its own invalidation succeeds (upstream, PR #82).
 
         failures: list[str] = []
         attempted = 0
@@ -463,6 +473,7 @@ class CascadingRuntime:
                     idx = self.tiers.index(tier)
                     self._tier_failures[idx] = 0
                     self._recently_guilty.discard(idx)
+                    self._job_guilty.discard(idx)
         if failures:
             raise CascadeInvalidateFailed(
                 "cascade: base invalidation failed for " + "; ".join(failures)

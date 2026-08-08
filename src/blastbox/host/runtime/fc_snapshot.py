@@ -208,6 +208,12 @@ class SnapshotManager:
         """Build the warm snapshot. Idempotent — a second call returns the same
         artifact without rebuilding. Raises :class:`SnapshotBuildError` on failure
         (callers fall back to cold-boot)."""
+        # BEFORE the idempotent early return. A checkpoint that SUCCEEDS but whose boot.kill()
+        # fails retains the possibly-live sandbox -- and from then on every build() returns here
+        # immediately because the artifact exists, so the retry was unreachable until some
+        # unrelated invalidation. The base VM sat running and consuming host RAM through normal
+        # operation, which is exactly when the success path retains one (upstream, PR #82).
+        self._retry_undead_bases()
         if self._artifact is not None:
             return self._artifact
         self._base_dir.mkdir(parents=True, exist_ok=True)
@@ -242,8 +248,6 @@ class SnapshotManager:
                     sweep()
             except Exception as exc:  # noqa: BLE001 -- a failed sweep must never block the tier
                 _log.warning("snapshot.orphan_sweep_failed (retrying on the next build): %s", exc)
-        # Retry base sandboxes a previous build could not tear down (see the teardown paths).
-        self._retry_undead_bases()
         # boot_base() is its own try so a base-boot failure is wrapped as
         # SnapshotBuildError (as documented), not propagated raw. boot_base already
         # tears down its own sandbox on partial failure, so no handle/finally is

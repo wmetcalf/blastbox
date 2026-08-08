@@ -1215,12 +1215,19 @@ class WarmPool:
             # Wedged-slot visibility: a slot whose in-guest agent has stopped answering looks
             # identical to a healthy IDLE one in every other gauge, which is why a 100%-failing
             # pool went unnoticed for days. Surface the failure state directly.
-            live = set(self._slots)
-            failing = sum(1 for sid, n in self._slot_failures.items() if sid in live and n > 0)
-            worst = max((n for sid, n in self._slot_failures.items() if sid in live), default=0)
+            # Resolve each live slot to the key its health is FILED under. With a reusing
+            # runtime (a static pool, or a static tier inside a cascade) the record is keyed
+            # "static:0" / "tier:static:0" while `live` holds per-assignment slot ids, so these
+            # membership tests reported slots_failing=0 and worst_consecutive=0 while a box was
+            # walking toward burnout -- defeating this log for the one runtime that needed
+            # stable identities in the first place (upstream, PR #82).
+            live = {self._health_key_by_slot.get(sid, sid) for sid in self._slots}
+            failing = sum(1 for k, n in self._slot_failures.items() if k in live and n > 0)
+            worst = max((n for k, n in self._slot_failures.items() if k in live), default=0)
             never_ok = sum(
                 1 for sid, s in self._slots.items()
-                if s.jobs > 0 and not self._slot_last_success.get(sid)
+                if s.jobs > 0
+                and not self._slot_last_success.get(self._health_key_by_slot.get(sid, sid))
             )
             pool_failures = self._pool_consecutive_failures
             rebuilds = self._base_rebuilds
@@ -2317,8 +2324,15 @@ class WarmPool:
                     # value backdates the token by the whole pass, so on a short window the next
                     # pass expires every token immediately and evicts another full capped batch --
                     # defeating max_evictions_per_window exactly when it matters (PR #82).
-                    if (slot.slot_id in suspected
-                            and not self._reserve_eviction_unlocked(self._clock())):
+                    # A warming timeout is a HEURISTIC too: "healthy but slower than the
+                    # configured budget" looks identical to "never coming up", and a low timeout
+                    # on a cloud tier churns the entire warm set. Only a runtime-CONFIRMED death
+                    # may bypass the cap; a timed-out WARMING slot was never confirmed by anyone,
+                    # so it spends budget exactly like an escalated-unknown one. It bypassed the
+                    # cap purely because it was never added to `suspected` (upstream, PR #82).
+                    heuristic = (slot.slot_id in suspected
+                                 or cur.state == SlotState.WARMING)
+                    if heuristic and not self._reserve_eviction_unlocked(self._clock()):
                         logger.warning(
                             "pool.health_unknown_escalation_capped slot_id=%s — budget exhausted "
                             "at demotion; leaving the slot in place", slot.slot_id,

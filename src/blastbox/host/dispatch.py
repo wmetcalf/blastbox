@@ -1375,13 +1375,25 @@ class Dispatcher:
                 # terminal DONE CAS). Like the other three, a peer
                 # owning the job says nothing about this worker -- which here has already produced
                 # and sealed valid output (upstream, PR #82).
-                warm_fault = "unknown"
+                # "job", not "unknown". This worker has already RUN, produced output and had it
+                # pass the host trust gate -- positive proof it and the base it restored from are
+                # healthy. Leaving it unknown preserved both streaks, so worker-failure /
+                # valid-output-then-claim-loss / worker-failure counted as CONSECUTIVE and could
+                # evict the slot or invalidate its base on two unrelated events. The peer owning
+                # the job says nothing about this worker; the demonstrated success does
+                # (upstream, PR #82).
+                warm_fault = "job"
                 _log.info(
                     "warm job %s reclaimed before upload; skipping put_output (peer owns "
                     "it now)", job.job_id,
                 )
                 return
             if not self._upload_output(job, output_dir):
+                # The worker RAN and its output passed the trust gate; the upload is OUR side
+                # failing. Attribute the demonstrated success so the streaks reset -- the default
+                # would convict the worker for this dispatcher's storage problem, and an upload
+                # outage hits every job at once (upstream, PR #82).
+                warm_fault = "job"
                 self._fail_job(
                     job,
                     f"result upload failed after {self._put_output_max_attempts} attempts; "
@@ -1420,7 +1432,11 @@ class Dispatcher:
                 # claim-loss sites: reclaim races cluster exactly when the queue is deep, so a
                 # busy fleet would steadily burn out its healthiest, fastest slots and eventually
                 # invalidate a perfectly good base (upstream, PR #82).
-                warm_fault = "unknown"
+                # "job", not "unknown", for the same reason as the pre-upload exit: unknown
+                # PRESERVES both streaks, so a failure on either side of this success still
+                # counted as consecutive. The run itself is proof the worker and its base are
+                # healthy, and reclaim races cluster exactly when the queue is deep.
+                warm_fault = "job"
                 _log.warning(
                     "warm job %s no longer our RUNNING claim at DONE write (recovered/reclaimed "
                     "by another dispatcher); leaving its terminal state untouched",

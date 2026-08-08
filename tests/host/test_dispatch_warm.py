@@ -643,7 +643,7 @@ def test_warm_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(tmp
         f"via warm_clean=True, which returns a possibly-contaminated slot to IDLE unreset "
         f"(got dirty={pool.release_dirty})"
     )
-    assert pool.release_fault == ["unknown"], (
+    assert pool.release_fault == ["job"], (
         f"a reclaim race is not worker evidence (got {pool.release_fault})"
     )
 
@@ -806,7 +806,7 @@ def test_warm_claim_lost_at_the_done_write_is_not_blamed_on_the_worker(tmp_path)
         f"via warm_clean=True, which returns a possibly-contaminated slot to IDLE unreset "
         f"(got dirty={pool.release_dirty})"
     )
-    assert pool.release_fault == ["unknown"], (
+    assert pool.release_fault == ["job"], (
         f"losing only the DONE race is not worker evidence (got {pool.release_fault})"
     )
 
@@ -1610,8 +1610,9 @@ def test_an_upload_failure_is_not_blamed_on_the_worker(tmp_path):
     dispatcher.dispatch_once()
 
     assert pool.release_calls == [slot]
-    assert pool.release_fault == ["unknown"], (
-        f"a host-side upload failure is not worker evidence (got {pool.release_fault})"
+    assert pool.release_fault == ["job"], (
+        f"a host-side upload failure is not worker evidence, and the run itself PROVED the "
+        f"worker healthy, so the streaks must reset (got {pool.release_fault})"
     )
 
 

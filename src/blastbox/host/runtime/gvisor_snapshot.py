@@ -550,9 +550,13 @@ class GvisorSnapshotBackend:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        except Exception:
-            # No boot handle is returned on failure, so nothing reaps the base — drop any
-            # registered runsc state for this cid AND remove the bundle dir so neither leaks.
+        except BaseException:
+            # BaseException, matching restore_in and build()'s teardown: an interrupt or
+            # cancellation during `runsc run` still leaves registered container state behind, and
+            # no boot handle is returned on failure, so nothing else can ever reap it (PR #82).
+            #
+            # Nothing reaps the base — drop any registered runsc state for this cid AND remove
+            # the bundle dir so neither leaks.
             _best_effort_delete(self._cfg, self._run, cid)
             shutil.rmtree(base, ignore_errors=True)
             raise
@@ -571,7 +575,15 @@ class GvisorSnapshotBackend:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        except Exception as exc:
+        except BaseException as exc:
+            # BaseException, not Exception. A KeyboardInterrupt, SystemExit or task cancellation
+            # during `runsc restore` skipped this handler entirely -- yet the command may already
+            # have registered a container and spawned its sandbox/gofer processes. Worse,
+            # SnapshotManager.restore() then saw an escaping exception with no kill_failed marker
+            # and UNPINNED the checkpoint, so a later invalidation could delete a generation the
+            # untracked sandbox was still using. Same reasoning as build()'s teardown, which was
+            # widened for exactly this (upstream, PR #82).
+            #
             # A partially-failed `runsc restore` can leave registered container state (with
             # its sandbox/gofer processes) under -root. No handle is returned on failure, and
             # the manager only knows the slot dir — not this cid — so tear it down here before

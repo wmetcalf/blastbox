@@ -498,7 +498,10 @@ class FcSnapshotLauncher:
         # the caller only gets a killable _Handle once restore_in RETURNS.
         try:
             self._copy_outdisk(base_outdisk, Path(slot_workdir) / REL_OUTDISK)
-        except Exception:
+        except BaseException:
+            # BaseException: the caller only gets a killable _Handle once restore_in RETURNS, so
+            # a KeyboardInterrupt/SystemExit/cancellation here leaks the firecracker process this
+            # method just spawned -- permanently, since nothing else knows its pid (PR #82).
             _terminate_proc(proc)
             raise
         return _Handle(proc, api, str(Path(slot_workdir) / REL_VSOCK))

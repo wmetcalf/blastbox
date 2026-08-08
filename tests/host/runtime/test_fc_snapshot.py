@@ -472,3 +472,45 @@ def test_a_confirmed_base_teardown_is_not_retained(tmp_path):
     mgr = SnapshotManager(tmp_path, backend)
     mgr.build()
     assert mgr._undead_bases == []
+
+
+def test_a_retained_base_is_retried_even_once_the_artifact_exists(tmp_path):
+    """The retry sat AFTER build()'s idempotent early return.
+
+    A checkpoint that succeeds but whose boot.kill() fails retains the possibly-live sandbox —
+    and from then on every build() returns immediately because the artifact exists, so the retry
+    was unreachable until some unrelated invalidation. The base VM sat running through normal
+    operation, which is exactly when the success path retains one.
+    """
+    class _Unkillable(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.kills = 0
+            self.fail_kill = True
+
+        def boot_base(self):
+            boot = super().boot_base()
+            outer = self
+
+            def _kill():
+                outer.kills += 1
+                if outer.fail_kill:
+                    raise RuntimeError("teardown unconfirmed")
+
+            boot.kill = _kill
+            return boot
+
+    backend = _Unkillable()
+    mgr = SnapshotManager(tmp_path, backend)
+    mgr.build()
+    assert len(mgr._undead_bases) == 1
+
+    # The artifact now EXISTS, so build() short-circuits -- and must still retry the teardown.
+    backend.fail_kill = False
+    before = backend.kills
+    mgr.build()
+    assert backend.kills > before, (
+        "the retained sandbox was never retried once an artifact existed, so it ran for the life "
+        "of the process"
+    )
+    assert mgr._undead_bases == []
