@@ -15,7 +15,6 @@ toggle, the FcSnapshotArtifact) live in
 """
 from __future__ import annotations
 
-import contextlib
 import logging
 import shutil
 import threading
@@ -112,7 +111,10 @@ class SnapshotManager:
         # nothing, and the build then published the very artifact the repair meant to reject --
         # so the second repair request was silently lost (upstream, PR #82).
         self._build_epoch = 0
-        self._swept_orphans = False
+        # Base boot handles whose kill() raised. Suppressing it discarded the ONLY reference to a
+        # sandbox that may still be running, and the async retry then booted another beside it --
+        # untracked, unreapable, for the life of the process (upstream, PR #82).
+        self._undead_bases: list[object] = []
         # Async-build state (used by ensure_build_started so the up-to-ready_timeout_s build
         # never runs on the pool's single tick thread). _build_lock guards only the cheap
         # bookkeeping below, never the slow boot/checkpoint inside build().
@@ -171,6 +173,37 @@ class SnapshotManager:
             with self._build_lock:
                 self._build_error = None
 
+    def _kill_base(self, boot: object) -> None:
+        """Tear a base sandbox down, RETAINING it for retry if the teardown could not be confirmed.
+
+        ``contextlib.suppress`` here threw away the only handle to a sandbox that may still be
+        alive: gVisor's boot handle raises when neither teardown command succeeds, and FC's does
+        on a process-control failure. The next async build then booted a second base beside the
+        first, which nothing tracked and nothing could ever reap.
+        """
+        try:
+            boot.kill()  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001 -- a failed teardown must not mask the build error
+            with self._build_lock:
+                self._undead_bases.append(boot)
+            _log.warning(
+                "snapshot.base_teardown_unconfirmed: the base sandbox may still be running; "
+                "retained for retry on the next build. %s", exc,
+            )
+
+    def _retry_undead_bases(self) -> None:
+        """Re-attempt teardown of base sandboxes a previous build could not confirm gone."""
+        with self._build_lock:
+            pending = list(self._undead_bases)
+            self._undead_bases.clear()
+        for boot in pending:
+            try:
+                boot.kill()  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                with self._build_lock:
+                    self._undead_bases.append(boot)
+                _log.warning("snapshot.base_teardown_retry_failed: %s", exc)
+
     def build(self) -> object:
         """Build the warm snapshot. Idempotent — a second call returns the same
         artifact without rebuilding. Raises :class:`SnapshotBuildError` on failure
@@ -186,38 +219,31 @@ class SnapshotManager:
         # so the tier stayed wedged even after the transient unlink problem cleared. The build
         # path is the one thing guaranteed to run on every retry (upstream, PR #82).
         self._sweep_retired()
-        # Reclaim generations left by a dispatcher that is gone. Done here rather than at import
-        # or construction so it runs on the first real build, with the directories already
-        # created. Best-effort: a failed sweep must never block bringing the tier up.
-        if not self._swept_orphans:
-            sweep = getattr(self._backend, "sweep_orphan_generations", None)
-            if not callable(sweep):
-                self._swept_orphans = True          # nothing to retry on this backend
-            else:
-                try:
-                    # Hand over the checkpoint root when the backend asks for it. FC's launcher
-                    # already owns its own base/mem dirs, but gVisor's backend only learns the
-                    # path at checkpoint() time -- far too late for a sweep that must run BEFORE
-                    # the first build consumes the space. Introspection, not except-TypeError: a
-                    # TypeError raised INSIDE a sweep must never be mistaken for an older
-                    # signature (same reasoning as _accepts_kwarg in pool.py).
-                    if _accepts_kwarg(sweep, "base_dir"):
-                        sweep(base_dir=self._base_dir)
-                    else:
-                        sweep()
-                except Exception as exc:  # noqa: BLE001
-                    # LATCH ONLY ON SUCCESS. The flag was set before the call, so a transient
-                    # EIO/EROFS during startup reclamation left the orphan in place and the sweep
-                    # never ran again for the life of the process. That orphan is a RAM-sized .mem
-                    # -- itself a reason the replacement build fails for want of space -- so the
-                    # tier could stay blocked long after the filesystem recovered. Leaving the
-                    # flag clear costs one extra directory scan per retry and is idempotent
-                    # (unlink is missing_ok) (upstream, PR #82).
-                    _log.warning(
-                        "snapshot.orphan_sweep_failed (retrying on the next build): %s", exc
-                    )
+        # Reclaim generations left by a dispatcher that is gone. EVERY build, deliberately not
+        # once per process. The latch produced two separate bugs: it was set before the call, so
+        # a transient EIO disabled reclamation for the whole process; and once that was fixed it
+        # still latched on a sweep that had SKIPPED a live owner -- during a rolling deployment
+        # the old dispatcher legitimately still held its lease, so the sweep "succeeded" having
+        # removed nothing, and when that process later exited its RAM-sized generation (often the
+        # very thing making this build fail for want of space) could never be reclaimed again.
+        # A sweep is a directory glob against a boot-and-checkpoint, and it is idempotent and
+        # conservative; running it per build costs nothing worth a latch (upstream, PR #82).
+        sweep = getattr(self._backend, "sweep_orphan_generations", None)
+        if callable(sweep):
+            try:
+                # Hand over the checkpoint root when the backend asks for it. FC's launcher
+                # already owns its base/mem dirs, but gVisor's backend only learns the path at
+                # checkpoint() time -- far too late for a sweep that must run BEFORE the build
+                # consumes the space. Introspection, not except-TypeError: a TypeError raised
+                # INSIDE a sweep must never be mistaken for an older signature.
+                if _accepts_kwarg(sweep, "base_dir"):
+                    sweep(base_dir=self._base_dir)
                 else:
-                    self._swept_orphans = True
+                    sweep()
+            except Exception as exc:  # noqa: BLE001 -- a failed sweep must never block the tier
+                _log.warning("snapshot.orphan_sweep_failed (retrying on the next build): %s", exc)
+        # Retry base sandboxes a previous build could not tear down (see the teardown paths).
+        self._retry_undead_bases()
         # boot_base() is its own try so a base-boot failure is wrapped as
         # SnapshotBuildError (as documented), not propagated raw. boot_base already
         # tears down its own sandbox on partial failure, so no handle/finally is
@@ -236,8 +262,7 @@ class SnapshotManager:
         except SnapshotError:
             # FAILURE paths still tear the base down unconditionally -- there is no artifact to
             # protect here, and leaving the base microVM running is a straight leak.
-            with contextlib.suppress(Exception):
-                boot.kill()
+            self._kill_base(boot)
             raise
         except BaseException as exc:
             # BaseException, not Exception. Replacing the original `finally: boot.kill()` with
@@ -246,8 +271,7 @@ class SnapshotManager:
             # Firecracker VM or gVisor base container running -- interrupting the dispatcher
             # mid-build leaked one every time. Every unsuccessful exit tears down; only the
             # success path below publishes first (upstream, PR #82).
-            with contextlib.suppress(Exception):
-                boot.kill()
+            self._kill_base(boot)
             if isinstance(exc, Exception):   # readiness / checkpoint failure
                 raise SnapshotBuildError(f"warm snapshot build failed: {exc}") from exc
             raise
@@ -273,8 +297,7 @@ class SnapshotManager:
             # artifact the repair explicitly rejected; discard it instead and let the next build
             # produce a fresh one.
             _log.info("snapshot.build_discarded reason=invalidated_while_building")
-            with contextlib.suppress(Exception):
-                boot.kill()
+            self._kill_base(boot)
             if not self._discard(artifact):
                 # Never published and never in _retired, so nothing else can rediscover it: a
                 # failed cleanup here leaks a generation-stamped snapshot AND its RAM-sized memory
@@ -282,13 +305,10 @@ class SnapshotManager:
                 with self._build_lock:
                     self._retired[id(artifact)] = artifact
             raise SnapshotBuildInvalidated("snapshot invalidated while it was being built")
-        try:
-            boot.kill()
-        except Exception as exc:  # noqa: BLE001 -- a live base VM is a leak, not a bad snapshot
-            _log.warning(
-                "snapshot.base_teardown_failed: the base microVM may still be running; its "
-                "snapshot is registered and usable. %s", exc,
-            )
+        # Same on the SUCCESS path: the snapshot is registered and usable either way, but a base
+        # sandbox we could not confirm gone must stay reachable for retry rather than be logged
+        # and forgotten.
+        self._kill_base(boot)
         return artifact
 
     def invalidate(self) -> bool:

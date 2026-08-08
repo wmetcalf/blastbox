@@ -529,3 +529,54 @@ def test_a_disposable_runtimes_history_is_still_dropped_with_its_slot():
     assert slot.slot_id not in pool._slot_failures
     assert slot.slot_id not in pool._slot_last_success
     assert slot.slot_id not in pool._health_key_by_slot
+
+
+def test_a_static_tier_under_a_cascade_keeps_its_worker_identity():
+    """The identity hook existed only on StaticPoolRuntime and the cascade did not forward it.
+
+    In the supported static-tier-under-CascadingRuntime configuration the pool asked the OUTER
+    cascade, which has no hook, so each reusable box was keyed by its fresh per-spawn slot_id
+    again — reap deleted the one recorded failure and max_consecutive_failures > 1 stayed
+    unreachable, exactly the bug the hook was added to fix.
+    """
+    from blastbox.host.pool import WarmPool
+    from blastbox.host.runtime.cascade import CascadingRuntime, Tier
+
+    inner = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"),
+                              http_probe=FakeProbe(all_ok=True))
+    # Tier name deliberately DIFFERENT from the inner identity prefix, or a qualified key and a
+    # bare one look identical and the assertion proves nothing.
+    casc = CascadingRuntime(tiers=[Tier(name="boxes", runtime=inner, capacity=2)],
+                            tier_rebuild_after=99)
+    pool = WarmPool(runtime=casc, warm_size=1, concurrent_ceiling=2)
+
+    slot = casc.spawn()
+    key = pool._health_key(slot)
+    assert key is not None and key != slot.slot_id, (
+        "the cascade did not forward the tier's worker identity, so the box is keyed by a "
+        "per-spawn slot_id again"
+    )
+    assert key.startswith("boxes:"), (
+        f"the key must be TIER-QUALIFIED — two tiers can each report 'static:0' for different "
+        f"physical boxes (got {key})"
+    )
+    assert f"static:{slot.worker_index}" in key
+
+
+def test_a_cascade_over_a_disposable_tier_reports_no_identity():
+    """The carve-out stays narrow: without a reusing tier the slot IS the worker."""
+    from blastbox.host.pool import Slot, SlotState
+    from blastbox.host.runtime.cascade import CascadingRuntime, Tier
+
+    class _Disposable:
+        def spawn(self):
+            return Slot(slot_id="d1", control_dir="/c", input_dir="/i", output_dir="/o",
+                        state=SlotState.IDLE)
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): pass
+
+    casc = CascadingRuntime(tiers=[Tier(name="d", runtime=_Disposable(), capacity=2)],
+                            tier_rebuild_after=99)
+    slot = casc.spawn()
+    assert casc.worker_identity(slot) is None

@@ -190,6 +190,12 @@ class CascadingRuntime:
         self.tier_rebuild_after = 4 if tier_rebuild_after is None else max(0, int(tier_rebuild_after))
         self._counts = [0] * len(tiers)          # live slots per tier
         self._owner: dict[str, int] = {}          # slot_id -> tier index
+        # Tiers blamed for a JOB failure since the last repair. Separate from _recently_guilty,
+        # which carries SPAWN guilt: mixing them let a stale spawn failure narrow a job repair to
+        # the wrong tier. Recorded at blame time because _owner is gone by repair time -- a dirty
+        # release reaps the slot, so an episode spanning four slots has three of them already
+        # unmapped when the fourth crosses the threshold (upstream, PR #82).
+        self._job_guilty: set[int] = set()
         self._lock = threading.Lock()
         # Consecutive spawn failures PER TIER. The pool's own streak cannot see these: a tier
         # whose base is poisoned raises here, the cascade falls through to a healthy overflow
@@ -349,6 +355,32 @@ class CascadingRuntime:
                 self._tier_failures[index] = max(self._tier_failures[index], streak)
             _log.warning("cascade: tier %r base invalidation failed: %s", tier.name, exc)
 
+    def worker_identity(self, slot: object) -> str | None:
+        """Delegate to the tier that produced this slot, TIER-QUALIFIED.
+
+        The identity hook exists so a runtime that REUSES a physical worker across slots keeps
+        its failure history. A static tier under a cascade -- the supported configuration -- lost
+        that entirely: the pool asked the outer cascade, which had no hook, so each reusable box
+        was keyed by its fresh per-spawn slot_id again and the burnout threshold stayed
+        unreachable. Qualified by tier index because two tiers can each report "static:0" and
+        they are different boxes (upstream, PR #82).
+        """
+        slot_id = str(getattr(slot, "slot_id", "") or "")
+        with self._lock:
+            idx = self._owner.get(slot_id)
+        if idx is None:
+            return None
+        inner = getattr(self.tiers[idx].runtime, "worker_identity", None)
+        if not callable(inner):
+            return None                       # a disposable tier: the slot IS the worker
+        try:
+            got = inner(slot)
+        except Exception as exc:  # noqa: BLE001 -- attribution must never break a release
+            _log.warning("cascade: worker_identity failed for tier %r: %s",
+                         self.tiers[idx].name, exc)
+            return None
+        return None if not got else f"{self.tiers[idx].name}:{got}"
+
     def blame_tier_for_slot(self, slot_id: str) -> bool:
         """Attribute a post-spawn failure to the tier that produced ``slot_id``.
 
@@ -366,13 +398,13 @@ class CascadingRuntime:
                 return False
             self._tier_failures[idx] += 1
             self._recently_guilty.add(idx)
+            self._job_guilty.add(idx)
             streak = self._tier_failures[idx]
             tier = self.tiers[idx]
         self._maybe_repair_tier(idx, tier, streak)
         return True
 
-    def invalidate_base(self, *, reason: str | None = None,
-                        slot_ids: "list[str] | None" = None) -> None:
+    def invalidate_base(self, *, reason: str | None = None) -> None:
         """Forward base invalidation to every wrapped tier that supports it.
 
         Every tier is attempted even if an earlier one fails -- one poisoned tier must not stop
@@ -402,9 +434,15 @@ class CascadingRuntime:
         # to one discards healthy sibling snapshots and removes usable fallback capacity
         # (upstream, PR #82).
         named: set[int] = set()
-        if slot_ids:
+        if reason != "spawn":
+            # The tiers blamed during THIS episode, recorded by blame_tier_for_slot as each
+            # failure happened. Resolving slot ids at repair time instead was too late: a dirty
+            # release reaps its slot, so by the time the fourth failure of an A,A,B,B episode
+            # crossed the threshold only that last slot was still in _owner and the repair hit B
+            # alone -- leaving A's failing base active while the pool reset the episode and
+            # started its cooldown (upstream, PR #82).
             with self._lock:
-                named = {i for i in (self._owner.get(str(s)) for s in slot_ids) if i is not None}
+                named = set(self._job_guilty)
         if named:
             targets = [t for i, t in enumerate(self.tiers) if i in named]
         elif reason == "spawn":
@@ -418,6 +456,7 @@ class CascadingRuntime:
 
         with self._lock:
             self._recently_guilty.clear()   # consumed by this repair
+            self._job_guilty.clear()
 
         failures: list[str] = []
         attempted = 0

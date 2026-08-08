@@ -2836,7 +2836,10 @@ def test_a_job_repair_targets_only_the_tier_that_served_the_failing_slot() -> No
     slot_b = casc.spawn()                # tier b
     assert casc._owner[str(slot_b.slot_id)] == 1, "sanity: b served the second slot"
 
-    casc.invalidate_base(reason="job", slot_ids=[str(slot_b.slot_id)])
+    # Attribution is recorded WHEN THE FAILURE HAPPENS, which is the only time the slot is still
+    # mapped to its tier -- a dirty release reaps it moments later.
+    casc.blame_tier_for_slot(str(slot_b.slot_id))
+    casc.invalidate_base(reason="job")
 
     assert b.invalidated == 1, "the tier that served the failing job must be repaired"
     assert a.invalidated == 0, (
@@ -3203,3 +3206,145 @@ def test_an_unstamped_slot_still_counts_toward_a_rebuild() -> None:
 
     pool.release(slot, dirty=True, fault="worker")
     assert rt.invalidated >= 1, "an unstamped slot's failure was discarded, so nothing repairs"
+
+
+def test_a_rebuild_names_every_tier_the_episode_implicated() -> None:
+    """The rebuild CONSUMES the whole streak, so it must repair everything that fed it.
+
+    A cascade gives named slots precedence over its accumulated guilty set, so passing only the
+    slot that crossed the threshold made an A,A,B,B episode repair B alone — leaving A's failing
+    base active while the pool reset the episode and started its cooldown, putting the next
+    chance to repair A a whole cooldown away.
+    """
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    class _Tier:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.invalidated = 0
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            self.n += 1
+            return Slot(slot_id=f"{self.name}{self.n}", control_dir="/c", input_dir="/i",
+                        output_dir="/o", state=SlotState.IDLE)
+
+        def is_ready(self, slot):
+            return True
+        def is_alive(self, slot):
+            return True
+        def reap(self, slot):
+            pass
+        def recycle(self, slot):
+            pass
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    a, b = _Tier("a"), _Tier("b")
+    casc = CascadingRuntime(
+        tiers=[Tier(name="a", runtime=a, capacity=2), Tier(name="b", runtime=b, capacity=2)],
+        tier_rebuild_after=99,                 # keep per-tier repair out of the picture
+    )
+    pool = WarmPool(runtime=casc, warm_size=4, concurrent_ceiling=4,
+                    snapshot_rebuild_after=4, base_rebuild_cooldown_s=0.0,
+                    max_consecutive_failures=99)
+    pool.tick()
+    pool.tick()
+
+    by_tier: dict[int, list] = {}
+    for sid, slot in pool._slots.items():
+        by_tier.setdefault(casc._owner[str(sid)], []).append(slot)
+    assert len(by_tier) == 2, "sanity: both tiers served slots"
+
+    # A, A, B, B -- the fourth failure crosses the threshold.
+    episode = by_tier[0][:2] + by_tier[1][:2]
+    for slot in episode:
+        pool.release(slot, dirty=True, fault="worker")
+
+    assert a.invalidated >= 1 and b.invalidated >= 1, (
+        f"the episode spanned both tiers but only some were repaired "
+        f"(a={a.invalidated}, b={b.invalidated})"
+    )
+
+
+def test_a_resolved_episode_stops_naming_its_tiers() -> None:
+    """The episode is the cascade's job guilt, and a repair consumes it.
+
+    Guilt that outlives its repair re-targets a tier that was already fixed -- exactly the
+    problem spawn guilt had, which is why job evidence gets its own set.
+    """
+    class _Tier:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.invalidated = 0
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            self.n += 1
+            return SimpleNamespace(slot_id=f"{self.name}{self.n}")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    a, b = _Tier("a"), _Tier("b")
+    casc = CascadingRuntime(
+        tiers=[Tier(name="a", runtime=a, capacity=1), Tier(name="b", runtime=b, capacity=1)],
+        tier_rebuild_after=99,
+    )
+    slot_a = casc.spawn()
+    casc.spawn()
+    casc.blame_tier_for_slot(str(slot_a.slot_id))
+    assert casc._job_guilty == {0}
+    casc.invalidate_base(reason="job")
+    assert casc._job_guilty == set(), (
+        "the episode outlived the repair that spent it, so the next one re-targets a tier that "
+        "has already been fixed"
+    )
+
+
+def test_job_guilt_is_consumed_by_the_repair_it_drove() -> None:
+    """Guilt that outlives its repair re-targets a tier that was already fixed.
+
+    _recently_guilty had exactly this problem for spawn evidence — a per-tier repair does not
+    consume it — which is why job evidence gets its own set. That set is only correct if the
+    repair that spends it also clears it.
+    """
+    class _Tier:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.invalidated = 0
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            self.n += 1
+            return SimpleNamespace(slot_id=f"{self.name}{self.n}")
+
+        def invalidate_base(self) -> None:
+            self.invalidated += 1
+
+    a, b = _Tier("a"), _Tier("b")
+    casc = CascadingRuntime(
+        tiers=[Tier(name="a", runtime=a, capacity=1), Tier(name="b", runtime=b, capacity=1)],
+        tier_rebuild_after=99,
+    )
+    slot_a = casc.spawn()                       # tier a
+    casc.spawn()                                # tier b
+    casc.blame_tier_for_slot(str(slot_a.slot_id))
+    casc.invalidate_base(reason="job")
+    assert (a.invalidated, b.invalidated) == (1, 0), "sanity: only a was blamed"
+
+    # A SECOND, unrelated job repair with no fresh evidence must not re-target a.
+    casc.invalidate_base(reason="job")
+    assert b.invalidated == 1, (
+        "stale job guilt narrowed the next repair to a tier that had already been fixed, so the "
+        "tier that actually needed it was skipped"
+    )

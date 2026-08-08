@@ -354,10 +354,13 @@ def test_a_failed_orphan_sweep_is_retried_on_the_next_build(tmp_path):
         "transient failure disabled reclamation for the life of the dispatcher"
     )
 
-    # ...and once it SUCCEEDS the latch holds — no re-sweeping on every later build.
+    # ...and it keeps running on later builds. The latch is gone deliberately: a sweep that
+    # SKIPS a live owner also "succeeds", so latching on success meant a generation became
+    # unreclaimable the moment its owner outlived one sweep — during a rolling deployment, the
+    # normal case. A directory glob per build is nothing against a boot-and-checkpoint.
     mgr.invalidate()
     mgr.build()
-    assert backend.sweeps == 2, "a successful sweep must latch; this is a once-per-process job"
+    assert backend.sweeps == 3, "the sweep must stay reachable on every build"
 
 
 def test_the_manager_hands_its_checkpoint_root_to_a_backend_that_asks(tmp_path):
@@ -414,4 +417,58 @@ def test_a_typeerror_from_inside_a_sweep_is_not_read_as_an_old_signature(tmp_pat
     mgr = SnapshotManager(tmp_path, backend)
     mgr.build()
     assert backend.calls == 1, "the sweep must not be retried bare as a compatibility fallback"
-    assert mgr._swept_orphans is False, "a failed sweep must stay retryable"
+
+    # ...and it stays retryable: the next build asks again.
+    mgr.invalidate()
+    mgr.build()
+    assert backend.calls == 2, "a failed sweep must stay retryable"
+
+
+def test_a_base_we_could_not_kill_stays_reachable_for_retry(tmp_path):
+    """Suppressing a failed kill() discarded the only handle to a live base sandbox.
+
+    gVisor's boot handle raises when neither teardown command succeeds, and FC's does on a
+    process-control failure. The async retry then booted another base beside the first — which
+    nothing tracked and nothing could ever reap, for the life of the process.
+    """
+    class _Unkillable(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.kills = 0
+            self.fail_kill = True
+
+        def boot_base(self):
+            boot = super().boot_base()
+            outer = self
+
+            def _kill():
+                outer.kills += 1
+                if outer.fail_kill:
+                    raise RuntimeError("teardown unconfirmed; the sandbox may still be running")
+                boot.killed = True
+
+            boot.kill = _kill
+            return boot
+
+    backend = _Unkillable()
+    mgr = SnapshotManager(tmp_path, backend)
+    mgr.build()
+    assert backend.kills == 1
+    assert len(mgr._undead_bases) == 1, (
+        "the only handle to a sandbox that may still be running was thrown away"
+    )
+
+    # The next build retries it, and a teardown that now works clears it.
+    backend.fail_kill = False
+    mgr.invalidate()
+    mgr.build()
+    assert backend.kills >= 2, "the retained base was never retried"
+    assert mgr._undead_bases == []
+
+
+def test_a_confirmed_base_teardown_is_not_retained(tmp_path):
+    """The carve-out stays narrow: a kill that works leaves nothing behind."""
+    backend = FakeBackend()
+    mgr = SnapshotManager(tmp_path, backend)
+    mgr.build()
+    assert mgr._undead_bases == []

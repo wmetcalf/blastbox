@@ -789,7 +789,7 @@ class WarmPool:
             # The generation check lives on the STREAK (see the counter above), which is the
             # single thing this call consults -- a second guard here would be unreachable, and an
             # unreachable guard is one nobody can prove still works.
-            self._maybe_rebuild_base(slot_ids=[slot.slot_id])
+            self._maybe_rebuild_base()
         if burned_out and not self._eviction_allowed():
             # (3) The heuristic wants this slot gone, but the window's budget is spent. Refuse, and
             # say so loudly: if the wedge is real the slot keeps failing and the next window takes
@@ -1926,8 +1926,7 @@ class WarmPool:
         with self._lock:
             return self._pool_consecutive_failures
 
-    def _maybe_rebuild_base(self, streak: "int | None" = None, *, reason: str = "job",
-                            slot_ids: "list[str] | None" = None) -> bool:
+    def _maybe_rebuild_base(self, streak: "int | None" = None, *, reason: str = "job") -> bool:
         """Discard the runtime's persisted warm base after sustained pool-wide failure.
 
         Reaping a burned-out slot only helps if a FRESH slot would be healthy. When the persisted
@@ -2049,15 +2048,10 @@ class WarmPool:
             # Pass the trigger through when the runtime accepts it: a cascade can only attribute a
             # SPAWN-driven repair to a tier. Introspection, not except-TypeError -- a TypeError
             # from inside drop() must never be mistaken for an older signature.
-            # slot_ids: name the slots this episode implicates so a cascade can repair exactly
-            # the tier that served them instead of every tier. Introspection per kwarg, so a
-            # runtime that takes reason= but not slot_ids= still gets reason=.
-            kw: dict[str, Any] = {}
             if _accepts_kwarg(drop, "reason"):
-                kw["reason"] = reason
-            if slot_ids and _accepts_kwarg(drop, "slot_ids"):
-                kw["slot_ids"] = list(slot_ids)
-            drop(**kw)
+                drop(reason=reason)
+            else:
+                drop()
         except Exception:
             logger.exception("pool.base_rebuild_error pool_consecutive_failures=%d", pool_failures)
             # RESTORE the consumed episode. The streak was consumed to make the decision, but the
