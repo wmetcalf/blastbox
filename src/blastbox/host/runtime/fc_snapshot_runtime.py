@@ -29,7 +29,7 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
-from blastbox.host.pool import Slot, SlotState
+from blastbox.host.pool import RuntimeAtCapacity, Slot, SlotState
 from blastbox.host.runtime.fc_snapshot import SnapshotError, SnapshotManager
 from blastbox.host.runtime.fc_snapshot_launcher import REL_OUTDISK, REL_VSOCK
 
@@ -135,8 +135,24 @@ class SnapshotSlotRuntime:
     def spawn(self) -> Slot:
         """Build the warm snapshot once (idempotent), then restore it into a fresh
         per-slot microVM. Returns a WARMING Slot."""
-        # build() is idempotent — the snapshot is captured on the first spawn only (instant
-        # once built; prepare() gates the pool so the slow first build is off the tick thread).
+        # NEVER build INLINE. prepare() reports readiness and the pool's generation fence tries
+        # to avoid spawning against a base that was just invalidated -- but both are check-then-act
+        # against a job thread that can invalidate in the window between the check and this call,
+        # and build() then runs the FULL base boot plus readiness timeout on the pool's ONLY
+        # maintenance thread, stalling promotion, health checks and deferred reaping behind it.
+        # No lock discipline in the pool can close that window from the outside; the runtime has
+        # to refuse. Kick the async build and report CAPACITY -- not a failure, so it never
+        # touches the restore-failure streak -- and the next tick spawns once the artifact exists
+        # (upstream, PR #82).
+        _is_built = getattr(self._manager, "is_built", None)
+        _ensure = getattr(self._manager, "ensure_build_started", None)
+        if callable(_is_built) and callable(_ensure) and not _is_built():
+            _ensure()
+            raise RuntimeAtCapacity(
+                "warm snapshot is still building; not blocking the maintenance thread"
+            )
+        # Idempotent and instant once built; a manager without the async seam (a test double)
+        # still gets the old inline behaviour.
         self._manager.build()
         slot_id = str(uuid.uuid4())
         handle = self._manager.restore(slot_id)

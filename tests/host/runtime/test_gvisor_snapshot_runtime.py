@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -458,3 +459,44 @@ def test_reap_retains_the_generation_when_the_sandbox_cannot_be_killed(tmp_path)
     assert slot.slot_id in rt._handles, (
         "the handle was dropped, so nothing can ever try to kill this sandbox again"
     )
+
+
+def test_spawn_refuses_to_build_inline(tmp_path):
+    """The FC sibling's rule, in its twin: a synchronous build on spawn blocks the pool's only
+    maintenance thread for a full boot plus readiness timeout."""
+    from blastbox.host.pool import RuntimeAtCapacity
+
+    class _AsyncMgr:
+        def __init__(self):
+            self.kicked = 0
+            self.builds = 0
+            self.restored: list[str] = []
+            self._built = False
+
+        def is_built(self):
+            return self._built
+
+        def ensure_build_started(self):
+            self.kicked += 1
+
+        def build(self):
+            self.builds += 1
+
+        def restore(self, slot_id):
+            self.restored.append(str(slot_id))
+            wd = tmp_path / "slots" / str(slot_id)
+            (wd / "ctrl").mkdir(parents=True, exist_ok=True)
+            return SimpleNamespace(slot_workdir=wd, kill=lambda: None)
+
+    mgr = _AsyncMgr()
+    rt = GvisorSnapshotSlotRuntime(mgr, settle_s=0.0)
+
+    with pytest.raises(RuntimeAtCapacity):
+        rt.spawn()
+    assert mgr.kicked == 1 and mgr.builds == 0 and mgr.restored == [], (
+        "spawn built INLINE — that is the stall this exists to prevent"
+    )
+
+    mgr._built = True
+    slot = rt.spawn()
+    assert mgr.restored == [slot.slot_id]

@@ -255,3 +255,41 @@ def test_select_snapshot_runtime_refuses_old_guest_kernel(tmp_path, monkeypatch)
         select_snapshot_runtime(cfg=cfg, require_available=True)
     # Soft path: refuse quietly (falls back to cold FC) rather than raise.
     assert select_snapshot_runtime(cfg=cfg, require_available=False) is None
+
+
+def test_spawn_refuses_to_build_inline(tmp_path):
+    """A synchronous build on spawn blocks the pool's ONLY maintenance thread.
+
+    prepare() and the pool's generation fence are both check-then-act against a job thread that
+    can invalidate in the window before spawn() runs, and build() then takes a full base boot plus
+    readiness timeout with promotion, health checks and deferred reaping stalled behind it. No
+    lock discipline in the pool can close that window from the outside — the runtime has to
+    refuse, and report CAPACITY so it never touches the restore-failure streak.
+    """
+    from blastbox.host.pool import RuntimeAtCapacity
+
+    class _AsyncManager(FakeManager):
+        def __init__(self, base):
+            super().__init__(base)
+            self.kicked = 0
+            self._built = False
+
+        def is_built(self):
+            return self._built
+
+        def ensure_build_started(self):
+            self.kicked += 1
+
+    mgr = _AsyncManager(tmp_path)
+    rt = SnapshotSlotRuntime(FakeCfg(), mgr, settle_s=0.0)
+
+    with pytest.raises(RuntimeAtCapacity):
+        rt.spawn()
+    assert mgr.kicked == 1, "the async build must still be kicked"
+    assert mgr.builds == 0, "spawn built INLINE — that is the stall this exists to prevent"
+    assert mgr.restored == []
+
+    # Once the artifact exists, spawn proceeds normally.
+    mgr._built = True
+    slot = rt.spawn()
+    assert mgr.restored == [slot.slot_id]

@@ -1023,13 +1023,17 @@ def test_a_413_from_the_worker_is_about_the_sample_not_the_box(tmp_path):
     after another, correlated across the whole tier, which is exactly the signal that must never
     reach burnout.
     """
-    assert _fault_for_http(tmp_path, 413, "Payload Too Large") != "worker"
+    assert _fault_for_http(tmp_path, 413, "Payload Too Large") == "job", (
+        "the agent ANSWERED, which proves it and its base responsive -- 'unknown' merely stops "
+        "the rejection itself from incrementing the streak, it does not clear the failure before "
+        "it, so two transport failures either side of a 413 still counted as consecutive"
+    )
 
 
 def test_auth_and_version_skew_are_not_worker_faults(tmp_path):
     """401/403 (token skew) and 404 (endpoint skew) fail identically on EVERY box."""
     for code in (401, 403, 404, 400, 422):
-        assert _fault_for_http(tmp_path, code) != "worker", f"HTTP {code} convicted the worker"
+        assert _fault_for_http(tmp_path, code) == "job", f"HTTP {code} convicted the worker"
 
 
 def test_a_5xx_is_still_evidence_about_this_worker(tmp_path):

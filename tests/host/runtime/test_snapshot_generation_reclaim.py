@@ -309,6 +309,7 @@ def test_a_spawn_that_cannot_publish_its_slot_releases_the_pin(tmp_path):
         max_extracted_bytes = 1 << 20
 
     rt = SnapshotSlotRuntime(_Cfg(), mgr, settle_s=0.0)
+    mgr.build()   # spawn() no longer builds INLINE -- that is what stalled the tick thread
 
     with pytest.raises(Exception):
         rt.spawn()
@@ -344,6 +345,7 @@ def test_a_generation_is_retained_when_the_vm_cannot_be_confirmed_dead(tmp_path)
         max_extracted_bytes = 1 << 20
 
     rt = SnapshotSlotRuntime(_Cfg(), mgr, settle_s=0.0)
+    mgr.build()   # spawn() no longer builds INLINE -- that is what stalled the tick thread
 
     slot = rt.spawn()
     gen1 = tmp_path / "snap" / "warm-gen1.mem"
@@ -511,6 +513,7 @@ def test_spawn_cleanup_retains_the_pin_when_it_cannot_kill_the_vm(tmp_path):
         max_extracted_bytes = 1 << 20
 
     rt = SnapshotSlotRuntime(_Cfg(), mgr, settle_s=0.0)
+    mgr.build()   # spawn() no longer builds INLINE -- that is what stalled the tick thread
     gen1 = tmp_path / "snap" / "warm-gen1.mem"
 
     with pytest.raises(Exception):

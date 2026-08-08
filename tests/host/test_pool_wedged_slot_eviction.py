@@ -3929,3 +3929,94 @@ def test_a_claim_time_death_is_attributed_to_its_tier() -> None:
     assert blamed, (
         "the claim-time death blamed no tier, so its repair invalidates every sibling base"
     )
+
+
+def test_a_partial_repair_still_retires_the_tiers_it_replaced() -> None:
+    """The exception discarded the nonempty `repaired` list.
+
+    So the pool never advanced the generation of a tier whose artifact really WAS replaced: its
+    old assigned slots still looked current, their later failures re-added that tier to
+    _job_guilty, and the next repair invalidated its fresh REPLACEMENT while the retry was still
+    chasing the failed sibling.
+    """
+    from blastbox.host.pool import WarmPool
+
+    class _Rt:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            raise RuntimeError("not used")
+
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): pass
+
+        def invalidate_base(self, *, reason=None):
+            from blastbox.host.runtime.cascade import CascadeInvalidateFailed
+
+            exc = CascadeInvalidateFailed("tier b failed")
+            exc.repaired = ["a"]          # a WAS replaced; b was not
+            raise exc
+
+    pool = WarmPool(runtime=_Rt(), warm_size=1, concurrent_ceiling=2,
+                    snapshot_rebuild_after=1, base_rebuild_cooldown_s=0.0)
+    before_a = pool._base_generation.get("a", 0)
+    before_b = pool._base_generation.get("b", 0)
+
+    assert pool._maybe_rebuild_base(99, reason="spawn") is False, "sanity: the repair failed"
+
+    assert pool._base_generation.get("a", 0) == before_a + 1, (
+        "tier a's artifact was replaced but its slots were not retired, so their failures will "
+        "re-blame a and invalidate the replacement that just arrived"
+    )
+    assert pool._base_generation.get("b", 0) == before_b, (
+        "tier b was NOT repaired, so retiring its slots would discard the evidence that repairs it"
+    )
+
+
+def test_a_partially_failed_cascade_repair_names_what_it_replaced() -> None:
+    """The other half: the CASCADE must attach it, not just the pool read it.
+
+    Asserting the pool honours a `repaired` list it was handed proves nothing about whether
+    anything ever attaches one.
+    """
+    from blastbox.host.runtime.cascade import CascadeInvalidateFailed
+
+    class _Tier:
+        def __init__(self, name: str, broken: bool = False) -> None:
+            self.name = name
+            self.broken = broken
+            self.n = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            self.n += 1
+            return SimpleNamespace(slot_id=f"{self.name}{self.n}")
+
+        def invalidate_base(self) -> None:
+            if self.broken:
+                raise RuntimeError(f"tier {self.name} invalidation failed")
+
+    good, bad = _Tier("good"), _Tier("bad", broken=True)
+    casc = CascadingRuntime(
+        tiers=[Tier(name="good", runtime=good, capacity=1),
+               Tier(name="bad", runtime=bad, capacity=1)],
+        tier_rebuild_after=99,
+    )
+    s_good, s_bad = casc.spawn(), casc.spawn()
+    casc.blame_tier_for_slot(str(s_good.slot_id))
+    casc.blame_tier_for_slot(str(s_bad.slot_id))
+
+    with pytest.raises(CascadeInvalidateFailed) as ei:
+        casc.invalidate_base(reason="job")
+
+    assert getattr(ei.value, "repaired", None) == ["good"], (
+        "the tier that WAS replaced is not named on the failure, so the pool cannot retire its "
+        "slots and their next failure invalidates the replacement that just arrived"
+    )

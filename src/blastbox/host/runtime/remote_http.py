@@ -637,7 +637,12 @@ def make_remote_validate(
                 # box -- exactly the correlated signal that must never reach burnout. 5xx falls
                 # through: the agent itself broke, which IS evidence about this worker. 409 never
                 # arrives here; it is WorkerBusy (capacity) further up (upstream, PR #82).
-                fault = "unknown"
+                # "job", not "unknown". The agent ANSWERED, which proves it and the base it
+                # restored from are responsive -- and unknown merely stops the rejection itself
+                # from incrementing the streak, it does not CLEAR the failure before it. A
+                # transport failure, then a 413, then another transport failure still counted as
+                # consecutive (upstream, PR #82).
+                fault = "job"
                 _log.warning("remote_http: worker rejected the request (HTTP %s): %s",
                              getattr(exc, "code", "?"), exc)
                 return {"error": _sanitized_failure(exc)}, False

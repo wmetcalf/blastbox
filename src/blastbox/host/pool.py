@@ -2145,7 +2145,16 @@ class WarmPool:
                 repaired = drop(reason=reason)
             else:
                 repaired = drop()
-        except Exception:
+        except Exception as exc:
+            # A PARTIAL repair still replaced some artifacts. Retire their slots even though the
+            # call failed overall, or those tiers' old slots keep reporting failures against a
+            # base that is already gone -- which re-blames the tier and invalidates its fresh
+            # replacement (upstream, PR #82).
+            _repaired = getattr(exc, "repaired", None)
+            if isinstance(_repaired, (list, tuple, set, frozenset)) and _repaired:
+                with self._lock:
+                    for _name in {str(n) for n in _repaired}:
+                        self._base_generation[_name] = self._base_generation.get(_name, 0) + 1
             logger.exception("pool.base_rebuild_error pool_consecutive_failures=%d", pool_failures)
             # RESTORE the consumed episode. The streak was consumed to make the decision, but the
             # repair did not happen -- so making the poisoned base wait for another full

@@ -496,9 +496,16 @@ class CascadingRuntime:
                     self._recently_guilty.discard(idx)
                     self._job_guilty.discard(idx)
         if failures:
-            raise CascadeInvalidateFailed(
+            # CARRY what succeeded. Discarding `repaired` here meant the pool never advanced the
+            # generation of a tier whose artifact really was replaced, so its old assigned slots
+            # still looked current -- their later failures re-added that tier to _job_guilty and
+            # immediately invalidated its REPLACEMENT while the retry was still chasing the
+            # failed sibling (upstream, PR #82).
+            partial = CascadeInvalidateFailed(
                 "cascade: base invalidation failed for " + "; ".join(failures)
             )
+            partial.repaired = repaired  # type: ignore[attr-defined]
+            raise partial
         if attempted == 0:
             # NOTHING was repaired. When a spawn-driven repair attributes the failures to a
             # static/AWS tier that has no base to invalidate, every target is skipped and a silent
