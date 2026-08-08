@@ -25,6 +25,7 @@ recycle "succeeds", is_alive() keeps saying True, but the worker never does usef
 """
 from __future__ import annotations
 
+import time
 import threading
 from pathlib import Path
 from uuid import uuid4
@@ -2658,4 +2659,146 @@ def test_no_spawn_happens_while_an_invalidation_is_in_flight() -> None:
     assert spawns_during_drop == [0], (
         f"{spawns_during_drop} slots were spawned while the base was being discarded -- each of "
         "those spawn() calls rebuilds the base synchronously on the maintenance thread"
+    )
+
+
+def test_a_zero_eviction_cap_blocks_eviction_instead_of_unleashing_it() -> None:
+    """0 read as "cap disabled" and permitted UNLIMITED evictions.
+
+    That is the opposite of what the number says, and it is reachable exactly when an operator
+    sets BLASTBOX_POOL_MAX_EVICTIONS_PER_WINDOW=0 mid-incident to stop the heuristic taking more
+    slots — the mitigation removed the blast-radius guard entirely. Nothing in PoolConfig or
+    docs/CONFIGURATION.md documents zero as an unlimited sentinel, so there is no reading to
+    preserve.
+
+    One slot, faulted past the wedge threshold: no surplus reaping to confuse the signal.
+    """
+    def _wedge(pool):
+        # Re-claim between releases: the production sequence. Releasing the same handle twice
+        # leaves it IDLE and takes a different path entirely.
+        for _ in range(2):                     # two worker faults = over the wedge threshold
+            got = pool.claim(timeout_s=0.2)
+            if got is None:
+                break
+            pool.release(got, dirty=True, fault="worker")
+
+    capped, capped_reaped = _healthy_pool(max_evictions_per_window=0,
+                                          eviction_window_s=10_000.0)
+    _wedge(capped)
+    assert capped_reaped == [], (
+        f"a zero cap evicted {capped_reaped} — an operator disabling the heuristic mid-incident "
+        f"instead removed its only bound"
+    )
+
+    # SANITY: the very same sequence with a real cap DOES evict, so the assertion above is
+    # measuring the cap and not a wedge that never triggered.
+    allowed, allowed_reaped = _healthy_pool(max_evictions_per_window=1,
+                                            eviction_window_s=10_000.0)
+    _wedge(allowed)
+    assert allowed_reaped == ["s0"], f"the wedge never fired at all: {allowed_reaped}"
+
+
+def test_the_zero_cap_holds_at_the_locked_reservation_too() -> None:
+    """Two call sites share one rule; the demotion path reserves under the caller's lock."""
+    pool, _ = _healthy_pool(max_evictions_per_window=0, eviction_window_s=10_000.0)
+    with pool._lock:
+        assert pool._reserve_eviction_unlocked(pool._clock()) is False
+    assert pool._eviction_allowed() is False
+
+
+def test_a_zero_window_still_leaves_a_real_cap_usable() -> None:
+    """Separate knob: with no window there is nothing to rate-limit over. It must not re-absorb
+    the zero-cap case (they shared one condition, which is how 0 became 'unlimited')."""
+    pool, _ = _healthy_pool(max_evictions_per_window=2, eviction_window_s=0.0)
+    assert pool._eviction_allowed() is True
+    zero, _ = _healthy_pool(max_evictions_per_window=0, eviction_window_s=0.0)
+    assert zero._eviction_allowed() is False, "the cap wins over the window"
+
+
+def test_a_warming_timeout_is_attributed_to_the_tier_that_produced_it() -> None:
+    """The spawn RETURNED, so the cascade has no per-tier guilt recorded.
+
+    A repair driven by these failures therefore found no guilty tier and the empty-guilt fallback
+    invalidated EVERY tier — discarding healthy sibling snapshots because one tier keeps handing
+    back slots that never reach IDLE. The post-promotion death path already blamed; this newer
+    trigger, feeding the same streak and the same _maybe_rebuild_base(reason="spawn"), did not.
+    """
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    blamed: list[str] = []
+
+    class _NeverReady:
+        """Spawn always succeeds; the slot never becomes ready — the cascade sees no failure."""
+
+        def __init__(self) -> None:
+            self.n = 0
+
+        def spawn(self):
+            self.n += 1
+            return Slot(slot_id=f"w{self.n}", control_dir="/c", input_dir="/i",
+                        output_dir="/o", state=SlotState.WARMING, spawned_at=0.0)
+
+        def is_ready(self, slot):
+            return False
+        def is_alive(self, slot):
+            return True
+        def reap(self, slot):
+            pass
+        def blame_tier_for_slot(self, slot_id):
+            blamed.append(slot_id)
+            return True
+        def invalidate_base(self, *, reason=None):
+            pass
+
+    rt = _NeverReady()
+    pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=4,
+                    warming_timeout_s=0.01, snapshot_rebuild_after=1,
+                    base_rebuild_cooldown_s=0.0)
+    pool.tick()                       # spawn two WARMING slots
+    time.sleep(0.05)                  # let them blow the warming timeout
+    pool.tick()                       # the timeout path runs
+
+    assert blamed, (
+        "no tier was blamed for the warming timeouts, so a repair falls back to invalidating "
+        "EVERY tier and destroys healthy siblings"
+    )
+
+
+def test_the_blame_happens_before_the_repair_decision() -> None:
+    """Order is the whole point: guilt recorded after the repair teaches the cascade nothing."""
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    events: list[str] = []
+
+    class _Rt:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def spawn(self):
+            self.n += 1
+            return Slot(slot_id=f"w{self.n}", control_dir="/c", input_dir="/i",
+                        output_dir="/o", state=SlotState.WARMING, spawned_at=0.0)
+
+        def is_ready(self, slot):
+            return False
+        def is_alive(self, slot):
+            return True
+        def reap(self, slot):
+            pass
+        def blame_tier_for_slot(self, slot_id):
+            events.append("blame")
+            return True
+        def invalidate_base(self, *, reason=None):
+            events.append("invalidate")
+
+    pool = WarmPool(runtime=_Rt(), warm_size=2, concurrent_ceiling=4,
+                    warming_timeout_s=0.01, snapshot_rebuild_after=1,
+                    base_rebuild_cooldown_s=0.0)
+    pool.tick()
+    time.sleep(0.05)
+    pool.tick()
+
+    assert "invalidate" in events, "sanity: the repair actually ran"
+    assert events.index("blame") < events.index("invalidate"), (
+        f"blame must precede the repair; got {events}"
     )

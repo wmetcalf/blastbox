@@ -989,3 +989,52 @@ def test_a_tls_failure_is_transport_not_local_disk(tmp_path):
     assert calls and calls[0][1] == "worker", (
         f"a TLS failure is evidence about the worker, not our disk (got {calls[0][1]})"
     )
+
+
+def _fault_for_http(tmp_path, code: str | int, reason: str = "rejected"):
+    """Drive validate() against a worker that answers with one HTTP status; return the fault."""
+    import urllib.error
+
+    out = tmp_path / f"out{code}"
+    out.mkdir()
+    inp = tmp_path / f"in{code}.bin"
+    inp.write_bytes(b"sample")
+    slot = SimpleNamespace(slot_id="s1", url="https://worker.invalid", ip=None)
+    calls: list[tuple[bool, str | None]] = []
+
+    def release(s, *, dirty: bool = False, fault: str | None = None) -> None:
+        calls.append((dirty, fault))
+
+    def answer(req, timeout, context=None):
+        raise urllib.error.HTTPError(getattr(req, "full_url", "https://worker.invalid"),
+                                     int(code), reason, {}, io.BytesIO(b'{"error":"x"}'))
+
+    make_remote_validate(lambda: slot, release, output_dir_for=lambda p: out,
+                         http_open=answer)(inp)
+    assert calls
+    return calls[0][1]
+
+
+def test_a_413_from_the_worker_is_about_the_sample_not_the_box(tmp_path):
+    """The agent replies 413 when a sample exceeds its OWN max_bytes.
+
+    Raise BLASTBOX_MAX_INPUT on the dispatcher while a static/remote worker keeps the default and
+    every oversized-but-valid job becomes a worker conviction — burning down healthy boxes one
+    after another, correlated across the whole tier, which is exactly the signal that must never
+    reach burnout.
+    """
+    assert _fault_for_http(tmp_path, 413, "Payload Too Large") != "worker"
+
+
+def test_auth_and_version_skew_are_not_worker_faults(tmp_path):
+    """401/403 (token skew) and 404 (endpoint skew) fail identically on EVERY box."""
+    for code in (401, 403, 404, 400, 422):
+        assert _fault_for_http(tmp_path, code) != "worker", f"HTTP {code} convicted the worker"
+
+
+def test_a_5xx_is_still_evidence_about_this_worker(tmp_path):
+    """The carve-out stays narrow: the agent itself breaking IS about this box."""
+    for code in (500, 502, 503):
+        assert _fault_for_http(tmp_path, code) == "worker", (
+            f"HTTP {code} is the agent failing, not a verdict on our request"
+        )

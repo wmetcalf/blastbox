@@ -582,6 +582,20 @@ def make_remote_validate(
                 fault = "unknown"
                 _log.warning("remote_http: local preparation failed: %s", exc)
                 return {"error": _sanitized_failure(exc)}, False
+            if isinstance(exc, urllib.error.HTTPError) and 400 <= exc.code < 500:
+                # The agent ANSWERED and rejected what we SENT. A 4xx is a verdict on the request,
+                # not evidence the box is sick: the agent replies 413 when a sample exceeds its
+                # own max_bytes, so raising BLASTBOX_MAX_INPUT on the dispatcher while a
+                # static/remote worker keeps the default turns every oversized-but-valid job into
+                # a worker conviction and burns down healthy boxes one after another. 401/403
+                # (token skew) and 404 (version skew) fail the same way, and identically on EVERY
+                # box -- exactly the correlated signal that must never reach burnout. 5xx falls
+                # through: the agent itself broke, which IS evidence about this worker. 409 never
+                # arrives here; it is WorkerBusy (capacity) further up (upstream, PR #82).
+                fault = "unknown"
+                _log.warning("remote_http: worker rejected the request (HTTP %s): %s",
+                             exc.code, exc)
+                return {"error": _sanitized_failure(exc)}, False
             fault = "worker"         # transport failed -> evidence about this worker, not the input
             # transport error after the request may have reached the worker -> the box could still be
             # busy; keep dirty=True so the pool retires/recycles it instead of re-offering immediately.

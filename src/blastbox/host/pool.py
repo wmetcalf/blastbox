@@ -609,8 +609,10 @@ class WarmPool:
         Split out because the demotion step -- the only place that truly evicts -- already holds
         the lock, and the locking variant would deadlock there.
         """
-        if self._max_evictions_per_window <= 0 or self._eviction_window_s <= 0:
-            return True
+        if self._max_evictions_per_window <= 0:
+            return False        # 0 = evict NOTHING; see _eviction_allowed
+        if self._eviction_window_s <= 0:
+            return True         # no window to rate-limit over
         self._evictions = [ts for ts in self._evictions
                            if now - ts < self._eviction_window_s]
         if len(self._evictions) >= self._max_evictions_per_window:
@@ -624,8 +626,19 @@ class WarmPool:
         Wedge detection is a heuristic over a signal the pool cannot verify. This module's history
         is of predicates that read correctly in review and then took whole tiers, so the corrective
         action is bounded independently of how confident the predicate is."""
-        if self._max_evictions_per_window <= 0 or self._eviction_window_s <= 0:
-            return True                     # cap disabled
+        if self._max_evictions_per_window <= 0:
+            # A ZERO CAP BLOCKS EVICTION. This read "cap disabled" and permitted UNLIMITED
+            # evictions -- the exact opposite of what the number says, and reachable precisely
+            # when an operator sets BLASTBOX_POOL_MAX_EVICTIONS_PER_WINDOW=0 during an incident
+            # to stop the heuristic taking more slots. The mitigation removed the blast-radius
+            # guard entirely. Nothing in PoolConfig or docs/CONFIGURATION.md documents zero as an
+            # unlimited sentinel, so there is no reading to preserve; a negative is nonsense and
+            # fails the same way, toward LESS corrective action (upstream, PR #82).
+            return False
+        if self._eviction_window_s <= 0:
+            # A different knob: with no window there is nothing to rate-limit over, so the cap
+            # cannot be applied. Kept separate so it can never re-absorb the zero-cap case above.
+            return True
         now = self._clock()
         with self._lock:
             self._evictions = [ts for ts in self._evictions
@@ -1987,6 +2000,30 @@ class WarmPool:
         )
         return True
 
+    def _blame_tiers(self, slot_ids: "list[str]") -> None:
+        """Attribute post-spawn failures to the tiers that produced those slots.
+
+        A spawn that RETURNED leaves the cascade's per-tier streak empty, so a repair driven by
+        these failures finds no guilty tier and the empty-guilt fallback invalidates EVERY tier --
+        discarding healthy sibling snapshots over a fault confined to one. Must run BEFORE the
+        slots are reaped: the cascade drops its slot->tier mapping on reap, and an unattributable
+        slot is exactly the empty guilt this exists to avoid.
+
+        Shared by both post-spawn failure paths. It lived inline in the health check, so the
+        warming-timeout path -- added later, feeding the same streak and the same
+        _maybe_rebuild_base(reason="spawn") -- never attributed anything (upstream, PR #82).
+        """
+        if not slot_ids:
+            return
+        blame = getattr(self._runtime, "blame_tier_for_slot", None)
+        if not callable(blame):
+            return
+        for slot_id in slot_ids:
+            try:
+                blame(slot_id)
+            except Exception as exc:  # noqa: BLE001 -- attribution must never break the tick
+                logger.warning("pool.tier_blame_failed slot_id=%s: %s", slot_id, exc)
+
     def _health_check(self) -> None:
         """Evict dead IDLE slots AND stuck WARMING slots so the spawn loop replaces them.
 
@@ -2035,6 +2072,11 @@ class WarmPool:
             # replace forever, and invalidate_base() is never reached: the tier stays at zero
             # capacity until the process restarts, which is exactly the outage the restore-failure
             # streak exists to end (upstream, PR #82).
+            # Attribute BEFORE the repair decision and before these slots are reaped. Each
+            # spawn() returned successfully, so the cascade's per-tier streak is empty and a
+            # repair would fall back to invalidating every tier -- destroying healthy siblings
+            # because one tier hands back slots that never reach IDLE (upstream, PR #82).
+            self._blame_tiers([s.slot_id for s in stuck_warming])
             with self._lock:
                 self._spawn_consecutive_failures += len(stuck_warming)
                 warm_failures = self._spawn_consecutive_failures
@@ -2192,13 +2234,7 @@ class WarmPool:
 
         # Counted AFTER the demotion loop, which is the step that wins the race against a
         # concurrent claim -- so only deaths we actually acted on feed the restore-failure streak.
-        for slot_id in blamed:
-            blame = getattr(self._runtime, "blame_tier_for_slot", None)
-            if callable(blame):
-                try:
-                    blame(slot_id)
-                except Exception as exc:  # noqa: BLE001 -- attribution must never break the tick
-                    logger.warning("pool.tier_blame_failed slot_id=%s: %s", slot_id, exc)
+        self._blame_tiers(blamed)
 
         if unproven_deaths:
             with self._lock:
