@@ -1264,7 +1264,10 @@ def build_remote_vm_dispatcher(
             # ClaimLost, NOT OutputTrustError: a peer owning the job says nothing about this
             # worker's output, which validated fine. Raising a trust error routed it into the
             # generic handler and convicted a healthy slot on every reclaim race (upstream, PR #82).
-            raise ClaimLost("claim lost before host metadata write (peer recovered the job)")
+            # validated=True: the trust gate has ALREADY accepted this worker's output above, so
+            # the run is positive evidence about the worker -- not merely "nothing was proven".
+            raise ClaimLost("claim lost before host metadata write (peer recovered the job)",
+                            validated=True)
         atomic_write_confined(out_dir, "metadata.json",
                               env.model_dump_json(by_alias=True).encode("utf-8"), mode=0o644)
 

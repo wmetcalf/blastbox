@@ -1070,3 +1070,43 @@ def test_a_malformed_worker_archive_is_the_workers_fault(tmp_path):
         "a worker-authored archive that cannot be laid out must not surface as an OSError — that "
         "is the shape the caller reads as this dispatcher's disk"
     )
+
+
+def _fault_for_claim_loss(tmp_path, *, validated: bool):
+    """Drive validate() to a ClaimLost raised on the given side of the trust gate."""
+    from blastbox.host.runtime.remote_http import ClaimLost
+
+    out = tmp_path / f"out{validated}"
+    out.mkdir()
+    inp = tmp_path / f"in{validated}.bin"
+    inp.write_bytes(b"sample")
+    slot = SimpleNamespace(slot_id="s1", url="https://worker.invalid", ip=None)
+    calls: list[tuple[bool, str | None]] = []
+
+    def release(s, *, dirty: bool = False, fault: str | None = None) -> None:
+        calls.append((dirty, fault))
+
+    def boom(*a, **kw):
+        raise ClaimLost("a peer recovered the job", validated=validated)
+
+    with pytest.raises(ClaimLost):
+        make_remote_validate(lambda: slot, release, output_dir_for=lambda p: out,
+                             http_open=boom)(inp)
+    assert calls
+    return calls[0][1]
+
+
+def test_a_claim_lost_after_validation_records_the_demonstrated_success(tmp_path):
+    """The trust gate had already ACCEPTED this worker's output.
+
+    So the run is positive proof the worker and its base are responsive. Leaving it unattributed
+    PRESERVES both streaks, and worker-failure / validated-run-then-claim-loss / worker-failure
+    then counts as consecutive — evicting the slot or invalidating its base on two unrelated
+    events. Reclaim races cluster exactly when the queue is deep.
+    """
+    assert _fault_for_claim_loss(tmp_path, validated=True) == "job"
+
+
+def test_a_claim_lost_before_validation_stays_unattributed(tmp_path):
+    """The carve-out stays narrow: before the gate, nothing about this worker was demonstrated."""
+    assert _fault_for_claim_loss(tmp_path, validated=False) == "unknown"

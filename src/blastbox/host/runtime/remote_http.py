@@ -84,7 +84,20 @@ class RemoteOutputMalformed(RuntimeError):
 
 class ClaimLost(RuntimeError):
     """This attempt outlived its claim (a peer reclaimed the job) before a destructive output op -- abort
-    so we don't clobber the new owner's result in the shared output dir."""
+    so we don't clobber the new owner's result in the shared output dir.
+
+    ``validated`` says whether the WORKER'S OUTPUT had already passed the host trust gate when the
+    claim was found lost. It changes the attribution, not the control flow: after validation the
+    run is positive proof this worker and its base are responsive, so the streaks must RESET --
+    leaving it unattributed preserves them, and worker-failure / validated-run-then-claim-loss /
+    worker-failure then counts as consecutive and can evict the slot or rebuild its base. Before
+    validation nothing has been demonstrated, so it stays unattributed. Carried on the exception
+    because only the raise site knows which side of the gate it is on (upstream, PR #82).
+    """
+
+    def __init__(self, *args: object, validated: bool = False) -> None:
+        super().__init__(*args)
+        self.validated = validated
 
 
 class WorkerBusy(RuntimeError):
@@ -581,11 +594,15 @@ def make_remote_validate(
             # Propagate so the dispatcher requeues the job (like NoWarmSlot); the finally still
             # releases this slot DIRTY, quarantining the box so it is not immediately re-offered.
             raise
-        except ClaimLost:
+        except ClaimLost as exc:
             # A PEER already reclaimed or finished this job -- our claim simply outlived itself.
             # The worker did nothing wrong, so attributing it as a wedge let two stale attempts
             # burn out a healthy slot and feed base invalidation (upstream, PR #82).
-            fault = "unknown"
+            #
+            # ...and when the loss was found AFTER the trust gate accepted this worker's output,
+            # "did nothing wrong" understates it: the run PROVED the worker and its base
+            # responsive, and unknown preserves the streaks rather than clearing them.
+            fault = "job" if getattr(exc, "validated", False) else "unknown"
             raise
         except OutputTrustUnknown as exc:
             # The host could not COMPLETE validation (EMFILE/EIO/ENOMEM). validate_worker_output
