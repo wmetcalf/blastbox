@@ -17,6 +17,8 @@ import pytest
 from blastbox.host.pool import SlotRuntime, SlotState
 from blastbox.host.runtime.aws_worker import (
     AwsProbeTimeout,
+    AwsThrottled,
+    AwsUnknownState,
     AwsWorkerConfig,
     AwsUnavailable,
     AwsWorkerError,
@@ -2834,3 +2836,56 @@ def test_snapstart_is_ready_preserves_a_health_ok_unknown():
     slot = AwsWorkerSlot(slot_id="s", resource_id="mv-1")
     assert rt._health_ok(slot) is None, "sanity: this is the _health_ok UNKNOWN case"
     assert rt.is_ready(slot) is None
+
+
+def test_available_raises_rather_than_reporting_an_unentitled_tier():
+    """issue #79: availability is probed ONCE at construction and a False drops the tier for the
+    whole process lifetime. A throttled sts get-caller-identity must therefore NOT return False --
+    "throttled" is not "unentitled", and only the latter is a verdict.
+    """
+    def throttled(argv):  # noqa: ANN001
+        raise AwsProbeTimeout("Throttling: Rate exceeded")
+
+    rt, _ = _snapstart_rt({"sts get-caller-identity": throttled})
+    with pytest.raises(AwsUnknownState):
+        rt.available()
+
+
+def test_available_still_reports_false_for_a_real_verdict():
+    """Missing credentials IS a verdict, and must stay one -- otherwise a genuinely misconfigured
+    tier is retried forever instead of being dropped with a clear message."""
+    rt, _ = _snapstart_rt({"sts get-caller-identity": {}})   # answered, but no Account
+    assert rt.available() is False
+
+
+def test_available_reports_false_when_the_probe_fails_definitively():
+    """A CONFIRMED failure (bad credentials, no entitlement) must still return False rather than
+    propagate: that is the verdict the cascade drops a tier on. Only the undecided case escapes.
+    """
+    def denied(argv):  # noqa: ANN001
+        raise AwsWorkerError("AccessDenied: not authorized to perform sts:GetCallerIdentity")
+
+    rt, _ = _snapstart_rt({"sts get-caller-identity": denied})
+    assert rt.available() is False
+
+
+def test_a_throttled_call_raises_the_retryable_type():
+    """The classifier must SPLIT rate limiting from other unconfirmed failures, or availability
+    cannot tell "come back later" from "you may not use this"."""
+    def throttled(argv):  # noqa: ANN001
+        return _cp(rc=254, stderr="An error occurred (ThrottlingException): Rate exceeded")
+
+    rt, _ = _snapstart_rt({"sts get-caller-identity": throttled})
+    with pytest.raises(AwsThrottled):
+        rt.available()
+
+
+def test_an_access_denied_is_a_verdict_not_a_retry():
+    """AccessDenied stays a plain AwsUnknownState -- still never evidence a worker died, but a
+    definitive answer that this tier is unusable, so available() reports False rather than raising.
+    """
+    def denied(argv):  # noqa: ANN001
+        return _cp(rc=254, stderr="An error occurred (AccessDenied) when calling GetCallerIdentity")
+
+    rt, _ = _snapstart_rt({"sts get-caller-identity": denied})
+    assert rt.available() is False

@@ -91,6 +91,39 @@ _CONFIRMED_DEAD_AWS_MARKERS = (
 )
 
 
+# Which aws-cli failures are RETRYABLE RATE LIMITING?
+#
+# A second allowlist, and deliberately NOT the complement of the one above. That list answers "is
+# this WORKER gone?", where defaulting to UNKNOWN is the safe direction. This one answers "can this
+# TIER be used at all?", where the safe direction is the opposite: availability is probed once at
+# construction, so treating an unrecognised error as retryable re-probes a genuinely misconfigured
+# tier forever, while treating a throttle as a verdict silently removes real capacity for the whole
+# process lifetime (issue #79).
+#
+# Both lists are bounded and enumerable because both hold AWS ERROR CODES, never prose -- the rule
+# the confirmed-dead list learned the hard way when "does not exist" matched InvalidAccessKeyId.
+_THROTTLE_AWS_MARKERS = (
+    "throttling",                      # Throttling / ThrottlingException (most services)
+    "toomanyrequests",                 # TooManyRequestsException -- Lambda's own throttle
+    "requestlimitexceeded",            # EC2
+    "requestthrottled",                # STS and friends
+    "slowdown",
+    "provisionedthroughputexceeded",
+    "serviceunavailable",              # 503: the service is down, not our entitlement
+)
+
+
+def _is_throttle_aws_error(stderr: str) -> bool:
+    """True if AWS rate-limited us or was momentarily unavailable -- a retryable non-answer.
+
+    An auth failure is deliberately NOT here. ``AccessDenied`` tells us nothing about whether a
+    worker died, so the liveness path rightly calls it UNKNOWN -- but it is a perfectly definitive
+    answer about whether we may USE a tier. Same error, opposite meaning, different question.
+    """
+    low = (stderr or "").lower()
+    return any(marker in low for marker in _THROTTLE_AWS_MARKERS)
+
+
 def _is_confirmed_dead_aws_error(stderr: str) -> bool:
     """True ONLY if AWS positively told us the resource is gone.
 
@@ -117,6 +150,14 @@ class AwsUnknownState(AwsWorkerError):
     budget, so the same throttle/timeout at resume() time — where there is no budget in scope —
     surfaced as a bare AwsWorkerError and _resume_on_claim terminated a healthy PARKED worker.
     Every caller that can destroy a slot must treat this as "skip / try again", never "reap"."""
+
+
+class AwsThrottled(AwsUnknownState):
+    """AWS rate-limited us (or was momentarily unavailable) -- the retryable flavour of UNKNOWN.
+
+    Split out because availability asks a different question from liveness: a throttle is the one
+    non-answer that clearly warrants a retry, whereas an auth error is a real verdict about whether
+    the tier may be used at all (issue #79)."""
 
 
 class AwsProbeTimeout(AwsUnknownState):
@@ -595,7 +636,10 @@ class AwsDisposableRuntime:
             if _is_confirmed_dead_aws_error(stderr):
                 raise AwsWorkerError(f"aws {service} {op} failed (rc={cp.returncode}): {stderr[:400]}")
             # DEFAULT: we did not get a confirmed answer, so we do not have one. Never death.
-            raise AwsUnknownState(
+            # Throttles get their own type. Everything else stays a plain AwsUnknownState: still
+            # not evidence a worker died, but not a reason to keep re-probing a tier either.
+            exc_cls = AwsThrottled if _is_throttle_aws_error(stderr) else AwsUnknownState
+            raise exc_cls(
                 f"aws {service} {op}: unconfirmed failure (rc={cp.returncode}): {stderr[:200]}")
         out = (cp.stdout or "").strip()
         if not out:
@@ -610,12 +654,27 @@ class AwsDisposableRuntime:
 
     # -- fail-closed availability ------------------------------------------
     def available(self) -> bool:
-        """True iff creds resolve (sts get-caller-identity) AND the tier's service probe passes."""
+        """True iff creds resolve (sts get-caller-identity) AND the tier's service probe passes.
+
+        Raises ``AwsUnknownState`` when we could not TELL. That distinction is the whole point:
+        availability is checked ONCE, at construction, and a False here makes the cascade drop the
+        tier for the entire process lifetime. So a few seconds of STS throttling at dispatcher
+        start silently removed the AWS burst tier until a restart -- with the pool still reporting
+        green -- and, when it was the primary tier, stopped the dispatcher from starting at all
+        (issue #79). "Throttled" is not "unentitled"; only the latter is a verdict.
+        """
         try:
             ident = self._aws("sts", "get-caller-identity")
             if not ident.get("Account"):
                 return False
             return self._service_available()
+        except (AwsThrottled, AwsProbeTimeout):
+            # PROPAGATE, don't flatten. The caller decides whether to retry or defer the tier, and
+            # it cannot make that call if a brownout is indistinguishable from missing credentials.
+            # NARROW on purpose: only rate limiting and timeouts. A bare AwsUnknownState covers
+            # AccessDenied and friends, which say nothing about a WORKER but are a definitive answer
+            # about a TIER -- retrying those forever would be the mirror-image bug.
+            raise
         except (AwsWorkerError, OSError):
             return False
 

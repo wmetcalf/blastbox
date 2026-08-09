@@ -21,8 +21,10 @@ available is logged and skipped, so local capacity still comes up if the cloud t
 
 from __future__ import annotations
 
+import functools
 import inspect
 import logging
+import time
 
 from blastbox.errors import is_host_resource_failure
 import threading
@@ -79,6 +81,38 @@ class Tier:
     name: str
     runtime: Any          # a SlotRuntime (concrete slot type varies per backend)
     capacity: int
+
+
+@dataclass
+class DeferredTier:
+    """A tier we could not decide about at startup, kept for re-probing (issue #79).
+
+    NOT the same as an unavailable tier. This is "the control plane would not tell us", and the
+    difference is the whole point: a confirmed-unusable tier is dropped, an undecided one is
+    retried until it answers.
+    """
+    name: str
+    capacity: int
+    reason: str
+    build: "Callable[[], Any]"    # () -> SlotRuntime; re-runs the availability probe
+
+
+def _is_undecided_availability(exc: BaseException) -> bool:
+    """True when a tier's availability probe failed to REACH a verdict, rather than returning one.
+
+    Matched by type name and walked through the cause chain, the same shape ``_is_unknown_not_dead``
+    uses in vm_dispatch: the AWS runtime raises AwsThrottled/AwsProbeTimeout at the point of
+    failure, and the factory wraps errors on the way out. Name-based so this module keeps no import
+    dependency on the cloud runtime (which is optional and may not be installed).
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if any(c.__name__ in ("AwsThrottled", "AwsProbeTimeout") for c in type(cur).__mro__):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 def _takes_budget(fn: Any) -> bool:
@@ -159,10 +193,21 @@ class CascadingRuntime:
         ]
         return max(vals) if vals else None
 
-    def __init__(self, tiers: list[Tier], *, tier_rebuild_after: int | None = None) -> None:
+    def __init__(self, tiers: list[Tier], *, tier_rebuild_after: int | None = None,
+                 deferred: "list[DeferredTier] | None" = None,
+                 admit_retry_s: float = 60.0,
+                 clock: "Callable[[], float]" = time.monotonic) -> None:
         if not tiers:
             raise CascadeMisconfigured("cascade needs at least one tier")
         self.tiers = tiers
+        # Tiers whose availability could not be DETERMINED at startup (a throttled STS), as opposed
+        # to ones we confirmed unusable. Availability was a construction-time question with no
+        # re-probe, so a brownout lasting seconds removed a tier until the process restarted --
+        # pool reporting green the whole time (issue #79). These are retried instead.
+        self._deferred: list[DeferredTier] = list(deferred or [])
+        self._admit_retry_s = float(admit_retry_s)
+        self._clock = clock
+        self._last_admit_attempt: float | None = None
         # Consecutive per-tier spawn failures before that tier's base is invalidated. 0 disables
         # per-tier repair (the tier then stays broken until something else notices, which behind
         # a working fallback is "never").
@@ -199,8 +244,53 @@ class CascadingRuntime:
         # the pool's own (slightly later) global repair decision; a successful spawn clears them.
         self._recently_guilty: set[int] = set()
 
+    def _admit_deferred(self) -> None:
+        """Re-probe tiers whose availability was UNDECIDED at startup and admit the ones that answer.
+
+        APPEND-ONLY, deliberately. ``_tier_identity`` is ``f"{name}#{idx}"``, so inserting a tier at
+        its declared position would renumber every tier after it -- and live slots carry those
+        identities in the pool's base-generation map. A recovering tier joining at the end of the
+        order is a small priority loss; renumbering under running slots is a correctness bug.
+
+        Rate-limited: the probe is an STS round trip, and spawn() is on the pool's tick thread.
+        """
+        with self._lock:
+            if not self._deferred:
+                return
+            now = self._clock()
+            if self._last_admit_attempt is not None and \
+                    (now - self._last_admit_attempt) < self._admit_retry_s:
+                return
+            self._last_admit_attempt = now
+            pending = list(self._deferred)
+
+        still: list[DeferredTier] = []
+        for d in pending:
+            try:
+                rt = d.build()
+            except Exception as exc:  # noqa: BLE001 -- any failure just means "still undecided"
+                _log.debug("cascade: deferred tier %r still unavailable: %s", d.name, exc)
+                still.append(d)
+                continue
+            with self._lock:
+                # Re-check: a concurrent _admit_deferred may have admitted it already.
+                if any(t.name == d.name for t in self.tiers):
+                    continue
+                self.tiers.append(Tier(name=d.name, runtime=rt, capacity=d.capacity))
+                self._counts.append(0)
+                self._tier_failures.append(0)
+            _log.info("cascade: deferred tier %r became available -- admitted at position %d "
+                      "(was undecided at startup: %s)", d.name, len(self.tiers) - 1, d.reason)
+        with self._lock:
+            # Keep only entries still undecided AND not admitted by a racing caller.
+            admitted = {t.name for t in self.tiers}
+            self._deferred = [d for d in still if d.name not in admitted]
+
     # -- SlotRuntime protocol ----------------------------------------------
     def spawn(self) -> Any:
+        # Give an undecided tier a chance to join before we declare the cascade exhausted. Cheap:
+        # rate-limited to one probe per _admit_retry_s, and a no-op once nothing is deferred.
+        self._admit_deferred()
         last_exc: Exception | None = None
         for i, tier in enumerate(self.tiers):
             with self._lock:
@@ -740,20 +830,48 @@ def build_cascade_runtime(
         raise CascadeMisconfigured("BLASTBOX_POOL_TIERS is empty (need e.g. 'static:4,aws-ec2:16')")
 
     tiers: list[Tier] = []
+    deferred: list[DeferredTier] = []
     for pos, (name, capacity) in enumerate(parsed):
         try:
             rt = select_runtime_by_name(name, warm_snapshot=warm_snapshot, require_available=True)
         except Exception as exc:  # noqa: BLE001
+            # UNDECIDED vs UNUSABLE. A throttled sts get-caller-identity used to be indistinguishable
+            # from absent credentials, so seconds of throttling at startup dropped the tier for the
+            # whole process lifetime -- or, for the primary, refused to start at all (issue #79).
+            undecided = _is_undecided_availability(exc)
             if pos == 0:
+                if undecided:
+                    # Fail closed, but say WHY: this is retryable, so a supervisor restart fixes it.
+                    # Admitting a primary tier we could not verify would be the worse trade -- every
+                    # spawn would route to a tier that may not exist.
+                    raise CascadeMisconfigured(
+                        f"primary cascade tier {name!r}: could not determine availability "
+                        f"({exc}). This is a transient control-plane failure, not a "
+                        "misconfiguration -- retry."
+                    ) from exc
                 raise CascadeMisconfigured(f"primary cascade tier {name!r} is unavailable: {exc}") from exc
+            if undecided:
+                _log.warning("cascade: overflow tier %r availability UNDECIDED at startup -- will "
+                             "retry rather than drop it: %s", name, exc)
+                deferred.append(DeferredTier(
+                    name=name, capacity=capacity, reason=str(exc),
+                    build=functools.partial(select_runtime_by_name, name,
+                                            warm_snapshot=warm_snapshot, require_available=True),
+                ))
+                continue
             _log.warning("cascade: overflow tier %r unavailable at startup -- skipping: %s", name, exc)
             continue
         tiers.append(Tier(name=name, runtime=rt, capacity=capacity))
 
     if not tiers:
+        if deferred:
+            raise CascadeMisconfigured(
+                "no cascade tier could be verified available; "
+                f"{len(deferred)} tier(s) undecided (transient control-plane failure) -- retry"
+            )
         raise CascadeMisconfigured("no cascade tier is available")
     _log.info("cascade: %s", ", ".join(f"{t.name}:{t.capacity}" for t in tiers))
-    casc = CascadingRuntime(tiers, tier_rebuild_after=tier_rebuild_after)
+    casc = CascadingRuntime(tiers, tier_rebuild_after=tier_rebuild_after, deferred=deferred)
     if tier_rebuild_after_explicit is not None:
         # The caller knows whether its number came from an operator or from a derived default;
         # only the former should be immune to retuning.

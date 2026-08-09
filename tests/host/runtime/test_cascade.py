@@ -554,3 +554,162 @@ def test_a_failed_tier_invalidation_is_reported_not_swallowed():
     assert invalidated == ["a", "c"], (
         f"one failing tier must not stop the others being repaired (got {invalidated})"
     )
+
+
+# ------------------------------------------------- deferred admission (issue #79)
+
+# Stand-ins for the AWS runtime's types, matched by TYPE NAME so cascade keeps no import
+# dependency on the optional cloud runtime.
+AwsUnknownState = type("AwsUnknownState", (RuntimeError,), {})
+AwsThrottled = type("AwsThrottled", (AwsUnknownState,), {})
+AwsProbeTimeout = type("AwsProbeTimeout", (AwsUnknownState,), {})
+
+
+def test_an_undecided_overflow_tier_is_deferred_not_dropped(monkeypatch):
+    """issue #79: availability is probed ONCE at construction. A throttled sts get-caller-identity
+    was indistinguishable from absent credentials, so seconds of throttling at dispatcher start
+    removed the AWS burst tier for the whole process lifetime -- pool reporting green throughout.
+    """
+    from blastbox.host import pool_config
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):
+        if name == "aws-ec2":
+            raise AwsProbeTimeout("Throttling: Rate exceeded")
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
+    assert [t.name for t in rt.tiers] == ["gvisor"]
+    assert [d.name for d in rt._deferred] == ["aws-ec2"], (
+        "an undecided tier must be kept for re-probing, not dropped like a confirmed-unusable one"
+    )
+
+
+def test_a_confirmed_unusable_overflow_tier_is_still_dropped(monkeypatch):
+    """The distinction must stay narrow: missing credentials is a VERDICT, and retrying it forever
+    would just log noise every spawn."""
+    from blastbox.host import pool_config
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):
+        if name == "aws-ec2":
+            raise RuntimeError("no aws creds")
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
+    assert rt._deferred == []
+
+
+def test_a_recovered_tier_is_admitted_on_a_later_spawn(monkeypatch):
+    """The re-probe is the actual fix: without it the tier stays gone until the process restarts."""
+    from blastbox.host import pool_config
+    throttling = {"on": True}
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):
+        if name == "aws-ec2":
+            if throttling["on"]:
+                raise AwsProbeTimeout("Throttling: Rate exceeded")
+            return FakeRuntime(name)
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
+    rt._admit_retry_s = 0.0
+    assert [t.name for t in rt.tiers] == ["gvisor"]
+
+    throttling["on"] = False          # STS recovers
+    rt.spawn()
+    assert [t.name for t in rt.tiers] == ["gvisor", "aws-ec2"], "the recovered tier must be admitted"
+    assert rt._deferred == []
+    # Per-tier bookkeeping must grow with the tier list, or the next spawn indexes off the end.
+    assert len(rt._counts) == len(rt.tiers)
+    assert len(rt._tier_failures) == len(rt.tiers)
+
+
+def test_admission_is_rate_limited(monkeypatch):
+    """The probe is an STS round trip and spawn() runs on the pool's tick thread (~10Hz)."""
+    from blastbox.host import pool_config
+    attempts = {"n": 0}
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):
+        if name == "aws-ec2":
+            attempts["n"] += 1
+            raise AwsProbeTimeout("Throttling: Rate exceeded")
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    t = {"now": 1000.0}
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
+    rt._clock = lambda: t["now"]
+    rt._admit_retry_s = 60.0
+    rt._last_admit_attempt = None
+    attempts["n"] = 0
+
+    def _spawn():
+        # The local tier fills at capacity 4; CascadeExhausted is irrelevant here -- the admission
+        # probe runs BEFORE the tier loop, and that is what we are counting.
+        try:
+            rt.spawn()
+        except CascadeExhausted:
+            pass
+
+    for _ in range(5):
+        _spawn()
+    assert attempts["n"] == 1, "five spawns inside the window must cost ONE probe"
+
+    t["now"] += 61.0
+    _spawn()
+    assert attempts["n"] == 2, "past the window the tier is probed again"
+
+
+def test_an_undecided_primary_fails_closed_but_says_it_is_retryable(monkeypatch):
+    """Admitting a primary tier we could not verify is the worse trade -- every spawn would route
+    to a tier that may not exist. But the operator must be told it is transient, not a config bug.
+    """
+    from blastbox.host import pool_config
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):
+        raise AwsProbeTimeout("Throttling: Rate exceeded")
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    with pytest.raises(CascadeMisconfigured, match="could not determine availability"):
+        build_cascade_runtime({"BLASTBOX_POOL_TIERS": "aws-ec2:16"}.get)
+
+
+def test_an_undecided_cause_is_seen_through_a_wrapper(monkeypatch):
+    """The factory layers wrap errors on the way out, so the verdict is often not the OUTER type.
+    Judging only the outer exception reads a wrapped brownout as a config verdict and drops the
+    tier permanently -- the bug, one wrapper deeper.
+    """
+    from blastbox.host import pool_config
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):
+        if name == "aws-ec2":
+            try:
+                raise AwsProbeTimeout("Throttling: Rate exceeded")
+            except AwsProbeTimeout as inner:
+                raise RuntimeError("aws-ec2 unavailable") from inner
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
+    assert [d.name for d in rt._deferred] == ["aws-ec2"], (
+        "a brownout wrapped in a generic error is still a brownout"
+    )
+
+
+def test_an_auth_verdict_is_not_retried_forever(monkeypatch):
+    """The mirror-image bug. AccessDenied says nothing about whether a WORKER died -- so the
+    liveness path calls it UNKNOWN -- but it is a definitive answer about whether we may USE the
+    tier. Deferring it would re-probe a misconfigured tier every 60s for the process lifetime.
+    """
+    from blastbox.host import pool_config
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):
+        if name == "aws-ec2":
+            raise AwsUnknownState("AccessDenied: not authorized")
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
+    assert rt._deferred == [], "an auth verdict must be dropped, not deferred"
