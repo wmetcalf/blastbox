@@ -2999,3 +2999,65 @@ def test_an_unknown_probe_does_not_reap_a_draining_slot() -> None:
     pool.tick()   # is_ready flips it to DRAINING and returns UNKNOWN
     assert pool._slots[slot_id].state == SlotState.DRAINING, "sanity: the branch is reachable"
     assert slot_id not in rt.reaped, "a slot we could not ask about was reaped as not-ready"
+
+
+def test_an_unqueryable_liveness_probe_does_not_reap_a_recycled_slot() -> None:
+    """issue #79: the reuse path shared one `except` between recycle and the liveness probe.
+
+    A recycle failure IS a reason to reap -- the slot was never reset. An exception from is_alive
+    is not: it means we could not TELL, and the slot had just been reset successfully and served
+    its job fine. This path runs once PER JOB, so the mistake was charged at job rate.
+    """
+    class _RecycleOkProbeRaises(_FakeRuntime):
+        def recycle(self, slot: Slot) -> None:
+            pass
+
+        def is_alive(self, slot: Slot) -> bool:
+            raise RuntimeError("libvirtd connection reset")
+
+    rt = _RecycleOkProbeRaises()
+    pool = WarmPool(runtime=rt, warm_size=1)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    slot.state = SlotState.ASSIGNED
+    pool.release(slot, dirty=True)      # dirty forces the recycle branch
+
+    assert slot.slot_id not in rt.reaped, "a slot we could not probe was reaped after a good recycle"
+    assert pool._slots[slot.slot_id].state == SlotState.IDLE
+
+
+def test_a_failed_recycle_still_reaps() -> None:
+    """The other half: an unreset slot must never go back to IDLE, or the next job inherits a
+    contaminated worker. Splitting the handler must not weaken this."""
+    class _RecycleRaises(_FakeRuntime):
+        def recycle(self, slot: Slot) -> None:
+            raise RuntimeError("snapshot revert failed")
+
+    rt = _RecycleRaises()
+    pool = WarmPool(runtime=rt, warm_size=1)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    slot.state = SlotState.ASSIGNED
+    pool.release(slot, dirty=True)
+
+    assert slot.slot_id in rt.reaped, "an unreset slot must be reaped, not republished"
+
+
+def test_a_confirmed_dead_slot_after_recycle_is_still_reaped() -> None:
+    """And the third case: a CONFIRMED False must keep reaping. Widening the probe handler to
+    treat everything as unknown would republish genuinely dead workers."""
+    class _RecycleOkButDead(_FakeRuntime):
+        def recycle(self, slot: Slot) -> None:
+            pass
+
+        def is_alive(self, slot: Slot) -> bool:
+            return False
+
+    rt = _RecycleOkButDead()
+    pool = WarmPool(runtime=rt, warm_size=1)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    slot.state = SlotState.ASSIGNED
+    pool.release(slot, dirty=True)
+
+    assert slot.slot_id in rt.reaped, "a confirmed-dead slot must still be reaped"

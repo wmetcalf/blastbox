@@ -913,6 +913,7 @@ class WarmPool:
         if callable(self._recycle) and tracked and not burned_out and not (
             self._max_jobs_per_slot and jobs >= self._max_jobs_per_slot
         ):
+            recycled = True
             try:
                 if dirty or jobs % self._jobs_per_recycle == 0:
                     # Reset in place while the slot stays ASSIGNED. ASSIGNED is counted as active
@@ -921,10 +922,28 @@ class WarmPool:
                     # (_promote_warming only touches WARMING) — so the background tick cannot hand
                     # this slot out mid-reset. Flip to IDLE only once the reset completes.
                     self._recycle(slot)  # e.g. VM snapshot-revert (seconds-long)
+            except Exception:
+                # A recycle failure IS a real reason to reap: the slot was not reset, so the next
+                # job would inherit a contaminated or wedged worker. Fail-safe, keep it.
+                logger.exception("pool.recycle_error slot_id=%s", slot.slot_id)
+                recycled = False
+            if recycled:
+                try:
+                    alive = self._runtime.is_alive(slot)
+                except Exception:
+                    # UNKNOWN, not dead -- the same rule the health tick and the claim probe now
+                    # apply. This used to share the recycle handler's `except`, so an unenumerated
+                    # exception from a liveness probe reaped a slot that had just been reset
+                    # successfully and had served its job fine. A runtime's exception enumeration is
+                    # never complete, and the reuse path runs once PER JOB, so this was charged at
+                    # job rate rather than per tick (issue #79).
+                    logger.exception("pool.release_is_alive_error slot_id=%s — treating as unknown",
+                                     slot.slot_id)
+                    alive = None
                 # `is not False`: an UNKNOWN post-job liveness answer must not destroy the slot
                 # either. Republish it -- the claim-time fresh probe still gates hand-out, and the
                 # unknown-escalation clock bounds how long it can stay that way.
-                if self._runtime.is_alive(slot) is not False:
+                if alive is not False:
                     with self._lock:
                         # Only publish to IDLE if the slot is STILL the ASSIGNED one we're recycling.
                         # A concurrent stop() flips slots to DRAINING under the lock before reaping; if
@@ -935,8 +954,6 @@ class WarmPool:
                             self._last_idle_at = self._clock()
                             self._idle_event.set()
                             return
-            except Exception:
-                logger.exception("pool.recycle_error slot_id=%s", slot.slot_id)
             # recycle failed / slot died / max-jobs reached → fall through to reap (fail-safe)
 
         with self._lock:
