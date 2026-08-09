@@ -54,7 +54,7 @@ from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from blastbox.worker.warm import WarmJobSpec
 
-from blastbox.errors import SandboxError, WarmTimeout
+from blastbox.errors import HOST_RESOURCE_ERRNOS, SandboxError, WarmTimeout
 from blastbox.host.pool import Slot, SlotState
 from blastbox.worker.fc_guest import (
     MAX_STATUS_BYTES,
@@ -76,6 +76,7 @@ __all__ = [
     "VsockReadySignal",
     "VsockHostWarmControl",
 ]
+
 
 _log = logging.getLogger("blastbox.host.runtime.firecracker")
 
@@ -446,6 +447,17 @@ def make_ext4(path: Path, size_mib: int) -> None:
     )
 
 
+# What debugfs/e2fsck say when the HOST filesystem -- not the image -- is the problem. Matched
+# on the tool's own diagnosis because a CalledProcessError carries no errno.
+_HOST_DISK_MARKERS = (
+    b"no space left on device",
+    b"read-only file system",
+    b"input/output error",
+    b"disk quota exceeded",
+    b"too many open files",
+    b"cannot allocate memory",
+)
+
 _RDUMP_TIMEOUT_S = 300.0  # debugfs rdump over a fixed-size (<=512 MiB) image completes in seconds;
 #                           bound it so a crafted image can't hang the dispatcher indefinitely.
 
@@ -482,7 +494,13 @@ def rdump_ext4(
             f.seek(0x438)
             magic = f.read(2)
     except OSError as exc:
-        raise ValueError(f"cannot read ext4 image {image}: {exc}") from exc
+        # Keep the HOST-I/O nature visible through the wrapper. EMFILE/EIO/ENOMEM opening the
+        # per-slot image is this dispatcher failing, not the guest -- and the warm path convicts
+        # on a materialization failure, so flattening it to a bare ValueError blamed healthy
+        # guests during a host outage that hits every job at once (PR #82).
+        err = ValueError(f"cannot read ext4 image {image}: {exc}")
+        err.host_io = True  # type: ignore[attr-defined]
+        raise err from exc
 
     if magic != b"\x53\xef":
         raise ValueError(
@@ -530,7 +548,22 @@ def rdump_ext4(
         dest.mkdir(parents=True, exist_ok=True)
         # After recovery a failure IS fatal (check=True) — surface it loudly rather than
         # silently producing empty output that becomes an opaque "metadata.json not found".
-        _debugfs_rdump(check=True)
+        try:
+            _debugfs_rdump(check=True)
+        except subprocess.CalledProcessError as exc:
+            # debugfs WRITES the extracted tree to the host, so it fails on ENOSPC/EROFS/EIO
+            # here -- after the image-open guard above, and as a CalledProcessError, which is
+            # neither an OSError nor carries host_io. The warm path convicts on a materialization
+            # failure, so a host output filesystem filling up burned out healthy slots and
+            # invalidated healthy FC bases, on an outage that hits every job at once. Look at
+            # what the tool SAID: only its own diagnosis can distinguish "the host disk failed"
+            # from "this image is corrupt" (upstream, PR #82).
+            blob = b" ".join(
+                x for x in (exc.stderr, exc.stdout) if isinstance(x, (bytes, bytearray))
+            ).lower()
+            if any(m in blob for m in _HOST_DISK_MARKERS):
+                exc.host_io = True  # type: ignore[attr-defined]
+            raise
 
     # debugfs rdump always creates lost+found; remove it so it isn't mistaken
     # for an artifact.
@@ -779,6 +812,10 @@ class VsockHostWarmControl:
     ``read_output_disk`` after DONE.
     """
 
+    # Signalling here writes to the guest OVER VSOCK, so a failure is evidence about the worker.
+    # The file handshake's equivalent is a host-side write and deliberately does NOT set this.
+    signal_is_transport = True
+
     def __init__(
         self,
         vsock_uds: Path,
@@ -828,6 +865,19 @@ class VsockHostWarmControl:
         can't pin the dispatcher during the send (the send runs BEFORE wait_for_done's timeout
         starts, so without this it would otherwise be unbounded).
         """
+        # HOST-LOCAL work happens here as well as the transport: creating the Unix socket can
+        # fail with EMFILE/ENOMEM, and streaming the staged input stat()s, opens and reads a HOST
+        # file, which can fail with EIO. signal_is_transport marks this seam as worker evidence,
+        # so without the split a dispatcher outage burned out healthy FC slots and could
+        # invalidate their base (PR #82). Connection/protocol failures stay the worker's.
+        try:
+            return self._signal_go_inner(spec, deadline=deadline)
+        except OSError as exc:
+            if exc.errno in HOST_RESOURCE_ERRNOS:
+                exc.host_io = True  # type: ignore[attr-defined]
+            raise
+
+    def _signal_go_inner(self, spec: "WarmJobSpec", *, deadline: float | None = None) -> None:
         path = Path(spec.input_path)
         header = json.dumps(
             {"filename": path.name, "params": dict(spec.params)}

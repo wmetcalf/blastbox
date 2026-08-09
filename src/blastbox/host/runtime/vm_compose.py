@@ -32,8 +32,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from blastbox.errors import is_answered_http_rejection, is_transport_error
 from blastbox.host.netwire import parse_egress_ports
-from blastbox.host.pool import Slot, WarmPool
+from blastbox.host.pool import Slot, WarmPool, _accepts_kwarg, release_kwargs
 from blastbox.host.runtime.libvirt_egress import ExitRouting, VmEgressPolicy
 from blastbox.host.runtime.libvirt_vm import LibvirtVmConfig, LibvirtVmRuntime
 
@@ -379,11 +380,55 @@ def slot_bound_validate(
             # contaminated worker; clean → reuse per the pool's recycle policy).
             try:
                 if t.is_alive():
-                    pool.retire(slot)
+                    # ATTRIBUTE it. A hung VM agent is the most direct worker fault there is, but
+                    # retiring recorded nothing: if every VM restored from a poisoned snapshot
+                    # hangs, each is destroyed and replaced from that SAME snapshot forever and
+                    # the base-rebuild protection is never reached. The hard retire stays -- the
+                    # abandoned thread may still be talking to this VM, so it must not be
+                    # recycled and re-offered (upstream, PR #82).
+                    if _accepts_kwarg(pool.retire, "fault"):
+                        pool.retire(slot, fault="worker")
+                    else:
+                        pool.retire(slot)
                 else:
                     v = result.get("v")
                     clean = bool(isinstance(v, tuple) and len(v) == 2 and v[1])
-                    pool.release(slot, dirty=not clean)
+                    # ATTRIBUTE the failure. Releasing dirty with no fault leaves it "unknown",
+                    # which force-recycles the slot but advances neither the per-slot nor the
+                    # pool-wide streak -- so a broken VM agent failing every request was
+                    # snapshot-reverted and offered again indefinitely, never reaching burnout
+                    # protection or a base rebuild. Convict only on POSITIVE evidence that the
+                    # WORKER, not the sample, misbehaved: a transport failure (VM unreachable,
+                    # TLS broken, connection dropped). An engine that ran and returned ok=False
+                    # judged the INPUT, and any other exception is ambiguous at this seam --
+                    # both stay unattributed (upstream, PR #82).
+                    exc = result.get("e")
+                    if isinstance(exc, BaseException):
+                        # A transport failure is evidence about this worker...
+                        fault = (
+                            "worker"
+                            # ...but NOT a 4xx. HTTPError is a URLError, so an agent that ANSWERED
+                            # and rejected the request looked identical to an unreachable box
+                            # here. The HTTP transport learned this; its sibling did not (PR #82).
+                            if is_transport_error(exc) and not is_answered_http_rejection(exc)
+                            # An ANSWERED 4xx is not merely un-convictable: the agent replied, so
+                            # it and the base it restored from are demonstrably responsive.
+                            # "unknown" only stops the rejection incrementing the streak; it does
+                            # not CLEAR the failure before it, so a transport failure, then a 413,
+                            # then another transport failure still counted as consecutive. The
+                            # HTTP transport learned this; its sibling did not (PR #82).
+                            else "job" if is_answered_http_rejection(exc)
+                            else None          # ambiguous: never convict on a failure we can't
+                        )                      # attribute
+                    else:
+                        # NO exception: the run COMPLETED and the engine returned ok=False -- a
+                        # verdict on the INPUT, and positive proof this VM is responsive. Leaving
+                        # it unattributed made release() preserve both streaks, so a transport
+                        # failure on either side of a successful run counted as consecutive and
+                        # could evict the VM or rebuild its base (upstream, PR #82).
+                        fault = "job"
+                    pool.release(slot, **release_kwargs(
+                        pool.release, dirty=not clean, fault=fault))
             except Exception:  # noqa: BLE001 — slot return must never mask the validate result/error
                 _log.exception("slot_bound_validate: slot return failed for slot %s", slot.slot_id)
     return _validate

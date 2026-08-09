@@ -26,7 +26,15 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
 
-from blastbox.errors import EngineErrorEnvelope
+from blastbox.errors import is_transport_error
+from blastbox.host.pool import release_kwargs
+from blastbox.errors import (
+    HOST_RESOURCE_ERRNOS,
+    EngineErrorEnvelope,
+    OutputTrustUnknown,
+    is_answered_http_rejection,
+)
+
 
 _log = logging.getLogger("blastbox.host.runtime.remote_http")
 
@@ -63,9 +71,33 @@ class RemoteOutputTooLarge(RuntimeError):
     """A remote worker returned more output than the configured cap allows (DoS guard)."""
 
 
+class RemoteOutputMalformed(RuntimeError):
+    """The worker's tar is internally inconsistent -- a WORKER verdict, not a host failure.
+
+    Deliberately NOT an OSError. The blanket handler in the validate path splits OSError into
+    "this dispatcher's disk" vs "the wire", and a worker-authored archive that cannot be laid out
+    (a regular file ``a`` followed by a member ``a/b``, so ``a`` must be both) surfaced there as
+    FileExistsError/ENOTDIR and was filed under the dispatcher's disk. A reusable static worker
+    could then repeat the violation forever without advancing burnout or repair (upstream, PR #82).
+    """
+
+
 class ClaimLost(RuntimeError):
     """This attempt outlived its claim (a peer reclaimed the job) before a destructive output op -- abort
-    so we don't clobber the new owner's result in the shared output dir."""
+    so we don't clobber the new owner's result in the shared output dir.
+
+    ``validated`` says whether the WORKER'S OUTPUT had already passed the host trust gate when the
+    claim was found lost. It changes the attribution, not the control flow: after validation the
+    run is positive proof this worker and its base are responsive, so the streaks must RESET --
+    leaving it unattributed preserves them, and worker-failure / validated-run-then-claim-loss /
+    worker-failure then counts as consecutive and can evict the slot or rebuild its base. Before
+    validation nothing has been demonstrated, so it stays unattributed. Carried on the exception
+    because only the raise site knows which side of the gate it is on (upstream, PR #82).
+    """
+
+    def __init__(self, *args: object, validated: bool = False) -> None:
+        super().__init__(*args)
+        self.validated = validated
 
 
 class WorkerBusy(RuntimeError):
@@ -284,6 +316,8 @@ def _empty_dir(d: Path) -> None:
                 pass
 
 
+
+
 def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: int | None = None,
                       max_members: int | None = None, max_metadata_bytes: int | None = None) -> list[str]:
     """Extract regular files from a tar (bytes or a seekable fileobj) into ``dest``, rejecting path
@@ -313,11 +347,23 @@ def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: i
                 continue
             raw = dest / m.name
             # bounds check on the FULLY-RESOLVED path (catches leaf + intermediate-dir symlink escapes).
-            resolved = raw.resolve()
-            if resolved != dest and not str(resolved).startswith(str(dest) + os.sep):
-                _log.warning("remote_http: dropping traversal member %r", m.name)
-                continue
-            _make_traversable(raw.parent, dest)   # 0755 intermediates so a different API UID can read
+            # resolve() and the parent mkdir happen BEFORE the guarded open below, and they are
+            # just as worker-controlled: with a regular file `a` and a later member `a/b`, `a`
+            # must be both a file and a directory, so this raises FileExistsError/ENOTDIR and
+            # escapes the loop into the caller's OSError branch -- which reads it as this
+            # dispatcher's disk. Split it here, where we still know the member that caused it.
+            try:
+                resolved = raw.resolve()
+                if resolved != dest and not str(resolved).startswith(str(dest) + os.sep):
+                    _log.warning("remote_http: dropping traversal member %r", m.name)
+                    continue
+                _make_traversable(raw.parent, dest)   # 0755 so a different API UID can read
+            except OSError as exc:
+                if exc.errno in HOST_RESOURCE_ERRNOS:
+                    raise                              # ours: stays unattributed upstream
+                raise RemoteOutputMalformed(
+                    f"remote output member {m.name!r} cannot be laid out ({exc})"
+                ) from exc
             src = tf.extractfile(m)
             if src is None:
                 continue
@@ -332,6 +378,13 @@ def _safe_extract_tar(tar_source: bytes | Any, dest: Path, *, max_total_bytes: i
             except OSError as exc:
                 src.close()
                 _log.warning("remote_http: refusing to write member %r (%s)", m.name, exc)
+                # A member skipped because THIS HOST ran out of fds/space/inodes is a dispatcher
+                # failure, but the caller only sees "no metadata" and blames the worker. Surface
+                # it instead of silently returning an empty extraction: during an EMFILE/ENOSPC
+                # incident every job would otherwise advance burnout and base-rebuild streaks
+                # (PR #82). EACCES/ELOOP stay a skip -- those ARE the worker's doing.
+                if exc.errno in HOST_RESOURCE_ERRNOS:
+                    raise
                 continue
             rel = str(resolved.relative_to(dest))
             with src, os.fdopen(fd, "wb") as out:
@@ -444,6 +497,11 @@ def detonate_remote(
     return {}
 
 
+# Re-exported from blastbox.errors so this module's callers keep the local name while the RULE
+# has exactly one definition (vm_compose classifies the same way).
+_is_transport_error = is_transport_error
+
+
 def make_remote_validate(
     claim: Callable[[], _Slot],
     release: Callable[..., None],
@@ -482,6 +540,9 @@ def make_remote_validate(
             return {"error": _sanitized_failure(exc)}, False
         slot = claim()
         dirty = True  # only a clean, successful round-trip releases the slot as reusable
+        # WHOSE failure was it? "unknown" is the safe default: an unattributed dirty release still
+        # force-resets the slot but never advances it toward eviction (see WarmPool.release).
+        fault = "unknown"
         try:
             base = slot_base_url(slot, tls=ssl_context is not None)
             out_dir = output_dir_for(input_path)
@@ -499,6 +560,12 @@ def make_remote_validate(
             )
             # No metadata at all is abnormal worker output -> fail the job AND retire the slot (dirty).
             if not meta:
+                # Attribute HERE, not in the chain below: an earlier version added an
+                # `elif not meta` after this return, which could never execute -- so malformed
+                # worker output still never advanced burnout or base rebuilding. EMPTY metadata
+                # is abnormal worker output: the engine reported nothing at all, so a
+                # recycle-capable worker could otherwise be reset and re-offered forever.
+                fault = "worker"
                 _log.warning("remote_http: remote worker returned no metadata")
                 return {"error": "remote worker returned no metadata"}, False
             # HOST TRUST GATE -- runs BEFORE the slot is released clean, so a worker whose output fails
@@ -521,16 +588,75 @@ def make_remote_validate(
                 if sealed.exists():
                     meta = json.loads(sealed.read_text())
             elif meta.get("status") == "engine_error":
+                fault = "job"        # the engine RAN and reported on this input; not the worker
                 # no trust gate to validate the envelope (direct callers / tests) -> can't tell a genuine
                 # engine_error from a faked one, so fail CONSERVATIVELY (dirty).
                 return {"error": "remote engine error"}, False
             dirty = False
             return meta, True
         except WorkerBusy:
-            # NOT a job failure -- the worker's lock is held by a stale detonation. Propagate so the
-            # dispatcher requeues the job (like NoWarmSlot); the finally releases this slot dirty (cooldown).
+            # 409 means the worker ANSWERED and its single-flight lock is held: capacity pressure,
+            # and the job is REQUEUED rather than failed, so it is not failure evidence at all.
+            # Recording it advanced the pool-wide rebuild streak on nothing but load, and a
+            # job-driven repair carries no guilty-tier attribution, so in a cascade it could
+            # invalidate unrelated healthy snapshot tiers (upstream, PR #82).
+            fault = "unknown"
+            # Propagate so the dispatcher requeues the job (like NoWarmSlot); the finally still
+            # releases this slot DIRTY, quarantining the box so it is not immediately re-offered.
             raise
+        except ClaimLost as exc:
+            # A PEER already reclaimed or finished this job -- our claim simply outlived itself.
+            # The worker did nothing wrong, so attributing it as a wedge let two stale attempts
+            # burn out a healthy slot and feed base invalidation (upstream, PR #82).
+            #
+            # ...and when the loss was found AFTER the trust gate accepted this worker's output,
+            # "did nothing wrong" understates it: the run PROVED the worker and its base
+            # responsive, and unknown preserves the streaks rather than clearing them.
+            fault = "job" if getattr(exc, "validated", False) else "unknown"
+            raise
+        except OutputTrustUnknown as exc:
+            # The host could not COMPLETE validation (EMFILE/EIO/ENOMEM). validate_worker_output
+            # wraps the OSError, so this is no longer an OSError and the generic branch below
+            # would convict -- defeating the whole point of the type on this path.
+            fault = "unknown"
+            _log.warning("remote_http: could not complete output validation: %s", exc)
+            return {"error": _sanitized_failure(exc)}, False
         except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, OSError) and not _is_transport_error(exc):
+                # LOCAL HOST I/O: input_path.stat(), output_dir.mkdir(), _empty_dir(), tar
+                # extraction. These fail on ENOSPC/EROFS/EMFILE with the request never sent, so
+                # they are evidence about THIS DISPATCHER, not the worker -- and a dispatcher
+                # disk outage hits every job at once, which would burn out every healthy slot
+                # and invalidate healthy bases (upstream, PR #82).
+                #
+                # Decided INSIDE this handler deliberately. A separate `except OSError:` fails
+                # twice over: urllib's URLError/HTTPError and socket.timeout are all OSError
+                # SUBCLASSES, so it would swallow every transport failure as host I/O; and
+                # re-raising from one handler does not fall through to a sibling handler, it
+                # escapes the try entirely.
+                fault = "unknown"
+                _log.warning("remote_http: local preparation failed: %s", exc)
+                return {"error": _sanitized_failure(exc)}, False
+            if is_answered_http_rejection(exc):
+                # The agent ANSWERED and rejected what we SENT. A 4xx is a verdict on the request,
+                # not evidence the box is sick: the agent replies 413 when a sample exceeds its
+                # own max_bytes, so raising BLASTBOX_MAX_INPUT on the dispatcher while a
+                # static/remote worker keeps the default turns every oversized-but-valid job into
+                # a worker conviction and burns down healthy boxes one after another. 401/403
+                # (token skew) and 404 (version skew) fail the same way, and identically on EVERY
+                # box -- exactly the correlated signal that must never reach burnout. 5xx falls
+                # through: the agent itself broke, which IS evidence about this worker. 409 never
+                # arrives here; it is WorkerBusy (capacity) further up (upstream, PR #82).
+                # "job", not "unknown". The agent ANSWERED, which proves it and the base it
+                # restored from are responsive -- and unknown merely stops the rejection itself
+                # from incrementing the streak, it does not CLEAR the failure before it. A
+                # transport failure, then a 413, then another transport failure still counted as
+                # consecutive (upstream, PR #82).
+                fault = "job"
+                _log.warning("remote_http: worker rejected the request (HTTP %s): %s",
+                             getattr(exc, "code", "?"), exc)
+                return {"error": _sanitized_failure(exc)}, False
+            fault = "worker"         # transport failed -> evidence about this worker, not the input
             # transport error after the request may have reached the worker -> the box could still be
             # busy; keep dirty=True so the pool retires/recycles it instead of re-offering immediately.
             _log.warning("remote_http: validate failed: %s", exc)
@@ -538,9 +664,12 @@ def make_remote_validate(
             # job carries an actionable error the API can show -- without leaking hosts/paths/internals.
             return {"error": _sanitized_failure(exc)}, False
         finally:
-            try:
-                release(slot, dirty=dirty)
-            except TypeError:            # release seam that doesn't accept dirty (legacy callers/tests)
-                release(slot)
+            # Introspect ONCE rather than laddering down `except TypeError` around the CALL.
+            # The ladder could not tell an old seam from a real TypeError inside release, so one
+            # genuine bug released the SAME slot three times -- and its last rung dropped `dirty`,
+            # returning a worker that had just failed a detonation straight to IDLE with no forced
+            # recycle. Never invent an attribution a caller cannot carry: an unattributed dirty
+            # release still force-resets the slot, it just does not advance it toward eviction.
+            release(slot, **release_kwargs(release, dirty=dirty, fault=fault))
 
     return validate

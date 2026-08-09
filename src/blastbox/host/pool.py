@@ -36,10 +36,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from blastbox.errors import is_host_resource_failure
 from blastbox.observability.metrics import (
     record_pool_state,
     record_slot_reaped,
     record_slot_spawned,
+    record_spawn_capacity_miss,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,6 +70,62 @@ class Slot:
     container_id: str | None = None
     spawned_at: float = 0.0
     jobs: int = 0            # cumulative jobs served (reuse mode: drives recycle/reprovision)
+
+
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    """Whether ``fn`` declares ``name`` (or absorbs it via **kwargs). Introspection only."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def release_kwargs(fn: Any, *, dirty: bool, fault: str | None = None) -> dict[str, Any]:
+    """The subset of ``dirty``/``fault`` that this ``release`` callable actually accepts.
+
+    Introspection ONLY, deliberately separate from the call. Every seam here used to degrade with
+    a ladder of ``except TypeError`` wrapped around ``release(...)`` itself, which cannot tell
+    "this pool predates the kwarg" from "release() raised TypeError for a real reason". One
+    genuine bug inside release was therefore retried as a compatibility fallback: the same slot
+    was released two or three times, and the longest ladder's final rung dropped ``dirty``
+    entirely -- returning a worker that had just failed a detonation to IDLE with no forced
+    recycle, to be handed the next untrusted sample. Same reasoning as ``_takes_budget`` in
+    cascade.py.
+
+    A ``**kwargs`` release counts as accepting everything: the ladders passed those through, and
+    reporting otherwise would silently drop the attribution -- no exception, no log, and the
+    conflated worker/job signal quietly returns.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return {"dirty": dirty, "fault": fault}
+    out: dict[str, Any] = {}
+    if "dirty" in params:
+        out["dirty"] = dirty
+    # Never invent an attribution a caller cannot carry: an unattributed dirty release still
+    # force-resets the slot, it just does not advance it toward eviction.
+    if "fault" in params:
+        out["fault"] = fault
+    return out
+
+
+class RuntimeAtCapacity(RuntimeError):
+    """``spawn()`` has no room right now — a NORMAL condition, not a fault.
+
+    Part of the :class:`SlotRuntime` contract. A runtime that can be legitimately full
+    (a cascade whose ready tiers are saturated while a snapshot tier still builds; a static
+    pool with every worker busy) raises this instead of a generic error, so the pool can tell
+    "no capacity this instant" apart from "spawning is broken". The distinction matters: the
+    latter feeds the consecutive-failure streak that eventually invalidates the snapshot base,
+    so counting a routine capacity miss there slowly destroys a perfectly good base under load
+    — exactly when the pool is busiest and can least afford a rebuild.
+    """
 
 
 @runtime_checkable
@@ -181,8 +239,14 @@ class WarmPool:
         warmup_grace_s: float = 30.0,
         warming_timeout_s: float = 120.0,
         unknown_grace_s: float = 300.0,
+        capacity_starved_after_s: float = 300.0,
         jobs_per_recycle: int = 1,
         max_jobs_per_slot: int = 0,
+        max_consecutive_failures: int = 2,
+        max_evictions_per_window: int | None = None,
+        eviction_window_s: float = 600.0,
+        snapshot_rebuild_after: int | None = None,
+        base_rebuild_cooldown_s: float = 300.0,
     ) -> None:
         self._runtime = runtime
         # Some runtimes (static pool) reuse a long-lived box on reap and care whether the just-finished
@@ -200,6 +264,102 @@ class WarmPool:
         self._recycle = getattr(runtime, "recycle", None)
         self._jobs_per_recycle = max(1, jobs_per_recycle)
         self._max_jobs_per_slot = max_jobs_per_slot
+        # A wedged warm worker is INVISIBLE to is_alive(): the sandbox process is healthy, only the
+        # in-guest agent has stopped answering. release(dirty=True) therefore recycled it (a
+        # snapshot-revert, which restores the SAME persisted base) and republished it to IDLE, so it
+        # took the next job and failed again -- observed as a pool failing 100% of jobs for days,
+        # curable only by restarting the dispatcher (which rebuilds the base). Counting consecutive
+        # dirty releases gives the pool a way to notice without a liveness probe it does not have:
+        # after N in a row, stop trusting the slot and reap it so a genuinely fresh one replaces it.
+        self._max_consecutive_failures = max(0, max_consecutive_failures)
+        # (3) Blast radius. Wedge detection is a HEURISTIC over a signal the pool cannot fully
+        # verify, and this file's history is of predicates that looked right in review and then
+        # took whole tiers. Whatever the predicate decides, never let it evict more than this many
+        # slots per window: a wrong signal then costs some churn instead of the warm pool.
+        # Default scales with the tier: you may churn through the warm set ONCE inside a window,
+        # but not over and over. An absolute constant is wrong at both ends -- 2 starves a large
+        # pool's legitimate replacement, and is far too permissive for a warm_size of 1.
+        # None => DERIVED, and re-derived whenever resize() moves the warm target. Computing it
+        # once from the constructor's warm_size meant a pool started at 16 and downsized to 1 by
+        # the autosizer still permitted 16 evictions per window -- the cap is meant to bound damage
+        # to roughly one warm set, so it has to track the live set (upstream, PR #82).
+        self._eviction_cap_explicit = max_evictions_per_window is not None
+        self._max_evictions_per_window = (
+            max(2, int(warm_size)) if max_evictions_per_window is None
+            else max(0, int(max_evictions_per_window)))
+        self._eviction_window_s = max(0.0, eviction_window_s)
+        # (timestamp, owner) -- the owner is the slot the token was reserved FOR. Refunding by
+        # popping the newest entry gave back whichever thread reserved LAST, so a concurrent
+        # reservation was cancelled while the failed attempt stayed charged: the cap could then be
+        # exceeded (upstream, PR #82).
+        self._evictions: list[tuple[float, str]] = []
+        # Reaping cannot help when the persisted warm BASE is what is poisoned -- every replacement
+        # restores the same bad state. After this many dirty releases pool-wide with no intervening
+        # success, ask the runtime to discard its base so the next spawn rebuilds it.
+        #   None -> derive from warm_size, so it scales with the pool
+        #   0    -> DISABLED
+        #   >0   -> exactly that many
+        # The previous form said "0 disables" in the comment while treating <=0 as "use the derived
+        # default", so rebuilds were on by default and there was no way to turn them off at all
+        # (upstream, PR #82). Same sentinel convention as max_evictions_per_window above.
+        self._rebuild_after_explicit = snapshot_rebuild_after is not None
+        self._snapshot_rebuild_after = (
+            max(4, 2 * max(1, warm_size)) if snapshot_rebuild_after is None
+            else max(0, int(snapshot_rebuild_after))
+        )
+        # PER BASE IDENTITY ("" for a single-base runtime). A cascade has one base per tier, and
+        # one shared counter meant a healthy tier-A job reset the episode a poisoned tier B was
+        # accumulating -- so alternating A successes and B failures kept B below the threshold
+        # forever, and since blame_tier_for_slot no longer repairs on its own, nothing else would
+        # ever fix it (upstream, PR #82).
+        self._pool_consecutive_failures: dict[str, int] = {}
+        self._base_rebuilds = 0
+        # Rebuilding the base is a full sandbox BOOT (seconds), unlike a slot respawn which is a
+        # cheap snapshot restore. Slot respawn churn is already bounded by the spawn token bucket;
+        # rebuilds are not, so a systemic failure unrelated to the base (bad input class, full disk,
+        # a sick dependency) would otherwise trigger a boot every snapshot_rebuild_after failures
+        # forever. Cool down between rebuilds so a wrong guess costs one boot per window, not a
+        # boot storm. 0 disables the cooldown.
+        self._base_rebuild_cooldown_s = max(0.0, base_rebuild_cooldown_s)
+        self._last_base_rebuild_at: float | None = None
+        # Consecutive runtime.spawn() failures. A base broken badly enough that RESTORES fail never
+        # produces a slot, so no job is ever dispatched and no dirty release happens -- the
+        # job-failure counter stays at zero while the tier sits at zero capacity forever. Spawn
+        # failures must feed base invalidation too: "cannot restore the base" is even stronger
+        # evidence the base is bad than "jobs restored from it fail".
+        self._spawn_consecutive_failures = 0
+        # Keyed by slot_id, NOT stored on the slot: runtimes supply their own slot types (e.g.
+        # AwsWorkerSlot) that duck-type the Slot protocol without inheriting its dataclass fields,
+        # so attributes added to Slot are not universally present.
+        self._slot_failures: dict[str, int] = {}
+        self._slot_last_success: dict[str, float] = {}
+        # slot_id -> the key its failure history is filed under. Usually the slot_id itself; a
+        # runtime that REUSES a physical worker across slots reports a stable identity instead.
+        self._health_key_by_slot: dict[str, str] = {}
+        # slot_id -> the value of _base_rebuilds when this slot was spawned, i.e. WHICH warm base
+        # produced it. A slot restored from generation A can still be mid-job long after A was
+        # invalidated and B built in its place.
+        # slot_id -> (base identity, generation) it was restored from. The IDENTITY matters:
+        # a cascade has one base PER TIER, and a job-driven repair may touch only tier A while
+        # tier B's artifact stays current. A single pool-wide counter retired B's live slots too,
+        # discarding their failures as coming from a base that was in fact never replaced.
+        self._slot_base: dict[str, tuple[str, int]] = {}
+        # COMMITTED base generation, advanced only when an invalidation actually succeeded.
+        # Deliberately not _base_rebuilds, which is bumped BEFORE drop() so an in-flight spawn
+        # batch can be fenced: a drop() that RAISED still advanced it, so slots whose tier was
+        # never repaired were stamped with a "retired" generation and their later failures were
+        # discarded -- leaving the un-repaired tier unable to reach the rebuild threshold at all.
+        # base identity -> committed generation. "" is the whole-runtime base (anything that is
+        # not a cascade). Advanced only when an invalidation actually succeeded, and only for the
+        # bases it actually repaired.
+        self._base_generation: dict[str, int] = {}
+        # ONE invalidation at a time, whatever base triggered it. Two identities reaching the
+        # threshold concurrently -- worker failures from two cascade tiers -- each consumed their
+        # own episode, saw the same pre-cooldown state and both called invalidate_base(). Both
+        # calls can target the same guilty tiers, so the second discards the first's replacement
+        # or bumps its build epoch and the replacement build is REJECTED, while the pool advances
+        # that generation twice. Not _lock: drop() is slow and must never run under it (PR #82).
+        self._invalidation_lock = threading.Lock()
         self._warm_size = warm_size
         self._concurrent_ceiling = concurrent_ceiling
         self._poll_interval = poll_interval
@@ -214,6 +374,34 @@ class WarmPool:
         # too short and it becomes the destroy-healthy-workers bug #77 fixes; 0 disables escalation
         # entirely (a slot can then be unknown forever, which wedges the tier -- see _health_check).
         self._unknown_grace_s = unknown_grace_s
+        # How long the pool may be CONTINUOUSLY unable to spawn for capacity reasons before that
+        # stops being backpressure and becomes an outage. Capacity misses are deliberately not
+        # faults -- they must not invalidate the base -- but "not a fault" must not mean
+        # "unbounded and silent": with no floor here, a permanently full or misconfigured cascade
+        # (ceiling above the fleet, a snapshot tier whose build never finishes) sits at zero warm
+        # capacity forever emitting nothing above DEBUG, and the only symptom is a sagging warm-hit
+        # rate. Same reasoning as _unknown_grace_s above; 0 disables the escalation.
+        self._capacity_starved_after_s = capacity_starved_after_s
+        self._capacity_miss_since: float | None = None
+        self._capacity_starved_logged = False
+        # Monotonic count of CLEAN releases. Read as an episode token so a rebuild decision can
+        # be abandoned if a slot succeeded while it was being made.
+        self._clean_release_count = 0
+        # Slots promoted to IDLE that have not yet completed a job. Their promotion cleared the
+        # restore-failure streak provisionally; a confirmed death before first use revokes that.
+        self._promoted_unproven: set[str] = set()
+        # Set by _health_check when it invalidates the base, read and cleared by tick(): the next
+        # spawn would run a synchronous rebuild on this thread.
+        self._rebuilt_this_tick = False
+        # Derive from the FEASIBLE target, not the requested one. PoolConfig permits
+        # warm_size > concurrent_ceiling, and the pool can then only ever run at the ceiling --
+        # so warm_size=16 with ceiling=1 waited 32 consecutive failures before repairing a
+        # poisoned base and allowed 16 evictions per window on a ONE-slot pool. resize() already
+        # clamps and then re-derives; construction did neither, so the two disagreed until some
+        # later resize happened to correct it (upstream, PR #82).
+        if self._warm_size > self._concurrent_ceiling:
+            self._warm_size = self._concurrent_ceiling
+        self._rederive_warm_size_thresholds()
 
         # slot_id → Slot; all mutations under _lock
         self._slots: dict[str, Slot] = {}
@@ -395,6 +583,7 @@ class WarmPool:
                 if disposed:   # skip-because-another-thread-owns-it (False) -> leave it for that thread
                     with self._lock:
                         self._slots.pop(slot.slot_id, None)
+                        self._forget_slot_health(slot.slot_id)
 
         # Whatever remains in _slots failed to reap (or is owned by another thread mid-dispose) —
         # a still-live VM the caller must keep reserving for. A wedged background thread means an
@@ -451,7 +640,71 @@ class WarmPool:
             if self._clock() >= deadline:
                 return None
 
-    def release(self, slot: Slot, *, dirty: bool = False) -> None:
+    def _refund_eviction_unlocked(self, owner: str) -> None:
+        """Give back the token reserved FOR ``owner``. CALLER MUST HOLD ``self._lock``.
+
+        Reservations are taken at the DECISION and the eviction can still be undone afterwards; a
+        token that bought nothing must not count against the window. It must be the RIGHT token:
+        popping the newest entry refunded whichever thread reserved last, leaving the failed
+        attempt charged and a real eviction uncounted, so later releases could exceed the cap
+        (upstream, PR #82).
+        """
+        for i in range(len(self._evictions) - 1, -1, -1):
+            if self._evictions[i][1] == owner:
+                del self._evictions[i]
+                return
+
+    def _reserve_eviction_unlocked(self, now: float, owner: str = "") -> bool:
+        """Check-and-reserve one eviction token. CALLER MUST HOLD ``self._lock``.
+
+        Split out because the demotion step -- the only place that truly evicts -- already holds
+        the lock, and the locking variant would deadlock there.
+        """
+        if self._max_evictions_per_window <= 0:
+            return False        # 0 = evict NOTHING; see _eviction_allowed
+        if self._eviction_window_s <= 0:
+            return True         # no window to rate-limit over
+        self._evictions = [e for e in self._evictions
+                           if now - e[0] < self._eviction_window_s]
+        if len(self._evictions) >= self._max_evictions_per_window:
+            return False
+        self._evictions.append((now, owner))
+        return True
+
+    def _eviction_allowed(self, owner: str = "") -> bool:
+        """True if the wedge heuristic may still evict a slot inside the current window.
+
+        Wedge detection is a heuristic over a signal the pool cannot verify. This module's history
+        is of predicates that read correctly in review and then took whole tiers, so the corrective
+        action is bounded independently of how confident the predicate is."""
+        if self._max_evictions_per_window <= 0:
+            # A ZERO CAP BLOCKS EVICTION. This read "cap disabled" and permitted UNLIMITED
+            # evictions -- the exact opposite of what the number says, and reachable precisely
+            # when an operator sets BLASTBOX_POOL_MAX_EVICTIONS_PER_WINDOW=0 during an incident
+            # to stop the heuristic taking more slots. The mitigation removed the blast-radius
+            # guard entirely. Nothing in PoolConfig or docs/CONFIGURATION.md documents zero as an
+            # unlimited sentinel, so there is no reading to preserve; a negative is nonsense and
+            # fails the same way, toward LESS corrective action (upstream, PR #82).
+            return False
+        if self._eviction_window_s <= 0:
+            # A different knob: with no window there is nothing to rate-limit over, so the cap
+            # cannot be applied. Kept separate so it can never re-absorb the zero-cap case above.
+            return True
+        now = self._clock()
+        with self._lock:
+            self._evictions = [e for e in self._evictions
+                               if now - e[0] < self._eviction_window_s]
+            if len(self._evictions) >= self._max_evictions_per_window:
+                return False
+            # RESERVE inside the same critical section. Checking here and appending in a separate
+            # _record_eviction() let two threads both observe "under the cap" before either wrote,
+            # so with max_evictions_per_window=1 a concurrent burnout could reap two slots -- a cap
+            # that is not a cap is worse than none, because it is trusted (upstream, PR #82).
+            self._evictions.append((now, owner))
+            return True
+
+    def release(self, slot: Slot, *, dirty: bool = False,
+                fault: "str | None" = None) -> None:
         """Finish a job on ``slot``.
 
         Default (no ``recycle`` on the runtime): ASSIGNED → DRAINING → reap (warm ≠ reuse); the
@@ -465,13 +718,186 @@ class WarmPool:
         the ``jobs_per_recycle`` boundary) in REUSE mode, so the next job never inherits a wedged or
         contaminated warm worker. In non-reuse mode the slot is reaped anyway, which is already a
         full reset.
+
+        ``fault`` says WHOSE failure it was, and only ``"worker"`` counts toward wedge eviction:
+
+          "worker"  the WORKER is suspect -- a hung validate (dead in-guest agent), a transport
+                    error, a busy-lock held by a stale detonation. Evidence about this slot.
+          "job"     the ENGINE ran and reported a failure on this INPUT. Says nothing about the
+                    worker: on a malware corpus, samples that crash the engine are the workload.
+          "unknown" we cannot attribute it. Treated like "job" -- never destroy a warm worker on a
+                    failure we could not attribute (the invariant this whole module is built on).
+
+        Omitting ``fault`` on a dirty release therefore force-resets the slot exactly as before but
+        does NOT advance it toward eviction. That default is deliberate: a caller that has not been
+        taught to attribute must not be able to reap warm capacity by accident.
         """
+        fault = (fault or "unknown") if dirty else None
+        # Resolved OUTSIDE the lock: the optional worker_identity() hook belongs to the runtime
+        # and must not run under the pool lock.
+        hkey = self._health_key(slot)
+        _bident = self._base_identity(slot)
+        # Set under the lock by either recovery branch; the runtime hook runs outside it.
+        episode_recovered = False
         with self._lock:
             slot.jobs += 1
             jobs = slot.jobs
             tracked = slot.slot_id in self._slots
+            if not tracked:
+                # A late release for a slot stop()/eviction already removed. Recording anything
+                # here leaks an entry keyed on a dead slot_id AND moves the POOL-wide counter on
+                # evidence from a slot that is no longer in the pool -- which can tip a base
+                # rebuild (upstream, PR #82).
+                #
+                # ...including the identity caches _health_key/_base_identity just populated.
+                # retire() or an eviction can remove a slot while its timed-out validation is
+                # still running, and that validation reaches release() afterwards --
+                # _forget_slot_health has already run, so nothing else would ever drop the fresh
+                # entries and every such late completion grew both dicts forever.
+                self._health_key_by_slot.pop(slot.slot_id, None)
+                self._slot_base.pop(slot.slot_id, None)
+                slot_failures = 0
+                last_success = 0.0
+            elif dirty and fault == "job":
+                # POSITIVE evidence: the worker RAN and returned a structurally valid
+                # engine_error, so it is demonstrably responsive and so is the base it restored
+                # from. "Consecutive" has to mean consecutive -- leaving the streaks untouched
+                # meant a timeout, then any number of valid engine errors, then another timeout
+                # read as two CONSECUTIVE worker failures, evicting a healthy slot or invalidating
+                # a good base on two unrelated events an hour apart. The slot is still
+                # force-recycled (dirty); only the HEALTH streaks reset (upstream, PR #82).
+                # hkey, not slot_id. With a reusing runtime the record is filed under the
+                # physical worker while slot_id is minted fresh for every assignment, so popping
+                # the slot id left the box's prior failure intact -- and the lookup below,
+                # correctly keyed, read it straight back. A failure / valid engine_error /
+                # failure sequence was then treated as CONSECUTIVE and could burn out a healthy
+                # box or spend eviction budget on it. The clean-release branch already had this
+                # right (upstream, PR #82).
+                self._slot_failures.pop(hkey, None)
+                episode_recovered = True
+                self._pool_consecutive_failures.pop(_bident, None)
+                slot_failures = 0
+                # ...and it proves the RESTORED BASE is responsive too, so it must clear the
+                # restore-side evidence as well. Leaving these meant restore deaths separated by
+                # a successfully validated engine run still counted as consecutive (PR #82).
+                self._spawn_consecutive_failures = 0
+                self._promoted_unproven.discard(slot.slot_id)
+                self._clean_release_count += 1
+            elif dirty and fault == "worker":
+                # ONLY worker-attributed failures are evidence about the slot. Counting job faults
+                # here is what let two bad samples in a row destroy a warm worker with a hundred
+                # clean jobs behind it -- and on this workload two bad samples in a row is routine,
+                # not exceptional.
+                self._slot_failures[hkey] = self._slot_failures.get(hkey, 0) + 1
+                # The SLOT counter always moves -- this worker really did fail. The POOL-wide
+                # counter judges the BASE, and it is the only evidence _maybe_rebuild_base
+                # consults, so a slot restored from a generation that has since been RETIRED must
+                # not feed it. Generation A is invalidated while A-backed slots are still
+                # assigned; those jobs run for minutes, and their later failures kept accumulating
+                # here. With the cooldown elapsed (or configured to zero) and no intervening clean
+                # release from B, enough long-running A failures invalidated the freshly built B
+                # artifact -- which produced none of them -- and the tier rebuilt cold over and
+                # over. slot_ids carries cascade-TIER attribution; it says nothing about which
+                # snapshot generation restored the slot (upstream, PR #82).
+                _stamp = self._slot_base.get(slot.slot_id)
+                if _stamp is None or _stamp[1] == self._base_generation.get(_stamp[0], 0):
+                    self._pool_consecutive_failures[_bident] = (
+                        self._pool_consecutive_failures.get(_bident, 0) + 1)
+                else:
+                    logger.info(
+                        "pool.failure_from_retired_generation slot_id=%s spawned_generation=%d "
+                        "current_generation=%d -- not counted against the base now installed",
+                        slot.slot_id, _stamp[1], self._base_generation.get(_stamp[0], 0),
+                    )
+            elif dirty:
+                # A job/unknown fault still forces a recycle (the slot may be contaminated) but must
+                # not advance it toward eviction, and must not reset its success record either.
+                pass
+            else:
+                self._slot_failures.pop(hkey, None)
+                self._slot_last_success[hkey] = self._clock()
+                self._pool_consecutive_failures.pop(_bident, None)
+                episode_recovered = True
+                # Episode token: a rebuild decision taken before this point is abandoned, because
+                # the base demonstrably just produced a valid result.
+                self._clean_release_count += 1
+                # A served job is the only conclusive proof that the base yields a usable worker,
+                # so it — not promotion — is what clears the restore-failure streak.
+                self._spawn_consecutive_failures = 0
+                self._promoted_unproven.discard(slot.slot_id)
+            if tracked:
+                slot_failures = self._slot_failures.get(hkey, 0)
+                last_success = self._slot_last_success.get(hkey, 0.0)
 
-        if callable(self._recycle) and tracked and not (
+        # A wedged in-guest agent is invisible to is_alive(), so consecutive dirty releases are the
+        # only signal the pool gets. Once a slot hits the limit, do NOT recycle-and-republish it:
+        # fall through to the reap path so the slot is destroyed and genuinely respawned.
+        burned_out = (
+            self._max_consecutive_failures > 0
+            and slot_failures >= self._max_consecutive_failures
+        )
+        if episode_recovered:
+            # The pool-wide episode is over, so the per-tier attribution it accumulated is over
+            # too. A cascade otherwise consumes _job_guilty only on a successful invalidation, so
+            # a tier blamed in an episode that then RECOVERED stayed guilty -- and the next,
+            # independent episode on a different tier invalidated both, discarding a healthy
+            # snapshot and its fallback capacity for a failure it had nothing to do with
+            # (upstream, PR #82).
+            self._clear_runtime_job_guilt()
+
+        # POOL-wide, and deliberately NOT gated on this slot burning out. Disposable snapshot
+        # runtimes (FC/gVisor) have no recycle(), so every dirty release reaps the restored VM and
+        # _forget_slot_health() clears its counter -- no individual slot ever reaches the
+        # consecutive-failure limit, so hanging the rebuild off `burned_out` meant a poisoned base
+        # could restore into fresh slot after fresh slot forever without ever being invalidated
+        # (upstream, PR #82). It is also ordered before the eviction cap: refusing to destroy more
+        # slots must not suppress the one action that fixes the base.
+        if dirty and fault == "worker":
+            # ATTRIBUTE FIRST. A job-triggered repair carried no tier evidence, so a cascade fell
+            # back to invalidating EVERY tier -- discarding healthy siblings and removing usable
+            # fallback capacity because one tier's workers were failing jobs. The cascade still
+            # knows which tier served this slot (it is in _owner until the slot is reaped), and
+            # this is the one place that knows the failure was worker-attributed (upstream,
+            # PR #82).
+            self._blame_tiers([slot.slot_id])
+            # The generation check lives on the STREAK (see the counter above), which is the
+            # single thing this call consults -- a second guard here would be unreachable, and an
+            # unreachable guard is one nobody can prove still works.
+            self._maybe_rebuild_base()
+        if burned_out and not self._eviction_allowed(slot.slot_id):
+            # (3) The heuristic wants this slot gone, but the window's budget is spent. Refuse, and
+            # say so loudly: if the wedge is real the slot keeps failing and the next window takes
+            # it, while a WRONG signal costs some churn instead of the warm tier. No predicate over
+            # a signal the pool cannot verify should be able to empty the pool.
+            logger.error(
+                "pool.eviction_capped slot_id=%s consecutive_worker_failures=%d limit=%d -- "
+                "%d evictions already in the last %.0fs; recycling instead of reaping. If this "
+                "repeats the wedge is real; if it repeats across MANY slots at once, suspect a "
+                "shared cause (inputs, disk, base image) rather than the workers.",
+                slot.slot_id, slot_failures, self._max_consecutive_failures,
+                self._max_evictions_per_window, self._eviction_window_s,
+            )
+            burned_out = False
+        if burned_out:
+            # TELL THE RUNTIME. On a disposable tier reaping IS the eviction, but a REUSING one
+            # (a static pool) just returns the same physical box to its free list, so the
+            # threshold was reached, logged and charged against the eviction budget while the
+            # wedged endpoint kept receiving and failing jobs forever. Optional seam,
+            # hasattr-guarded (upstream, PR #82).
+            _burn = getattr(self._runtime, "burn_out", None)
+            if callable(_burn):
+                try:
+                    _burn(slot)
+                except Exception as exc:  # noqa: BLE001 -- must never break the release path
+                    logger.warning("pool.burn_out_failed slot_id=%s: %s", slot.slot_id, exc)
+            logger.warning(
+                "pool.slot_burned_out slot_id=%s fault=worker consecutive_failures=%d limit=%d "
+                "jobs=%d last_success_age=%s -- reaping instead of recycling",
+                slot.slot_id, slot_failures, self._max_consecutive_failures, jobs,
+                ("never" if not last_success else "%.1fs" % (self._clock() - last_success)),
+            )
+
+        if callable(self._recycle) and tracked and not burned_out and not (
             self._max_jobs_per_slot and jobs >= self._max_jobs_per_slot
         ):
             try:
@@ -521,6 +947,7 @@ class WarmPool:
             with self._lock:
                 if reaped:
                     self._slots.pop(slot.slot_id, None)
+                    self._forget_slot_health(slot.slot_id)
 
     def unclaim(self, slot: Slot) -> None:
         """Hand an ASSIGNED slot back UNUSED, without disposing it (issue #77).
@@ -538,7 +965,7 @@ class WarmPool:
             self._last_idle_at = self._clock()
         self._idle_event.set()
 
-    def retire(self, slot: Slot) -> None:
+    def retire(self, slot: Slot, *, fault: "str | None" = None) -> None:
         """Permanently dispose ``slot`` WITHOUT recycling it — for a worker that may STILL be in use
         by an abandoned/hung thread (e.g. a validate that timed out). Unlike ``release(dirty=True)``,
         which on a recycle-capable runtime snapshot-reverts and returns the SAME endpoint to IDLE
@@ -546,6 +973,22 @@ class WarmPool:
         the worker — severing the hung interaction — and removes the slot. On a reap failure the slot
         is quarantined (kept tracked/DRAINING, never reused). The replacement spawns on the next tick.
         """
+        if fault == "worker":
+            # A hard retire still has to leave EVIDENCE. The compose seam retires a slot whose
+            # agent hung, which is the most direct worker fault there is -- but retiring recorded
+            # nothing, so if every VM restored from a poisoned snapshot hangs, each is destroyed
+            # and replaced from that same snapshot forever and the base-rebuild protection is
+            # unreachable. Attribute first, then retire as before (upstream, PR #82).
+            hkey = self._health_key(slot)
+            bident = self._base_identity(slot)
+            with self._lock:
+                self._slot_failures[hkey] = self._slot_failures.get(hkey, 0) + 1
+                stamp = self._slot_base.get(slot.slot_id)
+                if stamp is None or stamp[1] == self._base_generation.get(stamp[0], 0):
+                    self._pool_consecutive_failures[bident] = (
+                        self._pool_consecutive_failures.get(bident, 0) + 1)
+            self._blame_tiers([slot.slot_id])
+            self._maybe_rebuild_base()
         with self._lock:
             if slot.slot_id not in self._slots:
                 return  # already removed/reaped concurrently — don't double-reap
@@ -559,6 +1002,7 @@ class WarmPool:
         with self._lock:
             if reaped:
                 self._slots.pop(slot.slot_id, None)
+                self._forget_slot_health(slot.slot_id)
 
     def tick(self) -> None:
         """One maintenance step: promote WARMING→IDLE, health-check, burst, spawn to deficit.
@@ -580,9 +1024,27 @@ class WarmPool:
         # is deliberate: a husk whose disposal has not been confirmed may still be a live worker
         # holding node RAM, and this file's policy is to keep counting it (see _spawn_to_deficit's
         # headroom + the quarantine comments) rather than risk over-committing the node.
+        self._drain_runtime_repairs()
         self._reap_deferred()
         self._update_burst(ready)
-        self._spawn_to_deficit(ready)
+        # CONSUME the flag and commit to the decision in one locked step. Checking it here and
+        # spawning afterwards left a window in which a job thread's _maybe_rebuild_base() could
+        # invalidate the base: `ready` then still described the discarded artifact, and the
+        # snapshot runtime's spawn() ran SnapshotManager.build() synchronously on this thread --
+        # the sole maintenance thread -- for a full boot plus readiness timeout. That is exactly
+        # the stall this flag exists to prevent, reintroduced by reading it non-atomically
+        # (PR #82).
+        with self._lock:
+            rebuilt = self._rebuilt_this_tick
+            self._rebuilt_this_tick = False
+            spawn_generation = self._base_rebuilds
+        if rebuilt:
+            # _health_check or a racing release invalidated the base during THIS tick. `ready` was
+            # captured before that, so spawning now would build synchronously. The next tick
+            # re-reads readiness and spawns against the fresh base.
+            logger.info("pool.tick_spawn_deferred reason=base_invalidated_this_tick")
+        else:
+            self._spawn_to_deficit(ready, expect_generation=spawn_generation)
         self._reap_surplus()
         self._sample_metrics()
 
@@ -602,6 +1064,31 @@ class WarmPool:
     # 4 on a permanently-hung terminate. Past this we stop starting reapers; the queue waits rather
     # than melting the host, and stop() still disposes everything it can.
     _MAX_REAPER_THREADS = 32
+
+    def _drain_runtime_repairs(self) -> None:
+        """Advance generations for bases a runtime repaired on its OWN (the spawn path).
+
+        A cascade repairs a tier whose spawns keep failing behind a healthy fallback -- which the
+        pool never sees, because the fallback makes every spawn succeed. Unreported, the retired
+        artifact's slots and the replacement's slots share a generation stamp, so a late failure
+        from an old slot is charged to the new base and can invalidate it at once. Optional seam,
+        hasattr-guarded (upstream, PR #82).
+        """
+        take = getattr(self._runtime, "take_repaired_tiers", None)
+        if not callable(take):
+            return
+        try:
+            names = take()
+        except Exception as exc:  # noqa: BLE001 -- bookkeeping must never break the tick
+            logger.warning("pool.take_repaired_tiers_failed: %s", exc)
+            return
+        if not names:
+            return
+        with self._lock:
+            for name in names:
+                self._base_generation[str(name)] = self._base_generation.get(str(name), 0) + 1
+        logger.info("pool.runtime_repaired_bases tiers=%s -- their slots are now retired",
+                    ",".join(str(n) for n in names))
 
     def _reap_deferred(self) -> None:
         """Kick the DEDICATED reaper thread for slots claim() found dead and deferred (issue #75).
@@ -725,6 +1212,13 @@ class WarmPool:
                         cur = self._slots.get(slot.slot_id)
                         if cur is not None and cur.state == SlotState.DRAINING:
                             cur.state = SlotState.IDLE
+                            # REFUND: the demotion spent a token to evict this slot and we have
+                            # just put it back, so the budget bought nothing. This is the path the
+                            # deferred reaper takes, and it is the COMMON one during a brownout --
+                            # every disposal goes through the same unresponsive control plane, so
+                            # the window's whole allowance can be consumed without evicting
+                            # anything (upstream, PR #82).
+                            self._refund_eviction_unlocked(slot.slot_id)
                             logger.warning("pool.deferred_escalation_undone slot_id=%s — could not "
                                            "dispose a suspected slot; returning it to IDLE",
                                            slot.slot_id)
@@ -769,6 +1263,7 @@ class WarmPool:
             if reaped:
                 with self._lock:
                     self._slots.pop(slot.slot_id, None)
+                    self._forget_slot_health(slot.slot_id)
 
     def _runtime_ready(self) -> bool:
         """Kick the warm runtime's async prepare (if any) and report whether it can spawn this
@@ -824,6 +1319,7 @@ class WarmPool:
                 # running — exactly the orphan the quarantine policy exists to prevent.
                 if pop_on_success and disposed:
                     self._slots.pop(slot.slot_id, None)
+                    self._forget_slot_health(slot.slot_id)
                 self._reaping.discard(slot.slot_id)
         return True
 
@@ -835,6 +1331,31 @@ class WarmPool:
                 counts[s.state] = counts.get(s.state, 0) + 1
             target = self._effective_target_unlocked()
             burst = self._burst_active
+            # Wedged-slot visibility: a slot whose in-guest agent has stopped answering looks
+            # identical to a healthy IDLE one in every other gauge, which is why a 100%-failing
+            # pool went unnoticed for days. Surface the failure state directly.
+            # Resolve each live slot to the key its health is FILED under. With a reusing
+            # runtime (a static pool, or a static tier inside a cascade) the record is keyed
+            # "static:0" / "tier:static:0" while `live` holds per-assignment slot ids, so these
+            # membership tests reported slots_failing=0 and worst_consecutive=0 while a box was
+            # walking toward burnout -- defeating this log for the one runtime that needed
+            # stable identities in the first place (upstream, PR #82).
+            live = {self._health_key_by_slot.get(sid, sid) for sid in self._slots}
+            failing = sum(1 for k, n in self._slot_failures.items() if k in live and n > 0)
+            worst = max((n for k, n in self._slot_failures.items() if k in live), default=0)
+            never_ok = sum(
+                1 for sid, s in self._slots.items()
+                if s.jobs > 0
+                and not self._slot_last_success.get(self._health_key_by_slot.get(sid, sid))
+            )
+            pool_failures = max(self._pool_consecutive_failures.values(), default=0)
+            rebuilds = self._base_rebuilds
+        if failing or pool_failures:
+            logger.info(
+                "pool.health slots_failing=%d worst_consecutive=%d never_succeeded=%d "
+                "pool_consecutive_failures=%d base_rebuilds=%d",
+                failing, worst, never_ok, pool_failures, rebuilds,
+            )
         record_pool_state(
             spawning=counts[SlotState.SPAWNING],
             warming=counts[SlotState.WARMING],
@@ -881,6 +1402,62 @@ class WarmPool:
         with self._lock:
             return self._concurrent_ceiling
 
+    def _note_capacity_miss(self, reason: str) -> None:
+        """Record that the pool wanted capacity and could not get any, and escalate a SUSTAINED
+        episode exactly once. Shared by the two ways this happens: a tier reporting itself full,
+        and a deficit with no headroom to even try."""
+        record_spawn_capacity_miss()
+        now = self._clock()
+        with self._lock:
+            if self._capacity_miss_since is None:
+                self._capacity_miss_since = now
+            starved_for = now - self._capacity_miss_since
+            # Latched so a sustained outage logs once, not once per tick.
+            escalate = (
+                self._capacity_starved_after_s > 0
+                and starved_for > self._capacity_starved_after_s
+                and not self._capacity_starved_logged
+            )
+            if escalate:
+                self._capacity_starved_logged = True
+        if escalate:
+            logger.error(
+                "pool.spawn_capacity_starved: no capacity for %.0fs (>%.0fs) — this is no longer "
+                "backpressure. Check ceiling vs fleet size, a snapshot tier stuck building, or "
+                "leaked capacity reservations. reason=%s",
+                starved_for, self._capacity_starved_after_s, reason,
+            )
+
+    def _retune_runtime_thresholds(self, rebuild_after: int) -> None:
+        """Push a re-derived rebuild threshold into a runtime that keeps its own copy.
+
+        Optional seam (hasattr-guarded): only CascadingRuntime has a per-tier threshold today,
+        and a runtime without one is unaffected.
+        """
+        runtime = getattr(self, "_runtime", None)
+        if runtime is None or not hasattr(runtime, "tier_rebuild_after"):
+            return
+        if getattr(runtime, "tier_rebuild_after_explicit", False):
+            return          # the caller pinned it; a derived policy must not stomp that
+        try:
+            runtime.tier_rebuild_after = max(0, int(rebuild_after))
+        except Exception as exc:  # noqa: BLE001 -- retuning must never break a resize
+            logger.warning("pool.retune_runtime_threshold_failed: %s", exc)
+
+    def _rederive_warm_size_thresholds(self) -> None:
+        """Recompute every threshold derived from the LIVE warm target, preserving explicit
+        operator values. Called from __init__ and resize() so the two can never disagree."""
+        if not self._eviction_cap_explicit:
+            # Bounds damage to roughly ONE warm set, so it follows the live target.
+            self._max_evictions_per_window = max(2, int(self._warm_size))
+        if not self._rebuild_after_explicit:
+            self._snapshot_rebuild_after = max(4, 2 * max(1, self._warm_size))
+            # ...and tell a cascade, which keeps its OWN per-tier copy. The autosizer moves the
+            # target in production, so after a 4->16 resize per-tier repair still fired at 8
+            # while the pool-wide policy had moved to 32 (and downsizing gave the reverse
+            # delay). One policy, both consumers -- at construction AND at resize (PR #82).
+            self._retune_runtime_thresholds(self._snapshot_rebuild_after)
+
     def resize(self, *, warm_size: int | None = None, concurrent_ceiling: int | None = None,
                mark_autosized: bool = True) -> None:
         """Retune the warm target / hard ceiling on a live pool. Used by an external
@@ -905,6 +1482,17 @@ class WarmPool:
             # keep warm within the ceiling
             if self._warm_size > self._concurrent_ceiling:
                 self._warm_size = self._concurrent_ceiling
+            # EVERY value derived from warm_size has to follow resize, not just the one that was
+            # reported. The autosizer moves the target in production: a pool created at 16 and
+            # shrunk to 1 otherwise waits 32 consecutive failures instead of 4 before repairing a
+            # poisoned base, and one grown 1 -> 16 invalidates far too eagerly (upstream, PR #82).
+            #
+            # Derived AFTER the clamp and from self._warm_size, NOT from the warm_size argument,
+            # and OUTSIDE the `warm_size is not None` branch. Both matter: a ceiling-only resize
+            # silently lowers the live target (so it must re-derive too), and a warm_size above
+            # the ceiling would otherwise derive thresholds for a size the pool never runs at --
+            # reintroducing the very "waits 32 failures instead of 4" defect this fixes.
+            self._rederive_warm_size_thresholds()
             # This pool is now under external (autosizer) control → eager surplus reaping
             # is enabled so a downsize frees node RAM promptly instead of draining lazily.
             # Skipped for provisional moves (mark_autosized=False) so an opt-in that never
@@ -1113,8 +1701,20 @@ class WarmPool:
             # while this husk is awaiting its (possibly slow) reap.
             logger.warning("pool.claim_found_dead_slot slot_id=%s (reap deferred to tick)",
                            candidate.slot_id)
+            claim_unproven_death = False
             with self._lock:
                 candidate.state = SlotState.DRAINING
+                # CONFIRMED dead, and it never served a job: its promotion was the only evidence
+                # the base yields a usable worker, and that is now refuted. Demand can reach a
+                # newly promoted slot before the health tick does, and this path neither advanced
+                # the restore-failure streak nor consumed the marker -- _forget_slot_health then
+                # discarded it silently, so a poisoned base whose restores briefly pass is_ready()
+                # was never repaired when claims got there first (PR #82).
+                if candidate.slot_id in self._promoted_unproven:
+                    self._promoted_unproven.discard(candidate.slot_id)
+                    self._spawn_consecutive_failures += 1
+                    claim_unproven_death = True
+                    warm_failures = self._spawn_consecutive_failures
                 if self._stop_event.is_set():
                     # stop() already drained the queue; re-adding here (the probe above takes
                     # seconds, so stop() can land mid-probe) resurrects a husk stop() quarantined
@@ -1123,6 +1723,18 @@ class WarmPool:
                     logger.debug("pool.defer_reap_skipped_after_stop slot_id=%s", candidate.slot_id)
                 else:
                     self._deferred_reap.add(candidate.slot_id)
+
+            if claim_unproven_death:
+                # ATTRIBUTE FIRST, while the cascade still owns this slot's mapping -- the reap is
+                # deferred, so the ownership is still there right now. spawn() returned and the
+                # slot even reached IDLE, so the cascade's per-tier streak is empty, and a repair
+                # with no guilty tier falls back to invalidating EVERY snapshot-capable tier:
+                # healthy sibling bases discarded for deaths confined to one. The warming-timeout
+                # and background-health paths already blame here; this third one, the claim-time
+                # probe, did not (upstream, PR #82).
+                self._blame_tiers([candidate.slot_id])
+                # Outside the lock: _maybe_rebuild_base takes it itself.
+                self._maybe_rebuild_base(warm_failures, reason="spawn")
 
             # Loop: try to find another IDLE slot. Every iteration returns, or moves one slot out
             # of IDLE (→DRAINING), so the rescan is bounded by the IDLE-slot count — but NOT in
@@ -1157,6 +1769,14 @@ class WarmPool:
                     if slot.slot_id in self._slots and slot.state == SlotState.WARMING:
                         slot.state = SlotState.IDLE
                         newly_idle.append(slot.slot_id)
+                        # Promotion is EVIDENCE, not proof, so it does NOT clear the
+                        # restore-failure streak. A poisoned snapshot can restore a process that
+                        # survives long enough to pass is_ready() and then dies while IDLE:
+                        # clearing here let it promote, die and be replaced forever, with each new
+                        # promotion wiping the evidence the previous death had just produced, so
+                        # the streak oscillated and invalidate_base() was never reached. A SERVED
+                        # JOB is the proof, and that is where the reset lives (upstream, PR #82).
+                        self._promoted_unproven.add(slot.slot_id)
             elif slot.state == SlotState.DRAINING and not raised:
                 # is_ready returned False AND the slot is DRAINING. Usually the runtime's finalize
                 # failed closed and reaped the VM ITSELF; but DRAINING can ALSO be set EXTERNALLY (a
@@ -1174,13 +1794,15 @@ class WarmPool:
                 with self._lock:
                     if reaped:
                         self._slots.pop(slot.slot_id, None)
+                        self._forget_slot_health(slot.slot_id)
 
         if newly_idle:
             with self._lock:
                 self._last_idle_at = self._clock()
             self._idle_event.set()
 
-    def _spawn_to_deficit(self, ready: bool = True) -> None:
+    def _spawn_to_deficit(self, ready: bool = True, *,
+                          expect_generation: int | None = None) -> None:
         """Spawn new slots to fill the deficit, respecting ceiling + rate limit.
 
         ``ready`` is the warm runtime's per-tick readiness (resolved once in tick()). When False
@@ -1188,6 +1810,22 @@ class WarmPool:
         _health_check already ran, and dispatch falls back to cold until the snapshot is ready.
         """
         if not ready:
+            # A stuck or repeatedly-failing snapshot build keeps prepare() False forever. Bailing
+            # out here meant the pool could sit at a positive target with ZERO slots and never
+            # touch the capacity meter or the starvation clock -- even though "a snapshot tier
+            # stuck building" is one of the causes the alert message itself names (upstream,
+            # PR #82).
+            with self._lock:
+                active = sum(
+                    1 for s in self._slots.values() if s.state != SlotState.DRAINING
+                )
+                deficit = max(0, self._effective_target_unlocked() - active)
+            if deficit > 0:
+                self._note_capacity_miss("the warm snapshot is not ready (build stuck or failing)")
+            else:
+                with self._lock:
+                    self._capacity_miss_since = None
+                    self._capacity_starved_logged = False
             return
         with self._lock:
             # Deficit = effective_target minus everything not DRAINING
@@ -1199,6 +1837,33 @@ class WarmPool:
             # Never exceed concurrent_ceiling
             headroom = self._concurrent_ceiling - len(self._slots)
             to_spawn = max(0, min(deficit, headroom))
+            starved_without_headroom = deficit > 0 and to_spawn == 0
+            if deficit == 0:
+                # NOT starving -- we are not asking for anything. Keyed on DEFICIT, not on
+                # to_spawn: to_spawn is also zero when there IS a deficit but no headroom, which
+                # happens when failed reaps leave DRAINING slots occupying concurrent_ceiling.
+                # That is a pool with zero usable capacity -- precisely what the alert exists to
+                # report -- and clearing the episode there meant it could never fire.
+                #
+                # The episode clock is cleared
+                # only by a successful spawn otherwise, so a pool whose target the autosizer
+                # shrank to zero keeps a stale timestamp for however long it idles; the first
+                # capacity miss after a later scale-up then fires pool.spawn_capacity_starved
+                # citing that whole unrelated idle interval. The alert must measure CONTINUOUS
+                # starvation, not the gap between two autosizer epochs (upstream, PR #82).
+                self._capacity_miss_since = None
+                self._capacity_starved_logged = False
+
+        if starved_without_headroom:
+            # A deficit we cannot even ATTEMPT to fill. The spawn loop below never runs, so the
+            # capacity handler inside it — the only thing that used to open a starvation episode —
+            # is unreachable here. That is how a pool whose ceiling is entirely occupied by
+            # DRAINING slots (failed reaps, leaked reservations) sat at zero usable capacity
+            # without ever reporting it: not merely clearing the clock, but never starting it.
+            self._note_capacity_miss(
+                "a deficit exists but no headroom: the ceiling is full of slots that are not "
+                "usable (DRAINING/leaked reservations)"
+            )
 
         for _ in range(to_spawn):
             # Rate-limit: consume one token per spawn
@@ -1217,13 +1882,74 @@ class WarmPool:
                 if len(self._slots) >= self._concurrent_ceiling:
                     break
 
+            if expect_generation is not None:
+                with self._lock:
+                    if self._base_rebuilds != expect_generation:
+                        # A rebuild landed after tick() committed. Abandon the batch rather than
+                        # call spawn() -- it would build the new base synchronously here.
+                        logger.info(
+                            "pool.spawn_batch_abandoned reason=base_rebuilt_mid_batch"
+                        )
+                        break
+            # SNAPSHOT the generation ledger BEFORE the restore starts. spawn() can take a long
+            # time, and a job thread can invalidate while it runs: the manager keeps the retired
+            # artifact pinned long enough for the restore to finish, so the slot really is from
+            # the OLD generation -- but publication below read the already-advanced counter and
+            # stamped it as CURRENT. A later worker failure from that slot then passed the
+            # retired-generation guard and could invalidate the replacement base (PR #82).
+            with self._lock:
+                _gen_at_spawn = dict(self._base_generation)
             try:
                 slot = self._runtime.spawn()
+                with self._lock:
+                    # NOT the failure streak. A spawn that merely RETURNS says nothing about
+                    # whether the base can produce a usable worker: with warm_size=1 each
+                    # timed-out WARMING slot bumped the streak to 1 and its replacement's spawn
+                    # immediately cleared it, so a base that consistently restores but never
+                    # becomes ready cycled at a streak of one and never reached the rebuild
+                    # threshold. Only reaching IDLE is proof (upstream, PR #82).
+                    #
+                    # Capacity came back: reset the starvation clock AND the latch, so a later
+                    # outage escalates again rather than being permanently silenced by the first.
+                    self._capacity_miss_since = None
+                    self._capacity_starved_logged = False
                 slot.state = SlotState.WARMING
                 slot.spawned_at = self._clock()
                 record_slot_spawned()
-            except Exception:
+            except RuntimeAtCapacity as exc:
+                # NOT a restore failure, so it must NOT touch the streak. prepare() reports ready
+                # when ANY tier is, so spawn() legitimately raises this while the ready tiers are
+                # full and a snapshot tier is still building. Break rather than continue: capacity
+                # will not appear later in the SAME batch, and each further attempt is a wasted
+                # spawn. The next tick retries (upstream, PR #82).
+                logger.debug("pool.spawn_capacity_miss reason=%s", exc)
+                self._note_capacity_miss(str(exc))
+                break
+            except Exception as exc:
+                if is_host_resource_failure(exc):
+                    # THIS HOST is out of space/fds/inodes. Spawning creates a slot workdir and
+                    # copies a per-slot disk, so it says nothing about the base -- and the cascade
+                    # deliberately leaves its per-tier guilt EMPTY for these, so counting it here
+                    # produced a spawn-driven repair with no guilty tier, whose empty-guilt
+                    # fallback invalidates every healthy tier. An all-local cascade sharing one
+                    # full filesystem hits exactly that (upstream, PR #82).
+                    logger.warning("pool.spawn_host_resource_failure (not counted against the "
+                                   "base): %s", exc)
+                    self._note_capacity_miss(f"host resources exhausted: {exc}")
+                    break
                 logger.exception("pool.spawn_failed")
+                with self._lock:
+                    self._spawn_consecutive_failures += 1
+                    spawn_failures = self._spawn_consecutive_failures
+                rebuilt = self._maybe_rebuild_base(spawn_failures, reason="spawn")
+                if rebuilt:
+                    # STOP the batch. The artifact is gone, so the very next runtime.spawn() would
+                    # run SnapshotManager.build() synchronously and block this maintenance thread
+                    # for a full base boot + readiness timeout -- promotion, health checks and
+                    # deferred reaping all stall behind it. The next tick spawns against the fresh
+                    # base instead (upstream, PR #82).
+                    logger.info("pool.spawn_batch_halted_for_rebuild reason=base_invalidated")
+                    break
                 continue
 
             # Publish under the lock, BUT only if shutdown hasn't begun AND we're still under
@@ -1241,6 +1967,14 @@ class WarmPool:
                 drop = self._stop_event.is_set() or len(self._slots) >= self._concurrent_ceiling
                 if not drop:
                     self._slots[slot.slot_id] = slot
+                    # STAMP the generation this slot came from, under the same lock that
+                    # publishes it, so a later failure can be told apart from one produced by
+                    # the base currently installed.
+                    _ident = self._base_identity(slot)
+                    # ...from the ledger as it was when this restore STARTED, not as it is now.
+                    self._slot_base[slot.slot_id] = (
+                        _ident, _gen_at_spawn.get(_ident, 0)
+                    )
             if drop:
                 reaped = False
                 try:
@@ -1300,6 +2034,336 @@ class WarmPool:
                     self._last_miss_at = None
                     logger.info("pool.burst_drained")
 
+    def _base_identity(self, slot: "Slot") -> str:
+        """Which BASE produced this slot: a cascade tier name, or "" for a single-base runtime.
+
+        Optional seam, hasattr-guarded, exactly like worker_identity.
+        """
+        fn = getattr(self._runtime, "base_identity", None)
+        if callable(fn):
+            try:
+                got = fn(slot)
+            except Exception as exc:  # noqa: BLE001 -- attribution must never break a release
+                logger.warning("pool.base_identity_failed slot_id=%s: %s", slot.slot_id, exc)
+            else:
+                if got:
+                    return str(got)
+        return ""
+
+    def _clear_runtime_job_guilt(self) -> None:
+        """Tell a runtime that keeps per-tier job attribution that the episode recovered.
+
+        Optional seam, hasattr-guarded: only a cascade tracks this. MUST NOT be called under
+        _lock -- it takes the runtime's own lock.
+        """
+        fn = getattr(self._runtime, "clear_job_guilt", None)
+        if not callable(fn):
+            return
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001 -- attribution must never break a release
+            logger.warning("pool.clear_job_guilt_failed: %s", exc)
+
+    def _health_key(self, slot: "Slot") -> str:
+        """The identity this slot's failure history belongs to.
+
+        A disposable runtime mints a fresh slot per worker, so the slot_id IS the worker and the
+        default is right. A STATIC pool does the opposite: every spawn() hands a new slot_id to
+        the same long-lived box and reap() just returns that box to the free list. Keyed by
+        slot_id, its counter reached one, the non-recycle release path removed the slot,
+        _forget_slot_health() erased the history, and the next request to the SAME endpoint
+        started from zero -- so the default threshold of two could never burn out a static box,
+        even for correctly attributed transport failures. And a static tier has no snapshot base
+        to invalidate, so burnout is the only protection it has (upstream, PR #82).
+
+        Optional seam, hasattr-guarded: a runtime that does not reuse workers is unaffected.
+        """
+        # No lock: dict get/set are atomic, the value for a given slot is deterministic, and a
+        # concurrent double-fill therefore stores the same key twice. Taking _lock here would put
+        # a runtime callout inside it and invite the lock-ordering hazard this module has already
+        # produced once.
+        cached = self._health_key_by_slot.get(slot.slot_id)
+        if cached is not None:
+            return cached
+        key = slot.slot_id
+        identity = getattr(self._runtime, "worker_identity", None)
+        if callable(identity):
+            try:
+                got = identity(slot)
+            except Exception as exc:  # noqa: BLE001 -- attribution must never break a release
+                logger.warning("pool.worker_identity_failed slot_id=%s: %s", slot.slot_id, exc)
+            else:
+                if got:
+                    key = str(got)
+        self._health_key_by_slot[slot.slot_id] = key
+        return key
+
+    def _forget_slot_health(self, slot_id: str) -> None:
+        """Drop per-slot failure bookkeeping for a slot that has left the pool.
+
+        Called wherever a slot is popped from ``_slots`` so the tracking dicts cannot grow without
+        bound over a long-lived dispatcher (slot ids are per-spawn UUIDs).
+        """
+        # ...but only when the history belongs to THIS SLOT. On a static pool the key is the
+        # physical box, which outlives every slot handed to it -- dropping its record on reap is
+        # exactly how its failures could never accumulate. Bounded either way: a reused identity
+        # is one entry per registered worker.
+        self._slot_base.pop(slot_id, None)
+        key = self._health_key_by_slot.pop(slot_id, slot_id)
+        if key == slot_id:
+            self._slot_failures.pop(slot_id, None)
+            self._slot_last_success.pop(slot_id, None)
+        # ...and the promotion ledger. Disposable runtimes mint a new slot_id per replacement, so a
+        # workload with recurring failures or resizes grows this set without bound, and none of its
+        # entries can ever be consulted again (PR #82).
+        self._promoted_unproven.discard(slot_id)
+
+    def _current_failure_streak(self) -> int:
+        """The pool-wide consecutive-failure streak, read NOW under the lock.
+
+        Carrying a value captured earlier in release() meant another slot could release cleanly and
+        reset the streak before this ran, and the stale reading still invalidated the shared base --
+        dropping a healthy warm snapshot after the pool had already recovered (upstream, PR #82)."""
+        with self._lock:
+            return max(self._pool_consecutive_failures.values(), default=0)
+
+    def _maybe_rebuild_base(self, streak: "int | None" = None, *, reason: str = "job") -> bool:
+        """Discard the runtime's persisted warm base after sustained pool-wide failure.
+
+        Reaping a burned-out slot only helps if a FRESH slot would be healthy. When the persisted
+        base itself captured a bad guest state, every replacement restores the same wedge and the
+        tier stays dead until an operator restarts the dispatcher. If the runtime exposes a way to
+        drop that base (``invalidate_base``/``invalidate_snapshot``), call it once the pool has
+        failed ``snapshot_rebuild_after`` times in a row with no intervening success.
+        """
+        # streak=None means "read the JOB streak live, under the lock, right now". The release
+        # path must use that: it computed a value earlier in release(), and another slot could
+        # release cleanly -- resetting the streak -- before the call ran, so a stale reading still
+        # invalidated the base and dropped a healthy warm snapshot after the pool had recovered
+        # (upstream, PR #82). The SPAWN path passes its own counter explicitly, because consecutive
+        # restore failures are a different signal from consecutive job failures.
+        if self._snapshot_rebuild_after <= 0:
+            return False
+        success_token: int | None = None
+        # "" is the whole-runtime base: the SPAWN path passes its own counter and does not consume
+        # a per-identity episode, so it has no identity of its own to restore on failure.
+        episode_ident = ""
+        if streak is None:
+            # CHECK-AND-CONSUME in one locked step. Reading the streak under the lock and then
+            # deciding outside it still leaves a window: a clean release from another dispatch
+            # thread resets the counter to zero in between, and this stale failing release goes
+            # on to destroy a base that a job has just succeeded against. Consuming the episode
+            # here also stops several concurrent failures from each triggering their own rebuild
+            # off the same streak. (The spawn path passes its own counter and is single-threaded
+            # in the maintenance tick, so it opts out.)
+            with self._lock:
+                _worst = max(self._pool_consecutive_failures.items(),
+                             key=lambda kv: kv[1], default=("", 0))
+                if _worst[1] < self._snapshot_rebuild_after:
+                    return False
+                # Consume ONLY the episode that crossed. Zeroing every base's counter let one
+                # tier's repair discard the evidence another tier was still accumulating.
+                episode_ident, pool_failures = _worst
+                self._pool_consecutive_failures.pop(episode_ident, None)
+                # Token captured WITH the decision. Consuming the streak closed the read/decide
+                # gap, but drop() still runs outside the lock: a clean release landing in that
+                # window is proof the base just produced a valid result, and rebuilding it then
+                # is an unnecessary outage during recovery (upstream, PR #82).
+                success_token = self._clean_release_count
+        else:
+            pool_failures = streak
+            if pool_failures < self._snapshot_rebuild_after:
+                return False
+            # Take the episode token even on the explicit-streak path. The caller captured its
+            # count earlier, so a concurrent clean release can land between then and here -- and
+            # skipping the token meant that path invalidated a base which had just produced a
+            # valid result, the very case the token was added to prevent (PR #82).
+            with self._lock:
+                success_token = self._clean_release_count
+        now = self._clock()
+        with self._lock:
+            last = self._last_base_rebuild_at
+            cooling = (
+                self._base_rebuild_cooldown_s > 0
+                and last is not None
+                and (now - last) < self._base_rebuild_cooldown_s
+            )
+        if cooling:
+            # Keep failing loudly, but do not boot again yet: if the base were the problem, the
+            # previous rebuild would have fixed it, so continued failure points elsewhere.
+            logger.error(
+                "pool.base_rebuild_suppressed pool_consecutive_failures=%d since_last_rebuild=%.1fs "
+                "cooldown=%.1fs -- sustained failure that a base rebuild did NOT fix; the cause is "
+                "likely NOT the warm base (check inputs/disk/dependencies)",
+                pool_failures, now - float(last or now), self._base_rebuild_cooldown_s,
+            )
+            with self._lock:
+                if reason == "spawn":
+                    self._spawn_consecutive_failures = 0
+                else:
+                    self._pool_consecutive_failures.pop(episode_ident, None)
+            return False
+        if reason == "spawn":
+            with self._lock:
+                # ASSIGNED counts too. A slot only reaches ASSIGNED by being CLAIMED, which is
+                # stronger proof the base produces usable workers than sitting IDLE -- yet the
+                # guard recognised IDLE alone, so an ordinary claim erased its own evidence: with
+                # one healthy worker the streak was retained, the worker was handed a job, and
+                # the next failed restore saw zero usable slots and invalidated the base out from
+                # under a demonstrably-live worker mid-job. The protection was lost to nothing
+                # more than normal traffic (upstream, PR #82).
+                usable = sum(1 for s in self._slots.values()
+                             if s.state in (SlotState.IDLE, SlotState.ASSIGNED))
+            if usable:
+                # A base with LIVE, IDLE workers is not poisoned. Counting restore failures alone
+                # made fail/succeed/fail/succeed/fail reach the threshold with healthy workers
+                # sitting right there, while resetting on every promotion went the other way and
+                # let promote/die/promote/die never accumulate at all. "Is it currently producing
+                # usable workers?" separates the two directly, which a consecutive count of one
+                # side of the story cannot (PR #82).
+                logger.info(
+                    "pool.base_rebuild_skipped reason=usable_workers_present usable=%d "
+                    "restore_failures=%d", usable, pool_failures,
+                )
+                return False
+
+        drop = (getattr(self._runtime, "invalidate_base", None)
+                or getattr(self._runtime, "invalidate_snapshot", None))
+        if not callable(drop):
+            logger.error(
+                "pool.base_rebuild_unavailable pool_consecutive_failures=%d -- runtime %s exposes no "
+                "invalidate_base(); the warm base may be poisoned and only a dispatcher restart can "
+                "rebuild it", pool_failures, type(self._runtime).__name__,
+            )
+            return False
+        with self._lock:
+            stale = success_token is not None and success_token != self._clean_release_count
+        if stale:
+            logger.info(
+                "pool.base_rebuild_skipped reason=slot_succeeded_during_decision — the base "
+                "produced a valid result while this failure was being judged"
+            )
+            return False
+        # Bump the generation BEFORE drop() runs. It was incremented only after drop() returned,
+        # so throughout the call -- which is where the artifact is actually cleared -- the spawn
+        # batch's re-check still saw the old value and spawned against a base the manager had
+        # already discarded, rebuilding it synchronously on the maintenance thread. The generation
+        # must mark "an invalidation is IN PROGRESS", not "one finished" (PR #82).
+        with self._lock:
+            self._base_rebuilds += 1
+            self._rebuilt_this_tick = True
+        # SERIALISE. Held across the whole drop() so a second repair cannot land mid-rebuild; the
+        # cooldown check above is re-read inside so the loser of the race sees the winner's result
+        # instead of repeating it.
+        with self._invalidation_lock:
+            with self._lock:
+                _last = self._last_base_rebuild_at
+            if (self._base_rebuild_cooldown_s > 0 and _last
+                    and (now - float(_last)) < self._base_rebuild_cooldown_s):
+                logger.info(
+                    "pool.base_rebuild_skipped reason=another_repair_just_completed "
+                    "reason_kind=%s", reason,
+                )
+                return False
+            return self._invalidate_now(drop, reason, pool_failures, success_token, now,
+                                        episode_ident)
+
+    def _invalidate_now(self, drop, reason, pool_failures, success_token, now,
+                        episode_ident):  # noqa: ANN001, ANN201
+        """Perform the invalidation. CALLER MUST HOLD ``self._invalidation_lock``."""
+        try:
+            # Pass the trigger through when the runtime accepts it: a cascade can only attribute a
+            # SPAWN-driven repair to a tier. Introspection, not except-TypeError -- a TypeError
+            # from inside drop() must never be mistaken for an older signature.
+            if _accepts_kwarg(drop, "reason"):
+                repaired = drop(reason=reason)
+            else:
+                repaired = drop()
+        except Exception as exc:
+            # A PARTIAL repair still replaced some artifacts. Retire their slots even though the
+            # call failed overall, or those tiers' old slots keep reporting failures against a
+            # base that is already gone -- which re-blames the tier and invalidates its fresh
+            # replacement (upstream, PR #82).
+            _repaired = getattr(exc, "repaired", None)
+            if isinstance(_repaired, (list, tuple, set, frozenset)) and _repaired:
+                with self._lock:
+                    for _name in {str(n) for n in _repaired}:
+                        self._base_generation[_name] = self._base_generation.get(_name, 0) + 1
+            logger.exception("pool.base_rebuild_error pool_consecutive_failures=%d", pool_failures)
+            # RESTORE the consumed episode. The streak was consumed to make the decision, but the
+            # repair did not happen -- so making the poisoned base wait for another full
+            # snapshot_rebuild_after failures before retrying just fails that many more jobs. Only
+            # restore what we took, and never below what has accumulated since.
+            if success_token is not None and reason != "spawn":
+                # Only a JOB episode is consumed from _pool_consecutive_failures, so only that one
+                # is restored here. A spawn episode lives in _spawn_consecutive_failures and is
+                # already retained by its own caller -- copying its count into the job counter
+                # meant one later worker fault could trigger an immediate job-driven rebuild, and
+                # in a cascade that repair carries no tier attribution and hits every tier (PR #82).
+                with self._lock:
+                    self._pool_consecutive_failures[episode_ident] = max(
+                        self._pool_consecutive_failures.get(episode_ident, 0), pool_failures
+                    )
+            return False
+        with self._lock:
+            if reason == "spawn":
+                self._spawn_consecutive_failures = 0
+            else:
+                self._pool_consecutive_failures.pop(episode_ident, None)
+            # NB _base_rebuilds was already bumped before drop() (it is the in-flight fence).
+            # The COMMITTED generation advances only here, on the success path: a drop() that
+            # raised leaves the tier's artifact in place, and stamping its live slots as retired
+            # would discard the very failures that must repair it.
+            # Advance ONLY the bases actually repaired. A cascade reports the tier names it
+            # invalidated; anything else repaired its single base. Bumping one pool-wide counter
+            # retired the live slots of tiers this repair never touched, so their failures --
+            # about a base that is still current -- were discarded, and for reusable slots that
+            # suppressed the evidence until the slot was eventually replaced (upstream, PR #82).
+            if isinstance(repaired, (list, tuple, set, frozenset)):
+                names = {str(n) for n in repaired}
+            else:
+                names = {ident for ident, _ in self._slot_base.values()} | {""}
+            for _name in names:
+                self._base_generation[_name] = self._base_generation.get(_name, 0) + 1
+            self._last_base_rebuild_at = now
+            # Defer this tick's spawning wherever the rebuild came from. tick() captured `ready`
+            # before release() could run, and a JOB-triggered rebuild races it: both snapshot
+            # runtimes call SnapshotManager.build() synchronously from spawn(), so spawning on a
+            # stale ready=True blocks the sole maintenance thread for a full boot + readiness
+            # timeout. Setting the flag only in _health_check covered one of the two triggers
+            # (PR #82).
+            self._rebuilt_this_tick = True
+            rebuilds = self._base_rebuilds
+        logger.warning(
+            "pool.base_invalidated reason=%s consecutive_failures=%d rebuilds=%d -- next spawn "
+            "rebuilds the warm base", reason, pool_failures, rebuilds,
+        )
+        return True
+
+    def _blame_tiers(self, slot_ids: "list[str]") -> None:
+        """Attribute post-spawn failures to the tiers that produced those slots.
+
+        A spawn that RETURNED leaves the cascade's per-tier streak empty, so a repair driven by
+        these failures finds no guilty tier and the empty-guilt fallback invalidates EVERY tier --
+        discarding healthy sibling snapshots over a fault confined to one. Must run BEFORE the
+        slots are reaped: the cascade drops its slot->tier mapping on reap, and an unattributable
+        slot is exactly the empty guilt this exists to avoid.
+
+        Shared by both post-spawn failure paths. It lived inline in the health check, so the
+        warming-timeout path -- added later, feeding the same streak and the same
+        _maybe_rebuild_base(reason="spawn") -- never attributed anything (upstream, PR #82).
+        """
+        if not slot_ids:
+            return
+        blame = getattr(self._runtime, "blame_tier_for_slot", None)
+        if not callable(blame):
+            return
+        for slot_id in slot_ids:
+            try:
+                blame(slot_id)
+            except Exception as exc:  # noqa: BLE001 -- attribution must never break the tick
+                logger.warning("pool.tier_blame_failed slot_id=%s: %s", slot_id, exc)
+
     def _health_check(self) -> None:
         """Evict dead IDLE slots AND stuck WARMING slots so the spawn loop replaces them.
 
@@ -1325,14 +2389,68 @@ class WarmPool:
             ]
 
         dead: list[Slot] = list(stuck_warming)
+        # Deaths of slots that were promoted but never served a job are restore failures too:
+        # see _promote_warming. Collected here so the streak reflects them before the rebuild
+        # decision below.
+        unproven_deaths = 0
+        # Slot ids whose post-promotion death should be attributed to their owning tier: the
+        # spawn SUCCEEDED, so the cascade has no guilt recorded and would otherwise fall back to
+        # invalidating every tier (PR #82).
+        blamed: list[str] = []
         # Slots we escalated because we could not TELL, as opposed to ones AWS/libvirt confirmed
         # dead. If disposing of a merely-suspected slot also fails, we have learned nothing and must
         # not strand it (see the reap loop below).
         suspected: set[str] = set()
+        # Slots that already hold an eviction token (reserved when their timeout was detected),
+        # so the demotion loop must not charge them again.
+        budgeted: set[str] = set()
         for slot in stuck_warming:
             logger.warning(
                 "pool.warming_timeout_evict slot_id=%s age=%.1fs", slot.slot_id, now - slot.spawned_at
             )
+        if stuck_warming:
+            # A spawn that RETURNED a slot reset the spawn-failure streak, but a slot that never
+            # reached IDLE produced no usable worker at all. Without counting these, a base
+            # poisoned just enough to restore-and-then-die cycles restore -> warmup timeout ->
+            # replace forever, and invalidate_base() is never reached: the tier stays at zero
+            # capacity until the process restarts, which is exactly the outage the restore-failure
+            # streak exists to end (upstream, PR #82).
+            # Attribute BEFORE the repair decision and before these slots are reaped. Each
+            # spawn() returned successfully, so the cascade's per-tier streak is empty and a
+            # repair would fall back to invalidating every tier -- destroying healthy siblings
+            # because one tier hands back slots that never reach IDLE (upstream, PR #82).
+            # RESERVE FIRST, then count only what is actually being evicted. The streak was
+            # advanced for every timed-out slot before the budget decision, so a slot the cap
+            # REFUSED to evict stayed WARMING and was counted again by every later tick: one
+            # healthy-but-slow capped slot reached the rebuild threshold within a few poll cycles
+            # and invalidated a healthy snapshot on no additional restore failure at all. With
+            # max_evictions_per_window=0 -- the operator's "stop evicting" -- it counted forever
+            # (upstream, PR #82). The tokens taken here are carried in `budgeted` so the demotion
+            # loop does not charge these slots a second time.
+            with self._lock:
+                for s in stuck_warming:
+                    if self._reserve_eviction_unlocked(self._clock(), s.slot_id):
+                        budgeted.add(s.slot_id)
+            capped = [s for s in stuck_warming if s.slot_id not in budgeted]
+            if capped:
+                logger.warning(
+                    "pool.warming_timeout_capped count=%d -- the eviction budget is spent; these "
+                    "slots stay WARMING and are NOT counted as restore failures", len(capped),
+                )
+            evicting = [s for s in stuck_warming if s.slot_id in budgeted]
+            self._blame_tiers([s.slot_id for s in evicting])
+            with self._lock:
+                self._spawn_consecutive_failures += len(evicting)
+                warm_failures = self._spawn_consecutive_failures
+            if self._maybe_rebuild_base(warm_failures, reason="spawn"):
+                # HALT THE TICK. The artifact is gone, so the very next runtime.spawn() runs
+                # SnapshotManager.build() synchronously and blocks this thread -- the pool's only
+                # maintenance thread -- for a full base boot plus readiness timeout, stalling
+                # promotion, health checks and deferred reaping behind it. tick() captured
+                # ready=True before _health_check ran, so without this it walks straight into
+                # exactly that. The spawn-failure path already halts its batch for this reason;
+                # this newer trigger did not inherit it (upstream, PR #82).
+                self._rebuilt_this_tick = True
         for slot in idle_slots:
             # TRI-STATE, same contract as the claim probe (_probe_alive): True = alive,
             # False = CONFIRMED dead, None = UNKNOWN. Only a CONFIRMED negative may evict — the
@@ -1380,12 +2498,27 @@ class WarmPool:
                     if cur is not slot or cur.state != SlotState.IDLE:
                         continue
                     since = self._unknown_since.setdefault(slot.slot_id, probed_at)
-                stuck_for = probed_at - since
-                if self._unknown_grace_s > 0 and stuck_for > self._unknown_grace_s:
+                    # DECIDE under the same lock that verified the state. Computing stuck_for and
+                    # escalating after releasing it left a window in which a concurrent claim()
+                    # could take this slot -- and we would still mark it dead and dispose of it
+                    # WHILE IT WAS SERVING A JOB. Locking the check but not the decision is the
+                    # same mistake as reading the failure streak under the lock and deciding
+                    # outside it, and as comparing the build epoch before publishing (PR #82).
+                    stuck_for = probed_at - since
+                    escalate = (
+                        self._unknown_grace_s > 0 and stuck_for > self._unknown_grace_s
+                    )
+                    if escalate:
+                        self._unknown_since.pop(slot.slot_id, None)
+                # NB the eviction cap is NOT consulted here. It is enforced at the demotion
+                # below -- the step that actually evicts -- because a claimant can take this slot
+                # in between and the budget must not be spent on an eviction that never happens.
+                # A peek here as well was pure duplication: removing it changed no behaviour,
+                # which is exactly what a surviving mutant told me (PR #82).
+                if escalate:
                     logger.warning("pool.health_unknown_escalated slot_id=%s unknown_for=%.0fs "
                                    "(> %.0fs) — treating as dead so the slot is replaced",
                                    slot.slot_id, stuck_for, self._unknown_grace_s)
-                    self._unknown_since.pop(slot.slot_id, None)
                     suspected.add(slot.slot_id)   # escalated on suspicion, not on a verdict
                     dead.append(slot)
                 else:
@@ -1396,6 +2529,11 @@ class WarmPool:
             self._unknown_since.pop(slot.slot_id, None)
             if not alive:
                 dead.append(slot)
+                # Bookkeeping is deferred to the DEMOTION below, which is the step that
+                # actually wins the race against a concurrent claim. Recording it here let a
+                # stale death verdict advance the restore-failure streak for a slot a claimant
+                # had just taken -- and whose own fresher probe had accepted the worker -- so a
+                # perfectly good shared base could be invalidated on it (PR #82).
 
         if not dead:
             return
@@ -1411,7 +2549,46 @@ class WarmPool:
             for slot in dead:
                 cur = self._slots.get(slot.slot_id)
                 if cur is not None and cur.state in (SlotState.IDLE, SlotState.WARMING):
+                    # RESERVE here: this is the step that actually evicts. A slot a claimant took
+                    # between the escalation decision and now is skipped by the guard above, and
+                    # must not have consumed budget on the way past.
+                    # Reserve INLINE: we already hold self._lock, and _eviction_allowed takes
+                    # it -- calling it here deadlocks on a non-reentrant Lock (it hung the whole
+                    # suite before this was caught).
+                    # A FRESH clock read: `now` was sampled before any probe ran, and a pass
+                    # over a large static/cloud tier probes serially. Reserving with that stale
+                    # value backdates the token by the whole pass, so on a short window the next
+                    # pass expires every token immediately and evicts another full capped batch --
+                    # defeating max_evictions_per_window exactly when it matters (PR #82).
+                    # A warming timeout is a HEURISTIC too: "healthy but slower than the
+                    # configured budget" looks identical to "never coming up", and a low timeout
+                    # on a cloud tier churns the entire warm set. Only a runtime-CONFIRMED death
+                    # may bypass the cap; a timed-out WARMING slot was never confirmed by anyone,
+                    # so it spends budget exactly like an escalated-unknown one. It bypassed the
+                    # cap purely because it was never added to `suspected` (upstream, PR #82).
+                    heuristic = (slot.slot_id in suspected
+                                 or cur.state == SlotState.WARMING)
+                    if (heuristic and slot.slot_id not in budgeted
+                            and not self._reserve_eviction_unlocked(self._clock(), slot.slot_id)):
+                        logger.warning(
+                            "pool.health_unknown_escalation_capped slot_id=%s — budget exhausted "
+                            "at demotion; leaving the slot in place", slot.slot_id,
+                        )
+                        self._unknown_since.setdefault(slot.slot_id, now)
+                        continue
                     cur.state = SlotState.DRAINING
+                    # We won the race, so this death is real evidence. A slot that never served a
+                    # job had only its promotion vouching for the base, and that is now refuted.
+                    # ONLY a confirmed death is restore evidence. A slot escalated from
+                    # UNKNOWN entered `dead` on suspicion, and during a prolonged control-plane
+                    # brownout every slot does -- counting those would invalidate a healthy base
+                    # on no verdict at all, and the count would stand even when the disposal then
+                    # failed and the slot was restored to IDLE (PR #82).
+                    if (cur.slot_id in self._promoted_unproven
+                            and cur.slot_id not in suspected):
+                        self._promoted_unproven.discard(cur.slot_id)
+                        unproven_deaths += 1
+                        blamed.append(cur.slot_id)
                     if slot.slot_id in suspected:
                         self._suspected_unknown.add(slot.slot_id)
                         # SUSPECTED (escalated after a long UNKNOWN), not confirmed. Its disposal
@@ -1424,6 +2601,17 @@ class WarmPool:
                     else:
                         to_reap.append(slot)
 
+
+        # Counted AFTER the demotion loop, which is the step that wins the race against a
+        # concurrent claim -- so only deaths we actually acted on feed the restore-failure streak.
+        self._blame_tiers(blamed)
+
+        if unproven_deaths:
+            with self._lock:
+                self._spawn_consecutive_failures += unproven_deaths
+                warm_failures = self._spawn_consecutive_failures
+            if self._maybe_rebuild_base(warm_failures, reason="spawn"):
+                self._rebuilt_this_tick = True
         for slot in to_reap:
             logger.warning("pool.health_evicted_dead_slot slot_id=%s", slot.slot_id)
             reaped = False
@@ -1446,12 +2634,20 @@ class WarmPool:
                         cur = self._slots.get(slot.slot_id)
                         if cur is not None and cur.state == SlotState.DRAINING:
                             cur.state = SlotState.IDLE
+                            # REFUND the token. The demotion spent one to evict this slot, and we
+                            # have just put it back -- so the budget paid for nothing. During a
+                            # brownout every disposal goes through the same unresponsive control
+                            # plane and fails, so the window's whole allowance could be consumed
+                            # without a single eviction, blocking the replacement of a slot that
+                            # IS confirmed dead for the rest of the window (upstream, PR #82).
+                            self._refund_eviction_unlocked(slot.slot_id)
                     logger.warning("pool.health_escalation_undone slot_id=%s — could not dispose a "
                                    "merely-suspected slot; returning it to IDLE", slot.slot_id)
             finally:
                 if reaped:
                     with self._lock:
                         self._slots.pop(slot.slot_id, None)
+                        self._forget_slot_health(slot.slot_id)
 
     def _background_loop(self) -> None:
         """Run tick() repeatedly until stop() is called."""

@@ -33,13 +33,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping
 
+from blastbox.host.pool import release_kwargs
 from blastbox.contract.envelope import (
     Artifact,
     atomic_write_confined,
     confined_atomic_writer,
     open_confined_regular_fd,
 )
-from blastbox.errors import OutputTrustError, WarmTimeout, sanitize_public_error
+from blastbox.errors import HOST_RESOURCE_ERRNOS, OutputTrustError, OutputTrustUnknown, WarmTimeout, sanitize_public_error
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.runtime.docker import (
@@ -59,6 +60,22 @@ from blastbox.worker.warm import HostWarmControl, WarmJobSpec
 if TYPE_CHECKING:
     from blastbox.host.concurrency_gate import DynamicConcurrencyGate
     from blastbox.host.pool import Slot, WarmPool
+
+
+
+
+
+# Errors that mean the GUEST or its seam failed, as opposed to our own filesystem. FCError covers
+# rdump/vsock faults; both are OSError subclasses in places, so the distinction must be explicit.
+def _guest_seam_errors() -> tuple[type[BaseException], ...]:
+    try:
+        from blastbox.host.runtime.firecracker import FCError
+    except Exception:  # noqa: BLE001 -- FC not installed; nothing guest-specific to distinguish
+        return ()
+    return (FCError,)
+
+
+_GUEST_SEAM_ERRORS: tuple[type[BaseException], ...] = _guest_seam_errors()
 
 
 _log = logging.getLogger("blastbox.host.dispatch")
@@ -1027,6 +1044,24 @@ class Dispatcher:
         warm_clean = False  # set True ONLY on the clean DONE path; every _fail_job/timeout/error path
         #                     leaves it False so the slot is released DIRTY (force-recycled, never
         #                     returned to IDLE with a wedged/contaminated worker for the next job).
+        # ...and WHOSE failure it was. Dirty means "reset before reuse" either way; the fault only
+        # decides whether it counts as evidence AGAINST THE WORKER. A validated engine_error is the
+        # engine successfully running and reporting an input-specific failure, so a run of
+        # malformed samples must not advance the pool streak and invalidate a healthy snapshot
+        # (upstream, PR #82). Attributing everything non-DONE to the worker was my over-correction
+        # for the opposite bug one round earlier.
+        # UNATTRIBUTED until this worker is positively observed to be at fault. This used to
+        # default to "worker" and be walked back exit by exit; six review rounds found six
+        # different exits that needed acquitting (four claim races, blob fetch, result upload),
+        # because an enumerate-the-innocents design fails OPEN -- every exit anyone forgets
+        # silently burns healthy slots and can invalidate a good base. Positive-evidence
+        # conviction is the posture the pool already takes on liveness (issue #77): a slow or
+        # erroring control plane must never be read as "this worker is dead".
+        #
+        # Set to "worker" ONLY where the worker itself demonstrably misbehaved: its IO seam
+        # failed, it never answered, or it produced output we cannot trust. Host-side failures
+        # (blob store, local disk) and lost claims stay unattributed by construction.
+        warm_fault = "unknown"
         try:
             # ------------------------------------------------------------------
             # Step 1: Engine lookup (security: engine spec is operator-configured)
@@ -1053,6 +1088,11 @@ class Dispatcher:
                 # "warm"): self._tier is "firecracker"/"gvisor" on a warm dispatcher.
                 worker_tier=self._tier,
             ):
+                # RECLAIM RACE, not a bad worker: a peer owns the job now, so this worker either
+                # never ran or already finished cleanly. Attributing it burns out healthy slots and
+                # can invalidate a good base (upstream, PR #82). Same reasoning as ClaimLost on the
+                # remote path -- which I fixed while leaving this one.
+                warm_fault = "unknown"
                 _log.warning(
                     "warm job %s lost its claim before staging (requeued/recovered by another "
                     "dispatcher); aborting", job.job_id,
@@ -1068,18 +1108,43 @@ class Dispatcher:
             # staged_input_path on the host, and the file-based seam shutil.copy2's it.
             # ------------------------------------------------------------------
             if not self._materialise_sample(job, staged_input_path):
+                # THIS HOST could not fetch the sample (blob store unreachable / integrity
+                # failure) and the claim has been released back to QUEUED. Nothing was ever
+                # handed to the slot, so blaming it means a MinIO/S3 outage marches every node
+                # to a base rebuild while evicting healthy slots -- a far more common trigger
+                # than any of the claim races.
+                warm_fault = "unknown"
                 return
 
             # ------------------------------------------------------------------
             # Step 3: Stage input — over the wire (vsock) or into slot.input_dir
             # ------------------------------------------------------------------
             if callable(stage_fn):
-                input_path = stage_fn(slot, staged_input_path)
+                try:
+                    input_path = stage_fn(slot, staged_input_path)
+                except Exception:
+                    # Convict ONLY if this runtime's staging really does talk to the worker.
+                    # "There is a stage_warm_input hook" does not mean "this is a transport" --
+                    # today NO runtime's does: FC returns the host path unchanged (the bytes go
+                    # over vsock later, at signal_go) and gVisor does a host-side shutil.copyfile
+                    # into a bind mount, where an ENOSPC/EROFS on the DISPATCHER disk would
+                    # otherwise burn out the entire healthy gVisor pool. An earlier version
+                    # convicted this branch outright on the mistaken premise that the hook meant
+                    # vsock. Runtimes opt IN, so a new one is safe by default, not dangerous.
+                    if getattr(runtime, "warm_staging_is_transport", False):
+                        warm_fault = "worker"
+                    raise
             else:
                 slot_input_copy = slot.input_dir / staged_input_path.name
                 try:
                     shutil.copy2(staged_input_path, slot_input_copy)
                 except OSError as exc:
+                    # UNATTRIBUTED. This is a local shutil.copy2 on the dispatcher host; ENOSPC,
+                    # EROFS or a failing disk here says nothing about the worker, which has not
+                    # been contacted at all yet. A host-wide filesystem outage hits every job at
+                    # once, so convicting here burns the whole warm set and invalidates a healthy
+                    # base during an incident the workers had no part in. The vsock staging seam
+                    # above IS a transport to the worker and stays convicted (upstream, PR #82).
                     self._fail_job(job, f"failed to stage input to warm slot: {exc}")
                     return
                 input_path = slot_input_copy
@@ -1110,6 +1175,25 @@ class Dispatcher:
             try:
                 control.signal_go(spec, deadline=warm_deadline)
             except Exception as exc:  # noqa: BLE001
+                # Only if signalling really does reach the worker. FC's control writes over
+                # vsock (worker evidence); the FILE handshake used by gVisor is a host-side
+                # atomic_write_confined() into the bind-mounted ctrl dir, where ENOSPC/EROFS is a
+                # dispatcher-disk failure that would burn out the whole healthy pool. Same
+                # opt-in shape as staging, and asked of the CONTROL object because that is what
+                # differs -- the runtime may offer both (upstream, PR #82).
+                if (getattr(control, "signal_is_transport", False)
+                        and not getattr(exc, "host_io", False)):
+                    warm_fault = "worker"
+                elif isinstance(exc, OSError) and exc.errno not in HOST_RESOURCE_ERRNOS:
+                    # ...and the FILE handshake has its own worker evidence. ctrl/ is
+                    # WORKER-WRITABLE (the gVisor tier bind-mounts it 0o777), so a poisoned
+                    # worker can put a directory or a symlink where go.json belongs and
+                    # atomic_write_confined()'s os.replace() raises EISDIR/ENOTEMPTY/ENOTDIR.
+                    # That is a concrete violation, not our disk failing -- and leaving it
+                    # unknown meant repeated restores from a poisoned checkpoint never advanced
+                    # burnout or base-rebuild detection. Only a host-resource errno is ours; the
+                    # same split ctrl/done already carries on the worker side (upstream, PR #82).
+                    warm_fault = "worker"
                 self._fail_job(job, f"failed to signal go to warm worker: {exc}")
                 return
 
@@ -1118,13 +1202,20 @@ class Dispatcher:
             # ------------------------------------------------------------------
             remaining = warm_deadline - time.monotonic()
             if remaining <= 0:
+                warm_fault = "worker"   # it never answered within its deadline
                 self._fail_job(
                     job, f"warm worker timed out after {self._worker_timeout_s}s"
                 )
                 return
             try:
                 control.wait_for_done(timeout_s=remaining)
-            except WarmTimeout:
+            except WarmTimeout as exc:
+                # ...unless the timeout came from OUR filesystem. The FILE handshake turns an
+                # EMFILE/EIO/ENOMEM reading ctrl/done into a WarmTimeout, which would otherwise
+                # convict a worker that may have completed perfectly -- and a host outage hits
+                # every job at once (upstream, PR #82).
+                if not getattr(exc, "host_io", False):
+                    warm_fault = "worker"   # it never answered within its deadline
                 self._fail_job(
                     job,
                     f"warm worker timed out after {self._worker_timeout_s}s",
@@ -1144,6 +1235,11 @@ class Dispatcher:
                 expect_claim_id=job.claim_id,
                 started_at=time.time(),
             ):
+                # RECLAIM RACE, not a bad worker: a peer owns the job now, so this worker either
+                # never ran or already finished cleanly. Attributing it burns out healthy slots and
+                # can invalidate a good base (upstream, PR #82). Same reasoning as ClaimLost on the
+                # remote path -- which I fixed while leaving this one.
+                warm_fault = "unknown"
                 _log.warning(
                     "warm job %s lost its claim before sealing (recovered/reclaimed by another "
                     "dispatcher); aborting", job.job_id,
@@ -1158,6 +1254,17 @@ class Dispatcher:
                 try:
                     materialize_fn(slot)
                 except Exception as exc:  # noqa: BLE001
+                    # materialize_warm_output ends in a host-side rdump_ext4() extraction into
+                    # slot.output_dir, so an ENOSPC/EROFS here is a DISPATCHER-disk outage -- which
+                    # hits every job at once -- and the guest's output disk may be perfectly valid.
+                    # Only a guest/seam failure (FCError: rdump/vsock) is worker evidence.
+                    # rdump_ext4 converts a host OSError into ValueError, so the type alone is
+                    # not enough -- check the flag it carries as well (PR #82).
+                    host_io = getattr(exc, "host_io", False) or (
+                        isinstance(exc, OSError) and not isinstance(exc, _GUEST_SEAM_ERRORS)
+                    )
+                    if not host_io:
+                        warm_fault = "worker"   # the guest/seam failed to hand its output back
                     self._fail_job(job, f"failed to read warm worker output: {exc}")
                     return
 
@@ -1179,6 +1286,11 @@ class Dispatcher:
             try:
                 self._enforce_output_size_cap(slot.output_dir)
             except OutputTrustError as exc:
+                # Same guard as its siblings. The size cap raises a verdict today, but this
+                # handler catches the PARENT type, so a future non-verdict subtype arriving here
+                # must not silently become a conviction.
+                if not isinstance(exc, OutputTrustUnknown):
+                    warm_fault = "worker"   # it emitted more than the declared bound
                 self._fail_job(job, f"warm output too large: {exc}")
                 return
 
@@ -1194,6 +1306,12 @@ class Dispatcher:
                     limits=self._limits,
                 )
             except OutputTrustError as exc:
+                # ...only when validation reached a VERDICT. OutputTrustUnknown means the host
+                # could not complete the check (EMFILE/EIO/ENOMEM reading or hashing), which is
+                # evidence about this dispatcher, not the worker -- and a host I/O outage hits
+                # every job at once (upstream, PR #82).
+                if not isinstance(exc, OutputTrustUnknown):
+                    warm_fault = "worker"   # it produced output that failed trust validation
                 self._fail_job(job, f"output trust validation failed: {exc}")
                 return
             except Exception as exc:  # noqa: BLE001
@@ -1208,6 +1326,7 @@ class Dispatcher:
             # so it stays DONE.
             if envelope.status == "engine_error":
                 detail = envelope.warnings[0].message if envelope.warnings else "engine_error"
+                warm_fault = "job"      # the engine RAN and reported on this input
                 self._fail_job(job, f"engine_error: {detail}")
                 return
 
@@ -1221,6 +1340,14 @@ class Dispatcher:
             try:
                 self._materialize_sealed_warm_output(envelope, slot.output_dir, output_dir)
             except OutputTrustError as exc:
+                # OutputTrustUnknown is a SUBCLASS by design, so catching the parent here and
+                # convicting unconditionally undoes the distinction at the point that consumes
+                # it: a host EMFILE/ENOMEM/EIO opening the declared artifact would advance slot
+                # burnout and the rebuild streak with no worker verdict at all. Guarded at the
+                # trust-gate handler above and not here -- the same sibling omission this series
+                # keeps producing (upstream, PR #82).
+                if not isinstance(exc, OutputTrustUnknown):
+                    warm_fault = "worker"   # its output could not be materialized
                 self._fail_job(job, f"failed to materialize warm output: {exc}")
                 return
 
@@ -1244,12 +1371,29 @@ class Dispatcher:
             # longer ours to terminalize; the peer's own state is left untouched.
             # ------------------------------------------------------------------
             if not self._claim_is_still_ours(job):
+                # Third of the four claim-loss exits (file order: pre-staging, pre-seal, here,
+                # terminal DONE CAS). Like the other three, a peer
+                # owning the job says nothing about this worker -- which here has already produced
+                # and sealed valid output (upstream, PR #82).
+                # "job", not "unknown". This worker has already RUN, produced output and had it
+                # pass the host trust gate -- positive proof it and the base it restored from are
+                # healthy. Leaving it unknown preserved both streaks, so worker-failure /
+                # valid-output-then-claim-loss / worker-failure counted as CONSECUTIVE and could
+                # evict the slot or invalidate its base on two unrelated events. The peer owning
+                # the job says nothing about this worker; the demonstrated success does
+                # (upstream, PR #82).
+                warm_fault = "job"
                 _log.info(
                     "warm job %s reclaimed before upload; skipping put_output (peer owns "
                     "it now)", job.job_id,
                 )
                 return
             if not self._upload_output(job, output_dir):
+                # The worker RAN and its output passed the trust gate; the upload is OUR side
+                # failing. Attribute the demonstrated success so the streaks reset -- the default
+                # would convict the worker for this dispatcher's storage problem, and an upload
+                # outage hits every job at once (upstream, PR #82).
+                warm_fault = "job"
                 self._fail_job(
                     job,
                     f"result upload failed after {self._put_output_max_attempts} attempts; "
@@ -1283,6 +1427,16 @@ class Dispatcher:
                 error=None,
             )
             if not applied:
+                # This worker RAN AND PRODUCED VALID OUTPUT -- it merely lost the terminal race.
+                # Leaving the default "worker" attribution here is the worst of the four
+                # claim-loss sites: reclaim races cluster exactly when the queue is deep, so a
+                # busy fleet would steadily burn out its healthiest, fastest slots and eventually
+                # invalidate a perfectly good base (upstream, PR #82).
+                # "job", not "unknown", for the same reason as the pre-upload exit: unknown
+                # PRESERVES both streaks, so a failure on either side of this success still
+                # counted as consecutive. The run itself is proof the worker and its base are
+                # healthy, and reclaim races cluster exactly when the queue is deep.
+                warm_fault = "job"
                 _log.warning(
                     "warm job %s no longer our RUNNING claim at DONE write (recovered/reclaimed "
                     "by another dispatcher); leaving its terminal state untouched",
@@ -1304,7 +1458,17 @@ class Dispatcher:
                 except OSError:
                     pass
             # dirty=not warm_clean → a failed run force-recycles the slot before reuse.
-            self._pool.release(slot, dirty=not warm_clean)  # type: ignore[union-attr]  # non-None here
+            # ATTRIBUTED: without a fault this defaults to "unknown", which never advances a slot
+            # toward eviction -- so FC/gVisor snapshot workers that time out or return unusable
+            # output were invisible to wedge detection entirely, and a poisoned base was never
+            # invalidated (upstream, PR #82). A warm run that failed AGAINST this worker is worker
+            # evidence; the engine reporting a bad sample is not, and is already excluded because
+            # warm_clean covers only the clean DONE path.
+            self._pool.release(slot, **release_kwargs(          # type: ignore[union-attr]
+                self._pool.release,                                # type: ignore[union-attr]
+                dirty=not warm_clean,
+                fault=None if warm_clean else warm_fault,
+            ))
 
     def _dispatch_inner(
         self, job: Job, input_path: Path, output_dir: Path,
@@ -2300,7 +2464,31 @@ class Dispatcher:
         shutil.rmtree(dst_dir, ignore_errors=True)
         dst_dir.mkdir(parents=True, exist_ok=True)
         for a in envelope.artifacts:
-            fd = open_confined_regular_fd(src_dir, a.path)
+            try:
+                fd = open_confined_regular_fd(src_dir, a.path)
+            except (FileNotFoundError, ValueError) as exc:
+                # The worker DELETED or SWAPPED a declared artifact between validation and this
+                # copy -- on the gVisor tier /out is a live 0o777 bind mount, so it can. Those
+                # come out of the confinement check as FileNotFoundError/ValueError rather than
+                # OutputTrustError, so they bypassed the trust handler upstream and left the
+                # failure unattributed: repeated untrusted-output races never advanced burnout or
+                # rebuild detection even though the worker caused every one (upstream, PR #82).
+                raise OutputTrustError(
+                    f"declared artifact {a.id} vanished or changed type during materialization"
+                ) from exc
+            except OSError as exc:
+                # ELOOP/ENOTDIR come from the CONFINEMENT check: the worker swapped the artifact
+                # for a symlink, or put a symlink/non-directory in the path. That is a violation,
+                # and calling it unknown meant repeated malicious swaps never advanced burnout.
+                # Only a host-resource errno is ours (PR #82) -- the same split just applied to
+                # the validation path, missing from this one.
+                if exc.errno not in HOST_RESOURCE_ERRNOS:
+                    raise OutputTrustError(
+                        f"declared artifact {a.id} failed the confinement check ({exc})"
+                    ) from exc
+                raise OutputTrustUnknown(
+                    f"could not open declared artifact {a.id} ({exc})"
+                ) from exc
             digest = hashlib.sha256()
             n = 0
             try:

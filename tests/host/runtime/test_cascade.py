@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from dataclasses import dataclass
 
 import pytest
@@ -464,3 +466,91 @@ def test_cascade_does_not_retry_resume_when_the_tier_itself_raises():
     with pytest.raises(TypeError):
         rt.resume(slot, budget_s=0.5)
     assert calls == [0.5], f"a side-effecting resume was retried unbudgeted: {calls}"
+
+
+def test_spawn_raises_a_FAULT_when_attempted_tiers_fail_and_CAPACITY_when_merely_full():
+    """The type itself is the contract, independent of any downstream repair.
+
+    CascadingRuntime.spawn() raises one exception for two opposite conditions unless it is
+    careful: "every tier is full" (routine backpressure) and "every tier tried and threw" (a
+    corrupt base restores nowhere). Making both a capacity type once disabled base repair for
+    every cascaded deployment. Per-tier repair now also covers that case, so this asserts the
+    type DIRECTLY — otherwise the second safety net silently hides the loss of the first.
+    """
+    from blastbox.host.pool import RuntimeAtCapacity
+    from blastbox.host.runtime.cascade import (
+        CascadeExhausted,
+        CascadeSpawnFailed,
+        CascadingRuntime,
+        Tier,
+    )
+
+    class _Broken:
+        def prepare(self): return True
+        def spawn(self): raise RuntimeError("snapshot restore failed: corrupt warm.mem")
+
+    class _Fine:
+        def __init__(self): self.n = 0
+        def prepare(self): return True
+        def spawn(self):
+            self.n += 1
+            return SimpleNamespace(slot_id=f"s{self.n}")
+
+    # every ATTEMPTED tier threw -> a fault, and explicitly NOT a capacity type
+    broken = CascadingRuntime(tiers=[Tier(name="fc", runtime=_Broken(), capacity=4)],
+                              tier_rebuild_after=0)   # isolate from per-tier repair
+    with pytest.raises(CascadeSpawnFailed) as ei:
+        broken.spawn()
+    assert not isinstance(ei.value, RuntimeAtCapacity), (
+        "a total spawn failure must never read as capacity — that is what stops the pool "
+        "from ever repairing a poisoned base"
+    )
+    assert isinstance(ei.value.__cause__, RuntimeError), "the tier's cause must survive"
+
+    # nothing attempted, everything full -> routine capacity
+    fine = _Fine()
+    full = CascadingRuntime(tiers=[Tier(name="fc", runtime=fine, capacity=1)],
+                            tier_rebuild_after=0)
+    full.spawn()                       # fills the only tier
+    with pytest.raises(CascadeExhausted) as ei2:
+        full.spawn()
+    assert isinstance(ei2.value, RuntimeAtCapacity), (
+        "a merely-full cascade is backpressure and must not advance any failure streak"
+    )
+
+
+def test_a_failed_tier_invalidation_is_reported_not_swallowed():
+    """A rebuild the pool believes happened, but didn't, is worse than a loud failure.
+
+    Swallowing a tier's invalidate_base() error made CascadingRuntime.invalidate_base() return
+    normally, so WarmPool recorded a successful rebuild and started its cooldown while the
+    poisoned tier was untouched — delaying the next repair attempt for the whole cooldown while
+    that tier kept failing. Every tier is still attempted; the failure is raised at the end.
+    """
+    from blastbox.host.runtime.cascade import (
+        CascadeInvalidateFailed,
+        CascadingRuntime,
+        Tier,
+    )
+
+    invalidated: list[str] = []
+
+    class _Ok:
+        def __init__(self, name): self.name = name
+        def invalidate_base(self): invalidated.append(self.name)
+
+    class _Broken:
+        def invalidate_base(self): raise RuntimeError("snapshot cleanup failed")
+
+    casc = CascadingRuntime(tiers=[
+        Tier(name="a", runtime=_Ok("a"), capacity=1),
+        Tier(name="broken", runtime=_Broken(), capacity=1),
+        Tier(name="c", runtime=_Ok("c"), capacity=1),
+    ])
+
+    with pytest.raises(CascadeInvalidateFailed):
+        casc.invalidate_base()
+
+    assert invalidated == ["a", "c"], (
+        f"one failing tier must not stop the others being repaired (got {invalidated})"
+    )

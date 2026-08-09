@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import io
 import json
 import os
@@ -832,3 +834,351 @@ def test_make_remote_validate_failure_releases_slot(tmp_path):
     assert ok is False
     assert meta == {"error": "remote worker transport error"}   # sanitized reason surfaced
     assert released == [slot]   # released even on failure
+
+
+def test_a_broken_release_is_not_laddered_into_a_clean_release(tmp_path):
+    """A TypeError from INSIDE release() must not walk the compatibility ladder.
+
+    The old three-rung `except TypeError` ladder could not tell "this seam predates the kwarg"
+    from "release() raised TypeError for a real reason", so one genuine bug released the SAME
+    slot three times -- and the final rung dropped `dirty`, returning a worker that had just
+    failed a detonation to IDLE with no forced recycle, ready to take the next untrusted sample.
+    """
+    calls: list[tuple[bool, str | None]] = []
+    slot = SimpleNamespace(slot_id="s1", url="http://worker.invalid", ip=None)
+
+    def release(s, *, dirty: bool = False, fault: str | None = None) -> None:
+        calls.append((dirty, fault))
+        raise TypeError("bug inside release(), NOT an old signature")
+
+    def boom(*a, **kw):
+        raise OSError("transport down")
+
+    validate = make_remote_validate(
+        lambda: slot, release, output_dir_for=lambda p: tmp_path, http_open=boom,
+    )
+
+    (tmp_path / "in.bin").write_bytes(b"sample")
+    with contextlib.suppress(TypeError):
+        validate(tmp_path / "in.bin")
+
+    assert len(calls) == 1, f"one slot, one release -- got {len(calls)}: {calls}"
+    assert calls[0][0] is True, "a failed detonation must stay DIRTY, never fall back to clean"
+
+
+def test_empty_metadata_is_attributed_to_the_worker(tmp_path):
+    """Empty metadata is abnormal worker output — and the attribution must be REACHABLE.
+
+    The first attempt added this as an `elif not meta` placed AFTER the `if not meta: return`
+    that already exits, so it could never execute: malformed worker output still never advanced
+    burnout or base rebuilding, and a recycle-capable worker could be reset and re-offered
+    forever. A test that only asserts the failure result would have passed throughout.
+    """
+    calls: list[tuple[bool, str | None]] = []
+
+    def release(s, *, dirty: bool = False, fault: str | None = None) -> None:
+        calls.append((dirty, fault))
+
+    slot = SimpleNamespace(slot_id="s1", url="http://worker.invalid", ip=None)
+    out = tmp_path / "out"
+    out.mkdir()
+    inp = tmp_path / "in.bin"
+    inp.write_bytes(b"sample")
+    validate = make_remote_validate(
+        lambda: slot, release, output_dir_for=lambda p: out,
+        http_open=_opener(_tar({"metadata.json": b"{}"})),
+    )
+
+    meta, ok = validate(inp)
+
+    assert ok is False
+    # Pin WHICH branch produced the fault. The generic transport handler also sets "worker", so
+    # an assertion on the fault alone passes even when this branch is never reached — the first
+    # version of this test did exactly that, and the mutant survived because of it.
+    assert meta == {"error": "remote worker returned no metadata"}, (
+        f"the empty-metadata branch was not reached; got {meta}"
+    )
+    assert calls and calls[0][1] == "worker", (
+        f"empty metadata must advance worker burnout, got fault={calls[0][1] if calls else None}"
+    )
+
+
+def test_local_host_io_is_unattributed_but_transport_still_convicts(tmp_path):
+    """The two must be told apart EXPLICITLY, because Python's hierarchy conflates them.
+
+    urllib's URLError/HTTPError and socket.timeout are all OSError subclasses, so an
+    `except OSError` written for ENOSPC silently swallows every connection failure too. Fixing
+    the reported half (host I/O wrongly convicting) without this guard would have killed wedge
+    detection for the transport failures the attribution exists for — so both directions are
+    asserted here.
+    """
+    import socket
+    import urllib.error
+
+    out = tmp_path / "out"
+    out.mkdir()
+    inp = tmp_path / "in.bin"
+    inp.write_bytes(b"sample")
+    slot = SimpleNamespace(slot_id="s1", url="http://worker.invalid", ip=None)
+
+    def _run(err):
+        calls: list[tuple[bool, str | None]] = []
+
+        def release(s, *, dirty: bool = False, fault: str | None = None) -> None:
+            calls.append((dirty, fault))
+
+        def boom(*a, **kw):
+            raise err
+
+        validate = make_remote_validate(
+            lambda: slot, release, output_dir_for=lambda p: out, http_open=boom,
+        )
+        validate(inp)
+        return calls[0][1] if calls else None
+
+    # LOCAL disk failure: the request never went out — not this worker's fault.
+    assert _run(OSError(28, "No space left on device")) == "unknown", (
+        "a dispatcher-disk failure must not burn out healthy slots"
+    )
+
+    # TRANSPORT failures still convict, despite also being OSErrors.
+    assert _run(urllib.error.URLError("connection refused")) == "worker"
+    assert _run(socket.timeout("timed out")) == "worker"
+    assert _run(ConnectionResetError("peer reset")) == "worker"
+
+
+def test_worker_busy_and_incomplete_validation_are_not_worker_evidence(tmp_path):
+    """Two conditions that reach the remote path's generic handler but are not failures.
+
+    409/WorkerBusy means the worker ANSWERED and its single-flight lock is held — capacity
+    pressure, and the job is requeued rather than failed. OutputTrustUnknown means the HOST could
+    not complete validation; validate_worker_output wraps the OSError, so it is no longer an
+    OSError and the generic branch would convict, defeating the type's whole purpose on this path.
+    """
+    from blastbox.errors import OutputTrustUnknown
+    from blastbox.host.runtime.remote_http import WorkerBusy
+
+    out = tmp_path / "out"
+    out.mkdir()
+    inp = tmp_path / "in.bin"
+    inp.write_bytes(b"sample")
+    slot = SimpleNamespace(slot_id="s1", url="http://worker.invalid", ip=None)
+
+    def _run(err, expect_raise):
+        calls: list[tuple[bool, str | None]] = []
+
+        def release(s, *, dirty: bool = False, fault: str | None = None) -> None:
+            calls.append((dirty, fault))
+
+        def boom(*a, **kw):
+            raise err
+
+        validate = make_remote_validate(
+            lambda: slot, release, output_dir_for=lambda p: out, http_open=boom,
+        )
+        if expect_raise:
+            with contextlib.suppress(Exception):
+                validate(inp)
+        else:
+            validate(inp)
+        return calls[0] if calls else (None, None)
+
+    dirty, fault = _run(WorkerBusy("worker busy (409)"), expect_raise=True)
+    assert fault == "unknown", f"a 409 is capacity pressure, not failure evidence (got {fault})"
+    assert dirty is True, "still quarantine the box so it is not immediately re-offered"
+
+    _, fault = _run(OutputTrustUnknown("EMFILE hashing metadata.json"), expect_raise=False)
+    assert fault == "unknown", (
+        f"a check the HOST could not complete is not worker evidence (got {fault})"
+    )
+
+
+def test_a_tls_failure_is_transport_not_local_disk(tmp_path):
+    """ssl.SSLError is an OSError but none of the other transport types.
+
+    So an HTTPS read failing on a TLS protocol error or a mid-stream disconnect landed in the
+    local-filesystem branch: a worker with a broken TLS stack could never be detected, because
+    every failure it produced was attributed to this dispatcher's disk.
+    """
+    import ssl
+
+    out = tmp_path / "out"
+    out.mkdir()
+    inp = tmp_path / "in.bin"
+    inp.write_bytes(b"sample")
+    slot = SimpleNamespace(slot_id="s1", url="https://worker.invalid", ip=None)
+
+    calls: list[tuple[bool, str | None]] = []
+
+    def release(s, *, dirty: bool = False, fault: str | None = None) -> None:
+        calls.append((dirty, fault))
+
+    def boom(*a, **kw):
+        raise ssl.SSLError(1, "[SSL: DECRYPTION_FAILED] protocol error")
+
+    validate = make_remote_validate(
+        lambda: slot, release, output_dir_for=lambda p: out, http_open=boom,
+    )
+    validate(inp)
+
+    assert calls and calls[0][1] == "worker", (
+        f"a TLS failure is evidence about the worker, not our disk (got {calls[0][1]})"
+    )
+
+
+def _fault_for_http(tmp_path, code: str | int, reason: str = "rejected"):
+    """Drive validate() against a worker that answers with one HTTP status; return the fault."""
+    import urllib.error
+
+    out = tmp_path / f"out{code}"
+    out.mkdir()
+    inp = tmp_path / f"in{code}.bin"
+    inp.write_bytes(b"sample")
+    slot = SimpleNamespace(slot_id="s1", url="https://worker.invalid", ip=None)
+    calls: list[tuple[bool, str | None]] = []
+
+    def release(s, *, dirty: bool = False, fault: str | None = None) -> None:
+        calls.append((dirty, fault))
+
+    def answer(req, timeout, context=None):
+        raise urllib.error.HTTPError(getattr(req, "full_url", "https://worker.invalid"),
+                                     int(code), reason, {}, io.BytesIO(b'{"error":"x"}'))
+
+    make_remote_validate(lambda: slot, release, output_dir_for=lambda p: out,
+                         http_open=answer)(inp)
+    assert calls
+    return calls[0][1]
+
+
+def test_a_413_from_the_worker_is_about_the_sample_not_the_box(tmp_path):
+    """The agent replies 413 when a sample exceeds its OWN max_bytes.
+
+    Raise BLASTBOX_MAX_INPUT on the dispatcher while a static/remote worker keeps the default and
+    every oversized-but-valid job becomes a worker conviction — burning down healthy boxes one
+    after another, correlated across the whole tier, which is exactly the signal that must never
+    reach burnout.
+    """
+    assert _fault_for_http(tmp_path, 413, "Payload Too Large") == "job", (
+        "the agent ANSWERED, which proves it and its base responsive -- 'unknown' merely stops "
+        "the rejection itself from incrementing the streak, it does not clear the failure before "
+        "it, so two transport failures either side of a 413 still counted as consecutive"
+    )
+
+
+def test_auth_and_version_skew_are_not_worker_faults(tmp_path):
+    """401/403 (token skew) and 404 (endpoint skew) fail identically on EVERY box."""
+    for code in (401, 403, 404, 400, 422):
+        assert _fault_for_http(tmp_path, code) == "job", f"HTTP {code} convicted the worker"
+
+
+def test_a_5xx_is_still_evidence_about_this_worker(tmp_path):
+    """The carve-out stays narrow: the agent itself breaking IS about this box."""
+    for code in (500, 502, 503):
+        assert _fault_for_http(tmp_path, code) == "worker", (
+            f"HTTP {code} is the agent failing, not a verdict on our request"
+        )
+
+
+def test_a_malformed_worker_archive_is_the_workers_fault(tmp_path):
+    """A tar with a regular file `a` and a later member `a/b` cannot be laid out.
+
+    `a` must be both a file and a directory, so resolving/creating the second member's parent
+    raises FileExistsError/ENOTDIR — BEFORE the guarded os.open() that already classifies
+    correctly. It escaped into the blanket OSError branch and was filed under this dispatcher's
+    disk, so a reusable static worker could repeat the violation forever without advancing
+    burnout or snapshot repair.
+    """
+    import io as _io
+    import tarfile
+
+    from blastbox.host.runtime.remote_http import _safe_extract_tar
+
+    buf = _io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for name, data in (("a", b"x"), ("a/b", b"y")):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, _io.BytesIO(data))
+    buf.seek(0)
+
+    out = tmp_path / "out"
+    out.mkdir()
+    with pytest.raises(Exception) as ei:
+        _safe_extract_tar(buf.getvalue(), out)
+    assert not isinstance(ei.value, OSError), (
+        "a worker-authored archive that cannot be laid out must not surface as an OSError — that "
+        "is the shape the caller reads as this dispatcher's disk"
+    )
+
+
+def _fault_for_claim_loss(tmp_path, *, validated: bool):
+    """Drive validate() to a ClaimLost raised on the given side of the trust gate."""
+    from blastbox.host.runtime.remote_http import ClaimLost
+
+    out = tmp_path / f"out{validated}"
+    out.mkdir()
+    inp = tmp_path / f"in{validated}.bin"
+    inp.write_bytes(b"sample")
+    slot = SimpleNamespace(slot_id="s1", url="https://worker.invalid", ip=None)
+    calls: list[tuple[bool, str | None]] = []
+
+    def release(s, *, dirty: bool = False, fault: str | None = None) -> None:
+        calls.append((dirty, fault))
+
+    def boom(*a, **kw):
+        raise ClaimLost("a peer recovered the job", validated=validated)
+
+    with pytest.raises(ClaimLost):
+        make_remote_validate(lambda: slot, release, output_dir_for=lambda p: out,
+                             http_open=boom)(inp)
+    assert calls
+    return calls[0][1]
+
+
+def test_a_claim_lost_after_validation_records_the_demonstrated_success(tmp_path):
+    """The trust gate had already ACCEPTED this worker's output.
+
+    So the run is positive proof the worker and its base are responsive. Leaving it unattributed
+    PRESERVES both streaks, and worker-failure / validated-run-then-claim-loss / worker-failure
+    then counts as consecutive — evicting the slot or invalidating its base on two unrelated
+    events. Reclaim races cluster exactly when the queue is deep.
+    """
+    assert _fault_for_claim_loss(tmp_path, validated=True) == "job"
+
+
+def test_a_claim_lost_before_validation_stays_unattributed(tmp_path):
+    """The carve-out stays narrow: before the gate, nothing about this worker was demonstrated."""
+    assert _fault_for_claim_loss(tmp_path, validated=False) == "unknown"
+
+
+def test_local_fd_exhaustion_is_not_a_transport_fault():
+    """urllib's do_open does a bare `raise URLError(err)`.
+
+    So an EMFILE/ENFILE/ENOMEM from creating the socket arrives as a URLError whose .errno is
+    None — and an outer-type check called it transport, so the remote handler skipped its
+    host-I/O branch and a host-wide exhaustion event advanced every affected slot's worker and
+    base streaks at once. That is the fleet-wipe shape.
+    """
+    import errno as _errno
+    import urllib.error
+
+    from blastbox.errors import is_transport_error
+
+    for code in (_errno.EMFILE, _errno.ENFILE, _errno.ENOMEM, _errno.EADDRNOTAVAIL):
+        wrapped = urllib.error.URLError(OSError(code, "local exhaustion"))
+        assert is_transport_error(wrapped) is False, (
+            f"errno {code} is OUR side running out, not the worker answering -- treating it as "
+            f"transport convicts every slot on the same tick"
+        )
+
+
+def test_a_real_wire_failure_is_still_a_transport_fault():
+    """The carve-out stays narrow: a refused/reset connection IS an answer about the worker."""
+    import errno as _errno
+    import urllib.error
+
+    from blastbox.errors import is_transport_error
+
+    assert is_transport_error(urllib.error.URLError(ConnectionRefusedError(
+        _errno.ECONNREFUSED, "refused"))) is True
+    assert is_transport_error(ConnectionResetError(_errno.ECONNRESET, "reset")) is True

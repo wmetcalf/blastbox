@@ -21,10 +21,12 @@ from blastbox.contract.envelope import (
     seal_envelope,
     validate_envelope,
 )
-from blastbox.errors import OutputTrustError, sanitize_public_error
+from blastbox.errors import HOST_RESOURCE_ERRNOS, OutputTrustError, OutputTrustUnknown, sanitize_public_error
 from blastbox.limits import Limits
 
 _log = logging.getLogger("blastbox.host.trust")
+
+
 
 
 def validate_worker_output(
@@ -64,12 +66,27 @@ def validate_worker_output(
         )
     except FileNotFoundError as exc:
         raise OutputTrustError("metadata.json not found in output directory") from exc
-    except (OSError, ValueError) as exc:
+    except ValueError as exc:
+        # A ValueError here IS a verdict: the worker wrote something that is not a regular file
+        # inside the output dir, or exceeded the declared size.
         raise OutputTrustError(
             sanitize_public_error(
                 "metadata.json must be a regular file inside the output dir within the size "
                 f"limit ({exc})"
             )
+        ) from exc
+    except OSError as exc:
+        # ...but only a HOST-RESOURCE errno is unknown. A worker that replaces metadata.json with
+        # a symlink, or puts a symlink/non-directory in the path, produces ELOOP/ENOTDIR from the
+        # confinement check -- a concrete violation, and classifying it as unknown meant recurring
+        # malformed output never advanced burnout and a reusable broken worker could be recycled
+        # forever (PR #82).
+        if exc.errno not in HOST_RESOURCE_ERRNOS:
+            raise OutputTrustError(
+                sanitize_public_error(f"metadata.json failed the confinement check ({exc})")
+            ) from exc
+        raise OutputTrustUnknown(
+            sanitize_public_error(f"could not read metadata.json ({exc})")
         ) from exc
 
     # ------------------------------------------------------------------
@@ -117,7 +134,29 @@ def validate_worker_output(
             # declared artifact had already been opened + hashed).
             max_artifacts=limits.max_artifacts,
         )
-    except (ValueError, Exception) as exc:
+    except ValueError as exc:
+        # seal_envelope catches an OSError from open_confined_regular_fd and re-raises it as
+        # ValueError, so a host EMFILE/ENFILE/ENOMEM/EIO never reached the OSError handler below
+        # and the generic branch convicted the worker for a host-wide incident. Look through the
+        # wrapper at the cause rather than trusting the outer type (PR #82).
+        cause = exc.__cause__ or exc.__context__
+        if isinstance(cause, OSError) and cause.errno in HOST_RESOURCE_ERRNOS:
+            raise OutputTrustUnknown(
+                sanitize_public_error(f"could not re-seal worker output: {exc}")
+            ) from exc
+        raise OutputTrustError(
+            sanitize_public_error(f"re-seal failed: {exc}")
+        ) from exc
+    except OSError as exc:
+        # HOST I/O while opening/stat-ing/hashing a declared artifact. seal_envelope surfaces
+        # these as OSError (and open failures as ValueError, handled below), and wrapping both as
+        # a plain OutputTrustError meant a host-wide EMFILE/EIO/ENOMEM incident convicted every
+        # worker at once -- the same distinction already drawn when READING metadata.json, missing
+        # from the re-seal that follows it (PR #82).
+        raise OutputTrustUnknown(
+            sanitize_public_error(f"could not re-seal worker output: {exc}")
+        ) from exc
+    except Exception as exc:
         raise OutputTrustError(
             sanitize_public_error(f"re-seal failed: {exc}")
         ) from exc
@@ -142,7 +181,30 @@ def validate_worker_output(
             max_total_bytes=limits.max_total_artifact_bytes,
             max_artifacts=limits.max_artifacts,
         )
-    except (ValueError, Exception) as exc:
+    except OSError as exc:
+        # The caps pass re-stats every declared artifact, so it does HOST I/O -- and an
+        # EIO/EMFILE/ENOMEM there is this dispatcher failing, not the worker declaring bad sizes.
+        # Flattening it to OutputTrustError convicted a healthy worker during a host-wide storage
+        # incident even though the re-seal one step earlier had already succeeded. This is the
+        # same split the read and re-seal steps carry, missing from the last step that touches
+        # the disk (upstream, PR #82).
+        if exc.errno in HOST_RESOURCE_ERRNOS:
+            raise OutputTrustUnknown(
+                sanitize_public_error(f"could not complete the output caps check: {exc}")
+            ) from exc
+        raise OutputTrustError(
+            sanitize_public_error(f"output caps violated: {exc}")
+        ) from exc
+    except Exception as exc:
+        # A ValueError from validate_envelope IS a verdict: declared size mismatch, path outside
+        # outdir, artifact missing. Still look through a wrapper at the cause, for the same
+        # reason the re-seal step does -- a host OSError re-raised as something else must not
+        # become a conviction on the way out.
+        cause = exc.__cause__ or exc.__context__
+        if isinstance(cause, OSError) and cause.errno in HOST_RESOURCE_ERRNOS:
+            raise OutputTrustUnknown(
+                sanitize_public_error(f"could not complete the output caps check: {exc}")
+            ) from exc
         raise OutputTrustError(
             sanitize_public_error(f"output caps violated: {exc}")
         ) from exc

@@ -19,6 +19,7 @@ host-side via ``rdump_ext4`` (no mount, no root).
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import shutil
@@ -29,7 +30,7 @@ from pathlib import Path
 from typing import Callable
 
 from blastbox.host.pool import Slot, SlotState
-from blastbox.host.runtime.fc_snapshot import SnapshotManager
+from blastbox.host.runtime.fc_snapshot import SnapshotError, SnapshotManager
 from blastbox.host.runtime.fc_snapshot_launcher import REL_OUTDISK, REL_VSOCK
 
 _log = logging.getLogger(__name__)
@@ -134,21 +135,59 @@ class SnapshotSlotRuntime:
     def spawn(self) -> Slot:
         """Build the warm snapshot once (idempotent), then restore it into a fresh
         per-slot microVM. Returns a WARMING Slot."""
-        # build() is idempotent — the snapshot is captured on the first spawn only (instant
-        # once built; prepare() gates the pool so the slow first build is off the tick thread).
-        self._manager.build()
+        # NEVER build INLINE. prepare() reports readiness and the pool's generation fence tries
+        # to avoid spawning against a base that was just invalidated -- but both are check-then-act
+        # against a job thread that can invalidate in the window between the check and this call,
+        # and build() then runs the FULL base boot plus readiness timeout on the pool's ONLY
+        # maintenance thread, stalling promotion, health checks and deferred reaping behind it.
+        # No lock discipline in the pool can close that window from the outside; the runtime has
+        # to refuse. Kick the async build and report CAPACITY -- not a failure, so it never
+        # touches the restore-failure streak -- and the next tick spawns once the artifact exists
+        # (upstream, PR #82).
+        # ATOMIC against invalidate(): asking "is it built?" and then building is a
+        # check-then-act, and a job thread invalidating in that gap sends build() down the full
+        # synchronous boot on the pool's only maintenance thread (upstream, PR #82).
+        _acquire = getattr(self._manager, "acquire_built", None)
+        if callable(_acquire):
+            _acquire()
+        else:
+            self._manager.build()   # a manager without the seam (a test double)
         slot_id = str(uuid.uuid4())
         handle = self._manager.restore(slot_id)
         # The launcher restores in base_dir/slots/<id>; the vsock UDS lives there, so
         # its parent IS the per-slot workdir (vsock.sock + outdisk.ext4 + fc-api.sock).
         # vsock_uds is a concrete-FC-handle accessor not on the generic RestoreHandle
         # seam (kill-only) — the FC backend's handle always provides it.
-        slot_workdir = Path(handle.vsock_uds).parent  # type: ignore[attr-defined]
-        output_dir = slot_workdir / "out"
-        input_dir = slot_workdir / "in"
-        control_dir = slot_workdir / "ctrl"
-        for d in (output_dir, input_dir, control_dir):
-            d.mkdir(parents=True, exist_ok=True)
+        # EVERYTHING between a successful restore and publishing the handle must clean up after
+        # itself. restore() has already pinned this generation, but no Slot exists yet, so the
+        # pool can never reap it and nothing would ever call release(slot_id): a failure here
+        # (reading vsock_uds, or mkdir hitting ENOSPC) would strand the pin AND leak a running
+        # microVM, permanently, until the process restarts.
+        try:
+            slot_workdir = Path(handle.vsock_uds).parent  # type: ignore[attr-defined]
+            output_dir = slot_workdir / "out"
+            input_dir = slot_workdir / "in"
+            control_dir = slot_workdir / "ctrl"
+            for d in (output_dir, input_dir, control_dir):
+                d.mkdir(parents=True, exist_ok=True)
+        except BaseException:
+            vm_gone = True
+            try:
+                handle.kill()  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                # Identical rule to reap(): a kill() that raised leaves the microVM possibly
+                # ALIVE and still mapping this generation. Releasing the pin anyway lets a later
+                # invalidation unlink its backing files underneath. This cleanup path was added
+                # in the same commit that guarded reap() and repeated the very bug it fixed.
+                vm_gone = False
+                _log.warning(
+                    "snapshot.spawn_cleanup_kill_error slot_id=%s: %s", slot_id, exc
+                )
+            release = getattr(self._manager, "release", None)
+            if callable(release) and vm_gone:
+                with contextlib.suppress(Exception):
+                    release(slot_id)
+            raise
 
         with self._lock:
             self._handles[slot_id] = handle
@@ -189,6 +228,22 @@ class SnapshotSlotRuntime:
         handle = self._get(slot.slot_id)
         return handle is not None and self._proc_alive(handle)
 
+    def invalidate_base(self) -> None:
+        """Drop the persisted warm snapshot so the next spawn rebuilds it.
+
+        Called by the pool after sustained pool-wide dirty releases: at that point the shared
+        base -- not the individual slots -- is the likely culprit, and slots restored from it are
+        born wedged. ``reap()`` deliberately preserves ``warm.snapshot``/``warm.mem``, so without
+        this the only cure is a dispatcher restart.
+        """
+        drop = getattr(self._manager, "invalidate", None)
+        if not callable(drop):
+            _log.warning("snapshot.invalidate_unsupported manager=%s", type(self._manager).__name__)
+            return
+        discarded = drop()
+        _log.warning("snapshot.base_invalidated had_artifact=%s -- next spawn rebuilds the base",
+                     bool(discarded))
+
     def reap(self, slot: Slot) -> None:
         """Kill the restored microVM (if alive) and remove its per-slot workdir.
 
@@ -197,10 +252,14 @@ class SnapshotSlotRuntime:
         with self._lock:
             handle = self._handles.pop(slot.slot_id, None)
             self._restored_at.pop(slot.slot_id, None)
+        vm_gone = True
         if handle is not None:
             try:
                 handle.kill()  # type: ignore[attr-defined]
             except Exception as exc:  # noqa: BLE001 — reap must never raise
+                # The microVM may still be RUNNING and still mapping this generation's memory
+                # file. Releasing the pin anyway can unlink it under a live VM.
+                vm_gone = False
                 _log.warning(
                     "snapshot.reap_kill_error slot_id=%s: %s", slot.slot_id, exc
                 )
@@ -209,6 +268,39 @@ class SnapshotSlotRuntime:
         if slot_workdir.exists():
             shutil.rmtree(slot_workdir, ignore_errors=True)
             _log.debug("snapshot.reap_cleaned slot_id=%s", slot.slot_id)
+        # Drop this slot's pin on its snapshot generation; if it was the last user of a
+        # SUPERSEDED generation, its files are unlinked now. Without this every rebuild leaks a
+        # memory file the size of guest RAM until the tmpfs fills.
+        # ...but ONLY once the VM is provably gone. The whole guarantee of generation stamping
+        # is that a file is never removed while something still maps it; a kill() that raised
+        # leaves that unproven, so the pin is deliberately retained. Retaining a generation costs
+        # disk until the process restarts; unlinking one under a live VM corrupts it.
+        release = getattr(self._manager, "release", None)
+        if callable(release):
+            if vm_gone:
+                release(slot.slot_id)
+            else:
+                _log.warning(
+                    "snapshot.generation_retained slot_id=%s: could not confirm the microVM is "
+                    "gone, so its snapshot generation is kept rather than risk unlinking a file "
+                    "a live VM still maps", slot.slot_id,
+                )
+        if not vm_gone:
+            # PROPAGATE, and put the handle back. Retaining the pin stops the backing file being
+            # deleted under a VM that may still be running -- but returning NORMALLY told the pool
+            # the disposal SUCCEEDED, so _reap_and_count removed the slot and allowed a
+            # replacement. That left a live microVM and its now-permanent pin outside pool
+            # accounting entirely: nothing tracks it, nothing ever retries the kill, and its
+            # generation is held until the process restarts. Raising makes the pool quarantine the
+            # slot instead (kept tracked, DRAINING, never reused), which is exactly what an
+            # unconfirmed teardown means. The handle goes back so a later reap can retry the kill
+            # (upstream, PR #82).
+            with self._lock:
+                self._handles.setdefault(slot.slot_id, handle)
+            raise SnapshotError(
+                f"could not confirm the microVM for slot {slot.slot_id} is gone; "
+                f"quarantining the slot rather than replacing it"
+            )
 
     # ------------------------------------------------------------------
     # Warm-path seam (mirrors FirecrackerSlotRuntime so the dispatcher's per-slot

@@ -104,6 +104,25 @@ The default CSP (`middleware.DEFAULT_CSP`) is `default-src 'self'; script-src 's
 | `BLASTBOX_POOL_WARMING_TIMEOUT_S` | `120` | Max seconds a slot may sit WARMING before eviction. **Raise for cloud tiers** (`aws-ec2` first-boot can exceed 120s) or healthy-but-slow slots get churned. |
 | `BLASTBOX_POOL_WARM_SNAPSHOT` | `0` | FC only: restore from a memory snapshot (warm-UNO) instead of cold-booting the guest. |
 
+### Pool safety controls
+
+These decide when the pool **evicts a slot** or **destroys and rebuilds a snapshot base**. All
+default to values derived from `BLASTBOX_POOL_WARM_SIZE`, so leaving them unset is the supported
+configuration — set them when an incident or a specific tier demands it.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER` | `2 × warm_size` (min 4) | Consecutive restore/warm failures before the snapshot base is invalidated and rebuilt. **`0` disables automatic base invalidation entirely** — the incident escape hatch. It applies to every rebuild path, including per-tier repair inside a `cascade`. |
+| `BLASTBOX_POOL_MAX_EVICTIONS_PER_WINDOW` | `max(2, warm_size)` | Cap on slots evicted per window, so one bad signal cannot churn the whole warm set at once. **`0` blocks heuristic eviction entirely** — the incident escape hatch, and the direction a zero reads in; it is *not* an "unlimited" sentinel. This stops only the *wedge heuristic*: a slot the runtime CONFIRMS dead is still reaped. |
+| `BLASTBOX_POOL_MAX_CONSECUTIVE_FAILURES` | pool default (`2`) | Worker-attributed failures in a row before a reusable slot is burned out. Only failures attributed to the *worker* count — a bad sample (`engine_error`) or a host-side failure does not. |
+| `BLASTBOX_POOL_UNKNOWN_GRACE_S` | `300` | How long a slot may stay **continuously UNKNOWN** (control plane not answering) before it may be replaced. Must comfortably outlast a real control-plane brownout. `0` disables the escalation, which lets a slot stay unknown forever and wedges the tier. |
+| `BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S` | `300` | How long the pool may be unable to spawn **for capacity reasons** before that stops being backpressure and is logged as `pool.spawn_capacity_starved` (ERROR, once per episode). `0` disables the alert. |
+
+> Capacity misses are deliberately *not* failures: a full cascade, a cooling static fleet or a
+> saturated tier must never invalidate a base. `pool_spawn_capacity_miss_total` counts them
+> separately from spawn failures so a dashboard cannot confuse "we are busy" with
+> "spawning is broken".
+
 ## Node pool autosizer (opt-in)
 
 Right-sizes every node-managed pool on one physical host from live demand under the host's
@@ -186,6 +205,7 @@ counts cheap.
 | `BLASTBOX_FC_MEM_MIB` | `512` | Guest RAM (compose sets 2048 for LibreOffice). |
 | `BLASTBOX_FC_OUTDISK_MIB` | — | Size of the per-slot ext4 output disk the host reads via `debugfs`. |
 | `BLASTBOX_SNAPSHOT_MEM_DIR` / `BLASTBOX_SNAPSHOT_MEM_TMPFS` | — | Where the warm memory-snapshot base lives; `_TMPFS` pins the CoW base in RAM (per-host toggle). |
+| `BLASTBOX_SNAPSHOT_RECLAIM_LEGACY` | unset (off) | Delete pre-generation snapshot artifacts (`warm.snapshot` / `warm.mem`) left by a build older than generation stamping. **Set this only once no pre-upgrade dispatcher is still running**: those files carry no owner lease, so nothing can prove an overlapping old process is not still mapping them, and unlinking a live one corrupts its microVMs. Left off, the tier logs `fc_snapshot.legacy_artifacts_present` with the paths and size — the RAM-sized `warm.mem` often occupies the very tmpfs the replacement generation needs, so it is a common cause of an upgraded tier failing every build with ENOSPC. |
 | `BLASTBOX_SNAPSHOT_SETTLE_S` | `""` | Settle delay before snapshotting a freshly-warmed guest. |
 
 ## Runtime: gVisor C/R (runsc checkpoint/restore)

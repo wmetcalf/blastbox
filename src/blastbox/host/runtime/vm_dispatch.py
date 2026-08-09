@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+from blastbox.host.pool import release_kwargs
 from blastbox.contract.envelope import atomic_write_confined
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
@@ -62,6 +63,9 @@ MAX_MATERIALISE_ATTEMPTS = 3
 # job FAILs and its dir is purged like every other terminal path -- see _process.
 PUT_OUTPUT_MAX_ATTEMPTS = 3
 PUT_OUTPUT_RETRY_BACKOFF_S = 1.0
+
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -957,7 +961,9 @@ def _resume_on_claim(pool: Any, slot: Any, *, budget_s: float | None = None) -> 
                     unclaim(slot)
                 raise
         try:
-            pool.release(slot, dirty=True)
+            # A CONFIRMED-dead resume verdict (AWS says the resource is gone / the state is
+            # terminal) is evidence about the WORKER, so it counts toward wedge eviction.
+            pool.release(slot, **release_kwargs(pool.release, dirty=True, fault="worker"))
         except Exception:   # noqa: BLE001 -- release failure must not mask the resume error
             logger.warning("vm_dispatch: releasing un-resumable slot failed", exc_info=True)
         raise
@@ -1161,8 +1167,13 @@ def build_remote_vm_dispatcher(
             raise NoWarmSlot("no warm slot available within claim timeout")   # capacity -> REQUEUE
         return slot
 
-    def _release(slot: Any, dirty: bool = False) -> None:
-        pool.release(slot, dirty=dirty)
+    def _release(slot: Any, dirty: bool = False, fault: str | None = None) -> None:
+        # Forward the transport's attribution through to the pool -- dropping it here would put the
+        # conflated signal straight back (job failures counting as worker evidence). But degrade
+        # HERE rather than making the caller retry: this seam always passed fault= through, so
+        # against a pool predating fault attribution EVERY retry in remote_http's fallback ladder
+        # raised TypeError again and the slot was never released at all (upstream, PR #82).
+        pool.release(slot, **release_kwargs(pool.release, dirty=dirty, fault=fault))
 
     sanitize: Callable[[dict[str, str]], dict[str, str]] | None = None
     # the RESOLVED policy the worker's egress is actually provisioned to (None = enforcement opt-out, i.e.
@@ -1224,7 +1235,8 @@ def build_remote_vm_dispatcher(
     def output_trust(input_path: Path, out_dir: Path, expected_sha: str | None,
                      owns: Callable[[], bool] | None = None) -> None:
         from blastbox.errors import EngineErrorEnvelope
-        from blastbox.host.trust import OutputTrustError, validate_worker_output
+        from blastbox.host.runtime.remote_http import ClaimLost
+        from blastbox.host.trust import validate_worker_output
         # Compare the worker's sealed envelope against the AUTHORITATIVE ingress-recorded input SHA
         # (job.input_sha256), matching the cold/file-warm paths -- so a staged input that was
         # corrupted/replaced after submission is caught (the worker hashed different bytes). Fall
@@ -1249,7 +1261,13 @@ def build_remote_vm_dispatcher(
         # metadata.json in the shared output dir. Raise -> job fails for this stale attempt, slot
         # retired dirty. Checked immediately before the write to shrink the TOCTOU to ~nothing.
         if owns is not None and not owns():
-            raise OutputTrustError("claim lost before host metadata write (peer recovered the job)")
+            # ClaimLost, NOT OutputTrustError: a peer owning the job says nothing about this
+            # worker's output, which validated fine. Raising a trust error routed it into the
+            # generic handler and convicted a healthy slot on every reclaim race (upstream, PR #82).
+            # validated=True: the trust gate has ALREADY accepted this worker's output above, so
+            # the run is positive evidence about the worker -- not merely "nothing was proven".
+            raise ClaimLost("claim lost before host metadata write (peer recovered the job)",
+                            validated=True)
         atomic_write_confined(out_dir, "metadata.json",
                               env.model_dump_json(by_alias=True).encode("utf-8"), mode=0o644)
 

@@ -163,7 +163,17 @@ def test_reap_is_safe_on_unknown_slot(tmp_path):
     rt.reap(slot)  # double reap must not raise
 
 
-def test_reap_swallows_kill_errors(tmp_path):
+def test_an_unconfirmed_teardown_quarantines_the_slot(tmp_path):
+    """reap() used to swallow a failed kill() and return normally.
+
+    _reap_and_count then recorded a SUCCESSFUL disposal, removed the slot and allowed a
+    replacement -- leaving a possibly-live microVM and its now-permanent generation pin outside
+    pool accounting entirely: nothing tracked it, nothing would ever retry the kill, and the
+    generation was held until the process restarted. Raising is what makes the pool quarantine
+    the slot instead (kept tracked, DRAINING, never reused).
+    """
+    from blastbox.host.runtime.fc_snapshot import SnapshotError
+
     rt, mgr = _runtime(tmp_path)
     slot = rt.spawn()
 
@@ -171,8 +181,22 @@ def test_reap_swallows_kill_errors(tmp_path):
         raise RuntimeError("kill failed")
 
     mgr.handles[slot.slot_id].kill = boom  # type: ignore[method-assign]
-    rt.reap(slot)  # must not propagate
+    with pytest.raises(SnapshotError):
+        rt.reap(slot)
+    # The workdir is still cleaned, and the HANDLE goes back so a later reap can retry the kill.
     assert not slot.output_dir.parent.exists()
+    assert slot.slot_id in rt._handles, (
+        "the handle was dropped, so nothing can ever try to kill this microVM again"
+    )
+
+
+def test_a_confirmed_teardown_still_returns_quietly(tmp_path):
+    """The carve-out stays narrow: a kill that works is an ordinary reap."""
+    rt, _ = _runtime(tmp_path)
+    slot = rt.spawn()
+    rt.reap(slot)
+    assert not slot.output_dir.parent.exists()
+    assert slot.slot_id not in rt._handles
 
 
 # --- warm-path seam --------------------------------------------------------
@@ -231,3 +255,51 @@ def test_select_snapshot_runtime_refuses_old_guest_kernel(tmp_path, monkeypatch)
         select_snapshot_runtime(cfg=cfg, require_available=True)
     # Soft path: refuse quietly (falls back to cold FC) rather than raise.
     assert select_snapshot_runtime(cfg=cfg, require_available=False) is None
+
+
+def test_spawn_refuses_to_build_inline(tmp_path):
+    """A synchronous build on spawn blocks the pool's ONLY maintenance thread.
+
+    prepare() and the pool's generation fence are both check-then-act against a job thread that
+    can invalidate in the window before spawn() runs, and build() then takes a full base boot plus
+    readiness timeout with promotion, health checks and deferred reaping stalled behind it. No
+    lock discipline in the pool can close that window from the outside — the runtime has to
+    refuse, and report CAPACITY so it never touches the restore-failure streak.
+    """
+    from blastbox.host.pool import RuntimeAtCapacity
+
+    class _AsyncManager(FakeManager):
+        def __init__(self, base):
+            super().__init__(base)
+            self.kicked = 0
+            self._built = False
+
+        def is_built(self):
+            return self._built
+
+        def ensure_build_started(self):
+            self.kicked += 1
+
+        def acquire_built(self):
+            # The manager's ATOMIC seam: hand back the artifact, or refuse and kick the async
+            # build -- never build inline on the caller's thread.
+            from blastbox.host.runtime.fc_snapshot import SnapshotBuildInvalidated
+
+            if self._built:
+                return object()
+            self.ensure_build_started()
+            raise SnapshotBuildInvalidated("not built")
+
+    mgr = _AsyncManager(tmp_path)
+    rt = SnapshotSlotRuntime(FakeCfg(), mgr, settle_s=0.0)
+
+    with pytest.raises(RuntimeAtCapacity):
+        rt.spawn()
+    assert mgr.kicked == 1, "the async build must still be kicked"
+    assert mgr.builds == 0, "spawn built INLINE — that is the stall this exists to prevent"
+    assert mgr.restored == []
+
+    # Once the artifact exists, spawn proceeds normally.
+    mgr._built = True
+    slot = rt.spawn()
+    assert mgr.restored == [slot.slot_id]

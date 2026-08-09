@@ -17,6 +17,7 @@ Fail-closed: ``available()`` returns False unless at least one configured box an
 from __future__ import annotations
 
 import itertools
+import contextlib
 import logging
 import threading
 import time
@@ -24,14 +25,25 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from blastbox.host.pool import SlotState
+from blastbox.host.pool import RuntimeAtCapacity, SlotState
 from blastbox.host.runtime.aws_worker import _MIN_PROBE_S, HttpProbe, _default_http_probe
 
 _log = logging.getLogger("blastbox.host.runtime.static_pool")
 
 
-class StaticPoolExhausted(RuntimeError):
-    """All registered workers are already claimed (pool ceiling exceeds the fleet size)."""
+class StaticPoolExhausted(RuntimeAtCapacity):
+    """All registered workers are already CLAIMED (pool ceiling exceeds the fleet size).
+
+    Routine backpressure. See StaticPoolUnhealthy for the case where workers are free but none
+    of them is healthy -- conflating the two hides a dead fleet behind a "we're busy" counter."""
+
+
+class StaticPoolUnhealthy(RuntimeError):
+    """Free workers exist but NONE passed its health probe -- the fleet is broken, not busy.
+
+    Deliberately NOT a RuntimeAtCapacity: as capacity this is logged at debug and counted on the
+    capacity-miss meter, so a fleet-wide agent death would be indistinguishable from saturation
+    and the only symptom would be a sagging warm-hit rate."""
 
 
 class StaticPoolUnavailable(RuntimeError):
@@ -173,6 +185,7 @@ class StaticPoolRuntime:
         self._ids = _Counter()
         # worker_index -> monotonic time until which a DIRTY-released box stays quarantined (a stale,
         # possibly-still-running request must be given time to drain before the box is re-offered).
+        self._burned_out: set[int] = set()   # boxes the pool convicted; never re-offered
         self._cooldown_until: dict[int, float] = {}
         self._dirty_cooldown_s = cfg.dirty_cooldown_s
 
@@ -217,6 +230,20 @@ class StaticPoolRuntime:
         return any(self._health_ok(w) is True for w in self.cfg.workers)
 
     # -- SlotRuntime protocol ----------------------------------------------
+    def worker_identity(self, slot: object) -> str | None:
+        """The PHYSICAL box behind this slot, so failure history follows the worker.
+
+        Every spawn() hands a fresh slot_id to the same registered box and reap() just returns it
+        to the free list, so per-slot bookkeeping resets on each job: a static worker's counter
+        reached one, the slot was removed, its history erased, and the next request to the same
+        endpoint started from zero -- the default threshold of two was unreachable no matter how
+        many correctly-attributed transport failures that box produced. A static tier has no
+        snapshot base to invalidate either, so burnout is the only protection it has
+        (upstream, PR #82).
+        """
+        idx = getattr(slot, "worker_index", None)
+        return None if idx is None else f"static:{idx}"
+
     def spawn(self) -> StaticWorkerSlot:
         with self._lock:
             candidates = list(self._free)
@@ -228,6 +255,12 @@ class StaticPoolRuntime:
         # claim the first free box that actually answers /healthz -- don't hand out a dead one
         # (probe outside the lock; re-check under it in case another thread claimed it meanwhile).
         now = self._clock()
+        # WHY each candidate was skipped decides which exception this raises, and that decides
+        # whether the pool treats the miss as backpressure or as a fault worth repairing a base
+        # over. A worker inside dirty_cooldown_s is perfectly healthy and will come back on its
+        # own -- no probe failed -- so a fleet that is merely cooling must not be reported as
+        # broken (upstream, PR #82).
+        saw_unhealthy = False
         for idx in candidates:
             with self._lock:
                 cool = self._cooldown_until.get(idx, 0.0)
@@ -235,8 +268,18 @@ class StaticPoolRuntime:
                 _log.info("static: worker[%d] cooling down (%.0fs left), skipping for this claim",
                           idx, cool - now)
                 continue
-            if self._health_ok(self.cfg.workers[idx]) is not True:
-                _log.warning("static: worker[%d] unhealthy, skipping for this claim", idx)
+            verdict = self._health_ok(self.cfg.workers[idx])
+            if verdict is not True:
+                # TRI-STATE. _health_ok returns None when this host could not even ATTEMPT the
+                # probe (EMFILE, ENOMEM, a local networking reconfiguration) -- that is a
+                # dispatcher-side outage, not a verdict on the worker. Counting it as unhealthy
+                # turns our own resource exhaustion into a tier spawn FAULT that advances rebuild
+                # streaks and can invalidate snapshot bases in a cascade: the same "a slow or
+                # erroring control plane must never read as dead" invariant as issue #77.
+                if verdict is False:
+                    saw_unhealthy = True
+                _log.warning("static: worker[%d] %s, skipping for this claim",
+                             idx, "unhealthy" if verdict is False else "health UNKNOWN")
                 continue
             with self._lock:
                 if idx not in self._free:
@@ -255,7 +298,14 @@ class StaticPoolRuntime:
             )
             _log.info("static: claimed worker[%d] %s for slot=%s", idx, self._base_url(w), slot.slot_id)
             return slot
-        raise StaticPoolExhausted("no free static worker is currently healthy")
+        if not saw_unhealthy:
+            # Every free worker was skipped ONLY for cooldown: routine backpressure, and it
+            # clears itself. Reporting a fault here would advance the pool's spawn-failure
+            # streak on every tick and could invalidate an unrelated snapshot base.
+            raise StaticPoolExhausted(
+                "all free static workers are within dirty_cooldown_s (transient)"
+            )
+        raise StaticPoolUnhealthy("no free static worker is currently healthy")
 
     def is_ready(self, slot: StaticWorkerSlot) -> bool:
         return self._health_ok(self.cfg.workers[slot.worker_index]) is True
@@ -286,6 +336,24 @@ class StaticPoolRuntime:
             return None      # no window left to ask meaningfully -> UNKNOWN, never a verdict
         return self._health_ok(w, timeout=timeout)
 
+    def burn_out(self, slot: StaticWorkerSlot) -> None:
+        """Take this physical box OUT of rotation -- the pool has convicted it.
+
+        reap() returns the same worker_index to the free list after a cooldown, so reaching the
+        burnout threshold changed nothing: an agent that still answers /healthz while every job
+        transport wedges kept receiving and failing jobs forever, with each crossing logged and
+        charged against the eviction budget for an eviction that never happened. Excluded until
+        an operator restarts the dispatcher -- a box the pool has convicted should not silently
+        re-enter service on a timer (upstream, PR #82).
+        """
+        with self._lock:
+            self._burned_out.add(slot.worker_index)
+            with contextlib.suppress(ValueError):
+                self._free.remove(slot.worker_index)
+        _log.error("static: worker[%d] BURNED OUT -- removed from rotation; %d of %d boxes remain",
+                   slot.worker_index, len(self.cfg.workers) - len(self._burned_out),
+                   len(self.cfg.workers))
+
     def reap(self, slot: StaticWorkerSlot, dirty: bool = False) -> None:
         """Return the box to the free pool (nothing is torn down). On a DIRTY release (timeout/trust-
         fail/agent error) QUARANTINE it for ``dirty_cooldown_s`` first -- a stale request may still be
@@ -297,7 +365,8 @@ class StaticPoolRuntime:
                 self._cooldown_until[slot.worker_index] = self._clock() + self._dirty_cooldown_s
             else:
                 self._cooldown_until.pop(slot.worker_index, None)   # clean release clears any cooldown
-            if slot.worker_index not in self._free:
+            if (slot.worker_index not in self._free
+                    and slot.worker_index not in self._burned_out):
                 self._free.append(slot.worker_index)
         _log.info("static: released worker[%d] from slot=%s (dirty=%s)",
                   slot.worker_index, slot.slot_id, dirty)

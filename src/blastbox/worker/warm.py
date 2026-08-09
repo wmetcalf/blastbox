@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from blastbox.errors import HOST_RESOURCE_ERRNOS
 from blastbox.errors import WarmTimeout
 from blastbox.limits import Limits
 from blastbox.worker.harness import run_detonation
@@ -332,8 +333,20 @@ class HostWarmControl:
                 return raw.decode("utf-8", "replace").strip()
             except FileNotFoundError:
                 pass  # not signalled yet → keep polling
-            except (OSError, ValueError) as exc:
+            except ValueError as exc:
+                # The worker wrote something unreadable: a verdict about IT.
                 raise WarmTimeout(f"invalid done file: {exc}") from exc
+            except OSError as exc:
+                # EMFILE/EIO/ENOMEM reading ctrl/done is THIS HOST failing, and the dispatcher
+                # convicts on WarmTimeout -- flag those so a host-side failure is not charged to a
+                # worker that may have completed perfectly. But ctrl/ is WORKER-WRITABLE (the
+                # gVisor tier bind-mounts it 0o777), so a worker-created symlink or non-directory
+                # at `done` raises ELOOP/ENOTDIR from the confinement check: a concrete violation,
+                # and flagging it host_io meant repeated ones never advanced burnout (PR #82).
+                err = WarmTimeout(f"could not read done file: {exc}")
+                if exc.errno in HOST_RESOURCE_ERRNOS:
+                    err.host_io = True  # type: ignore[attr-defined]
+                raise err from exc
 
             if time.monotonic() >= deadline:
                 raise WarmTimeout(

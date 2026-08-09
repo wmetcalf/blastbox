@@ -1,7 +1,10 @@
 import json
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
+
+from blastbox.host.runtime.fc_snapshot import SnapshotError
 
 from blastbox.host.runtime.gvisor_snapshot_runtime import (
     GvisorHostWarmControl,
@@ -366,3 +369,144 @@ def test_secure_snapshot_base_refuses_symlink(tmp_path):
         _secure_snapshot_base(link)
     # The victim's perms must be untouched (no fchmod-through-symlink).
     assert (victim.stat().st_mode & 0o777) == 0o755
+
+
+def test_reap_releases_the_slots_generation_pin(tmp_path):
+    """The gVisor reap must drop its pin, exactly as the FC one does.
+
+    Nothing covered this, which is how a botched edit could move the release out of reap() (or
+    look as though it had) without a single test noticing. It is also the only thing that lets a
+    superseded gVisor checkpoint be reclaimed once its last sandbox is gone.
+    """
+    released: list[str] = []
+
+    class _Mgr:
+        def release(self, slot_id):
+            released.append(slot_id)
+
+        def invalidate(self):
+            return True
+
+    rt = GvisorSnapshotSlotRuntime(_Mgr(), settle_s=0.0)
+
+    out = tmp_path / "slot" / "out"
+    out.mkdir(parents=True)
+
+    class _Slot:
+        slot_id = "s1"
+        output_dir = str(out)
+
+    rt.reap(_Slot())
+
+    assert released == ["s1"], (
+        f"reap did not release the slot's generation pin (got {released}) — superseded "
+        "checkpoints would accumulate until the filesystem fills"
+    )
+
+
+def test_the_module_imports_cleanly():
+    """A guard against exactly the failure mode the reviewer suspected.
+
+    An edit that lands a statement at class scope makes this module raise NameError on import, so
+    BLASTBOX_POOL_RUNTIME=gvisor (and any cascade containing it) fails before a runtime can even
+    be selected. Cheap to assert, and nothing else in the suite imports this module directly.
+    """
+    import importlib
+
+    mod = importlib.import_module("blastbox.host.runtime.gvisor_snapshot_runtime")
+    assert hasattr(mod, "GvisorSnapshotSlotRuntime")
+
+
+def test_reap_retains_the_generation_when_the_sandbox_cannot_be_killed(tmp_path):
+    """Found by sweeping every generation-release site, not by a report.
+
+    The FC reap, the FC spawn-cleanup and both FC restore-cleanup paths all refuse to release a
+    pin when the process cannot be confirmed gone; this one released unconditionally. Removing a
+    checkpoint a live sandbox is still restoring from breaks it, while retaining one costs disk.
+    """
+    released: list[str] = []
+
+    class _Mgr:
+        def release(self, slot_id):
+            released.append(slot_id)
+
+        def invalidate(self):
+            return True
+
+    class _UnkillableHandle:
+        def kill(self):
+            raise RuntimeError("runsc delete failed; the sandbox may still be running")
+
+    rt = GvisorSnapshotSlotRuntime(_Mgr(), settle_s=0.0)
+    out = tmp_path / "slot" / "out"
+    out.mkdir(parents=True)
+
+    class _Slot:
+        slot_id = "s1"
+        output_dir = str(out)
+
+    slot = _Slot()
+    rt._handles[slot.slot_id] = _UnkillableHandle()   # type: ignore[index]
+    # ...and it must PROPAGATE: returning normally told the pool the disposal succeeded, so the
+    # slot was removed and replaced while a possibly-live sandbox held its pin outside pool
+    # accounting. Raising quarantines the slot instead.
+    with pytest.raises(SnapshotError):
+        rt.reap(slot)
+
+    assert released == [], (
+        "the generation pin was released while the sandbox could not be confirmed gone"
+    )
+    assert slot.slot_id in rt._handles, (
+        "the handle was dropped, so nothing can ever try to kill this sandbox again"
+    )
+
+
+def test_spawn_refuses_to_build_inline(tmp_path):
+    """The FC sibling's rule, in its twin: a synchronous build on spawn blocks the pool's only
+    maintenance thread for a full boot plus readiness timeout."""
+    from blastbox.host.pool import RuntimeAtCapacity
+
+    class _AsyncMgr:
+        def __init__(self):
+            self.kicked = 0
+            self.builds = 0
+            self.restored: list[str] = []
+            self._built = False
+
+        def is_built(self):
+            return self._built
+
+        def ensure_build_started(self):
+            self.kicked += 1
+
+        def acquire_built(self):
+            # The manager's ATOMIC seam: hand back the artifact, or refuse and kick the async
+            # build -- never build inline on the caller's thread.
+            from blastbox.host.runtime.fc_snapshot import SnapshotBuildInvalidated
+
+            if self._built:
+                return object()
+            self.ensure_build_started()
+            raise SnapshotBuildInvalidated("not built")
+
+        def build(self):
+            self.builds += 1
+
+        def restore(self, slot_id):
+            self.restored.append(str(slot_id))
+            wd = tmp_path / "slots" / str(slot_id)
+            (wd / "ctrl").mkdir(parents=True, exist_ok=True)
+            return SimpleNamespace(slot_workdir=wd, kill=lambda: None)
+
+    mgr = _AsyncMgr()
+    rt = GvisorSnapshotSlotRuntime(mgr, settle_s=0.0)
+
+    with pytest.raises(RuntimeAtCapacity):
+        rt.spawn()
+    assert mgr.kicked == 1 and mgr.builds == 0 and mgr.restored == [], (
+        "spawn built INLINE — that is the stall this exists to prevent"
+    )
+
+    mgr._built = True
+    slot = rt.spawn()
+    assert mgr.restored == [slot.slot_id]

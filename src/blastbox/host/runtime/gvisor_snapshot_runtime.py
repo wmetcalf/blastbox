@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable
 
 from blastbox.host.pool import Slot, SlotState
+from blastbox.host.runtime.fc_snapshot import SnapshotError
 
 _log = logging.getLogger(__name__)
 
@@ -52,7 +53,17 @@ class GvisorSnapshotSlotRuntime:
         return True  # a manager without the async seam (test double) is always ready
 
     def spawn(self) -> Slot:
-        self._mgr.build()  # idempotent: snapshot built on first spawn only (instant once built)
+        # NEVER build INLINE -- see the FC sibling. A job thread can invalidate between the pool's
+        # generation check and this call, and a synchronous build then blocks the pool's only
+        # maintenance thread for a full boot plus readiness timeout (upstream, PR #82).
+        # ATOMIC against invalidate(): asking "is it built?" and then building is a
+        # check-then-act, and a job thread invalidating in that gap sends build() down the full
+        # synchronous boot on the pool's only maintenance thread (upstream, PR #82).
+        _acquire = getattr(self._mgr, "acquire_built", None)
+        if callable(_acquire):
+            _acquire()
+        else:
+            self._mgr.build()   # a manager without the seam (a test double)
         slot_id = str(uuid.uuid4())
         handle = self._mgr.restore(slot_id)
         wd = Path(handle.slot_workdir)  # type: ignore[attr-defined]
@@ -97,20 +108,65 @@ class GvisorSnapshotSlotRuntime:
         alive = getattr(handle, "alive", None)
         return alive() if callable(alive) else True
 
+    def invalidate_base(self) -> None:
+        """Drop the persisted warm snapshot so the next spawn rebuilds it.
+
+        The FC snapshot runtime has had this since the wedge work landed; this one did not, so the
+        pool's lookup always failed here and sustained failures merely logged
+        pool.base_rebuild_unavailable while every replacement kept restoring the poisoned snapshot
+        until a dispatcher restart (upstream, PR #82). Same SnapshotManager underneath."""
+        drop = getattr(self._mgr, "invalidate", None)
+        if callable(drop):
+            drop()
+
     def reap(self, slot: Slot) -> None:
         with self._lock:
             handle = self._handles.pop(slot.slot_id, None)
             self._restored_at.pop(slot.slot_id, None)
+        sandbox_gone = True
         if handle is not None:
             try:
                 handle.kill()  # type: ignore[attr-defined]
             except Exception as exc:  # noqa: BLE001 — reap must never raise
+                # The sandbox may still be RUNNING and still reading this checkpoint directory.
+                sandbox_gone = False
                 _log.warning("gvisor_snapshot.reap_kill_error slot_id=%s: %s", slot.slot_id, exc)
         slot_workdir = Path(slot.output_dir).parent
         if slot_workdir.exists():
             shutil.rmtree(slot_workdir, ignore_errors=True)
 
+        # Mirror the FC runtime: drop this slot's pin so a superseded generation can be
+        # reclaimed once its last user is gone -- but ONLY once the sandbox is provably gone.
+        # Found by sweeping every generation-release site rather than by a report: the FC reap,
+        # the FC spawn-cleanup and both FC restore-cleanup paths all carry this guard, and this
+        # one did not. Retaining a checkpoint costs disk; removing one a live sandbox is still
+        # restoring from breaks it (PR #82).
+        release = getattr(self._mgr, "release", None)
+        if callable(release):
+            if sandbox_gone:
+                release(slot.slot_id)
+            else:
+                _log.warning(
+                    "gvisor_snapshot.generation_retained slot_id=%s: could not confirm the "
+                    "sandbox is gone, so its checkpoint generation is kept", slot.slot_id,
+                )
+        if not sandbox_gone:
+            # PROPAGATE, and put the handle back -- the same hole as the FC reap, in its twin.
+            # Retaining the pin protects the checkpoint files, but returning NORMALLY told the
+            # pool the disposal succeeded, so it removed the slot and allowed a replacement while
+            # a live sandbox and its permanent pin sat outside pool accounting: untracked, never
+            # retried, holding its generation until the process restarts. Raising quarantines the
+            # slot (kept tracked, DRAINING, never reused), which is what an unconfirmed teardown
+            # actually means (upstream, PR #82).
+            with self._lock:
+                self._handles.setdefault(slot.slot_id, handle)
+            raise SnapshotError(
+                f"could not confirm the gVisor sandbox for slot {slot.slot_id} is gone; "
+                f"quarantining the slot rather than replacing it"
+            )
+
     # --- warm-path seam (file-trigger control; output already on the bind mount) ---
+
     def host_warm_control(self, slot: Slot) -> GvisorHostWarmControl:
         return GvisorHostWarmControl(slot.control_dir)
 

@@ -22,12 +22,15 @@ snapshot→restore→convert round-trip is pixel-identical to cold (see the spec
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from blastbox.host.runtime.fc_snapshot import SnapshotBuildError, SnapshotRestoreError
+
+_log = logging.getLogger("blastbox.host.runtime.fc_snapshot_backend")
 
 # RAM-preload toggle (see resolve_mem_dir). Default tmpfs mount on Linux.
 _DEFAULT_TMPFS_MEM_DIR = Path("/dev/shm")
@@ -66,6 +69,7 @@ def resolve_mem_dir() -> Path | None:
 
 
 @runtime_checkable
+
 class FcApi(Protocol):
     """The subset of the Firecracker API client the orchestration uses."""
 
@@ -129,6 +133,13 @@ class FcSnapshotArtifact:
 
     snapshot_path: Path
     mem_path: Path
+    # The snapshot-time ext4 image, versioned WITH the pair above. The guest's ext4 metadata
+    # (superblock, journal, dir checksums) lives in the captured guest RAM, so the disk and the
+    # memory snapshot are one unit: restoring generation N's memory against generation N+1's disk
+    # gives "EXT4-fs error: Directory block failed checksum". Leaving this at a fixed base path
+    # while stamping the other two meant a rebuild could rewrite it under an in-flight restore --
+    # the exact corruption the stamping was introduced to prevent (upstream, PR #82).
+    outdisk_path: Path | None = None
 
 
 class FcSnapshotBackend:
@@ -141,6 +152,45 @@ class FcSnapshotBackend:
     handle (it needs the launcher's mem-dir), so this backend's role on the build
     side is simply to hand the boot handle back to the manager.
     """
+
+    def sweep_orphan_generations(self) -> int:
+        """Delegate to the launcher, which owns the on-disk layout."""
+        sweep = getattr(self._launcher, "sweep_orphan_generations", None)
+        return sweep() if callable(sweep) else 0
+
+    def discard(self, artifact: object) -> None:
+        """Unlink a fully drained generation's files.
+
+        Only ever called once the manager's refcount for this artifact reaches zero, i.e. no
+        live microVM still maps the memory file. Unlinking one that is still mapped would
+        SIGBUS or silently corrupt the VMs using it.
+        """
+        # Attribute access, NOT getattr-with-default. The first version of this read
+        # `artifact.snapshot` / `artifact.mem` -- fields that do not exist on
+        # FcSnapshotArtifact (they are snapshot_path / mem_path) -- so both lookups returned
+        # None, every file was skipped, and the whole reclamation was a silent no-op in
+        # production while its tests passed against a fake that had invented the same wrong
+        # names. A getattr default turns "this type changed" into "quietly leak gigabytes";
+        # an AttributeError turns it into a test failure. Prefer the crash.
+        if not isinstance(artifact, FcSnapshotArtifact):
+            _log.warning("fc_snapshot: refusing to discard unknown artifact type %r",
+                         type(artifact).__name__)
+            return
+        failed: list[str] = []
+        for path in (artifact.snapshot_path, artifact.mem_path, artifact.outdisk_path):
+            if path is None:
+                continue
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError as exc:
+                # PROPAGATE. SnapshotManager._discard treats a normal return as CONFIRMED cleanup
+                # and drops the artifact from _retired, so swallowing a transient EIO/EROFS here
+                # meant these files were never retried -- the retryable-retirement machinery was
+                # defeated by the one place that decides whether cleanup happened (PR #82).
+                failed.append(f"{path}: {exc}")
+                _log.warning("fc_snapshot: could not unlink %s: %s", path, exc)
+        if failed:
+            raise OSError("could not unlink generation files: " + "; ".join(failed))
 
     def __init__(
         self,
@@ -199,13 +249,24 @@ class FcSnapshotBackend:
                 f"FcSnapshotBackend.restore_in expected FcSnapshotArtifact, "
                 f"got {type(artifact).__name__}"
             )
-        handle = self._launcher.restore_in(slot_workdir)
+        handle = self._launcher.restore_in(slot_workdir, outdisk_src=artifact.outdisk_path)
         try:
             _restore_from_snapshot(
                 handle.api, str(artifact.snapshot_path), str(artifact.mem_path)
             )
-        except Exception:
-            # Don't leak the spawned firecracker if load/resume fails.
-            handle.kill()
+        except BaseException as exc:
+            # BaseException, not Exception: a KeyboardInterrupt, SystemExit or task cancellation
+            # landing after the spawn skipped this cleanup entirely, leaving an unmanaged
+            # firecracker running with the memory file mapped -- and the manager then unpinned the
+            # generation, so a later invalidation could unlink it underneath (PR #82).
+            try:
+                handle.kill()
+            except Exception as kill_exc:  # noqa: BLE001
+                # The process may STILL BE ALIVE with the memory file mapped. Flag it so the
+                # manager retains this generation's pin: a later invalidation must not unlink
+                # files a live firecracker is still using (PR #82).
+                _log.warning("fc_snapshot: could not kill firecracker after a failed restore: %s",
+                             kill_exc)
+                exc.kill_failed = True  # type: ignore[attr-defined]
             raise
         return handle

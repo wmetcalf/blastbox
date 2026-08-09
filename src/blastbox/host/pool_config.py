@@ -44,6 +44,25 @@ class PoolConfig:
     # Warm-snapshot tier (firecracker only): spawn = restore-from-warm-snapshot
     # instead of cold-boot. Opt-in; default OFF (cold FC boot per slot).
     warm_snapshot: bool = False
+    # --- safety controls -------------------------------------------------------------------
+    # These decide when the pool evicts a slot or destroys and rebuilds a snapshot base. They
+    # were reachable only from the constructor, so an env-configured deployment (which is every
+    # production one) could not tune them -- and could not use the documented
+    # snapshot_rebuild_after=0 escape hatch to disable automatic base invalidation at all.
+    # None everywhere means "not configured — let WarmPool's own default stand". Copying the
+    # literals here is what created the last bug: this field said 3 while WarmPool said 2, so
+    # every env-configured deployment silently sent a third job to a repeatedly failing slot
+    # while the comment claimed the defaults matched. A sentinel cannot drift.
+    max_consecutive_failures: int | None = None
+    # 0 disables automatic base invalidation entirely; None derives 2*warm_size.
+    snapshot_rebuild_after: int | None = None
+    # None derives max(2, warm_size).
+    max_evictions_per_window: int | None = None
+    # How long a slot may stay CONTINUOUSLY unknown before it can be replaced; 0 disables.
+    unknown_grace_s: float | None = None
+    # How long the pool may be unable to spawn for capacity reasons before that is an outage
+    # rather than backpressure; 0 disables the alert.
+    capacity_starved_after_s: float | None = None
 
     @classmethod
     def from_env(cls, **overrides: object) -> "PoolConfig":
@@ -71,7 +90,37 @@ class PoolConfig:
                 return default
             return raw not in ("0", "false", "no", "off")
 
+        def _opt_int(key: str, default: int | None) -> int | None:
+            """None means "derive from warm_size"; an explicit 0 must survive as 0, so this
+            cannot use the falsy-means-default shortcut."""
+            raw = os.environ.get(key, "").strip()
+            if not raw:
+                return default
+            try:
+                return int(raw)
+            except ValueError as exc:
+                raise ValueError(f"invalid integer for {key}={raw!r}: {exc}") from exc
+
+        def _opt_float(key: str, default: float | None) -> float | None:
+            raw = os.environ.get(key, "").strip()
+            if not raw:
+                return default
+            try:
+                return float(raw)
+            except ValueError as exc:
+                raise ValueError(f"invalid float for {key}={raw!r}: {exc}") from exc
+
         values: dict[str, object] = {
+            "max_consecutive_failures": _opt_int(
+                "BLASTBOX_POOL_MAX_CONSECUTIVE_FAILURES", cls.max_consecutive_failures),
+            "snapshot_rebuild_after": _opt_int(
+                "BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", cls.snapshot_rebuild_after),
+            "max_evictions_per_window": _opt_int(
+                "BLASTBOX_POOL_MAX_EVICTIONS_PER_WINDOW", cls.max_evictions_per_window),
+            "unknown_grace_s": _opt_float(
+                "BLASTBOX_POOL_UNKNOWN_GRACE_S", cls.unknown_grace_s),
+            "capacity_starved_after_s": _opt_float(
+                "BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S", cls.capacity_starved_after_s),
             "runtime": os.environ.get("BLASTBOX_POOL_RUNTIME", cls.runtime).strip().lower(),
             "warm_size": _int("BLASTBOX_POOL_WARM_SIZE", cls.warm_size),
             "concurrent_ceiling": _int("BLASTBOX_POOL_CEILING", cls.concurrent_ceiling),
@@ -129,6 +178,33 @@ def select_runtime_by_name(
     raise ValueError(f"unknown pool runtime: {name!r}")
 
 
+def _resolved_rebuild_after(cfg: PoolConfig) -> int:
+    """The rebuild threshold BOTH the pool and its cascade must use.
+
+    None means "derive from the feasible warm size" -- the same formula WarmPool applies -- not
+    "let each consumer pick its own default".
+    """
+    if cfg.snapshot_rebuild_after is not None:
+        return max(0, int(cfg.snapshot_rebuild_after))
+    feasible = min(cfg.warm_size, cfg.concurrent_ceiling)
+    return max(4, 2 * max(1, feasible))
+
+
+def _configured_only(cfg: PoolConfig) -> dict[str, Any]:
+    """Only the knobs the operator actually set.
+
+    An unset knob must not be forwarded at all: copying WarmPool's default into this config is
+    exactly how the two drifted once already (config said 3, the pool said 2, and every
+    env-configured deployment silently changed behaviour while a comment claimed they matched).
+    """
+    candidates: dict[str, Any] = {
+        "max_consecutive_failures": cfg.max_consecutive_failures,
+        "unknown_grace_s": cfg.unknown_grace_s,
+        "capacity_starved_after_s": cfg.capacity_starved_after_s,
+    }
+    return {k: v for k, v in candidates.items() if v is not None}
+
+
 def build_warm_pool(
     cfg: PoolConfig | None = None,
     *,
@@ -152,11 +228,52 @@ def build_warm_pool(
         if cfg.runtime == RUNTIME_CASCADE:
             from blastbox.host.runtime.cascade import build_cascade_runtime
 
-            runtime = build_cascade_runtime(warm_snapshot=cfg.warm_snapshot)
+            # Pass the RESOLVED value, not "let it re-read the environment". A caller using
+            # PoolConfig.from_env(snapshot_rebuild_after=0) — the supported override — or
+            # constructing a PoolConfig directly would otherwise have the outer pool honour 0
+            # while per-tier repair silently fell back to its own default and kept invalidating
+            # bases (upstream, PR #82).
+            runtime = build_cascade_runtime(
+                warm_snapshot=cfg.warm_snapshot,
+                # DERIVE it here rather than forwarding None. build_cascade_runtime
+                # substitutes a fixed 4, while WarmPool derives max(4, 2*warm_size) -- so on the
+                # documented default (nothing configured) a cascade with warm_size > 2
+                # invalidated tier bases far earlier than the pool-wide policy it is supposed to
+                # follow. One resolved value, both paths (upstream, PR #82).
+                tier_rebuild_after=_resolved_rebuild_after(cfg),
+                # ...and say whether that number was DERIVED. Resolving it to an int made the
+                # cascade record it as explicit, so _retune_runtime_thresholds refused to update
+                # it: an autosized cascade resizing 4 -> 16 moved the pool to 32 while per-tier
+                # repair stayed pinned at 8, invalidating healthy tier bases far earlier than the
+                # documented live-size policy. Two of my own fixes cancelling out (PR #82).
+                tier_rebuild_after_explicit=cfg.snapshot_rebuild_after is not None,
+            )
         else:
             runtime = select_runtime_by_name(cfg.runtime, warm_snapshot=cfg.warm_snapshot)
 
     assert runtime is not None  # narrowed: every branch above returned/raised/assigned
+    # The per-tier repair threshold is a property of the RUNTIME, not of how it was obtained, so
+    # apply the config to an INJECTED one too. The block above only reaches a cascade this
+    # function built; a caller using the supported runtime= injection with a CascadingRuntime kept
+    # the cascade's own default of 4. That is not merely drift: an explicit cfg value makes
+    # WarmPool record its own threshold as explicit, and _retune_runtime_thresholds then declines
+    # to push anything down -- so PoolConfig(snapshot_rebuild_after=0), the documented incident
+    # escape hatch, disabled pool-wide invalidation while the injected cascade went on
+    # invalidating tier bases every four spawn failures. The hatch has to close EVERY rebuild
+    # path (upstream, PR #82).
+    if hasattr(runtime, "tier_rebuild_after"):
+        _explicit = cfg.snapshot_rebuild_after is not None
+        # An operator's value always wins. With nothing configured the number is DERIVED, and a
+        # runtime the caller deliberately pinned keeps its own -- the same precedence the pool
+        # applies to itself, rather than stomping an injected object's configuration.
+        if _explicit or not getattr(runtime, "tier_rebuild_after_explicit", False):
+            try:
+                # setattr, not attribute syntax: this is an OPTIONAL runtime seam (only a cascade
+                # carries it today), so the SlotRuntime protocol deliberately does not declare it.
+                setattr(runtime, "tier_rebuild_after", _resolved_rebuild_after(cfg))  # noqa: B010
+                setattr(runtime, "tier_rebuild_after_explicit", _explicit)            # noqa: B010
+            except Exception as exc:  # noqa: BLE001 -- a read-only knob must not fail pool build
+                _log.warning("pool_config.tier_rebuild_after_not_applied: %s", exc)
     # A slow-booting runtime (aws-ec2 first boot commonly >120s) declares its own readiness budget.
     # If the operator DIDN'T explicitly set the pool warming timeout, raise it to that budget so a
     # healthy-but-slow cloud slot isn't evicted + churned. An explicit env value always wins.
@@ -170,6 +287,13 @@ def build_warm_pool(
         concurrent_ceiling=cfg.concurrent_ceiling,
         spawn_rate_limit=cfg.spawn_rate_limit,
         burst_size=cfg.burst_size,
+        # snapshot_rebuild_after / max_evictions_per_window take None natively (it means
+        # "derive from warm_size"), so they always forward. The rest use None as "unset", and an
+        # unset knob must not be forwarded at all -- passing a copied literal is exactly how this
+        # config drifted from the pool's own default once already.
+        snapshot_rebuild_after=cfg.snapshot_rebuild_after,
+        max_evictions_per_window=cfg.max_evictions_per_window,
+        **_configured_only(cfg),
     )
     _log.info(
         "warm_pool_built runtime=%s warm_size=%d ceiling=%d warm_snapshot=%s",

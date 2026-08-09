@@ -398,3 +398,157 @@ def test_build_image_needs_recipe():
     spec = VmWorkerSpec(name="x", image=VmImageSpec(golden="/no/such.qcow2", builder="qemu"))
     with pytest.raises(ValueError):  # qemu builder with no base_qcow2
         spec.build_image()
+
+
+class _FaultPool(_FakePool):
+    """A pool whose release() ACCEPTS attribution (the current WarmPool shape)."""
+
+    def __init__(self, slot=None) -> None:
+        super().__init__(slot)
+        self.faults: list[str | None] = []
+
+    def release(self, slot, *, dirty=False, fault=None):
+        self.released.append(dirty)
+        self.faults.append(fault)
+
+
+def test_a_transport_failure_convicts_the_worker():
+    """Releasing dirty with no fault leaves it 'unknown' — force-recycled, streak unmoved.
+
+    A broken VM agent that fails every request was therefore snapshot-reverted and offered again
+    indefinitely, never reaching burnout protection or a base rebuild.
+    """
+    import ssl
+
+    pool = _FaultPool()
+
+    def unreachable(slot, p):
+        raise ssl.SSLError("worker TLS stack is broken")
+
+    with pytest.raises(ssl.SSLError):
+        slot_bound_validate(pool, unreachable)("/in")
+    assert pool.released == [True]
+    assert pool.faults == ["worker"], (
+        "a transport failure is positive evidence the WORKER misbehaved; without it the wedge "
+        "never advances toward eviction"
+    )
+
+
+def test_an_engine_verdict_on_the_sample_is_not_a_worker_fault():
+    """ok=False means the engine RAN and judged the input.
+
+    Convicting the worker there would burn out healthy slots on a run of malformed samples -- and
+    leaving it UNATTRIBUTED is not enough either: unknown preserves both streaks, so a transport
+    failure on either side of a successful run counted as consecutive. A completed run is
+    positive proof the VM is responsive, so it must RESET them.
+    """
+    pool = _FaultPool()
+    assert slot_bound_validate(pool, lambda slot, p: ({}, False))("/in") == ({}, False)
+    assert pool.released == [True] and pool.faults == ["job"]
+
+
+def test_an_ambiguous_exception_stays_unattributed():
+    """Positive-evidence conviction: anything that isn't demonstrably the worker fails OPEN."""
+    pool = _FaultPool()
+
+    def boom(slot, p):
+        raise ValueError("engine could not parse this sample")
+
+    with pytest.raises(ValueError):
+        slot_bound_validate(pool, boom)("/in")
+    assert pool.released == [True] and pool.faults == [None]
+
+
+def test_attribution_degrades_on_a_pool_that_predates_it():
+    """_FakePool.release() takes no fault=; the seam must drop it, not raise TypeError and leak
+    the slot (that ladder-of-except-TypeError bug is why release_kwargs exists)."""
+    import ssl
+
+    pool = _FakePool()
+
+    def unreachable(slot, p):
+        raise ssl.SSLError("broken")
+
+    with pytest.raises(ssl.SSLError):
+        slot_bound_validate(pool, unreachable)("/in")
+    assert pool.released == [True]        # still released, just unattributed
+
+
+def test_an_http_rejection_is_not_a_worker_fault():
+    """HTTPError subclasses URLError, so a 4xx looked identical to an unreachable box.
+
+    The remote_http transport learned that 413 (sample over the agent's own max_bytes), 401/403
+    (token skew) and 404 (version skew) are verdicts on the REQUEST — and fail identically on
+    every box. Its sibling here did not, so repeated rejections advanced burnout and base
+    rebuilding against perfectly healthy slots.
+    """
+    import io as _io
+    import urllib.error
+
+    for code in (400, 401, 403, 404, 413, 422):
+        pool = _FaultPool()
+
+        def rejected(slot, p, _c=code):
+            raise urllib.error.HTTPError("https://vm.invalid/x", _c, "rejected", {},
+                                         _io.BytesIO(b"{}"))
+
+        with pytest.raises(urllib.error.HTTPError):
+            slot_bound_validate(pool, rejected)("/in")
+        assert pool.faults == ["job"], (
+            f"HTTP {code} must RESET the streaks, not merely avoid incrementing them: the agent "
+            f"answered, so it and its base are demonstrably responsive (got {pool.faults})"
+        )
+
+
+def test_a_5xx_from_the_vm_agent_is_still_a_worker_fault():
+    """The carve-out stays narrow: the agent itself breaking IS about this box."""
+    import io as _io
+    import urllib.error
+
+    for code in (500, 502, 503):
+        pool = _FaultPool()
+
+        def broken(slot, p, _c=code):
+            raise urllib.error.HTTPError("https://vm.invalid/x", _c, "boom", {},
+                                         _io.BytesIO(b"{}"))
+
+        with pytest.raises(urllib.error.HTTPError):
+            slot_bound_validate(pool, broken)("/in")
+        assert pool.faults == ["worker"], f"HTTP {code} is the agent failing, not our request"
+
+
+def test_a_hung_agent_is_attributed_even_though_the_slot_is_retired():
+    """The work thread is still alive after work_timeout_s — a wedged VM agent.
+
+    Retiring recorded nothing, so if every VM restored from a poisoned snapshot hangs, each is
+    destroyed and replaced from that SAME snapshot forever and the base-rebuild protection is
+    never reached. The hard retire must stay: the abandoned thread may still be talking to this
+    VM, so it must not be recycled and re-offered.
+    """
+    import threading
+
+    class _RetirePool(_FaultPool):
+        def __init__(self) -> None:
+            super().__init__()
+            self.retire_faults: list[str | None] = []
+
+        def retire(self, slot, *, fault=None):
+            self.retired.append(slot.slot_id)
+            self.retire_faults.append(fault)
+
+    pool = _RetirePool()
+    started = threading.Event()
+
+    def hangs(slot, p):
+        started.set()
+        threading.Event().wait(5.0)        # never returns within the work timeout
+
+    with pytest.raises(TimeoutError):
+        slot_bound_validate(pool, hangs, work_timeout_s=0.05)("/in")
+
+    assert pool.retired, "sanity: the hung slot was hard-retired"
+    assert pool.retire_faults == ["worker"], (
+        f"a wedged agent recorded no evidence (got {pool.retire_faults}) -- a poisoned snapshot "
+        f"that hangs every VM would be rebuilt into forever"
+    )
+    assert pool.released == [], "a hung slot must NOT be released for reuse"

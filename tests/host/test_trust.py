@@ -584,3 +584,221 @@ def test_missing_payload_raises(tmp_path):
             engine=_ENGINE,
             limits=_limits(),
         )
+
+
+def test_a_host_io_failure_reading_metadata_is_not_a_trust_verdict(tmp_path, monkeypatch):
+    """OutputTrustError conflated "the output is bad" with "we could not read it".
+
+    An OSError here (EMFILE, EIO, ENOMEM) is this dispatcher's failure, not proof the worker
+    produced anything invalid — and a host I/O outage hits every job at once, so convicting on it
+    burns out the whole warm set. OutputTrustUnknown subclasses OutputTrustError, so the job still
+    fails closed; only the ATTRIBUTION changes.
+    """
+    from blastbox.errors import OutputTrustError, OutputTrustUnknown
+
+    out = tmp_path / "out"
+    out.mkdir()
+
+    def _boom(*a, **kw):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr("blastbox.host.trust.read_confined_regular_bytes", _boom)
+
+    with pytest.raises(OutputTrustUnknown) as ei:
+        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())
+    assert isinstance(ei.value, OutputTrustError), "must still fail the job closed"
+
+
+def test_a_malformed_metadata_file_is_still_a_trust_verdict(tmp_path, monkeypatch):
+    """The carve-out must stay narrow: a ValueError IS a verdict about the worker's output."""
+    from blastbox.errors import OutputTrustUnknown
+
+    out = tmp_path / "out"
+    out.mkdir()
+
+    def _bad(*a, **kw):
+        raise ValueError("not a regular file inside the output dir")
+
+    monkeypatch.setattr("blastbox.host.trust.read_confined_regular_bytes", _bad)
+
+    with pytest.raises(OutputTrustError) as ei:
+        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())
+    assert not isinstance(ei.value, OutputTrustUnknown), (
+        "a worker writing a non-regular file is a real verdict"
+    )
+
+
+def test_host_io_during_reseal_is_also_not_a_verdict(tmp_path, monkeypatch):
+    """The unknown classification must survive the RE-SEAL, not just the metadata read.
+
+    seal_envelope opens, stats and hashes every declared artifact, so a host-wide EMFILE/EIO
+    incident surfaces there too — and wrapping it as a plain OutputTrustError convicted every
+    worker at once, exactly what the distinction drawn one step earlier exists to prevent.
+    """
+    from blastbox.errors import OutputTrustError, OutputTrustUnknown
+
+    out, _ = _make_output_dir(tmp_path, artifact_content=b"payload")
+
+    def _boom(**kw):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr("blastbox.host.trust.seal_envelope", _boom)
+
+    with pytest.raises(OutputTrustUnknown) as ei:
+        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())
+    assert isinstance(ei.value, OutputTrustError), "must still fail the job closed"
+
+
+def test_a_genuine_reseal_violation_is_still_a_verdict(tmp_path, monkeypatch):
+    """The carve-out stays narrow: a non-OSError from the re-seal is real evidence."""
+    from blastbox.errors import OutputTrustUnknown
+
+    out, _ = _make_output_dir(tmp_path, artifact_content=b"payload")
+
+    def _bad(**kw):
+        raise ValueError("declared artifact hash mismatch")
+
+    monkeypatch.setattr("blastbox.host.trust.seal_envelope", _bad)
+
+    with pytest.raises(OutputTrustError) as ei:
+        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())
+    assert not isinstance(ei.value, OutputTrustUnknown)
+
+
+def test_a_worker_symlink_is_a_verdict_not_an_unknown(tmp_path, monkeypatch):
+    """ELOOP/ENOTDIR come from the confinement check, not from host exhaustion.
+
+    A worker that replaces metadata.json with a symlink, or puts a symlink/non-directory in the
+    path, produces those errnos — a concrete violation. Classifying them as unknown meant
+    recurring malformed output never advanced burnout, so a reusable broken worker could be
+    recycled indefinitely.
+    """
+    import errno as _errno
+
+    from blastbox.errors import OutputTrustUnknown
+
+    out, _ = _make_output_dir(tmp_path, artifact_content=b"payload")
+
+    for bad in (_errno.ELOOP, _errno.ENOTDIR):
+        def _boom(*a, _e=bad, **kw):
+            raise OSError(_e, "confinement violation")
+
+        monkeypatch.setattr("blastbox.host.trust.read_confined_regular_bytes", _boom)
+        with pytest.raises(OutputTrustError) as ei:
+            validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                                   limits=_limits())
+        assert not isinstance(ei.value, OutputTrustUnknown), (
+            f"errno {bad} is a worker confinement violation, not a host failure"
+        )
+
+    # ...and a genuine host-resource errno is still unknown.
+    def _emfile(*a, **kw):
+        raise OSError(_errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr("blastbox.host.trust.read_confined_regular_bytes", _emfile)
+    with pytest.raises(OutputTrustUnknown):
+        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())
+
+
+def test_a_host_error_wrapped_by_seal_envelope_is_still_not_a_verdict(tmp_path, monkeypatch):
+    """seal_envelope re-raises an OSError from the confinement open as ValueError.
+
+    So a host EMFILE/ENOMEM/EIO never reached the OSError handler, and the generic branch
+    convicted the worker for a host-wide incident. The classification has to look through the
+    wrapper at the cause, not trust the outer type.
+    """
+    import errno as _errno
+
+    from blastbox.errors import OutputTrustUnknown
+
+    out, _ = _make_output_dir(tmp_path, artifact_content=b"payload")
+
+    def _wrapped_host_error(**kw):
+        try:
+            raise OSError(_errno.EMFILE, "Too many open files")
+        except OSError as inner:
+            raise ValueError(f"cannot open artifact: {inner}") from inner
+
+    monkeypatch.setattr("blastbox.host.trust.seal_envelope", _wrapped_host_error)
+    with pytest.raises(OutputTrustUnknown):
+        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())
+
+
+def test_a_genuine_reseal_value_error_is_still_a_verdict(tmp_path, monkeypatch):
+    """The carve-out stays narrow: a ValueError with no host cause is real evidence."""
+    from blastbox.errors import OutputTrustUnknown
+
+    out, _ = _make_output_dir(tmp_path, artifact_content=b"payload")
+
+    def _bad(**kw):
+        raise ValueError("declared artifact hash mismatch")
+
+    monkeypatch.setattr("blastbox.host.trust.seal_envelope", _bad)
+    with pytest.raises(OutputTrustError) as ei:
+        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())
+    assert not isinstance(ei.value, OutputTrustUnknown)
+
+
+def test_a_host_error_in_the_final_caps_check_is_not_a_verdict(tmp_path, monkeypatch):
+    """The caps pass re-stats every declared artifact, so it does HOST I/O.
+
+    An EIO/EMFILE there is this dispatcher failing, not the worker declaring bad sizes — and the
+    re-seal one step earlier had already succeeded, so the worker had demonstrably produced a
+    valid envelope. Flattening it convicted a healthy worker during a host-wide storage incident.
+    """
+    import errno as _errno
+
+    from blastbox.errors import OutputTrustUnknown
+
+    out, _ = _make_output_dir(tmp_path, artifact_content=b"payload")
+
+    def _boom(*a, **kw):
+        raise OSError(_errno.EIO, "Input/output error")
+
+    monkeypatch.setattr("blastbox.host.trust.validate_envelope", _boom)
+    with pytest.raises(OutputTrustUnknown):
+        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())
+
+
+def test_a_real_caps_violation_is_still_a_verdict(tmp_path, monkeypatch):
+    """The carve-out stays narrow: a declared-size mismatch IS the worker's doing."""
+    from blastbox.errors import OutputTrustUnknown
+
+    out, _ = _make_output_dir(tmp_path, artifact_content=b"payload")
+
+    def _bad(*a, **kw):
+        raise ValueError("artifact x declared bytes=1 but on-disk size=99")
+
+    monkeypatch.setattr("blastbox.host.trust.validate_envelope", _bad)
+    with pytest.raises(OutputTrustError) as ei:
+        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())
+    assert not isinstance(ei.value, OutputTrustUnknown)
+
+
+def test_a_host_error_wrapped_by_the_caps_check_is_seen_through(tmp_path, monkeypatch):
+    """Same wrapper rule as the re-seal step: look at the cause, not the outer type."""
+    import errno as _errno
+
+    from blastbox.errors import OutputTrustUnknown
+
+    out, _ = _make_output_dir(tmp_path, artifact_content=b"payload")
+
+    def _wrapped(*a, **kw):
+        try:
+            raise OSError(_errno.EMFILE, "Too many open files")
+        except OSError as inner:
+            raise ValueError(f"caps check failed: {inner}") from inner
+
+    monkeypatch.setattr("blastbox.host.trust.validate_envelope", _wrapped)
+    with pytest.raises(OutputTrustUnknown):
+        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())

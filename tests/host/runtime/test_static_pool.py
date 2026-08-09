@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import pytest
+from types import SimpleNamespace
 
 from blastbox.host.pool import SlotRuntime
 from blastbox.host.runtime.remote_http import slot_base_url
 from blastbox.host.runtime.static_pool import (
     StaticPoolConfig,
     StaticPoolExhausted,
+    StaticPoolUnhealthy,
     StaticPoolRuntime,
     StaticPoolUnavailable,
     StaticWorker,
@@ -117,7 +119,7 @@ def test_spawn_skips_unhealthy_worker():
 
 def test_spawn_raises_when_no_free_worker_healthy():
     rt = StaticPoolRuntime(_cfg("a:8765", "b:8765"), http_probe=FakeProbe(healthy=set()))
-    with pytest.raises(StaticPoolExhausted):
+    with pytest.raises(StaticPoolUnhealthy):
         rt.spawn()
 
 
@@ -405,3 +407,289 @@ def test_static_hand_out_probe_honours_the_claim_deadline():
 
     # no window left to ask meaningfully -> UNKNOWN, never a verdict
     assert rt.is_alive_for_claim(slot, budget_s=0.0) is None
+
+
+def test_cooldown_only_misses_are_capacity_not_a_broken_fleet():
+    """A cooling worker is HEALTHY — it just is not claimable this instant.
+
+    One raise site served both "every free worker failed its probe" (the fleet is broken) and
+    "every free worker is inside dirty_cooldown_s" (routine, self-clearing). Reporting the
+    latter as a fault advances the pool's spawn-failure streak every tick and, behind a cascade,
+    can invalidate an unrelated healthy snapshot base.
+    """
+    cfg = _cfg("a:8765", "b:8765", dirty_cooldown_s=30.0)
+    rt = StaticPoolRuntime(cfg, http_probe=FakeProbe(all_ok=True))   # both answer /healthz
+    a = rt.spawn()
+    b = rt.spawn()
+    rt.reap(a, dirty=True)      # both quarantined, neither unhealthy
+    rt.reap(b, dirty=True)
+
+    with pytest.raises(StaticPoolExhausted) as ei:
+        rt.spawn()
+    assert not isinstance(ei.value, StaticPoolUnhealthy), (
+        "a cooling fleet is at capacity, not broken"
+    )
+
+
+def test_an_unknown_health_probe_is_capacity_not_a_broken_fleet():
+    """`None` from _health_ok means the probe could not be ATTEMPTED, not that the worker failed.
+
+    EMFILE, ENOMEM or a local networking reconfiguration all produce None — a dispatcher-side
+    outage. Counting it as unhealthy turns our own resource exhaustion into a tier spawn FAULT
+    that advances rebuild streaks and can invalidate snapshot bases in a cascade: the same
+    "a slow or erroring control plane must never read as dead" invariant as issue #77.
+    """
+    cfg = _cfg("a:8765", "b:8765")
+    rt = StaticPoolRuntime(cfg, http_probe=lambda *a, **kw: None)   # UNKNOWN, not False
+
+    with pytest.raises(StaticPoolExhausted) as ei:
+        rt.spawn()
+    assert not isinstance(ei.value, StaticPoolUnhealthy), (
+        "an unknown probe is not a verdict on the fleet"
+    )
+
+
+def test_a_genuinely_failing_probe_is_still_unhealthy():
+    """The carve-out must stay narrow: False is a real verdict and must keep reporting a fault."""
+    cfg = _cfg("a:8765", "b:8765")
+    rt = StaticPoolRuntime(cfg, http_probe=FakeProbe(healthy=set()))   # explicit False
+
+    with pytest.raises(StaticPoolUnhealthy):
+        rt.spawn()
+
+
+def test_a_static_workers_failures_survive_its_slot():
+    """Per-slot bookkeeping cannot burn out a REUSED box.
+
+    Every spawn() hands a fresh slot_id to the same registered worker and reap() just returns it
+    to the free list, so the counter reached one, the slot was removed, _forget_slot_health()
+    erased the history, and the next request to the same endpoint started from zero — the default
+    threshold of two was unreachable however many correctly-attributed transport failures that
+    box produced. A static tier has no snapshot base to invalidate either, so burnout is its only
+    protection.
+    """
+    from blastbox.host.pool import WarmPool
+
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"),
+                           http_probe=FakeProbe(all_ok=True))
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
+                    max_consecutive_failures=2, eviction_window_s=10_000.0,
+                    max_evictions_per_window=10)
+
+    slot1 = rt.spawn()
+    pool._slots[slot1.slot_id] = slot1
+    key1 = pool._health_key(slot1)
+    assert key1 == f"static:{slot1.worker_index}", "the physical box must be the identity"
+
+    pool.release(slot1, dirty=True, fault="worker")
+    assert pool._slot_failures.get(key1) == 1
+
+    # The slot goes away; the BOX does not.
+    pool._slots.pop(slot1.slot_id, None)
+    pool._forget_slot_health(slot1.slot_id)
+    assert pool._slot_failures.get(key1) == 1, (
+        "the box's failure history was erased with its slot, so a static worker could never "
+        "reach the burnout threshold"
+    )
+
+    # A second failure on the SAME box, through a brand-new slot, now reaches the threshold.
+    slot2 = rt.spawn()
+    slot2.worker_index = slot1.worker_index
+    pool._slots[slot2.slot_id] = slot2
+    pool.release(slot2, dirty=True, fault="worker")
+    assert pool._slot_failures.get(pool._health_key(slot2)) == 2
+
+
+def test_a_disposable_runtimes_history_is_still_dropped_with_its_slot():
+    """The carve-out stays narrow: without a stable identity the slot IS the worker, and keeping
+    its record would grow unboundedly over a long-lived dispatcher."""
+    from blastbox.host.pool import Slot, SlotState, WarmPool
+
+    from uuid import uuid4
+
+    class _Disposable:
+        def spawn(self):
+            return Slot(slot_id=str(uuid4()), control_dir="/c", input_dir="/i",
+                        output_dir="/o", state=SlotState.IDLE)
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): pass
+
+    pool = WarmPool(runtime=_Disposable(), warm_size=1, concurrent_ceiling=2)
+    slot = pool._runtime.spawn()
+    pool._slots[slot.slot_id] = slot
+    assert pool._health_key(slot) == slot.slot_id, (
+        "with no stable identity the slot IS the worker"
+    )
+
+    # A disposable runtime has no recycle(), so a dirty release reaps the slot outright and its
+    # record goes with it. Nothing may be retained under a dead slot_id: those ids are per-spawn
+    # UUIDs, so keeping them grows without bound over a long-lived dispatcher.
+    pool.release(slot, dirty=True, fault="worker")
+    pool._forget_slot_health(slot.slot_id)
+    assert slot.slot_id not in pool._slot_failures
+    assert slot.slot_id not in pool._slot_last_success
+    assert slot.slot_id not in pool._health_key_by_slot
+
+
+def test_a_static_tier_under_a_cascade_keeps_its_worker_identity():
+    """The identity hook existed only on StaticPoolRuntime and the cascade did not forward it.
+
+    In the supported static-tier-under-CascadingRuntime configuration the pool asked the OUTER
+    cascade, which has no hook, so each reusable box was keyed by its fresh per-spawn slot_id
+    again — reap deleted the one recorded failure and max_consecutive_failures > 1 stayed
+    unreachable, exactly the bug the hook was added to fix.
+    """
+    from blastbox.host.pool import WarmPool
+    from blastbox.host.runtime.cascade import CascadingRuntime, Tier
+
+    inner = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"),
+                              http_probe=FakeProbe(all_ok=True))
+    # Tier name deliberately DIFFERENT from the inner identity prefix, or a qualified key and a
+    # bare one look identical and the assertion proves nothing.
+    casc = CascadingRuntime(tiers=[Tier(name="boxes", runtime=inner, capacity=2)],
+                            tier_rebuild_after=99)
+    pool = WarmPool(runtime=casc, warm_size=1, concurrent_ceiling=2)
+
+    slot = casc.spawn()
+    key = pool._health_key(slot)
+    assert key is not None and key != slot.slot_id, (
+        "the cascade did not forward the tier's worker identity, so the box is keyed by a "
+        "per-spawn slot_id again"
+    )
+    assert key.startswith("boxes#0:"), (
+        f"the key must be TIER-QUALIFIED and POSITION-unique — two tiers can share a backend "
+        f"name and each report 'static:0' for different boxes (got {key})"
+    )
+    assert f"static:{slot.worker_index}" in key
+
+
+def test_a_cascade_over_a_disposable_tier_reports_no_identity():
+    """The carve-out stays narrow: without a reusing tier the slot IS the worker."""
+    from blastbox.host.pool import Slot, SlotState
+    from blastbox.host.runtime.cascade import CascadingRuntime, Tier
+
+    class _Disposable:
+        def spawn(self):
+            return Slot(slot_id="d1", control_dir="/c", input_dir="/i", output_dir="/o",
+                        state=SlotState.IDLE)
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): pass
+
+    casc = CascadingRuntime(tiers=[Tier(name="d", runtime=_Disposable(), capacity=2)],
+                            tier_rebuild_after=99)
+    slot = casc.spawn()
+    assert casc.worker_identity(slot) is None
+
+
+def test_a_job_fault_clears_the_boxs_failures_not_the_slots():
+    """A valid engine_error proves the box responsive, so its failure record must reset.
+
+    The clear popped slot.slot_id while the record is filed under the physical worker, so the
+    box's prior failure survived and the lookup right below — correctly keyed — read it straight
+    back. A failure / valid engine_error / failure sequence then counted as CONSECUTIVE and could
+    burn out a healthy box or spend eviction budget on it.
+    """
+    from blastbox.host.pool import WarmPool
+
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"),
+                           http_probe=FakeProbe(all_ok=True))
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
+                    max_consecutive_failures=2, eviction_window_s=10_000.0,
+                    max_evictions_per_window=10)
+
+    slot = rt.spawn()
+    pool._slots[slot.slot_id] = slot
+    key = pool._health_key(slot)
+
+    pool.release(slot, dirty=True, fault="worker")
+    assert pool._slot_failures.get(key) == 1
+
+    # A valid engine_error on the SAME physical box, through a FRESH slot -- the production
+    # shape, since a static runtime reaps the slot and mints a new id for the next assignment.
+    again = rt.spawn()
+    again.worker_index = slot.worker_index
+    pool._slots[again.slot_id] = again
+    assert pool._health_key(again) == key, "sanity: same box, same health key"
+
+    pool.release(again, dirty=True, fault="job")
+    assert pool._slot_failures.get(key, 0) == 0, (
+        "the box's failure record survived a valid engine response, so two unrelated failures "
+        "an hour apart count as consecutive"
+    )
+
+
+def test_a_burned_out_static_box_leaves_the_rotation():
+    """Reaching the threshold changed nothing for a REUSING runtime.
+
+    reap() returns the same worker_index to the free list after a cooldown, so an agent that
+    still answers /healthz while every job transport wedges kept receiving and failing jobs
+    forever — each crossing logged, and charged against the eviction budget for an eviction that
+    never happened.
+    """
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"),
+                           http_probe=FakeProbe(all_ok=True))
+    doomed = rt.spawn()
+    idx = doomed.worker_index
+
+    rt.burn_out(doomed)
+    # dirty=False deliberately: a DIRTY reap parks the box in dirty_cooldown_s anyway, which
+    # would hide it from spawn() for reasons that have nothing to do with burnout.
+    rt.reap(doomed, dirty=False)
+
+    seen = set()
+    for _ in range(6):
+        try:
+            s = rt.spawn()
+        except Exception:
+            break
+        seen.add(s.worker_index)
+        rt.reap(s, dirty=False)
+
+    # ...and a box burned out while it is ALREADY sitting in the free list must come out of it,
+    # not merely be blocked from re-entering: nothing re-appends it, so the reap guard alone
+    # never sees it.
+    other = next(i for i in range(len(rt.cfg.workers)) if i != idx)
+    with rt._lock:
+        if other not in rt._free:
+            rt._free.append(other)
+    rt.burn_out(SimpleNamespace(worker_index=other, slot_id="s-other"))
+    with rt._lock:
+        assert other not in rt._free, (
+            "a box convicted while idle stayed in the free list, so spawn() hands it straight out"
+        )
+
+    assert idx not in seen, (
+        f"the convicted box {idx} was handed out again -- the burnout threshold is reached, "
+        f"logged and charged, but the wedged endpoint keeps taking jobs"
+    )
+    assert seen, "sanity: the healthy sibling is still served"
+
+
+def test_the_pool_tells_a_reusing_runtime_about_burnout():
+    """End-to-end: the seam is only worth anything if the pool actually calls it."""
+    from blastbox.host.pool import WarmPool
+
+    burned: list[int] = []
+
+    class _Reusing(StaticPoolRuntime):
+        def burn_out(self, slot):
+            burned.append(slot.worker_index)
+            super().burn_out(slot)
+
+    rt = _Reusing(_cfg("10.0.0.1:8765", "10.0.0.2:8765"), http_probe=FakeProbe(all_ok=True))
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
+                    max_consecutive_failures=2, eviction_window_s=10_000.0,
+                    max_evictions_per_window=10)
+
+    for _ in range(2):                     # two worker faults on the SAME physical box
+        slot = rt.spawn()
+        slot.worker_index = 0
+        pool._slots[slot.slot_id] = slot
+        pool.release(slot, dirty=True, fault="worker")
+
+    assert burned == [0], (
+        f"the pool convicted the box but never told the runtime, so it stays in rotation "
+        f"(burn_out calls: {burned})"
+    )

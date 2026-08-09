@@ -61,6 +61,10 @@ POOL_BURST_ACTIVE = Gauge(
 POOL_SPAWNS_TOTAL = Counter(
     "blastbox_pool_spawns_total", "Warm-pool slots spawned"
 )
+POOL_SPAWN_CAPACITY_MISS_TOTAL = Counter(
+    "blastbox_pool_spawn_capacity_miss_total",
+    "Spawns skipped because no tier had room (routine backpressure, NOT a spawn failure)",
+)
 
 POOL_REAPS_TOTAL = Counter(
     "blastbox_pool_reaps_total", "Warm-pool slots reaped (disposed)"
@@ -89,6 +93,14 @@ def record_pool_state(
 
 def record_slot_spawned() -> None:
     POOL_SPAWNS_TOTAL.inc()
+
+
+def record_spawn_capacity_miss() -> None:
+    """A spawn found no room. Routine under load -- but a SUSTAINED rate means the pool is
+    permanently starved (ceiling too low, or a tier stuck building), which looks identical to
+    "warm hits are down" from the outside. Kept separate from spawn FAILURES so a dashboard
+    can never confuse "we are busy" with "spawning is broken"."""
+    POOL_SPAWN_CAPACITY_MISS_TOTAL.inc()
 
 
 def record_slot_reaped() -> None:

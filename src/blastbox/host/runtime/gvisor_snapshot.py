@@ -18,6 +18,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from blastbox.host.runtime.snapshot_backend import (
+    generation_owner,
+    hold_owner_lease,
+    owner_alive,
+    prune_owner_lease,
+    owner_token,
+)
+
 _log = logging.getLogger(__name__)
 
 # Root-level filename the warm container packs its /out tree into so a C/R-restored container's
@@ -230,17 +238,26 @@ def _default_ready_wait(ctrl_dir: Path, timeout_s: float) -> None:
     raise TimeoutError(f"warm base not READY within {timeout_s}s ({ctrl_dir})")
 
 
-def _best_effort_delete(cfg: GvisorConfig, run: Callable[..., int], cid: str) -> None:
+def _best_effort_delete(cfg: GvisorConfig, run: Callable[..., int], cid: str) -> bool:
     """Tear down a (possibly half-created) runsc container: kill then force-delete,
     swallowing errors. Used on failure + reap paths where the container may or may not
     exist — a `runsc run`/`restore` that fails partway can still register container state
     under ``-root`` (with its sandbox/gofer processes), which would otherwise leak because
-    the caller never gets a handle to reap it."""
+    the caller never gets a handle to reap it.
+
+    Returns True when at least one teardown command SUCCEEDED. Callers that must not reclaim
+    resources a live sandbox still uses check this rather than assuming a clean return."""
+    ok = False
     for argv in (["kill", cid, "KILL"], ["delete", "-force", cid]):
         try:
             run([*_runsc(cfg), *argv])
+            ok = True
         except Exception:
             pass
+    # REPORT it. Swallowing every failure made kill() return normally even when both the kill and
+    # the force-delete failed, so the reap's `sandbox_gone` guard stayed True and released the
+    # generation pin anyway -- the guard was defeated by the layer beneath it (PR #82).
+    return ok
 
 
 class GvisorBootHandle:
@@ -252,7 +269,12 @@ class GvisorBootHandle:
         base_dir: Path,
         ctrl_dir: Path,
         ready_wait: Callable[[Path, float], None],
+        stranded: list[str] | None = None,
     ) -> None:
+        # Partial checkpoint directories whose cleanup failed. OWNED BY THE BACKEND and shared in:
+        # SnapshotManager kills and abandons this handle after a failed checkpoint, so a list held
+        # here alone is discarded with it and the retry never fires (PR #82).
+        self._stranded_partials: list[str] = stranded if stranded is not None else []
         self._cfg = cfg
         self._run = run
         self._cid = cid
@@ -264,13 +286,52 @@ class GvisorBootHandle:
         self._ready(self._ctrl, timeout_s)
 
     def checkpoint(self, dest_dir: Path) -> object:
-        img = Path(dest_dir) / "checkpoint"
+        # Retry anything a previous failed checkpoint could not remove; no artifact was returned
+        # for those, so nothing else can discover them. Also attempted BEFORE the base boots (see
+        # boot_base) -- reaching only this point is too late when the leftovers filled the disk.
+        _retry_stranded_partials(self._stranded_partials)
+
+        # GENERATION-STAMPED, never a fixed "checkpoint" path. restore_in() reads this directory
+        # for the whole life of a `runsc restore`, so a rebuild writing the SAME path can
+        # overwrite files an in-flight restore is still consuming -- it fails, or worse observes
+        # a mix of two checkpoints. A pin stops the old generation being DELETED; only a distinct
+        # path stops it being OVERWRITTEN. FC's mem/snapshot pair got this; gVisor did not
+        # (upstream, PR #82).
+        # Take the lease BEFORE the first generation exists, and REFUSE to write one without it.
+        # Not best-effort: the sweep's rule is that a lease nobody holds proves its owner dead, so
+        # an uncovered checkpoint can be reclaimed by another dispatcher while this process's
+        # sandboxes are still restoring from it (upstream, PR #82).
+        if not hold_owner_lease(dest_dir):
+            raise RuntimeError(
+                f"refusing to write a checkpoint generation without a lease in {dest_dir}: "
+                f"another dispatcher could reclaim it while this one is still using it"
+            )
+        gen = f"{owner_token()}-{time.monotonic_ns():019d}"
+        img = Path(dest_dir) / f"checkpoint-{gen}"
         img.mkdir(parents=True, exist_ok=True)
-        self._run([*_runsc(self._cfg), "checkpoint", "-image-path", str(img), self._cid])
+        try:
+            self._run([*_runsc(self._cfg), "checkpoint", "-image-path", str(img), self._cid])
+        except BaseException:
+            # runsc can write part of the checkpoint and then fail. No artifact is returned, so
+            # SnapshotManager never learns this directory exists and can never retire or discard
+            # it -- and because every attempt now gets a unique name, each async retry leaves
+            # another partial checkpoint behind instead of overwriting the last (upstream, PR #82).
+            errs: list[str] = []
+            shutil.rmtree(img, onerror=lambda fn, p, exc: errs.append(str(p)))
+            if errs:
+                # ...and if the cleanup ITSELF fails, nothing can rediscover the directory either.
+                # Record it for the next checkpoint's sweep rather than dropping it, exactly as the
+                # FC launcher does for its partial files.
+                self._stranded_partials.append(str(img))
+                _log.warning("gvisor_snapshot: could not remove partial checkpoint %s", img)
+            raise
         return str(img)
 
     def kill(self) -> None:
-        _best_effort_delete(self._cfg, self._run, self._cid)
+        if not _best_effort_delete(self._cfg, self._run, self._cid):
+            # The sandbox may still exist. Raise so the caller's guard retains the generation pin
+            # instead of reclaiming a checkpoint a live sandbox may still be restoring from.
+            raise RuntimeError(f"could not confirm teardown of runsc container {self._cid}")
         shutil.rmtree(self._base, ignore_errors=True)  # don't leave the base bundle dir behind
 
 
@@ -330,10 +391,111 @@ class GvisorRestoreHandle:
             return False
 
     def kill(self) -> None:
-        _best_effort_delete(self._cfg, self._run, self._cid)
+        if not _best_effort_delete(self._cfg, self._run, self._cid):
+            # The sandbox may still exist. Raise so the caller's guard retains the generation pin
+            # instead of reclaiming a checkpoint a live sandbox may still be restoring from.
+            raise RuntimeError(f"could not confirm teardown of runsc container {self._cid}")
+
+
+def _retry_stranded_partials(stranded: "list[str]") -> None:
+    """Re-attempt removal of partial checkpoints a previous failed attempt could not delete.
+
+    MUTATED IN PLACE: rebinding would detach the caller from the backend-owned list, so later
+    appends land on a private copy the next handle never sees.
+    """
+    if not stranded:
+        return
+    still: list[str] = []
+    for leftover in stranded:
+        errs: list[str] = []
+        shutil.rmtree(leftover, onerror=lambda fn, p, exc: errs.append(str(p)))
+        if errs:
+            still.append(leftover)
+    stranded[:] = still
 
 
 class GvisorSnapshotBackend:
+    def sweep_orphan_generations(self, base_dir: Path) -> int:
+        """Reclaim ``checkpoint-<gen>`` dirs left behind by a dispatcher that is gone.
+
+        gVisor got generation stamping (so a rebuild can never overwrite a checkpoint an
+        in-flight restore is still reading) and reference-counted reclamation for the
+        generations it supersedes IN THIS PROCESS -- but nothing swept the ones a PREVIOUS
+        process left. Nothing retires the current artifact at shutdown, so every restart, clean
+        or not, stranded a whole runsc checkpoint directory that no code path could ever
+        rediscover. The FC tier has swept its ``warm-*`` files since generations were introduced;
+        this side only ever got the other half (upstream, PR #82).
+
+        ``base_dir`` is the manager's checkpoint root -- the same dir it hands ``checkpoint()``.
+        This backend only learns that path at checkpoint time, which is far too late for a sweep
+        that has to run BEFORE the first build consumes the space.
+
+        Deliberately conservative, exactly as the FC sweep is: a directory is removed ONLY when
+        its owning process is provably gone. Deleting a generation a LIVE dispatcher is still
+        restoring from is far worse than the leak, so unknown ownership counts as alive.
+        """
+        root = Path(base_dir)
+        if not root.exists():
+            return 0
+        removed = 0
+        failed: list[str] = []
+        reclaimed_owners: set[str] = set()
+        failed_owners: set[str] = set()
+        for path in root.glob("checkpoint-*"):
+            token = generation_owner(path.name, prefix="checkpoint-")
+            # lease_dir: proved by a flock on the shared filesystem, never by a pid -- two
+            # dispatcher containers overlapping through a rolling deployment both see themselves
+            # as pid 1, and the /proc rule would call the live one dead (upstream, PR #82).
+            if (token is None or token == owner_token()
+                    or owner_alive(token, lease_dir=root)):
+                continue
+            # NOT ignore_errors: SnapshotManager latches "swept" on a clean return, so reporting
+            # success for a tree we could not remove disables reclamation for the whole process.
+            errs: list[str] = []
+            shutil.rmtree(path, onerror=lambda fn, p, exc: errs.append(f"{p}: {exc[1]}"))
+            if errs:
+                failed.append("; ".join(errs))
+                failed_owners.add(token)
+                _log.warning("gvisor_snapshot: could not sweep orphan checkpoint %s", path)
+            else:
+                removed += 1
+                reclaimed_owners.add(token)
+        # AFTER the loop, and only for owners whose every checkpoint is actually gone: pruning
+        # the lease of an owner whose rmtree FAILED leaves the retry with nothing to prove death
+        # with, so it skips that checkpoint forever (upstream, PR #82).
+        for token in reclaimed_owners - failed_owners:
+            prune_owner_lease(root, token)
+        if removed:
+            _log.info("gvisor_snapshot.swept_orphan_generations count=%d", removed)
+        if failed:
+            raise OSError("could not sweep orphan checkpoints: " + "; ".join(failed))
+        return removed
+
+    def discard(self, artifact: object) -> None:
+        """Remove a fully drained checkpoint generation.
+
+        Generation stamping and reclamation are two halves of one mechanism: stamping alone just
+        turns "one directory that gets overwritten" into "a new directory every rebuild that
+        nothing ever deletes". SnapshotManager reclaims retired artifacts only through this hook,
+        so without it every superseded runsc checkpoint stayed on disk until the filesystem
+        filled (upstream, PR #82). Called only once the refcount for this artifact reaches zero,
+        i.e. no live sandbox is still restoring from it.
+        """
+        path = Path(str(artifact))
+        if not path.name.startswith("checkpoint-"):
+            # Refuse anything that is not one of OUR generation dirs: this deletes a tree, and
+            # an unexpected artifact shape must never turn into an rmtree of something else.
+            _log.warning("gvisor_snapshot: refusing to discard unexpected artifact %r", artifact)
+            return
+        # NOT ignore_errors: SnapshotManager._discard treats a normal return as CONFIRMED
+        # cleanup and drops the artifact from _retired, so silently swallowing a transient
+        # EIO/EROFS here means this checkpoint directory is never retried and rebuilds accumulate
+        # them until the filesystem fills. Same fix as the FC backend's unlink (PR #82).
+        errors: list[str] = []
+        shutil.rmtree(path, onerror=lambda fn, p, exc: errors.append(f"{p}: {exc[1]}"))
+        if errors:
+            raise OSError("could not remove checkpoint generation: " + "; ".join(errors))
+
     def __init__(
         self,
         cfg: GvisorConfig,
@@ -350,6 +512,9 @@ class GvisorSnapshotBackend:
         self._ready = ready_wait
         self._probe = probe
         self._cr_capable = cr_capable
+        # Durable across boot handles: SnapshotManager kills and abandons a handle after a failed
+        # checkpoint, so a retry list held on the handle is discarded with it (PR #82).
+        self._stranded_partials: list[str] = []
 
     def available(self) -> bool:
         # `probe` is a full override (tests/embedders); honor it verbatim.
@@ -363,6 +528,12 @@ class GvisorSnapshotBackend:
         return self._cr_capable(self._cfg.runsc_bin)
 
     def boot_base(self) -> GvisorBootHandle:
+        # BEFORE the bundle dir is written. The retry used to run only in checkpoint(), which
+        # happens after a successful boot -- so a stranded checkpoint big enough to fill the
+        # filesystem blocked the boot that would have reached the cleanup, and the tier stayed
+        # cold permanently. Same fix as the FC launcher; a retry is worthless if the condition it
+        # fixes is what stops you reaching it (upstream, PR #82).
+        _retry_stranded_partials(self._stranded_partials)
         # Unique per build so two pool processes sharing this -root parent (e.g. a
         # restart-overlap: the old process still tearing down while the new one boots)
         # don't collide on a fixed base bundle dir / cid and stomp each other's base.
@@ -379,13 +550,25 @@ class GvisorSnapshotBackend:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        except Exception:
-            # No boot handle is returned on failure, so nothing reaps the base — drop any
-            # registered runsc state for this cid AND remove the bundle dir so neither leaks.
-            _best_effort_delete(self._cfg, self._run, cid)
+        except BaseException:
+            # BaseException, matching restore_in and build()'s teardown: an interrupt or
+            # cancellation during `runsc run` still leaves registered container state behind, and
+            # no boot handle is returned on failure, so nothing else can ever reap it (PR #82).
+            #
+            # Nothing reaps the base — drop any registered runsc state for this cid AND remove
+            # the bundle dir so neither leaks.
+            if not _best_effort_delete(self._cfg, self._run, cid):
+                # UNCONFIRMED: both teardown commands failed, so the sandbox/gofer processes may
+                # still be live. Ignoring that result and removing the bundle anyway forgot the
+                # only cid anything could retry, and every later build retry leaked another base.
+                # Keep both for the next attempt (upstream, PR #82).
+                self._stranded_partials.append(str(base))
+                _log.warning("gvisor_snapshot: base %s could not be confirmed deleted; retaining "
+                             "its bundle for retry", cid)
+                raise
             shutil.rmtree(base, ignore_errors=True)
             raise
-        return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready)
+        return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready, stranded=self._stranded_partials)
 
     def restore_in(self, slot_workdir: Path, artifact: object) -> GvisorRestoreHandle:
         wd = Path(slot_workdir)
@@ -400,11 +583,31 @@ class GvisorSnapshotBackend:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        except Exception:
+        except BaseException as exc:
+            # BaseException, not Exception. A KeyboardInterrupt, SystemExit or task cancellation
+            # during `runsc restore` skipped this handler entirely -- yet the command may already
+            # have registered a container and spawned its sandbox/gofer processes. Worse,
+            # SnapshotManager.restore() then saw an escaping exception with no kill_failed marker
+            # and UNPINNED the checkpoint, so a later invalidation could delete a generation the
+            # untracked sandbox was still using. Same reasoning as build()'s teardown, which was
+            # widened for exactly this (upstream, PR #82).
+            #
             # A partially-failed `runsc restore` can leave registered container state (with
             # its sandbox/gofer processes) under -root. No handle is returned on failure, and
             # the manager only knows the slot dir — not this cid — so tear it down here before
             # re-raising, or it orphans an unmanaged sandbox.
-            _best_effort_delete(self._cfg, self._run, cid)
+            if not _best_effort_delete(self._cfg, self._run, cid):
+                # Signal it on the ORIGINAL error: SnapshotManager reads this to decide whether
+                # the checkpoint may be reclaimed. Ignoring the result meant the manager unpinned
+                # even though an unmanaged sandbox might still be using the generation (PR #82).
+                exc.kill_failed = True  # type: ignore[attr-defined]
+                # ...and RETAIN it. kill_failed keeps the generation pinned, but the manager then
+                # discards the cid and removes the slot workdir, so nothing could ever retry the
+                # teardown OR release that pin: repeated restores leaked sandbox/gofer processes
+                # and the checkpoint could never be reclaimed. Same retention the base-boot path
+                # now does (upstream, PR #82).
+                self._stranded_partials.append(str(wd))
+                _log.warning("gvisor_snapshot: restore sandbox %s could not be confirmed deleted; "
+                             "retaining its bundle for retry", cid)
             raise
         return GvisorRestoreHandle(self._cfg, self._run, cid, wd, self._run_text)
