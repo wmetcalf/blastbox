@@ -3061,3 +3061,85 @@ def test_a_confirmed_dead_slot_after_recycle_is_still_reaped() -> None:
     pool.release(slot, dirty=True)
 
     assert slot.slot_id in rt.reaped, "a confirmed-dead slot must still be reaped"
+
+
+def test_maintenance_holds_an_exclusive_window_so_claim_cannot_take_the_slot() -> None:
+    """issue #80: state-changing maintenance must run under a window the POOL grants.
+
+    The first attempt ran it from is_alive() on an IDLE slot with nothing excluding a concurrent
+    claim, so it could hibernate an instance out from under a job. Ownership has to come from the
+    only thing that can make a slot unclaimable.
+    """
+    seen_states: list = []
+
+    class _MaintainingRuntime(_FakeRuntime):
+        def __init__(self, pool_ref: dict) -> None:
+            super().__init__()
+            self.pool_ref = pool_ref
+
+        def maintain_idle(self, slot: Slot) -> bool:
+            pool = self.pool_ref["pool"]
+            live = pool._slots[slot.slot_id]
+            seen_states.append(live.state)
+            # A claimant running right now must NOT be able to take it.
+            assert pool.claim(timeout_s=0.0) is None, "claim took a slot under maintenance"
+            return True
+
+    ref: dict = {}
+    rt = _MaintainingRuntime(ref)
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    ref["pool"] = pool
+    pool.tick()
+    pool.tick()
+
+    assert seen_states, "the maintenance hook never ran"
+    assert seen_states[0] == SlotState.ASSIGNED, "the slot was not reserved before the hook ran"
+    # ...and it is handed back afterwards.
+    slot_id = next(iter(pool._slots))
+    assert pool._slots[slot_id].state == SlotState.IDLE
+
+
+def test_a_raising_maintenance_hook_still_hands_the_slot_back() -> None:
+    """A slot stranded in ASSIGNED is capacity lost forever: _spawn_to_deficit counts it as active,
+    so nothing replaces it and nothing can claim it."""
+    class _RaisingRuntime(_FakeRuntime):
+        def maintain_idle(self, slot: Slot) -> bool:
+            raise RuntimeError("describe blew up")
+
+    rt = _RaisingRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool.tick()
+    pool.tick()
+
+    slot_id = next(iter(pool._slots))
+    assert pool._slots[slot_id].state == SlotState.IDLE, "the slot was stranded in ASSIGNED"
+    assert slot_id not in rt.reaped, "an exception is not a verdict about the slot"
+
+
+def test_a_slot_reported_unusable_is_retired() -> None:
+    """The terminal give-up has to RETURN capacity. Parking a permanently unclaimable slot is the
+    failure mode issue #80 calls out: it blocks its own replacement."""
+    class _UnusableRuntime(_FakeRuntime):
+        def maintain_idle(self, slot: Slot) -> bool:
+            return False
+
+    rt = _UnusableRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool.tick()
+    slot_id = next(iter(pool._slots))
+    pool.tick()
+
+    assert slot_id in rt.reaped or slot_id not in pool._slots, (
+        "an unusable slot must be retired so a replacement can spawn"
+    )
+
+
+def test_a_runtime_without_the_hook_is_untouched() -> None:
+    """The seam is optional -- every local tier lacks it and must be unaffected."""
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    pool.tick()
+    pool.tick()
+    slot_id = next(iter(pool._slots))
+    assert pool._slots[slot_id].state == SlotState.IDLE
+    assert rt.reaped == []

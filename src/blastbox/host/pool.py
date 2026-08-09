@@ -1055,6 +1055,7 @@ class WarmPool:
         # holding node RAM, and this file's policy is to keep counting it (see _spawn_to_deficit's
         # headroom + the quarantine comments) rather than risk over-committing the node.
         self._drain_runtime_repairs()
+        self._maintain_idle()
         self._reap_deferred()
         self._update_burst(ready)
         # CONSUME the flag and commit to the decision in one locked step. Checking it here and
@@ -2412,6 +2413,62 @@ class WarmPool:
                 blame(slot_id)
             except Exception as exc:  # noqa: BLE001 -- attribution must never break the tick
                 logger.warning("pool.tier_blame_failed slot_id=%s: %s", slot_id, exc)
+
+    def _maintain_idle(self) -> None:
+        """Grant a runtime an EXCLUSIVE window on one IDLE slot for state-changing maintenance.
+
+        Some tiers have upkeep that mutates the worker rather than merely observing it -- the
+        motivating case is ec2-hibernate re-parking an instance whose resume half-succeeded, left
+        RUNNING and billing while the pool believes it is hibernated (issue #80). That work cannot
+        live on a liveness probe: ``is_alive`` runs on IDLE slots with nothing excluding a
+        concurrent ``claim``, so the first version of this raced a claimant and could hibernate an
+        instance out from under a job. Ownership has to come from the POOL, which is the only thing
+        that can make a slot unclaimable.
+
+        The contract is deliberately small:
+          * CAS IDLE -> ASSIGNED under the lock, so ``claim`` (which only picks IDLE) cannot take it
+          * run the hook OUTSIDE the lock -- it makes AWS calls and would otherwise stall every
+            claim, promotion and health check behind it
+          * hand the slot back even when the hook raises; a slot stranded in ASSIGNED is capacity
+            lost forever, and ``_spawn_to_deficit`` counts it as active so nothing replaces it
+          * a hook that reports the slot UNUSABLE gets it retired, so a terminal state (a
+            hibernation stuck in `stopping` past its timeout) returns capacity instead of parking
+            a permanently unclaimable slot
+
+        ONE slot per tick. Taking every IDLE slot at once would empty the claimable pool for the
+        duration of an AWS round trip.
+        """
+        hook = getattr(self._runtime, "maintain_idle", None)
+        if not callable(hook):
+            return
+        with self._lock:
+            cand = next((s for s in self._slots.values() if s.state == SlotState.IDLE), None)
+            if cand is None:
+                return
+            # Reserve it BEFORE releasing the lock. This is the whole point of the seam.
+            cand.state = SlotState.ASSIGNED
+            slot_id = cand.slot_id
+
+        usable = True
+        try:
+            usable = hook(cand) is not False
+        except Exception:
+            # An exception is not a verdict about the slot -- same rule as everywhere else here.
+            # Hand it back and let the ordinary health path judge it.
+            logger.exception("pool.maintain_idle_error slot_id=%s — handing the slot back", slot_id)
+        finally:
+            with self._lock:
+                cur = self._slots.get(slot_id)
+                # Only restore the slot we actually reserved, and only if nothing else moved it
+                # (a concurrent stop() flips slots to DRAINING; republishing would hand out a slot
+                # that is about to be disposed).
+                if cur is cand and cur.state == SlotState.ASSIGNED:
+                    cur.state = SlotState.IDLE
+                    self._last_idle_at = self._clock()
+                    self._idle_event.set()
+        if not usable:
+            logger.warning("pool.maintain_idle_unusable slot_id=%s — retiring", slot_id)
+            self.retire(cand, fault="worker")
 
     def _warming_unknown_unexpired(self, slot_id: str, now: float) -> bool:
         """True while a WARMING slot is inside a live, still-plausible UNKNOWN episode.

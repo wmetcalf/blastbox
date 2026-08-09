@@ -2889,3 +2889,119 @@ def test_an_access_denied_is_a_verdict_not_a_retry():
 
     rt, _ = _snapstart_rt({"sts get-caller-identity": denied})
     assert rt.available() is False
+
+
+# ---------------------------------------------- #80: warm-slot reconciliation state machine
+
+def test_a_half_succeeded_resume_is_re_parked(tmp_path=None):
+    """THE motivating case (issue #80). resume() half-succeeds: start-instances is accepted and a
+    later describe browns out, so the claim is handed back non-destructively with the instance
+    RUNNING while the pool believes it is parked. Nothing re-hibernated it: the pool counted a
+    parked warm slot while EC2 billed a running one until the uptime backstop fired.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    state, healthy, ticks = ["running"], [True], [1000.0]
+    rt, fake = _hibernate_rt(state=state, healthy=healthy, clock=lambda: ticks[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt._phase["s"] = "parked"      # what the pool believes
+
+    assert rt.maintain_idle(slot) is True
+    assert rt._phase["s"] == "warming", "the mismatch must be noticed from the OBSERVED state"
+
+    ticks[0] += 10.0
+    rt.maintain_idle(slot)         # next window: warmed + healthy -> re-issue the hibernate
+    stops = [a for k, a in fake.calls if k == "ec2 stop-instances"]
+    assert stops, "a running-but-recorded-parked instance was never re-hibernated"
+    assert any("--hibernate" in a for a in stops)
+
+
+def test_a_stopping_instance_is_not_claimable():
+    """issue #80, finding 1: if EC2 accepts stop --hibernate but the response is LOST, the instance
+    is 'stopping' -- which EC2 counts as alive and whose agent still answers. A claimant would
+    resume it successfully and the pending hibernation would then complete DURING the job.
+
+    The previous attempt guarded this with the phase bookkeeping, which is exactly the state a lost
+    response corrupts, so it guarded nothing. Note the phase here says 'parked' -- i.e. wrong.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    state, healthy, ticks = ["stopping"], [True], [1000.0]
+    rt, _ = _hibernate_rt(state=state, healthy=healthy, clock=lambda: ticks[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt._phase["s"] = "parked"
+
+    assert rt.is_alive_for_claim(slot) is None, (
+        "a stopping instance must be skipped -- and skipped as UNKNOWN, never destroyed"
+    )
+
+
+def test_a_hibernation_stuck_in_stopping_is_eventually_given_up_on():
+    """issue #80, finding 2: AWS documents instances getting stuck in 'stopping'. With no timeout
+    escape the slot is unclaimable forever AND blocks its own replacement, so a warm_size=1 tier
+    stays dead until someone intervenes.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    state, healthy, ticks = ["stopping"], [True], [1000.0]
+    rt, _ = _hibernate_rt(state=state, healthy=healthy, clock=lambda: ticks[0],
+                          hibernate_timeout_s=300.0)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    assert rt.maintain_idle(slot) is True          # in flight, still plausible
+    ticks[0] += 301.0
+    assert rt.maintain_idle(slot) is False, "a stuck hibernation must be given up on, not held forever"
+
+
+def test_an_instance_that_keeps_waking_up_still_reaches_the_give_up():
+    """The escape must measure the whole EPISODE, not one attempt. A slot that keeps accepting the
+    stop and landing back at 'running' re-drives each time; resetting the clock on each re-drive
+    would cycle running -> stop -> running forever and never escape.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    state, healthy, ticks = ["running"], [True], [1000.0]
+    rt, _ = _hibernate_rt(state=state, healthy=healthy, clock=lambda: ticks[0],
+                          hibernate_timeout_s=300.0)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    for _ in range(12):            # 12 cycles x 30s = 360s > 300s, each one re-driving
+        rt.maintain_idle(slot)
+        ticks[0] += 30.0
+    assert rt.maintain_idle(slot) is False, (
+        "re-driving reset the give-up clock, so the slot cycles forever"
+    )
+
+
+def test_reaching_stopped_clears_the_give_up_clock():
+    """The mirror: a slot that DOES park must not carry a stale episode clock into its next park,
+    or its second hibernation would be given up on early."""
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    state, healthy, ticks = ["running"], [True], [1000.0]
+    rt, _ = _hibernate_rt(state=state, healthy=healthy, clock=lambda: ticks[0],
+                          hibernate_timeout_s=300.0)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt.maintain_idle(slot)                     # starts the episode
+    assert "s" in rt._park_since
+    state[0] = "stopped"
+    ticks[0] += 10.0
+    assert rt.maintain_idle(slot) is True
+    assert rt._phase["s"] == "parked"
+    assert "s" not in rt._park_since, "a completed park must clear its episode clock"
+
+
+def test_maintain_idle_changes_nothing_when_the_control_plane_is_silent():
+    """Reconciliation must be driven by an OBSERVATION. Acting on a guess is how the bookkeeping
+    got corrupted in the first place."""
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+
+    def throttled(argv):  # noqa: ANN001
+        raise AwsProbeTimeout("Throttling: Rate exceeded")
+
+    fake = FakeAws({**_IDENT, "ec2 run-instances": {"Instances": [{"InstanceId": "i-1"}]},
+                    "ec2 describe-instances": throttled, "ec2 stop-instances": {}})
+    cfg = Ec2HibernateConfig(region="us-east-1", image_id="ami-x", resume_poll_s=0.0)
+    rt = Ec2HibernateRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True,
+                             clock=lambda: 1000.0)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt._phase["s"] = "parked"
+
+    assert rt.maintain_idle(slot) is True, "a brownout must not retire a healthy parked slot"
+    assert rt._phase["s"] == "parked", "and must not rewrite the bookkeeping on a guess"
+    assert not [a for k, a in fake.calls if k == "ec2 stop-instances"]

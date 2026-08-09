@@ -1627,6 +1627,9 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         self._phase: dict[str, str] = {}   # slot_id -> "warming" | "hibernating" | "parked"
         self._hib_attempt: dict[str, float] = {}   # slot_id -> last stop --hibernate attempt (throttle)
         self._hib_started: dict[str, float] = {}   # slot_id -> when it entered the hibernating phase
+        # slot_id -> when this slot FIRST began trying to park. Survives re-drives (see
+        # _park_expired) and is cleared only when the instance actually reaches 'stopped'.
+        self._park_since: dict[str, float] = {}
 
     def _service_available(self) -> bool:
         # fail LOUD (once, at pool build) on a hibernation-incapable config instead of churning
@@ -1723,6 +1726,149 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         self._hib_started[slot.slot_id] = now
         return True
 
+    def is_alive_for_claim(self, slot: AwsWorkerSlot, *, budget_s: float | None = None
+                           ) -> "bool | None":
+        """Reject a slot whose hibernation is IN FLIGHT (issue #80, finding 1).
+
+        If EC2 accepts ``stop-instances --hibernate`` but the response is lost, the instance is
+        ``stopping`` -- which EC2 counts as alive and whose agent still answers. A claimant would
+        resume it, succeed against that still-live agent, and the pending hibernation would then
+        complete DURING the job. The previous attempt guarded this with the phase bookkeeping, which
+        is exactly the state a lost response corrupts, so it guarded nothing.
+
+        UNKNOWN rather than False: a stopping instance is not dead, and a claim probe must never
+        destroy one. It is simply not claimable right now, and either reaches `stopped` (claimable
+        again) or is escaped by the maintenance window's timeout.
+        """
+        try:
+            self._desc_cache.pop(slot.slot_id, None)
+            with self._claim_probe_budget(budget_s):
+                if self._state(slot) == "stopping":
+                    _log.info("ec2-hibernate: slot %s is 'stopping' (hibernate in flight) -- "
+                              "not claimable this scan", slot.slot_id)
+                    return None
+        except AwsUnknownState:
+            return None       # could not tell -> skip, never destroy
+        except (AwsWorkerError, OSError):
+            pass              # fall through to the ordinary probe, which has its own verdict rules
+        return super().is_alive_for_claim(slot, budget_s=budget_s)
+
+    _PARK_GIVE_UP = "give-up"
+
+    def _park_expired(self, sid: str, now: float) -> bool:
+        """Has this slot spent longer than hibernate_timeout_s trying to PARK, across all attempts?
+
+        Measured from the first attempt of the episode and NOT reset by a re-drive, so a slot that
+        keeps accepting the stop and waking back up still reaches the escape instead of cycling
+        forever (issue #80).
+        """
+        started = self._park_since.get(sid)
+        return started is not None and (now - started) > self.cfg.hibernate_timeout_s
+
+    def _park_step(self, slot: AwsWorkerSlot, st: str, now: float) -> "tuple[str, bool | None]":
+        """Advance the boot -> warm -> hibernate -> parked machine ONE step from an OBSERVED state.
+
+        Returns ``(phase, ready)``; ``ready`` is the is_ready verdict (True = parked and claimable).
+
+        ONE machine, driven from BOTH the WARMING poll and the IDLE maintenance window (issue #80).
+        The previous attempt bolted a second, partial copy onto the idle path, and the transitions
+        it was missing -- the timeout escape and the back-to-running recovery that the warming copy
+        already had -- became the next review round's findings. There is no second copy now.
+
+        REALITY-DRIVEN, not bookkeeping-driven. Every transition is decided from ``st``, because a
+        lost ``stop-instances`` response is precisely what corrupts the phase: EC2 accepted the
+        hibernate, we never saw the reply, and our own record is the one thing we cannot trust.
+        """
+        sid = slot.slot_id
+        phase = self._phase.get(sid, "warming")
+        if st in self._DEAD_STATES:
+            return phase, False          # is_alive/_health_check reaps it
+        if st == "stopped":
+            # Hibernated, whatever we believed. This is the lost-response case landing correctly:
+            # the stop DID take, so adopt reality rather than re-issuing it.
+            self._phase[sid] = "parked"
+            self._hib_started.pop(sid, None)
+            self._park_since.pop(sid, None)     # parked: the give-up clock is done
+            return "parked", True
+        if st == "stopping":
+            # A hibernate is in flight -- possibly one whose response we lost, which is why the
+            # phase is adopted from the observation rather than trusted.
+            if phase != "hibernating":
+                self._phase[sid] = "hibernating"
+            self._hib_started.setdefault(sid, now)
+            # Start the episode clock from the OBSERVATION when we have none. The lost-response
+            # case is precisely the one where we never recorded issuing the stop, so keying the
+            # escape only on our own attempt record left exactly that case unable to ever expire.
+            self._park_since.setdefault(sid, now)
+            if self._park_expired(sid, now):
+                # AWS documents instances getting stuck in `stopping`. Without this escape the slot
+                # is unclaimable forever AND blocks its own replacement, so a warm_size=1 tier stays
+                # dead until someone intervenes (issue #80, finding 2).
+                _log.warning("ec2-hibernate: %s stuck in 'stopping' for %.0fs -- giving up on it",
+                             sid, now - self._park_since.get(sid, now))
+                return self._PARK_GIVE_UP, False
+            return "hibernating", False
+        if st == "running":
+            if phase in ("hibernating", "parked"):
+                # Two ways to be awake when we did not expect it:
+                #  - hibernating: the stop was ACCEPTED and then failed asynchronously
+                #  - parked: THE MOTIVATING CASE (issue #80). resume() half-succeeded --
+                #    start-instances landed, a later describe browned out, the claim was handed back
+                #    non-destructively -- so the instance is RUNNING while the pool counts a parked
+                #    warm slot and EC2 bills a running one, with nothing to re-hibernate it. Also
+                #    the ordinary post-job state, since a slot that served a job is awake.
+                _log.info("ec2-hibernate: %s is running but recorded %s -- re-driving to warm", sid, phase)
+                self._phase[sid] = "warming"
+                self._hib_started.pop(sid, None)
+                # Deliberately do NOT clear _park_since. Re-driving resets the per-ATTEMPT clock;
+                # the give-up clock measures the whole episode. Resetting it here would let an
+                # instance that keeps accepting the stop and waking up again cycle
+                # running -> stop -> running forever, never reaching the escape -- finding 2
+                # inverted, and a hole an existing test caught.
+                return "warming", False      # observe once more before acting again
+            if self._park_expired(sid, now):
+                _log.warning("ec2-hibernate: %s never parked after %.0fs -- giving up on it",
+                             sid, now - self._park_since.get(sid, now))
+                return self._PARK_GIVE_UP, False
+            if not self._agent_healthy(slot):
+                return "warming", False
+            # Warmed -> PARK it: stop --hibernate. THROTTLED (the pool polls is_ready at ~10Hz) and
+            # TOLERANT of "not ready to hibernate yet" -- the ec2-hibinit-agent needs ~1-2min after
+            # boot to lay down the hibernation reserve. Only a SUCCESSFUL stop advances the phase,
+            # and re-issuing it is harmless: the operation is idempotent by design, because an
+            # accepted-but-lost response must be safe to repeat.
+            self._park_since.setdefault(sid, now)
+            self._try_park(slot)
+            return self._phase.get(sid, "warming"), False
+        # pending / rebooting / anything else: still coming up.
+        return phase, False
+
+    def maintain_idle(self, slot: AwsWorkerSlot) -> bool:
+        """Reconcile one IDLE slot against reality, under the pool's exclusive window (issue #80).
+
+        Returns False when the slot is UNUSABLE and should be retired.
+
+        The pool has flipped this slot to ASSIGNED for the duration, so ``claim`` cannot take it --
+        which is the property the first attempt lacked, when this ran off ``is_alive`` with nothing
+        excluding a concurrent claimant and could hibernate an instance out from under a job.
+        """
+        try:
+            st = self._state(slot)     # UNCACHED: reconciliation must not act on a stale describe
+        except AwsUnknownState as exc:
+            # We could not look. Change nothing -- acting on a guess here is how the bookkeeping got
+            # corrupted in the first place.
+            _log.debug("ec2-hibernate: maintain_idle(%s) unknown: %s", slot.slot_id, exc)
+            return True
+        except (AwsWorkerError, OSError) as exc:
+            _log.debug("ec2-hibernate: maintain_idle(%s) error: %s", slot.slot_id, exc)
+            return True
+        try:
+            phase, _ = self._park_step(slot, st, self._clock())
+        except (AwsWorkerError, OSError) as exc:
+            _log.debug("ec2-hibernate: maintain_idle(%s) step error: %s", slot.slot_id, exc)
+            return True
+        return phase != self._PARK_GIVE_UP
+
     def is_ready(self, slot: AwsWorkerSlot) -> "bool | None":
         # Per-slot state machine, polled by the pool during WARMING: boot -> warm -> hibernate -> parked.
         # TRI-STATE like the base class: None = the control plane didn't answer. This tier has the
@@ -1731,37 +1877,14 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # handler at the bottom as a False (issue #79).
         try:
             now = self._clock()
-            phase = self._phase.get(slot.slot_id, "warming")
-            if phase == "warming":
-                if str(self._describe_cached(slot, self._liveness_cache_s)
-                       .get("State", {}).get("Name", "")).lower() != "running":
-                    return False
-                if not self._agent_healthy(slot):
-                    return False
-                # Warmed -> PARK it: stop --hibernate. THROTTLE the attempt (the pool polls is_ready at
-                # ~10Hz) -- and TOLERATE "not ready to hibernate yet" (the ec2-hibinit-agent needs ~1-2min
-                # after boot to lay down the hibernation reserve). On a failed/throttled attempt we stay
-                # in "warming" and retry on a later tick; only a SUCCESSFUL stop advances to "hibernating".
-                self._try_park(slot)
+            st = str(self._describe_cached(slot, self._liveness_cache_s)
+                     .get("State", {}).get("Name", "")).lower()
+            phase, ready = self._park_step(slot, st, now)
+            if phase == self._PARK_GIVE_UP:
+                # Stuck past hibernate_timeout_s. Report not-ready and let the warming timeout /
+                # health check replace it, rather than spinning here forever.
                 return False
-            if phase == "hibernating":
-                st = str(self._describe_cached(slot, self._liveness_cache_s)
-                         .get("State", {}).get("Name", "")).lower()
-                if st == "stopped":
-                    self._phase[slot.slot_id] = "parked"
-                    return True
-                # RECOVERY: hibernate can be ACCEPTED then fail async (instance lands back 'running'), or
-                # hang. Don't sit in 'hibernating' forever spinning until warming_timeout -- re-drive from
-                # 'warming' (the stop is re-issued, throttled) if it came back running or blew the budget.
-                started = self._hib_started.get(slot.slot_id, now)
-                if st in self._DEAD_STATES:
-                    return False   # is_alive/_health_check will reap it
-                if st == "running" or (now - started) > self.cfg.hibernate_timeout_s:
-                    _log.info("ec2-hibernate: %s hibernate did not take (state=%s, %.0fs) -- re-driving",
-                              slot.slot_id, st, now - started)
-                    self._phase[slot.slot_id] = "warming"
-                return False
-            return True   # parked -- claimable; resume() wakes it on claim
+            return ready
         except AwsUnknownState as exc:
             # A throttled describe tells us NOTHING about whether this instance booted, warmed, or
             # parked. Returning False here spent the 600s warming budget on the control plane's
@@ -1922,7 +2045,8 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         ) from last_exc
 
     def reap(self, slot: AwsWorkerSlot) -> None:
-        for d in (self._phase, self._desc_cache, self._hib_attempt, self._hib_started):
+        for d in (self._phase, self._desc_cache, self._hib_attempt, self._hib_started,
+                  self._park_since):
             d.pop(slot.slot_id, None)
         super().reap(slot)   # terminate-instances (disposable after one untrusted job)
 
