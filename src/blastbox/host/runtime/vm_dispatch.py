@@ -973,10 +973,18 @@ _RETRY_SLOT_COOLDOWN_S = 3.0   # how long a slot that just failed to resume is p
 
 
 def _claim_resumable_slot(pool: Any, timeout_s: float, *,
+                          thaw_budget_s: float | None = None,
                           clock: "Callable[[], float]" = time.monotonic) -> Any:
     """Claim a warm slot and resume it, trying OTHER slots when one can't be woken.
 
     Returns the claimed+resumed slot, or None if the window closed without one.
+
+    ``timeout_s`` bounds how long we SCAN for a claimable slot. ``thaw_budget_s`` -- the tier's own
+    ``resume_timeout_s`` -- is the separate budget a claimed slot gets to wake up in, deliberately
+    NOT taken from the claim window (issue #81). One fair thaw may therefore overrun the claim
+    window; the loop's own deadline check then ends the scan, so the worst case is bounded at
+    roughly one claim window plus one thaw, and the job requeues rather than convicting a worker
+    that was merely slow.
 
     issue #77 round 2: this loop used to rely on a failed resume having REMOVED the slot from the
     pool (``release(dirty=True)``), so "try the next one" happened for free. Making the UNKNOWN
@@ -1038,18 +1046,37 @@ def _claim_resumable_slot(pool: Any, timeout_s: float, *,
                 continue
             if sid is not None:
                 tried[sid] = clock()
-            remaining_for_resume = deadline - clock()
-            if remaining_for_resume <= 0:
-                # The window closed while we were probing. Hand the slot back untouched rather than
-                # starting a resume we cannot afford -- attempting one with no budget is how a
-                # never-probed healthy slot got destroyed (issue #77 round 5).
-                unclaim = getattr(pool, "unclaim", None)
-                if callable(unclaim):
-                    with contextlib.suppress(Exception):
-                        unclaim(slot)
-                break
+            # THE THAW IS NOT PART OF THE CLAIM WINDOW (issue #81).
+            #
+            # This used to hand the resume whatever was LEFT of the claim window. ec2-hibernate
+            # declares resume_timeout_s=180 -- its own statement of how long a healthy hibernated
+            # instance may take to thaw -- while warm_claim_timeout_s defaults to 60, so the tier
+            # could NEVER receive the budget it says it needs. Every window was truncated, and a
+            # truncated window ending in silence was then read as a confirmed failure and the
+            # instance terminated. Three attempts to fix that in the VERDICT logic each produced
+            # the mirror image of the previous bug, because the rule cannot distinguish "the agent
+            # is dead" from "the agent needed more time than we gave it" when we never give it the
+            # time it declared. It is a configuration contradiction, not a classification problem.
+            #
+            # So the thaw gets its OWN budget, granted outside the claim window: the slot stays
+            # ASSIGNED and the job waits. The claim window keeps bounding how long we SCAN for a
+            # slot; it no longer bounds how long a worker is allowed to wake up.
+            if thaw_budget_s is not None:
+                budget_for_resume = float(thaw_budget_s)
+            else:
+                # No declared thaw budget (a tier with no resume seam, or a fast one): unchanged.
+                budget_for_resume = deadline - clock()
+                if budget_for_resume <= 0:
+                    # The window closed while we were probing. Hand the slot back untouched rather
+                    # than starting a resume we cannot afford -- attempting one with no budget is
+                    # how a never-probed healthy slot got destroyed (issue #77 round 5).
+                    unclaim = getattr(pool, "unclaim", None)
+                    if callable(unclaim):
+                        with contextlib.suppress(Exception):
+                            unclaim(slot)
+                    break
             try:
-                _resume_on_claim(pool, slot, budget_s=remaining_for_resume)
+                _resume_on_claim(pool, slot, budget_s=budget_for_resume)
                 return slot
             except Exception as exc:  # noqa: BLE001 -- dead slots are already retired dirty by
                 last_exc = exc        # _resume_on_claim; UNKNOWN ones were handed back. Try another.
@@ -1123,6 +1150,13 @@ def build_remote_vm_dispatcher(
                        "BLASTBOX_LAMBDA_SNAPSTART_RESUME_TIMEOUT_S below BLASTBOX_WORKER_TIMEOUT_S so a "
                        "slow resume can't outlast the job budget and leak a live slot", float(_resume_to),
                        worker_timeout_s)
+    # The thaw budget the claim seam grants OUTSIDE the claim window (issue #81). A tier that
+    # declares a resume_timeout_s longer than the whole job budget cannot be honoured at all, so
+    # fall back to no declared budget there rather than let one thaw eat the job: the warning above
+    # already tells the operator to size them the other way round.
+    _thaw_budget: float | None = None
+    if _resume_to is not None and float(_resume_to) < worker_timeout_s:
+        _thaw_budget = float(_resume_to)
     # Disposable AWS tiers have no recycle(), so make_remote_validate's finally release() runs a
     # SYNCHRONOUS terminate-instances/terminate-microvm (bounded by the aws-cli timeout) BEFORE validate()
     # returns -- i.e. INSIDE the heartbeat watchdog. Budget that cleanup too, else a job that used most of
@@ -1162,7 +1196,10 @@ def build_remote_vm_dispatcher(
         # job's input/content. So REQUEUE (NoWarmSlot), don't FAIL+delete-input: AWS auto-terminates
         # parked slots in correlated batches, so a whole claim window can be stale at once and that
         # must not fail jobs.
-        slot = _claim_resumable_slot(pool, warm_claim_timeout_s)
+        # Hand the tier's DECLARED thaw budget through, separately from the claim window (issue
+        # #81). _resume_to is resume_timeout_s: for a cascade, the max across its wrapped tiers,
+        # which is exactly the "can this tier ever get a fair window?" number.
+        slot = _claim_resumable_slot(pool, warm_claim_timeout_s, thaw_budget_s=_thaw_budget)
         if slot is None:
             raise NoWarmSlot("no warm slot available within claim timeout")   # capacity -> REQUEUE
         return slot
