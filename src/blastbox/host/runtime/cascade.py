@@ -280,9 +280,15 @@ class CascadingRuntime:
             i = self._owner.get(slot.slot_id)
         return self.tiers[i] if i is not None else None
 
-    def is_ready(self, slot: Any) -> bool:
+    def is_ready(self, slot: Any) -> "bool | None":
+        # Delegate the owning tier's TRI-STATE verdict through unchanged, including None. The old
+        # `tier is not None and ...` form happened to propagate None correctly, but it was typed
+        # bool and read as a boolean guard -- one tidy-up away from collapsing a brownout into
+        # "not ready" for every cloud slot behind the cascade (issue #79).
         tier = self._tier_of(slot)
-        return tier is not None and tier.runtime.is_ready(slot)
+        if tier is None:
+            return False
+        return tier.runtime.is_ready(slot)
 
     def is_alive(self, slot: Any) -> "bool | None":
         tier = self._tier_of(slot)

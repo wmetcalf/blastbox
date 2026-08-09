@@ -2823,3 +2823,179 @@ def test_the_wedge_threshold_sees_through_a_cascade():
     assert pool._reaper_wedged_after_s() > 120.0, (
         "behind a cascade the threshold fell back to the floor, so a legitimate 120s disposal is "
         "declared wedged and replaced mid-flight")
+
+
+class _UnknownReadyRuntime(_FakeRuntime):
+    """A runtime whose is_ready() reports UNKNOWN -- the control plane won't answer.
+
+    The cloud tiers' shape during an AWS brownout: the instance may be booting perfectly well,
+    we simply cannot describe it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.unknown = True
+
+    def is_ready(self, slot: Slot) -> "bool | None":
+        if self.unknown:
+            return None
+        return super().is_ready(slot)
+
+
+def test_a_brownout_does_not_evict_the_tiers_warming_slots() -> None:
+    """issue #79: is_ready UNKNOWN must not be spent as the warming timeout's evidence.
+
+    A brownout outlasting warming_timeout_s used to terminate every WARMING instance in the tier
+    at once -- instances booting fine whose only fault was that AWS wouldn't describe them. Spawns
+    are throttled during the same event, so the tier then held at zero.
+    """
+    clock = _FakeClock()
+    rt = _UnknownReadyRuntime()
+    pool = WarmPool(
+        runtime=rt, warm_size=1, clock=clock, spawn_rate_limit=100.0,
+        warming_timeout_s=60.0, unknown_grace_s=300.0,
+    )
+    pool.tick()
+    warming = [s for s in pool._slots.values() if s.state == SlotState.WARMING]
+    assert len(warming) == 1
+    slot_id = warming[0].slot_id
+
+    # Well past warming_timeout_s, still inside the unknown grace: the slot SURVIVES.
+    clock.advance(120.0)
+    pool.tick()
+    assert slot_id in pool._slots, "a slot we could not ask about was evicted by the warming timeout"
+    assert slot_id not in rt.reaped
+
+    # The control plane comes back and says "ready": it promotes, having never been destroyed.
+    rt.unknown = False
+    clock.advance(1.0)
+    pool.tick()
+    assert pool._slots[slot_id].state == SlotState.IDLE
+
+
+def test_an_unknown_that_outlasts_the_grace_still_evicts() -> None:
+    """The exemption must be BOUNDED. An unbounded one is strictly worse than the bug it fixes:
+    the tier wedges at zero capacity forever while is_healthy() still reports True.
+    """
+    clock = _FakeClock()
+    rt = _UnknownReadyRuntime()
+    pool = WarmPool(
+        runtime=rt, warm_size=1, clock=clock, spawn_rate_limit=100.0,
+        warming_timeout_s=60.0, unknown_grace_s=100.0,
+    )
+    pool.tick()
+    slot_id = [s for s in pool._slots.values() if s.state == SlotState.WARMING][0].slot_id
+
+    clock.advance(90.0)   # past warming timeout, and the episode is first OBSERVED here
+    pool.tick()
+    assert slot_id in pool._slots
+    # The grace runs from when the UNKNOWN was first SEEN, not from spawn -- we cannot start a
+    # clock on an episode we had not yet observed.
+    since = pool._warming_unknown_since[slot_id]
+
+    clock.advance(101.0)  # unbroken UNKNOWN for longer than the 100s grace
+    pool.tick()
+    assert clock() - since > 100.0, "sanity: the episode really did outlast the grace"
+    assert slot_id in rt.reaped, "an outage that outlasts the grace must still let the slot age out"
+    assert slot_id not in pool._slots
+
+
+def test_a_definitive_not_ready_still_ages_the_slot_out() -> None:
+    """Only the ABSENCE of an answer is exempt. A tier that keeps answering "not ready yet" is
+    telling us about the worker, so the warming timeout must still apply -- otherwise the exemption
+    would silently disable the timeout for every runtime.
+    """
+    clock = _FakeClock()
+    rt = _FakeRuntime()
+    rt.set_default_ready_after(10**9)  # answers, definitively, "not ready"
+    pool = WarmPool(
+        runtime=rt, warm_size=1, clock=clock, spawn_rate_limit=100.0,
+        warming_timeout_s=60.0, unknown_grace_s=300.0,
+    )
+    pool.tick()
+    slot_id = [s for s in pool._slots.values() if s.state == SlotState.WARMING][0].slot_id
+
+    clock.advance(70.0)
+    pool.tick()
+    assert slot_id in rt.reaped, "a definitively not-ready slot must still age out"
+
+
+def test_a_recovered_control_plane_resumes_aging_the_slot() -> None:
+    """A brownout that ENDS must not leave the slot permanently exempt: the episode is cleared by
+    a definitive answer, so the timeout applies again from then on.
+    """
+    clock = _FakeClock()
+    rt = _UnknownReadyRuntime()
+    pool = WarmPool(
+        runtime=rt, warm_size=1, clock=clock, spawn_rate_limit=100.0,
+        warming_timeout_s=60.0, unknown_grace_s=300.0,
+    )
+    pool.tick()
+    slot_id = [s for s in pool._slots.values() if s.state == SlotState.WARMING][0].slot_id
+
+    clock.advance(120.0)
+    pool.tick()
+    assert slot_id in pool._slots
+
+    # Control plane answers again -- definitively "not ready". The episode ends.
+    rt.unknown = False
+    rt.set_default_ready_after(10**9)
+    rt._ready_after[slot_id] = 10**9
+    clock.advance(1.0)
+    pool.tick()
+    assert pool._warming_unknown_since.get(slot_id) is None, "the episode must be cleared"
+    assert slot_id in rt.reaped, "with the brownout over, the long-overdue slot ages out"
+
+
+def test_a_zero_grace_disables_the_warming_exemption_entirely() -> None:
+    """unknown_grace_s=0 is the operator saying "do not ride out brownouts". The exemption must
+    honour that, exactly as the IDLE path's escalation does -- otherwise setting it to 0 silently
+    turns the warming timeout OFF for any tier that reports UNKNOWN, the opposite of the intent.
+    """
+    clock = _FakeClock()
+    rt = _UnknownReadyRuntime()
+    pool = WarmPool(
+        runtime=rt, warm_size=1, clock=clock, spawn_rate_limit=100.0,
+        warming_timeout_s=60.0, unknown_grace_s=0.0,
+    )
+    pool.tick()
+    slot_id = [s for s in pool._slots.values() if s.state == SlotState.WARMING][0].slot_id
+
+    clock.advance(70.0)
+    pool.tick()
+    assert slot_id in rt.reaped, "grace=0 must disable the exemption, not enable it forever"
+
+
+class _DrainingOnProbeRuntime(_FakeRuntime):
+    """is_ready() finds the slot has been flipped to DRAINING by a concurrent stop(), and cannot
+    reach the control plane to say anything about it."""
+
+    def __init__(self, pool_ref: dict) -> None:
+        super().__init__()
+        self.pool_ref = pool_ref
+
+    def is_ready(self, slot: Slot) -> "bool | None":
+        live = self.pool_ref["pool"]._slots.get(slot.slot_id)
+        if live is not None:
+            live.state = SlotState.DRAINING
+        return None
+
+
+def test_an_unknown_probe_does_not_reap_a_draining_slot() -> None:
+    """The DRAINING branch reaps on a CONFIRMED not-ready. UNKNOWN is falsy too, so a plain
+    truthiness test there would reap a slot precisely BECAUSE we could not ask about it -- the bug
+    the tri-state exists to prevent, re-entering through the back door (issue #79).
+    """
+    ref: dict = {}
+    clock = _FakeClock()
+    rt = _DrainingOnProbeRuntime(ref)
+    pool = WarmPool(runtime=rt, warm_size=1, clock=clock, spawn_rate_limit=100.0,
+                    warming_timeout_s=600.0, unknown_grace_s=300.0)
+    ref["pool"] = pool
+    pool.tick()
+    slot_id = next(iter(pool._slots))
+
+    clock.advance(1.0)
+    pool.tick()   # is_ready flips it to DRAINING and returns UNKNOWN
+    assert pool._slots[slot_id].state == SlotState.DRAINING, "sanity: the branch is reachable"
+    assert slot_id not in rt.reaped, "a slot we could not ask about was reaped as not-ready"

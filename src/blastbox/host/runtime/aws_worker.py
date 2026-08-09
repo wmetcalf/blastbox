@@ -630,13 +630,57 @@ class AwsDisposableRuntime:
         _log.info("%s: spawned slot=%s resource=%s", self.kind, slot.slot_id, slot.resource_id)
         return slot
 
-    def is_ready(self, slot: AwsWorkerSlot) -> bool:
+    def is_ready(self, slot: AwsWorkerSlot) -> "bool | None":
+        """TRI-STATE: True = ready, False = CONFIRMED not ready yet, None = UNKNOWN.
+
+        "Could not ask" used to collapse into "not ready yet" here, on the reasoning that the pool
+        just retries next tick. It does -- but ``_health_check`` ALSO evicts any WARMING slot older
+        than ``warming_timeout_s`` (300s lambda / 600s ec2-hibernate) and reaps it. So a brownout
+        outlasting the readiness budget terminated every WARMING instance in the tier: instances
+        booting perfectly well whose only fault was that AWS would not describe them. Spawns are
+        throttled during the same event, so the tier then held at zero (issue #79).
+
+        UNKNOWN is not a verdict about the worker, so it must not be spent as one. The pool now
+        suppresses the warming timeout for the duration of an unknown episode -- bounded, so a
+        control plane that never comes back still lets the slot age out rather than wedging the
+        tier (the same trade ``_unknown_grace_s`` makes on the IDLE path).
+        """
         try:
-            # "could not ask" is not-ready-yet here; the pool retries next tick. Only resume() and
-            # the liveness paths care about the difference (issue #77 marla-loop 3).
-            return self._health_ok(slot) is True
+            ok = self._health_ok(slot)
+        except AwsUnknownState as exc:
+            # Includes AwsProbeTimeout. But NOT every unconfirmed call means we failed to observe
+            # the WORKER: minting a token needs a running microVM, so a slot that is merely still
+            # `pending` fails the mint with an unconfirmed error even though the describe answered
+            # perfectly and told us, definitively, that it is not ready yet. Treating that as
+            # UNKNOWN would suppress the warming timeout for an instance that never boots -- the
+            # exact wedge this exemption is bounded to avoid.
+            #
+            # So: UNKNOWN here means "we could not observe the instance's state", nothing weaker.
+            # If the state is still readable, we DID observe the worker and the downstream failure
+            # is a consequence of the state we read.
+            if self._state_observable(slot):
+                _log.debug("%s: is_ready(%s) not ready (observed state; %s)",
+                           self.kind, slot.slot_id, exc)
+                return False
+            _log.debug("%s: is_ready(%s) unknown: %s", self.kind, slot.slot_id, exc)
+            return None
         except (AwsWorkerError, OSError) as exc:
+            # A verdict chosen at the raise site: a definitive answer that this slot is not up.
             _log.debug("%s: is_ready(%s) probe error: %s", self.kind, slot.slot_id, exc)
+            return False
+        # _health_ok is itself tri-state; preserve its UNKNOWN rather than flattening it to False.
+        return None if ok is None else (ok is True)
+
+    def _state_observable(self, slot: AwsWorkerSlot) -> bool:
+        """True if we can still read this instance's state from the control plane.
+
+        Served from the same describe cache ``_health_ok`` just used, so the common path costs no
+        extra API call -- and during a real brownout the underlying describe fails too, which is
+        precisely the signal we want.
+        """
+        try:
+            return bool(self._describe_cached(slot, self._liveness_cache_s))
+        except (AwsWorkerError, OSError):
             return False
 
     def is_alive(self, slot: AwsWorkerSlot) -> "bool | None":
@@ -1620,8 +1664,12 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         self._hib_started[slot.slot_id] = now
         return True
 
-    def is_ready(self, slot: AwsWorkerSlot) -> bool:
+    def is_ready(self, slot: AwsWorkerSlot) -> "bool | None":
         # Per-slot state machine, polled by the pool during WARMING: boot -> warm -> hibernate -> parked.
+        # TRI-STATE like the base class: None = the control plane didn't answer. This tier has the
+        # LONGEST warming budget (600s) and therefore the most to lose from folding a brownout into
+        # "not ready" -- every describe below can throttle, and each one used to land in the blanket
+        # handler at the bottom as a False (issue #79).
         try:
             now = self._clock()
             phase = self._phase.get(slot.slot_id, "warming")
@@ -1655,6 +1703,13 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                     self._phase[slot.slot_id] = "warming"
                 return False
             return True   # parked -- claimable; resume() wakes it on claim
+        except AwsUnknownState as exc:
+            # A throttled describe tells us NOTHING about whether this instance booted, warmed, or
+            # parked. Returning False here spent the 600s warming budget on the control plane's
+            # silence and then terminated the instance (issue #79). The phase is left untouched, so
+            # the machine resumes from wherever it was once AWS answers again.
+            _log.debug("ec2-hibernate: is_ready(%s) unknown: %s", slot.slot_id, exc)
+            return None
         except (AwsWorkerError, OSError) as exc:
             _log.debug("ec2-hibernate: is_ready(%s) error: %s", slot.slot_id, exc)
             return False

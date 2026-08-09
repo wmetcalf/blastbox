@@ -136,8 +136,14 @@ class SlotRuntime(Protocol):
         """Launch a warm worker; returns a SPAWNING/WARMING slot."""
         ...
 
-    def is_ready(self, slot: Slot) -> bool:
-        """True once the worker has signalled ready (control_dir/ready)."""
+    def is_ready(self, slot: Slot) -> "bool | None":
+        """Tri-state readiness: True = ready, False = CONFIRMED not ready yet, None = UNKNOWN.
+
+        None means the runtime could not find out (a throttled control plane), NOT that the worker
+        failed to come up. The pool suppresses the warming timeout for the duration of an unknown
+        episode, so a brownout cannot terminate a tier's entire WARMING population (issue #79).
+        Local runtimes poll a process or a file and simply never return None.
+        """
         ...
 
     def is_alive(self, slot: Slot) -> "bool | None":
@@ -428,6 +434,13 @@ class WarmPool:
         # slot_id -> when it FIRST went UNKNOWN and stayed that way (cleared by any definitive
         # answer). Bounds how long "we can't tell" may keep a slot alive; see _health_check.
         self._unknown_since: dict[str, float] = {}
+        # The same idea for the WARMING path: slot_id -> when is_ready() FIRST returned UNKNOWN and
+        # kept doing so. A brownout longer than warming_timeout_s used to terminate every WARMING
+        # instance in a tier -- instances booting fine whose only fault was that the control plane
+        # would not describe them (issue #79). Cleared by any definitive ready/not-ready answer, so
+        # a tier that IS answering still ages its slots out normally; bounded by _unknown_grace_s so
+        # a control plane that never returns cannot wedge the tier at zero capacity forever.
+        self._warming_unknown_since: dict[str, float] = {}
         # Slots escalated on SUSPICION (a long UNKNOWN) rather than a confirmed verdict. Disposal is
         # asynchronous now, so this must outlive the tick that queued it -- the reaper needs to know
         # not to strand a slot it merely could not dispose of.
@@ -1760,9 +1773,25 @@ class WarmPool:
             try:
                 ready = self._runtime.is_ready(slot)
             except Exception:
-                logger.exception("pool.is_ready_error slot_id=%s", slot.slot_id)
-                ready = False
+                # An exception is not evidence the instance failed to boot, for the same reason it
+                # isn't on the liveness paths: a runtime's exception enumeration is never complete.
+                # It stays non-promoting (as before) but now also counts as UNKNOWN, so the warming
+                # timeout does not convict a slot we could not ask about (issue #79).
+                logger.exception("pool.is_ready_error slot_id=%s — treating as unknown", slot.slot_id)
+                ready = None
                 raised = True
+            # TRI-STATE, same contract as _probe_alive and the health tick: True = ready,
+            # False = CONFIRMED not ready, None = UNKNOWN. Record/clear the unknown episode BEFORE
+            # acting, so _health_check's warming-timeout decision sees this pass's observation.
+            probed_at = self._clock()
+            with self._lock:
+                if ready is None:
+                    self._warming_unknown_since.setdefault(slot.slot_id, probed_at)
+                else:
+                    # A definitive answer -- in EITHER direction -- ends the episode. "Not ready yet"
+                    # is a real observation of the worker, so it must resume aging it; only the
+                    # absence of an answer is exempt.
+                    self._warming_unknown_since.pop(slot.slot_id, None)
             if ready:
                 with self._lock:
                     # Only promote if still WARMING (concurrent stop could clear it)
@@ -1777,7 +1806,10 @@ class WarmPool:
                         # the streak oscillated and invalidate_base() was never reached. A SERVED
                         # JOB is the proof, and that is where the reset lives (upstream, PR #82).
                         self._promoted_unproven.add(slot.slot_id)
-            elif slot.state == SlotState.DRAINING and not raised:
+            elif ready is False and slot.state == SlotState.DRAINING and not raised:
+                # `ready is False`, not merely falsy: UNKNOWN is falsy too, and letting it in here
+                # would reap a slot precisely because we could not ask about it -- the bug this
+                # tri-state exists to prevent, re-entering through the back door (issue #79).
                 # is_ready returned False AND the slot is DRAINING. Usually the runtime's finalize
                 # failed closed and reaped the VM ITSELF; but DRAINING can ALSO be set EXTERNALLY (a
                 # concurrent stop() flips every slot to DRAINING before reaping) while a slow finalize
@@ -2364,6 +2396,25 @@ class WarmPool:
             except Exception as exc:  # noqa: BLE001 -- attribution must never break the tick
                 logger.warning("pool.tier_blame_failed slot_id=%s: %s", slot_id, exc)
 
+    def _warming_unknown_unexpired(self, slot_id: str, now: float) -> bool:
+        """True while a WARMING slot is inside a live, still-plausible UNKNOWN episode.
+
+        Call with ``_lock`` held. The warming timeout is a statement about the WORKER ("it never
+        came up"), so it may only be spent on evidence about the worker. While ``is_ready`` is
+        returning UNKNOWN we have none -- the control plane simply isn't answering -- and a
+        brownout longer than ``warming_timeout_s`` would otherwise terminate the tier's entire
+        WARMING population at once (issue #79).
+
+        Bounded by ``_unknown_grace_s``, the same knob the IDLE path uses, because the opposite
+        failure is just as real: an unbounded exemption means a control plane that never returns
+        wedges the tier at zero capacity while is_healthy() still reports True. Ride out a
+        brownout; do not ride out an outage. A grace of 0 disables the exemption entirely.
+        """
+        since = self._warming_unknown_since.get(slot_id)
+        if since is None or self._unknown_grace_s <= 0:
+            return False
+        return (now - since) <= self._unknown_grace_s
+
     def _health_check(self) -> None:
         """Evict dead IDLE slots AND stuck WARMING slots so the spawn loop replaces them.
 
@@ -2381,11 +2432,17 @@ class WarmPool:
             if self._unknown_since:
                 for gone in [k for k in self._unknown_since if k not in self._slots]:
                     self._unknown_since.pop(gone, None)
+            # Drop warming-unknown bookkeeping for slots that have left the pool, same leak the
+            # _unknown_since sweep above closes.
+            if self._warming_unknown_since:
+                for gone in [k for k in self._warming_unknown_since if k not in self._slots]:
+                    self._warming_unknown_since.pop(gone, None)
             stuck_warming = [
                 s for s in self._slots.values()
                 if s.state == SlotState.WARMING
                 and self._warming_timeout_s > 0
                 and now - s.spawned_at > self._warming_timeout_s
+                and not self._warming_unknown_unexpired(s.slot_id, now)
             ]
 
         dead: list[Slot] = list(stuck_warming)

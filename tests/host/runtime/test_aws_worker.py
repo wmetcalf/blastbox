@@ -2741,3 +2741,96 @@ def test_a_confirmed_dead_mint_error_is_not_swallowed_into_a_backoff():
     assert not isinstance(ei.value, AwsUnknownState), (
         "a microVM AWS confirmed GONE was handed back as unknown because the confirmed-dead mint "
         "error was swallowed into a backoff and the later throttles decided the verdict")
+
+
+def test_is_ready_reports_unknown_when_the_control_plane_throttles():
+    """issue #79: a throttled describe is NOT "the instance didn't boot".
+
+    is_ready() folded every AwsWorkerError into False, and the pool evicts any WARMING slot older
+    than warming_timeout_s -- so a brownout outlasting that budget terminated the tier's entire
+    WARMING population, instances that were booting perfectly well.
+    """
+    def throttled(argv):  # noqa: ANN001
+        raise AwsProbeTimeout("Throttling: Rate exceeded")
+
+    fake = FakeAws({**_IDENT, "ec2 run-instances": {"Instances": [{"InstanceId": "i-1"}]},
+                    "ec2 describe-instances": throttled})
+    cfg = Ec2HibernateConfig(region="us-east-1", image_id="ami-x", resume_poll_s=0.0)
+    rt = Ec2HibernateRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True,
+                             clock=lambda: 100.0)
+    slot = rt.spawn()
+    assert rt.is_ready(slot) is None, "a throttled describe must be UNKNOWN, not not-ready"
+
+
+def test_is_ready_still_reports_a_definitive_not_ready():
+    """The exemption must not swallow real answers: an instance that is genuinely still booting
+    reports False, so the warming timeout keeps working for actual failures.
+    """
+    rt, _ = _hibernate_rt(state=["pending"], healthy=[False])
+    slot = rt.spawn()
+    assert rt.is_ready(slot) is False
+
+
+def test_a_throttle_leaves_the_hibernate_phase_untouched():
+    """The phase machine must resume where it was once AWS answers again, rather than being
+    re-driven from the start by a brownout."""
+    state = ["running"]
+    calls = {"n": 0}
+
+    def describe(argv):  # noqa: ANN001
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise AwsProbeTimeout("Throttling: Rate exceeded")
+        return _cp(stdout=json.dumps({"Reservations": [{"Instances": [
+            {"InstanceId": "i-1", "State": {"Name": state[0]}, "PrivateIpAddress": "10.0.0.5"}]}]}))
+
+    fake = FakeAws({**_IDENT, "ec2 run-instances": {"Instances": [{"InstanceId": "i-1"}]},
+                    "ec2 describe-instances": describe, "ec2 stop-instances": {}})
+    cfg = Ec2HibernateConfig(region="us-east-1", image_id="ami-x", resume_poll_s=0.0)
+    rt = Ec2HibernateRuntime(cfg, aws_runner=fake, http_probe=lambda u, h, t: True,
+                             clock=lambda: 100.0)
+    slot = rt.spawn()
+    rt.is_ready(slot)                      # call 1: running + healthy -> parks, phase advances
+    phase_before = rt._phase.get(slot.slot_id)
+    assert rt.is_ready(slot) is None       # call 2: throttled -> UNKNOWN
+    assert rt._phase.get(slot.slot_id) == phase_before, "a brownout must not rewind the phase"
+
+
+def test_snapstart_is_ready_is_unknown_when_the_instance_is_unobservable():
+    """SnapStart is the DEFAULT warm tier, so the base-class is_ready is the one that matters most.
+
+    A brownout that hides the microVM entirely must read UNKNOWN, not "didn't boot" -- otherwise
+    warming_timeout_s terminates the tier's whole WARMING population (issue #79).
+    """
+    def throttled(argv):  # noqa: ANN001
+        raise AwsProbeTimeout("Throttling: Rate exceeded")
+
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": throttled})
+    slot = AwsWorkerSlot(slot_id="s", resource_id="mv-1")
+    assert rt.is_ready(slot) is None
+
+
+def test_snapstart_is_ready_is_not_ready_when_the_state_is_still_readable():
+    """The mirror case, and the reason the exemption is narrow: minting a token needs a RUNNING
+    microVM, so a `pending` slot fails the mint with an unconfirmed error. The describe answered,
+    though -- we DID observe the worker -- so this is a definitive not-ready-yet, and the warming
+    timeout must keep running against it. Reading it as UNKNOWN would exempt an instance that
+    never boots from the very timeout that replaces it.
+    """
+    rt, _ = _snapstart_rt({
+        "lambda-microvms get-microvm": {"state": "pending", "endpoint": "vm.example"},
+        "lambda-microvms create-microvm-auth-token": _cp(rc=254, stderr="microvm not running"),
+    })
+    slot = AwsWorkerSlot(slot_id="s", resource_id="mv-1")
+    assert rt.is_ready(slot) is False
+
+
+def test_snapstart_is_ready_preserves_a_health_ok_unknown():
+    """_health_ok is itself tri-state: it returns None when NO probe was issued (the endpoint has
+    not surfaced yet). Flattening that to False convicts a running microVM with zero agent probes
+    ever sent -- the shape the liveness path already fixed; readiness must not undo it.
+    """
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "running"}})  # no endpoint
+    slot = AwsWorkerSlot(slot_id="s", resource_id="mv-1")
+    assert rt._health_ok(slot) is None, "sanity: this is the _health_ok UNKNOWN case"
+    assert rt.is_ready(slot) is None
