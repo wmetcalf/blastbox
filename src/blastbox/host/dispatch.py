@@ -25,6 +25,8 @@ import logging
 import os
 import re
 import shutil
+
+from blastbox.host.jobs.retention import purge_job_dir
 import subprocess
 import threading
 import time
@@ -893,8 +895,10 @@ class Dispatcher:
                         job, staged_input_path=input_path, slot=slot, output_dir=output_dir
                     )
                 finally:
-                    # Delete the staged input on every terminal path WE own.
+                    # Delete the staged input on every terminal path WE own, then purge the
+                    # whole dir -- output/ included (issue #84).
                     self._delete_input_if_owned(job, input_path)
+                    self._purge_job_dir_if_owned(job)
                     self._record_outcome(job, path="warm", started=t0)
                 return
             elif self._warm_only:
@@ -947,8 +951,10 @@ class Dispatcher:
                              "retaining the concurrency permit until a sweep confirms the container "
                              "is gone", job.job_id)
             # Delete the malicious input on every terminal path WE own, regardless of success,
-            # failure, exception, or unknown engine. We never touch output/ here.
+            # failure, exception, or unknown engine -- then purge the whole job dir. output/ used
+            # to survive here forever, which is the leak in issue #84.
             self._delete_input_if_owned(job, input_path)
+            self._purge_job_dir_if_owned(job)
             self._record_outcome(job, path="cold", started=t0)
 
     def _requeue_claimed(self, job: Job, *, reason: str, defer: bool = False) -> None:
@@ -987,6 +993,24 @@ class Dispatcher:
         _log.info("job_id=%s requeued=%s defer=%s (%s)", job.job_id, requeued, defer, reason)
         if self._warm_requeue_backoff_s:
             time.sleep(self._warm_requeue_backoff_s)
+
+    def _purge_job_dir_if_owned(self, job: Job) -> None:
+        """Terminal purge of this job's whole dir -- parity with VmJobDispatcher (issue #84).
+
+        Deleting only the input left output/ (metadata.json, rmeta -- text and embedded objects
+        extracted from the sample) on the worker forever. The blob store holds the durable copy,
+        so nothing is lost by removing it.
+
+        OWNERSHIP-GATED, and that is not optional here. Two dispatcher containers on one node
+        share a single job_root bind mount, so a peer that reclaimed this job still needs the
+        staged bytes; purging unconditionally would delete them out from under the new owner
+        mid-flight. That peer's own terminal purge cleans up instead. This mirrors exactly the
+        condition _delete_input_if_owned already applies, so the two cannot disagree about who
+        owns the tree.
+        """
+        final = self._job_store.get(job.job_id)
+        if final is None or final.claim_id == job.claim_id:
+            purge_job_dir(self._job_root, job.job_id, _log)
 
     def _delete_input_if_owned(self, job: Job, input_path: Path) -> None:
         """Delete the shared staged input ONLY if we still hold the claim (or the job

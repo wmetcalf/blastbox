@@ -28,6 +28,40 @@ _log = logging.getLogger("blastbox.host.jobs.retention")
 _TERMINAL = frozenset({JobStatus.DONE, JobStatus.FAILED, JobStatus.EXPIRED})
 
 
+def purge_job_dir(job_root: "Path", job_id: str, log: "logging.Logger") -> None:
+    """Remove a job's ENTIRE per-job dir (input AND output) from this worker's disk.
+
+    SECURITY INVARIANT, not housekeeping: a worker is a malware-analysis node, frequently
+    spare hardware that is not a hardened sample repository. Nothing may survive a terminal
+    state, and there is deliberately no setting that disables this. The durable copy lives in
+    the blob store (``results/<job_id>/``), so removing the local tree loses nothing.
+
+    Shared by BOTH dispatchers on purpose. It previously existed only in VmJobDispatcher, so
+    the file-handshake path (firecracker/gvisor -- every local warm worker) deleted just the
+    input and left output/ forever: 97,681 dirs / 184 GiB across a 3-node fleet, one node's
+    root filesystem at 100%, and its warm pool collapsed 16 guests -> 3 (issue #84). Keeping
+    one implementation is what stops the two from drifting apart again.
+
+    Best-effort by design -- a purge failure must never mask the job's real outcome -- but it
+    is logged loudly, never silently swallowed, so an operator can see a worker failing to
+    clean up after itself. Containment: resolve first, then refuse anything that does not land
+    strictly under ``job_root`` (guards a job_id carrying traversal components).
+    """
+    root = (job_root / job_id).resolve()
+    try:
+        root.relative_to(job_root.resolve())
+    except ValueError:
+        log.error("refusing to purge %s (outside job_root %s)", root, job_root)
+        return
+    if not root.exists():
+        return
+    try:
+        shutil.rmtree(root)
+    except OSError as exc:
+        log.error("PURGE FAILED for job %s at %s: %s — sample bytes may remain on this "
+                  "worker's disk", job_id, root, exc)
+
+
 class JobRetentionSweeper:
     """Sweeps expired terminal-status jobs and deletes their artifacts.
 

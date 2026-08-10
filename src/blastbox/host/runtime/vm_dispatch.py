@@ -23,7 +23,6 @@ import contextlib
 import inspect
 import logging
 import os
-import shutil
 import threading
 import time
 from collections.abc import Callable
@@ -35,7 +34,7 @@ from blastbox.host.pool import release_kwargs
 from blastbox.contract.envelope import atomic_write_confined
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
-from blastbox.host.jobs.retention import JobRetentionSweeper
+from blastbox.host.jobs.retention import JobRetentionSweeper, purge_job_dir
 from blastbox.host.runtime.remote_http import WorkerBusy   # 409 from a busy worker -> requeue, not fail
 from blastbox.observability.metrics import (
     observe_job_duration,
@@ -253,20 +252,9 @@ class VmJobDispatcher:
         resolve first, then refuse anything that doesn't land strictly under
         ``job_root`` (guards a job_id/path with traversal components).
         """
-        root = self._job_dir(job).resolve()
-        try:
-            root.relative_to(self._job_root.resolve())
-        except ValueError:
-            logger.error("vm_dispatch: refusing to purge %s (outside job_root %s)",
-                        root, self._job_root)
-            return
-        if not root.exists():
-            return
-        try:
-            shutil.rmtree(root)
-        except OSError as exc:
-            logger.error("vm_dispatch: PURGE FAILED for job %s at %s: %s — sample bytes may "
-                        "remain on this worker's disk", job.job_id, root, exc)
+        # Delegates to the shared implementation so this invariant cannot drift between the
+        # two dispatchers -- it already had, and the file-handshake path leaked forever (#84).
+        purge_job_dir(self._job_root, job.job_id, logger)
 
     def _expiry(self, finished_at: float) -> float | None:
         return finished_at + self._retention_s if self._retention_s > 0 else None

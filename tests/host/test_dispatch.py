@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import shutil
+import logging
 import hashlib
 import json
 import subprocess
@@ -218,6 +220,22 @@ def test_happy_path_done_result_summary_input_gone(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _sealed_metadata(job_root: Path, job) -> dict:
+    """Read a job's sealed metadata from the DURABLE copy, not the purged job dir.
+
+    The dispatcher destroys job_root/<id> on every terminal path (issue #84). LocalBlobStore
+    deliberately roots durable bytes OUTSIDE job_root (a sibling `blobs/results/<job_id>`)
+    precisely so the purge cannot touch them -- see blobs/local.py's header. Reading there is
+    also more faithful: it is the copy the API actually serves.
+    """
+    return json.loads((job_root.parent / "blobs" / "results" / job.job_id / "metadata.json").read_text())
+
+
+def _durable_artifact(job_root: Path, job, rel: str) -> Path:
+    """Path to a sealed artifact in the durable blob copy (see _sealed_metadata)."""
+    return job_root.parent / "blobs" / "results" / job.job_id / rel
+
+
 class _RecordingBlobs:
     """Minimal BlobStore double that records put_output calls + a snapshot of
     whether metadata.json existed in out_dir at call time (it must -- upload
@@ -241,6 +259,28 @@ class _RecordingBlobs:
     def open_output(self, job_id, name): ...
     def delete_job(self, job_id):
         self.deleted.append(job_id)
+
+class _SnapshotBlobs(_RecordingBlobs):
+    """Recording blob store that also COPIES out_dir aside at put_output time.
+
+    Needed because the dispatcher now purges the whole job dir on every terminal path
+    (issue #84) -- the durable copy is the blob store, so a test that inspects
+    job_root/<id>/output after dispatch is reading a directory production deliberately
+    deletes. Upload happens while output/ is still intact, so snapshotting there asserts
+    exactly what the blob store received, which is what the API actually serves.
+    """
+
+    def __init__(self, snapshot_root: Path, fail_times: int = 0):
+        super().__init__(fail_times=fail_times)
+        self.snapshot_root = Path(snapshot_root)
+        self.snapshot: Path | None = None
+
+    def put_output(self, job_id, out_dir):
+        super().put_output(job_id, out_dir)
+        dest = self.snapshot_root / f"snap-{job_id}"
+        shutil.rmtree(dest, ignore_errors=True)
+        shutil.copytree(out_dir, dest)
+        self.snapshot = dest
 
 
 def test_cold_dispatch_uploads_result_to_blob_store_before_done(tmp_path):
@@ -462,7 +502,7 @@ def test_cold_dispatch_serves_host_sealed_metadata(tmp_path):
     d = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
     assert d.dispatch_once() is True
     assert store.get(job.job_id).status == JobStatus.DONE
-    served = json.loads((output_dir / "metadata.json").read_text())
+    served = _sealed_metadata(tmp_path, job)
     assert served["artifacts"][0]["sha256"] == real_sha
     assert served["artifacts"][0]["bytes"] == len(content)
 
@@ -1541,14 +1581,14 @@ def test_network_capture_sealed_as_trusted_artifact(tmp_path, monkeypatch):
 
     assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
 
-    sealed = json.loads((output_dir / "metadata.json").read_text())
+    sealed = _sealed_metadata(tmp_path, job)
     caps = [a for a in sealed["artifacts"] if a["kind"] == "network_capture"]
     assert len(caps) == 1, f"capture artifact not sealed: {sealed['artifacts']}"
     assert caps[0]["path"] == "capture/dump.pcap"
     assert caps[0]["sha256"] == hashlib.sha256(pcap_bytes).hexdigest()
     assert caps[0]["bytes"] == len(pcap_bytes)
     # The pcap is now servable from within the output dir.
-    assert (output_dir / "capture" / "dump.pcap").read_bytes() == pcap_bytes
+    assert _durable_artifact(tmp_path, job, "capture/dump.pcap").read_bytes() == pcap_bytes
 
 
 def test_network_capture_seal_proceeds_when_done_sentinel_never_lands(tmp_path, monkeypatch):
@@ -1575,7 +1615,7 @@ def test_network_capture_seal_proceeds_when_done_sentinel_never_lands(tmp_path, 
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
-    sealed = json.loads((output_dir / "metadata.json").read_text())
+    sealed = _sealed_metadata(tmp_path, job)
     caps = [a for a in sealed["artifacts"] if a["kind"] == "network_capture"]
     assert len(caps) == 1  # sealed anyway after the bounded wait
     assert caps[0]["sha256"] == hashlib.sha256(pcap_bytes).hexdigest()
@@ -1653,7 +1693,7 @@ def test_capture_refuses_symlinked_capture_dir(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
-    sealed = json.loads((output_dir / "metadata.json").read_text())
+    sealed = _sealed_metadata(tmp_path, job)
     assert not [a for a in sealed["artifacts"] if a["kind"] == "network_capture"]  # refused
     assert not (escape / "dump.pcap").exists()  # nothing written through the symlink
 
@@ -1905,7 +1945,7 @@ def test_decrypt_seal_refuses_symlinked_output(tmp_path, monkeypatch):
 
     assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
     assert escape.read_bytes() == b"DO NOT TOUCH"  # the symlink target was never written through
-    sealed = json.loads((output_dir / "metadata.json").read_text())
+    sealed = _sealed_metadata(tmp_path, job)
     paths = [a["path"] for a in sealed["artifacts"]]
     assert "capture/decrypted.pcap" not in paths      # symlinked output skipped
     assert "capture/mixed.pcap" in paths              # the non-symlinked output still sealed
@@ -1964,14 +2004,15 @@ def test_decrypt_seals_decrypted_and_mixed_when_keylog_present(tmp_path, monkeyp
     dispatcher = _direct_dispatcher(store, tmp_path, fake_runner)
     assert dispatcher.dispatch_once() is True
 
-    sealed = json.loads((output_dir / "metadata.json").read_text())
+    sealed = _sealed_metadata(tmp_path, job)
     kinds = {a["kind"] for a in sealed["artifacts"]}
     assert "network_capture" in kinds
     assert "network_capture_decrypted" in kinds
     assert "network_capture_mixed" in kinds
-    # The decrypted pcap is servable from the output dir + hash matches.
+    # The decrypted pcap is servable + its hash matches. Read the DURABLE copy: the job dir
+    # is purged on every terminal path (issue #84), and this is the copy the API serves.
     dec = next(a for a in sealed["artifacts"] if a["kind"] == "network_capture_decrypted")
-    served = (output_dir / dec["path"]).read_bytes()
+    served = _durable_artifact(tmp_path, job, dec["path"]).read_bytes()
     assert dec["sha256"] == hashlib.sha256(served).hexdigest()
 
 
@@ -1998,7 +2039,7 @@ def test_decrypt_noop_without_keylog(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
-    sealed = json.loads((output_dir / "metadata.json").read_text())
+    sealed = _sealed_metadata(tmp_path, job)
     kinds = {a["kind"] for a in sealed["artifacts"]}
     assert "network_capture_decrypted" not in kinds
     assert store.get(job.job_id).status == JobStatus.DONE
@@ -2266,7 +2307,7 @@ def test_no_capture_artifact_when_netd_produced_none(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
-    sealed = json.loads((output_dir / "metadata.json").read_text())
+    sealed = _sealed_metadata(tmp_path, job)
     assert not any(a["kind"] == "network_capture" for a in sealed["artifacts"])
     assert store.get(job.job_id).status == JobStatus.DONE
 
@@ -2435,3 +2476,92 @@ def test_cold_dispatch_fenced_after_shutdown_begins(tmp_path):
     assert gate.in_flight == 0                     # no permit acquired
     final = store.get(job.job_id)
     assert final is not None and final.status == JobStatus.QUEUED   # requeued for restart
+
+
+def test_terminal_job_leaves_nothing_on_this_workers_disk(tmp_path):
+    """SECURITY INVARIANT parity with VmJobDispatcher._purge_job_dir (issue #84).
+
+    A worker is a malware-analysis node, often spare hardware that is not a hardened sample
+    repository, so nothing may survive a terminal state. VmJobDispatcher purges the whole job
+    dir; the classic Dispatcher deleted only the INPUT and left output/ -- which holds
+    metadata.json and rmeta, i.e. text and embedded objects extracted from the sample. On a
+    real fleet that leaked 97,681 dirs / 184 GiB, filled a node's root filesystem, and
+    collapsed its warm pool from 16 Firecracker guests to 3.
+
+    The durable copy lives in the blob store (results/<job_id>/), so removing the local dir
+    loses nothing.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    assert dispatcher.dispatch_once() is True
+    assert store.get(job.job_id).status == JobStatus.DONE
+
+    job_dir = tmp_path / job.job_id
+    assert not job_dir.exists(), (
+        f"the whole job dir must be gone; survivors: "
+        f"{sorted(p.relative_to(job_dir).as_posix() for p in job_dir.rglob('*'))}"
+    )
+
+
+def test_a_peer_reclaimed_job_keeps_its_dir_for_the_new_owner(tmp_path):
+    """The purge must stay ownership-gated, exactly as input deletion already is.
+
+    Two dispatcher containers on one node share a single job_root bind mount, so a peer that
+    reclaimed this job needs the staged bytes still on disk. Purging unconditionally would
+    delete them out from under the new owner mid-flight; that peer's own terminal purge is
+    what cleans up.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        # A peer reclaims mid-flight: the claim_id moves on while we are still running.
+        cur = store.get(job.job_id)
+        cur.claim_id = "peer-took-it"
+        store.update(cur.job_id, claim_id="peer-took-it")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher.dispatch_once()
+
+    assert (tmp_path / job.job_id).exists(), (
+        "a job reclaimed by a same-host peer must keep its dir for the new owner"
+    )
+
+
+def test_purge_refuses_a_job_id_that_escapes_the_job_root(tmp_path):
+    """Containment: a job_id carrying traversal components must never delete outside job_root.
+
+    The purge resolves the path first and refuses anything that does not land strictly under
+    job_root. Without that check a crafted job_id would hand an attacker an arbitrary rmtree
+    running as the dispatcher.
+    """
+    from blastbox.host.jobs.retention import purge_job_dir
+
+    job_root = tmp_path / "jobs"
+    (job_root / "safe").mkdir(parents=True)
+    outsider = tmp_path / "outside"
+    outsider.mkdir()
+    (outsider / "keepme").write_text("must survive")
+
+    purge_job_dir(job_root, "../outside", logging.getLogger("t"))
+
+    assert (outsider / "keepme").exists(), "purge escaped job_root and deleted an outside tree"
+    assert outsider.exists()
