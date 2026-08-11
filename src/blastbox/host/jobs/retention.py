@@ -696,7 +696,13 @@ def reap_stale_scratch(
         #   * a DONE row with nothing durable -- a pre-blob-store job whose only copy is the
         #     legacy <job_root>/<id>/output path LocalBlobStore.open_output still falls back to.
         # Anything else is scratch, and reclaiming it on age is the entire point (#85 review).
-        pending = (d / PENDING_UPLOAD_SENTINEL).is_file()
+        # A pending-upload hold is only meaningful while the job is FAILED and awaiting its
+        # retry. If retention EXPIRED it (the operator's schedule deliberately dropped that
+        # result, and expire_due clears expires_at so it is never selected again) or the row is
+        # gone entirely (DELETE /v1/jobs), nothing will ever upload the tree -- retry_pending_
+        # uploads requires a FAILED row -- so holding it is an immortal leak, not protection.
+        pending = ((d / PENDING_UPLOAD_SENTINEL).is_file()
+                   and job is not None and job.status is JobStatus.FAILED)
         if blob_store is not None and (pending or (job is not None
                                                    and job.status is JobStatus.DONE)):
             try:

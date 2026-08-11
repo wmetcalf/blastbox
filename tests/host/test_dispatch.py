@@ -3217,12 +3217,19 @@ def test_scratch_reclaim_never_deletes_a_sealed_result_that_has_no_durable_copy(
     jl.status = JobStatus.DONE
     store.create(jl)
 
-    # (2) upload exhausted: the host left its sentinel
+    # (2) upload exhausted: the host left its sentinel AND the row is still FAILED, i.e. the
+    # retry is genuinely outstanding. The hold is scoped to exactly that: an EXPIRED row means
+    # retention already dropped the result, and a missing row means it was deleted — in both
+    # cases nothing will ever upload the tree, so holding it would be an immortal leak.
     pending = "22222222-2222-4222-8222-222222222222"
     dp = tmp_path / pending
     (dp / "output").mkdir(parents=True)
     (dp / "output" / "metadata.json").write_text('{"sealed": true}')
     (dp / PENDING_UPLOAD_SENTINEL).write_text("")
+    jp = Job.new(engine="redtusk", filename="b.doc")
+    jp.job_id = pending
+    jp.status = JobStatus.FAILED
+    store.create(jp)
 
     old = time.time() - 99_999
     for base in (dl, dp):
@@ -3711,3 +3718,41 @@ def test_a_blob_root_ABOVE_job_root_does_not_disable_the_whole_reclaim(tmp_path)
     assert reap_stale_scratch(job_root, 60.0, InMemoryJobStore(), _logging.getLogger("t"),
                               blob_store=RootedAbove()) == 1, "the reclaim was disabled entirely"
     assert not d.exists()
+
+
+def test_an_expired_or_deleted_job_does_not_hold_its_tree_forever(tmp_path):
+    """The pending-upload hold is only meaningful while the retry is genuinely outstanding.
+
+    retry_pending_uploads requires a FAILED row, so once retention EXPIRES the job (which also
+    clears expires_at, so it is never selected again) or the row is deleted outright, NOTHING will
+    ever upload that tree — and the hold turns from protection into an immortal leak, which is the
+    exact failure this whole PR exists to eliminate.
+    """
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL, reap_stale_scratch
+    import logging as _logging
+
+    class NothingDurable:
+        def has_output(self, job_id):
+            return False
+
+    for label, status in (("expired", JobStatus.EXPIRED), ("deleted", None)):
+        root = tmp_path / label
+        root.mkdir()
+        jid = "33333333-3333-4333-8333-333333333333"
+        d = root / jid
+        (d / "output").mkdir(parents=True)
+        (d / "output" / "metadata.json").write_text("{}")
+        (d / PENDING_UPLOAD_SENTINEL).write_text("")
+        store = InMemoryJobStore()
+        if status is not None:
+            job = Job.new(engine="redtusk", filename="a.doc")
+            job.job_id = jid
+            job.status = status
+            store.create(job)
+        old = time.time() - 99_999
+        for pth in (d / "output" / "metadata.json", d / PENDING_UPLOAD_SENTINEL, d / "output", d):
+            os.utime(pth, (old, old))
+
+        assert reap_stale_scratch(root, 60.0, store, _logging.getLogger("t"),
+                                  blob_store=NothingDurable()) == 1, f"{label} tree held forever"
+        assert not d.exists()
