@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from blastbox.host.blobs.base import BlobStore, upload_output_with_retry
@@ -148,6 +149,7 @@ def retry_pending_uploads(
     log: logging.Logger,
     *,
     attempts: int = 1,
+    on_repaired: "Callable[[str, Path], None] | None" = None,
 ) -> int:
     """Re-attempt ``put_output`` for every local tree holding a sealed result with no durable copy.
 
@@ -232,6 +234,17 @@ def retry_pending_uploads(
                 ):
                     log.info("pending-upload sweep: job %s repaired to DONE (its result is "
                              "durable now)", d.name)
+                    # Everything this job's own DONE path would have done and never got to --
+                    # page-hash indexing for similarity search, keyed off the sealed envelope.
+                    # Without it a recovered job is DONE and servable but permanently invisible
+                    # to /similar, because nothing re-walks DONE jobs (upstream review of #85).
+                    # Best-effort: an indexing problem must never undo a good repair.
+                    if on_repaired is not None:
+                        try:
+                            on_repaired(d.name, out_dir)
+                        except Exception:  # noqa: BLE001
+                            log.warning("pending-upload sweep: post-repair hook failed for %s",
+                                        d.name, exc_info=True)
             except Exception:  # noqa: BLE001 -- the bytes are safe; the status can retry
                 log.warning("pending-upload sweep: uploaded %s but could not repair its "
                             "status", d.name, exc_info=True)
@@ -252,6 +265,7 @@ def reap_stale_scratch(
     skip_job_ids: "frozenset[str] | set[str]" = frozenset(),
     blob_store: BlobStore | None = None,
     protect_paths: "tuple[Path, ...]" = (),
+    max_per_sweep: int = 2000,
 ) -> int:
     """Reclaim per-job scratch dirs older than ``BLASTBOX_SCRATCH_MAX_AGE_S``.
 
@@ -297,7 +311,7 @@ def reap_stale_scratch(
         except (OSError, RuntimeError, ValueError):
             continue
     retained_last_copy: list[str] = []
-    for d in entries:
+    for i, d in enumerate(entries):
         try:
             # Must LOOK like a job dir before it can be considered for deletion. "the store
             # has never heard of it" is not evidence of an orphan -- job_root can legitimately
@@ -398,6 +412,17 @@ def reap_stale_scratch(
         # "removed N job dir(s)" line report directories still on disk, forever.
         if purge_job_dir(job_root, d.name, log):
             n += 1
+        if n >= max_per_sweep:
+            # BOUNDED per tick. The fleet state this exists to clean up is 97,681 dirs / 184 GiB;
+            # doing it all in one pass means a full recursive walk, a store lookup per candidate
+            # (sequential round-trips on a shared Redis/Postgres) and 184 GiB of unlink ahead of
+            # every other maintenance task -- including the cold-permit reclaim and crash
+            # recovery. The sweep is idempotent and runs every tick, so the backlog still drains,
+            # just without one tick owning the process. Announced, never silent: a cap you cannot
+            # see reads as "fully cleaned" (upstream review of #85).
+            log.info("scratch reclaim: hit the %d-dir cap this sweep; %d candidate(s) not "
+                     "examined, continuing next tick", max_per_sweep, len(entries) - i - 1)
+            break
     if retained_last_copy:
         log.warning("scratch reclaim: retained %d tree(s) holding a sealed result with no durable "
                     "copy in the blob store — deleting them would destroy the last copy (e.g. %s)",

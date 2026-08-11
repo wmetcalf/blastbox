@@ -774,6 +774,21 @@ class VmJobDispatcher:
             logger.warning("vm_dispatch: could not parse sealed metadata for %s", job.job_id, exc_info=True)
             return None
 
+    def _index_repaired_result(self, job_id: str, out_dir: "Path") -> None:
+        """Post-repair hook for the pending-upload sweep -- parity with the container Dispatcher.
+        A recovered job is otherwise DONE and permanently invisible to /similar."""
+        try:
+            from blastbox.contract.envelope import Envelope
+
+            envelope = Envelope.model_validate_json((out_dir / "metadata.json").read_text())
+        except Exception:  # noqa: BLE001 -- the repair stands; only the index is best-effort
+            logger.warning("vm_dispatch: could not parse sealed metadata for repaired job %s",
+                           job_id, exc_info=True)
+            return
+        job = self._store.get(job_id)
+        if job is not None:
+            self._index_page_hashes(job, envelope)
+
     def _index_page_hashes(self, job: Job, envelope: Any) -> None:
         """Best-effort: index the job's per-page perceptual hashes (phash/colorhash/sha256) for
         ``/v1/similar``, same as the cold/file-warm paths -- else a network-endpoint page-hash job is
@@ -824,7 +839,8 @@ class VmJobDispatcher:
         except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
             logger.warning("vm_dispatch: retention sweep failed", exc_info=True)
         try:
-            retry_pending_uploads(self._job_root, self._blobs, self._store, logger)
+            retry_pending_uploads(self._job_root, self._blobs, self._store, logger,
+                                  on_repaired=self._index_repaired_result)
         except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
             logger.warning("vm_dispatch: pending-upload sweep failed", exc_info=True)
         try:

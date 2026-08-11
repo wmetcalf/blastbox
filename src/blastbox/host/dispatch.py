@@ -2275,6 +2275,20 @@ class Dispatcher:
             )
         return False
 
+    def _index_repaired_result(self, job_id: str, out_dir: Path) -> None:
+        """Post-repair hook for the pending-upload sweep: do what this job's own DONE path never
+        got to do. Only page-hash indexing today -- a recovered job is otherwise DONE, servable
+        and permanently invisible to /similar, because nothing re-walks DONE jobs."""
+        try:
+            from blastbox.contract.envelope import Envelope
+
+            envelope = Envelope.model_validate_json((out_dir / "metadata.json").read_text())
+        except Exception:  # noqa: BLE001 -- the repair stands; only the index is best-effort
+            _log.warning("could not parse sealed metadata for repaired job %s", job_id,
+                         exc_info=True)
+            return
+        self._index_page_hashes(job_id, envelope)
+
     def _index_page_hashes(self, job_id: str, envelope: object) -> None:
         """Best-effort: index the job's per-page perceptual hashes (phash/colorhash/
         sha256) for similarity search. Only the Postgres + pg_bktree store can serve
@@ -2686,7 +2700,8 @@ class Dispatcher:
         # BEFORE the reclaim: a retained tree is a PENDING UPLOAD, and draining it is what makes
         # the reclaim's last-copy rule a temporary hold rather than a permanent one.
         try:
-            retry_pending_uploads(self._job_root, self._blobs, self._job_store, _log)
+            retry_pending_uploads(self._job_root, self._blobs, self._job_store, _log,
+                                  on_repaired=self._index_repaired_result)
         except Exception:  # noqa: BLE001
             _log.exception("pending-upload sweep failed")
         try:

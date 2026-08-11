@@ -3308,3 +3308,34 @@ def test_scratch_reclaim_spares_a_uuid_named_blob_root(tmp_path, monkeypatch):
     assert (blob_root / "results" / "some-job" / "metadata.json").exists(), (
         "the reclaim destroyed the durable blob store because it was uuid-named"
     )
+
+
+def test_scratch_reclaim_is_bounded_per_sweep_and_says_so(tmp_path):
+    """The fleet state this exists to clean is 97,681 dirs / 184 GiB. Doing it in one pass puts a
+    full recursive walk, a store lookup per candidate and 184 GiB of unlink ahead of every other
+    maintenance task — including the cold-permit reclaim and crash recovery. The sweep is
+    idempotent and runs every tick, so a cap still drains the backlog.
+
+    The cap is ANNOUNCED: a silent truncation reads as "the disk is clean now" when it isn't.
+    """
+    import logging as _logging
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    old = time.time() - 99_999
+    for i in range(7):
+        d = tmp_path / f"{i:08d}-1111-4111-8111-111111111111"
+        d.mkdir()
+        os.utime(d, (old, old))
+
+    from blastbox.host.jobs.retention import reap_stale_scratch
+    removed = reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"), max_per_sweep=3)
+    assert removed == 3, "the cap did not bound the sweep"
+    assert len(list(tmp_path.iterdir())) == 4, "removed more than the cap allowed"
+
+    # ...and the next tick continues where it left off.
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                              max_per_sweep=3) == 3
+    assert len(list(tmp_path.iterdir())) == 1

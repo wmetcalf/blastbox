@@ -647,3 +647,38 @@ class TestRetryPendingUploads:
         blobs = _FakeBlobs()
         assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
         assert blobs.put_calls == 0
+
+    def test_a_repaired_job_gets_its_post_done_work_done(self, tmp_path):
+        """A recovered job is DONE and servable but was permanently invisible to /similar: its own
+        DONE path never ran, so page hashes were never indexed, and nothing re-walks DONE jobs.
+        The hook is where a dispatcher does what its DONE path would have."""
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+        d = _sealed_tree(tmp_path, _JID)
+
+        seen: list[tuple[str, Path]] = []
+        retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"),
+                              on_repaired=lambda jid, out: seen.append((jid, out)))
+        assert seen == [(_JID, d / "output")]
+
+    def test_a_failing_post_repair_hook_never_undoes_the_repair(self, tmp_path):
+        """Best-effort: the bytes are durable and the status is correct. An indexing problem must
+        not drag the job back to FAILED or crash the maintenance tick."""
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+        _sealed_tree(tmp_path, _JID)
+
+        def boom(jid, out):
+            raise RuntimeError("indexer down")
+
+        retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"),
+                              on_repaired=boom)
+        assert store.get(_JID).status is JobStatus.DONE
