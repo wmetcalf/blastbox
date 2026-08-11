@@ -2565,3 +2565,68 @@ def test_purge_refuses_a_job_id_that_escapes_the_job_root(tmp_path):
 
     assert (outsider / "keepme").exists(), "purge escaped job_root and deleted an outside tree"
     assert outsider.exists()
+
+
+def test_orphan_recovery_purges_the_whole_dir_not_just_the_input(tmp_path):
+    """Orphan recovery terminalises a job nobody owns, so it must clean up completely (#84).
+
+    It already deleted the staged input for exactly this reason -- "nothing else will clean up
+    its staged input" -- but left output/ behind, which is the same half-measure the live
+    dispatch path had. A dispatcher that dies mid-job therefore leaked extracted sample content
+    forever, and this is the path where NO other actor can ever come back for it.
+
+    Ownership is settled here: _fail_if_running only returns True when our CAS won, so no peer
+    can still be using the tree.
+    """
+    store = InMemoryJobStore()
+    job = Job.new(engine=_ENGINE_NAME, filename="a.docx")
+    job.status = JobStatus.RUNNING
+    job.worker_runtime = "warm"
+    job.started_at = time.time() - 100_000        # far past worker_timeout + grace
+    store.create(job)
+
+    _setup_job_dirs(tmp_path, job)
+    out = tmp_path / job.job_id / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "metadata.json").write_text("{}")
+    (out / "rmeta").write_text("extracted sample text")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher.requeue_orphaned_jobs()
+
+    assert store.get(job.job_id).status == JobStatus.FAILED
+    job_dir = tmp_path / job.job_id
+    assert not job_dir.exists(), (
+        f"orphan recovery left content behind: "
+        f"{sorted(p.relative_to(job_dir).as_posix() for p in job_dir.rglob('*'))}"
+    )
+
+
+def test_a_store_failure_during_purge_does_not_escape_or_delete(tmp_path):
+    """The ownership lookup runs inside a terminal `finally`, so it must never raise (#85 review).
+
+    An escaping exception there masks the job's real outcome. It must also fail SAFE: an
+    unprovable owner means a peer may be mid-flight on this tree, so leave it. A leaked dir is
+    recoverable; a job whose staged input vanished under it is not.
+
+    Exercises the purge contract directly. (The same `finally` also calls _record_outcome, which
+    has its own unguarded store lookup -- pre-existing and outside this change; noted on the PR.)
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    (tmp_path / job.job_id / "output" / "rmeta").write_text("extracted sample text")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+
+    class _BrokenStore:
+        def get(self, job_id):
+            raise RuntimeError("job store unavailable")
+
+    dispatcher._job_store = _BrokenStore()
+    dispatcher._purge_job_dir_if_owned(job)      # must not raise
+
+    assert (tmp_path / job.job_id).exists(), (
+        "ownership was unprovable, so the tree must be left for its real owner, not deleted"
+    )

@@ -706,11 +706,12 @@ class Dispatcher:
             ):
                 recovered += 1
                 # The owner is gone and the job is now terminal (FAILED is not claim_next-able),
-                # so nothing else will clean up its staged input. Delete it here so a recovered
-                # job's untrusted input doesn't leak on disk even when retention is disabled.
-                self._delete_input(
-                    self._job_root / job.job_id / "input" / Path(job.filename).name
-                )
+                # so nothing else will EVER clean up this tree. Purge all of it, not just the
+                # input: output/ holds metadata.json and rmeta (text and embedded objects
+                # extracted from the sample), and this is precisely the path where no other
+                # actor can come back for it (#84). Unconditional is correct here -- our CAS
+                # won, so no peer owns the tree.
+                purge_job_dir(self._job_root, job.job_id, _log)
 
         # --- COLD requeue (needs docker liveness) -------------------------------------------
         active_job_ids = self._list_active_worker_job_ids()
@@ -1008,7 +1009,18 @@ class Dispatcher:
         condition _delete_input_if_owned already applies, so the two cannot disagree about who
         owns the tree.
         """
-        final = self._job_store.get(job.job_id)
+        # This runs from a terminal `finally`, so it must not raise: an escaping store error
+        # would mask the DONE/FAILED the job actually produced. And it fails SAFE -- if we
+        # cannot PROVE we still own the tree we leave it alone, because the alternative is
+        # deleting a peer's staged input mid-flight. A leaked dir is recoverable; a job whose
+        # input vanished under it is not (upstream review of #85).
+        try:
+            final = self._job_store.get(job.job_id)
+        except Exception:  # noqa: BLE001
+            _log.warning("job %s: could not confirm ownership for the terminal purge (store "
+                         "error); leaving %s in place", job.job_id, self._job_root / job.job_id,
+                         exc_info=True)
+            return
         if final is None or final.claim_id == job.claim_id:
             purge_job_dir(self._job_root, job.job_id, _log)
 
@@ -1020,7 +1032,15 @@ class Dispatcher:
         we must NOT delete it. On the normal owned terminal path claim_id still matches and the
         untrusted input is deleted exactly as before; a leak only occurs if the reclaiming owner
         also dies before its own cleanup, bounded by the retention sweep of job_root/<id>."""
-        final = self._job_store.get(job.job_id)
+        # Same terminal-`finally` contract as _purge_job_dir_if_owned: never raise (that would
+        # mask the job's real outcome) and fail SAFE -- an unprovable owner means leave the
+        # bytes for whoever does own them.
+        try:
+            final = self._job_store.get(job.job_id)
+        except Exception:  # noqa: BLE001
+            _log.warning("job %s: could not confirm ownership for input deletion (store error); "
+                         "leaving the staged input in place", job.job_id, exc_info=True)
+            return
         if final is None or final.claim_id == job.claim_id:
             self._delete_input(input_path)
         else:
