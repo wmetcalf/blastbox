@@ -29,6 +29,7 @@ import shutil
 from blastbox.host.jobs.retention import (
     RESULT_RETAINED_MARKER,
     purge_job_dir,
+    _blob_local_roots,
     reap_stale_scratch,
     retry_pending_uploads,
 )
@@ -2718,6 +2719,7 @@ class Dispatcher:
         return reap_stale_scratch(
             self._job_root, self._scratch_max_age_s, self._job_store, _log,
             skip_job_ids=retained, blob_store=self._blobs,
+            protect_paths=_blob_local_roots(),
         )
 
     def _reconcile_cold_orphans(self) -> None:

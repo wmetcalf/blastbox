@@ -15,6 +15,7 @@ Security properties:
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import time
@@ -130,6 +131,16 @@ def purge_job_dir(job_root: "Path", job_id: str, log: "logging.Logger") -> bool:
         return False
 
 
+def _blob_local_roots() -> "tuple[Path, ...]":
+    """Paths the local blob backend may be rooted at, for protect_paths above.
+
+    BLASTBOX_BLOB_LOCAL_ROOT is operator-set, so it can legitimately live under job_root -- a
+    documented layout -- and can be named anything, including a uuid.
+    """
+    raw = os.environ.get("BLASTBOX_BLOB_LOCAL_ROOT", "").strip()
+    return (Path(raw),) if raw else ()
+
+
 def retry_pending_uploads(
     job_root: Path,
     blob_store: BlobStore | None,
@@ -172,28 +183,41 @@ def retry_pending_uploads(
                 continue          # no sealed result here -- ordinary scratch
         except OSError:
             continue
-        # CLAIM FENCE. A local tree is only ours to upload if OUR attempt is the one that
-        # produced the job's terminal state. If a peer reclaimed the job and finished it, its
-        # result is authoritative and sits at the same results/<job_id> prefix -- uploading our
-        # stale attempt over it would serve the wrong bytes for a DONE job, with nothing to
-        # repair it. DONE is the tell: our own exhaustion path always FAILs the job, so a DONE
-        # row means somebody else won. A row we cannot read is left alone (#85 review).
+        # THE GATE: the JOB ROW must say this tree is a host-sealed result whose upload failed.
+        #
+        # A root metadata.json does NOT prove that. The WORKER writes output/metadata.json
+        # (worker/harness.py) and the host only OVERWRITES it when the trust gate passes, so a
+        # tree abandoned before sealing -- gate rejection, worker timeout, a dispatcher killed
+        # between worker exit and _write_sealed_metadata -- still has one, full of
+        # worker-controlled bytes. Uploading that would publish untrusted output into the
+        # results namespace under a job id (upstream review of #85).
+        #
+        # RESULT_RETAINED_MARKER is written by the dispatcher ONLY after the seal, when the
+        # upload exhausted, so it is a host-only fact. It also subsumes the claim fence: a peer
+        # that reclaimed and finished the job overwrites the row, marker gone. And a row that is
+        # missing or unreadable -- a peer's delete, a Redis key past its 24h TTL, a store outage
+        # -- yields no marker and no upload, which is the safe direction.
         try:
             row = job_store.get(d.name)
         except Exception:  # noqa: BLE001 -- store trouble must not turn into a bad upload
             log.warning("pending-upload sweep: cannot confirm %s is ours; skipping", d.name)
             continue
-        if row is not None and row.status is JobStatus.DONE:
+        if row is None or RESULT_RETAINED_MARKER not in (row.error or ""):
             continue
         try:
-            if blob_store.has_output(d.name):
-                continue          # already durable; the age reclaim will collect the tree
+            durable = blob_store.has_output(d.name)
         except Exception:  # noqa: BLE001 -- unknown is NOT durable, so try the upload
-            pass
-        upload_exc = upload_output_with_retry(blob_store, d.name, out_dir, attempts=attempts)
+            durable = False
+        # Already durable but still FAILED: a previous sweep uploaded the bytes and then could
+        # not write the status (store blip), or the dispatcher's own upload landed after it had
+        # given up. Skipping here would strand that job FAILED forever with its result sitting
+        # in the store -- so fall through to the repair with no upload (upstream review of #85).
+        upload_exc = None if durable else upload_output_with_retry(
+            blob_store, d.name, out_dir, attempts=attempts)
         if upload_exc is None:
-            n += 1
-            log.info("pending-upload sweep: result for %s is now durably stored", d.name)
+            if not durable:
+                n += 1
+                log.info("pending-upload sweep: result for %s is now durably stored", d.name)
             # REPAIR THE JOB. Uploading the bytes is only half of it: the job was FAILED because
             # its upload exhausted, and open_output is DONE-gated, so a recovered result stays
             # unreachable -- from a client's view the outcome is identical to having discarded it.
@@ -202,16 +226,15 @@ def retry_pending_uploads(
             # this sweep just undid -- never a job that failed for any other reason, and never a
             # peer's terminal state (#85, found by end-to-end testing: the sweep reported success
             # while the API still answered 409).
-            if row is not None and RESULT_RETAINED_MARKER in (row.error or ""):
-                try:
-                    if job_store.update_if_status(
-                        d.name, JobStatus.FAILED, status=JobStatus.DONE, error=None,
-                    ):
-                        log.info("pending-upload sweep: job %s repaired to DONE (its result is "
-                                 "durable now)", d.name)
-                except Exception:  # noqa: BLE001 -- the bytes are safe; the status can retry
-                    log.warning("pending-upload sweep: uploaded %s but could not repair its "
-                                "status", d.name, exc_info=True)
+            try:
+                if job_store.update_if_status(
+                    d.name, JobStatus.FAILED, status=JobStatus.DONE, error=None,
+                ):
+                    log.info("pending-upload sweep: job %s repaired to DONE (its result is "
+                             "durable now)", d.name)
+            except Exception:  # noqa: BLE001 -- the bytes are safe; the status can retry
+                log.warning("pending-upload sweep: uploaded %s but could not repair its "
+                            "status", d.name, exc_info=True)
         else:
             log.warning("pending-upload sweep: %s still has no durable copy (%s); retaining "
                         "the local tree", d.name, upload_exc)
@@ -228,6 +251,7 @@ def reap_stale_scratch(
     *,
     skip_job_ids: "frozenset[str] | set[str]" = frozenset(),
     blob_store: BlobStore | None = None,
+    protect_paths: "tuple[Path, ...]" = (),
 ) -> int:
     """Reclaim per-job scratch dirs older than ``BLASTBOX_SCRATCH_MAX_AGE_S``.
 
@@ -260,6 +284,18 @@ def reap_stale_scratch(
     except OSError as exc:
         log.warning("scratch reclaim: cannot list %s: %s", job_root, exc)
         return 0
+    # Canonical paths this sweep must never delete whatever they are named. The uuid4 shape
+    # check protects a conventionally-named blob root ("blobs"), but BLASTBOX_BLOB_LOCAL_ROOT is
+    # operator-set and may itself be a uuid-shaped directory directly beneath job_root -- in which
+    # case the shape check waves it through and the sweep deletes every durable result on the node
+    # (upstream review of #85). Compare canonically so a symlinked or ..-laden setting still
+    # matches.
+    protected: set[Path] = set()
+    for p in protect_paths:
+        try:
+            protected.add(Path(p).resolve())
+        except (OSError, RuntimeError, ValueError):
+            continue
     retained_last_copy: list[str] = []
     for d in entries:
         try:
@@ -273,7 +309,9 @@ def reap_stale_scratch(
                 continue          # resolve() would dereference to a SIBLING's real tree
             if not d.is_dir() or not _JOB_ID_RE.match(d.name):
                 continue
-        except OSError:
+            if protected and d.resolve() in protected:
+                continue
+        except (OSError, RuntimeError, ValueError):
             continue
         # NEWEST mtime anywhere in the tree, not just the top-level dir. A live worker writes
         # INTO output/, and on Linux that does not touch the PARENT's mtime -- so a job that

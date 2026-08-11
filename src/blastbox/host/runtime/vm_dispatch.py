@@ -38,6 +38,7 @@ from blastbox.host.jobs.retention import (
     RESULT_RETAINED_MARKER,
     JobRetentionSweeper,
     purge_job_dir,
+    _blob_local_roots,
     reap_stale_scratch,
     retry_pending_uploads,
 )
@@ -731,10 +732,14 @@ class VmJobDispatcher:
             # deliberately purges output/ too, and there is no setting that disables it -- with
             # exactly one exception, below, where purging would DESTROY the result rather than
             # release a redundant copy of it.
-            # ...and only when OUR attempt won the terminal CAS. A lost claim means a peer owns
-            # the job now; retaining our stale tree would feed the pending-upload sweep bytes that
-            # would overwrite the peer's authoritative result.
-            if pending_upload and owned:
+            # ...and only when we have no POSITIVE evidence the job is someone else's. `owned` is
+            # False both when a peer demonstrably reclaimed the job AND when the terminal CAS could
+            # not be performed at all (store outage) -- and those must not be treated alike: the
+            # first makes our tree stale, the second is simply unknown, and purging on unknown
+            # destroys the only copy of a sealed result exactly when the store is already sick.
+            # Retaining is the recoverable direction; the sweep's marker gate then refuses to
+            # upload it unless the row really does say the result was retained (upstream #85).
+            if pending_upload and (owned or terminal_status is None):
                 # The ONLY copy of a host-sealed, trust-gate-passed result. Retained for
                 # retry_pending_uploads to drain, and bounded by the age reclaim's last-copy rule,
                 # which releases it the moment the durable copy lands.
@@ -825,7 +830,7 @@ class VmJobDispatcher:
         try:
             reap_stale_scratch(
                 self._job_root, self._scratch_max_age_s, self._store, logger,
-                blob_store=self._blobs,
+                blob_store=self._blobs, protect_paths=_blob_local_roots(),
             )
         except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
             logger.warning("vm_dispatch: scratch reclaim failed", exc_info=True)

@@ -3280,3 +3280,31 @@ def test_scratch_reclaim_reports_only_what_it_actually_removed(tmp_path):
         assert dispatcher._reap_stale_scratch() == 0, "counted a dir it did not remove"
     finally:
         mod.purge_job_dir = real
+
+
+def test_scratch_reclaim_spares_a_uuid_named_blob_root(tmp_path, monkeypatch):
+    """The uuid4 shape check is not enough on its own.
+
+    BLASTBOX_BLOB_LOCAL_ROOT is operator-set: it may live under job_root (a documented layout)
+    and it may be named anything — including a uuid. Then the shape check waves it straight
+    through and the sweep deletes every durable result on the node, which is the opposite of what
+    the last-copy rule is for. The configured root is protected by CANONICAL path, so a symlinked
+    or ..-laden setting still matches.
+    """
+    blob_root = tmp_path / "55555555-5555-4555-8555-555555555555"
+    (blob_root / "results" / "some-job").mkdir(parents=True)
+    (blob_root / "results" / "some-job" / "metadata.json").write_text("{}")
+    monkeypatch.setenv("BLASTBOX_BLOB_LOCAL_ROOT", str(tmp_path / "." / blob_root.name))
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+    old = time.time() - 99_999
+    for p in (blob_root / "results" / "some-job" / "metadata.json",
+              blob_root / "results" / "some-job", blob_root / "results", blob_root):
+        os.utime(p, (old, old))
+
+    assert dispatcher._reap_stale_scratch() == 0
+    assert (blob_root / "results" / "some-job" / "metadata.json").exists(), (
+        "the reclaim destroyed the durable blob store because it was uuid-named"
+    )

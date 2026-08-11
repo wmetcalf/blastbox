@@ -486,6 +486,7 @@ class TestRetryPendingUploads:
         job = Job.new(engine="redtusk", filename="a.doc")
         job.job_id = _JID
         job.status = JobStatus.FAILED           # our own exhaustion path FAILs the job
+        job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
         store.create(job)
         _sealed_tree(tmp_path, _JID)
         blobs = _FakeBlobs()
@@ -578,11 +579,11 @@ class TestRetryPendingUploads:
         assert repaired.status is JobStatus.DONE
         assert repaired.error is None
 
-    def test_does_not_repair_a_job_that_failed_for_any_other_reason(self, tmp_path):
-        """The repair is gated on OUR marker, so it can only ever undo the failure this sweep just
-        fixed. A job that failed in the trust gate or the worker must stay FAILED even if a sealed
-        tree happens to be lying next to it — silently promoting that to DONE would serve a result
-        for a job that genuinely did not succeed."""
+    def test_ignores_a_job_that_failed_for_any_other_reason(self, tmp_path):
+        """Gated on OUR marker, which the dispatcher writes ONLY after the host seal, when the
+        upload exhausted. A job that failed in the trust gate or the worker is neither uploaded
+        nor promoted to DONE, even with a metadata.json lying next to it — that file is written by
+        the WORKER (worker/harness.py) and only overwritten by the host once the gate passes."""
         store = InMemoryJobStore()
         job = Job.new(engine="redtusk", filename="a.doc")
         job.job_id = _JID
@@ -591,5 +592,58 @@ class TestRetryPendingUploads:
         store.create(job)
         _sealed_tree(tmp_path, _JID)
 
-        assert retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t")) == 1
+        blobs = _FakeBlobs()
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
+        assert blobs.put_calls == 0, "published a tree the host never sealed"
         assert store.get(_JID).status is JobStatus.FAILED, "promoted an unrelated failure to DONE"
+
+
+    def test_never_publishes_a_tree_the_host_never_sealed(self, tmp_path):
+        """A root metadata.json is NOT proof of a host seal.
+
+        The WORKER writes output/metadata.json (worker/harness.py); the host only OVERWRITES it
+        once the trust gate passes. So a tree abandoned before sealing — gate rejection, worker
+        timeout, a dispatcher killed between worker exit and _write_sealed_metadata — still has
+        one, full of worker-controlled bytes. Uploading it would publish untrusted output into
+        the results namespace under a real job id.
+        """
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.error = "output rejected by the trust gate"      # never sealed
+        store.create(job)
+        d = tmp_path / _JID
+        (d / "output").mkdir(parents=True)
+        (d / "output" / "metadata.json").write_text('{"forged": "by the worker"}')
+
+        blobs = _FakeBlobs()
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
+        assert blobs.put_calls == 0, "published worker-controlled bytes as a job result"
+
+    def test_repairs_a_job_whose_bytes_are_already_durable(self, tmp_path):
+        """A previous sweep may have uploaded the bytes and then failed to write the status (store
+        blip), or the dispatcher's own upload landed after it gave up. Skipping on "already
+        durable" stranded that job FAILED forever with its result sitting in the store."""
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+        _sealed_tree(tmp_path, _JID)
+        blobs = _FakeBlobs()
+        blobs.stored[_JID] = ["metadata.json"]               # already there
+
+        retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"))
+        assert blobs.put_calls == 0, "re-uploaded bytes that were already durable"
+        assert store.get(_JID).status is JobStatus.DONE, "left a job FAILED with a durable result"
+
+    def test_a_row_lost_to_a_ttl_is_not_uploaded(self, tmp_path):
+        """Redis rows expire (24h default). A missing row yields no marker, so the sweep does
+        nothing — the safe direction: the age reclaim still bounds the tree."""
+        store = InMemoryJobStore()                            # no row for _JID at all
+        _sealed_tree(tmp_path, _JID)
+        blobs = _FakeBlobs()
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
+        assert blobs.put_calls == 0
