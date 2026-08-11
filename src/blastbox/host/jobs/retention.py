@@ -60,6 +60,22 @@ def purge_job_dir(job_root: "Path", job_id: str, log: "logging.Logger") -> bool:
     if not job_id or "/" in job_id or "\\" in job_id:
         log.error("refusing to purge: job_id %r is not a single path component", job_id)
         return False
+    # A job dir is NEVER a symlink: both dispatchers create it with mkdir(). Refuse one here,
+    # because the dangerous alias is the one that stays INSIDE job_root -- "jobs/<id> ->
+    # jobs/<peer>" resolves strictly under job_root, so every containment check below passes
+    # and rmtree takes out a LIVE PEER's tree while the named job loses nothing and the call
+    # reports success. Containment only catches links that escape. The reclaim already refuses
+    # symlinks; this is the same rule on the path both dispatchers take for every terminal job
+    # (#85 review, matching an upstream codex comment).
+    try:
+        if (job_root / job_id).is_symlink():
+            log.error("refusing to purge job %s: %s is a symlink, not a job dir — sample bytes "
+                      "may remain on this worker's disk", job_id, job_root / job_id)
+            return False
+    except OSError as exc:
+        log.error("PURGE FAILED for job %s: cannot stat under %s: %s — sample bytes may remain "
+                  "on this worker's disk", job_id, job_root, exc)
+        return False
     # Canonicalisation itself can raise -- a symlink loop makes Path.resolve() raise RuntimeError
     # on 3.12, and other filesystem errors escape too. Both dispatchers call this from terminal
     # cleanup, so an escape here masks the job's outcome and skips its metrics. The docstring

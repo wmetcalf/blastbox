@@ -389,6 +389,24 @@ class TestPurgeJobDir:
             assert purge_job_dir(root, "self", logging.getLogger("t")) is False
         assert (root / "other").exists()
 
+    def test_refuses_a_symlink_alias_pointing_at_a_LIVE_PEER(self, tmp_path, caplog):
+        """The dangerous symlink is the one that stays INSIDE job_root.
+
+        An escaping link is caught by containment, but `jobs/<id> -> jobs/<peer>` resolves
+        to a path that is strictly under job_root, so every containment check passes and
+        rmtree takes out a peer's tree — while the job whose id was passed still has no
+        bytes removed, and the call reports success. Job dirs are created with mkdir() and
+        are never symlinks, so any link here is anomalous by construction.
+        """
+        root = tmp_path / "jobs"
+        (root / "victim").mkdir(parents=True)
+        (root / "victim" / "live.bin").write_bytes(b"PEER STILL RUNNING")
+        (root / "alias").symlink_to(root / "victim", target_is_directory=True)
+
+        with caplog.at_level(logging.ERROR):
+            assert purge_job_dir(root, "alias", logging.getLogger("t")) is False
+        assert (root / "victim" / "live.bin").exists(), "purged a live peer's tree"
+
     def test_refuses_a_symlink_that_escapes_job_root(self, tmp_path, caplog):
         outside = tmp_path / "outside"
         outside.mkdir()

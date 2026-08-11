@@ -2447,17 +2447,106 @@ def test_retained_cold_permit_reclaimed_when_container_confirmed_gone(tmp_path):
     dispatcher._concurrency_gate = gate
 
     gate.acquire(0.0)                                    # the retained permit
-    dispatcher._retained_cold_orphans.add("blastbox-worker-abc123def456")
+    dispatcher._retained_cold_orphans["blastbox-worker-abc123def456"] = ("abc123def456", None)
     dispatcher._list_active_worker_job_ids = lambda: set()   # docker ps: no live workers
     dispatcher._reconcile_cold_orphans()
     assert gate.in_flight == 0                           # reclaimed
     assert not dispatcher._retained_cold_orphans
 
     gate.acquire(0.0)                                    # another orphan, but docker ps unreadable
-    dispatcher._retained_cold_orphans.add("blastbox-worker-999888777666")
+    dispatcher._retained_cold_orphans["blastbox-worker-999888777666"] = ("999888777666", None)
     dispatcher._list_active_worker_job_ids = lambda: None
     dispatcher._reconcile_cold_orphans()
     assert gate.in_flight == 1                           # still retained (absence unconfirmed)
+
+
+def test_confirmed_gone_cold_orphan_gets_its_tree_purged(tmp_path):
+    """The failed-kill orphan's dir is DEFERRED, not forgiven.
+
+    The inline terminal purge skips it on purpose: rmtree'ing under a live writer half-deletes
+    the tree, fires a spurious "PURGE FAILED — sample bytes may remain", and reclaims nothing
+    because the container's open fds pin the disk. That reservation expires the moment docker ps
+    confirms the container is gone — the tree is inert and the security invariant applies again.
+    Before this, the reconcile reclaimed only the PERMIT and the sample bytes sat until the age
+    reclaim hours later, while the deferral comment promised a sweep that handled them.
+    """
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._concurrency_gate = DynamicConcurrencyGate(2)
+    dispatcher._concurrency_gate.acquire(0.0)
+
+    jid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "metadata.json").write_text("{}")
+    (d / "input.bin").write_bytes(b"MALWARE-BYTES-MUST-NOT-PERSIST")
+
+    dispatcher._retained_cold_orphans[f"blastbox-worker-{jid[:12]}"] = (jid, "claim-1")
+    dispatcher._list_active_worker_job_ids = lambda: set()
+
+    dispatcher._reconcile_cold_orphans()
+
+    assert not d.exists(), "the confirmed-gone orphan's sample bytes were left on disk"
+    assert dispatcher._concurrency_gate.in_flight == 0
+
+
+def test_confirmed_gone_cold_orphan_is_not_purged_after_a_peer_reclaims_it(tmp_path):
+    """The deferred purge runs LONG after the claim, which is exactly when a peer has had time
+    to reclaim the job — and two dispatcher containers on one node share a single job_root bind
+    mount. Purging then deletes the new owner's staged input mid-flight. This is why the tracker
+    records the claim_id we held rather than just the job id: re-reading the store row and
+    comparing it against itself would pass trivially and delete the peer's tree every time.
+    """
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._concurrency_gate = DynamicConcurrencyGate(2)
+    dispatcher._concurrency_gate.acquire(0.0)
+
+    job = Job.new(engine="redtusk", filename="s.doc")
+    job.claim_id = "peer-2"                      # the PEER owns it now
+    job.status = JobStatus.RUNNING
+    store.create(job)
+    d = tmp_path / job.job_id
+    d.mkdir()
+    (d / "input.bin").write_bytes(b"PEER IS USING THIS")
+
+    dispatcher._retained_cold_orphans[f"blastbox-worker-{job.job_id[:12]}"] = (
+        job.job_id, "claim-1")                   # we held claim-1
+    dispatcher._list_active_worker_job_ids = lambda: set()
+
+    dispatcher._reconcile_cold_orphans()
+
+    assert (d / "input.bin").exists(), "deleted a peer's staged input out from under it"
+    assert dispatcher._concurrency_gate.in_flight == 0, "the permit must still be reclaimed"
+
+
+def test_confirmed_gone_cold_orphan_with_a_failed_upload_is_retained(tmp_path):
+    """The upload-exhaustion carve-out has to survive the deferral too: with results/<id> absent,
+    this tree is the ONLY copy of a host-sealed result, including evidence that cannot be
+    reproduced by re-running. The age reclaim still bounds it."""
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._concurrency_gate = DynamicConcurrencyGate(2)
+    dispatcher._concurrency_gate.acquire(0.0)
+
+    jid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "metadata.json").write_text('{"only": "copy"}')
+
+    dispatcher._upload_failed_job_ids.add(jid)
+    dispatcher._retained_cold_orphans[f"blastbox-worker-{jid[:12]}"] = (jid, None)
+    dispatcher._list_active_worker_job_ids = lambda: set()
+
+    dispatcher._reconcile_cold_orphans()
+
+    assert (d / "output" / "metadata.json").exists(), "destroyed the only copy of a result"
 
 
 def test_cold_dispatch_fenced_after_shutdown_begins(tmp_path):

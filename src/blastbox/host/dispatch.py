@@ -318,7 +318,11 @@ class Dispatcher:
         # worker stacks on a possible orphan) and reconcile in maintenance — once `docker ps` shows
         # the container is gone, we release the permit. Without this the permit leaks permanently
         # and cold capacity bleeds to zero after enough failed kills. name → nothing (a set).
-        self._retained_cold_orphans: set[str] = set()
+        # container name -> (job_id, claim_id we held). The claim_id is what lets the
+        # reconcile below apply the SAME ownership gate as the terminal purge: by the time
+        # the container is confirmed gone a peer may have reclaimed the job, and comparing
+        # the store row against itself would pass trivially and delete the peer's tree.
+        self._retained_cold_orphans: dict[str, tuple[str, str | None]] = {}
         # Jobs whose result upload EXHAUSTED its retries: the durable copy never landed, so the
         # local tree is the ONLY copy and the terminal purge must spare it. Everything else in
         # this file assumes the blob store is the durable copy -- on this one branch that is
@@ -979,7 +983,8 @@ class Dispatcher:
                 gate.release()
             elif gate is not None:
                 with self._retained_lock:
-                    self._retained_cold_orphans.update(orphaned)
+                    self._retained_cold_orphans.update(
+                        {n: (job.job_id, job.claim_id) for n in orphaned})
                 _log.warning("cold worker cleanup unconfirmed for job_id=%s (docker kill failed) — "
                              "retaining the concurrency permit until a sweep confirms the container "
                              "is gone", job.job_id)
@@ -1051,16 +1056,25 @@ class Dispatcher:
         condition _delete_input_if_owned already applies, so the two cannot disagree about who
         owns the tree.
         """
-        if job.job_id in self._upload_failed_job_ids:
+        self._purge_job_dir_if_claim_matches(job.job_id, job.claim_id)
+
+    def _purge_job_dir_if_claim_matches(self, job_id: str, claim_id: str | None) -> None:
+        """The ownership gate itself, callable with an id + the claim we held.
+
+        Split out so the deferred cold-orphan purge (_reconcile_cold_orphans) applies exactly
+        the same rule as the inline terminal purge -- the two must never drift, since between
+        them they decide whether a peer's staged input survives.
+        """
+        if job_id in self._upload_failed_job_ids:
             # The result upload exhausted its retries, so results/<job_id> does not exist and
             # this tree is the ONLY copy of a host-sealed, trust-gate-passed result -- including
             # evidence that cannot be reproduced by re-running (the C2 pcap is moved into it, and
             # detonation is explicitly not deterministic run-to-run). Purging here would turn a
             # transient object-store outage into fleet-wide, irreversible result loss. The scratch
             # sweep still bounds it on age. Reviewed on #85.
-            self._upload_failed_job_ids.discard(job.job_id)
+            self._upload_failed_job_ids.discard(job_id)
             _log.warning("job %s: retaining %s — the result upload failed, so this is the only "
-                         "copy", job.job_id, self._job_root / job.job_id)
+                         "copy", job_id, self._job_root / job_id)
             return
 
         # This runs from a terminal `finally`, so it must not raise: an escaping store error
@@ -1069,14 +1083,14 @@ class Dispatcher:
         # deleting a peer's staged input mid-flight. A leaked dir is recoverable; a job whose
         # input vanished under it is not (upstream review of #85).
         try:
-            final = self._job_store.get(job.job_id)
+            final = self._job_store.get(job_id)
         except Exception:  # noqa: BLE001
             _log.warning("job %s: could not confirm ownership for the terminal purge (store "
-                         "error); leaving %s in place", job.job_id, self._job_root / job.job_id,
+                         "error); leaving %s in place", job_id, self._job_root / job_id,
                          exc_info=True)
             return
-        if final is None or final.claim_id == job.claim_id:
-            purge_job_dir(self._job_root, job.job_id, _log)
+        if final is None or final.claim_id == claim_id:
+            purge_job_dir(self._job_root, job_id, _log)
 
     def _delete_input_if_owned(self, job: Job, input_path: Path) -> None:
         """Delete the shared staged input ONLY if we still hold the claim (or the job
@@ -2771,11 +2785,23 @@ class Dispatcher:
         live_names = {f"blastbox-worker-{jid[:12]}" for jid in live_ids}
         with self._retained_lock:
             gone = [n for n in self._retained_cold_orphans if n not in live_names]
-            for name in gone:
-                self._retained_cold_orphans.discard(name)
-                gate.release()            # container confirmed gone → reclaim its permit
+            reclaimed = [self._retained_cold_orphans.pop(n) for n in gone]
+        for _ in gone:
+            gate.release()                # container confirmed gone → reclaim its permit
         if gone:
             _log.info("reclaimed %d cold permit(s) from confirmed-gone orphan container(s)", len(gone))
+        # ...and NOW purge the trees we deliberately left behind. The inline terminal purge skips
+        # a failed-kill orphan because rmtree'ing under a live writer half-deletes the tree, races
+        # into a spurious "PURGE FAILED", and reclaims nothing (its fds pin the disk anyway). This
+        # is the moment that reservation expires: docker ps has CONFIRMED the container is gone,
+        # so the tree is inert and the security invariant applies again. Without this the sample
+        # bytes sat until the age reclaim -- hours -- and the deferral comment upstream promised a
+        # sweep that only ever reclaimed the permit (#85 review / upstream codex comment).
+        for job_id, claim_id in reclaimed:
+            try:
+                self._purge_job_dir_if_claim_matches(job_id, claim_id)
+            except Exception:  # noqa: BLE001 -- one bad tree must not strand the rest
+                _log.exception("cold-orphan purge failed for job %s", job_id)
 
     def _kill_container(self, container_name: str) -> bool:
         """``docker kill`` a timed-out worker. Returns True only if the container is CONFIRMED
