@@ -134,9 +134,22 @@ class S3BlobStore:
             if self._compress:
                 body = gzip.compress(body)
                 extra["ContentEncoding"] = "gzip"
+            # A name we can NEVER store is not an outage -- retrying it forever is what turns
+            # one worker-chosen filename into a permanent leak. The sample writes an undeclared
+            # 250-char name into its 0o777 output/, the key exceeds 1024 bytes on every
+            # attempt, the host marks the tree pending-upload, and the last-copy rule then
+            # exempts it from BOTH sweeps for the life of the node -- #84 reproduced on demand
+            # (upstream review of #85). Skip it loudly, exactly as a hostile symlink is skipped:
+            # undeclared files are not servable anyway (the result routes are manifest-gated), so
+            # nothing a consumer can reach is lost. Every other error still propagates, because a
+            # real outage MUST fail the upload rather than silently ship a partial result.
+            key = self._key("results", job_id, rel)
+            if len(key.encode("utf-8")) > 1024:      # hard S3 limit; no retry will fix it
+                _log.warning("put_output_skipped_unstorable_key", job_id=job_id, path=str(rel))
+                continue
             self._s3.put_object(
                 Bucket=self._bucket,
-                Key=self._key("results", job_id, rel),
+                Key=key,
                 Body=body,
                 **extra,
             )

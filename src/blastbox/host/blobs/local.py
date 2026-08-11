@@ -15,6 +15,8 @@ dispatcher) safe in single-node mode too.
 """
 from __future__ import annotations
 
+import errno
+
 import hashlib
 import os
 import shutil
@@ -146,7 +148,22 @@ class LocalBlobStore:
             if not path.is_file():
                 continue
             rel = path.relative_to(out_dir)
-            self._atomic_copy(path, dest_dir / rel)
+            # A name we can NEVER store is not an outage -- retrying it forever is what turns
+            # one worker-chosen filename into a permanent leak. The sample writes an undeclared
+            # 250-char name into its 0o777 output/, put_output raises ENAMETOOLONG on every
+            # attempt, the host marks the tree pending-upload, and the last-copy rule then
+            # exempts it from BOTH sweeps for the life of the node -- #84 reproduced on demand
+            # (upstream review of #85). Skip it loudly, exactly as a hostile symlink is skipped:
+            # undeclared files are not servable anyway (the result routes are manifest-gated), so
+            # nothing a consumer can reach is lost. Every other error still propagates, because a
+            # real outage MUST fail the upload rather than silently ship a partial result.
+            try:
+                self._atomic_copy(path, dest_dir / rel)
+            except OSError as exc:
+                if exc.errno != errno.ENAMETOOLONG:
+                    raise
+                _log.warning("put_output_skipped_unstorable_name", job_id=job_id,
+                             path=str(rel), error=str(exc))
 
     def open_output(self, job_id: str, name: str) -> BinaryIO:
         # put_output stores nested rel paths (results/<job_id>/<foo/bar.png>), so open_output must

@@ -21,6 +21,7 @@ Security properties (review will check):
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import logging
 import os
 import re
@@ -28,7 +29,9 @@ import shutil
 
 from blastbox.host.jobs.retention import (
     RESULT_RETAINED_MARKER,
+    clear_retained_orphan,
     mark_pending_upload,
+    mark_retained_orphan,
     purge_job_dir,
     _blob_local_roots,
     reap_stale_scratch,
@@ -996,6 +999,9 @@ class Dispatcher:
                 with self._retained_lock:
                     self._retained_cold_orphans.update(
                         {n: (job.job_id, job.claim_id) for n in orphaned})
+                # ...and on DISK too, so the other dispatcher sharing this job_root -- and this
+                # one after a restart -- also knows not to reclaim it.
+                mark_retained_orphan(self._job_root, job.job_id, _log)
                 _log.warning("cold worker cleanup unconfirmed for job_id=%s (docker kill failed) — "
                              "deferring the job-dir purge%s until a sweep confirms the container "
                              "is gone", job.job_id,
@@ -2291,6 +2297,16 @@ class Dispatcher:
                          exc_info=True)
             return
         self._index_page_hashes(job_id, envelope)
+        # ...and the summary the DONE path would have written. Without it a recovered job is DONE
+        # with result_summary=None forever -- /v1/jobs and the status route report null
+        # artifact/warning counts, and anything that tallies off them (the fleet corpus runners
+        # do) silently under-reports every recovered job. Nothing re-walks DONE jobs to fix it.
+        try:
+            summary = _build_result_summary(envelope)
+        except Exception:  # noqa: BLE001 -- the repair stands; the summary is cosmetic
+            return
+        with contextlib.suppress(Exception):
+            self._job_store.update(job_id, result_summary=summary)
 
     def _index_page_hashes(self, job_id: str, envelope: object) -> None:
         """Best-effort: index the job's per-page perceptual hashes (phash/colorhash/
@@ -2783,6 +2799,7 @@ class Dispatcher:
         # sweep that only ever reclaimed the permit (#85 review / upstream codex comment).
         for job_id, claim_id in reclaimed:
             try:
+                clear_retained_orphan(self._job_root, job_id)   # confirmed gone: the hold ends
                 self._purge_job_dir_if_claim_matches(job_id, claim_id)
             except Exception:  # noqa: BLE001 -- one bad tree must not strand the rest
                 _log.exception("cold-orphan purge failed for job %s", job_id)

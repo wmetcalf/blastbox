@@ -3523,3 +3523,90 @@ def test_scratch_reclaim_cap_counts_work_not_just_deletions(tmp_path):
         f"sweep whose trees are retained rather than removed"
     )
     assert len(list(tmp_path.iterdir())) == 10
+
+
+def test_a_retained_orphan_is_marked_on_disk_for_every_sweeper(tmp_path):
+    """The unconfirmed-kill hold has to be visible to processes that never saw the failed kill.
+
+    It lived in a process-local set, but the danger is cross-process: two dispatcher containers
+    share one job_root, VmJobDispatcher has no docker access to probe with at all, and a restart
+    empties the set — so the OTHER sweeper deletes exactly the trees the hold exists to protect,
+    under a live 0o777 bind mount. A file in the host-only job dir is seen by every sweeper.
+    """
+    from blastbox.host.jobs.retention import RETAINED_ORPHAN_SENTINEL, reap_stale_scratch
+    import logging as _logging
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+
+    job = Job.new(engine="redtusk", filename="s.doc")
+    job.claim_id = "claim-1"
+    job.status = JobStatus.RUNNING
+    store.create(job)
+    d = tmp_path / job.job_id
+    (d / "output").mkdir(parents=True)
+    name = f"blastbox-worker-{job.job_id[:12]}"
+    dispatcher._dispatch_inner = lambda j, i, o, *, orphan_out=None: orphan_out.append(name)
+    dispatcher._dispatch_claimed_job(job)
+
+    assert (d / RETAINED_ORPHAN_SENTINEL).is_file(), "no cross-process record of the hold"
+
+    # A COMPLETELY SEPARATE sweeper — no shared memory, no docker probe — must honour it.
+    # The job is made TERMINAL first, so the status check cannot be what saves the tree: the
+    # on-disk marker has to be the only thing standing between it and the rmtree.
+    store.update(job.job_id, status=JobStatus.FAILED)
+    # Every timestamp is STALE — including the marker's own, which is 90s old against a 60s
+    # reclaim age. So nothing here looks alive: the mtime walk would happily reclaim this tree,
+    # and only the marker (whose hold runs to 2x the reclaim age) stands in the way. A fresh
+    # marker would have made the tree look live and the test would pass without testing anything.
+    now = time.time()
+    for pth in (d / "output", d):
+        os.utime(pth, (now - 99_999,) * 2)
+    os.utime(d / RETAINED_ORPHAN_SENTINEL, (now - 90, now - 90))
+
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t")) == 0
+    assert d.exists(), "another process deleted a tree under a possibly-live container"
+
+
+def test_the_retained_orphan_hold_expires_so_the_disk_bound_still_wins(tmp_path):
+    """...but not forever. A container that still has not died at twice the reclaim age is an
+    operator problem, and an unbounded hold is just #84 with extra steps."""
+    from blastbox.host.jobs.retention import RETAINED_ORPHAN_SENTINEL, reap_stale_scratch
+    import logging as _logging
+
+    store = InMemoryJobStore()
+    jid = "77777777-7777-4777-8777-777777777777"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / RETAINED_ORPHAN_SENTINEL).write_text("")
+    old = time.time() - 99_999
+    for pth in (d / RETAINED_ORPHAN_SENTINEL, d / "output", d):
+        os.utime(pth, (old, old))
+
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t")) == 1
+    assert not d.exists()
+
+
+def test_a_repaired_job_gets_the_result_summary_its_done_path_would_have_written(tmp_path):
+    """A recovered job was DONE with result_summary=None forever: /v1/jobs and the status route
+    report null artifact/warning counts, anything tallying off them under-reports every recovered
+    job, and nothing re-walks DONE jobs to fix it."""
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = tmp_path / job.job_id / "output"
+    out.mkdir(parents=True)
+    # A minimal sealed envelope: the summary is built from it, so it must parse.
+    (out / "metadata.json").write_text(json.dumps({
+        "engine": "redtusk", "status": "ok", "input_sha256": "a" * 64,
+        "detected": {"label": "docx", "mime": "x", "confidence": 1.0, "source": "magika"},
+        "artifacts": [], "warnings": [],
+        "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
+    }))
+
+    dispatcher._index_repaired_result(job.job_id, out)
+
+    assert store.get(job.job_id).result_summary is not None, "recovered job left with null counts"

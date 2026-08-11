@@ -257,3 +257,45 @@ def test_a_nested_metadata_json_is_not_treated_as_the_seal(tmp_path):
     order = [p.relative_to(out).as_posix() for p in _upload_order(out) if p.is_file()]
     assert order[-1] == "metadata.json", f"the seal must be written last, got {order}"
     assert "rmeta/metadata.json" in order[:-1], "a nested metadata.json is an ordinary artifact"
+
+
+def test_an_unstorable_filename_is_skipped_not_retried_forever(tmp_path, caplog):
+    """One worker-chosen filename must not become a permanent leak.
+
+    The sample writes an undeclared 250-char name into its 0o777 output/. _atomic_copy's temp name
+    then exceeds NAME_MAX, so put_output raised ENAMETOOLONG on every attempt — the host marked
+    the tree pending-upload, and the last-copy rule exempted it from BOTH sweeps for the life of
+    the node. That is #84 reproduced on demand, and it is deterministic: no retry ever fixes it.
+
+    Undeclared files are not servable (the result routes are manifest-gated), so skipping loses
+    nothing a consumer can reach — while the declared result still lands durably.
+    """
+    import logging
+
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "metadata.json").write_text('{"sealed": true}')
+    (out / ("A" * 250)).write_bytes(b"undeclared, unstorable")
+
+    with caplog.at_level(logging.WARNING):
+        store.put_output("j-long", out)          # must NOT raise
+
+    assert store.has_output("j-long") is True, "the real result must still land"
+    assert (tmp_path / "blobs" / "results" / "j-long" / "metadata.json").exists()
+
+
+def test_a_real_upload_error_still_fails_the_upload(tmp_path, monkeypatch):
+    """The counterpart: only the deterministic name failure is skipped. A genuine outage must
+    fail the upload, or the terminal purge would delete the local tree believing it durable."""
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "metadata.json").write_text("{}")
+
+    def enospc(src, dest):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(LocalBlobStore, "_atomic_copy", staticmethod(enospc))
+    with pytest.raises(OSError):
+        store.put_output("j-enospc", out)

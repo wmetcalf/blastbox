@@ -1,6 +1,7 @@
 """Tests for retention sweeper."""
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import pathlib
@@ -765,6 +766,18 @@ class TestDeepTreeRemoval:
     demand and giving any sample a way to fill the node's root filesystem.
     """
 
+    @pytest.fixture(autouse=True)
+    def _no_stranded_trees(self, tmp_path):
+        """These tests build trees deliberately too deep for shutil.rmtree, so a FAILING one would
+        strand something pytest's own cleanup cannot remove — it renames the dir to garbage-* and
+        the next run inherits it. Remove it with the very function under test."""
+        yield
+        from blastbox.host.jobs.retention import _rmtree_iterative
+        for child in list(tmp_path.iterdir()):
+            if child.is_dir() and not child.is_symlink():
+                with contextlib.suppress(OSError):
+                    _rmtree_iterative(child)
+
     @staticmethod
     def _nest(base: Path, levels: int, leaf=None) -> None:
         """Build *levels* of nesting under *base*, one chdir at a time.
@@ -837,3 +850,105 @@ class TestDeepTreeRemoval:
         assert purge_job_dir(root, "abc", logging.getLogger("t")) is True
         assert not d.exists()
         assert (outside / "precious.bin").exists(), "the removal followed a symlink out"
+
+
+class TestRemovalRobustness:
+    """Properties the removal must hold against a worker that chooses the tree's shape."""
+
+    def test_an_unremovable_directory_fails_cleanly_instead_of_spinning(self, tmp_path):
+        """A dir the host cannot rmdir — the worker chmods 0555 a dir it owns, or a bind mount is
+        still live (EBUSY) — used to make the pass loop return "more to do" forever: a 100% CPU
+        spin inside a dispatch `finally` (measured 369,871 passes in 8s), which is far worse than
+        the clean failure shutil.rmtree would have produced. A pass that removes nothing raises.
+        """
+        if os.geteuid() == 0:
+            pytest.skip("root ignores the permission bits this relies on")
+        from blastbox.host.jobs.retention import _rmtree_iterative
+
+        # Exercised DIRECTLY, not through purge_job_dir: shutil.rmtree hits the EACCES first and
+        # re-raises it, so going through the front door never reaches the fallback and the test
+        # would pass without testing anything.
+        d = tmp_path / "abc"
+        (d / "output").mkdir(parents=True)
+        pinned = d / "output" / "pin"
+        (pinned / "child").mkdir(parents=True)
+        os.chmod(pinned, 0o555)
+        try:
+            t0 = time.monotonic()
+            with pytest.raises(OSError):
+                _rmtree_iterative(d)
+            assert time.monotonic() - t0 < 30, "spun instead of giving up"
+        finally:
+            os.chmod(pinned, 0o755)
+
+    def test_purge_reports_a_permission_failure_rather_than_spinning(self, tmp_path):
+        """...and the front door still returns a clean False for it, exactly as shutil.rmtree
+        alone would have. The fallback must never convert a bounded failure into a hang."""
+        if os.geteuid() == 0:
+            pytest.skip("root ignores the permission bits this relies on")
+        root = tmp_path / "jobs"
+        d = root / "abc"
+        (d / "output").mkdir(parents=True)
+        pinned = d / "output" / "pin"
+        (pinned / "child").mkdir(parents=True)
+        self._nest_deep(d / "output")
+        os.chmod(pinned, 0o555)
+        try:
+            t0 = time.monotonic()
+            assert purge_job_dir(root, "abc", logging.getLogger("t")) is False
+            assert time.monotonic() - t0 < 30, "purge spun instead of failing"
+        finally:
+            os.chmod(pinned, 0o755)
+
+    def test_residue_from_an_interrupted_purge_does_not_poison_the_next_one(self, tmp_path):
+        """The hoist used a fixed `.rm-0`, so residue from a killed purge (likely, given the spin
+        above) made every later attempt rename onto a NON-EMPTY dir — ENOTEMPTY, zero progress,
+        forever. Hoist names are now probed for freshness."""
+        root = tmp_path / "jobs"
+        d = root / "abc"
+        (d / "output").mkdir(parents=True)
+        residue = d / ".rm-0"
+        (residue / "leftover").mkdir(parents=True)
+        (residue / "leftover" / "f").write_text("x")
+        self._nest_deep(d / "output")
+
+        assert purge_job_dir(root, "abc", logging.getLogger("t")) is True
+        assert not d.exists()
+
+    def test_a_wide_tree_does_not_cost_a_pass_per_directory(self, tmp_path):
+        """Descending only the first child per pass made the cost quadratic in sibling count
+        (16k dirs = 24s, 4x per doubling) — inside the single maintenance thread, on a shape the
+        worker picks for free. Iterators live on the stack, so one pass clears any width."""
+        root = tmp_path / "jobs"
+        d = root / "abc"
+        (d / "output").mkdir(parents=True)
+        for i in range(4000):
+            (d / "output" / f"w{i}").mkdir()
+        self._nest_deep(d / "output")
+
+        t0 = time.monotonic()
+        assert purge_job_dir(root, "abc", logging.getLogger("t")) is True
+        assert time.monotonic() - t0 < 20, "wide tree cost is superlinear again"
+        assert not d.exists()
+
+    @staticmethod
+    def _nest_deep(base: Path, levels: int = 1200) -> None:
+        cwd = os.getcwd()
+        try:
+            os.chdir(base)
+            os.mkdir("deep")
+            os.chdir("deep")
+            for _ in range(levels):
+                os.mkdir("a")
+                os.chdir("a")
+        finally:
+            os.chdir(cwd)
+
+    @pytest.fixture(autouse=True)
+    def _no_stranded_trees(self, tmp_path):
+        yield
+        from blastbox.host.jobs.retention import _rmtree_iterative
+        for child in list(tmp_path.iterdir()):
+            if child.is_dir() and not child.is_symlink():
+                with contextlib.suppress(OSError):
+                    _rmtree_iterative(child)

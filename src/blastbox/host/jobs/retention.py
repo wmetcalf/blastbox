@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import itertools
 import logging
 import os
 import re
@@ -23,6 +24,7 @@ import shutil
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from blastbox.host.blobs.base import BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import JobStatus, JobStore
@@ -58,6 +60,27 @@ RESULT_RETAINED_MARKER = "result retained on this worker (no durable copy)"
 # which matters at the 97,681-dir fleet state this PR exists to clean up.
 PENDING_UPLOAD_SENTINEL = ".pending-upload"
 
+# The same trick for the other tree a sweep must not touch: one whose worker container was never
+# confirmed dead. That knowledge lived in a PROCESS-LOCAL set, which is where the danger is --
+# two dispatcher containers share one job_root, VmJobDispatcher has no docker access at all to
+# probe with, and a restart empties the set. A file in the host-only job dir is visible to every
+# sweeper in every process and survives restarts.
+RETAINED_ORPHAN_SENTINEL = ".retained-orphan"
+
+
+def mark_retained_orphan(job_root: "Path", job_id: str, log: "logging.Logger") -> None:
+    """Record that this job's worker container was NOT confirmed dead, so its tree must not be
+    rmtree'd out from under a possibly-live 0o777 bind mount. Best-effort."""
+    try:
+        (job_root / job_id / RETAINED_ORPHAN_SENTINEL).write_text("")
+    except OSError as exc:
+        log.warning("could not mark %s as a retained orphan (%s)", job_id, exc)
+
+
+def clear_retained_orphan(job_root: "Path", job_id: str) -> None:
+    with contextlib.suppress(OSError):
+        (job_root / job_id / RETAINED_ORPHAN_SENTINEL).unlink()
+
 
 def mark_pending_upload(job_root: "Path", job_id: str, log: "logging.Logger") -> None:
     """Record that this job's sealed result is on local disk with no durable copy.
@@ -84,27 +107,46 @@ _RM_FD_BUDGET = 64
 
 
 def _rmtree_iterative(root: "Path") -> None:
-    """Remove *root* with bounded resources, whatever depth it has.
+    """Remove *root* with bounded resources, whatever shape it has.
 
-    A worker owns output/ (a 0o777 bind mount) and can nest directories as deep as it likes, so
-    every limit here is one it can aim at:
+    A worker owns output/ (a 0o777 bind mount), so every limit here is one it can aim at:
       * shutil.rmtree's fd walk RECURSES -- RecursionError at ~1000 levels;
       * a path-based walk (os.walk, rglob) silently stops at PATH_MAX;
-      * holding one fd per level -- the obvious iterative rewrite -- hits EMFILE at ~1024.
-    So: descend at most _RM_FD_BUDGET levels at a time using openat/unlinkat (no absolute paths,
-    so PATH_MAX never applies), and when the budget runs out, RENAME whatever is still below up
-    into the root and carry on. Depth falls by a full budget each pass, so it terminates in
-    depth/64 passes with a fixed fd cost. O_NOFOLLOW throughout: a symlink is an entry to unlink,
-    never something to descend into.
+      * one fd per level -- the obvious iterative rewrite -- hits EMFILE at ~1024.
+
+    So: a post-order walk over openat/unlinkat (no absolute paths, so PATH_MAX never applies)
+    holding at most _RM_FD_BUDGET fds, and when the budget runs out, whatever is still below is
+    RENAMED up into the root and picked up by a later pass.
+
+    Three properties this needs, each of which an earlier version got wrong:
+      * TERMINATION. Every pass must remove something. A directory the host cannot rmdir (the
+        worker chmods 0555 a dir it owns; a still-mounted bind mount gives EBUSY) used to be
+        swallowed by a bare suppress(), leaving root non-empty forever -- a 100% CPU spin inside
+        a dispatch `finally` (measured: 369,871 passes in 8s), which is far worse than the clean
+        "PURGE FAILED" shutil.rmtree would have produced. A pass that removes nothing now raises.
+      * FRESH HOIST NAMES. Renaming onto a fixed `.rm-0` meant residue from an interrupted purge
+        (likely, given the spin above) collided with a NON-EMPTY dir -> ENOTEMPTY on every later
+        attempt -> zero progress, forever.
+      * WIDTH. Descending only the first child per pass made the cost quadratic in sibling count
+        (16k dirs = 24s, and 4x per doubling) inside the single maintenance thread. Iterators are
+        kept per frame, so one pass clears everything within the budget depth at any width.
     """
     parent_fd = os.open(root.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
         root_fd = os.open(root.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                           dir_fd=parent_fd)
         try:
-            salt = 0
-            while _rm_one_pass(root_fd, salt):
-                salt += 1
+            counter = itertools.count()
+            while True:
+                removed, remaining = _rm_one_pass(root_fd, counter)
+                if not remaining:
+                    break
+                if not removed:
+                    # Nothing left that we are able to remove. Report it the way shutil.rmtree
+                    # would have, instead of looping on it.
+                    raise OSError(errno.ENOTEMPTY,
+                                  "cannot remove every entry (permissions, or a live mount)",
+                                  str(root))
         finally:
             os.close(root_fd)
         os.rmdir(root.name, dir_fd=parent_fd)
@@ -112,39 +154,67 @@ def _rmtree_iterative(root: "Path") -> None:
         os.close(parent_fd)
 
 
-def _rm_one_pass(root_fd: int, salt: int) -> bool:
-    """One bounded descent. Returns True while *root_fd* still has entries left to remove."""
-    stack: list[tuple[int, int, str]] = []          # (parent_fd, own_fd, own name)
-    cur = root_fd
+def _hoist_name(root_fd: int, counter: "itertools.count") -> str:
+    """An unused `.rm-N` in the root, so a hoist never lands on residue from an earlier purge."""
+    for _ in range(10_000):
+        name = f".rm-{next(counter)}"
+        try:
+            os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return name
+        except OSError:
+            continue
+    raise OSError(errno.EEXIST, "no free hoist name under job dir")
+
+
+def _rm_one_pass(root_fd: int, counter: "itertools.count") -> "tuple[bool, bool]":
+    """One bounded post-order pass. Returns (removed_anything, root_still_has_entries)."""
+    removed = False
+    # (parent_fd or None for the root, own name or None, own fd, its scandir iterator)
+    stack: list[tuple[int | None, str | None, int, "Any"]] = [
+        (None, None, root_fd, os.scandir(root_fd)),
+    ]
     try:
-        while True:
-            deeper = None
-            with os.scandir(cur) as it:
-                for entry in it:
-                    if entry.is_dir(follow_symlinks=False):
-                        if deeper is None:
-                            deeper = entry.name
-                        continue
-                    os.unlink(entry.name, dir_fd=cur)
-            if deeper is None:
-                break                                # this directory is empty now
-            if len(stack) >= _RM_FD_BUDGET:
-                # Out of budget with depth to spare: hoist the rest up to the root and let the
-                # next pass start from there. renameat with two dir fds needs no path at all.
-                os.rename(deeper, f".rm-{salt}", src_dir_fd=cur, dst_dir_fd=root_fd)
-                break
-            fd = os.open(deeper, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur)
-            stack.append((cur, fd, deeper))
-            cur = fd
-    finally:
-        # Unwind: close every fd we took, removing each directory once it is empty.
         while stack:
-            pfd, fd, name = stack.pop()
-            os.close(fd)
-            with contextlib.suppress(OSError):       # not empty yet -> a later pass gets it
-                os.rmdir(name, dir_fd=pfd)
-    with os.scandir(root_fd) as it:
-        return any(True for _ in it)
+            pfd, name, fd, it = stack[-1]
+            descended = False
+            for entry in it:                      # the iterator LIVES on the frame, so returning
+                try:                              # to a parent resumes rather than re-scanning
+                    if entry.is_dir(follow_symlinks=False):
+                        if len(stack) >= _RM_FD_BUDGET:
+                            os.rename(entry.name, _hoist_name(root_fd, counter),
+                                      src_dir_fd=fd, dst_dir_fd=root_fd)
+                            removed = True        # depth fell by a budget: real progress
+                            continue
+                        cfd = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                      dir_fd=fd)
+                        stack.append((fd, entry.name, cfd, os.scandir(cfd)))
+                        descended = True
+                        break
+                    os.unlink(entry.name, dir_fd=fd)
+                    removed = True
+                except FileNotFoundError:
+                    continue                      # a peer got there first
+            if descended:
+                continue
+            it.close()
+            stack.pop()
+            if pfd is not None:
+                os.close(fd)
+                try:
+                    os.rmdir(name, dir_fd=pfd)    # type: ignore[arg-type]
+                    removed = True
+                except OSError:
+                    pass                          # not empty yet, or not ours to remove
+    finally:
+        for _pfd, _name, fd, it in stack:         # only reached on an exception mid-walk
+            with contextlib.suppress(Exception):
+                it.close()
+            if _pfd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+    with os.scandir(root_fd) as it2:
+        return removed, any(True for _ in it2)
 
 
 def purge_job_dir(job_root: "Path", job_id: str, log: "logging.Logger") -> bool:
@@ -487,6 +557,17 @@ def reap_stale_scratch(
             if d.is_symlink():
                 continue          # resolve() would dereference to a SIBLING's real tree
             if not d.is_dir() or not _JOB_ID_RE.match(d.name):
+                continue
+            # A container this node never confirmed dead may still hold output/ bind-mounted
+            # 0o777; rmtree'ing under it half-deletes the tree, frees nothing (its fds pin the
+            # blocks) and fires the spurious "PURGE FAILED". Honoured across processes and
+            # restarts -- but NOT forever: past twice the reclaim age, a container that still has
+            # not died is an operator problem, and the disk bound has to win (#85 review).
+            try:
+                orphan_marked = (d / RETAINED_ORPHAN_SENTINEL).lstat().st_mtime
+            except OSError:
+                orphan_marked = None
+            if orphan_marked is not None and orphan_marked > now - (max_age_s * 2):
                 continue
             # CONTAINMENT, not equality: a blob root NESTED under a candidate
             # (<job_root>/<uuid>/blobs) is destroyed by deleting the candidate, so equality
