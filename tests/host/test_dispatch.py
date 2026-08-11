@@ -2890,3 +2890,106 @@ def test_scratch_reclaim_leaves_the_tree_when_the_store_cannot_be_read(tmp_path)
     dispatcher._job_store = _BrokenStore()
     assert dispatcher._reap_stale_scratch() == 0
     assert d.exists(), "a store error caused a deletion"
+
+
+def test_scratch_reclaim_never_touches_a_colocated_blob_store(tmp_path):
+    """"The store has never heard of it" is NOT evidence of an orphan (#85 review).
+
+    job_root can legitimately contain a co-located blob store — BLASTBOX_BLOB_LOCAL_ROOT under
+    job_root is a documented multi-node layout — plus lost+found when it is its own filesystem.
+    Reclaiming anything the job store doesn't recognise destroys every sample and every durable
+    result on that mount: the copy the API serves, and the copy that makes the terminal purge
+    safe in the first place. Only uuid4-shaped directories are candidates.
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    old = time.time() - 99_999
+    blobs = tmp_path / "blobs" / "results" / "some-job"
+    blobs.mkdir(parents=True)
+    (blobs / "metadata.json").write_text("{}")
+    lostfound = tmp_path / "lost+found"
+    lostfound.mkdir()
+    for p in (blobs / "metadata.json", blobs, blobs.parent, tmp_path / "blobs", lostfound):
+        os.utime(p, (old, old))
+
+    assert dispatcher._reap_stale_scratch() == 0
+    assert (blobs / "metadata.json").exists(), "the reclaim destroyed the durable blob store"
+    assert lostfound.exists()
+
+
+def test_scratch_reclaim_refuses_a_symlink_even_with_a_perfect_job_id_name(tmp_path):
+    """A uuid4-NAMED SYMLINK is not a job dir, and following one is how this sweep would
+    delete a tree it was never pointed at.
+
+    purge_job_dir resolves before it deletes, so a symlink under job_root is dereferenced to
+    whatever it points at — a sibling job's live tree, or the co-located blob store. The name
+    passes the uuid4 shape check (names are free), and the link's own mtime is trivially old,
+    so every other guard waves it through. Nothing but the is_symlink() refusal stops it.
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    victim = tmp_path / "blobs" / "results" / "some-job"
+    victim.mkdir(parents=True)
+    (victim / "metadata.json").write_text("{}")
+
+    link = tmp_path / "88888888-8888-4888-8888-888888888888"
+    link.symlink_to(tmp_path / "blobs", target_is_directory=True)
+    # The TARGET is old too, so every age-based guard waves it through and the
+    # is_symlink() refusal is the only thing left holding the line. (stat() follows
+    # the link, so a freshly-created target would spare it for the wrong reason and
+    # the test would pass even with the refusal deleted.)
+    old = time.time() - 99_999
+    for pth in (victim / "metadata.json", victim, victim.parent, tmp_path / "blobs"):
+        os.utime(pth, (old, old))
+    os.utime(link, (old, old), follow_symlinks=False)
+
+    assert dispatcher._reap_stale_scratch() == 0
+    assert (victim / "metadata.json").exists(), "the reclaim followed a symlink out of its lane"
+    assert link.is_symlink()
+
+
+def test_scratch_reclaim_cannot_be_evaded_by_a_worker_setting_a_future_mtime(tmp_path):
+    """The worker owns files under output/ (a 0o777 bind mount) and utime() is unprivileged, so a
+    detonated sample could stamp a future mtime and make its tree immortal — defeating the only
+    bound on job_root and reproducing #84 on purpose. A future mtime is not liveness.
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    d = tmp_path / "77777777-7777-4777-8777-777777777777"
+    (d / "output").mkdir(parents=True)
+    pad = d / "output" / "pad.bin"
+    pad.write_bytes(b"x")
+    old = time.time() - 99_999
+    os.utime(d, (old, old))
+    os.utime(d / "output", (old, old))
+    os.utime(pad, (2**31, 2**31))          # malware stamps the far future
+
+    assert dispatcher._reap_stale_scratch() == 1, "a future mtime made the tree immortal"
+    assert not d.exists()
+
+
+def test_scratch_reclaim_reports_only_what_it_actually_removed(tmp_path):
+    """purge_job_dir refuses and fails best-effort, so counting unconditionally made the
+    operator-facing "removed N job dir(s)" line report directories still on disk — forever, on
+    every tick, next to the ERROR explaining it had refused them."""
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    d = tmp_path / "88888888-8888-4888-8888-888888888888"
+    d.mkdir()
+    os.utime(d, (time.time() - 99_999,) * 2)
+
+    import blastbox.host.dispatch as mod
+    real = mod.purge_job_dir
+    try:
+        mod.purge_job_dir = lambda root, jid, log: False      # simulate a refusal/failure
+        assert dispatcher._reap_stale_scratch() == 0, "counted a dir it did not remove"
+    finally:
+        mod.purge_job_dir = real

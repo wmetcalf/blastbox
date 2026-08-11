@@ -1,12 +1,17 @@
 """Tests for retention sweeper."""
 from __future__ import annotations
 
+import logging
+import shutil
 import time
+from pathlib import Path
+
+import pytest
 
 
 from blastbox.host.jobs.base import Job, JobStatus
 from blastbox.host.jobs.memory import InMemoryJobStore
-from blastbox.host.jobs.retention import JobRetentionSweeper
+from blastbox.host.jobs.retention import JobRetentionSweeper, purge_job_dir
 
 
 # ---------------------------------------------------------------------------
@@ -282,3 +287,134 @@ def test_failure_on_one_job_does_not_block_others(tmp_path, caplog):
     # job2 must be expired even if job1 had issues
     assert job2.job_id in expired
     assert not result2.exists()
+
+
+# ---------------------------------------------------------------------------
+# purge_job_dir — the shared helper both dispatchers call (#84)
+# ---------------------------------------------------------------------------
+
+class TestPurgeJobDir:
+    """The helper is the ONLY thing standing between a terminal job and sample bytes
+    left on spare hardware, so its refusals and its successes must both be exact:
+    a refusal that fires wrongly leaks bytes, and a success reported wrongly
+    (or a success reported as a failure) makes the operator alarm useless.
+    """
+
+    def test_returns_true_and_removes_the_tree(self, tmp_path, caplog):
+        root = tmp_path / "jobs"
+        (root / "abc").mkdir(parents=True)
+        (root / "abc" / "sample.bin").write_bytes(b"MALWARE")
+
+        with caplog.at_level(logging.ERROR):
+            assert purge_job_dir(root, "abc", logging.getLogger("t")) is True
+        assert not (root / "abc").exists()
+        assert "PURGE FAILED" not in caplog.text
+
+    def test_already_gone_is_success_not_failure(self, tmp_path):
+        root = tmp_path / "jobs"
+        root.mkdir()
+        # Nothing to do is the correct outcome, not an error: both dispatchers call
+        # this from terminal cleanup and may race each other to the same job.
+        assert purge_job_dir(root, "never-existed", logging.getLogger("t")) is True
+
+    def test_a_peer_reaping_concurrently_is_not_reported_as_a_failure(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """rmtree losing the race to a peer is the NORMAL two-dispatcher case.
+
+        Both dispatchers share one job_root and the age-based reclaim is not
+        claim-fenced, so the tree can vanish between exists() and rmtree(). Treating
+        that as failure fired the module's loudest operator-facing string ("sample
+        bytes may remain") on cycles that had in fact succeeded — training the
+        operator to ignore the one message that means bytes really did survive.
+        """
+        root = tmp_path / "jobs"
+        (root / "abc").mkdir(parents=True)
+        (root / "abc" / "sample.bin").write_bytes(b"MALWARE")
+
+        real_rmtree = shutil.rmtree
+
+        def racing_rmtree(path, *a, **kw):
+            real_rmtree(path, *a, **kw)      # the peer's delete, landing first
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+
+        monkeypatch.setattr("blastbox.host.jobs.retention.shutil.rmtree", racing_rmtree)
+
+        with caplog.at_level(logging.ERROR):
+            assert purge_job_dir(root, "abc", logging.getLogger("t")) is True
+        assert not (root / "abc").exists()
+        assert "PURGE FAILED" not in caplog.text
+        assert "sample bytes may remain" not in caplog.text
+
+    def test_a_real_rmtree_failure_is_still_reported(self, tmp_path, monkeypatch, caplog):
+        """The counterpart: a genuine OSError must keep the loud alarm and return False,
+        so the concurrent-reap exemption above cannot be read as 'purge never fails'."""
+        root = tmp_path / "jobs"
+        (root / "abc").mkdir(parents=True)
+
+        def failing_rmtree(path, *a, **kw):
+            raise PermissionError(13, "Permission denied", str(path))
+
+        monkeypatch.setattr("blastbox.host.jobs.retention.shutil.rmtree", failing_rmtree)
+
+        with caplog.at_level(logging.ERROR):
+            assert purge_job_dir(root, "abc", logging.getLogger("t")) is False
+        assert "PURGE FAILED" in caplog.text
+        assert (root / "abc").exists()
+
+    @pytest.mark.parametrize("job_id", ["", ".", "..", "a/b", "..\\b", "../victim"])
+    def test_refuses_anything_that_is_not_one_path_component(self, tmp_path, job_id, caplog):
+        """'victim/child/..' is strictly UNDER job_root yet resolves to a different job's
+        tree, so containment alone cannot protect a peer. Job IDs are server-side uuid4
+        and ingress validates them, but Job.from_dict() does not — an imported or
+        corrupted store row reaches here unvalidated."""
+        root = tmp_path / "jobs"
+        (root / "victim").mkdir(parents=True)
+        (root / "victim" / "keep.bin").write_bytes(b"LIVE PEER")
+
+        with caplog.at_level(logging.ERROR):
+            assert purge_job_dir(root, job_id, logging.getLogger("t")) is False
+        assert (root / "victim" / "keep.bin").exists()
+        assert root.exists()
+
+    def test_refuses_to_purge_job_root_itself(self, tmp_path, caplog):
+        """Path.relative_to(itself) returns '.' rather than raising, so containment
+        alone would let a degenerate id take out every job on the worker."""
+        root = tmp_path / "jobs"
+        (root / "other").mkdir(parents=True)
+
+        # A component that canonicalises back to job_root.
+        (root / "self").symlink_to(root, target_is_directory=True)
+        with caplog.at_level(logging.ERROR):
+            assert purge_job_dir(root, "self", logging.getLogger("t")) is False
+        assert (root / "other").exists()
+
+    def test_refuses_a_symlink_that_escapes_job_root(self, tmp_path, caplog):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "precious.bin").write_bytes(b"NOT OURS")
+        root = tmp_path / "jobs"
+        root.mkdir()
+        (root / "escape").symlink_to(outside, target_is_directory=True)
+
+        with caplog.at_level(logging.ERROR):
+            assert purge_job_dir(root, "escape", logging.getLogger("t")) is False
+        assert (outside / "precious.bin").exists()
+
+    def test_a_canonicalisation_error_is_contained_not_raised(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """A symlink loop makes Path.resolve() raise RuntimeError. Both dispatchers call
+        this from terminal cleanup, so an escape here would mask the job's real outcome
+        and skip its metrics — the docstring promises best-effort."""
+        root = tmp_path / "jobs"
+        root.mkdir()
+
+        def exploding_resolve(self, *a, **kw):
+            raise RuntimeError("symlink loop")
+
+        monkeypatch.setattr(Path, "resolve", exploding_resolve)
+
+        with caplog.at_level(logging.ERROR):
+            assert purge_job_dir(root, "abc", logging.getLogger("t")) is False
+        assert "PURGE FAILED" in caplog.text

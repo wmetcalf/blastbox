@@ -28,7 +28,7 @@ _log = logging.getLogger("blastbox.host.jobs.retention")
 _TERMINAL = frozenset({JobStatus.DONE, JobStatus.FAILED, JobStatus.EXPIRED})
 
 
-def purge_job_dir(job_root: "Path", job_id: str, log: "logging.Logger") -> None:
+def purge_job_dir(job_root: "Path", job_id: str, log: "logging.Logger") -> bool:
     """Remove a job's ENTIRE per-job dir (input AND output) from this worker's disk.
 
     SECURITY INVARIANT, not housekeeping: a worker is a malware-analysis node, frequently
@@ -59,7 +59,7 @@ def purge_job_dir(job_root: "Path", job_id: str, log: "logging.Logger") -> None:
     # a duplicate pre-check here is unreachable and mutation-testing cannot justify it.)
     if not job_id or "/" in job_id or "\\" in job_id:
         log.error("refusing to purge: job_id %r is not a single path component", job_id)
-        return
+        return False
     # Canonicalisation itself can raise -- a symlink loop makes Path.resolve() raise RuntimeError
     # on 3.12, and other filesystem errors escape too. Both dispatchers call this from terminal
     # cleanup, so an escape here masks the job's outcome and skips its metrics. The docstring
@@ -67,26 +67,36 @@ def purge_job_dir(job_root: "Path", job_id: str, log: "logging.Logger") -> None:
     try:
         root = (job_root / job_id).resolve()
         jr = job_root.resolve()
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
+        # ValueError too: Path.resolve() raises it on an embedded NUL, which the component
+        # guard above does not reject, and an escape here masks the job's terminal outcome.
         log.error("PURGE FAILED for job %s: cannot canonicalise under %s: %s — sample bytes may "
                   "remain on this worker's disk", job_id, job_root, exc)
-        return
+        return False
     if root == jr:
         # STRICTLY under, not equal: Path.relative_to(itself) returns "." rather than raising.
         log.error("refusing to purge job_root itself (%s) — degenerate job_id %r", jr, job_id)
-        return
+        return False
     try:
         root.relative_to(jr)
     except ValueError:
         log.error("refusing to purge %s (outside job_root %s)", root, job_root)
-        return
+        return False
     if not root.exists():
-        return
+        return True
     try:
         shutil.rmtree(root)
+        return True
+    except FileNotFoundError:
+        # A peer reaped the same tree concurrently. Two dispatchers share one job_root, and the
+        # age-based reclaim is not claim-fenced, so this is the NORMAL two-node case -- not a
+        # failure. Reporting it as one fired the module's loudest operator-facing string ("sample
+        # bytes may remain") on every reap cycle that actually succeeded (#85 review).
+        return True
     except OSError as exc:
         log.error("PURGE FAILED for job %s at %s: %s — sample bytes may remain on this "
                   "worker's disk", job_id, root, exc)
+        return False
 
 
 class JobRetentionSweeper:

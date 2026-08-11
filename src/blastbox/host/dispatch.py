@@ -80,6 +80,8 @@ def _guest_seam_errors() -> tuple[type[BaseException], ...]:
 _GUEST_SEAM_ERRORS: tuple[type[BaseException], ...] = _guest_seam_errors()
 
 
+_JOB_ID_RE = re.compile(r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+
 _log = logging.getLogger("blastbox.host.dispatch")
 
 # Maximum length for a validated env-var value derived from job.params.
@@ -2679,7 +2681,8 @@ class Dispatcher:
         """
         if self._scratch_max_age_s <= 0 or not self._job_root.is_dir():
             return 0
-        cutoff = time.time() - self._scratch_max_age_s
+        now = time.time()
+        cutoff = now - self._scratch_max_age_s
         n = 0
         try:
             entries = list(self._job_root.iterdir())
@@ -2688,7 +2691,15 @@ class Dispatcher:
             return 0
         for d in entries:
             try:
-                if not d.is_dir():
+                # Must LOOK like a job dir before it can be considered for deletion. "the store
+                # has never heard of it" is not evidence of an orphan -- job_root can legitimately
+                # contain a co-located blob store (BLASTBOX_BLOB_LOCAL_ROOT under job_root is a
+                # documented mode-2 layout), lost+found when it is its own filesystem, or an
+                # operator's scratch. Deleting those would destroy the durable results this whole
+                # design depends on. Ingress mints uuid4 job ids, so require that shape.
+                if d.is_symlink():
+                    continue          # resolve() would dereference to a SIBLING's real tree
+                if not d.is_dir() or not _JOB_ID_RE.match(d.name):
                     continue
             except OSError:
                 continue
@@ -2698,15 +2709,30 @@ class Dispatcher:
             # cutoff is supported) looks arbitrarily stale by the parent alone, and this sweep
             # would delete the tree out from under it (#85 review).
             try:
-                newest = d.stat().st_mtime
+                # A future mtime is NO EVIDENCE, not fresh evidence. The worker owns files under
+                # output/ (a 0o777 bind mount) and utime() is unprivileged, so a detonated sample
+                # could stamp the far future and make its tree immortal -- defeating the only
+                # bound on job_root and reproducing #84 deliberately. Clamping such a stamp to
+                # `now` would still read as "just touched", so ignore it outright. The small
+                # tolerance keeps ordinary clock skew from discarding honest timestamps.
+                horizon = now + 60.0
+
+                def _evidence(st_mtime: float) -> float:
+                    return -1.0 if st_mtime > horizon else st_mtime
+
+                newest = _evidence(d.stat().st_mtime)
+                live = newest > cutoff
                 for child in d.rglob("*"):
+                    if live:
+                        break     # already proven active -- no reason to walk the rest
                     try:
-                        newest = max(newest, child.stat().st_mtime)
+                        newest = max(newest, _evidence(child.stat().st_mtime))
+                        live = newest > cutoff
                     except OSError:
                         continue
             except (OSError, RuntimeError):
                 continue
-            if newest > cutoff:
+            if live:
                 continue
             # Belt and braces: age is a heuristic, job state is a fact. Never reclaim a tree whose
             # job is still live. A job unknown to the store is a genuine orphan and IS reclaimable.
@@ -2719,8 +2745,11 @@ class Dispatcher:
             if job is not None and job.status not in (JobStatus.DONE, JobStatus.FAILED,
                                                       JobStatus.EXPIRED):
                 continue
-            purge_job_dir(self._job_root, d.name, _log)
-            n += 1
+            # Count only what was actually removed: purge_job_dir refuses and fails
+            # best-effort, and an unconditional increment made the operator-facing
+            # "removed N job dir(s)" line report directories still on disk, forever.
+            if purge_job_dir(self._job_root, d.name, _log):
+                n += 1
         if n:
             _log.info("scratch reclaim: removed %d job dir(s) older than %.0fs from %s",
                       n, self._scratch_max_age_s, self._job_root)
