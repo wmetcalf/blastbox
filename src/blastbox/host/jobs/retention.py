@@ -228,26 +228,33 @@ def retry_pending_uploads(
             # this sweep just undid -- never a job that failed for any other reason, and never a
             # peer's terminal state (#85, found by end-to-end testing: the sweep reported success
             # while the API still answered 409).
+            repaired = False
             try:
-                if job_store.update_if_status(
+                repaired = job_store.update_if_status(
                     d.name, JobStatus.FAILED, status=JobStatus.DONE, error=None,
-                ):
-                    log.info("pending-upload sweep: job %s repaired to DONE (its result is "
-                             "durable now)", d.name)
-                    # Everything this job's own DONE path would have done and never got to --
-                    # page-hash indexing for similarity search, keyed off the sealed envelope.
-                    # Without it a recovered job is DONE and servable but permanently invisible
-                    # to /similar, because nothing re-walks DONE jobs (upstream review of #85).
-                    # Best-effort: an indexing problem must never undo a good repair.
-                    if on_repaired is not None:
-                        try:
-                            on_repaired(d.name, out_dir)
-                        except Exception:  # noqa: BLE001
-                            log.warning("pending-upload sweep: post-repair hook failed for %s",
-                                        d.name, exc_info=True)
+                )
             except Exception:  # noqa: BLE001 -- the bytes are safe; the status can retry
                 log.warning("pending-upload sweep: uploaded %s but could not repair its "
                             "status", d.name, exc_info=True)
+            if repaired:
+                log.info("pending-upload sweep: job %s repaired to DONE (its result is "
+                         "durable now)", d.name)
+            # SEPARATE boundary, deliberately outside the store's. Nesting the hook inside the
+            # update's try meant a hook failure was reported as "could not repair its status"
+            # when the status HAD been repaired -- an operator chasing a store problem that does
+            # not exist. Different failure, different message.
+            #
+            # This is everything the job's own DONE path would have done and never got to:
+            # page-hash indexing for similarity search, keyed off the sealed envelope. Without
+            # it a recovered job is DONE and servable but permanently invisible to /similar,
+            # because nothing re-walks DONE jobs (upstream review of #85). Best-effort -- an
+            # indexing problem must never undo a good repair.
+            if repaired and on_repaired is not None:
+                try:
+                    on_repaired(d.name, out_dir)
+                except Exception:  # noqa: BLE001
+                    log.warning("pending-upload sweep: %s was repaired, but its post-repair "
+                                "indexing failed", d.name, exc_info=True)
         else:
             log.warning("pending-upload sweep: %s still has no durable copy (%s); retaining "
                         "the local tree", d.name, upload_exc)

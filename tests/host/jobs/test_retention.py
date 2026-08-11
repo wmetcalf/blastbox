@@ -682,3 +682,24 @@ class TestRetryPendingUploads:
         retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"),
                               on_repaired=boom)
         assert store.get(_JID).status is JobStatus.DONE
+
+    def test_the_post_repair_hook_does_not_run_when_the_repair_did_not_happen(self, tmp_path):
+        """The hook means "this job just became DONE". Running it on a CAS that lost — a peer
+        moved the row out of FAILED between our read and our write — would index a result for a
+        job whose terminal state somebody else owns, off an envelope from our stale attempt."""
+        class LosesTheCas(InMemoryJobStore):
+            def update_if_status(self, job_id, expect_status, **kw):
+                return False               # somebody else moved it first
+
+        store = LosesTheCas()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+        _sealed_tree(tmp_path, _JID)
+
+        seen: list[str] = []
+        retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"),
+                              on_repaired=lambda jid, out: seen.append(jid))
+        assert seen == [], "indexed a job this sweep did not repair"
