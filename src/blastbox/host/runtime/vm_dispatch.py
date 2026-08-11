@@ -36,6 +36,7 @@ from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_wi
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.jobs.retention import (
     RESULT_RETAINED_MARKER,
+    mark_pending_upload,
     JobRetentionSweeper,
     purge_job_dir,
     _blob_local_roots,
@@ -645,6 +646,7 @@ class VmJobDispatcher:
                     # the result or not depending purely on which dispatcher happened to claim the
                     # job from the shared queue (#85 review).
                     pending_upload = True
+                    mark_pending_upload(self._job_root, job.job_id, logger)
                     logger.error(
                         "vm_dispatch: result upload failed for %s after %d attempt(s) (%s); "
                         "failing the job and RETAINING its output for the pending-upload sweep",

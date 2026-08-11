@@ -14,6 +14,7 @@ Security properties:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -39,6 +40,74 @@ _TERMINAL = frozenset({JobStatus.DONE, JobStatus.FAILED, JobStatus.EXPIRED})
 # dispatchers build their failure message with it and retry_pending_uploads matches on it, so
 # there is a SINGLE definition rather than a literal duplicated across three call sites.
 RESULT_RETAINED_MARKER = "result retained on this worker (no durable copy)"
+
+# The HOST-ONLY record that a tree holds a sealed result whose upload failed.
+#
+# It is a file in the JOB DIR, deliberately a sibling of output/ and never inside it. The worker
+# owns output/ (a 0o777 bind mount) and nothing else: the job dir itself is host-only, which is
+# already why the egress resolv.conf is staged there rather than under output/.
+#
+# The previous gate -- RESULT_RETAINED_MARKER appearing in job.error -- was NOT host-only, and
+# that was a real hole, not a theoretical one. job.error carries verbatim worker text on the
+# engine-error path (`f"engine_error: {detail}"`), so a worker could put the marker string in its
+# own envelope warning, get it copied into the row, and have this sweep upload its untrusted
+# output/ as the job's result and CAS the job to DONE. Demonstrated end-to-end in review of #85.
+#
+# A file also makes the sweep cheap: one stat per job dir instead of a store round-trip per dir,
+# which matters at the 97,681-dir fleet state this PR exists to clean up.
+PENDING_UPLOAD_SENTINEL = ".pending-upload"
+
+
+def mark_pending_upload(job_root: "Path", job_id: str, log: "logging.Logger") -> None:
+    """Record that this job's sealed result is on local disk with no durable copy.
+
+    Best-effort: failing to write it costs a retry opportunity, never correctness -- the tree is
+    still retained by the caller, and the reclaim's own gate keeps a DONE job's last copy.
+    """
+    try:
+        (job_root / job_id / PENDING_UPLOAD_SENTINEL).write_text("")
+    except OSError as exc:
+        log.warning("could not mark %s as pending-upload (%s); the retry sweep will not see it",
+                    job_id, exc)
+
+
+def _clear_pending_upload(job_root: "Path", job_id: str) -> None:
+    with contextlib.suppress(OSError):
+        (job_root / job_id / PENDING_UPLOAD_SENTINEL).unlink()
+
+
+def _rmtree_iterative(root: "Path") -> None:
+    """Remove *root* with an explicit stack and fd-relative syscalls.
+
+    Immune to BOTH limits a hostile worker can hit on purpose: Python's recursion limit (which
+    shutil.rmtree's recursive fd walk trips at ~1000 levels) and PATH_MAX (which a path-based
+    walk trips at ~4096 bytes of accumulated name, silently truncating what it can even see).
+    Every step is openat/unlinkat relative to a directory fd, so absolute path length never
+    matters, and O_NOFOLLOW means a symlink is unlinked, never descended.
+    """
+    parent_fd = os.open(root.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        stack: list[tuple[int, str, int]] = []
+        fd = os.open(root.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        stack.append((parent_fd, root.name, fd))
+        while stack:
+            pfd, name, dfd = stack[-1]
+            descended = False
+            with os.scandir(dfd) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        cfd = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                      dir_fd=dfd)
+                        stack.append((dfd, entry.name, cfd))
+                        descended = True
+                        break
+                    os.unlink(entry.name, dir_fd=dfd)
+            if not descended:
+                os.close(dfd)
+                stack.pop()
+                os.rmdir(name, dir_fd=pfd)
+    finally:
+        os.close(parent_fd)
 
 
 def purge_job_dir(job_root: "Path", job_id: str, log: "logging.Logger") -> bool:
@@ -114,7 +183,15 @@ def purge_job_dir(job_root: "Path", job_id: str, log: "logging.Logger") -> bool:
     if not root.exists():
         return True
     try:
-        shutil.rmtree(root)
+        try:
+            shutil.rmtree(root)
+        except RecursionError:
+            # shutil.rmtree's fd walk RECURSES, so ~1000 nested dirs blow the stack. The worker
+            # owns output/ (0o777) and `for i in $(seq 1500); do mkdir a; cd a; done` is
+            # unprivileged, instant, and stays well inside PATH_MAX -- so a sample could make its
+            # own tree PERMANENTLY undeletable and reproduce #84 on demand. Catching the error is
+            # not enough: it must still be removed (#85 review).
+            _rmtree_iterative(root)
         return True
     except FileNotFoundError:
         # A peer reaped the same tree concurrently. Two dispatchers share one job_root, and the
@@ -181,8 +258,12 @@ def retry_pending_uploads(
             if d.is_symlink() or not d.is_dir() or not _JOB_ID_RE.match(d.name):
                 continue
             out_dir = d / "output"
+            # The host-only sentinel FIRST: it is one stat, it is unforgeable by the worker, and
+            # it means almost no directory reaches the store round-trip below.
+            if not (d / PENDING_UPLOAD_SENTINEL).is_file():
+                continue
             if not (out_dir / "metadata.json").is_file():
-                continue          # no sealed result here -- ordinary scratch
+                continue          # sentinel without a result: nothing to upload
         except OSError:
             continue
         # THE GATE: the JOB ROW must say this tree is a host-sealed result whose upload failed.
@@ -204,7 +285,11 @@ def retry_pending_uploads(
         except Exception:  # noqa: BLE001 -- store trouble must not turn into a bad upload
             log.warning("pending-upload sweep: cannot confirm %s is ours; skipping", d.name)
             continue
-        if row is None or RESULT_RETAINED_MARKER not in (row.error or ""):
+        # The row must still be the FAILED job we retained. Not DONE (a peer won it, and its
+        # result is authoritative at the same prefix), not EXPIRED (retention deleted the result
+        # on an operator's instruction -- re-uploading would silently undo that, and with
+        # expires_at cleared nothing would ever collect it again), and not missing.
+        if row is None or row.status is not JobStatus.FAILED:
             continue
         try:
             durable = blob_store.has_output(d.name)
@@ -220,6 +305,7 @@ def retry_pending_uploads(
             if not durable:
                 n += 1
                 log.info("pending-upload sweep: result for %s is now durably stored", d.name)
+            _clear_pending_upload(job_root, d.name)   # drained: the tree is redundant now
             # REPAIR THE JOB. Uploading the bytes is only half of it: the job was FAILED because
             # its upload exhausted, and open_output is DONE-gated, so a recovered result stays
             # unreachable -- from a client's view the outcome is identical to having discarded it.
@@ -273,6 +359,7 @@ def reap_stale_scratch(
     blob_store: BlobStore | None = None,
     protect_paths: "tuple[Path, ...]" = (),
     max_per_sweep: int = 2000,
+    live_job_ids: "Callable[[], set[str] | None] | None" = None,
 ) -> int:
     """Reclaim per-job scratch dirs older than ``BLASTBOX_SCRATCH_MAX_AGE_S``.
 
@@ -299,7 +386,19 @@ def reap_stale_scratch(
     # this sweep while _reconcile_cold_orphans, running LATER in this same tick, is still
     # deliberately retaining it. _reconcile_cold_orphans purges it the moment docker ps
     # confirms it is gone; until then it is not ours to delete (#85 review).
-    retained = skip_job_ids
+    retained = set(skip_job_ids)
+    # skip_job_ids is a PROCESS-LOCAL memory of failed kills, which is not where the danger lives:
+    # two dispatcher containers share one job_root, VmJobDispatcher keeps no such set, and a
+    # restart empties it -- so the other sweeper deletes exactly the trees this guard exists to
+    # spare, under a live 0o777 bind mount. `docker ps` is node-wide and survives restarts, so ask
+    # it too. Unreadable (None) changes nothing: we keep whatever we already knew.
+    if live_job_ids is not None:
+        try:
+            in_flight = live_job_ids()
+        except Exception:  # noqa: BLE001 -- never turn a probe failure into a deletion
+            in_flight = None
+        if in_flight:
+            retained |= in_flight
     try:
         entries = list(job_root.iterdir())
     except OSError as exc:
@@ -317,7 +416,22 @@ def reap_stale_scratch(
             protected.add(Path(p).resolve())
         except (OSError, RuntimeError, ValueError):
             continue
+    # ...and whatever the blob store ITSELF says it is rooted at. Reading only the environment
+    # meant a store constructed in code (`Dispatcher(blob_store=LocalBlobStore(..., blob_root=X))`
+    # -- a public kwarg) or a process with drifted env was protected by nothing at all, and the
+    # uuid-shape check does not save a uuid-named blob root (#85 review).
+    local_root = getattr(blob_store, "local_root", None)
+    if local_root is not None:
+        try:
+            protected.add(Path(local_root).resolve())
+        except (OSError, RuntimeError, ValueError):
+            pass
     retained_last_copy: list[str] = []
+    # Counts WORK, not deletions. Capping on removals alone never bounded anything in the state
+    # this was written for: a retained or undeletable tree still costs a full rglob walk, a store
+    # round-trip and a has_output() call, none of which advanced the counter -- so the sweep
+    # re-walked all 97,681 candidates every tick and the cap message never fired (#85 review).
+    examined = 0
     for i, d in enumerate(entries):
         try:
             # Must LOOK like a job dir before it can be considered for deletion. "the store
@@ -330,10 +444,31 @@ def reap_stale_scratch(
                 continue          # resolve() would dereference to a SIBLING's real tree
             if not d.is_dir() or not _JOB_ID_RE.match(d.name):
                 continue
-            if protected and d.resolve() in protected:
-                continue
+            # CONTAINMENT, not equality: a blob root NESTED under a candidate
+            # (<job_root>/<uuid>/blobs) is destroyed by deleting the candidate, so equality
+            # protected it not at all.
+            if protected:
+                rd = d.resolve()
+                if any(rd == p or p.is_relative_to(rd) or rd.is_relative_to(p)
+                       for p in protected):
+                    continue
         except (OSError, RuntimeError, ValueError):
             continue
+        # BOUNDED per tick, checked HERE. Everything above is a couple of cheap stats;
+        # everything below is the expensive half -- a full recursive walk, a store round-trip and
+        # a has_output() call per candidate. The state this exists to clean up is 97,681 dirs /
+        # 184 GiB, and doing it in one pass runs all of that ahead of every other maintenance
+        # task, including the cold-permit reclaim and crash recovery. Placing the check after the
+        # work (and counting only REMOVALS) bounded nothing: a retained or undeletable tree costs
+        # the same work, never advanced the counter, and `continue`d straight past the check. The
+        # sweep is idempotent and runs every tick, so the backlog still drains -- just without one
+        # tick owning the process. Announced, never silent: a cap you cannot see reads as "fully
+        # cleaned" (#85 review).
+        if examined >= max_per_sweep:
+            log.info("scratch reclaim: hit the %d-candidate cap this sweep (%d removed); %d not "
+                     "examined, continuing next tick", max_per_sweep, n, len(entries) - i)
+            break
+        examined += 1
         # NEWEST mtime anywhere in the tree, not just the top-level dir. A live worker writes
         # INTO output/, and on Linux that does not touch the PARENT's mtime -- so a job that
         # has been running for hours (a cold run with BLASTBOX_WORKER_TIMEOUT_S above this
@@ -396,22 +531,32 @@ def reap_stale_scratch(
         # run-to-run). has_output() may only answer True on positively observed bytes -- an error
         # or an outage answers False -- so the failure mode is a retained tree, which the operator
         # can see and this sweep will collect once the store recovers (#85 review).
-        # ...but ONLY for a tree that actually holds a RESULT. A tree stranded by a SIGKILL
-        # mid-detonation has no sealed output and never will, so requiring a durable copy of it
-        # would retain it forever -- reintroducing the exact leak this sweep exists to bound.
-        # metadata.json is the host-written seal (_write_sealed_metadata), so its presence is
-        # what distinguishes "a finished result with nowhere else to live" from "scratch".
-        if blob_store is not None and (d / "output" / "metadata.json").is_file():
+        # ...but ONLY for a tree the HOST vouches for. output/metadata.json cannot be that
+        # evidence: the WORKER writes it (worker/harness.py) and the host merely OVERWRITES it
+        # once the trust gate passes, so keying on its presence retained every crash-orphaned
+        # tree forever -- has_output() is False, no sweep drains it, and #84's unbounded
+        # accumulation comes straight back with the malware input still on disk. Two host-only
+        # facts qualify instead:
+        #   * the pending-upload sentinel -- the host sealed a result and its upload failed; or
+        #   * a DONE row with nothing durable -- a pre-blob-store job whose only copy is the
+        #     legacy <job_root>/<id>/output path LocalBlobStore.open_output still falls back to.
+        # Anything else is scratch, and reclaiming it on age is the entire point (#85 review).
+        pending = (d / PENDING_UPLOAD_SENTINEL).is_file()
+        if blob_store is not None and (pending or (job is not None
+                                                   and job.status is JobStatus.DONE)):
             try:
                 durable = blob_store.has_output(d.name)
             except Exception:  # noqa: BLE001 -- unknown is NOT durable
                 durable = False
+            # AGGREGATED, not per-tree: a fleet mid-migration can hold thousands of these, and one
+            # WARNING each per tick buries every other line. One count per sweep says it.
             if not durable:
-                # AGGREGATED, not per-tree. A fleet mid-migration can hold thousands of these
-                # (the #84 state was 97,681 dirs), and one WARNING each per tick -- forever,
-                # since a legacy DONE job is never uploaded by the pending-upload sweep -- buries
-                # every other line in the log. One count per sweep says the same thing (#85,
-                # observed in end-to-end testing).
+                retained_last_copy.append(d.name)
+                continue
+            # Durable, but the job is still not DONE: the status repair has not landed (a store
+            # blip mid-sweep). Deleting now strands the job FAILED forever with bytes it can
+            # never serve, because the repair's fall-through needs this tree next tick.
+            if pending and (job is None or job.status is not JobStatus.DONE):
                 retained_last_copy.append(d.name)
                 continue
         # Count only what was actually removed: purge_job_dir refuses and fails
@@ -419,17 +564,6 @@ def reap_stale_scratch(
         # "removed N job dir(s)" line report directories still on disk, forever.
         if purge_job_dir(job_root, d.name, log):
             n += 1
-        if n >= max_per_sweep:
-            # BOUNDED per tick. The fleet state this exists to clean up is 97,681 dirs / 184 GiB;
-            # doing it all in one pass means a full recursive walk, a store lookup per candidate
-            # (sequential round-trips on a shared Redis/Postgres) and 184 GiB of unlink ahead of
-            # every other maintenance task -- including the cold-permit reclaim and crash
-            # recovery. The sweep is idempotent and runs every tick, so the backlog still drains,
-            # just without one tick owning the process. Announced, never silent: a cap you cannot
-            # see reads as "fully cleaned" (upstream review of #85).
-            log.info("scratch reclaim: hit the %d-dir cap this sweep; %d candidate(s) not "
-                     "examined, continuing next tick", max_per_sweep, len(entries) - i - 1)
-            break
     if retained_last_copy:
         log.warning("scratch reclaim: retained %d tree(s) holding a sealed result with no durable "
                     "copy in the blob store — deleting them would destroy the last copy (e.g. %s)",

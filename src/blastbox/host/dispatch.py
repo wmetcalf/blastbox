@@ -28,6 +28,7 @@ import shutil
 
 from blastbox.host.jobs.retention import (
     RESULT_RETAINED_MARKER,
+    mark_pending_upload,
     purge_job_dir,
     _blob_local_roots,
     reap_stale_scratch,
@@ -1533,6 +1534,7 @@ class Dispatcher:
                 # Same as the cold branch: no durable copy landed, so the terminal purge must
                 # spare this tree rather than destroy the only copy.
                 self._upload_failed_job_ids.add(job.job_id)
+                mark_pending_upload(self._job_root, job.job_id, _log)
                 self._fail_job(
                     job,
                     f"result upload failed after {self._put_output_max_attempts} attempts; "
@@ -2053,6 +2055,7 @@ class Dispatcher:
         if not self._upload_output(job, output_dir):
             # The durable copy never landed, so do NOT purge this tree -- it is the only copy.
             self._upload_failed_job_ids.add(job.job_id)
+            mark_pending_upload(self._job_root, job.job_id, _log)
             self._fail_job(
                 job,
                 f"result upload failed after {self._put_output_max_attempts} attempts; "
@@ -2735,6 +2738,7 @@ class Dispatcher:
             self._job_root, self._scratch_max_age_s, self._job_store, _log,
             skip_job_ids=retained, blob_store=self._blobs,
             protect_paths=_blob_local_roots(),
+            live_job_ids=self._list_active_worker_job_ids,
         )
 
     def _reconcile_cold_orphans(self) -> None:

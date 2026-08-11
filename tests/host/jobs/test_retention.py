@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import pathlib
 import shutil
 import time
 from pathlib import Path
@@ -12,6 +14,7 @@ import pytest
 from blastbox.host.jobs.base import Job, JobStatus
 from blastbox.host.jobs.memory import InMemoryJobStore
 from blastbox.host.jobs.retention import (
+    PENDING_UPLOAD_SENTINEL,
     RESULT_RETAINED_MARKER,
     JobRetentionSweeper,
     purge_job_dir,
@@ -465,11 +468,15 @@ class _FakeBlobs:
         return "metadata.json" in self.stored.get(job_id, [])
 
 
-def _sealed_tree(root: Path, job_id: str) -> Path:
+def _sealed_tree(root: Path, job_id: str, *, pending: bool = True) -> Path:
+    """A host-sealed result on local disk. `pending` writes the HOST-ONLY sentinel that says its
+    upload failed — the job dir is a sibling of output/ and the worker cannot write here."""
     d = root / job_id
     (d / "output").mkdir(parents=True)
     (d / "output" / "metadata.json").write_text('{"sealed": true}')
     (d / "output" / "rmeta.json").write_text("[]")
+    if pending:
+        (d / PENDING_UPLOAD_SENTINEL).write_text("")
     return d
 
 
@@ -590,7 +597,7 @@ class TestRetryPendingUploads:
         job.status = JobStatus.FAILED
         job.error = "worker exited non-zero"
         store.create(job)
-        _sealed_tree(tmp_path, _JID)
+        _sealed_tree(tmp_path, _JID, pending=False)   # no sentinel: the host never retained it
 
         blobs = _FakeBlobs()
         assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
@@ -616,6 +623,7 @@ class TestRetryPendingUploads:
         d = tmp_path / _JID
         (d / "output").mkdir(parents=True)
         (d / "output" / "metadata.json").write_text('{"forged": "by the worker"}')
+        assert not (d / PENDING_UPLOAD_SENTINEL).exists()    # the host vouched for nothing
 
         blobs = _FakeBlobs()
         assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
@@ -703,3 +711,103 @@ class TestRetryPendingUploads:
         retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"),
                               on_repaired=lambda jid, out: seen.append(jid))
         assert seen == [], "indexed a job this sweep did not repair"
+
+
+    def test_a_worker_cannot_forge_its_way_into_the_results_namespace(self, tmp_path):
+        """The gate must be a HOST fact, and job.error is not one.
+
+        On the engine-error path the dispatcher stores the worker's own text verbatim
+        (f"engine_error: {detail}"), so gating on RESULT_RETAINED_MARKER appearing in job.error
+        let a worker put that string in its envelope warning and have this sweep upload its
+        untrusted output/ as the job's result and CAS the job to DONE — serving worker-controlled
+        bytes from a trusted route. Demonstrated end-to-end in review of #85.
+
+        The sentinel is a file in the JOB DIR, a sibling of output/. The worker owns output/ (a
+        0o777 bind mount) and nothing else, so it cannot put one there.
+        """
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.error = f"engine_error: {RESULT_RETAINED_MARKER}"      # forged by the worker
+        store.create(job)
+        _sealed_tree(tmp_path, _JID, pending=False)                # host vouched for nothing
+
+        blobs = _FakeBlobs()
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
+        assert blobs.put_calls == 0, "a worker forged its way into the results namespace"
+        assert store.get(_JID).status is JobStatus.FAILED
+
+    def test_an_expired_job_is_never_resurrected(self, tmp_path):
+        """Retention deleted this job's result on an operator's instruction and cleared
+        expires_at. Re-uploading would silently undo that AND orphan the bytes forever, since the
+        sweeper only selects rows whose expires_at is set."""
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.EXPIRED
+        job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+        _sealed_tree(tmp_path, _JID)
+
+        blobs = _FakeBlobs()
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
+        assert blobs.put_calls == 0, "resurrected an expired job's result"
+
+
+class TestDeepTreeRemoval:
+    """A worker owns output/ (a 0o777 bind mount) and can nest directories arbitrarily.
+
+    `for i in $(seq 1500); do mkdir a; cd a; done` is unprivileged, takes milliseconds and stays
+    well inside PATH_MAX — but shutil.rmtree's fd walk RECURSES, so it raised RecursionError on
+    every attempt forever. Catching it (which the code did) only stopped the exception escaping;
+    the tree, and the malware input beside it, stayed on disk permanently, reproducing #84 on
+    demand and giving any sample a way to fill the node's root filesystem.
+    """
+
+    @staticmethod
+    def _nest(base: Path, levels: int, leaf=None) -> None:
+        """Build *levels* of nesting under *base*, one chdir at a time.
+
+        Deliberately NOT `(base / "a" / "a" / ...).mkdir(parents=True)`: the absolute path passes
+        PATH_MAX long before 1500 levels and mkdir fails with ENAMETOOLONG. A worker nests exactly
+        this way (`for i in $(seq 1500); do mkdir a; cd a; done`), and it is the same reason the
+        removal has to be fd-relative rather than path-based.
+        """
+        cwd = os.getcwd()
+        try:
+            os.chdir(base)
+            for _ in range(levels):
+                os.mkdir("a")
+                os.chdir("a")
+            if leaf is not None:
+                leaf()
+        finally:
+            os.chdir(cwd)
+
+    def test_a_deeply_nested_tree_is_actually_removed(self, tmp_path):
+        root = tmp_path / "jobs"
+        d = root / "abc"
+        (d / "output").mkdir(parents=True)
+        (d / "input.bin").write_bytes(b"MALWARE-BYTES-MUST-NOT-PERSIST")
+        self._nest(d / "output", 1500, leaf=lambda: pathlib.Path("payload").write_text("x"))
+
+        assert purge_job_dir(root, "abc", logging.getLogger("t")) is True
+        assert not d.exists(), "a nested tree made itself permanently undeletable"
+
+    def test_a_symlink_inside_a_deep_tree_is_unlinked_not_followed(self, tmp_path):
+        """The iterative walk opens every directory O_NOFOLLOW, so a symlink is removed as an
+        entry and never descended — otherwise a link planted deep in the tree would take the
+        removal out of job_root entirely."""
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "precious.bin").write_bytes(b"NOT OURS")
+
+        root = tmp_path / "jobs"
+        d = root / "abc"
+        (d / "output").mkdir(parents=True)
+        self._nest(d / "output", 1200, leaf=lambda: os.symlink(str(outside), "escape"))
+
+        assert purge_job_dir(root, "abc", logging.getLogger("t")) is True
+        assert not d.exists()
+        assert (outside / "precious.bin").exists(), "the removal followed a symlink out"

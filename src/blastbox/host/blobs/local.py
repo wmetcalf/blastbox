@@ -46,6 +46,12 @@ class LocalBlobStore:
     def _sample_path(self, sha256: str) -> Path:
         return self._blob_root / "samples" / sha256
 
+    @property
+    def local_root(self) -> Path:
+        """Where this store keeps its bytes. The scratch reclaim asks so it can refuse to delete
+        the blob root, whatever it is named and however it was configured."""
+        return self._blob_root
+
     def _results_dir(self, job_id: str) -> Path:
         return self._blob_root / "results" / job_id
 
