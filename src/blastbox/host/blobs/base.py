@@ -6,7 +6,7 @@ need a real path. A remote backend does not replace ``job_root``, it feeds it.
 from __future__ import annotations
 
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Protocol, runtime_checkable
 
 
@@ -64,7 +64,15 @@ def _declared_paths(out_dir: Path) -> "set[str] | None":
     except Exception:  # noqa: BLE001
         return None
     try:
-        return {str(a.get("path")) for a in env.get("artifacts") or [] if a.get("path")}
+        # NORMALIZED on both sides. Manifest paths are stored verbatim, so a perfectly valid
+        # declaration of "./nested/x" or "nested//x" would not match the walker's
+        # relative_to(out_dir).as_posix() ("nested/x") -- the artifact would look UNDECLARED, and
+        # an unstorable one would then be skipped while the seal was still committed, which is
+        # the exact data loss the declared-path check exists to prevent (#85 review).
+        return {
+            PurePosixPath(str(a.get("path"))).as_posix()
+            for a in env.get("artifacts") or [] if a.get("path")
+        }
     except Exception:  # noqa: BLE001
         return None
 

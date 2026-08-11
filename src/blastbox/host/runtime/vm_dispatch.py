@@ -759,7 +759,7 @@ class VmJobDispatcher:
             # publish our stale output over it and CAS the job to DONE. The container Dispatcher
             # already gated on _fail_job winning; this is the same rule (#85 review).
             if pending_upload and (owned or terminal_status is None):
-                mark_pending_upload(self._job_root, job.job_id, logger)
+                mark_pending_upload(self._job_root, job.job_id, logger, job.claim_id)
                 # The ONLY copy of a host-sealed, trust-gate-passed result. Retained for
                 # retry_pending_uploads to drain, and bounded by the age reclaim's last-copy rule,
                 # which releases it the moment the durable copy lands.

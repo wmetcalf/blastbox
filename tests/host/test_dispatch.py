@@ -7,6 +7,7 @@ from __future__ import annotations
 import shutil
 import logging
 import hashlib
+import contextlib
 import copy
 import json
 import os
@@ -3841,3 +3842,42 @@ def test_the_recovery_sweep_is_bounded_and_rotates(tmp_path):
     assert len(Blobs.seen) == 2, f"the cap did not bound the sweep ({len(Blobs.seen)} uploads)"
     retry_pending_uploads(tmp_path, Blobs(), store, _logging.getLogger("t"), max_per_sweep=2)
     assert len(set(Blobs.seen)) == 4, "the second tick re-scanned the same prefix"
+
+
+def test_the_pending_marker_is_on_disk_BEFORE_the_terminal_write(tmp_path, monkeypatch):
+    """Ordering, not just presence.
+
+    Written after the terminal CAS, a crash in between (SIGKILL, OOM, redeploy — the class this
+    whole mechanism exists for) loses the marker, and without it the tree is ordinary scratch that
+    the reclaim deletes: the only copy of a host-sealed result, gone. Writing it first is what
+    makes the recovery crash-safe; the claim recorded in it is what stops an attempt that then
+    LOSES the CAS from ever publishing its stale bytes.
+    """
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.claim_id = "ours"
+    job.status = JobStatus.RUNNING
+    store.create(job)
+    d = tmp_path / job.job_id
+    (d / "output").mkdir(parents=True)
+
+    seen = {}
+
+    def crashing_fail_job(j, reason):
+        # Stand-in for the process dying between the two steps.
+        seen["marker_present_at_terminal_write"] = (d / PENDING_UPLOAD_SENTINEL).is_file()
+        raise RuntimeError("process died before the terminal write landed")
+
+    monkeypatch.setattr(dispatcher, "_fail_job", crashing_fail_job)
+
+    with contextlib.suppress(RuntimeError):
+        dispatcher._retain_for_upload_retry(job, "upload failed")
+
+    assert seen.get("marker_present_at_terminal_write") is True, (
+        "the marker was written AFTER the terminal write — a crash in the gap loses the only copy"
+    )
+    assert (d / PENDING_UPLOAD_SENTINEL).read_text() == "ours", "the marker must record the claim"

@@ -88,14 +88,19 @@ def clear_retained_orphan(job_root: "Path", job_id: str) -> None:
         (job_root / job_id / RETAINED_ORPHAN_SENTINEL).unlink()
 
 
-def mark_pending_upload(job_root: "Path", job_id: str, log: "logging.Logger") -> None:
+def mark_pending_upload(job_root: "Path", job_id: str, log: "logging.Logger",
+                        claim_id: str | None = None) -> None:
     """Record that this job's sealed result is on local disk with no durable copy.
 
-    Best-effort: failing to write it costs a retry opportunity, never correctness -- the tree is
-    still retained by the caller, and the reclaim's own gate keeps a DONE job's last copy.
+    Written BEFORE the terminal store write, so a crash in between cannot lose it: without the
+    marker the tree is ordinary scratch and the reclaim deletes the only copy of a sealed result.
+    That ordering needs an ownership fence of its own, hence *claim_id*: the sweep will only act
+    on a marker whose claim still matches the row, so a marker left behind by an attempt that
+    LOST its terminal CAS can never license publishing that attempt's stale bytes over the peer's
+    result (#85 review).
     """
     try:
-        (job_root / job_id / PENDING_UPLOAD_SENTINEL).write_text("")
+        (job_root / job_id / PENDING_UPLOAD_SENTINEL).write_text(claim_id or "")
     except OSError as exc:
         # NOT best-effort. This file is the ONLY durable record that the tree holds the last copy
         # of a result: the in-memory carve-out protects just the immediate terminal purge, and
@@ -106,7 +111,7 @@ def mark_pending_upload(job_root: "Path", job_id: str, log: "logging.Logger") ->
                   "ages out", job_id, exc)
 
 
-def _clear_pending_upload(job_root: "Path", job_id: str) -> None:
+def clear_pending_upload(job_root: "Path", job_id: str) -> None:
     with contextlib.suppress(OSError):
         (job_root / job_id / PENDING_UPLOAD_SENTINEL).unlink()
 
@@ -428,6 +433,19 @@ def retry_pending_uploads(
         # expires_at cleared nothing would ever collect it again), and not missing.
         if row is None or row.status is not JobStatus.FAILED:
             continue
+        # OWNERSHIP. The marker is written before the terminal CAS (so a crash cannot lose it),
+        # which means one can survive an attempt that LOST that CAS. It records the claim it was
+        # written under; if the row has moved to a different claim, this tree is a stale attempt
+        # and its bytes must never be published over the current owner's result. An empty marker
+        # is from a caller that had no claim to record and is accepted as before.
+        try:
+            marker_claim = (d / PENDING_UPLOAD_SENTINEL).read_text().strip()
+        except OSError:
+            continue
+        if marker_claim and row.claim_id and marker_claim != row.claim_id:
+            log.warning("pending-upload sweep: %s was marked under claim %s but the row is now "
+                        "%s; leaving it to its owner", d.name, marker_claim[:8], row.claim_id[:8])
+            continue
         try:
             durable = blob_store.has_output(d.name)
         except Exception:  # noqa: BLE001 -- unknown is NOT durable, so try the upload
@@ -502,7 +520,7 @@ def retry_pending_uploads(
             # LAST: after the CAS and after the hook, so a crash mid-recovery leaves the marker
             # (and therefore the tree, and therefore another attempt) rather than a half-done job.
             if repaired:
-                _clear_pending_upload(job_root, d.name)
+                clear_pending_upload(job_root, d.name)
         else:
             log.warning("pending-upload sweep: %s still has no durable copy (%s); retaining "
                         "the local tree", d.name, upload_exc)

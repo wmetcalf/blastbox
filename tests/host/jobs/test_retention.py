@@ -1065,3 +1065,52 @@ class TestRemovalRobustness:
         assert (d / "output" / "metadata.json").exists(), (
             "retention destroyed the only copy of a host-sealed result"
         )
+
+
+class TestMarkerOwnership:
+    """The marker is written BEFORE the terminal CAS so a crash cannot lose it — which means one
+    can outlive an attempt that LOST that CAS. It records the claim it was written under."""
+
+    def test_a_marker_from_a_superseded_attempt_never_publishes_its_bytes(self, tmp_path):
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.claim_id = "the-peer"                      # the row moved on
+        job.error = f"x; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+        d = _sealed_tree(tmp_path, _JID, pending=False)
+        (d / PENDING_UPLOAD_SENTINEL).write_text("our-stale-claim")
+
+        blobs = _FakeBlobs()
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
+        assert blobs.put_calls == 0, "published a superseded attempt's bytes over the owner's"
+        assert store.get(_JID).status is JobStatus.FAILED
+
+    def test_a_marker_matching_the_current_claim_is_acted_on(self, tmp_path):
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.claim_id = "ours"
+        job.error = f"x; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+        d = _sealed_tree(tmp_path, _JID, pending=False)
+        (d / PENDING_UPLOAD_SENTINEL).write_text("ours")
+
+        assert retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t")) == 1
+        assert store.get(_JID).status is JobStatus.DONE
+
+    def test_a_declared_path_written_with_dot_or_double_slash_still_counts_as_declared(self):
+        """Manifest paths are stored verbatim, so './nested/x' or 'nested//x' would not match the
+        walker's normalized 'nested/x' — the artifact would look UNDECLARED and an unstorable one
+        would be skipped while the seal was still committed."""
+        import json as _json
+        import tempfile
+
+        from blastbox.host.blobs.base import _declared_paths
+
+        d = Path(tempfile.mkdtemp())
+        (d / "metadata.json").write_text(_json.dumps({"artifacts": [
+            {"path": "./nested/x.png"}, {"path": "nested//y.png"}, {"path": "plain.png"}]}))
+        assert _declared_paths(d) == {"nested/x.png", "nested/y.png", "plain.png"}

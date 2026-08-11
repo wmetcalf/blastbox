@@ -30,6 +30,7 @@ import shutil
 from blastbox.host.jobs.retention import (
     RESULT_RETAINED_MARKER,
     clear_retained_orphan,
+    clear_pending_upload,
     mark_pending_upload,
     mark_retained_orphan,
     purge_job_dir,
@@ -1548,13 +1549,12 @@ class Dispatcher:
                 # Same as the cold branch: no durable copy landed, so the terminal purge must
                 # spare this tree rather than destroy the only copy.
                 self._upload_failed_job_ids.add(job.job_id)
-                # Same fence as the cold path: a sentinel only belongs on a tree we still own.
-                if self._fail_job(
+                # Same ordering and same fence as the cold path above.
+                self._retain_for_upload_retry(
                     job,
                     f"result upload failed after {self._put_output_max_attempts} attempts; "
                     f"{RESULT_RETAINED_MARKER}",
-                ):
-                    mark_pending_upload(self._job_root, job.job_id, _log)
+                )
                 return
 
             # ------------------------------------------------------------------
@@ -2070,16 +2070,17 @@ class Dispatcher:
         if not self._upload_output(job, output_dir):
             # The durable copy never landed, so do NOT purge this tree -- it is the only copy.
             self._upload_failed_job_ids.add(job.job_id)
-            # ...but only if OUR attempt is still the owner. A peer can reclaim the job during
-            # the retry window, in which case _fail_job's CAS loses and the tree is a stale
-            # attempt -- leaving a sentinel on it would hand the pending-upload sweep our stale
-            # bytes to publish over the new owner's result (#85 review).
-            if self._fail_job(
+            # BEFORE the terminal write, not after: a crash in between would otherwise lose the
+            # marker, and without it the tree is ordinary scratch that the reclaim deletes -- the
+            # only copy of a sealed result. The marker records OUR claim, and the sweep refuses to
+            # act on one whose claim no longer matches the row, so writing it early cannot let a
+            # superseded attempt publish over a peer. If we then lose the CAS we clear it anyway,
+            # so the common case leaves nothing behind (#85 review).
+            self._retain_for_upload_retry(
                 job,
                 f"result upload failed after {self._put_output_max_attempts} attempts; "
                 f"{RESULT_RETAINED_MARKER}",
-            ):
-                mark_pending_upload(self._job_root, job.job_id, _log)
+            )
             return
 
         # ------------------------------------------------------------------
@@ -2375,6 +2376,27 @@ class Dispatcher:
         if failed:
             _log.info("stale_queued_failed count=%d", failed)
         return failed
+
+    def _retain_for_upload_retry(self, job: Job, reason: str) -> None:
+        """Terminalize a job whose result upload exhausted, keeping its tree as the last copy.
+
+        The ORDER here is the whole point, and both call sites need exactly this order, which is
+        why it is one method rather than two copies:
+
+        1. Mark FIRST. The marker is what tells every later sweep -- in this process, in the peer
+           dispatcher, and after a restart -- that this tree holds the only copy of a host-sealed
+           result. Written after the terminal store write instead, a crash in the gap (SIGKILL,
+           OOM, redeploy: the class this mechanism exists for) loses it, and the tree becomes
+           ordinary scratch that the reclaim deletes.
+        2. Then the terminal CAS.
+        3. If the CAS LOST, drop the marker again: a peer reclaimed the job during our retry
+           window, so our tree is a stale attempt. The marker also records our claim, so even a
+           marker stranded by a crash at step 2 cannot license publishing those stale bytes -- the
+           sweep refuses one whose claim no longer matches the row.
+        """
+        mark_pending_upload(self._job_root, job.job_id, _log, job.claim_id)
+        if not self._fail_job(job, reason):
+            clear_pending_upload(self._job_root, job.job_id)
 
     def _fail_job(self, job: Job, reason: str) -> bool:
         """Mark a job FAILED, scrubbing the error string before storage. Returns whether OUR
