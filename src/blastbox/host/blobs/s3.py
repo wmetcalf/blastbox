@@ -18,7 +18,12 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 from urllib.parse import urlparse
 
-from blastbox.host.blobs.base import BlobFetchError, BlobIntegrityError
+from blastbox.host.blobs.base import (
+    _SEAL_NAME,
+    BlobFetchError,
+    BlobIntegrityError,
+    _upload_order,
+)
 from blastbox.observability import get_logger
 
 _log = get_logger("blastbox.blobs.s3")
@@ -99,7 +104,13 @@ class S3BlobStore:
         out_dir = Path(out_dir)
         if not out_dir.is_dir():
             raise FileNotFoundError(f"put_output: output dir missing for {job_id}: {out_dir}")
-        for path in sorted(out_dir.rglob("*")):
+        # TWO-PHASE COMMIT. metadata.json is written LAST, so its presence under
+        # results/<job_id> means "every other artifact already landed" -- that is what makes
+        # has_output() a real durability answer instead of a guess. Uploading in plain sorted
+        # order put it FIRST ('m' < 'r'), so a run that died mid-upload left the seal present with
+        # artifacts missing, and the age reclaim would then delete the complete local tree as
+        # redundant. It is also the artifact the API fetches to serve a job at all (#85 review).
+        for path in _upload_order(out_dir):
             # Skip symlinks BEFORE is_file() -- is_file() follows a symlink to its
             # target, so `p.is_symlink() or not p.is_file()` (checked in that
             # order) never reads or uploads a symlink's target bytes. A worker
@@ -161,12 +172,10 @@ class S3BlobStore:
         reclaim deletes the local tree on the strength of this answer, so a transient object-store
         outage must never be read as "the durable copy is there"."""
         try:
-            resp = self._s3.list_objects_v2(
-                Bucket=self._bucket, Prefix=self._key("results", job_id) + "/", MaxKeys=1,
-            )
-        except Exception:  # noqa: BLE001 -- unknown is NOT durable
+            self._s3.head_object(Bucket=self._bucket, Key=self._key("results", job_id, _SEAL_NAME))
+        except Exception:  # noqa: BLE001 -- a miss AND any error are both "not durable"
             return False
-        return bool(resp.get("KeyCount") or resp.get("Contents"))
+        return True
 
     def delete_job(self, job_id: str) -> None:
         """Drop this job's RESULTS only.

@@ -23,7 +23,12 @@ import uuid
 from pathlib import Path
 from typing import BinaryIO
 
-from blastbox.host.blobs.base import BlobFetchError, BlobIntegrityError
+from blastbox.host.blobs.base import (
+    _SEAL_NAME,
+    BlobFetchError,
+    BlobIntegrityError,
+    _upload_order,
+)
 from blastbox.observability import get_logger
 
 _log = get_logger("blastbox.blobs.local")
@@ -110,7 +115,13 @@ class LocalBlobStore:
         if not out_dir.is_dir():
             raise FileNotFoundError(f"put_output: output dir missing for {job_id}: {out_dir}")
         dest_dir = self._results_dir(job_id)
-        for path in sorted(out_dir.rglob("*")):
+        # TWO-PHASE COMMIT. metadata.json is written LAST, so its presence under
+        # results/<job_id> means "every other artifact already landed" -- that is what makes
+        # has_output() a real durability answer instead of a guess. Uploading in plain sorted
+        # order put it FIRST ('m' < 'r'), so a run that died mid-upload left the seal present with
+        # artifacts missing, and the age reclaim would then delete the complete local tree as
+        # redundant. It is also the artifact the API fetches to serve a job at all (#85 review).
+        for path in _upload_order(out_dir):
             # Skip symlinks BEFORE is_file() -- is_file() follows a symlink to its
             # target, so `p.is_symlink() or not p.is_file()` (checked in that
             # order) never reads or uploads a symlink's target bytes. A worker
@@ -163,9 +174,8 @@ class LocalBlobStore:
         with the tree itself as the evidence -- and destroy the only copy of every pre-blob-store
         result on the node (#85 review).
         """
-        d = self._results_dir(job_id)
         try:
-            return d.is_dir() and any(d.iterdir())
+            return (self._results_dir(job_id) / _SEAL_NAME).is_file()
         except OSError:
             return False        # unknown is NOT durable
 

@@ -20,7 +20,7 @@ import shutil
 import time
 from pathlib import Path
 
-from blastbox.host.blobs.base import BlobStore
+from blastbox.host.blobs.base import BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import JobStatus, JobStore
 
 _log = logging.getLogger("blastbox.host.jobs.retention")
@@ -123,6 +123,78 @@ def purge_job_dir(job_root: "Path", job_id: str, log: "logging.Logger") -> bool:
         log.error("PURGE FAILED for job %s at %s: %s — sample bytes may remain on this "
                   "worker's disk", job_id, root, exc)
         return False
+
+
+def retry_pending_uploads(
+    job_root: Path,
+    blob_store: BlobStore | None,
+    job_store: JobStore,
+    log: logging.Logger,
+    *,
+    attempts: int = 1,
+) -> int:
+    """Re-attempt ``put_output`` for every local tree holding a sealed result with no durable copy.
+
+    THIS is what makes retaining such a tree legitimate. Without it the two dispatchers were
+    forced to choose between two wrong answers on upload exhaustion -- discard a host-sealed,
+    trust-gate-passed, unreproducible result (detonation is not deterministic run-to-run, and the
+    C2 pcap is MOVED into the tree), or keep it forever as bytes no consumer can reach, since the
+    API serves results from the blob store alone. Neither ever gets the result durable.
+
+    A retained tree is a PENDING UPLOAD, not a leak: this sweep drains it, and once the seal lands
+    the ordinary age reclaim collects the tree like any other. The inline retry inside a dispatch
+    is deliberately bounded (it must not hold a claim open across an outage); this is the
+    unbounded-in-time half, and an outage that outlives the process is exactly the case the
+    in-memory bookkeeping could never survive -- which is why the durability oracle is the store
+    itself (has_output) rather than a set of job ids.
+
+    Best-effort and idempotent: put_output overwrites, and every failure is logged, not raised.
+    """
+    if blob_store is None or not job_root.is_dir():
+        return 0
+    n = 0
+    try:
+        entries = list(job_root.iterdir())
+    except OSError as exc:
+        log.warning("pending-upload sweep: cannot list %s: %s", job_root, exc)
+        return 0
+    for d in entries:
+        try:
+            if d.is_symlink() or not d.is_dir() or not _JOB_ID_RE.match(d.name):
+                continue
+            out_dir = d / "output"
+            if not (out_dir / "metadata.json").is_file():
+                continue          # no sealed result here -- ordinary scratch
+        except OSError:
+            continue
+        # CLAIM FENCE. A local tree is only ours to upload if OUR attempt is the one that
+        # produced the job's terminal state. If a peer reclaimed the job and finished it, its
+        # result is authoritative and sits at the same results/<job_id> prefix -- uploading our
+        # stale attempt over it would serve the wrong bytes for a DONE job, with nothing to
+        # repair it. DONE is the tell: our own exhaustion path always FAILs the job, so a DONE
+        # row means somebody else won. A row we cannot read is left alone (#85 review).
+        try:
+            row = job_store.get(d.name)
+        except Exception:  # noqa: BLE001 -- store trouble must not turn into a bad upload
+            log.warning("pending-upload sweep: cannot confirm %s is ours; skipping", d.name)
+            continue
+        if row is not None and row.status is JobStatus.DONE:
+            continue
+        try:
+            if blob_store.has_output(d.name):
+                continue          # already durable; the age reclaim will collect the tree
+        except Exception:  # noqa: BLE001 -- unknown is NOT durable, so try the upload
+            pass
+        upload_exc = upload_output_with_retry(blob_store, d.name, out_dir, attempts=attempts)
+        if upload_exc is None:
+            n += 1
+            log.info("pending-upload sweep: result for %s is now durably stored", d.name)
+        else:
+            log.warning("pending-upload sweep: %s still has no durable copy (%s); retaining "
+                        "the local tree", d.name, upload_exc)
+    if n:
+        log.info("pending-upload sweep: uploaded %d retained result(s)", n)
+    return n
 
 
 def reap_stale_scratch(

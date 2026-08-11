@@ -11,7 +11,11 @@ import pytest
 
 from blastbox.host.jobs.base import Job, JobStatus
 from blastbox.host.jobs.memory import InMemoryJobStore
-from blastbox.host.jobs.retention import JobRetentionSweeper, purge_job_dir
+from blastbox.host.jobs.retention import (
+    JobRetentionSweeper,
+    purge_job_dir,
+    retry_pending_uploads,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -436,3 +440,116 @@ class TestPurgeJobDir:
         with caplog.at_level(logging.ERROR):
             assert purge_job_dir(root, "abc", logging.getLogger("t")) is False
         assert "PURGE FAILED" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# retry_pending_uploads — what makes retaining a result legitimate (#85)
+# ---------------------------------------------------------------------------
+
+class _FakeBlobs:
+    """Minimal BlobStore: put_output can be made to fail, has_output reflects what landed."""
+
+    def __init__(self, fail_put: bool = False) -> None:
+        self.fail_put = fail_put
+        self.stored: dict[str, list[str]] = {}
+        self.put_calls = 0
+
+    def put_output(self, job_id: str, out_dir) -> None:
+        self.put_calls += 1
+        if self.fail_put:
+            raise OSError("object store unavailable")
+        self.stored[job_id] = sorted(p.name for p in Path(out_dir).rglob("*") if p.is_file())
+
+    def has_output(self, job_id: str) -> bool:
+        return "metadata.json" in self.stored.get(job_id, [])
+
+
+def _sealed_tree(root: Path, job_id: str) -> Path:
+    d = root / job_id
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "metadata.json").write_text('{"sealed": true}')
+    (d / "output" / "rmeta.json").write_text("[]")
+    return d
+
+
+_JID = "44444444-4444-4444-8444-444444444444"
+
+
+class TestRetryPendingUploads:
+
+    def test_drains_a_retained_result_once_the_store_recovers(self, tmp_path):
+        """The whole reason a tree may be retained. Without this sweep the two dispatchers had to
+        choose between destroying a host-sealed, unreproducible result and keeping it forever as
+        bytes no consumer can reach — neither of which ever gets the result durable."""
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED           # our own exhaustion path FAILs the job
+        store.create(job)
+        _sealed_tree(tmp_path, _JID)
+        blobs = _FakeBlobs()
+
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 1
+        assert blobs.has_output(_JID)
+
+    def test_is_a_noop_once_the_result_is_already_durable(self, tmp_path):
+        """Idempotent and cheap: a tree whose bytes already landed is the age reclaim's business,
+        not this sweep's — re-uploading every tick would hammer the store for nothing."""
+        store = InMemoryJobStore()
+        _sealed_tree(tmp_path, _JID)
+        blobs = _FakeBlobs()
+        blobs.stored[_JID] = ["metadata.json"]
+
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
+        assert blobs.put_calls == 0
+
+    def test_never_overwrites_a_peers_authoritative_result(self, tmp_path):
+        """THE claim fence. If a peer reclaimed the job and finished it, its result is
+        authoritative and sits at the same results/<job_id> prefix. Uploading our stale attempt
+        over it would serve the wrong bytes for a DONE job with nothing to repair it. DONE is the
+        tell: our own exhaustion path always FAILs the job, so a DONE row means somebody else won.
+        """
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.DONE             # the peer won
+        store.create(job)
+        _sealed_tree(tmp_path, _JID)
+        blobs = _FakeBlobs()
+
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
+        assert blobs.put_calls == 0, "uploaded a stale attempt over the peer's result"
+
+    def test_leaves_the_tree_when_the_store_cannot_be_read(self, tmp_path):
+        """Fails safe in the same direction as everything else here: unable to prove the tree is
+        ours, we neither upload it nor lose it."""
+        class Broken(InMemoryJobStore):
+            def get(self, job_id):
+                raise RuntimeError("store down")
+
+        _sealed_tree(tmp_path, _JID)
+        blobs = _FakeBlobs()
+        assert retry_pending_uploads(tmp_path, blobs, Broken(), logging.getLogger("t")) == 0
+        assert blobs.put_calls == 0
+
+    def test_ignores_ordinary_scratch_with_no_sealed_result(self, tmp_path):
+        """A tree stranded mid-detonation has no seal and nothing worth uploading; this sweep must
+        not manufacture a half-result from it. The age reclaim is what bounds those."""
+        store = InMemoryJobStore()
+        d = tmp_path / _JID
+        (d / "output").mkdir(parents=True)
+        (d / "input.bin").write_bytes(b"MALWARE")
+        blobs = _FakeBlobs()
+
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
+        assert blobs.put_calls == 0
+
+    def test_a_still_failing_upload_keeps_the_tree(self, tmp_path):
+        """An outage that outlives the process is exactly the case in-memory bookkeeping could
+        never survive — which is why the durability oracle is the store itself, not a set of ids."""
+        store = InMemoryJobStore()
+        d = _sealed_tree(tmp_path, _JID)
+        blobs = _FakeBlobs(fail_put=True)
+
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
+        assert (d / "output" / "metadata.json").exists()

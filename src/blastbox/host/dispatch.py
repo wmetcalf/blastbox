@@ -26,7 +26,11 @@ import os
 import re
 import shutil
 
-from blastbox.host.jobs.retention import purge_job_dir, reap_stale_scratch
+from blastbox.host.jobs.retention import (
+    purge_job_dir,
+    reap_stale_scratch,
+    retry_pending_uploads,
+)
 import subprocess
 import threading
 import time
@@ -2677,6 +2681,12 @@ class Dispatcher:
             self._reconcile_cold_orphans()
         except Exception:  # noqa: BLE001
             _log.exception("cold-orphan reconcile failed")
+        # BEFORE the reclaim: a retained tree is a PENDING UPLOAD, and draining it is what makes
+        # the reclaim's last-copy rule a temporary hold rather than a permanent one.
+        try:
+            retry_pending_uploads(self._job_root, self._blobs, self._job_store, _log)
+        except Exception:  # noqa: BLE001
+            _log.exception("pending-upload sweep failed")
         try:
             self._reap_stale_scratch()
         except Exception:  # noqa: BLE001

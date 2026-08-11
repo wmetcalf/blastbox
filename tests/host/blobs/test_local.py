@@ -187,8 +187,45 @@ def test_has_output_is_false_when_the_results_dir_cannot_be_read(tmp_path, monke
     store.put_output("j-err", out)
     assert store.has_output("j-err") is True
 
-    def boom(self):
+    def boom(self, *a, **kw):
         raise PermissionError(13, "Permission denied")
 
-    monkeypatch.setattr(Path, "iterdir", boom)
+    monkeypatch.setattr(Path, "is_file", boom)
     assert store.has_output("j-err") is False
+
+
+def test_the_seal_is_uploaded_last_so_a_partial_upload_is_not_mistaken_for_durable(
+    tmp_path, monkeypatch,
+):
+    """put_output is a TWO-PHASE COMMIT: metadata.json lands last, so its presence means every
+    other artifact already did.
+
+    Plain sorted order uploaded it FIRST ('m' < 'r'), so an upload that died partway left the
+    marker present with artifacts missing — and has_output() would then answer "durable copy
+    exists", letting the age reclaim delete the COMPLETE local tree as redundant. The half-result
+    is what the API would serve from then on, with nothing left to repair it.
+    """
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "metadata.json").write_text('{"sealed": true}')
+    (out / "rmeta.json").write_text("[]")
+    (out / "screenshot.png").write_bytes(b"\x89PNG")
+
+    real = LocalBlobStore._atomic_copy
+    calls = {"n": 0}
+
+    def flaky(src, dest):
+        calls["n"] += 1
+        if calls["n"] == 2:                      # die partway through the upload
+            raise OSError("object store went away")
+        real(src, dest)
+
+    monkeypatch.setattr(LocalBlobStore, "_atomic_copy", staticmethod(flaky))
+    with pytest.raises(OSError):
+        store.put_output("j-partial", out)
+
+    assert store.has_output("j-partial") is False, (
+        "a partial upload left the commit marker behind — the reclaim would now delete the "
+        "only complete copy"
+    )

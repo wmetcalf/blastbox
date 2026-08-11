@@ -24,6 +24,23 @@ class BlobIntegrityError(BlobFetchError):
     """Fetched bytes did not hash to the requested key (corrupt or substituted)."""
 
 
+# The host-written seal. It is both the artifact the API needs to serve a job at all and,
+# because put_output uploads it LAST, the commit marker that makes has_output() meaningful.
+_SEAL_NAME = "metadata.json"
+
+
+def _upload_order(out_dir: Path) -> list[Path]:
+    """Every artifact under *out_dir*, with the seal LAST.
+
+    Plain sorted order puts metadata.json first ('m' < 'r'), so an upload that died partway
+    left the marker present with artifacts missing -- and the age reclaim would then read that
+    as "durable copy exists" and delete the complete local tree.
+    """
+    paths = sorted(out_dir.rglob("*"))
+    return ([p for p in paths if p.name != _SEAL_NAME]
+            + [p for p in paths if p.name == _SEAL_NAME])
+
+
 @runtime_checkable
 class BlobStore(Protocol):
     def put_sample(self, sha256: str, src: Path) -> None:

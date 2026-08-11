@@ -81,10 +81,25 @@ def test_upload_retries_inline_and_recovers_from_a_transient_failure(vm_dispatch
     assert not (tmp_path / job.job_id).exists(), "purge must still run on the recovered success path"
 
 
-def test_upload_failure_after_exhausting_retries_fails_the_job_and_purges(vm_dispatcher_factory, tmp_path):
-    """Finding D1's replacement contract: once every inline attempt fails, the
-    upload is treated as failed -- FAIL the job (never leave it RUNNING) and let
-    the unconditional purge run (never leave a leftover output dir "for later").
+def test_upload_failure_after_exhausting_retries_fails_the_job_and_retains_the_result(
+    vm_dispatcher_factory, tmp_path,
+):
+    """Finding D1's contract, half revised (#85).
+
+    STILL TRUE: once every inline attempt fails the job is FAILED, never left RUNNING -- nothing
+    re-runs a RUNNING job, so that was only ever a leak.
+
+    CHANGED: D1 also DISCARDED the result, and that was correct at the time -- a retained tree had
+    no consumer. It was unreachable bytes (the API serves results from the blob store alone) that
+    nothing would ever upload, so keeping it bought nothing and violated the no-bytes-survive
+    invariant for free. retry_pending_uploads is that consumer now, so the tree is a PENDING
+    UPLOAD: retained, drained by maintenance, then collected by the age reclaim once the durable
+    copy lands. Purging here would destroy a host-sealed, trust-gate-passed result that cannot be
+    reproduced by re-running -- detonation is not deterministic, and the C2 pcap is MOVED into the
+    tree -- turning a transient object-store outage into permanent evidence loss.
+
+    It also ends a split brain: the container Dispatcher already retained, so before this the same
+    outage lost the result or not depending purely on which dispatcher claimed the job.
     """
     store = InMemoryJobStore()
     job = Job.new(engine="redtusk", filename="a.doc")
@@ -102,8 +117,11 @@ def test_upload_failure_after_exhausting_retries_fails_the_job_and_purges(vm_dis
     final = store.get(job.job_id)
     assert final.status is JobStatus.FAILED, "must not be left RUNNING -- there is no consumer for that"
     assert "upload failed" in (final.error or "").lower()
-    # the cleanup invariant holds on every terminal path -- no leftover output dir survives.
-    assert not (tmp_path / job.job_id).exists(), "job dir (input AND output) must be purged, not preserved"
+    # The result is RETAINED as the only copy -- and it is the sealed output that must survive,
+    # not merely the directory.
+    assert (tmp_path / job.job_id / "output" / "metadata.json").exists(), (
+        "the only copy of a host-sealed result was destroyed by a transient upload failure"
+    )
     # Finding S1: the exhaustion path must reap any partial result blob -- else, with the
     # default job_retention_s=0 (expires_at=None), the retention sweeper skips this FAILED
     # job forever and the partial results/<job_id> blob leaks unbounded.

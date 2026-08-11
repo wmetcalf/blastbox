@@ -38,6 +38,7 @@ from blastbox.host.jobs.retention import (
     JobRetentionSweeper,
     purge_job_dir,
     reap_stale_scratch,
+    retry_pending_uploads,
 )
 from blastbox.host.runtime.remote_http import WorkerBusy   # 409 from a busy worker -> requeue, not fail
 from blastbox.observability.metrics import (
@@ -445,6 +446,10 @@ class VmJobDispatcher:
             self._purge_job_dir(job)
             return
         in_path = self._input_path(job)
+        # Set only if this attempt's result upload exhausts its retries: the local tree is then the
+        # ONLY copy of a host-sealed result and must survive the terminal purge. A LOCAL, not an
+        # attribute -- _process runs concurrently for different jobs.
+        pending_upload = False
         owned = False
         terminal_status: JobStatus | None = None   # the terminal state THIS attempt CAS-won (for metrics)
         # The `finally` purge is UNCONDITIONAL for every terminal state and every lost/released claim
@@ -626,19 +631,26 @@ class VmJobDispatcher:
                     backoff_s=self._put_output_retry_backoff_s,
                 )
                 if upload_exc is not None:
-                    # Finding D1: every inline attempt failed. There is no consumer for a job left
-                    # RUNNING "for the sweeper" (nothing re-runs a RUNNING job), so treat this the
-                    # same as any other post-detonation failure -- FAIL the job (the terminal write
-                    # below) and let the unconditional `finally` purge run. The completed result is
-                    # discarded (it was never durably stored), but the job dir + claim don't leak.
+                    # Finding D1 still holds: never leave the job RUNNING "for the sweeper", so it
+                    # is FAILED by the terminal write below. What changed is the TREE. D1 also
+                    # DISCARDED the result, and that was right at the time -- a retained tree had
+                    # no consumer, so it was unreachable bytes (the API serves results from the
+                    # blob store alone) that nothing would ever upload. retry_pending_uploads is
+                    # that consumer now, so the tree is a PENDING UPLOAD and skipping the purge is
+                    # what lets a host-sealed, unreproducible result survive an object-store
+                    # outage instead of being destroyed by one. The container Dispatcher already
+                    # behaved this way, so leaving this path discarding meant the same outage lost
+                    # the result or not depending purely on which dispatcher happened to claim the
+                    # job from the shared queue (#85 review).
+                    pending_upload = True
                     logger.error(
                         "vm_dispatch: result upload failed for %s after %d attempt(s) (%s); "
-                        "discarding the result and failing the job (no leftover output dir)",
+                        "failing the job and RETAINING its output for the pending-upload sweep",
                         job.job_id, self._put_output_max_attempts, upload_exc,
                     )
                     ok = False
                     err = (f"result upload failed after {self._put_output_max_attempts} attempts; "
-                           "result discarded")
+                           "result retained on this worker (no durable copy)")
                     # Finding S1: a partial result may already be sitting under
                     # results/<job_id> (some of put_output's per-file writes may have landed
                     # before a later one failed). This attempt marks the job FAILED (never
@@ -715,8 +727,20 @@ class VmJobDispatcher:
             # leak a job dir forever). Bytes left behind would be orphaned malware that no peer on
             # another host could ever read (this design rejects a shared filesystem), while the blob
             # store (real in every mode) always re-materialises the sample for the new owner. It
-            # deliberately purges output/ too, and there is no setting that disables it.
-            self._purge_job_dir(job)
+            # deliberately purges output/ too, and there is no setting that disables it -- with
+            # exactly one exception, below, where purging would DESTROY the result rather than
+            # release a redundant copy of it.
+            # ...and only when OUR attempt won the terminal CAS. A lost claim means a peer owns
+            # the job now; retaining our stale tree would feed the pending-upload sweep bytes that
+            # would overwrite the peer's authoritative result.
+            if pending_upload and owned:
+                # The ONLY copy of a host-sealed, trust-gate-passed result. Retained for
+                # retry_pending_uploads to drain, and bounded by the age reclaim's last-copy rule,
+                # which releases it the moment the durable copy lands.
+                logger.warning("vm_dispatch: retaining %s — the result upload failed, so this is "
+                               "the only copy", self._job_dir(job))
+            else:
+                self._purge_job_dir(job)
             # Metric parity with the cold dispatcher: count the terminal outcome + wall time -- but ONLY
             # for THIS attempt's own winning CAS (owned + the status we wrote). Requeued (NoWarmSlot)
             # attempts set owned=False, and a reclaimed attempt loses the CAS -> both are skipped. Gating
@@ -793,6 +817,10 @@ class VmJobDispatcher:
             self._retention.expire_due(self._store)
         except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
             logger.warning("vm_dispatch: retention sweep failed", exc_info=True)
+        try:
+            retry_pending_uploads(self._job_root, self._blobs, self._store, logger)
+        except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
+            logger.warning("vm_dispatch: pending-upload sweep failed", exc_info=True)
         try:
             reap_stale_scratch(
                 self._job_root, self._scratch_max_age_s, self._store, logger,
