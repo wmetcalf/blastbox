@@ -15,6 +15,7 @@ Security properties:
 from __future__ import annotations
 
 import contextlib
+import errno
 import logging
 import os
 import re
@@ -76,38 +77,74 @@ def _clear_pending_upload(job_root: "Path", job_id: str) -> None:
         (job_root / job_id / PENDING_UPLOAD_SENTINEL).unlink()
 
 
-def _rmtree_iterative(root: "Path") -> None:
-    """Remove *root* with an explicit stack and fd-relative syscalls.
+# How many directory fds the removal below may hold at once. Bounded because a hostile worker
+# controls the depth: holding one fd per level hit EMFILE ("Too many open files") at the default
+# 1024 ulimit, which is just RecursionError wearing a different hat -- the tree stayed immortal.
+_RM_FD_BUDGET = 64
 
-    Immune to BOTH limits a hostile worker can hit on purpose: Python's recursion limit (which
-    shutil.rmtree's recursive fd walk trips at ~1000 levels) and PATH_MAX (which a path-based
-    walk trips at ~4096 bytes of accumulated name, silently truncating what it can even see).
-    Every step is openat/unlinkat relative to a directory fd, so absolute path length never
-    matters, and O_NOFOLLOW means a symlink is unlinked, never descended.
+
+def _rmtree_iterative(root: "Path") -> None:
+    """Remove *root* with bounded resources, whatever depth it has.
+
+    A worker owns output/ (a 0o777 bind mount) and can nest directories as deep as it likes, so
+    every limit here is one it can aim at:
+      * shutil.rmtree's fd walk RECURSES -- RecursionError at ~1000 levels;
+      * a path-based walk (os.walk, rglob) silently stops at PATH_MAX;
+      * holding one fd per level -- the obvious iterative rewrite -- hits EMFILE at ~1024.
+    So: descend at most _RM_FD_BUDGET levels at a time using openat/unlinkat (no absolute paths,
+    so PATH_MAX never applies), and when the budget runs out, RENAME whatever is still below up
+    into the root and carry on. Depth falls by a full budget each pass, so it terminates in
+    depth/64 passes with a fixed fd cost. O_NOFOLLOW throughout: a symlink is an entry to unlink,
+    never something to descend into.
     """
     parent_fd = os.open(root.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        stack: list[tuple[int, str, int]] = []
-        fd = os.open(root.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
-        stack.append((parent_fd, root.name, fd))
-        while stack:
-            pfd, name, dfd = stack[-1]
-            descended = False
-            with os.scandir(dfd) as it:
-                for entry in it:
-                    if entry.is_dir(follow_symlinks=False):
-                        cfd = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                                      dir_fd=dfd)
-                        stack.append((dfd, entry.name, cfd))
-                        descended = True
-                        break
-                    os.unlink(entry.name, dir_fd=dfd)
-            if not descended:
-                os.close(dfd)
-                stack.pop()
-                os.rmdir(name, dir_fd=pfd)
+        root_fd = os.open(root.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                          dir_fd=parent_fd)
+        try:
+            salt = 0
+            while _rm_one_pass(root_fd, salt):
+                salt += 1
+        finally:
+            os.close(root_fd)
+        os.rmdir(root.name, dir_fd=parent_fd)
     finally:
         os.close(parent_fd)
+
+
+def _rm_one_pass(root_fd: int, salt: int) -> bool:
+    """One bounded descent. Returns True while *root_fd* still has entries left to remove."""
+    stack: list[tuple[int, int, str]] = []          # (parent_fd, own_fd, own name)
+    cur = root_fd
+    try:
+        while True:
+            deeper = None
+            with os.scandir(cur) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        if deeper is None:
+                            deeper = entry.name
+                        continue
+                    os.unlink(entry.name, dir_fd=cur)
+            if deeper is None:
+                break                                # this directory is empty now
+            if len(stack) >= _RM_FD_BUDGET:
+                # Out of budget with depth to spare: hoist the rest up to the root and let the
+                # next pass start from there. renameat with two dir fds needs no path at all.
+                os.rename(deeper, f".rm-{salt}", src_dir_fd=cur, dst_dir_fd=root_fd)
+                break
+            fd = os.open(deeper, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur)
+            stack.append((cur, fd, deeper))
+            cur = fd
+    finally:
+        # Unwind: close every fd we took, removing each directory once it is empty.
+        while stack:
+            pfd, fd, name = stack.pop()
+            os.close(fd)
+            with contextlib.suppress(OSError):       # not empty yet -> a later pass gets it
+                os.rmdir(name, dir_fd=pfd)
+    with os.scandir(root_fd) as it:
+        return any(True for _ in it)
 
 
 def purge_job_dir(job_root: "Path", job_id: str, log: "logging.Logger") -> bool:
@@ -185,12 +222,19 @@ def purge_job_dir(job_root: "Path", job_id: str, log: "logging.Logger") -> bool:
     try:
         try:
             shutil.rmtree(root)
-        except RecursionError:
-            # shutil.rmtree's fd walk RECURSES, so ~1000 nested dirs blow the stack. The worker
-            # owns output/ (0o777) and `for i in $(seq 1500); do mkdir a; cd a; done` is
-            # unprivileged, instant, and stays well inside PATH_MAX -- so a sample could make its
-            # own tree PERMANENTLY undeletable and reproduce #84 on demand. Catching the error is
-            # not enough: it must still be removed (#85 review).
+        except (RecursionError, OSError) as exc:
+            # DEPTH ATTACK. The worker owns output/ (0o777) and `for i in $(seq 1500); do mkdir a;
+            # cd a; done` is unprivileged, instant, and stays well inside PATH_MAX -- so it can
+            # make its own tree undeletable and reproduce #84 on demand. shutil.rmtree gives up
+            # in whichever way the box runs out first: RecursionError (its fd walk recurses),
+            # EMFILE/ENFILE (one held fd per level against the ulimit), or ENAMETOOLONG. Catching
+            # the error is not enough -- the tree has to actually go -- so retry with the bounded
+            # iterative removal below. Anything else (EACCES, EROFS, EBUSY) is a real failure and
+            # is reported (#85 review; the EMFILE case was found in end-to-end testing, where the
+            # container's 1024 ulimit was reached long before the recursion limit).
+            if not isinstance(exc, RecursionError) and getattr(exc, "errno", None) not in (
+                    errno.EMFILE, errno.ENFILE, errno.ENAMETOOLONG):
+                raise
             _rmtree_iterative(root)
         return True
     except FileNotFoundError:

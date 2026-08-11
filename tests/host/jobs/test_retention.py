@@ -785,6 +785,32 @@ class TestDeepTreeRemoval:
         finally:
             os.chdir(cwd)
 
+    def test_a_deep_tree_is_removed_under_a_LOW_fd_limit(self, tmp_path):
+        """The fd limit is the one a worker actually reaches first.
+
+        The obvious iterative rewrite of rmtree holds one directory fd per level, so at the
+        default 1024 ulimit it dies with EMFILE — RecursionError wearing a different hat, and the
+        tree stays just as immortal. shutil.rmtree hits EMFILE first too, which is why the
+        fallback cannot trigger on RecursionError alone. Found in end-to-end testing against a
+        real dispatcher, where the container's limit was reached long before the recursion limit;
+        the unit tests had missed it because pytest runs with a far higher limit.
+        """
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (256, hard))
+        try:
+            root = tmp_path / "jobs"
+            d = root / "abc"
+            (d / "output").mkdir(parents=True)
+            (d / "input.bin").write_bytes(b"MALWARE-BYTES-MUST-NOT-PERSIST")
+            self._nest(d / "output", 2000, leaf=lambda: pathlib.Path("payload").write_text("x"))
+
+            assert purge_job_dir(root, "abc", logging.getLogger("t")) is True
+            assert not d.exists(), "a deep tree survived because the removal ran out of fds"
+        finally:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
     def test_a_deeply_nested_tree_is_actually_removed(self, tmp_path):
         root = tmp_path / "jobs"
         d = root / "abc"
