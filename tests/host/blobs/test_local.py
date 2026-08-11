@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from blastbox.host.blobs.base import BlobFetchError
+from blastbox.host.blobs.base import _upload_order
 from blastbox.host.blobs.local import LocalBlobStore
 
 
@@ -211,6 +212,12 @@ def test_the_seal_is_uploaded_last_so_a_partial_upload_is_not_mistaken_for_durab
     (out / "metadata.json").write_text('{"sealed": true}')
     (out / "rmeta.json").write_text("[]")
     (out / "screenshot.png").write_bytes(b"\x89PNG")
+    # REAL output shape: RedTusk writes one metadata.json PER EMBEDDED DOCUMENT under rmeta/.
+    # Identifying the seal by basename classified these as seals too and shipped them to the end
+    # alongside the real one — where sorted order put the top-level seal first again, silently
+    # undoing the two-phase commit. Only <out_dir>/metadata.json is the seal.
+    (out / "rmeta").mkdir()
+    (out / "rmeta" / "metadata.json").write_text('{"embedded": 1}')
 
     real = LocalBlobStore._atomic_copy
     calls = {"n": 0}
@@ -229,3 +236,24 @@ def test_the_seal_is_uploaded_last_so_a_partial_upload_is_not_mistaken_for_durab
         "a partial upload left the commit marker behind — the reclaim would now delete the "
         "only complete copy"
     )
+
+
+def test_a_nested_metadata_json_is_not_treated_as_the_seal(tmp_path):
+    """Only <out_dir>/metadata.json commits the upload.
+
+    RedTusk writes one metadata.json PER EMBEDDED DOCUMENT under rmeta/, so a basename test
+    classified those as seals as well and moved them to the end of the upload together with the
+    real one — where sorted order put the top-level seal FIRST again and the two-phase commit
+    quietly stopped holding. Observed against real MinIO: the seal landed at .226 and
+    rmeta/metadata.json at .233.
+    """
+    out = tmp_path / "out"
+    (out / "rmeta").mkdir(parents=True)
+    (out / "metadata.json").write_text("{}")
+    (out / "rmeta" / "metadata.json").write_text("{}")
+    (out / "rmeta" / "0" / "a.txt").parent.mkdir()
+    (out / "rmeta" / "0" / "a.txt").write_text("x")
+
+    order = [p.relative_to(out).as_posix() for p in _upload_order(out) if p.is_file()]
+    assert order[-1] == "metadata.json", f"the seal must be written last, got {order}"
+    assert "rmeta/metadata.json" in order[:-1], "a nested metadata.json is an ordinary artifact"

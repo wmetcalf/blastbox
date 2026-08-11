@@ -260,6 +260,7 @@ def reap_stale_scratch(
     except OSError as exc:
         log.warning("scratch reclaim: cannot list %s: %s", job_root, exc)
         return 0
+    retained_last_copy: list[str] = []
     for d in entries:
         try:
             # Must LOOK like a job dir before it can be considered for deletion. "the store
@@ -347,15 +348,22 @@ def reap_stale_scratch(
             except Exception:  # noqa: BLE001 -- unknown is NOT durable
                 durable = False
             if not durable:
-                log.warning("scratch reclaim: %s holds a sealed result with no durable copy in "
-                            "the blob store; retaining it rather than deleting the last copy",
-                            d.name)
+                # AGGREGATED, not per-tree. A fleet mid-migration can hold thousands of these
+                # (the #84 state was 97,681 dirs), and one WARNING each per tick -- forever,
+                # since a legacy DONE job is never uploaded by the pending-upload sweep -- buries
+                # every other line in the log. One count per sweep says the same thing (#85,
+                # observed in end-to-end testing).
+                retained_last_copy.append(d.name)
                 continue
         # Count only what was actually removed: purge_job_dir refuses and fails
         # best-effort, and an unconditional increment made the operator-facing
         # "removed N job dir(s)" line report directories still on disk, forever.
         if purge_job_dir(job_root, d.name, log):
             n += 1
+    if retained_last_copy:
+        log.warning("scratch reclaim: retained %d tree(s) holding a sealed result with no durable "
+                    "copy in the blob store — deleting them would destroy the last copy (e.g. %s)",
+                    len(retained_last_copy), ", ".join(sorted(retained_last_copy)[:3]))
     if n:
         log.info("scratch reclaim: removed %d job dir(s) older than %.0fs from %s",
                   n, max_age_s, job_root)

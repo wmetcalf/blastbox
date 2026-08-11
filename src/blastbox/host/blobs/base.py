@@ -29,6 +29,21 @@ class BlobIntegrityError(BlobFetchError):
 _SEAL_NAME = "metadata.json"
 
 
+def _is_seal(path: Path, out_dir: Path) -> bool:
+    """True only for ``<out_dir>/metadata.json`` -- the seal, not any file sharing its name.
+
+    Matching on the BASENAME was wrong against real output: RedTusk writes
+    ``rmeta/metadata.json`` per embedded document, so a basename test classified those as seals
+    too and shipped them to the end of the upload alongside the real one -- where sorted order
+    put the top-level seal FIRST again, silently undoing the two-phase commit. Caught by
+    end-to-end testing against MinIO (#85); the unit fixture had no nested metadata.json.
+    """
+    try:
+        return path.relative_to(out_dir).as_posix() == _SEAL_NAME
+    except ValueError:
+        return False
+
+
 def _upload_order(out_dir: Path) -> list[Path]:
     """Every artifact under *out_dir*, with the seal LAST.
 
@@ -37,8 +52,8 @@ def _upload_order(out_dir: Path) -> list[Path]:
     as "durable copy exists" and delete the complete local tree.
     """
     paths = sorted(out_dir.rglob("*"))
-    return ([p for p in paths if p.name != _SEAL_NAME]
-            + [p for p in paths if p.name == _SEAL_NAME])
+    return ([p for p in paths if not _is_seal(p, out_dir)]
+            + [p for p in paths if _is_seal(p, out_dir)])
 
 
 @runtime_checkable
