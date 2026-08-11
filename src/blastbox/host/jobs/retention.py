@@ -15,6 +15,7 @@ Security properties:
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import time
 from pathlib import Path
@@ -23,6 +24,11 @@ from blastbox.host.blobs.base import BlobStore
 from blastbox.host.jobs.base import JobStatus, JobStore
 
 _log = logging.getLogger("blastbox.host.jobs.retention")
+
+# A scratch dir must LOOK like a job dir before it can be considered for deletion.
+# Ingress mints uuid4 job ids, so require that shape.
+_JOB_ID_RE = re.compile(
+    r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
 
 # Only these statuses are eligible for expiry.
 _TERMINAL = frozenset({JobStatus.DONE, JobStatus.FAILED, JobStatus.EXPIRED})
@@ -109,10 +115,156 @@ def purge_job_dir(job_root: "Path", job_id: str, log: "logging.Logger") -> bool:
         # failure. Reporting it as one fired the module's loudest operator-facing string ("sample
         # bytes may remain") on every reap cycle that actually succeeded (#85 review).
         return True
-    except OSError as exc:
+    except (OSError, RecursionError) as exc:
+        # RecursionError too: shutil.rmtree descends recursively, and the tree is written by an
+        # untrusted worker into a 0o777 bind mount. A few thousand nested dirs stay well inside
+        # PATH_MAX while blowing Python's stack -- so a sample could make its own tree
+        # undeletable AND, without this, escape a terminal `finally` and mask the job's outcome.
         log.error("PURGE FAILED for job %s at %s: %s — sample bytes may remain on this "
                   "worker's disk", job_id, root, exc)
         return False
+
+
+def reap_stale_scratch(
+    job_root: Path,
+    max_age_s: float,
+    job_store: JobStore,
+    log: logging.Logger,
+    *,
+    skip_job_ids: "frozenset[str] | set[str]" = frozenset(),
+    blob_store: BlobStore | None = None,
+) -> int:
+    """Reclaim per-job scratch dirs older than ``BLASTBOX_SCRATCH_MAX_AGE_S``.
+
+    The terminal purge handles the normal case. This bounds the ones it deliberately
+    SKIPS -- a tree whose worker container was never confirmed dead, and a result whose
+    upload exhausted its retries (which must be retained, since it is then the only copy).
+    Without this they leak forever, because the retention sweeper is gated on
+    job_retention_seconds > 0 and that knob also deletes results from the blob store.
+
+    Age-based on purpose: it needs no store lookup, so it cannot be fooled by a corrupt
+    row, and mtime rises whenever a live writer touches the tree -- a job still being
+    worked on is never old enough to qualify. SCRATCH ONLY: the blob store is untouched.
+    """
+    if max_age_s <= 0 or not job_root.is_dir():
+        return 0
+    now = time.time()
+    cutoff = now - max_age_s
+    n = 0
+    # Trees whose worker container THIS PROCESS still believes is alive. The inline purge
+    # refuses to rmtree under an unconfirmed-kill orphan for good reasons -- it half-deletes
+    # the tree, fires a spurious "PURGE FAILED", and frees nothing because the container's
+    # open fds pin the blocks -- and those reasons do not expire just because the tree got
+    # old. A wedged container writes nothing, so its mtime stops advancing and it ages into
+    # this sweep while _reconcile_cold_orphans, running LATER in this same tick, is still
+    # deliberately retaining it. _reconcile_cold_orphans purges it the moment docker ps
+    # confirms it is gone; until then it is not ours to delete (#85 review).
+    retained = skip_job_ids
+    try:
+        entries = list(job_root.iterdir())
+    except OSError as exc:
+        log.warning("scratch reclaim: cannot list %s: %s", job_root, exc)
+        return 0
+    for d in entries:
+        try:
+            # Must LOOK like a job dir before it can be considered for deletion. "the store
+            # has never heard of it" is not evidence of an orphan -- job_root can legitimately
+            # contain a co-located blob store (BLASTBOX_BLOB_LOCAL_ROOT under job_root is a
+            # documented mode-2 layout), lost+found when it is its own filesystem, or an
+            # operator's scratch. Deleting those would destroy the durable results this whole
+            # design depends on. Ingress mints uuid4 job ids, so require that shape.
+            if d.is_symlink():
+                continue          # resolve() would dereference to a SIBLING's real tree
+            if not d.is_dir() or not _JOB_ID_RE.match(d.name):
+                continue
+        except OSError:
+            continue
+        # NEWEST mtime anywhere in the tree, not just the top-level dir. A live worker writes
+        # INTO output/, and on Linux that does not touch the PARENT's mtime -- so a job that
+        # has been running for hours (a cold run with BLASTBOX_WORKER_TIMEOUT_S above this
+        # cutoff is supported) looks arbitrarily stale by the parent alone, and this sweep
+        # would delete the tree out from under it (#85 review).
+        try:
+            # A future mtime is NO EVIDENCE, not fresh evidence. The worker owns files under
+            # output/ (a 0o777 bind mount) and utime() is unprivileged, so a detonated sample
+            # could stamp the far future and make its tree immortal -- defeating the only
+            # bound on job_root and reproducing #84 deliberately. Clamping such a stamp to
+            # `now` would still read as "just touched", so ignore it outright. The small
+            # tolerance keeps ordinary clock skew from discarding honest timestamps.
+            horizon = now + 60.0
+
+            def _evidence(st_mtime: float) -> float:
+                return -1.0 if st_mtime > horizon else st_mtime
+
+            newest = _evidence(d.lstat().st_mtime)
+            live = newest > cutoff
+            for child in d.rglob("*"):
+                if live:
+                    break     # already proven active -- no reason to walk the rest
+                try:
+                    # lstat, NOT stat: stat() DEREFERENCES, and the worker owns output/
+                    # (0o777 bind mount). One `ln -s /tmp output/notes` borrows a busy host
+                    # path's continuously-refreshed mtime and pins the tree live forever --
+                    # permanently defeating the only bound on job_root and reproducing #84
+                    # on demand. The stamp is honest, so the future-mtime guard above cannot
+                    # see it. rglob already refuses to descend INTO a symlinked dir, so the
+                    # link's own mtime is the only evidence it gets to offer (#85 review).
+                    newest = max(newest, _evidence(child.lstat().st_mtime))
+                    live = newest > cutoff
+                except OSError:
+                    continue
+        except (OSError, RuntimeError):
+            continue
+        if live:
+            continue
+        if d.name in retained:
+            continue
+        # Belt and braces: age is a heuristic, job state is a fact. Never reclaim a tree whose
+        # job is still live. A job unknown to the store is a genuine orphan and IS reclaimable.
+        try:
+            job = job_store.get(d.name)
+        except Exception:  # noqa: BLE001 -- store trouble must not turn into deletion
+            log.warning("scratch reclaim: cannot confirm job %s is terminal; leaving it",
+                         d.name)
+            continue
+        if job is not None and job.status not in (JobStatus.DONE, JobStatus.FAILED,
+                                                  JobStatus.EXPIRED):
+            continue
+        # NEVER delete the last copy. This whole sweep rests on "the durable copy lives in the
+        # blob store, so removing the local tree loses nothing" -- and there are two states where
+        # that is simply false. (1) A job completed BEFORE the blob store shipped was never
+        # put_output'd: LocalBlobStore.open_output still serves it from the legacy
+        # <job_root>/<id>/output path, which is exactly the tree we are about to rmtree, so the
+        # first tick after an upgrade would destroy every pre-migration result the API can still
+        # serve. (2) A result whose upload exhausted its retries is host-sealed, trust-gate-passed,
+        # and unreproducible (the C2 pcap is MOVED into it, and detonation is not deterministic
+        # run-to-run). has_output() may only answer True on positively observed bytes -- an error
+        # or an outage answers False -- so the failure mode is a retained tree, which the operator
+        # can see and this sweep will collect once the store recovers (#85 review).
+        # ...but ONLY for a tree that actually holds a RESULT. A tree stranded by a SIGKILL
+        # mid-detonation has no sealed output and never will, so requiring a durable copy of it
+        # would retain it forever -- reintroducing the exact leak this sweep exists to bound.
+        # metadata.json is the host-written seal (_write_sealed_metadata), so its presence is
+        # what distinguishes "a finished result with nowhere else to live" from "scratch".
+        if blob_store is not None and (d / "output" / "metadata.json").is_file():
+            try:
+                durable = blob_store.has_output(d.name)
+            except Exception:  # noqa: BLE001 -- unknown is NOT durable
+                durable = False
+            if not durable:
+                log.warning("scratch reclaim: %s holds a sealed result with no durable copy in "
+                            "the blob store; retaining it rather than deleting the last copy",
+                            d.name)
+                continue
+        # Count only what was actually removed: purge_job_dir refuses and fails
+        # best-effort, and an unconditional increment made the operator-facing
+        # "removed N job dir(s)" line report directories still on disk, forever.
+        if purge_job_dir(job_root, d.name, log):
+            n += 1
+    if n:
+        log.info("scratch reclaim: removed %d job dir(s) older than %.0fs from %s",
+                  n, max_age_s, job_root)
+    return n
 
 
 class JobRetentionSweeper:

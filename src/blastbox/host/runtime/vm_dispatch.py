@@ -34,7 +34,11 @@ from blastbox.host.pool import release_kwargs
 from blastbox.contract.envelope import atomic_write_confined
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
-from blastbox.host.jobs.retention import JobRetentionSweeper, purge_job_dir
+from blastbox.host.jobs.retention import (
+    JobRetentionSweeper,
+    purge_job_dir,
+    reap_stale_scratch,
+)
 from blastbox.host.runtime.remote_http import WorkerBusy   # 409 from a busy worker -> requeue, not fail
 from blastbox.observability.metrics import (
     observe_job_duration,
@@ -155,6 +159,15 @@ class VmJobDispatcher:
         # Dispatcher to run this sweep, so a job pinned to a target_tier nobody serves (or for an engine
         # this single-engine dispatcher can't claim) would otherwise keep its untrusted input forever.
         self._max_queued_age_s = max(0.0, float(max_queued_age_s))
+        # Same bound on job_root the container Dispatcher applies, and the SAME
+        # implementation (jobs/retention.reap_stale_scratch). The terminal purge in _process's
+        # finally covers every path this dispatcher can reach, but a SIGKILL/OOM/redeploy
+        # mid-detonation reaches none of them and strands the sample plus its output forever --
+        # that is exactly the #84 accumulation class, and on a remote-only (static/AWS) node
+        # there is no container Dispatcher to sweep it up. BLASTBOX_SCRATCH_MAX_AGE_S was
+        # documented as a global knob while only one dispatcher honoured it (#85 review).
+        self._scratch_max_age_s = max(0.0, float(
+            os.environ.get("BLASTBOX_SCRATCH_MAX_AGE_S", "21600") or "21600"))
         # Bound a hung validate() so a dead VM agent can't occupy a claim thread forever (heartbeat
         # would keep the job looking fresh, so the orphan sweep never recovers it).
         self._validate_timeout_s = max(self._heartbeat_s, float(validate_timeout_s))
@@ -780,6 +793,13 @@ class VmJobDispatcher:
             self._retention.expire_due(self._store)
         except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
             logger.warning("vm_dispatch: retention sweep failed", exc_info=True)
+        try:
+            reap_stale_scratch(
+                self._job_root, self._scratch_max_age_s, self._store, logger,
+                blob_store=self._blobs,
+            )
+        except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
+            logger.warning("vm_dispatch: scratch reclaim failed", exc_info=True)
         try:
             cutoff = time.time() - self._orphan_timeout_s
             for job in self._store.list(status=JobStatus.RUNNING):

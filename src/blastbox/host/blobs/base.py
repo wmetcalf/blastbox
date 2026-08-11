@@ -41,6 +41,14 @@ class BlobStore(Protocol):
     def delete_job(self, job_id: str) -> None:
         """Drop *job_id*'s outputs. MUST NOT touch shared ``samples/`` blobs."""
 
+    def has_output(self, job_id: str) -> bool:
+        """True iff a DURABLE result exists for *job_id* in this store.
+
+        The age reclaim deletes local trees on the strength of this answer, so an
+        implementation MUST NOT return True on an error or an unknown -- it may only say
+        True when it has positively observed the bytes.
+        """
+
 
 def upload_output_with_retry(
     store: "BlobStore",

@@ -99,7 +99,6 @@ class S3BlobStore:
         out_dir = Path(out_dir)
         if not out_dir.is_dir():
             raise FileNotFoundError(f"put_output: output dir missing for {job_id}: {out_dir}")
-        out_dir = Path(out_dir)
         for path in sorted(out_dir.rglob("*")):
             # Skip symlinks BEFORE is_file() -- is_file() follows a symlink to its
             # target, so `p.is_symlink() or not p.is_file()` (checked in that
@@ -156,6 +155,18 @@ class S3BlobStore:
         if obj.get("ContentEncoding") == "gzip":
             data = gzip.decompress(data)
         return io.BytesIO(data)
+
+    def has_output(self, job_id: str) -> bool:
+        """Positively observed durable result bytes for *job_id*. Any error -> False: the age
+        reclaim deletes the local tree on the strength of this answer, so a transient object-store
+        outage must never be read as "the durable copy is there"."""
+        try:
+            resp = self._s3.list_objects_v2(
+                Bucket=self._bucket, Prefix=self._key("results", job_id) + "/", MaxKeys=1,
+            )
+        except Exception:  # noqa: BLE001 -- unknown is NOT durable
+            return False
+        return bool(resp.get("KeyCount") or resp.get("Contents"))
 
     def delete_job(self, job_id: str) -> None:
         """Drop this job's RESULTS only.

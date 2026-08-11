@@ -6,6 +6,7 @@ easiest to omit, and ~1.6% of a real corpus hits the timeout path.
 """
 import logging
 import shutil
+import time
 
 import pytest
 
@@ -245,3 +246,34 @@ def test_no_residue_after_net_policy_rejection_when_failed_cas_loses(tmp_path):
         "sample bytes survived a net_policy-rejected job whose FAILED CAS lost"
     assert not (tmp_path / job.job_id).exists(), \
         "job dir must be purged even when the net_policy FAILED CAS lost"
+
+
+def test_vm_dispatcher_reclaims_stale_scratch_too(tmp_path, monkeypatch):
+    """BLASTBOX_SCRATCH_MAX_AGE_S is documented as a global bound on job_root, so the network-tier
+    dispatcher must honour it — and it is the one that MOST needs it.
+
+    _process's finally-purge covers every terminal path this dispatcher can reach, but a
+    SIGKILL / OOM-kill / redeploy mid-detonation reaches none of them and strands the sample and
+    its output forever. On a remote-only (static/AWS) node there is no container Dispatcher to
+    sweep up behind it, and JobRetentionSweeper is gated on job_retention_seconds > 0 — the same
+    docs tell operators to leave that at 0. That is #84's accumulation class, unbounded, on the
+    tier the reclaim originally skipped.
+    """
+    import os as _os
+
+    monkeypatch.setenv("BLASTBOX_SCRATCH_MAX_AGE_S", "60")
+    job_root = tmp_path / "job_root"
+    job_root.mkdir()
+    disp = VmJobDispatcher(store=InMemoryJobStore(), job_root=str(job_root),
+                           validate=lambda p: ({}, True))
+
+    stranded = job_root / "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    (stranded / "output").mkdir(parents=True)
+    (stranded / "input.bin").write_bytes(SECRET)
+    old = time.time() - 99_999
+    for pth in (stranded / "input.bin", stranded / "output", stranded):
+        _os.utime(pth, (old, old))
+
+    disp._run_maintenance()
+
+    assert not stranded.exists(), "a SIGKILL-stranded tree is unbounded on the network tier"

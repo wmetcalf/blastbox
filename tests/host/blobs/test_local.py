@@ -3,6 +3,7 @@ rooted OUTSIDE job_root (see tests/host/blobs/test_local_roundtrip.py for the
 property this exists to guarantee: bytes surviving job-dir destruction). These
 tests cover the per-method contract in isolation."""
 import hashlib
+from pathlib import Path
 
 import pytest
 
@@ -173,3 +174,21 @@ def test_delete_job_propagates_a_real_removal_error(tmp_path, monkeypatch):
 
     with pytest.raises(OSError):
         store.delete_job("j1")
+
+
+def test_has_output_is_false_when_the_results_dir_cannot_be_read(tmp_path, monkeypatch):
+    """The age reclaim deletes a sealed result's local tree on the strength of this answer, so an
+    unreadable/errored store must never be reported as "the durable copy is there" — that turns a
+    transient storage fault into irreversible loss of the only copy."""
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "metadata.json").write_text("{}")
+    store.put_output("j-err", out)
+    assert store.has_output("j-err") is True
+
+    def boom(self):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "iterdir", boom)
+    assert store.has_output("j-err") is False

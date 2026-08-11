@@ -109,7 +109,6 @@ class LocalBlobStore:
         out_dir = Path(out_dir)
         if not out_dir.is_dir():
             raise FileNotFoundError(f"put_output: output dir missing for {job_id}: {out_dir}")
-        out_dir = Path(out_dir)
         dest_dir = self._results_dir(job_id)
         for path in sorted(out_dir.rglob("*")):
             # Skip symlinks BEFORE is_file() -- is_file() follows a symlink to its
@@ -154,6 +153,21 @@ class LocalBlobStore:
             return legacy
 
         raise BlobFetchError(f"result fetch failed: {job_id}/{name}")
+
+    def has_output(self, job_id: str) -> bool:
+        """Positively observed durable result bytes for *job_id*.
+
+        Deliberately does NOT count the legacy `<job_root>/<id>/output` fallback that
+        open_output still serves: that path IS the local tree the reclaim is deciding whether
+        to delete, so counting it would make the check answer "yes, a durable copy exists"
+        with the tree itself as the evidence -- and destroy the only copy of every pre-blob-store
+        result on the node (#85 review).
+        """
+        d = self._results_dir(job_id)
+        try:
+            return d.is_dir() and any(d.iterdir())
+        except OSError:
+            return False        # unknown is NOT durable
 
     def _contained_open(self, base_dir: Path, name: str, job_id: str) -> BinaryIO | None:
         """Open ``base_dir/name`` if present and contained under ``base_dir``.

@@ -26,7 +26,7 @@ import os
 import re
 import shutil
 
-from blastbox.host.jobs.retention import purge_job_dir
+from blastbox.host.jobs.retention import purge_job_dir, reap_stale_scratch
 import subprocess
 import threading
 import time
@@ -979,15 +979,22 @@ class Dispatcher:
             # accumulating past the budget across repeated failures. RETAIN the permit and record
             # the container so maintenance can reclaim it once `docker ps` confirms the container
             # is gone (else the permit would leak permanently and cold capacity bleed to zero).
-            if gate is not None and not orphaned:
-                gate.release()
-            elif gate is not None:
+            if orphaned:
+                # Register the TREE unconditionally. This used to live under the permit's branch
+                # (`elif gate is not None`), while the purge skip below ran regardless -- so with
+                # the node autosizer off (gate is None, the default) the orphan was never
+                # recorded, _reconcile_cold_orphans returned at its own `gate is None` check, and
+                # NOTHING ever purged it. Retention is about the sample bytes; the permit is a
+                # separate concern that simply has nothing to release here (#85 review).
                 with self._retained_lock:
                     self._retained_cold_orphans.update(
                         {n: (job.job_id, job.claim_id) for n in orphaned})
                 _log.warning("cold worker cleanup unconfirmed for job_id=%s (docker kill failed) — "
-                             "retaining the concurrency permit until a sweep confirms the container "
-                             "is gone", job.job_id)
+                             "deferring the job-dir purge%s until a sweep confirms the container "
+                             "is gone", job.job_id,
+                             " and retaining the concurrency permit" if gate is not None else "")
+            elif gate is not None:
+                gate.release()
             # Delete the malicious input on every terminal path WE own, regardless of success,
             # failure, exception, or unknown engine -- then purge the whole job dir. output/ used
             # to survive here forever, which is the leak in issue #84.
@@ -2660,6 +2667,16 @@ class Dispatcher:
             self._fail_stale_queued_jobs()
         except Exception:  # noqa: BLE001
             _log.exception("stale-queued sweep failed")
+        # BEFORE the scratch reclaim, for two reasons. (1) It is cheap -- one `docker ps` and a
+        # purge per confirmed-gone orphan -- while the reclaim walks every tree under job_root and
+        # does a store lookup per candidate; running the reclaim first head-of-line blocks the
+        # cold permits behind it on exactly the fleet state this PR targets (97,681 dirs). (2) It
+        # purges the orphans it confirms and drops them from _retained_cold_orphans, so the
+        # reclaim's skip set is accurate for THIS tick instead of one tick stale (#85 review).
+        try:
+            self._reconcile_cold_orphans()
+        except Exception:  # noqa: BLE001
+            _log.exception("cold-orphan reconcile failed")
         try:
             self._reap_stale_scratch()
         except Exception:  # noqa: BLE001
@@ -2675,99 +2692,22 @@ class Dispatcher:
                     _log.info("retention_sweep_expired count=%d", len(expired))
             except Exception:  # noqa: BLE001
                 _log.exception("retention sweep failed")
-        try:
-            self._reconcile_cold_orphans()
-        except Exception:  # noqa: BLE001
-            _log.exception("cold-orphan reconcile failed")
 
     def _reap_stale_scratch(self) -> int:
-        """Reclaim per-job scratch dirs older than ``BLASTBOX_SCRATCH_MAX_AGE_S``.
+        """Reclaim this dispatcher's stale scratch. The implementation is SHARED with
+        VmJobDispatcher (jobs/retention.reap_stale_scratch) for the same reason purge_job_dir
+        is: two copies of a destructive age rule drift, and #84 is what that costs.
 
-        The terminal purge handles the normal case. This bounds the ones it deliberately
-        SKIPS -- a tree whose worker container was never confirmed dead, and a result whose
-        upload exhausted its retries (which must be retained, since it is then the only copy).
-        Without this they leak forever, because the retention sweeper is gated on
-        job_retention_seconds > 0 and that knob also deletes results from the blob store.
-
-        Age-based on purpose: it needs no store lookup, so it cannot be fooled by a corrupt
-        row, and mtime rises whenever a live writer touches the tree -- a job still being
-        worked on is never old enough to qualify. SCRATCH ONLY: the blob store is untouched.
+        The one thing only this dispatcher can supply is skip_job_ids -- trees whose worker
+        container this process still believes is alive. VmJobDispatcher has no cold-orphan
+        retention, so it passes none.
         """
-        if self._scratch_max_age_s <= 0 or not self._job_root.is_dir():
-            return 0
-        now = time.time()
-        cutoff = now - self._scratch_max_age_s
-        n = 0
-        try:
-            entries = list(self._job_root.iterdir())
-        except OSError as exc:
-            _log.warning("scratch reclaim: cannot list %s: %s", self._job_root, exc)
-            return 0
-        for d in entries:
-            try:
-                # Must LOOK like a job dir before it can be considered for deletion. "the store
-                # has never heard of it" is not evidence of an orphan -- job_root can legitimately
-                # contain a co-located blob store (BLASTBOX_BLOB_LOCAL_ROOT under job_root is a
-                # documented mode-2 layout), lost+found when it is its own filesystem, or an
-                # operator's scratch. Deleting those would destroy the durable results this whole
-                # design depends on. Ingress mints uuid4 job ids, so require that shape.
-                if d.is_symlink():
-                    continue          # resolve() would dereference to a SIBLING's real tree
-                if not d.is_dir() or not _JOB_ID_RE.match(d.name):
-                    continue
-            except OSError:
-                continue
-            # NEWEST mtime anywhere in the tree, not just the top-level dir. A live worker writes
-            # INTO output/, and on Linux that does not touch the PARENT's mtime -- so a job that
-            # has been running for hours (a cold run with BLASTBOX_WORKER_TIMEOUT_S above this
-            # cutoff is supported) looks arbitrarily stale by the parent alone, and this sweep
-            # would delete the tree out from under it (#85 review).
-            try:
-                # A future mtime is NO EVIDENCE, not fresh evidence. The worker owns files under
-                # output/ (a 0o777 bind mount) and utime() is unprivileged, so a detonated sample
-                # could stamp the far future and make its tree immortal -- defeating the only
-                # bound on job_root and reproducing #84 deliberately. Clamping such a stamp to
-                # `now` would still read as "just touched", so ignore it outright. The small
-                # tolerance keeps ordinary clock skew from discarding honest timestamps.
-                horizon = now + 60.0
-
-                def _evidence(st_mtime: float) -> float:
-                    return -1.0 if st_mtime > horizon else st_mtime
-
-                newest = _evidence(d.stat().st_mtime)
-                live = newest > cutoff
-                for child in d.rglob("*"):
-                    if live:
-                        break     # already proven active -- no reason to walk the rest
-                    try:
-                        newest = max(newest, _evidence(child.stat().st_mtime))
-                        live = newest > cutoff
-                    except OSError:
-                        continue
-            except (OSError, RuntimeError):
-                continue
-            if live:
-                continue
-            # Belt and braces: age is a heuristic, job state is a fact. Never reclaim a tree whose
-            # job is still live. A job unknown to the store is a genuine orphan and IS reclaimable.
-            try:
-                job = self._job_store.get(d.name)
-            except Exception:  # noqa: BLE001 -- store trouble must not turn into deletion
-                _log.warning("scratch reclaim: cannot confirm job %s is terminal; leaving it",
-                             d.name)
-                continue
-            if job is not None and job.status not in (JobStatus.DONE, JobStatus.FAILED,
-                                                      JobStatus.EXPIRED):
-                continue
-            # Count only what was actually removed: purge_job_dir refuses and fails
-            # best-effort, and an unconditional increment made the operator-facing
-            # "removed N job dir(s)" line report directories still on disk, forever.
-            if purge_job_dir(self._job_root, d.name, _log):
-                n += 1
-        if n:
-            _log.info("scratch reclaim: removed %d job dir(s) older than %.0fs from %s",
-                      n, self._scratch_max_age_s, self._job_root)
-        return n
+        with self._retained_lock:
+            retained = {jid for jid, _claim in self._retained_cold_orphans.values()}
+        return reap_stale_scratch(
+            self._job_root, self._scratch_max_age_s, self._job_store, _log,
+            skip_job_ids=retained, blob_store=self._blobs,
+        )
 
     def _reconcile_cold_orphans(self) -> None:
         """Release cold permits we RETAINED for a failed-kill container ONCE `docker ps` confirms
@@ -2775,20 +2715,32 @@ class Dispatcher:
         then the permit stays held so no worker stacks on a possible orphan; here we reclaim it so
         the retention isn't permanent. If docker ps can't be read we keep retaining (can't confirm
         absence)."""
+        # NOT gated on `gate is not None`: the deferred PURGE has to run whether or not this
+        # dispatcher has a concurrency gate. Only the release below is the gate's business.
         gate = self._concurrency_gate
         with self._retained_lock:
-            if gate is None or not self._retained_cold_orphans:
+            if not self._retained_cold_orphans:
                 return
+        # Snapshot WHICH orphans this verdict is about BEFORE querying docker. `docker ps` is a
+        # subprocess round-trip, and dispatch threads register new orphans throughout it; judging
+        # the post-query map against the pre-query snapshot would classify an orphan registered
+        # in that window as "confirmed gone" -- its container was never in the listing because it
+        # did not exist yet when the listing was taken. That used to leak a permit; now it also
+        # rmtree's a live container's tree (#85 review).
+        with self._retained_lock:
+            candidates = set(self._retained_cold_orphans)
         live_ids = self._list_active_worker_job_ids()
         if live_ids is None:
             return                        # can't confirm absence → keep retaining
         live_names = {f"blastbox-worker-{jid[:12]}" for jid in live_ids}
         with self._retained_lock:
-            gone = [n for n in self._retained_cold_orphans if n not in live_names]
+            gone = [n for n in candidates
+                    if n not in live_names and n in self._retained_cold_orphans]
             reclaimed = [self._retained_cold_orphans.pop(n) for n in gone]
-        for _ in gone:
-            gate.release()                # container confirmed gone → reclaim its permit
-        if gone:
+        if gate is not None:
+            for _ in gone:
+                gate.release()            # container confirmed gone → reclaim its permit
+        if gone and gate is not None:
             _log.info("reclaimed %d cold permit(s) from confirmed-gone orphan container(s)", len(gone))
         # ...and NOW purge the trees we deliberately left behind. The inline terminal purge skips
         # a failed-kill orphan because rmtree'ing under a live writer half-deletes the tree, races

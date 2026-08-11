@@ -2492,6 +2492,70 @@ def test_confirmed_gone_cold_orphan_gets_its_tree_purged(tmp_path):
     assert dispatcher._concurrency_gate.in_flight == 0
 
 
+def test_failed_kill_orphan_registers_through_the_real_dispatch_path_with_no_gate(tmp_path):
+    """Same hole as the test below, but exercised through _dispatch_claimed_job rather than by
+    seeding the map — registration used to sit in the PERMIT's branch (`elif gate is not None`),
+    so with the autosizer off it never ran at all and there was nothing for any sweep to find.
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    assert dispatcher._concurrency_gate is None          # autosizer off — the default
+
+    job = Job.new(engine="redtusk", filename="s.doc")
+    job.claim_id = "claim-1"
+    job.status = JobStatus.RUNNING
+    store.create(job)
+    d = tmp_path / job.job_id
+    (d / "output").mkdir(parents=True)
+    (d / "input.bin").write_bytes(b"MALWARE-BYTES-MUST-NOT-PERSIST")
+
+    name = f"blastbox-worker-{job.job_id[:12]}"
+
+    def fake_inner(j, input_path, output_dir, *, orphan_out=None):
+        if orphan_out is not None:
+            orphan_out.append(name)      # `docker kill` came back non-zero
+
+    dispatcher._dispatch_inner = fake_inner
+    dispatcher._dispatch_claimed_job(job)
+
+    assert name in dispatcher._retained_cold_orphans, (
+        "with no gate the failed-kill orphan is never recorded, so nothing ever purges its tree"
+    )
+    assert dispatcher._retained_cold_orphans[name] == (job.job_id, "claim-1")
+    assert d.exists(), "the tree must be DEFERRED, not purged under a possibly-live container"
+
+
+def test_failed_kill_orphan_is_registered_even_without_a_concurrency_gate(tmp_path):
+    """The deferred purge must not depend on the node autosizer being switched on.
+
+    Registration used to sit under `elif gate is not None:` — the permit's branch — while the
+    "retaining until a sweep reclaims it" skip ran unconditionally. With BLASTBOX_NODE_* unset
+    (gate is None) the tree was therefore never recorded, and _reconcile_cold_orphans returned at
+    its first `gate is None` check on every tick, so NOTHING purged it. A terminal job kept its
+    sample-derived output/ indefinitely, and the only remaining reclaim was the age sweep — which
+    BLASTBOX_SCRATCH_MAX_AGE_S=0 disables, giving a setting that switches off a purge whose own
+    docstring says there is deliberately no setting that disables it.
+
+    Retention is about the TREE; the permit is a separate concern that simply has nothing to
+    release when there is no gate.
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    assert dispatcher._concurrency_gate is None          # autosizer off — the default
+
+    jid = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "metadata.json").write_text("{}")
+
+    dispatcher._retained_cold_orphans[f"blastbox-worker-{jid[:12]}"] = (jid, None)
+    dispatcher._list_active_worker_job_ids = lambda: set()
+
+    dispatcher._reconcile_cold_orphans()
+
+    assert not d.exists(), "with no gate the reconcile never purges — the deferral is dead code"
+
+
 def test_confirmed_gone_cold_orphan_is_not_purged_after_a_peer_reclaims_it(tmp_path):
     """The deferred purge runs LONG after the claim, which is exactly when a peer has had time
     to reclaim the job — and two dispatcher containers on one node share a single job_root bind
@@ -3063,6 +3127,140 @@ def test_scratch_reclaim_cannot_be_evaded_by_a_worker_setting_a_future_mtime(tmp
     assert not d.exists()
 
 
+def test_scratch_reclaim_cannot_be_evaded_by_a_worker_planting_a_symlink(tmp_path):
+    """The other half of the mtime-evasion class, and the one the future-mtime guard cannot see.
+
+    stat() DEREFERENCES. A detonated sample owns output/ (a 0o777 bind mount) and needs one
+    `ln -s /tmp output/notes` to make its own tree immortal: every tick reads /tmp's mtime,
+    which a busy host refreshes continuously, so the tree is "live" forever. The stamp is
+    perfectly honest, so clamping the future does nothing. That permanently defeats the only
+    bound this PR puts on job_root and reproduces #84's 184 GiB leak on demand.
+
+    lstat() is the whole fix — rglob already refuses to descend INTO a symlinked directory,
+    so the link's own (old) mtime is the only evidence it can offer.
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    busy = tmp_path.parent / "busy-host-path"
+    busy.mkdir(exist_ok=True)                      # mtime = now, refreshed on a real host
+
+    d = tmp_path / "99999999-9999-4999-8999-999999999999"
+    (d / "output").mkdir(parents=True)
+    (d / "input.bin").write_bytes(b"MALWARE-BYTES-MUST-NOT-PERSIST")
+    (d / "output" / "notes").symlink_to(busy, target_is_directory=True)
+
+    old = time.time() - 99_999
+    for pth in (d / "input.bin", d / "output" / "notes", d / "output", d):
+        os.utime(pth, (old, old), follow_symlinks=False)
+
+    assert dispatcher._reap_stale_scratch() == 1, "a planted symlink made the tree immortal"
+    assert not d.exists()
+
+
+def test_scratch_reclaim_leaves_a_tree_whose_container_is_still_retained(tmp_path):
+    """The reclaim must not do what the inline purge refuses to do.
+
+    A wedged container (its `docker kill` failed — that is WHY it is retained) writes nothing,
+    so its tree's mtime stops advancing and it ages into this sweep, while _reconcile_cold_orphans
+    — running LATER in the same maintenance tick — is still deliberately retaining it because
+    docker ps keeps listing it. rmtree'ing there half-deletes the tree under a live 0o777 bind
+    mount, fires the spurious "PURGE FAILED", and frees nothing (its open fds pin the blocks),
+    so the operator-facing "removed N job dir(s)" reports bytes that are still allocated.
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    jid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "partial.json").write_text("{}")
+    old = time.time() - 99_999
+    for pth in (d / "output" / "partial.json", d / "output", d):
+        os.utime(pth, (old, old))
+
+    dispatcher._retained_cold_orphans[f"blastbox-worker-{jid[:12]}"] = (jid, "claim-1")
+
+    assert dispatcher._reap_stale_scratch() == 0
+    assert d.exists(), "deleted a tree under a container this process still believes is alive"
+
+
+def test_scratch_reclaim_never_deletes_a_sealed_result_that_has_no_durable_copy(tmp_path):
+    """The sweep rests on "the blob store has the durable copy, so the local tree loses nothing" —
+    and there are two states where that is simply false.
+
+    (1) A job completed BEFORE the blob store shipped was never put_output'd, and
+    LocalBlobStore.open_output still serves it from the legacy <job_root>/<id>/output path — which
+    is precisely the tree this sweep rmtrees. The first tick after an upgrade would destroy every
+    pre-migration result the API can still serve.
+    (2) A result whose upload exhausted its retries is host-sealed, trust-gate-passed and
+    unreproducible (the C2 pcap is MOVED into it; detonation is not deterministic run-to-run).
+
+    metadata.json is the host-written seal, so it is what separates "a finished result with
+    nowhere else to live" from ordinary scratch.
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    jid = "11111111-1111-4111-8111-111111111111"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "metadata.json").write_text('{"sealed": true}')     # a real result
+    old = time.time() - 99_999
+    for pth in (d / "output" / "metadata.json", d / "output", d):
+        os.utime(pth, (old, old))
+
+    assert not dispatcher._blobs.has_output(jid), "precondition: nothing durable was stored"
+    assert dispatcher._reap_stale_scratch() == 0
+    assert (d / "output" / "metadata.json").exists(), "deleted the last copy of a sealed result"
+
+
+def test_scratch_reclaim_takes_a_sealed_result_once_it_is_durably_stored(tmp_path):
+    """The counterpart: once put_output has landed the bytes, the local tree really is redundant
+    and the sweep must still collect it — otherwise the last-copy rule quietly disables the bound
+    on every DONE job and #84 comes straight back."""
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    jid = "22222222-2222-4222-8222-222222222222"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "metadata.json").write_text('{"sealed": true}')
+    dispatcher._blobs.put_output(jid, d / "output")                    # the durable copy lands
+    assert dispatcher._blobs.has_output(jid)
+
+    old = time.time() - 99_999
+    for pth in (d / "output" / "metadata.json", d / "output", d):
+        os.utime(pth, (old, old))
+
+    assert dispatcher._reap_stale_scratch() == 1
+    assert not d.exists()
+
+
+def test_scratch_reclaim_still_takes_a_crash_stranded_tree_with_no_result(tmp_path):
+    """The last-copy rule must NOT extend to scratch. A SIGKILL mid-detonation leaves a tree with
+    no sealed output and no durable copy — and never will have one. Requiring durability there
+    would retain it forever, reintroducing the exact leak this sweep exists to bound."""
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    jid = "33333333-3333-4333-8333-333333333333"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)                                  # started, never sealed
+    (d / "input.bin").write_bytes(b"MALWARE-BYTES-MUST-NOT-PERSIST")
+    old = time.time() - 99_999
+    for pth in (d / "input.bin", d / "output", d):
+        os.utime(pth, (old, old))
+
+    assert dispatcher._reap_stale_scratch() == 1, "a crash-stranded tree is unbounded again"
+    assert not d.exists()
+
+
 def test_scratch_reclaim_reports_only_what_it_actually_removed(tmp_path):
     """purge_job_dir refuses and fails best-effort, so counting unconditionally made the
     operator-facing "removed N job dir(s)" line report directories still on disk — forever, on
@@ -3075,7 +3273,7 @@ def test_scratch_reclaim_reports_only_what_it_actually_removed(tmp_path):
     d.mkdir()
     os.utime(d, (time.time() - 99_999,) * 2)
 
-    import blastbox.host.dispatch as mod
+    import blastbox.host.jobs.retention as mod
     real = mod.purge_job_dir
     try:
         mod.purge_job_dir = lambda root, jid, log: False      # simulate a refusal/failure
