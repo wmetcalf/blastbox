@@ -952,3 +952,40 @@ class TestRemovalRobustness:
             if child.is_dir() and not child.is_symlink():
                 with contextlib.suppress(OSError):
                     _rmtree_iterative(child)
+
+    def test_the_sentinel_survives_a_failed_status_repair(self, tmp_path):
+        """Clearing the marker on upload alone stranded the job forever.
+
+        The recovery is two steps: upload the bytes, then CAS FAILED->DONE. If the CAS fails (a
+        store blip), the next sweep must still find the tree — but the marker was already gone, so
+        it saw ordinary scratch, the fall-through repair could never run, and the job stayed
+        FAILED with a durable result and every result route answering 409.
+        """
+        class CasFails(InMemoryJobStore):
+            def update_if_status(self, job_id, expect_status, **kw):
+                return False
+
+        store = CasFails()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+        d = _sealed_tree(tmp_path, _JID)
+
+        retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"))
+        assert (d / PENDING_UPLOAD_SENTINEL).is_file(), (
+            "the marker was dropped before the repair landed — nothing can retry it now"
+        )
+
+    def test_a_sentinel_that_cannot_be_written_is_an_error_not_a_shrug(self, tmp_path, caplog):
+        """It is the ONLY durable record that a tree holds the last copy: the in-memory carve-out
+        covers just the immediate purge, and once consumed the reclaim treats the tree as ordinary
+        scratch. A failure here is pending data loss and has to read like one."""
+        from blastbox.host.jobs.retention import mark_pending_upload
+
+        with caplog.at_level(logging.WARNING):
+            mark_pending_upload(tmp_path, "no-such-job", logging.getLogger("t"))
+        assert any(r.levelno >= logging.ERROR for r in caplog.records), (
+            "a failed sentinel write was logged below ERROR"
+        )

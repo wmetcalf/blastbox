@@ -692,12 +692,17 @@ class VmJobDispatcher:
             finished = time.time()
             # CAS on (status, claim_id) so a stale owner can't clobber a job that was reclaimed
             # (RUNNING->QUEUED->RUNNING under another dispatcher). The return value is OUR ownership.
-            terminal_status = JobStatus.DONE if ok else JobStatus.FAILED
+            intended = JobStatus.DONE if ok else JobStatus.FAILED
             owned = self._store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
-                status=terminal_status,
+                status=intended,
                 finished_at=finished, result_summary=summary, error=err,
                 expires_at=self._expiry(finished))
+            # Assigned only once the store has ANSWERED. The `finally` reads terminal_status to
+            # tell "a peer owns this job now" (our tree is stale) from "the store was
+            # unreachable" (we know nothing) -- and only the first justifies destroying a
+            # retained result. Setting it before the call collapsed the two (#85 review).
+            terminal_status = intended
             if ok and owned:
                 # index per-page perceptual hashes for /v1/similar, same as the cold/file-warm paths --
                 # else a network-endpoint (static/AWS) page-hash job is DONE but invisible to search.
@@ -716,11 +721,16 @@ class VmJobDispatcher:
         except Exception as exc:  # noqa: BLE001 — one bad job must not sink the dispatcher
             logger.warning("vm_dispatch: job %s failed: %s", job.job_id, exc, exc_info=True)
             finished = time.time()
-            terminal_status = JobStatus.FAILED
             owned = self._store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                 status=JobStatus.FAILED, finished_at=finished, error=type(exc).__name__,
                 expires_at=self._expiry(finished))
+            # AFTER the store call, never before. terminal_status is what the `finally` reads to
+            # tell "a peer owns this job now" from "we could not reach the store at all", and the
+            # difference decides whether a retained result is purged. Setting it first meant a
+            # store outage during this very handler looked like a lost claim -- and destroyed the
+            # only copy of a sealed result precisely when the store was already sick (#85 review).
+            terminal_status = JobStatus.FAILED
         finally:
             # SECURITY INVARIANT (not housekeeping): nothing survives on this worker's disk once its
             # attempt ends. The purge is UNCONDITIONAL across every terminal state (DONE/FAILED) AND

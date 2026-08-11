@@ -3610,3 +3610,46 @@ def test_a_repaired_job_gets_the_result_summary_its_done_path_would_have_written
     dispatcher._index_repaired_result(job.job_id, out)
 
     assert store.get(job.job_id).result_summary is not None, "recovered job left with null counts"
+
+
+def test_the_capped_sweep_rotates_so_held_trees_cannot_starve_the_rest(tmp_path):
+    """iterdir order is stable, so a capped sweep re-examined the same prefix every tick.
+
+    A prefix of permanently-held trees — a legacy result with no durable copy, a retained orphan —
+    would consume the entire cap forever and starve every candidate behind it, which is precisely
+    the unbounded growth the cap was added to prevent.
+    """
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL, reap_stale_scratch
+    import logging as _logging
+
+    store = InMemoryJobStore()
+    old = time.time() - 99_999
+    held, reclaimable = [], []
+    for i in range(3):                                  # held: sealed result, nothing durable
+        jid = f"0000000{i}-1111-4111-8111-111111111111"
+        d = tmp_path / jid
+        (d / "output").mkdir(parents=True)
+        (d / "output" / "metadata.json").write_text("{}")
+        (d / PENDING_UPLOAD_SENTINEL).write_text("")
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = jid
+        job.status = JobStatus.FAILED
+        store.create(job)
+        held.append(d)
+    for i in range(3):                                  # plain scratch, behind them in sort order
+        jid = f"9000000{i}-1111-4111-8111-111111111111"
+        d = tmp_path / jid
+        d.mkdir()
+        reclaimable.append(d)
+    for d in held + reclaimable:
+        for pth in sorted(d.rglob("*"), reverse=True) + [d]:
+            os.utime(pth, (old, old))
+
+    blobs = _blob_store_for(tmp_path)
+    total = 0
+    for _ in range(8):                                  # a few ticks, cap smaller than the holds
+        total += reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                                    blob_store=blobs, max_per_sweep=2)
+    # Without rotation this is 0 forever: the three held trees fill the cap on every tick.
+    assert total == 3, f"held trees starved the reclaimable ones (removed {total}/3)"
+    assert all(d.exists() for d in held), "a held tree was deleted"

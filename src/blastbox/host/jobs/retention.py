@@ -33,6 +33,11 @@ _log = logging.getLogger("blastbox.host.jobs.retention")
 
 # A scratch dir must LOOK like a job dir before it can be considered for deletion.
 # Ingress mints uuid4 job ids, so require that shape.
+# Where the last capped sweep of each job_root stopped, so the next one starts there instead of
+# re-examining the same prefix. Process-local and purely an ordering hint: losing it on restart
+# costs one repeated sweep, never correctness.
+_sweep_cursor: dict[str, int] = {}
+
 _JOB_ID_RE = re.compile(
     r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
 
@@ -91,8 +96,13 @@ def mark_pending_upload(job_root: "Path", job_id: str, log: "logging.Logger") ->
     try:
         (job_root / job_id / PENDING_UPLOAD_SENTINEL).write_text("")
     except OSError as exc:
-        log.warning("could not mark %s as pending-upload (%s); the retry sweep will not see it",
-                    job_id, exc)
+        # NOT best-effort. This file is the ONLY durable record that the tree holds the last copy
+        # of a result: the in-memory carve-out protects just the immediate terminal purge, and
+        # once that is consumed the age reclaim sees an ordinary FAILED job and deletes it. So a
+        # failure here is a pending DATA LOSS, not a missed optimisation, and it says so (#85).
+        log.error("CANNOT MARK %s as pending-upload (%s) — its result is the only copy and the "
+                  "scratch reclaim will not recognise it; the result may be lost when the tree "
+                  "ages out", job_id, exc)
 
 
 def _clear_pending_upload(job_root: "Path", job_id: str) -> None:
@@ -419,7 +429,7 @@ def retry_pending_uploads(
             if not durable:
                 n += 1
                 log.info("pending-upload sweep: result for %s is now durably stored", d.name)
-            _clear_pending_upload(job_root, d.name)   # drained: the tree is redundant now
+
             # REPAIR THE JOB. Uploading the bytes is only half of it: the job was FAILED because
             # its upload exhausted, and open_output is DONE-gated, so a recovered result stays
             # unreachable -- from a client's view the outcome is identical to having discarded it.
@@ -449,6 +459,12 @@ def retry_pending_uploads(
             # it a recovered job is DONE and servable but permanently invisible to /similar,
             # because nothing re-walks DONE jobs (upstream review of #85). Best-effort -- an
             # indexing problem must never undo a good repair.
+            # Only NOW is the tree redundant. Clearing the sentinel on upload alone meant a
+            # failed status CAS left no marker for the next sweep to find, so the job stayed
+            # FAILED forever with its result durable and every result route answering 409 -- the
+            # fall-through repair exists precisely for that case and could never run (#85 review).
+            if repaired:
+                _clear_pending_upload(job_root, d.name)
             if repaired and on_repaired is not None:
                 try:
                     on_repaired(d.name, out_dir)
@@ -514,10 +530,20 @@ def reap_stale_scratch(
         if in_flight:
             retained |= in_flight
     try:
-        entries = list(job_root.iterdir())
+        entries = sorted(job_root.iterdir(), key=lambda p: p.name)
     except OSError as exc:
         log.warning("scratch reclaim: cannot list %s: %s", job_root, exc)
         return 0
+    # ROTATE the starting point. iterdir order is stable, so a capped sweep examined the same
+    # prefix every tick -- and a prefix of permanently-held trees (a legacy result with no durable
+    # copy, a retained orphan) would consume the whole cap forever and starve every candidate
+    # behind it, which is exactly the unbounded growth the cap was added to prevent. Deterministic
+    # (no clock, no randomness): advance by the cap each sweep so successive ticks cover the whole
+    # directory (#85 review).
+    if entries and max_per_sweep > 0:
+        start = _sweep_cursor.get(str(job_root), 0) % len(entries)
+        entries = entries[start:] + entries[:start]
+        _sweep_cursor[str(job_root)] = (start + max_per_sweep) % len(entries)
     # Canonical paths this sweep must never delete whatever they are named. The uuid4 shape
     # check protects a conventionally-named blob root ("blobs"), but BLASTBOX_BLOB_LOCAL_ROOT is
     # operator-set and may itself be a uuid-shaped directory directly beneath job_root -- in which

@@ -14,6 +14,8 @@ bounded inline retry (a transient blip gets a real chance to succeed while this
 worker still holds the claim and the output dir exists), and on exhaustion an
 unconditional FAIL + purge — the same shape as every other terminal path.
 """
+import contextlib
+
 from blastbox.host.jobs.base import Job, JobStatus
 from blastbox.host.jobs.memory import InMemoryJobStore
 
@@ -210,3 +212,40 @@ def test_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(vm_dispa
     # Our local copy must be purged -- nothing may survive on this worker's disk once we're no
     # longer the owner (same invariant as the other lost-claim paths in this method).
     assert not (tmp_path / job.job_id).exists()
+
+
+def test_a_store_outage_during_terminal_write_does_not_destroy_the_retained_result(
+    vm_dispatcher_factory, tmp_path,
+):
+    """`terminal_status` is what the `finally` reads to tell "a peer owns this job now" from
+    "we could not reach the store at all" — and only the first of those makes our tree stale.
+
+    It used to be assigned BEFORE the store call, so an outage during the terminal write looked
+    exactly like a lost claim: the retained result was purged precisely when the store was already
+    sick, which is the worst possible moment to also lose the only copy of a sealed result.
+    """
+    class StoreDiesOnTerminalWrite(InMemoryJobStore):
+        calls = 0
+
+        def update_if_status(self, job_id, expect_status, **kw):
+            type(self).calls += 1
+            if kw.get("status") is JobStatus.FAILED:
+                raise RuntimeError("job store unavailable")
+            return super().update_if_status(job_id, expect_status, **kw)
+
+    store = StoreDiesOnTerminalWrite()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.input_sha256 = "e" * 64
+    store.create(job)
+    claimed = store.claim_next()
+
+    disp = vm_dispatcher_factory(
+        store=store, blob_store=Blobs(fail_put=True), validate_ok=True,
+        put_output_max_attempts=1,
+    )
+    with contextlib.suppress(Exception):        # the store error still propagates, as before
+        disp._process(claimed)
+
+    assert (tmp_path / job.job_id / "output" / "metadata.json").exists(), (
+        "purged the only copy of a sealed result because the STORE was down"
+    )
