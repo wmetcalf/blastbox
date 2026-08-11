@@ -27,6 +27,7 @@ from typing import BinaryIO
 
 from blastbox.host.blobs.base import (
     _SEAL_NAME,
+    _declared_paths,
     BlobFetchError,
     BlobIntegrityError,
     _upload_order,
@@ -123,6 +124,7 @@ class LocalBlobStore:
         if not out_dir.is_dir():
             raise FileNotFoundError(f"put_output: output dir missing for {job_id}: {out_dir}")
         dest_dir = self._results_dir(job_id)
+        declared = _declared_paths(out_dir)
         # TWO-PHASE COMMIT. metadata.json is written LAST, so its presence under
         # results/<job_id> means "every other artifact already landed" -- that is what makes
         # has_output() a real durability answer instead of a guess. Uploading in plain sorted
@@ -160,8 +162,9 @@ class LocalBlobStore:
             try:
                 self._atomic_copy(path, dest_dir / rel)
             except OSError as exc:
-                if exc.errno != errno.ENAMETOOLONG:
-                    raise
+                if (exc.errno != errno.ENAMETOOLONG or declared is None
+                        or rel.as_posix() in declared):
+                    raise      # a DECLARED artifact must never be silently dropped
                 _log.warning("put_output_skipped_unstorable_name", job_id=job_id,
                              path=str(rel), error=str(exc))
 

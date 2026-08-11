@@ -44,6 +44,31 @@ def _is_seal(path: Path, out_dir: Path) -> bool:
         return False
 
 
+def _declared_paths(out_dir: Path) -> "set[str] | None":
+    """Relative paths the sealed envelope DECLARES as artifacts.
+
+    Skipping a file we cannot store is only safe for an UNDECLARED one: those are not servable
+    (the result routes are manifest-gated), so nothing a consumer can reach is lost. A declared
+    artifact is the opposite -- dropping it and then writing the seal anyway produces a DONE job
+    whose manifest promises bytes the store does not have, and marks the complete local copy
+    redundant so the reclaim deletes it. That must fail the upload instead (#85 review).
+
+    Returns None when the envelope is missing or unparseable -- NOT an empty set. Those are
+    different: an empty set means "nothing was promised, so a skip is safe", while None means "we
+    cannot tell", and the only safe response to that is to skip nothing at all.
+    """
+    try:
+        import json
+
+        env = json.loads((out_dir / _SEAL_NAME).read_text())
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return {str(a.get("path")) for a in env.get("artifacts") or [] if a.get("path")}
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _upload_order(out_dir: Path) -> list[Path]:
     """Every artifact under *out_dir*, with the seal LAST.
 

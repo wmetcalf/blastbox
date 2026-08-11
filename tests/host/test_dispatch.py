@@ -7,6 +7,7 @@ from __future__ import annotations
 import shutil
 import logging
 import hashlib
+import copy
 import json
 import os
 import subprocess
@@ -3653,3 +3654,60 @@ def test_the_capped_sweep_rotates_so_held_trees_cannot_starve_the_rest(tmp_path)
     # Without rotation this is 0 forever: the three held trees fill the cap on every tick.
     assert total == 3, f"held trees starved the reclaimable ones (removed {total}/3)"
     assert all(d.exists() for d in held), "a held tree was deleted"
+
+
+def test_a_lost_claim_during_the_upload_retry_leaves_no_sentinel(tmp_path):
+    """The sentinel says "this tree holds the last copy and is ours to publish".
+
+    A peer can reclaim the job during the upload's retry window; _fail_job's CAS then loses, and
+    our tree is a stale attempt. Writing the sentinel anyway would hand the pending-upload sweep
+    our stale bytes to publish over the new owner's authoritative result.
+    """
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.claim_id = "ours"
+    job.status = JobStatus.RUNNING
+    store.create(job)
+    # OUR attempt's view of the job, snapshotted before the peer takes it. InMemoryJobStore hands
+    # back the same object, so mutating the stored row would otherwise rewrite our own claim_id
+    # and the CAS would trivially "win" — the test would pass while testing nothing.
+    ours = copy.deepcopy(job)
+    store.update(job.job_id, claim_id="the-peer")      # reclaimed mid-retry
+    d = tmp_path / job.job_id
+    (d / "output").mkdir(parents=True)
+
+    won = dispatcher._fail_job(ours, "result upload failed after 3 attempts; retained")
+    assert won is False, "the CAS should have lost to the peer"
+    assert not (d / PENDING_UPLOAD_SENTINEL).exists()
+
+
+def test_a_blob_root_ABOVE_job_root_does_not_disable_the_whole_reclaim(tmp_path):
+    """Protection must cover what deleting the CANDIDATE could destroy — not the reverse.
+
+    Treating a protected ANCESTOR of job_root as a match made every job dir "protected" and
+    silently switched the entire reclaim off, which is precisely the unbounded leak it exists to
+    stop. The dangerous direction is a blob root nested INSIDE a candidate.
+    """
+    from blastbox.host.jobs.retention import reap_stale_scratch
+    import logging as _logging
+
+    job_root = tmp_path / "jobs"
+    job_root.mkdir()
+    jid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+    d = job_root / jid
+    d.mkdir()
+    os.utime(d, (time.time() - 99_999,) * 2)
+
+    class RootedAbove:
+        local_root = tmp_path                          # an ANCESTOR of job_root
+
+        def has_output(self, job_id):
+            return True
+
+    assert reap_stale_scratch(job_root, 60.0, InMemoryJobStore(), _logging.getLogger("t"),
+                              blob_store=RootedAbove()) == 1, "the reclaim was disabled entirely"
+    assert not d.exists()

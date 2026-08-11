@@ -798,8 +798,20 @@ class VmJobDispatcher:
                            job_id, exc_info=True)
             return
         job = self._store.get(job_id)
-        if job is not None:
-            self._index_page_hashes(job, envelope)
+        if job is None:
+            return
+        self._index_page_hashes(job, envelope)
+        # ...and the summary, exactly as the container dispatcher's hook does. Restoring it in
+        # only one of the two left a VM-recovered job DONE with null artifact/warning counts
+        # forever -- the same sibling omission this PR keeps producing (#85 review).
+        try:
+            from blastbox.host.dispatch import _build_result_summary
+
+            summary = _build_result_summary(envelope)
+        except Exception:  # noqa: BLE001 -- the repair stands; the summary is cosmetic
+            return
+        with contextlib.suppress(Exception):
+            self._store.update(job_id, result_summary=summary)
 
     def _index_page_hashes(self, job: Job, envelope: Any) -> None:
         """Best-effort: index the job's per-page perceptual hashes (phash/colorhash/sha256) for

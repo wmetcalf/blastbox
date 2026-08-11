@@ -1540,12 +1540,13 @@ class Dispatcher:
                 # Same as the cold branch: no durable copy landed, so the terminal purge must
                 # spare this tree rather than destroy the only copy.
                 self._upload_failed_job_ids.add(job.job_id)
-                mark_pending_upload(self._job_root, job.job_id, _log)
-                self._fail_job(
+                # Same fence as the cold path: a sentinel only belongs on a tree we still own.
+                if self._fail_job(
                     job,
                     f"result upload failed after {self._put_output_max_attempts} attempts; "
                     f"{RESULT_RETAINED_MARKER}",
-                )
+                ):
+                    mark_pending_upload(self._job_root, job.job_id, _log)
                 return
 
             # ------------------------------------------------------------------
@@ -2061,12 +2062,16 @@ class Dispatcher:
         if not self._upload_output(job, output_dir):
             # The durable copy never landed, so do NOT purge this tree -- it is the only copy.
             self._upload_failed_job_ids.add(job.job_id)
-            mark_pending_upload(self._job_root, job.job_id, _log)
-            self._fail_job(
+            # ...but only if OUR attempt is still the owner. A peer can reclaim the job during
+            # the retry window, in which case _fail_job's CAS loses and the tree is a stale
+            # attempt -- leaving a sentinel on it would hand the pending-upload sweep our stale
+            # bytes to publish over the new owner's result (#85 review).
+            if self._fail_job(
                 job,
                 f"result upload failed after {self._put_output_max_attempts} attempts; "
                 f"{RESULT_RETAINED_MARKER}",
-            )
+            ):
+                mark_pending_upload(self._job_root, job.job_id, _log)
             return
 
         # ------------------------------------------------------------------
@@ -2363,12 +2368,17 @@ class Dispatcher:
             _log.info("stale_queued_failed count=%d", failed)
         return failed
 
-    def _fail_job(self, job: Job, reason: str) -> None:
-        """Mark a job FAILED, scrubbing the error string before storage.
+    def _fail_job(self, job: Job, reason: str) -> bool:
+        """Mark a job FAILED, scrubbing the error string before storage. Returns whether OUR
+        attempt won the CAS.
 
         Claim-fenced on (RUNNING, our claim_id): if a peer dispatcher already requeued/recovered
         this job, the owner's FAILED is a no-op (don't clobber the new owner's state). In the
-        normal path the job is RUNNING under our claim, so it applies as before."""
+        normal path the job is RUNNING under our claim, so it applies as before.
+
+        The return value matters to callers that leave state behind on the strength of the
+        failure -- specifically the pending-upload sentinel, which must never be written onto a
+        tree a peer now owns."""
         error = sanitize_public_error(reason)
         finished_at = time.time()
         expires_at = (
@@ -2376,7 +2386,7 @@ class Dispatcher:
             if self._job_retention_seconds > 0
             else None
         )
-        self._job_store.update_if_status(
+        return bool(self._job_store.update_if_status(
             job.job_id,
             JobStatus.RUNNING,
             expect_claim_id=job.claim_id,
@@ -2384,7 +2394,7 @@ class Dispatcher:
             finished_at=finished_at,
             expires_at=expires_at,
             error=error,
-        )
+        ))
 
     def _delete_input(self, input_path: Path) -> None:
         """Delete the malicious input file and its containing input/ directory.

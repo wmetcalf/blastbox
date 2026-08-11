@@ -600,8 +600,12 @@ def reap_stale_scratch(
             # protected it not at all.
             if protected:
                 rd = d.resolve()
-                if any(rd == p or p.is_relative_to(rd) or rd.is_relative_to(p)
-                       for p in protected):
+                # Only paths deleting THIS candidate would destroy: the candidate itself, or a
+                # protected root nested inside it. NOT the reverse -- a protected path that is an
+                # ANCESTOR of job_root (e.g. blob_root=<job_root>/.., the parent that holds both
+                # `jobs/` and `blobs/`) made every job dir "protected" and silently disabled the
+                # entire reclaim, which is the leak this exists to stop (#85 review).
+                if any(rd == p or p.is_relative_to(rd) for p in protected):
                     continue
         except (OSError, RuntimeError, ValueError):
             continue

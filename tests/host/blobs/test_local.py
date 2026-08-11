@@ -3,6 +3,7 @@ rooted OUTSIDE job_root (see tests/host/blobs/test_local_roundtrip.py for the
 property this exists to guarantee: bytes surviving job-dir destruction). These
 tests cover the per-method contract in isolation."""
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -299,3 +300,44 @@ def test_a_real_upload_error_still_fails_the_upload(tmp_path, monkeypatch):
     monkeypatch.setattr(LocalBlobStore, "_atomic_copy", staticmethod(enospc))
     with pytest.raises(OSError):
         store.put_output("j-enospc", out)
+
+
+def test_a_DECLARED_artifact_is_never_silently_skipped(tmp_path):
+    """Skipping an unstorable name is safe only for an UNDECLARED file.
+
+    Undeclared files are not servable (the result routes are manifest-gated), so dropping one
+    loses nothing a consumer can reach. A DECLARED artifact is the opposite: dropping it and then
+    writing the seal anyway produces a DONE job whose manifest promises bytes the store does not
+    have — and marks the complete local copy redundant, so the reclaim deletes it. The upload has
+    to fail instead, which keeps the tree and lets the pending-upload sweep retry.
+    """
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    (out / "nested").mkdir(parents=True)
+    long_name = "n" * 250
+    (out / "nested" / long_name).write_bytes(b"THE DECLARED ARTIFACT")
+    (out / "metadata.json").write_text(json.dumps({
+        "engine": "redtusk", "status": "ok", "input_sha256": "a" * 64,
+        "detected": {"label": "docx", "mime": "x", "confidence": 1.0, "source": "magika"},
+        "artifacts": [{"id": "a1", "path": f"nested/{long_name}", "kind": "image",
+                       "sha256": "f" * 64, "bytes": 21}],
+        "warnings": [], "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
+    }))
+
+    with pytest.raises(OSError):
+        store.put_output("j-declared", out)
+    assert store.has_output("j-declared") is False, (
+        "published a seal promising an artifact that was never stored"
+    )
+
+
+def test_an_unparseable_envelope_makes_every_skip_fatal(tmp_path):
+    """If we cannot tell what was promised, we cannot safely drop anything."""
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "metadata.json").write_text("{ not json")
+    (out / ("z" * 250)).write_bytes(b"x")
+
+    with pytest.raises(OSError):
+        store.put_output("j-unparseable", out)

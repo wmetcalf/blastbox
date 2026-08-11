@@ -9,6 +9,8 @@ Key layout:
 """
 from __future__ import annotations
 
+import errno
+
 import gzip
 import hashlib
 import io
@@ -20,6 +22,7 @@ from urllib.parse import urlparse
 
 from blastbox.host.blobs.base import (
     _SEAL_NAME,
+    _declared_paths,
     BlobFetchError,
     BlobIntegrityError,
     _upload_order,
@@ -110,6 +113,7 @@ class S3BlobStore:
         # order put it FIRST ('m' < 'r'), so a run that died mid-upload left the seal present with
         # artifacts missing, and the age reclaim would then delete the complete local tree as
         # redundant. It is also the artifact the API fetches to serve a job at all (#85 review).
+        declared = _declared_paths(out_dir)
         for path in _upload_order(out_dir):
             # Skip symlinks BEFORE is_file() -- is_file() follows a symlink to its
             # target, so `p.is_symlink() or not p.is_file()` (checked in that
@@ -145,6 +149,10 @@ class S3BlobStore:
             # real outage MUST fail the upload rather than silently ship a partial result.
             key = self._key("results", job_id, rel)
             if len(key.encode("utf-8")) > 1024:      # hard S3 limit; no retry will fix it
+                if declared is None or rel in declared:
+                    raise OSError(  # a DECLARED artifact must never be silently dropped
+                        errno.ENAMETOOLONG,
+                        f"declared artifact {rel!r} exceeds the 1024-byte key limit", key)
                 _log.warning("put_output_skipped_unstorable_key", job_id=job_id, path=str(rel))
                 continue
             self._s3.put_object(
