@@ -346,6 +346,14 @@ class Dispatcher:
         # sweep" decision in terminal cleanup (an unconfirmed-dead container's tree, a result
         # whose upload exhausted) was therefore an unbounded leak (#85 review). This is the
         # bound, and it never touches the blob store. 0 disables.
+        # Separate from BLASTBOX_SCRATCH_MAX_AGE_S on purpose: that knob governs DELETION,
+        # this one governs RECOVERY (re-uploading a retained result and repairing its row
+        # FAILED->DONE). An operator staging an upgrade conservatively needs to be able to
+        # turn the write-side off without also disabling the only thing bounding the disk,
+        # and vice versa -- and before this there was no off-switch for the write side at
+        # all short of disabling maintenance entirely, which also kills crash recovery.
+        self._pending_upload_retry = os.environ.get(
+            "BLASTBOX_PENDING_UPLOAD_RETRY", "1").strip().lower() not in ("0", "false", "no", "off")
         self._scratch_max_age_s = max(0.0, float(
             os.environ.get("BLASTBOX_SCRATCH_MAX_AGE_S", "21600") or "21600"))
         self._retained_lock = threading.Lock()
@@ -2729,9 +2737,10 @@ class Dispatcher:
         # BEFORE the reclaim: a retained tree is a PENDING UPLOAD, and draining it is what makes
         # the reclaim's last-copy rule a temporary hold rather than a permanent one.
         try:
-            retry_pending_uploads(self._job_root, self._blobs, self._job_store, _log,
-                                  on_repaired=self._index_repaired_result,
-                                  retention_seconds=self._job_retention_seconds)
+            if self._pending_upload_retry:
+                retry_pending_uploads(self._job_root, self._blobs, self._job_store, _log,
+                                      on_repaired=self._index_repaired_result,
+                                      retention_seconds=self._job_retention_seconds)
         except Exception:  # noqa: BLE001
             _log.exception("pending-upload sweep failed")
         try:

@@ -170,6 +170,8 @@ class VmJobDispatcher:
         # that is exactly the #84 accumulation class, and on a remote-only (static/AWS) node
         # there is no container Dispatcher to sweep it up. BLASTBOX_SCRATCH_MAX_AGE_S was
         # documented as a global knob while only one dispatcher honoured it (#85 review).
+        self._pending_upload_retry = os.environ.get(
+            "BLASTBOX_PENDING_UPLOAD_RETRY", "1").strip().lower() not in ("0", "false", "no", "off")
         self._scratch_max_age_s = max(0.0, float(
             os.environ.get("BLASTBOX_SCRATCH_MAX_AGE_S", "21600") or "21600"))
         # Bound a hung validate() so a dead VM agent can't occupy a claim thread forever (heartbeat
@@ -869,9 +871,10 @@ class VmJobDispatcher:
         except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
             logger.warning("vm_dispatch: retention sweep failed", exc_info=True)
         try:
-            retry_pending_uploads(self._job_root, self._blobs, self._store, logger,
-                                  on_repaired=self._index_repaired_result,
-                                  retention_seconds=self._retention_s)
+            if self._pending_upload_retry:
+                retry_pending_uploads(self._job_root, self._blobs, self._store, logger,
+                                      on_repaired=self._index_repaired_result,
+                                      retention_seconds=self._retention_s)
         except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
             logger.warning("vm_dispatch: pending-upload sweep failed", exc_info=True)
         try:

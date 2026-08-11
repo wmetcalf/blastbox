@@ -37,6 +37,7 @@ _log = logging.getLogger("blastbox.host.jobs.retention")
 # re-examining the same prefix. Process-local and purely an ordering hint: losing it on restart
 # costs one repeated sweep, never correctness.
 _sweep_cursor: dict[str, int] = {}
+_upload_cursor: dict[str, int] = {}
 
 _JOB_ID_RE = re.compile(
     r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
@@ -352,6 +353,7 @@ def retry_pending_uploads(
     attempts: int = 1,
     on_repaired: "Callable[[str, Path], None] | None" = None,
     retention_seconds: float = 0.0,
+    max_per_sweep: int = 2000,
 ) -> int:
     """Re-attempt ``put_output`` for every local tree holding a sealed result with no durable copy.
 
@@ -374,10 +376,20 @@ def retry_pending_uploads(
         return 0
     n = 0
     try:
-        entries = list(job_root.iterdir())
+        entries = sorted(job_root.iterdir(), key=lambda p: p.name)
     except OSError as exc:
         log.warning("pending-upload sweep: cannot list %s: %s", job_root, exc)
         return 0
+    # BOUNDED and ROTATING, like the reclaim. This runs FIRST in the maintenance tick and, at
+    # default BLASTBOX_DISPATCH_CONCURRENCY=1, maintenance runs inline between dispatch_once()
+    # calls -- so on the fleet state this PR targets (97,681 dirs) an uncapped scan stats every
+    # entry on every tick before a single job can be claimed. The sentinel check is one stat, so
+    # the scan is cheap per entry, but 97k of them per tick is not free (#85 review).
+    if entries and max_per_sweep > 0:
+        start = _upload_cursor.get(str(job_root), 0) % len(entries)
+        entries = entries[start:] + entries[:start]
+        _upload_cursor[str(job_root)] = (start + max_per_sweep) % len(entries)
+        entries = entries[:max_per_sweep]
     for d in entries:
         try:
             if d.is_symlink() or not d.is_dir() or not _JOB_ID_RE.match(d.name):

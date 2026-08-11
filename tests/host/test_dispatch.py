@@ -3785,3 +3785,59 @@ def test_deleting_an_unrecoverable_last_copy_is_reported_as_data_loss(tmp_path, 
     assert any(r.levelno >= _logging.ERROR and "data loss" in r.message for r in caplog.records), (
         "the only copy of a sealed result was deleted without an ERROR saying so"
     )
+
+
+def test_the_recovery_sweep_has_its_own_off_switch(tmp_path, monkeypatch):
+    """`BLASTBOX_SCRATCH_MAX_AGE_S=0` governs DELETION; it must not be the only way to stop the
+    WRITE side. Before this, an operator staging an upgrade conservatively still got blob-store
+    writes and FAILED→DONE row rewrites on jobs a client had already been told failed, with no
+    documented knob to stop it short of disabling maintenance entirely (which also kills crash
+    recovery and the stale-queued reaper)."""
+    store = InMemoryJobStore()
+
+    monkeypatch.setenv("BLASTBOX_PENDING_UPLOAD_RETRY", "0")
+    off = _make_dispatcher(store, job_root=tmp_path)
+    assert off._pending_upload_retry is False
+
+    monkeypatch.delenv("BLASTBOX_PENDING_UPLOAD_RETRY", raising=False)
+    on = _make_dispatcher(store, job_root=tmp_path)
+    assert on._pending_upload_retry is True, "the default must stay on"
+
+
+def test_the_recovery_sweep_is_bounded_and_rotates(tmp_path):
+    """It runs FIRST in the tick and, at the default BLASTBOX_DISPATCH_CONCURRENCY=1, maintenance
+    runs inline between dispatch_once() calls — so an uncapped scan stats every entry under
+    job_root before a single job can be claimed. On the fleet state this PR targets that is 97,681
+    stats per tick. Bounded, and rotating so a capped prefix cannot starve the tail."""
+    from blastbox.host.jobs.retention import (PENDING_UPLOAD_SENTINEL, RESULT_RETAINED_MARKER,
+                                              retry_pending_uploads)
+    import logging as _logging
+
+    class Blobs:
+        seen: list = []
+
+        def has_output(self, job_id):
+            return False
+
+        def put_output(self, job_id, out_dir):
+            type(self).seen.append(job_id)
+
+    store = InMemoryJobStore()
+    ids = []
+    for i in range(6):
+        jid = f"{i:08d}-9999-4999-8999-999999999999"
+        ids.append(jid)
+        d = tmp_path / jid
+        (d / "output").mkdir(parents=True)
+        (d / "output" / "metadata.json").write_text("{}")
+        (d / PENDING_UPLOAD_SENTINEL).write_text("")
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = jid
+        job.status = JobStatus.FAILED
+        job.error = f"x; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+
+    retry_pending_uploads(tmp_path, Blobs(), store, _logging.getLogger("t"), max_per_sweep=2)
+    assert len(Blobs.seen) == 2, f"the cap did not bound the sweep ({len(Blobs.seen)} uploads)"
+    retry_pending_uploads(tmp_path, Blobs(), store, _logging.getLogger("t"), max_per_sweep=2)
+    assert len(set(Blobs.seen)) == 4, "the second tick re-scanned the same prefix"
