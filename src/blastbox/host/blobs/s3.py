@@ -92,6 +92,13 @@ class S3BlobStore:
 
     # ── results ──────────────────────────────────────────────────────────────
     def put_output(self, job_id: str, out_dir: Path) -> None:
+        # The terminal purge deletes the local tree on the strength of THIS call, so a
+        # silent no-op here turns "upload succeeded" into a DONE job with no durable copy
+        # anywhere. rglob on a missing dir yields nothing and raises nothing, so assert the
+        # durability barrier explicitly (#85 review).
+        out_dir = Path(out_dir)
+        if not out_dir.is_dir():
+            raise FileNotFoundError(f"put_output: output dir missing for {job_id}: {out_dir}")
         out_dir = Path(out_dir)
         for path in sorted(out_dir.rglob("*")):
             # Skip symlinks BEFORE is_file() -- is_file() follows a symlink to its

@@ -976,7 +976,17 @@ class Dispatcher:
             # failure, exception, or unknown engine -- then purge the whole job dir. output/ used
             # to survive here forever, which is the leak in issue #84.
             self._delete_input_if_owned(job, input_path)
-            self._purge_job_dir_if_owned(job)
+            if orphaned:
+                # `docker kill` was NOT confirmed, which is exactly why the permit above is
+                # retained -- the container may still be running with job_root/<id>/output
+                # bind-mounted 0o777. rmtree'ing a tree a live writer is using races it into a
+                # half-deleted state and a spurious "PURGE FAILED ... sample bytes may remain",
+                # and its open fds pin the disk anyway, so nothing is reclaimed. Leave it for the
+                # maintenance sweep that already reconciles these orphans (#85 review).
+                _log.warning("job %s: worker container not confirmed gone; retaining %s until a "
+                             "sweep reclaims it", job.job_id, self._job_root / job.job_id)
+            else:
+                self._purge_job_dir_if_owned(job)
             self._record_outcome(job, path="cold", started=t0)
 
     def _requeue_claimed(self, job: Job, *, reason: str, defer: bool = False) -> None:
@@ -1085,6 +1095,17 @@ class Dispatcher:
     def _record_outcome(self, job: Job, *, path: str, started: float) -> None:
         """Record the dispatched-job outcome + duration (warm|cold). Read the
         final status from the store so a crash mid-dispatch counts as 'failed'."""
+        # Metrics must never mask the job's real outcome: this runs from the same terminal
+        # `finally` as the input delete and the purge, so a store error here would surface
+        # instead of the DONE/FAILED the job actually produced (#85 review).
+        try:
+            return self._record_outcome_inner(job, path=path, started=started)
+        except Exception:  # noqa: BLE001
+            _log.warning("job %s: failed to record outcome metrics", job.job_id,
+                         exc_info=True)
+            return
+
+    def _record_outcome_inner(self, job: Job, *, path: str, started: float) -> None:
         final = self._job_store.get(job.job_id)
         outcome = "done" if final is not None and final.status == JobStatus.DONE else "failed"
         record_job_dispatched(path=path, outcome=outcome)

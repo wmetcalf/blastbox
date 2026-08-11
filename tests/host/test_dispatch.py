@@ -2658,3 +2658,45 @@ def test_a_store_failure_during_purge_does_not_escape_or_delete(tmp_path):
     assert (tmp_path / job.job_id).exists(), (
         "ownership was unprovable, so the tree must be left for its real owner, not deleted"
     )
+
+
+def test_a_live_orphaned_container_keeps_its_bind_mounted_tree(tmp_path):
+    """Do not rmtree a tree a possibly-live worker still has bind-mounted (#85 review).
+
+    The same `finally` deliberately RETAINS the concurrency permit when `docker kill` was not
+    confirmed, on the grounds the container may still be running. Purging its bind-mount source
+    five lines later races a live writer into a half-deleted tree and a spurious
+    "PURGE FAILED ... sample bytes may remain", and its open fds pin the disk regardless — so
+    nothing is even reclaimed.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    out = tmp_path / job.job_id / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "metadata.json").write_text("{}")
+
+    def fake_runner(argv, **kw):
+        if "kill" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "kill failed")   # NOT confirmed gone
+        raise subprocess.TimeoutExpired(argv, 1)
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher.dispatch_once()
+
+    assert (tmp_path / job.job_id).exists(), (
+        "purged a tree whose worker container was never confirmed dead"
+    )
+
+
+def test_put_output_is_a_real_durability_barrier(tmp_path):
+    """The terminal purge deletes the local tree on the strength of put_output succeeding, so a
+    silent no-op there yields a DONE job with no copy anywhere (#85 review). rglob on a missing
+    directory yields nothing and raises nothing, so the barrier has to be asserted explicitly.
+    """
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    with pytest.raises(FileNotFoundError):
+        store.put_output("jid", tmp_path / "jobs" / "jid" / "output")   # never created
