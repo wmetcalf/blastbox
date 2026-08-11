@@ -8,6 +8,7 @@ import shutil
 import logging
 import hashlib
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -228,12 +229,23 @@ def _sealed_metadata(job_root: Path, job) -> dict:
     precisely so the purge cannot touch them -- see blobs/local.py's header. Reading there is
     also more faithful: it is the copy the API actually serves.
     """
-    return json.loads((job_root.parent / "blobs" / "results" / job.job_id / "metadata.json").read_text())
+    return json.loads((_blob_root(job_root) / "results" / job.job_id / "metadata.json").read_text())
+
+
+def _blob_root(job_root: Path) -> Path:
+    """Where LocalBlobStore actually put the durable copy.
+
+    Derived from the SAME env the factory reads, not hardcoded: with BLASTBOX_BLOB_LOCAL_ROOT
+    set in an operator's environment the store writes elsewhere, and a hardcoded sibling path
+    made these tests fail on correct production behaviour (#85 review).
+    """
+    configured = os.environ.get("BLASTBOX_BLOB_LOCAL_ROOT", "").strip()
+    return Path(configured) if configured else job_root.parent / "blobs"
 
 
 def _durable_artifact(job_root: Path, job, rel: str) -> Path:
     """Path to a sealed artifact in the durable blob copy (see _sealed_metadata)."""
-    return job_root.parent / "blobs" / "results" / job.job_id / rel
+    return _blob_root(job_root) / "results" / job.job_id / rel
 
 
 class _RecordingBlobs:
@@ -2700,3 +2712,75 @@ def test_put_output_is_a_real_durability_barrier(tmp_path):
     store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
     with pytest.raises(FileNotFoundError):
         store.put_output("jid", tmp_path / "jobs" / "jid" / "output")   # never created
+
+
+def test_scratch_reclaim_bounds_the_dirs_the_purge_deliberately_skips(tmp_path):
+    """The terminal purge skips two trees on purpose — an unconfirmed-dead container's, and a
+    result whose upload exhausted (the only copy). Without a bound those leak forever, because
+    the retention sweeper is gated on job_retention_seconds > 0 and that knob also deletes
+    results from the blob store. This is the bound, and it must not touch the blob store (#85).
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    stale = tmp_path / "11111111-1111-4111-8111-111111111111"
+    (stale / "output").mkdir(parents=True)
+    (stale / "output" / "rmeta").write_text("extracted sample text")
+    os.utime(stale, (time.time() - 3600, time.time() - 3600))
+
+    fresh = tmp_path / "22222222-2222-4222-8222-222222222222"
+    (fresh / "output").mkdir(parents=True)
+
+    blobs_before = sorted((tmp_path.parent / "blobs").rglob("*")) if (tmp_path.parent / "blobs").exists() else []
+    assert dispatcher._reap_stale_scratch() == 1
+    assert not stale.exists(), "the aged tree was not reclaimed"
+    assert fresh.exists(), "a live/recent tree must never be reclaimed on age"
+    blobs_after = sorted((tmp_path.parent / "blobs").rglob("*")) if (tmp_path.parent / "blobs").exists() else []
+    assert blobs_before == blobs_after, "scratch reclaim must never touch the blob store"
+
+
+def test_scratch_reclaim_is_off_when_disabled(tmp_path):
+    """0 disables it — an operator who wants trees kept must be able to keep them."""
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 0.0
+    old = tmp_path / "33333333-3333-4333-8333-333333333333"
+    old.mkdir(parents=True)
+    os.utime(old, (time.time() - 99999, time.time() - 99999))
+    assert dispatcher._reap_stale_scratch() == 0
+    assert old.exists()
+
+
+def test_purge_refuses_a_sibling_alias_job_id(tmp_path):
+    """Containment alone is not enough: "victim/child/.." is strictly UNDER job_root yet resolves
+    to a different job's tree, so a malformed store row could rmtree a live peer's working dir.
+    Job.from_dict() does not validate IDs, so such a row can reach here (#85 review).
+    """
+    from blastbox.host.jobs.retention import purge_job_dir
+
+    job_root = tmp_path / "jobs"
+    (job_root / "victim" / "child").mkdir(parents=True)
+    (job_root / "victim" / "keep").write_text("live peer's work")
+
+    for hostile in ("victim/child/..", "", ".", "..", "../jobs", "a/b"):
+        purge_job_dir(job_root, hostile, logging.getLogger("t"))
+
+    assert (job_root / "victim" / "keep").exists(), "a sibling job's tree was destroyed"
+    assert job_root.exists()
+
+
+def test_purge_survives_a_path_that_cannot_be_canonicalised(tmp_path):
+    """resolve() itself can raise (a symlink loop raises RuntimeError on 3.12). Both dispatchers
+    call this from terminal cleanup, so an escape masks the job's outcome and skips its metrics.
+    The docstring promises best-effort; the boundary must cover canonicalisation too.
+    """
+    from blastbox.host.jobs.retention import purge_job_dir
+
+    job_root = tmp_path / "jobs"
+    job_root.mkdir(parents=True)
+    loop = job_root / "loopy"
+    loop.symlink_to(job_root / "loopy2")
+    (job_root / "loopy2").symlink_to(loop)
+
+    purge_job_dir(job_root, "loopy", logging.getLogger("t"))   # must not raise

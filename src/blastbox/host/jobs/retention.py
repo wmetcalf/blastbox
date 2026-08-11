@@ -47,16 +47,33 @@ def purge_job_dir(job_root: "Path", job_id: str, log: "logging.Logger") -> None:
     clean up after itself. Containment: resolve first, then refuse anything that does not land
     strictly under ``job_root`` (guards a job_id carrying traversal components).
     """
-    root = (job_root / job_id).resolve()
-    jr = job_root.resolve()
+    # ONE canonical path component, decided BEFORE touching the filesystem. Containment alone
+    # is not enough: "victim/child/.." is strictly under job_root yet resolves to a DIFFERENT
+    # job's tree, so a malformed store row could rmtree a live peer's working directory. Job IDs
+    # are server-side uuid4 and ingress validates them, but Job.from_dict() does not, so an
+    # imported or corrupted row reaches here unvalidated (#85 review).
+    # A job_id must be ONE path component. Containment alone is not enough: "victim/child/.."
+    # is strictly under job_root yet resolves to a DIFFERENT job's tree, so a malformed store
+    # row could rmtree a live peer's working directory. (Degenerate ids like "" / "." / ".."
+    # are left to the root-equality and containment guards below, which already reject them --
+    # a duplicate pre-check here is unreachable and mutation-testing cannot justify it.)
+    if not job_id or "/" in job_id or "\\" in job_id:
+        log.error("refusing to purge: job_id %r is not a single path component", job_id)
+        return
+    # Canonicalisation itself can raise -- a symlink loop makes Path.resolve() raise RuntimeError
+    # on 3.12, and other filesystem errors escape too. Both dispatchers call this from terminal
+    # cleanup, so an escape here masks the job's outcome and skips its metrics. The docstring
+    # promises best-effort; make the boundary cover the whole operation, not just the rmtree.
+    try:
+        root = (job_root / job_id).resolve()
+        jr = job_root.resolve()
+    except (OSError, RuntimeError) as exc:
+        log.error("PURGE FAILED for job %s: cannot canonicalise under %s: %s — sample bytes may "
+                  "remain on this worker's disk", job_id, job_root, exc)
+        return
     if root == jr:
-        # STRICTLY under, not equal. Path.relative_to(itself) returns "." rather than raising,
-        # so an empty/"."/None-coerced job_id sailed through the guard below and rmtree'd the
-        # ENTIRE job_root -- every peer container's in-flight tree on a shared-mount node, from
-        # one bad store row. Not reachable today (job_ids are server-side uuid4 and ingress
-        # validates them), but this function's docstring calls itself a security invariant.
-        log.error("refusing to purge job_root itself (%s) — empty or traversal job_id %r",
-                  jr, job_id)
+        # STRICTLY under, not equal: Path.relative_to(itself) returns "." rather than raising.
+        log.error("refusing to purge job_root itself (%s) — degenerate job_id %r", jr, job_id)
         return
     try:
         root.relative_to(jr)

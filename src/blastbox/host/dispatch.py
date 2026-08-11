@@ -323,6 +323,15 @@ class Dispatcher:
         # false BY CONSTRUCTION, and the tree holds host-sealed, trust-gate-passed output plus
         # one-shot evidence (the netd C2 pcap is MOVED, not copied, into it). Reviewed on #85.
         self._upload_failed_job_ids: set[str] = set()
+        # Age-based reclaim of per-job SCRATCH, deliberately independent of
+        # job_retention_seconds. That knob governs RESULT lifecycle -- its sweeper also calls
+        # blob_store.delete_job(), so it must stay 0 in any deployment that wants to keep
+        # results, which left NOTHING in-process reclaiming job_root. Every "leave it for the
+        # sweep" decision in terminal cleanup (an unconfirmed-dead container's tree, a result
+        # whose upload exhausted) was therefore an unbounded leak (#85 review). This is the
+        # bound, and it never touches the blob store. 0 disables.
+        self._scratch_max_age_s = max(0.0, float(
+            os.environ.get("BLASTBOX_SCRATCH_MAX_AGE_S", "21600") or "21600"))
         self._retained_lock = threading.Lock()
         # Set once shutdown begins: a dispatch worker abandoned past the join deadline (e.g. blocked
         # in a slow claim_next) must NOT acquire a cold permit and spawn a container after the CLI
@@ -2635,6 +2644,10 @@ class Dispatcher:
             self._fail_stale_queued_jobs()
         except Exception:  # noqa: BLE001
             _log.exception("stale-queued sweep failed")
+        try:
+            self._reap_stale_scratch()
+        except Exception:  # noqa: BLE001
+            _log.exception("scratch reclaim failed")
         if self._job_retention_seconds > 0:
             try:
                 from blastbox.host.jobs.retention import JobRetentionSweeper
@@ -2650,6 +2663,41 @@ class Dispatcher:
             self._reconcile_cold_orphans()
         except Exception:  # noqa: BLE001
             _log.exception("cold-orphan reconcile failed")
+
+    def _reap_stale_scratch(self) -> int:
+        """Reclaim per-job scratch dirs older than ``BLASTBOX_SCRATCH_MAX_AGE_S``.
+
+        The terminal purge handles the normal case. This bounds the ones it deliberately
+        SKIPS -- a tree whose worker container was never confirmed dead, and a result whose
+        upload exhausted its retries (which must be retained, since it is then the only copy).
+        Without this they leak forever, because the retention sweeper is gated on
+        job_retention_seconds > 0 and that knob also deletes results from the blob store.
+
+        Age-based on purpose: it needs no store lookup, so it cannot be fooled by a corrupt
+        row, and mtime rises whenever a live writer touches the tree -- a job still being
+        worked on is never old enough to qualify. SCRATCH ONLY: the blob store is untouched.
+        """
+        if self._scratch_max_age_s <= 0 or not self._job_root.is_dir():
+            return 0
+        cutoff = time.time() - self._scratch_max_age_s
+        n = 0
+        try:
+            entries = list(self._job_root.iterdir())
+        except OSError as exc:
+            _log.warning("scratch reclaim: cannot list %s: %s", self._job_root, exc)
+            return 0
+        for d in entries:
+            try:
+                if not d.is_dir() or d.stat().st_mtime > cutoff:
+                    continue
+            except OSError:
+                continue
+            purge_job_dir(self._job_root, d.name, _log)
+            n += 1
+        if n:
+            _log.info("scratch reclaim: removed %d job dir(s) older than %.0fs from %s",
+                      n, self._scratch_max_age_s, self._job_root)
+        return n
 
     def _reconcile_cold_orphans(self) -> None:
         """Release cold permits we RETAINED for a failed-kill container ONCE `docker ps` confirms
