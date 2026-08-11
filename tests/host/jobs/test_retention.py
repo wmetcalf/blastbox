@@ -12,6 +12,7 @@ import pytest
 from blastbox.host.jobs.base import Job, JobStatus
 from blastbox.host.jobs.memory import InMemoryJobStore
 from blastbox.host.jobs.retention import (
+    RESULT_RETAINED_MARKER,
     JobRetentionSweeper,
     purge_job_dir,
     retry_pending_uploads,
@@ -553,3 +554,42 @@ class TestRetryPendingUploads:
 
         assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
         assert (d / "output" / "metadata.json").exists()
+
+    def test_repairs_the_job_to_done_so_the_recovered_result_is_actually_servable(self, tmp_path):
+        """Uploading the bytes is only HALF the recovery.
+
+        The job was FAILED because its upload exhausted, and open_output is DONE-gated — so a
+        recovered result stayed unreachable and the API answered 409 forever. From a client's
+        view that is identical to having discarded it, which is the very outcome this whole
+        mechanism exists to avoid. Found by end-to-end testing against a real dispatcher: the
+        sweep logged "now durably stored" while /v1/jobs/<id>/result still returned
+        "job not done (status=failed)".
+        """
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+        _sealed_tree(tmp_path, _JID)
+
+        assert retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t")) == 1
+        repaired = store.get(_JID)
+        assert repaired.status is JobStatus.DONE
+        assert repaired.error is None
+
+    def test_does_not_repair_a_job_that_failed_for_any_other_reason(self, tmp_path):
+        """The repair is gated on OUR marker, so it can only ever undo the failure this sweep just
+        fixed. A job that failed in the trust gate or the worker must stay FAILED even if a sealed
+        tree happens to be lying next to it — silently promoting that to DONE would serve a result
+        for a job that genuinely did not succeed."""
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.error = "worker exited non-zero"
+        store.create(job)
+        _sealed_tree(tmp_path, _JID)
+
+        assert retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t")) == 1
+        assert store.get(_JID).status is JobStatus.FAILED, "promoted an unrelated failure to DONE"

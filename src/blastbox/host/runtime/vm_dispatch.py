@@ -35,6 +35,7 @@ from blastbox.contract.envelope import atomic_write_confined
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.jobs.retention import (
+    RESULT_RETAINED_MARKER,
     JobRetentionSweeper,
     purge_job_dir,
     reap_stale_scratch,
@@ -649,8 +650,8 @@ class VmJobDispatcher:
                         job.job_id, self._put_output_max_attempts, upload_exc,
                     )
                     ok = False
-                    err = (f"result upload failed after {self._put_output_max_attempts} attempts; "
-                           "result retained on this worker (no durable copy)")
+                    err = (f"result upload failed after {self._put_output_max_attempts} "
+                           f"attempts; {RESULT_RETAINED_MARKER}")
                     # Finding S1: a partial result may already be sitting under
                     # results/<job_id> (some of put_output's per-file writes may have landed
                     # before a later one failed). This attempt marks the job FAILED (never

@@ -33,6 +33,11 @@ _JOB_ID_RE = re.compile(
 # Only these statuses are eligible for expiry.
 _TERMINAL = frozenset({JobStatus.DONE, JobStatus.FAILED, JobStatus.EXPIRED})
 
+# The one marker that identifies "the analysis finished; only its upload didn't". Both
+# dispatchers build their failure message with it and retry_pending_uploads matches on it, so
+# there is a SINGLE definition rather than a literal duplicated across three call sites.
+RESULT_RETAINED_MARKER = "result retained on this worker (no durable copy)"
+
 
 def purge_job_dir(job_root: "Path", job_id: str, log: "logging.Logger") -> bool:
     """Remove a job's ENTIRE per-job dir (input AND output) from this worker's disk.
@@ -189,6 +194,24 @@ def retry_pending_uploads(
         if upload_exc is None:
             n += 1
             log.info("pending-upload sweep: result for %s is now durably stored", d.name)
+            # REPAIR THE JOB. Uploading the bytes is only half of it: the job was FAILED because
+            # its upload exhausted, and open_output is DONE-gated, so a recovered result stays
+            # unreachable -- from a client's view the outcome is identical to having discarded it.
+            # The analysis DID finish and its result is now durable, so DONE is the honest status.
+            # CAS-fenced on FAILED and gated on OUR marker, so it can only ever repair the failure
+            # this sweep just undid -- never a job that failed for any other reason, and never a
+            # peer's terminal state (#85, found by end-to-end testing: the sweep reported success
+            # while the API still answered 409).
+            if row is not None and RESULT_RETAINED_MARKER in (row.error or ""):
+                try:
+                    if job_store.update_if_status(
+                        d.name, JobStatus.FAILED, status=JobStatus.DONE, error=None,
+                    ):
+                        log.info("pending-upload sweep: job %s repaired to DONE (its result is "
+                                 "durable now)", d.name)
+                except Exception:  # noqa: BLE001 -- the bytes are safe; the status can retry
+                    log.warning("pending-upload sweep: uploaded %s but could not repair its "
+                                "status", d.name, exc_info=True)
         else:
             log.warning("pending-upload sweep: %s still has no durable copy (%s); retaining "
                         "the local tree", d.name, upload_exc)

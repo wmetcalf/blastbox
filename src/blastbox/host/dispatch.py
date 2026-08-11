@@ -27,6 +27,7 @@ import re
 import shutil
 
 from blastbox.host.jobs.retention import (
+    RESULT_RETAINED_MARKER,
     purge_job_dir,
     reap_stale_scratch,
     retry_pending_uploads,
@@ -1534,7 +1535,7 @@ class Dispatcher:
                 self._fail_job(
                     job,
                     f"result upload failed after {self._put_output_max_attempts} attempts; "
-                    "result retained on this worker (no durable copy)",
+                    f"{RESULT_RETAINED_MARKER}",
                 )
                 return
 
@@ -2054,7 +2055,7 @@ class Dispatcher:
             self._fail_job(
                 job,
                 f"result upload failed after {self._put_output_max_attempts} attempts; "
-                "result retained on this worker (no durable copy)",
+                f"{RESULT_RETAINED_MARKER}",
             )
             return
 
