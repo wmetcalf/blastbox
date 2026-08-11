@@ -989,3 +989,79 @@ class TestRemovalRobustness:
         assert any(r.levelno >= logging.ERROR for r in caplog.records), (
             "a failed sentinel write was logged below ERROR"
         )
+
+    def test_a_repaired_job_gets_a_FRESH_retention_clock(self, tmp_path):
+        """Recovery must restart the retention clock, not inherit a dead one.
+
+        The row still carried the expires_at that _fail_job computed at the ORIGINAL failure, so
+        after any outage longer than job_retention_seconds the repaired job was already past its
+        expiry — expire_due would delete the freshly recovered result later in the SAME
+        maintenance tick, before any client could fetch it (it was never servable while FAILED).
+        """
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.error = f"upload failed; {RESULT_RETAINED_MARKER}"
+        job.expires_at = time.time() - 10_000          # long past, from the original failure
+        store.create(job)
+        _sealed_tree(tmp_path, _JID)
+
+        retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"),
+                              retention_seconds=3600)
+        row = store.get(_JID)
+        assert row.status is JobStatus.DONE
+        assert row.expires_at > time.time(), "repaired job kept an already-expired retention clock"
+
+    def test_a_failing_post_repair_hook_leaves_a_servable_job_and_says_so(self, tmp_path, caplog):
+        """The recovery itself must stand, and the shortfall must be visible.
+
+        Keeping the sentinel here would NOT buy a retry — this sweep only looks at FAILED rows and
+        the row is DONE by then — so the honest behaviour is: the result is durable and servable,
+        the /similar index and the counts are missing, and that is logged rather than pretended
+        away. The clear happens after the hook so a CRASH mid-recovery (as opposed to a handled
+        error) still leaves the marker, the tree, and another attempt.
+        """
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.error = f"upload failed; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+        d = _sealed_tree(tmp_path, _JID)
+
+        def boom(jid, out):
+            raise RuntimeError("indexer down")
+
+        with caplog.at_level(logging.WARNING):
+            retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"),
+                                  on_repaired=boom)
+        assert store.get(_JID).status is JobStatus.DONE, "the repair itself must stand"
+        assert not (d / PENDING_UPLOAD_SENTINEL).exists(), (
+            "kept a marker no later tick can act on — a mechanism that does not exist"
+        )
+        assert any("post-repair indexing failed" in r.message for r in caplog.records), (
+            "the shortfall was not reported"
+        )
+
+    def test_expiry_never_deletes_a_pending_upload_tree(self, tmp_path):
+        """The reclaim spares this tree as the only copy, and the retention sweeper would rmtree
+        it a few lines later in the SAME tick — with the operator's own
+        BLASTBOX_JOB_RETENTION_SECONDS as the trigger, and the docs promising the opposite.
+        Expiry is a RESULT lifecycle policy; it has no business destroying bytes that were never
+        durably stored."""
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.error = f"upload failed; {RESULT_RETAINED_MARKER}"
+        job.expires_at = time.time() - 10
+        job.result_dir = str(tmp_path / _JID / "output")
+        store.create(job)
+        d = _sealed_tree(tmp_path, _JID)
+
+        JobRetentionSweeper(job_root=tmp_path).expire_due(store)
+
+        assert (d / "output" / "metadata.json").exists(), (
+            "retention destroyed the only copy of a host-sealed result"
+        )

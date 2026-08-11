@@ -2730,7 +2730,8 @@ class Dispatcher:
         # the reclaim's last-copy rule a temporary hold rather than a permanent one.
         try:
             retry_pending_uploads(self._job_root, self._blobs, self._job_store, _log,
-                                  on_repaired=self._index_repaired_result)
+                                  on_repaired=self._index_repaired_result,
+                                  retention_seconds=self._job_retention_seconds)
         except Exception:  # noqa: BLE001
             _log.exception("pending-upload sweep failed")
         try:

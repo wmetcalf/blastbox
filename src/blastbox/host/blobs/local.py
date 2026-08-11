@@ -20,7 +20,6 @@ import errno
 import hashlib
 import os
 import shutil
-import threading
 import uuid
 from pathlib import Path
 from typing import BinaryIO
@@ -63,17 +62,24 @@ class LocalBlobStore:
         """Copy *src* -> *dest* via a temp file in the same dir + atomic rename, so a
         crash mid-copy can never leave a truncated blob that a later read would trust.
 
-        The temp name includes a per-call uuid4 (plus the thread id, belt-and-braces)
-        rather than just the PID: two threads in the SAME process can race to
-        ``put_sample`` byte-identical content (the ingress upload path is threaded via
-        an ``api_workers``-wide semaphore), and a PID-only name would let both writers
-        share one temp path, interleaving/truncating each other before either
-        ``os.replace`` — corrupting the bytes that rename then atomically publishes.
+        The temp name is a per-call uuid4 and NOTHING ELSE -- specifically not the
+        destination's name. A uuid4 alone already gives the uniqueness this needs: two threads in
+        the SAME process can race to ``put_sample`` byte-identical content (the ingress upload
+        path is threaded via an ``api_workers``-wide semaphore), and a shared temp path would let
+        both writers interleave/truncate each other before either ``os.replace`` — corrupting the
+        bytes that rename then atomically publishes.
+
+        Including ``dest.name`` inflated the temp basename by ~62 characters, so a DECLARED
+        artifact with a ~200-char name -- which the filesystem, the envelope (path allows 4096)
+        and S3 all accept -- made this raise ENAMETOOLONG on a destination that is perfectly
+        storable. That failure is deterministic, so the pending-upload sweep could never drain
+        it: the job stayed FAILED forever, every result route answered 409, and the reclaim held
+        the tree as the last copy indefinitely. #84 on demand, from one artifact name (#85
+        review). A fixed-length temp keeps "storable destination" and "storable temp" the same
+        question.
         """
         dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.parent / (
-            f".{dest.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.part"
-        )
+        tmp = dest.parent / f".tmp-{uuid.uuid4().hex}.part"
         try:
             shutil.copyfile(src, tmp)
             os.replace(tmp, dest)

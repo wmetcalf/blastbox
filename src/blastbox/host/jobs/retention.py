@@ -351,6 +351,7 @@ def retry_pending_uploads(
     *,
     attempts: int = 1,
     on_repaired: "Callable[[str, Path], None] | None" = None,
+    retention_seconds: float = 0.0,
 ) -> int:
     """Re-attempt ``put_output`` for every local tree holding a sealed result with no durable copy.
 
@@ -440,8 +441,17 @@ def retry_pending_uploads(
             # while the API still answered 409).
             repaired = False
             try:
+                # finished_at/expires_at are re-stamped from NOW. The row still carried the
+                # clock _fail_job set at the ORIGINAL failure, so after any outage longer than
+                # job_retention_seconds the repaired job was already past its expiry: expire_due
+                # would delete the freshly recovered result later in this same tick, before any
+                # client could fetch it (it was never servable while FAILED). Recovery has to
+                # restart the retention clock, not inherit a dead one (#85 review).
+                now_ts = time.time()
                 repaired = job_store.update_if_status(
                     d.name, JobStatus.FAILED, status=JobStatus.DONE, error=None,
+                    finished_at=now_ts,
+                    expires_at=(now_ts + retention_seconds) if retention_seconds > 0 else None,
                 )
             except Exception:  # noqa: BLE001 -- the bytes are safe; the status can retry
                 log.warning("pending-upload sweep: uploaded %s but could not repair its "
@@ -463,14 +473,24 @@ def retry_pending_uploads(
             # failed status CAS left no marker for the next sweep to find, so the job stayed
             # FAILED forever with its result durable and every result route answering 409 -- the
             # fall-through repair exists precisely for that case and could never run (#85 review).
-            if repaired:
-                _clear_pending_upload(job_root, d.name)
             if repaired and on_repaired is not None:
                 try:
                     on_repaired(d.name, out_dir)
                 except Exception:  # noqa: BLE001
-                    log.warning("pending-upload sweep: %s was repaired, but its post-repair "
-                                "indexing failed", d.name, exc_info=True)
+                    # ACCEPTED RESIDUAL, stated plainly rather than papered over. Keeping the
+                    # sentinel here would NOT buy a retry: this sweep only looks at FAILED rows,
+                    # and the row is DONE now, so no later tick would act on the marker -- it
+                    # would just hold a stat forever and read like a mechanism that does not
+                    # exist. The result itself is durable and servable; what is lost is the
+                    # /similar index entry and the artifact/warning counts, which are cosmetic
+                    # and separately rebuildable. Logged at WARNING so it is visible (#85 review).
+                    log.warning("pending-upload sweep: %s was repaired and its result is durable, "
+                                "but post-repair indexing failed; the job is servable with a null "
+                                "summary and no /similar entry", d.name, exc_info=True)
+            # LAST: after the CAS and after the hook, so a crash mid-recovery leaves the marker
+            # (and therefore the tree, and therefore another attempt) rather than a half-done job.
+            if repaired:
+                _clear_pending_upload(job_root, d.name)
         else:
             log.warning("pending-upload sweep: %s still has no durable copy (%s); retaining "
                         "the local tree", d.name, upload_exc)
@@ -567,6 +587,8 @@ def reap_stale_scratch(
         except (OSError, RuntimeError, ValueError):
             pass
     retained_last_copy: list[str] = []
+    unreachable_last_copy: list[str] = []
+    unconfirmed: list[str] = []
     # Counts WORK, not deletions. Capping on removals alone never bounded anything in the state
     # this was written for: a retained or undeletable tree still costs a full rglob walk, a store
     # round-trip and a has_output() call, none of which advanced the counter -- so the sweep
@@ -669,8 +691,7 @@ def reap_stale_scratch(
         try:
             job = job_store.get(d.name)
         except Exception:  # noqa: BLE001 -- store trouble must not turn into deletion
-            log.warning("scratch reclaim: cannot confirm job %s is terminal; leaving it",
-                         d.name)
+            unconfirmed.append(d.name)      # aggregated: see below
             continue
         if job is not None and job.status not in (JobStatus.DONE, JobStatus.FAILED,
                                                   JobStatus.EXPIRED):
@@ -701,8 +722,15 @@ def reap_stale_scratch(
         # result, and expire_due clears expires_at so it is never selected again) or the row is
         # gone entirely (DELETE /v1/jobs), nothing will ever upload the tree -- retry_pending_
         # uploads requires a FAILED row -- so holding it is an immortal leak, not protection.
-        pending = ((d / PENDING_UPLOAD_SENTINEL).is_file()
-                   and job is not None and job.status is JobStatus.FAILED)
+        marked = (d / PENDING_UPLOAD_SENTINEL).is_file()
+        # The hold only means anything while the retry is genuinely outstanding: the sweep needs a
+        # FAILED row, so once the row is EXPIRED (retention dropped it) or gone (deleted, or a
+        # Redis key past its TTL) nothing will ever upload this tree and holding it is an
+        # immortal leak. But deleting the only copy of a sealed result is not routine hygiene
+        # either -- it is data loss, and it says so, once, at ERROR (#85 review).
+        pending = marked and job is not None and job.status is JobStatus.FAILED
+        if marked and not pending:
+            unreachable_last_copy.append(d.name)
         if blob_store is not None and (pending or (job is not None
                                                    and job.status is JobStatus.DONE)):
             try:
@@ -725,6 +753,17 @@ def reap_stale_scratch(
         # "removed N job dir(s)" line report directories still on disk, forever.
         if purge_job_dir(job_root, d.name, log):
             n += 1
+    if unconfirmed:
+        # ONE line, not up to max_per_sweep of them. A store outage on a node holding the #84
+        # backlog emitted 2000 identical warnings per tick, burying the store error itself --
+        # the same reason the last-copy warning below is aggregated.
+        log.warning("scratch reclaim: could not confirm %d job(s) are terminal (store error); "
+                    "leaving them (e.g. %s)", len(unconfirmed), ", ".join(sorted(unconfirmed)[:3]))
+    if unreachable_last_copy:
+        log.error("scratch reclaim: DELETING %d tree(s) whose result was never durably stored and "
+                  "whose job row is gone or expired — nothing can upload them and nothing can "
+                  "serve them, so this is data loss, not hygiene (e.g. %s)",
+                  len(unreachable_last_copy), ", ".join(sorted(unreachable_last_copy)[:3]))
     if retained_last_copy:
         log.warning("scratch reclaim: retained %d tree(s) holding a sealed result with no durable "
                     "copy in the blob store — deleting them would destroy the last copy (e.g. %s)",
@@ -798,7 +837,19 @@ class JobRetentionSweeper:
         result_dir: str | None,
     ) -> None:
         """Delete artifacts and mark the job EXPIRED in the store."""
-        if result_dir is not None:
+        # NEVER delete a pending-upload tree. The reclaim two blocks earlier in this same
+        # maintenance tick deliberately spares it as the only copy of a host-sealed result, and
+        # this sweeper would then rmtree it a few lines later -- with the operator's own
+        # BLASTBOX_JOB_RETENTION_SECONDS as the trigger, and with the docs promising the exact
+        # opposite. Expiry is a RESULT lifecycle policy; it has no business destroying bytes that
+        # were never durably stored in the first place (#85 review). The blob delete below still
+        # runs (it is a no-op when nothing landed) and the row still advances, so a later sweep
+        # after the upload finally succeeds collects the tree normally.
+        pending = (self._job_root / job_id / PENDING_UPLOAD_SENTINEL).is_file()
+        if pending:
+            _log.warning("retention: %s has a sealed result with no durable copy; expiring the "
+                         "row but KEEPING the local tree (it is the only copy)", job_id)
+        if result_dir is not None and not pending:
             self._safe_rmtree(job_id, Path(result_dir))
 
         blob_delete_ok = True

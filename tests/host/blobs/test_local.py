@@ -2,6 +2,7 @@
 rooted OUTSIDE job_root (see tests/host/blobs/test_local_roundtrip.py for the
 property this exists to guarantee: bytes surviving job-dir destruction). These
 tests cover the per-method contract in isolation."""
+import errno
 import hashlib
 import json
 from pathlib import Path
@@ -302,7 +303,7 @@ def test_a_real_upload_error_still_fails_the_upload(tmp_path, monkeypatch):
         store.put_output("j-enospc", out)
 
 
-def test_a_DECLARED_artifact_is_never_silently_skipped(tmp_path):
+def test_a_DECLARED_artifact_is_never_silently_skipped(tmp_path, monkeypatch):
     """Skipping an unstorable name is safe only for an UNDECLARED file.
 
     Undeclared files are not servable (the result routes are manifest-gated), so dropping one
@@ -314,7 +315,7 @@ def test_a_DECLARED_artifact_is_never_silently_skipped(tmp_path):
     store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
     out = tmp_path / "out"
     (out / "nested").mkdir(parents=True)
-    long_name = "n" * 250
+    long_name = "n" * 200
     (out / "nested" / long_name).write_bytes(b"THE DECLARED ARTIFACT")
     (out / "metadata.json").write_text(json.dumps({
         "engine": "redtusk", "status": "ok", "input_sha256": "a" * 64,
@@ -324,6 +325,17 @@ def test_a_DECLARED_artifact_is_never_silently_skipped(tmp_path):
         "warnings": [], "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
     }))
 
+    # The guard is exercised directly: on this filesystem a 200-char name is now perfectly
+    # storable (the temp name no longer inflates it), so forcing the error is the only honest
+    # way to test the DECISION rather than the platform's NAME_MAX.
+    real = LocalBlobStore._atomic_copy
+
+    def too_long(src, dest):
+        if dest.name == long_name:
+            raise OSError(errno.ENAMETOOLONG, "File name too long", str(dest))
+        real(src, dest)
+
+    monkeypatch.setattr(LocalBlobStore, "_atomic_copy", staticmethod(too_long))
     with pytest.raises(OSError):
         store.put_output("j-declared", out)
     assert store.has_output("j-declared") is False, (
@@ -331,13 +343,42 @@ def test_a_DECLARED_artifact_is_never_silently_skipped(tmp_path):
     )
 
 
-def test_an_unparseable_envelope_makes_every_skip_fatal(tmp_path):
+def test_an_unparseable_envelope_makes_every_skip_fatal(tmp_path, monkeypatch):
     """If we cannot tell what was promised, we cannot safely drop anything."""
     store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
     out = tmp_path / "out"
     out.mkdir()
     (out / "metadata.json").write_text("{ not json")
-    (out / ("z" * 250)).write_bytes(b"x")
+    (out / "mystery.bin").write_bytes(b"x")
 
+    def too_long(src, dest):
+        raise OSError(errno.ENAMETOOLONG, "File name too long", str(dest))
+
+    monkeypatch.setattr(LocalBlobStore, "_atomic_copy", staticmethod(too_long))
     with pytest.raises(OSError):
         store.put_output("j-unparseable", out)
+
+
+def test_a_long_but_storable_artifact_name_is_not_made_unstorable_by_the_temp_file(tmp_path):
+    """The temp name must not decide what is storable.
+
+    It used to be `.{dest.name}.{pid}.{tid}.{uuid4hex}.part` — ~62 characters ON TOP of the
+    destination's own name — so a DECLARED artifact with a ~200-char name, which ext4 (NAME_MAX
+    255), the envelope (path allows 4096) and S3 all accept, raised ENAMETOOLONG here. That
+    failure is deterministic, so the pending-upload sweep could never drain it: the job stayed
+    FAILED forever, every result route answered 409, and the reclaim held the tree as the last
+    copy indefinitely. One artifact name reproduced #84 on demand.
+    """
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    out.mkdir()
+    # 250 chars: storable on ext4 (NAME_MAX 255) with the fixed-length temp, but NOT with the
+    # old `.{dest.name}.{pid}.{tid}.{uuid4hex}.part`, which added ~62 on top.
+    long_name = "n" * 250
+    (out / long_name).write_bytes(b"STORABLE")
+    (out / "metadata.json").write_text("{}")
+
+    store.put_output("j-long", out)          # must not raise
+
+    assert store.has_output("j-long") is True
+    assert (tmp_path / "blobs" / "results" / "j-long" / long_name).exists()

@@ -3756,3 +3756,32 @@ def test_an_expired_or_deleted_job_does_not_hold_its_tree_forever(tmp_path):
         assert reap_stale_scratch(root, 60.0, store, _logging.getLogger("t"),
                                   blob_store=NothingDurable()) == 1, f"{label} tree held forever"
         assert not d.exists()
+
+
+def test_deleting_an_unrecoverable_last_copy_is_reported_as_data_loss(tmp_path, caplog):
+    """Reclaiming a sentinel-marked tree whose job can no longer be retried is correct — nothing
+    will ever upload it — but it is NOT routine hygiene: it is the permanent loss of a
+    host-sealed, unreproducible result. It has to say so, at ERROR, or the one line an operator
+    needed is indistinguishable from the disk-cleanup chatter around it."""
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL, reap_stale_scratch
+    import logging as _logging
+
+    class NothingDurable:
+        def has_output(self, job_id):
+            return False
+
+    jid = "44444444-4444-4444-8444-444444444444"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "metadata.json").write_text("{}")
+    (d / PENDING_UPLOAD_SENTINEL).write_text("")
+    old = time.time() - 99_999
+    for pth in (d / "output" / "metadata.json", d / PENDING_UPLOAD_SENTINEL, d / "output", d):
+        os.utime(pth, (old, old))
+
+    with caplog.at_level(_logging.WARNING):
+        assert reap_stale_scratch(tmp_path, 60.0, InMemoryJobStore(), _logging.getLogger("t"),
+                                  blob_store=NothingDurable()) == 1
+    assert any(r.levelno >= _logging.ERROR and "data loss" in r.message for r in caplog.records), (
+        "the only copy of a sealed result was deleted without an ERROR saying so"
+    )

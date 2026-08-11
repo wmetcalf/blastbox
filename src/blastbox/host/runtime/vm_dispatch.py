@@ -646,7 +646,6 @@ class VmJobDispatcher:
                     # the result or not depending purely on which dispatcher happened to claim the
                     # job from the shared queue (#85 review).
                     pending_upload = True
-                    mark_pending_upload(self._job_root, job.job_id, logger)
                     logger.error(
                         "vm_dispatch: result upload failed for %s after %d attempt(s) (%s); "
                         "failing the job and RETAINING its output for the pending-upload sweep",
@@ -751,7 +750,14 @@ class VmJobDispatcher:
             # destroys the only copy of a sealed result exactly when the store is already sick.
             # Retaining is the recoverable direction; the sweep's marker gate then refuses to
             # upload it unless the row really does say the result was retained (upstream #85).
+            # The sentinel is written HERE, not at the upload failure, and only once we know we
+            # still own the job. It asserts "we terminalized this job FAILED and its result is
+            # the last copy" -- writing it before the terminal CAS let a superseded attempt claim
+            # that about a job a PEER went on to fail legitimately, and the sweep would then
+            # publish our stale output over it and CAS the job to DONE. The container Dispatcher
+            # already gated on _fail_job winning; this is the same rule (#85 review).
             if pending_upload and (owned or terminal_status is None):
+                mark_pending_upload(self._job_root, job.job_id, logger)
                 # The ONLY copy of a host-sealed, trust-gate-passed result. Retained for
                 # retry_pending_uploads to drain, and bounded by the age reclaim's last-copy rule,
                 # which releases it the moment the durable copy lands.
@@ -864,7 +870,8 @@ class VmJobDispatcher:
             logger.warning("vm_dispatch: retention sweep failed", exc_info=True)
         try:
             retry_pending_uploads(self._job_root, self._blobs, self._store, logger,
-                                  on_repaired=self._index_repaired_result)
+                                  on_repaired=self._index_repaired_result,
+                                  retention_seconds=self._retention_s)
         except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
             logger.warning("vm_dispatch: pending-upload sweep failed", exc_info=True)
         try:
