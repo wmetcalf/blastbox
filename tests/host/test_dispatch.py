@@ -2727,7 +2727,12 @@ def test_scratch_reclaim_bounds_the_dirs_the_purge_deliberately_skips(tmp_path):
     stale = tmp_path / "11111111-1111-4111-8111-111111111111"
     (stale / "output").mkdir(parents=True)
     (stale / "output" / "rmeta").write_text("extracted sample text")
-    os.utime(stale, (time.time() - 3600, time.time() - 3600))
+    # Age the WHOLE tree. Aging only the parent is not a stale tree -- a live worker writing into
+    # output/ leaves the parent's mtime untouched, which is precisely why the sweep now looks at
+    # the newest mtime anywhere beneath it.
+    old_ts = time.time() - 3600
+    for path in (stale / "output" / "rmeta", stale / "output", stale):
+        os.utime(path, (old_ts, old_ts))
 
     fresh = tmp_path / "22222222-2222-4222-8222-222222222222"
     (fresh / "output").mkdir(parents=True)
@@ -2784,3 +2789,104 @@ def test_purge_survives_a_path_that_cannot_be_canonicalised(tmp_path):
     (job_root / "loopy2").symlink_to(loop)
 
     purge_job_dir(job_root, "loopy", logging.getLogger("t"))   # must not raise
+
+
+def test_scratch_reclaim_spares_a_live_job_writing_into_output(tmp_path):
+    """The top-level dir mtime is NOT refreshed by writes into output/ (verified: a live worker
+    writing job_root/<id>/output/artifact.bin leaves the parent's mtime untouched). A cold run
+    with BLASTBOX_WORKER_TIMEOUT_S above the cutoff is supported, so age alone would delete a
+    running job's tree — the exact failure this sweep exists to avoid elsewhere (#85 review).
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.status = JobStatus.RUNNING
+    store.create(job)
+
+    d = tmp_path / job.job_id
+    (d / "output").mkdir(parents=True)
+    old = time.time() - 99_999
+    os.utime(d, (old, old))                       # parent looks ancient...
+    (d / "output" / "artifact.bin").write_bytes(b"live worker writing right now")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+    assert dispatcher._reap_stale_scratch() == 0
+    assert d.exists(), "deleted a live job's tree because only the parent mtime was checked"
+
+
+def test_scratch_reclaim_spares_a_running_job_even_if_the_whole_tree_is_old(tmp_path):
+    """Second, independent safeguard: age is a heuristic, job state is a fact. A RUNNING job is
+    never reclaimable regardless of how stale every file looks."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.status = JobStatus.RUNNING
+    store.create(job)
+
+    d = tmp_path / job.job_id
+    (d / "output").mkdir(parents=True)
+    old = time.time() - 99_999
+    for p in (d / "output", d):
+        os.utime(p, (old, old))
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+    assert dispatcher._reap_stale_scratch() == 0
+    assert d.exists(), "reclaimed a tree whose job is still RUNNING"
+
+
+def test_scratch_reclaim_still_takes_a_genuinely_orphaned_tree(tmp_path):
+    """The bound must still work: a dir the store knows nothing about is a real orphan."""
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    d = tmp_path / "44444444-4444-4444-8444-444444444444"
+    (d / "output").mkdir(parents=True)
+    old = time.time() - 99_999
+    for p in (d / "output", d):
+        os.utime(p, (old, old))
+
+    assert dispatcher._reap_stale_scratch() == 1
+    assert not d.exists()
+
+
+def test_scratch_reclaim_spares_a_fresh_tree_the_store_does_not_know_yet(tmp_path):
+    """The two safeguards are NOT redundant, and this is the case only the mtime one catches.
+
+    Ingress spools job_root/<id>/input before the store row is durably visible to a dispatcher,
+    so there is a window where the job is unknown (job is None = "genuine orphan, reclaimable")
+    while the tree is being actively written. Age is what protects it there.
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    d = tmp_path / "55555555-5555-4555-8555-555555555555"
+    (d / "input").mkdir(parents=True)
+    old = time.time() - 99_999
+    os.utime(d, (old, old))                       # parent ancient, content brand new
+    (d / "input" / "sample.doc").write_bytes(b"just spooled by ingress")
+
+    assert dispatcher._reap_stale_scratch() == 0
+    assert d.exists(), "deleted a tree being spooled, before its job row was visible"
+
+
+def test_scratch_reclaim_leaves_the_tree_when_the_store_cannot_be_read(tmp_path):
+    """Store trouble must never turn into deletion. Unprovable state = leave the bytes."""
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    d = tmp_path / "66666666-6666-4666-8666-666666666666"
+    (d / "output").mkdir(parents=True)
+    old = time.time() - 99_999
+    for p in (d / "output", d):
+        os.utime(p, (old, old))
+
+    class _BrokenStore:
+        def get(self, job_id):
+            raise RuntimeError("job store unavailable")
+
+    dispatcher._job_store = _BrokenStore()
+    assert dispatcher._reap_stale_scratch() == 0
+    assert d.exists(), "a store error caused a deletion"

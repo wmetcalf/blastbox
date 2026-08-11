@@ -2688,9 +2688,36 @@ class Dispatcher:
             return 0
         for d in entries:
             try:
-                if not d.is_dir() or d.stat().st_mtime > cutoff:
+                if not d.is_dir():
                     continue
             except OSError:
+                continue
+            # NEWEST mtime anywhere in the tree, not just the top-level dir. A live worker writes
+            # INTO output/, and on Linux that does not touch the PARENT's mtime -- so a job that
+            # has been running for hours (a cold run with BLASTBOX_WORKER_TIMEOUT_S above this
+            # cutoff is supported) looks arbitrarily stale by the parent alone, and this sweep
+            # would delete the tree out from under it (#85 review).
+            try:
+                newest = d.stat().st_mtime
+                for child in d.rglob("*"):
+                    try:
+                        newest = max(newest, child.stat().st_mtime)
+                    except OSError:
+                        continue
+            except (OSError, RuntimeError):
+                continue
+            if newest > cutoff:
+                continue
+            # Belt and braces: age is a heuristic, job state is a fact. Never reclaim a tree whose
+            # job is still live. A job unknown to the store is a genuine orphan and IS reclaimable.
+            try:
+                job = self._job_store.get(d.name)
+            except Exception:  # noqa: BLE001 -- store trouble must not turn into deletion
+                _log.warning("scratch reclaim: cannot confirm job %s is terminal; leaving it",
+                             d.name)
+                continue
+            if job is not None and job.status not in (JobStatus.DONE, JobStatus.FAILED,
+                                                      JobStatus.EXPIRED):
                 continue
             purge_job_dir(self._job_root, d.name, _log)
             n += 1
