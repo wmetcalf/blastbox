@@ -3688,9 +3688,14 @@ def test_a_lost_claim_during_the_upload_retry_leaves_no_sentinel(tmp_path):
     d = tmp_path / job.job_id
     (d / "output").mkdir(parents=True)
 
-    won = dispatcher._fail_job(ours, "result upload failed after 3 attempts; retained")
-    assert won is False, "the CAS should have lost to the peer"
-    assert not (d / PENDING_UPLOAD_SENTINEL).exists()
+    # Through the real seam, so the marker is written first and then withdrawn — not merely
+    # never written. That is the sequence a crash can interrupt, so it is the one to test.
+    dispatcher._retain_for_upload_retry(ours, "result upload failed after 3 attempts; retained")
+
+    assert store.get(job.job_id).claim_id == "the-peer", "the peer still owns the row"
+    assert not (d / PENDING_UPLOAD_SENTINEL).exists(), (
+        "left a marker on a tree the peer owns — the sweep could publish our stale bytes"
+    )
 
 
 def test_a_blob_root_ABOVE_job_root_does_not_disable_the_whole_reclaim(tmp_path):
