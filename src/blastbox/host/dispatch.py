@@ -317,6 +317,12 @@ class Dispatcher:
         # the container is gone, we release the permit. Without this the permit leaks permanently
         # and cold capacity bleeds to zero after enough failed kills. name → nothing (a set).
         self._retained_cold_orphans: set[str] = set()
+        # Jobs whose result upload EXHAUSTED its retries: the durable copy never landed, so the
+        # local tree is the ONLY copy and the terminal purge must spare it. Everything else in
+        # this file assumes the blob store is the durable copy -- on this one branch that is
+        # false BY CONSTRUCTION, and the tree holds host-sealed, trust-gate-passed output plus
+        # one-shot evidence (the netd C2 pcap is MOVED, not copied, into it). Reviewed on #85.
+        self._upload_failed_job_ids: set[str] = set()
         self._retained_lock = threading.Lock()
         # Set once shutdown begins: a dispatch worker abandoned past the join deadline (e.g. blocked
         # in a slow claim_next) must NOT acquire a cold permit and spawn a container after the CLI
@@ -705,13 +711,28 @@ class Dispatcher:
                 warning="recovered: warm worker owner gone",
             ):
                 recovered += 1
-                # The owner is gone and the job is now terminal (FAILED is not claim_next-able),
-                # so nothing else will EVER clean up this tree. Purge all of it, not just the
-                # input: output/ holds metadata.json and rmeta (text and embedded objects
-                # extracted from the sample), and this is precisely the path where no other
-                # actor can come back for it (#84). Unconditional is correct here -- our CAS
-                # won, so no peer owns the tree.
-                purge_job_dir(self._job_root, job.job_id, _log)
+                # Delete the staged input only -- NOT the whole tree.
+                #
+                # An earlier revision purged everything here, reasoning "our CAS won, so no peer
+                # owns the tree". That is FALSE and this file says so 560 lines down: the CAS is
+                # on (RUNNING, claim_id), and a live owner mid-SEAL still holds exactly that
+                # state, because it writes its terminal status only after the seal completes. The
+                # seal (rdump materialize, size-cap walk, re-hash, upload) is explicitly NOT
+                # bounded by warm_deadline, which is why _dispatch_warm refreshes started_at
+                # before it -- see the comment there: "a legitimately slow/large seal could be
+                # judged 'owner gone' and FAILed out from under a live owner". Refreshing narrows
+                # that window; it does not close it. So this sweep CAN fire against a live owner,
+                # and rmtree'ing output/ while that owner is writing into it destroys a result
+                # that actually succeeded.
+                #
+                # Deleting the input is safe in that same race (the owner no longer needs it by
+                # seal time, and the sample is content-addressed in the blob store), which is why
+                # this path has always done exactly that. output/ is left for the age-based
+                # scratch sweep: a leaked dir is recoverable, a live job's destroyed output is
+                # not. Reviewed on #85.
+                self._delete_input(
+                    self._job_root / job.job_id / "input" / Path(job.filename).name
+                )
 
         # --- COLD requeue (needs docker liveness) -------------------------------------------
         active_job_ids = self._list_active_worker_job_ids()
@@ -1009,6 +1030,18 @@ class Dispatcher:
         condition _delete_input_if_owned already applies, so the two cannot disagree about who
         owns the tree.
         """
+        if job.job_id in self._upload_failed_job_ids:
+            # The result upload exhausted its retries, so results/<job_id> does not exist and
+            # this tree is the ONLY copy of a host-sealed, trust-gate-passed result -- including
+            # evidence that cannot be reproduced by re-running (the C2 pcap is moved into it, and
+            # detonation is explicitly not deterministic run-to-run). Purging here would turn a
+            # transient object-store outage into fleet-wide, irreversible result loss. The scratch
+            # sweep still bounds it on age. Reviewed on #85.
+            self._upload_failed_job_ids.discard(job.job_id)
+            _log.warning("job %s: retaining %s — the result upload failed, so this is the only "
+                         "copy", job.job_id, self._job_root / job.job_id)
+            return
+
         # This runs from a terminal `finally`, so it must not raise: an escaping store error
         # would mask the DONE/FAILED the job actually produced. And it fails SAFE -- if we
         # cannot PROVE we still own the tree we leave it alone, because the alternative is
@@ -1438,10 +1471,13 @@ class Dispatcher:
                 # would convict the worker for this dispatcher's storage problem, and an upload
                 # outage hits every job at once (upstream, PR #82).
                 warm_fault = "job"
+                # Same as the cold branch: no durable copy landed, so the terminal purge must
+                # spare this tree rather than destroy the only copy.
+                self._upload_failed_job_ids.add(job.job_id)
                 self._fail_job(
                     job,
                     f"result upload failed after {self._put_output_max_attempts} attempts; "
-                    "result discarded",
+                    "result retained on this worker (no durable copy)",
                 )
                 return
 
@@ -1956,10 +1992,12 @@ class Dispatcher:
             )
             return
         if not self._upload_output(job, output_dir):
+            # The durable copy never landed, so do NOT purge this tree -- it is the only copy.
+            self._upload_failed_job_ids.add(job.job_id)
             self._fail_job(
                 job,
                 f"result upload failed after {self._put_output_max_attempts} attempts; "
-                "result discarded",
+                "result retained on this worker (no durable copy)",
             )
             return
 

@@ -2567,38 +2567,66 @@ def test_purge_refuses_a_job_id_that_escapes_the_job_root(tmp_path):
     assert outsider.exists()
 
 
-def test_orphan_recovery_purges_the_whole_dir_not_just_the_input(tmp_path):
-    """Orphan recovery terminalises a job nobody owns, so it must clean up completely (#84).
+def test_orphan_recovery_deletes_input_but_spares_a_possibly_live_output(tmp_path):
+    """The orphan sweep must NOT rmtree output/ — its CAS cannot prove the owner is dead (#85 review).
 
-    It already deleted the staged input for exactly this reason -- "nothing else will clean up
-    its staged input" -- but left output/ behind, which is the same half-measure the live
-    dispatch path had. A dispatcher that dies mid-job therefore leaked extracted sample content
-    forever, and this is the path where NO other actor can ever come back for it.
+    _fail_if_running CASes on (RUNNING, claim_id), and a live owner mid-SEAL still holds exactly
+    that state because it writes its terminal status only after sealing completes. The seal is
+    explicitly not bounded by warm_deadline. So this sweep can fire against a live owner, and
+    deleting output/ there destroys a result that actually succeeded.
 
-    Ownership is settled here: _fail_if_running only returns True when our CAS won, so no peer
-    can still be using the tree.
+    Deleting the input stays safe in that race (the owner no longer needs it by seal time and the
+    sample is content-addressed in the blob store), which is what this path always did.
     """
     store = InMemoryJobStore()
     job = Job.new(engine=_ENGINE_NAME, filename="a.docx")
     job.status = JobStatus.RUNNING
     job.worker_runtime = "warm"
-    job.started_at = time.time() - 100_000        # far past worker_timeout + grace
+    job.started_at = time.time() - 100_000
     store.create(job)
 
-    _setup_job_dirs(tmp_path, job)
+    input_path = _setup_job_dirs(tmp_path, job)
     out = tmp_path / job.job_id / "output"
     out.mkdir(parents=True, exist_ok=True)
     (out / "metadata.json").write_text("{}")
-    (out / "rmeta").write_text("extracted sample text")
 
     dispatcher = _make_dispatcher(store, job_root=tmp_path)
     dispatcher.requeue_orphaned_jobs()
 
     assert store.get(job.job_id).status == JobStatus.FAILED
-    job_dir = tmp_path / job.job_id
-    assert not job_dir.exists(), (
-        f"orphan recovery left content behind: "
-        f"{sorted(p.relative_to(job_dir).as_posix() for p in job_dir.rglob('*'))}"
+    assert not input_path.exists(), "the staged input is safe to delete and must be"
+    assert (out / "metadata.json").exists(), (
+        "output/ was destroyed — a live owner mid-seal would have lost a successful result"
+    )
+
+
+def test_an_upload_exhausted_result_is_retained_not_purged(tmp_path):
+    """The purge's whole justification is that the blob store holds the durable copy. On this one
+    branch that is false BY CONSTRUCTION — it is reached because the upload never landed (#85
+    review). The tree is host-sealed, trust-gate-passed, and holds evidence a re-run cannot
+    reproduce, so destroying it turns a transient object-store outage into permanent loss.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    # A blob store whose put_output never succeeds -> retries exhaust.
+    blobs = _RecordingBlobs(fail_times=99)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner, blob_store=blobs
+    )
+    dispatcher.dispatch_once()
+
+    assert store.get(job.job_id).status == JobStatus.FAILED
+    assert (tmp_path / job.job_id / "output").exists(), (
+        "the only copy of a sealed result was destroyed after the upload failed"
     )
 
 

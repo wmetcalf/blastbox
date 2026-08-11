@@ -48,8 +48,18 @@ def purge_job_dir(job_root: "Path", job_id: str, log: "logging.Logger") -> None:
     strictly under ``job_root`` (guards a job_id carrying traversal components).
     """
     root = (job_root / job_id).resolve()
+    jr = job_root.resolve()
+    if root == jr:
+        # STRICTLY under, not equal. Path.relative_to(itself) returns "." rather than raising,
+        # so an empty/"."/None-coerced job_id sailed through the guard below and rmtree'd the
+        # ENTIRE job_root -- every peer container's in-flight tree on a shared-mount node, from
+        # one bad store row. Not reachable today (job_ids are server-side uuid4 and ingress
+        # validates them), but this function's docstring calls itself a security invariant.
+        log.error("refusing to purge job_root itself (%s) — empty or traversal job_id %r",
+                  jr, job_id)
+        return
     try:
-        root.relative_to(job_root.resolve())
+        root.relative_to(jr)
     except ValueError:
         log.error("refusing to purge %s (outside job_root %s)", root, job_root)
         return
