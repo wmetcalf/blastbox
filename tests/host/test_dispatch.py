@@ -3632,7 +3632,7 @@ def test_a_repaired_job_gets_the_result_summary_its_done_path_would_have_written
         "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
     }))
 
-    dispatcher._index_repaired_result(job.job_id, out)
+    dispatcher._index_repaired_result(job.job_id, out, (out / "metadata.json").read_text())
 
     assert store.get(job.job_id).result_summary is not None, "recovered job left with null counts"
 
@@ -3929,3 +3929,65 @@ def test_a_backward_clock_step_does_not_wipe_live_trees(tmp_path, monkeypatch):
 
     assert dispatcher._reap_stale_scratch() == 0, "a clock correction deleted live trees"
     assert (d / "input.bin").exists()
+
+
+def test_disabling_recovery_does_not_turn_the_hold_into_a_leak(tmp_path):
+    """With BLASTBOX_PENDING_UPLOAD_RETRY=0 the operator has switched the drainer off.
+
+    Holding a marked tree then is protection whose escape hatch no longer runs — an unbounded leak
+    dressed as safety, which is the exact failure this whole PR exists to eliminate. The tree is
+    reclaimed on the ordinary age instead, and because that destroys the only copy of a sealed
+    result it is reported as data loss, not hygiene.
+    """
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL, reap_stale_scratch
+    import logging as _logging
+
+    class NothingDurable:
+        def has_output(self, job_id):
+            return False
+
+    store = InMemoryJobStore()
+    jid = "aaaaaaaa-5555-4555-8555-aaaaaaaaaaaa"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "metadata.json").write_text("{}")
+    (d / PENDING_UPLOAD_SENTINEL).write_text("")
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = jid
+    job.status = JobStatus.FAILED
+    store.create(job)
+    old = time.time() - 99_999
+    for pth in sorted(d.rglob("*"), reverse=True) + [d]:
+        os.utime(pth, (old, old))
+
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                              blob_store=NothingDurable(), recovery_enabled=True) == 0
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                              blob_store=NothingDurable(), recovery_enabled=False) == 1
+    assert not d.exists()
+
+
+def test_the_orphan_ceiling_yields_to_a_container_docker_still_sees(tmp_path):
+    """The ceiling stops a hold lasting forever when nobody can confirm the container died. It
+    must not fire while somebody positively SEES it alive — rmtree'ing a live 0o777 bind mount is
+    the half-deleted tree, the spurious "PURGE FAILED" and the zero reclaimed blocks that the
+    whole deferral exists to avoid."""
+    from blastbox.host.jobs.retention import RETAINED_ORPHAN_SENTINEL, reap_stale_scratch
+    import logging as _logging
+
+    store = InMemoryJobStore()
+    jid = "bbbbbbbb-5555-4555-8555-bbbbbbbbbbbb"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / RETAINED_ORPHAN_SENTINEL).write_text("")
+    old = time.time() - 99_999                      # marker far past the 2x ceiling
+    for pth in sorted(d.rglob("*"), reverse=True) + [d]:
+        os.utime(pth, (old, old))
+
+    # docker still lists it -> the hold stands despite the ceiling
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                              live_job_ids=lambda: {jid}) == 0
+    assert d.exists()
+    # nobody can see it any more -> the ceiling does its job
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                              live_job_ids=lambda: set()) == 1

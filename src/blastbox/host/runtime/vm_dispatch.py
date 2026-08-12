@@ -806,13 +806,15 @@ class VmJobDispatcher:
             logger.warning("vm_dispatch: could not parse sealed metadata for %s", job.job_id, exc_info=True)
             return None
 
-    def _index_repaired_result(self, job_id: str, out_dir: "Path") -> None:
+    def _index_repaired_result(self, job_id: str, out_dir: "Path", seal_text: str) -> None:
         """Post-repair hook for the pending-upload sweep -- parity with the container Dispatcher.
         A recovered job is otherwise DONE and permanently invisible to /similar."""
         try:
             from blastbox.contract.envelope import Envelope
 
-            envelope = Envelope.model_validate_json((out_dir / "metadata.json").read_text())
+            # From the bytes the sweep read while the tree was still held, not from the
+            # tree itself -- which a peer may already have reclaimed once the row went DONE.
+            envelope = Envelope.model_validate_json(seal_text)
         except Exception:  # noqa: BLE001 -- the repair stands; only the index is best-effort
             logger.warning("vm_dispatch: could not parse sealed metadata for repaired job %s",
                            job_id, exc_info=True)
@@ -893,6 +895,7 @@ class VmJobDispatcher:
             reap_stale_scratch(
                 self._job_root, self._scratch_max_age_s, self._store, logger,
                 blob_store=self._blobs, protect_paths=_blob_local_roots(),
+                recovery_enabled=self._pending_upload_retry,
             )
         except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
             logger.warning("vm_dispatch: scratch reclaim failed", exc_info=True)

@@ -77,6 +77,50 @@ def _declared_paths(out_dir: Path) -> "set[str] | None":
         return None
 
 
+def _assert_declared_landed(job_id: str, out_dir: Path, stored: "set[str]") -> None:
+    """Refuse to commit the seal unless every DECLARED artifact was actually stored.
+
+    The per-file checks only ever saw paths the walker ENUMERATED. A worker controls the tree, so
+    it can declare a path the walker never returns -- one inside a symlinked directory (rglob does
+    not descend those), or past the point where a path-based walk stops -- and that artifact is
+    then neither uploaded nor skipped, it is simply absent, while the seal is committed anyway.
+    The result: a DONE job whose manifest promises bytes the store does not have, has_output()
+    reporting it durable, and the reclaim deleting the complete local copy as redundant.
+
+    Checking the manifest against what we actually stored closes the whole class, whatever the
+    walker missed and why (#85 review).
+    """
+    declared = _declared_paths(out_dir)
+    if not declared:
+        return
+    missing = []
+    for rel in sorted(declared - stored):
+        # Only a declared path that EXISTS as a real file under out_dir and was still not stored
+        # is this function's problem -- that is the walker having missed something it should have
+        # returned. A declared path with no file behind it is a manifest that lies, which is the
+        # trust gate's business, not the uploader's: failing here would make an upload that can
+        # never succeed, and a deterministic upload failure is precisely the immortal-tree class
+        # this PR keeps having to close. lstat, so a symlink is not followed into being "real".
+        try:
+            # CONTAINMENT FIRST. `out_dir / "/etc/passwd"` is /etc/passwd -- an absolute or
+            # ..-laden declaration escapes the tree entirely, and such a path is by definition not
+            # an artifact we would ever store. That is a manifest lying about where its bytes are,
+            # which the trust gate and the serve-time confinement handle; treating it as "missing"
+            # here would fail an upload that can never succeed.
+            p = out_dir / rel
+            if PurePosixPath(rel).is_absolute() or ".." in PurePosixPath(rel).parts:
+                continue
+            if p.is_symlink() or not p.is_file():
+                continue
+        except OSError:
+            continue
+        missing.append(rel)
+    if missing:
+        raise BlobIntegrityError(
+            f"put_output({job_id}): {len(missing)} declared artifact(s) exist on disk but were "
+            f"not stored, so the seal was not committed: {missing[:3]}")
+
+
 def _upload_order(out_dir: Path) -> list[Path]:
     """Every artifact under *out_dir*, with the seal LAST.
 

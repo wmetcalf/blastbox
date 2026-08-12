@@ -382,3 +382,66 @@ def test_a_long_but_storable_artifact_name_is_not_made_unstorable_by_the_temp_fi
 
     assert store.has_output("j-long") is True
     assert (tmp_path / "blobs" / "results" / "j-long" / long_name).exists()
+
+
+def test_the_seal_does_not_commit_when_a_declared_artifact_was_never_enumerated(tmp_path, monkeypatch):
+    """The per-file checks only ever saw paths the WALKER returned.
+
+    A worker controls the tree, so it can declare a real file the walker never yields — one inside
+    a symlinked directory (rglob does not descend those), or past where a path-based walk stops.
+    That artifact is then neither uploaded nor skipped, it is simply absent, while the seal is
+    committed anyway: a DONE job whose manifest promises bytes the store does not have,
+    has_output() calling it durable, and the reclaim deleting the complete local copy as redundant.
+    Checking the manifest against what was actually stored closes the class whatever the walker
+    missed and why.
+    """
+    from blastbox.host.blobs.base import _upload_order
+
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "seen.png").write_bytes(b"enumerated")
+    (out / "hidden.png").write_bytes(b"REAL FILE THE WALKER MISSES")
+    (out / "metadata.json").write_text(json.dumps({
+        "engine": "redtusk", "status": "ok", "input_sha256": "a" * 64,
+        "detected": {"label": "docx", "mime": "x", "confidence": 1.0, "source": "magika"},
+        "artifacts": [{"id": "a1", "path": "seen.png", "kind": "image",
+                       "sha256": "f" * 64, "bytes": 10},
+                      {"id": "a2", "path": "hidden.png", "kind": "image",
+                       "sha256": "e" * 64, "bytes": 27}],
+        "warnings": [], "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
+    }))
+
+    # A walker that cannot see hidden.png — exactly what a symlinked dir or PATH_MAX produces.
+    real_order = _upload_order
+    monkeypatch.setattr("blastbox.host.blobs.local._upload_order",
+                        lambda d: [p for p in real_order(d) if p.name != "hidden.png"])
+
+    with pytest.raises(Exception):
+        store.put_output("j-missed", out)
+    assert store.has_output("j-missed") is False, (
+        "committed a seal promising an artifact that was never stored"
+    )
+
+
+def test_a_declared_path_with_no_file_behind_it_does_not_fail_the_upload(tmp_path):
+    """The counterpart. A manifest that lies about where its bytes are is the trust gate's
+    business — failing here would create an upload that can NEVER succeed, and a deterministic
+    upload failure is precisely the immortal-tree class this keeps having to close."""
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "metadata.json").write_text(json.dumps({
+        "engine": "redtusk", "status": "ok", "input_sha256": "a" * 64,
+        "detected": {"label": "docx", "mime": "x", "confidence": 1.0, "source": "magika"},
+        "artifacts": [{"id": "a1", "path": "/etc/passwd", "kind": "image",
+                       "sha256": "f" * 64, "bytes": 1},
+                      {"id": "a2", "path": "../escape.png", "kind": "image",
+                       "sha256": "e" * 64, "bytes": 1},
+                      {"id": "a3", "path": "ghost.png", "kind": "image",
+                       "sha256": "d" * 64, "bytes": 1}],
+        "warnings": [], "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
+    }))
+
+    store.put_output("j-phantom", out)          # must not raise
+    assert store.has_output("j-phantom") is True

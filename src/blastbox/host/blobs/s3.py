@@ -22,7 +22,9 @@ from urllib.parse import urlparse
 
 from blastbox.host.blobs.base import (
     _SEAL_NAME,
+    _assert_declared_landed,
     _declared_paths,
+    _is_seal,
     BlobFetchError,
     BlobIntegrityError,
     _upload_order,
@@ -114,6 +116,7 @@ class S3BlobStore:
         # artifacts missing, and the age reclaim would then delete the complete local tree as
         # redundant. It is also the artifact the API fetches to serve a job at all (#85 review).
         declared = _declared_paths(out_dir)
+        stored: set[str] = set()
         for path in _upload_order(out_dir):
             # Skip symlinks BEFORE is_file() -- is_file() follows a symlink to its
             # target, so `p.is_symlink() or not p.is_file()` (checked in that
@@ -155,12 +158,16 @@ class S3BlobStore:
                         f"declared artifact {rel!r} exceeds the 1024-byte key limit", key)
                 _log.warning("put_output_skipped_unstorable_key", job_id=job_id, path=str(rel))
                 continue
+            if _is_seal(path, out_dir):
+                # The seal commits the upload: everything it promises must already be stored.
+                _assert_declared_landed(job_id, out_dir, stored)
             self._s3.put_object(
                 Bucket=self._bucket,
                 Key=key,
                 Body=body,
                 **extra,
             )
+            stored.add(rel)
 
     @staticmethod
     def _safe_rel(name: str) -> str:

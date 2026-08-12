@@ -670,10 +670,13 @@ class TestRetryPendingUploads:
         store.create(job)
         d = _sealed_tree(tmp_path, _JID)
 
-        seen: list[tuple[str, Path]] = []
+        seen: list[tuple[str, Path, str]] = []
         retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"),
-                              on_repaired=lambda jid, out: seen.append((jid, out)))
-        assert seen == [(_JID, d / "output")]
+                              on_repaired=lambda jid, out, seal: seen.append((jid, out, seal)))
+        assert [(s[0], s[1]) for s in seen] == [(_JID, d / "output")]
+        # The hook is handed the SEAL BYTES, read while the tree was still held — so it does not
+        # matter whether a peer reclaims the tree the moment the row goes DONE.
+        assert seen[0][2].strip() == '{"sealed": true}' 
 
     def test_a_failing_post_repair_hook_never_undoes_the_repair(self, tmp_path):
         """Best-effort: the bytes are durable and the status is correct. An indexing problem must
@@ -686,7 +689,7 @@ class TestRetryPendingUploads:
         store.create(job)
         _sealed_tree(tmp_path, _JID)
 
-        def boom(jid, out):
+        def boom(jid, out, seal):
             raise RuntimeError("indexer down")
 
         retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"),
@@ -711,7 +714,7 @@ class TestRetryPendingUploads:
 
         seen: list[str] = []
         retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"),
-                              on_repaired=lambda jid, out: seen.append(jid))
+                              on_repaired=lambda jid, out, seal: seen.append(jid))
         assert seen == [], "indexed a job this sweep did not repair"
 
 
@@ -1031,7 +1034,7 @@ class TestRemovalRobustness:
         store.create(job)
         d = _sealed_tree(tmp_path, _JID)
 
-        def boom(jid, out):
+        def boom(jid, out, seal):
             raise RuntimeError("indexer down")
 
         with caplog.at_level(logging.WARNING):
@@ -1194,3 +1197,49 @@ class TestMarkerOwnership:
 
         clear_pending_upload(tmp_path, _JID, "the-winner")    # the owner withdrawing its own
         assert not (d / PENDING_UPLOAD_SENTINEL).exists()
+
+    def test_a_result_uploaded_into_an_expiring_job_is_not_left_orphaned(self, tmp_path):
+        """Recovery and retention run in different processes over one store.
+
+        If the row EXPIRES while we are uploading, our seal lands after retention's delete_job and
+        the repair CAS then no-ops — leaving a complete result in the store under a row whose
+        expires_at was cleared, so nothing will ever select it for deletion and nothing can serve
+        it (open_output is DONE-gated). Undo our own write rather than orphan the bytes.
+        """
+        class ExpiresMidUpload(InMemoryJobStore):
+            """FAILED when the sweep looks, EXPIRED by the time the repair CAS runs."""
+
+            expired = False
+
+            def update_if_status(self, job_id, expect_status, **kw):
+                type(self).expired = True         # retention won the race
+                return False
+
+            def get(self, job_id):
+                r = super().get(job_id)
+                if r is not None and type(self).expired:
+                    r.status = JobStatus.EXPIRED
+                return r
+
+        store = ExpiresMidUpload()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED             # ...until retention expires it mid-upload
+        job.error = f"x; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+        _sealed_tree(tmp_path, _JID)
+
+        class Blobs(_FakeBlobs):
+            deleted: list = []
+
+            def delete_job(self, job_id):
+                type(self).deleted.append(job_id)
+                self.stored.pop(job_id, None)
+
+        blobs = Blobs()
+        retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"))
+
+        assert _JID in Blobs.deleted, (
+            "left a complete result in the store under an expired row that nothing can serve, "
+            "select for deletion, or ever revisit"
+        )

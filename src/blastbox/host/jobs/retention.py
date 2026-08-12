@@ -371,7 +371,7 @@ def retry_pending_uploads(
     log: logging.Logger,
     *,
     attempts: int = 1,
-    on_repaired: "Callable[[str, Path], None] | None" = None,
+    on_repaired: "Callable[[str, Path, str], None] | None" = None,
     retention_seconds: float = 0.0,
     max_per_sweep: int = 2000,
 ) -> int:
@@ -476,6 +476,11 @@ def retry_pending_uploads(
         # not write the status (store blip), or the dispatcher's own upload landed after it had
         # given up. Skipping here would strand that job FAILED forever with its result sitting
         # in the store -- so fall through to the repair with no upload (upstream review of #85).
+        # Read the seal while the tree is still definitely ours, for the post-repair hook below.
+        try:
+            seal_text = (out_dir / "metadata.json").read_text()
+        except OSError:
+            seal_text = ""
         upload_exc = None if durable else upload_output_with_retry(
             blob_store, d.name, out_dir, attempts=attempts)
         if upload_exc is None:
@@ -527,7 +532,12 @@ def retry_pending_uploads(
             # fall-through repair exists precisely for that case and could never run (#85 review).
             if repaired and on_repaired is not None:
                 try:
-                    on_repaired(d.name, out_dir)
+                    # seal_text was read BEFORE the CAS. Once the row is DONE the tree is no
+                    # longer held by the last-copy rule, so another dispatcher sharing job_root
+                    # can reclaim it between the CAS and this call -- and then the hook reads a
+                    # tree that is already gone. Handing it the bytes removes the dependency
+                    # entirely (#85 review).
+                    on_repaired(d.name, out_dir, seal_text)
                 except Exception:  # noqa: BLE001
                     # ACCEPTED RESIDUAL, stated plainly rather than papered over. Keeping the
                     # sentinel here would NOT buy a retry: this sweep only looks at FAILED rows,
@@ -541,6 +551,23 @@ def retry_pending_uploads(
                                 "summary and no /similar entry", d.name, exc_info=True)
             # LAST: after the CAS and after the hook, so a crash mid-recovery leaves the marker
             # (and therefore the tree, and therefore another attempt) rather than a half-done job.
+            if not repaired:
+                # The CAS lost. Either a peer repaired it first (fine), or retention EXPIRED the
+                # row while we were uploading -- and in THAT case we have just re-created the
+                # result bytes the operator's retention policy deleted, under a row with
+                # expires_at cleared, so nothing will ever select it for deletion again. Undo our
+                # own write rather than leave permanently orphaned bytes in the store (#85 review).
+                try:
+                    after = job_store.get(d.name)
+                except Exception:  # noqa: BLE001
+                    after = None
+                if after is not None and after.status is JobStatus.EXPIRED:
+                    log.warning("pending-upload sweep: %s expired while its result was uploading; "
+                                "removing the bytes we just wrote so they are not orphaned",
+                                d.name)
+                    with contextlib.suppress(Exception):
+                        blob_store.delete_job(d.name)
+                    clear_pending_upload(job_root, d.name)
             if repaired:
                 clear_pending_upload(job_root, d.name)
         else:
@@ -562,6 +589,7 @@ def reap_stale_scratch(
     protect_paths: "tuple[Path, ...]" = (),
     max_per_sweep: int = 2000,
     live_job_ids: "Callable[[], set[str] | None] | None" = None,
+    recovery_enabled: bool = True,
 ) -> int:
     """Reclaim per-job scratch dirs older than ``BLASTBOX_SCRATCH_MAX_AGE_S``.
 
@@ -668,6 +696,12 @@ def reap_stale_scratch(
                 orphan_marked = (d / RETAINED_ORPHAN_SENTINEL).lstat().st_mtime
             except OSError:
                 orphan_marked = None
+            # The ceiling exists so a hold cannot last forever when nobody can confirm the
+            # container died. It is NOT the only thing protecting a live container: a tree whose
+            # id docker still reports is skipped by the `retained` check below whatever the
+            # marker's age says, so the ceiling firing cannot rmtree a live 0o777 bind mount.
+            # (Upstream raised exactly that risk; adding a second guard here would have been dead
+            # logic no mutation could kill -- the test below pins the real one instead.)
             if orphan_marked is not None and orphan_marked > now - (max_age_s * 2):
                 continue
             # CONTAINMENT, not equality: a blob root NESTED under a candidate
@@ -803,7 +837,13 @@ def reap_stale_scratch(
         # Redis key past its TTL) nothing will ever upload this tree and holding it is an
         # immortal leak. But deleting the only copy of a sealed result is not routine hygiene
         # either -- it is data loss, and it says so, once, at ERROR (#85 review).
-        pending = marked and job is not None and job.status is JobStatus.FAILED
+        # ...and only while something can still ACT on it. With BLASTBOX_PENDING_UPLOAD_RETRY=0
+        # the operator has switched the drainer off, so a marked tree would be held by a rule
+        # whose escape hatch no longer runs -- an unbounded leak dressed as protection. The tree
+        # is reclaimed on the ordinary age instead, and because that destroys the only copy of a
+        # sealed result it is reported as data loss, exactly like the expired/deleted case.
+        pending = (marked and recovery_enabled
+                   and job is not None and job.status is JobStatus.FAILED)
         if marked and not pending:
             unreachable_last_copy.append(d.name)
         if pending or (job is not None and job.status is JobStatus.DONE):

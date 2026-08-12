@@ -26,7 +26,9 @@ from typing import BinaryIO
 
 from blastbox.host.blobs.base import (
     _SEAL_NAME,
+    _assert_declared_landed,
     _declared_paths,
+    _is_seal,
     BlobFetchError,
     BlobIntegrityError,
     _upload_order,
@@ -131,6 +133,7 @@ class LocalBlobStore:
             raise FileNotFoundError(f"put_output: output dir missing for {job_id}: {out_dir}")
         dest_dir = self._results_dir(job_id)
         declared = _declared_paths(out_dir)
+        stored: set[str] = set()
         # TWO-PHASE COMMIT. metadata.json is written LAST, so its presence under
         # results/<job_id> means "every other artifact already landed" -- that is what makes
         # has_output() a real durability answer instead of a guess. Uploading in plain sorted
@@ -165,8 +168,12 @@ class LocalBlobStore:
             # undeclared files are not servable anyway (the result routes are manifest-gated), so
             # nothing a consumer can reach is lost. Every other error still propagates, because a
             # real outage MUST fail the upload rather than silently ship a partial result.
+            if _is_seal(path, out_dir):
+                # The seal commits the upload, so everything it PROMISES must already be stored.
+                _assert_declared_landed(job_id, out_dir, stored)
             try:
                 self._atomic_copy(path, dest_dir / rel)
+                stored.add(rel.as_posix())
             except OSError as exc:
                 if (exc.errno != errno.ENAMETOOLONG or declared is None
                         or rel.as_posix() in declared):
