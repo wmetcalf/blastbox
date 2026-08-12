@@ -784,10 +784,15 @@ def reap_stale_scratch(
         pending = marked and job is not None and job.status is JobStatus.FAILED
         if marked and not pending:
             unreachable_last_copy.append(d.name)
-        if blob_store is not None and (pending or (job is not None
-                                                   and job.status is JobStatus.DONE)):
+        if pending or (job is not None and job.status is JobStatus.DONE):
+            # NOT gated on having a blob store. Without one there is no durable copy to check --
+            # which means we cannot prove this tree is redundant, so it is the LAST copy by
+            # definition and deleting it is unconditional data loss. Gating the whole protection
+            # on `blob_store is not None` meant the DEFAULT argument silently disabled it: every
+            # production caller passes a store, so this never bit, but any new caller inherited a
+            # sweep that deletes sealed results (#85 review, full-PR sweep).
             try:
-                durable = blob_store.has_output(d.name)
+                durable = blob_store.has_output(d.name) if blob_store is not None else False
             except Exception:  # noqa: BLE001 -- unknown is NOT durable
                 durable = False
             # AGGREGATED, not per-tree: a fleet mid-migration can hold thousands of these, and one

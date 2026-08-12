@@ -16,6 +16,7 @@ from blastbox.host.jobs.base import Job, JobStatus
 from blastbox.host.jobs.memory import InMemoryJobStore
 from blastbox.host.jobs.retention import (
     PENDING_UPLOAD_SENTINEL,
+    reap_stale_scratch,
     RESULT_RETAINED_MARKER,
     JobRetentionSweeper,
     purge_job_dir,
@@ -1114,3 +1115,41 @@ class TestMarkerOwnership:
         (d / "metadata.json").write_text(_json.dumps({"artifacts": [
             {"path": "./nested/x.png"}, {"path": "nested//y.png"}, {"path": "plain.png"}]}))
         assert _declared_paths(d) == {"nested/x.png", "nested/y.png", "plain.png"}
+
+    def test_the_last_copy_rule_does_not_depend_on_being_handed_a_blob_store(self, tmp_path):
+        """Without a store there is no durable copy to check — which means the tree cannot be
+        PROVEN redundant, so it is the last copy by definition.
+
+        The whole protection used to sit inside `if blob_store is not None`, so the DEFAULT
+        argument silently disabled it. Every production caller passes a store, so it never bit;
+        any new caller would have inherited a sweep that deletes sealed results (found by the
+        full-PR sweep).
+        """
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.error = f"x; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+        d = _sealed_tree(tmp_path, _JID)
+        old = time.time() - 99_999
+        for pth in sorted(d.rglob("*"), reverse=True) + [d]:
+            os.utime(pth, (old, old))
+
+        removed = reap_stale_scratch(tmp_path, 60.0, store, logging.getLogger("t"))  # no store
+        assert removed == 0, "deleted a sealed result because no blob store was passed"
+        assert (d / "output" / "metadata.json").exists()
+
+    def test_ordinary_scratch_is_still_reclaimed_without_a_blob_store(self, tmp_path):
+        """The counterpart: 'cannot prove it is redundant' must not become 'never delete
+        anything', or the bound this PR exists to add disappears."""
+        store = InMemoryJobStore()
+        d = tmp_path / _JID
+        (d / "output").mkdir(parents=True)
+        (d / "input.bin").write_bytes(b"MALWARE-BYTES-MUST-NOT-PERSIST")
+        old = time.time() - 99_999
+        for pth in sorted(d.rglob("*"), reverse=True) + [d]:
+            os.utime(pth, (old, old))
+
+        assert reap_stale_scratch(tmp_path, 60.0, store, logging.getLogger("t")) == 1
+        assert not d.exists()
