@@ -587,9 +587,10 @@ def reap_stale_scratch(
     skip_job_ids: "frozenset[str] | set[str]" = frozenset(),
     blob_store: BlobStore | None = None,
     protect_paths: "tuple[Path, ...]" = (),
-    max_per_sweep: int = 2000,
+    max_per_sweep: int = 200,
     live_job_ids: "Callable[[], set[str] | None] | None" = None,
     recovery_enabled: bool = True,
+    yield_to_work: "Callable[[], bool] | None" = None,
 ) -> int:
     """Reclaim per-job scratch dirs older than ``BLASTBOX_SCRATCH_MAX_AGE_S``.
 
@@ -605,6 +606,20 @@ def reap_stale_scratch(
     """
     if max_age_s <= 0 or not job_root.is_dir():
         return 0
+    # HOUSEKEEPING YIELDS TO WORK. Measured on a real 190k-dir backlog while a corpus ran: a
+    # 2000-candidate sweep costs ~7.1s of rglob plus ~6.1s of has_output round trips -- 13s of
+    # saturating disk and object-store I/O every tick, on exactly the disk and MinIO the job
+    # pipeline needs. The effect was not subtle: concurrent jobs 11 -> 6, median job latency
+    # 0.49s -> 0.99s, completions 70/min -> 48/min, all from the sweep alone. A malware pipeline
+    # exists to process samples; reclaiming disk is never the more urgent of the two at minute
+    # granularity, and the sweep is idempotent, so a skipped tick costs only time. Hence both a
+    # much smaller default batch AND an explicit backpressure check (#85, from the fleet soak).
+    if yield_to_work is not None:
+        try:
+            if yield_to_work():
+                return 0
+        except Exception:  # noqa: BLE001 -- a probe failure must not stop the sweep forever
+            pass
     now = time.time()
     cutoff = now - max_age_s
     n = 0

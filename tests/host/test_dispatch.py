@@ -3991,3 +3991,48 @@ def test_the_orphan_ceiling_yields_to_a_container_docker_still_sees(tmp_path):
     # nobody can see it any more -> the ceiling does its job
     assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
                               live_job_ids=lambda: set()) == 1
+
+
+def test_the_reclaim_yields_while_dispatch_is_saturated(tmp_path):
+    """Housekeeping must never compete with the work the machine exists to do.
+
+    Measured on a real 190k-dir backlog during a corpus run: a 2000-candidate sweep costs ~7.1s
+    of rglob plus ~6.1s of has_output round trips — 13s of saturating disk and object-store I/O
+    every tick, against exactly the disk and MinIO the job pipeline needs. Concurrent jobs fell
+    11 → 6, median job latency doubled 0.49s → 0.99s, and completions dropped 70/min → 48/min.
+    The sweep is idempotent, so skipping a tick costs only time; a starved pipeline costs work.
+    """
+    from blastbox.host.jobs.retention import reap_stale_scratch
+    import logging as _logging
+
+    store = InMemoryJobStore()
+    old = time.time() - 99_999
+    for i in range(3):
+        d = tmp_path / f"{i:08d}-4444-4444-8444-444444444444"
+        d.mkdir()
+        os.utime(d, (old, old))
+
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                              yield_to_work=lambda: True) == 0, "swept while dispatch was busy"
+    assert len(list(tmp_path.iterdir())) == 3
+
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                              yield_to_work=lambda: False) == 3
+    assert len(list(tmp_path.iterdir())) == 0
+
+
+def test_a_broken_backpressure_probe_does_not_disable_the_reclaim_forever(tmp_path):
+    """Fail-safe in the direction that keeps the disk bounded: if the probe raises we sweep
+    anyway, because an unbounded job_root is the failure this whole feature exists to prevent."""
+    from blastbox.host.jobs.retention import reap_stale_scratch
+    import logging as _logging
+
+    d = tmp_path / "55555555-4444-4444-8444-444444444444"
+    d.mkdir()
+    os.utime(d, (time.time() - 99_999,) * 2)
+
+    def broken():
+        raise RuntimeError("gate unavailable")
+
+    assert reap_stale_scratch(tmp_path, 60.0, InMemoryJobStore(), _logging.getLogger("t"),
+                              yield_to_work=broken) == 1

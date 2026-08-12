@@ -2783,6 +2783,20 @@ class Dispatcher:
             except Exception:  # noqa: BLE001
                 _log.exception("retention sweep failed")
 
+    def _dispatch_saturated(self) -> bool:
+        """True when every dispatch slot is in use, i.e. work is queueing behind us.
+
+        Read from the concurrency gate when there is one (it counts in-flight cold workers);
+        otherwise assume NOT saturated, so a deployment without the autosizer still reclaims.
+        """
+        gate = self._concurrency_gate
+        if gate is None:
+            return False
+        try:
+            return gate.in_flight >= gate.limit
+        except Exception:  # noqa: BLE001
+            return False
+
     def _reap_stale_scratch(self) -> int:
         """Reclaim this dispatcher's stale scratch. The implementation is SHARED with
         VmJobDispatcher (jobs/retention.reap_stale_scratch) for the same reason purge_job_dir
@@ -2800,6 +2814,9 @@ class Dispatcher:
             recovery_enabled=self._pending_upload_retry,
             protect_paths=_blob_local_roots(),
             live_job_ids=self._list_active_worker_job_ids,
+            # Skip the sweep entirely while every dispatch slot is busy: the machine has better
+            # things to do with its disk and its object store than housekeeping.
+            yield_to_work=self._dispatch_saturated,
         )
 
     def _reconcile_cold_orphans(self) -> None:
