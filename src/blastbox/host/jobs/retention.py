@@ -111,9 +111,24 @@ def mark_pending_upload(job_root: "Path", job_id: str, log: "logging.Logger",
                   "ages out", job_id, exc)
 
 
-def clear_pending_upload(job_root: "Path", job_id: str) -> None:
+def clear_pending_upload(job_root: "Path", job_id: str,
+                         claim_id: str | None = None) -> None:
+    """Withdraw a pending-upload marker.
+
+    With *claim_id*, withdraw ONLY a marker this claim wrote. The marker is one shared pathname
+    under a job_root two dispatchers share, so an attempt that lost its CAS and cleared
+    unconditionally would delete the WINNER's marker -- leaving the winner's tree unprotected and
+    its result undiscoverable by the recovery sweep (#85 review).
+    """
+    p = job_root / job_id / PENDING_UPLOAD_SENTINEL
+    if claim_id is not None:
+        try:
+            if p.read_text().strip() != claim_id:
+                return                       # not ours to withdraw
+        except OSError:
+            return
     with contextlib.suppress(OSError):
-        (job_root / job_id / PENDING_UPLOAD_SENTINEL).unlink()
+        p.unlink()
 
 
 # How many directory fds the removal below may hold at once. Bounded because a hostile worker
@@ -442,9 +457,16 @@ def retry_pending_uploads(
             marker_claim = (d / PENDING_UPLOAD_SENTINEL).read_text().strip()
         except OSError:
             continue
-        if marker_claim and row.claim_id and marker_claim != row.claim_id:
-            log.warning("pending-upload sweep: %s was marked under claim %s but the row is now "
-                        "%s; leaving it to its owner", d.name, marker_claim[:8], row.claim_id[:8])
+        # A claim-bound marker requires an EXACT match, and `row.claim_id is None` is not a
+        # wildcard -- it is a row that was REQUEUED (_requeue_claimed clears the claim). Treating
+        # it as "no objection" meant: our attempt marks under claim A, loses, the job is requeued
+        # (claim cleared) and later fails for an unrelated reason, and the sweep then publishes
+        # our superseded bytes over that job. Only a marker with no claim recorded at all -- from
+        # a caller that had none -- is accepted without a match (#85 review).
+        if marker_claim and marker_claim != (row.claim_id or ""):
+            log.warning("pending-upload sweep: %s was marked under claim %s but the row now has "
+                        "%s; leaving it to its owner", d.name, marker_claim[:8],
+                        (row.claim_id or "none")[:8])
             continue
         try:
             durable = blob_store.has_output(d.name)

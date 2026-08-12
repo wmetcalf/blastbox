@@ -1153,3 +1153,44 @@ class TestMarkerOwnership:
 
         assert reap_stale_scratch(tmp_path, 60.0, store, logging.getLogger("t")) == 1
         assert not d.exists()
+
+    def test_a_claimless_row_does_not_satisfy_a_claim_bound_marker(self, tmp_path):
+        """`row.claim_id is None` is not a wildcard — it is a REQUEUED row.
+
+        Our attempt marks under claim A and loses; _requeue_claimed clears the claim; the job
+        later fails for an unrelated reason. Accepting the marker then published our superseded
+        bytes over that job. Only a marker with no claim recorded at all is matchless-by-design.
+        """
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.claim_id = None                                  # requeued since we marked it
+        job.error = f"x; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+        d = _sealed_tree(tmp_path, _JID, pending=False)
+        (d / PENDING_UPLOAD_SENTINEL).write_text("our-stale-claim")
+
+        blobs = _FakeBlobs()
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
+        assert blobs.put_calls == 0, "published a superseded attempt's bytes onto a requeued job"
+
+    def test_a_losing_attempt_cannot_withdraw_the_winners_marker(self, tmp_path):
+        """The marker is ONE shared pathname under a job_root two dispatchers share.
+
+        An attempt that lost its CAS used to clear unconditionally, deleting the WINNER's marker —
+        leaving the winner's tree unprotected by the last-copy rule and its result invisible to
+        the recovery sweep.
+        """
+        from blastbox.host.jobs.retention import clear_pending_upload, mark_pending_upload
+
+        d = tmp_path / _JID
+        d.mkdir()
+        mark_pending_upload(tmp_path, _JID, logging.getLogger("t"), "the-winner")
+
+        clear_pending_upload(tmp_path, _JID, "the-loser")     # a superseded attempt withdrawing
+        assert (d / PENDING_UPLOAD_SENTINEL).is_file(), "a loser deleted the winner's marker"
+        assert (d / PENDING_UPLOAD_SENTINEL).read_text() == "the-winner"
+
+        clear_pending_upload(tmp_path, _JID, "the-winner")    # the owner withdrawing its own
+        assert not (d / PENDING_UPLOAD_SENTINEL).exists()

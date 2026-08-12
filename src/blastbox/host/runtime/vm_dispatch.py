@@ -36,6 +36,7 @@ from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_wi
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.jobs.retention import (
     RESULT_RETAINED_MARKER,
+    clear_pending_upload,
     mark_pending_upload,
     JobRetentionSweeper,
     purge_job_dir,
@@ -648,6 +649,11 @@ class VmJobDispatcher:
                     # the result or not depending purely on which dispatcher happened to claim the
                     # job from the shared queue (#85 review).
                     pending_upload = True
+                    # BEFORE the terminal write, matching the container dispatcher: a crash
+                    # between committing FAILED and recording the marker leaves the only copy of
+                    # a sealed result looking like ordinary scratch. The marker carries our claim,
+                    # so the finally can withdraw it if this attempt turns out not to own the job.
+                    mark_pending_upload(self._job_root, job.job_id, logger, job.claim_id)
                     logger.error(
                         "vm_dispatch: result upload failed for %s after %d attempt(s) (%s); "
                         "failing the job and RETAINING its output for the pending-upload sweep",
@@ -759,13 +765,19 @@ class VmJobDispatcher:
             # publish our stale output over it and CAS the job to DONE. The container Dispatcher
             # already gated on _fail_job winning; this is the same rule (#85 review).
             if pending_upload and (owned or terminal_status is None):
-                mark_pending_upload(self._job_root, job.job_id, logger, job.claim_id)
-                # The ONLY copy of a host-sealed, trust-gate-passed result. Retained for
-                # retry_pending_uploads to drain, and bounded by the age reclaim's last-copy rule,
-                # which releases it the moment the durable copy lands.
+                # The ONLY copy of a host-sealed, trust-gate-passed result. Its marker was written
+                # BEFORE the terminal store write, so a crash in that window cannot leave the tree
+                # looking like ordinary scratch. Retained for retry_pending_uploads to drain, and
+                # bounded by the age reclaim's last-copy rule, which releases it the moment the
+                # durable copy lands.
                 logger.warning("vm_dispatch: retaining %s — the result upload failed, so this is "
                                "the only copy", self._job_dir(job))
             else:
+                if pending_upload:
+                    # A peer demonstrably owns this job now, so our tree is a stale attempt.
+                    # Withdraw the marker we wrote before the terminal write -- scoped to our own
+                    # claim, so we can never delete the owner's.
+                    clear_pending_upload(self._job_root, job.job_id, job.claim_id)
                 self._purge_job_dir(job)
             # Metric parity with the cold dispatcher: count the terminal outcome + wall time -- but ONLY
             # for THIS attempt's own winning CAS (owned + the status we wrote). Requeued (NoWarmSlot)

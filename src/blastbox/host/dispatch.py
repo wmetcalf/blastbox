@@ -2396,7 +2396,7 @@ class Dispatcher:
         """
         mark_pending_upload(self._job_root, job.job_id, _log, job.claim_id)
         if not self._fail_job(job, reason):
-            clear_pending_upload(self._job_root, job.job_id)
+            clear_pending_upload(self._job_root, job.job_id, job.claim_id)
 
     def _fail_job(self, job: Job, reason: str) -> bool:
         """Mark a job FAILED, scrubbing the error string before storage. Returns whether OUR

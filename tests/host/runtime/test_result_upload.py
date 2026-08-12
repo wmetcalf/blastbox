@@ -249,3 +249,12 @@ def test_a_store_outage_during_terminal_write_does_not_destroy_the_retained_resu
     assert (tmp_path / job.job_id / "output" / "metadata.json").exists(), (
         "purged the only copy of a sealed result because the STORE was down"
     )
+    # ...and the MARKER must already be on disk, because it is written BEFORE the terminal store
+    # write. Written after, a crash in that window (which is exactly what a store outage can turn
+    # into) leaves the only copy of a sealed result looking like ordinary scratch to every later
+    # sweep — the tree survives this tick and the reclaim deletes it on a later one.
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL
+
+    assert (tmp_path / job.job_id / PENDING_UPLOAD_SENTINEL).is_file(), (
+        "the recovery marker was written after the terminal write — a crash in the gap loses it"
+    )
