@@ -619,6 +619,7 @@ def reap_stale_scratch(
     retained_last_copy: list[str] = []
     unreachable_last_copy: list[str] = []
     unconfirmed: list[str] = []
+    clock_suspect: list[str] = []
     # Counts WORK, not deletions. Capping on removals alone never bounded anything in the state
     # this was written for: a retained or undeletable tree still costs a full rglob walk, a store
     # round-trip and a has_output() call, none of which advanced the counter -- so the sweep
@@ -688,12 +689,32 @@ def reap_stale_scratch(
             # bound on job_root and reproducing #84 deliberately. Clamping such a stamp to
             # `now` would still read as "just touched", so ignore it outright. The small
             # tolerance keeps ordinary clock skew from discarding honest timestamps.
+            # CTIME, not mtime, and no future-clamp. The worker owns output/ (a 0o777 bind
+            # mount) and utime() is unprivileged, so it can stamp mtime anywhere it likes --
+            # which is why an earlier version discarded a future mtime as "no evidence". That
+            # traded one bug for a worse one: after a backward clock step (an ordinary NTP
+            # correction) EVERY honest timestamp looks like the future, so a node's live trees
+            # read as ancient and were deleted seconds after being created -- reproduced with a
+            # 1h rollback.
+            #
+            # ctime has no setter. No syscall backdates or forward-dates it, and any metadata
+            # change bumps it to now, so a sample cannot forge it at all -- the anti-evasion
+            # property comes for free instead of from a clamp. A ctime in the FUTURE therefore
+            # means the CLOCK is wrong, not that we are under attack, and the safe reading of
+            # "I cannot tell how old this is" is to leave it alone and say so once, not to
+            # delete it (#85 review, from an untriaged round-6 codex finding).
             horizon = now + 60.0
 
-            def _evidence(st_mtime: float) -> float:
-                return -1.0 if st_mtime > horizon else st_mtime
+            def _evidence(st: "os.stat_result") -> float:
+                if st.st_mtime <= horizon:
+                    return st.st_mtime          # an ordinary, plausible stamp
+                # A future mtime is either an evasion attempt or a clock that moved. ctime tells
+                # them apart, because nothing can set it: if ctime is sane, the mtime was forged
+                # and ctime is the honest age; if ctime is ALSO in the future, the clock is wrong
+                # and this tree's age is simply unknowable.
+                return st.st_ctime if st.st_ctime <= horizon else float("inf")
 
-            newest = _evidence(d.lstat().st_mtime)
+            newest = _evidence(d.lstat())
             live = newest > cutoff
             for child in d.rglob("*"):
                 if live:
@@ -706,12 +727,14 @@ def reap_stale_scratch(
                     # on demand. The stamp is honest, so the future-mtime guard above cannot
                     # see it. rglob already refuses to descend INTO a symlinked dir, so the
                     # link's own mtime is the only evidence it gets to offer (#85 review).
-                    newest = max(newest, _evidence(child.lstat().st_mtime))
+                    newest = max(newest, _evidence(child.lstat()))
                     live = newest > cutoff
                 except OSError:
                     continue
         except (OSError, RuntimeError):
             continue
+        if newest == float("inf"):
+            clock_suspect.append(d.name)
         if live:
             continue
         if d.name in retained:
@@ -783,6 +806,10 @@ def reap_stale_scratch(
         # "removed N job dir(s)" line report directories still on disk, forever.
         if purge_job_dir(job_root, d.name, log):
             n += 1
+    if clock_suspect:
+        log.warning("scratch reclaim: %d tree(s) carry timestamps in the future — the clock has "
+                    "moved backwards, so their age cannot be judged and they were left alone "
+                    "(e.g. %s)", len(clock_suspect), ", ".join(sorted(clock_suspect)[:3]))
     if unconfirmed:
         # ONE line, not up to max_per_sweep of them. A store outage on a node holding the #84
         # backlog emitted 2000 identical warnings per tick, burying the store error itself --

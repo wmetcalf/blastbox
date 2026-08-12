@@ -3107,11 +3107,22 @@ def test_scratch_reclaim_refuses_a_symlink_even_with_a_perfect_job_id_name(tmp_p
     assert link.is_symlink()
 
 
-def test_scratch_reclaim_cannot_be_evaded_by_a_worker_setting_a_future_mtime(tmp_path):
-    """The worker owns files under output/ (a 0o777 bind mount) and utime() is unprivileged, so a
-    detonated sample could stamp a future mtime and make its tree immortal — defeating the only
-    bound on job_root and reproducing #84 on purpose. A future mtime is not liveness.
+def test_a_forged_future_mtime_cannot_grant_permanent_immortality(tmp_path, monkeypatch):
+    """The guarantee is about PERMANENCE, not about one tick.
+
+    A sample owns output/ (a 0o777 bind mount) and utime() is unprivileged, so it can stamp mtime
+    anywhere it likes. Liveness falls back to ctime for an implausible mtime, and ctime has no
+    setter — but the utime() call itself legitimately bumps ctime, so the tree really was modified
+    a moment ago and is correctly treated as live for one window. What must NOT happen is that a
+    single stamp buys immortality: staying alive has to require a process that is still running
+    and still touching the tree, which a dead worker cannot do.
+
+    (An earlier version discarded future mtimes outright. That was worse: after a backward clock
+    step every honest timestamp looks like the future, so a node's live trees read as ancient and
+    were deleted seconds after being created.)
     """
+    import blastbox.host.jobs.retention as retention_mod
+
     store = InMemoryJobStore()
     dispatcher = _make_dispatcher(store, job_root=tmp_path)
     dispatcher._scratch_max_age_s = 60.0
@@ -3123,9 +3134,14 @@ def test_scratch_reclaim_cannot_be_evaded_by_a_worker_setting_a_future_mtime(tmp
     old = time.time() - 99_999
     os.utime(d, (old, old))
     os.utime(d / "output", (old, old))
-    os.utime(pad, (2**31, 2**31))          # malware stamps the far future
+    os.utime(pad, (2**31, 2**31))              # the sample stamps the far future
 
-    assert dispatcher._reap_stale_scratch() == 1, "a future mtime made the tree immortal"
+    assert dispatcher._reap_stale_scratch() == 0, "a just-touched tree is genuinely live"
+
+    # ...and the worker is now dead, so nothing touches it again. Time moves on.
+    real = time.time
+    monkeypatch.setattr(retention_mod.time, "time", lambda: real() + 3600)
+    assert dispatcher._reap_stale_scratch() == 1, "one forged stamp bought permanent immortality"
     assert not d.exists()
 
 
@@ -3886,3 +3902,30 @@ def test_the_pending_marker_is_on_disk_BEFORE_the_terminal_write(tmp_path, monke
         "the marker was written AFTER the terminal write — a crash in the gap loses the only copy"
     )
     assert (d / PENDING_UPLOAD_SENTINEL).read_text() == "ours", "the marker must record the claim"
+
+
+def test_a_backward_clock_step_does_not_wipe_live_trees(tmp_path, monkeypatch):
+    """An NTP correction is not a reason to delete the node's work.
+
+    Liveness used to discard any timestamp in the future as "no evidence", which is fine against a
+    forged stamp and catastrophic against a clock that moved: after a backward step EVERY honest
+    timestamp is in the future, so every live tree reads as ancient. Reproduced with a 1h
+    rollback — a tree created seconds earlier was deleted. ctime cannot be forged, so a future
+    ctime means the clock is wrong, and the only safe reading of "I cannot tell how old this is"
+    is to leave it alone and say so.
+    """
+    import blastbox.host.jobs.retention as retention_mod
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 21600.0
+
+    d = tmp_path / "88888888-8888-4888-8888-888888888888"
+    (d / "output").mkdir(parents=True)
+    (d / "input.bin").write_bytes(b"A LIVE JOB'S SAMPLE")
+
+    real = time.time
+    monkeypatch.setattr(retention_mod.time, "time", lambda: real() - 3600)   # clock steps back
+
+    assert dispatcher._reap_stale_scratch() == 0, "a clock correction deleted live trees"
+    assert (d / "input.bin").exists()
