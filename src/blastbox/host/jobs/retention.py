@@ -578,6 +578,81 @@ def retry_pending_uploads(
     return n
 
 
+def migrate_legacy_results(
+    job_root: Path,
+    blob_store: BlobStore,
+    job_store: JobStore,
+    log: logging.Logger,
+    *,
+    limit: int = 0,
+    dry_run: bool = False,
+) -> "tuple[int, int, int]":
+    """Upload the results of DONE jobs that predate the blob store, so the reclaim can free them.
+
+    The last-copy rule deliberately refuses to delete a DONE job whose result is not in the store:
+    those are pre-blob-store jobs whose ONLY copy is the legacy ``<job_root>/<id>/output`` path
+    that ``LocalBlobStore.open_output`` still serves, and the first tick after an upgrade would
+    otherwise destroy every one of them. Correct -- and permanent, because nothing ever uploads
+    them: the recovery sweep only touches FAILED rows carrying the host's pending-upload marker.
+
+    Measured on a real node: ~82k such trees, every sweep retaining rather than removing. The
+    reclaim alone cannot bound that disk, and the operator has no way to resolve it. Uploading a
+    legacy result makes it durable, servable from the store like any other, and finally
+    reclaimable -- which is the only ending where the disk actually recovers.
+
+    OPT-IN and offline by design: this is an operator action with real I/O cost against the object
+    store, not something a maintenance tick should start doing unannounced. Returns
+    (migrated, skipped, failed).
+    """
+    migrated = skipped = failed = 0
+    try:
+        entries = sorted(job_root.iterdir(), key=lambda p: p.name)
+    except OSError as exc:
+        log.error("legacy migration: cannot list %s: %s", job_root, exc)
+        return (0, 0, 0)
+
+    for d in entries:
+        if limit and migrated + failed >= limit:
+            break
+        try:
+            if d.is_symlink() or not d.is_dir() or not _JOB_ID_RE.match(d.name):
+                continue
+            out_dir = d / "output"
+            if not (out_dir / "metadata.json").is_file():
+                continue
+        except OSError:
+            continue
+        try:
+            row = job_store.get(d.name)
+        except Exception:  # noqa: BLE001
+            skipped += 1
+            continue
+        # ONLY a DONE job. A FAILED one is the recovery sweep's business (it owns the marker and
+        # the claim fence), and anything else has no result worth publishing.
+        if row is None or row.status is not JobStatus.DONE:
+            continue
+        try:
+            if blob_store.has_output(d.name):
+                skipped += 1                      # already durable; the reclaim will collect it
+                continue
+        except Exception:  # noqa: BLE001 -- unknown is NOT durable, so try the upload
+            pass
+        if dry_run:
+            migrated += 1
+            continue
+        up_exc = upload_output_with_retry(blob_store, d.name, out_dir, attempts=2)
+        if up_exc is None:
+            migrated += 1
+            log.info("legacy migration: %s is now durably stored", d.name)
+        else:
+            failed += 1
+            log.warning("legacy migration: %s could not be uploaded (%s); leaving it in place",
+                        d.name, up_exc)
+    log.info("legacy migration: %d migrated, %d already durable, %d failed%s",
+             migrated, skipped, failed, " (dry run)" if dry_run else "")
+    return (migrated, skipped, failed)
+
+
 def reap_stale_scratch(
     job_root: Path,
     max_age_s: float,

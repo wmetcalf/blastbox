@@ -697,6 +697,36 @@ def _pki_cmd(args: argparse.Namespace) -> int:
     return 2
 
 
+def _migrate_results_cmd(args) -> int:
+    """Upload pre-blob-store results so the scratch reclaim can finally free their disk.
+
+    The reclaim refuses to delete a DONE job whose result is not in the blob store -- those are
+    legacy jobs whose only copy is the local tree, and deleting them would destroy results the API
+    still serves. Correct, but permanent: nothing else ever uploads them, so on an upgraded node
+    they accumulate as trees the sweep can only ever retain (~82k of them on the fleet this was
+    written for). This is the operator action that ends that state.
+    """
+    import logging as _logging
+    import os as _os
+    from pathlib import Path as _Path
+
+    from blastbox.host.blobs.factory import build_blob_store_from_env
+    from blastbox.host.jobs.factory import build_job_store_from_env
+    from blastbox.host.jobs.retention import migrate_legacy_results
+
+    job_root = _Path(args.job_root or _os.environ.get(
+        "BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs"))
+    blobs = build_blob_store_from_env({**_os.environ, "BLASTBOX_JOB_ROOT": str(job_root)})
+    store = build_job_store_from_env()
+    log = _logging.getLogger("blastbox.migrate")
+    migrated, skipped, failed = migrate_legacy_results(
+        job_root, blobs, store, log, limit=args.limit, dry_run=args.dry_run,
+    )
+    print(f"migrated={migrated} already-durable={skipped} failed={failed}"
+          + (" (dry run — nothing was uploaded)" if args.dry_run else ""))
+    return 1 if failed else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="blastbox")
     sub = p.add_subparsers(dest="command", required=True)
@@ -772,6 +802,17 @@ def build_parser() -> argparse.ArgumentParser:
     pk.set_defaults(func=_pki_cmd)
 
     # version
+    pm = sub.add_parser(
+        "migrate-results",
+        help="upload pre-blob-store results so the scratch reclaim can free their disk",
+    )
+    pm.add_argument("--job-root", default=None, help="default: BLASTBOX_JOB_ROOT")
+    pm.add_argument("--limit", type=int, default=0,
+                    help="stop after N uploads (0 = all); run it in batches on a busy node")
+    pm.add_argument("--dry-run", action="store_true",
+                    help="report what would be uploaded without touching the blob store")
+    pm.set_defaults(func=_migrate_results_cmd)
+
     pv = sub.add_parser("version", help="print version and exit")
     pv.set_defaults(func=_version_cmd)
 

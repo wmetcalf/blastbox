@@ -16,6 +16,7 @@ from blastbox.host.jobs.base import Job, JobStatus
 from blastbox.host.jobs.memory import InMemoryJobStore
 from blastbox.host.jobs.retention import (
     PENDING_UPLOAD_SENTINEL,
+    migrate_legacy_results,
     reap_stale_scratch,
     RESULT_RETAINED_MARKER,
     JobRetentionSweeper,
@@ -1243,3 +1244,88 @@ class TestMarkerOwnership:
             "left a complete result in the store under an expired row that nothing can serve, "
             "select for deletion, or ever revisit"
         )
+
+
+class TestLegacyMigration:
+    """The ending where the disk actually recovers.
+
+    The last-copy rule refuses to delete a DONE job whose result is not in the store — correct,
+    since those pre-blob-store jobs have no other copy — but nothing ever uploads them, so on an
+    upgraded node they accumulate as trees the sweep can only retain. Measured: ~82k on one fleet
+    node, every sweep retaining rather than removing.
+    """
+
+    def test_a_legacy_result_becomes_durable_and_then_reclaimable(self, tmp_path):
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.DONE
+        store.create(job)
+        d = _sealed_tree(tmp_path, _JID, pending=False)
+        blobs = _FakeBlobs()
+
+        assert not blobs.has_output(_JID)
+        # Before: the reclaim can only retain it.
+        old = time.time() - 99_999
+        for pth in sorted(d.rglob("*"), reverse=True) + [d]:
+            os.utime(pth, (old, old))
+        assert reap_stale_scratch(tmp_path, 60.0, store, logging.getLogger("t"),
+                                  blob_store=blobs) == 0
+
+        migrated, skipped, failed = migrate_legacy_results(
+            tmp_path, blobs, store, logging.getLogger("t"))
+        assert (migrated, failed) == (1, 0)
+        assert blobs.has_output(_JID), "the legacy result is durable now"
+
+        # After: it is redundant, so the sweep collects it — the disk finally comes back.
+        assert reap_stale_scratch(tmp_path, 60.0, store, logging.getLogger("t"),
+                                  blob_store=blobs) == 1
+        assert not d.exists()
+
+    def test_it_leaves_FAILED_jobs_to_the_recovery_sweep(self, tmp_path):
+        """A FAILED job's tree belongs to retry_pending_uploads, which owns the marker and the
+        claim fence. Uploading it from here would bypass both."""
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.error = f"x; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+        _sealed_tree(tmp_path, _JID)
+        blobs = _FakeBlobs()
+
+        assert migrate_legacy_results(tmp_path, blobs, store, logging.getLogger("t")) == (0, 0, 0)
+        assert blobs.put_calls == 0
+
+    def test_dry_run_touches_nothing(self, tmp_path):
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.DONE
+        store.create(job)
+        _sealed_tree(tmp_path, _JID, pending=False)
+        blobs = _FakeBlobs()
+
+        migrated, _, failed = migrate_legacy_results(
+            tmp_path, blobs, store, logging.getLogger("t"), dry_run=True)
+        assert (migrated, failed) == (1, 0)
+        assert blobs.put_calls == 0, "a dry run wrote to the blob store"
+        assert not blobs.has_output(_JID)
+
+    def test_it_does_not_re_upload_what_is_already_durable(self, tmp_path):
+        """Re-uploading is not free: this runs over tens of thousands of trees against an object
+        store, so a result already in the store must cost one has_output and nothing more —
+        otherwise a second run rewrites the entire corpus."""
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.DONE
+        store.create(job)
+        _sealed_tree(tmp_path, _JID, pending=False)
+        blobs = _FakeBlobs()
+        blobs.stored[_JID] = ["metadata.json"]          # a previous run already migrated it
+
+        migrated, skipped, failed = migrate_legacy_results(
+            tmp_path, blobs, store, logging.getLogger("t"))
+        assert (migrated, skipped, failed) == (0, 1, 0)
+        assert blobs.put_calls == 0, "re-uploaded a result that was already durable"
