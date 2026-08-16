@@ -231,6 +231,7 @@ class WarmPool:
         warm_size: int = 4,
         concurrent_ceiling: int = 16,
         spawn_rate_limit: float = 4.0,
+        spawn_concurrency: int = 1,
         clock: Callable[[], float] = time.monotonic,
         poll_interval: float = 0.1,
         burst_size: int = 4,
@@ -412,6 +413,11 @@ class WarmPool:
 
         # Token bucket for spawn rate limiting
         self._bucket = _TokenBucket(rate=spawn_rate_limit, clock=clock)
+        # >1 lets several runtime.spawn() calls overlap. Slots reserved but not yet
+        # published must still count against concurrent_ceiling, or a batch would
+        # overshoot the cap by however many spawns are in flight.
+        self._spawn_concurrency = max(1, int(spawn_concurrency))
+        self._spawns_in_flight = 0
 
         # Background thread
         self._stop_event = threading.Event()
@@ -1801,6 +1807,115 @@ class WarmPool:
                 self._last_idle_at = self._clock()
             self._idle_event.set()
 
+    def _spawn_batch_concurrent(self, to_spawn: int, expect_generation: int | None) -> None:
+        """Issue up to *to_spawn* spawns with at most ``spawn_concurrency`` in flight.
+
+        Why this exists: the maintenance thread issues runtime.spawn() one at a time, so a tier
+        whose spawn is LATENCY-bound (an FC snapshot restore: measured gap p50 0.57s) caps the
+        whole pool at ~1.7 slots/s. With a disposable slot per job that is the job-throughput
+        ceiling too -- observed 1.4/s on a 32-core node sitting at load 8 with 94G free. Spawns
+        wait on I/O, not CPU, so overlapping them is nearly free.
+
+        Same gates as the serial path (token bucket, ceiling, base generation).
+
+        ``_spawns_in_flight`` counts spawns reserved but not yet published. It is DEFENSIVE, not
+        load-bearing today: the executor context manager blocks until the batch finishes, so two
+        batches cannot overlap on the single maintenance thread, and ``to_spawn`` is already
+        clamped to the ceiling headroom. It exists so that a future caller which issues batches
+        without waiting cannot overshoot the cap. Mutation-checked: removing it does not fail any
+        test, precisely because the overlap it guards against is currently unreachable.
+
+        Ordering note: the serial path can ``break`` mid-batch on a capacity/host-resource error
+        and never issue the remaining spawns. Here the batch is already in flight when the first
+        error surfaces, so every issued spawn is still accounted for -- published if usable, reaped
+        if not. It never leaks a worker; it can spend a few extra spawns on the tick that fails.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        reservations: list[dict] = []
+        for _ in range(to_spawn):
+            if not self._bucket.consume():
+                break
+            with self._lock:
+                if len(self._slots) + self._spawns_in_flight >= self._concurrent_ceiling:
+                    break
+                if expect_generation is not None and self._base_rebuilds != expect_generation:
+                    logger.info("pool.spawn_batch_abandoned reason=base_rebuilt_mid_batch")
+                    break
+                self._spawns_in_flight += 1
+                # Ledger as of the moment THIS restore starts -- same reason as the serial path.
+                reservations.append(dict(self._base_generation))
+        if not reservations:
+            return
+
+        workers = min(self._spawn_concurrency, len(reservations))
+        try:
+            with ThreadPoolExecutor(max_workers=workers,
+                                    thread_name_prefix="bb-spawn") as pool:
+                futures = [(pool.submit(self._runtime.spawn), gen) for gen in reservations]
+                outcomes = [(f, gen) for f, gen in futures]
+        finally:
+            with self._lock:
+                self._spawns_in_flight = max(0, self._spawns_in_flight - len(reservations))
+
+        for fut, gen_at_spawn in outcomes:
+            exc = fut.exception()
+            if exc is not None:
+                self._handle_concurrent_spawn_error(exc)
+                continue
+            slot = fut.result()
+            with self._lock:
+                # Capacity came back -- same reset as the serial path.
+                self._capacity_miss_since = None
+                self._capacity_starved_logged = False
+            slot.state = SlotState.WARMING
+            slot.spawned_at = self._clock()
+            record_slot_spawned()
+            self._publish_or_reap_spawned(slot, gen_at_spawn)
+
+    def _handle_concurrent_spawn_error(self, exc: BaseException) -> None:
+        """Classify a failed spawn exactly as the serial loop does (minus its ``break``)."""
+        if isinstance(exc, RuntimeAtCapacity):
+            logger.debug("pool.spawn_capacity_miss reason=%s", exc)
+            self._note_capacity_miss(str(exc))
+            return
+        if is_host_resource_failure(exc):
+            logger.warning("pool.spawn_host_resource_failure (not counted against the base): %s", exc)
+            self._note_capacity_miss(f"host resources exhausted: {exc}")
+            return
+        logger.error("pool.spawn_failed", exc_info=exc)
+        with self._lock:
+            self._spawn_consecutive_failures += 1
+            spawn_failures = self._spawn_consecutive_failures
+        self._maybe_rebuild_base(spawn_failures, reason="spawn")
+
+    def _publish_or_reap_spawned(self, slot: Any, gen_at_spawn: dict) -> None:
+        """Publish a freshly spawned slot, or reap it if shutdown/ceiling says we must not.
+
+        Mirrors the serial path's publish block: stop() may have snapshotted _slots while the
+        spawn was in flight (publishing then leaks a live microVM/instance), and a concurrent
+        resize() may have lowered the ceiling underneath us.
+        """
+        with self._lock:
+            drop = self._stop_event.is_set() or len(self._slots) >= self._concurrent_ceiling
+            if not drop:
+                self._slots[slot.slot_id] = slot
+                _ident = self._base_identity(slot)
+                self._slot_base[slot.slot_id] = (_ident, gen_at_spawn.get(_ident, 0))
+        if not drop:
+            return
+        reaped = False
+        try:
+            reaped = self._reap_and_count(slot)
+        except Exception:
+            logger.exception("pool.reap_unpublished_failed slot_id=%s — quarantining (worker may "
+                             "persist)", slot.slot_id)
+        if not reaped:
+            # Track the husk as DRAINING so it is accounted for instead of silently leaked.
+            slot.state = SlotState.DRAINING
+            with self._lock:
+                self._slots[slot.slot_id] = slot
+
     def _spawn_to_deficit(self, ready: bool = True, *,
                           expect_generation: int | None = None) -> None:
         """Spawn new slots to fill the deficit, respecting ceiling + rate limit.
@@ -1864,6 +1979,12 @@ class WarmPool:
                 "a deficit exists but no headroom: the ceiling is full of slots that are not "
                 "usable (DRAINING/leaked reservations)"
             )
+
+        if self._spawn_concurrency > 1 and to_spawn > 1:
+            # Overlap the slow runtime.spawn() calls. Everything else -- gates, accounting,
+            # publication -- is unchanged; see _spawn_batch_concurrent.
+            self._spawn_batch_concurrent(to_spawn, expect_generation)
+            return
 
         for _ in range(to_spawn):
             # Rate-limit: consume one token per spawn
