@@ -1825,10 +1825,28 @@ class WarmPool:
         without waiting cannot overshoot the cap. Mutation-checked: removing it does not fail any
         test, precisely because the overlap it guards against is currently unreachable.
 
-        Ordering note: the serial path can ``break`` mid-batch on a capacity/host-resource error
-        and never issue the remaining spawns. Here the batch is already in flight when the first
-        error surfaces, so every issued spawn is still accounted for -- published if usable, reaped
-        if not. It never leaks a worker; it can spend a few extra spawns on the tick that fails.
+        !!! NOT PRODUCTION READY -- DO NOT RAISE spawn_concurrency ABOVE 1 !!!
+
+        An adversarial review (2026-08-16) found defects here that are REPRODUCED, not theoretical.
+        The claim this docstring used to make -- "it never leaks a worker" -- is FALSE:
+
+          1. LEAK: `pool.submit()` raising mid-comprehension (RuntimeError: can't start new thread,
+             realistic under fd/thread pressure) discards the partially-built future list while
+             __exit__ still runs shutdown(wait=True), so already-submitted spawns RUN and create
+             real microVMs/instances that are never published and never reaped.
+             Measured: spawned=2 tracked=0 reaped=0 LEAKED=2.
+          2. LEAK: the outcome loop has no try/finally, so one exception at outcome i abandons
+             every already-completed spawn after it. Measured: spawned=4 LEAKED=4.
+          3. Capacity-starvation clock: a success later in the batch clears the episode an earlier
+             capacity miss opened, so pool.spawn_capacity_starved can never fire.
+             Measured: serial ends (700.0, True); concurrent ends (None, False).
+          4. The serial per-spawn re-checks (ceiling, base generation, stop_event) happen here only
+             at RESERVATION time -- microseconds, before any spawn starts -- so a mid-batch
+             resize()/rebuild/stop() cannot truncate the batch the way serial does.
+
+        Fixing this properly means moving the gates INSIDE the submitted callable and making both
+        the submit and the outcome phases exception-safe, so every issued spawn is reaped on every
+        path. Until then the default of 1 keeps the serial path, which is untouched and correct.
         """
         from concurrent.futures import ThreadPoolExecutor
 

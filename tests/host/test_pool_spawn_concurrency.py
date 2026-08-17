@@ -70,14 +70,13 @@ def test_concurrency_overlaps_spawns():
     assert rt.max_in_flight <= 4, f"must not exceed the configured cap, saw {rt.max_in_flight}"
 
 
+@pytest.mark.skip(reason="VACUOUS: WarmPool.__init__ clamps warm_size to concurrent_ceiling "
+                         "(pool.py:404), so warm_size=10/ceiling=4 becomes target=4 and the "
+                         "overshoot this claims to test is unreachable. Verified: deleting BOTH "
+                         "the headroom clamp and the in-flight ceiling check still passes. "
+                         "Rewrite against a real overshoot before trusting it.")
 def test_ceiling_is_never_breached_under_concurrent_spawning():
-    """End-to-end ceiling guard.
-
-    NOTE: this does NOT prove the _spawns_in_flight accounting is load-bearing -- mutating that
-    check away still passes, because the executor blocks so batches never overlap and to_spawn is
-    already clamped to headroom. Kept as a regression guard on the ceiling itself, which is what
-    actually bounds node RAM.
-    """
+    """VACUOUS -- see skip reason. Kept visible rather than deleted so the gap stays on the record."""
     rt = _SlowSpawnRuntime(delay=0.15)
     pool = WarmPool(runtime=rt, warm_size=10, concurrent_ceiling=4,
                     spawn_rate_limit=1000.0, spawn_concurrency=8)
