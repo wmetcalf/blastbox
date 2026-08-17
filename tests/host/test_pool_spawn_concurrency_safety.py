@@ -107,18 +107,42 @@ def test_stop_during_batch_declines_spawns_instead_of_creating_them(monkeypatch)
     assert pool._spawns_in_flight == 0
 
 
-def test_base_rebuild_midbatch_stops_further_spawns(monkeypatch):
+def test_base_rebuild_landing_during_the_spawns_stops_the_queued_ones():
     """MUTATION: remove the generation check from _gated_spawn -> queued spawns run against a
     base the manager already dropped, each triggering a synchronous rebuild (the PR #82 stall,
-    now fanned out across executor threads)."""
-    rt = _TrackingRuntime()
+    fanned out across executor threads).
+
+    The rebuild must land AFTER reservations are taken -- a pre-reservation bump is caught by the
+    reservation loop, which is why an earlier version of this test was hollow.
+    """
+    started = threading.Event()
+
+    class _BumpMidBatch(_TrackingRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pool_ref = None
+
+        def spawn(self):
+            # First spawn signals the batch is underway, then retires the generation the batch
+            # committed to; every queued spawn after it must be declined.
+            if not started.is_set():
+                started.set()
+                with self.pool_ref._lock:
+                    self.pool_ref._base_rebuilds += 1
+            return super().spawn()
+
+    rt = _BumpMidBatch()
+    # spawn_concurrency MUST be >1 or _spawn_to_deficit routes to the serial path and this
+    # exercises the serial gate instead of _gated_spawn (that mistake made an earlier version
+    # of this test survive its own mutation).
     pool = WarmPool(runtime=rt, warm_size=8, concurrent_ceiling=16,
                     spawn_rate_limit=1000.0, spawn_concurrency=2)
+    rt.pool_ref = pool
     gen = pool._base_rebuilds
-    # A rebuild lands after tick() committed but before the queued spawns run.
-    pool._base_rebuilds = gen + 1
     pool._spawn_to_deficit(ready=True, expect_generation=gen)
-    assert rt.spawned == [], "no spawn may run against a superseded base generation"
+    assert len(rt.spawned) <= 2, (
+        f"only spawns already past the gate may complete; {len(rt.spawned)} of 8 ran against a "
+        "superseded base generation")
     assert pool._spawns_in_flight == 0
 
 
@@ -186,18 +210,58 @@ def test_one_batch_of_failures_drives_at_most_one_base_rebuild():
     assert run(8) == run(1) == 1, "concurrent must match serial: exactly one rebuild per batch"
 
 
-def test_stop_counts_every_in_flight_spawn_as_an_orphan():
-    """MUTATION: restore `1 if thread_wedged else 0` -> the caller releases node budget for
-    RAM/vCPU that up to spawn_concurrency-1 live workers still hold."""
+def test_resize_during_the_spawns_declines_the_queued_ones():
+    """MUTATION: remove the ceiling check from _gated_spawn -> a mid-batch downsize is caught
+    only at publish, so every over-committed worker is really CREATED and then reaped (N real
+    run-instances + N terminates on a cloud tier) instead of never being created."""
+    class _ShrinkMidBatch(_TrackingRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pool_ref = None
+
+        def spawn(self):
+            if not self.spawned:              # during the first spawn, the autosizer shrinks us
+                self.pool_ref.resize(concurrent_ceiling=1)
+            return super().spawn()
+
+    rt = _ShrinkMidBatch()
+    # >1 for the same reason as the generation test: concurrency=1 takes the serial path.
+    pool = WarmPool(runtime=rt, warm_size=8, concurrent_ceiling=8,
+                    spawn_rate_limit=1000.0, spawn_concurrency=2)
+    rt.pool_ref = pool
+    pool._spawn_to_deficit(ready=True, expect_generation=None)
+    assert len(rt.spawned) <= 2, (
+        f"{len(rt.spawned)} workers created against a ceiling lowered to 1 mid-batch")
+    assert not _leaked(rt, pool)
+    assert pool._spawns_in_flight == 0
+
+
+def test_stop_reports_in_flight_spawns_as_orphans():
+    """MUTATION: restore `1 if thread_wedged else 0` -> stop() under-reports orphans by up to
+    spawn_concurrency-1, so the caller releases node budget for RAM/vCPU that live workers hold.
+
+    Deterministic by construction: a never-exiting stand-in thread forces the wedged branch, so
+    the test exercises the REAL stop() accounting without racing a live maintenance loop. An
+    earlier version started the pool and polled for a batch, which passed alone and failed in the
+    suite -- a flaky test is a defect, not a test.
+    """
     rt = _TrackingRuntime()
-    pool = WarmPool(runtime=rt, warm_size=8, concurrent_ceiling=16,
-                    spawn_rate_limit=1000.0, spawn_concurrency=8)
+    pool = WarmPool(runtime=rt, warm_size=4, concurrent_ceiling=8,
+                    spawn_rate_limit=1000.0, spawn_concurrency=4)
+
+    never_exits = threading.Event()
+    wedged = threading.Thread(target=never_exits.wait, daemon=True)
+    wedged.start()
+    pool._thread = wedged                 # stop() will join, time out, and set thread_wedged
     with pool._lock:
-        pool._spawns_in_flight = 5
-    # _wedged_stop_orphans mirrors stop()'s accounting without needing a wedged thread.
-    with pool._lock:
-        counted = len(pool._slots) + (max(1, pool._spawns_in_flight))
-    assert counted >= 5, "a wedged stop must report every uncommitted in-flight spawn"
+        pool._spawns_in_flight = 5        # a 5-wide batch uncommitted when shutdown began
+    try:
+        orphans = pool.stop(stop_timeout_s=0.2)
+    finally:
+        never_exits.set()
+    assert orphans >= 5, (
+        f"stop() reported {orphans} orphans with 5 spawns in flight; the caller would release "
+        "node budget for live workers")
 
 
 def test_spawns_in_flight_returns_to_zero_even_when_every_spawn_fails():
