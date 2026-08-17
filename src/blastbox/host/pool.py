@@ -1833,28 +1833,15 @@ class WarmPool:
         without waiting cannot overshoot the cap. Mutation-checked: removing it does not fail any
         test, precisely because the overlap it guards against is currently unreachable.
 
-        !!! NOT PRODUCTION READY -- DO NOT RAISE spawn_concurrency ABOVE 1 !!!
-
-        An adversarial review (2026-08-16) found defects here that are REPRODUCED, not theoretical.
-        The claim this docstring used to make -- "it never leaks a worker" -- is FALSE:
-
-          1. LEAK: `pool.submit()` raising mid-comprehension (RuntimeError: can't start new thread,
-             realistic under fd/thread pressure) discards the partially-built future list while
-             __exit__ still runs shutdown(wait=True), so already-submitted spawns RUN and create
-             real microVMs/instances that are never published and never reaped.
-             Measured: spawned=2 tracked=0 reaped=0 LEAKED=2.
-          2. LEAK: the outcome loop has no try/finally, so one exception at outcome i abandons
-             every already-completed spawn after it. Measured: spawned=4 LEAKED=4.
-          3. Capacity-starvation clock: a success later in the batch clears the episode an earlier
-             capacity miss opened, so pool.spawn_capacity_starved can never fire.
-             Measured: serial ends (700.0, True); concurrent ends (None, False).
-          4. The serial per-spawn re-checks (ceiling, base generation, stop_event) happen here only
-             at RESERVATION time -- microseconds, before any spawn starts -- so a mid-batch
-             resize()/rebuild/stop() cannot truncate the batch the way serial does.
-
-        Fixing this properly means moving the gates INSIDE the submitted callable and making both
-        the submit and the outcome phases exception-safe, so every issued spawn is reaped on every
-        path. Until then the default of 1 keeps the serial path, which is untouched and correct.
+        History, because the shape of this function is a direct response to it: a 2026-08-16
+        adversarial review REPRODUCED four defects in the first version -- two worker-leak classes
+        (a raising submit() abandoned already-submitted spawns; an unprotected outcome loop
+        abandoned the rest of the batch), a capacity-starvation clock a later success could erase,
+        and gates evaluated only at reservation time so no mid-batch stop()/resize()/rebuild could
+        truncate the batch. All four are fixed here and each is mutation-checked by
+        tests/host/test_pool_spawn_concurrency_safety.py -- reverting any one of them fails a test.
+        Do not "simplify" the gated callable, the per-outcome try/finally, or the deferred
+        capacity reset back into a plain comprehension; that is precisely the code that leaked.
         """
         from concurrent.futures import ThreadPoolExecutor
 
