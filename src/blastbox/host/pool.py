@@ -592,11 +592,19 @@ class WarmPool:
                         self._forget_slot_health(slot.slot_id)
 
         # Whatever remains in _slots failed to reap (or is owned by another thread mid-dispose) —
-        # a still-live VM the caller must keep reserving for. A wedged background thread means an
-        # in-flight spawn that isn't in _slots yet but may still complete into a live worker, so
-        # count it as one more orphan too — the caller must hold the reservation for it.
+        # a still-live VM the caller must keep reserving for. A wedged background thread means
+        # in-flight spawns that aren't in _slots yet but may still complete into live workers, so
+        # count them as orphans too — the caller must hold the reservation for them.
+        #
+        # Count them from _spawns_in_flight rather than assuming ONE. That assumption was true
+        # while spawns were strictly serial; with spawn_concurrency>1 a wedged thread can be
+        # holding up to that many uncommitted spawns, and undercounting makes the caller release
+        # node budget for RAM/vCPU that live workers still hold (peer oversubscription — the
+        # exact harm this return value exists to prevent). max(1, ...) keeps the old floor: a
+        # wedged thread means at least one in-flight spawn even if the counter says zero.
         with self._lock:
-            return len(self._slots) + (1 if thread_wedged else 0)
+            in_flight = max(1, self._spawns_in_flight) if thread_wedged else 0
+            return len(self._slots) + in_flight
 
     # ------------------------------------------------------------------
     # Public interface
@@ -1850,7 +1858,7 @@ class WarmPool:
         """
         from concurrent.futures import ThreadPoolExecutor
 
-        reservations: list[dict] = []
+        reservations = 0
         for _ in range(to_spawn):
             if not self._bucket.consume():
                 break
@@ -1861,51 +1869,160 @@ class WarmPool:
                     logger.info("pool.spawn_batch_abandoned reason=base_rebuilt_mid_batch")
                     break
                 self._spawns_in_flight += 1
-                # Ledger as of the moment THIS restore starts -- same reason as the serial path.
-                reservations.append(dict(self._base_generation))
+                reservations += 1
         if not reservations:
             return
 
-        workers = min(self._spawn_concurrency, len(reservations))
-        try:
-            with ThreadPoolExecutor(max_workers=workers,
-                                    thread_name_prefix="bb-spawn") as pool:
-                futures = [(pool.submit(self._runtime.spawn), gen) for gen in reservations]
-                outcomes = [(f, gen) for f, gen in futures]
-        finally:
-            with self._lock:
-                self._spawns_in_flight = max(0, self._spawns_in_flight - len(reservations))
+        def _gated_spawn() -> tuple[Any, dict] | tuple[None, None]:
+            """Re-check every gate immediately before the slow spawn, then spawn.
 
-        for fut, gen_at_spawn in outcomes:
-            exc = fut.exception()
-            if exc is not None:
-                self._handle_concurrent_spawn_error(exc)
-                continue
-            slot = fut.result()
+            This is the fix for the reservation-time-only gating: reservations are taken in a
+            microsecond loop, so a stop(), a resize() lowering the ceiling, or a base rebuild
+            landing DURING the spawns could not truncate the batch. Running the checks here --
+            on the worker thread, microseconds before runtime.spawn() -- restores the serial
+            path's per-spawn semantics: a declined spawn creates nothing at all, rather than
+            creating a worker that the publish step then has to reap.
+
+            The generation ledger is snapshotted HERE, not at reservation time, so a queued
+            spawn is stamped with the ledger as its own restore starts (the serial path's
+            invariant); stamping a stale generation would make the slot born pre-retired and
+            its later failures silently discarded.
+            """
             with self._lock:
-                # Capacity came back -- same reset as the serial path.
+                if self._stop_event.is_set():
+                    return (None, None)
+                if len(self._slots) + self._spawns_in_flight > self._concurrent_ceiling:
+                    return (None, None)
+                if expect_generation is not None and self._base_rebuilds != expect_generation:
+                    return (None, None)
+                gen_at_spawn = dict(self._base_generation)
+            return (self._runtime.spawn(), gen_at_spawn)
+
+        workers = min(self._spawn_concurrency, reservations)
+        futures: list[Any] = []
+        submit_exc: BaseException | None = None
+        executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bb-spawn")
+        try:
+            for _ in range(reservations):
+                try:
+                    futures.append(executor.submit(_gated_spawn))
+                except Exception as exc:  # noqa: BLE001 - RuntimeError: can't start new thread
+                    # Stop submitting, but DO NOT abandon what is already submitted: shutdown
+                    # below waits for it, and the settle loop reaps every worker it created.
+                    submit_exc = exc
+                    break
+            never_submitted = reservations - len(futures)
+            if never_submitted:
+                with self._lock:
+                    self._spawns_in_flight = max(0, self._spawns_in_flight - never_submitted)
+        finally:
+            # wait=True: every submitted spawn has finished, so no worker can be created after
+            # this returns. Not the `with` form -- an exception from submit() must not skip the
+            # settle loop below, which is the only thing that reaps what was already created.
+            executor.shutdown(wait=True)
+
+        capacity_miss = False
+        rebuild_attempted = False
+        spawned = 0
+        for fut in futures:
+            slot = None
+            try:
+                exc = fut.exception()
+                if exc is not None:
+                    kind, rebuild_attempted = self._handle_concurrent_spawn_error(
+                        exc, rebuild_attempted)
+                    capacity_miss = capacity_miss or kind == "capacity"
+                    continue
+                slot, gen_at_spawn = fut.result()
+                if slot is None:
+                    continue        # a gate declined it; nothing was created
+                slot.state = SlotState.WARMING
+                slot.spawned_at = self._clock()
+                record_slot_spawned()
+                spawned += 1
+                self._publish_or_reap_spawned(slot, gen_at_spawn)
+                slot = None         # settled: the helper either published or reaped it
+            except Exception:  # noqa: BLE001
+                # One bad outcome must never abandon the rest of the batch -- those are already
+                # COMPLETED spawns holding live workers, and this loop is the only thing that
+                # will ever publish or reap them.
+                logger.exception("pool.spawn_outcome_failed")
+                if slot is not None:
+                    self._reap_unsettled_spawn(slot)
+            finally:
+                with self._lock:
+                    self._spawns_in_flight = max(0, self._spawns_in_flight - 1)
+
+        if spawned and not capacity_miss:
+            # Capacity came back. Deferred to here so a success later in the batch cannot erase
+            # the starvation episode an earlier capacity miss opened -- that reset is what made
+            # pool.spawn_capacity_starved unfireable.
+            with self._lock:
                 self._capacity_miss_since = None
                 self._capacity_starved_logged = False
-            slot.state = SlotState.WARMING
-            slot.spawned_at = self._clock()
-            record_slot_spawned()
-            self._publish_or_reap_spawned(slot, gen_at_spawn)
+        if submit_exc is not None:
+            # Reported, not raised: the batch is fully settled by here, and raising would only
+            # surface as pool.tick_error while telling the operator nothing about the cause.
+            logger.error("pool.spawn_submit_failed after %d/%d submitted: %s",
+                         len(futures), reservations, submit_exc)
 
-    def _handle_concurrent_spawn_error(self, exc: BaseException) -> None:
-        """Classify a failed spawn exactly as the serial loop does (minus its ``break``)."""
+    def _handle_concurrent_spawn_error(
+        self, exc: BaseException, rebuild_attempted: bool
+    ) -> tuple[str, bool]:
+        """Classify a failed spawn as the serial loop does. Returns (kind, rebuild_attempted).
+
+        The serial loop ``break``s on each of these; a batch is already in flight here, so
+        instead the caller carries the state the break used to imply: *capacity* suppresses the
+        end-of-batch "capacity came back" reset, and *rebuild_attempted* makes the base rebuild
+        at-most-once per batch (N failing spawns must not drive N invalidations, which with a
+        zero cooldown is N real base rebuilds and N generation bumps).
+        """
         if isinstance(exc, RuntimeAtCapacity):
             logger.debug("pool.spawn_capacity_miss reason=%s", exc)
             self._note_capacity_miss(str(exc))
-            return
+            return ("capacity", rebuild_attempted)
         if is_host_resource_failure(exc):
             logger.warning("pool.spawn_host_resource_failure (not counted against the base): %s", exc)
             self._note_capacity_miss(f"host resources exhausted: {exc}")
-            return
+            return ("capacity", rebuild_attempted)
         logger.error("pool.spawn_failed", exc_info=exc)
         with self._lock:
             self._spawn_consecutive_failures += 1
             spawn_failures = self._spawn_consecutive_failures
-        self._maybe_rebuild_base(spawn_failures, reason="spawn")
+        if rebuild_attempted:
+            # A rebuild already landed in this batch. Serial would have broken out entirely;
+            # the remaining outcomes still need settling, but must not drive a SECOND
+            # invalidation (with a zero cooldown that is a second real base rebuild, and with
+            # the default cooldown it is a spurious ERROR that also resets the streak).
+            return ("failed", rebuild_attempted)
+        # Latch only on a rebuild that actually HAPPENED, not on the attempt: the threshold is
+        # reached mid-batch (streak 1 is below it, streak 2 crosses it), so latching on the
+        # attempt would stop the streak from ever crossing and no rebuild would occur at all.
+        if self._maybe_rebuild_base(spawn_failures, reason="spawn"):
+            logger.info("pool.spawn_batch_halted_for_rebuild reason=base_invalidated")
+            return ("failed", True)
+        return ("failed", False)
+
+    def _reap_unsettled_spawn(self, slot: Any) -> None:
+        """Last-resort disposal for a spawned worker that publish raised on.
+
+        Without this the slot that TRIGGERED the exception is the one leaked: it exists as a real
+        microVM/instance but is in neither _slots nor reaped, so stop() cannot see it. If publish
+        got far enough to insert it, leave it -- it is tracked, and the health check owns it now.
+        """
+        with self._lock:
+            if slot.slot_id in self._slots:
+                return
+        try:
+            if self._reap_and_count(slot):
+                return
+        except Exception:
+            logger.exception("pool.reap_unsettled_failed slot_id=%s", slot.slot_id)
+        # Terminate failed or raised: track the husk as DRAINING so it is accounted for and
+        # surfaced for manual cleanup rather than silently leaked off the books.
+        slot.state = SlotState.DRAINING
+        with self._lock:
+            self._slots[slot.slot_id] = slot
 
     def _publish_or_reap_spawned(self, slot: Any, gen_at_spawn: dict) -> None:
         """Publish a freshly spawned slot, or reap it if shutdown/ceiling says we must not.
