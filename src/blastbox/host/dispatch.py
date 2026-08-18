@@ -186,6 +186,60 @@ MAX_MATERIALISE_ATTEMPTS = 3
 _BLOB_RETRY_BACKOFF_S = 30.0
 
 
+class _PhaseTimer:
+    """Host-side wall-clock per phase for ONE warm dispatch, keyed by job_id.
+
+    Throughput on a disposable-slot tier is `slots / slot_cycle_time`, not `1 / engine_time`:
+    24 slots sustaining ~2.6 jobs/s means a ~9s slot cycle, while a single job against an idle
+    tier finishes in well under a second. So most of the cycle is something OTHER than
+    extraction -- and until this existed, nothing could say which part, which makes every
+    engine-side optimisation a guess.
+
+    Why the HOST and not the guest: the guest's log lines carry no correlation id, so under
+    concurrency pairing the k-th "job received" with the k-th "returned" pairs DIFFERENT JOBS.
+    That method reported 0.67s and 5.48s for the same tier minutes apart, which is how you can
+    tell it measures nothing (see RedTusk scripts/slot_cycle_profile.sh, which refuses to print
+    such numbers). `_dispatch_claimed_job` owns one job start to finish on ONE thread, so its
+    phases are already sequential and already ours -- no correlation id needed, and no guest
+    change, so this deploys with a container rebuild instead of a rootfs rebuild.
+
+    Instrumentation only: it never raises and never touches control flow. A phase that was
+    never reached is simply ABSENT from the line, which is itself the diagnostic -- the last
+    phase present is where the dispatch exited.
+    """
+
+    __slots__ = ("job_id", "outcome", "_start", "_last", "_phases")
+
+    def __init__(self, job_id: str) -> None:
+        self.job_id = job_id
+        self.outcome = "unknown"
+        now = time.monotonic()
+        self._start = now
+        self._last = now
+        self._phases: list[tuple[str, float]] = []
+
+    def mark(self, name: str) -> None:
+        """Close the phase that ended at this line and open the next one."""
+        now = time.monotonic()
+        self._phases.append((name, now - self._last))
+        self._last = now
+
+    def emit(self, log: logging.Logger = _log) -> None:
+        """One line per job. Guarded: a broken logging backend must not fail a job that has
+        already done its work -- this runs from the outer `finally`, past every terminal path."""
+        try:
+            total = time.monotonic() - self._start
+            log.info(
+                "warm_phases job_id=%s outcome=%s total=%.3f %s",
+                self.job_id,
+                self.outcome,
+                total,
+                " ".join(f"{name}={secs:.3f}" for name, secs in self._phases),
+            )
+        except Exception:  # noqa: BLE001 -- instrumentation is never worth a failed job
+            pass
+
+
 @dataclass(frozen=True)
 class EngineSpec:
     """Operator-configured description of one detonation engine.
@@ -932,7 +986,11 @@ class Dispatcher:
                 if egress:
                     _log.info("net_policy egress job_id=%s → bypassing warm slot (cold wires egress)",
                               job.job_id)
+                phases = _PhaseTimer(job.job_id)
                 slot = None if egress else self._pool.claim(timeout_s=self._warm_claim_timeout_s)
+                # BEFORE the reservation release below, so a slow claim is billed to the claim
+                # and not to whatever runs next.
+                phases.mark("slot_claim")
             finally:
                 # The reservation covered gate→slot-resolution only. Free it now: the slot is
                 # ASSIGNED (out of idle_count) or was missed, so keeping the reservation would
@@ -948,7 +1006,8 @@ class Dispatcher:
                 t0 = time.monotonic()
                 try:
                     self._dispatch_warm(
-                        job, staged_input_path=input_path, slot=slot, output_dir=output_dir
+                        job, staged_input_path=input_path, slot=slot, output_dir=output_dir,
+                        phases=phases,
                     )
                 finally:
                     # Delete the staged input on every terminal path WE own, then purge the
@@ -956,6 +1015,12 @@ class Dispatcher:
                     self._delete_input_if_owned(job, input_path)
                     self._purge_job_dir_if_owned(job)
                     self._record_outcome(job, path="warm", started=t0)
+                    # Emitted HERE, not inside _dispatch_warm, so the line covers the whole
+                    # slot cycle this thread is responsible for -- the purge is real per-job
+                    # wall-clock on a tier that keeps 82.7k result trees around, and billing it
+                    # to nobody is how it stayed invisible.
+                    phases.mark("purge")
+                    phases.emit()
                 return
             elif self._warm_only:
                 # Warm-only sidecar: do NOT cold-fall-back (no docker socket here — the cold
@@ -1172,6 +1237,7 @@ class Dispatcher:
         staged_input_path: Path,
         slot: "Slot",
         output_dir: Path,
+        phases: "_PhaseTimer | None" = None,
     ) -> None:
         """Execute one claimed job via a pre-warmed slot.
 
@@ -1187,6 +1253,11 @@ class Dispatcher:
         # (and other vsock runtimes) carry input over the wire and materialize
         # output via rdump; file-based runtimes copy into slot.input_dir and read
         # slot.output_dir directly. Absent the seam, the file-based path is used.
+        # Default rather than required: the marks below then need no `if phases is not None`
+        # guard, and the dozens of existing callers/tests that predate the instrumentation keep
+        # working. A timer with nobody to emit to costs a list append per phase.
+        if phases is None:
+            phases = _PhaseTimer(job.job_id)
         runtime = self._pool.runtime  # type: ignore[union-attr]  # pool non-None here
         stage_fn = getattr(runtime, "stage_warm_input", None)
         control_fn = getattr(runtime, "host_warm_control", None)
@@ -1300,6 +1371,7 @@ class Dispatcher:
                     self._fail_job(job, f"failed to stage input to warm slot: {exc}")
                     return
                 input_path = slot_input_copy
+            phases.mark("stage")
 
             # ------------------------------------------------------------------
             # Step 4: Signal go to warm worker (atomic write of go.json)
@@ -1348,6 +1420,9 @@ class Dispatcher:
                     warm_fault = "worker"
                 self._fail_job(job, f"failed to signal go to warm worker: {exc}")
                 return
+            # On the FC seam signal_go is where the sample crosses vsock into the guest, so this
+            # is the input-transfer cost and it scales with the document, unlike its neighbours.
+            phases.mark("go")
 
             # ------------------------------------------------------------------
             # Step 5: Wait for done signal (same deadline; remaining budget after the send)
@@ -1373,6 +1448,10 @@ class Dispatcher:
                     f"warm worker timed out after {self._worker_timeout_s}s",
                 )
                 return
+            # THE one phase that is actual extraction. Everything else on this line is the cost
+            # of running it in a disposable sandbox; if the rest outweighs this, tuning the
+            # engine is the wrong lever.
+            phases.mark("guest")
 
             # The guest is done; the sealing phase below (rdump materialize, output-cap, validate,
             # re-seal of up to max_total_artifact_bytes) is real wall-clock work NOT bounded by
@@ -1419,6 +1498,7 @@ class Dispatcher:
                         warm_fault = "worker"   # the guest/seam failed to hand its output back
                     self._fail_job(job, f"failed to read warm worker output: {exc}")
                     return
+            phases.mark("rdump")
 
             # Bound TOTAL on-disk output (declared + UNDECLARED) before trusting it. The gVisor
             # warm /out is a live 0o777 host bind mount with NO kernel size/inode quota, so a
@@ -1469,6 +1549,9 @@ class Dispatcher:
             except Exception as exc:  # noqa: BLE001
                 self._fail_job(job, f"unexpected trust validation error: {exc}")
                 return
+            # Covers the output-size cap AND the trust gate: both walk + hash the same output
+            # tree, so splitting them would report one traversal as two phases.
+            phases.mark("validate")
 
             # The trust gate validates output STRUCTURE, not the engine's verdict: an engine that
             # honestly reports a FAILED conversion (status="engine_error", typically 0 artifacts)
@@ -1502,6 +1585,7 @@ class Dispatcher:
                     warm_fault = "worker"   # its output could not be materialized
                 self._fail_job(job, f"failed to materialize warm output: {exc}")
                 return
+            phases.mark("seal")
 
             # ------------------------------------------------------------------
             # Step 6c: Upload the sealed HOST output dir to the blob store BEFORE marking
@@ -1556,6 +1640,7 @@ class Dispatcher:
                     f"{RESULT_RETAINED_MARKER}",
                 )
                 return
+            phases.mark("upload")
 
             # ------------------------------------------------------------------
             # Step 7: Mark DONE
@@ -1602,8 +1687,10 @@ class Dispatcher:
                 # DONE applied + still ours: index per-page perceptual hashes for /similar.
                 self._index_page_hashes(job.job_id, envelope)
                 warm_clean = True   # clean run → the warm slot is safe to reuse without a forced reset
+            phases.mark("commit")
 
         finally:
+            phases.outcome = "done" if warm_clean else "failed"
             # Security: release the slot on EVERY terminal path (success, trust-fail,
             # timeout, unexpected error). release() reaps+replaces — warm ≠ reuse.
             # Delete the slot's copy of the input (only the file path makes one; the
@@ -1625,6 +1712,9 @@ class Dispatcher:
                 dirty=not warm_clean,
                 fault=None if warm_clean else warm_fault,
             ))
+            # release() reaps AND replaces the microVM (warm != reuse), so this is the respawn
+            # cost -- the phase most likely to dominate a cycle whose extraction is milliseconds.
+            phases.mark("release")
 
     def _dispatch_inner(
         self, job: Job, input_path: Path, output_dir: Path,
