@@ -21,12 +21,41 @@ from blastbox.limits import Limits
 from blastbox.observability import configure_logging
 
 
+def _serve_workers(flag: int | None, env: "os._Environ[str] | dict[str, str] | None" = None) -> int:
+    """Resolve the uvicorn worker count: an explicit --workers, else the env, else 1.
+
+    Tolerates a SET-BUT-EMPTY variable, because that is what compose produces: the list form
+    `- BLASTBOX_SERVE_WORKERS=${BLASTBOX_SERVE_WORKERS:-}` renders as the empty STRING, not as
+    an absent variable, so `os.environ.get(KEY, "1")` returns "" and the default never applies.
+    A bare int() there raises before uvicorn starts, and with `restart: unless-stopped` that is
+    a crash loop -- on the ingress, which is the only way into the system.
+
+    Same fail-soft shape as every sibling knob (_int_env, _upload_concurrency): a value that
+    cannot be a worker count is an operator typo, not a request.
+    """
+    if flag:
+        return flag
+    e = os.environ if env is None else env
+    raw = str(e.get("BLASTBOX_SERVE_WORKERS", "")).strip()
+    if not raw:
+        return 1
+    try:
+        n = int(raw)
+    except ValueError:
+        logging.getLogger("blastbox.host.cli").warning(
+            "invalid BLASTBOX_SERVE_WORKERS=%r; using 1", raw)
+        return 1
+    if n < 1:
+        logging.getLogger("blastbox.host.cli").warning(
+            "BLASTBOX_SERVE_WORKERS=%r is below 1; using 1", raw)
+        return 1
+    return n
+
+
 def _serve_cmd(args: argparse.Namespace) -> int:
     import uvicorn
 
-    workers = args.workers if getattr(args, "workers", None) else int(
-        os.environ.get("BLASTBOX_SERVE_WORKERS", "1")
-    )
+    workers = _serve_workers(getattr(args, "workers", None))
 
     if workers and workers > 1:
         # uvicorn forks `workers` processes; each must build its own app, so we pass an
