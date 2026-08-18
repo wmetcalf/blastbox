@@ -15,7 +15,8 @@ import gzip
 import hashlib
 import io
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 from urllib.parse import urlparse
@@ -35,6 +36,29 @@ _log = get_logger("blastbox.blobs.s3")
 
 _CHUNK = 1024 * 1024
 
+# put_output costs one round-trip PER OBJECT, and a result tree is often hundreds of them.
+# Measured on the fleet (200 corpus documents, FC tier, 24 slots): the upload was 39.7% of all
+# job-seconds -- more than extraction itself (38.0%) -- and its duration tracked artifact COUNT,
+# not bytes (821 artifacts -> 63.3s; 1 artifact -> 0.35s). Fanning the artifacts out is the
+# largest throughput lever left on the tier. 8 is well inside what a local MinIO absorbs; if this
+# ever becomes the limit again, the object store is the thing to look at, not this number.
+_DEFAULT_UPLOAD_CONCURRENCY = 8
+
+
+def _upload_concurrency(raw: object) -> int:
+    """Parse BLASTBOX_BLOB_UPLOAD_CONCURRENCY, falling back rather than raising.
+
+    This runs AFTER the detonation, holding a result that exists nowhere else yet, so an operator
+    typo in a deployment env must not be able to take the upload path down for every job. 1 is a
+    real setting -- the escape hatch back to the exact serial behaviour this replaced; anything
+    unparseable or below 1 is a typo, not a request, and gets the default.
+    """
+    try:
+        n = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _DEFAULT_UPLOAD_CONCURRENCY
+    return n if n >= 1 else _DEFAULT_UPLOAD_CONCURRENCY
+
 
 class S3BlobStore:
     def __init__(
@@ -51,7 +75,21 @@ class S3BlobStore:
             "0", "false", "no",
         )
         endpoint = e.get("BLASTBOX_BLOB_ENDPOINT_URL", "").strip() or None
-        self._s3 = boto3.client("s3", endpoint_url=endpoint)
+        self._upload_concurrency = _upload_concurrency(
+            e.get("BLASTBOX_BLOB_UPLOAD_CONCURRENCY", _DEFAULT_UPLOAD_CONCURRENCY)
+        )
+        # botocore's connection pool defaults to 10. Left alone, a fan-out wider than that
+        # silently BLOCKS on the pool rather than erroring -- the change would look deployed,
+        # measure as no faster, and give no clue why. Size the pool to the fan-out.
+        import botocore.config  # type: ignore[import-untyped]  # noqa: PLC0415 -- optional dep
+
+        self._s3 = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            config=botocore.config.Config(
+                max_pool_connections=max(10, self._upload_concurrency),
+            ),
+        )
 
     def _key(self, *parts: str) -> str:
         return "/".join(p for p in (self._prefix, *parts) if p)
@@ -117,57 +155,118 @@ class S3BlobStore:
         # redundant. It is also the artifact the API fetches to serve a job at all (#85 review).
         declared = _declared_paths(out_dir)
         stored: set[str] = set()
-        for path in _upload_order(out_dir):
-            # Skip symlinks BEFORE is_file() -- is_file() follows a symlink to its
-            # target, so `p.is_symlink() or not p.is_file()` (checked in that
-            # order) never reads or uploads a symlink's target bytes. A worker
-            # that plants e.g. output/metadata.json -> /etc/passwd before this
-            # runs must not get that file's bytes stored (and later served) as
-            # trusted job output. A single hostile entry is skipped + logged,
-            # not raised — it must not fail the upload of the rest of a
-            # legitimate job's output.
-            if path.is_symlink():
-                _log.warning(
-                    "put_output_skipped_symlink",
-                    job_id=job_id,
-                    path=str(path.relative_to(out_dir)),
-                )
-                continue
-            if not path.is_file():
-                continue
-            rel = path.relative_to(out_dir).as_posix()
-            body = path.read_bytes()
-            extra: dict[str, str] = {}
-            if self._compress:
-                body = gzip.compress(body)
-                extra["ContentEncoding"] = "gzip"
-            # A name we can NEVER store is not an outage -- retrying it forever is what turns
-            # one worker-chosen filename into a permanent leak. The sample writes an undeclared
-            # 250-char name into its 0o777 output/, the key exceeds 1024 bytes on every
-            # attempt, the host marks the tree pending-upload, and the last-copy rule then
-            # exempts it from BOTH sweeps for the life of the node -- #84 reproduced on demand
-            # (upstream review of #85). Skip it loudly, exactly as a hostile symlink is skipped:
-            # undeclared files are not servable anyway (the result routes are manifest-gated), so
-            # nothing a consumer can reach is lost. Every other error still propagates, because a
-            # real outage MUST fail the upload rather than silently ship a partial result.
-            key = self._key("results", job_id, rel)
-            if len(key.encode("utf-8")) > 1024:      # hard S3 limit; no retry will fix it
-                if declared is None or rel in declared:
-                    raise OSError(  # a DECLARED artifact must never be silently dropped
-                        errno.ENAMETOOLONG,
-                        f"declared artifact {rel!r} exceeds the 1024-byte key limit", key)
-                _log.warning("put_output_skipped_unstorable_key", job_id=job_id, path=str(rel))
-                continue
-            if _is_seal(path, out_dir):
-                # The seal commits the upload: everything it promises must already be stored.
-                _assert_declared_landed(job_id, out_dir, stored)
-            self._s3.put_object(
-                Bucket=self._bucket,
-                Key=key,
-                Body=body,
-                **extra,
+
+        paths = _upload_order(out_dir)          # seal LAST, by construction
+        seals = [p for p in paths if _is_seal(p, out_dir)]
+        rest = [p for p in paths if not _is_seal(p, out_dir)]
+
+        # PHASE 1 — every artifact, fanned out. The seal is deliberately NOT in this set: its
+        # whole meaning is "everything else already landed", so it cannot share a barrier with
+        # the things it vouches for.
+        results: list[tuple[str | None, Exception | None]] = []
+        if self._upload_concurrency <= 1:
+            for path in rest:
+                results.append((self._put_one(job_id, path, out_dir, declared), None))
+        else:
+            with ThreadPoolExecutor(
+                max_workers=self._upload_concurrency,
+                thread_name_prefix="bb-put",
+            ) as pool:
+                futures = [pool.submit(self._put_one, job_id, p, out_dir, declared) for p in rest]
+                # Drained in SUBMISSION order, so the exception that surfaces is deterministic:
+                # the same tree must fail the same way every time, or the bounded retry wrapped
+                # around this call is chasing a moving target. Every future is drained even after
+                # one fails -- the pool joins them at __exit__ regardless, and a half-read result
+                # set is how `stored` silently loses entries that really did land.
+                for fut in futures:
+                    try:
+                        results.append((fut.result(), None))
+                    except Exception as exc:  # noqa: BLE001 -- re-raised in order below
+                        results.append((None, exc))
+
+        for rel, err in results:
+            if err is not None:
+                # A real outage MUST fail the upload rather than ship a partial result: the
+                # caller fails the job and retains the local tree instead of purging it.
+                raise err
+            if rel is not None:
+                stored.add(rel)
+
+        # PHASE 2 — the commit. Only now, with every artifact confirmed stored, may the seal
+        # exist: its presence under results/<job_id> is what has_output() reports as durable, and
+        # what the age reclaim deletes the complete LOCAL tree on the strength of.
+        for path in seals:
+            self._put_one(
+                job_id, path, out_dir, declared,
+                before_put=lambda: _assert_declared_landed(job_id, out_dir, stored),
             )
-            stored.add(rel)
+
+    def _put_one(
+        self,
+        job_id: str,
+        path: Path,
+        out_dir: Path,
+        declared: "set[str] | None",
+        *,
+        before_put: Callable[[], None] | None = None,
+    ) -> str | None:
+        """Store ONE file. Returns its relative key, or None if it was legitimately skipped.
+
+        Runs on a pool thread, so it touches no shared state: the caller collects the returned
+        rels and builds `stored` itself. Raises for anything that must fail the whole upload.
+        """
+        # Skip symlinks BEFORE is_file() -- is_file() follows a symlink to its
+        # target, so `p.is_symlink() or not p.is_file()` (checked in that
+        # order) never reads or uploads a symlink's target bytes. A worker
+        # that plants e.g. output/metadata.json -> /etc/passwd before this
+        # runs must not get that file's bytes stored (and later served) as
+        # trusted job output. A single hostile entry is skipped + logged,
+        # not raised — it must not fail the upload of the rest of a
+        # legitimate job's output.
+        if path.is_symlink():
+            _log.warning(
+                "put_output_skipped_symlink",
+                job_id=job_id,
+                path=str(path.relative_to(out_dir)),
+            )
+            return None
+        if not path.is_file():
+            return None
+        rel = path.relative_to(out_dir).as_posix()
+        body = path.read_bytes()
+        extra: dict[str, str] = {}
+        if self._compress:
+            body = gzip.compress(body)
+            extra["ContentEncoding"] = "gzip"
+        # A name we can NEVER store is not an outage -- retrying it forever is what turns
+        # one worker-chosen filename into a permanent leak. The sample writes an undeclared
+        # 250-char name into its 0o777 output/, the key exceeds 1024 bytes on every
+        # attempt, the host marks the tree pending-upload, and the last-copy rule then
+        # exempts it from BOTH sweeps for the life of the node -- #84 reproduced on demand
+        # (upstream review of #85). Skip it loudly, exactly as a hostile symlink is skipped:
+        # undeclared files are not servable anyway (the result routes are manifest-gated), so
+        # nothing a consumer can reach is lost. Every other error still propagates, because a
+        # real outage MUST fail the upload rather than silently ship a partial result.
+        key = self._key("results", job_id, rel)
+        if len(key.encode("utf-8")) > 1024:      # hard S3 limit; no retry will fix it
+            if declared is None or rel in declared:
+                raise OSError(  # a DECLARED artifact must never be silently dropped
+                    errno.ENAMETOOLONG,
+                    f"declared artifact {rel!r} exceeds the 1024-byte key limit", key)
+            _log.warning("put_output_skipped_unstorable_key", job_id=job_id, path=str(rel))
+            return None
+        if before_put is not None:
+            # The seal's pre-condition, injected by the caller: everything the manifest promises
+            # must already be stored. Passed in rather than checked here because `stored` is the
+            # CALLER's accumulator, and a pool thread has no business reading it.
+            before_put()
+        self._s3.put_object(
+            Bucket=self._bucket,
+            Key=key,
+            Body=body,
+            **extra,
+        )
+        return rel
 
     @staticmethod
     def _safe_rel(name: str) -> str:
