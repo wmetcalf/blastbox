@@ -239,3 +239,69 @@ def test_a_declared_artifact_the_walker_missed_still_blocks_the_seal(tmp_path):
     assert not any(c.endswith(SEAL) for c in s3.calls), (
         "the seal committed while a DECLARED artifact was never stored"
     )
+
+
+def test_concurrent_jobs_share_one_upload_budget(tmp_path):
+    """The fan-out budget is PER DISPATCHER, not per job.
+
+    The dispatcher builds one S3BlobStore and shares its boto3 client -- and therefore one
+    connection pool -- across every concurrent job. A per-call executor passes every other test
+    in this file and is badly wrong in production: 24 slots x 8 workers is 192 threads queueing
+    on a 10-connection pool, so the fan-out is fake past the tenth and the rest is pure
+    contention. Measured on the fleet when it was per-call: upload's share halved as intended
+    while purge, commit, rdump and fetch -- none of which touch this code -- all got 3-4x
+    SLOWER, and per-job p50 rose from 12.8s to 19.6s.
+
+    MUTATION: build a ThreadPoolExecutor inside put_output instead of reusing the shared one ->
+    4 concurrent jobs reach ~4x the configured concurrency and this fails.
+    """
+    limit = 4
+    s3 = _RecordingS3(delay=0.02)
+    store = _store(tmp_path, s3, BLASTBOX_BLOB_UPLOAD_CONCURRENCY=str(limit))
+
+    dirs = []
+    for n in range(4):
+        d = tmp_path / f"j{n}" / "output"
+        d.mkdir(parents=True)
+        for i in range(12):
+            (d / f"page-{i:03d}.png").write_bytes(b"PNG")
+        (d / SEAL).write_text(json.dumps(
+            {"engine": "t", "status": "ok", "input_sha256": "a" * 64, "artifacts": []}))
+        dirs.append((f"j{n}", d))
+
+    threads = [threading.Thread(target=store.put_output, args=(jid, d)) for jid, d in dirs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(s3.calls) == 4 * 13
+    assert s3.max_concurrent <= limit, (
+        f"4 concurrent jobs reached {s3.max_concurrent} simultaneous uploads against a budget of "
+        f"{limit} — the executor is per-job, not per-dispatcher"
+    )
+    assert s3.max_concurrent > 1, "no overlap at all — the shared pool is not being used"
+
+
+@pytest.mark.parametrize("configured,expected_min", [("4", 10), ("16", 16), ("64", 64)])
+def test_the_connection_pool_is_sized_to_the_upload_budget(tmp_path, configured, expected_min):
+    """botocore's connection pool defaults to 10. A fan-out wider than the pool does not error --
+    it BLOCKS, so the change looks deployed, measures as no faster, and gives no clue why. No
+    behavioural test can see this (a fake client has no pool), so assert the config directly.
+
+    The floor stays at botocore's 10 for small budgets: shrinking the pool below the default
+    would be a regression for the sample get/put path, which shares this client.
+
+    MUTATION: pin max_pool_connections to 10 -> a 16- or 64-wide budget queues on ten sockets and
+    this fails.
+    """
+    with moto.mock_aws():
+        boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=BUCKET)
+        store = S3BlobStore(f"s3://{BUCKET}/pfx", job_root=tmp_path,
+                            env={"BLASTBOX_BLOB_UPLOAD_CONCURRENCY": configured})
+
+    assert store._upload_concurrency == int(configured)
+    assert store._s3.meta.config.max_pool_connections == expected_min, (
+        f"budget {configured} against a pool of "
+        f"{store._s3.meta.config.max_pool_connections} — the fan-out will block on sockets"
+    )

@@ -17,6 +17,7 @@ import io
 import os
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+import threading
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 from urllib.parse import urlparse
@@ -40,9 +41,20 @@ _CHUNK = 1024 * 1024
 # Measured on the fleet (200 corpus documents, FC tier, 24 slots): the upload was 39.7% of all
 # job-seconds -- more than extraction itself (38.0%) -- and its duration tracked artifact COUNT,
 # not bytes (821 artifacts -> 63.3s; 1 artifact -> 0.35s). Fanning the artifacts out is the
-# largest throughput lever left on the tier. 8 is well inside what a local MinIO absorbs; if this
-# ever becomes the limit again, the object store is the thing to look at, not this number.
-_DEFAULT_UPLOAD_CONCURRENCY = 8
+# largest throughput lever left on the tier.
+#
+# This is a PER-DISPATCHER budget, not a per-job one. The dispatcher builds ONE S3BlobStore and
+# shares its boto3 client -- and therefore one connection pool -- across every concurrent job.
+# A per-call executor looks the same in a unit test and is badly wrong in production: 24 slots x
+# 8 workers = 192 threads queueing on a 10-connection pool, so the fan-out is fake past the tenth
+# and the other 182 threads are pure contention. Measured cost of getting this wrong: upload's
+# share halved as intended, while purge, commit, rdump and fetch -- none of which touch this code
+# -- all got 3-4x SLOWER and per-job p50 rose from 12.8s to 19.6s.
+#
+# So: one shared bounded pool, and a connection pool sized to it. Jobs queue against a budget
+# instead of thrashing. 16 is comfortable for a local MinIO across a 24-slot tier; if uploads
+# become the limit again, raise this AND look at the object store, in that order.
+_DEFAULT_UPLOAD_CONCURRENCY = 16
 
 
 def _upload_concurrency(raw: object) -> int:
@@ -78,9 +90,12 @@ class S3BlobStore:
         self._upload_concurrency = _upload_concurrency(
             e.get("BLASTBOX_BLOB_UPLOAD_CONCURRENCY", _DEFAULT_UPLOAD_CONCURRENCY)
         )
+        self._upload_pool: ThreadPoolExecutor | None = None
+        self._upload_pool_lock = threading.Lock()
         # botocore's connection pool defaults to 10. Left alone, a fan-out wider than that
         # silently BLOCKS on the pool rather than erroring -- the change would look deployed,
-        # measure as no faster, and give no clue why. Size the pool to the fan-out.
+        # measure as no faster, and give no clue why. Size it to the SHARED upload budget, which
+        # is the real ceiling on in-flight requests now that the executor is shared.
         import botocore.config  # type: ignore[import-untyped]  # noqa: PLC0415 -- optional dep
 
         self._s3 = boto3.client(
@@ -168,21 +183,19 @@ class S3BlobStore:
             for path in rest:
                 results.append((self._put_one(job_id, path, out_dir, declared), None))
         else:
-            with ThreadPoolExecutor(
-                max_workers=self._upload_concurrency,
-                thread_name_prefix="bb-put",
-            ) as pool:
-                futures = [pool.submit(self._put_one, job_id, p, out_dir, declared) for p in rest]
-                # Drained in SUBMISSION order, so the exception that surfaces is deterministic:
-                # the same tree must fail the same way every time, or the bounded retry wrapped
-                # around this call is chasing a moving target. Every future is drained even after
-                # one fails -- the pool joins them at __exit__ regardless, and a half-read result
-                # set is how `stored` silently loses entries that really did land.
-                for fut in futures:
-                    try:
-                        results.append((fut.result(), None))
-                    except Exception as exc:  # noqa: BLE001 -- re-raised in order below
-                        results.append((None, exc))
+            pool = self._pool_for_uploads()
+            futures = [pool.submit(self._put_one, job_id, p, out_dir, declared) for p in rest]
+            # Drained in SUBMISSION order, so the exception that surfaces is deterministic: the
+            # same tree must fail the same way every time, or the bounded retry wrapped around
+            # this call is chasing a moving target. EVERY future is drained even after one fails
+            # -- the pool is shared and long-lived, so abandoning futures would leave another
+            # job's uploads racing ours, and a half-read result set is how `stored` silently
+            # loses entries that really did land.
+            for fut in futures:
+                try:
+                    results.append((fut.result(), None))
+                except Exception as exc:  # noqa: BLE001 -- re-raised in order below
+                    results.append((None, exc))
 
         for rel, err in results:
             if err is not None:
@@ -196,10 +209,36 @@ class S3BlobStore:
         # exist: its presence under results/<job_id> is what has_output() reports as durable, and
         # what the age reclaim deletes the complete LOCAL tree on the strength of.
         for path in seals:
-            self._put_one(
-                job_id, path, out_dir, declared,
-                before_put=lambda: _assert_declared_landed(job_id, out_dir, stored),
-            )
+            def _precondition() -> None:
+                _assert_declared_landed(job_id, out_dir, stored)
+
+            if self._upload_concurrency <= 1:
+                self._put_one(job_id, path, out_dir, declared, before_put=_precondition)
+            else:
+                # Through the SAME pool, so a sealing job counts against the shared budget like
+                # any other request -- otherwise the real in-flight ceiling is
+                # concurrency + (jobs currently sealing), which on a 24-slot tier is 24 requests
+                # nobody budgeted for, against a connection pool sized for the budget alone.
+                # Ordering is unaffected: the barrier above has already completed, and .result()
+                # both waits for the seal and re-raises whatever it hit. Nothing in the pool ever
+                # waits on the pool, so a saturated pool always drains.
+                self._pool_for_uploads().submit(
+                    self._put_one, job_id, path, out_dir, declared, before_put=_precondition,
+                ).result()
+
+    def _pool_for_uploads(self) -> ThreadPoolExecutor:
+        """The dispatcher-wide upload pool, created on first use.
+
+        SHARED on purpose: see _DEFAULT_UPLOAD_CONCURRENCY. It is never shut down -- the store
+        lives for the process, and ThreadPoolExecutor's own atexit hook joins the workers.
+        """
+        with self._upload_pool_lock:
+            if self._upload_pool is None:
+                self._upload_pool = ThreadPoolExecutor(
+                    max_workers=self._upload_concurrency,
+                    thread_name_prefix="bb-put",
+                )
+            return self._upload_pool
 
     def _put_one(
         self,
