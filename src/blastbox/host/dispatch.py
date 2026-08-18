@@ -1338,6 +1338,12 @@ class Dispatcher:
                 # than any of the claim races.
                 warm_fault = "unknown"
                 return
+            # SPLIT from `stage` on purpose. _materialise_sample pulls the sample from the blob
+            # store over the NETWORK; staging below is a vsock write or a local copy. Lumping
+            # them reported ~10% of all job-seconds as "staging" when nearly all of it was blob
+            # I/O -- and blob I/O is a MinIO/S3 problem, not a dispatcher one. Different fix,
+            # different phase.
+            phases.mark("fetch")
 
             # ------------------------------------------------------------------
             # Step 3: Stage input — over the wire (vsock) or into slot.input_dir

@@ -100,7 +100,7 @@ def test_a_clean_warm_run_emits_one_phase_line_covering_every_phase(tmp_path, ca
     # Every step of the slot cycle a HOST can see. `guest` is the only one that is extraction;
     # if the others sum to more than it does, tuning the engine is the wrong lever -- which is
     # the entire question this instrumentation exists to answer.
-    for name in ("slot_claim", "stage", "go", "guest", "rdump",
+    for name in ("slot_claim", "fetch", "stage", "go", "guest", "rdump",
                  "validate", "seal", "commit", "release", "purge"):
         assert name in phases, f"phase {name!r} missing from: {line}"
     assert phases["total"] > 0.0
