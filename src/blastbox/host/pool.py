@@ -1914,10 +1914,15 @@ class WarmPool:
         for fut in futures:
             slot = None
             try:
-                exc = fut.exception()
-                if exc is not None:
+                # `err`, not `exc`: an `except ... as exc` earlier in this method binds that
+                # name, and Python deletes it at the end of the clause -- so reusing it here is
+                # legal but reads as a live rebind, and mypy rejects it outright ("Assignment to
+                # variable exc outside except: block"). CI runs `mypy src`, so this was a red
+                # build on the branch while origin/main was clean.
+                err = fut.exception()
+                if err is not None:
                     kind, rebuild_attempted = self._handle_concurrent_spawn_error(
-                        exc, rebuild_attempted)
+                        err, rebuild_attempted)
                     capacity_miss = capacity_miss or kind == "capacity"
                     continue
                 slot, gen_at_spawn = fut.result()
