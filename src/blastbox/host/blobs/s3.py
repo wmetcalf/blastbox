@@ -9,21 +9,67 @@ Key layout:
 """
 from __future__ import annotations
 
+import errno
+
 import gzip
 import hashlib
 import io
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
+import threading
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 from urllib.parse import urlparse
 
-from blastbox.host.blobs.base import BlobFetchError, BlobIntegrityError
+from blastbox.host.blobs.base import (
+    _SEAL_NAME,
+    _assert_declared_landed,
+    _declared_paths,
+    _is_seal,
+    BlobFetchError,
+    BlobIntegrityError,
+    _upload_order,
+)
 from blastbox.observability import get_logger
 
 _log = get_logger("blastbox.blobs.s3")
 
 _CHUNK = 1024 * 1024
+
+# put_output costs one round-trip PER OBJECT, and a result tree is often hundreds of them.
+# Measured on the fleet (200 corpus documents, FC tier, 24 slots): the upload was 39.7% of all
+# job-seconds -- more than extraction itself (38.0%) -- and its duration tracked artifact COUNT,
+# not bytes (821 artifacts -> 63.3s; 1 artifact -> 0.35s). Fanning the artifacts out is the
+# largest throughput lever left on the tier.
+#
+# This is a PER-DISPATCHER budget, not a per-job one. The dispatcher builds ONE S3BlobStore and
+# shares its boto3 client -- and therefore one connection pool -- across every concurrent job.
+# A per-call executor looks the same in a unit test and is badly wrong in production: 24 slots x
+# 8 workers = 192 threads queueing on a 10-connection pool, so the fan-out is fake past the tenth
+# and the other 182 threads are pure contention. Measured cost of getting this wrong: upload's
+# share halved as intended, while purge, commit, rdump and fetch -- none of which touch this code
+# -- all got 3-4x SLOWER and per-job p50 rose from 12.8s to 19.6s.
+#
+# So: one shared bounded pool, and a connection pool sized to it. Jobs queue against a budget
+# instead of thrashing. 16 is comfortable for a local MinIO across a 24-slot tier; if uploads
+# become the limit again, raise this AND look at the object store, in that order.
+_DEFAULT_UPLOAD_CONCURRENCY = 16
+
+
+def _upload_concurrency(raw: object) -> int:
+    """Parse BLASTBOX_BLOB_UPLOAD_CONCURRENCY, falling back rather than raising.
+
+    This runs AFTER the detonation, holding a result that exists nowhere else yet, so an operator
+    typo in a deployment env must not be able to take the upload path down for every job. 1 is a
+    real setting -- the escape hatch back to the exact serial behaviour this replaced; anything
+    unparseable or below 1 is a typo, not a request, and gets the default.
+    """
+    try:
+        n = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _DEFAULT_UPLOAD_CONCURRENCY
+    return n if n >= 1 else _DEFAULT_UPLOAD_CONCURRENCY
 
 
 class S3BlobStore:
@@ -41,7 +87,24 @@ class S3BlobStore:
             "0", "false", "no",
         )
         endpoint = e.get("BLASTBOX_BLOB_ENDPOINT_URL", "").strip() or None
-        self._s3 = boto3.client("s3", endpoint_url=endpoint)
+        self._upload_concurrency = _upload_concurrency(
+            e.get("BLASTBOX_BLOB_UPLOAD_CONCURRENCY", _DEFAULT_UPLOAD_CONCURRENCY)
+        )
+        self._upload_pool: ThreadPoolExecutor | None = None
+        self._upload_pool_lock = threading.Lock()
+        # botocore's connection pool defaults to 10. Left alone, a fan-out wider than that
+        # silently BLOCKS on the pool rather than erroring -- the change would look deployed,
+        # measure as no faster, and give no clue why. Size it to the SHARED upload budget, which
+        # is the real ceiling on in-flight requests now that the executor is shared.
+        import botocore.config  # type: ignore[import-untyped]  # noqa: PLC0415 -- optional dep
+
+        self._s3 = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            config=botocore.config.Config(
+                max_pool_connections=max(10, self._upload_concurrency),
+            ),
+        )
 
     def _key(self, *parts: str) -> str:
         return "/".join(p for p in (self._prefix, *parts) if p)
@@ -92,37 +155,157 @@ class S3BlobStore:
 
     # ── results ──────────────────────────────────────────────────────────────
     def put_output(self, job_id: str, out_dir: Path) -> None:
+        # The terminal purge deletes the local tree on the strength of THIS call, so a
+        # silent no-op here turns "upload succeeded" into a DONE job with no durable copy
+        # anywhere. rglob on a missing dir yields nothing and raises nothing, so assert the
+        # durability barrier explicitly (#85 review).
         out_dir = Path(out_dir)
-        for path in sorted(out_dir.rglob("*")):
-            # Skip symlinks BEFORE is_file() -- is_file() follows a symlink to its
-            # target, so `p.is_symlink() or not p.is_file()` (checked in that
-            # order) never reads or uploads a symlink's target bytes. A worker
-            # that plants e.g. output/metadata.json -> /etc/passwd before this
-            # runs must not get that file's bytes stored (and later served) as
-            # trusted job output. A single hostile entry is skipped + logged,
-            # not raised — it must not fail the upload of the rest of a
-            # legitimate job's output.
-            if path.is_symlink():
-                _log.warning(
-                    "put_output_skipped_symlink",
-                    job_id=job_id,
-                    path=str(path.relative_to(out_dir)),
+        if not out_dir.is_dir():
+            raise FileNotFoundError(f"put_output: output dir missing for {job_id}: {out_dir}")
+        # TWO-PHASE COMMIT. metadata.json is written LAST, so its presence under
+        # results/<job_id> means "every other artifact already landed" -- that is what makes
+        # has_output() a real durability answer instead of a guess. Uploading in plain sorted
+        # order put it FIRST ('m' < 'r'), so a run that died mid-upload left the seal present with
+        # artifacts missing, and the age reclaim would then delete the complete local tree as
+        # redundant. It is also the artifact the API fetches to serve a job at all (#85 review).
+        declared = _declared_paths(out_dir)
+        stored: set[str] = set()
+
+        paths = _upload_order(out_dir)          # seal LAST, by construction
+        seals = [p for p in paths if _is_seal(p, out_dir)]
+        rest = [p for p in paths if not _is_seal(p, out_dir)]
+
+        # PHASE 1 — every artifact, fanned out. The seal is deliberately NOT in this set: its
+        # whole meaning is "everything else already landed", so it cannot share a barrier with
+        # the things it vouches for.
+        results: list[tuple[str | None, Exception | None]] = []
+        if self._upload_concurrency <= 1:
+            for path in rest:
+                results.append((self._put_one(job_id, path, out_dir, declared), None))
+        else:
+            pool = self._pool_for_uploads()
+            futures = [pool.submit(self._put_one, job_id, p, out_dir, declared) for p in rest]
+            # Drained in SUBMISSION order, so the exception that surfaces is deterministic: the
+            # same tree must fail the same way every time, or the bounded retry wrapped around
+            # this call is chasing a moving target. EVERY future is drained even after one fails
+            # -- the pool is shared and long-lived, so abandoning futures would leave another
+            # job's uploads racing ours, and a half-read result set is how `stored` silently
+            # loses entries that really did land.
+            for fut in futures:
+                try:
+                    results.append((fut.result(), None))
+                except Exception as exc:  # noqa: BLE001 -- re-raised in order below
+                    results.append((None, exc))
+
+        for rel, err in results:
+            if err is not None:
+                # A real outage MUST fail the upload rather than ship a partial result: the
+                # caller fails the job and retains the local tree instead of purging it.
+                raise err
+            if rel is not None:
+                stored.add(rel)
+
+        # PHASE 2 — the commit. Only now, with every artifact confirmed stored, may the seal
+        # exist: its presence under results/<job_id> is what has_output() reports as durable, and
+        # what the age reclaim deletes the complete LOCAL tree on the strength of.
+        for path in seals:
+            def _precondition() -> None:
+                _assert_declared_landed(job_id, out_dir, stored)
+
+            if self._upload_concurrency <= 1:
+                self._put_one(job_id, path, out_dir, declared, before_put=_precondition)
+            else:
+                # Through the SAME pool, so a sealing job counts against the shared budget like
+                # any other request -- otherwise the real in-flight ceiling is
+                # concurrency + (jobs currently sealing), which on a 24-slot tier is 24 requests
+                # nobody budgeted for, against a connection pool sized for the budget alone.
+                # Ordering is unaffected: the barrier above has already completed, and .result()
+                # both waits for the seal and re-raises whatever it hit. Nothing in the pool ever
+                # waits on the pool, so a saturated pool always drains.
+                self._pool_for_uploads().submit(
+                    self._put_one, job_id, path, out_dir, declared, before_put=_precondition,
+                ).result()
+
+    def _pool_for_uploads(self) -> ThreadPoolExecutor:
+        """The dispatcher-wide upload pool, created on first use.
+
+        SHARED on purpose: see _DEFAULT_UPLOAD_CONCURRENCY. It is never shut down -- the store
+        lives for the process, and ThreadPoolExecutor's own atexit hook joins the workers.
+        """
+        with self._upload_pool_lock:
+            if self._upload_pool is None:
+                self._upload_pool = ThreadPoolExecutor(
+                    max_workers=self._upload_concurrency,
+                    thread_name_prefix="bb-put",
                 )
-                continue
-            if not path.is_file():
-                continue
-            rel = path.relative_to(out_dir).as_posix()
-            body = path.read_bytes()
-            extra: dict[str, str] = {}
-            if self._compress:
-                body = gzip.compress(body)
-                extra["ContentEncoding"] = "gzip"
-            self._s3.put_object(
-                Bucket=self._bucket,
-                Key=self._key("results", job_id, rel),
-                Body=body,
-                **extra,
+            return self._upload_pool
+
+    def _put_one(
+        self,
+        job_id: str,
+        path: Path,
+        out_dir: Path,
+        declared: "set[str] | None",
+        *,
+        before_put: Callable[[], None] | None = None,
+    ) -> str | None:
+        """Store ONE file. Returns its relative key, or None if it was legitimately skipped.
+
+        Runs on a pool thread, so it touches no shared state: the caller collects the returned
+        rels and builds `stored` itself. Raises for anything that must fail the whole upload.
+        """
+        # Skip symlinks BEFORE is_file() -- is_file() follows a symlink to its
+        # target, so `p.is_symlink() or not p.is_file()` (checked in that
+        # order) never reads or uploads a symlink's target bytes. A worker
+        # that plants e.g. output/metadata.json -> /etc/passwd before this
+        # runs must not get that file's bytes stored (and later served) as
+        # trusted job output. A single hostile entry is skipped + logged,
+        # not raised — it must not fail the upload of the rest of a
+        # legitimate job's output.
+        if path.is_symlink():
+            _log.warning(
+                "put_output_skipped_symlink",
+                job_id=job_id,
+                path=str(path.relative_to(out_dir)),
             )
+            return None
+        if not path.is_file():
+            return None
+        rel = path.relative_to(out_dir).as_posix()
+        body = path.read_bytes()
+        extra: dict[str, str] = {}
+        if self._compress:
+            body = gzip.compress(body)
+            extra["ContentEncoding"] = "gzip"
+        # A name we can NEVER store is not an outage -- retrying it forever is what turns
+        # one worker-chosen filename into a permanent leak. The sample writes an undeclared
+        # 250-char name into its 0o777 output/, the key exceeds 1024 bytes on every
+        # attempt, the host marks the tree pending-upload, and the last-copy rule then
+        # exempts it from BOTH sweeps for the life of the node -- #84 reproduced on demand
+        # (upstream review of #85). Skip it loudly, exactly as a hostile symlink is skipped:
+        # undeclared files are not servable anyway (the result routes are manifest-gated), so
+        # nothing a consumer can reach is lost. Every other error still propagates, because a
+        # real outage MUST fail the upload rather than silently ship a partial result.
+        key = self._key("results", job_id, rel)
+        if len(key.encode("utf-8")) > 1024:      # hard S3 limit; no retry will fix it
+            if declared is None or rel in declared:
+                raise OSError(  # a DECLARED artifact must never be silently dropped
+                    errno.ENAMETOOLONG,
+                    f"declared artifact {rel!r} exceeds the 1024-byte key limit", key)
+            _log.warning("put_output_skipped_unstorable_key", job_id=job_id, path=str(rel))
+            return None
+        if before_put is not None:
+            # The seal's pre-condition, injected by the caller: everything the manifest promises
+            # must already be stored. Passed in rather than checked here because `stored` is the
+            # CALLER's accumulator, and a pool thread has no business reading it.
+            before_put()
+        self._s3.put_object(
+            Bucket=self._bucket,
+            Key=key,
+            Body=body,
+            **extra,
+        )
+        return rel
 
     @staticmethod
     def _safe_rel(name: str) -> str:
@@ -149,6 +332,16 @@ class S3BlobStore:
         if obj.get("ContentEncoding") == "gzip":
             data = gzip.decompress(data)
         return io.BytesIO(data)
+
+    def has_output(self, job_id: str) -> bool:
+        """Positively observed durable result bytes for *job_id*. Any error -> False: the age
+        reclaim deletes the local tree on the strength of this answer, so a transient object-store
+        outage must never be read as "the durable copy is there"."""
+        try:
+            self._s3.head_object(Bucket=self._bucket, Key=self._key("results", job_id, _SEAL_NAME))
+        except Exception:  # noqa: BLE001 -- a miss AND any error are both "not durable"
+            return False
+        return True
 
     def delete_job(self, job_id: str) -> None:
         """Drop this job's RESULTS only.

@@ -2326,3 +2326,34 @@ def test_a_host_resource_failure_on_the_file_handshake_is_still_ours(tmp_path):
     assert pool.release_fault == ["unknown"], (
         f"a host disk failure must never burn out a healthy worker (got {pool.release_fault})"
     )
+
+
+def test_warm_terminal_job_leaves_nothing_on_this_workers_disk(tmp_path):
+    """Warm-path half of the purge invariant (issue #84).
+
+    The warm (file-handshake) path is what every local Firecracker/gVisor worker runs, and it
+    is where the leak actually bit: output/ held metadata.json and rmeta -- text and embedded
+    objects extracted from the sample -- and survived every terminal state forever. Asserting
+    only that the staged INPUT is gone (as the seam test above does) passes happily while the
+    extracted content stays on disk.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    job_root = tmp_path / "jobs"
+    _setup_job_dirs(job_root, job)
+
+    slot = _make_slot(tmp_path)
+    pool = FakeWarmPool(slot, runtime=_FakeVsockRuntime())
+    dispatcher = _make_dispatcher_with_pool(
+        store, job_root=job_root, pool=pool, worker_timeout_s=10
+    )
+    assert dispatcher.dispatch_once() is True
+    assert store.get(job.job_id).status == JobStatus.DONE
+
+    job_dir = job_root / job.job_id
+    assert not job_dir.exists(), (
+        f"the whole job dir must be gone on the warm path; survivors: "
+        f"{sorted(p.relative_to(job_dir).as_posix() for p in job_dir.rglob('*'))}"
+    )

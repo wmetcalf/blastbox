@@ -2,11 +2,15 @@
 rooted OUTSIDE job_root (see tests/host/blobs/test_local_roundtrip.py for the
 property this exists to guarantee: bytes surviving job-dir destruction). These
 tests cover the per-method contract in isolation."""
+import errno
 import hashlib
+import json
+from pathlib import Path
 
 import pytest
 
 from blastbox.host.blobs.base import BlobFetchError
+from blastbox.host.blobs.base import _upload_order
 from blastbox.host.blobs.local import LocalBlobStore
 
 
@@ -173,3 +177,271 @@ def test_delete_job_propagates_a_real_removal_error(tmp_path, monkeypatch):
 
     with pytest.raises(OSError):
         store.delete_job("j1")
+
+
+def test_has_output_is_false_when_the_results_dir_cannot_be_read(tmp_path, monkeypatch):
+    """The age reclaim deletes a sealed result's local tree on the strength of this answer, so an
+    unreadable/errored store must never be reported as "the durable copy is there" — that turns a
+    transient storage fault into irreversible loss of the only copy."""
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "metadata.json").write_text("{}")
+    store.put_output("j-err", out)
+    assert store.has_output("j-err") is True
+
+    def boom(self, *a, **kw):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "is_file", boom)
+    assert store.has_output("j-err") is False
+
+
+def test_the_seal_is_uploaded_last_so_a_partial_upload_is_not_mistaken_for_durable(
+    tmp_path, monkeypatch,
+):
+    """put_output is a TWO-PHASE COMMIT: metadata.json lands last, so its presence means every
+    other artifact already did.
+
+    Plain sorted order uploaded it FIRST ('m' < 'r'), so an upload that died partway left the
+    marker present with artifacts missing — and has_output() would then answer "durable copy
+    exists", letting the age reclaim delete the COMPLETE local tree as redundant. The half-result
+    is what the API would serve from then on, with nothing left to repair it.
+    """
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "metadata.json").write_text('{"sealed": true}')
+    (out / "rmeta.json").write_text("[]")
+    (out / "screenshot.png").write_bytes(b"\x89PNG")
+    # REAL output shape: RedTusk writes one metadata.json PER EMBEDDED DOCUMENT under rmeta/.
+    # Identifying the seal by basename classified these as seals too and shipped them to the end
+    # alongside the real one — where sorted order put the top-level seal first again, silently
+    # undoing the two-phase commit. Only <out_dir>/metadata.json is the seal.
+    (out / "rmeta").mkdir()
+    (out / "rmeta" / "metadata.json").write_text('{"embedded": 1}')
+
+    real = LocalBlobStore._atomic_copy
+    calls = {"n": 0}
+
+    def flaky(src, dest):
+        calls["n"] += 1
+        if calls["n"] == 2:                      # die partway through the upload
+            raise OSError("object store went away")
+        real(src, dest)
+
+    monkeypatch.setattr(LocalBlobStore, "_atomic_copy", staticmethod(flaky))
+    with pytest.raises(OSError):
+        store.put_output("j-partial", out)
+
+    assert store.has_output("j-partial") is False, (
+        "a partial upload left the commit marker behind — the reclaim would now delete the "
+        "only complete copy"
+    )
+
+
+def test_a_nested_metadata_json_is_not_treated_as_the_seal(tmp_path):
+    """Only <out_dir>/metadata.json commits the upload.
+
+    RedTusk writes one metadata.json PER EMBEDDED DOCUMENT under rmeta/, so a basename test
+    classified those as seals as well and moved them to the end of the upload together with the
+    real one — where sorted order put the top-level seal FIRST again and the two-phase commit
+    quietly stopped holding. Observed against real MinIO: the seal landed at .226 and
+    rmeta/metadata.json at .233.
+    """
+    out = tmp_path / "out"
+    (out / "rmeta").mkdir(parents=True)
+    (out / "metadata.json").write_text("{}")
+    (out / "rmeta" / "metadata.json").write_text("{}")
+    (out / "rmeta" / "0" / "a.txt").parent.mkdir()
+    (out / "rmeta" / "0" / "a.txt").write_text("x")
+
+    order = [p.relative_to(out).as_posix() for p in _upload_order(out) if p.is_file()]
+    assert order[-1] == "metadata.json", f"the seal must be written last, got {order}"
+    assert "rmeta/metadata.json" in order[:-1], "a nested metadata.json is an ordinary artifact"
+
+
+def test_an_unstorable_filename_is_skipped_not_retried_forever(tmp_path, caplog):
+    """One worker-chosen filename must not become a permanent leak.
+
+    The sample writes an undeclared 250-char name into its 0o777 output/. _atomic_copy's temp name
+    then exceeds NAME_MAX, so put_output raised ENAMETOOLONG on every attempt — the host marked
+    the tree pending-upload, and the last-copy rule exempted it from BOTH sweeps for the life of
+    the node. That is #84 reproduced on demand, and it is deterministic: no retry ever fixes it.
+
+    Undeclared files are not servable (the result routes are manifest-gated), so skipping loses
+    nothing a consumer can reach — while the declared result still lands durably.
+    """
+    import logging
+
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "metadata.json").write_text('{"sealed": true}')
+    (out / ("A" * 250)).write_bytes(b"undeclared, unstorable")
+
+    with caplog.at_level(logging.WARNING):
+        store.put_output("j-long", out)          # must NOT raise
+
+    assert store.has_output("j-long") is True, "the real result must still land"
+    assert (tmp_path / "blobs" / "results" / "j-long" / "metadata.json").exists()
+
+
+def test_a_real_upload_error_still_fails_the_upload(tmp_path, monkeypatch):
+    """The counterpart: only the deterministic name failure is skipped. A genuine outage must
+    fail the upload, or the terminal purge would delete the local tree believing it durable."""
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "metadata.json").write_text("{}")
+
+    def enospc(src, dest):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(LocalBlobStore, "_atomic_copy", staticmethod(enospc))
+    with pytest.raises(OSError):
+        store.put_output("j-enospc", out)
+
+
+def test_a_DECLARED_artifact_is_never_silently_skipped(tmp_path, monkeypatch):
+    """Skipping an unstorable name is safe only for an UNDECLARED file.
+
+    Undeclared files are not servable (the result routes are manifest-gated), so dropping one
+    loses nothing a consumer can reach. A DECLARED artifact is the opposite: dropping it and then
+    writing the seal anyway produces a DONE job whose manifest promises bytes the store does not
+    have — and marks the complete local copy redundant, so the reclaim deletes it. The upload has
+    to fail instead, which keeps the tree and lets the pending-upload sweep retry.
+    """
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    (out / "nested").mkdir(parents=True)
+    long_name = "n" * 200
+    (out / "nested" / long_name).write_bytes(b"THE DECLARED ARTIFACT")
+    (out / "metadata.json").write_text(json.dumps({
+        "engine": "redtusk", "status": "ok", "input_sha256": "a" * 64,
+        "detected": {"label": "docx", "mime": "x", "confidence": 1.0, "source": "magika"},
+        "artifacts": [{"id": "a1", "path": f"nested/{long_name}", "kind": "image",
+                       "sha256": "f" * 64, "bytes": 21}],
+        "warnings": [], "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
+    }))
+
+    # The guard is exercised directly: on this filesystem a 200-char name is now perfectly
+    # storable (the temp name no longer inflates it), so forcing the error is the only honest
+    # way to test the DECISION rather than the platform's NAME_MAX.
+    real = LocalBlobStore._atomic_copy
+
+    def too_long(src, dest):
+        if dest.name == long_name:
+            raise OSError(errno.ENAMETOOLONG, "File name too long", str(dest))
+        real(src, dest)
+
+    monkeypatch.setattr(LocalBlobStore, "_atomic_copy", staticmethod(too_long))
+    with pytest.raises(OSError):
+        store.put_output("j-declared", out)
+    assert store.has_output("j-declared") is False, (
+        "published a seal promising an artifact that was never stored"
+    )
+
+
+def test_an_unparseable_envelope_makes_every_skip_fatal(tmp_path, monkeypatch):
+    """If we cannot tell what was promised, we cannot safely drop anything."""
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "metadata.json").write_text("{ not json")
+    (out / "mystery.bin").write_bytes(b"x")
+
+    def too_long(src, dest):
+        raise OSError(errno.ENAMETOOLONG, "File name too long", str(dest))
+
+    monkeypatch.setattr(LocalBlobStore, "_atomic_copy", staticmethod(too_long))
+    with pytest.raises(OSError):
+        store.put_output("j-unparseable", out)
+
+
+def test_a_long_but_storable_artifact_name_is_not_made_unstorable_by_the_temp_file(tmp_path):
+    """The temp name must not decide what is storable.
+
+    It used to be `.{dest.name}.{pid}.{tid}.{uuid4hex}.part` — ~62 characters ON TOP of the
+    destination's own name — so a DECLARED artifact with a ~200-char name, which ext4 (NAME_MAX
+    255), the envelope (path allows 4096) and S3 all accept, raised ENAMETOOLONG here. That
+    failure is deterministic, so the pending-upload sweep could never drain it: the job stayed
+    FAILED forever, every result route answered 409, and the reclaim held the tree as the last
+    copy indefinitely. One artifact name reproduced #84 on demand.
+    """
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    out.mkdir()
+    # 250 chars: storable on ext4 (NAME_MAX 255) with the fixed-length temp, but NOT with the
+    # old `.{dest.name}.{pid}.{tid}.{uuid4hex}.part`, which added ~62 on top.
+    long_name = "n" * 250
+    (out / long_name).write_bytes(b"STORABLE")
+    (out / "metadata.json").write_text("{}")
+
+    store.put_output("j-long", out)          # must not raise
+
+    assert store.has_output("j-long") is True
+    assert (tmp_path / "blobs" / "results" / "j-long" / long_name).exists()
+
+
+def test_the_seal_does_not_commit_when_a_declared_artifact_was_never_enumerated(tmp_path, monkeypatch):
+    """The per-file checks only ever saw paths the WALKER returned.
+
+    A worker controls the tree, so it can declare a real file the walker never yields — one inside
+    a symlinked directory (rglob does not descend those), or past where a path-based walk stops.
+    That artifact is then neither uploaded nor skipped, it is simply absent, while the seal is
+    committed anyway: a DONE job whose manifest promises bytes the store does not have,
+    has_output() calling it durable, and the reclaim deleting the complete local copy as redundant.
+    Checking the manifest against what was actually stored closes the class whatever the walker
+    missed and why.
+    """
+    from blastbox.host.blobs.base import _upload_order
+
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "seen.png").write_bytes(b"enumerated")
+    (out / "hidden.png").write_bytes(b"REAL FILE THE WALKER MISSES")
+    (out / "metadata.json").write_text(json.dumps({
+        "engine": "redtusk", "status": "ok", "input_sha256": "a" * 64,
+        "detected": {"label": "docx", "mime": "x", "confidence": 1.0, "source": "magika"},
+        "artifacts": [{"id": "a1", "path": "seen.png", "kind": "image",
+                       "sha256": "f" * 64, "bytes": 10},
+                      {"id": "a2", "path": "hidden.png", "kind": "image",
+                       "sha256": "e" * 64, "bytes": 27}],
+        "warnings": [], "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
+    }))
+
+    # A walker that cannot see hidden.png — exactly what a symlinked dir or PATH_MAX produces.
+    real_order = _upload_order
+    monkeypatch.setattr("blastbox.host.blobs.local._upload_order",
+                        lambda d: [p for p in real_order(d) if p.name != "hidden.png"])
+
+    with pytest.raises(Exception):
+        store.put_output("j-missed", out)
+    assert store.has_output("j-missed") is False, (
+        "committed a seal promising an artifact that was never stored"
+    )
+
+
+def test_a_declared_path_with_no_file_behind_it_does_not_fail_the_upload(tmp_path):
+    """The counterpart. A manifest that lies about where its bytes are is the trust gate's
+    business — failing here would create an upload that can NEVER succeed, and a deterministic
+    upload failure is precisely the immortal-tree class this keeps having to close."""
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "metadata.json").write_text(json.dumps({
+        "engine": "redtusk", "status": "ok", "input_sha256": "a" * 64,
+        "detected": {"label": "docx", "mime": "x", "confidence": 1.0, "source": "magika"},
+        "artifacts": [{"id": "a1", "path": "/etc/passwd", "kind": "image",
+                       "sha256": "f" * 64, "bytes": 1},
+                      {"id": "a2", "path": "../escape.png", "kind": "image",
+                       "sha256": "e" * 64, "bytes": 1},
+                      {"id": "a3", "path": "ghost.png", "kind": "image",
+                       "sha256": "d" * 64, "bytes": 1}],
+        "warnings": [], "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
+    }))
+
+    store.put_output("j-phantom", out)          # must not raise
+    assert store.has_output("j-phantom") is True
