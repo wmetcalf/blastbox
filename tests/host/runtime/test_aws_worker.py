@@ -1879,8 +1879,16 @@ def test_f14_health_ok_propagates_an_unknown_mint_rather_than_returning_false():
     """The contract, pinned directly. resume() reads only what ESCAPES _health_ok, so collapsing an
     unconfirmed mint failure into a bare False loses the verdict on that pass. (The mint back-off
     re-raises it on later passes, which is why an end-to-end resume test alone cannot detect this:
-    a single-pass resume would still be misclassified.) is_ready() catches it and returns False,
-    exactly as before."""
+    a single-pass resume would still be misclassified.)
+
+    CHANGED 2026-08-20: the last assertion used to be ``is_ready(slot) is False``, "exactly as
+    before". That was pinning the defect. The microVM here is RUNNING and only the TOKEN MINT is
+    throttled, so the control plane has told us nothing about the worker -- and a False restarts
+    the warming timeout aging, which terminates the tier's whole healthy WARMING population during
+    a partial brownout. That is issue #79's exact failure mode, inside the branch that fixes #79.
+    The sibling tier already answers None here (Ec2HibernateRuntime.is_ready: "A throttled
+    describe tells us NOTHING"). UNKNOWN is the correct answer and the test name already said so.
+    """
     from blastbox.host.runtime.aws_worker import AwsUnknownState
 
     rt, _ = _snapstart_rt({"lambda-microvms get-microvm": {"state": "RUNNING", "endpoint": "vm.example"},
@@ -1891,7 +1899,10 @@ def test_f14_health_ok_propagates_an_unknown_mint_rather_than_returning_false():
                          url="http://10.0.0.1:8080")
     with pytest.raises(AwsUnknownState):
         rt._health_ok(slot)          # first call: nothing suppressed yet, so this is the raise site
-    assert rt.is_ready(slot) is False, "is_ready must still absorb it and report not-ready"
+    assert rt.is_ready(slot) is None, (
+        "a RUNNING microVM whose token mint is merely throttled must stay UNKNOWN: a definitive "
+        "False here spends the warming budget on the control plane's silence (issue #79)"
+    )
 
 
 def test_f23_a_resume_that_never_got_to_try_is_unknown_not_failure():

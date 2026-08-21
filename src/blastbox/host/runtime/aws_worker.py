@@ -717,8 +717,8 @@ class AwsDisposableRuntime:
             # So: UNKNOWN here means "we could not observe the instance's state", nothing weaker.
             # If the state is still readable, we DID observe the worker and the downstream failure
             # is a consequence of the state we read.
-            if self._state_observable(slot):
-                _log.debug("%s: is_ready(%s) not ready (observed state; %s)",
+            if self._observed_not_running(slot):
+                _log.debug("%s: is_ready(%s) not ready (observed non-running state; %s)",
                            self.kind, slot.slot_id, exc)
                 return False
             _log.debug("%s: is_ready(%s) unknown: %s", self.kind, slot.slot_id, exc)
@@ -730,17 +730,34 @@ class AwsDisposableRuntime:
         # _health_ok is itself tri-state; preserve its UNKNOWN rather than flattening it to False.
         return None if ok is None else (ok is True)
 
-    def _state_observable(self, slot: AwsWorkerSlot) -> bool:
-        """True if we can still read this instance's state from the control plane.
+    def _observed_not_running(self, slot: AwsWorkerSlot) -> bool:
+        """True only when we READ the state and it is definitively not running yet.
+
+        This is the discriminator the caller actually needs, and the one the old
+        ``_state_observable`` only appeared to implement: it returned ``bool(describe)``, i.e.
+        "the describe answered at all", and never looked at WHAT it said. The justification in the
+        caller is that a still-``pending`` instance legitimately fails the token mint -- but a
+        RUNNING instance whose mint is merely THROTTLED took the same branch and became a
+        definitive ``False``. The warming timeout then kept aging and terminated the tier's entire
+        healthy WARMING population over a throttled token API: issue #79's exact failure, inside
+        the change that fixes issue #79.
 
         Served from the same describe cache ``_health_ok`` just used, so the common path costs no
         extra API call -- and during a real brownout the underlying describe fails too, which is
-        precisely the signal we want.
+        precisely the signal we want: unreadable -> False here -> the caller returns UNKNOWN.
         """
         try:
-            return bool(self._describe_cached(slot, self._liveness_cache_s))
+            desc = self._describe_cached(slot, self._liveness_cache_s)
         except (AwsWorkerError, OSError):
             return False
+        if not desc:
+            return False
+        st = self._desc_state_name(desc)
+        if st is None:
+            # Unrecognised shape: we cannot say it is NOT running, so we must not manufacture a
+            # death out of that. Caller answers UNKNOWN.
+            return False
+        return st not in self._RUNNING_STATES
 
     def is_alive(self, slot: AwsWorkerSlot) -> "bool | None":
         # cache for _liveness_cache_s so the pool's fast tick (~0.1s) doesn't issue an AWS describe per
@@ -825,6 +842,15 @@ class AwsDisposableRuntime:
     def _running(self, slot: AwsWorkerSlot) -> bool:
         raise NotImplementedError
 
+    # States in which the worker is up and a downstream call SHOULD have succeeded. Anything else
+    # that is readable explains a failed mint/health call as a consequence of the state.
+    _RUNNING_STATES = ("running", "active", "ready")
+
+    def _desc_state_name(self, desc: dict) -> "str | None":
+        """The lower-cased state string from a RAW description, or None if this tier's shape has
+        none. None means "cannot tell", which callers must treat as UNKNOWN -- never as a death."""
+        return None
+
     def _terminate(self, slot: AwsWorkerSlot) -> None:
         raise NotImplementedError
 
@@ -885,7 +911,10 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
 
     def _running(self, slot: AwsWorkerSlot) -> bool:
         st = str(self._describe(slot).get("state", "")).lower()
-        return st in ("running", "active", "ready")
+        return st in self._RUNNING_STATES
+
+    def _desc_state_name(self, desc: dict) -> "str | None":
+        return str(desc.get("state", "")).lower() or None
 
     def _mint_token(self, slot: AwsWorkerSlot) -> str:
         # minted fresh at probe/detonation time with a short TTL + scoped to the agent port (both
@@ -1512,6 +1541,9 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
     def _running(self, slot: AwsWorkerSlot) -> bool:
         return str(self._describe(slot).get("State", {}).get("Name", "")) == "running"
 
+    def _desc_state_name(self, desc: dict) -> "str | None":
+        return str(desc.get("State", {}).get("Name", "")).lower() or None
+
     def _health_ok(self, slot: AwsWorkerSlot) -> "bool | None":
         if slot.ip is None:
             inst = self._describe_cached(slot, self._liveness_cache_s)   # throttle the ~10Hz warming poll
@@ -1751,7 +1783,12 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             return None       # could not tell -> skip, never destroy
         except (AwsWorkerError, OSError):
             pass              # fall through to the ordinary probe, which has its own verdict rules
-        return super().is_alive_for_claim(slot, budget_s=budget_s)
+        # INSIDE the same budget scope. _claim_probe_budget nests (it mins with any outer
+        # deadline), but closing this one first and letting the base open a fresh one gave the two
+        # describes a full budget EACH -- so is_alive_for_claim(budget_s=5) could block ~10s while
+        # holding the dispatcher's warm-gate reservation, twice its contract.
+        with self._claim_probe_budget(budget_s):
+            return super().is_alive_for_claim(slot, budget_s=budget_s)
 
     _PARK_GIVE_UP = "give-up"
 
@@ -1853,7 +1890,12 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         excluding a concurrent claimant and could hibernate an instance out from under a job.
         """
         try:
-            st = self._state(slot)     # UNCACHED: reconciliation must not act on a stale describe
+            # BUDGETED, like every other tick-thread path here (see is_alive). Unbudgeted, _aws
+            # falls back to cli_timeout_s (120s), and this runs on the pool's single maintenance
+            # thread -- so a brownout stalled promotion, health checks, deferred reaping and
+            # spawn-to-deficit for two minutes per call, while the slot stayed reserved.
+            with self._health_probe_budget():
+                st = self._state(slot)  # UNCACHED: reconciliation must not act on a stale describe
         except AwsUnknownState as exc:
             # We could not look. Change nothing -- acting on a guess here is how the bookkeeping got
             # corrupted in the first place.
@@ -1863,7 +1905,8 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             _log.debug("ec2-hibernate: maintain_idle(%s) error: %s", slot.slot_id, exc)
             return True
         try:
-            phase, _ = self._park_step(slot, st, self._clock())
+            with self._health_probe_budget():
+                phase, _ = self._park_step(slot, st, self._clock())
         except (AwsWorkerError, OSError) as exc:
             _log.debug("ec2-hibernate: maintain_idle(%s) step error: %s", slot.slot_id, exc)
             return True

@@ -239,6 +239,10 @@ class WarmPool:
         spawn_rate_limit: float = 4.0,
         clock: Callable[[], float] = time.monotonic,
         poll_interval: float = 0.1,
+        # Minimum seconds between maintain_idle passes on the SAME slot. The hook may issue
+        # uncached control-plane calls and the tick runs at ~10Hz; 5.0 matches the liveness cache
+        # TTL the AWS runtimes already use to keep that same tick from storming DescribeInstances.
+        maintain_interval_s: float = 5.0,
         burst_size: int = 4,
         burst_trigger_s: float = 3.0,
         burst_drain_s: float = 60.0,
@@ -369,6 +373,7 @@ class WarmPool:
         self._warm_size = warm_size
         self._concurrent_ceiling = concurrent_ceiling
         self._poll_interval = poll_interval
+        self._maintain_interval_s = maintain_interval_s
         self._clock = clock
         self._burst_size = burst_size
         self._burst_trigger_s = burst_trigger_s
@@ -441,6 +446,9 @@ class WarmPool:
         # a tier that IS answering still ages its slots out normally; bounded by _unknown_grace_s so
         # a control plane that never returns cannot wedge the tier at zero capacity forever.
         self._warming_unknown_since: dict[str, float] = {}
+        # Rotation cursor + per-slot cooldown for _maintain_idle (issue #80 follow-up).
+        self._maintain_cursor: "str | None" = None
+        self._maintain_last: dict[str, float] = {}
         # Slots escalated on SUSPICION (a long UNKNOWN) rather than a confirmed verdict. Disposal is
         # asynchronous now, so this must outlive the tick that queued it -- the reaper needs to know
         # not to strand a slot it merely could not dispose of.
@@ -2442,12 +2450,37 @@ class WarmPool:
         if not callable(hook):
             return
         with self._lock:
-            cand = next((s for s in self._slots.values() if s.state == SlotState.IDLE), None)
+            now = self._clock()
+            # ROTATE. `next(... if state is IDLE)` over an insertion-ordered dict returns the SAME
+            # slot every tick, because the hook hands it back as IDLE without changing the order --
+            # so slots 2..N were never reconciled at all, and the stranded RUNNING instance this
+            # hook exists to find is not usually slot 1.
+            idle = [s for s in self._slots.values() if s.state == SlotState.IDLE]
+            if not idle:
+                return
+            start = 0
+            if self._maintain_cursor is not None:
+                for i, s in enumerate(idle):
+                    if s.slot_id == self._maintain_cursor:
+                        start = (i + 1) % len(idle)
+                        break
+            cand = None
+            for k in range(len(idle)):
+                s = idle[(start + k) % len(idle)]
+                # RATE LIMIT. The hook is allowed to make uncached control-plane calls, and tick()
+                # runs at ~10Hz; without a per-slot interval an ec2-hibernate pool issues an
+                # unthrottled describe-instances every 0.1s forever and manufactures the very
+                # brownout the rest of this class exists to survive.
+                if now - self._maintain_last.get(s.slot_id, 0.0) >= self._maintain_interval_s:
+                    cand = s
+                    break
             if cand is None:
                 return
             # Reserve it BEFORE releasing the lock. This is the whole point of the seam.
             cand.state = SlotState.ASSIGNED
             slot_id = cand.slot_id
+            self._maintain_cursor = slot_id
+            self._maintain_last[slot_id] = now
 
         usable = True
         try:
@@ -2462,13 +2495,31 @@ class WarmPool:
                 # Only restore the slot we actually reserved, and only if nothing else moved it
                 # (a concurrent stop() flips slots to DRAINING; republishing would hand out a slot
                 # that is about to be disposed).
-                if cur is cand and cur.state == SlotState.ASSIGNED:
+                if cur is cand and cur.state == SlotState.ASSIGNED and usable:
                     cur.state = SlotState.IDLE
                     self._last_idle_at = self._clock()
                     self._idle_event.set()
+                # NOT usable -> deliberately left ASSIGNED, i.e. unclaimable, and handed straight
+                # to retire() below. Republishing it first (and worse, waking claimants with
+                # _idle_event.set()) opened a window in which a claimant could take the slot:
+                # retire() is not a CAS, it overwrites ASSIGNED, so the instance was terminated
+                # out from under a running job. The window was widened by fault="worker" doing
+                # failure attribution before it takes the lock.
         if not usable:
             logger.warning("pool.maintain_idle_unusable slot_id=%s — retiring", slot_id)
-            self.retire(cand, fault="worker")
+            try:
+                self.retire(cand, fault="worker")
+            except Exception:
+                # Retirement itself failed. A slot stranded in ASSIGNED is capacity lost forever
+                # (_spawn_to_deficit counts it as active), so hand it back and let the ordinary
+                # health path judge it -- the same rule the hook-raised case follows above.
+                logger.exception(
+                    "pool.maintain_idle_retire_error slot_id=%s — handing the slot back", slot_id)
+                with self._lock:
+                    cur = self._slots.get(slot_id)
+                    if cur is cand and cur.state == SlotState.ASSIGNED:
+                        cur.state = SlotState.IDLE
+                        self._idle_event.set()
 
     def _warming_unknown_unexpired(self, slot_id: str, now: float) -> bool:
         """True while a WARMING slot is inside a live, still-plausible UNKNOWN episode.

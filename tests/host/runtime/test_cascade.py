@@ -600,6 +600,116 @@ def test_a_confirmed_unusable_overflow_tier_is_still_dropped(monkeypatch):
     assert rt._deferred == []
 
 
+def test_a_deferred_tier_that_turns_out_definitively_broken_is_dropped(monkeypatch):
+    """The startup rule -- "missing credentials is a VERDICT" -- must survive deferral.
+
+    _admit_deferred caught bare `Exception` and re-queued the tier on ANY failure, so a tier that
+    was throttled at startup (undecided, correctly deferred) and whose credentials were later
+    revoked (definitive) was re-probed every _admit_retry_s for the life of the process. That
+    directly contradicts test_a_confirmed_unusable_overflow_tier_is_still_dropped above, which
+    pins the same rule for the startup path.
+
+    MUTATION: widen the handler back to `except Exception` -> the tier stays deferred forever and
+    this fails.
+    """
+    from blastbox.host import pool_config
+
+    state = {"mode": "throttled"}
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):
+        if name == "aws-ec2":
+            if state["mode"] == "throttled":
+                raise AwsProbeTimeout("sts: timed out")        # UNDECIDED -> defer
+            raise RuntimeError("no aws creds (AccessDenied)")  # VERDICT   -> drop
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
+    assert [d.name for d in rt._deferred] == ["aws-ec2"], "a throttled probe must defer, not drop"
+
+    state["mode"] = "definitive"
+    rt._last_admit_attempt = None
+    rt._admit_deferred()
+
+    assert rt._deferred == [], (
+        "a deferred tier whose retry returned a DEFINITIVE failure is still queued; it will be "
+        "re-probed every admit interval for the life of the process"
+    )
+
+
+def test_the_cascade_forwards_maintain_idle_to_the_slots_owning_tier(monkeypatch):
+    """issue #80's reconciliation hook is resolved off the runtime the POOL holds -- and in every
+    documented deployment that is the CASCADE, not the tier.
+
+    CascadingRuntime delegates every other optional per-slot seam explicitly (resume,
+    is_alive_for_claim, host_warm_control...) because it has no __getattr__ passthrough.
+    maintain_idle got neither, so the entire feature was inert behind a cascade: a half-succeeded
+    resume left an instance RUNNING and billing with the pool believing it parked.
+
+    MUTATION: delete CascadingRuntime.maintain_idle -> pool._maintain_idle's getattr finds
+    nothing, the hook never runs, and this fails.
+    """
+    seen: list = []
+
+    class _MaintainingTier(FakeRuntime):
+        def maintain_idle(self, slot):
+            seen.append(slot)
+            return False        # and the verdict must come back intact
+
+    from blastbox.host import pool_config
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):
+        return _MaintainingTier(name) if name == "aws-ec2-hibernate" else FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2-hibernate:16"}.get)
+
+    assert callable(getattr(rt, "maintain_idle", None)), (
+        "CascadingRuntime has no maintain_idle, so pool._maintain_idle's getattr returns None "
+        "and the whole #80 reconciliation never runs in production"
+    )
+    # gvisor has capacity 4, so the 5th spawn lands on the hibernate tier.
+    slots = [rt.spawn() for _ in range(5)]
+    slot = next(s for s in slots if s.slot_id.startswith("aws-ec2-hibernate"))
+    assert rt.maintain_idle(slot) is False, "the tier's UNUSABLE verdict was not forwarded back"
+    assert seen, "the owning tier's maintain_idle was never called"
+
+
+def test_a_deferred_tier_is_still_covered_by_the_allowed_runtimes_gate(monkeypatch):
+    """The fail-closed tier gate must not be escapable by being undecided at startup.
+
+    ``enforce_allowed_runtimes`` runs once, at dispatcher construction, against
+    ``reachable_tiers`` -- which read only ``cascade.tiers``. A tier deferred by a transient probe
+    failure is not in that list yet, so the gate passed; ``_admit_deferred`` then appended it a
+    minute later and jobs for an engine pinned to ``static`` routed onto public AWS. Had the tier
+    been available at startup the dispatcher would have REFUSED TO START.
+
+    A deferred tier is a tier the operator configured and that we intend to admit, so it belongs
+    in the gate's input from the beginning -- only its AVAILABILITY was ever undecided, never its
+    identity.
+
+    MUTATION: drop `_deferred` from reachable_tiers -> the gate passes and this fails.
+    """
+    from blastbox.host import pool_config
+    from blastbox.host.dispatch import reachable_tiers
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):
+        if name == "aws-ec2":
+            raise AwsProbeTimeout("sts: timed out")     # UNDECIDED -> deferred, not dropped
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
+    assert [d.name for d in rt._deferred] == ["aws-ec2"]
+
+    pool = SimpleNamespace(runtime=rt)
+    reachable = reachable_tiers(pool, "warm", warm_only=True)
+    assert "aws-ec2" in reachable, (
+        f"a deferred tier is invisible to the allowed_runtimes gate ({sorted(reachable)}); it "
+        f"joins the cascade ~60s later and silently bypasses a fail-closed policy check"
+    )
+
+
 def test_a_recovered_tier_is_admitted_on_a_later_spawn(monkeypatch):
     """The re-probe is the actual fix: without it the tier stays gone until the process restarts."""
     from blastbox.host import pool_config

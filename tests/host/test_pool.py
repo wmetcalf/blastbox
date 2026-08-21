@@ -3116,6 +3116,138 @@ def test_a_raising_maintenance_hook_still_hands_the_slot_back() -> None:
     assert slot_id not in rt.reaped, "an exception is not a verdict about the slot"
 
 
+def test_maintenance_is_rate_limited_per_slot_not_run_on_every_tick() -> None:
+    """The hook is allowed to make UNCACHED control-plane calls, and tick() runs at ~10Hz.
+
+    ec2-hibernate's maintain_idle opens with an uncached describe-instances, so with no per-slot
+    interval an idle pool issued one AWS round trip every 0.1s forever -- the reconciliation hook
+    manufacturing the DescribeInstances throttling the rest of this PR exists to survive. Every
+    other AWS probe path in that runtime is throttled behind the 5s liveness cache for exactly
+    this reason; this one was not.
+
+    MUTATION: remove the _maintain_last cooldown check -> 20 calls instead of 1 and this fails.
+    """
+    calls: list = []
+    now = [1000.0]
+
+    class _CountingRuntime(_FakeRuntime):
+        def maintain_idle(self, slot: Slot) -> bool:
+            calls.append(slot.slot_id)
+            return True
+
+    rt = _CountingRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0,
+                    clock=lambda: now[0], maintain_interval_s=5.0)
+    pool._spawn_to_deficit(ready=True)
+    for sl in pool._slots.values():
+        sl.state = SlotState.IDLE
+
+    for _ in range(20):                 # 2 seconds of ticks at 0.1s
+        pool._maintain_idle()
+        now[0] += 0.1
+
+    assert len(calls) == 1, (
+        f"maintain_idle ran {len(calls)}x in 2s on one slot; at 10Hz that is an unthrottled "
+        f"control-plane call per tick"
+    )
+
+    now[0] += 5.0                       # past the cooldown
+    pool._maintain_idle()
+    assert len(calls) == 2, "the cooldown never expires — the slot would stop being reconciled"
+
+
+def test_an_unusable_slot_is_never_claimable_between_maintenance_and_retirement() -> None:
+    """issue #80 follow-up: the exclusive window must not end one instruction before the
+    destructive act.
+
+    The first version republished the slot to IDLE and called ``_idle_event.set()`` -- actively
+    WAKING a blocked claimant -- and only then called ``retire()``. ``retire`` is not a CAS: it
+    overwrites whatever state it finds, ASSIGNED included. So a claimant could take the slot,
+    pass ``is_alive_for_claim``, start a job, and have the instance terminated under it.
+
+    Asserted as an INVARIANT on the slot's state rather than by racing a real claimant: `claim`
+    is only able to take a slot that is IDLE, so "never IDLE between the verdict and retirement"
+    is the property, and checking it directly is deterministic instead of timing-dependent.
+
+    MUTATION: restore the unconditional `cur.state = SlotState.IDLE` in the finally block -> the
+    observed state below is IDLE and this fails.
+    """
+    seen: list = []
+
+    class _UnusableRuntime(_FakeRuntime):
+        def __init__(self, pool_ref: dict) -> None:
+            super().__init__()
+            self.pool_ref = pool_ref
+            self.verdict_given = False
+
+        def maintain_idle(self, slot: Slot) -> bool:
+            self.verdict_given = True
+            return False        # terminal: hibernation stuck past its timeout
+
+        def base_identity(self, slot: Slot) -> str:
+            # Called by retire(fault="worker") during failure attribution, i.e. BEFORE the lock
+            # that flips the slot to DRAINING. This is the exact window the bug opened.
+            # base_identity is also called on the spawn path, so only record AFTER the verdict --
+            # an unscoped recorder passes for the wrong reason (it reads a WARMING slot).
+            if self.verdict_given:
+                pool = self.pool_ref["pool"]
+                live = pool._slots.get(slot.slot_id)
+                seen.append(live.state if live else None)
+            return "base"
+
+    ref: dict = {}
+    rt = _UnusableRuntime(ref)
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    ref["pool"] = pool
+    pool.tick()
+    pool.tick()
+
+    assert seen, "retire() never ran, so the window was never exercised"
+    assert seen[0] != SlotState.IDLE, (
+        f"slot was {seen[0]} -- claimable -- between the unusable verdict and retirement; a "
+        f"claimant taking it here has its instance terminated mid-job"
+    )
+
+
+def test_maintenance_rotates_so_every_idle_slot_is_eventually_reconciled() -> None:
+    """issue #80: 'ONE slot per tick' has to mean a DIFFERENT slot per tick.
+
+    ``next(s for s in self._slots.values() if s.state is IDLE)`` over an insertion-ordered dict
+    returns the same slot forever, because the hook restores it to IDLE without changing the
+    order. Slot #2 -- the one whose resume half-succeeded and is billing -- is then never looked
+    at, which is precisely the leak this hook exists to close.
+
+    MUTATION: drop the rotation cursor -> only the first slot is ever maintained and this fails.
+    """
+    maintained: list = []
+
+    class _RecordingRuntime(_FakeRuntime):
+        def maintain_idle(self, slot: Slot) -> bool:
+            maintained.append(slot.slot_id)
+            return True
+
+    rt = _RecordingRuntime()
+    # interval 0 ISOLATES the cursor. With the default 5s cooldown this property also holds
+    # without any cursor at all (a recently-maintained slot is skipped, so the scan falls through
+    # to the next one) -- and a mutation that broke the cursor survived the first version of this
+    # test for exactly that reason. Turning the cooldown off leaves the cursor as the only thing
+    # that can rotate.
+    pool = WarmPool(runtime=rt, warm_size=3, spawn_rate_limit=100.0, maintain_interval_s=0.0)
+    pool._spawn_to_deficit(ready=True)
+    for s in pool._slots.values():
+        s.state = SlotState.IDLE
+    ids = [s.slot_id for s in pool._slots.values()]
+    assert len(ids) == 3
+
+    for _ in range(9):
+        pool._maintain_idle()
+
+    assert set(maintained) == set(ids), (
+        f"only {len(set(maintained))} of 3 idle slots were ever reconciled: "
+        f"{ {i: maintained.count(i) for i in ids} }"
+    )
+
+
 def test_a_slot_reported_unusable_is_retired() -> None:
     """The terminal give-up has to RETURN capacity. Parking a permanently unclaimable slot is the
     failure mode issue #80 calls out: it blocks its own replacement."""

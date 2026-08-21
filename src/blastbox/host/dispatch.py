@@ -235,6 +235,14 @@ def reachable_tiers(pool: Any, tier: str, warm_only: bool) -> frozenset[str]:
     members = getattr(rt, "tiers", None)
     if getattr(rt, "kind", None) == "cascade" and members:
         tiers = {t.name for t in members}   # the concrete BLASTBOX_POOL_TIERS entries spawn routes to
+        # DEFERRED tiers count too. A tier whose startup availability probe was undecided (issue
+        # #79) is not in `tiers` yet, but `_admit_deferred` appends it on a later spawn -- so
+        # leaving it out let a tier the operator's allowed_runtimes EXCLUDES join a dispatcher
+        # that had already passed the fail-closed check, minutes after start. Its identity was
+        # never in doubt, only its availability, so it belongs in the gate's input from the
+        # beginning: had it been reachable at startup the dispatcher would have refused to boot,
+        # and being briefly unreachable must not buy a weaker verdict.
+        tiers |= {d.name for d in (getattr(rt, "_deferred", None) or ())}
     else:
         tiers = {tier}
     # Only the file-handshake Dispatcher cold-falls-back; network-endpoint tiers requeue (no cold path).

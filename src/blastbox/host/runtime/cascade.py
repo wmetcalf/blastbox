@@ -268,9 +268,18 @@ class CascadingRuntime:
         for d in pending:
             try:
                 rt = d.build()
-            except Exception as exc:  # noqa: BLE001 -- any failure just means "still undecided"
-                _log.debug("cascade: deferred tier %r still unavailable: %s", d.name, exc)
-                still.append(d)
+            except Exception as exc:  # noqa: BLE001 -- classified immediately below
+                # The narrow startup rule has to survive deferral. Re-queueing on ANY failure
+                # meant a tier throttled at startup (undecided, rightly deferred) whose creds were
+                # later revoked (definitive) got re-probed every admit interval forever -- two
+                # aws-cli round trips a time, on the pool's tick thread. That contradicts the
+                # startup path, where "missing credentials is a VERDICT" and the tier is dropped.
+                if _is_undecided_availability(exc):
+                    _log.debug("cascade: deferred tier %r still undecided: %s", d.name, exc)
+                    still.append(d)
+                else:
+                    _log.warning("cascade: deferred tier %r is confirmed unusable, dropping: %s",
+                                 d.name, exc)
                 continue
             with self._lock:
                 # Re-check: a concurrent _admit_deferred may have admitted it already.
@@ -740,6 +749,29 @@ class CascadingRuntime:
 
     def materialize_warm_output(self, slot: Any) -> None:
         self._delegate(slot, "materialize_warm_output")(slot)
+
+    def maintain_idle(self, slot: Any) -> bool:
+        """Delegate the OPTIONAL idle-reconciliation seam (issue #80) to the slot's OWNING tier.
+
+        The pool resolves this hook with ``getattr(self._runtime, "maintain_idle", None)``, and in
+        every documented deployment the pool holds the CASCADE, not the tier -- the same reason
+        ``resume`` and ``is_alive_for_claim`` need explicit passthroughs. Without it the entire
+        reconciliation was inert behind a cascade: a resume that half-succeeded left the instance
+        RUNNING and billing while the pool counted a parked warm slot.
+
+        Returns True (usable) for a tier that has no such upkeep, so a mixed or all-non-hibernate
+        cascade is unaffected. An unknown slot is likewise reported usable rather than raising:
+        this runs on the maintenance tick, and a False here RETIRES the slot.
+        """
+        tier = self._tier_of(slot)
+        if tier is None:
+            _log.debug("cascade: maintain_idle for unknown slot %r — treating as usable",
+                       getattr(slot, "slot_id", slot))
+            return True
+        fn = getattr(tier.runtime, "maintain_idle", None)
+        if not callable(fn):
+            return True
+        return fn(slot) is not False
 
     def resume(self, slot: Any, *, budget_s: float | None = None) -> None:
         """Delegate the OPTIONAL per-claim resume seam (aws-ec2-hibernate / aws-lambda-snapstart) to the
