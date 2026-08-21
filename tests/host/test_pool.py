@@ -2875,6 +2875,27 @@ def test_a_brownout_does_not_evict_the_tiers_warming_slots() -> None:
     assert pool._slots[slot_id].state == SlotState.IDLE
 
 
+def _drain_reapers(pool, timeout: float = 5.0) -> None:
+    """Wait for the dedicated reaper thread(s) to finish.
+
+    An expired WARMING unknown is a SUSPICION, so since 2026-08-21 it is disposed of on the
+    deferred reaper thread rather than synchronously on the tick thread -- that is the whole point
+    (a terminate burning its full CLI timeout must not stall promotion, health checks and spawning
+    for the entire pool). The eviction is therefore still guaranteed but no longer complete by the
+    time tick() returns, so a test asserting `slot_id in rt.reaped` has to join the reaper instead
+    of racing it. Without this it passes alone and fails under load, which is worse than failing.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        threads = [t for t, *_ in list(getattr(pool, "_reaper_threads", []))]
+        alive = [t for t in threads if t.is_alive()]
+        for t in alive:
+            t.join(timeout=0.1)
+        if not alive and not pool._deferred_reap:
+            return
+        pool.tick()
+
+
 def test_an_unknown_that_outlasts_the_grace_still_evicts() -> None:
     """The exemption must be BOUNDED. An unbounded one is strictly worse than the bug it fixes:
     the tier wedges at zero capacity forever while is_healthy() still reports True.
@@ -2897,6 +2918,7 @@ def test_an_unknown_that_outlasts_the_grace_still_evicts() -> None:
 
     clock.advance(101.0)  # unbroken UNKNOWN for longer than the 100s grace
     pool.tick()
+    _drain_reapers(pool)
     assert clock() - since > 100.0, "sanity: the episode really did outlast the grace"
     assert slot_id in rt.reaped, "an outage that outlasts the grace must still let the slot age out"
     assert slot_id not in pool._slots
@@ -2965,6 +2987,7 @@ def test_a_zero_grace_disables_the_warming_exemption_entirely() -> None:
 
     clock.advance(70.0)
     pool.tick()
+    _drain_reapers(pool)
     assert slot_id in rt.reaped, "grace=0 must disable the exemption, not enable it forever"
 
 
@@ -3116,6 +3139,73 @@ def test_a_raising_maintenance_hook_still_hands_the_slot_back() -> None:
     slot_id = next(iter(pool._slots))
     assert pool._slots[slot_id].state == SlotState.IDLE, "the slot was stranded in ASSIGNED"
     assert slot_id not in rt.reaped, "an exception is not a verdict about the slot"
+
+
+def test_a_warming_slot_whose_unknown_episode_expires_is_suspected_not_convicted() -> None:
+    """The IDLE path escalates an expired UNKNOWN "on suspicion, not on a verdict". The WARMING
+    path did not, and the asymmetry costs a tier its capacity during the outage this PR exists to
+    survive.
+
+    A WARMING slot past its timeout with no definitive observation lands in `stuck_warming`, which
+    becomes `dead` with no `suspected` membership. Three consequences, all during one brownout:
+    it is charged to the restore-failure streak (which can discard a healthy snapshot on zero
+    confirmed deaths), it is reaped SYNCHRONOUSLY on the sole tick thread, and when that reap
+    fails -- same unresponsive control plane -- it is left DRAINING forever with its eviction
+    token spent, counting against the ceiling until the process restarts.
+
+    MUTATION: drop the warming-unknown ids from `suspected` -> the slot is convicted, reaped
+    synchronously and stranded, and this fails.
+    """
+    ready_answer: list = [None]        # UNKNOWN: the control plane will not say
+
+    reap_threads: list = []
+
+    class _BrownoutRuntime(_FakeRuntime):
+        def is_ready(self, slot: Slot):
+            return ready_answer[0]
+
+        def reap(self, slot: Slot) -> None:
+            reap_threads.append(threading.get_ident())
+            super().reap(slot)
+
+        # NOTE: in the real outage the terminate is throttled too, and that reap failure is what
+        # strands the slot DRAINING forever. Not simulated here -- it raises out of tick() and
+        # masks the assertion below. This test pins the CLASSIFICATION; the stranding is its
+        # consequence.
+
+    now = [1000.0]
+    rt = _BrownoutRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, clock=lambda: now[0],
+                    warming_timeout_s=10.0, unknown_grace_s=5.0)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    slot.state = SlotState.WARMING
+
+    for _ in range(4):                 # age it past both the grace and the warming timeout
+        pool.tick()
+        now[0] += 6.0
+
+    # The directly observable half of the conviction: the restore-failure streak drives
+    # _maybe_rebuild_base, which DISCARDS A HEALTHY SNAPSHOT. Silence is not evidence about the
+    # worker, so it must not be spent as any. (The other half -- deferred vs synchronous reap, and
+    # the DRAINING stranding when that reap also fails -- needs a failing terminate to observe,
+    # which raises out of tick() and would mask this assertion.)
+    assert pool._spawn_consecutive_failures == 0, (
+        f"a WARMING slot that timed out on SILENCE was charged to the restore-failure streak "
+        f"({pool._spawn_consecutive_failures}); one brownout can now invalidate a healthy base "
+        f"on zero confirmed deaths"
+    )
+
+    # And the disposal must leave the tick thread. A suspected slot goes to the dedicated reaper
+    # (issue #75/#77); a CONVICTED one is terminated inline, so during a brownout each terminate
+    # burns its full CLI timeout on the pool's only maintenance thread -- no promotion, no health
+    # check, no spawning, for the duration.
+    _drain_reapers(pool)
+    assert reap_threads, "the slot was never disposed of at all"
+    assert threading.get_ident() not in reap_threads, (
+        "the slot was reaped INLINE on the tick thread: a suspected-unknown disposal must be "
+        "deferred, or one throttled terminate stalls the whole pool"
+    )
 
 
 def test_maintenance_is_rate_limited_per_slot_not_run_on_every_tick() -> None:

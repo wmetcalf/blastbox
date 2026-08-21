@@ -309,6 +309,8 @@ class CascadingRuntime:
             if self._last_admit_attempt is not None and \
                     (now - self._last_admit_attempt) < self._admit_retry_s:
                 return
+            # Provisional stamp: keeps a CONCURRENT caller out while this probe runs. The
+            # authoritative stamp is taken AFTER the probes return, below.
             self._last_admit_attempt = now
             pending = list(self._deferred)
 
@@ -339,6 +341,14 @@ class CascadingRuntime:
             _log.info("cascade: deferred tier %r became available -- admitted at position %d "
                       "(was undecided at startup: %s)", d.name, len(self.tiers) - 1, d.reason)
         with self._lock:
+            # Re-stamp from COMPLETION, not from the start. The probe is two aws-cli calls that can
+            # each burn the full cli_timeout_s during the very outage that caused the deferral, so
+            # stamping at the start meant a probe longer than _admit_retry_s was already eligible
+            # by the time it returned: the next tick launched another one immediately and the
+            # pool's sole maintenance thread never got back to promotion, health checks or local
+            # spawning. Rate-limiting a call by when it STARTED throttles nothing once the call
+            # outruns its own window.
+            self._last_admit_attempt = self._clock()
             # Keep only entries still undecided AND not admitted by a racing caller.
             admitted = {t.name for t in self.tiers}
             self._deferred = [d for d in still if d.name not in admitted]

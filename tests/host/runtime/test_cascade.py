@@ -753,6 +753,52 @@ def test_a_deferred_tiers_declared_budgets_are_in_the_cascade_totals(monkeypatch
     )
 
 
+def test_a_slow_admit_probe_does_not_become_eligible_again_immediately(monkeypatch):
+    """`_last_admit_attempt` was stamped BEFORE the probe ran, so the interval measured from the
+    probe's START.
+
+    The probe is `select_runtime_by_name(..., require_available=True)` -- two aws-cli calls, each
+    able to burn the full cli_timeout_s (120s) during exactly the persistent timeout that caused
+    the deferral. A probe lasting longer than `_admit_retry_s` is therefore already eligible when
+    it returns, so the next tick runs another one immediately: `spawn()` is on the pool's sole
+    maintenance thread, and promotion, health checks and local spawning stall continuously for the
+    duration of the outage. Rate-limiting a call by when it STARTED does not limit anything once
+    the call outruns its own window.
+
+    MUTATION: stamp _last_admit_attempt before the probe again -> 5 ticks give 5 probes and this
+    fails.
+    """
+    from blastbox.host import pool_config
+
+    now = [1000.0]
+    probes: list = []
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):
+        if name == "aws-ec2":
+            if require_available:
+                probes.append(now[0])
+                now[0] += 240.0            # two cli calls at their full timeout
+                raise AwsProbeTimeout("sts: timed out")
+            return FakeRuntime(name)
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
+    rt._clock = lambda: now[0]
+    rt._admit_retry_s = 60.0
+    rt._last_admit_attempt = None
+    probes.clear()
+
+    for _ in range(5):
+        rt._admit_deferred()
+
+    assert len(probes) == 1, (
+        f"{len(probes)} probes across 5 back-to-back ticks ({sum(1 for _ in probes)*240:.0f}s of "
+        f"tick-thread blockage): a probe that outruns _admit_retry_s is eligible the moment it "
+        f"returns, so the rate limit throttles nothing"
+    )
+
+
 def test_a_recovered_tier_is_admitted_on_a_later_spawn(monkeypatch):
     """The re-probe is the actual fix: without it the tier stays gone until the process restarts."""
     from blastbox.host import pool_config

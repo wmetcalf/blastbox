@@ -2569,6 +2569,17 @@ class WarmPool:
                 and now - s.spawned_at > self._warming_timeout_s
                 and not self._warming_unknown_unexpired(s.slot_id, now)
             ]
+            # Which of those timed out on SILENCE rather than on an answer. `_warming_unknown_since`
+            # holds an entry only while the last observation was UNKNOWN (any definitive answer,
+            # either way, pops it in _promote_warming), so membership here IS the discriminator.
+            # The IDLE path already escalates its expired unknowns "on suspicion, not on a verdict";
+            # WARMING did not, so during one brownout an unanswered slot was charged to the
+            # restore-failure streak, reaped synchronously on the tick thread, and -- when that
+            # terminate failed against the same control plane -- left DRAINING forever with its
+            # eviction token spent.
+            warming_unknown_expired = {
+                s.slot_id for s in stuck_warming if s.slot_id in self._warming_unknown_since
+            }
 
         dead: list[Slot] = list(stuck_warming)
         # Deaths of slots that were promoted but never served a job are restore failures too:
@@ -2582,7 +2593,7 @@ class WarmPool:
         # Slots we escalated because we could not TELL, as opposed to ones AWS/libvirt confirmed
         # dead. If disposing of a merely-suspected slot also fails, we have learned nothing and must
         # not strand it (see the reap loop below).
-        suspected: set[str] = set()
+        suspected: set[str] = set(warming_unknown_expired)
         # Slots that already hold an eviction token (reserved when their timeout was detected),
         # so the demotion loop must not charge them again.
         budgeted: set[str] = set()
@@ -2620,9 +2631,15 @@ class WarmPool:
                     "slots stay WARMING and are NOT counted as restore failures", len(capped),
                 )
             evicting = [s for s in stuck_warming if s.slot_id in budgeted]
-            self._blame_tiers([s.slot_id for s in evicting])
+            # The streak is RESTORE-FAILURE evidence, and it drives _maybe_rebuild_base, which
+            # can discard a healthy snapshot. A slot that timed out because the control plane
+            # never answered is not evidence about the worker -- charging it means one brownout
+            # can invalidate a good base on zero confirmed deaths. Same rule the warming timeout
+            # itself follows: only spend it on an observation.
+            confirmed = [s for s in evicting if s.slot_id not in warming_unknown_expired]
+            self._blame_tiers([s.slot_id for s in confirmed])
             with self._lock:
-                self._spawn_consecutive_failures += len(evicting)
+                self._spawn_consecutive_failures += len(confirmed)
                 warm_failures = self._spawn_consecutive_failures
             if self._maybe_rebuild_base(warm_failures, reason="spawn"):
                 # HALT THE TICK. The artifact is gone, so the very next runtime.spawn() runs
