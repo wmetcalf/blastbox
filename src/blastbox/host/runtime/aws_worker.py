@@ -152,7 +152,21 @@ class AwsUnknownState(AwsWorkerError):
     Every caller that can destroy a slot must treat this as "skip / try again", never "reap"."""
 
 
-class AwsThrottled(AwsUnknownState):
+class AwsNoVerdict(AwsUnknownState):
+    """We never got an ANSWER AT ALL -- about the worker OR about the tier (issue #79 round 2).
+
+    ``AwsUnknownState`` says "this is not evidence a WORKER died". That is a weaker claim than this
+    one, and availability asks the stronger question: ``AccessDenied`` and ``ExpiredToken`` tell us
+    nothing about a worker but are perfectly definitive about whether a tier may be USED, so they
+    must stay a verdict there. A call that never reached AWS, or whose response could not be read,
+    is a verdict about nothing -- and availability is probed ONCE, so spending it as "unentitled"
+    drops the tier for the whole process lifetime (or, for the primary, refuses to start).
+
+    The parent of the throttle/timeout flavours, so ``except AwsNoVerdict`` covers every way we can
+    fail to get an answer -- including the ones added next."""
+
+
+class AwsThrottled(AwsNoVerdict):
     """AWS rate-limited us (or was momentarily unavailable) -- the retryable flavour of UNKNOWN.
 
     Split out because availability asks a different question from liveness: a throttle is the one
@@ -160,7 +174,7 @@ class AwsThrottled(AwsUnknownState):
     the tier may be used at all (issue #79)."""
 
 
-class AwsProbeTimeout(AwsUnknownState):
+class AwsProbeTimeout(AwsNoVerdict):
     """The control plane didn't answer in time — the timeout flavour of AwsUnknownState. Raised
     whether or not a probe budget was in scope (a 120s cli_timeout_s expiring is no more evidence
     of death than a 5s claim budget expiring)."""
@@ -498,6 +512,10 @@ class AwsDisposableRuntime:
         # cache the READINESS get-microvm/describe-instances too (is_ready is polled ~10Hz during WARMING,
         # and its endpoint-resolution describe is uncached) so a booting slot doesn't spam the control plane.
         self._desc_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        # slot_id -> when a describe last FAILED. Only successes are cached, so without this a
+        # second caller on the same pass re-issues a describe that has just failed and pays another
+        # full timeout for the same non-answer -- on the pool's single maintenance thread.
+        self._desc_fail_at: dict[str, float] = {}
         # Per-PROCESS ownership fence for the aws-ec2-hibernate orphan sweep. A leaked STOPPED slot
         # from a CRASHED dispatcher isn't bounded by the guest uptime timer (it's frozen while
         # hibernated), so sweep_orphans() reclaims stopped slots NOT carrying this id. Deliberately
@@ -511,7 +529,15 @@ class AwsDisposableRuntime:
         cached = self._desc_cache.get(slot.slot_id)
         if cached is not None and (now - cached[0]) < ttl:
             return cached[1]
-        desc = self._describe(slot)
+        try:
+            desc = self._describe(slot)
+        except (AwsWorkerError, OSError):
+            # Remember that the LOOKUP failed, not merely that it did not succeed: "we already
+            # tried and could not read this state" is information, and re-deriving it costs another
+            # control-plane call we do not have the budget for.
+            self._desc_fail_at[slot.slot_id] = now
+            raise
+        self._desc_fail_at.pop(slot.slot_id, None)
         self._desc_cache[slot.slot_id] = (now, desc)
         return desc
 
@@ -621,7 +647,7 @@ class AwsDisposableRuntime:
             # briefly absent mid-`pip install -U awscli`). That says nothing whatsoever about the
             # worker, and it is maximally CORRELATED -- every slot and every thread hits it at once,
             # so collapsing it to "dead" wipes the tier (issue #77 marla-loop).
-            raise AwsUnknownState(f"aws {service} {op}: cannot execute ({exc})") from exc
+            raise AwsNoVerdict(f"aws {service} {op}: cannot execute ({exc})") from exc
         except subprocess.TimeoutExpired as exc:
             # UNKNOWN in every scope (issue #77 round 2): a timeout means the control plane never
             # answered. Outside a probe this used to be a plain AwsWorkerError, and resume()'s
@@ -650,7 +676,7 @@ class AwsDisposableRuntime:
             # We could not PARSE the answer -- a truncated pipe, a CLI upgraded mid-flight, a
             # proxy's error page. That is not the worker telling us it is gone, and whatever caused
             # it applies to every call on this host at once (upstream P2).
-            raise AwsUnknownState(f"aws {service} {op}: unparseable response") from exc
+            raise AwsNoVerdict(f"aws {service} {op}: unparseable response") from exc
 
     # -- fail-closed availability ------------------------------------------
     def available(self) -> bool:
@@ -668,12 +694,15 @@ class AwsDisposableRuntime:
             if not ident.get("Account"):
                 return False
             return self._service_available()
-        except (AwsThrottled, AwsProbeTimeout):
+        except AwsNoVerdict:
             # PROPAGATE, don't flatten. The caller decides whether to retry or defer the tier, and
             # it cannot make that call if a brownout is indistinguishable from missing credentials.
-            # NARROW on purpose: only rate limiting and timeouts. A bare AwsUnknownState covers
-            # AccessDenied and friends, which say nothing about a WORKER but are a definitive answer
-            # about a TIER -- retrying those forever would be the mirror-image bug.
+            # EVERY no-answer, not just rate limiting and timeouts: a truncated or unreadable
+            # response, or a host that could not even start the aws process, is equally not a
+            # verdict, and one of them at startup dropped the tier for the whole process lifetime.
+            # Still NARROW where it counts -- a bare AwsUnknownState covers AccessDenied and
+            # friends, which say nothing about a WORKER but are a definitive answer about a TIER,
+            # and retrying those forever would be the mirror-image bug.
             raise
         except (AwsWorkerError, OSError):
             return False
@@ -745,9 +774,22 @@ class AwsDisposableRuntime:
         Served from the same describe cache ``_health_ok`` just used, so the common path costs no
         extra API call -- and during a real brownout the underlying describe fails too, which is
         precisely the signal we want: unreadable -> False here -> the caller returns UNKNOWN.
+
+        A FAILED describe is not cached, though, so during that brownout the readiness path would
+        re-issue the describe that just failed and wait out a second full ``cli_timeout_s`` for the
+        same non-answer -- per warming slot, on the pool's sole maintenance thread. Whether the
+        state was readable is exactly what the readiness path already learned, so read it from the
+        failure memo instead of buying it again, and budget the call we do still make.
         """
+        sid = slot.slot_id
+        now = self._clock()
+        cached = self._desc_cache.get(sid)
+        if (cached is None or (now - cached[0]) >= self._liveness_cache_s) and \
+                (now - self._desc_fail_at.get(sid, -1e18)) < self._liveness_cache_s:
+            return False    # the readiness path just tried to read the state and could not
         try:
-            desc = self._describe_cached(slot, self._liveness_cache_s)
+            with self._call_budget(self.cfg.health_probe_timeout_s):
+                desc = self._describe_cached(slot, self._liveness_cache_s)
         except (AwsWorkerError, OSError):
             return False
         if not desc:
@@ -825,6 +867,7 @@ class AwsDisposableRuntime:
     def reap(self, slot: AwsWorkerSlot) -> None:
         self._live_cache.pop(slot.slot_id, None)
         self._desc_cache.pop(slot.slot_id, None)
+        self._desc_fail_at.pop(slot.slot_id, None)
         self._mint_fail_at.pop(slot.slot_id, None)
         self._mint_fail_exc.pop(slot.slot_id, None)
         if slot.resource_id is None:
@@ -1662,6 +1705,9 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # slot_id -> when this slot FIRST began trying to park. Survives re-drives (see
         # _park_expired) and is cleared only when the instance actually reaches 'stopped'.
         self._park_since: dict[str, float] = {}
+        # slot_id -> when the stop API last stopped ANSWERING. While this is set the give-up clock
+        # above is frozen: a brownout is the control plane failing, not the slot failing to park.
+        self._park_unknown_since: dict[str, float] = {}
 
     def _service_available(self) -> bool:
         # fail LOUD (once, at pool build) on a hibernation-incapable config instead of churning
@@ -1736,8 +1782,13 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             return None
         return answer
 
-    def _try_park(self, slot: AwsWorkerSlot) -> bool:
-        """Issue the THROTTLED ``stop --hibernate`` that parks a warmed slot. True iff it was accepted.
+    def _try_park(self, slot: AwsWorkerSlot) -> "bool | None":
+        """Issue the THROTTLED ``stop --hibernate`` that parks a warmed slot.
+
+        Returns True iff AWS ACCEPTED it, False iff AWS REFUSED it, and None iff we did not ask at
+        all (inside the throttle window). Raises ``AwsUnknownState`` when the stop API gave us no
+        verdict -- a throttle or a timeout. The three are deliberately distinct: only an ANSWER may
+        spend the caller's give-up budget.
 
         Throttled because the pool polls is_ready at ~10Hz, and TOLERANT of "not ready to hibernate
         yet" (the ec2-hibinit-agent needs ~1-2min after boot to lay down the hibernation reserve):
@@ -1745,10 +1796,18 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         advances to "hibernating"."""
         now = self._clock()
         if now - self._hib_attempt.get(slot.slot_id, 0.0) < self._liveness_cache_s:
-            return False
+            return None      # we did not ask, so this pass learned nothing either way
         self._hib_attempt[slot.slot_id] = now
         try:
             self._aws("ec2", "stop-instances", "--instance-ids", str(slot.resource_id), "--hibernate")
+        except AwsUnknownState as exc:
+            # NO VERDICT: throttled, or the control plane never answered. NOT "this slot refuses to
+            # park" -- the difference decides whether the give-up clock may keep running, and
+            # stop-instances brownouts are CORRELATED, so reading them as refusals retires every
+            # healthy hibernate worker in the tier at once (issue #79).
+            _log.info("ec2-hibernate: stop --hibernate %s got no verdict (%s); will retry",
+                      slot.slot_id, str(exc)[:120])
+            raise
         except AwsWorkerError as exc:
             _log.info("ec2-hibernate: stop --hibernate %s not ready yet (%s); will retry",
                       slot.slot_id, str(exc)[:120])
@@ -1820,7 +1879,15 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         forever (issue #80).
         """
         started = self._park_since.get(sid)
-        return started is not None and (now - started) > self.cfg.hibernate_timeout_s
+        if started is None:
+            return False
+        # An OPEN no-verdict episode FREEZES the clock. hibernate_timeout_s asks "has this SLOT
+        # spent too long failing to park?", and a stop API that will not answer is not the slot
+        # failing -- so a brownout longer than the timeout must not retire the tier's whole healthy
+        # hibernate population. The freeze is closed by the next ANSWERED attempt, which credits
+        # the outage back into _park_since (see _park_step).
+        as_of = self._park_unknown_since.get(sid, now)
+        return (as_of - started) > self.cfg.hibernate_timeout_s
 
     def _park_step(self, slot: AwsWorkerSlot, st: str, now: float) -> "tuple[str, bool | None]":
         """Advance the boot -> warm -> hibernate -> parked machine ONE step from an OBSERVED state.
@@ -1846,6 +1913,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             self._phase[sid] = "parked"
             self._hib_started.pop(sid, None)
             self._park_since.pop(sid, None)     # parked: the give-up clock is done
+            self._park_unknown_since.pop(sid, None)
             return "parked", True
         if st == "stopping":
             # A hibernate is in flight -- possibly one whose response we lost, which is why the
@@ -1853,6 +1921,10 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             if phase != "hibernating":
                 self._phase[sid] = "hibernating"
             self._hib_started.setdefault(sid, now)
+            # Seeing 'stopping' IS the stop API answering: whatever we could not get a verdict on
+            # was in fact accepted. Close any open freeze, or a stop-API brownout would disable the
+            # stuck-in-'stopping' escape (issue #80 finding 2) for the rest of the episode.
+            self._park_unknown_since.pop(sid, None)
             # Start the episode clock from the OBSERVATION when we have none. The lost-response
             # case is precisely the one where we never recorded issuing the stop, so keying the
             # escape only on our own attempt record left exactly that case unable to ever expire.
@@ -1894,8 +1966,22 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             # boot to lay down the hibernation reserve. Only a SUCCESSFUL stop advances the phase,
             # and re-issuing it is harmless: the operation is idempotent by design, because an
             # accepted-but-lost response must be safe to repeat.
-            self._park_since.setdefault(sid, now)
-            self._try_park(slot)
+            try:
+                answered = self._try_park(slot) is not None
+            except AwsUnknownState:
+                # Freeze the give-up clock for as long as the stop API keeps not answering, and
+                # never START it on a non-answer: an unanswered stop is no evidence at all about
+                # this slot, and spending the park budget on it drains every healthy hibernate
+                # worker during a stop-API brownout (issue #79).
+                self._park_unknown_since.setdefault(sid, now)
+                return self._phase.get(sid, "warming"), False
+            if answered:
+                stalled = self._park_unknown_since.pop(sid, None)
+                if stalled is not None and sid in self._park_since:
+                    # AWS is talking to us again: credit the outage back, so the episode measures
+                    # the time this slot had a working stop API and still did not park.
+                    self._park_since[sid] += max(0.0, now - stalled)
+                self._park_since.setdefault(sid, now)
             return self._phase.get(sid, "warming"), False
         # pending / rebooting / anything else: still coming up.
         return phase, False
@@ -2109,7 +2195,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
 
     def reap(self, slot: AwsWorkerSlot) -> None:
         for d in (self._phase, self._desc_cache, self._hib_attempt, self._hib_started,
-                  self._park_since):
+                  self._park_since, self._park_unknown_since):
             d.pop(slot.slot_id, None)
         super().reap(slot)   # terminate-instances (disposable after one untrusted job)
 

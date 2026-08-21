@@ -3208,6 +3208,42 @@ def test_a_warming_slot_whose_unknown_episode_expires_is_suspected_not_convicted
     )
 
 
+def test_a_slow_maintenance_hook_does_not_become_eligible_again_immediately() -> None:
+    """The cooldown must measure from when the hook RETURNS, not when it started.
+
+    The hook's control-plane calls are bounded by health_probe_timeout_s (default 30s) against a
+    cooldown that defaults to 5s. Stamping on entry means a stalled describe leaves the stamp six
+    times older than the cooldown before the hook even returns, so the next 0.1s tick starts
+    another one -- the rate limit throttles nothing during exactly the brownout it exists for.
+    Same defect as _last_admit_attempt in cascade.py, made twice.
+
+    MUTATION: remove the completion re-stamp -> 5 back-to-back ticks give 5 slow calls.
+    """
+    now = [1000.0]
+    calls: list = []
+
+    class _SlowRuntime(_FakeRuntime):
+        def maintain_idle(self, slot: Slot) -> bool:
+            calls.append(now[0])
+            now[0] += 30.0          # a stalled describe at the health-probe bound
+            return True
+
+    pool = WarmPool(runtime=_SlowRuntime(), warm_size=1, spawn_rate_limit=100.0,
+                    clock=lambda: now[0], maintain_interval_s=5.0)
+    pool._spawn_to_deficit(ready=True)
+    for sl in pool._slots.values():
+        sl.state = SlotState.IDLE
+
+    for _ in range(5):
+        pool._maintain_idle()
+        now[0] += 0.1
+
+    assert len(calls) == 1, (
+        f"{len(calls)} slow maintenance passes across 5 ticks ({len(calls)*30}s of tick-thread "
+        f"blockage): a hook that outruns its own cooldown is eligible the moment it returns"
+    )
+
+
 def test_the_maintenance_cooldown_map_does_not_grow_without_bound() -> None:
     """`_maintain_last` is keyed by per-spawn slot id, so it leaks one entry per disposed slot.
 

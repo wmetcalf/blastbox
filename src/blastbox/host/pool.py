@@ -452,6 +452,14 @@ class WarmPool:
         # a tier that IS answering still ages its slots out normally; bounded by _unknown_grace_s so
         # a control plane that never returns cannot wedge the tier at zero capacity forever.
         self._warming_unknown_since: dict[str, float] = {}
+        # slot_id -> total warming time already spent inside CLOSED unknown episodes. The exemption
+        # suspends the VERDICT, but the age it is measured against keeps running: after a brownout
+        # the slot is past warming_timeout_s by construction, so the first definitive answer --
+        # including the "not ready yet" a healthy ec2-hibernate machine returns for most of its
+        # boot->park sequence -- evicts a worker we had only just regained the ability to observe.
+        # Credit that unobservable time back, so the budget is spent on OBSERVATIONS, which is what
+        # warming_timeout_s claims to measure (issue #79).
+        self._warming_unknown_credit: dict[str, float] = {}
         # Rotation cursor + per-slot cooldown for _maintain_idle (issue #80 follow-up).
         self._maintain_cursor: "str | None" = None
         self._maintain_last: dict[str, float] = {}
@@ -1831,7 +1839,13 @@ class WarmPool:
                     # A definitive answer -- in EITHER direction -- ends the episode. "Not ready yet"
                     # is a real observation of the worker, so it must resume aging it; only the
                     # absence of an answer is exempt.
-                    self._warming_unknown_since.pop(slot.slot_id, None)
+                    since = self._warming_unknown_since.pop(slot.slot_id, None)
+                    if since is not None:
+                        # Bank what the episode cost. Aging RESUMES here (the slot is observable
+                        # again), it does not restart: only the unobservable interval is credited.
+                        self._warming_unknown_credit[slot.slot_id] = (
+                            self._warming_unknown_credit.get(slot.slot_id, 0.0)
+                            + max(0.0, probed_at - since))
             if ready:
                 with self._lock:
                     # Only promote if still WARMING (concurrent stop could clear it)
@@ -2735,6 +2749,13 @@ class WarmPool:
             cand.state = SlotState.ASSIGNED
             slot_id = cand.slot_id
             self._maintain_cursor = slot_id
+            # PROVISIONAL stamp: keeps this slot out of a concurrent pass while the hook runs. The
+            # authoritative one is taken from COMPLETION in the finally below -- the hook makes
+            # control-plane calls bounded by health_probe_timeout_s (default 30s) against a
+            # cooldown that defaults to 5s, so a stalled describe leaves this stamp six times
+            # older than the cooldown by the time it returns and the next tick starts another one
+            # immediately. Rate-limiting a call by when it STARTED throttles nothing once the call
+            # outruns its own window (same defect as _last_admit_attempt in cascade.py).
             self._maintain_last[slot_id] = now
 
         usable = True
@@ -2754,6 +2775,8 @@ class WarmPool:
                     cur.state = SlotState.IDLE
                     self._last_idle_at = self._clock()
                     self._idle_event.set()
+                # Re-stamp from COMPLETION, not from the start. See the provisional stamp above.
+                self._maintain_last[slot_id] = self._clock()
                 # NOT usable -> deliberately left ASSIGNED, i.e. unclaimable, and handed straight
                 # to retire() below. Republishing it first (and worse, waking claimants with
                 # _idle_event.set()) opened a window in which a claimant could take the slot:
@@ -2775,6 +2798,20 @@ class WarmPool:
                     if cur is cand and cur.state == SlotState.ASSIGNED:
                         cur.state = SlotState.IDLE
                         self._idle_event.set()
+
+    def _warming_unknown_credit_s(self, slot_id: str) -> float:
+        """Warming time that was never an observation of the worker, so cannot be spent on it.
+
+        Call with ``_lock`` held. CLOSED episodes only, and capped at ``_unknown_grace_s`` -- the
+        same bound the exemption itself carries, for the same reason: ride out a brownout, do not
+        ride out an outage, and do not let a flapping control plane disable the timeout entirely.
+        Crediting a LIVE episode would be worse than the bug it fixes: the effective age would stop
+        advancing exactly when the outage stops being excusable, so the grace could never expire
+        and the tier would wedge at zero capacity.
+        """
+        if self._unknown_grace_s <= 0:
+            return 0.0
+        return min(self._warming_unknown_credit.get(slot_id, 0.0), self._unknown_grace_s)
 
     def _warming_unknown_unexpired(self, slot_id: str, now: float) -> bool:
         """True while a WARMING slot is inside a live, still-plausible UNKNOWN episode.
@@ -2817,11 +2854,15 @@ class WarmPool:
             if self._warming_unknown_since:
                 for gone in [k for k in self._warming_unknown_since if k not in self._slots]:
                     self._warming_unknown_since.pop(gone, None)
+            if self._warming_unknown_credit:
+                for gone in [k for k in self._warming_unknown_credit if k not in self._slots]:
+                    self._warming_unknown_credit.pop(gone, None)
             stuck_warming = [
                 s for s in self._slots.values()
                 if s.state == SlotState.WARMING
                 and self._warming_timeout_s > 0
-                and now - s.spawned_at > self._warming_timeout_s
+                and (now - s.spawned_at
+                     - self._warming_unknown_credit_s(s.slot_id)) > self._warming_timeout_s
                 and not self._warming_unknown_unexpired(s.slot_id, now)
             ]
             # Which of those timed out on SILENCE rather than on an answer. `_warming_unknown_since`

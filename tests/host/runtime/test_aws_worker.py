@@ -3089,3 +3089,72 @@ def test_maintain_idle_changes_nothing_when_the_control_plane_is_silent():
     assert rt.maintain_idle(slot) is True, "a brownout must not retire a healthy parked slot"
     assert rt._phase["s"] == "parked", "and must not rewrite the bookkeeping on a guess"
     assert not [a for k, a in fake.calls if k == "ec2 stop-instances"]
+
+
+# Red tests for findings A / B / C -- append to tests/host/runtime/test_aws_worker.py.
+# Verified: all three FAIL on d1c83c0 and PASS with findings-ABC.patch applied.
+# (test_aws_worker.py already imports _cp, FakeAws, _IDENT, _snapstart_rt, _hibernate_rt.)
+
+
+def test_a_stop_api_brownout_does_not_drain_the_hibernate_tier():
+    """issue #79, park path: `stop-instances --hibernate` being THROTTLED is the control plane
+    failing to answer, not this slot failing to park. _try_park caught it as a generic
+    AwsWorkerError and reported a definitive not-accepted, so the give-up clock kept aging and
+    every healthy warm worker in the tier was retired after hibernate_timeout_s -- during exactly
+    the brownout when replacing them is least possible.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    state, healthy, ticks = ["running"], [True], [1000.0]
+    rt, fake = _hibernate_rt(state=state, healthy=healthy, clock=lambda: ticks[0],
+                             hibernate_timeout_s=300.0)
+    fake.responses["ec2 stop-instances"] = lambda argv: _cp(
+        rc=254, stderr="An error occurred (RequestLimitExceeded) when calling StopInstances")
+
+    for _ in range(14):                      # 14 x 30s = 420s > 300s of stop-API brownout
+        assert rt.maintain_idle(slot := AwsWorkerSlot(slot_id="s", resource_id="i-1")) is True, (
+            "a healthy warm worker was retired over a stop API that never answered"
+        )
+        ticks[0] += 30.0
+    assert slot is not None
+
+
+def test_b_a_failed_readiness_describe_is_not_repeated():
+    """upstream P2: _observed_not_running re-asked the control plane for the state _health_ok had
+    just failed to read. Failed describes are not cached, so one warming slot cost TWO full
+    cli_timeout_s windows per pass on the pool's single maintenance thread.
+    """
+    import subprocess as _sp
+    n = {"describe": 0}
+
+    def stalled(argv):  # noqa: ANN001
+        n["describe"] += 1
+        raise _sp.TimeoutExpired(cmd="aws", timeout=120.0)
+
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": stalled})
+    slot = AwsWorkerSlot(slot_id="s", resource_id="mv-1")
+    assert rt.is_ready(slot) is None
+    assert n["describe"] == 1, "the readiness path bought the same non-answer twice"
+
+
+def test_c_an_unreadable_availability_answer_is_not_a_verdict():
+    """issue #79 round 2: availability is probed ONCE, so a False drops the tier for the whole
+    process lifetime (or, for the primary, refuses to start). A truncated/unparseable STS response
+    -- or a host that could not even fork the aws process -- is not an answer about entitlement.
+    """
+    def truncated(argv):  # noqa: ANN001
+        return _cp(stdout='{"Account": "1234567890')          # rc=0, unreadable
+
+    def cannot_execute(argv):  # noqa: ANN001
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    for responder in (truncated, cannot_execute):
+        rt, _ = _snapstart_rt({"sts get-caller-identity": responder})
+        with pytest.raises(AwsUnknownState):
+            rt.available()
+
+    # ... and the mirror stays intact: AccessDenied IS a verdict about a tier.
+    def denied(argv):  # noqa: ANN001
+        return _cp(rc=254, stderr="An error occurred (AccessDenied) when calling GetCallerIdentity")
+
+    rt, _ = _snapstart_rt({"sts get-caller-identity": denied})
+    assert rt.available() is False

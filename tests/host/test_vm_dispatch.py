@@ -1630,9 +1630,18 @@ def test_the_declared_thaw_budget_is_actually_wired_through_the_factory(tmp_path
     )
 
 
-def test_a_thaw_budget_longer_than_the_job_budget_is_not_granted(tmp_path):
+def test_a_thaw_budget_longer_than_the_job_budget_is_still_granted(tmp_path):
     """A tier declaring a thaw longer than the entire job budget cannot be honoured: granting it
     would let one wake-up eat the job. Fall back rather than pretend, and keep the operator warning.
+    
+    CHANGED 2026-08-21: this asserted the OPPOSITE, on the premise that granting the declared thaw
+    "would let one wake-up eat the job". That premise is false in this code. Detonation is bounded
+    separately by timeout=worker_timeout_s, and validate_timeout_s adds the FULL _resume_to on top
+    of the claim wait and the job budget UNCONDITIONALLY -- so the watchdog already reserves a 600s
+    thaw whether or not _thaw_budget was set. Withholding it therefore withheld nothing: it
+    substituted the claim remainder, which is the #81 truncation, and one full-duration silent
+    probe inside that remainder while describe still says `running` is a CONVICTING verdict in
+    aws_worker.resume -- so the healthy parked instance was released dirty and terminated.
     """
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
 
@@ -1665,6 +1674,7 @@ def test_a_thaw_budget_longer_than_the_job_budget_is_not_granted(tmp_path):
         vm._validate(tmp_path / "in.bin")
 
     granted = seen.get("budget")
-    assert granted is None or granted <= 60.0, (
-        f"a 600s thaw was granted against a 300s job budget: {granted!r}"
+    assert granted == 600.0, (
+        f"the tier's declared thaw was withheld ({granted!r}) -- which does not withhold a budget, "
+        f"it substitutes the CLAIM REMAINDER and re-creates the #81 truncation."
     )

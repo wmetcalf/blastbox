@@ -154,7 +154,8 @@ def _is_undecided_availability(exc: BaseException) -> bool:
     cur: BaseException | None = exc
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
-        if any(c.__name__ in ("AwsThrottled", "AwsProbeTimeout") for c in type(cur).__mro__):
+        if any(c.__name__ in ("AwsNoVerdict", "AwsThrottled", "AwsProbeTimeout")
+               for c in type(cur).__mro__):
             return True
         cur = cur.__cause__ or cur.__context__
     return False
@@ -335,6 +336,18 @@ class CascadingRuntime:
                 # Re-check: a concurrent _admit_deferred may have admitted it already.
                 if any(t.name == d.name for t in self.tiers):
                     continue
+                # REVALIDATE THE TRANSPORT. The startup path refuses a cascade that mixes dispatch
+                # styles or TLS postures; this is the only other door in, so it must refuse too.
+                # Not by RAISING: this runs inside spawn() on the pool's sole maintenance thread,
+                # where an exception aborts that spawn and every tick behind it -- an unusable tier
+                # must not take down a healthy pool. Drop it loudly. Fail-closed for the policy gate
+                # too: reachable_tiers already counted this name at startup, so removing it only
+                # ever SHRINKS what the dispatcher can reach.
+                conflict = self._transport_conflict(rt)
+                if conflict is not None:
+                    _log.error("cascade: deferred tier %r became available but cannot be admitted: "
+                               "%s -- dropping it. Run it in a separate pool.", d.name, conflict)
+                    continue
                 self.tiers.append(Tier(name=d.name, runtime=rt, capacity=d.capacity))
                 self._counts.append(0)
                 self._tier_failures.append(0)
@@ -431,6 +444,31 @@ class CascadingRuntime:
             f"all {len(self.tiers)} cascade tiers full/unavailable "
             f"(capacities {[t.capacity for t in self.tiers]})"
         ) from last_exc
+
+    def _transport_conflict(self, rt: Any) -> "str | None":
+        """Why ``rt`` cannot join the admitted tiers, or None if it can. Call with ``_lock`` held.
+
+        ``dispatch_style`` and ``ssl_context`` are the cascade's two uniformity invariants, and both
+        are consumed exactly ONCE, at startup: the CLI picks the file vs network dispatcher from the
+        style, and the VM dispatcher captures the context when it is built. A tier admitted later
+        can therefore neither change that choice nor be raised about -- it is simply handed jobs
+        over a transport it does not speak. So the check the startup path makes fatal has to be made
+        here too, at the only other door into the cascade.
+        """
+        style = getattr(rt, "dispatch_style", "file")
+        admitted = {getattr(t.runtime, "dispatch_style", "file") for t in self.tiers}
+        if admitted and style not in admitted:
+            return (f"dispatch style {style!r} does not match the admitted tiers {sorted(admitted)}"
+                    " -- one job cannot use two transports")
+        if style == "network":
+            ctxs = [getattr(t.runtime, "ssl_context", None) for t in self.tiers
+                    if getattr(t.runtime, "dispatch_style", "file") == "network"]
+            if ctxs and (getattr(rt, "ssl_context", None) is not None) != any(
+                    c is not None for c in ctxs):
+                return ("its worker-TLS posture differs from the admitted network tiers "
+                        "(private-CA mTLS vs AWS public TLS) -- the dispatcher holds ONE client "
+                        "context and it cannot verify both")
+        return None
 
     def _tier_of(self, slot: Any) -> Tier | None:
         with self._lock:

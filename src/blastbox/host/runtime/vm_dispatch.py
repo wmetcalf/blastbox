@@ -1253,16 +1253,27 @@ def build_remote_vm_dispatcher(
     if _resume_to is None:
         _resume_to = getattr(pool.runtime, "resume_timeout_s", None)
     if _resume_to is not None and float(_resume_to) >= worker_timeout_s:
-        logger.warning("vm_dispatch: resume_timeout_s=%.0f >= worker_timeout_s=%.0f -- lower "
-                       "BLASTBOX_LAMBDA_SNAPSTART_RESUME_TIMEOUT_S below BLASTBOX_WORKER_TIMEOUT_S so a "
-                       "slow resume can't outlast the job budget and leak a live slot", float(_resume_to),
-                       worker_timeout_s)
-    # The thaw budget the claim seam grants OUTSIDE the claim window (issue #81). A tier that
-    # declares a resume_timeout_s longer than the whole job budget cannot be honoured at all, so
-    # fall back to no declared budget there rather than let one thaw eat the job: the warning above
-    # already tells the operator to size them the other way round.
+        # Informational, not a defect. The premise -- "a slow wake can abandon the claim thread with
+        # a live billing slot" -- was true when the thaw ran on the claim window's remainder; the
+        # thaw now has its own budget and validate_timeout_s reserves the FULL resume_timeout_s on
+        # top of the job budget, so the watchdog covers it whatever its size (issue #81).
+        logger.debug("vm_dispatch: resume_timeout_s=%.0f >= worker_timeout_s=%.0f -- supported; the "
+                     "thaw is budgeted separately and the watchdog allowance already reserves it",
+                     float(_resume_to), worker_timeout_s)
+    # The thaw budget the claim seam grants OUTSIDE the claim window (issue #81).
+    # Granted for ANY declared resume_timeout_s, including one at or above worker_timeout_s.
+    # Withholding it there did not withhold a budget -- it fell back to the CLAIM REMAINDER (see
+    # _claim_resumable_slot), i.e. exactly the truncation this change exists to remove, and the
+    # strictly worse of the two options: a hibernate tier resuming inside a 60s remainder gets one
+    # full-duration silent probe while describe still says `running`, which is `silent_while_up` in
+    # aws_worker.resume -- a CONVICTING verdict -- so the healthy parked instance is released dirty
+    # and terminated. The thaw cannot eat the job either way: detonation is bounded separately by
+    # timeout=worker_timeout_s, and validate_timeout_s below already reserves the FULL _resume_to on
+    # top of the claim wait and the job budget, whatever its size. Sizing them backwards is still
+    # worth telling the operator about, but the answer to a badly sized budget is not to substitute
+    # an even smaller one.
     _thaw_budget: float | None = None
-    if _resume_to is not None and float(_resume_to) < worker_timeout_s:
+    if _resume_to is not None and float(_resume_to) > 0:
         _thaw_budget = float(_resume_to)
     # Disposable AWS tiers have no recycle(), so make_remote_validate's finally release() runs a
     # SYNCHRONOUS terminate-instances/terminate-microvm (bounded by the aws-cli timeout) BEFORE validate()
@@ -1427,14 +1438,16 @@ def build_remote_vm_dispatcher(
     if _tier_resume is None:
         _tier_resume = getattr(pool.runtime, "resume_timeout_s", None)
     if _tier_resume is not None and float(_tier_resume) > float(warm_claim_timeout_s):
-        logger.warning(
-            "vm_dispatch: warm_claim_timeout_s=%.0fs cannot honour the %s tier's declared "
-            "resume_timeout_s=%.0fs -- a slot that legitimately takes longer than the claim window "
-            "is judged on a window it was never given. NOTE the resume budget is "
-            "min(resume_timeout_s, remaining claim window), so RAISING warm_claim_timeout_s alone "
-            "does not close the gap: the tier's own resume_timeout_s must come down to at or below "
-            "the claim window, or the claim path must stop truncating it. Tracking in issue #81.",
-            float(warm_claim_timeout_s), tier, float(_tier_resume),
+        # Was a WARNING whose formula ("min(resume_timeout_s, remaining claim window)") is no longer
+        # true and whose advice -- lower the tier's resume_timeout_s -- now directly SHRINKS
+        # _thaw_budget, i.e. re-creates the truncation it was warning about. It also fired on the
+        # shipped default (180 vs 60) at every dispatcher start. This shape is supported now.
+        logger.debug(
+            "vm_dispatch: %s declares resume_timeout_s=%.0fs against warm_claim_timeout_s=%.0fs -- "
+            "expected; the thaw is granted in full outside the claim window (issue #81), so a slow "
+            "wake is bounded at roughly one claim window plus one thaw and the job requeues rather "
+            "than convicting a worker that was merely slow.",
+            tier, float(_tier_resume), float(warm_claim_timeout_s),
         )
 
     validate = make_remote_validate(

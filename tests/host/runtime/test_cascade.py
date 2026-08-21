@@ -799,6 +799,46 @@ def test_a_slow_admit_probe_does_not_become_eligible_again_immediately(monkeypat
     )
 
 
+def test_a_deferred_tier_with_a_foreign_transport_is_refused_at_admission(monkeypatch):
+    """The startup path REFUSES a cascade that mixes dispatch styles.
+
+    dispatch_style and ssl_context are read ONCE -- cli.py picks the file vs network dispatcher and
+    vm_dispatch captures the context -- so a tier that joins 60s later cannot change either. It is
+    simply handed jobs over a transport it does not speak: a network tier in a file cascade fails
+    per job in _delegate, and a public-TLS tier behind a private-CA context fails verification.
+    Fixing reachable_tiers closed the allowed_runtimes POLICY hole; this is the transport one.
+
+    MUTATION: delete _transport_conflict's use -> the network tier is admitted and this fails.
+    """
+    from blastbox.host import pool_config
+
+    class _NetworkTier(FakeRuntime):
+        dispatch_style = "network"
+
+    state = {"up": False}
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):
+        if name == "aws-ec2":
+            if require_available and not state["up"]:
+                raise AwsProbeTimeout("sts: timed out")
+            return _NetworkTier(name)
+        return FakeRuntime(name)          # dispatch_style defaults to "file"
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
+    assert [d.name for d in rt._deferred] == ["aws-ec2"]
+    assert rt.dispatch_style == "file"
+
+    state["up"] = True
+    rt._last_admit_attempt = None
+    rt._admit_deferred()
+
+    assert [t.name for t in rt.tiers] == ["gvisor"], (
+        "a network tier was admitted into a file cascade the file Dispatcher is already driving")
+    assert rt.dispatch_style == "file", "the cascade's transport changed under a live dispatcher"
+    assert not rt._deferred, "an incompatible tier must be dropped, not re-probed forever"
+
+
 def test_a_recovered_tier_is_admitted_on_a_later_spawn(monkeypatch):
     """The re-probe is the actual fix: without it the tier stays gone until the process restarts."""
     from blastbox.host import pool_config
