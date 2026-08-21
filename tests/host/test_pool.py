@@ -3208,6 +3208,40 @@ def test_a_warming_slot_whose_unknown_episode_expires_is_suspected_not_convicted
     )
 
 
+def test_the_maintenance_cooldown_map_does_not_grow_without_bound() -> None:
+    """`_maintain_last` is keyed by per-spawn slot id, so it leaks one entry per disposed slot.
+
+    ec2-hibernate slots are disposable after a single job and every promoted slot normally passes
+    through maintenance before being claimed, so a long-running dispatcher accumulates a permanent
+    dictionary entry per COMPLETED JOB while the slots themselves are long gone. Same unbounded
+    growth `_forget_slot_health` exists to prevent for every other per-slot map.
+
+    MUTATION: remove the _maintain_last.pop from _forget_slot_health -> the map keeps every id.
+    """
+    class _MaintainedRuntime(_FakeRuntime):
+        def maintain_idle(self, slot: Slot) -> bool:
+            return True
+
+    rt = _MaintainedRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, maintain_interval_s=0.0)
+    seen: set = set()
+    for _ in range(6):
+        pool._spawn_to_deficit(ready=True)
+        for sl in list(pool._slots.values()):
+            sl.state = SlotState.IDLE
+        pool._maintain_idle()
+        for sl in list(pool._slots.values()):
+            seen.add(sl.slot_id)
+            pool.retire(sl)
+
+    assert len(seen) >= 3, "sanity: several distinct slots really did pass through maintenance"
+    leaked = set(pool._maintain_last) - set(pool._slots)
+    assert not leaked, (
+        f"{len(leaked)} cooldown entries survive slots that have left the pool; on a disposable "
+        f"tier that is one permanent entry per completed job"
+    )
+
+
 def test_maintenance_is_rate_limited_per_slot_not_run_on_every_tick() -> None:
     """The hook is allowed to make UNCACHED control-plane calls, and tick() runs at ~10Hz.
 

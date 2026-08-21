@@ -2415,6 +2415,13 @@ class WarmPool:
         # exactly how its failures could never accumulate. Bounded either way: a reused identity
         # is one entry per registered worker.
         self._slot_base.pop(slot_id, None)
+        # The maintenance cooldown map is keyed by per-spawn slot id. ec2-hibernate slots are
+        # disposable after one job and every promoted slot normally passes through maintenance
+        # before being claimed, so without this a long-lived dispatcher accumulates one permanent
+        # entry per completed job -- the same unbounded growth this method exists to prevent.
+        self._maintain_last.pop(slot_id, None)
+        if self._maintain_cursor == slot_id:
+            self._maintain_cursor = None
         key = self._health_key_by_slot.pop(slot_id, slot_id)
         if key == slot_id:
             self._slot_failures.pop(slot_id, None)

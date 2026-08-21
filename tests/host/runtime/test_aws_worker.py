@@ -1875,6 +1875,48 @@ def test_f21_resume_honours_a_shorter_claim_budget():
     assert spent < 50.0, f"resume ignored the 0.5s claim budget and ran for {spent} clock-seconds"
 
 
+def test_the_two_claim_describes_share_one_deadline():
+    """`is_alive_for_claim(budget_s=B)` must not cost 2xB.
+
+    The hibernate override does its own uncached describe and then delegates to the base, which
+    describes again. _claim_probe_budget only mins against an OUTER LIVE scope, so two SIBLING
+    scopes each compute a fresh clock()+bound and the call can hold the dispatcher's warm-gate
+    reservation for twice its contract. (My first fix wrapped only the super() call in a scope,
+    which changed nothing -- the sibling-scope problem was the whole bug.)
+
+    MUTATION: split the body back into two sibling `with self._claim_probe_budget(...)` scopes ->
+    the second describe gets a full fresh budget and the elapsed doubles.
+    """
+    now = [1000.0]
+    granted: list = []
+    real_state = ["running"]
+
+    rt, fake = _hibernate_rt(state=real_state, healthy=[True], clock=lambda: now[0],
+                             claim_probe_timeout_s=5.0)
+
+    orig_aws = rt._aws
+
+    def timed_aws(svc, op, *args, timeout_s=None, **kw):
+        # burn almost the whole granted budget on every control-plane call
+        deadline = getattr(rt._tls, "probe_deadline", None)
+        left = (deadline - now[0]) if deadline is not None else 999.0
+        granted.append(round(left, 3))
+        now[0] += max(0.0, left - 0.1)
+        return orig_aws(svc, op, *args, timeout_s=timeout_s, **kw)
+
+    rt._aws = timed_aws
+    start = now[0]
+    rt.is_alive_for_claim(AwsWorkerSlot(slot_id="h9", resource_id="i-1", state=SlotState.IDLE,
+                                        url="http://10.0.0.5:8080"), budget_s=5.0)
+    elapsed = now[0] - start
+
+    assert elapsed <= 5.0 + 0.5, (
+        f"is_alive_for_claim(budget_s=5.0) consumed {elapsed:.1f}s across {len(granted)} "
+        f"control-plane calls granted {granted}; the claim reservation is held for twice its "
+        f"contract"
+    )
+
+
 def test_a_hibernate_accepted_this_tick_makes_the_slot_unclaimable_immediately():
     """The exclusive maintenance window ends one instruction after `stop --hibernate` is accepted.
 

@@ -1789,22 +1789,25 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             _log.info("ec2-hibernate: slot %s has a hibernate in flight -- not claimable this scan",
                       slot.slot_id)
             return None
-        try:
-            self._desc_cache.pop(slot.slot_id, None)
-            with self._claim_probe_budget(budget_s):
+        # ONE scope around BOTH describes. _claim_probe_budget only mins against an OUTER LIVE
+        # scope (`prev = getattr(self._tls, "probe_deadline", None)`); once a scope exits it
+        # restores prev to None, so a second sibling scope computes a FRESH clock()+bound. An
+        # earlier attempt at this fix simply wrapped the super() call in its own scope, which left
+        # the two describes with a full budget each exactly as before -- is_alive_for_claim(
+        # budget_s=5) blocking ~10s while holding the dispatcher's warm-gate reservation. The
+        # nesting the docstring describes only works from INSIDE, so the whole body has to be in
+        # one scope and super()'s own nested scope then mins against it.
+        with self._claim_probe_budget(budget_s):
+            try:
+                self._desc_cache.pop(slot.slot_id, None)
                 if self._state(slot) == "stopping":
                     _log.info("ec2-hibernate: slot %s is 'stopping' (hibernate in flight) -- "
                               "not claimable this scan", slot.slot_id)
                     return None
-        except AwsUnknownState:
-            return None       # could not tell -> skip, never destroy
-        except (AwsWorkerError, OSError):
-            pass              # fall through to the ordinary probe, which has its own verdict rules
-        # INSIDE the same budget scope. _claim_probe_budget nests (it mins with any outer
-        # deadline), but closing this one first and letting the base open a fresh one gave the two
-        # describes a full budget EACH -- so is_alive_for_claim(budget_s=5) could block ~10s while
-        # holding the dispatcher's warm-gate reservation, twice its contract.
-        with self._claim_probe_budget(budget_s):
+            except AwsUnknownState:
+                return None   # could not tell -> skip, never destroy
+            except (AwsWorkerError, OSError):
+                pass          # fall through to the ordinary probe, which has its own verdict rules
             return super().is_alive_for_claim(slot, budget_s=budget_s)
 
     _PARK_GIVE_UP = "give-up"
