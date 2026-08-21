@@ -2495,7 +2495,8 @@ def test_early_silence_while_parked_cannot_convict_a_later_running_instance():
         return tick[0]
 
     def runner(argv, timeout):  # noqa: ANN001
-        argv = list(argv); op = f"{argv[1]} {argv[2]}"
+        argv = list(argv)
+        op = f"{argv[1]} {argv[2]}"
         tick[0] += 1.0
         if op == "sts get-caller-identity":
             return _cp(stdout=json.dumps({"Account": "1", "Arn": "arn:aws:iam::1:user/x"}))

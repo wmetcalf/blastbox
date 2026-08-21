@@ -2813,8 +2813,10 @@ def test_the_wedge_threshold_sees_through_a_cascade():
         def reap(self, slot):  # noqa: ANN001
             pass
 
-    slow = _Rt(); slow.cfg = SimpleNamespace(cli_timeout_s=120.0)      # type: ignore[attr-defined]
-    fast = _Rt(); fast.cfg = SimpleNamespace(cli_timeout_s=30.0)       # type: ignore[attr-defined]
+    slow = _Rt()
+    slow.cfg = SimpleNamespace(cli_timeout_s=120.0)      # type: ignore[attr-defined]
+    fast = _Rt()
+    fast.cfg = SimpleNamespace(cli_timeout_s=30.0)       # type: ignore[attr-defined]
 
     class _Cascade(_Rt):
         tiers = [SimpleNamespace(runtime=fast), SimpleNamespace(runtime=slow)]

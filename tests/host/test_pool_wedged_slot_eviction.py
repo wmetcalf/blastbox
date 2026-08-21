@@ -665,7 +665,6 @@ def _snapshot_pool(**kw):
         spawns = 0
 
         def spawn(self):
-            from blastbox.host.pool import Slot, SlotState
             _Rt.spawns += 1
             raise RuntimeError("restore failed")
 
@@ -708,7 +707,6 @@ def test_gvisor_invalidate_base_reaches_the_snapshot_manager():
 def test_cascade_invalidate_base_reaches_every_wrapped_tier():
     """In production the pool holds the CASCADE, not the snapshot runtime, so without delegation
     the lookup fails and a poisoned base is never rebuilt (upstream, PR #82)."""
-    from types import SimpleNamespace
 
     from blastbox.host.runtime.cascade import CascadingRuntime
 
