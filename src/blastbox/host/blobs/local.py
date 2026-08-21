@@ -15,15 +15,24 @@ dispatcher) safe in single-node mode too.
 """
 from __future__ import annotations
 
+import errno
+
 import hashlib
 import os
 import shutil
-import threading
 import uuid
 from pathlib import Path
 from typing import BinaryIO
 
-from blastbox.host.blobs.base import BlobFetchError, BlobIntegrityError
+from blastbox.host.blobs.base import (
+    _SEAL_NAME,
+    _assert_declared_landed,
+    _declared_paths,
+    _is_seal,
+    BlobFetchError,
+    BlobIntegrityError,
+    _upload_order,
+)
 from blastbox.observability import get_logger
 
 _log = get_logger("blastbox.blobs.local")
@@ -41,6 +50,12 @@ class LocalBlobStore:
     def _sample_path(self, sha256: str) -> Path:
         return self._blob_root / "samples" / sha256
 
+    @property
+    def local_root(self) -> Path:
+        """Where this store keeps its bytes. The scratch reclaim asks so it can refuse to delete
+        the blob root, whatever it is named and however it was configured."""
+        return self._blob_root
+
     def _results_dir(self, job_id: str) -> Path:
         return self._blob_root / "results" / job_id
 
@@ -49,17 +64,24 @@ class LocalBlobStore:
         """Copy *src* -> *dest* via a temp file in the same dir + atomic rename, so a
         crash mid-copy can never leave a truncated blob that a later read would trust.
 
-        The temp name includes a per-call uuid4 (plus the thread id, belt-and-braces)
-        rather than just the PID: two threads in the SAME process can race to
-        ``put_sample`` byte-identical content (the ingress upload path is threaded via
-        an ``api_workers``-wide semaphore), and a PID-only name would let both writers
-        share one temp path, interleaving/truncating each other before either
-        ``os.replace`` — corrupting the bytes that rename then atomically publishes.
+        The temp name is a per-call uuid4 and NOTHING ELSE -- specifically not the
+        destination's name. A uuid4 alone already gives the uniqueness this needs: two threads in
+        the SAME process can race to ``put_sample`` byte-identical content (the ingress upload
+        path is threaded via an ``api_workers``-wide semaphore), and a shared temp path would let
+        both writers interleave/truncate each other before either ``os.replace`` — corrupting the
+        bytes that rename then atomically publishes.
+
+        Including ``dest.name`` inflated the temp basename by ~62 characters, so a DECLARED
+        artifact with a ~200-char name -- which the filesystem, the envelope (path allows 4096)
+        and S3 all accept -- made this raise ENAMETOOLONG on a destination that is perfectly
+        storable. That failure is deterministic, so the pending-upload sweep could never drain
+        it: the job stayed FAILED forever, every result route answered 409, and the reclaim held
+        the tree as the last copy indefinitely. #84 on demand, from one artifact name (#85
+        review). A fixed-length temp keeps "storable destination" and "storable temp" the same
+        question.
         """
         dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.parent / (
-            f".{dest.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.part"
-        )
+        tmp = dest.parent / f".tmp-{uuid.uuid4().hex}.part"
         try:
             shutil.copyfile(src, tmp)
             os.replace(tmp, dest)
@@ -102,9 +124,23 @@ class LocalBlobStore:
 
     # ── results ──────────────────────────────────────────────────────────────
     def put_output(self, job_id: str, out_dir: Path) -> None:
+        # The terminal purge deletes the local tree on the strength of THIS call, so a
+        # silent no-op here turns "upload succeeded" into a DONE job with no durable copy
+        # anywhere. rglob on a missing dir yields nothing and raises nothing, so assert the
+        # durability barrier explicitly (#85 review).
         out_dir = Path(out_dir)
+        if not out_dir.is_dir():
+            raise FileNotFoundError(f"put_output: output dir missing for {job_id}: {out_dir}")
         dest_dir = self._results_dir(job_id)
-        for path in sorted(out_dir.rglob("*")):
+        declared = _declared_paths(out_dir)
+        stored: set[str] = set()
+        # TWO-PHASE COMMIT. metadata.json is written LAST, so its presence under
+        # results/<job_id> means "every other artifact already landed" -- that is what makes
+        # has_output() a real durability answer instead of a guess. Uploading in plain sorted
+        # order put it FIRST ('m' < 'r'), so a run that died mid-upload left the seal present with
+        # artifacts missing, and the age reclaim would then delete the complete local tree as
+        # redundant. It is also the artifact the API fetches to serve a job at all (#85 review).
+        for path in _upload_order(out_dir):
             # Skip symlinks BEFORE is_file() -- is_file() follows a symlink to its
             # target, so `p.is_symlink() or not p.is_file()` (checked in that
             # order) never reads or uploads a symlink's target bytes. A worker
@@ -123,7 +159,27 @@ class LocalBlobStore:
             if not path.is_file():
                 continue
             rel = path.relative_to(out_dir)
-            self._atomic_copy(path, dest_dir / rel)
+            # A name we can NEVER store is not an outage -- retrying it forever is what turns
+            # one worker-chosen filename into a permanent leak. The sample writes an undeclared
+            # 250-char name into its 0o777 output/, put_output raises ENAMETOOLONG on every
+            # attempt, the host marks the tree pending-upload, and the last-copy rule then
+            # exempts it from BOTH sweeps for the life of the node -- #84 reproduced on demand
+            # (upstream review of #85). Skip it loudly, exactly as a hostile symlink is skipped:
+            # undeclared files are not servable anyway (the result routes are manifest-gated), so
+            # nothing a consumer can reach is lost. Every other error still propagates, because a
+            # real outage MUST fail the upload rather than silently ship a partial result.
+            if _is_seal(path, out_dir):
+                # The seal commits the upload, so everything it PROMISES must already be stored.
+                _assert_declared_landed(job_id, out_dir, stored)
+            try:
+                self._atomic_copy(path, dest_dir / rel)
+                stored.add(rel.as_posix())
+            except OSError as exc:
+                if (exc.errno != errno.ENAMETOOLONG or declared is None
+                        or rel.as_posix() in declared):
+                    raise      # a DECLARED artifact must never be silently dropped
+                _log.warning("put_output_skipped_unstorable_name", job_id=job_id,
+                             path=str(rel), error=str(exc))
 
     def open_output(self, job_id: str, name: str) -> BinaryIO:
         # put_output stores nested rel paths (results/<job_id>/<foo/bar.png>), so open_output must
@@ -147,6 +203,20 @@ class LocalBlobStore:
             return legacy
 
         raise BlobFetchError(f"result fetch failed: {job_id}/{name}")
+
+    def has_output(self, job_id: str) -> bool:
+        """Positively observed durable result bytes for *job_id*.
+
+        Deliberately does NOT count the legacy `<job_root>/<id>/output` fallback that
+        open_output still serves: that path IS the local tree the reclaim is deciding whether
+        to delete, so counting it would make the check answer "yes, a durable copy exists"
+        with the tree itself as the evidence -- and destroy the only copy of every pre-blob-store
+        result on the node (#85 review).
+        """
+        try:
+            return (self._results_dir(job_id) / _SEAL_NAME).is_file()
+        except OSError:
+            return False        # unknown is NOT durable
 
     def _contained_open(self, base_dir: Path, name: str, job_id: str) -> BinaryIO | None:
         """Open ``base_dir/name`` if present and contained under ``base_dir``.

@@ -21,10 +21,23 @@ Security properties (review will check):
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import logging
 import os
 import re
 import shutil
+
+from blastbox.host.jobs.retention import (
+    RESULT_RETAINED_MARKER,
+    clear_retained_orphan,
+    clear_pending_upload,
+    mark_pending_upload,
+    mark_retained_orphan,
+    purge_job_dir,
+    _blob_local_roots,
+    reap_stale_scratch,
+    retry_pending_uploads,
+)
 import subprocess
 import threading
 import time
@@ -77,6 +90,8 @@ def _guest_seam_errors() -> tuple[type[BaseException], ...]:
 
 _GUEST_SEAM_ERRORS: tuple[type[BaseException], ...] = _guest_seam_errors()
 
+
+_JOB_ID_RE = re.compile(r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
 
 _log = logging.getLogger("blastbox.host.dispatch")
 
@@ -169,6 +184,60 @@ _PUT_OUTPUT_RETRY_BACKOFF_S = 1.0
 # looping release -> reclaim -> release forever.
 MAX_MATERIALISE_ATTEMPTS = 3
 _BLOB_RETRY_BACKOFF_S = 30.0
+
+
+class _PhaseTimer:
+    """Host-side wall-clock per phase for ONE warm dispatch, keyed by job_id.
+
+    Throughput on a disposable-slot tier is `slots / slot_cycle_time`, not `1 / engine_time`:
+    24 slots sustaining ~2.6 jobs/s means a ~9s slot cycle, while a single job against an idle
+    tier finishes in well under a second. So most of the cycle is something OTHER than
+    extraction -- and until this existed, nothing could say which part, which makes every
+    engine-side optimisation a guess.
+
+    Why the HOST and not the guest: the guest's log lines carry no correlation id, so under
+    concurrency pairing the k-th "job received" with the k-th "returned" pairs DIFFERENT JOBS.
+    That method reported 0.67s and 5.48s for the same tier minutes apart, which is how you can
+    tell it measures nothing (see RedTusk scripts/slot_cycle_profile.sh, which refuses to print
+    such numbers). `_dispatch_claimed_job` owns one job start to finish on ONE thread, so its
+    phases are already sequential and already ours -- no correlation id needed, and no guest
+    change, so this deploys with a container rebuild instead of a rootfs rebuild.
+
+    Instrumentation only: it never raises and never touches control flow. A phase that was
+    never reached is simply ABSENT from the line, which is itself the diagnostic -- the last
+    phase present is where the dispatch exited.
+    """
+
+    __slots__ = ("job_id", "outcome", "_start", "_last", "_phases")
+
+    def __init__(self, job_id: str) -> None:
+        self.job_id = job_id
+        self.outcome = "unknown"
+        now = time.monotonic()
+        self._start = now
+        self._last = now
+        self._phases: list[tuple[str, float]] = []
+
+    def mark(self, name: str) -> None:
+        """Close the phase that ended at this line and open the next one."""
+        now = time.monotonic()
+        self._phases.append((name, now - self._last))
+        self._last = now
+
+    def emit(self, log: logging.Logger = _log) -> None:
+        """One line per job. Guarded: a broken logging backend must not fail a job that has
+        already done its work -- this runs from the outer `finally`, past every terminal path."""
+        try:
+            total = time.monotonic() - self._start
+            log.info(
+                "warm_phases job_id=%s outcome=%s total=%.3f %s",
+                self.job_id,
+                self.outcome,
+                total,
+                " ".join(f"{name}={secs:.3f}" for name, secs in self._phases),
+            )
+        except Exception:  # noqa: BLE001 -- instrumentation is never worth a failed job
+            pass
 
 
 @dataclass(frozen=True)
@@ -322,7 +391,34 @@ class Dispatcher:
         # worker stacks on a possible orphan) and reconcile in maintenance — once `docker ps` shows
         # the container is gone, we release the permit. Without this the permit leaks permanently
         # and cold capacity bleeds to zero after enough failed kills. name → nothing (a set).
-        self._retained_cold_orphans: set[str] = set()
+        # container name -> (job_id, claim_id we held). The claim_id is what lets the
+        # reconcile below apply the SAME ownership gate as the terminal purge: by the time
+        # the container is confirmed gone a peer may have reclaimed the job, and comparing
+        # the store row against itself would pass trivially and delete the peer's tree.
+        self._retained_cold_orphans: dict[str, tuple[str, str | None]] = {}
+        # Jobs whose result upload EXHAUSTED its retries: the durable copy never landed, so the
+        # local tree is the ONLY copy and the terminal purge must spare it. Everything else in
+        # this file assumes the blob store is the durable copy -- on this one branch that is
+        # false BY CONSTRUCTION, and the tree holds host-sealed, trust-gate-passed output plus
+        # one-shot evidence (the netd C2 pcap is MOVED, not copied, into it). Reviewed on #85.
+        self._upload_failed_job_ids: set[str] = set()
+        # Age-based reclaim of per-job SCRATCH, deliberately independent of
+        # job_retention_seconds. That knob governs RESULT lifecycle -- its sweeper also calls
+        # blob_store.delete_job(), so it must stay 0 in any deployment that wants to keep
+        # results, which left NOTHING in-process reclaiming job_root. Every "leave it for the
+        # sweep" decision in terminal cleanup (an unconfirmed-dead container's tree, a result
+        # whose upload exhausted) was therefore an unbounded leak (#85 review). This is the
+        # bound, and it never touches the blob store. 0 disables.
+        # Separate from BLASTBOX_SCRATCH_MAX_AGE_S on purpose: that knob governs DELETION,
+        # this one governs RECOVERY (re-uploading a retained result and repairing its row
+        # FAILED->DONE). An operator staging an upgrade conservatively needs to be able to
+        # turn the write-side off without also disabling the only thing bounding the disk,
+        # and vice versa -- and before this there was no off-switch for the write side at
+        # all short of disabling maintenance entirely, which also kills crash recovery.
+        self._pending_upload_retry = os.environ.get(
+            "BLASTBOX_PENDING_UPLOAD_RETRY", "1").strip().lower() not in ("0", "false", "no", "off")
+        self._scratch_max_age_s = max(0.0, float(
+            os.environ.get("BLASTBOX_SCRATCH_MAX_AGE_S", "21600") or "21600"))
         self._retained_lock = threading.Lock()
         # Set once shutdown begins: a dispatch worker abandoned past the join deadline (e.g. blocked
         # in a slow claim_next) must NOT acquire a cold permit and spawn a container after the CLI
@@ -711,9 +807,25 @@ class Dispatcher:
                 warning="recovered: warm worker owner gone",
             ):
                 recovered += 1
-                # The owner is gone and the job is now terminal (FAILED is not claim_next-able),
-                # so nothing else will clean up its staged input. Delete it here so a recovered
-                # job's untrusted input doesn't leak on disk even when retention is disabled.
+                # Delete the staged input only -- NOT the whole tree.
+                #
+                # An earlier revision purged everything here, reasoning "our CAS won, so no peer
+                # owns the tree". That is FALSE and this file says so 560 lines down: the CAS is
+                # on (RUNNING, claim_id), and a live owner mid-SEAL still holds exactly that
+                # state, because it writes its terminal status only after the seal completes. The
+                # seal (rdump materialize, size-cap walk, re-hash, upload) is explicitly NOT
+                # bounded by warm_deadline, which is why _dispatch_warm refreshes started_at
+                # before it -- see the comment there: "a legitimately slow/large seal could be
+                # judged 'owner gone' and FAILed out from under a live owner". Refreshing narrows
+                # that window; it does not close it. So this sweep CAN fire against a live owner,
+                # and rmtree'ing output/ while that owner is writing into it destroys a result
+                # that actually succeeded.
+                #
+                # Deleting the input is safe in that same race (the owner no longer needs it by
+                # seal time, and the sample is content-addressed in the blob store), which is why
+                # this path has always done exactly that. output/ is left for the age-based
+                # scratch sweep: a leaked dir is recoverable, a live job's destroyed output is
+                # not. Reviewed on #85.
                 self._delete_input(
                     self._job_root / job.job_id / "input" / Path(job.filename).name
                 )
@@ -882,7 +994,11 @@ class Dispatcher:
                 if egress:
                     _log.info("net_policy egress job_id=%s → bypassing warm slot (cold wires egress)",
                               job.job_id)
+                phases = _PhaseTimer(job.job_id)
                 slot = None if egress else self._pool.claim(timeout_s=self._warm_claim_timeout_s)
+                # BEFORE the reservation release below, so a slow claim is billed to the claim
+                # and not to whatever runs next.
+                phases.mark("slot_claim")
             finally:
                 # The reservation covered gate→slot-resolution only. Free it now: the slot is
                 # ASSIGNED (out of idle_count) or was missed, so keeping the reservation would
@@ -898,12 +1014,21 @@ class Dispatcher:
                 t0 = time.monotonic()
                 try:
                     self._dispatch_warm(
-                        job, staged_input_path=input_path, slot=slot, output_dir=output_dir
+                        job, staged_input_path=input_path, slot=slot, output_dir=output_dir,
+                        phases=phases,
                     )
                 finally:
-                    # Delete the staged input on every terminal path WE own.
+                    # Delete the staged input on every terminal path WE own, then purge the
+                    # whole dir -- output/ included (issue #84).
                     self._delete_input_if_owned(job, input_path)
+                    self._purge_job_dir_if_owned(job)
                     self._record_outcome(job, path="warm", started=t0)
+                    # Emitted HERE, not inside _dispatch_warm, so the line covers the whole
+                    # slot cycle this thread is responsible for -- the purge is real per-job
+                    # wall-clock on a tier that keeps 82.7k result trees around, and billing it
+                    # to nobody is how it stayed invisible.
+                    phases.mark("purge")
+                    phases.emit()
                 return
             elif self._warm_only:
                 # Warm-only sidecar: do NOT cold-fall-back (no docker socket here — the cold
@@ -946,17 +1071,40 @@ class Dispatcher:
             # accumulating past the budget across repeated failures. RETAIN the permit and record
             # the container so maintenance can reclaim it once `docker ps` confirms the container
             # is gone (else the permit would leak permanently and cold capacity bleed to zero).
-            if gate is not None and not orphaned:
-                gate.release()
-            elif gate is not None:
+            if orphaned:
+                # Register the TREE unconditionally. This used to live under the permit's branch
+                # (`elif gate is not None`), while the purge skip below ran regardless -- so with
+                # the node autosizer off (gate is None, the default) the orphan was never
+                # recorded, _reconcile_cold_orphans returned at its own `gate is None` check, and
+                # NOTHING ever purged it. Retention is about the sample bytes; the permit is a
+                # separate concern that simply has nothing to release here (#85 review).
                 with self._retained_lock:
-                    self._retained_cold_orphans.update(orphaned)
+                    self._retained_cold_orphans.update(
+                        {n: (job.job_id, job.claim_id) for n in orphaned})
+                # ...and on DISK too, so the other dispatcher sharing this job_root -- and this
+                # one after a restart -- also knows not to reclaim it.
+                mark_retained_orphan(self._job_root, job.job_id, _log)
                 _log.warning("cold worker cleanup unconfirmed for job_id=%s (docker kill failed) — "
-                             "retaining the concurrency permit until a sweep confirms the container "
-                             "is gone", job.job_id)
+                             "deferring the job-dir purge%s until a sweep confirms the container "
+                             "is gone", job.job_id,
+                             " and retaining the concurrency permit" if gate is not None else "")
+            elif gate is not None:
+                gate.release()
             # Delete the malicious input on every terminal path WE own, regardless of success,
-            # failure, exception, or unknown engine. We never touch output/ here.
+            # failure, exception, or unknown engine -- then purge the whole job dir. output/ used
+            # to survive here forever, which is the leak in issue #84.
             self._delete_input_if_owned(job, input_path)
+            if orphaned:
+                # `docker kill` was NOT confirmed, which is exactly why the permit above is
+                # retained -- the container may still be running with job_root/<id>/output
+                # bind-mounted 0o777. rmtree'ing a tree a live writer is using races it into a
+                # half-deleted state and a spurious "PURGE FAILED ... sample bytes may remain",
+                # and its open fds pin the disk anyway, so nothing is reclaimed. Leave it for the
+                # maintenance sweep that already reconciles these orphans (#85 review).
+                _log.warning("job %s: worker container not confirmed gone; retaining %s until a "
+                             "sweep reclaims it", job.job_id, self._job_root / job.job_id)
+            else:
+                self._purge_job_dir_if_owned(job)
             self._record_outcome(job, path="cold", started=t0)
 
     def _requeue_claimed(self, job: Job, *, reason: str, defer: bool = False) -> None:
@@ -996,6 +1144,56 @@ class Dispatcher:
         if self._warm_requeue_backoff_s:
             time.sleep(self._warm_requeue_backoff_s)
 
+    def _purge_job_dir_if_owned(self, job: Job) -> None:
+        """Terminal purge of this job's whole dir -- parity with VmJobDispatcher (issue #84).
+
+        Deleting only the input left output/ (metadata.json, rmeta -- text and embedded objects
+        extracted from the sample) on the worker forever. The blob store holds the durable copy,
+        so nothing is lost by removing it.
+
+        OWNERSHIP-GATED, and that is not optional here. Two dispatcher containers on one node
+        share a single job_root bind mount, so a peer that reclaimed this job still needs the
+        staged bytes; purging unconditionally would delete them out from under the new owner
+        mid-flight. That peer's own terminal purge cleans up instead. This mirrors exactly the
+        condition _delete_input_if_owned already applies, so the two cannot disagree about who
+        owns the tree.
+        """
+        self._purge_job_dir_if_claim_matches(job.job_id, job.claim_id)
+
+    def _purge_job_dir_if_claim_matches(self, job_id: str, claim_id: str | None) -> None:
+        """The ownership gate itself, callable with an id + the claim we held.
+
+        Split out so the deferred cold-orphan purge (_reconcile_cold_orphans) applies exactly
+        the same rule as the inline terminal purge -- the two must never drift, since between
+        them they decide whether a peer's staged input survives.
+        """
+        if job_id in self._upload_failed_job_ids:
+            # The result upload exhausted its retries, so results/<job_id> does not exist and
+            # this tree is the ONLY copy of a host-sealed, trust-gate-passed result -- including
+            # evidence that cannot be reproduced by re-running (the C2 pcap is moved into it, and
+            # detonation is explicitly not deterministic run-to-run). Purging here would turn a
+            # transient object-store outage into fleet-wide, irreversible result loss. The scratch
+            # sweep still bounds it on age. Reviewed on #85.
+            self._upload_failed_job_ids.discard(job_id)
+            _log.warning("job %s: retaining %s — the result upload failed, so this is the only "
+                         "copy", job_id, self._job_root / job_id)
+            return
+
+        # This runs from a terminal `finally`, so it must not raise: an escaping store error
+        # would mask the DONE/FAILED the job actually produced. And it fails SAFE -- if we
+        # cannot PROVE we still own the tree we leave it alone, because the alternative is
+        # deleting a peer's staged input mid-flight. A leaked dir is recoverable; a job whose
+        # input vanished under it is not (upstream review of #85).
+        try:
+            final = self._job_store.get(job_id)
+        except Exception:  # noqa: BLE001
+            _log.warning("job %s: could not confirm ownership for the terminal purge (store "
+                         "error); leaving %s in place", job_id, self._job_root / job_id,
+                         exc_info=True)
+            return
+        if final is None or final.claim_id == claim_id:
+            purge_job_dir(self._job_root, job_id, _log)
+
     def _delete_input_if_owned(self, job: Job, input_path: Path) -> None:
         """Delete the shared staged input ONLY if we still hold the claim (or the job
         terminalized under it). The input at job_root/<id>/input is spooled ONCE at submission
@@ -1004,7 +1202,15 @@ class Dispatcher:
         we must NOT delete it. On the normal owned terminal path claim_id still matches and the
         untrusted input is deleted exactly as before; a leak only occurs if the reclaiming owner
         also dies before its own cleanup, bounded by the retention sweep of job_root/<id>."""
-        final = self._job_store.get(job.job_id)
+        # Same terminal-`finally` contract as _purge_job_dir_if_owned: never raise (that would
+        # mask the job's real outcome) and fail SAFE -- an unprovable owner means leave the
+        # bytes for whoever does own them.
+        try:
+            final = self._job_store.get(job.job_id)
+        except Exception:  # noqa: BLE001
+            _log.warning("job %s: could not confirm ownership for input deletion (store error); "
+                         "leaving the staged input in place", job.job_id, exc_info=True)
+            return
         if final is None or final.claim_id == job.claim_id:
             self._delete_input(input_path)
         else:
@@ -1016,6 +1222,17 @@ class Dispatcher:
     def _record_outcome(self, job: Job, *, path: str, started: float) -> None:
         """Record the dispatched-job outcome + duration (warm|cold). Read the
         final status from the store so a crash mid-dispatch counts as 'failed'."""
+        # Metrics must never mask the job's real outcome: this runs from the same terminal
+        # `finally` as the input delete and the purge, so a store error here would surface
+        # instead of the DONE/FAILED the job actually produced (#85 review).
+        try:
+            return self._record_outcome_inner(job, path=path, started=started)
+        except Exception:  # noqa: BLE001
+            _log.warning("job %s: failed to record outcome metrics", job.job_id,
+                         exc_info=True)
+            return
+
+    def _record_outcome_inner(self, job: Job, *, path: str, started: float) -> None:
         final = self._job_store.get(job.job_id)
         outcome = "done" if final is not None and final.status == JobStatus.DONE else "failed"
         record_job_dispatched(path=path, outcome=outcome)
@@ -1028,6 +1245,7 @@ class Dispatcher:
         staged_input_path: Path,
         slot: "Slot",
         output_dir: Path,
+        phases: "_PhaseTimer | None" = None,
     ) -> None:
         """Execute one claimed job via a pre-warmed slot.
 
@@ -1043,6 +1261,11 @@ class Dispatcher:
         # (and other vsock runtimes) carry input over the wire and materialize
         # output via rdump; file-based runtimes copy into slot.input_dir and read
         # slot.output_dir directly. Absent the seam, the file-based path is used.
+        # Default rather than required: the marks below then need no `if phases is not None`
+        # guard, and the dozens of existing callers/tests that predate the instrumentation keep
+        # working. A timer with nobody to emit to costs a list append per phase.
+        if phases is None:
+            phases = _PhaseTimer(job.job_id)
         runtime = self._pool.runtime  # type: ignore[union-attr]  # pool non-None here
         stage_fn = getattr(runtime, "stage_warm_input", None)
         control_fn = getattr(runtime, "host_warm_control", None)
@@ -1123,6 +1346,12 @@ class Dispatcher:
                 # than any of the claim races.
                 warm_fault = "unknown"
                 return
+            # SPLIT from `stage` on purpose. _materialise_sample pulls the sample from the blob
+            # store over the NETWORK; staging below is a vsock write or a local copy. Lumping
+            # them reported ~10% of all job-seconds as "staging" when nearly all of it was blob
+            # I/O -- and blob I/O is a MinIO/S3 problem, not a dispatcher one. Different fix,
+            # different phase.
+            phases.mark("fetch")
 
             # ------------------------------------------------------------------
             # Step 3: Stage input — over the wire (vsock) or into slot.input_dir
@@ -1156,6 +1385,7 @@ class Dispatcher:
                     self._fail_job(job, f"failed to stage input to warm slot: {exc}")
                     return
                 input_path = slot_input_copy
+            phases.mark("stage")
 
             # ------------------------------------------------------------------
             # Step 4: Signal go to warm worker (atomic write of go.json)
@@ -1204,6 +1434,9 @@ class Dispatcher:
                     warm_fault = "worker"
                 self._fail_job(job, f"failed to signal go to warm worker: {exc}")
                 return
+            # On the FC seam signal_go is where the sample crosses vsock into the guest, so this
+            # is the input-transfer cost and it scales with the document, unlike its neighbours.
+            phases.mark("go")
 
             # ------------------------------------------------------------------
             # Step 5: Wait for done signal (same deadline; remaining budget after the send)
@@ -1229,6 +1462,10 @@ class Dispatcher:
                     f"warm worker timed out after {self._worker_timeout_s}s",
                 )
                 return
+            # THE one phase that is actual extraction. Everything else on this line is the cost
+            # of running it in a disposable sandbox; if the rest outweighs this, tuning the
+            # engine is the wrong lever.
+            phases.mark("guest")
 
             # The guest is done; the sealing phase below (rdump materialize, output-cap, validate,
             # re-seal of up to max_total_artifact_bytes) is real wall-clock work NOT bounded by
@@ -1275,6 +1512,7 @@ class Dispatcher:
                         warm_fault = "worker"   # the guest/seam failed to hand its output back
                     self._fail_job(job, f"failed to read warm worker output: {exc}")
                     return
+            phases.mark("rdump")
 
             # Bound TOTAL on-disk output (declared + UNDECLARED) before trusting it. The gVisor
             # warm /out is a live 0o777 host bind mount with NO kernel size/inode quota, so a
@@ -1325,6 +1563,9 @@ class Dispatcher:
             except Exception as exc:  # noqa: BLE001
                 self._fail_job(job, f"unexpected trust validation error: {exc}")
                 return
+            # Covers the output-size cap AND the trust gate: both walk + hash the same output
+            # tree, so splitting them would report one traversal as two phases.
+            phases.mark("validate")
 
             # The trust gate validates output STRUCTURE, not the engine's verdict: an engine that
             # honestly reports a FAILED conversion (status="engine_error", typically 0 artifacts)
@@ -1358,6 +1599,7 @@ class Dispatcher:
                     warm_fault = "worker"   # its output could not be materialized
                 self._fail_job(job, f"failed to materialize warm output: {exc}")
                 return
+            phases.mark("seal")
 
             # ------------------------------------------------------------------
             # Step 6c: Upload the sealed HOST output dir to the blob store BEFORE marking
@@ -1402,12 +1644,17 @@ class Dispatcher:
                 # would convict the worker for this dispatcher's storage problem, and an upload
                 # outage hits every job at once (upstream, PR #82).
                 warm_fault = "job"
-                self._fail_job(
+                # Same as the cold branch: no durable copy landed, so the terminal purge must
+                # spare this tree rather than destroy the only copy.
+                self._upload_failed_job_ids.add(job.job_id)
+                # Same ordering and same fence as the cold path above.
+                self._retain_for_upload_retry(
                     job,
                     f"result upload failed after {self._put_output_max_attempts} attempts; "
-                    "result discarded",
+                    f"{RESULT_RETAINED_MARKER}",
                 )
                 return
+            phases.mark("upload")
 
             # ------------------------------------------------------------------
             # Step 7: Mark DONE
@@ -1454,8 +1701,10 @@ class Dispatcher:
                 # DONE applied + still ours: index per-page perceptual hashes for /similar.
                 self._index_page_hashes(job.job_id, envelope)
                 warm_clean = True   # clean run → the warm slot is safe to reuse without a forced reset
+            phases.mark("commit")
 
         finally:
+            phases.outcome = "done" if warm_clean else "failed"
             # Security: release the slot on EVERY terminal path (success, trust-fail,
             # timeout, unexpected error). release() reaps+replaces — warm ≠ reuse.
             # Delete the slot's copy of the input (only the file path makes one; the
@@ -1477,6 +1726,9 @@ class Dispatcher:
                 dirty=not warm_clean,
                 fault=None if warm_clean else warm_fault,
             ))
+            # release() reaps AND replaces the microVM (warm != reuse), so this is the respawn
+            # cost -- the phase most likely to dominate a cycle whose extraction is milliseconds.
+            phases.mark("release")
 
     def _dispatch_inner(
         self, job: Job, input_path: Path, output_dir: Path,
@@ -1920,10 +2172,18 @@ class Dispatcher:
             )
             return
         if not self._upload_output(job, output_dir):
-            self._fail_job(
+            # The durable copy never landed, so do NOT purge this tree -- it is the only copy.
+            self._upload_failed_job_ids.add(job.job_id)
+            # BEFORE the terminal write, not after: a crash in between would otherwise lose the
+            # marker, and without it the tree is ordinary scratch that the reclaim deletes -- the
+            # only copy of a sealed result. The marker records OUR claim, and the sweep refuses to
+            # act on one whose claim no longer matches the row, so writing it early cannot let a
+            # superseded attempt publish over a peer. If we then lose the CAS we clear it anyway,
+            # so the common case leaves nothing behind (#85 review).
+            self._retain_for_upload_retry(
                 job,
                 f"result upload failed after {self._put_output_max_attempts} attempts; "
-                "result discarded",
+                f"{RESULT_RETAINED_MARKER}",
             )
             return
 
@@ -2142,6 +2402,32 @@ class Dispatcher:
             )
         return False
 
+    def _index_repaired_result(self, job_id: str, out_dir: Path, seal_text: str) -> None:
+        """Post-repair hook for the pending-upload sweep: do what this job's own DONE path never
+        got to do. Only page-hash indexing today -- a recovered job is otherwise DONE, servable
+        and permanently invisible to /similar, because nothing re-walks DONE jobs."""
+        try:
+            from blastbox.contract.envelope import Envelope
+
+            # From the bytes the sweep read while the tree was still held, not from the
+            # tree itself -- which a peer may already have reclaimed once the row went DONE.
+            envelope = Envelope.model_validate_json(seal_text)
+        except Exception:  # noqa: BLE001 -- the repair stands; only the index is best-effort
+            _log.warning("could not parse sealed metadata for repaired job %s", job_id,
+                         exc_info=True)
+            return
+        self._index_page_hashes(job_id, envelope)
+        # ...and the summary the DONE path would have written. Without it a recovered job is DONE
+        # with result_summary=None forever -- /v1/jobs and the status route report null
+        # artifact/warning counts, and anything that tallies off them (the fleet corpus runners
+        # do) silently under-reports every recovered job. Nothing re-walks DONE jobs to fix it.
+        try:
+            summary = _build_result_summary(envelope)
+        except Exception:  # noqa: BLE001 -- the repair stands; the summary is cosmetic
+            return
+        with contextlib.suppress(Exception):
+            self._job_store.update(job_id, result_summary=summary)
+
     def _index_page_hashes(self, job_id: str, envelope: object) -> None:
         """Best-effort: index the job's per-page perceptual hashes (phash/colorhash/
         sha256) for similarity search. Only the Postgres + pg_bktree store can serve
@@ -2197,12 +2483,38 @@ class Dispatcher:
             _log.info("stale_queued_failed count=%d", failed)
         return failed
 
-    def _fail_job(self, job: Job, reason: str) -> None:
-        """Mark a job FAILED, scrubbing the error string before storage.
+    def _retain_for_upload_retry(self, job: Job, reason: str) -> None:
+        """Terminalize a job whose result upload exhausted, keeping its tree as the last copy.
+
+        The ORDER here is the whole point, and both call sites need exactly this order, which is
+        why it is one method rather than two copies:
+
+        1. Mark FIRST. The marker is what tells every later sweep -- in this process, in the peer
+           dispatcher, and after a restart -- that this tree holds the only copy of a host-sealed
+           result. Written after the terminal store write instead, a crash in the gap (SIGKILL,
+           OOM, redeploy: the class this mechanism exists for) loses it, and the tree becomes
+           ordinary scratch that the reclaim deletes.
+        2. Then the terminal CAS.
+        3. If the CAS LOST, drop the marker again: a peer reclaimed the job during our retry
+           window, so our tree is a stale attempt. The marker also records our claim, so even a
+           marker stranded by a crash at step 2 cannot license publishing those stale bytes -- the
+           sweep refuses one whose claim no longer matches the row.
+        """
+        mark_pending_upload(self._job_root, job.job_id, _log, job.claim_id)
+        if not self._fail_job(job, reason):
+            clear_pending_upload(self._job_root, job.job_id, job.claim_id)
+
+    def _fail_job(self, job: Job, reason: str) -> bool:
+        """Mark a job FAILED, scrubbing the error string before storage. Returns whether OUR
+        attempt won the CAS.
 
         Claim-fenced on (RUNNING, our claim_id): if a peer dispatcher already requeued/recovered
         this job, the owner's FAILED is a no-op (don't clobber the new owner's state). In the
-        normal path the job is RUNNING under our claim, so it applies as before."""
+        normal path the job is RUNNING under our claim, so it applies as before.
+
+        The return value matters to callers that leave state behind on the strength of the
+        failure -- specifically the pending-upload sentinel, which must never be written onto a
+        tree a peer now owns."""
         error = sanitize_public_error(reason)
         finished_at = time.time()
         expires_at = (
@@ -2210,7 +2522,7 @@ class Dispatcher:
             if self._job_retention_seconds > 0
             else None
         )
-        self._job_store.update_if_status(
+        return bool(self._job_store.update_if_status(
             job.job_id,
             JobStatus.RUNNING,
             expect_claim_id=job.claim_id,
@@ -2218,7 +2530,7 @@ class Dispatcher:
             finished_at=finished_at,
             expires_at=expires_at,
             error=error,
-        )
+        ))
 
     def _delete_input(self, input_path: Path) -> None:
         """Delete the malicious input file and its containing input/ directory.
@@ -2540,6 +2852,29 @@ class Dispatcher:
             self._fail_stale_queued_jobs()
         except Exception:  # noqa: BLE001
             _log.exception("stale-queued sweep failed")
+        # BEFORE the scratch reclaim, for two reasons. (1) It is cheap -- one `docker ps` and a
+        # purge per confirmed-gone orphan -- while the reclaim walks every tree under job_root and
+        # does a store lookup per candidate; running the reclaim first head-of-line blocks the
+        # cold permits behind it on exactly the fleet state this PR targets (97,681 dirs). (2) It
+        # purges the orphans it confirms and drops them from _retained_cold_orphans, so the
+        # reclaim's skip set is accurate for THIS tick instead of one tick stale (#85 review).
+        try:
+            self._reconcile_cold_orphans()
+        except Exception:  # noqa: BLE001
+            _log.exception("cold-orphan reconcile failed")
+        # BEFORE the reclaim: a retained tree is a PENDING UPLOAD, and draining it is what makes
+        # the reclaim's last-copy rule a temporary hold rather than a permanent one.
+        try:
+            if self._pending_upload_retry:
+                retry_pending_uploads(self._job_root, self._blobs, self._job_store, _log,
+                                      on_repaired=self._index_repaired_result,
+                                      retention_seconds=self._job_retention_seconds)
+        except Exception:  # noqa: BLE001
+            _log.exception("pending-upload sweep failed")
+        try:
+            self._reap_stale_scratch()
+        except Exception:  # noqa: BLE001
+            _log.exception("scratch reclaim failed")
         if self._job_retention_seconds > 0:
             try:
                 from blastbox.host.jobs.retention import JobRetentionSweeper
@@ -2551,10 +2886,42 @@ class Dispatcher:
                     _log.info("retention_sweep_expired count=%d", len(expired))
             except Exception:  # noqa: BLE001
                 _log.exception("retention sweep failed")
+
+    def _dispatch_saturated(self) -> bool:
+        """True when every dispatch slot is in use, i.e. work is queueing behind us.
+
+        Read from the concurrency gate when there is one (it counts in-flight cold workers);
+        otherwise assume NOT saturated, so a deployment without the autosizer still reclaims.
+        """
+        gate = self._concurrency_gate
+        if gate is None:
+            return False
         try:
-            self._reconcile_cold_orphans()
+            return gate.in_flight >= gate.limit
         except Exception:  # noqa: BLE001
-            _log.exception("cold-orphan reconcile failed")
+            return False
+
+    def _reap_stale_scratch(self) -> int:
+        """Reclaim this dispatcher's stale scratch. The implementation is SHARED with
+        VmJobDispatcher (jobs/retention.reap_stale_scratch) for the same reason purge_job_dir
+        is: two copies of a destructive age rule drift, and #84 is what that costs.
+
+        The one thing only this dispatcher can supply is skip_job_ids -- trees whose worker
+        container this process still believes is alive. VmJobDispatcher has no cold-orphan
+        retention, so it passes none.
+        """
+        with self._retained_lock:
+            retained = {jid for jid, _claim in self._retained_cold_orphans.values()}
+        return reap_stale_scratch(
+            self._job_root, self._scratch_max_age_s, self._job_store, _log,
+            skip_job_ids=retained, blob_store=self._blobs,
+            recovery_enabled=self._pending_upload_retry,
+            protect_paths=_blob_local_roots(),
+            live_job_ids=self._list_active_worker_job_ids,
+            # Skip the sweep entirely while every dispatch slot is busy: the machine has better
+            # things to do with its disk and its object store than housekeeping.
+            yield_to_work=self._dispatch_saturated,
+        )
 
     def _reconcile_cold_orphans(self) -> None:
         """Release cold permits we RETAINED for a failed-kill container ONCE `docker ps` confirms
@@ -2562,21 +2929,46 @@ class Dispatcher:
         then the permit stays held so no worker stacks on a possible orphan; here we reclaim it so
         the retention isn't permanent. If docker ps can't be read we keep retaining (can't confirm
         absence)."""
+        # NOT gated on `gate is not None`: the deferred PURGE has to run whether or not this
+        # dispatcher has a concurrency gate. Only the release below is the gate's business.
         gate = self._concurrency_gate
         with self._retained_lock:
-            if gate is None or not self._retained_cold_orphans:
+            if not self._retained_cold_orphans:
                 return
+        # Snapshot WHICH orphans this verdict is about BEFORE querying docker. `docker ps` is a
+        # subprocess round-trip, and dispatch threads register new orphans throughout it; judging
+        # the post-query map against the pre-query snapshot would classify an orphan registered
+        # in that window as "confirmed gone" -- its container was never in the listing because it
+        # did not exist yet when the listing was taken. That used to leak a permit; now it also
+        # rmtree's a live container's tree (#85 review).
+        with self._retained_lock:
+            candidates = set(self._retained_cold_orphans)
         live_ids = self._list_active_worker_job_ids()
         if live_ids is None:
             return                        # can't confirm absence → keep retaining
         live_names = {f"blastbox-worker-{jid[:12]}" for jid in live_ids}
         with self._retained_lock:
-            gone = [n for n in self._retained_cold_orphans if n not in live_names]
-            for name in gone:
-                self._retained_cold_orphans.discard(name)
+            gone = [n for n in candidates
+                    if n not in live_names and n in self._retained_cold_orphans]
+            reclaimed = [self._retained_cold_orphans.pop(n) for n in gone]
+        if gate is not None:
+            for _ in gone:
                 gate.release()            # container confirmed gone → reclaim its permit
-        if gone:
+        if gone and gate is not None:
             _log.info("reclaimed %d cold permit(s) from confirmed-gone orphan container(s)", len(gone))
+        # ...and NOW purge the trees we deliberately left behind. The inline terminal purge skips
+        # a failed-kill orphan because rmtree'ing under a live writer half-deletes the tree, races
+        # into a spurious "PURGE FAILED", and reclaims nothing (its fds pin the disk anyway). This
+        # is the moment that reservation expires: docker ps has CONFIRMED the container is gone,
+        # so the tree is inert and the security invariant applies again. Without this the sample
+        # bytes sat until the age reclaim -- hours -- and the deferral comment upstream promised a
+        # sweep that only ever reclaimed the permit (#85 review / upstream codex comment).
+        for job_id, claim_id in reclaimed:
+            try:
+                clear_retained_orphan(self._job_root, job_id)   # confirmed gone: the hold ends
+                self._purge_job_dir_if_claim_matches(job_id, claim_id)
+            except Exception:  # noqa: BLE001 -- one bad tree must not strand the rest
+                _log.exception("cold-orphan purge failed for job %s", job_id)
 
     def _kill_container(self, container_name: str) -> bool:
         """``docker kill`` a timed-out worker. Returns True only if the container is CONFIRMED

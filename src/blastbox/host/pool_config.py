@@ -36,6 +36,16 @@ class PoolConfig:
     warm_size: int = 4
     concurrent_ceiling: int = 16
     spawn_rate_limit: float = 4.0
+    # How many runtime.spawn() calls may be IN FLIGHT at once. The pool's maintenance thread
+    # issues spawns one at a time, so a tier whose spawn takes ~0.6s (an FC snapshot restore)
+    # caps the WHOLE pool at ~1.7 slots/s -- and with a disposable slot per job that is also the
+    # job throughput ceiling, no matter how many warm slots or cores the node has. Measured on
+    # toolz2: spawn gap p50=0.57s, ceiling 1.74/s, observed throughput 1.4-1.56/s while the host
+    # sat at load 8 of 32 cores with 94G free.
+    #
+    # DEFAULT 1 = exactly the previous serial behaviour. Raise it only for tiers whose spawn is
+    # latency-bound rather than CPU-bound (snapshot restore, cloud API calls).
+    spawn_concurrency: int = 1
     burst_size: int = 4
     # Max seconds a slot may sit WARMING before it's evicted. The 120s default is fine for FC/gVisor;
     # raise it for cloud tiers (aws-ec2 first-boot can take minutes) so healthy-but-slow slots aren't
@@ -125,6 +135,7 @@ class PoolConfig:
             "warm_size": _int("BLASTBOX_POOL_WARM_SIZE", cls.warm_size),
             "concurrent_ceiling": _int("BLASTBOX_POOL_CEILING", cls.concurrent_ceiling),
             "spawn_rate_limit": _float("BLASTBOX_POOL_SPAWN_RATE", cls.spawn_rate_limit),
+            "spawn_concurrency": max(1, _int("BLASTBOX_POOL_SPAWN_CONCURRENCY", cls.spawn_concurrency)),
             "burst_size": _int("BLASTBOX_POOL_BURST_SIZE", cls.burst_size),
             "warming_timeout_s": _float("BLASTBOX_POOL_WARMING_TIMEOUT_S", cls.warming_timeout_s),
             "warm_snapshot": _bool("BLASTBOX_POOL_WARM_SNAPSHOT", cls.warm_snapshot),
@@ -286,6 +297,7 @@ def build_warm_pool(
         warming_timeout_s=warming_timeout_s,
         concurrent_ceiling=cfg.concurrent_ceiling,
         spawn_rate_limit=cfg.spawn_rate_limit,
+        spawn_concurrency=cfg.spawn_concurrency,
         burst_size=cfg.burst_size,
         # snapshot_rebuild_after / max_evictions_per_window take None natively (it means
         # "derive from warm_size"), so they always forward. The rest use None as "unset", and an

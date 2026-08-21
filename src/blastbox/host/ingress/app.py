@@ -25,6 +25,8 @@ import asyncio
 import hashlib
 import json
 import mimetypes
+import contextlib
+import threading
 import os
 import re
 import shutil
@@ -375,12 +377,61 @@ def build_app(
     _expose_docs = os.environ.get("BLASTBOX_EXPOSE_DOCS", "").strip().lower() in (
         "1", "true", "yes", "on",
     )
+    @contextlib.asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        # BOUND THIS NODE'S job_root. Ingress spools every upload to
+        # <job_root>/<id>/input/<sample> and deletes it only on the put_sample/create failure
+        # paths, while BOTH new sweeps live in DISPATCHER maintenance -- so in the documented
+        # role-separated topology (serve xN + dispatch xM, which deliberately rejects a shared
+        # filesystem) a serve node accumulates raw malware inputs forever. That is #84's class on
+        # the node that holds the untrusted bytes FIRST (#85 review).
+        #
+        # Same reclaim, same rules: age-based, terminal-or-unknown jobs only, marker-aware. On a
+        # single-node deployment where serve and dispatch share job_root that makes it a harmless
+        # duplicate of the dispatcher's sweep rather than a second, differently-behaved one.
+        stop = threading.Event()
+
+        def _reap_loop() -> None:
+            import logging as _logging
+
+            from blastbox.host.jobs.retention import reap_stale_scratch
+
+            # A STDLIB logger, not the module's structlog one: the retention sweeps log
+            # %-style with positional args, which a BoundLogger would render as literal
+            # "%s" text rather than formatting it.
+            reap_log = _logging.getLogger("blastbox.ingress.reap")
+
+            while not stop.wait(_reap_interval_s):
+                try:
+                    reap_stale_scratch(_job_root, _scratch_max_age_s, _job_store, reap_log,
+                                       blob_store=_blob_store)
+                except Exception:  # noqa: BLE001 -- a sweep failure must not kill the server
+                    _log.warning("ingress: scratch reclaim failed", exc_info=True)
+
+        thread = None
+        if _scratch_max_age_s > 0 and _reap_interval_s > 0:
+            thread = threading.Thread(target=_reap_loop, name="blastbox-ingress-reap",
+                                      daemon=True)
+            thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            if thread is not None:
+                thread.join(timeout=5)
+
+    _scratch_max_age_s = max(0.0, float(
+        os.environ.get("BLASTBOX_SCRATCH_MAX_AGE_S", "21600") or "21600"))
+    _reap_interval_s = max(0.0, float(
+        os.environ.get("BLASTBOX_MAINTENANCE_INTERVAL_S", "60") or "60"))
+
     app = FastAPI(
         title="blastbox",
         version=__version__,
         docs_url="/docs" if _expose_docs else None,
         redoc_url="/redoc" if _expose_docs else None,
         openapi_url="/openapi.json" if _expose_docs else None,
+        lifespan=_lifespan,
     )
 
     # Hardening headers on every response (clickjacking / MIME-sniff / referrer /

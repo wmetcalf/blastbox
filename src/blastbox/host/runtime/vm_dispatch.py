@@ -23,7 +23,6 @@ import contextlib
 import inspect
 import logging
 import os
-import shutil
 import threading
 import time
 from collections.abc import Callable
@@ -35,7 +34,16 @@ from blastbox.host.pool import release_kwargs
 from blastbox.contract.envelope import atomic_write_confined
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
-from blastbox.host.jobs.retention import JobRetentionSweeper
+from blastbox.host.jobs.retention import (
+    RESULT_RETAINED_MARKER,
+    clear_pending_upload,
+    mark_pending_upload,
+    JobRetentionSweeper,
+    purge_job_dir,
+    _blob_local_roots,
+    reap_stale_scratch,
+    retry_pending_uploads,
+)
 from blastbox.host.runtime.remote_http import WorkerBusy   # 409 from a busy worker -> requeue, not fail
 from blastbox.observability.metrics import (
     observe_job_duration,
@@ -156,6 +164,17 @@ class VmJobDispatcher:
         # Dispatcher to run this sweep, so a job pinned to a target_tier nobody serves (or for an engine
         # this single-engine dispatcher can't claim) would otherwise keep its untrusted input forever.
         self._max_queued_age_s = max(0.0, float(max_queued_age_s))
+        # Same bound on job_root the container Dispatcher applies, and the SAME
+        # implementation (jobs/retention.reap_stale_scratch). The terminal purge in _process's
+        # finally covers every path this dispatcher can reach, but a SIGKILL/OOM/redeploy
+        # mid-detonation reaches none of them and strands the sample plus its output forever --
+        # that is exactly the #84 accumulation class, and on a remote-only (static/AWS) node
+        # there is no container Dispatcher to sweep it up. BLASTBOX_SCRATCH_MAX_AGE_S was
+        # documented as a global knob while only one dispatcher honoured it (#85 review).
+        self._pending_upload_retry = os.environ.get(
+            "BLASTBOX_PENDING_UPLOAD_RETRY", "1").strip().lower() not in ("0", "false", "no", "off")
+        self._scratch_max_age_s = max(0.0, float(
+            os.environ.get("BLASTBOX_SCRATCH_MAX_AGE_S", "21600") or "21600"))
         # Bound a hung validate() so a dead VM agent can't occupy a claim thread forever (heartbeat
         # would keep the job looking fresh, so the orphan sweep never recovers it).
         self._validate_timeout_s = max(self._heartbeat_s, float(validate_timeout_s))
@@ -253,20 +272,9 @@ class VmJobDispatcher:
         resolve first, then refuse anything that doesn't land strictly under
         ``job_root`` (guards a job_id/path with traversal components).
         """
-        root = self._job_dir(job).resolve()
-        try:
-            root.relative_to(self._job_root.resolve())
-        except ValueError:
-            logger.error("vm_dispatch: refusing to purge %s (outside job_root %s)",
-                        root, self._job_root)
-            return
-        if not root.exists():
-            return
-        try:
-            shutil.rmtree(root)
-        except OSError as exc:
-            logger.error("vm_dispatch: PURGE FAILED for job %s at %s: %s — sample bytes may "
-                        "remain on this worker's disk", job.job_id, root, exc)
+        # Delegates to the shared implementation so this invariant cannot drift between the
+        # two dispatchers -- it already had, and the file-handshake path leaked forever (#84).
+        purge_job_dir(self._job_root, job.job_id, logger)
 
     def _expiry(self, finished_at: float) -> float | None:
         return finished_at + self._retention_s if self._retention_s > 0 else None
@@ -444,6 +452,10 @@ class VmJobDispatcher:
             self._purge_job_dir(job)
             return
         in_path = self._input_path(job)
+        # Set only if this attempt's result upload exhausts its retries: the local tree is then the
+        # ONLY copy of a host-sealed result and must survive the terminal purge. A LOCAL, not an
+        # attribute -- _process runs concurrently for different jobs.
+        pending_upload = False
         owned = False
         terminal_status: JobStatus | None = None   # the terminal state THIS attempt CAS-won (for metrics)
         # The `finally` purge is UNCONDITIONAL for every terminal state and every lost/released claim
@@ -625,19 +637,31 @@ class VmJobDispatcher:
                     backoff_s=self._put_output_retry_backoff_s,
                 )
                 if upload_exc is not None:
-                    # Finding D1: every inline attempt failed. There is no consumer for a job left
-                    # RUNNING "for the sweeper" (nothing re-runs a RUNNING job), so treat this the
-                    # same as any other post-detonation failure -- FAIL the job (the terminal write
-                    # below) and let the unconditional `finally` purge run. The completed result is
-                    # discarded (it was never durably stored), but the job dir + claim don't leak.
+                    # Finding D1 still holds: never leave the job RUNNING "for the sweeper", so it
+                    # is FAILED by the terminal write below. What changed is the TREE. D1 also
+                    # DISCARDED the result, and that was right at the time -- a retained tree had
+                    # no consumer, so it was unreachable bytes (the API serves results from the
+                    # blob store alone) that nothing would ever upload. retry_pending_uploads is
+                    # that consumer now, so the tree is a PENDING UPLOAD and skipping the purge is
+                    # what lets a host-sealed, unreproducible result survive an object-store
+                    # outage instead of being destroyed by one. The container Dispatcher already
+                    # behaved this way, so leaving this path discarding meant the same outage lost
+                    # the result or not depending purely on which dispatcher happened to claim the
+                    # job from the shared queue (#85 review).
+                    pending_upload = True
+                    # BEFORE the terminal write, matching the container dispatcher: a crash
+                    # between committing FAILED and recording the marker leaves the only copy of
+                    # a sealed result looking like ordinary scratch. The marker carries our claim,
+                    # so the finally can withdraw it if this attempt turns out not to own the job.
+                    mark_pending_upload(self._job_root, job.job_id, logger, job.claim_id)
                     logger.error(
                         "vm_dispatch: result upload failed for %s after %d attempt(s) (%s); "
-                        "discarding the result and failing the job (no leftover output dir)",
+                        "failing the job and RETAINING its output for the pending-upload sweep",
                         job.job_id, self._put_output_max_attempts, upload_exc,
                     )
                     ok = False
-                    err = (f"result upload failed after {self._put_output_max_attempts} attempts; "
-                           "result discarded")
+                    err = (f"result upload failed after {self._put_output_max_attempts} "
+                           f"attempts; {RESULT_RETAINED_MARKER}")
                     # Finding S1: a partial result may already be sitting under
                     # results/<job_id> (some of put_output's per-file writes may have landed
                     # before a later one failed). This attempt marks the job FAILED (never
@@ -675,12 +699,17 @@ class VmJobDispatcher:
             finished = time.time()
             # CAS on (status, claim_id) so a stale owner can't clobber a job that was reclaimed
             # (RUNNING->QUEUED->RUNNING under another dispatcher). The return value is OUR ownership.
-            terminal_status = JobStatus.DONE if ok else JobStatus.FAILED
+            intended = JobStatus.DONE if ok else JobStatus.FAILED
             owned = self._store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
-                status=terminal_status,
+                status=intended,
                 finished_at=finished, result_summary=summary, error=err,
                 expires_at=self._expiry(finished))
+            # Assigned only once the store has ANSWERED. The `finally` reads terminal_status to
+            # tell "a peer owns this job now" (our tree is stale) from "the store was
+            # unreachable" (we know nothing) -- and only the first justifies destroying a
+            # retained result. Setting it before the call collapsed the two (#85 review).
+            terminal_status = intended
             if ok and owned:
                 # index per-page perceptual hashes for /v1/similar, same as the cold/file-warm paths --
                 # else a network-endpoint (static/AWS) page-hash job is DONE but invisible to search.
@@ -699,11 +728,16 @@ class VmJobDispatcher:
         except Exception as exc:  # noqa: BLE001 — one bad job must not sink the dispatcher
             logger.warning("vm_dispatch: job %s failed: %s", job.job_id, exc, exc_info=True)
             finished = time.time()
-            terminal_status = JobStatus.FAILED
             owned = self._store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                 status=JobStatus.FAILED, finished_at=finished, error=type(exc).__name__,
                 expires_at=self._expiry(finished))
+            # AFTER the store call, never before. terminal_status is what the `finally` reads to
+            # tell "a peer owns this job now" from "we could not reach the store at all", and the
+            # difference decides whether a retained result is purged. Setting it first meant a
+            # store outage during this very handler looked like a lost claim -- and destroyed the
+            # only copy of a sealed result precisely when the store was already sick (#85 review).
+            terminal_status = JobStatus.FAILED
         finally:
             # SECURITY INVARIANT (not housekeeping): nothing survives on this worker's disk once its
             # attempt ends. The purge is UNCONDITIONAL across every terminal state (DONE/FAILED) AND
@@ -714,8 +748,37 @@ class VmJobDispatcher:
             # leak a job dir forever). Bytes left behind would be orphaned malware that no peer on
             # another host could ever read (this design rejects a shared filesystem), while the blob
             # store (real in every mode) always re-materialises the sample for the new owner. It
-            # deliberately purges output/ too, and there is no setting that disables it.
-            self._purge_job_dir(job)
+            # deliberately purges output/ too, and there is no setting that disables it -- with
+            # exactly one exception, below, where purging would DESTROY the result rather than
+            # release a redundant copy of it.
+            # ...and only when we have no POSITIVE evidence the job is someone else's. `owned` is
+            # False both when a peer demonstrably reclaimed the job AND when the terminal CAS could
+            # not be performed at all (store outage) -- and those must not be treated alike: the
+            # first makes our tree stale, the second is simply unknown, and purging on unknown
+            # destroys the only copy of a sealed result exactly when the store is already sick.
+            # Retaining is the recoverable direction; the sweep's marker gate then refuses to
+            # upload it unless the row really does say the result was retained (upstream #85).
+            # The sentinel is written HERE, not at the upload failure, and only once we know we
+            # still own the job. It asserts "we terminalized this job FAILED and its result is
+            # the last copy" -- writing it before the terminal CAS let a superseded attempt claim
+            # that about a job a PEER went on to fail legitimately, and the sweep would then
+            # publish our stale output over it and CAS the job to DONE. The container Dispatcher
+            # already gated on _fail_job winning; this is the same rule (#85 review).
+            if pending_upload and (owned or terminal_status is None):
+                # The ONLY copy of a host-sealed, trust-gate-passed result. Its marker was written
+                # BEFORE the terminal store write, so a crash in that window cannot leave the tree
+                # looking like ordinary scratch. Retained for retry_pending_uploads to drain, and
+                # bounded by the age reclaim's last-copy rule, which releases it the moment the
+                # durable copy lands.
+                logger.warning("vm_dispatch: retaining %s — the result upload failed, so this is "
+                               "the only copy", self._job_dir(job))
+            else:
+                if pending_upload:
+                    # A peer demonstrably owns this job now, so our tree is a stale attempt.
+                    # Withdraw the marker we wrote before the terminal write -- scoped to our own
+                    # claim, so we can never delete the owner's.
+                    clear_pending_upload(self._job_root, job.job_id, job.claim_id)
+                self._purge_job_dir(job)
             # Metric parity with the cold dispatcher: count the terminal outcome + wall time -- but ONLY
             # for THIS attempt's own winning CAS (owned + the status we wrote). Requeued (NoWarmSlot)
             # attempts set owned=False, and a reclaimed attempt loses the CAS -> both are skipped. Gating
@@ -742,6 +805,35 @@ class VmJobDispatcher:
         except Exception:  # noqa: BLE001
             logger.warning("vm_dispatch: could not parse sealed metadata for %s", job.job_id, exc_info=True)
             return None
+
+    def _index_repaired_result(self, job_id: str, out_dir: "Path", seal_text: str) -> None:
+        """Post-repair hook for the pending-upload sweep -- parity with the container Dispatcher.
+        A recovered job is otherwise DONE and permanently invisible to /similar."""
+        try:
+            from blastbox.contract.envelope import Envelope
+
+            # From the bytes the sweep read while the tree was still held, not from the
+            # tree itself -- which a peer may already have reclaimed once the row went DONE.
+            envelope = Envelope.model_validate_json(seal_text)
+        except Exception:  # noqa: BLE001 -- the repair stands; only the index is best-effort
+            logger.warning("vm_dispatch: could not parse sealed metadata for repaired job %s",
+                           job_id, exc_info=True)
+            return
+        job = self._store.get(job_id)
+        if job is None:
+            return
+        self._index_page_hashes(job, envelope)
+        # ...and the summary, exactly as the container dispatcher's hook does. Restoring it in
+        # only one of the two left a VM-recovered job DONE with null artifact/warning counts
+        # forever -- the same sibling omission this PR keeps producing (#85 review).
+        try:
+            from blastbox.host.dispatch import _build_result_summary
+
+            summary = _build_result_summary(envelope)
+        except Exception:  # noqa: BLE001 -- the repair stands; the summary is cosmetic
+            return
+        with contextlib.suppress(Exception):
+            self._store.update(job_id, result_summary=summary)
 
     def _index_page_hashes(self, job: Job, envelope: Any) -> None:
         """Best-effort: index the job's per-page perceptual hashes (phash/colorhash/sha256) for
@@ -792,6 +884,21 @@ class VmJobDispatcher:
             self._retention.expire_due(self._store)
         except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
             logger.warning("vm_dispatch: retention sweep failed", exc_info=True)
+        try:
+            if self._pending_upload_retry:
+                retry_pending_uploads(self._job_root, self._blobs, self._store, logger,
+                                      on_repaired=self._index_repaired_result,
+                                      retention_seconds=self._retention_s)
+        except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
+            logger.warning("vm_dispatch: pending-upload sweep failed", exc_info=True)
+        try:
+            reap_stale_scratch(
+                self._job_root, self._scratch_max_age_s, self._store, logger,
+                blob_store=self._blobs, protect_paths=_blob_local_roots(),
+                recovery_enabled=self._pending_upload_retry,
+            )
+        except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
+            logger.warning("vm_dispatch: scratch reclaim failed", exc_info=True)
         try:
             cutoff = time.time() - self._orphan_timeout_s
             for job in self._store.list(status=JobStatus.RUNNING):

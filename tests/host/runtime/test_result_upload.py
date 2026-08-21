@@ -14,6 +14,8 @@ bounded inline retry (a transient blip gets a real chance to succeed while this
 worker still holds the claim and the output dir exists), and on exhaustion an
 unconditional FAIL + purge — the same shape as every other terminal path.
 """
+import contextlib
+
 from blastbox.host.jobs.base import Job, JobStatus
 from blastbox.host.jobs.memory import InMemoryJobStore
 
@@ -81,10 +83,25 @@ def test_upload_retries_inline_and_recovers_from_a_transient_failure(vm_dispatch
     assert not (tmp_path / job.job_id).exists(), "purge must still run on the recovered success path"
 
 
-def test_upload_failure_after_exhausting_retries_fails_the_job_and_purges(vm_dispatcher_factory, tmp_path):
-    """Finding D1's replacement contract: once every inline attempt fails, the
-    upload is treated as failed -- FAIL the job (never leave it RUNNING) and let
-    the unconditional purge run (never leave a leftover output dir "for later").
+def test_upload_failure_after_exhausting_retries_fails_the_job_and_retains_the_result(
+    vm_dispatcher_factory, tmp_path,
+):
+    """Finding D1's contract, half revised (#85).
+
+    STILL TRUE: once every inline attempt fails the job is FAILED, never left RUNNING -- nothing
+    re-runs a RUNNING job, so that was only ever a leak.
+
+    CHANGED: D1 also DISCARDED the result, and that was correct at the time -- a retained tree had
+    no consumer. It was unreachable bytes (the API serves results from the blob store alone) that
+    nothing would ever upload, so keeping it bought nothing and violated the no-bytes-survive
+    invariant for free. retry_pending_uploads is that consumer now, so the tree is a PENDING
+    UPLOAD: retained, drained by maintenance, then collected by the age reclaim once the durable
+    copy lands. Purging here would destroy a host-sealed, trust-gate-passed result that cannot be
+    reproduced by re-running -- detonation is not deterministic, and the C2 pcap is MOVED into the
+    tree -- turning a transient object-store outage into permanent evidence loss.
+
+    It also ends a split brain: the container Dispatcher already retained, so before this the same
+    outage lost the result or not depending purely on which dispatcher claimed the job.
     """
     store = InMemoryJobStore()
     job = Job.new(engine="redtusk", filename="a.doc")
@@ -102,8 +119,11 @@ def test_upload_failure_after_exhausting_retries_fails_the_job_and_purges(vm_dis
     final = store.get(job.job_id)
     assert final.status is JobStatus.FAILED, "must not be left RUNNING -- there is no consumer for that"
     assert "upload failed" in (final.error or "").lower()
-    # the cleanup invariant holds on every terminal path -- no leftover output dir survives.
-    assert not (tmp_path / job.job_id).exists(), "job dir (input AND output) must be purged, not preserved"
+    # The result is RETAINED as the only copy -- and it is the sealed output that must survive,
+    # not merely the directory.
+    assert (tmp_path / job.job_id / "output" / "metadata.json").exists(), (
+        "the only copy of a host-sealed result was destroyed by a transient upload failure"
+    )
     # Finding S1: the exhaustion path must reap any partial result blob -- else, with the
     # default job_retention_s=0 (expires_at=None), the retention sweeper skips this FAILED
     # job forever and the partial results/<job_id> blob leaks unbounded.
@@ -192,3 +212,49 @@ def test_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(vm_dispa
     # Our local copy must be purged -- nothing may survive on this worker's disk once we're no
     # longer the owner (same invariant as the other lost-claim paths in this method).
     assert not (tmp_path / job.job_id).exists()
+
+
+def test_a_store_outage_during_terminal_write_does_not_destroy_the_retained_result(
+    vm_dispatcher_factory, tmp_path,
+):
+    """`terminal_status` is what the `finally` reads to tell "a peer owns this job now" from
+    "we could not reach the store at all" — and only the first of those makes our tree stale.
+
+    It used to be assigned BEFORE the store call, so an outage during the terminal write looked
+    exactly like a lost claim: the retained result was purged precisely when the store was already
+    sick, which is the worst possible moment to also lose the only copy of a sealed result.
+    """
+    class StoreDiesOnTerminalWrite(InMemoryJobStore):
+        calls = 0
+
+        def update_if_status(self, job_id, expect_status, **kw):
+            type(self).calls += 1
+            if kw.get("status") is JobStatus.FAILED:
+                raise RuntimeError("job store unavailable")
+            return super().update_if_status(job_id, expect_status, **kw)
+
+    store = StoreDiesOnTerminalWrite()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.input_sha256 = "e" * 64
+    store.create(job)
+    claimed = store.claim_next()
+
+    disp = vm_dispatcher_factory(
+        store=store, blob_store=Blobs(fail_put=True), validate_ok=True,
+        put_output_max_attempts=1,
+    )
+    with contextlib.suppress(Exception):        # the store error still propagates, as before
+        disp._process(claimed)
+
+    assert (tmp_path / job.job_id / "output" / "metadata.json").exists(), (
+        "purged the only copy of a sealed result because the STORE was down"
+    )
+    # ...and the MARKER must already be on disk, because it is written BEFORE the terminal store
+    # write. Written after, a crash in that window (which is exactly what a store outage can turn
+    # into) leaves the only copy of a sealed result looking like ordinary scratch to every later
+    # sweep — the tree survives this tick and the reclaim deletes it on a later one.
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL
+
+    assert (tmp_path / job.job_id / PENDING_UPLOAD_SENTINEL).is_file(), (
+        "the recovery marker was written after the terminal write — a crash in the gap loses it"
+    )

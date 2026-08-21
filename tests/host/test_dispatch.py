@@ -4,8 +4,13 @@
 """
 from __future__ import annotations
 
+import shutil
+import logging
 import hashlib
+import contextlib
+import copy
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -218,6 +223,33 @@ def test_happy_path_done_result_summary_input_gone(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _sealed_metadata(job_root: Path, job) -> dict:
+    """Read a job's sealed metadata from the DURABLE copy, not the purged job dir.
+
+    The dispatcher destroys job_root/<id> on every terminal path (issue #84). LocalBlobStore
+    deliberately roots durable bytes OUTSIDE job_root (a sibling `blobs/results/<job_id>`)
+    precisely so the purge cannot touch them -- see blobs/local.py's header. Reading there is
+    also more faithful: it is the copy the API actually serves.
+    """
+    return json.loads((_blob_root(job_root) / "results" / job.job_id / "metadata.json").read_text())
+
+
+def _blob_root(job_root: Path) -> Path:
+    """Where LocalBlobStore actually put the durable copy.
+
+    Derived from the SAME env the factory reads, not hardcoded: with BLASTBOX_BLOB_LOCAL_ROOT
+    set in an operator's environment the store writes elsewhere, and a hardcoded sibling path
+    made these tests fail on correct production behaviour (#85 review).
+    """
+    configured = os.environ.get("BLASTBOX_BLOB_LOCAL_ROOT", "").strip()
+    return Path(configured) if configured else job_root.parent / "blobs"
+
+
+def _durable_artifact(job_root: Path, job, rel: str) -> Path:
+    """Path to a sealed artifact in the durable blob copy (see _sealed_metadata)."""
+    return _blob_root(job_root) / "results" / job.job_id / rel
+
+
 class _RecordingBlobs:
     """Minimal BlobStore double that records put_output calls + a snapshot of
     whether metadata.json existed in out_dir at call time (it must -- upload
@@ -241,6 +273,28 @@ class _RecordingBlobs:
     def open_output(self, job_id, name): ...
     def delete_job(self, job_id):
         self.deleted.append(job_id)
+
+class _SnapshotBlobs(_RecordingBlobs):
+    """Recording blob store that also COPIES out_dir aside at put_output time.
+
+    Needed because the dispatcher now purges the whole job dir on every terminal path
+    (issue #84) -- the durable copy is the blob store, so a test that inspects
+    job_root/<id>/output after dispatch is reading a directory production deliberately
+    deletes. Upload happens while output/ is still intact, so snapshotting there asserts
+    exactly what the blob store received, which is what the API actually serves.
+    """
+
+    def __init__(self, snapshot_root: Path, fail_times: int = 0):
+        super().__init__(fail_times=fail_times)
+        self.snapshot_root = Path(snapshot_root)
+        self.snapshot: Path | None = None
+
+    def put_output(self, job_id, out_dir):
+        super().put_output(job_id, out_dir)
+        dest = self.snapshot_root / f"snap-{job_id}"
+        shutil.rmtree(dest, ignore_errors=True)
+        shutil.copytree(out_dir, dest)
+        self.snapshot = dest
 
 
 def test_cold_dispatch_uploads_result_to_blob_store_before_done(tmp_path):
@@ -462,7 +516,7 @@ def test_cold_dispatch_serves_host_sealed_metadata(tmp_path):
     d = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
     assert d.dispatch_once() is True
     assert store.get(job.job_id).status == JobStatus.DONE
-    served = json.loads((output_dir / "metadata.json").read_text())
+    served = _sealed_metadata(tmp_path, job)
     assert served["artifacts"][0]["sha256"] == real_sha
     assert served["artifacts"][0]["bytes"] == len(content)
 
@@ -1541,14 +1595,14 @@ def test_network_capture_sealed_as_trusted_artifact(tmp_path, monkeypatch):
 
     assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
 
-    sealed = json.loads((output_dir / "metadata.json").read_text())
+    sealed = _sealed_metadata(tmp_path, job)
     caps = [a for a in sealed["artifacts"] if a["kind"] == "network_capture"]
     assert len(caps) == 1, f"capture artifact not sealed: {sealed['artifacts']}"
     assert caps[0]["path"] == "capture/dump.pcap"
     assert caps[0]["sha256"] == hashlib.sha256(pcap_bytes).hexdigest()
     assert caps[0]["bytes"] == len(pcap_bytes)
     # The pcap is now servable from within the output dir.
-    assert (output_dir / "capture" / "dump.pcap").read_bytes() == pcap_bytes
+    assert _durable_artifact(tmp_path, job, "capture/dump.pcap").read_bytes() == pcap_bytes
 
 
 def test_network_capture_seal_proceeds_when_done_sentinel_never_lands(tmp_path, monkeypatch):
@@ -1575,7 +1629,7 @@ def test_network_capture_seal_proceeds_when_done_sentinel_never_lands(tmp_path, 
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
-    sealed = json.loads((output_dir / "metadata.json").read_text())
+    sealed = _sealed_metadata(tmp_path, job)
     caps = [a for a in sealed["artifacts"] if a["kind"] == "network_capture"]
     assert len(caps) == 1  # sealed anyway after the bounded wait
     assert caps[0]["sha256"] == hashlib.sha256(pcap_bytes).hexdigest()
@@ -1653,7 +1707,7 @@ def test_capture_refuses_symlinked_capture_dir(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
-    sealed = json.loads((output_dir / "metadata.json").read_text())
+    sealed = _sealed_metadata(tmp_path, job)
     assert not [a for a in sealed["artifacts"] if a["kind"] == "network_capture"]  # refused
     assert not (escape / "dump.pcap").exists()  # nothing written through the symlink
 
@@ -1905,7 +1959,7 @@ def test_decrypt_seal_refuses_symlinked_output(tmp_path, monkeypatch):
 
     assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
     assert escape.read_bytes() == b"DO NOT TOUCH"  # the symlink target was never written through
-    sealed = json.loads((output_dir / "metadata.json").read_text())
+    sealed = _sealed_metadata(tmp_path, job)
     paths = [a["path"] for a in sealed["artifacts"]]
     assert "capture/decrypted.pcap" not in paths      # symlinked output skipped
     assert "capture/mixed.pcap" in paths              # the non-symlinked output still sealed
@@ -1964,14 +2018,15 @@ def test_decrypt_seals_decrypted_and_mixed_when_keylog_present(tmp_path, monkeyp
     dispatcher = _direct_dispatcher(store, tmp_path, fake_runner)
     assert dispatcher.dispatch_once() is True
 
-    sealed = json.loads((output_dir / "metadata.json").read_text())
+    sealed = _sealed_metadata(tmp_path, job)
     kinds = {a["kind"] for a in sealed["artifacts"]}
     assert "network_capture" in kinds
     assert "network_capture_decrypted" in kinds
     assert "network_capture_mixed" in kinds
-    # The decrypted pcap is servable from the output dir + hash matches.
+    # The decrypted pcap is servable + its hash matches. Read the DURABLE copy: the job dir
+    # is purged on every terminal path (issue #84), and this is the copy the API serves.
     dec = next(a for a in sealed["artifacts"] if a["kind"] == "network_capture_decrypted")
-    served = (output_dir / dec["path"]).read_bytes()
+    served = _durable_artifact(tmp_path, job, dec["path"]).read_bytes()
     assert dec["sha256"] == hashlib.sha256(served).hexdigest()
 
 
@@ -1998,7 +2053,7 @@ def test_decrypt_noop_without_keylog(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
-    sealed = json.loads((output_dir / "metadata.json").read_text())
+    sealed = _sealed_metadata(tmp_path, job)
     kinds = {a["kind"] for a in sealed["artifacts"]}
     assert "network_capture_decrypted" not in kinds
     assert store.get(job.job_id).status == JobStatus.DONE
@@ -2266,7 +2321,7 @@ def test_no_capture_artifact_when_netd_produced_none(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
-    sealed = json.loads((output_dir / "metadata.json").read_text())
+    sealed = _sealed_metadata(tmp_path, job)
     assert not any(a["kind"] == "network_capture" for a in sealed["artifacts"])
     assert store.get(job.job_id).status == JobStatus.DONE
 
@@ -2394,17 +2449,170 @@ def test_retained_cold_permit_reclaimed_when_container_confirmed_gone(tmp_path):
     dispatcher._concurrency_gate = gate
 
     gate.acquire(0.0)                                    # the retained permit
-    dispatcher._retained_cold_orphans.add("blastbox-worker-abc123def456")
+    dispatcher._retained_cold_orphans["blastbox-worker-abc123def456"] = ("abc123def456", None)
     dispatcher._list_active_worker_job_ids = lambda: set()   # docker ps: no live workers
     dispatcher._reconcile_cold_orphans()
     assert gate.in_flight == 0                           # reclaimed
     assert not dispatcher._retained_cold_orphans
 
     gate.acquire(0.0)                                    # another orphan, but docker ps unreadable
-    dispatcher._retained_cold_orphans.add("blastbox-worker-999888777666")
+    dispatcher._retained_cold_orphans["blastbox-worker-999888777666"] = ("999888777666", None)
     dispatcher._list_active_worker_job_ids = lambda: None
     dispatcher._reconcile_cold_orphans()
     assert gate.in_flight == 1                           # still retained (absence unconfirmed)
+
+
+def test_confirmed_gone_cold_orphan_gets_its_tree_purged(tmp_path):
+    """The failed-kill orphan's dir is DEFERRED, not forgiven.
+
+    The inline terminal purge skips it on purpose: rmtree'ing under a live writer half-deletes
+    the tree, fires a spurious "PURGE FAILED — sample bytes may remain", and reclaims nothing
+    because the container's open fds pin the disk. That reservation expires the moment docker ps
+    confirms the container is gone — the tree is inert and the security invariant applies again.
+    Before this, the reconcile reclaimed only the PERMIT and the sample bytes sat until the age
+    reclaim hours later, while the deferral comment promised a sweep that handled them.
+    """
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._concurrency_gate = DynamicConcurrencyGate(2)
+    dispatcher._concurrency_gate.acquire(0.0)
+
+    jid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "metadata.json").write_text("{}")
+    (d / "input.bin").write_bytes(b"MALWARE-BYTES-MUST-NOT-PERSIST")
+
+    dispatcher._retained_cold_orphans[f"blastbox-worker-{jid[:12]}"] = (jid, "claim-1")
+    dispatcher._list_active_worker_job_ids = lambda: set()
+
+    dispatcher._reconcile_cold_orphans()
+
+    assert not d.exists(), "the confirmed-gone orphan's sample bytes were left on disk"
+    assert dispatcher._concurrency_gate.in_flight == 0
+
+
+def test_failed_kill_orphan_registers_through_the_real_dispatch_path_with_no_gate(tmp_path):
+    """Same hole as the test below, but exercised through _dispatch_claimed_job rather than by
+    seeding the map — registration used to sit in the PERMIT's branch (`elif gate is not None`),
+    so with the autosizer off it never ran at all and there was nothing for any sweep to find.
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    assert dispatcher._concurrency_gate is None          # autosizer off — the default
+
+    job = Job.new(engine="redtusk", filename="s.doc")
+    job.claim_id = "claim-1"
+    job.status = JobStatus.RUNNING
+    store.create(job)
+    d = tmp_path / job.job_id
+    (d / "output").mkdir(parents=True)
+    (d / "input.bin").write_bytes(b"MALWARE-BYTES-MUST-NOT-PERSIST")
+
+    name = f"blastbox-worker-{job.job_id[:12]}"
+
+    def fake_inner(j, input_path, output_dir, *, orphan_out=None):
+        if orphan_out is not None:
+            orphan_out.append(name)      # `docker kill` came back non-zero
+
+    dispatcher._dispatch_inner = fake_inner
+    dispatcher._dispatch_claimed_job(job)
+
+    assert name in dispatcher._retained_cold_orphans, (
+        "with no gate the failed-kill orphan is never recorded, so nothing ever purges its tree"
+    )
+    assert dispatcher._retained_cold_orphans[name] == (job.job_id, "claim-1")
+    assert d.exists(), "the tree must be DEFERRED, not purged under a possibly-live container"
+
+
+def test_failed_kill_orphan_is_registered_even_without_a_concurrency_gate(tmp_path):
+    """The deferred purge must not depend on the node autosizer being switched on.
+
+    Registration used to sit under `elif gate is not None:` — the permit's branch — while the
+    "retaining until a sweep reclaims it" skip ran unconditionally. With BLASTBOX_NODE_* unset
+    (gate is None) the tree was therefore never recorded, and _reconcile_cold_orphans returned at
+    its first `gate is None` check on every tick, so NOTHING purged it. A terminal job kept its
+    sample-derived output/ indefinitely, and the only remaining reclaim was the age sweep — which
+    BLASTBOX_SCRATCH_MAX_AGE_S=0 disables, giving a setting that switches off a purge whose own
+    docstring says there is deliberately no setting that disables it.
+
+    Retention is about the TREE; the permit is a separate concern that simply has nothing to
+    release when there is no gate.
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    assert dispatcher._concurrency_gate is None          # autosizer off — the default
+
+    jid = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "metadata.json").write_text("{}")
+
+    dispatcher._retained_cold_orphans[f"blastbox-worker-{jid[:12]}"] = (jid, None)
+    dispatcher._list_active_worker_job_ids = lambda: set()
+
+    dispatcher._reconcile_cold_orphans()
+
+    assert not d.exists(), "with no gate the reconcile never purges — the deferral is dead code"
+
+
+def test_confirmed_gone_cold_orphan_is_not_purged_after_a_peer_reclaims_it(tmp_path):
+    """The deferred purge runs LONG after the claim, which is exactly when a peer has had time
+    to reclaim the job — and two dispatcher containers on one node share a single job_root bind
+    mount. Purging then deletes the new owner's staged input mid-flight. This is why the tracker
+    records the claim_id we held rather than just the job id: re-reading the store row and
+    comparing it against itself would pass trivially and delete the peer's tree every time.
+    """
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._concurrency_gate = DynamicConcurrencyGate(2)
+    dispatcher._concurrency_gate.acquire(0.0)
+
+    job = Job.new(engine="redtusk", filename="s.doc")
+    job.claim_id = "peer-2"                      # the PEER owns it now
+    job.status = JobStatus.RUNNING
+    store.create(job)
+    d = tmp_path / job.job_id
+    d.mkdir()
+    (d / "input.bin").write_bytes(b"PEER IS USING THIS")
+
+    dispatcher._retained_cold_orphans[f"blastbox-worker-{job.job_id[:12]}"] = (
+        job.job_id, "claim-1")                   # we held claim-1
+    dispatcher._list_active_worker_job_ids = lambda: set()
+
+    dispatcher._reconcile_cold_orphans()
+
+    assert (d / "input.bin").exists(), "deleted a peer's staged input out from under it"
+    assert dispatcher._concurrency_gate.in_flight == 0, "the permit must still be reclaimed"
+
+
+def test_confirmed_gone_cold_orphan_with_a_failed_upload_is_retained(tmp_path):
+    """The upload-exhaustion carve-out has to survive the deferral too: with results/<id> absent,
+    this tree is the ONLY copy of a host-sealed result, including evidence that cannot be
+    reproduced by re-running. The age reclaim still bounds it."""
+    from blastbox.host.concurrency_gate import DynamicConcurrencyGate
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._concurrency_gate = DynamicConcurrencyGate(2)
+    dispatcher._concurrency_gate.acquire(0.0)
+
+    jid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "metadata.json").write_text('{"only": "copy"}')
+
+    dispatcher._upload_failed_job_ids.add(jid)
+    dispatcher._retained_cold_orphans[f"blastbox-worker-{jid[:12]}"] = (jid, None)
+    dispatcher._list_active_worker_job_ids = lambda: set()
+
+    dispatcher._reconcile_cold_orphans()
+
+    assert (d / "output" / "metadata.json").exists(), "destroyed the only copy of a result"
 
 
 def test_cold_dispatch_fenced_after_shutdown_begins(tmp_path):
@@ -2435,3 +2643,1396 @@ def test_cold_dispatch_fenced_after_shutdown_begins(tmp_path):
     assert gate.in_flight == 0                     # no permit acquired
     final = store.get(job.job_id)
     assert final is not None and final.status == JobStatus.QUEUED   # requeued for restart
+
+
+def test_terminal_job_leaves_nothing_on_this_workers_disk(tmp_path):
+    """SECURITY INVARIANT parity with VmJobDispatcher._purge_job_dir (issue #84).
+
+    A worker is a malware-analysis node, often spare hardware that is not a hardened sample
+    repository, so nothing may survive a terminal state. VmJobDispatcher purges the whole job
+    dir; the classic Dispatcher deleted only the INPUT and left output/ -- which holds
+    metadata.json and rmeta, i.e. text and embedded objects extracted from the sample. On a
+    real fleet that leaked 97,681 dirs / 184 GiB, filled a node's root filesystem, and
+    collapsed its warm pool from 16 Firecracker guests to 3.
+
+    The durable copy lives in the blob store (results/<job_id>/), so removing the local dir
+    loses nothing.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    assert dispatcher.dispatch_once() is True
+    assert store.get(job.job_id).status == JobStatus.DONE
+
+    job_dir = tmp_path / job.job_id
+    assert not job_dir.exists(), (
+        f"the whole job dir must be gone; survivors: "
+        f"{sorted(p.relative_to(job_dir).as_posix() for p in job_dir.rglob('*'))}"
+    )
+
+
+def test_a_peer_reclaimed_job_keeps_its_dir_for_the_new_owner(tmp_path):
+    """The purge must stay ownership-gated, exactly as input deletion already is.
+
+    Two dispatcher containers on one node share a single job_root bind mount, so a peer that
+    reclaimed this job needs the staged bytes still on disk. Purging unconditionally would
+    delete them out from under the new owner mid-flight; that peer's own terminal purge is
+    what cleans up.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        # A peer reclaims mid-flight: the claim_id moves on while we are still running.
+        cur = store.get(job.job_id)
+        cur.claim_id = "peer-took-it"
+        store.update(cur.job_id, claim_id="peer-took-it")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher.dispatch_once()
+
+    assert (tmp_path / job.job_id).exists(), (
+        "a job reclaimed by a same-host peer must keep its dir for the new owner"
+    )
+
+
+def test_purge_refuses_a_job_id_that_escapes_the_job_root(tmp_path):
+    """Containment: a job_id carrying traversal components must never delete outside job_root.
+
+    The purge resolves the path first and refuses anything that does not land strictly under
+    job_root. Without that check a crafted job_id would hand an attacker an arbitrary rmtree
+    running as the dispatcher.
+    """
+    from blastbox.host.jobs.retention import purge_job_dir
+
+    job_root = tmp_path / "jobs"
+    (job_root / "safe").mkdir(parents=True)
+    outsider = tmp_path / "outside"
+    outsider.mkdir()
+    (outsider / "keepme").write_text("must survive")
+
+    purge_job_dir(job_root, "../outside", logging.getLogger("t"))
+
+    assert (outsider / "keepme").exists(), "purge escaped job_root and deleted an outside tree"
+    assert outsider.exists()
+
+
+def test_orphan_recovery_deletes_input_but_spares_a_possibly_live_output(tmp_path):
+    """The orphan sweep must NOT rmtree output/ — its CAS cannot prove the owner is dead (#85 review).
+
+    _fail_if_running CASes on (RUNNING, claim_id), and a live owner mid-SEAL still holds exactly
+    that state because it writes its terminal status only after sealing completes. The seal is
+    explicitly not bounded by warm_deadline. So this sweep can fire against a live owner, and
+    deleting output/ there destroys a result that actually succeeded.
+
+    Deleting the input stays safe in that race (the owner no longer needs it by seal time and the
+    sample is content-addressed in the blob store), which is what this path always did.
+    """
+    store = InMemoryJobStore()
+    job = Job.new(engine=_ENGINE_NAME, filename="a.docx")
+    job.status = JobStatus.RUNNING
+    job.worker_runtime = "warm"
+    job.started_at = time.time() - 100_000
+    store.create(job)
+
+    input_path = _setup_job_dirs(tmp_path, job)
+    out = tmp_path / job.job_id / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "metadata.json").write_text("{}")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher.requeue_orphaned_jobs()
+
+    assert store.get(job.job_id).status == JobStatus.FAILED
+    assert not input_path.exists(), "the staged input is safe to delete and must be"
+    assert (out / "metadata.json").exists(), (
+        "output/ was destroyed — a live owner mid-seal would have lost a successful result"
+    )
+
+
+def test_an_upload_exhausted_result_is_retained_not_purged(tmp_path):
+    """The purge's whole justification is that the blob store holds the durable copy. On this one
+    branch that is false BY CONSTRUCTION — it is reached because the upload never landed (#85
+    review). The tree is host-sealed, trust-gate-passed, and holds evidence a re-run cannot
+    reproduce, so destroying it turns a transient object-store outage into permanent loss.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+
+    def fake_runner(argv, **kw):
+        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    # A blob store whose put_output never succeeds -> retries exhaust.
+    blobs = _RecordingBlobs(fail_times=99)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner, blob_store=blobs
+    )
+    dispatcher.dispatch_once()
+
+    assert store.get(job.job_id).status == JobStatus.FAILED
+    assert (tmp_path / job.job_id / "output").exists(), (
+        "the only copy of a sealed result was destroyed after the upload failed"
+    )
+
+
+def test_a_store_failure_during_purge_does_not_escape_or_delete(tmp_path):
+    """The ownership lookup runs inside a terminal `finally`, so it must never raise (#85 review).
+
+    An escaping exception there masks the job's real outcome. It must also fail SAFE: an
+    unprovable owner means a peer may be mid-flight on this tree, so leave it. A leaked dir is
+    recoverable; a job whose staged input vanished under it is not.
+
+    Exercises the purge contract directly. (The same `finally` also calls _record_outcome, which
+    has its own unguarded store lookup -- pre-existing and outside this change; noted on the PR.)
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    (tmp_path / job.job_id / "output" / "rmeta").write_text("extracted sample text")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+
+    class _BrokenStore:
+        def get(self, job_id):
+            raise RuntimeError("job store unavailable")
+
+    dispatcher._job_store = _BrokenStore()
+    dispatcher._purge_job_dir_if_owned(job)      # must not raise
+
+    assert (tmp_path / job.job_id).exists(), (
+        "ownership was unprovable, so the tree must be left for its real owner, not deleted"
+    )
+
+
+def test_a_live_orphaned_container_keeps_its_bind_mounted_tree(tmp_path):
+    """Do not rmtree a tree a possibly-live worker still has bind-mounted (#85 review).
+
+    The same `finally` deliberately RETAINS the concurrency permit when `docker kill` was not
+    confirmed, on the grounds the container may still be running. Purging its bind-mount source
+    five lines later races a live writer into a half-deleted tree and a spurious
+    "PURGE FAILED ... sample bytes may remain", and its open fds pin the disk regardless — so
+    nothing is even reclaimed.
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    out = tmp_path / job.job_id / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "metadata.json").write_text("{}")
+
+    def fake_runner(argv, **kw):
+        if "kill" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "kill failed")   # NOT confirmed gone
+        raise subprocess.TimeoutExpired(argv, 1)
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher.dispatch_once()
+
+    assert (tmp_path / job.job_id).exists(), (
+        "purged a tree whose worker container was never confirmed dead"
+    )
+
+
+def test_put_output_is_a_real_durability_barrier(tmp_path):
+    """The terminal purge deletes the local tree on the strength of put_output succeeding, so a
+    silent no-op there yields a DONE job with no copy anywhere (#85 review). rglob on a missing
+    directory yields nothing and raises nothing, so the barrier has to be asserted explicitly.
+    """
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    with pytest.raises(FileNotFoundError):
+        store.put_output("jid", tmp_path / "jobs" / "jid" / "output")   # never created
+
+
+def test_scratch_reclaim_bounds_the_dirs_the_purge_deliberately_skips(tmp_path):
+    """The terminal purge skips two trees on purpose — an unconfirmed-dead container's, and a
+    result whose upload exhausted (the only copy). Without a bound those leak forever, because
+    the retention sweeper is gated on job_retention_seconds > 0 and that knob also deletes
+    results from the blob store. This is the bound, and it must not touch the blob store (#85).
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    stale = tmp_path / "11111111-1111-4111-8111-111111111111"
+    (stale / "output").mkdir(parents=True)
+    (stale / "output" / "rmeta").write_text("extracted sample text")
+    # Age the WHOLE tree. Aging only the parent is not a stale tree -- a live worker writing into
+    # output/ leaves the parent's mtime untouched, which is precisely why the sweep now looks at
+    # the newest mtime anywhere beneath it.
+    old_ts = time.time() - 3600
+    for path in (stale / "output" / "rmeta", stale / "output", stale):
+        os.utime(path, (old_ts, old_ts))
+
+    fresh = tmp_path / "22222222-2222-4222-8222-222222222222"
+    (fresh / "output").mkdir(parents=True)
+
+    blobs_before = sorted((tmp_path.parent / "blobs").rglob("*")) if (tmp_path.parent / "blobs").exists() else []
+    assert dispatcher._reap_stale_scratch() == 1
+    assert not stale.exists(), "the aged tree was not reclaimed"
+    assert fresh.exists(), "a live/recent tree must never be reclaimed on age"
+    blobs_after = sorted((tmp_path.parent / "blobs").rglob("*")) if (tmp_path.parent / "blobs").exists() else []
+    assert blobs_before == blobs_after, "scratch reclaim must never touch the blob store"
+
+
+def test_scratch_reclaim_is_off_when_disabled(tmp_path):
+    """0 disables it — an operator who wants trees kept must be able to keep them."""
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 0.0
+    old = tmp_path / "33333333-3333-4333-8333-333333333333"
+    old.mkdir(parents=True)
+    os.utime(old, (time.time() - 99999, time.time() - 99999))
+    assert dispatcher._reap_stale_scratch() == 0
+    assert old.exists()
+
+
+def test_purge_refuses_a_sibling_alias_job_id(tmp_path):
+    """Containment alone is not enough: "victim/child/.." is strictly UNDER job_root yet resolves
+    to a different job's tree, so a malformed store row could rmtree a live peer's working dir.
+    Job.from_dict() does not validate IDs, so such a row can reach here (#85 review).
+    """
+    from blastbox.host.jobs.retention import purge_job_dir
+
+    job_root = tmp_path / "jobs"
+    (job_root / "victim" / "child").mkdir(parents=True)
+    (job_root / "victim" / "keep").write_text("live peer's work")
+
+    for hostile in ("victim/child/..", "", ".", "..", "../jobs", "a/b"):
+        purge_job_dir(job_root, hostile, logging.getLogger("t"))
+
+    assert (job_root / "victim" / "keep").exists(), "a sibling job's tree was destroyed"
+    assert job_root.exists()
+
+
+def test_purge_survives_a_path_that_cannot_be_canonicalised(tmp_path):
+    """resolve() itself can raise (a symlink loop raises RuntimeError on 3.12). Both dispatchers
+    call this from terminal cleanup, so an escape masks the job's outcome and skips its metrics.
+    The docstring promises best-effort; the boundary must cover canonicalisation too.
+    """
+    from blastbox.host.jobs.retention import purge_job_dir
+
+    job_root = tmp_path / "jobs"
+    job_root.mkdir(parents=True)
+    loop = job_root / "loopy"
+    loop.symlink_to(job_root / "loopy2")
+    (job_root / "loopy2").symlink_to(loop)
+
+    purge_job_dir(job_root, "loopy", logging.getLogger("t"))   # must not raise
+
+
+def test_scratch_reclaim_spares_a_live_job_writing_into_output(tmp_path):
+    """The top-level dir mtime is NOT refreshed by writes into output/ (verified: a live worker
+    writing job_root/<id>/output/artifact.bin leaves the parent's mtime untouched). A cold run
+    with BLASTBOX_WORKER_TIMEOUT_S above the cutoff is supported, so age alone would delete a
+    running job's tree — the exact failure this sweep exists to avoid elsewhere (#85 review).
+    """
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.status = JobStatus.RUNNING
+    store.create(job)
+
+    d = tmp_path / job.job_id
+    (d / "output").mkdir(parents=True)
+    old = time.time() - 99_999
+    os.utime(d, (old, old))                       # parent looks ancient...
+    (d / "output" / "artifact.bin").write_bytes(b"live worker writing right now")
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+    assert dispatcher._reap_stale_scratch() == 0
+    assert d.exists(), "deleted a live job's tree because only the parent mtime was checked"
+
+
+def test_scratch_reclaim_spares_a_running_job_even_if_the_whole_tree_is_old(tmp_path):
+    """Second, independent safeguard: age is a heuristic, job state is a fact. A RUNNING job is
+    never reclaimable regardless of how stale every file looks."""
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.status = JobStatus.RUNNING
+    store.create(job)
+
+    d = tmp_path / job.job_id
+    (d / "output").mkdir(parents=True)
+    old = time.time() - 99_999
+    for p in (d / "output", d):
+        os.utime(p, (old, old))
+
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+    assert dispatcher._reap_stale_scratch() == 0
+    assert d.exists(), "reclaimed a tree whose job is still RUNNING"
+
+
+def test_scratch_reclaim_still_takes_a_genuinely_orphaned_tree(tmp_path):
+    """The bound must still work: a dir the store knows nothing about is a real orphan."""
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    d = tmp_path / "44444444-4444-4444-8444-444444444444"
+    (d / "output").mkdir(parents=True)
+    old = time.time() - 99_999
+    for p in (d / "output", d):
+        os.utime(p, (old, old))
+
+    assert dispatcher._reap_stale_scratch() == 1
+    assert not d.exists()
+
+
+def test_scratch_reclaim_spares_a_fresh_tree_the_store_does_not_know_yet(tmp_path):
+    """The two safeguards are NOT redundant, and this is the case only the mtime one catches.
+
+    Ingress spools job_root/<id>/input before the store row is durably visible to a dispatcher,
+    so there is a window where the job is unknown (job is None = "genuine orphan, reclaimable")
+    while the tree is being actively written. Age is what protects it there.
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    d = tmp_path / "55555555-5555-4555-8555-555555555555"
+    (d / "input").mkdir(parents=True)
+    old = time.time() - 99_999
+    os.utime(d, (old, old))                       # parent ancient, content brand new
+    (d / "input" / "sample.doc").write_bytes(b"just spooled by ingress")
+
+    assert dispatcher._reap_stale_scratch() == 0
+    assert d.exists(), "deleted a tree being spooled, before its job row was visible"
+
+
+def test_scratch_reclaim_leaves_the_tree_when_the_store_cannot_be_read(tmp_path):
+    """Store trouble must never turn into deletion. Unprovable state = leave the bytes."""
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    d = tmp_path / "66666666-6666-4666-8666-666666666666"
+    (d / "output").mkdir(parents=True)
+    old = time.time() - 99_999
+    for p in (d / "output", d):
+        os.utime(p, (old, old))
+
+    class _BrokenStore:
+        def get(self, job_id):
+            raise RuntimeError("job store unavailable")
+
+    dispatcher._job_store = _BrokenStore()
+    assert dispatcher._reap_stale_scratch() == 0
+    assert d.exists(), "a store error caused a deletion"
+
+
+def test_scratch_reclaim_never_touches_a_colocated_blob_store(tmp_path):
+    """"The store has never heard of it" is NOT evidence of an orphan (#85 review).
+
+    job_root can legitimately contain a co-located blob store — BLASTBOX_BLOB_LOCAL_ROOT under
+    job_root is a documented multi-node layout — plus lost+found when it is its own filesystem.
+    Reclaiming anything the job store doesn't recognise destroys every sample and every durable
+    result on that mount: the copy the API serves, and the copy that makes the terminal purge
+    safe in the first place. Only uuid4-shaped directories are candidates.
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    old = time.time() - 99_999
+    blobs = tmp_path / "blobs" / "results" / "some-job"
+    blobs.mkdir(parents=True)
+    (blobs / "metadata.json").write_text("{}")
+    lostfound = tmp_path / "lost+found"
+    lostfound.mkdir()
+    for p in (blobs / "metadata.json", blobs, blobs.parent, tmp_path / "blobs", lostfound):
+        os.utime(p, (old, old))
+
+    assert dispatcher._reap_stale_scratch() == 0
+    assert (blobs / "metadata.json").exists(), "the reclaim destroyed the durable blob store"
+    assert lostfound.exists()
+
+
+def test_scratch_reclaim_refuses_a_symlink_even_with_a_perfect_job_id_name(tmp_path):
+    """A uuid4-NAMED SYMLINK is not a job dir, and following one is how this sweep would
+    delete a tree it was never pointed at.
+
+    purge_job_dir resolves before it deletes, so a symlink under job_root is dereferenced to
+    whatever it points at — a sibling job's live tree, or the co-located blob store. The name
+    passes the uuid4 shape check (names are free), and the link's own mtime is trivially old,
+    so every other guard waves it through. Nothing but the is_symlink() refusal stops it.
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    victim = tmp_path / "blobs" / "results" / "some-job"
+    victim.mkdir(parents=True)
+    (victim / "metadata.json").write_text("{}")
+
+    link = tmp_path / "88888888-8888-4888-8888-888888888888"
+    link.symlink_to(tmp_path / "blobs", target_is_directory=True)
+    # The TARGET is old too, so every age-based guard waves it through and the
+    # is_symlink() refusal is the only thing left holding the line. (stat() follows
+    # the link, so a freshly-created target would spare it for the wrong reason and
+    # the test would pass even with the refusal deleted.)
+    old = time.time() - 99_999
+    for pth in (victim / "metadata.json", victim, victim.parent, tmp_path / "blobs"):
+        os.utime(pth, (old, old))
+    os.utime(link, (old, old), follow_symlinks=False)
+
+    assert dispatcher._reap_stale_scratch() == 0
+    assert (victim / "metadata.json").exists(), "the reclaim followed a symlink out of its lane"
+    assert link.is_symlink()
+
+
+def test_a_forged_future_mtime_cannot_grant_permanent_immortality(tmp_path, monkeypatch):
+    """The guarantee is about PERMANENCE, not about one tick.
+
+    A sample owns output/ (a 0o777 bind mount) and utime() is unprivileged, so it can stamp mtime
+    anywhere it likes. Liveness falls back to ctime for an implausible mtime, and ctime has no
+    setter — but the utime() call itself legitimately bumps ctime, so the tree really was modified
+    a moment ago and is correctly treated as live for one window. What must NOT happen is that a
+    single stamp buys immortality: staying alive has to require a process that is still running
+    and still touching the tree, which a dead worker cannot do.
+
+    (An earlier version discarded future mtimes outright. That was worse: after a backward clock
+    step every honest timestamp looks like the future, so a node's live trees read as ancient and
+    were deleted seconds after being created.)
+    """
+    import blastbox.host.jobs.retention as retention_mod
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    d = tmp_path / "77777777-7777-4777-8777-777777777777"
+    (d / "output").mkdir(parents=True)
+    pad = d / "output" / "pad.bin"
+    pad.write_bytes(b"x")
+    old = time.time() - 99_999
+    os.utime(d, (old, old))
+    os.utime(d / "output", (old, old))
+    os.utime(pad, (2**31, 2**31))              # the sample stamps the far future
+
+    assert dispatcher._reap_stale_scratch() == 0, "a just-touched tree is genuinely live"
+
+    # ...and the worker is now dead, so nothing touches it again. Time moves on.
+    real = time.time
+    monkeypatch.setattr(retention_mod.time, "time", lambda: real() + 3600)
+    assert dispatcher._reap_stale_scratch() == 1, "one forged stamp bought permanent immortality"
+    assert not d.exists()
+
+
+def test_scratch_reclaim_cannot_be_evaded_by_a_worker_planting_a_symlink(tmp_path):
+    """The other half of the mtime-evasion class, and the one the future-mtime guard cannot see.
+
+    stat() DEREFERENCES. A detonated sample owns output/ (a 0o777 bind mount) and needs one
+    `ln -s /tmp output/notes` to make its own tree immortal: every tick reads /tmp's mtime,
+    which a busy host refreshes continuously, so the tree is "live" forever. The stamp is
+    perfectly honest, so clamping the future does nothing. That permanently defeats the only
+    bound this PR puts on job_root and reproduces #84's 184 GiB leak on demand.
+
+    lstat() is the whole fix — rglob already refuses to descend INTO a symlinked directory,
+    so the link's own (old) mtime is the only evidence it can offer.
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    busy = tmp_path.parent / "busy-host-path"
+    busy.mkdir(exist_ok=True)                      # mtime = now, refreshed on a real host
+
+    d = tmp_path / "99999999-9999-4999-8999-999999999999"
+    (d / "output").mkdir(parents=True)
+    (d / "input.bin").write_bytes(b"MALWARE-BYTES-MUST-NOT-PERSIST")
+    (d / "output" / "notes").symlink_to(busy, target_is_directory=True)
+
+    old = time.time() - 99_999
+    for pth in (d / "input.bin", d / "output" / "notes", d / "output", d):
+        os.utime(pth, (old, old), follow_symlinks=False)
+
+    assert dispatcher._reap_stale_scratch() == 1, "a planted symlink made the tree immortal"
+    assert not d.exists()
+
+
+def test_scratch_reclaim_leaves_a_tree_whose_container_is_still_retained(tmp_path):
+    """The reclaim must not do what the inline purge refuses to do.
+
+    A wedged container (its `docker kill` failed — that is WHY it is retained) writes nothing,
+    so its tree's mtime stops advancing and it ages into this sweep, while _reconcile_cold_orphans
+    — running LATER in the same maintenance tick — is still deliberately retaining it because
+    docker ps keeps listing it. rmtree'ing there half-deletes the tree under a live 0o777 bind
+    mount, fires the spurious "PURGE FAILED", and frees nothing (its open fds pin the blocks),
+    so the operator-facing "removed N job dir(s)" reports bytes that are still allocated.
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    jid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "partial.json").write_text("{}")
+    old = time.time() - 99_999
+    for pth in (d / "output" / "partial.json", d / "output", d):
+        os.utime(pth, (old, old))
+
+    dispatcher._retained_cold_orphans[f"blastbox-worker-{jid[:12]}"] = (jid, "claim-1")
+
+    assert dispatcher._reap_stale_scratch() == 0
+    assert d.exists(), "deleted a tree under a container this process still believes is alive"
+
+
+def test_scratch_reclaim_never_deletes_a_sealed_result_that_has_no_durable_copy(tmp_path):
+    """The sweep rests on "the blob store has the durable copy, so the local tree loses nothing" —
+    and there are two states where that is false, each with its own HOST-only evidence.
+
+    (1) A job completed BEFORE the blob store shipped was never put_output'd, and
+    LocalBlobStore.open_output still serves it from the legacy <job_root>/<id>/output path — which
+    is precisely the tree this sweep rmtrees. Evidence: a DONE row with nothing durable.
+    (2) A result whose upload exhausted is host-sealed and unreproducible (the C2 pcap is MOVED
+    into it; detonation is not deterministic). Evidence: the pending-upload sentinel.
+
+    output/metadata.json is NOT evidence — the worker writes it (worker/harness.py) and the host
+    only overwrites it once the trust gate passes. See the crash-orphan test below.
+    """
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    # (1) legacy: DONE row, only copy on local disk
+    legacy = "11111111-1111-4111-8111-111111111111"
+    dl = tmp_path / legacy
+    (dl / "output").mkdir(parents=True)
+    (dl / "output" / "metadata.json").write_text('{"sealed": true}')
+    jl = Job.new(engine="redtusk", filename="a.doc")
+    jl.job_id = legacy
+    jl.status = JobStatus.DONE
+    store.create(jl)
+
+    # (2) upload exhausted: the host left its sentinel AND the row is still FAILED, i.e. the
+    # retry is genuinely outstanding. The hold is scoped to exactly that: an EXPIRED row means
+    # retention already dropped the result, and a missing row means it was deleted — in both
+    # cases nothing will ever upload the tree, so holding it would be an immortal leak.
+    pending = "22222222-2222-4222-8222-222222222222"
+    dp = tmp_path / pending
+    (dp / "output").mkdir(parents=True)
+    (dp / "output" / "metadata.json").write_text('{"sealed": true}')
+    (dp / PENDING_UPLOAD_SENTINEL).write_text("")
+    jp = Job.new(engine="redtusk", filename="b.doc")
+    jp.job_id = pending
+    jp.status = JobStatus.FAILED
+    store.create(jp)
+
+    old = time.time() - 99_999
+    for base in (dl, dp):
+        for pth in (base / "output" / "metadata.json", base / "output", base):
+            os.utime(pth, (old, old))
+        if (base / PENDING_UPLOAD_SENTINEL).exists():
+            os.utime(base / PENDING_UPLOAD_SENTINEL, (old, old))
+
+    assert not dispatcher._blobs.has_output(legacy), "precondition: nothing durable"
+    assert dispatcher._reap_stale_scratch() == 0
+    assert (dl / "output" / "metadata.json").exists(), "deleted a legacy result's only copy"
+    assert (dp / "output" / "metadata.json").exists(), "deleted a retained result's only copy"
+
+
+def test_scratch_reclaim_still_takes_a_crash_orphaned_tree_the_host_never_vouched_for(tmp_path):
+    """The counterpart, and the reason the gate cannot key on output/metadata.json.
+
+    The WORKER writes that file itself. A cold job whose dispatcher was SIGKILLed before it could
+    seal, upload and purge leaves one behind — and if its mere presence meant "sealed result with
+    no durable copy", every such tree would be retained forever: has_output() is False, no sweep
+    drains it (no sentinel), and #84's unbounded accumulation returns with the malware input still
+    on disk. Without host evidence, the tree is scratch.
+    """
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    jid = "33333333-3333-4333-8333-333333333333"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "metadata.json").write_text('{"written": "by the worker"}')
+    (d / "input.bin").write_bytes(b"MALWARE-BYTES-MUST-NOT-PERSIST")
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = jid
+    job.status = JobStatus.FAILED                      # orphan-recovered
+    job.error = "orphaned"
+    store.create(job)
+
+    old = time.time() - 99_999
+    for pth in (d / "output" / "metadata.json", d / "input.bin", d / "output", d):
+        os.utime(pth, (old, old))
+
+    assert dispatcher._reap_stale_scratch() == 1, "a crash-orphaned tree is immortal again"
+    assert not d.exists()
+
+
+def test_scratch_reclaim_takes_a_sealed_result_once_it_is_durably_stored(tmp_path):
+    """The counterpart: once put_output has landed the bytes, the local tree really is redundant
+    and the sweep must still collect it — otherwise the last-copy rule quietly disables the bound
+    on every DONE job and #84 comes straight back."""
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    jid = "22222222-2222-4222-8222-222222222222"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "metadata.json").write_text('{"sealed": true}')
+    dispatcher._blobs.put_output(jid, d / "output")                    # the durable copy lands
+    assert dispatcher._blobs.has_output(jid)
+
+    old = time.time() - 99_999
+    for pth in (d / "output" / "metadata.json", d / "output", d):
+        os.utime(pth, (old, old))
+
+    assert dispatcher._reap_stale_scratch() == 1
+    assert not d.exists()
+
+
+def test_scratch_reclaim_still_takes_a_crash_stranded_tree_with_no_result(tmp_path):
+    """The last-copy rule must NOT extend to scratch. A SIGKILL mid-detonation leaves a tree with
+    no sealed output and no durable copy — and never will have one. Requiring durability there
+    would retain it forever, reintroducing the exact leak this sweep exists to bound."""
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    jid = "33333333-3333-4333-8333-333333333333"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)                                  # started, never sealed
+    (d / "input.bin").write_bytes(b"MALWARE-BYTES-MUST-NOT-PERSIST")
+    old = time.time() - 99_999
+    for pth in (d / "input.bin", d / "output", d):
+        os.utime(pth, (old, old))
+
+    assert dispatcher._reap_stale_scratch() == 1, "a crash-stranded tree is unbounded again"
+    assert not d.exists()
+
+
+def test_scratch_reclaim_reports_only_what_it_actually_removed(tmp_path):
+    """purge_job_dir refuses and fails best-effort, so counting unconditionally made the
+    operator-facing "removed N job dir(s)" line report directories still on disk — forever, on
+    every tick, next to the ERROR explaining it had refused them."""
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    d = tmp_path / "88888888-8888-4888-8888-888888888888"
+    d.mkdir()
+    os.utime(d, (time.time() - 99_999,) * 2)
+
+    import blastbox.host.jobs.retention as mod
+    real = mod.purge_job_dir
+    try:
+        mod.purge_job_dir = lambda root, jid, log: False      # simulate a refusal/failure
+        assert dispatcher._reap_stale_scratch() == 0, "counted a dir it did not remove"
+    finally:
+        mod.purge_job_dir = real
+
+
+def test_scratch_reclaim_spares_a_uuid_named_blob_root(tmp_path, monkeypatch):
+    """The uuid4 shape check is not enough on its own.
+
+    BLASTBOX_BLOB_LOCAL_ROOT is operator-set: it may live under job_root (a documented layout)
+    and it may be named anything — including a uuid. Then the shape check waves it straight
+    through and the sweep deletes every durable result on the node, which is the opposite of what
+    the last-copy rule is for. The configured root is protected by CANONICAL path, so a symlinked
+    or ..-laden setting still matches.
+    """
+    blob_root = tmp_path / "55555555-5555-4555-8555-555555555555"
+    (blob_root / "results" / "some-job").mkdir(parents=True)
+    (blob_root / "results" / "some-job" / "metadata.json").write_text("{}")
+    monkeypatch.setenv("BLASTBOX_BLOB_LOCAL_ROOT", str(tmp_path / "." / blob_root.name))
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+    old = time.time() - 99_999
+    for p in (blob_root / "results" / "some-job" / "metadata.json",
+              blob_root / "results" / "some-job", blob_root / "results", blob_root):
+        os.utime(p, (old, old))
+
+    assert dispatcher._reap_stale_scratch() == 0
+    assert (blob_root / "results" / "some-job" / "metadata.json").exists(), (
+        "the reclaim destroyed the durable blob store because it was uuid-named"
+    )
+
+
+def test_scratch_reclaim_is_bounded_per_sweep_and_says_so(tmp_path):
+    """The fleet state this exists to clean is 97,681 dirs / 184 GiB. Doing it in one pass puts a
+    full recursive walk, a store lookup per candidate and 184 GiB of unlink ahead of every other
+    maintenance task — including the cold-permit reclaim and crash recovery. The sweep is
+    idempotent and runs every tick, so a cap still drains the backlog.
+
+    The cap is ANNOUNCED: a silent truncation reads as "the disk is clean now" when it isn't.
+    """
+    import logging as _logging
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    old = time.time() - 99_999
+    for i in range(7):
+        d = tmp_path / f"{i:08d}-1111-4111-8111-111111111111"
+        d.mkdir()
+        os.utime(d, (old, old))
+
+    from blastbox.host.jobs.retention import reap_stale_scratch
+    removed = reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"), max_per_sweep=3)
+    assert removed == 3, "the cap did not bound the sweep"
+    assert len(list(tmp_path.iterdir())) == 4, "removed more than the cap allowed"
+
+    # ...and the next tick continues where it left off.
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                              max_per_sweep=3) == 3
+    assert len(list(tmp_path.iterdir())) == 1
+
+
+def test_scratch_reclaim_holds_a_pending_tree_until_its_repair_actually_lands(tmp_path):
+    """Durable bytes are not enough to release the tree — the JOB has to be fixed too.
+
+    The recovery path is: upload the bytes, then CAS the row FAILED->DONE. If that second step
+    fails (a store blip mid-sweep) the fall-through repair needs this tree again next tick.
+    Deleting it the moment has_output() went true stranded the job FAILED forever with a durable
+    result it can never serve — every artifact route answering 409, and no sweep able to fix it.
+    """
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 60.0
+
+    jid = "44444444-4444-4444-8444-444444444444"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "metadata.json").write_text('{"sealed": true}')
+    (d / PENDING_UPLOAD_SENTINEL).write_text("")
+    dispatcher._blobs.put_output(jid, d / "output")          # bytes ARE durable
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = jid
+    job.status = JobStatus.FAILED                            # ...but the repair never landed
+    store.create(job)
+
+    old = time.time() - 99_999
+    for pth in (d / "output" / "metadata.json", d / PENDING_UPLOAD_SENTINEL, d / "output", d):
+        os.utime(pth, (old, old))
+
+    assert dispatcher._reap_stale_scratch() == 0
+    assert d.exists(), "deleted the tree the repair needs, stranding the job FAILED forever"
+
+
+def test_scratch_reclaim_asks_docker_not_just_its_own_memory(tmp_path):
+    """The unconfirmed-kill guard was a PROCESS-LOCAL set, which is not where the danger is: two
+    dispatcher containers share one job_root, the VM dispatcher keeps no such set, and a restart
+    empties it — so the other sweeper deletes exactly the trees the guard exists to spare, under a
+    live 0o777 bind mount. docker ps is node-wide and survives restarts."""
+    from blastbox.host.jobs.retention import reap_stale_scratch
+    import logging as _logging
+
+    store = InMemoryJobStore()
+    jid = "55555555-5555-4555-8555-555555555555"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    old = time.time() - 99_999
+    for pth in (d / "output", d):
+        os.utime(pth, (old, old))
+
+    # No process-local knowledge at all — a fresh dispatcher after a restart.
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                              live_job_ids=lambda: {jid}) == 0
+    assert d.exists(), "deleted a tree whose container docker still reports as running"
+
+    # ...and an unreadable probe must not become a deletion either way round.
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                              live_job_ids=lambda: None) == 1
+
+
+def test_scratch_reclaim_protects_a_blob_root_nested_under_a_candidate(tmp_path):
+    """Equality protected nothing when the blob root lives INSIDE a uuid-named dir: deleting the
+    candidate destroys the root within it. And the root is taken from the STORE, not the
+    environment, so a store constructed in code (a public kwarg) is protected too."""
+    from blastbox.host.blobs.local import LocalBlobStore
+    from blastbox.host.jobs.retention import reap_stale_scratch
+    import logging as _logging
+
+    candidate = tmp_path / "66666666-6666-4666-8666-666666666666"
+    blob_root = candidate / "blobs"
+    (blob_root / "results" / "j").mkdir(parents=True)
+    (blob_root / "results" / "j" / "metadata.json").write_text("{}")
+    old = time.time() - 99_999
+    for pth in (blob_root / "results" / "j" / "metadata.json", blob_root / "results" / "j",
+                blob_root / "results", blob_root, candidate):
+        os.utime(pth, (old, old))
+
+    store = InMemoryJobStore()
+    blobs = LocalBlobStore(tmp_path, blob_root=blob_root)     # no env var anywhere
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                              blob_store=blobs) == 0
+    assert (blob_root / "results" / "j" / "metadata.json").exists(), (
+        "deleted the durable blob store because it was nested inside the candidate"
+    )
+
+
+def _blob_store_for(job_root):
+    """A LocalBlobStore rooted OUTSIDE job_root, matching the production default."""
+    from blastbox.host.blobs.local import LocalBlobStore
+    return LocalBlobStore(job_root, blob_root=job_root.parent / "blobs-for-test")
+
+
+def test_scratch_reclaim_cap_counts_work_not_just_deletions(tmp_path):
+    """Capping on removals alone bounded nothing in the state this was written for.
+
+    A tree that is RETAINED (last-copy hold) or that fails to delete still costs a full rglob
+    walk, a store round-trip and a has_output() call — and none of that advanced a removal
+    counter, so the sweep re-walked all 97,681 candidates on every tick and the "hit the cap" line
+    never fired. The bound has to be on work done, not on work that succeeded.
+    """
+    from blastbox.host.jobs.retention import reap_stale_scratch
+    import logging as _logging
+
+    class CountingStore(InMemoryJobStore):
+        gets = 0
+
+        def get(self, job_id):
+            type(self).gets += 1
+            return super().get(job_id)
+
+    store = CountingStore()
+    old = time.time() - 99_999
+    for i in range(10):
+        jid = f"{i:08d}-7777-4777-8777-777777777777"
+        d = tmp_path / jid
+        (d / "output").mkdir(parents=True)
+        (d / "output" / "metadata.json").write_text("{}")
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = jid
+        job.status = JobStatus.DONE                    # legacy: retained, never removed
+        store.create(job)
+        for pth in (d / "output" / "metadata.json", d / "output", d):
+            os.utime(pth, (old, old))
+
+    blobs = _blob_store_for(tmp_path)
+    removed = reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                                 blob_store=blobs, max_per_sweep=3)
+    assert removed == 0, "these are all retained"
+    assert CountingStore.gets <= 4, (
+        f"examined {CountingStore.gets} candidates with a cap of 3 — the cap never bounds a "
+        f"sweep whose trees are retained rather than removed"
+    )
+    assert len(list(tmp_path.iterdir())) == 10
+
+
+def test_a_retained_orphan_is_marked_on_disk_for_every_sweeper(tmp_path):
+    """The unconfirmed-kill hold has to be visible to processes that never saw the failed kill.
+
+    It lived in a process-local set, but the danger is cross-process: two dispatcher containers
+    share one job_root, VmJobDispatcher has no docker access to probe with at all, and a restart
+    empties the set — so the OTHER sweeper deletes exactly the trees the hold exists to protect,
+    under a live 0o777 bind mount. A file in the host-only job dir is seen by every sweeper.
+    """
+    from blastbox.host.jobs.retention import RETAINED_ORPHAN_SENTINEL, reap_stale_scratch
+    import logging as _logging
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+
+    job = Job.new(engine="redtusk", filename="s.doc")
+    job.claim_id = "claim-1"
+    job.status = JobStatus.RUNNING
+    store.create(job)
+    d = tmp_path / job.job_id
+    (d / "output").mkdir(parents=True)
+    name = f"blastbox-worker-{job.job_id[:12]}"
+    dispatcher._dispatch_inner = lambda j, i, o, *, orphan_out=None: orphan_out.append(name)
+    dispatcher._dispatch_claimed_job(job)
+
+    assert (d / RETAINED_ORPHAN_SENTINEL).is_file(), "no cross-process record of the hold"
+
+    # A COMPLETELY SEPARATE sweeper — no shared memory, no docker probe — must honour it.
+    # The job is made TERMINAL first, so the status check cannot be what saves the tree: the
+    # on-disk marker has to be the only thing standing between it and the rmtree.
+    store.update(job.job_id, status=JobStatus.FAILED)
+    # Every timestamp is STALE — including the marker's own, which is 90s old against a 60s
+    # reclaim age. So nothing here looks alive: the mtime walk would happily reclaim this tree,
+    # and only the marker (whose hold runs to 2x the reclaim age) stands in the way. A fresh
+    # marker would have made the tree look live and the test would pass without testing anything.
+    now = time.time()
+    for pth in (d / "output", d):
+        os.utime(pth, (now - 99_999,) * 2)
+    os.utime(d / RETAINED_ORPHAN_SENTINEL, (now - 90, now - 90))
+
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t")) == 0
+    assert d.exists(), "another process deleted a tree under a possibly-live container"
+
+
+def test_the_retained_orphan_hold_expires_so_the_disk_bound_still_wins(tmp_path):
+    """...but not forever. A container that still has not died at twice the reclaim age is an
+    operator problem, and an unbounded hold is just #84 with extra steps."""
+    from blastbox.host.jobs.retention import RETAINED_ORPHAN_SENTINEL, reap_stale_scratch
+    import logging as _logging
+
+    store = InMemoryJobStore()
+    jid = "77777777-7777-4777-8777-777777777777"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / RETAINED_ORPHAN_SENTINEL).write_text("")
+    old = time.time() - 99_999
+    for pth in (d / RETAINED_ORPHAN_SENTINEL, d / "output", d):
+        os.utime(pth, (old, old))
+
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t")) == 1
+    assert not d.exists()
+
+
+def test_a_repaired_job_gets_the_result_summary_its_done_path_would_have_written(tmp_path):
+    """A recovered job was DONE with result_summary=None forever: /v1/jobs and the status route
+    report null artifact/warning counts, anything tallying off them under-reports every recovered
+    job, and nothing re-walks DONE jobs to fix it."""
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = tmp_path / job.job_id / "output"
+    out.mkdir(parents=True)
+    # A minimal sealed envelope: the summary is built from it, so it must parse.
+    (out / "metadata.json").write_text(json.dumps({
+        "engine": "redtusk", "status": "ok", "input_sha256": "a" * 64,
+        "detected": {"label": "docx", "mime": "x", "confidence": 1.0, "source": "magika"},
+        "artifacts": [], "warnings": [],
+        "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
+    }))
+
+    dispatcher._index_repaired_result(job.job_id, out, (out / "metadata.json").read_text())
+
+    assert store.get(job.job_id).result_summary is not None, "recovered job left with null counts"
+
+
+def test_the_capped_sweep_rotates_so_held_trees_cannot_starve_the_rest(tmp_path):
+    """iterdir order is stable, so a capped sweep re-examined the same prefix every tick.
+
+    A prefix of permanently-held trees — a legacy result with no durable copy, a retained orphan —
+    would consume the entire cap forever and starve every candidate behind it, which is precisely
+    the unbounded growth the cap was added to prevent.
+    """
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL, reap_stale_scratch
+    import logging as _logging
+
+    store = InMemoryJobStore()
+    old = time.time() - 99_999
+    held, reclaimable = [], []
+    for i in range(3):                                  # held: sealed result, nothing durable
+        jid = f"0000000{i}-1111-4111-8111-111111111111"
+        d = tmp_path / jid
+        (d / "output").mkdir(parents=True)
+        (d / "output" / "metadata.json").write_text("{}")
+        (d / PENDING_UPLOAD_SENTINEL).write_text("")
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = jid
+        job.status = JobStatus.FAILED
+        store.create(job)
+        held.append(d)
+    for i in range(3):                                  # plain scratch, behind them in sort order
+        jid = f"9000000{i}-1111-4111-8111-111111111111"
+        d = tmp_path / jid
+        d.mkdir()
+        reclaimable.append(d)
+    for d in held + reclaimable:
+        for pth in sorted(d.rglob("*"), reverse=True) + [d]:
+            os.utime(pth, (old, old))
+
+    blobs = _blob_store_for(tmp_path)
+    total = 0
+    for _ in range(8):                                  # a few ticks, cap smaller than the holds
+        total += reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                                    blob_store=blobs, max_per_sweep=2)
+    # Without rotation this is 0 forever: the three held trees fill the cap on every tick.
+    assert total == 3, f"held trees starved the reclaimable ones (removed {total}/3)"
+    assert all(d.exists() for d in held), "a held tree was deleted"
+
+
+def test_a_lost_claim_during_the_upload_retry_leaves_no_sentinel(tmp_path):
+    """The sentinel says "this tree holds the last copy and is ours to publish".
+
+    A peer can reclaim the job during the upload's retry window; _fail_job's CAS then loses, and
+    our tree is a stale attempt. Writing the sentinel anyway would hand the pending-upload sweep
+    our stale bytes to publish over the new owner's authoritative result.
+    """
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.claim_id = "ours"
+    job.status = JobStatus.RUNNING
+    store.create(job)
+    # OUR attempt's view of the job, snapshotted before the peer takes it. InMemoryJobStore hands
+    # back the same object, so mutating the stored row would otherwise rewrite our own claim_id
+    # and the CAS would trivially "win" — the test would pass while testing nothing.
+    ours = copy.deepcopy(job)
+    store.update(job.job_id, claim_id="the-peer")      # reclaimed mid-retry
+    d = tmp_path / job.job_id
+    (d / "output").mkdir(parents=True)
+
+    # Through the real seam, so the marker is written first and then withdrawn — not merely
+    # never written. That is the sequence a crash can interrupt, so it is the one to test.
+    dispatcher._retain_for_upload_retry(ours, "result upload failed after 3 attempts; retained")
+
+    assert store.get(job.job_id).claim_id == "the-peer", "the peer still owns the row"
+    assert not (d / PENDING_UPLOAD_SENTINEL).exists(), (
+        "left a marker on a tree the peer owns — the sweep could publish our stale bytes"
+    )
+
+
+def test_a_blob_root_ABOVE_job_root_does_not_disable_the_whole_reclaim(tmp_path):
+    """Protection must cover what deleting the CANDIDATE could destroy — not the reverse.
+
+    Treating a protected ANCESTOR of job_root as a match made every job dir "protected" and
+    silently switched the entire reclaim off, which is precisely the unbounded leak it exists to
+    stop. The dangerous direction is a blob root nested INSIDE a candidate.
+    """
+    from blastbox.host.jobs.retention import reap_stale_scratch
+    import logging as _logging
+
+    job_root = tmp_path / "jobs"
+    job_root.mkdir()
+    jid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+    d = job_root / jid
+    d.mkdir()
+    os.utime(d, (time.time() - 99_999,) * 2)
+
+    class RootedAbove:
+        local_root = tmp_path                          # an ANCESTOR of job_root
+
+        def has_output(self, job_id):
+            return True
+
+    assert reap_stale_scratch(job_root, 60.0, InMemoryJobStore(), _logging.getLogger("t"),
+                              blob_store=RootedAbove()) == 1, "the reclaim was disabled entirely"
+    assert not d.exists()
+
+
+def test_an_expired_or_deleted_job_does_not_hold_its_tree_forever(tmp_path):
+    """The pending-upload hold is only meaningful while the retry is genuinely outstanding.
+
+    retry_pending_uploads requires a FAILED row, so once retention EXPIRES the job (which also
+    clears expires_at, so it is never selected again) or the row is deleted outright, NOTHING will
+    ever upload that tree — and the hold turns from protection into an immortal leak, which is the
+    exact failure this whole PR exists to eliminate.
+    """
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL, reap_stale_scratch
+    import logging as _logging
+
+    class NothingDurable:
+        def has_output(self, job_id):
+            return False
+
+    for label, status in (("expired", JobStatus.EXPIRED), ("deleted", None)):
+        root = tmp_path / label
+        root.mkdir()
+        jid = "33333333-3333-4333-8333-333333333333"
+        d = root / jid
+        (d / "output").mkdir(parents=True)
+        (d / "output" / "metadata.json").write_text("{}")
+        (d / PENDING_UPLOAD_SENTINEL).write_text("")
+        store = InMemoryJobStore()
+        if status is not None:
+            job = Job.new(engine="redtusk", filename="a.doc")
+            job.job_id = jid
+            job.status = status
+            store.create(job)
+        old = time.time() - 99_999
+        for pth in (d / "output" / "metadata.json", d / PENDING_UPLOAD_SENTINEL, d / "output", d):
+            os.utime(pth, (old, old))
+
+        assert reap_stale_scratch(root, 60.0, store, _logging.getLogger("t"),
+                                  blob_store=NothingDurable()) == 1, f"{label} tree held forever"
+        assert not d.exists()
+
+
+def test_deleting_an_unrecoverable_last_copy_is_reported_as_data_loss(tmp_path, caplog):
+    """Reclaiming a sentinel-marked tree whose job can no longer be retried is correct — nothing
+    will ever upload it — but it is NOT routine hygiene: it is the permanent loss of a
+    host-sealed, unreproducible result. It has to say so, at ERROR, or the one line an operator
+    needed is indistinguishable from the disk-cleanup chatter around it."""
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL, reap_stale_scratch
+    import logging as _logging
+
+    class NothingDurable:
+        def has_output(self, job_id):
+            return False
+
+    jid = "44444444-4444-4444-8444-444444444444"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "metadata.json").write_text("{}")
+    (d / PENDING_UPLOAD_SENTINEL).write_text("")
+    old = time.time() - 99_999
+    for pth in (d / "output" / "metadata.json", d / PENDING_UPLOAD_SENTINEL, d / "output", d):
+        os.utime(pth, (old, old))
+
+    with caplog.at_level(_logging.WARNING):
+        assert reap_stale_scratch(tmp_path, 60.0, InMemoryJobStore(), _logging.getLogger("t"),
+                                  blob_store=NothingDurable()) == 1
+    assert any(r.levelno >= _logging.ERROR and "data loss" in r.message for r in caplog.records), (
+        "the only copy of a sealed result was deleted without an ERROR saying so"
+    )
+
+
+def test_the_recovery_sweep_has_its_own_off_switch(tmp_path, monkeypatch):
+    """`BLASTBOX_SCRATCH_MAX_AGE_S=0` governs DELETION; it must not be the only way to stop the
+    WRITE side. Before this, an operator staging an upgrade conservatively still got blob-store
+    writes and FAILED→DONE row rewrites on jobs a client had already been told failed, with no
+    documented knob to stop it short of disabling maintenance entirely (which also kills crash
+    recovery and the stale-queued reaper)."""
+    store = InMemoryJobStore()
+
+    monkeypatch.setenv("BLASTBOX_PENDING_UPLOAD_RETRY", "0")
+    off = _make_dispatcher(store, job_root=tmp_path)
+    assert off._pending_upload_retry is False
+
+    monkeypatch.delenv("BLASTBOX_PENDING_UPLOAD_RETRY", raising=False)
+    on = _make_dispatcher(store, job_root=tmp_path)
+    assert on._pending_upload_retry is True, "the default must stay on"
+
+
+def test_the_recovery_sweep_is_bounded_and_rotates(tmp_path):
+    """It runs FIRST in the tick and, at the default BLASTBOX_DISPATCH_CONCURRENCY=1, maintenance
+    runs inline between dispatch_once() calls — so an uncapped scan stats every entry under
+    job_root before a single job can be claimed. On the fleet state this PR targets that is 97,681
+    stats per tick. Bounded, and rotating so a capped prefix cannot starve the tail."""
+    from blastbox.host.jobs.retention import (PENDING_UPLOAD_SENTINEL, RESULT_RETAINED_MARKER,
+                                              retry_pending_uploads)
+    import logging as _logging
+
+    class Blobs:
+        seen: list = []
+
+        def has_output(self, job_id):
+            return False
+
+        def put_output(self, job_id, out_dir):
+            type(self).seen.append(job_id)
+
+    store = InMemoryJobStore()
+    ids = []
+    for i in range(6):
+        jid = f"{i:08d}-9999-4999-8999-999999999999"
+        ids.append(jid)
+        d = tmp_path / jid
+        (d / "output").mkdir(parents=True)
+        (d / "output" / "metadata.json").write_text("{}")
+        (d / PENDING_UPLOAD_SENTINEL).write_text("")
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = jid
+        job.status = JobStatus.FAILED
+        job.error = f"x; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+
+    retry_pending_uploads(tmp_path, Blobs(), store, _logging.getLogger("t"), max_per_sweep=2)
+    assert len(Blobs.seen) == 2, f"the cap did not bound the sweep ({len(Blobs.seen)} uploads)"
+    retry_pending_uploads(tmp_path, Blobs(), store, _logging.getLogger("t"), max_per_sweep=2)
+    assert len(set(Blobs.seen)) == 4, "the second tick re-scanned the same prefix"
+
+
+def test_the_pending_marker_is_on_disk_BEFORE_the_terminal_write(tmp_path, monkeypatch):
+    """Ordering, not just presence.
+
+    Written after the terminal CAS, a crash in between (SIGKILL, OOM, redeploy — the class this
+    whole mechanism exists for) loses the marker, and without it the tree is ordinary scratch that
+    the reclaim deletes: the only copy of a host-sealed result, gone. Writing it first is what
+    makes the recovery crash-safe; the claim recorded in it is what stops an attempt that then
+    LOSES the CAS from ever publishing its stale bytes.
+    """
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.claim_id = "ours"
+    job.status = JobStatus.RUNNING
+    store.create(job)
+    d = tmp_path / job.job_id
+    (d / "output").mkdir(parents=True)
+
+    seen = {}
+
+    def crashing_fail_job(j, reason):
+        # Stand-in for the process dying between the two steps.
+        seen["marker_present_at_terminal_write"] = (d / PENDING_UPLOAD_SENTINEL).is_file()
+        raise RuntimeError("process died before the terminal write landed")
+
+    monkeypatch.setattr(dispatcher, "_fail_job", crashing_fail_job)
+
+    with contextlib.suppress(RuntimeError):
+        dispatcher._retain_for_upload_retry(job, "upload failed")
+
+    assert seen.get("marker_present_at_terminal_write") is True, (
+        "the marker was written AFTER the terminal write — a crash in the gap loses the only copy"
+    )
+    assert (d / PENDING_UPLOAD_SENTINEL).read_text() == "ours", "the marker must record the claim"
+
+
+def test_a_backward_clock_step_does_not_wipe_live_trees(tmp_path, monkeypatch):
+    """An NTP correction is not a reason to delete the node's work.
+
+    Liveness used to discard any timestamp in the future as "no evidence", which is fine against a
+    forged stamp and catastrophic against a clock that moved: after a backward step EVERY honest
+    timestamp is in the future, so every live tree reads as ancient. Reproduced with a 1h
+    rollback — a tree created seconds earlier was deleted. ctime cannot be forged, so a future
+    ctime means the clock is wrong, and the only safe reading of "I cannot tell how old this is"
+    is to leave it alone and say so.
+    """
+    import blastbox.host.jobs.retention as retention_mod
+
+    store = InMemoryJobStore()
+    dispatcher = _make_dispatcher(store, job_root=tmp_path)
+    dispatcher._scratch_max_age_s = 21600.0
+
+    d = tmp_path / "88888888-8888-4888-8888-888888888888"
+    (d / "output").mkdir(parents=True)
+    (d / "input.bin").write_bytes(b"A LIVE JOB'S SAMPLE")
+
+    real = time.time
+    monkeypatch.setattr(retention_mod.time, "time", lambda: real() - 3600)   # clock steps back
+
+    assert dispatcher._reap_stale_scratch() == 0, "a clock correction deleted live trees"
+    assert (d / "input.bin").exists()
+
+
+def test_disabling_recovery_does_not_turn_the_hold_into_a_leak(tmp_path):
+    """With BLASTBOX_PENDING_UPLOAD_RETRY=0 the operator has switched the drainer off.
+
+    Holding a marked tree then is protection whose escape hatch no longer runs — an unbounded leak
+    dressed as safety, which is the exact failure this whole PR exists to eliminate. The tree is
+    reclaimed on the ordinary age instead, and because that destroys the only copy of a sealed
+    result it is reported as data loss, not hygiene.
+    """
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL, reap_stale_scratch
+    import logging as _logging
+
+    class NothingDurable:
+        def has_output(self, job_id):
+            return False
+
+    store = InMemoryJobStore()
+    jid = "aaaaaaaa-5555-4555-8555-aaaaaaaaaaaa"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / "output" / "metadata.json").write_text("{}")
+    (d / PENDING_UPLOAD_SENTINEL).write_text("")
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = jid
+    job.status = JobStatus.FAILED
+    store.create(job)
+    old = time.time() - 99_999
+    for pth in sorted(d.rglob("*"), reverse=True) + [d]:
+        os.utime(pth, (old, old))
+
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                              blob_store=NothingDurable(), recovery_enabled=True) == 0
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                              blob_store=NothingDurable(), recovery_enabled=False) == 1
+    assert not d.exists()
+
+
+def test_the_orphan_ceiling_yields_to_a_container_docker_still_sees(tmp_path):
+    """The ceiling stops a hold lasting forever when nobody can confirm the container died. It
+    must not fire while somebody positively SEES it alive — rmtree'ing a live 0o777 bind mount is
+    the half-deleted tree, the spurious "PURGE FAILED" and the zero reclaimed blocks that the
+    whole deferral exists to avoid."""
+    from blastbox.host.jobs.retention import RETAINED_ORPHAN_SENTINEL, reap_stale_scratch
+    import logging as _logging
+
+    store = InMemoryJobStore()
+    jid = "bbbbbbbb-5555-4555-8555-bbbbbbbbbbbb"
+    d = tmp_path / jid
+    (d / "output").mkdir(parents=True)
+    (d / RETAINED_ORPHAN_SENTINEL).write_text("")
+    old = time.time() - 99_999                      # marker far past the 2x ceiling
+    for pth in sorted(d.rglob("*"), reverse=True) + [d]:
+        os.utime(pth, (old, old))
+
+    # docker still lists it -> the hold stands despite the ceiling
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                              live_job_ids=lambda: {jid}) == 0
+    assert d.exists()
+    # nobody can see it any more -> the ceiling does its job
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                              live_job_ids=lambda: set()) == 1
+
+
+def test_the_reclaim_yields_while_dispatch_is_saturated(tmp_path):
+    """Housekeeping must never compete with the work the machine exists to do.
+
+    Measured on a real 190k-dir backlog during a corpus run: a 2000-candidate sweep costs ~7.1s
+    of rglob plus ~6.1s of has_output round trips — 13s of saturating disk and object-store I/O
+    every tick, against exactly the disk and MinIO the job pipeline needs. Concurrent jobs fell
+    11 → 6, median job latency doubled 0.49s → 0.99s, and completions dropped 70/min → 48/min.
+    The sweep is idempotent, so skipping a tick costs only time; a starved pipeline costs work.
+    """
+    from blastbox.host.jobs.retention import reap_stale_scratch
+    import logging as _logging
+
+    store = InMemoryJobStore()
+    old = time.time() - 99_999
+    for i in range(3):
+        d = tmp_path / f"{i:08d}-4444-4444-8444-444444444444"
+        d.mkdir()
+        os.utime(d, (old, old))
+
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                              yield_to_work=lambda: True) == 0, "swept while dispatch was busy"
+    assert len(list(tmp_path.iterdir())) == 3
+
+    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
+                              yield_to_work=lambda: False) == 3
+    assert len(list(tmp_path.iterdir())) == 0
+
+
+def test_a_broken_backpressure_probe_does_not_disable_the_reclaim_forever(tmp_path):
+    """Fail-safe in the direction that keeps the disk bounded: if the probe raises we sweep
+    anyway, because an unbounded job_root is the failure this whole feature exists to prevent."""
+    from blastbox.host.jobs.retention import reap_stale_scratch
+    import logging as _logging
+
+    d = tmp_path / "55555555-4444-4444-8444-444444444444"
+    d.mkdir()
+    os.utime(d, (time.time() - 99_999,) * 2)
+
+    def broken():
+        raise RuntimeError("gate unavailable")
+
+    assert reap_stale_scratch(tmp_path, 60.0, InMemoryJobStore(), _logging.getLogger("t"),
+                              yield_to_work=broken) == 1
