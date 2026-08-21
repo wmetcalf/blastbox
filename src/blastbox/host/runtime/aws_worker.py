@@ -1772,6 +1772,23 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         destroy one. It is simply not claimable right now, and either reaches `stopped` (claimable
         again) or is escaped by the maintenance window's timeout.
         """
+        # CORROBORATE the describe with what we already know. maintain_idle issues
+        # `stop-instances --hibernate` and records the phase synchronously, then reports the slot
+        # usable -- so the pool republishes it as IDLE and wakes claimants one instruction later.
+        # DescribeInstances is eventually consistent and still answers "running" for a short
+        # window after the stop is accepted, so the describe below cannot be the only guard: the
+        # claim succeeds, the job POSTs, and the accepted hibernation completes mid-detonation.
+        #
+        # Deliberately an OR, and deliberately only in this direction: this can make the probe
+        # more conservative (skip a claim) and never authorise one. That is what makes it safe to
+        # lean on bookkeeping a lost response can corrupt -- a phase wrongly reading "hibernating"
+        # costs a skipped claim, which the park give-up timeout escapes; the inverse would cost a
+        # job. (The earlier attempt guarded this with phase state ALONE, which is why the describe
+        # check exists at all; the two together are strictly stronger than either.)
+        if self._phase.get(slot.slot_id) == "hibernating":
+            _log.info("ec2-hibernate: slot %s has a hibernate in flight -- not claimable this scan",
+                      slot.slot_id)
+            return None
         try:
             self._desc_cache.pop(slot.slot_id, None)
             with self._claim_probe_budget(budget_s):

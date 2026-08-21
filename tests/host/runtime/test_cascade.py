@@ -710,6 +710,49 @@ def test_a_deferred_tier_is_still_covered_by_the_allowed_runtimes_gate(monkeypat
     )
 
 
+def test_a_deferred_tiers_declared_budgets_are_in_the_cascade_totals(monkeypatch):
+    """Budgets are sized ONCE, from the tiers admitted at build. A tier that arrives late must
+    therefore already be counted, or every budget it needs is wrong for the life of the process.
+
+    warming_timeout_s, _thaw_budget, _cleanup_budget and the watchdog allowance are all derived
+    from these cascade properties by consumers that read them exactly once. So a hibernate tier
+    deferred by an STS brownout was admitted a minute later and then had its slots evicted at the
+    primary tier's 120s WARMING limit though it declares 600s, and its 180s thaws truncated to
+    whatever remained of a 60s claim window -- issues #79 and #81 reintroduced for precisely the
+    tier the deferral was built to rescue.
+
+    A deferred tier's IDENTITY and DECLARED budgets were never undecided -- only whether it was
+    reachable. Availability needs a probe; `ready_timeout_s` does not.
+
+    MUTATION: drop the deferred entries from readiness_timeout_s -> back to 120.0 and this fails.
+    """
+    from blastbox.host import pool_config
+
+    class _SlowTier(FakeRuntime):
+        readiness_timeout_s = 600.0
+        resume_timeout_s = 180.0
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):
+        if name == "aws-ec2-hibernate":
+            if require_available:
+                raise AwsProbeTimeout("sts: timed out")   # the PROBE is what fails
+            return _SlowTier(name)                        # construction alone is fine
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2-hibernate:16"}.get)
+    assert [d.name for d in rt._deferred] == ["aws-ec2-hibernate"]
+
+    assert rt.readiness_timeout_s == 600.0, (
+        f"cascade reports readiness_timeout_s={rt.readiness_timeout_s}, so the pool sizes its "
+        f"WARMING eviction budget without the deferred tier and reaps its instances mid-boot"
+    )
+    assert rt.resume_timeout_s == 180.0, (
+        f"cascade reports resume_timeout_s={rt.resume_timeout_s}, so the dispatcher builds "
+        f"_thaw_budget=None and truncates the thaw to the claim remainder (issue #81)"
+    )
+
+
 def test_a_recovered_tier_is_admitted_on_a_later_spawn(monkeypatch):
     """The re-probe is the actual fix: without it the tier stays gone until the process restarts."""
     from blastbox.host import pool_config

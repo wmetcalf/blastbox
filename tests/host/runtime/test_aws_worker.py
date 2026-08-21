@@ -1875,6 +1875,36 @@ def test_f21_resume_honours_a_shorter_claim_budget():
     assert spent < 50.0, f"resume ignored the 0.5s claim budget and ran for {spent} clock-seconds"
 
 
+def test_a_hibernate_accepted_this_tick_makes_the_slot_unclaimable_immediately():
+    """The exclusive maintenance window ends one instruction after `stop --hibernate` is accepted.
+
+    maintain_idle issues the stop, records phase="hibernating", and returns USABLE -- so the pool
+    republishes the slot as IDLE and wakes claimants. The only thing standing between that
+    claimant and a job on an instance that is about to hibernate is is_alive_for_claim's fresh
+    describe reading "stopping"; and DescribeInstances is eventually consistent, so for a short
+    window it still answers "running". The claim then succeeds, the job POSTs, and the accepted
+    hibernation completes mid-detonation.
+
+    The runtime already KNOWS a stop was accepted. Using its own bookkeeping to CORROBORATE the
+    describe closes the window, and it is safe in the direction that matters: it can only ever
+    make the probe more conservative (skip a claim), never authorise one. A phase corrupted by a
+    lost response therefore costs at most a skipped claim, which the park give-up timeout escapes.
+
+    MUTATION: drop the _phase check from is_alive_for_claim -> the stale "running" describe wins
+    and this returns True.
+    """
+    # eventual consistency: the stop was accepted, the describe has not caught up yet
+    rt, _ = _hibernate_rt(state=["running"], healthy=[True])
+    slot = AwsWorkerSlot(slot_id="h1", resource_id="i-1", state=SlotState.IDLE,
+                         url="http://10.0.0.5:8080")
+    rt._phase[slot.slot_id] = "hibernating"      # a stop-instances --hibernate was ACCEPTED
+
+    assert rt.is_alive_for_claim(slot, budget_s=5.0) is None, (
+        "a slot with a hibernate already in flight was reported claimable because the describe "
+        "had not caught up; the job would run on an instance that is about to suspend"
+    )
+
+
 def test_f14_health_ok_propagates_an_unknown_mint_rather_than_returning_false():
     """The contract, pinned directly. resume() reads only what ESCAPES _health_ok, so collapsing an
     unconfirmed mint failure into a bare False loses the verdict on that pass. (The mint back-off

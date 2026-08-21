@@ -95,6 +95,51 @@ class DeferredTier:
     capacity: int
     reason: str
     build: "Callable[[], Any]"    # () -> SlotRuntime; re-runs the availability probe
+    # DECLARED budgets, captured at startup from a probe-free construction of the runtime. Every
+    # budget in the system (the pool's WARMING eviction, the dispatcher's thaw and cleanup, the
+    # watchdog allowance) is sized ONCE from the cascade's aggregate properties below, so a tier
+    # that joins later is invisible to all of them unless it is counted from the beginning. Its
+    # AVAILABILITY was undecided; its declared budgets never were.
+    readiness_timeout_s: float = 0.0
+    resume_timeout_s: "float | None" = None
+    cli_timeout_s: "float | None" = None
+
+
+
+def _declared_budgets(name: str, *, warm_snapshot: bool) -> dict:
+    """Read a tier's DECLARED timeouts without probing whether it is reachable.
+
+    ``require_available=False`` constructs the runtime from configuration alone -- no control-plane
+    call -- which is exactly the distinction that matters for a deferred tier: we could not learn
+    whether it is *up*, but what it *needs* is a config fact we already have. Without this, a
+    deferred tier contributes 0.0 to every cascade budget and is silently sized out of the pool's
+    warming timeout, the dispatcher's thaw and cleanup budgets and the watchdog allowance.
+
+    Best-effort by construction: a tier whose config is broken enough that even a probe-free build
+    fails simply contributes nothing, exactly as before. This runs during startup and must never be
+    the thing that prevents a cascade from coming up.
+    """
+    # Imported here, not in the try below: the module-level name does not exist (the builder
+    # imports it lazily inside build_cascade_runtime), and the first version of this helper
+    # NameError'd into its own best-effort handler and silently returned nothing -- a broad
+    # except that swallows a bug in the code it guards is worse than no guard.
+    from blastbox.host.pool_config import select_runtime_by_name
+
+    out: dict = {}
+    try:
+        rt = select_runtime_by_name(name, warm_snapshot=warm_snapshot, require_available=False)
+    except Exception as exc:  # noqa: BLE001 -- unreachable tier config, never fatal at startup
+        _log.debug("cascade: could not read declared budgets for deferred tier %r: %s", name, exc)
+        return out
+    cfg = getattr(rt, "cfg", None)
+    ready = getattr(rt, "readiness_timeout_s", None)
+    if ready is not None:
+        out["readiness_timeout_s"] = float(ready)
+    for field in ("resume_timeout_s", "cli_timeout_s"):
+        val = getattr(cfg, field, None) or getattr(rt, field, None)
+        if val is not None:
+            out[field] = float(val)
+    return out
 
 
 def _is_undecided_availability(exc: BaseException) -> bool:
@@ -164,8 +209,9 @@ class CascadingRuntime:
     def readiness_timeout_s(self) -> float:
         """The MAX readiness budget across tiers, so the warm pool's warming timeout covers the slowest
         tier (e.g. an aws-ec2 overflow tier that boots slower than a local one)."""
-        return max((float(getattr(t.runtime, "readiness_timeout_s", 0.0)) for t in self.tiers),
-                   default=0.0)
+        vals = [float(getattr(t.runtime, "readiness_timeout_s", 0.0)) for t in self.tiers]
+        vals += [d.readiness_timeout_s for d in self._deferred]      # see DeferredTier
+        return max(vals, default=0.0)
 
     @property
     def resume_timeout_s(self) -> float | None:
@@ -177,6 +223,7 @@ class CascadingRuntime:
             if (rt := getattr(getattr(t.runtime, "cfg", None), "resume_timeout_s", None)
                 or getattr(t.runtime, "resume_timeout_s", None)) is not None
         ]
+        vals += [d.resume_timeout_s for d in self._deferred if d.resume_timeout_s is not None]
         return max(vals) if vals else None
 
     @property
@@ -191,6 +238,7 @@ class CascadingRuntime:
             if (ct := getattr(getattr(t.runtime, "cfg", None), "cli_timeout_s", None)
                 or getattr(t.runtime, "cli_timeout_s", None)) is not None
         ]
+        vals += [d.cli_timeout_s for d in self._deferred if d.cli_timeout_s is not None]
         return max(vals) if vals else None
 
     def __init__(self, tiers: list[Tier], *, tier_rebuild_after: int | None = None,
@@ -885,10 +933,12 @@ def build_cascade_runtime(
             if undecided:
                 _log.warning("cascade: overflow tier %r availability UNDECIDED at startup -- will "
                              "retry rather than drop it: %s", name, exc)
+                declared = _declared_budgets(name, warm_snapshot=warm_snapshot)
                 deferred.append(DeferredTier(
                     name=name, capacity=capacity, reason=str(exc),
                     build=functools.partial(select_runtime_by_name, name,
                                             warm_snapshot=warm_snapshot, require_available=True),
+                    **declared,
                 ))
                 continue
             _log.warning("cascade: overflow tier %r unavailable at startup -- skipping: %s", name, exc)
