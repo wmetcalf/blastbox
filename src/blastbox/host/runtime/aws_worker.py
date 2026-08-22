@@ -535,7 +535,13 @@ class AwsDisposableRuntime:
             # Remember that the LOOKUP failed, not merely that it did not succeed: "we already
             # tried and could not read this state" is information, and re-deriving it costs another
             # control-plane call we do not have the budget for.
-            self._desc_fail_at[slot.slot_id] = now
+            #
+            # Stamped from COMPLETION, not the pre-call `now`. A failed describe is the SLOW case --
+            # it usually failed by timing out -- so a 30s failure against this 5s memo would leave
+            # the memo already expired the moment it was written, and the very next caller reissues
+            # the describe this memo exists to prevent. Fifth site on this branch where a timestamp
+            # guarding a slow call was taken before it instead of after.
+            self._desc_fail_at[slot.slot_id] = self._clock()
             raise
         self._desc_fail_at.pop(slot.slot_id, None)
         self._desc_cache[slot.slot_id] = (now, desc)

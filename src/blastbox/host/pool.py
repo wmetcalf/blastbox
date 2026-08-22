@@ -2799,7 +2799,7 @@ class WarmPool:
             try:
                 self.retire(cand, fault="worker")
             except Exception:
-                # Retirement itself failed. A slot stranded in ASSIGNED is capacity lost forever
+                # Retirement itself RAISED. A slot stranded in ASSIGNED is capacity lost forever
                 # (_spawn_to_deficit counts it as active), so hand it back and let the ordinary
                 # health path judge it -- the same rule the hook-raised case follows above.
                 logger.exception(
@@ -2809,6 +2809,21 @@ class WarmPool:
                     if cur is cand and cur.state == SlotState.ASSIGNED:
                         cur.state = SlotState.IDLE
                         self._idle_event.set()
+            # ...but that except is NOT the common failure. retire() catches its own reap error,
+            # logs pool.retire_reap_error, and returns NORMALLY with the slot left tracked and
+            # DRAINING -- so the handler above never fires and nothing retries the disposal. A
+            # tracked DRAINING husk keeps counting against concurrent_ceiling, so during a
+            # correlated termination brownout every retired slot is stranded and its replacement
+            # never spawns, until the process restarts. Hand it to the deferred reaper, which is
+            # the machinery that already exists for "disposal failed, try again off the tick
+            # thread" (issue #75).
+            with self._lock:
+                cur = self._slots.get(slot_id)
+                if cur is not None and cur.state == SlotState.DRAINING:
+                    self._deferred_reap.add(slot_id)
+                    logger.warning(
+                        "pool.maintain_idle_retire_unconfirmed slot_id=%s — terminate did not "
+                        "confirm; queued for the deferred reaper", slot_id)
 
     def _warming_unknown_credit_s(self, slot_id: str) -> float:
         """Warming time that was never an observation of the worker, so cannot be spent on it.

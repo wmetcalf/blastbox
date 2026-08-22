@@ -3243,6 +3243,35 @@ def test_b_a_failed_readiness_describe_is_not_repeated():
     assert n["describe"] == 1, "the readiness path bought the same non-answer twice"
 
 
+def test_a_slow_failed_describe_memo_outlives_the_call_that_wrote_it():
+    """The memo has to be stamped from COMPLETION, or it is born expired.
+
+    A failed describe is the SLOW case -- it usually failed by timing out. Storing the pre-call
+    clock against a 5s memo means a 30s failure writes a mark that is already 25s stale when
+    control returns, so the very next caller reissues the describe the memo exists to prevent.
+    test_b above cannot see this: its stall raises instantly on a fake clock that never advances.
+
+    MUTATION: store the pre-call `now` -> the memo is expired on arrival and the describe runs
+    twice.
+    """
+    import subprocess as _sp
+    ticks = [1000.0]
+    n = {"describe": 0}
+
+    def slow_fail(argv):  # noqa: ANN001
+        n["describe"] += 1
+        ticks[0] += 30.0                    # the failure took six times the 5s memo window
+        raise _sp.TimeoutExpired(cmd="aws", timeout=30.0)
+
+    rt, _ = _snapstart_rt({"lambda-microvms get-microvm": slow_fail}, clock=lambda: ticks[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="mv-1")
+    assert rt.is_ready(slot) is None
+    assert n["describe"] == 1, (
+        f"{n['describe']} describes: the failure memo was stamped before a call that outran it, "
+        f"so it expired the instant it was written"
+    )
+
+
 def test_c_an_unreadable_availability_answer_is_not_a_verdict():
     """issue #79 round 2: availability is probed ONCE, so a False drops the tier for the whole
     process lifetime (or, for the primary, refuses to start). A truncated/unparseable STS response

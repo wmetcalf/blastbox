@@ -3141,6 +3141,42 @@ def test_a_raising_maintenance_hook_still_hands_the_slot_back() -> None:
     assert slot_id not in rt.reaped, "an exception is not a verdict about the slot"
 
 
+def test_a_maintenance_retirement_whose_terminate_fails_is_retried_not_stranded() -> None:
+    """`retire()` does NOT raise on a failed reap -- it logs pool.retire_reap_error and returns
+    normally, leaving the slot tracked and DRAINING.
+
+    So the `except Exception` around the retire call was dead code for the case that actually
+    happens. A tracked DRAINING husk keeps counting against concurrent_ceiling, and nothing retries
+    it: during a correlated termination brownout every retired slot is stranded and its replacement
+    never spawns, until the process restarts. The deferred reaper is exactly the machinery for
+    "disposal failed, retry off the tick thread".
+
+    MUTATION: drop the _deferred_reap enqueue -> the husk sits DRAINING with nothing retrying it.
+    """
+    class _UnusableUnreapable(_FakeRuntime):
+        def maintain_idle(self, slot: Slot) -> bool:
+            return False                          # terminal: retire it
+
+        def reap(self, slot: Slot) -> None:
+            raise OSError("terminate-instances: throttled")
+
+    pool = WarmPool(runtime=_UnusableUnreapable(), warm_size=1, spawn_rate_limit=100.0,
+                    maintain_interval_s=0.0)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    slot.state = SlotState.IDLE
+
+    pool._maintain_idle()
+
+    cur = pool._slots.get(slot.slot_id)
+    assert cur is not None and cur.state == SlotState.DRAINING, (
+        "sanity: a failed terminate should leave the husk tracked and DRAINING")
+    assert slot.slot_id in pool._deferred_reap, (
+        "the husk was left DRAINING with nothing retrying its disposal; it counts against "
+        "concurrent_ceiling forever and its replacement never spawns"
+    )
+
+
 def test_an_undone_disposal_does_not_publish_a_never_ready_slot_as_claimable() -> None:
     """The undo path restores a suspected slot to IDLE. Since expired warming-unknowns became
     `suspected`, that path can now apply to a slot which has NEVER passed is_ready().
