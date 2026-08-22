@@ -100,6 +100,11 @@ class DeferredTier:
     # watchdog allowance) is sized ONCE from the cascade's aggregate properties below, so a tier
     # that joins later is invisible to all of them unless it is counted from the beginning. Its
     # AVAILABILITY was undecided; its declared budgets never were.
+    # The entry's DECLARED position in BLASTBOX_POOL_TIERS. Names are NOT unique -- the codebase
+    # already knows this (`_tier_identity` is f"{name}#{idx}", "a UNIQUE identity per tier position,
+    # not per backend name") -- so "aws-ec2:4,aws-ec2:16" has two legitimate entries. Deduping the
+    # deferred list by NAME silently discarded the second one the moment its sibling was admitted.
+    pos: int = -1
     readiness_timeout_s: float = 0.0
     resume_timeout_s: "float | None" = None
     cli_timeout_s: "float | None" = None
@@ -254,6 +259,9 @@ class CascadingRuntime:
         # re-probe, so a brownout lasting seconds removed a tier until the process restarted --
         # pool reporting green the whole time (issue #79). These are retried instead.
         self._deferred: list[DeferredTier] = list(deferred or [])
+        # Declared positions already admitted, so a concurrent pass cannot admit one twice. Keyed
+        # by position rather than name because names repeat legitimately (see DeferredTier.pos).
+        self._admitted_deferred: set[int] = set()
         self._admit_retry_s = float(admit_retry_s)
         self._clock = clock
         self._last_admit_attempt: float | None = None
@@ -333,8 +341,11 @@ class CascadingRuntime:
                                  d.name, exc)
                 continue
             with self._lock:
-                # Re-check: a concurrent _admit_deferred may have admitted it already.
-                if any(t.name == d.name for t in self.tiers):
+                # Re-check: a concurrent _admit_deferred may have admitted it already. Keyed by the
+                # DECLARED POSITION, not the name: a repeated backend ("aws-ec2:4,aws-ec2:16") has
+                # two legitimate entries, and matching on name dropped the second as soon as the
+                # first was admitted -- silently losing capacity the operator asked for.
+                if d.pos in self._admitted_deferred:
                     continue
                 # REVALIDATE THE TRANSPORT. The startup path refuses a cascade that mixes dispatch
                 # styles or TLS postures; this is the only other door in, so it must refuse too.
@@ -349,6 +360,7 @@ class CascadingRuntime:
                                "%s -- dropping it. Run it in a separate pool.", d.name, conflict)
                     continue
                 self.tiers.append(Tier(name=d.name, runtime=rt, capacity=d.capacity))
+                self._admitted_deferred.add(d.pos)
                 self._counts.append(0)
                 self._tier_failures.append(0)
             _log.info("cascade: deferred tier %r became available -- admitted at position %d "
@@ -363,8 +375,7 @@ class CascadingRuntime:
             # outruns its own window.
             self._last_admit_attempt = self._clock()
             # Keep only entries still undecided AND not admitted by a racing caller.
-            admitted = {t.name for t in self.tiers}
-            self._deferred = [d for d in still if d.name not in admitted]
+            self._deferred = [x for x in still if x.pos not in self._admitted_deferred]
 
     # -- SlotRuntime protocol ----------------------------------------------
     def spawn(self) -> Any:
@@ -983,7 +994,7 @@ def build_cascade_runtime(
                              "retry rather than drop it: %s", name, exc)
                 declared = _declared_budgets(name, warm_snapshot=warm_snapshot)
                 deferred.append(DeferredTier(
-                    name=name, capacity=capacity, reason=str(exc),
+                    name=name, capacity=capacity, reason=str(exc), pos=pos,
                     build=functools.partial(select_runtime_by_name, name,
                                             warm_snapshot=warm_snapshot, require_available=True),
                     **declared,

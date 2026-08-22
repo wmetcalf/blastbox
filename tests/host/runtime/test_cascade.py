@@ -839,6 +839,44 @@ def test_a_deferred_tier_with_a_foreign_transport_is_refused_at_admission(monkey
     assert not rt._deferred, "an incompatible tier must be dropped, not re-probed forever"
 
 
+def test_two_deferred_entries_of_the_same_backend_are_both_admitted(monkeypatch):
+    """BLASTBOX_POOL_TIERS entries are positional, not a set of names.
+
+    "aws-ec2:4,aws-ec2:16" is a legitimate config -- the codebase already says so: _tier_identity
+    is f"{name}#{idx}", "a UNIQUE identity per tier position, not per backend name". The deferred
+    list deduped by NAME, so admitting one entry silently discarded its sibling and the operator
+    lost the capacity they asked for, with no error anywhere.
+
+    MUTATION: key the admit re-check on name again -> only one entry is admitted and this fails.
+    """
+    from blastbox.host import pool_config
+
+    state = {"up": False}
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):
+        if name == "aws-ec2":
+            if require_available and not state["up"]:
+                raise AwsProbeTimeout("sts: timed out")
+            return FakeRuntime(name)
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:4,aws-ec2:16"}.get)
+    assert [d.name for d in rt._deferred] == ["aws-ec2", "aws-ec2"], "both entries must defer"
+    assert sorted(d.pos for d in rt._deferred) == [1, 2], "each carries its declared position"
+
+    state["up"] = True
+    rt._last_admit_attempt = None
+    rt._admit_deferred()
+
+    caps = sorted(t.capacity for t in rt.tiers if t.name == "aws-ec2")
+    assert caps == [4, 16], (
+        f"only {caps} admitted -- the second declared aws-ec2 entry was discarded as a duplicate "
+        f"name, silently losing the capacity the operator configured"
+    )
+    assert not rt._deferred, "both entries were admitted, so nothing should remain deferred"
+
+
 def test_a_recovered_tier_is_admitted_on_a_later_spawn(monkeypatch):
     """The re-probe is the actual fix: without it the tier stays gone until the process restarts."""
     from blastbox.host import pool_config

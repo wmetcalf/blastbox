@@ -1959,7 +1959,16 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 _log.warning("ec2-hibernate: %s never parked after %.0fs -- giving up on it",
                              sid, now - self._park_since.get(sid, now))
                 return self._PARK_GIVE_UP, False
-            if not self._agent_healthy(slot):
+            healthy = self._agent_healthy(slot)
+            if healthy is None:
+                # UNKNOWN, not unhealthy. _agent_healthy is tri-state and a bare falsy check
+                # flattened it: the host failing to OPEN the health socket (correlated local fd
+                # exhaustion, for instance) says nothing about the worker, but read as "not warm
+                # yet" it kept aging the give-up clock until a healthy instance was retired. Same
+                # freeze as an unanswered stop -- an absent answer is not evidence.
+                self._park_unknown_since.setdefault(sid, now)
+                return "warming", False
+            if not healthy:
                 return "warming", False
             # Warmed -> PARK it: stop --hibernate. THROTTLED (the pool polls is_ready at ~10Hz) and
             # TOLERANT of "not ready to hibernate yet" -- the ec2-hibinit-agent needs ~1-2min after

@@ -3158,3 +3158,31 @@ def test_c_an_unreadable_availability_answer_is_not_a_verdict():
 
     rt, _ = _snapstart_rt({"sts get-caller-identity": denied})
     assert rt.available() is False
+
+
+def test_an_unknown_agent_probe_does_not_age_the_park_clock():
+    """`_agent_healthy` is tri-state; the park state machine falsy-checked it.
+
+    None means the probe could not be MADE -- e.g. the host cannot open the health socket because
+    of correlated local resource exhaustion. That says nothing about the worker, but `if not
+    self._agent_healthy(slot)` read it as "not warm yet", so the give-up clock kept running and a
+    healthy instance was eventually retired. Same class as every other UNKNOWN collapse on this
+    branch, and the same remedy: freeze the clock.
+
+    MUTATION: restore `if not self._agent_healthy(slot)` -> the clock ages and this fails.
+    """
+    now = [1000.0]
+    rt, _ = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: now[0],
+                          hibernate_timeout_s=60.0)
+    rt._agent_healthy = lambda slot: None          # cannot probe at all
+    slot = AwsWorkerSlot(slot_id="hz", resource_id="i-1", state=SlotState.IDLE,
+                         url="http://10.0.0.5:8080")
+
+    for _ in range(12):                            # well past hibernate_timeout_s
+        rt.maintain_idle(slot)
+        now[0] += 10.0
+
+    assert rt.maintain_idle(slot) is not False, (
+        "an unprobeable agent aged the park clock to give-up and the slot was retired; the host "
+        "not being able to open a socket is not evidence about the worker"
+    )
