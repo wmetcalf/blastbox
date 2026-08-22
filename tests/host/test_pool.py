@@ -3141,6 +3141,46 @@ def test_a_raising_maintenance_hook_still_hands_the_slot_back() -> None:
     assert slot_id not in rt.reaped, "an exception is not a verdict about the slot"
 
 
+def test_an_undone_disposal_does_not_publish_a_never_ready_slot_as_claimable() -> None:
+    """The undo path restores a suspected slot to IDLE. Since expired warming-unknowns became
+    `suspected`, that path can now apply to a slot which has NEVER passed is_ready().
+
+    IDLE is claimable. A disposable EC2/Lambda resource that merely describes as `running` would
+    be handed to a job before its agent or auth token is up, so user jobs fail during exactly the
+    recovery this restore exists to help. A restored warming slot has to go back to WARMING and
+    earn IDLE through promotion.
+
+    MUTATION: restore `cur.state = SlotState.IDLE` unconditionally -> the slot is claimable while
+    never having been ready, and this fails.
+    """
+    now = [1000.0]
+
+    class _BrownoutRuntime(_FakeRuntime):
+        def is_ready(self, slot: Slot):
+            return None                       # control plane will not answer
+
+        def reap(self, slot: Slot) -> None:
+            raise OSError("terminate-instances: throttled")   # the same outage
+
+    pool = WarmPool(runtime=_BrownoutRuntime(), warm_size=1, spawn_rate_limit=100.0,
+                    clock=lambda: now[0], warming_timeout_s=10.0, unknown_grace_s=5.0)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    slot.state = SlotState.WARMING
+
+    for _ in range(4):                        # age past the grace and the warming timeout
+        pool.tick()
+        now[0] += 6.0
+    _drain_reapers(pool)
+
+    cur = pool._slots.get(slot.slot_id)
+    assert cur is not None, "the failed disposal should have left the slot tracked"
+    assert cur.state != SlotState.IDLE, (
+        "a slot that never passed is_ready() was republished as IDLE (claimable) after its "
+        "disposal failed; a job would run on a worker whose agent may not be up"
+    )
+
+
 def test_a_warming_slot_whose_unknown_episode_expires_is_suspected_not_convicted() -> None:
     """The IDLE path escalates an expired UNKNOWN "on suspicion, not on a verdict". The WARMING
     path did not, and the asymmetry costs a tier its capacity during the outage this PR exists to

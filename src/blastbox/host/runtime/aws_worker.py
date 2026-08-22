@@ -1800,16 +1800,23 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         self._hib_attempt[slot.slot_id] = now
         try:
             self._aws("ec2", "stop-instances", "--instance-ids", str(slot.resource_id), "--hibernate")
-        except AwsUnknownState as exc:
+        except AwsNoVerdict as exc:
             # NO VERDICT: throttled, or the control plane never answered. NOT "this slot refuses to
             # park" -- the difference decides whether the give-up clock may keep running, and
             # stop-instances brownouts are CORRELATED, so reading them as refusals retires every
             # healthy hibernate worker in the tier at once (issue #79).
+            #
+            # AwsNoVerdict, not AwsUnknownState: AWS ANSWERING "AccessDenied" or "InvalidParameter"
+            # arrives as a bare AwsUnknownState, and re-raising that froze the give-up clock
+            # forever -- the slot was republished every pass while the instance ran and billed
+            # indefinitely. A refusal is a verdict; only silence is not. An answered refusal falls
+            # through to the handler below, ages the clock, and is retired at give-up like any
+            # other slot that will not park.
             _log.info("ec2-hibernate: stop --hibernate %s got no verdict (%s); will retry",
                       slot.slot_id, str(exc)[:120])
             raise
         except AwsWorkerError as exc:
-            _log.info("ec2-hibernate: stop --hibernate %s not ready yet (%s); will retry",
+            _log.info("ec2-hibernate: stop --hibernate %s refused (%s); will retry until give-up",
                       slot.slot_id, str(exc)[:120])
             return False
         self._desc_cache.pop(slot.slot_id, None)   # force a fresh describe next poll
@@ -1977,11 +1984,17 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             # accepted-but-lost response must be safe to repeat.
             try:
                 answered = self._try_park(slot) is not None
-            except AwsUnknownState:
+            except AwsNoVerdict:
                 # Freeze the give-up clock for as long as the stop API keeps not answering, and
                 # never START it on a non-answer: an unanswered stop is no evidence at all about
                 # this slot, and spending the park budget on it drains every healthy hibernate
                 # worker during a stop-API brownout (issue #79).
+                #
+                # AwsNoVerdict, NOT AwsUnknownState. AWS answering "AccessDenied" or
+                # "InvalidParameter" to stop-instances arrives as a bare AwsUnknownState, and
+                # freezing on THAT is the mirror bug: _park_since never starts, the give-up clock
+                # is frozen forever, the slot is republished every pass, and the instance runs and
+                # bills indefinitely. A refusal is a verdict; only silence is not.
                 self._park_unknown_since.setdefault(sid, now)
                 return self._phase.get(sid, "warming"), False
             if answered:
@@ -2004,26 +2017,26 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         which is the property the first attempt lacked, when this ran off ``is_alive`` with nothing
         excluding a concurrent claimant and could hibernate an instance out from under a job.
         """
-        try:
-            # BUDGETED, like every other tick-thread path here (see is_alive). Unbudgeted, _aws
-            # falls back to cli_timeout_s (120s), and this runs on the pool's single maintenance
-            # thread -- so a brownout stalled promotion, health checks, deferred reaping and
-            # spawn-to-deficit for two minutes per call, while the slot stayed reserved.
-            with self._health_probe_budget():
-                st = self._state(slot)  # UNCACHED: reconciliation must not act on a stale describe
-        except AwsUnknownState as exc:
-            # We could not look. Change nothing -- acting on a guess here is how the bookkeeping got
-            # corrupted in the first place.
-            _log.debug("ec2-hibernate: maintain_idle(%s) unknown: %s", slot.slot_id, exc)
-            return True
-        except (AwsWorkerError, OSError) as exc:
-            _log.debug("ec2-hibernate: maintain_idle(%s) error: %s", slot.slot_id, exc)
-            return True
+        # ONE budget across the WHOLE pass, not one per stage. Unbudgeted, _aws falls back to
+        # cli_timeout_s (120s) and this runs on the pool's single maintenance thread -- but two
+        # SIBLING scopes are barely better: _health_probe_budget mins only against an OUTER LIVE
+        # scope, so a describe that nearly exhausts the 30s bound followed by a FRESH scope for
+        # _park_step (an agent probe AND stop-instances) occupies the tick thread for nearly twice
+        # the configured bound. Third time this exact sibling-scope mistake has been made on this
+        # branch: the nesting composes only from INSIDE.
         try:
             with self._health_probe_budget():
+                try:
+                    # UNCACHED: reconciliation must not act on a stale describe.
+                    st = self._state(slot)
+                except AwsUnknownState as exc:
+                    # We could not look. Change nothing -- acting on a guess here is how the
+                    # bookkeeping got corrupted in the first place.
+                    _log.debug("ec2-hibernate: maintain_idle(%s) unknown: %s", slot.slot_id, exc)
+                    return True
                 phase, _ = self._park_step(slot, st, self._clock())
         except (AwsWorkerError, OSError) as exc:
-            _log.debug("ec2-hibernate: maintain_idle(%s) step error: %s", slot.slot_id, exc)
+            _log.debug("ec2-hibernate: maintain_idle(%s) error: %s", slot.slot_id, exc)
             return True
         return phase != self._PARK_GIVE_UP
 
@@ -2044,6 +2057,16 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 return False
             return ready
         except AwsUnknownState as exc:
+            # FREEZE THE PARK CLOCK TOO, not only the pool's warming timeout. _park_step is never
+            # reached on this path, so an unanswered DESCRIBE left the independent hibernation
+            # timer running: an outage covering the remainder of hibernate_timeout_s -- comfortably
+            # inside the default UNKNOWN grace -- meant the first recovered `running` observation
+            # went straight to _park_expired and retired a HEALTHY slot before even retrying the
+            # park. Same correlated-brownout drain as the stop-API case, through a different door.
+            # Only for a slot whose park episode has actually started; _park_expired ignores the
+            # rest.
+            if slot.slot_id in self._park_since:
+                self._park_unknown_since.setdefault(slot.slot_id, self._clock())
             # A throttled describe tells us NOTHING about whether this instance booted, warmed, or
             # parked. Returning False here spent the 600s warming budget on the control plane's
             # silence and then terminated the instance (issue #79). The phase is left untouched, so

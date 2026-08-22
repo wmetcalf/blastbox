@@ -3096,6 +3096,78 @@ def test_maintain_idle_changes_nothing_when_the_control_plane_is_silent():
 # (test_aws_worker.py already imports _cp, FakeAws, _IDENT, _snapstart_rt, _hibernate_rt.)
 
 
+def test_a_definitive_park_refusal_is_not_frozen_like_a_brownout():
+    """The mirror of the freeze. AWS ANSWERING "AccessDenied" to stop-instances is a VERDICT.
+
+    It arrives as a bare AwsUnknownState, and the freeze originally caught AwsUnknownState -- so a
+    permanent refusal froze the give-up clock forever: _park_since never started, the slot was
+    republished every pass, and the instance ran and billed indefinitely with liveness happily
+    reporting it alive. Only silence (AwsNoVerdict) may freeze; a refusal must age the clock and
+    be retired at give-up like any other slot that will not park.
+
+    MUTATION: widen the freeze back to `except AwsUnknownState` -> maintain_idle never returns
+    False and this fails.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    state, healthy, ticks = ["running"], [True], [1000.0]
+    rt, fake = _hibernate_rt(state=state, healthy=healthy, clock=lambda: ticks[0],
+                             hibernate_timeout_s=120.0)
+    fake.responses["ec2 stop-instances"] = lambda argv: _cp(
+        rc=254, stderr="An error occurred (AccessDenied) when calling the StopInstances operation")
+
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    verdicts = []
+    for _ in range(10):                       # 10 x 30s = 300s, well past hibernate_timeout_s
+        verdicts.append(rt.maintain_idle(slot))
+        ticks[0] += 30.0
+
+    assert False in verdicts, (
+        "a permanently REFUSED park never reached give-up: the clock was frozen as though the "
+        "control plane had gone silent, so the instance runs and bills forever"
+    )
+
+
+def test_a_describe_brownout_does_not_age_the_park_clock():
+    """The freeze has to cover BOTH doors. _park_step is never reached when the describe itself is
+    unanswered, so the independent hibernation timer kept running through a describe brownout: an
+    outage covering the remainder of hibernate_timeout_s -- comfortably inside the default UNKNOWN
+    grace -- meant the first recovered `running` observation went straight to _park_expired and
+    retired a healthy slot before even retrying the park.
+
+    MUTATION: drop the _park_unknown_since stamp from is_ready's AwsUnknownState handler -> the
+    clock ages through the outage and the slot is given up on.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    state, healthy, ticks = ["running"], [True], [1000.0]
+    rt, fake = _hibernate_rt(state=state, healthy=healthy, clock=lambda: ticks[0],
+                             hibernate_timeout_s=120.0)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    rt.maintain_idle(slot)                    # starts the park episode
+    assert slot.slot_id in rt._park_since, "sanity: the park clock must have started"
+
+    fake.responses["ec2 describe-instances"] = lambda argv: _cp(
+        rc=254, stderr="An error occurred (RequestLimitExceeded) when calling DescribeInstances")
+    for _ in range(8):                        # 240s of describe brownout > hibernate_timeout_s
+        rt.is_ready(slot)
+        ticks[0] += 30.0
+
+    fake.responses["ec2 describe-instances"] = lambda argv: _cp(stdout=json.dumps(
+        {"Reservations": [{"Instances": [
+            {"InstanceId": "i-1", "State": {"Name": "running"}, "PrivateIpAddress": "10.0.0.5"}]}]}))
+    # TWO passes on purpose. A slot recorded `hibernating` but observed `running` takes the
+    # "re-driving to warm" branch, which returns BEFORE _park_expired -- so a single call cannot
+    # discriminate here at all, and the first version of this test passed with the fix reverted.
+    verdicts = []
+    for _ in range(2):
+        verdicts.append(rt.maintain_idle(slot))
+        ticks[0] += 30.0
+    assert False not in verdicts, (
+        f"the slot was retired on recovery ({verdicts}): the park clock aged through a DESCRIBE "
+        f"outage in which we learned nothing about it"
+    )
+
+
 def test_a_stop_api_brownout_does_not_drain_the_hibernate_tier():
     """issue #79, park path: `stop-instances --hibernate` being THROTTLED is the control plane
     failing to answer, not this slot failing to park. _try_park caught it as a generic

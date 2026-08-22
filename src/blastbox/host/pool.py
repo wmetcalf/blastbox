@@ -1272,7 +1272,18 @@ class WarmPool:
                         # exists to fix (that one healed when the brownout ended). Put it back.
                         cur = self._slots.get(slot.slot_id)
                         if cur is not None and cur.state == SlotState.DRAINING:
-                            cur.state = SlotState.IDLE
+                            # Back to what it WAS, not unconditionally to IDLE. Since expired
+                            # warming-unknowns became `suspected`, this undo can apply to a slot
+                            # that never passed is_ready() -- and IDLE is CLAIMABLE. A disposable
+                            # EC2/Lambda resource that merely describes as `running` would then be
+                            # handed to a job before its agent or auth token is up, failing user
+                            # jobs during the very recovery this restore exists to help. WARMING
+                            # re-enters promotion and has to EARN idle by being ready.
+                            cur.state = (
+                                SlotState.WARMING
+                                if (slot.slot_id in self._warming_unknown_since
+                                    or slot.slot_id in self._warming_unknown_credit)
+                                else SlotState.IDLE)
                             # REFUND: the demotion spent a token to evict this slot and we have
                             # just put it back, so the budget bought nothing. This is the path the
                             # deferred reaper takes, and it is the COMMON one during a brownout --
@@ -3128,7 +3139,18 @@ class WarmPool:
                     with self._lock:
                         cur = self._slots.get(slot.slot_id)
                         if cur is not None and cur.state == SlotState.DRAINING:
-                            cur.state = SlotState.IDLE
+                            # Back to what it WAS, not unconditionally to IDLE. Since expired
+                            # warming-unknowns became `suspected`, this undo can apply to a slot
+                            # that never passed is_ready() -- and IDLE is CLAIMABLE. A disposable
+                            # EC2/Lambda resource that merely describes as `running` would then be
+                            # handed to a job before its agent or auth token is up, failing user
+                            # jobs during the very recovery this restore exists to help. WARMING
+                            # re-enters promotion and has to EARN idle by being ready.
+                            cur.state = (
+                                SlotState.WARMING
+                                if (slot.slot_id in self._warming_unknown_since
+                                    or slot.slot_id in self._warming_unknown_credit)
+                                else SlotState.IDLE)
                             # REFUND the token. The demotion spent one to evict this slot, and we
                             # have just put it back -- so the budget paid for nothing. During a
                             # brownout every disposal goes through the same unresponsive control
