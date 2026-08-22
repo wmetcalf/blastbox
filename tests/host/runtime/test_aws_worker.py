@@ -3168,6 +3168,41 @@ def test_a_describe_brownout_does_not_age_the_park_clock():
     )
 
 
+def test_a_slow_stop_call_is_not_re_issued_the_instant_it_returns():
+    """Found by sweeping for the shape, not by a review: the FOURTH site on this branch where a
+    rate-limit stamp was taken BEFORE the slow call it throttles.
+
+    _hib_attempt gates `stop-instances --hibernate` at _liveness_cache_s (5s), but that call is
+    bounded by the health-probe budget (30s), or cli_timeout_s (120s) unbudgeted. Stamping only on
+    entry leaves the mark six to twenty-four times older than the interval by the time the call
+    returns, so the next pass re-issues it immediately and the pool's sole tick thread does nothing
+    but stop-instances for the duration of a control-plane stall.
+
+    MUTATION: drop the finally re-stamp -> every pass issues another stop and this fails.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    ticks = [1000.0]
+    calls: list = []
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: ticks[0])
+
+    def slow_stop(argv):
+        calls.append(ticks[0])
+        ticks[0] += 30.0            # a stalled stop-instances at the health-probe bound
+        return _cp()
+
+    fake.responses["ec2 stop-instances"] = slow_stop
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    for _ in range(5):
+        rt._try_park(slot)
+        ticks[0] += 0.1             # the pool's tick interval
+
+    assert len(calls) == 1, (
+        f"{len(calls)} stop-instances calls in {ticks[0] - 1000.0:.0f}s against a 5s throttle: a "
+        f"call that outruns its own interval is eligible the moment it returns"
+    )
+
+
 def test_a_stop_api_brownout_does_not_drain_the_hibernate_tier():
     """issue #79, park path: `stop-instances --hibernate` being THROTTLED is the control plane
     failing to answer, not this slot failing to park. _try_park caught it as a generic

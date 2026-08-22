@@ -1797,6 +1797,14 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         now = self._clock()
         if now - self._hib_attempt.get(slot.slot_id, 0.0) < self._liveness_cache_s:
             return None      # we did not ask, so this pass learned nothing either way
+        # PROVISIONAL stamp; the authoritative one is taken from COMPLETION in the finally below.
+        # The interval is _liveness_cache_s (5s) but stop-instances is bounded by the health-probe
+        # budget (30s), or cli_timeout_s (120s) unbudgeted -- so stamping only on entry left the
+        # mark six to twenty-four times older than the interval by the time the call returned, and
+        # the next pass re-issued it immediately. Rate-limiting a call by when it STARTED throttles
+        # nothing once the call outruns its own window. Fourth site on this branch with this exact
+        # shape (_last_admit_attempt, _maintain_last, and the two here), so it is worth naming:
+        # a throttle stamp belongs in a finally, not before the thing it throttles.
         self._hib_attempt[slot.slot_id] = now
         try:
             self._aws("ec2", "stop-instances", "--instance-ids", str(slot.resource_id), "--hibernate")
@@ -1819,6 +1827,10 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             _log.info("ec2-hibernate: stop --hibernate %s refused (%s); will retry until give-up",
                       slot.slot_id, str(exc)[:120])
             return False
+        finally:
+            # Re-stamp from COMPLETION. See the provisional stamp above: the whole point of the
+            # throttle is that a slow call must not be re-issued the instant it returns.
+            self._hib_attempt[slot.slot_id] = self._clock()
         self._desc_cache.pop(slot.slot_id, None)   # force a fresh describe next poll
         self._phase[slot.slot_id] = "hibernating"
         self._hib_started[slot.slot_id] = now
@@ -2064,8 +2076,15 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             # went straight to _park_expired and retired a HEALTHY slot before even retrying the
             # park. Same correlated-brownout drain as the stop-API case, through a different door.
             # Only for a slot whose park episode has actually started; _park_expired ignores the
-            # rest.
-            if slot.slot_id in self._park_since:
+            # rest -- and only on AwsNoVerdict, never the broad class.
+            #
+            # That narrowing is the RULE this branch kept learning the hard way: catching the broad
+            # AwsUnknownState is fine when the consequence is "do nothing THIS PASS" (every other
+            # handler in this file returns None and is conservative), and wrong when the
+            # consequence is "suppress a safety timeout INDEFINITELY". A revoked credential makes
+            # describe-instances answer AccessDenied -- a bare AwsUnknownState -- and freezing on
+            # that would park the give-up clock forever while the instance runs and bills.
+            if isinstance(exc, AwsNoVerdict) and slot.slot_id in self._park_since:
                 self._park_unknown_since.setdefault(slot.slot_id, self._clock())
             # A throttled describe tells us NOTHING about whether this instance booted, warmed, or
             # parked. Returning False here spent the 600s warming budget on the control plane's
