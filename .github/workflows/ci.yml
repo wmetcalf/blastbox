@@ -19,7 +19,7 @@ jobs:
         # tests/ too, since 2026-08-21. It was carrying 17 violations that `ruff check src`
         # could never see -- the same blind spot RedTusk had. E402 in tests is exempted in
         # pyproject: pytest.importorskip must precede the imports it guards.
-        run: ruff check src tests
+        run: ruff check src tests scripts
       - name: Mypy
         run: mypy src
       - name: Pytest

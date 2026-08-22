@@ -3276,6 +3276,81 @@ def test_recovery_observing_stopping_credits_the_brownout_like_every_other_close
     )
 
 
+def test_a_definitive_agent_answer_closes_the_freeze():
+    """"Only SILENCE freezes" has to run in BOTH directions.
+
+    The agent-probe writer opens an episode on `_agent_healthy() is None` and had no closer, so a
+    slot that went unknown ONCE and was thereafter definitively unhealthy kept _park_expired pinned
+    to that first timestamp: give-up was unreachable and maintenance republished a running, billing
+    instance. The bound caps the damage; it is not a substitute for closing on an answer.
+
+    MUTATION: remove the _thaw_park from the `not healthy` branch -> the episode stays open.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    ticks = [1000.0]
+    healthy: list = [None]
+    rt, _ = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: ticks[0],
+                          hibernate_timeout_s=300.0)
+    rt._agent_healthy = lambda slot: healthy[0]
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    rt._park_since[slot.slot_id] = 1000.0
+    rt.maintain_idle(slot)                       # UNKNOWN agent -> freeze opens
+    assert slot.slot_id in rt._park_unknown_since, "sanity: the episode must open"
+
+    healthy[0] = False                           # now a DEFINITIVE answer: not warm yet
+    ticks[0] += 30.0
+    rt.maintain_idle(slot)
+
+    assert slot.slot_id not in rt._park_unknown_since, (
+        "a definitive agent answer left the freeze open; the give-up clock stays pinned to the "
+        "first UNKNOWN and a running, billing instance is republished forever"
+    )
+
+
+def test_a_stopped_instance_that_never_tried_to_hibernate_is_not_a_parked_slot():
+    """`stopped` was adopted as parked+ready unconditionally.
+
+    A failed boot, or an operator stopping the instance by hand, reaches `stopped` with no warmed
+    process ever captured. Adopting it advertises capacity that cannot serve, and a claim spends
+    the whole resume budget starting an instance whose agent was never up.
+
+    MUTATION: drop the `attempted` guard -> the slot is reported ready.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    rt, _ = _hibernate_rt(state=["stopped"], healthy=[True])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    assert slot.slot_id not in rt._park_since and slot.slot_id not in rt._hib_started
+
+    phase, ready = rt._park_step(slot, "stopped", 1000.0)
+    assert ready is not True, (
+        f"a stopped instance with no hibernation ever attempted was reported ready (phase={phase})"
+    )
+
+
+def test_a_partially_resumed_slot_restarts_the_give_up_clock():
+    """A slot that reached `parked` had _park_since POPPED.
+
+    Coming back RUNNING after a half-succeeded resume therefore left no clock at all, and if the
+    resumed agent stays unhealthy _park_step returns before _try_park is ever reached -- so nothing
+    starts one later either, and maintenance republishes a running, billing instance indefinitely.
+
+    MUTATION: remove the _park_since.setdefault from the re-drive branch -> no clock is started.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    rt, _ = _hibernate_rt(state=["running"], healthy=[True])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt._phase[slot.slot_id] = "parked"           # we believed it was hibernated
+    assert slot.slot_id not in rt._park_since, "parked slots have no give-up clock"
+
+    rt._park_step(slot, "running", 1000.0)       # ...but it is awake and billing
+
+    assert slot.slot_id in rt._park_since, (
+        "the re-drive started no give-up clock, so an instance whose agent never recovers is "
+        "republished forever with nothing able to retire it"
+    )
+
+
 def test_an_indefinite_freeze_still_expires():
     """The freeze must be BOUNDED, or it is worse than the drain it prevents.
 

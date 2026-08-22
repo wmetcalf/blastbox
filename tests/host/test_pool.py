@@ -3177,6 +3177,30 @@ def test_a_maintenance_retirement_whose_terminate_fails_is_retried_not_stranded(
     )
 
 
+def test_a_spawn_reaped_instead_of_published_leaves_no_marker_behind() -> None:
+    """A dropped spawn never enters _slots, so nothing that keys on "not in _slots" can clean it.
+
+    _forget_slot_health is only called for tracked slots and the sweeps skip untracked ids, so the
+    _never_ready marker for a slot that was reaped instead of published would live for the process
+    lifetime -- one UUID per discarded worker across repeated shutdown/resize races. Same leak
+    class as _suspected_unknown, and introduced in the same commit that fixed that one.
+
+    MUTATION: drop the discard from the reaped branch of _publish_or_reap_spawned -> the id stays.
+    """
+    pool = WarmPool(runtime=_FakeRuntime(), warm_size=1, spawn_rate_limit=100.0)
+    slot = pool._runtime.spawn()
+    pool._never_ready.add(slot.slot_id)          # as _spawn_to_deficit would have
+
+    pool._stop_event.set()                       # shutdown raced the in-flight spawn -> drop path
+    pool._publish_or_reap_spawned(slot, {})
+
+    assert slot.slot_id not in pool._slots, "sanity: the slot must have been dropped, not published"
+    assert slot.slot_id not in pool._never_ready, (
+        "the never-ready marker outlived a slot that never entered the pool; nothing sweeps "
+        "untracked ids, so it leaks one per discarded worker"
+    )
+
+
 def test_a_proven_slot_is_restored_to_idle_not_warming() -> None:
     """The undo path asks "has this slot ever been ready?" and briefly borrowed
     _warming_unknown_credit to answer it.

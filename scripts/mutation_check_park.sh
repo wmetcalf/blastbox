@@ -3,7 +3,18 @@
 # anything, is an ERROR -- never a surviving mutant. (An earlier harness reported SURVIVED for two
 # mutants it had never applied.)
 set -uo pipefail
-cd /home/coz/Downloads/blastbox
+# Resolve the repo from THIS SCRIPT's location, and abort if that fails. The first version
+# hardcoded one absolute path with no `set -e` and no check on the cd, so in any other checkout it
+# carried on against the CALLER's working directory -- a harness that rewrites source files and
+# reverts them from a snapshot, pointed at whatever repo you happened to be standing in. The
+# blast radius of that is worse than anything it was written to catch.
+REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd) || {
+  echo "mutation_check_park: cannot resolve the repository root" >&2; exit 2; }
+cd -- "$REPO" || { echo "mutation_check_park: cannot cd to $REPO" >&2; exit 2; }
+[ -f src/blastbox/host/runtime/aws_worker.py ] || {
+  echo "mutation_check_park: $REPO does not look like the blastbox checkout" >&2; exit 2; }
+[ -x .venv/bin/python ] || {
+  echo "mutation_check_park: $REPO/.venv/bin/python is missing" >&2; exit 2; }
 SNAP=$(mktemp -d)
 cp src/blastbox/host/pool.py src/blastbox/host/runtime/aws_worker.py "$SNAP/"
 restore() {

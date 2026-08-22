@@ -1997,8 +1997,23 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         if st in self._DEAD_STATES:
             return phase, False          # is_alive/_health_check reaps it
         if st == "stopped":
-            # Hibernated, whatever we believed. This is the lost-response case landing correctly:
-            # the stop DID take, so adopt reality rather than re-issuing it.
+            # Hibernated, whatever we believed -- but only if a hibernation was ever ATTEMPTED.
+            # Adopting `stopped` unconditionally treats any stopped instance as a parked warm slot,
+            # including one that never got that far: a failed boot, or an operator stopping it by
+            # hand. There is no warmed process captured in that image, so the pool advertises
+            # capacity that cannot serve, and a claim spends the whole resume budget starting an
+            # instance whose agent was never up. Require evidence: a phase we drove, a started
+            # hibernation, an open give-up episode, or an unresolved attempt.
+            attempted = (phase in ("hibernating", "parked")
+                         or sid in self._hib_started
+                         or sid in self._park_since
+                         or sid in self._park_unknown_since)
+            if not attempted:
+                _log.warning("ec2-hibernate: slot %s is 'stopped' with no hibernation ever "
+                             "attempted -- not a parked warm slot", sid)
+                return phase, False        # not ready; the health path judges it
+            # The lost-response case lands here correctly: the stop DID take, so adopt reality
+            # rather than re-issuing it.
             self._phase[sid] = "parked"
             self._hib_started.pop(sid, None)
             self._park_since.pop(sid, None)     # parked: the give-up clock is done
@@ -2046,6 +2061,14 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 # instance that keeps accepting the stop and waking up again cycle
                 # running -> stop -> running forever, never reaching the escape -- finding 2
                 # inverted, and a hole an existing test caught.
+                #
+                # ...but START it if it is not running. A slot that reached `parked` had
+                # _park_since POPPED, so coming back RUNNING after a partial resume left no clock
+                # at all: if the resumed agent then stays unhealthy, _park_step returns above
+                # before _try_park is ever reached, so no later path starts one either, and
+                # maintenance republishes a running, billing instance indefinitely. Setting it
+                # here starts the episode at the observation that opened it.
+                self._park_since.setdefault(sid, now)
                 return "warming", False      # observe once more before acting again
             if self._park_expired(sid, now):
                 _log.warning("ec2-hibernate: %s never parked after %.0fs -- giving up on it",
@@ -2057,13 +2080,18 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 # flattened it: the host failing to OPEN the health socket (correlated local fd
                 # exhaustion, for instance) says nothing about the worker, but read as "not warm
                 # yet" it kept aging the give-up clock until a healthy instance was retired. Same
-                # freeze as an unanswered stop -- an absent answer is not evidence. Bounded by
-                # _park_expired, which matters most here: this writer opens on a LOCAL condition
-                # that also returns before _try_park is reached, so nothing but the bound can
-                # close it.
+                # freeze as an unanswered stop -- an absent answer is not evidence.
                 self._freeze_park(sid, now)
                 return "warming", False
             if not healthy:
+                # A DEFINITIVE "not warm yet" closes the episode. Opening the freeze here without a
+                # closer left _park_expired pinned to the first UNKNOWN timestamp for good: an
+                # agent that went unknown once and was thereafter definitively unhealthy could
+                # never reach give-up, so maintenance republished a running, billing instance
+                # forever. The rule this whole branch runs on is "only SILENCE freezes"; the
+                # closer has to honour it too, or the rule only ever runs in one direction.
+                # (The bound in _park_expired caps the damage; it is not a substitute for closing.)
+                self._thaw_park(sid, now)
                 return "warming", False
             # Warmed -> PARK it: stop --hibernate. THROTTLED (the pool polls is_ready at ~10Hz) and
             # TOLERANT of "not ready to hibernate yet" -- the ec2-hibinit-agent needs ~1-2min after

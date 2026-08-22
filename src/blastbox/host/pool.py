@@ -2138,6 +2138,14 @@ class WarmPool:
             slot.state = SlotState.DRAINING
             with self._lock:
                 self._slots[slot.slot_id] = slot
+            return
+        # Successfully reaped and never published: the slot never enters _slots, so neither
+        # _forget_slot_health nor the sweeps (which key on "not in _slots") will ever see it, and
+        # its _never_ready marker would live for the process lifetime. Repeated shutdown/resize
+        # races therefore accumulate one UUID per discarded worker. Same leak class as
+        # _suspected_unknown -- introduced in the same commit that fixed that one.
+        with self._lock:
+            self._never_ready.discard(slot.slot_id)
 
     def _spawn_to_deficit(self, ready: bool = True, *,
                           expect_generation: int | None = None) -> None:
