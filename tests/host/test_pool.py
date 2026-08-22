@@ -3177,6 +3177,63 @@ def test_a_maintenance_retirement_whose_terminate_fails_is_retried_not_stranded(
     )
 
 
+def test_a_proven_slot_is_restored_to_idle_not_warming() -> None:
+    """The undo path asks "has this slot ever been ready?" and briefly borrowed
+    _warming_unknown_credit to answer it.
+
+    That dict is a timeout LEDGER with a different lifetime -- it survived promotion -- so it
+    silently became a permanent "was once warming-unknown" flag. A PROVEN, promoted, IDLE slot was
+    then restored to WARMING carrying its original spawned_at, which had already exceeded
+    warming_timeout_s; it was evicted on the next tick and charged as a CONFIRMED restore failure,
+    which feeds _maybe_rebuild_base and can discard a healthy snapshot base. Two questions, two
+    fields: _never_ready answers this one and is cleared on promotion.
+
+    Driven straight at _drain_deferred_reaps rather than through tick(). Two earlier attempts went
+    through the tick loop and were VACUOUS: the restore is immediately followed by a re-promotion,
+    so the state sampled afterwards is IDLE whatever the undo chose, and a mutation of BOTH halves
+    of the fix survived. The decision under test is one branch; test that branch.
+
+    MUTATION: key the restore on _warming_unknown_credit and stop clearing it at promotion ->
+    the proven slot comes back WARMING.
+    """
+    class _Unreapable(_FakeRuntime):
+        def reap(self, slot: Slot) -> None:
+            raise OSError("terminate-instances: throttled")
+
+    pool = WarmPool(runtime=_Unreapable(), warm_size=1, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    assert slot.slot_id in pool._never_ready, "a freshly spawned slot has never been ready"
+
+    # Promote it FOR REAL, so the clearing is exercised rather than simulated. The banked credit
+    # must go with it: it is WARMING-scoped, and leaving it behind is precisely what turned a
+    # timeout ledger into a permanent state-history flag.
+    pool._warming_unknown_credit[slot.slot_id] = 3.0
+    slot.state = SlotState.WARMING
+    pool._promote_warming()
+    assert slot.state == SlotState.IDLE, "sanity: the slot must have been promoted"
+    assert slot.slot_id not in pool._never_ready, (
+        "promotion did not clear the never-ready marker, so a proven slot still looks unproven")
+    assert slot.slot_id not in pool._warming_unknown_credit, (
+        "the WARMING-scoped credit outlived promotion; that is the lifetime bug that made it a "
+        "permanent 'was once warming-unknown' flag")
+    pool._warming_unknown_credit[slot.slot_id] = 3.0   # the stale entry the old code keyed on
+
+    # ...now escalated on suspicion and queued for disposal, which will fail.
+    slot.state = SlotState.DRAINING
+    pool._suspected_unknown.add(slot.slot_id)
+    pool._deferred_reap.add(slot.slot_id)
+
+    pool._drain_deferred_reaps()
+
+    cur = pool._slots.get(slot.slot_id)
+    assert cur is not None, "the failed disposal must leave the slot tracked"
+    assert cur.state == SlotState.IDLE, (
+        f"a slot that HAS been ready was restored to {cur.state} with a stale spawned_at; it trips "
+        f"the warming timeout on the next tick and is charged as a confirmed restore failure"
+    )
+
+
 def test_an_undone_disposal_does_not_publish_a_never_ready_slot_as_claimable() -> None:
     """The undo path restores a suspected slot to IDLE. Since expired warming-unknowns became
     `suspected`, that path can now apply to a slot which has NEVER passed is_ready().

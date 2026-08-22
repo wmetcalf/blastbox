@@ -110,6 +110,21 @@ _THROTTLE_AWS_MARKERS = (
     "slowdown",
     "provisionedthroughputexceeded",
     "serviceunavailable",              # 503: the service is down, not our entitlement
+    # Server-side timeouts. These arrived here late and the omission mattered more once this list
+    # started deciding AwsNoVerdict vs AwsUnknownState: a RequestTimeout fell through to the bare
+    # class, so `available()` read it as a DEFINITIVE unusable tier and _try_park read it as an
+    # ANSWERED refusal that advances the give-up clock -- both the opposite of what a timeout means.
+    # "We did not get an answer" is exactly this list's subject.
+    "requesttimeout",                  # RequestTimeout / RequestTimeoutException
+    "requesttimetooskewed",            # clock skew: retryable, says nothing about the resource
+    "internalerror",                   # 500 InternalError / InternalFailure
+    "internalfailure",
+    "serviceexception",                # generic 5xx service fault
+    "priorrequestnotcomplete",
+    "transientfailure",
+    "connectionerror",                 # botocore surfaces socket faults with this text
+    "could not connect to the endpoint url",
+    "endpointconnectionerror",
 )
 
 
@@ -1873,6 +1888,17 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             _log.info("ec2-hibernate: slot %s has a hibernate in flight -- not claimable this scan",
                       slot.slot_id)
             return None
+        if slot.slot_id in self._park_unknown_since:
+            # A park attempt we never got a verdict on. The LOST-RESPONSE case leaves the phase at
+            # "warming" (only a SUCCESSFUL stop advances it) and EC2 can still describe the
+            # instance as `running` for a window afterwards -- so both checks above pass and the
+            # slot is handed to a job that the accepted hibernation then suspends underneath.
+            # Unknown means unknown: not claimable until something answers. One-directional like
+            # the phase check, so a stale entry costs a skipped claim, never a bad claim, and the
+            # bound in _park_expired keeps it from costing that forever.
+            _log.info("ec2-hibernate: slot %s has an unresolved park attempt -- not claimable "
+                      "this scan", slot.slot_id)
+            return None
         # ONE scope around BOTH describes. _claim_probe_budget only mins against an OUTER LIVE
         # scope (`prev = getattr(self._tls, "probe_deadline", None)`); once a scope exits it
         # restores prev to None, so a second sibling scope computes a FRESH clock()+bound. An
@@ -1896,6 +1922,33 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
 
     _PARK_GIVE_UP = "give-up"
 
+    # ---- the give-up clock's no-verdict episode -------------------------------------------
+    #
+    # ONE opener and ONE closer, deliberately. This started as a single freeze in _try_park and
+    # grew to three writers (that site, the agent probe, is_ready's describe handler) and TWO
+    # closers that disagreed: the answered-stop closer credited the outage back, the `stopping`
+    # closer popped the freeze bare. So a brownout was charged in full to the episode whenever
+    # recovery observed `stopping` -- the HEALTHY state, meaning the hibernate was progressing --
+    # while a recovery observing `running` was forgiven. The failing state was pardoned and the
+    # succeeding one retired. A fourth spot fix would not have made three writers agree; a single
+    # pair does, by construction.
+
+    def _freeze_park(self, sid: str, now: float) -> None:
+        """Open a no-verdict episode: we asked and learned nothing about this slot's parking."""
+        self._park_unknown_since.setdefault(sid, now)
+
+    def _thaw_park(self, sid: str, now: float) -> None:
+        """Close it, crediting the unobservable interval back to the give-up clock.
+
+        Every recovery path goes through here, so they cannot drift apart again. Crediting is what
+        makes the freeze honest: hibernate_timeout_s asks "has this SLOT spent too long failing to
+        park?", and time in which the control plane would not answer is not time the slot spent
+        failing.
+        """
+        stalled = self._park_unknown_since.pop(sid, None)
+        if stalled is not None and sid in self._park_since:
+            self._park_since[sid] += max(0.0, now - stalled)
+
     def _park_expired(self, sid: str, now: float) -> bool:
         """Has this slot spent longer than hibernate_timeout_s trying to PARK, across all attempts?
 
@@ -1906,13 +1959,24 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         started = self._park_since.get(sid)
         if started is None:
             return False
-        # An OPEN no-verdict episode FREEZES the clock. hibernate_timeout_s asks "has this SLOT
-        # spent too long failing to park?", and a stop API that will not answer is not the slot
-        # failing -- so a brownout longer than the timeout must not retire the tier's whole healthy
-        # hibernate population. The freeze is closed by the next ANSWERED attempt, which credits
-        # the outage back into _park_since (see _park_step).
-        as_of = self._park_unknown_since.get(sid, now)
-        return (as_of - started) > self.cfg.hibernate_timeout_s
+        frozen_at = self._park_unknown_since.get(sid)
+        if frozen_at is None:
+            return (now - started) > self.cfg.hibernate_timeout_s
+        # An OPEN episode freezes the clock -- but BOUNDED, at one hibernate_timeout_s of frozen
+        # time. Unbounded, the freeze was closable only by an event it could itself suppress: the
+        # agent-probe writer opens on `_agent_healthy() is None`, and that same condition returns
+        # before _try_park is ever reached, so nothing could ever close it. Measured: 6.6 simulated
+        # hours, ONE stop-instances attempt, the slot never retired and the instance billing
+        # throughout. Ride out a brownout; do not ride out an outage -- the same trade
+        # _unknown_grace_s makes on the pool side.
+        # Expressed as a CREDIT, not as a capped `as_of`. The capped-as_of form was wrong at the
+        # boundary that matters most: a freeze opened AT the episode start gives
+        # as_of = started + timeout, so `as_of - started > timeout` is false by exactly one
+        # comparison and the clock never expires at all -- the unbounded bug, reintroduced by the
+        # bound meant to fix it. Crediting is also the same shape the pool uses for its own
+        # warming credit, so the two mechanisms now read alike.
+        credited = min(now - frozen_at, self.cfg.hibernate_timeout_s)
+        return (now - started - credited) > self.cfg.hibernate_timeout_s
 
     def _park_step(self, slot: AwsWorkerSlot, st: str, now: float) -> "tuple[str, bool | None]":
         """Advance the boot -> warm -> hibernate -> parked machine ONE step from an OBSERVED state.
@@ -1938,7 +2002,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             self._phase[sid] = "parked"
             self._hib_started.pop(sid, None)
             self._park_since.pop(sid, None)     # parked: the give-up clock is done
-            self._park_unknown_since.pop(sid, None)
+            self._park_unknown_since.pop(sid, None)   # episode over; nothing to credit it to
             return "parked", True
         if st == "stopping":
             # A hibernate is in flight -- possibly one whose response we lost, which is why the
@@ -1946,14 +2010,17 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             if phase != "hibernating":
                 self._phase[sid] = "hibernating"
             self._hib_started.setdefault(sid, now)
-            # Seeing 'stopping' IS the stop API answering: whatever we could not get a verdict on
-            # was in fact accepted. Close any open freeze, or a stop-API brownout would disable the
-            # stuck-in-'stopping' escape (issue #80 finding 2) for the rest of the episode.
-            self._park_unknown_since.pop(sid, None)
             # Start the episode clock from the OBSERVATION when we have none. The lost-response
             # case is precisely the one where we never recorded issuing the stop, so keying the
             # escape only on our own attempt record left exactly that case unable to ever expire.
             self._park_since.setdefault(sid, now)
+            # Seeing 'stopping' IS the stop API answering: whatever we could not get a verdict on
+            # was in fact accepted. Close the episode -- THROUGH _thaw_park, so the outage is
+            # credited exactly as the answered-stop path credits it. This used to be a bare pop,
+            # which charged the whole brownout to the give-up clock on the one observation that
+            # means the hibernate is SUCCEEDING. Ordered after the setdefault above so a lost-
+            # response episode has something to credit against.
+            self._thaw_park(sid, now)
             if self._park_expired(sid, now):
                 # AWS documents instances getting stuck in `stopping`. Without this escape the slot
                 # is unclaimable forever AND blocks its own replacement, so a warm_size=1 tier stays
@@ -1990,8 +2057,11 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 # flattened it: the host failing to OPEN the health socket (correlated local fd
                 # exhaustion, for instance) says nothing about the worker, but read as "not warm
                 # yet" it kept aging the give-up clock until a healthy instance was retired. Same
-                # freeze as an unanswered stop -- an absent answer is not evidence.
-                self._park_unknown_since.setdefault(sid, now)
+                # freeze as an unanswered stop -- an absent answer is not evidence. Bounded by
+                # _park_expired, which matters most here: this writer opens on a LOCAL condition
+                # that also returns before _try_park is reached, so nothing but the bound can
+                # close it.
+                self._freeze_park(sid, now)
                 return "warming", False
             if not healthy:
                 return "warming", False
@@ -2013,14 +2083,11 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 # freezing on THAT is the mirror bug: _park_since never starts, the give-up clock
                 # is frozen forever, the slot is republished every pass, and the instance runs and
                 # bills indefinitely. A refusal is a verdict; only silence is not.
-                self._park_unknown_since.setdefault(sid, now)
+                self._freeze_park(sid, now)
                 return self._phase.get(sid, "warming"), False
             if answered:
-                stalled = self._park_unknown_since.pop(sid, None)
-                if stalled is not None and sid in self._park_since:
-                    # AWS is talking to us again: credit the outage back, so the episode measures
-                    # the time this slot had a working stop API and still did not park.
-                    self._park_since[sid] += max(0.0, now - stalled)
+                # AWS is talking to us again.
+                self._thaw_park(sid, now)
                 self._park_since.setdefault(sid, now)
             return self._phase.get(sid, "warming"), False
         # pending / rebooting / anything else: still coming up.
@@ -2050,6 +2117,15 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 except AwsUnknownState as exc:
                     # We could not look. Change nothing -- acting on a guess here is how the
                     # bookkeeping got corrupted in the first place.
+                    #
+                    # ...but DO freeze the give-up clock, exactly as is_ready does. These are the
+                    # two drivers of ONE state machine against ONE control plane, and the freeze
+                    # was applied to only one of them: an IDLE slot's park clock aged straight
+                    # through a describe brownout and the first answered pass retired it. Measured
+                    # on the same 400s outage: is_ready path park_expired=False, maintain_idle path
+                    # park_expired=True and the slot retired.
+                    if isinstance(exc, AwsNoVerdict) and slot.slot_id in self._park_since:
+                        self._freeze_park(slot.slot_id, self._clock())
                     _log.debug("ec2-hibernate: maintain_idle(%s) unknown: %s", slot.slot_id, exc)
                     return True
                 phase, _ = self._park_step(slot, st, self._clock())
@@ -2091,7 +2167,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             # describe-instances answer AccessDenied -- a bare AwsUnknownState -- and freezing on
             # that would park the give-up clock forever while the instance runs and bills.
             if isinstance(exc, AwsNoVerdict) and slot.slot_id in self._park_since:
-                self._park_unknown_since.setdefault(slot.slot_id, self._clock())
+                self._freeze_park(slot.slot_id, self._clock())
             # A throttled describe tells us NOTHING about whether this instance booted, warmed, or
             # parked. Returning False here spent the 600s warming budget on the control plane's
             # silence and then terminated the instance (issue #79). The phase is left untouched, so

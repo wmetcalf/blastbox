@@ -460,6 +460,14 @@ class WarmPool:
         # Credit that unobservable time back, so the budget is spent on OBSERVATIONS, which is what
         # warming_timeout_s claims to measure (issue #79).
         self._warming_unknown_credit: dict[str, float] = {}
+        # Slots that have NEVER been promoted, i.e. never returned a ready verdict. A separate,
+        # single-meaning marker on purpose: the undo path needs "has this slot ever been ready?"
+        # and briefly borrowed _warming_unknown_credit for it. That dict is a timeout LEDGER with a
+        # different lifetime -- it survives promotion -- so it silently became a permanent
+        # "was once warming-unknown" flag, and a PROVEN idle slot was restored to WARMING with a
+        # stale spawned_at, tripping the warming timeout on the next tick and being charged as a
+        # CONFIRMED restore failure. Two questions, two fields.
+        self._never_ready: set[str] = set()
         # Rotation cursor + per-slot cooldown for _maintain_idle (issue #80 follow-up).
         self._maintain_cursor: "str | None" = None
         self._maintain_last: dict[str, float] = {}
@@ -1279,11 +1287,9 @@ class WarmPool:
                             # handed to a job before its agent or auth token is up, failing user
                             # jobs during the very recovery this restore exists to help. WARMING
                             # re-enters promotion and has to EARN idle by being ready.
-                            cur.state = (
-                                SlotState.WARMING
-                                if (slot.slot_id in self._warming_unknown_since
-                                    or slot.slot_id in self._warming_unknown_credit)
-                                else SlotState.IDLE)
+                            cur.state = (SlotState.WARMING
+                                         if slot.slot_id in self._never_ready
+                                         else SlotState.IDLE)
                             # REFUND: the demotion spent a token to evict this slot and we have
                             # just put it back, so the budget bought nothing. This is the path the
                             # deferred reaper takes, and it is the COMMON one during a brownout --
@@ -1863,6 +1869,12 @@ class WarmPool:
                     if slot.slot_id in self._slots and slot.state == SlotState.WARMING:
                         slot.state = SlotState.IDLE
                         newly_idle.append(slot.slot_id)
+                        # The slot has now been READY. Both of these are WARMING-scoped: the credit
+                        # exists only to offset the warming timeout, and leaving it behind turned a
+                        # timeout ledger into a permanent state-history flag that the undo path
+                        # then misread.
+                        self._never_ready.discard(slot.slot_id)
+                        self._warming_unknown_credit.pop(slot.slot_id, None)
                         # Promotion is EVIDENCE, not proof, so it does NOT clear the
                         # restore-failure streak. A poisoned snapshot can restore a process that
                         # survives long enough to pass is_ready() and then dies while IDLE:
@@ -2013,6 +2025,7 @@ class WarmPool:
                     continue        # a gate declined it; nothing was created
                 slot.state = SlotState.WARMING
                 slot.spawned_at = self._clock()
+                self._never_ready.add(slot.slot_id)   # cleared by the first ready promotion
                 record_slot_spawned()
                 spawned += 1
                 self._publish_or_reap_spawned(slot, gen_at_spawn)
@@ -2246,6 +2259,7 @@ class WarmPool:
                     self._capacity_starved_logged = False
                 slot.state = SlotState.WARMING
                 slot.spawned_at = self._clock()
+                self._never_ready.add(slot.slot_id)   # cleared by the first ready promotion
                 record_slot_spawned()
             except RuntimeAtCapacity as exc:
                 # NOT a restore failure, so it must NOT touch the streak. prepare() reports ready
@@ -2447,6 +2461,13 @@ class WarmPool:
         self._maintain_last.pop(slot_id, None)
         if self._maintain_cursor == slot_id:
             self._maintain_cursor = None
+        self._never_ready.discard(slot_id)
+        self._warming_unknown_credit.pop(slot_id, None)
+        # _suspected_unknown was the one new per-slot collection with neither a sweep nor an entry
+        # here: its only removals are inside _drain_deferred_reaps, which early-outs when the slot
+        # has already left _slots -- so stop(), which clears _deferred_reap and pops every slot,
+        # leaked one id per suspected slot. Ids are per-spawn UUIDs, so it grew without bound.
+        self._suspected_unknown.discard(slot_id)
         key = self._health_key_by_slot.pop(slot_id, slot_id)
         if key == slot_id:
             self._slot_failures.pop(slot_id, None)
@@ -3161,11 +3182,9 @@ class WarmPool:
                             # handed to a job before its agent or auth token is up, failing user
                             # jobs during the very recovery this restore exists to help. WARMING
                             # re-enters promotion and has to EARN idle by being ready.
-                            cur.state = (
-                                SlotState.WARMING
-                                if (slot.slot_id in self._warming_unknown_since
-                                    or slot.slot_id in self._warming_unknown_credit)
-                                else SlotState.IDLE)
+                            cur.state = (SlotState.WARMING
+                                         if slot.slot_id in self._never_ready
+                                         else SlotState.IDLE)
                             # REFUND the token. The demotion spent one to evict this slot, and we
                             # have just put it back -- so the budget paid for nothing. During a
                             # brownout every disposal goes through the same unresponsive control

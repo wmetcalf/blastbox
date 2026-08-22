@@ -3127,6 +3127,37 @@ def test_a_definitive_park_refusal_is_not_frozen_like_a_brownout():
     )
 
 
+def test_the_maintenance_door_freezes_the_park_clock_too():
+    """is_ready and maintain_idle drive the SAME state machine against the SAME control plane.
+
+    The freeze was applied to one of them. An IDLE slot's park clock therefore aged straight
+    through a describe brownout on the maintenance path, and the first answered pass retired it --
+    measured on one 400s outage: is_ready path park_expired=False, maintain_idle path
+    park_expired=True, slot retired.
+
+    MUTATION: remove the _freeze_park call from maintain_idle's handler -> the clock ages and the
+    slot is given up on.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    ticks = [1000.0]
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: ticks[0],
+                             hibernate_timeout_s=120.0)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt.maintain_idle(slot)                       # starts the episode
+    assert slot.slot_id in rt._park_since
+
+    fake.responses["ec2 describe-instances"] = lambda argv: _cp(
+        rc=254, stderr="An error occurred (RequestLimitExceeded) when calling DescribeInstances")
+    for _ in range(8):                           # 240s of brownout, driven ONLY through maintain_idle
+        rt.maintain_idle(slot)
+        ticks[0] += 30.0
+
+    assert slot.slot_id in rt._park_unknown_since, (
+        "the maintenance door never opened a no-verdict episode, so the give-up clock aged through "
+        "an outage in which nothing was learned about the slot"
+    )
+
+
 def test_a_describe_brownout_does_not_age_the_park_clock():
     """The freeze has to cover BOTH doors. _park_step is never reached when the describe itself is
     unanswered, so the independent hibernation timer kept running through a describe brownout: an
@@ -3148,7 +3179,12 @@ def test_a_describe_brownout_does_not_age_the_park_clock():
 
     fake.responses["ec2 describe-instances"] = lambda argv: _cp(
         rc=254, stderr="An error occurred (RequestLimitExceeded) when calling DescribeInstances")
-    for _ in range(8):                        # 240s of describe brownout > hibernate_timeout_s
+    # 90s of brownout. Deliberately INSIDE the freeze's bound (one hibernate_timeout_s of frozen
+    # time): the freeze absorbs a brownout, it does not absorb an outage. An earlier version ran
+    # 240s here and started failing the moment the bound was added -- correctly, because 120s
+    # elapsed plus 120s frozen is the whole allowance. The unbounded case is pinned separately by
+    # test_an_indefinite_freeze_still_expires.
+    for _ in range(3):
         rt.is_ready(slot)
         ticks[0] += 30.0
 
@@ -3201,6 +3237,118 @@ def test_a_slow_stop_call_is_not_re_issued_the_instant_it_returns():
         f"{len(calls)} stop-instances calls in {ticks[0] - 1000.0:.0f}s against a 5s throttle: a "
         f"call that outruns its own interval is eligible the moment it returns"
     )
+
+
+def test_recovery_observing_stopping_credits_the_brownout_like_every_other_closer():
+    """The two closers of the freeze disagreed, and the disagreement was inverted.
+
+    The answered-stop closer credited the outage back to the give-up clock; the `stopping` closer
+    popped the freeze bare, charging the whole brownout to the episode. `stopping` is the HEALTHY
+    observation -- the hibernate is in flight and progressing -- so recovery on `running` was
+    forgiven while recovery on `stopping` retired the slot. The failing state pardoned, the
+    succeeding one convicted. One _thaw_park is the fix.
+
+    MUTATION: replace the _thaw_park call in the `stopping` branch with a bare pop -> the episode
+    is charged the full outage and this gives up.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    ticks = [1000.0]
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: ticks[0],
+                             hibernate_timeout_s=300.0)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    rt.maintain_idle(slot)                       # accepted stop -> _park_since starts
+    assert slot.slot_id in rt._park_since
+
+    fake.responses["ec2 describe-instances"] = lambda argv: _cp(
+        rc=254, stderr="An error occurred (RequestLimitExceeded) when calling DescribeInstances")
+    for _ in range(14):                          # 420s > hibernate_timeout_s, all unanswered
+        rt.is_ready(slot)
+        ticks[0] += 30.0
+
+    # AWS answers again, and what it says is `stopping`: the hibernate WAS accepted.
+    fake.responses["ec2 describe-instances"] = lambda argv: _cp(stdout=json.dumps(
+        {"Reservations": [{"Instances": [
+            {"InstanceId": "i-1", "State": {"Name": "stopping"}, "PrivateIpAddress": "10.0.0.5"}]}]}))
+    assert rt.maintain_idle(slot) is not False, (
+        "a slot whose hibernate was PROGRESSING was retired on recovery: the brownout was charged "
+        "to the give-up clock because this closer did not credit it"
+    )
+
+
+def test_an_indefinite_freeze_still_expires():
+    """The freeze must be BOUNDED, or it is worse than the drain it prevents.
+
+    Unbounded, it was closable only by an event it could itself suppress: the agent-probe writer
+    opens on `_agent_healthy() is None`, and that same condition returns before _try_park is ever
+    reached, so nothing could close it. Measured before the bound: 6.6 simulated hours, ONE
+    stop-instances attempt, the slot never retired and a RUNNING instance billing throughout.
+    Ride out a brownout; do not ride out an outage.
+
+    MUTATION: drop the min(now, frozen_at + hibernate_timeout_s) cap -> the clock is frozen at the
+    episode start forever and the slot never gives up.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    ticks = [1000.0]
+    rt, _ = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: ticks[0],
+                          hibernate_timeout_s=300.0)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    rt._park_since[slot.slot_id] = 1000.0
+    rt._freeze_park(slot.slot_id, 1000.0)        # and nothing will ever close it
+    ticks[0] += 24 * 3600.0                      # a day of frozen time
+
+    assert rt._park_expired(slot.slot_id, ticks[0]), (
+        "the give-up clock was suppressed for a full day; hibernate_timeout_s is unreachable and "
+        "the instance bills forever"
+    )
+
+
+def test_an_unresolved_park_attempt_makes_the_slot_unclaimable():
+    """A lost `stop-instances` response leaves the phase at "warming" -- only a SUCCESSFUL stop
+    advances it -- and EC2 can still describe the instance as `running` for a window afterwards.
+
+    So both existing claim-gate checks pass and the slot is handed to a job that the accepted
+    hibernation then suspends underneath it: the original #80 hazard, reopened by the freeze.
+
+    MUTATION: drop the _park_unknown_since check from is_alive_for_claim -> the slot is authorised.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    rt, _ = _hibernate_rt(state=["running"], healthy=[True])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1", state=SlotState.IDLE,
+                         url="http://10.0.0.5:8080")
+    rt._freeze_park(slot.slot_id, 1000.0)        # a stop we never got a verdict on
+    assert rt._phase.get(slot.slot_id) != "hibernating", "the lost-response case: phase unchanged"
+
+    assert rt.is_alive_for_claim(slot, budget_s=5.0) is None, (
+        "a slot with an unresolved park attempt was reported claimable; if that stop was in fact "
+        "accepted, the instance suspends mid-job"
+    )
+
+
+def test_a_server_side_timeout_is_a_non_answer_not_a_refusal():
+    """The AwsNoVerdict boundary was drawn on a throttle-marker list that omitted timeouts.
+
+    RequestTimeout fell through to bare AwsUnknownState, so `available()` read it as a DEFINITIVE
+    unusable tier and _try_park read it as an ANSWERED refusal that advances the give-up clock --
+    both the opposite of what a timeout means. Narrowing the class without widening this list made
+    real transients worse.
+
+    MUTATION: drop the timeout markers -> the timeout is classified definitive and this fails.
+    """
+    from blastbox.host.runtime.aws_worker import AwsNoVerdict, _is_throttle_aws_error
+    for stderr in (
+        "An error occurred (RequestTimeout) when calling the StopInstances operation",
+        "An error occurred (RequestTimeoutException) when calling the GetMicrovm operation",
+        "An error occurred (InternalError) when calling the DescribeInstances operation",
+        "Could not connect to the endpoint URL: https://ec2.us-east-1.amazonaws.com/",
+    ):
+        assert _is_throttle_aws_error(stderr), f"classified as a definitive answer: {stderr[:60]}"
+
+    # ...and AccessDenied must STAY definitive; that is the whole point of the boundary.
+    assert not _is_throttle_aws_error(
+        "An error occurred (AccessDenied) when calling the StopInstances operation")
+    assert issubclass(AwsNoVerdict, AwsUnknownState)
 
 
 def test_a_stop_api_brownout_does_not_drain_the_hibernate_tier():
