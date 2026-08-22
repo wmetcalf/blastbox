@@ -1729,6 +1729,10 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # slot_id -> when the stop API last stopped ANSWERING. While this is set the give-up clock
         # above is frozen: a brownout is the control plane failing, not the slot failing to park.
         self._park_unknown_since: dict[str, float] = {}
+        # slot_id -> seconds already banked from CLOSED no-verdict episodes. Kept separate from
+        # _park_since so that stays a FACT (when parking first began) rather than a running total
+        # that can be pushed into the future; the cap is applied to this ledger in _park_expired.
+        self._park_credit: dict[str, float] = {}
 
     def _service_available(self) -> bool:
         # fail LOUD (once, at pool build) on a hibernation-incapable config instead of churning
@@ -1938,16 +1942,34 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         self._park_unknown_since.setdefault(sid, now)
 
     def _thaw_park(self, sid: str, now: float) -> None:
-        """Close it, crediting the unobservable interval back to the give-up clock.
+        """Close it, banking the unobservable interval in the CREDIT LEDGER.
 
         Every recovery path goes through here, so they cannot drift apart again. Crediting is what
         makes the freeze honest: hibernate_timeout_s asks "has this SLOT spent too long failing to
         park?", and time in which the control plane would not answer is not time the slot spent
         failing.
+
+        Banked, NOT applied to _park_since. Shifting the origin forward was wrong twice over:
+
+          * UNBOUNDED. _park_expired caps a LIVE freeze, so the cap only ever governed an OPEN
+            episode; closing one added the whole interval with no cap at all. A partial brownout --
+            silence broken by one answered pass every so often -- therefore reset the effective age
+            on every cycle. Measured: 6.9h of wall clock, effective age pinned at 5s, the slot never
+            retired and the instance billing throughout. That is precisely the failure the cap was
+            introduced to end, re-entered through the closer instead of the opener.
+          * ORDER-DEPENDENT. It only worked if _park_since already existed, so the two closers had
+            to disagree about whether to setdefault first -- and the `stopping` one credited against
+            a clock it had created in the same breath, landing _park_since in the FUTURE by the
+            length of the outage (measured: the give-up escape fired at 7510s instead of 310s, and
+            logged "stuck for 310s" while doing it). I had written a comment calling that ordering
+            deliberate.
+
+        A ledger has neither problem: _park_since stays a FACT that never moves, and the cap is
+        applied once, to the total, in _park_expired.
         """
         stalled = self._park_unknown_since.pop(sid, None)
-        if stalled is not None and sid in self._park_since:
-            self._park_since[sid] += max(0.0, now - stalled)
+        if stalled is not None:
+            self._park_credit[sid] = self._park_credit.get(sid, 0.0) + max(0.0, now - stalled)
 
     def _park_expired(self, sid: str, now: float) -> bool:
         """Has this slot spent longer than hibernate_timeout_s trying to PARK, across all attempts?
@@ -1959,23 +1981,15 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         started = self._park_since.get(sid)
         if started is None:
             return False
+        # ONE cap, applied ONCE, to the TOTAL: banked credit from closed episodes plus whatever a
+        # currently-open one has accrued. Capping only the OPEN episode was the hole -- closing one
+        # banked its whole interval uncapped, so a partial brownout (silence, one answered pass,
+        # repeat) reset the effective age every cycle and the give-up escape never fired: 6.9h of
+        # wall clock with the age pinned at 5s. Ride out a brownout; do not ride out an outage.
+        # This is the same shape the pool uses for _warming_unknown_credit_s, deliberately.
         frozen_at = self._park_unknown_since.get(sid)
-        if frozen_at is None:
-            return (now - started) > self.cfg.hibernate_timeout_s
-        # An OPEN episode freezes the clock -- but BOUNDED, at one hibernate_timeout_s of frozen
-        # time. Unbounded, the freeze was closable only by an event it could itself suppress: the
-        # agent-probe writer opens on `_agent_healthy() is None`, and that same condition returns
-        # before _try_park is ever reached, so nothing could ever close it. Measured: 6.6 simulated
-        # hours, ONE stop-instances attempt, the slot never retired and the instance billing
-        # throughout. Ride out a brownout; do not ride out an outage -- the same trade
-        # _unknown_grace_s makes on the pool side.
-        # Expressed as a CREDIT, not as a capped `as_of`. The capped-as_of form was wrong at the
-        # boundary that matters most: a freeze opened AT the episode start gives
-        # as_of = started + timeout, so `as_of - started > timeout` is false by exactly one
-        # comparison and the clock never expires at all -- the unbounded bug, reintroduced by the
-        # bound meant to fix it. Crediting is also the same shape the pool uses for its own
-        # warming credit, so the two mechanisms now read alike.
-        credited = min(now - frozen_at, self.cfg.hibernate_timeout_s)
+        live = max(0.0, now - frozen_at) if frozen_at is not None else 0.0
+        credited = min(self._park_credit.get(sid, 0.0) + live, self.cfg.hibernate_timeout_s)
         return (now - started - credited) > self.cfg.hibernate_timeout_s
 
     def _park_step(self, slot: AwsWorkerSlot, st: str, now: float) -> "tuple[str, bool | None]":
@@ -2018,6 +2032,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             self._hib_started.pop(sid, None)
             self._park_since.pop(sid, None)     # parked: the give-up clock is done
             self._park_unknown_since.pop(sid, None)   # episode over; nothing to credit it to
+            self._park_credit.pop(sid, None)
             return "parked", True
         if st == "stopping":
             # A hibernate is in flight -- possibly one whose response we lost, which is why the
@@ -2033,8 +2048,14 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             # was in fact accepted. Close the episode -- THROUGH _thaw_park, so the outage is
             # credited exactly as the answered-stop path credits it. This used to be a bare pop,
             # which charged the whole brownout to the give-up clock on the one observation that
-            # means the hibernate is SUCCEEDING. Ordered after the setdefault above so a lost-
-            # response episode has something to credit against.
+            # means the hibernate is SUCCEEDING.
+            #
+            # Order no longer matters here. It used to, and the comment that lived on this line
+            # asserted the ordering was deliberate -- "ordered after the setdefault so a
+            # lost-response episode has something to credit against". That was the bug written down
+            # as intent: crediting an interval to a clock that did not exist during it put
+            # _park_since in the FUTURE by the whole outage, and the escape fired at 7510s instead
+            # of 310s while logging "stuck for 310s". The ledger removed the dependency entirely.
             self._thaw_park(sid, now)
             if self._park_expired(sid, now):
                 # AWS documents instances getting stuck in `stopping`. Without this escape the slot
@@ -2356,7 +2377,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
 
     def reap(self, slot: AwsWorkerSlot) -> None:
         for d in (self._phase, self._desc_cache, self._hib_attempt, self._hib_started,
-                  self._park_since, self._park_unknown_since):
+                  self._park_since, self._park_unknown_since, self._park_credit):
             d.pop(slot.slot_id, None)
         super().reap(slot)   # terminate-instances (disposable after one untrusted job)
 

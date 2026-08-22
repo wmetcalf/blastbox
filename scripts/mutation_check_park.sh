@@ -37,7 +37,7 @@ P=tests/host/test_pool.py
 
 mut "stopping closer stops crediting" '
 import pathlib;p=pathlib.Path("src/blastbox/host/runtime/aws_worker.py");s=p.read_text()
-o="""            # response episode has something to credit against.
+o="""            # of 310s while logging "stuck for 310s". The ledger removed the dependency entirely.
             self._thaw_park(sid, now)"""
 assert s.count(o)==1
 p.write_text(s.replace(o,"            self._park_unknown_since.pop(sid, None)",1))
@@ -67,9 +67,9 @@ p.write_text(s.replace(o,"                    pass",1))
 
 mut "freeze becomes unbounded again" '
 import pathlib;p=pathlib.Path("src/blastbox/host/runtime/aws_worker.py");s=p.read_text()
-o="        credited = min(now - frozen_at, self.cfg.hibernate_timeout_s)"
+o="        credited = min(self._park_credit.get(sid, 0.0) + live, self.cfg.hibernate_timeout_s)"
 assert s.count(o)==1
-p.write_text(s.replace(o,"        credited = now - frozen_at",1))
+p.write_text(s.replace(o,"        credited = self._park_credit.get(sid, 0.0) + live",1))
 ' "$T::test_an_indefinite_freeze_still_expires"
 
 mut "restore uses the credit ledger again" '
@@ -81,7 +81,8 @@ p.write_text(s.replace(o,"                                         if slot.slot_
 
 mut "promotion stops clearing never_ready" '
 import pathlib;p=pathlib.Path("src/blastbox/host/pool.py");s=p.read_text()
-o="                        self._never_ready.discard(slot.slot_id)"
+o="""                        self._never_ready.discard(slot.slot_id)
+                        self._warming_unknown_credit.pop(slot.slot_id, None)"""
 assert s.count(o)==1
-p.write_text(s.replace(o,"                        pass",1))
+p.write_text(s.replace(o,"                        self._warming_unknown_credit.pop(slot.slot_id, None)",1))
 ' "$P::test_a_proven_slot_is_restored_to_idle_not_warming"

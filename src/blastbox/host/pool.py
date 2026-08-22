@@ -2342,6 +2342,15 @@ class WarmPool:
                     slot.state = SlotState.DRAINING
                     with self._lock:
                         self._slots[slot.slot_id] = slot
+                else:
+                    # Reaped and never published: nothing keyed on "not in _slots" can ever see it,
+                    # so the marker would live for the process lifetime. The SAME discard was added
+                    # to _publish_or_reap_spawned -- and only there, which is the CONCURRENT path.
+                    # This is the serial one, entered whenever spawn_concurrency == 1, i.e. the
+                    # default and the one that actually ships. Fixing the sibling and not this is
+                    # the missing-companion-change shape in its purest form.
+                    with self._lock:
+                        self._never_ready.discard(slot.slot_id)
                 break
 
     def _effective_target_unlocked(self) -> int:

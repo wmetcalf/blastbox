@@ -3351,6 +3351,67 @@ def test_a_partially_resumed_slot_restarts_the_give_up_clock():
     )
 
 
+def test_repeated_brownouts_cannot_reset_the_give_up_clock():
+    """The cap has to govern the TOTAL, not just an open episode.
+
+    _park_expired capped a LIVE freeze, so closing one banked its whole interval uncapped. A
+    partial brownout -- silence broken by one answered pass -- therefore moved the clock's origin
+    forward every cycle and the effective age never grew. Measured before the ledger: 6.9h of wall
+    clock with the age pinned at 5s, the slot never retired, the instance billing throughout. That
+    is the same failure the cap was added to end, re-entered through the closer.
+
+    MUTATION: bank into _park_since instead of the capped ledger -> the age resets every cycle and
+    give-up never fires.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    ticks = [1000.0]
+    rt, _ = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: ticks[0],
+                          hibernate_timeout_s=300.0)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt._park_since[slot.slot_id] = 1000.0
+
+    # 20 cycles of "500s of silence, then one answered pass". Each answered pass is a DEFINITIVE
+    # observation that the slot is still failing to park.
+    for _ in range(20):
+        rt._freeze_park(slot.slot_id, ticks[0])
+        ticks[0] += 500.0
+        rt._thaw_park(slot.slot_id, ticks[0])
+        ticks[0] += 5.0
+
+    assert rt._park_expired(slot.slot_id, ticks[0]), (
+        f"after {ticks[0] - 1000.0:.0f}s of wall clock against a 300s budget the slot still has "
+        f"not reached give-up: each closed brownout credited uncapped, so the age resets forever"
+    )
+
+
+def test_crediting_never_puts_the_park_clock_in_the_future():
+    """_park_since must stay a FACT: when parking began.
+
+    The `stopping` closer used to credit against a clock it created in the same breath -- the
+    lost-response case has no clock, so setdefault(now) then += (now - stalled) landed _park_since
+    in the FUTURE by the whole outage. Measured: the give-up escape fired at 7510s instead of 310s,
+    and logged "stuck for 310s" while doing it. A future-dated origin also poisons every later
+    freeze, since `now - started - credited` goes permanently negative.
+
+    MUTATION: have _thaw_park do `self._park_since[sid] += ...` -> the clock jumps ahead.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    rt, _ = _hibernate_rt(state=["stopping"], healthy=[True], hibernate_timeout_s=300.0)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    rt._freeze_park(slot.slot_id, 1000.0)        # a stop with no verdict, and NO _park_since
+    assert slot.slot_id not in rt._park_since, "the lost-response case starts with no clock"
+
+    now = 8200.0                                 # 7200s later, AWS finally answers 'stopping'
+    rt._park_step(slot, "stopping", now)
+
+    started = rt._park_since.get(slot.slot_id)
+    assert started is not None and started <= now, (
+        f"_park_since={started} is in the future relative to now={now}; the escape cannot fire "
+        f"until wall-clock catches up, and every later freeze computes a negative age"
+    )
+
+
 def test_an_indefinite_freeze_still_expires():
     """The freeze must be BOUNDED, or it is worse than the drain it prevents.
 
