@@ -27,6 +27,7 @@ Design notes:
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import os
@@ -1733,6 +1734,12 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # _park_since so that stays a FACT (when parking first began) rather than a running total
         # that can be pushed into the future; the cap is applied to this ledger in _park_expired.
         self._park_credit: dict[str, float] = {}
+        # Slot ids this runtime has already reaped. Disposal runs on the pool's dedicated reaper
+        # threads while is_ready / maintain_idle drive the park machine on the tick thread, so a
+        # write that started before the reap can land after it and RESURRECT per-slot entries for a
+        # slot that is gone -- ids are per-spawn UUIDs, so those never come back. Bounded by
+        # construction: capped, FIFO, and only ever consulted to suppress a late write.
+        self._reaped_ids: "collections.OrderedDict[str, None]" = collections.OrderedDict()
 
     def _service_available(self) -> bool:
         # fail LOUD (once, at pool build) on a hibernation-incapable config instead of churning
@@ -1937,8 +1944,16 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
     # succeeding one retired. A fourth spot fix would not have made three writers agree; a single
     # pair does, by construction.
 
+    _REAPED_IDS_MAX = 4096
+
+    def _slot_is_gone(self, sid: str) -> bool:
+        """True once this runtime has reaped ``sid`` -- so a late write must not re-create it."""
+        return sid in self._reaped_ids
+
     def _freeze_park(self, sid: str, now: float) -> None:
         """Open a no-verdict episode: we asked and learned nothing about this slot's parking."""
+        if self._slot_is_gone(sid):
+            return
         self._park_unknown_since.setdefault(sid, now)
 
     def _thaw_park(self, sid: str, now: float) -> None:
@@ -1968,7 +1983,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         applied once, to the total, in _park_expired.
         """
         stalled = self._park_unknown_since.pop(sid, None)
-        if stalled is not None:
+        if stalled is not None and not self._slot_is_gone(sid):
             self._park_credit[sid] = self._park_credit.get(sid, 0.0) + max(0.0, now - stalled)
 
     def _park_expired(self, sid: str, now: float) -> bool:
@@ -2412,6 +2427,11 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         for d in (self._phase, self._desc_cache, self._hib_attempt, self._hib_started,
                   self._park_since, self._park_unknown_since, self._park_credit):
             d.pop(slot.slot_id, None)
+        # Tombstone it, so a park write already in flight on the tick thread cannot re-create the
+        # entries this just removed. Capped and FIFO: the set is a leak-suppressor, not a ledger.
+        self._reaped_ids[slot.slot_id] = None
+        while len(self._reaped_ids) > self._REAPED_IDS_MAX:
+            self._reaped_ids.popitem(last=False)
 
     def sweep_orphans(self, *, max_age_s: float | None = None, now: float | None = None,
                       dry_run: bool = False) -> list[str]:

@@ -301,7 +301,7 @@ class CascadingRuntime:
         # the pool's own (slightly later) global repair decision; a successful spawn clears them.
         self._recently_guilty: set[int] = set()
 
-    def _admit_deferred(self) -> None:
+    def _admit_deferred(self) -> int:
         """Re-probe tiers whose availability was UNDECIDED at startup and admit the ones that answer.
 
         APPEND-ONLY, deliberately. ``_tier_identity`` is ``f"{name}#{idx}"``, so inserting a tier at
@@ -311,13 +311,14 @@ class CascadingRuntime:
 
         Rate-limited: the probe is an STS round trip, and spawn() is on the pool's tick thread.
         """
+        admitted_count = 0
         with self._lock:
             if not self._deferred:
-                return
+                return 0
             now = self._clock()
             if self._last_admit_attempt is not None and \
                     (now - self._last_admit_attempt) < self._admit_retry_s:
-                return
+                return 0
             # Provisional stamp: keeps a CONCURRENT caller out while this probe runs. The
             # authoritative stamp is taken AFTER the probes return, below.
             self._last_admit_attempt = now
@@ -361,6 +362,7 @@ class CascadingRuntime:
                     continue
                 self.tiers.append(Tier(name=d.name, runtime=rt, capacity=d.capacity))
                 self._admitted_deferred.add(d.pos)
+                admitted_count += 1
                 self._counts.append(0)
                 self._tier_failures.append(0)
             _log.info("cascade: deferred tier %r became available -- admitted at position %d "
@@ -376,14 +378,39 @@ class CascadingRuntime:
             self._last_admit_attempt = self._clock()
             # Keep only entries still undecided AND not admitted by a racing caller.
             self._deferred = [x for x in still if x.pos not in self._admitted_deferred]
+        return admitted_count
 
     # -- SlotRuntime protocol ----------------------------------------------
     def spawn(self) -> Any:
-        # Give an undecided tier a chance to join before we declare the cascade exhausted. Cheap:
-        # rate-limited to one probe per _admit_retry_s, and a no-op once nothing is deferred.
-        self._admit_deferred()
+        """Spawn on the first tier that can take it, admitting a recovered tier only if none can.
+
+        _admit_deferred used to run FIRST, on every spawn. It is rate-limited, but the probe itself
+        is a synchronous availability check that can burn full cloud CLI timeouts -- and spawn()
+        runs on the pool's sole maintenance thread. So a deferred AWS tier that stays unreachable
+        delayed every spawn from perfectly healthy local tiers, for the duration of the outage.
+        The deferred tier is the OVERFLOW; paying for it before trying the primary inverts the
+        cascade's whole ordering. Now it is only probed once the admitted tiers cannot serve, which
+        is exactly when a new one would help.
+        """
+        try:
+            return self._spawn_from_admitted()
+        except (CascadeExhausted, CascadeSpawnFailed):
+            with self._lock:
+                if not self._deferred:
+                    raise
+                before = len(self.tiers)
+            if self._admit_deferred() <= 0:
+                raise                      # nothing joined; the original verdict stands
+            # Retry ONLY the newly admitted tiers. Re-running the whole list would re-attempt the
+            # ones that just failed and charge their per-tier failure streaks a second time for a
+            # single spawn -- and those streaks drive base invalidation.
+            return self._spawn_from_admitted(start=before)
+
+    def _spawn_from_admitted(self, start: int = 0) -> Any:
         last_exc: Exception | None = None
         for i, tier in enumerate(self.tiers):
+            if i < start:
+                continue
             with self._lock:
                 if self._counts[i] >= tier.capacity:
                     continue

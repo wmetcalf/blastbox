@@ -3352,6 +3352,50 @@ def test_a_partially_resumed_slot_restarts_the_give_up_clock():
     )
 
 
+def test_a_write_racing_a_reap_cannot_resurrect_a_departed_slot():
+    """Disposal runs on the pool's dedicated reaper threads; the park machine runs on the tick
+    thread. A write that started before the reap can therefore land after it.
+
+    Slot ids are per-spawn UUIDs, so anything re-created that way is never removed again -- the
+    per-slot dicts grow for the process lifetime on a disposable tier. Bounded FIFO tombstones
+    suppress the late write instead.
+
+    MUTATION: drop the _slot_is_gone guards -> the freeze re-creates an entry for a reaped slot.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    rt, fake = _hibernate_rt(state=["stopped"], healthy=[True])
+    fake.responses["ec2 terminate-instances"] = {}   # the reap must SUCCEED for a tombstone
+    slot = AwsWorkerSlot(slot_id="ghost", resource_id="i-1")
+    rt._park_since[slot.slot_id] = 1000.0
+
+    rt.reap(slot)                                  # reaper thread disposes of it
+    assert slot.slot_id not in rt._park_since, "sanity: reap clears the per-slot state"
+
+    rt._freeze_park(slot.slot_id, 2000.0)          # a tick-thread write already in flight
+    # Checked HERE as well as at the end: _thaw_park pops what _freeze_park created, so asserting
+    # only after both runs lets a broken freeze hide behind a working thaw -- which is exactly how
+    # the first version of this test survived its own mutant.
+    assert slot.slot_id not in rt._park_unknown_since, (
+        "_freeze_park re-created an episode for a slot that has already been reaped")
+
+    rt._thaw_park(slot.slot_id, 2100.0)
+
+    # And the other interleaving, which the freeze guard cannot cover: the thaw had ALREADY read
+    # the open episode when the reap landed, so it arrives holding a real `stalled` value and would
+    # bank credit for a slot that is gone. Simulated by putting the entry back, since reproducing
+    # the true interleaving needs two threads.
+    rt._park_unknown_since[slot.slot_id] = 2000.0
+    rt._thaw_park(slot.slot_id, 2200.0)
+
+    leaked = [name for name, d in (("_park_unknown_since", rt._park_unknown_since),
+                                   ("_park_credit", rt._park_credit))
+              if slot.slot_id in d]
+    assert not leaked, (
+        f"a write that raced the reap re-created {leaked} for a slot that no longer exists; the "
+        f"id is a per-spawn UUID, so nothing will ever remove it again"
+    )
+
+
 def test_a_no_verdict_stop_is_unknown_to_the_pool_too():
     """The tri-state has to be honoured on the way OUT, not just on the way in.
 

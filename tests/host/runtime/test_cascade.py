@@ -877,6 +877,44 @@ def test_two_deferred_entries_of_the_same_backend_are_both_admitted(monkeypatch)
     assert not rt._deferred, "both entries were admitted, so nothing should remain deferred"
 
 
+def test_a_slow_deferred_probe_does_not_delay_a_spawn_the_primary_can_serve(monkeypatch):
+    """_admit_deferred used to run FIRST, on every spawn.
+
+    It is rate-limited, but the probe itself is a synchronous availability check that can burn full
+    cloud CLI timeouts -- and spawn() runs on the pool's sole maintenance thread. So a deferred AWS
+    tier that stays unreachable delayed every spawn from perfectly healthy LOCAL tiers, for the
+    duration of the outage. Paying for the overflow before trying the primary inverts the cascade's
+    entire ordering.
+
+    MUTATION: call _admit_deferred() at the top of spawn() again -> the probe runs and this fails.
+    """
+    from blastbox.host import pool_config
+
+    probes: list = []
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):
+        if name == "aws-ec2":
+            if require_available:
+                probes.append(1)
+                raise AwsProbeTimeout("sts: timed out")     # a SLOW, unreachable overflow tier
+            return FakeRuntime(name)
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
+    rt._admit_retry_s = 0.0                       # no rate limit hiding the behaviour
+    assert [d.name for d in rt._deferred] == ["aws-ec2"]
+    probes.clear()
+
+    for _ in range(4):                            # every one of these the PRIMARY can serve
+        rt.spawn()
+
+    assert probes == [], (
+        f"{len(probes)} deferred availability probes ran while the primary tier still had "
+        f"capacity; each is a synchronous cloud call on the pool's only maintenance thread"
+    )
+
+
 def test_a_recovered_tier_is_admitted_on_a_later_spawn(monkeypatch):
     """The re-probe is the actual fix: without it the tier stays gone until the process restarts."""
     from blastbox.host import pool_config
@@ -895,7 +933,16 @@ def test_a_recovered_tier_is_admitted_on_a_later_spawn(monkeypatch):
     assert [t.name for t in rt.tiers] == ["gvisor"]
 
     throttling["on"] = False          # STS recovers
-    rt.spawn()
+    # Fill the primary FIRST. Admission is now lazy: spawn() tries the admitted tiers before it
+    # pays for a deferred availability probe, because that probe is a synchronous cloud call on the
+    # pool's sole maintenance thread and a deferred OVERFLOW tier must never delay a spawn a
+    # healthy PRIMARY can serve. So the recovered tier joins when it is actually needed -- at
+    # exhaustion -- rather than on the next spawn regardless.
+    for _ in range(4):                # gvisor:4
+        rt.spawn()
+    assert [t.name for t in rt.tiers] == ["gvisor"], "no probe while the primary can still serve"
+
+    rt.spawn()                        # primary exhausted -> now the probe is worth paying for
     assert [t.name for t in rt.tiers] == ["gvisor", "aws-ec2"], "the recovered tier must be admitted"
     assert rt._deferred == []
     # Per-tier bookkeeping must grow with the tier list, or the next spawn indexes off the end.
