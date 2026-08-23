@@ -3352,6 +3352,121 @@ def test_a_partially_resumed_slot_restarts_the_give_up_clock():
     )
 
 
+def test_the_settle_window_survives_a_slow_stop():
+    """The settle window is measured from _hib_started, which was stamped PRE-call.
+
+    stop-instances is bounded at 30s (budgeted) or 120s (not), against a 5s window -- so the
+    duration of the stop itself consumed the whole window and the guard was a no-op for exactly
+    the THROTTLED case it exists for. Measured on the boundary: a 1s stop held the guard, 6s and
+    30s did not. Sixth instance of stamp-before-call on this branch, three lines below the sibling
+    that does it right.
+
+    MUTATION: stamp _hib_started from the pre-call `now` -> a slow stop reopens the claim gate.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    ticks = [1000.0]
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: ticks[0])
+
+    def slow_stop(argv):
+        ticks[0] += 30.0                  # a throttled-but-accepted stop
+        return _cp()
+
+    fake.responses["ec2 stop-instances"] = slow_stop
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1", state=SlotState.IDLE,
+                         url="http://10.0.0.5:8080")
+
+    rt._try_park(slot)                    # accepted, 30s later
+    assert rt._phase.get(slot.slot_id) == "hibernating"
+    ticks[0] += 0.2                       # the very next poll: describe is still stale `running`
+    rt._park_step(slot, "running", ticks[0])
+
+    assert rt._phase.get(slot.slot_id) == "hibernating", (
+        "a stale `running` re-drove an ACCEPTED hibernate because the settle window had already "
+        "been spent by the stop call itself; the claim gate is now open"
+    )
+
+
+def test_the_boot_warm_up_is_not_credited_to_the_park_clock():
+    """A freeze opened because the AGENT was unprobeable is not evidence of parking.
+
+    `_agent_healthy` returns None whenever the address has not resolved -- every poll of a
+    just-booted instance -- so removing the "only credit if a clock exists" guard banked the whole
+    boot window and then subtracted it from a clock that starts afterwards. That buys up to a
+    second hibernate_timeout_s of suppression an operator cannot configure away.
+
+    MUTATION: credit unconditionally in _thaw_park -> the boot window is banked and this fails.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    ticks = [1000.0]
+    rt, _ = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: ticks[0],
+                          hibernate_timeout_s=300.0)
+    slot = AwsWorkerSlot(slot_id="b1", resource_id="i-1")
+
+    rt._freeze_park(slot.slot_id, ticks[0])       # agent unprobeable at boot (NOT a park attempt)
+    ticks[0] += 120.0
+    rt._thaw_park(slot.slot_id, ticks[0])         # the agent finally answers
+    rt._park_since[slot.slot_id] = ticks[0]       # ...and only NOW does parking begin
+
+    assert rt._park_credit.get(slot.slot_id, 0.0) == 0.0, (
+        f"{rt._park_credit.get(slot.slot_id)}s of BOOT time was banked against a give-up clock "
+        f"that did not exist during it"
+    )
+    # ...so the escape fires on schedule, at park_since + hibernate_timeout_s, rather than being
+    # pushed out by the whole boot window.
+    assert rt._park_expired(slot.slot_id, ticks[0] + 301.0), (
+        "the give-up escape was delayed past its budget by credit banked before the clock existed; "
+        "the instance runs and bills for roughly twice hibernate_timeout_s"
+    )
+
+
+def test_a_lost_response_hibernate_is_still_recognised_as_parked():
+    """In the lost-response case the ONLY park evidence is the open episode.
+
+    A definitive-unhealthy agent probe thaws it -- the guest is shutting down, so the health socket
+    refuses, which is a real False, not a None -- and nothing replaced the evidence. The `stopped`
+    that followed was then refused as "no hibernation ever attempted": a genuinely parked slot
+    discarded, and with no _park_since the give-up escape could never fire either.
+
+    MUTATION: drop the _park_attempted bookkeeping -> the slot is refused.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    rt, _ = _hibernate_rt(state=["stopped"], healthy=[True])
+    slot = AwsWorkerSlot(slot_id="h2", resource_id="i-1")
+
+    rt._freeze_park(slot.slot_id, 1000.0, park_attempted=True)   # stop issued, no verdict
+    rt._thaw_park(slot.slot_id, 1010.0)                          # agent answers a definitive False
+
+    phase, ready = rt._park_step(slot, "stopped", 1020.0)
+    assert ready is True and phase == "parked", (
+        f"a slot whose hibernate WAS accepted was refused (phase={phase}, ready={ready}); the "
+        f"thaw destroyed the only evidence the attempt ever happened"
+    )
+
+
+def test_a_lost_response_park_attempt_starts_the_give_up_clock():
+    """...and the evidence has to become a CLOCK, not just an adoption flag.
+
+    A stop we issued and never got a verdict on deliberately does not start _park_since -- silence
+    is not evidence. But the ANSWER that closes the episode is, and if the clock never starts, a
+    lost-response hibernate that then fails to complete can never reach give-up: the instance runs
+    and bills with nothing able to retire it.
+
+    MUTATION: drop the `_park_attempted and not in _park_since` branch in _thaw_park -> no clock.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    rt, _ = _hibernate_rt(state=["running"], healthy=[True])
+    slot = AwsWorkerSlot(slot_id="h3", resource_id="i-1")
+
+    rt._freeze_park(slot.slot_id, 1000.0, park_attempted=True)
+    assert slot.slot_id not in rt._park_since, "silence alone must not start the clock"
+    rt._thaw_park(slot.slot_id, 1010.0)
+
+    assert slot.slot_id in rt._park_since, (
+        "the answer that closed a lost-response episode started no give-up clock; a hibernate that "
+        "never completes can never be retired"
+    )
+
+
 def test_a_write_racing_a_reap_cannot_resurrect_a_departed_slot():
     """Disposal runs on the pool's dedicated reaper threads; the park machine runs on the tick
     thread. A write that started before the reap can therefore land after it.
@@ -3386,6 +3501,21 @@ def test_a_write_racing_a_reap_cannot_resurrect_a_departed_slot():
     # the true interleaving needs two threads.
     rt._park_unknown_since[slot.slot_id] = 2000.0
     rt._thaw_park(slot.slot_id, 2200.0)
+
+    # And _park_step itself -- the DOMINANT writer of the entries reap clears. Guarding only the
+    # two credit helpers left the main path unprotected, which the direct freeze/thaw calls above
+    # cannot detect.
+    # 'stopping' on purpose: that branch writes _phase, _hib_started and _park_since DIRECTLY,
+    # without passing through _try_park -- whose own tombstone guard would otherwise cover for a
+    # missing one in _park_step and hide the gap.
+    rt._park_step(slot, "stopping", 2300.0)
+    step_leaked = [n for n, d in (("_phase", rt._phase), ("_hib_started", rt._hib_started),
+                                  ("_park_since", rt._park_since))
+                   if slot.slot_id in d]
+    assert not step_leaked, (
+        f"_park_step re-created {step_leaked} for a reaped slot; it writes _phase, _hib_started "
+        f"and _park_since, none of which the credit-helper guards cover"
+    )
 
     leaked = [name for name, d in (("_park_unknown_since", rt._park_unknown_since),
                                    ("_park_credit", rt._park_credit))

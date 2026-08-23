@@ -1734,6 +1734,13 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # _park_since so that stays a FACT (when parking first began) rather than a running total
         # that can be pushed into the future; the cap is applied to this ledger in _park_expired.
         self._park_credit: dict[str, float] = {}
+        # Episodes opened by a park ATTEMPT (a stop we issued and got no verdict on), as opposed to
+        # ones opened because the agent or the describe was unobservable. Both live in
+        # _park_unknown_since, and conflating them cost twice: boot-time agent-unknown episodes
+        # were credited against a give-up clock that did not exist yet, and the only evidence of a
+        # LOST-RESPONSE hibernate was thrown away by the thaw. Two questions, two fields -- the
+        # same lesson as _warming_unknown_credit vs _never_ready on the pool side.
+        self._park_attempted: set[str] = set()
         # Slot ids this runtime has already reaped. Disposal runs on the pool's dedicated reaper
         # threads while is_ready / maintain_idle drive the park machine on the tick thread, so a
         # write that started before the reap can land after it and RESURRECT per-slot entries for a
@@ -1827,6 +1834,8 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         a failed attempt leaves the phase alone so a later tick retries. Only a SUCCESSFUL stop
         advances to "hibernating"."""
         now = self._clock()
+        if self._slot_is_gone(slot.slot_id):
+            return None      # reaped mid-flight; do not re-create its bookkeeping
         if now - self._hib_attempt.get(slot.slot_id, 0.0) < self._liveness_cache_s:
             return None      # we did not ask, so this pass learned nothing either way
         # PROVISIONAL stamp; the authoritative one is taken from COMPLETION in the finally below.
@@ -1865,7 +1874,13 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             self._hib_attempt[slot.slot_id] = self._clock()
         self._desc_cache.pop(slot.slot_id, None)   # force a fresh describe next poll
         self._phase[slot.slot_id] = "hibernating"
-        self._hib_started[slot.slot_id] = now
+        # self._clock(), NOT the pre-call `now`. This is when the stop was ACCEPTED, and the
+        # stale-`running` settle window is measured from it -- so stamping the pre-call value let
+        # the duration of the stop itself consume the whole window: a throttled 30s stop against a
+        # 5s window left ZERO settle time, i.e. the guard was a no-op for exactly the throttled
+        # case it exists for. Sixth instance of stamp-before-call on this branch, three lines below
+        # the sibling that gets it right and the comment saying a stamp "belongs in a finally".
+        self._hib_started[slot.slot_id] = self._clock()
         return True
 
     def is_alive_for_claim(self, slot: AwsWorkerSlot, *, budget_s: float | None = None
@@ -1950,11 +1965,19 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         """True once this runtime has reaped ``sid`` -- so a late write must not re-create it."""
         return sid in self._reaped_ids
 
-    def _freeze_park(self, sid: str, now: float) -> None:
-        """Open a no-verdict episode: we asked and learned nothing about this slot's parking."""
+    def _freeze_park(self, sid: str, now: float, *, park_attempted: bool = False) -> None:
+        """Open a no-verdict episode: we asked and learned nothing about this slot's parking.
+
+        ``park_attempted`` means the silence was a STOP WE ISSUED going unanswered -- which is
+        itself evidence that this slot was being parked, and is the lost-response case. A freeze
+        opened because the agent socket or the describe was unreadable is NOT that, and must not be
+        mistaken for it.
+        """
         if self._slot_is_gone(sid):
             return
         self._park_unknown_since.setdefault(sid, now)
+        if park_attempted:
+            self._park_attempted.add(sid)
 
     def _thaw_park(self, sid: str, now: float) -> None:
         """Close it, banking the unobservable interval in the CREDIT LEDGER.
@@ -1983,8 +2006,26 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         applied once, to the total, in _park_expired.
         """
         stalled = self._park_unknown_since.pop(sid, None)
-        if stalled is not None and not self._slot_is_gone(sid):
-            self._park_credit[sid] = self._park_credit.get(sid, 0.0) + max(0.0, now - stalled)
+        if stalled is None or self._slot_is_gone(sid):
+            return
+        if sid in self._park_attempted and sid not in self._park_since:
+            # A stop we ISSUED but never got a verdict on is a park attempt, and this answer is the
+            # moment to start timing it -- from when the attempt began. Without this the thaw
+            # destroyed the only evidence a lost-response hibernate ever happened: the `stopped`
+            # that followed was refused as "no hibernation ever attempted", a genuinely parked slot
+            # was discarded, and _park_since never existed so give-up could never fire either.
+            self._park_since[sid] = stalled
+        started = self._park_since.get(sid)
+        if started is None:
+            # Nothing was being timed during the silence, so there is no clock to credit. Crediting
+            # anyway banked the whole BOOT warm-up window -- every poll before the address resolves
+            # freezes on `_agent_healthy() is None` -- and then subtracted it from a clock that
+            # starts afterwards, buying up to a second hibernate_timeout_s of free suppression that
+            # an operator could not configure away.
+            return
+        # Only the part of the silence that overlapped the clock can be credited to it.
+        self._park_credit[sid] = (
+            self._park_credit.get(sid, 0.0) + max(0.0, now - max(stalled, started)))
 
     def _park_expired(self, sid: str, now: float) -> bool:
         """Has this slot spent longer than hibernate_timeout_s trying to PARK, across all attempts?
@@ -2022,6 +2063,13 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         hibernate, we never saw the reply, and our own record is the one thing we cannot trust.
         """
         sid = slot.slot_id
+        if self._slot_is_gone(sid):
+            # The reaper disposed of this slot while the tick thread was inside a describe. Every
+            # write below (_phase, _hib_started, _park_since) would re-create per-slot state for an
+            # id that no longer exists, and ids are per-spawn UUIDs so nothing removes it again.
+            # Guarding the two credit helpers was not enough: _park_step is the DOMINANT writer of
+            # exactly the entries reap() clears.
+            return self._phase.get(sid, "warming"), False
         phase = self._phase.get(sid, "warming")
         if st in self._DEAD_STATES:
             return phase, False          # is_alive/_health_check reaps it
@@ -2036,7 +2084,8 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             attempted = (phase in ("hibernating", "parked")
                          or sid in self._hib_started
                          or sid in self._park_since
-                         or sid in self._park_unknown_since)
+                         or sid in self._park_unknown_since
+                         or sid in self._park_attempted)
             if not attempted:
                 _log.warning("ec2-hibernate: slot %s is 'stopped' with no hibernation ever "
                              "attempted -- not a parked warm slot", sid)
@@ -2048,6 +2097,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             self._park_since.pop(sid, None)     # parked: the give-up clock is done
             self._park_unknown_since.pop(sid, None)   # episode over; nothing to credit it to
             self._park_credit.pop(sid, None)
+            self._park_attempted.discard(sid)
             return "parked", True
         if st == "stopping":
             # A hibernate is in flight -- possibly one whose response we lost, which is why the
@@ -2163,7 +2213,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 # freezing on THAT is the mirror bug: _park_since never starts, the give-up clock
                 # is frozen forever, the slot is republished every pass, and the instance runs and
                 # bills indefinitely. A refusal is a verdict; only silence is not.
-                self._freeze_park(sid, now)
+                self._freeze_park(sid, now, park_attempted=True)
                 # ready=None, NOT False. This return feeds is_ready, and a definitive False there
                 # tells the POOL something we do not know: _promote_warming ends the slot's
                 # warming-unknown episode on any definitive answer, so the warming timeout resumes
@@ -2424,14 +2474,16 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # reported not-ready forever instead of being reclaimed. super() pops the slot from its own
         # tracking on success, so the ordering costs nothing on the happy path.
         super().reap(slot)   # terminate-instances (disposable after one untrusted job)
-        for d in (self._phase, self._desc_cache, self._hib_attempt, self._hib_started,
-                  self._park_since, self._park_unknown_since, self._park_credit):
-            d.pop(slot.slot_id, None)
-        # Tombstone it, so a park write already in flight on the tick thread cannot re-create the
-        # entries this just removed. Capped and FIFO: the set is a leak-suppressor, not a ledger.
+        # Tombstone FIRST. Written after the pops it left a window in which a concurrent write
+        # could re-create exactly what was just removed -- the guard not yet in force for the pops
+        # it exists to protect.
         self._reaped_ids[slot.slot_id] = None
         while len(self._reaped_ids) > self._REAPED_IDS_MAX:
             self._reaped_ids.popitem(last=False)
+        for d in (self._phase, self._desc_cache, self._hib_attempt, self._hib_started,
+                  self._park_since, self._park_unknown_since, self._park_credit):
+            d.pop(slot.slot_id, None)
+        self._park_attempted.discard(slot.slot_id)
 
     def sweep_orphans(self, *, max_age_s: float | None = None, now: float | None = None,
                       dry_run: bool = False) -> list[str]:

@@ -394,7 +394,7 @@ class CascadingRuntime:
         """
         try:
             return self._spawn_from_admitted()
-        except (CascadeExhausted, CascadeSpawnFailed):
+        except (CascadeExhausted, CascadeSpawnFailed) as first:
             with self._lock:
                 if not self._deferred:
                     raise
@@ -404,7 +404,17 @@ class CascadingRuntime:
             # Retry ONLY the newly admitted tiers. Re-running the whole list would re-attempt the
             # ones that just failed and charge their per-tier failure streaks a second time for a
             # single spawn -- and those streaks drive base invalidation.
-            return self._spawn_from_admitted(start=before)
+            try:
+                return self._spawn_from_admitted(start=before)
+            except CascadeExhausted:
+                # The retry ATTEMPTED nothing (the new tier is at capacity or still building its
+                # base), so it has no verdict of its own and raises the capacity type. Re-raising
+                # that would DOWNGRADE a CascadeSpawnFailed: CascadeExhausted is a
+                # RuntimeAtCapacity, which the pool treats as backpressure -- no failure streak, no
+                # _maybe_rebuild_base -- so a corrupt base would read as "we are busy" and never be
+                # repaired, on the very tick where the evidence was strongest. The first verdict is
+                # the real one, and it keeps its original cause.
+                raise first from first.__cause__
 
     def _spawn_from_admitted(self, start: int = 0) -> Any:
         last_exc: Exception | None = None
