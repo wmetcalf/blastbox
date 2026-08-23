@@ -124,8 +124,16 @@ p.write_text(s.replace(o,"                        self._warming_unknown_credit.p
 # used to end on a successful echo, so the script exited 0 for EVERY outcome -- an automated caller
 # got a green check even when mutants survived or were never tested. A harness whose whole purpose
 # is refusing to call an untested thing "verified" must not do that itself.
+# Restore EXPLICITLY and check it, before printing any verdict. The EXIT trap also restores, but
+# bash preserves the script's own exit status through a trap -- a trap returning 1 does NOT make
+# the script exit 1 -- so the LAST mutation's restore was the one thing here with no check at all,
+# and a failure there reported success while leaving that mutation in the source tree.
+if ! restore; then
+  echo "  == BASELINE NOT RESTORED — the last mutation may still be in the tree (snapshot: $SNAP)"
+  exit 2
+fi
 if [ "$FAILURES" -ne 0 ]; then
   echo "  == $FAILURES mutant(s) survived or could not be evaluated"
   exit 1
 fi
-echo "  == all mutants killed"
+echo "  == all mutants killed, baseline restored"

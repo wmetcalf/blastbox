@@ -96,8 +96,8 @@ def bool_uses_of(fn, name):
     return out
 
 
-def guards_none(fn, name):
-    """Does ``fn`` discriminate the three states of ``name`` anywhere?
+def guards_none(fn, name, before_line=None):
+    """Does ``fn`` discriminate the three states of ``name`` BEFORE ``before_line``?
 
     Any IDENTITY comparison against None, False or True counts. Looking only for `is None` was too
     narrow: `if _ok is False:` separates the definitive negative from the unknown just as well, and
@@ -109,6 +109,16 @@ def guards_none(fn, name):
         if not isinstance(n, ast.Compare) or not isinstance(n.left, ast.Name):
             continue
         if n.left.id != name:
+            continue
+        # ORDER MATTERS. Accepting a guard anywhere in the function suppressed
+        #     healthy = rt.is_ready(slot)
+        #     if not healthy: return          # <- UNKNOWN already collapsed here
+        #     if healthy is None: ...         # <- too late to matter
+        # i.e. exactly the regression the assignment-following was added to catch. A guard only
+        # helps a use it PRECEDES. Line order is an approximation of dominance -- it can still be
+        # fooled by a guard in an unrelated earlier branch -- but it is a far better one than
+        # "exists somewhere", and it errs toward reporting.
+        if before_line is not None and n.lineno >= before_line:
             continue
         if any(isinstance(o, (ast.Is, ast.IsNot)) for o in n.ops) and \
                 any(isinstance(c, ast.Constant) and c.value in (None, False, True)
@@ -176,9 +186,20 @@ def find_p1(trees, tri):
                 var = p.targets[0].id
                 fn = next((f for f in enclosing_funcs(tree)
                            if f.lineno <= n.lineno <= (f.end_lineno or n.lineno)), None)
-                if fn is None or guards_none(fn, var):
-                    continue        # an explicit `is None` comparison IS the tri-state handling
+                if fn is None:
+                    continue
                 for lineno, uctx in bool_uses_of(fn, var):
+                    # WHICH use decides whether order matters.
+                    #   `if x:` tests for SUCCESS and lets both other states fall through, so a
+                    #     discriminator anywhere -- including after it -- still governs them. Both
+                    #     aws_worker resume loops are this shape: `if _ok: return` then
+                    #     `if _ok is False:`. Correct, and demanding a preceding guard flags them.
+                    #   `not x` / `and`/`or` CONSUME the None branch on the spot, so only a guard
+                    #     that already ran can save them. This is the shape the review cited:
+                    #     `if not healthy: return` followed by a now-useless `if healthy is None:`.
+                    consumes_none = uctx != "if <var>:"
+                    if guards_none(fn, var, before_line=lineno if consumes_none else None):
+                        continue
                     decl = ", ".join(f"{c}@{loc}" for c, loc in by_name[nm][:2])
                     hits.append((f"{path}:{lineno}", f"{var} = {recv or '?'}.{nm}",
                                  f"{uctx}, no tri-state guard in {fn.name}()", decl))
