@@ -36,14 +36,24 @@ def ann_text(node):
 
 
 def tri_state_defs(trees):
-    """name -> file:line for every def annotated to return an optional bool."""
+    """(class, name) -> file:line for every def annotated to return an optional bool.
+
+    Keyed by the DECLARING CLASS as well as the name. Keying on the bare name made every
+    ``.is_alive()`` in the tree look tri-state because CascadingRuntime declares one -- so the
+    sweep reported ``threading.Thread.is_alive()`` in pool.py and a process-liveness call in
+    vm_dispatch.py as P1 collapses. Every P1 the script has ever emitted was one of those, and a
+    checker whose only output is false positives trains you to skim past it.
+    """
     out = {}
     for path, tree in trees.items():
-        for n in ast.walk(tree):
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                a = ann_text(n.returns).replace('"', "").replace("'", "").replace(" ", "")
-                if a in ("bool|None", "None|bool", "Optional[bool]"):
-                    out[n.name] = f"{path}:{n.lineno}"
+        for cls in ast.walk(tree):
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for n in cls.body:
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    a = ann_text(n.returns).replace('"', "").replace("'", "").replace(" ", "")
+                    if a in ("bool|None", "None|bool", "Optional[bool]"):
+                        out[(cls.name, n.name)] = f"{path}:{n.lineno}"
     return out
 
 
@@ -56,7 +66,33 @@ def called_name(node):
     return None
 
 
+def receiver_of(node):
+    """Best-effort static receiver text for `x.method()` / `self._x.method()`."""
+    f = node.func
+    if not isinstance(f, ast.Attribute):
+        return None
+    v = f.value
+    if isinstance(v, ast.Name):
+        return v.id
+    if isinstance(v, ast.Attribute):
+        return v.attr          # self._thread -> "_thread"
+    return None
+
+
 def find_p1(trees, tri):
+    # Only names declared tri-state SOMEWHERE, but reported only when the receiver is plausibly
+    # one of those classes: `self` (the declaring class or a subclass) or a name that is not an
+    # obvious stdlib object. Anything called on a `thread`/`proc`-ish receiver is skipped.
+    by_name = {}
+    for (cls, name), loc in tri.items():
+        by_name.setdefault(name, []).append((cls, loc))
+    # ALLOWLIST, not a denylist. A denylist never converges: the same `is_alive` name is used by
+    # threading.Thread, subprocess handles, and locals called `reaper`/`vt`, and each new one has
+    # to be discovered from a false positive. Only receivers that could plausibly BE one of these
+    # runtimes are worth reporting; anything else is skipped, at the cost of missing a call through
+    # an unusually-named variable. A checker that cries wolf is worse than one with a known blind
+    # spot, because you stop reading it.
+    OURS = ("self", "runtime", "_runtime", "rt", "tier", "engine", "slot_runtime")
     hits = []
     for path, tree in trees.items():
         parents = {}
@@ -67,8 +103,11 @@ def find_p1(trees, tri):
             if not isinstance(n, ast.Call):
                 continue
             nm = called_name(n)
-            if nm not in tri:
+            if nm not in by_name:
                 continue
+            recv = (receiver_of(n) or "").lower()
+            if recv not in OURS:
+                continue        # not one of our runtimes -- Thread.is_alive and friends
             p = parents.get(n)
             ctx = None
             if isinstance(p, ast.UnaryOp) and isinstance(p.op, ast.Not):
@@ -82,7 +121,8 @@ def find_p1(trees, tri):
             elif isinstance(p, (ast.While,)) and p.test is n:
                 ctx = "while <call>:"
             if ctx:
-                hits.append((f"{path}:{n.lineno}", nm, ctx, tri[nm]))
+                decl = ", ".join(f"{c}@{loc}" for c, loc in by_name[nm][:2])
+                hits.append((f"{path}:{n.lineno}", f"{recv or '?'}.{nm}", ctx, decl))
     return hits
 
 
@@ -153,9 +193,9 @@ for f in FILES:
     trees[f.split("/")[-1]] = ast.parse(p.read_text())
 
 tri = tri_state_defs(trees)
-print(f"tri-state functions found: {len(tri)}")
-for k, v in sorted(tri.items()):
-    print(f"    {k:<28} {v}")
+print(f"tri-state methods found: {len(tri)}")
+for (cls, name), v in sorted(tri.items()):
+    print(f"    {cls + '.' + name:<40} {v}")
 
 print("\n=== P1 tri-state collapse (a `bool | None` used as a boolean)")
 p1 = find_p1(trees, tri)

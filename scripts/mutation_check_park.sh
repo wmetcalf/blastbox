@@ -36,13 +36,33 @@ restore() {
 }
 trap restore EXIT
 
+FAILURES=0
+
 mut() {
-  local name="$1" patch="$2" test="$3"
-  restore
-  if ! .venv/bin/python -c "$patch" 2>/dev/null; then echo "  ERROR    $name (patch failed)"; return; fi
-  if git diff --quiet src/; then echo "  ERROR    $name (changed nothing)"; return; fi
-  if timeout 300 .venv/bin/python -m pytest "$test" -q -p no:cacheprovider >/dev/null 2>&1
-  then echo "  SURVIVED $name"; else echo "  killed   $name"; fi
+  local name="$1" patch="$2" test="$3" rc
+  # A failed restore is FATAL, not something to carry on from: the next patch would be applied on
+  # top of whatever mutation the previous case left behind and every result after it is fiction.
+  if ! restore; then
+    echo "  FATAL    $name (baseline restore failed; sources may be mutated)"
+    FAILURES=$((FAILURES + 1)); exit 1
+  fi
+  if ! .venv/bin/python -c "$patch" 2>/dev/null; then
+    echo "  ERROR    $name (patch failed)"; FAILURES=$((FAILURES + 1)); return
+  fi
+  if git diff --quiet src/; then
+    echo "  ERROR    $name (changed nothing)"; FAILURES=$((FAILURES + 1)); return
+  fi
+  # Distinguish a KILLED mutant from an infrastructure failure. pytest exits 1 for a real test
+  # failure -- that is a kill -- but 2/3/4/5 for collection errors, usage errors and internal
+  # faults, and 124 for a timeout. Counting those as kills reported a mutant as caught by a test
+  # run that never actually ran it.
+  timeout 300 .venv/bin/python -m pytest "$test" -q -p no:cacheprovider >/dev/null 2>&1
+  rc=$?
+  case "$rc" in
+    0) echo "  SURVIVED $name"; FAILURES=$((FAILURES + 1)) ;;
+    1) echo "  killed   $name" ;;
+    *) echo "  ERROR    $name (pytest rc=$rc -- not a verdict)"; FAILURES=$((FAILURES + 1)) ;;
+  esac
 }
 
 T=tests/host/runtime/test_aws_worker.py
@@ -99,3 +119,13 @@ o="""                        self._never_ready.discard(slot.slot_id)
 assert s.count(o)==1
 p.write_text(s.replace(o,"                        self._warming_unknown_credit.pop(slot.slot_id, None)",1))
 ' "$P::test_a_proven_slot_is_restored_to_idle_not_warming"
+
+# EXIT NONZERO on any surviving mutant, patch error or infrastructure failure. Every branch above
+# used to end on a successful echo, so the script exited 0 for EVERY outcome -- an automated caller
+# got a green check even when mutants survived or were never tested. A harness whose whole purpose
+# is refusing to call an untested thing "verified" must not do that itself.
+if [ "$FAILURES" -ne 0 ]; then
+  echo "  == $FAILURES mutant(s) survived or could not be evaluated"
+  exit 1
+fi
+echo "  == all mutants killed"

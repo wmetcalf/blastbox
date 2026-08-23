@@ -560,7 +560,11 @@ class AwsDisposableRuntime:
             self._desc_fail_at[slot.slot_id] = self._clock()
             raise
         self._desc_fail_at.pop(slot.slot_id, None)
-        self._desc_cache[slot.slot_id] = (now, desc)
+        # Stamped from COMPLETION. `now` was read before the call, so a describe slower than the
+        # TTL produced a cache entry that was ALREADY EXPIRED when it landed -- the next caller
+        # paid for another full control-plane wait to learn the same thing, which is precisely
+        # what the cache exists to prevent. Seventh instance of stamp-before-call on this branch.
+        self._desc_cache[slot.slot_id] = (self._clock(), desc)
         return desc
 
     def _describe(self, slot: "AwsWorkerSlot") -> dict[str, Any]:   # concrete tiers override
@@ -647,7 +651,8 @@ class AwsDisposableRuntime:
             self._tls.probe_deadline = prev
 
     def _aws(self, service: str, op: str, *args: str,
-             timeout_s: float | None = None) -> dict[str, Any]:
+             timeout_s: float | None = None,
+             expect_output: bool = False) -> dict[str, Any]:
         argv = self.cfg.aws_argv(service, op, *args)
         # A claim-probe budget set by is_alive_for_claim on THIS thread wins over the default. It is
         # thread-local on purpose: the background tick calls _aws concurrently and must keep the full
@@ -691,6 +696,14 @@ class AwsDisposableRuntime:
                 f"aws {service} {op}: unconfirmed failure (rc={cp.returncode}): {stderr[:200]}")
         out = (cp.stdout or "").strip()
         if not out:
+            if expect_output:
+                # A QUERY that answered with nothing has not answered. Only _aws can tell this
+                # apart from valid-JSON-that-happens-to-be-empty: both reach the caller as {}, and
+                # `{}` from a parsed document is a real verdict (no Account -> bad credentials)
+                # that existing tests pin. Callers that need a document opt in; mutating calls
+                # (stop-instances, terminate-instances) legitimately return nothing on rc=0 and
+                # must not raise -- raising for everything broke exactly those.
+                raise AwsNoVerdict(f"aws {service} {op}: empty response (rc=0)")
             return {}
         try:
             return json.loads(out)
@@ -712,7 +725,7 @@ class AwsDisposableRuntime:
         (issue #79). "Throttled" is not "unentitled"; only the latter is a verdict.
         """
         try:
-            ident = self._aws("sts", "get-caller-identity")
+            ident = self._aws("sts", "get-caller-identity", expect_output=True)
             if not ident.get("Account"):
                 return False
             return self._service_available()
@@ -1871,7 +1884,16 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         finally:
             # Re-stamp from COMPLETION. See the provisional stamp above: the whole point of the
             # throttle is that a slow call must not be re-issued the instant it returns.
-            self._hib_attempt[slot.slot_id] = self._clock()
+            #
+            # ...but only if the slot still exists. The entry check at the top of this method is not
+            # enough: stop-instances is the SLOW call, and a stop()/resize can reap the slot while
+            # it is in flight -- reap() then installs the tombstone and clears the dicts, and this
+            # finally writes one straight back. Same for the _phase/_hib_started assignments below.
+            # A tombstone consulted only on entry cannot see a reap that happens during the call.
+            if not self._slot_is_gone(slot.slot_id):
+                self._hib_attempt[slot.slot_id] = self._clock()
+        if self._slot_is_gone(slot.slot_id):
+            return None      # reaped while the stop was in flight; do not re-create its state
         self._desc_cache.pop(slot.slot_id, None)   # force a fresh describe next poll
         self._phase[slot.slot_id] = "hibernating"
         # self._clock(), NOT the pre-call `now`. This is when the stop was ACCEPTED, and the
