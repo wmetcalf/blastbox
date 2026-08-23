@@ -8,6 +8,7 @@ fail-closed availability probe, config from_env, and pool_config registration.
 from __future__ import annotations
 
 import errno
+import contextlib
 import json
 import os
 import subprocess
@@ -3348,6 +3349,87 @@ def test_a_partially_resumed_slot_restarts_the_give_up_clock():
     assert slot.slot_id in rt._park_since, (
         "the re-drive started no give-up clock, so an instance whose agent never recovers is "
         "republished forever with nothing able to retire it"
+    )
+
+
+def test_a_no_verdict_stop_is_unknown_to_the_pool_too():
+    """The tri-state has to be honoured on the way OUT, not just on the way in.
+
+    _park_step froze ITS clock on an unanswered stop and then handed the pool `ready=False` -- a
+    definitive verdict we do not have. _promote_warming ends the slot's warming-unknown episode on
+    any definitive answer, so the pool's warming timeout resumed aging and evicted the tier's
+    WARMING population over a stop API that never answered. Freezing our clock while lying to the
+    pool just moves the same drain one layer up.
+
+    MUTATION: return False instead of None from the AwsNoVerdict branch -> is_ready reports a
+    definitive not-ready and this fails.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True])
+    fake.responses["ec2 stop-instances"] = lambda argv: _cp(
+        rc=254, stderr="An error occurred (RequestLimitExceeded) when calling StopInstances")
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    assert rt.is_ready(slot) is None, (
+        "an unanswered stop was reported to the pool as a DEFINITIVE not-ready; the warming "
+        "timeout resumes aging and the tier's WARMING population is evicted over a silent API"
+    )
+
+
+def test_a_stale_running_read_does_not_erase_the_hibernation_claim_guard():
+    """DescribeInstances is eventually consistent -- this file depends on that elsewhere.
+
+    So a `running` reading can simply be stale for a window after a stop was ACCEPTED. Re-driving
+    on it wiped phase="hibernating", which IS the claim gate: is_alive_for_claim then saw "warming"
+    plus another stale `running`, authorised the claim, and the accepted hibernation suspended the
+    instance mid-job. That is the original #80 hazard, reopened from the other side.
+
+    MUTATION: drop the settle-window check -> the phase is wiped and the slot becomes claimable.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    ticks = [1000.0]
+    rt, _ = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: ticks[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1", state=SlotState.IDLE,
+                         url="http://10.0.0.5:8080")
+    rt._phase[slot.slot_id] = "hibernating"      # the stop was accepted...
+    rt._hib_started[slot.slot_id] = ticks[0]
+    ticks[0] += 1.0                              # ...1s ago; well inside the settle window
+
+    rt._park_step(slot, "running", ticks[0])     # ...and describe still says `running`
+
+    assert rt._phase.get(slot.slot_id) == "hibernating", (
+        "a stale `running` read wiped the hibernating phase, removing the claim guard while the "
+        "accepted stop was still in flight"
+    )
+    assert rt.is_alive_for_claim(slot, budget_s=5.0) is None, "the slot must stay unclaimable"
+
+
+def test_a_failed_terminate_keeps_the_evidence_needed_to_reclaim_the_slot():
+    """reap() cleared the park bookkeeping BEFORE terminating.
+
+    That only holds if the terminate succeeds. When it raises -- the correlated-brownout case,
+    where the pool keeps the slot and quarantines or restores it -- the runtime has already thrown
+    away every trace that this slot was parking. It matters more now that `stopped` is only adopted
+    as a parked warm slot when park evidence exists: the slot would come back with all of it gone
+    and its own hibernation no longer recognisable, so it would read not-ready forever.
+
+    MUTATION: clear the dicts before super().reap() -> the evidence is gone after a failed
+    terminate and this fails.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    rt, fake = _hibernate_rt(state=["stopped"], healthy=[True])
+    fake.responses["ec2 terminate-instances"] = lambda argv: _cp(
+        rc=254, stderr="An error occurred (RequestLimitExceeded) when calling TerminateInstances")
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt._phase[slot.slot_id] = "parked"
+    rt._park_since[slot.slot_id] = 1000.0
+
+    with contextlib.suppress(Exception):
+        rt.reap(slot)
+
+    assert rt._phase.get(slot.slot_id) == "parked" or slot.slot_id in rt._park_since, (
+        "a FAILED terminate still wiped the park evidence; the retained slot can no longer be "
+        "recognised as a parked worker and reads not-ready forever"
     )
 
 

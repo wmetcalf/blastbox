@@ -2074,6 +2074,22 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 #    non-destructively -- so the instance is RUNNING while the pool counts a parked
                 #    warm slot and EC2 bills a running one, with nothing to re-hibernate it. Also
                 #    the ordinary post-job state, since a slot that served a job is awake.
+                # ...but NOT on a stop that is still in flight. DescribeInstances is eventually
+                # consistent -- this file relies on that elsewhere -- so a `running` reading can
+                # simply be stale for a window after the stop was accepted. Re-driving on it wipes
+                # `hibernating`, which is the claim gate: is_alive_for_claim then sees phase
+                # "warming" and another stale `running`, authorises the claim, and the accepted
+                # hibernation suspends the instance mid-job. Wait out the settle window (the same
+                # _liveness_cache_s the rest of the file throttles on) before believing `running`
+                # over a stop we know landed; a genuinely failed hibernate is still re-driven, just
+                # one poll later.
+                started_at = self._hib_started.get(sid)
+                if phase == "hibernating" and started_at is not None \
+                        and (now - started_at) < self._liveness_cache_s:
+                    _log.debug("ec2-hibernate: %s reads running %.1fs after an accepted stop -- "
+                               "treating as an eventually-consistent describe, not a wake-up",
+                               sid, now - started_at)
+                    return "hibernating", False
                 _log.info("ec2-hibernate: %s is running but recorded %s -- re-driving to warm", sid, phase)
                 self._phase[sid] = "warming"
                 self._hib_started.pop(sid, None)
@@ -2133,7 +2149,14 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 # is frozen forever, the slot is republished every pass, and the instance runs and
                 # bills indefinitely. A refusal is a verdict; only silence is not.
                 self._freeze_park(sid, now)
-                return self._phase.get(sid, "warming"), False
+                # ready=None, NOT False. This return feeds is_ready, and a definitive False there
+                # tells the POOL something we do not know: _promote_warming ends the slot's
+                # warming-unknown episode on any definitive answer, so the warming timeout resumes
+                # aging and the tier's WARMING population is evicted over a stop API that never
+                # answered. Freezing OUR clock while handing the pool a verdict we do not have just
+                # moves the same drain one layer up -- the tri-state has to be honoured on the way
+                # out as well as on the way in.
+                return self._phase.get(sid, "warming"), None
             if answered:
                 # AWS is talking to us again.
                 self._thaw_park(sid, now)
@@ -2376,10 +2399,19 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         ) from last_exc
 
     def reap(self, slot: AwsWorkerSlot) -> None:
+        # TERMINATE FIRST, forget afterwards. Clearing the bookkeeping up front only holds if the
+        # terminate succeeds: when it raises -- the correlated-brownout case, where the pool KEEPS
+        # the slot and either quarantines or restores it -- the runtime has already thrown away the
+        # evidence that this slot was ever parking. That now matters more than it used to, because
+        # `stopped` is only adopted as a parked warm slot when some park evidence exists (phase,
+        # _hib_started, _park_since or an open episode); a slot whose terminate failed would come
+        # back with all four gone and its own hibernation no longer recognisable, so it would be
+        # reported not-ready forever instead of being reclaimed. super() pops the slot from its own
+        # tracking on success, so the ordering costs nothing on the happy path.
+        super().reap(slot)   # terminate-instances (disposable after one untrusted job)
         for d in (self._phase, self._desc_cache, self._hib_attempt, self._hib_started,
                   self._park_since, self._park_unknown_since, self._park_credit):
             d.pop(slot.slot_id, None)
-        super().reap(slot)   # terminate-instances (disposable after one untrusted job)
 
     def sweep_orphans(self, *, max_age_s: float | None = None, now: float | None = None,
                       dry_run: bool = False) -> list[str]:

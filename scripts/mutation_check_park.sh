@@ -15,11 +15,19 @@ cd -- "$REPO" || { echo "mutation_check_park: cannot cd to $REPO" >&2; exit 2; }
   echo "mutation_check_park: $REPO does not look like the blastbox checkout" >&2; exit 2; }
 [ -x .venv/bin/python ] || {
   echo "mutation_check_park: $REPO/.venv/bin/python is missing" >&2; exit 2; }
-SNAP=$(mktemp -d)
-cp src/blastbox/host/pool.py src/blastbox/host/runtime/aws_worker.py "$SNAP/"
+# The snapshot is the ONLY thing that undoes a mutation, so nothing below may run until it is
+# known-good. Previously mktemp and the copy were both unchecked while `set -e` was off, and the
+# EXIT trap assumed both had succeeded -- so a failure here left mutated source in the checkout and
+# the trap silently copied nothing over it.
+SNAP=$(mktemp -d) || { echo "mutation_check_park: mktemp failed" >&2; exit 2; }
+cp src/blastbox/host/pool.py src/blastbox/host/runtime/aws_worker.py "$SNAP/" || {
+  echo "mutation_check_park: could not snapshot the sources" >&2; rm -rf "$SNAP"; exit 2; }
+[ -s "$SNAP/pool.py" ] && [ -s "$SNAP/aws_worker.py" ] || {
+  echo "mutation_check_park: snapshot is incomplete" >&2; rm -rf "$SNAP"; exit 2; }
 restore() {
-  cp "$SNAP/pool.py" src/blastbox/host/pool.py
-  cp "$SNAP/aws_worker.py" src/blastbox/host/runtime/aws_worker.py
+  cp "$SNAP/pool.py" src/blastbox/host/pool.py \
+    && cp "$SNAP/aws_worker.py" src/blastbox/host/runtime/aws_worker.py \
+    || echo "mutation_check_park: RESTORE FAILED — sources may be mutated, snapshot at $SNAP" >&2
 }
 trap restore EXIT
 
