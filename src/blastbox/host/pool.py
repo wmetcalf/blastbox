@@ -1835,6 +1835,14 @@ class WarmPool:
         newly_idle: list[str] = []
         for slot in warming:
             raised = False
+            # Sampled BEFORE the probe. An UNKNOWN episode covers time we could not observe the
+            # worker, and that includes time spent BLOCKED INSIDE a probe that then produced no
+            # verdict -- an aws describe can burn its full timeout before raising. Stamping on
+            # return excluded exactly that interval, so a later definitive answer judged the slot
+            # as though the outage had been observed warming time. (The mirror of the rate-limit
+            # stamps elsewhere on this branch: a throttle is measured from COMPLETION, an episode
+            # from its START. Both are "measure the interval you actually mean".)
+            probe_began = self._clock()
             try:
                 ready = self._runtime.is_ready(slot)
             except Exception:
@@ -1848,7 +1856,7 @@ class WarmPool:
             # TRI-STATE, same contract as _probe_alive and the health tick: True = ready,
             # False = CONFIRMED not ready, None = UNKNOWN. Record/clear the unknown episode BEFORE
             # acting, so _health_check's warming-timeout decision sees this pass's observation.
-            probed_at = self._clock()
+            probed_at = probe_began
             with self._lock:
                 if ready is None:
                     self._warming_unknown_since.setdefault(slot.slot_id, probed_at)
@@ -1875,6 +1883,12 @@ class WarmPool:
                         # then misread.
                         self._never_ready.discard(slot.slot_id)
                         self._warming_unknown_credit.pop(slot.slot_id, None)
+                        # ...and the IDLE unknown clock. A warming slot whose eviction was
+                        # rate-limited seeds _unknown_since as a fallback; promotion cleared only
+                        # the WARMING one, so the stale stamp survived into IDLE and the first
+                        # indeterminate liveness check after promotion read as an outage that had
+                        # already been running for minutes.
+                        self._unknown_since.pop(slot.slot_id, None)
                         # Promotion is EVIDENCE, not proof, so it does NOT clear the
                         # restore-failure streak. A poisoned snapshot can restore a process that
                         # survives long enough to pass is_ready() and then dies while IDLE:
@@ -2825,7 +2839,12 @@ class WarmPool:
                     self._last_idle_at = self._clock()
                     self._idle_event.set()
                 # Re-stamp from COMPLETION, not from the start. See the provisional stamp above.
-                self._maintain_last[slot_id] = self._clock()
+                # Only while the slot is still TRACKED: _forget_slot_health pops _maintain_last when
+                # a concurrent stop()/reap removes the slot, and this write lands after that, so an
+                # unconditional re-stamp re-created an entry nothing cleans up again. _maintain_last
+                # has no not-in-_slots sweep, unlike its neighbours.
+                if cur is not None:
+                    self._maintain_last[slot_id] = self._clock()
                 # NOT usable -> deliberately left ASSIGNED, i.e. unclaimable, and handed straight
                 # to retire() below. Republishing it first (and worse, waking claimants with
                 # _idle_event.set()) opened a window in which a claimant could take the slot:

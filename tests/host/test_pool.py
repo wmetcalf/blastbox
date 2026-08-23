@@ -3177,6 +3177,112 @@ def test_a_maintenance_retirement_whose_terminate_fails_is_retried_not_stranded(
     )
 
 
+def test_the_cooldown_stamp_does_not_resurrect_a_slot_removed_during_the_hook() -> None:
+    """The completion re-stamp lands AFTER a concurrent stop()/reap has cleaned up.
+
+    _forget_slot_health pops _maintain_last when the slot leaves the pool, and the finally block
+    then wrote it straight back. _maintain_last has no not-in-_slots sweep -- unlike its neighbours
+    -- so nothing ever removes it again, and ids are per-spawn UUIDs.
+
+    MUTATION: re-stamp unconditionally -> the entry comes back for a slot that is gone.
+    """
+    class _VanishingRuntime(_FakeRuntime):
+        def __init__(self, pool_ref: dict) -> None:
+            super().__init__()
+            self.pool_ref = pool_ref
+
+        def maintain_idle(self, slot: Slot) -> bool:
+            # A concurrent stop() removes the slot WHILE the hook is running.
+            pool = self.pool_ref["pool"]
+            with pool._lock:
+                pool._slots.pop(slot.slot_id, None)
+            pool._forget_slot_health(slot.slot_id)
+            return True
+
+    ref: dict = {}
+    rt = _VanishingRuntime(ref)
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, maintain_interval_s=0.0)
+    ref["pool"] = pool
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    slot.state = SlotState.IDLE
+
+    pool._maintain_idle()
+
+    assert slot.slot_id not in pool._slots, "sanity: the slot really did leave the pool"
+    assert slot.slot_id not in pool._maintain_last, (
+        "the completion re-stamp re-created a cooldown entry for a departed slot; nothing sweeps "
+        "_maintain_last, so it leaks one per-spawn UUID every time this races"
+    )
+
+
+def test_time_spent_inside_an_unanswered_probe_counts_as_unobservable() -> None:
+    """An UNKNOWN episode has to include the time spent BLOCKED INSIDE the probe.
+
+    The stamp was taken after is_ready() returned, so a describe that burned its full timeout and
+    then produced no verdict contributed nothing to the episode -- and a later definitive answer
+    judged the slot as though that outage had been observed warming time. The mirror of the
+    rate-limit stamps elsewhere on this branch: a throttle measures from COMPLETION, an episode
+    from its START.
+
+    MUTATION: stamp after the probe returns -> the 30s spent inside it vanishes.
+    """
+    now = [1000.0]
+
+    class _SlowUnknownRuntime(_FakeRuntime):
+        def is_ready(self, slot: Slot):
+            now[0] += 30.0          # the probe blocks for 30s...
+            return None             # ...and then answers nothing
+
+    pool = WarmPool(runtime=_SlowUnknownRuntime(), warm_size=1, spawn_rate_limit=100.0,
+                    clock=lambda: now[0], warming_timeout_s=60.0, unknown_grace_s=300.0)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    slot.state = SlotState.WARMING
+
+    pool._promote_warming()
+    since = pool._warming_unknown_since.get(slot.slot_id)
+
+    assert since is not None, "sanity: an UNKNOWN readiness must open an episode"
+    assert since <= 1000.0, (
+        f"the episode starts at {since} but the probe began at 1000.0; the 30s spent blocked "
+        f"inside it is charged to the worker as observed warming time"
+    )
+
+
+def test_promotion_clears_the_idle_unknown_clock_too() -> None:
+    """A warming slot whose eviction was rate-limited seeds the IDLE _unknown_since as a fallback.
+
+    Promotion cleared only _warming_unknown_since, so that stale stamp survived into IDLE and the
+    first indeterminate liveness check after promotion read as an outage that had already been
+    running for minutes -- and could exceed unknown_grace_s immediately, evicting a worker that had
+    just proved itself ready.
+
+    MUTATION: drop the _unknown_since.pop from the promotion block -> the stale stamp survives.
+    """
+    now = [1000.0]
+
+    class _ReadyRuntime(_FakeRuntime):
+        def is_ready(self, slot: Slot):
+            return True
+
+    pool = WarmPool(runtime=_ReadyRuntime(), warm_size=1, spawn_rate_limit=100.0,
+                    clock=lambda: now[0], unknown_grace_s=60.0)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    slot.state = SlotState.WARMING
+    pool._unknown_since[slot.slot_id] = 100.0      # the capped-eviction fallback, long ago
+
+    now[0] += 5.0
+    pool._promote_warming()
+    assert slot.state == SlotState.IDLE, "sanity: it must promote"
+
+    assert slot.slot_id not in pool._unknown_since, (
+        "a stale IDLE unknown stamp survived promotion; the first indeterminate liveness check "
+        "reads as an outage that started 900s ago and evicts a worker that just proved ready"
+    )
+
+
 def test_a_spawn_reaped_instead_of_published_leaves_no_marker_behind() -> None:
     """A dropped spawn never enters _slots, so nothing that keys on "not in _slots" can clean it.
 

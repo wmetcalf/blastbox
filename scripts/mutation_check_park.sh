@@ -25,9 +25,14 @@ cp src/blastbox/host/pool.py src/blastbox/host/runtime/aws_worker.py "$SNAP/" ||
 [ -s "$SNAP/pool.py" ] && [ -s "$SNAP/aws_worker.py" ] || {
   echo "mutation_check_park: snapshot is incomplete" >&2; rm -rf "$SNAP"; exit 2; }
 restore() {
-  cp "$SNAP/pool.py" src/blastbox/host/pool.py \
-    && cp "$SNAP/aws_worker.py" src/blastbox/host/runtime/aws_worker.py \
-    || echo "mutation_check_park: RESTORE FAILED — sources may be mutated, snapshot at $SNAP" >&2
+  if cp "$SNAP/pool.py" src/blastbox/host/pool.py \
+     && cp "$SNAP/aws_worker.py" src/blastbox/host/runtime/aws_worker.py; then
+    return 0
+  fi
+  # MUST report failure. With `cp ... || echo ...` the function exit status was echo's, i.e. 0,
+  # so mut() would happily patch on top of an already-mutated tree and report a meaningless result.
+  echo "mutation_check_park: RESTORE FAILED — sources may be mutated, snapshot at $SNAP" >&2
+  return 1
 }
 trap restore EXIT
 
