@@ -3216,6 +3216,43 @@ def test_the_cooldown_stamp_does_not_resurrect_a_slot_removed_during_the_hook() 
     )
 
 
+def test_a_slow_definitive_probe_credits_the_time_it_spent_blocked() -> None:
+    """Opening an episode uses the probe's START; CLOSING one must use its COMPLETION.
+
+    Both ends have to include the time spent blocked inside the probe, and one timestamp cannot
+    serve both. A describe that blocks 30s and then answers `pending` closed the episode at the
+    probe's start, crediting nothing for those 30s -- and _health_check runs immediately afterwards
+    and can evict the slot on exactly that interval.
+
+    MUTATION: close the episode at probe_began -> the blocked interval is not credited.
+    """
+    now = [1000.0]
+    answers: list = [None, False]        # UNKNOWN, then a SLOW definitive "not ready yet"
+
+    class _SlowThenDefinite(_FakeRuntime):
+        def is_ready(self, slot: Slot):
+            a = answers.pop(0) if answers else False
+            if a is False:
+                now[0] += 30.0           # the definitive probe blocks for 30s before answering
+            return a
+
+    pool = WarmPool(runtime=_SlowThenDefinite(), warm_size=1, spawn_rate_limit=100.0,
+                    clock=lambda: now[0], warming_timeout_s=60.0, unknown_grace_s=300.0)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    slot.state = SlotState.WARMING
+
+    pool._promote_warming()              # opens the episode at t=1000
+    now[0] += 10.0
+    pool._promote_warming()              # blocks 30s, then answers definitively -> closes it
+
+    credit = pool._warming_unknown_credit.get(slot.slot_id, 0.0)
+    assert credit >= 40.0, (
+        f"credited only {credit}s: the episode was closed at the probe's START, so the 30s it "
+        f"spent blocked without an observation is charged to the worker and can evict it"
+    )
+
+
 def test_time_spent_inside_an_unanswered_probe_counts_as_unobservable() -> None:
     """An UNKNOWN episode has to include the time spent BLOCKED INSIDE the probe.
 

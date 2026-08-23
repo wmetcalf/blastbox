@@ -1856,10 +1856,16 @@ class WarmPool:
             # TRI-STATE, same contract as _probe_alive and the health tick: True = ready,
             # False = CONFIRMED not ready, None = UNKNOWN. Record/clear the unknown episode BEFORE
             # acting, so _health_check's warming-timeout decision sees this pass's observation.
-            probed_at = probe_began
+            # OPENING an episode uses the probe's START; CLOSING one uses its COMPLETION. Both
+            # ends must include the time spent blocked inside the probe, and one variable cannot
+            # serve both: a 30s describe that then answers `pending` was credited nothing for those
+            # 30s, and _health_check runs immediately afterwards and could evict on them. I fixed
+            # the opening half two rounds ago and left the closing half reading the same value --
+            # the same "measure the interval you actually mean" rule, applied at one end.
+            probe_ended = self._clock()
             with self._lock:
                 if ready is None:
-                    self._warming_unknown_since.setdefault(slot.slot_id, probed_at)
+                    self._warming_unknown_since.setdefault(slot.slot_id, probe_began)
                 else:
                     # A definitive answer -- in EITHER direction -- ends the episode. "Not ready yet"
                     # is a real observation of the worker, so it must resume aging it; only the
@@ -1870,7 +1876,7 @@ class WarmPool:
                         # again), it does not restart: only the unobservable interval is credited.
                         self._warming_unknown_credit[slot.slot_id] = (
                             self._warming_unknown_credit.get(slot.slot_id, 0.0)
-                            + max(0.0, probed_at - since))
+                            + max(0.0, probe_ended - since))
             if ready:
                 with self._lock:
                     # Only promote if still WARMING (concurrent stop could clear it)
