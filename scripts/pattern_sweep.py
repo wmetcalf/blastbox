@@ -46,15 +46,52 @@ def tri_state_defs(trees):
     """
     out = {}
     for path, tree in trees.items():
+        # Walk EVERY def, not just the direct children of a ClassDef. Module-level helpers and
+        # nested defs are declarations too, and missing one does not produce a smaller report --
+        # it produces `none`, because P1 only looks up names this function returned. A scan that
+        # found nothing and a scan that found no bugs printed the identical line.
+        owner = {}
         for cls in ast.walk(tree):
-            if not isinstance(cls, ast.ClassDef):
+            if isinstance(cls, ast.ClassDef):
+                for n in ast.walk(cls):
+                    owner.setdefault(n, cls.name)
+        for n in ast.walk(tree):
+            if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            for n in cls.body:
-                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    a = ann_text(n.returns).replace('"', "").replace("'", "").replace(" ", "")
-                    if a in ("bool|None", "None|bool", "Optional[bool]"):
-                        out[(cls.name, n.name)] = f"{path}:{n.lineno}"
+            a = ann_text(n.returns).replace('"', "").replace("'", "").replace(" ", "")
+            if a in ("bool|None", "None|bool", "Optional[bool]"):
+                out[(owner.get(n, "<module>"), n.name)] = f"{path}:{n.lineno}"
     return out
+
+
+def plain_bool_defs(trees):
+    """Same shape, for defs annotated `-> bool`. Used only to flag NAME AMBIGUITY in the report.
+
+    P1 matches on the bare method name, so a correct `-> bool` method sharing a name with a
+    tri-state one elsewhere gets reported. Resolving that needs the receiver's real type, which
+    this cannot do; saying so on the line is the honest alternative to silently guessing.
+    """
+    out = set()
+    for tree in trees.values():
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                    and ann_text(n.returns).strip().strip("\"'") == "bool":
+                out.add(n.name)
+    return out
+
+
+def parent_map(tree):
+    parents = {}
+    for n in ast.walk(tree):
+        for c in ast.iter_child_nodes(n):
+            parents[c] = n
+    return parents
+
+
+def bindings_of(fn, name):
+    """Every line where ``name`` is (re)bound in ``fn`` -- assignment, annotated, walrus, for, with."""
+    return sorted((n.lineno, n.col_offset) for n in ast.walk(fn)
+                  if isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Store))
 
 
 def called_name(node):
@@ -79,24 +116,131 @@ def receiver_of(node):
     return None
 
 
-def bool_uses_of(fn, name):
-    """Boolean-context uses of local ``name`` inside ``fn`` (not nested defs)."""
+def bool_context(p, n, fn):
+    """Name the boolean context ``n`` sits in under parent ``p``, or None.
+
+    The module docstring advertised `if x`, `not x`, `bool(x)` and `and`/`or`; the variable form
+    -- per this script's own commit message, the shape the codebase actually uses -- implemented
+    three of those and none of the others. `while x:`, `x if c else y`, `assert x`, `bool(x)` and
+    a `return x` from a `-> bool` function all coerce None to False just as silently, and every
+    one of them reported clean.
+    """
+    if isinstance(p, ast.UnaryOp) and isinstance(p.op, ast.Not):
+        return "not <var>"
+    if isinstance(p, ast.If) and p.test is n:
+        return "if <var>:"
+    if isinstance(p, ast.While) and p.test is n:
+        return "while <var>:"
+    if isinstance(p, ast.IfExp) and p.test is n:
+        return "<var> ? a : b"
+    if isinstance(p, ast.Assert) and p.test is n:
+        return "assert <var>"
+    if isinstance(p, ast.BoolOp) and n in p.values:
+        return "and/or"
+    if isinstance(p, ast.Call) and called_name(p) == "bool" and n in p.args:
+        return "bool(<var>)"
+    if isinstance(p, ast.comprehension) and any(i is n for i in p.ifs):
+        return "comprehension if"
+    if isinstance(p, ast.Return) and p.value is n and fn is not None:
+        # Returning UNKNOWN is only a collapse if the caller is promised a real bool.
+        if ann_text(fn.returns).replace('"', "").replace("'", "").strip() == "bool":
+            return "return <var> from -> bool"
+    return None
+
+
+def bool_uses_of(fn, name, parents=None):
+    """Boolean-context uses of local ``name`` inside ``fn``.
+
+    Takes a prebuilt parent map: the previous version ran a full ``ast.walk(fn)`` *per matching
+    Name* looking for the parent, which is quadratic and, worse, appended a hit for every parent
+    that matched rather than the one actual parent.
+    """
+    if parents is None:
+        parents = parent_map(fn)
     out = []
     for n in ast.walk(fn):
         if not isinstance(n, ast.Name) or n.id != name or not isinstance(n.ctx, ast.Load):
             continue
-        for parent in ast.walk(fn):
-            if isinstance(parent, ast.UnaryOp) and isinstance(parent.op, ast.Not) \
-                    and parent.operand is n:
-                out.append((n.lineno, "not <var>"))
-            elif isinstance(parent, ast.If) and parent.test is n:
-                out.append((n.lineno, "if <var>:"))
-            elif isinstance(parent, ast.BoolOp) and n in parent.values:
-                out.append((n.lineno, "and/or"))
+        ctx = bool_context(parents.get(n), n, fn)
+        if ctx:
+            out.append((n.lineno, ctx, n))
     return out
 
 
-def guards_none(fn, name, before_line=None):
+def block_paths(fn):
+    """node -> the chain of (block, index) slots that locate it in ``fn``'s nesting.
+
+    Line order alone let a guard buried in a SIBLING branch vouch for a use outside it:
+
+        if kind == "x":
+            if healthy is None: return   # guard -- only on the kind == "x" path
+        if not healthy: ...              # None still lands here for every other kind
+
+    which the sweep read as clean. Comparing block paths turns "earlier in the file" into
+    "actually on the path to this use". Two reviewers found this independently; the comment
+    above admitted the hole rather than closing it, which is not the same thing as knowing
+    how wide it was -- a false NEGATIVE here silently weakens every clean run.
+    """
+    paths = {}
+
+    def visit(st, here):
+        # Recurse FIRST. `setdefault` keeps whatever is already there, so descending before
+        # claiming lets the DEEPEST block win each node; claiming first made every node in a
+        # nested branch look like it lived at the outer statement's depth, which is exactly the
+        # confusion this map exists to remove.
+        #
+        # TRANSPARENT vs CONDITIONAL is the whole distinction. A `with` body is not a branch --
+        # control always flows through it -- so a guard inside one governs the code after it, and
+        # counting it as a branch reported pool._promote_warming, which handles all three states
+        # correctly, purely because its `ready is None` arm sits inside `with self._lock:`. A
+        # `try` body IS conditional here: an exception can skip the rest of it, so a guard there
+        # may never run, and that direction should err toward reporting.
+        if isinstance(st, ast.With | ast.AsyncWith):
+            for c in st.body:
+                visit(c, here)
+        else:
+            for field in ("body", "orelse"):
+                inner = getattr(st, field, None)
+                if isinstance(inner, list):
+                    walk(inner, here)
+            for h in getattr(st, "handlers", []) or []:
+                walk(h.body, here)
+        for c in getattr(st, "finalbody", []) or []:
+            visit(c, here)
+        for case in getattr(st, "cases", []) or []:
+            walk(case.body, here)
+        for n in ast.walk(st):
+            paths.setdefault(n, here)
+
+    def walk(stmts, prefix):
+        for i, st in enumerate(stmts):
+            visit(st, prefix + ((id(stmts), i),))
+
+    walk(fn.body, ())
+    return paths
+
+
+def dominates(paths, guard_node, use_node, ordered=True):
+    """True if the guard's block path is a prefix of the use's -- same block, or an ancestor.
+
+    An `if x is None: return` guard registers at the *test*, which sits in the enclosing block,
+    so the common early-return form still passes. A guard nested one level deeper than the use
+    does not.
+    """
+    g, u = paths.get(guard_node), paths.get(use_node)
+    if g is None or u is None:
+        return False
+    if len(g) > len(u):
+        return False
+    # ``ordered`` mirrors the same split the caller makes on `before_line`. A `not x` use CONSUMES
+    # the None branch, so only a guard that already ran helps -- same block AND at/before it. An
+    # `if x:` use lets None fall through, so a later sibling guard (`if x: return` then
+    # `if x is False:`) still governs it; there the block must match but the index need not.
+    return all(a[0] == b[0] and (not ordered or a[1] <= b[1])
+               for a, b in zip(g, u[:len(g)]))
+
+
+def guards_none(fn, name, before=None, use_node=None, paths=None, rebinds=None):
     """Does ``fn`` discriminate the three states of ``name`` BEFORE ``before_line``?
 
     Any IDENTITY comparison against None, False or True counts. Looking only for `is None` was too
@@ -118,7 +262,24 @@ def guards_none(fn, name, before_line=None):
         # helps a use it PRECEDES. Line order is an approximation of dominance -- it can still be
         # fooled by a guard in an unrelated earlier branch -- but it is a far better one than
         # "exists somewhere", and it errs toward reporting.
-        if before_line is not None and n.lineno >= before_line:
+        # Ordering is by (line, COLUMN), not line alone. A one-line ternary puts its guard and
+        # its use on the same line -- `return None if alive is None else bool(alive)`, which is
+        # correct code -- and a line-only comparison called the guard "too late", reporting
+        # pool._probe_alive, the very function whose docstring explains the tri-state contract.
+        if before is not None and (n.lineno, n.col_offset) >= before:
+            continue
+        # ...and preceding is not enough: it must also be ON THE PATH to the use.
+        if paths is not None and use_node is not None \
+                and not dominates(paths, n, use_node, ordered=before is not None):
+            continue
+        # ...and it must still be TALKING ABOUT THE SAME VALUE. A guard is evidence about the
+        # value it inspected; re-probing overwrites that value with a fresh unknown:
+        #     ok = rt.is_ready(s)
+        #     if ok is None: return          # guards the FIRST answer
+        #     ok = rt.is_ready(s)            # unknown all over again
+        #     if not ok: ...                 # collapse -- and the stale guard vouched for it
+        if rebinds and before is not None \
+                and any((n.lineno, n.col_offset) < rb < before for rb in rebinds):
             continue
         if any(isinstance(o, (ast.Is, ast.IsNot)) for o in n.ops) and \
                 any(isinstance(c, ast.Constant) and c.value in (None, False, True)
@@ -130,6 +291,29 @@ def guards_none(fn, name, before_line=None):
 def enclosing_funcs(tree):
     return [n for n in ast.walk(tree)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+
+def bound_name(p, call):
+    """The local name ``call`` is bound to under parent ``p``, or None.
+
+    Only `x = call()` counted. Annotating the variable with the very type that makes it dangerous
+    -- `ready: bool | None = rt.is_ready(s)` -- turned the check OFF, so writing the code more
+    carefully was what hid the bug. Walrus and tuple unpacking were equally invisible.
+    """
+    if isinstance(p, ast.Assign) and len(p.targets) == 1:
+        t = p.targets[0]
+        if isinstance(t, ast.Name):
+            return t.id
+        # `ok, why = rt.is_ready(s), reason` -- match the element position.
+        if isinstance(t, ast.Tuple) and isinstance(p.value, ast.Tuple):
+            for tgt, val in zip(t.elts, p.value.elts):
+                if val is call and isinstance(tgt, ast.Name):
+                    return tgt.id
+    if isinstance(p, ast.AnnAssign) and isinstance(p.target, ast.Name) and p.value is call:
+        return p.target.id
+    if isinstance(p, ast.NamedExpr) and isinstance(p.target, ast.Name):
+        return p.target.id
+    return None
 
 
 def find_p1(trees, tri):
@@ -146,7 +330,9 @@ def find_p1(trees, tri):
     # an unusually-named variable. A checker that cries wolf is worse than one with a known blind
     # spot, because you stop reading it.
     OURS = ("self", "runtime", "_runtime", "rt", "tier", "engine", "slot_runtime")
+    ambiguous = plain_bool_defs(trees) & set(by_name)
     hits = []
+    seen = set()
     for path, tree in trees.items():
         parents = {}
         for n in ast.walk(tree):
@@ -162,7 +348,21 @@ def find_p1(trees, tri):
             if recv not in OURS:
                 continue        # not one of our runtimes -- Thread.is_alive and friends
             p = parents.get(n)
+            # `ok, why = rt.is_ready(s), reason` puts the RHS Tuple between the call and the
+            # assignment, so the binding was invisible one level up.
+            if isinstance(p, ast.Tuple) and isinstance(parents.get(p), ast.Assign):
+                p = parents.get(p)
             ctx = None
+            if isinstance(p, ast.NamedExpr):
+                # `if not (ok := rt.is_ready(s)):` -- the walrus binds in STORE context, so there
+                # is no Load use for the variable scan to find, and the boolean context belongs to
+                # the NamedExpr rather than to a Name. Judge it as a direct use.
+                wctx = bool_context(parents.get(p), p, None)
+                if wctx:
+                    decl = ", ".join(f"{c}@{loc}" for c, loc in by_name[nm][:2])
+                    hits.append((f"{path}:{n.lineno}", f"({p.target.id} := {recv or '?'}.{nm})",
+                                 wctx.replace("<var>", "<walrus>"), decl))
+                    continue
             if isinstance(p, ast.UnaryOp) and isinstance(p.op, ast.Not):
                 ctx = "not <call>"
             elif isinstance(p, ast.If) and p.test is n:
@@ -176,19 +376,28 @@ def find_p1(trees, tri):
             if ctx:
                 decl = ", ".join(f"{c}@{loc}" for c, loc in by_name[nm][:2])
                 hits.append((f"{path}:{n.lineno}", f"{recv or '?'}.{nm}", ctx, decl))
-            elif isinstance(p, ast.Assign) and len(p.targets) == 1 \
-                    and isinstance(p.targets[0], ast.Name):
+            elif bound_name(p, n) is not None:
                 # INDIRECT use: `healthy = rt.is_ready(slot)` ... `if not healthy:`. Only the
                 # immediate parent was inspected, so this -- the shape every state machine in this
                 # codebase actually uses -- was invisible: deleting an `is None` guard recreated a
                 # collapse while the sweep still printed `none`. A checker blind to the dominant
                 # form of the bug it hunts is worse than none, because its silence reads as proof.
-                var = p.targets[0].id
+                var = bound_name(p, n)
                 fn = next((f for f in enclosing_funcs(tree)
                            if f.lineno <= n.lineno <= (f.end_lineno or n.lineno)), None)
                 if fn is None:
                     continue
-                for lineno, uctx in bool_uses_of(fn, var):
+                fpaths = block_paths(fn)
+                rebinds = bindings_of(fn, var)
+                fparents = parent_map(fn)
+                for lineno, uctx, unode in bool_uses_of(fn, var, fparents):
+                    # The use must come AFTER this tri-state binding. bool_uses_of returns every
+                    # use of the NAME, so a `if not ok:` on an unrelated earlier `ok = commit()`
+                    # was reported, blamed on a call three lines below it, and printed as
+                    # `ok = rt.is_ready()` -- a line that does not exist. Reporting correct code
+                    # under a quoted line it does not contain is worse than missing it.
+                    if (lineno, unode.col_offset) < (n.lineno, n.col_offset):
+                        continue
                     # WHICH use decides whether order matters.
                     #   `if x:` tests for SUCCESS and lets both other states fall through, so a
                     #     discriminator anywhere -- including after it -- still governs them. Both
@@ -198,99 +407,266 @@ def find_p1(trees, tri):
                     #     that already ran can save them. This is the shape the review cited:
                     #     `if not healthy: return` followed by a now-useless `if healthy is None:`.
                     consumes_none = uctx != "if <var>:"
-                    if guards_none(fn, var, before_line=lineno if consumes_none else None):
+                    if guards_none(fn, var,
+                                   before=(lineno, unode.col_offset) if consumes_none else None,
+                                   use_node=unode, paths=fpaths,
+                                   rebinds=rebinds if consumes_none else None):
                         continue
                     decl = ", ".join(f"{c}@{loc}" for c, loc in by_name[nm][:2])
+                    if nm in ambiguous:
+                        decl += "  [NAME ALSO DECLARED -> bool elsewhere; verify the receiver]"
+                    # One line per USE. Two branches assigning the same variable re-ran the whole
+                    # use scan and emitted a duplicate for each -- the exact repetitive texture
+                    # that teaches you to skim the report.
+                    key = (path, lineno, var, uctx)
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     hits.append((f"{path}:{lineno}", f"{var} = {recv or '?'}.{nm}",
                                  f"{uctx}, no tri-state guard in {fn.name}()", decl))
     return hits
 
 
 def find_p2(trees):
+    """Two budget scopes that BOTH run in one function, each getting a fresh full deadline."""
     hits = []
     for path, tree in trees.items():
         for fn in ast.walk(tree):
             if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
+            paths = block_paths(fn)
+            loops = {id(n) for lp in ast.walk(fn)
+                     if isinstance(lp, (ast.For, ast.AsyncFor, ast.While))
+                     for st in lp.body for n in ast.walk(st)}
             scopes = []
-
-            def walk(node, depth):
-                for c in ast.iter_child_nodes(node):
-                    if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for c in ast.walk(fn):
+                if not isinstance(c, (ast.With, ast.AsyncWith)):
+                    continue
+                items = [ann_text(i.context_expr) for i in c.items]
+                budgets = [t for t in items if "_budget(" in t]
+                if not budgets:
+                    continue
+                # `with A(), B():` is ONE statement, and Python defines multiple items as
+                # NESTING -- B opens inside A, so B mins against a live outer scope, the safe
+                # case. Recording each item separately reported that as two siblings costing 2x.
+                # Only the OUTERMOST budget item of a with-statement can be a sibling of anything.
+                scopes.append((c, budgets[0], len(budgets)))
+            for c, txt, _n in scopes:
+                if id(c) in loops:
+                    # A scope inside a loop body gets a fresh full deadline PER ITERATION, which
+                    # is the same defect with an unbounded multiplier -- and it was never reported,
+                    # because a single lexical scope can't be its own sibling.
+                    hits.append((f"{path}:{fn.lineno}", fn.name,
+                                 [f"L{c.lineno} (in a loop -- fresh budget per iteration)"]))
+            for i, (a, _t, _n) in enumerate(scopes):
+                for b, _t2, _n2 in scopes[i + 1:]:
+                    pa, pb = paths.get(a), paths.get(b)
+                    if pa is None or pb is None:
                         continue
-                    if isinstance(c, (ast.With, ast.AsyncWith)):
-                        for item in c.items:
-                            t = ann_text(item.context_expr)
-                            if "_budget(" in t:
-                                scopes.append((c.lineno, t, depth))
-                        walk(c, depth + 1)
-                    else:
-                        walk(c, depth)
-
-            walk(fn, 0)
-            if len(scopes) >= 2:
-                # siblings = same nesting depth
-                by_depth = {}
-                for ln, t, d in scopes:
-                    by_depth.setdefault(d, []).append((ln, t))
-                for d, group in by_depth.items():
-                    if len(group) >= 2:
-                        hits.append((f"{path}:{fn.lineno}", fn.name,
-                                     [f"L{ln}" for ln, _ in group]))
+                    # Nested (one path is a prefix of the other) -> the inner mins against a live
+                    # outer scope. Safe, and the reason nesting is the fix for this defect.
+                    shared = min(len(pa), len(pb))
+                    if pa[:shared] == pb[:shared]:
+                        continue
+                    # Divergent BLOCK identity means mutually exclusive arms -- an if/else where
+                    # only one ever runs. Reported as 2x the bound; it is 1x.
+                    if any(x[0] != y[0] for x, y in zip(pa, pb)):
+                        continue
+                    hits.append((f"{path}:{fn.lineno}", fn.name,
+                                 [f"L{a.lineno}", f"L{b.lineno}"]))
     return hits
+
+
+def is_clock(node):
+    """Is this expression a read of the current time?"""
+    t = ann_text(node)
+    if t in ("now", "_now"):
+        return True
+    return any(t.endswith(c) for c in
+               ("_clock()", "time.monotonic()", "time.time()", "time.perf_counter()",
+                "monotonic()", "_now()"))
+
+
+def name_tokens(attr):
+    """`self._last_probe_at` -> {'last','probe','at'} -- TOKENS, not substrings.
+
+    The old test was `"at" in key.lower()`, which matches `self._st-AT-e` and `self._d-AT-a`, and
+    the value test was `"now" in val`, which matches `self._k-NOW-n_good`. Three of the fourteen
+    hits this check produced were manufactured entirely by those two substring matches.
+    """
+    return set(attr.lower().replace("self.", "").strip("_").split("_"))
+
+
+def gate_attrs(fn):
+    """Attributes ``fn`` READS inside a comparison -- i.e. ones that gate something here.
+
+    P3 claimed to find "a rate-limit timestamp", but tested only the NAME and the VALUE, so every
+    start-time, idle-marker and phase-timer qualified. A throttle is defined by having a GATE
+    (`if now - self._x < interval: return`) in the same function as its stamp, so require one.
+    """
+    out = set()
+    for n in ast.walk(fn):
+        if not isinstance(n, ast.Compare):
+            continue
+        for side in [n.left, *n.comparators]:
+            for sub in ast.walk(side):
+                if isinstance(sub, ast.Attribute) and ann_text(sub).startswith("self."):
+                    out.add(ann_text(sub))
+    return out
+
+
+# Logging, event flags and container bookkeeping are not the slow operation a throttle exists to
+# space out. Counting them made `self._last_idle_at = now; self._idle_event.set()` -- correct code
+# -- read as "stamped before the call".
+BOOKKEEPING = ("log", "logger", "debug", "info", "warning", "error", "exception",
+               "set", "clear", "append", "add", "discard", "pop", "get", "setdefault",
+               "notify", "notify_all", "update", "remove")
+
+
+def is_bookkeeping(call):
+    nm = called_name(call) or ""
+    recv = (receiver_of(call) or "").lower()
+    return nm in BOOKKEEPING or "log" in recv
 
 
 def find_p3(trees):
-    """A `self.X[...] = <clock>` or `self.X = <clock>` with no second assignment to the same
-    target later in the same function -- i.e. stamped once, on entry."""
+    """A throttle stamp written BEFORE the slow call it throttles, and never re-stamped after it.
+
+    A timestamp written before the call it bounds is already stale when the call returns: a call
+    that outruns its own interval is eligible again the moment it finishes.
+    """
     hits = []
-    CLOCKS = ("_clock()", "now", "time.monotonic()")
+    STAMPY = {"last", "attempt", "since", "at", "stamp", "next", "prev"}
     for path, tree in trees.items():
-        for fn in ast.walk(tree):
-            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        for cls in ast.walk(tree):
+            if not isinstance(cls, ast.ClassDef):
                 continue
-            assigns = {}
-            for n in ast.walk(fn):
-                if not isinstance(n, ast.Assign) or len(n.targets) != 1:
+            for fn in ast.walk(cls):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
-                tgt, val = ann_text(n.targets[0]), ann_text(n.value)
-                if not tgt.startswith("self."):
+                # The gate must be in THIS function. A throttle is a three-step shape --
+                # check the stamp, stamp it, then do the slow thing -- and all three steps live
+                # together. Accepting a gate anywhere in the class admitted every start-time and
+                # idle-marker in a 3k-line class, which is how this check reached 14 hits with
+                # nothing to say.
+                gated = gate_attrs(fn)
+                if not gated:
                     continue
-                if not any(c in val for c in CLOCKS):
-                    continue
-                key = tgt.split("[")[0]
-                if any(w in key.lower() for w in ("last", "attempt", "since", "at", "stamp")):
-                    assigns.setdefault(key, []).append(n.lineno)
-            for key, lines in assigns.items():
-                if len(lines) == 1:
-                    hits.append((f"{path}:{lines[0]}", fn.name, key))
+                # A stamp written inside an `except` handler records WHEN THE FAILURE HAPPENED --
+                # an event, at the only moment it can be observed. That is the correct shape, not
+                # the bug; `_mint_fail_at` and friends were reported purely for being on one.
+                in_handler = {id(n) for h in ast.walk(fn)
+                              if isinstance(h, ast.ExceptHandler)
+                              for st in h.body for n in ast.walk(st)}
+                stamps = {}
+                for n in ast.walk(fn):
+                    if isinstance(n, ast.Assign) and len(n.targets) == 1:
+                        tgt, val = n.targets[0], n.value
+                    elif isinstance(n, ast.AnnAssign) and n.value is not None:
+                        tgt, val = n.target, n.value
+                    else:
+                        continue
+                    key = ann_text(tgt).split("[")[0]
+                    if not key.startswith("self."):
+                        continue
+                    # The value may be a clock read OR a local already holding one
+                    # (`ts = self._clock(); self._last_at = ts`), which the text match missed.
+                    if not (is_clock(val) or any(is_clock(v) for v in local_clocks(fn, val))):
+                        continue
+                    if key not in gated or not (name_tokens(key) & STAMPY):
+                        continue
+                    if id(n) in in_handler:
+                        continue
+                    stamps.setdefault(key, []).append(n)
+                for key, nodes in stamps.items():
+                    last = max(n.lineno for n in nodes)
+                    # The defect is a slow call AFTER the final stamp with no re-stamp following
+                    # it. Requiring exactly one assignment instead reported correct token-bucket
+                    # refills and, worse, went silent whenever a stamp appeared in both arms of an
+                    # if/else -- neither of which is the property.
+                    after = [c for c in ast.walk(fn)
+                             if isinstance(c, ast.Call) and c.lineno > last and not is_clock(c)
+                             and not is_bookkeeping(c)]
+                    if after:
+                        hits.append((f"{path}:{last}", fn.name,
+                                     f"{key}  (stamped before {ann_text(after[0].func)}(...))"))
     return hits
 
 
-trees = {}
-for f in FILES:
-    p = ROOT / f
-    trees[f.split("/")[-1]] = ast.parse(p.read_text())
+def local_clocks(fn, val):
+    """If ``val`` is a bare local name, the expressions assigned to it in ``fn``."""
+    if not isinstance(val, ast.Name):
+        return []
+    return [n.value for n in ast.walk(fn)
+            if isinstance(n, ast.Assign) and len(n.targets) == 1
+            and isinstance(n.targets[0], ast.Name) and n.targets[0].id == val.id]
 
-tri = tri_state_defs(trees)
-print(f"tri-state methods found: {len(tri)}")
-for (cls, name), v in sorted(tri.items()):
-    print(f"    {cls + '.' + name:<40} {v}")
 
-print("\n=== P1 tri-state collapse (a `bool | None` used as a boolean)")
-p1 = find_p1(trees, tri)
-print("  none" if not p1 else "")
-for loc, nm, ctx, decl in p1:
-    print(f"  {loc:<26} {nm}()  used as `{ctx}`   (declared {decl})")
+def main():
+    """Run every check and print the report.
 
-print("\n=== P2 sibling budget scopes in one function")
-p2 = find_p2(trees)
-print("  none" if not p2 else "")
-for loc, nm, lines in p2:
-    print(f"  {loc:<26} {nm}()  scopes at {', '.join(lines)}")
+    Behind a main() guard because the module-level version ran the ENTIRE sweep -- reading five
+    source files and printing three reports -- on `import pattern_sweep`, which is what a test of
+    these checks has to do. A checker with no way to test itself is the thing it warns about.
+    """
+    trees = {}
+    missing = []
+    for f in FILES:
+        fp = ROOT / f
+        # Unguarded reads died with a raw traceback on a missing or unparseable file. That at
+        # least fails loudly -- but it exits 1 for the same reason a real finding would, so the
+        # two are indistinguishable to anything calling this.
+        try:
+            trees[f.split("/")[-1]] = ast.parse(fp.read_text())
+        except (OSError, SyntaxError) as exc:
+            missing.append(f"{f}: {type(exc).__name__}: {exc}")
+    if missing:
+        print("CANNOT SCAN:")
+        for m in missing:
+            print(f"  {m}")
+        print(f"\nRefusing to report on a partial scan ({len(missing)}/{len(FILES)} unreadable).")
+        return 2
 
-print("\n=== P3 rate-limit stamp assigned once (never re-stamped after the call)")
-p3 = find_p3(trees)
-print("  none" if not p3 else "")
-for loc, nm, key in p3:
-    print(f"  {loc:<26} {nm}()  {key}")
+    tri = tri_state_defs(trees)
+    print(f"tri-state methods found: {len(tri)}")
+    for (cls, name), v in sorted(tri.items()):
+        print(f"    {cls + '.' + name:<40} {v}")
+    if not tri:
+        # A run that found nothing to look for printed exactly what a clean run prints. P1 can
+        # only report uses of names this scan collected, so zero declarations means a guaranteed
+        # `none` -- the most reassuring line in the output, produced by having scanned nothing.
+        print("\nNO tri-state declarations found. P1 cannot report anything, so its `none` below\n"
+              "would be vacuous. Check FILES and the annotation forms in tri_state_defs.")
+        return 2
+
+    print("\n=== P1 tri-state collapse (a `bool | None` used as a boolean)")
+    p1 = find_p1(trees, tri)
+    print("  none" if not p1 else "")
+    for loc, nm, ctx, decl in p1:
+        print(f"  {loc:<26} {nm}()  used as `{ctx}`   (declared {decl})")
+
+    print("\n=== P2 budget scopes that both run in one function")
+    p2 = find_p2(trees)
+    print("  none" if not p2 else "")
+    for loc, nm, lines in p2:
+        print(f"  {loc:<26} {nm}()  scopes at {', '.join(lines)}")
+
+    print("\n=== P3 throttle stamp written before the call it throttles  [ADVISORY]")
+    p3 = find_p3(trees)
+    print("  none" if not p3 else "")
+    for loc, nm, key in p3:
+        print(f"  {loc:<26} {nm}()  {key}")
+    print("  NOTE: advisory only, and NOT gated on. P3 cannot tell a stamp that RECORDS AN EVENT\n"
+          "  (`self._fail_at = now` at the moment of the failure -- correct) from one written\n"
+          "  BEFORE the work it throttles (the bug). Distinguishing them needs to know which call\n"
+          "  the throttle protects, which is not recoverable from the AST. Read these by hand;\n"
+          "  every hit on this tree so far has been correct code.")
+
+    # EXIT NONZERO on a real finding, so this can gate. A constant exit 0 meant no CI step or
+    # wrapper could tell "clean" from "findings" from "crashed before scanning" -- while the
+    # output was being cited as evidence the branch is correct.
+    return 1 if (p1 or p2) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

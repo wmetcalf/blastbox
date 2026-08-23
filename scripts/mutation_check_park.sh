@@ -24,6 +24,12 @@ cp src/blastbox/host/pool.py src/blastbox/host/runtime/aws_worker.py "$SNAP/" ||
   echo "mutation_check_park: could not snapshot the sources" >&2; rm -rf "$SNAP"; exit 2; }
 [ -s "$SNAP/pool.py" ] && [ -s "$SNAP/aws_worker.py" ] || {
   echo "mutation_check_park: snapshot is incomplete" >&2; rm -rf "$SNAP"; exit 2; }
+cleanup() {
+  restore || return 1
+  # Each run left a /tmp/tmp.XXXX behind holding copies of two source files.
+  rm -rf "$SNAP"
+}
+
 restore() {
   if cp "$SNAP/pool.py" src/blastbox/host/pool.py \
      && cp "$SNAP/aws_worker.py" src/blastbox/host/runtime/aws_worker.py; then
@@ -34,7 +40,7 @@ restore() {
   echo "mutation_check_park: RESTORE FAILED — sources may be mutated, snapshot at $SNAP" >&2
   return 1
 }
-trap restore EXIT
+trap cleanup EXIT
 
 FAILURES=0
 
@@ -49,7 +55,14 @@ mut() {
   if ! .venv/bin/python -c "$patch" 2>/dev/null; then
     echo "  ERROR    $name (patch failed)"; FAILURES=$((FAILURES + 1)); return
   fi
-  if git diff --quiet src/; then
+  # Compare against the SNAPSHOT, not against git. `git diff --quiet src/` is nonzero for ANY
+  # difference under src/ -- so a single unrelated uncommitted edit, the normal state while
+  # working on the branch this harness vouches for, made a patch that changed NOTHING report
+  # `killed` and the script exit 0 with "all mutants killed". (Outside a git checkout it also
+  # returned 128, with the same effect.) The snapshot is what restore() uses, so it is the only
+  # thing that actually answers "did this patch change the tree".
+  if cmp -s "$SNAP/pool.py" src/blastbox/host/pool.py \
+     && cmp -s "$SNAP/aws_worker.py" src/blastbox/host/runtime/aws_worker.py; then
     echo "  ERROR    $name (changed nothing)"; FAILURES=$((FAILURES + 1)); return
   fi
   # Distinguish a KILLED mutant from an infrastructure failure. pytest exits 1 for a real test
