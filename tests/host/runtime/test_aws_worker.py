@@ -3128,6 +3128,35 @@ def test_a_definitive_park_refusal_is_not_frozen_like_a_brownout():
     )
 
 
+def test_the_second_no_verdict_door_in_maintenance_freezes_too():
+    """maintain_idle has TWO places a no-verdict can escape, and only the first froze.
+
+    The opening `_state()` describe is handled; everything _park_step itself asks is not -- notably
+    _agent_healthy, which issues its own describe when slot.ip is unset (a public-IP slot returned
+    after a partial resume) and raises once the SHARED maintenance budget is spent by the first
+    call. That path returned the slot as usable without freezing, so _park_since aged through every
+    inconclusive pass until give-up retired a healthy, running instance.
+
+    MUTATION: remove the AwsNoVerdict handler -> the outer (AwsWorkerError, OSError) branch catches
+    it, nothing freezes, and this fails.
+    """
+    from blastbox.host.runtime.aws_worker import AwsNoVerdict, AwsWorkerSlot
+    rt, _ = _hibernate_rt(state=["running"], healthy=[True], hibernate_timeout_s=300.0)
+    slot = AwsWorkerSlot(slot_id="d2", resource_id="i-1")
+    rt._park_since[slot.slot_id] = 1000.0
+
+    def no_verdict(_slot):
+        raise AwsNoVerdict("ec2 describe-instances: probe budget exhausted")
+
+    rt._agent_healthy = no_verdict          # the SECOND describe, inside _park_step
+
+    assert rt.maintain_idle(slot) is True, "a no-verdict must not report the slot unusable"
+    assert slot.slot_id in rt._park_unknown_since, (
+        "the second no-verdict door did not freeze the give-up clock; _park_since ages through "
+        "every inconclusive pass until a healthy running instance is retired"
+    )
+
+
 def test_the_maintenance_door_freezes_the_park_clock_too():
     """is_ready and maintain_idle drive the SAME state machine against the SAME control plane.
 

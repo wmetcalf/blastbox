@@ -2288,6 +2288,18 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                     _log.debug("ec2-hibernate: maintain_idle(%s) unknown: %s", slot.slot_id, exc)
                     return True
                 phase, _ = self._park_step(slot, st, self._clock())
+        except AwsNoVerdict as exc:
+            # The SECOND no-verdict door. The handler above covers the opening describe; this one
+            # covers everything _park_step itself asks -- notably _agent_healthy, which issues its
+            # own describe when slot.ip is unset (a public-IP slot returned after a partial resume)
+            # and raises when the SHARED maintenance budget is already spent by the first call.
+            # Returning usable without freezing let _park_since age through every inconclusive pass
+            # until give-up retired a healthy running instance. Same rule as everywhere else on
+            # this branch: silence freezes the clock, and it has to freeze at every door.
+            if slot.slot_id in self._park_since:
+                self._freeze_park(slot.slot_id, self._clock())
+            _log.debug("ec2-hibernate: maintain_idle(%s) no verdict: %s", slot.slot_id, exc)
+            return True
         except (AwsWorkerError, OSError) as exc:
             _log.debug("ec2-hibernate: maintain_idle(%s) error: %s", slot.slot_id, exc)
             return True
