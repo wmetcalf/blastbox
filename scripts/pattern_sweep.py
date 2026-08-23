@@ -79,6 +79,49 @@ def receiver_of(node):
     return None
 
 
+def bool_uses_of(fn, name):
+    """Boolean-context uses of local ``name`` inside ``fn`` (not nested defs)."""
+    out = []
+    for n in ast.walk(fn):
+        if not isinstance(n, ast.Name) or n.id != name or not isinstance(n.ctx, ast.Load):
+            continue
+        for parent in ast.walk(fn):
+            if isinstance(parent, ast.UnaryOp) and isinstance(parent.op, ast.Not) \
+                    and parent.operand is n:
+                out.append((n.lineno, "not <var>"))
+            elif isinstance(parent, ast.If) and parent.test is n:
+                out.append((n.lineno, "if <var>:"))
+            elif isinstance(parent, ast.BoolOp) and n in parent.values:
+                out.append((n.lineno, "and/or"))
+    return out
+
+
+def guards_none(fn, name):
+    """Does ``fn`` discriminate the three states of ``name`` anywhere?
+
+    Any IDENTITY comparison against None, False or True counts. Looking only for `is None` was too
+    narrow: `if _ok is False:` separates the definitive negative from the unknown just as well, and
+    is what aws_worker's resume loops actually use -- so the first version of this check reported
+    both of them as collapses. A checker that flags correct code gets ignored exactly as fast as
+    one that misses bugs.
+    """
+    for n in ast.walk(fn):
+        if not isinstance(n, ast.Compare) or not isinstance(n.left, ast.Name):
+            continue
+        if n.left.id != name:
+            continue
+        if any(isinstance(o, (ast.Is, ast.IsNot)) for o in n.ops) and \
+                any(isinstance(c, ast.Constant) and c.value in (None, False, True)
+                    for c in n.comparators):
+            return True
+    return False
+
+
+def enclosing_funcs(tree):
+    return [n for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+
 def find_p1(trees, tri):
     # Only names declared tri-state SOMEWHERE, but reported only when the receiver is plausibly
     # one of those classes: `self` (the declaring class or a subclass) or a name that is not an
@@ -123,6 +166,22 @@ def find_p1(trees, tri):
             if ctx:
                 decl = ", ".join(f"{c}@{loc}" for c, loc in by_name[nm][:2])
                 hits.append((f"{path}:{n.lineno}", f"{recv or '?'}.{nm}", ctx, decl))
+            elif isinstance(p, ast.Assign) and len(p.targets) == 1 \
+                    and isinstance(p.targets[0], ast.Name):
+                # INDIRECT use: `healthy = rt.is_ready(slot)` ... `if not healthy:`. Only the
+                # immediate parent was inspected, so this -- the shape every state machine in this
+                # codebase actually uses -- was invisible: deleting an `is None` guard recreated a
+                # collapse while the sweep still printed `none`. A checker blind to the dominant
+                # form of the bug it hunts is worse than none, because its silence reads as proof.
+                var = p.targets[0].id
+                fn = next((f for f in enclosing_funcs(tree)
+                           if f.lineno <= n.lineno <= (f.end_lineno or n.lineno)), None)
+                if fn is None or guards_none(fn, var):
+                    continue        # an explicit `is None` comparison IS the tri-state handling
+                for lineno, uctx in bool_uses_of(fn, var):
+                    decl = ", ".join(f"{c}@{loc}" for c, loc in by_name[nm][:2])
+                    hits.append((f"{path}:{lineno}", f"{var} = {recv or '?'}.{nm}",
+                                 f"{uctx}, no tri-state guard in {fn.name}()", decl))
     return hits
 
 
