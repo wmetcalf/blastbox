@@ -30,6 +30,7 @@ import json
 import logging
 import socket
 import time
+import uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -105,9 +106,15 @@ def canary_job_id(key_hint: str = "") -> str:
     With the periodic pass on by default that left one permanent object PER INTERVAL PER
     DISPATCHER, growing forever, rather than the single leftover the cleanup warning describes.
 
-    A stable key bounds it at one object per dispatcher no matter how long it runs. The payload is
-    a constant, so even if two dispatchers did land on the same key the bytes they compare are
-    identical and the check is unharmed; ``key_hint`` (tier/engine) keeps them apart anyway.
+    A stable key bounds it at one object per dispatcher no matter how long it runs.
+
+    Two processes sharing a key is NOT harmless, and the earlier reasoning here -- "the payload is
+    identical so the comparison still succeeds" -- was wrong about which operation collides. It is
+    the DELETE: one process's cleanup can land between another's ``has_output`` and
+    ``open_output``, so the second reads a miss and, at startup, refuses to serve against a
+    perfectly healthy store. ``key_hint`` therefore has to carry enough identity to separate
+    co-located dispatchers (host + tier + engine + job_root), and :func:`blob_roundtrip` retries
+    once on a unique key when a read-back misses, so the residual race cannot fail a boot.
     """
     ident = f"{socket.gethostname()}|{key_hint}".encode()
     return f"__canary__{hashlib.sha256(ident).hexdigest()[:16]}"
@@ -122,7 +129,31 @@ def blob_roundtrip(store: Any, *, keep_failed: bool = False, key_hint: str = "",
     reasons and have different remedies. A store that passes this has been shown to be reachable,
     authorised, writable AND readable from this process.
     """
-    job_id = canary_job_id(key_hint)
+    try:
+        return _roundtrip_once(store, canary_job_id(key_hint), keep_failed, scratch_dir,
+                               racey=True)
+    except _RaceySuspicion as exc:
+        # A miss on a key another process may share is ambiguous: a broken store and a concurrent
+        # canary cleanup look identical from here. Retry ONCE on a key nobody else can hold --
+        # a genuinely broken store fails that too, while the race cannot fail a boot. The unique
+        # key is used only on this rare path, so leftovers stay bounded in the normal case.
+        _log.info("canary.retry_unique_key %s", exc)
+        return _roundtrip_once(store, f"{canary_job_id(key_hint)}-{uuid.uuid4().hex[:8]}",
+                               keep_failed, scratch_dir, racey=False)
+
+
+class _RaceySuspicion(RuntimeError):
+    """A read-back miss that a concurrent canary on a shared key could also explain."""
+
+
+def _roundtrip_once(store: Any, job_id: str, keep_failed: bool, scratch_dir: Any, *,
+                    racey: bool) -> str:
+    """One probe. ``racey`` marks the shared-key attempt, whose read-back misses are ambiguous.
+
+    On the retry (``racey=False``) the key is unique to this process, so a miss can only mean the
+    store is broken and must surface as a CanaryFailure -- otherwise a genuinely unreadable store
+    would escape as an internal exception type nobody handles.
+    """
     started = time.monotonic()
     payload = json.dumps(_SEAL, sort_keys=True).encode()
 
@@ -172,6 +203,9 @@ def blob_roundtrip(store: Any, *, keep_failed: bool = False, key_hint: str = "",
         if not present:
             if not keep_failed:
                 _cleanup(store, job_id)
+            if racey:
+                raise _RaceySuspicion(
+                    f"wrote {job_id}, has_output() then reported it absent")
             raise CanaryFailure(
                 f"blob store accepted a write that then did not exist ({describe_blob_store(store)})",
                 "the write path and the read path are not the same store -- check that every "
@@ -184,6 +218,10 @@ def blob_roundtrip(store: Any, *, keep_failed: bool = False, key_hint: str = "",
                 got = fh.read()
         except Exception as exc:  # noqa: BLE001
             _cleanup(store, job_id)
+            if racey:
+                # The delete is what collides, and this is exactly where it lands: another
+                # process's cleanup between our has_output and our open_output.
+                raise _RaceySuspicion(f"read-back of {job_id} failed: {exc}") from exc
             raise CanaryFailure(
                 f"blob store READ-BACK failed ({describe_blob_store(store)})",
                 "results are being written but cannot be served; check read permissions and that "

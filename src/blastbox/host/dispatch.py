@@ -678,9 +678,16 @@ class Dispatcher:
             # this fleet has had. Only the COMBINATION (shared queue, private store) reveals it.
             check_store_coherence(self._job_store, self._blobs, self._job_root,
                                   require_shared=self._require_shared_blob_store)
+            # Host+tier alone still collides for two engine-scoped dispatchers on one box, and a
+            # collision costs a retry (see canary_job_id). Fold in the engines and the job_root:
+            # cheap, stable across restarts, and distinct for every dispatcher that could co-exist.
+            key = "|".join((
+                str(getattr(self, "_tier", "") or ""),
+                ",".join(sorted(getattr(self, "_engines", {}) or {})),
+                str(self._job_root),
+            ))
             _log.info("canary.ok %s", blob_roundtrip(
-                self._blobs, key_hint=str(getattr(self, "_tier", "") or ""),
-                scratch_dir=self._job_root))
+                self._blobs, key_hint=key, scratch_dir=self._job_root))
             return True
         except CanaryFailure as exc:
             if gate:
@@ -725,7 +732,32 @@ class Dispatcher:
             )
             return
         last_maint = time.monotonic()
-        last_canary = time.monotonic()
+        # OFF THE CLAIM PATH. Checked inline, the probe only ran between jobs: dispatch_once() is
+        # synchronous here, so a single detonation up to the worker timeout (300s by default)
+        # delayed a 60s interval for the whole job, and a continuously busy dispatcher delayed it
+        # again every job. A configured cadence that only holds while idle is not the configured
+        # cadence. The concurrent path already has a coordinator thread for exactly this.
+        canary_stop = threading.Event()
+        canary_thread = None
+        if canary and canary_interval_s > 0:
+            def _canary_tick() -> None:
+                while not canary_stop.wait(canary_interval_s):
+                    try:
+                        self.self_test(gate=False)
+                    except Exception:  # noqa: BLE001 - advisory once serving
+                        _log.exception("canary raised; continuing to serve")
+            canary_thread = threading.Thread(target=_canary_tick, name="blastbox-canary",
+                                             daemon=True)
+            canary_thread.start()
+        try:
+            self._run_forever_serial(poll_interval_s, stop, maintenance_interval_s, last_maint)
+        finally:
+            canary_stop.set()
+            if canary_thread is not None:
+                canary_thread.join(timeout=5.0)
+
+    def _run_forever_serial(self, poll_interval_s: float, stop: "Callable[[], bool] | None",
+                            maintenance_interval_s: float, last_maint: float) -> None:
         while True:
             if stop is not None and stop():
                 break
@@ -738,18 +770,6 @@ class Dispatcher:
                 # returns it to the queue. Log and keep serving.
                 _log.exception("dispatch_once failed; continuing")
                 progressed = False
-            if canary and canary_interval_s > 0 \
-                    and time.monotonic() - last_canary >= canary_interval_s:
-                try:
-                    self.self_test(gate=False)
-                except Exception:  # noqa: BLE001
-                    _log.exception("canary raised; continuing to serve")
-                # Re-stamp from COMPLETION, not from the check above: the round-trip can itself
-                # block for the store's timeout during a brownout, and stamping before it would
-                # make the interval measure from a point already in the past -- so a slow store
-                # would be re-probed immediately, every loop, exactly when it is least able to
-                # answer.
-                last_canary = time.monotonic()
             if maintenance_interval_s > 0 and time.monotonic() - last_maint >= maintenance_interval_s:
                 last_maint = time.monotonic()
                 self._run_maintenance()

@@ -588,12 +588,13 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
                 _vmlog.info("canary.blob_store %s", describe_blob_store(_vmblobs))
                 check_store_coherence(store, _vmblobs, job_root,
                                       require_shared=_require_shared_blob_store())
+                _vmkey = f"{tier or ''}|{next(iter(engines), '')}|{job_root}"
                 _vmlog.info("canary.ok %s", blob_roundtrip(
-                    _vmblobs, key_hint=str(tier or ""), scratch_dir=job_root))
+                    _vmblobs, key_hint=_vmkey, scratch_dir=job_root))
 
-                def _vm_periodic_canary(_b=_vmblobs, _l=_vmlog, _t=tier, _jr=job_root) -> None:
+                def _vm_periodic_canary(_b=_vmblobs, _l=_vmlog, _k=_vmkey, _jr=job_root) -> None:
                     _l.info("canary.ok %s", blob_roundtrip(
-                        _b, key_hint=str(_t or ""), scratch_dir=_jr))
+                        _b, key_hint=_k, scratch_dir=_jr))
 
                 # Advisory once serving: a store that goes away mid-run is a brownout, not a
                 # config error, and tearing down a warm fleet over it is what #79 exists to stop.

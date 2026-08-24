@@ -368,3 +368,82 @@ def test_the_shared_store_declaration_parses_the_documented_values(raw, expected
     from blastbox.host.cli import _require_shared_blob_store
     monkeypatch.setenv("BLASTBOX_REQUIRE_SHARED_BLOB_STORE", raw)
     assert _require_shared_blob_store() is expected
+
+
+# --- round 5: the shared-key race, and a cadence blocked by long jobs -------------------------
+class _VanishesOnce(LocalBlobStore):
+    """Simulates a CONCURRENT canary's cleanup landing between our has_output and open_output.
+
+    The first probe's read-back misses; a second probe (unique key) is fine. That is exactly what
+    a co-located dispatcher sharing the key does, and treating it as a store failure would refuse
+    a boot against a perfectly healthy store.
+    """
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.misses = 0
+
+    def open_output(self, job_id, name):
+        if self.misses == 0:
+            self.misses += 1
+            raise FileNotFoundError("deleted by a concurrent canary")
+        return super().open_output(job_id, name)
+
+
+def test_a_concurrent_canary_cleanup_does_not_fail_a_boot(tmp_path):
+    """The earlier reasoning -- "a shared key is harmless, the payload is identical" -- was wrong
+    about which operation collides. It is the DELETE, and it lands right here."""
+    store = _VanishesOnce(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    assert "OK" in blob_roundtrip(store, key_hint="cold")
+    assert store.misses == 1, "the racey path must actually have been exercised"
+
+
+class _AlwaysUnreadable(LocalBlobStore):
+    def open_output(self, job_id, name):
+        raise FileNotFoundError("genuinely gone")
+
+
+def test_a_genuinely_unreadable_store_still_fails_after_the_retry(tmp_path):
+    """The retry must not become a way for a broken store to escape as an internal exception."""
+    store = _AlwaysUnreadable(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    with pytest.raises(CanaryFailure) as ei:
+        blob_roundtrip(store, key_hint="cold")
+    assert "READ-BACK failed" in str(ei.value)
+
+
+def test_the_serial_periodic_canary_is_not_blocked_by_a_long_job(tmp_path, monkeypatch):
+    """dispatch_once() is synchronous, so an inline check only ran BETWEEN jobs: one detonation
+    up to the worker timeout delayed the interval for the whole job, every job."""
+    import threading
+    import time as _time
+    from blastbox.host.dispatch import Dispatcher
+
+    ticks = []
+    released = threading.Event()
+
+    d = _make(_local(tmp_path), _Sqlite(), tmp_path / "jobs")
+    d.self_test = lambda gate: ticks.append(_time.monotonic())
+    d._run_forever_serial = lambda *a, **k: released.wait(3.0)   # a job that blocks for "ages"
+
+    t = threading.Thread(
+        target=lambda: Dispatcher.run_forever(
+            d, poll_interval_s=0.01, maintenance_interval_s=0,
+            canary=True, canary_interval_s=0.15),
+        daemon=True)
+    t.start()
+    _time.sleep(1.0)
+    released.set()
+    t.join(timeout=5)
+    # Inline, zero ticks would have fired while the "job" ran.
+    assert len(ticks) >= 3, f"canary ran {len(ticks)} times while a job was in flight"
+
+
+def test_co_located_dispatchers_get_distinct_keys():
+    """Host+tier alone collides for two engine-scoped dispatchers on one box. A collision only
+    costs a retry now, but avoiding it is free."""
+    from blastbox.host.canary import canary_job_id
+    a = canary_job_id("cold|redtusk|/var/lib/redtusk/jobs")
+    b = canary_job_id("cold|clippyshot|/var/lib/clippyshot/jobs")
+    c = canary_job_id("cold|redtusk|/var/lib/redtusk/jobs")
+    assert a != b
+    assert a == c, "must stay stable across restarts"
