@@ -647,3 +647,101 @@ def test_a_slow_maintenance_sweep_cannot_delay_the_canary():
     st._stop.set()
     t.join(timeout=3)
     assert order and order[0] == "canary", f"maintenance ran first and blocked the canary: {order}"
+
+
+# --- round 9: a stale object standing in for this probe's write -------------------------------
+class _WriteNoOpsAfterFirst(LocalBlobStore):
+    """Accepts later writes and does nothing — the accepted-but-not-landed shape.
+
+    With a stable key and a CONSTANT payload this was undetectable: has_output finds the object
+    the FIRST probe left behind, its bytes match the constant, and the probe reports success
+    without ever proving the current write worked.
+    """
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.writes = 0
+
+    def put_output(self, job_id, out_dir):
+        self.writes += 1
+        if self.writes == 1:
+            super().put_output(job_id, out_dir)     # first one lands
+        # later ones silently do nothing
+
+    def delete_job(self, job_id):
+        raise OSError("AccessDenied")               # so the first object stays behind
+
+
+def test_a_stale_object_cannot_stand_in_for_this_probes_write(tmp_path):
+    store = _WriteNoOpsAfterFirst(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    assert "OK" in blob_roundtrip(store, key_hint="fc")        # first probe genuinely lands
+    with pytest.raises(CanaryFailure) as ei:
+        blob_roundtrip(store, key_hint="fc")                   # second must NOT pass on the stale one
+    assert "different bytes" in str(ei.value) or "did not exist" in str(ei.value)
+
+
+def test_each_probe_carries_a_distinct_nonce():
+    from blastbox.host.canary import _seal_bytes
+    assert _seal_bytes("a") != _seal_bytes("b")
+    import json
+    assert json.loads(_seal_bytes("a"))["nonce"] == "a"
+
+
+def test_cleanup_failures_are_redacted_too(tmp_path, caplog):
+    """A separate exception path from the CanaryFailure cause, reached after every successful
+    probe — and botocore echoes the URL it was handed."""
+    import logging
+
+    class _LeakyDelete(LocalBlobStore):
+        def delete_job(self, job_id):
+            raise OSError('failed: "https://AK:s3cr3t@minio.internal:9000/b?token=zz"')
+
+    store = _LeakyDelete(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    with caplog.at_level(logging.WARNING, logger="blastbox.canary"):
+        assert "OK" in blob_roundtrip(store)
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    for secret in ("s3cr3t", "token=zz"):
+        assert secret not in logged, f"{secret!r} leaked into the cleanup warning"
+    assert "minio.internal:9000" in logged
+
+
+class _ForeignBytesOnce(LocalBlobStore):
+    """First read-back returns ANOTHER probe's payload — a co-located dispatcher sharing the key
+    overwrote ours between our put and our read. Distinct from the vanishing-object race: the
+    object is present, the bytes are simply not the ones we wrote."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.swapped = 0
+
+    def open_output(self, job_id, name):
+        if self.swapped == 0:
+            self.swapped += 1
+            import io
+            from blastbox.host.canary import _seal_bytes
+            return io.BytesIO(_seal_bytes("a-different-process"))
+        return super().open_output(job_id, name)
+
+
+def test_another_probes_bytes_on_a_shared_key_retries_rather_than_failing_a_boot(tmp_path):
+    """Adding the per-probe nonce reintroduced a way for a key collision to fail a boot: the
+    comparison now legitimately mismatches when another process overwrote our object. It has to
+    be treated as a race and retried, exactly like the vanishing-object case."""
+    store = _ForeignBytesOnce(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    assert "OK" in blob_roundtrip(store, key_hint="fc")
+    assert store.swapped == 1, "the mismatch path must actually have been exercised"
+
+
+class _AlwaysForeignBytes(LocalBlobStore):
+    def open_output(self, job_id, name):
+        import io
+        from blastbox.host.canary import _seal_bytes
+        return io.BytesIO(_seal_bytes("never-ours"))
+
+
+def test_a_store_that_always_returns_wrong_bytes_still_fails(tmp_path):
+    """The retry must not become an escape hatch for a store that genuinely corrupts."""
+    with pytest.raises(CanaryFailure) as ei:
+        blob_roundtrip(_AlwaysForeignBytes(tmp_path / "jobs", blob_root=tmp_path / "blobs"),
+                       key_hint="fc")
+    assert "different bytes" in str(ei.value)

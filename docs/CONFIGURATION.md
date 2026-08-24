@@ -70,6 +70,14 @@ issue #79 exists to prevent.
 | `BLASTBOX_CANARY_INTERVAL_S` | `900` | How often to re-run the round-trip while serving. Advisory: it logs, it never gates. `0` ⇒ startup only. Non-numeric, **non-finite** (`nan`, `inf`) and **negative** values fall back to 900 with a warning — `float()` accepts all three, and each would silently switch the periodic pass off while the documented disable value is `0`. Network dispatchers (aws/static/cascade) honour this cadence too; their loop wakes on the earlier of this and the maintenance interval. |
 | `BLASTBOX_REQUIRE_SHARED_BLOB_STORE` | `0` (advisory) | Declare that this deployment's results **must** be readable by other machines. With it set, a dispatcher claiming from a shared queue (postgres/redis) while writing to a `LocalBlobStore` **refuses to start**. Default is a loud warning instead, because the canary cannot infer the answer: both single-node-on-local-postgres and multi-node-with-`BLASTBOX_BLOB_LOCAL_ROOT`-on-NFS are documented, valid configurations that look identical from inside the process. Set this on a fleet where a local store is never correct. An unrecognised non-empty value is **warned about and treated as unset** rather than silently ignored. |
 
+**On a versioned S3 bucket**, set a lifecycle rule expiring noncurrent versions and delete
+markers. `S3BlobStore.delete_job` lists only current keys and deletes without a `VersionId`, so a
+delete adds a marker and leaves the prior version — true for every job result under retention, not
+just the canary, which simply makes it periodic (one noncurrent version + one marker per interval
+per dispatcher). Version-aware deletion is tracked in issue #89; the lifecycle rule is the
+standard remedy meanwhile, and `BLASTBOX_CANARY_INTERVAL_S=0` bounds the canary's share to one
+object per boot.
+
 The startup line names the backend, bucket, prefix and endpoint
 (`canary.blob_store S3BlobStore(bucket/prefix via http://…)`), and `blastbox serve` logs the same
 shape for the target it serves results **from** — so a dispatcher and an API pointed at different

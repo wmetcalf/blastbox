@@ -46,6 +46,22 @@ _log = logging.getLogger("blastbox.canary")
 _SEAL = {"status": "ok", "engine": "__canary__", "artifacts": [], "canary": True}
 
 
+def _seal_bytes(nonce: str) -> bytes:
+    """The sealed envelope for ONE probe, carrying a nonce unique to it.
+
+    A constant payload plus a stable key silently defeated the check it exists to make: once a
+    cleanup denial leaves the object behind, a later put that no-ops or is acknowledged without
+    landing is invisible -- has_output finds the OLD object and its bytes match the constant, so
+    the probe reports success without ever proving THIS write worked. That is precisely the
+    accepted-but-not-landed failure mode the canary was built for.
+
+    The nonce was originally omitted because a shared key would then produce spurious mismatches.
+    That reasoning no longer applies: the key carries host+tier+engine+job_root, and a mismatch on
+    the shared-key attempt is treated as a race and retried on a unique key.
+    """
+    return json.dumps({**_SEAL, "nonce": nonce}, sort_keys=True).encode()
+
+
 class CanaryFailure(RuntimeError):
     """A self-test failed.
 
@@ -202,7 +218,7 @@ def _roundtrip_once(store: Any, job_id: str, keep_failed: bool, scratch_dir: Any
     would escape as an internal exception type nobody handles.
     """
     started = time.monotonic()
-    payload = json.dumps(_SEAL, sort_keys=True).encode()
+    payload = _seal_bytes(uuid.uuid4().hex)
 
     # Stage under the dispatcher's OWN scratch when we know it. Requiring a writable system /tmp
     # made the gate reject a hardened deployment whose job_root and blob store are both fine --
@@ -292,6 +308,11 @@ def _roundtrip_once(store: Any, job_id: str, keep_failed: bool, scratch_dir: Any
 
         if got != payload:
             _cleanup(store, job_id)
+            if racey:
+                # Another process holding the same key overwrote it between our put and our read.
+                # Retrying on a unique key tells the two apart: a store that really returns the
+                # wrong bytes fails that attempt too.
+                raise _RaceySuspicion(f"read-back of {job_id} returned another probe's bytes")
             raise CanaryFailure(
                 f"blob store returned different bytes than were written "
                 f"({len(got)}B back vs {len(payload)}B written, {describe_blob_store(store)})",
@@ -316,8 +337,10 @@ def _cleanup(store: Any, job_id: str) -> None:
     try:
         store.delete_job(job_id)
     except Exception as exc:  # noqa: BLE001
+        # Redacted like every other message: this is a separate exception path, reached after
+        # both successful probes and ambiguous writes, and botocore echoes the URL it was handed.
         _log.warning("canary.cleanup_failed job_id=%s: %s: %s — leftover object left in the store",
-                     job_id, type(exc).__name__, exc)
+                     job_id, type(exc).__name__, redact_secrets(str(exc)))
 
 
 def is_shared_job_store(job_store: Any) -> bool:
