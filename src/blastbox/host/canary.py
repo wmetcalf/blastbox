@@ -25,10 +25,11 @@ them, and deletes them. A store that cannot do that cannot serve a job, whatever
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import socket
 import time
-import uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -95,7 +96,25 @@ def describe_blob_store(store: Any) -> str:
     return name
 
 
-def blob_roundtrip(store: Any, *, keep_failed: bool = False) -> str:
+def canary_job_id(key_hint: str = "") -> str:
+    """A STABLE per-dispatcher key, not a fresh random one each probe.
+
+    A random id per probe is fine only if deletes work. A store that permits PUT and GET but
+    denies DELETE reaches the cleanup handler on every successful probe -- and the probe still
+    returns success, correctly, because being unable to tidy up does not stop it serving jobs.
+    With the periodic pass on by default that left one permanent object PER INTERVAL PER
+    DISPATCHER, growing forever, rather than the single leftover the cleanup warning describes.
+
+    A stable key bounds it at one object per dispatcher no matter how long it runs. The payload is
+    a constant, so even if two dispatchers did land on the same key the bytes they compare are
+    identical and the check is unharmed; ``key_hint`` (tier/engine) keeps them apart anyway.
+    """
+    ident = f"{socket.gethostname()}|{key_hint}".encode()
+    return f"__canary__{hashlib.sha256(ident).hexdigest()[:16]}"
+
+
+def blob_roundtrip(store: Any, *, keep_failed: bool = False, key_hint: str = "",
+                   scratch_dir: Any = None) -> str:
     """PUT a sealed envelope through ``store``, read it back, verify the bytes, delete it.
 
     Returns a one-line description of what was proven. Raises :class:`CanaryFailure` naming the
@@ -103,11 +122,22 @@ def blob_roundtrip(store: Any, *, keep_failed: bool = False) -> str:
     reasons and have different remedies. A store that passes this has been shown to be reachable,
     authorised, writable AND readable from this process.
     """
-    job_id = f"__canary__{uuid.uuid4().hex[:16]}"
+    job_id = canary_job_id(key_hint)
     started = time.monotonic()
     payload = json.dumps(_SEAL, sort_keys=True).encode()
 
-    with TemporaryDirectory(prefix="blastbox-canary-") as tmp:
+    # Stage under the dispatcher's OWN scratch when we know it. Requiring a writable system /tmp
+    # made the gate reject a hardened deployment whose job_root and blob store are both fine --
+    # failing it for a prerequisite real dispatch never needed, before the store was even touched.
+    # The probe should test what the job path tests, not more.
+    parent = None
+    if scratch_dir is not None:
+        try:
+            parent = Path(scratch_dir)
+            parent.mkdir(parents=True, exist_ok=True)
+        except Exception:  # noqa: BLE001 - fall back to the system temp dir
+            parent = None
+    with TemporaryDirectory(prefix="blastbox-canary-", dir=parent) as tmp:
         out_dir = Path(tmp) / "output"
         out_dir.mkdir(parents=True)
         (out_dir / "metadata.json").write_bytes(payload)
@@ -179,9 +209,10 @@ def _cleanup(store: Any, job_id: str) -> None:
     """Best-effort removal of the canary object.
 
     Never raises: a store that cannot delete is worth a warning, but failing the self-test over it
-    would take a dispatcher down for something that does not stop it serving jobs. The leftover is
-    one tiny object under a `__canary__` prefix, which is greppable precisely so an operator can
-    find them if deletes are silently failing.
+    would take a dispatcher down for something that does not stop it serving jobs. Because the key
+    is STABLE per dispatcher (see :func:`canary_job_id`), a store that always denies deletes leaves
+    exactly one object rather than one per probe -- the earlier random-id version grew without
+    bound under precisely that IAM policy.
     """
     try:
         store.delete_job(job_id)

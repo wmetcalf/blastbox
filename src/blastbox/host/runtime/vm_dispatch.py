@@ -968,9 +968,22 @@ class VmJobDispatcher:
             logger.warning("vm_dispatch: stale-queued sweep failed", exc_info=True)
 
     def _maintenance_loop(self) -> None:
-        last_canary = time.monotonic()
-        while not self._stop.wait(self._maintenance_interval_s):
-            self._run_maintenance()
+        last_canary = last_maint = time.monotonic()
+        while True:
+            # Sleep to the EARLIER of the two deadlines. Waiting a fixed maintenance interval
+            # quantised the canary to it: with the CLI's 60s default, BLASTBOX_CANARY_INTERVAL_S=5
+            # ran about every 60s and 90 ran about every 120s. A configured cadence that silently
+            # becomes a different cadence is its own small lie.
+            now = time.monotonic()
+            waits = [self._maintenance_interval_s - (now - last_maint)]
+            if self._canary_cb is not None and self._canary_interval_s > 0:
+                waits.append(self._canary_interval_s - (now - last_canary))
+            if self._stop.wait(max(0.05, min(waits))):
+                return
+            now = time.monotonic()
+            if now - last_maint >= self._maintenance_interval_s:
+                last_maint = now
+                self._run_maintenance()
             # The periodic store self-test rides the maintenance timer, for the same reason
             # maintenance does: one place, on a cadence, off the claim path. Without it the
             # network tiers (aws/static/cascade) probed the blob store once at startup and never

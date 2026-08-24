@@ -678,7 +678,9 @@ class Dispatcher:
             # this fleet has had. Only the COMBINATION (shared queue, private store) reveals it.
             check_store_coherence(self._job_store, self._blobs, self._job_root,
                                   require_shared=self._require_shared_blob_store)
-            _log.info("canary.ok %s", blob_roundtrip(self._blobs))
+            _log.info("canary.ok %s", blob_roundtrip(
+                self._blobs, key_hint=str(getattr(self, "_tier", "") or ""),
+                scratch_dir=self._job_root))
             return True
         except CanaryFailure as exc:
             if gate:

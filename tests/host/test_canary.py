@@ -294,3 +294,77 @@ def test_a_malformed_interval_never_silently_disables_the_periodic_pass(raw, exp
     monkeypatch.setenv("BLASTBOX_CANARY_INTERVAL_S", raw)
     _, interval = _canary_settings()
     assert interval == expected
+
+
+# --- round 4: leftovers, scratch, and two more fail-open knobs --------------------------------
+class _NoDelete(LocalBlobStore):
+    """PUT and GET allowed, DELETE denied — a perfectly ordinary IAM policy."""
+
+    def delete_job(self, job_id):
+        raise OSError("AccessDenied")
+
+
+def test_an_undeletable_store_leaves_ONE_object_not_one_per_probe(tmp_path):
+    """A random id per probe grew without bound under this policy.
+
+    The probe correctly still SUCCEEDS -- being unable to tidy up does not stop a store serving
+    jobs -- so with the periodic pass on by default it left one permanent object per interval per
+    dispatcher, forever. A stable key bounds it at one.
+    """
+    store = _NoDelete(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    for _ in range(8):
+        assert "OK" in blob_roundtrip(store, key_hint="fc")
+    left = {p.relative_to(tmp_path / "blobs").parts[1]
+            for p in (tmp_path / "blobs").rglob("*") if p.is_file()}
+    assert len(left) == 1, f"expected one leftover key, got {len(left)}: {left}"
+
+
+def test_different_dispatchers_on_one_host_do_not_share_a_key():
+    from blastbox.host.canary import canary_job_id
+    assert canary_job_id("firecracker") != canary_job_id("gvisor")
+    assert canary_job_id("fc") == canary_job_id("fc"), "must be stable across restarts"
+
+
+def test_the_probe_uses_the_dispatchers_scratch_not_the_system_tmp(tmp_path, monkeypatch):
+    """A hardened dispatcher with a writable job_root and a reachable store but a read-only /tmp
+    was rejected by the default-on gate — failing it for a prerequisite real dispatch never had."""
+    import tempfile
+    # Make the DEFAULT temp location unusable, not mkdtemp itself: `TemporaryDirectory(dir=...)`
+    # goes through mkdtemp too, so patching that would break the very path being tested.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "no-such-tmp"))
+    scratch = tmp_path / "scratch"
+    store = _local(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        blob_roundtrip(store)                       # would stage in the broken system temp dir
+    assert "OK" in blob_roundtrip(store, scratch_dir=scratch)
+    assert scratch.exists()
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("-1", 900.0), ("-0.5", 900.0),   # finite, passes isfinite, then `> 0` silently disables
+    ("0", 0.0), ("5", 5.0),
+])
+def test_a_negative_interval_does_not_silently_disable_the_periodic_pass(raw, expected,
+                                                                        monkeypatch):
+    from blastbox.host.cli import _canary_settings
+    monkeypatch.setenv("BLASTBOX_CANARY_INTERVAL_S", raw)
+    assert _canary_settings()[1] == expected
+
+
+def test_a_typo_in_the_shared_store_declaration_is_reported(monkeypatch, caplog):
+    """This repeats, in the variable added to FIX the fail-open boolean, the same shape: a typo
+    returning the default silently. It is a deliberate declaration, so say so."""
+    import logging
+    from blastbox.host.cli import _require_shared_blob_store
+    monkeypatch.setenv("BLASTBOX_REQUIRE_SHARED_BLOB_STORE", "treu")
+    with caplog.at_level(logging.WARNING, logger="blastbox.host.cli"):
+        assert _require_shared_blob_store() is False
+    assert any("not a recognised boolean" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("raw,expected", [("1", True), ("true", True), ("on", True),
+                                          ("0", False), ("off", False), ("", False)])
+def test_the_shared_store_declaration_parses_the_documented_values(raw, expected, monkeypatch):
+    from blastbox.host.cli import _require_shared_blob_store
+    monkeypatch.setenv("BLASTBOX_REQUIRE_SHARED_BLOB_STORE", raw)
+    assert _require_shared_blob_store() is expected

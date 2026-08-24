@@ -444,8 +444,12 @@ def _canary_settings() -> "tuple[bool, float]":
     # periodic pass OFF: every `elapsed >= nan` is False, and `elapsed >= inf` never becomes
     # True. A malformed setting must not disable a check by accident -- that is the same
     # fail-open shape as the boolean parsing above.
-    if not math.isfinite(interval):
-        log.warning("BLASTBOX_CANARY_INTERVAL_S=%r is not finite; using 900", raw_interval)
+    # Negative is the same trap one step along: -1 is finite, passes, and then every dispatcher
+    # tests `interval > 0` before scheduling -- so it disables the periodic pass while the
+    # documented disable value is 0. A malformed setting must never turn a check off by accident.
+    if not math.isfinite(interval) or interval < 0:
+        log.warning("BLASTBOX_CANARY_INTERVAL_S=%r is not a usable interval (needs a finite "
+                    "value >= 0, where 0 means startup-only); using 900", raw_interval)
         interval = 900.0
     return enabled, interval
 
@@ -457,8 +461,19 @@ def _require_shared_blob_store() -> bool:
     from the deployment refused documented single-node and NFS configurations. This is the
     topology evidence, stated by the person who knows it.
     """
-    return (os.environ.get("BLASTBOX_REQUIRE_SHARED_BLOB_STORE", "").strip().lower()
-            in ("1", "true", "yes", "on"))
+    raw = os.environ.get("BLASTBOX_REQUIRE_SHARED_BLOB_STORE")
+    val = (raw or "").strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    # An affirmative allowlist here repeats, in the variable added to FIX that bug, the exact
+    # fail-open shape already fixed for BLASTBOX_CANARY: a typo returns the default silently.
+    # This one is a deliberate topology declaration -- someone set it on purpose -- so a value
+    # that parses as neither must be said out loud rather than quietly ignored.
+    if raw is not None and val not in ("0", "false", "no", "off", ""):
+        logging.getLogger("blastbox.host.cli").warning(
+            "BLASTBOX_REQUIRE_SHARED_BLOB_STORE=%r is not a recognised boolean; treating it as "
+            "NOT set (the shared-store check stays advisory). Use 1/true/yes/on to enforce.", raw)
+    return False
 
 
 def _dispatch_cmd(args: argparse.Namespace) -> int:
@@ -573,10 +588,12 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
                 _vmlog.info("canary.blob_store %s", describe_blob_store(_vmblobs))
                 check_store_coherence(store, _vmblobs, job_root,
                                       require_shared=_require_shared_blob_store())
-                _vmlog.info("canary.ok %s", blob_roundtrip(_vmblobs))
+                _vmlog.info("canary.ok %s", blob_roundtrip(
+                    _vmblobs, key_hint=str(tier or ""), scratch_dir=job_root))
 
-                def _vm_periodic_canary(_b=_vmblobs, _l=_vmlog) -> None:
-                    _l.info("canary.ok %s", blob_roundtrip(_b))
+                def _vm_periodic_canary(_b=_vmblobs, _l=_vmlog, _t=tier, _jr=job_root) -> None:
+                    _l.info("canary.ok %s", blob_roundtrip(
+                        _b, key_hint=str(_t or ""), scratch_dir=_jr))
 
                 # Advisory once serving: a store that goes away mid-run is a brownout, not a
                 # config error, and tearing down a warm fleet over it is what #79 exists to stop.
