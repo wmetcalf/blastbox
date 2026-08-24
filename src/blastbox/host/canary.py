@@ -115,6 +115,12 @@ def blob_roundtrip(store: Any, *, keep_failed: bool = False) -> str:
         try:
             store.put_output(job_id, out_dir)
         except Exception as exc:  # noqa: BLE001
+            # A raise here does NOT mean nothing landed: an S3-compatible store can commit the
+            # object and then lose the response or time out. Every other failure path cleans up;
+            # this one skipping it meant a crash-looping dispatcher -- the exact behaviour a
+            # fail-closed gate produces -- left one orphaned object per restart, forever, since
+            # each attempt uses a fresh random id.
+            _cleanup(store, job_id)
             raise CanaryFailure(
                 f"blob store WRITE failed ({describe_blob_store(store)})",
                 "check BLASTBOX_BLOB_URL, BLASTBOX_BLOB_ENDPOINT_URL and the AWS_* credentials on "
@@ -204,71 +210,51 @@ def is_local_blob_store(store: Any) -> bool:
     return type(store).__name__ == "LocalBlobStore"
 
 
-def default_local_blob_root(job_root: Any) -> Any:
-    """Where the factory puts a LocalBlobStore when nothing points it anywhere.
+def check_store_coherence(job_store: Any, blob_store: Any, job_root: Any = None, *,
+                          require_shared: bool = False) -> None:
+    """A shared queue needs a blob store the OTHER processes can also read.
 
-    Mirrors ``blobs/factory.py``: unset ``BLASTBOX_BLOB_LOCAL_ROOT`` means a ``blobs`` sibling of
-    job_root. Kept here so the coherence check can distinguish "nobody configured this" from
-    "an operator deliberately pointed it at a shared mount".
-    """
-    return Path(job_root).parent / "blobs"
-
-
-def check_store_coherence(job_store: Any, blob_store: Any, job_root: Any = None) -> None:
-    """A shared queue needs a blob store the OTHER processes can also read. Raise when it cannot.
-
-    This catches what the round-trip provably cannot. A LocalBlobStore round-trips perfectly -- it
+    Catches what the round-trip provably cannot: a LocalBlobStore round-trips perfectly -- it
     writes and reads its own directory -- so a dispatcher that silently fell back to one passes
-    every liveness test while sealing results the API cannot read: jobs reach DONE and every
+    every liveness test while sealing results the API cannot read. Jobs reach DONE and every
     artifact 404s. That is what happened to 17,626 jobs, invisibly, for days.
 
-    The discriminator is NOT "local store with a shared queue". Mode 2 in
-    ``docs/specs/2026-07-21-distributed-blob-storage-design.md`` is explicitly a supported
-    deployment: several nodes on one postgres with ``BLASTBOX_BLOB_URL`` unset and
-    ``BLASTBOX_BLOB_LOCAL_ROOT`` pointed at an NFS export common to every node. Refusing that would
-    break a documented configuration by default, fail-closed -- a check that invents a reason to
-    reject a valid deployment is worse than the bug it hunts.
+    WARNS by default; only ``require_shared`` makes it refuse. Two earlier attempts to infer
+    "is this store reachable by the other processes?" from the deployment both refused DOCUMENTED
+    configurations (docs/specs/2026-07-21-distributed-blob-storage-design.md):
 
-    So the tell is a local store that nobody pointed anywhere: still sitting on the factory's
-    private default beside this node's job_root, which no other process can read. That separates
-    the accident (the variable is simply absent) from the deliberate choice (the operator named a
-    shared mount). Without ``job_root`` we cannot tell the two apart, and the safe answer to "we
-    cannot tell" is to say nothing.
+      * Mode 2, multi-node on a LAN: shared postgres, ``BLASTBOX_BLOB_URL`` unset,
+        ``BLASTBOX_BLOB_LOCAL_ROOT`` on an NFS export. Rejected for being "local".
+      * Mode 1, single node: two processes on one box sharing a **local postgres** and the local
+        filesystem. Rejected for being "postgres with the default blob root".
+
+    Path equality cannot separate those from the accident, because the property that actually
+    matters -- can the process serving results read what this one writes -- is a fact about the
+    filesystem and the deployment topology, not about the string. Guessing it wrong is expensive
+    in a way guessing it right is not: a check that refuses a working deployment, by default and
+    fail-closed, is worse than the bug it hunts. So the operator declares it.
+    ``BLASTBOX_REQUIRE_SHARED_BLOB_STORE=1`` says "this is a fleet, results must be shared", and
+    then it refuses. Otherwise it says so loudly and lets the deployment boot.
+
+    The real fix supersedes this entirely: have the dispatcher and the ingress agree on a blob
+    target through the job store they already share (issue #88). That needs no inference at all.
     """
     if not (is_shared_job_store(job_store) and is_local_blob_store(blob_store)):
         return
-    if job_root is None:
-        # Without job_root the private-vs-shared distinction cannot be made, and guessing would
-        # refuse the documented NFS deployment. Say so rather than staying silent: a check that
-        # quietly did not run looks exactly like a check that passed, which is the reporting
-        # failure underneath this whole class of bug.
-        _log.warning("canary.coherence_skipped shared queue (%s) with a local blob store, but no "
-                     "job_root was supplied — cannot tell a private default from a shared mount",
-                     type(job_store).__name__)
-        return
-    root = getattr(blob_store, "local_root", None)
-    if root is None:
-        return
-    try:
-        if Path(str(root)).resolve() != default_local_blob_root(job_root).resolve():
-            # Deliberately pointed somewhere -- an NFS export or another shared mount. The
-            # operator made a choice; this check does not get to second-guess it.
-            _log.info("canary.shared_local_blob_root %s — assuming it is shared, as documented "
-                      "for multi-node LAN deployments", root)
-            return
-    except Exception:  # noqa: BLE001
-        return
-
-    raise CanaryFailure(
-        f"this dispatcher claims from a SHARED queue ({type(job_store).__name__}) but stores "
-        f"results in a PRIVATE local blob store ({describe_blob_store(blob_store)}), which is the "
-        f"factory default beside this node's job_root -- nothing else can read it",
-        "set BLASTBOX_BLOB_URL (and BLASTBOX_BLOB_ENDPOINT_URL + AWS_* credentials) on THIS "
-        "container -- it is almost certainly set on the API and missing here. Results written to a "
-        "private local store are unreadable by whatever serves them: jobs reach DONE and their "
-        "artifacts 404. If this really is a multi-node deployment sharing a filesystem, point "
-        "BLASTBOX_BLOB_LOCAL_ROOT at the shared mount and this check will accept it",
+    what = (f"this dispatcher claims from a SHARED queue ({type(job_store).__name__}) but stores "
+            f"results in a LOCAL blob store ({describe_blob_store(blob_store)})")
+    remedy = (
+        "if other machines run this queue, set BLASTBOX_BLOB_URL (plus BLASTBOX_BLOB_ENDPOINT_URL "
+        "and AWS_* credentials) on THIS container -- it is almost certainly set on the API and "
+        "missing here, and results written to a store only this container can read make jobs "
+        "reach DONE with artifacts that 404. If the API and this dispatcher genuinely share a "
+        "filesystem (a single node, or BLASTBOX_BLOB_LOCAL_ROOT on a shared mount) this is "
+        "correct and you can ignore it; set BLASTBOX_REQUIRE_SHARED_BLOB_STORE=1 to make it a "
+        "hard failure on fleets where it never is"
     )
+    if require_shared:
+        raise CanaryFailure(what, remedy)
+    _log.warning("canary.local_blob_store_with_shared_queue %s — %s", what, remedy)
 
 
 def blob_target_fingerprint(store: Any) -> str:

@@ -374,6 +374,7 @@ class Dispatcher:
         warm_requeue_backoff_s: float = 1.0,
         concurrency_gate: "DynamicConcurrencyGate | None" = None,
         blob_store: BlobStore | None = None,
+        require_shared_blob_store: bool = False,
         put_output_max_attempts: int = _PUT_OUTPUT_MAX_ATTEMPTS,
         put_output_retry_backoff_s: float = _PUT_OUTPUT_RETRY_BACKOFF_S,
         blob_retry_backoff_s: float = _BLOB_RETRY_BACKOFF_S,
@@ -423,6 +424,7 @@ class Dispatcher:
         # has removed the node reservation. The cold path checks this before acquiring the gate.
         self._shutting_down = threading.Event()
         self._job_store = job_store
+        self._require_shared_blob_store = bool(require_shared_blob_store)
         # engines is kept as an immutable mapping snapshot so callers cannot
         # mutate it after construction.
         self._engines: dict[str, EngineSpec] = dict(engines)
@@ -674,7 +676,8 @@ class Dispatcher:
             # BEFORE the round-trip. A LocalBlobStore round-trips perfectly -- it reads back its
             # own directory -- so the write/read test cannot see the single worst deployment bug
             # this fleet has had. Only the COMBINATION (shared queue, private store) reveals it.
-            check_store_coherence(self._job_store, self._blobs, self._job_root)
+            check_store_coherence(self._job_store, self._blobs, self._job_root,
+                                  require_shared=self._require_shared_blob_store)
             _log.info("canary.ok %s", blob_roundtrip(self._blobs))
             return True
         except CanaryFailure as exc:

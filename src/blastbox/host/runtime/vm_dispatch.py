@@ -153,6 +153,9 @@ class VmJobDispatcher:
         # to run it. interval<=0 disables. orphan_timeout: a RUNNING job not heartbeat-refreshed in
         # this long has a dead owner → FAIL it (keep it comfortably above heartbeat_s).
         self._maintenance_interval_s = float(maintenance_interval_s)
+        # Set by the CLI after construction; None = no periodic self-test.
+        self._canary_cb: "Callable[[], None] | None" = None
+        self._canary_interval_s = 0.0
         self._orphan_timeout_s = max(self._heartbeat_s * 4, float(orphan_timeout_s))
         # sole_owner: this is the ONLY dispatcher on the store (VM-only deployment, no cold/container
         # dispatcher). Then orphan recovery can also reclaim a stale RUNNING job that was claimed but
@@ -965,8 +968,24 @@ class VmJobDispatcher:
             logger.warning("vm_dispatch: stale-queued sweep failed", exc_info=True)
 
     def _maintenance_loop(self) -> None:
+        last_canary = time.monotonic()
         while not self._stop.wait(self._maintenance_interval_s):
             self._run_maintenance()
+            # The periodic store self-test rides the maintenance timer, for the same reason
+            # maintenance does: one place, on a cadence, off the claim path. Without it the
+            # network tiers (aws/static/cascade) probed the blob store once at startup and never
+            # again -- BLASTBOX_CANARY_INTERVAL_S was accepted and then silently ignored for
+            # exactly the deployments whose results always travel through a shared store.
+            cb, every = self._canary_cb, self._canary_interval_s
+            if cb is not None and every > 0 and time.monotonic() - last_canary >= every:
+                try:
+                    cb()
+                except Exception:  # noqa: BLE001 — advisory once serving; never kill the loop
+                    logger.warning("vm_dispatch: canary raised; continuing to serve", exc_info=True)
+                # Re-stamped from COMPLETION: the round-trip can block for the store's own
+                # timeout, so stamping first would re-probe every pass precisely when the store
+                # is least able to answer.
+                last_canary = time.monotonic()
 
     def run(self) -> None:
         """Block, claiming + processing jobs on ``concurrency`` threads until :meth:`stop`. Also runs

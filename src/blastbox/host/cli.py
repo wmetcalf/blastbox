@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from dataclasses import replace
@@ -433,13 +434,31 @@ def _canary_settings() -> "tuple[bool, float]":
         if raw is not None and val not in ("1", "true", "yes", "on", ""):
             log.warning("BLASTBOX_CANARY=%r is not a recognised boolean; leaving the startup "
                         "canary ENABLED (set 0/false/no/off to disable)", raw)
+    raw_interval = os.environ.get("BLASTBOX_CANARY_INTERVAL_S", "900")
     try:
-        interval = float(os.environ.get("BLASTBOX_CANARY_INTERVAL_S", "900"))
+        interval = float(raw_interval)
     except ValueError:
-        log.warning("BLASTBOX_CANARY_INTERVAL_S=%r is not a number; using 900",
-                    os.environ.get("BLASTBOX_CANARY_INTERVAL_S"))
+        log.warning("BLASTBOX_CANARY_INTERVAL_S=%r is not a number; using 900", raw_interval)
+        interval = 900.0
+    # float() happily accepts "nan" and "inf". Neither raises, and both silently switch the
+    # periodic pass OFF: every `elapsed >= nan` is False, and `elapsed >= inf` never becomes
+    # True. A malformed setting must not disable a check by accident -- that is the same
+    # fail-open shape as the boolean parsing above.
+    if not math.isfinite(interval):
+        log.warning("BLASTBOX_CANARY_INTERVAL_S=%r is not finite; using 900", raw_interval)
         interval = 900.0
     return enabled, interval
+
+
+def _require_shared_blob_store() -> bool:
+    """Has the operator declared this a fleet whose results MUST be shared?
+
+    The canary cannot infer it: both attempts to deduce "can the other processes read this store"
+    from the deployment refused documented single-node and NFS configurations. This is the
+    topology evidence, stated by the person who knows it.
+    """
+    return (os.environ.get("BLASTBOX_REQUIRE_SHARED_BLOB_STORE", "").strip().lower()
+            in ("1", "true", "yes", "on"))
 
 
 def _dispatch_cmd(args: argparse.Namespace) -> int:
@@ -539,7 +558,7 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         # therefore the ones where an unwritable or unreadable store is most likely and most
         # expensive. Before pool.start(), so a misconfigured deployment does not spawn microVMs
         # it is only going to fail jobs on.
-        _vm_canary, _ = _canary_settings()
+        _vm_canary, _canary_interval = _canary_settings()
         if _vm_canary:
             from blastbox.host.canary import (
                 blob_roundtrip,
@@ -552,8 +571,17 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
                 _vmlog.warning("canary: this dispatcher exposes no blob store; skipping")
             else:
                 _vmlog.info("canary.blob_store %s", describe_blob_store(_vmblobs))
-                check_store_coherence(store, _vmblobs, job_root)
+                check_store_coherence(store, _vmblobs, job_root,
+                                      require_shared=_require_shared_blob_store())
                 _vmlog.info("canary.ok %s", blob_roundtrip(_vmblobs))
+
+                def _vm_periodic_canary(_b=_vmblobs, _l=_vmlog) -> None:
+                    _l.info("canary.ok %s", blob_roundtrip(_b))
+
+                # Advisory once serving: a store that goes away mid-run is a brownout, not a
+                # config error, and tearing down a warm fleet over it is what #79 exists to stop.
+                vm._canary_cb = _vm_periodic_canary
+                vm._canary_interval_s = _canary_interval
         pool.start()   # validation passed -> now spawn/warm slots (nothing to leak on an earlier raise)
         try:
             # One-shot orphan sweep on start (aws-ec2-hibernate only; guarded by hasattr). A fresh run's
@@ -596,6 +624,7 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
                     "node self-sizer: could not pre-shrink pool before start", exc_info=True)
         pool.start()   # file-handshake warm path: start after tier-identity validation
     dispatcher = Dispatcher(
+        require_shared_blob_store=_require_shared_blob_store(),
         job_store=store,
         engines=engines,
         limits=limits,
