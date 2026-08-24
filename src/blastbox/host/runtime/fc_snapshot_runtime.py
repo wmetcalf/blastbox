@@ -95,6 +95,9 @@ class SnapshotSlotRuntime:
         settle_s: float = 1.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        # Shared with every VsockHostWarmControl handed out (see host_warm_control):
+        # one warm base image, so ack-capability belongs to the image, not the job.
+        self._ack_capable: set[str] = set()
         self._cfg = cfg
         self._manager = manager
         # cfg.max_extracted_bytes bounds rdump output; fall back to a 512 MiB default
@@ -308,11 +311,19 @@ class SnapshotSlotRuntime:
     # ------------------------------------------------------------------
 
     def host_warm_control(self, slot: Slot) -> object:
-        """The vsock warm control for this slot — input/status over vsock."""
+        """The vsock warm control for this slot — input/status over vsock.
+
+        ``ack_capable`` is shared across every control this runtime hands out, exactly as in
+        FirecrackerSlotRuntime: all slots restore from ONE warm base, so whether the guest image
+        speaks the start-ack is a property of the image, not of a job. Built per-control it would
+        be learned by a disposable object and forgotten, leaving guest_started permanently None --
+        and this is the runtime BLASTBOX_POOL_WARM_SNAPSHOT=1 selects, i.e. the one the wedge was
+        actually observed on, so the repair would have been inert precisely where it is needed.
+        """
         from blastbox.host.runtime.firecracker import VsockHostWarmControl
 
         vsock_uds = Path(slot.output_dir).parent / REL_VSOCK
-        return VsockHostWarmControl(vsock_uds)
+        return VsockHostWarmControl(vsock_uds, ack_capable=self._ack_capable)
 
     def stage_warm_input(self, slot: Slot, staged_input_path: Path) -> Path:
         """FC input travels over vsock (signal_go reads this path), not via a shared

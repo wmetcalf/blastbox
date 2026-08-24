@@ -138,3 +138,24 @@ def test_capability_memory_is_learned_from_any_slot(behaviour, expect):
     ctl, _ = _run(behaviour, ack_capable=seen)
     assert ctl.guest_started is expect
     assert bool(seen) is (expect is True), "an ack must teach the runtime the image is capable"
+
+
+def test_the_snapshot_runtime_shares_ack_capability_across_slots(tmp_path):
+    """BLASTBOX_POOL_WARM_SNAPSHOT=1 selects SnapshotSlotRuntime, which is what the production
+    wedge was observed on. Building each control with its own set means an ack is learned by a
+    disposable object and forgotten, guest_started stays None forever, and the fast path can
+    never arm -- inert in exactly the configuration it was written for.
+    """
+    from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
+
+    rt = object.__new__(SnapshotSlotRuntime)          # no VM setup needed for this seam
+    rt._ack_capable = set()
+    slot_a = type("S", (), {"output_dir": tmp_path / "a" / "out"})()
+    slot_b = type("S", (), {"output_dir": tmp_path / "b" / "out"})()
+
+    ctl_a = SnapshotSlotRuntime.host_warm_control(rt, slot_a)
+    ctl_b = SnapshotSlotRuntime.host_warm_control(rt, slot_b)
+    assert ctl_a._ack_capable is ctl_b._ack_capable, "capability must be shared, not per-control"
+
+    ctl_a._ack_capable.add("yes")                     # slot A acks once
+    assert ctl_b._ack_capable, "slot B must inherit what slot A proved about the image"

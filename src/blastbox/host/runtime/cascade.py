@@ -456,7 +456,8 @@ class CascadingRuntime:
         # see (upstream, PR #82).
         return True
 
-    def invalidate_base(self, *, reason: str | None = None) -> "list[str]":
+    def invalidate_base(self, *, reason: str | None = None,
+                        only: "str | None" = None) -> "list[str]":
         """Forward base invalidation to every wrapped tier that supports it.
 
         Every tier is attempted even if an earlier one fails -- one poisoned tier must not stop
@@ -465,6 +466,7 @@ class CascadingRuntime:
         untouched, so the next repair attempt was delayed for the whole cooldown and the tier
         kept failing (upstream, PR #82).
         """
+
         # Prefer the tiers that actually FAILED. The pool's global streak cannot attribute:
         # when one snapshot tier throws repeatedly while a later healthy tier is merely FULL, the
         # spawn still ends as CascadeSpawnFailed, and invalidating every wrapped base then
@@ -495,6 +497,18 @@ class CascadingRuntime:
             # started its cooldown (upstream, PR #82).
             with self._lock:
                 named = set(self._job_guilty)
+        if only:
+            # NAMED TARGET WINS. The pre-guest fast path convicts exactly ONE tier -- it counted
+            # distinct slots restored from that specific base -- but arrived with no way to say
+            # which, so it fell back to the episode-wide guilt set. An unrelated worker fault on
+            # healthy tier A followed by three pre-guest failures on B then rebuilt BOTH,
+            # removing the fallback capacity that is the entire point of a cascade.
+            _named = {i for i in range(len(self.tiers)) if self._tier_identity(i) == only}
+            if _named:
+                named = _named
+            else:
+                _log.warning("cascade.invalidate_base target %r matches no tier; "
+                             "falling back to the episode's guilt set", only)
         if named:
             targets = [t for i, t in enumerate(self.tiers) if i in named]
         elif reason == "spawn":

@@ -413,6 +413,11 @@ class WarmPool:
         # Monotonic count of CLEAN releases. Read as an episode token so a rebuild decision can
         # be abandoned if a slot succeeded while it was being made.
         self._clean_release_count = 0
+        # Per-base clean releases. The pool-wide counter cannot arbitrate a cascade: a job
+        # completing on healthy tier A changed it while tier B's repair was being judged, so B's
+        # decision was abandoned as "the base just produced a valid result" -- about a base that
+        # produced nothing of the kind. B then had to sacrifice three more distinct jobs.
+        self._clean_release_by_base: dict[str, int] = {}
         # Slots promoted to IDLE that have not yet completed a job. Their promotion cleared the
         # restore-failure streak provisionally; a confirmed death before first use revokes that.
         self._promoted_unproven: set[str] = set()
@@ -832,6 +837,8 @@ class WarmPool:
                 self._spawn_consecutive_failures = 0
                 self._promoted_unproven.discard(slot.slot_id)
                 self._clean_release_count += 1
+                self._clean_release_by_base[_bident] = (
+                    self._clean_release_by_base.get(_bident, 0) + 1)
             elif dirty and fault == "worker":
                 # ONLY worker-attributed failures are evidence about the slot. Counting job faults
                 # here is what let two bad samples in a row destroy a warm worker with a hundred
@@ -886,6 +893,8 @@ class WarmPool:
                 # Episode token: a rebuild decision taken before this point is abandoned, because
                 # the base demonstrably just produced a valid result.
                 self._clean_release_count += 1
+                self._clean_release_by_base[_bident] = (
+                    self._clean_release_by_base.get(_bident, 0) + 1)
                 # A served job is the only conclusive proof that the base yields a usable worker,
                 # so it — not promotion — is what clears the restore-failure streak.
                 self._spawn_consecutive_failures = 0
@@ -2499,7 +2508,7 @@ class WarmPool:
                 # gap, but drop() still runs outside the lock: a clean release landing in that
                 # window is proof the base just produced a valid result, and rebuilding it then
                 # is an unnecessary outage during recovery (upstream, PR #82).
-                success_token = self._clean_release_count
+                success_token = self._clean_release_by_base.get(episode_ident, 0)
         else:
             pool_failures = streak
             if pool_failures < self._snapshot_rebuild_after:
@@ -2509,7 +2518,7 @@ class WarmPool:
             # skipping the token meant that path invalidated a base which had just produced a
             # valid result, the very case the token was added to prevent (PR #82).
             with self._lock:
-                success_token = self._clean_release_count
+                success_token = self._clean_release_by_base.get(episode_ident, 0)
         now = self._clock()
         with self._lock:
             last = self._last_base_rebuild_at
@@ -2568,7 +2577,9 @@ class WarmPool:
             )
             return False
         with self._lock:
-            stale = success_token is not None and success_token != self._clean_release_count
+            # Scoped to the base being judged -- see _clean_release_by_base.
+            stale = (success_token is not None
+                     and success_token != self._clean_release_by_base.get(episode_ident, 0))
         if stale:
             logger.info(
                 "pool.base_rebuild_skipped reason=slot_succeeded_during_decision — the base "
@@ -2606,10 +2617,15 @@ class WarmPool:
             # Pass the trigger through when the runtime accepts it: a cascade can only attribute a
             # SPAWN-driven repair to a tier. Introspection, not except-TypeError -- a TypeError
             # from inside drop() must never be mistaken for an older signature.
+            # `only`: the pre-guest fast path convicted ONE base identity, and a cascade can act
+            # on that instead of rebuilding every tier in the episode. Introspection, same as
+            # `reason` -- a TypeError from inside drop() must never be read as an old signature.
+            _kw: dict[str, Any] = {}
             if _accepts_kwarg(drop, "reason"):
-                repaired = drop(reason=reason)
-            else:
-                repaired = drop()
+                _kw["reason"] = reason
+            if pre_guest_slots and episode_ident and _accepts_kwarg(drop, "only"):
+                _kw["only"] = episode_ident
+            repaired = drop(**_kw)
         except Exception as exc:
             # A PARTIAL repair still replaced some artifacts. Retire their slots even though the
             # call failed overall, or those tiers' old slots keep reporting failures against a
@@ -2650,6 +2666,14 @@ class WarmPool:
                 self._spawn_consecutive_failures = 0
             else:
                 self._pool_consecutive_failures.pop(episode_ident, None)
+            # Releases landing WHILE drop() ran rebuilt a set after this episode consumed the old
+            # one -- charging the retired base's failures to its replacement. With a threshold of
+            # 3, two such stragglers plus one genuine failure from the fresh base convict it, and
+            # with the cooldown disabled that is a back-to-back rebuild. The generation the commit
+            # installs starts with no inherited evidence.
+            for _name in ({str(n) for n in repaired} if isinstance(
+                    repaired, (list, tuple, set, frozenset)) else {episode_ident}):
+                self._pool_pre_guest_failures.pop(_name, None)
             # NB _base_rebuilds was already bumped before drop() (it is the in-flight fence).
             # The COMMITTED generation advances only here, on the success path: a drop() that
             # raised leaves the tier's artifact in place, and stamping its live slots as retired

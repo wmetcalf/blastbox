@@ -262,3 +262,87 @@ def test_the_stage_is_only_reported_when_the_guest_PROVED_it_never_started():
         "UNKNOWN (older worker image) must never convict"
     assert warm_fault_stage(False, "worker", wedged, None) is None, \
         "a seam with no ack at all must never convict"
+
+
+# --- review round 2 on #90 --------------------------------------------------------------------
+class _TieredWedge(_Wedged):
+    """A cascade-shaped runtime: slots carry a tier identity, repairs are recorded per tier."""
+
+    def __init__(self):
+        super().__init__()
+        self.invalidated: list = []
+        self._ident = {}
+
+    def base_identity(self, slot):
+        return self._ident.setdefault(slot.slot_id, "tierB")
+
+    def invalidate_base(self, *, reason=None, only=None):
+        self.invalidated.append(only)
+        self.base_invalidations += 1
+        return [only] if only else ["tierA", "tierB"]
+
+
+def test_the_fast_path_names_the_tier_it_convicted():
+    """A cascade otherwise rebuilds every tier in the episode-wide guilt set, so one unrelated
+    fault on healthy tier A plus three pre-guest failures on B destroys A's base too -- removing
+    the fallback capacity that is the whole point of a cascade."""
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3)
+    for slot in _claim_distinct(pool, 3):
+        _fail(pool, slot, stage="pre_guest")
+    assert rt.invalidated == ["tierB"], f"expected only the convicted tier, got {rt.invalidated}"
+
+
+def test_a_success_on_another_base_does_not_abandon_this_ones_repair():
+    """The stale-decision token was pool-wide, so a job completing on healthy tier A while tier
+    B's repair was being judged abandoned B's decision -- about a base that produced nothing of
+    the kind -- and B then had to sacrifice three more distinct jobs."""
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3)
+    a, b, c, other = _claim_distinct(pool, 4)
+    rt._ident[other.slot_id] = "tierA"          # a DIFFERENT base
+    _fail(pool, a, stage="pre_guest")
+    _fail(pool, b, stage="pre_guest")
+    pool.release(other, dirty=False)            # healthy tier A serves a job
+    _fail(pool, c, stage="pre_guest")
+    assert rt.base_invalidations >= 1, (
+        "a success on another base must not abandon this base's repair")
+
+
+def test_a_committed_generation_does_not_inherit_retired_evidence():
+    """Releases landing WHILE drop() ran rebuilt a set after the episode consumed the old one,
+    charging the retired base's failures to its replacement."""
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3)
+    for slot in _claim_distinct(pool, 3):
+        _fail(pool, slot, stage="pre_guest")
+    assert rt.base_invalidations == 1
+    assert not pool._pool_pre_guest_failures.get("tierB"), (
+        "the freshly installed generation must start with no inherited evidence")
+
+
+def test_evidence_accumulating_DURING_the_repair_is_not_charged_to_the_replacement():
+    """Slots still assigned when drop() starts release while it runs, building a NEW set after
+    the episode consumed the old one. Without clearing on commit, the retired base's failures are
+    charged to its replacement: two such stragglers plus one genuine failure convict a fresh base,
+    and with the cooldown disabled that is a back-to-back rebuild."""
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=0)
+    a, b, c, s1, s2 = _claim_distinct(pool, 5)
+
+    def _drop(*, reason=None, only=None):
+        # two stragglers from the RETIRED generation land mid-repair
+        _fail(pool, s1, stage="pre_guest")
+        _fail(pool, s2, stage="pre_guest")
+        rt.invalidated.append(only)
+        rt.base_invalidations += 1
+        return [only] if only else ["tierB"]
+
+    rt.invalidate_base = _drop
+    _fail(pool, a, stage="pre_guest")
+    _fail(pool, b, stage="pre_guest")
+    _fail(pool, c, stage="pre_guest")          # crosses -> drop() runs, stragglers land inside
+    assert rt.base_invalidations == 1
+    assert not pool._pool_pre_guest_failures.get("tierB"), (
+        "the committed generation inherited the retired base's stragglers: "
+        f"{pool._pool_pre_guest_failures}")

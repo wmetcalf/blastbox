@@ -373,3 +373,23 @@ def _recv_n(sock, n: int) -> bytes:
             raise ConnectionError("closed")
         buf += chunk
     return buf
+
+
+def test_a_guest_that_cannot_ack_refuses_the_job(tmp_path):
+    """Once ANY slot from an image has acked, the host initialises later controls to "not
+    started". So a swallowed ack-send failure means the guest detonates while the host records
+    guest_started=False -- and three such connection races on distinct slots would convict a base
+    whose guests all ran perfectly. If we cannot promise the host we started, we must not start.
+    """
+    host_end, guest_end = socket.socketpair()
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    guest = VsockWarmControl(tmp_path / "in", outdir, listener=_FakeListener(guest_end))
+
+    header = json.dumps({"filename": "doc.bin", "params": {}, "ack": True}).encode()
+    _send(host_end, header)
+    _send(host_end, b"payload")
+    host_end.close()                     # the ack send will fail
+
+    with pytest.raises(WarmTimeout, match="acknowledge"):
+        guest.wait_for_go(timeout_s=5.0)

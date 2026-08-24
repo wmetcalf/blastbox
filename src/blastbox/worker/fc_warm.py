@@ -161,9 +161,19 @@ class VsockWarmControl:
             try:
                 send_frame(conn, WARM_ACK.encode("utf-8"))
             except OSError as exc:
-                # Best effort: failing to ack must not fail the JOB. The host keeps
-                # guest_started=None and declines to draw a conclusion.
-                _log.warning("fc_warm.ack send failed: %s", exc)
+                # NOT best-effort, and the comment that used to sit here was simply wrong: once
+                # ANY slot from this image has acked, the host initialises later controls to
+                # "not started", so a swallowed send failure means the guest detonates while the
+                # host records guest_started=False. Three such connection races on distinct slots
+                # would then convict a base whose guests all ran perfectly. If we cannot promise
+                # the host we started, we must not start.
+                _log.warning("fc_warm.ack send failed: %s — refusing the job", exc)
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                self._conn = None
+                raise WarmTimeout(f"could not acknowledge job start: {exc}") from exc
 
         self._input_dir.mkdir(parents=True, exist_ok=True)
         input_path = self._input_dir / _safe_name(header.get("filename", "input"))

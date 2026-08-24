@@ -887,6 +887,12 @@ class VsockHostWarmControl:
             raise
 
     def _signal_go_inner(self, spec: "WarmJobSpec", *, deadline: float | None = None) -> None:
+        # BEFORE the upload. guest_started was only initialised in wait_for_done, so a guest
+        # wedged badly enough that it never drains a large input -- send_frame_from_file exhausting
+        # the deadline, signal_go raising -- left it None, and a DEFINITE never-started failure
+        # went uncounted. A received ack still flips it to True.
+        if self._ack_capable:
+            self.guest_started = False
         path = Path(spec.input_path)
         # ``ack``: ask the guest to send a START frame the moment it has the job, before it
         # begins work. OPT-IN from the host, and unknown header keys are ignored by the guest's
