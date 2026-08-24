@@ -346,3 +346,56 @@ def test_evidence_accumulating_DURING_the_repair_is_not_charged_to_the_replaceme
     assert not pool._pool_pre_guest_failures.get("tierB"), (
         "the committed generation inherited the retired base's stragglers: "
         f"{pool._pool_pre_guest_failures}")
+
+
+def test_the_loser_of_the_repair_race_keeps_its_evidence():
+    """Two cascade bases can cross concurrently: both threads consume their evidence before
+    contending for the invalidation lock, and the loser lands on the cooldown skip. Its tier was
+    never repaired -- the winner repaired a DIFFERENT one -- so dropping the evidence makes the
+    still-poisoned tier earn a whole fresh threshold-sized batch before it is even reconsidered,
+    which is the cost this fast path exists to avoid."""
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=300.0)
+    # a repair just completed (the winner), so the loser hits the serialized skip
+    pool._last_base_rebuild_at = pool._clock()
+    for slot in _claim_distinct(pool, 3):
+        _fail(pool, slot, stage="pre_guest")
+    assert rt.base_invalidations == 0, "the cooldown must suppress the second repair"
+    kept = len(pool._pool_pre_guest_failures.get("tierB", set()))
+    assert kept >= 3, (
+        f"the loser must keep the evidence that justified its decision (kept {kept})")
+
+
+def test_a_cooldown_from_THIS_base_still_discards_its_evidence():
+    """The original reasoning, unchanged where it holds: if this very base was just rebuilt and is
+    still failing, the cause is not the base, and hammering it again helps nobody."""
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=300.0)
+    pool._last_base_rebuild_at = pool._clock()
+    pool._last_base_rebuild_ident = "tierB"          # ...and it was THIS one
+    for slot in _claim_distinct(pool, 3):
+        _fail(pool, slot, stage="pre_guest")
+    assert rt.base_invalidations == 0
+    assert not pool._pool_pre_guest_failures.get("tierB"), (
+        "a base that a rebuild did not fix must not keep accumulating toward another")
+
+
+def test_a_real_rebuild_records_which_base_it_repaired():
+    """End-to-end rather than hand-set: an actual repair must record its target, or the cooldown
+    cannot tell "this base was just rebuilt and still fails" (drop the evidence) from "a DIFFERENT
+    base was rebuilt" (keep it)."""
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=300.0)
+
+    for slot in _claim_distinct(pool, 3):
+        _fail(pool, slot, stage="pre_guest")
+    assert rt.base_invalidations == 1, "the first crossing must actually repair"
+    assert pool._last_base_rebuild_ident == "tierB", "the repair must record its target"
+
+    # ...and now the SAME base keeps failing inside the cooldown: evidence must be discarded,
+    # which only works if the identity above was recorded.
+    for slot in _claim_distinct(pool, 3):
+        _fail(pool, slot, stage="pre_guest")
+    assert rt.base_invalidations == 1, "the cooldown must suppress the second repair"
+    assert not pool._pool_pre_guest_failures.get("tierB"), (
+        "a base a rebuild did not fix must not keep accumulating toward another")

@@ -418,6 +418,11 @@ class WarmPool:
         # decision was abandoned as "the base just produced a valid result" -- about a base that
         # produced nothing of the kind. B then had to sacrifice three more distinct jobs.
         self._clean_release_by_base: dict[str, int] = {}
+        # WHICH base the last rebuild targeted. The cooldown's "a rebuild did not fix it, so the
+        # cause is elsewhere" reasoning is only sound about the SAME base; in a cascade the
+        # previous repair may have been a different tier entirely, and discarding this tier's
+        # evidence on that basis makes a still-poisoned tier earn a fresh threshold-sized batch.
+        self._last_base_rebuild_ident: str | None = None
         # Slots promoted to IDLE that have not yet completed a job. Their promotion cleared the
         # restore-failure streak provisionally; a confirmed death before first use revokes that.
         self._promoted_unproven: set[str] = set()
@@ -2536,12 +2541,19 @@ class WarmPool:
                 "likely NOT the warm base (check inputs/disk/dependencies)",
                 pool_failures, now - float(last or now), self._base_rebuild_cooldown_s,
             )
-            with self._lock:
-                if reason == "spawn":
+            if reason == "spawn":
+                with self._lock:
                     self._spawn_consecutive_failures = 0
-                else:
+            elif self._last_base_rebuild_ident == episode_ident:
+                # THIS base was just rebuilt and is still failing, so the cause is elsewhere --
+                # the original reasoning, and it still holds. Drop the evidence.
+                with self._lock:
                     self._pool_consecutive_failures.pop(episode_ident, None)
                     self._pool_pre_guest_failures.pop(episode_ident, None)
+            else:
+                # A DIFFERENT base was repaired. This one was never touched, so its evidence is
+                # still valid and discarding it just delays its repair by a whole threshold.
+                self._restore_episode(episode_ident, pool_failures, _consumed_pre_guest, reason)
             return False
         if reason == "spawn":
             with self._lock:
@@ -2594,6 +2606,7 @@ class WarmPool:
         with self._lock:
             self._base_rebuilds += 1
             self._rebuilt_this_tick = True
+            self._last_base_rebuild_ident = episode_ident
         # SERIALISE. Held across the whole drop() so a second repair cannot land mid-rebuild; the
         # cooldown check above is re-read inside so the loser of the race sees the winner's result
         # instead of repeating it.
@@ -2606,9 +2619,38 @@ class WarmPool:
                     "pool.base_rebuild_skipped reason=another_repair_just_completed "
                     "reason_kind=%s", reason,
                 )
+                # HAND THE EPISODE BACK. Two cascade bases can cross concurrently: both threads
+                # consume their evidence before contending for _invalidation_lock, and the loser
+                # lands here. Its tier was never repaired -- the winner repaired a DIFFERENT one --
+                # so dropping the evidence makes the still-poisoned tier earn a whole fresh
+                # threshold-sized batch of failures after the cooldown before it is even
+                # reconsidered. Same restore the failed-repair path already does, for the other
+                # early return out of this decision.
+                self._restore_episode(episode_ident, pool_failures, _consumed_pre_guest, reason)
                 return False
             return self._invalidate_now(drop, reason, pool_failures, success_token, now,
                                         episode_ident, _consumed_pre_guest)
+
+    def _restore_episode(self, episode_ident, pool_failures, pre_guest_slots,
+                         reason) -> None:  # noqa: ANN001
+        """Give back evidence consumed for a decision that did NOT repair anything.
+
+        The streak is consumed to MAKE the decision, so every path that then declines to act has
+        to hand it back -- otherwise a still-poisoned base must earn a fresh threshold-sized batch
+        of failures before it is reconsidered, which is the cost this whole fast path exists to
+        avoid. Never restores below what has accumulated since.
+        """
+        if reason == "spawn":
+            # A spawn episode lives in _spawn_consecutive_failures and its own caller retains it;
+            # copying its count into the job counter let one later worker fault trigger an
+            # immediate job-driven rebuild, which in a cascade carries no tier attribution.
+            return
+        with self._lock:
+            self._pool_consecutive_failures[episode_ident] = max(
+                self._pool_consecutive_failures.get(episode_ident, 0), pool_failures)
+            if pre_guest_slots:
+                self._pool_pre_guest_failures.setdefault(episode_ident, set()).update(
+                    pre_guest_slots)
 
     def _invalidate_now(self, drop, reason, pool_failures, success_token, now,
                         episode_ident, pre_guest_slots=frozenset()):  # noqa: ANN001, ANN201
@@ -2647,19 +2689,7 @@ class WarmPool:
                 # already retained by its own caller -- copying its count into the job counter
                 # meant one later worker fault could trigger an immediate job-driven rebuild, and
                 # in a cascade that repair carries no tier attribution and hits every tier (PR #82).
-                with self._lock:
-                    self._pool_consecutive_failures[episode_ident] = max(
-                        self._pool_consecutive_failures.get(episode_ident, 0), pool_failures
-                    )
-                    # ...and the PRE-GUEST evidence with it. Restoring only the integer streak
-                    # made the fast path a one-shot: its crossing count (3) is far below the
-                    # ordinary threshold (48), so a failed repair meant the same unrepaired base
-                    # had to accumulate three fresh distinct slots all over again before it would
-                    # even retry -- three more jobs lost per failed attempt, which is precisely
-                    # what this path exists to stop.
-                    if pre_guest_slots:
-                        self._pool_pre_guest_failures.setdefault(episode_ident, set()).update(
-                            pre_guest_slots)
+                self._restore_episode(episode_ident, pool_failures, pre_guest_slots, reason)
             return False
         with self._lock:
             if reason == "spawn":
