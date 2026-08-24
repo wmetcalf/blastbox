@@ -62,6 +62,7 @@ from blastbox.worker.fc_guest import (
     recv_line,
     send_frame,
     send_frame_from_file,
+    WARM_ACK,
 )
 
 __all__ = [
@@ -816,6 +817,11 @@ class VsockHostWarmControl:
     # The file handshake's equivalent is a host-side write and deliberately does NOT set this.
     signal_is_transport = True
 
+    # None = UNKNOWN (no ack observed: an older guest image, which simply does not send one).
+    # True = the guest confirmed it HAS the job. Never False -- absence of evidence is not
+    # evidence of absence, and the whole point of this field is to stop the caller guessing.
+    guest_started: "bool | None" = None
+
     def __init__(
         self,
         vsock_uds: Path,
@@ -823,7 +829,10 @@ class VsockHostWarmControl:
         job_port: int = _JOB_PORT,
         connect_timeout_s: float = 10.0,
         connect_fn: "Callable[[], socket.socket] | None" = None,
+        ack_capable: "set[str] | None" = None,
     ) -> None:
+        # Shared with the runtime (see host_warm_control): non-empty once ANY slot has acked.
+        self._ack_capable = ack_capable if ack_capable is not None else set()
         self._uds = Path(vsock_uds)
         self._job_port = job_port
         self._connect_timeout = connect_timeout_s
@@ -879,8 +888,13 @@ class VsockHostWarmControl:
 
     def _signal_go_inner(self, spec: "WarmJobSpec", *, deadline: float | None = None) -> None:
         path = Path(spec.input_path)
+        # ``ack``: ask the guest to send a START frame the moment it has the job, before it
+        # begins work. OPT-IN from the host, and unknown header keys are ignored by the guest's
+        # .get() parsing, so BOTH mixed-version directions stay safe: an old guest never sends one
+        # (the host just never learns the answer), and a new guest never sends one unsolicited, so
+        # an old host is not handed a frame it would mistake for the status.
         header = json.dumps(
-            {"filename": path.name, "params": dict(spec.params)}
+            {"filename": path.name, "params": dict(spec.params), "ack": True}
         ).encode("utf-8")
         conn = self._connect(deadline=deadline)
         self._conn = conn
@@ -894,14 +908,32 @@ class VsockHostWarmControl:
 
         Uses an ABSOLUTE deadline (not a per-recv timeout), so a compromised guest
         that dribbles the status frame cannot pin the dispatcher past ``timeout_s``.
+
+        A guest that honours ``ack`` sends START first. That frame is what separates "this slot
+        never executed anything" (the warm base is wedged) from "it started and hung on this
+        document" -- indistinguishable otherwise, because the phase timer only records `guest`
+        once the work COMPLETES. Absent it, ``guest_started`` stays None, meaning "unknown", and
+        nothing downstream is entitled to guess.
         """
         if self._conn is None:
             raise WarmTimeout("signal_go was not called before wait_for_done")
+        # Only meaningful once this image has been SEEN to ack. Before that a missing ack is
+        # indistinguishable from an older worker, and False would be a guess.
+        if self._ack_capable:
+            self.guest_started = False
         deadline = time.monotonic() + timeout_s
         try:
-            return recv_frame(
+            frame = recv_frame(
                 self._conn, max_len=MAX_STATUS_BYTES, deadline=deadline
             ).decode("utf-8")
+            if frame == WARM_ACK:
+                # Ack-capable guest, and it HAS the job. The status is the next frame.
+                self.guest_started = True
+                self._ack_capable.add("yes")
+                frame = recv_frame(
+                    self._conn, max_len=MAX_STATUS_BYTES, deadline=deadline
+                ).decode("utf-8")
+            return frame
         except (OSError, ValueError, ConnectionError) as exc:
             raise WarmTimeout(f"warm worker did not signal done: {exc}") from exc
         finally:
@@ -990,6 +1022,9 @@ class FirecrackerSlotRuntime:
         subprocess_runner: SubprocessRunner = _default_subprocess_runner,
         ready_signal: ReadySignal | None = None,
     ) -> None:
+        # Shared with every VsockHostWarmControl this runtime hands out: one warm base
+        # image, so ack-capability is a property of the image rather than of a job.
+        self._ack_capable: set[str] = set()
         self._cfg = cfg
         self._subprocess_runner = subprocess_runner
         # Default to the live vsock signal — FileReadySignal cannot signal a warm
@@ -1222,9 +1257,15 @@ class FirecrackerSlotRuntime:
     # ------------------------------------------------------------------
 
     def host_warm_control(self, slot: Slot) -> VsockHostWarmControl:
-        """The vsock warm control for this slot — input/status over vsock."""
+        """The vsock warm control for this slot — input/status over vsock.
+
+        ``ack_capable`` is shared across slots on purpose: every slot restores from the SAME warm
+        base, so whether the guest image speaks the start-ack is a property of the image, not of
+        the job. One ack from any slot proves the image sends them -- and only then is a MISSING
+        ack meaningful. Until then it just means "older worker", which must not convict anything.
+        """
         vsock_uds = self._scratch_root / slot.slot_id / "vsock.sock"
-        return VsockHostWarmControl(vsock_uds)
+        return VsockHostWarmControl(vsock_uds, ack_capable=self._ack_capable)
 
     def stage_warm_input(self, slot: Slot, staged_input_path: Path) -> Path:
         """FC input travels over vsock (signal_go reads this path), NOT through a

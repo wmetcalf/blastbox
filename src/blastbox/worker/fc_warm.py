@@ -38,6 +38,7 @@ from blastbox.worker.fc_guest import (
     recv_frame,
     send_frame,
     signal_ready_vsock,
+    WARM_ACK,
 )
 from blastbox.worker.warm import WarmJobSpec, _RestoreAwareDeadline
 
@@ -151,6 +152,18 @@ class VsockWarmControl:
                 pass
             self._conn = None
             raise WarmTimeout(f"job header/input read failed: {exc}") from exc
+
+        # ACK BEFORE WORK. The host asked (`"ack": true`) and this is the only moment that
+        # distinguishes "the guest has the job" from "the guest never woke up" -- once detonation
+        # starts, a hang looks identical to a wedge from the outside. Sent only on request, so a
+        # guest running against an older host never emits a frame that host would read as status.
+        if header.get("ack"):
+            try:
+                send_frame(conn, WARM_ACK.encode("utf-8"))
+            except OSError as exc:
+                # Best effort: failing to ack must not fail the JOB. The host keeps
+                # guest_started=None and declines to draw a conclusion.
+                _log.warning("fc_warm.ack send failed: %s", exc)
 
         self._input_dir.mkdir(parents=True, exist_ok=True)
         input_path = self._input_dir / _safe_name(header.get("filename", "input"))

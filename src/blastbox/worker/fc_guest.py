@@ -45,6 +45,14 @@ MAX_HEADER_BYTES = 1 * 1024 * 1024  # job header JSON (filename + params)
 MAX_INPUT_BYTES = 1024 * 1024 * 1024  # input document hard ceiling
 MAX_STATUS_BYTES = 64 * 1024  # status string
 
+# Sent by the guest, on the same connection, the moment it HAS a job and before it starts work.
+# Its only purpose is to separate "this slot never executed anything" -- a wedged warm base --
+# from "it started and hung on this document", which are otherwise identical from the host: the
+# phase timer records `guest` only once the work COMPLETES, so both look like a timeout with no
+# guest phase. Sent ONLY when the host's header asks for it (`"ack": true`), so an old host is
+# never handed a frame it would read as the status.
+WARM_ACK = "__blastbox_started__"
+
 
 def send_frame(sock: "socket.socket", data: bytes) -> None:
     """Send a length-prefixed frame."""

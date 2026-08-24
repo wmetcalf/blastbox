@@ -254,7 +254,7 @@ class WarmPool:
         max_evictions_per_window: int | None = None,
         eviction_window_s: float = 600.0,
         snapshot_rebuild_after: int | None = None,
-        pre_guest_rebuild_after: int = 0,
+        pre_guest_rebuild_after: int = 3,
         base_rebuild_cooldown_s: float = 300.0,
     ) -> None:
         self._runtime = runtime

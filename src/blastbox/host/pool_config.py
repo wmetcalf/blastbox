@@ -68,11 +68,11 @@ class PoolConfig:
     snapshot_rebuild_after: int | None = None
     # Distinct slots that must fail before their guest ever executes before the base is judged
     # poisoned. Separate from snapshot_rebuild_after, which is sized to tolerate a run of bad
-    # DOCUMENTS. 0 = OFF, because the signal is evidence and not proof: `guest` is only marked
-    # after the guest COMPLETES, so a document that hangs a slot is indistinguishable from a slot
-    # that never ran (issue #91). Enable it where a wedged base costs more than a rare
-    # unnecessary rebuild -- which is any fleet running a warm tier under load.
-    pre_guest_rebuild_after: int = 0
+    # DOCUMENTS. Default ON, because the signal is PROOF rather than inference: the guest sends a
+    # START frame the moment it has the job, so a document that hangs a healthy slot reports
+    # guest_started=True and is never attributed to the base, and a worker image too old to send
+    # one leaves the answer UNKNOWN, which also never convicts. 0 disables the fast path.
+    pre_guest_rebuild_after: int = 3
     # None derives max(2, warm_size).
     max_evictions_per_window: int | None = None
     # How long a slot may stay CONTINUOUSLY unknown before it can be replaced; 0 disables.

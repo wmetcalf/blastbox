@@ -187,32 +187,40 @@ _BLOB_RETRY_BACKOFF_S = 30.0
 
 
 def warm_fault_stage(warm_clean: bool, warm_fault: "str | None",
-                     phases: "_PhaseTimer") -> "str | None":
+                     phases: "_PhaseTimer", control: "Any | None" = None) -> "str | None":
     """WHERE a warm run failed, when that changes what the failure is evidence ABOUT.
 
-    A worker fault whose ``guest`` phase never ran is EVIDENCE the slot never executed anything --
-    it did not fail on this document, it failed to become able to run one. That is the shape a
-    wedged warm base produces, and the reason the fast path exists: ordinary worker faults need
-    2 x warm_size (48 at warm_size=24) because they might be the samples, so a wedged base
-    otherwise costs 48 jobs at the full worker timeout before the tier repairs itself.
+    ``pre_guest`` means the slot never executed anything: it did not fail on this document, it
+    failed to become able to run one. That convicts the warm base far sooner than ordinary worker
+    faults can, which need 2 x warm_size (48 at warm_size=24) precisely because they might be the
+    samples -- so a wedged base otherwise costs 48 jobs at the full worker timeout before the tier
+    repairs itself.
 
-    NOT PROOF, and the difference matters. ``guest`` is marked only AFTER wait_for_done returns,
-    so a guest that DID start and then hung on a nasty document lands here too. The control
-    protocol has no start/ack frame to separate them, and on the FC tier the output disk is only
-    rdumped after wait_for_done, so an empty output dir does not separate them either. Closing
-    that needs a guest-side signal (issue #91).
+    It requires PROOF, not inference. "The `guest` phase was never marked" is not proof: that mark
+    lands only after the work COMPLETES, so a guest that started and hung on a pathological
+    document looks identical to one that never woke up. Convicting a base on that would destroy a
+    healthy artifact over three bad documents -- worse than the bug.
 
-    Until then the fast path is OPT-IN: three consecutive documents that each hang a fresh slot,
-    with no successful release anywhere in the pool between them, would otherwise invalidate a
-    perfectly healthy base. That is rare -- any clean release clears the evidence -- and its cost
-    is bounded (one unnecessary rebuild, cooldown-limited), but it is a regression this fix must
-    not introduce by default when the signal is known to be ambiguous.
+    So the guest says so itself. It sends a START frame the moment it has the job and before it
+    begins work, and the host records ``control.guest_started``:
 
-    A free function so the decision is testable without standing up a dispatch.
+        True  -> it ran; whatever went wrong afterwards may well be the document.  NOT pre_guest.
+        None  -> UNKNOWN. No ack seen, which is what an older worker image does, and absence of
+                 evidence is not evidence of absence.                              NOT pre_guest.
+
+    Only a control that is ack-capable AND reported no start yields ``pre_guest``. A free function
+    so the decision is testable without standing up a dispatch.
     """
     if warm_clean or warm_fault != "worker":
         return None
-    return None if phases.reached("guest") else "pre_guest"
+    if phases.reached("guest"):
+        return None
+    started = getattr(control, "guest_started", None)
+    if started is not False:
+        # True = it ran. None = the guest never told us (older image, or a seam with no ack), and
+        # guessing there is exactly the mistake this parameter exists to prevent.
+        return None
+    return "pre_guest"
 
 
 class _PhaseTimer:
@@ -1293,6 +1301,12 @@ class Dispatcher:
         if phases is None:
             phases = _PhaseTimer(job.job_id)
         runtime = self._pool.runtime  # type: ignore[union-attr]  # pool non-None here
+        # BOUND BEFORE THE TRY. The release in the finally consults it for the guest-start
+        # signal, and a failure early enough (a blob fetch, a lost claim, a staging error) leaves
+        # the later assignment unreached -- an UnboundLocalError raised out of the cleanup path,
+        # replacing a real failure with a confusing one. None simply means "no signal", which is
+        # exactly right for a job that never got as far as a guest.
+        control: "Any | None" = None
         stage_fn = getattr(runtime, "stage_warm_input", None)
         control_fn = getattr(runtime, "host_warm_control", None)
         materialize_fn = getattr(runtime, "materialize_warm_output", None)
@@ -1753,7 +1767,7 @@ class Dispatcher:
             # outright, where ordinary worker faults need 2 x warm_size (48 at warm_size=24) to
             # allow for a run of bad samples. Without this distinction a wedged base costs those
             # 48 jobs, each burning the full worker timeout, before the tier repairs itself.
-            _stage = warm_fault_stage(warm_clean, warm_fault, phases)
+            _stage = warm_fault_stage(warm_clean, warm_fault, phases, control)
             self._pool.release(slot, **release_kwargs(          # type: ignore[union-attr]
                 self._pool.release,                                # type: ignore[union-attr]
                 dirty=not warm_clean,

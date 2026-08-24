@@ -1290,7 +1290,9 @@ class TestSignalGoStreaming:
         off = 8
         header = json.loads(data[off : off + hlen])
         off += hlen
-        assert header == {"filename": "in.docx", "params": {"a": "b"}}
+        # `ack` asks the guest to confirm it HAS the job before it starts work -- the only signal
+        # that separates a wedged warm base from a document that hangs a healthy one.
+        assert header == {"filename": "in.docx", "params": {"a": "b"}, "ack": True}
         # Frame 2: the streamed body, wire-identical to send_frame(sock, body).
         (blen,) = struct.unpack(">Q", data[off : off + 8])
         off += 8

@@ -142,21 +142,24 @@ def test_warm_fault_stage_reports_pre_guest_only_when_the_guest_never_ran():
     production shape: signal_go succeeded, wait_for_done timed out, `guest` was never marked."""
     from blastbox.host.dispatch import _PhaseTimer, warm_fault_stage
 
+    class _Ctl:
+        guest_started = False                 # the guest PROVED it never started
+
     wedged = _PhaseTimer("j")
     for ph in ("slot_claim", "fetch", "stage", "go"):
         wedged.mark(ph)                       # ...then wait_for_done times out; no `guest`
-    assert warm_fault_stage(False, "worker", wedged) == "pre_guest"
+    assert warm_fault_stage(False, "worker", wedged, _Ctl()) == "pre_guest"
 
     ran = _PhaseTimer("j")
     for ph in ("slot_claim", "fetch", "stage", "go", "guest"):
         ran.mark(ph)
-    assert warm_fault_stage(False, "worker", ran) is None, (
+    assert warm_fault_stage(False, "worker", ran, _Ctl()) is None, (
         "a failure AFTER the guest executed could be the document")
 
     # a clean run, and a job-attributed fault, are never base evidence
-    assert warm_fault_stage(True, None, wedged) is None
-    assert warm_fault_stage(False, "job", wedged) is None
-    assert warm_fault_stage(False, None, wedged) is None
+    assert warm_fault_stage(True, None, wedged, _Ctl()) is None
+    assert warm_fault_stage(False, "job", wedged, _Ctl()) is None
+    assert warm_fault_stage(False, None, wedged, _Ctl()) is None
 
 
 def test_phase_timer_reports_which_phases_ran():
@@ -167,16 +170,21 @@ def test_phase_timer_reports_which_phases_ran():
 
 
 # --- review round 1 on #90 -------------------------------------------------------------------
-def test_the_fast_path_is_off_by_default():
-    """The signal is EVIDENCE, not proof: `guest` is marked only after the guest COMPLETES, so a
-    document that hangs a fresh slot is indistinguishable from a slot that never ran (issue #91).
-    Three such documents with no interleaved success would invalidate a healthy base, so this
-    must not be on by default while the signal stays ambiguous."""
+def test_the_fast_path_is_on_by_default():
+    """Safe to default on now that the guest itself reports the start (see
+    tests/host/runtime/test_warm_start_ack.py): a document that hangs a healthy slot acks first
+    and is never attributed to the base, and a worker too old to ack leaves the answer UNKNOWN,
+    which also never convicts."""
     from blastbox.host.pool_config import PoolConfig
-    assert PoolConfig.pre_guest_rebuild_after == 0
+    assert PoolConfig.pre_guest_rebuild_after == 3
+    pool = WarmPool(runtime=_Wedged(), warm_size=24, concurrent_ceiling=32,
+                    spawn_rate_limit=1000.0)
+    assert pool._pre_guest_rebuild_after == 3
+
+
+def test_zero_still_disables_it_entirely():
     rt = _Wedged()
-    pool = WarmPool(runtime=rt, warm_size=24, concurrent_ceiling=32, spawn_rate_limit=1000.0)
-    assert pool._pre_guest_rebuild_after == 0
+    pool = _pool(rt, pre_guest_rebuild_after=0)
     for slot in _claim_distinct(pool, 6):
         _fail(pool, slot, stage="pre_guest")
     assert rt.base_invalidations == 0, "disabled means disabled"
@@ -233,3 +241,24 @@ def test_a_success_from_a_retired_generation_does_not_clear_current_evidence():
     pool.release(stale, dirty=False)
     assert len(pool._pool_pre_guest_failures.get("", set())) == 2, (
         "a success from a retired base must not clear the current base's evidence")
+
+
+def test_the_stage_is_only_reported_when_the_guest_PROVED_it_never_started():
+    """The pool half is only sound if the dispatcher refuses to guess. Full matrix in
+    tests/host/runtime/test_warm_start_ack.py; this pins the decision itself."""
+    from blastbox.host.dispatch import _PhaseTimer, warm_fault_stage
+
+    class _Ctl:
+        def __init__(self, started): self.guest_started = started
+
+    wedged = _PhaseTimer("j")
+    for ph in ("slot_claim", "fetch", "stage", "go"):
+        wedged.mark(ph)                      # ...then a timeout; `guest` never marked
+
+    assert warm_fault_stage(False, "worker", wedged, _Ctl(False)) == "pre_guest"
+    assert warm_fault_stage(False, "worker", wedged, _Ctl(True)) is None, \
+        "it acked, so it ran -- the document is the suspect, not the base"
+    assert warm_fault_stage(False, "worker", wedged, _Ctl(None)) is None, \
+        "UNKNOWN (older worker image) must never convict"
+    assert warm_fault_stage(False, "worker", wedged, None) is None, \
+        "a seam with no ack at all must never convict"
