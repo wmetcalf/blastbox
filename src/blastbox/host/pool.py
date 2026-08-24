@@ -254,7 +254,7 @@ class WarmPool:
         max_evictions_per_window: int | None = None,
         eviction_window_s: float = 600.0,
         snapshot_rebuild_after: int | None = None,
-        pre_guest_rebuild_after: int = 3,
+        pre_guest_rebuild_after: int = 0,
         base_rebuild_cooldown_s: float = 300.0,
     ) -> None:
         self._runtime = runtime
@@ -319,7 +319,10 @@ class WarmPool:
         # one base, none of which could execute anything, is the base. Waiting for 48 of those
         # means 48 real jobs burning the full worker timeout apiece before the tier self-heals,
         # which is how a warm tier silently degrades to cold-only for hours.
-        self._pre_guest_rebuild_after = max(2, int(pre_guest_rebuild_after))
+        # 0 disables the fast path entirely (the default; see PoolConfig). Anything enabled is
+        # floored at 2 -- a threshold of 1 would rebuild the base on a single hung document.
+        _pg = int(pre_guest_rebuild_after)
+        self._pre_guest_rebuild_after = 0 if _pg <= 0 else max(2, _pg)
         self._rebuild_after_explicit = snapshot_rebuild_after is not None
         self._snapshot_rebuild_after = (
             max(4, 2 * max(1, warm_size)) if snapshot_rebuild_after is None
@@ -814,9 +817,14 @@ class WarmPool:
                 episode_recovered = True
                 self._pool_consecutive_failures.pop(_bident, None)
                 # One served job proves the base can execute, which is exactly what the
-                # pre-guest evidence claims it cannot. It must clear too, or a single
-                # stale episode would eventually rebuild a base that is demonstrably fine.
-                self._pool_pre_guest_failures.pop(_bident, None)
+                # pre-guest evidence claims it cannot -- but only for the base that SERVED it.
+                # The failure side is generation-guarded and this side was not: a long-running
+                # job from generation A, completing after A was invalidated, wiped evidence that
+                # replacement generation B had accumulated under the same identity, delaying the
+                # repair of a base which produced none of that success. Same guard, both sides.
+                _ok_stamp = self._slot_base.get(slot.slot_id)
+                if _ok_stamp is None or _ok_stamp[1] == self._base_generation.get(_ok_stamp[0], 0):
+                    self._pool_pre_guest_failures.pop(_bident, None)
                 slot_failures = 0
                 # ...and it proves the RESTORED BASE is responsive too, so it must clear the
                 # restore-side evidence as well. Leaving these meant restore deaths separated by
@@ -866,9 +874,14 @@ class WarmPool:
                 self._slot_last_success[hkey] = self._clock()
                 self._pool_consecutive_failures.pop(_bident, None)
                 # One served job proves the base can execute, which is exactly what the
-                # pre-guest evidence claims it cannot. It must clear too, or a single
-                # stale episode would eventually rebuild a base that is demonstrably fine.
-                self._pool_pre_guest_failures.pop(_bident, None)
+                # pre-guest evidence claims it cannot -- but only for the base that SERVED it.
+                # The failure side is generation-guarded and this side was not: a long-running
+                # job from generation A, completing after A was invalidated, wiped evidence that
+                # replacement generation B had accumulated under the same identity, delaying the
+                # repair of a base which produced none of that success. Same guard, both sides.
+                _ok_stamp = self._slot_base.get(slot.slot_id)
+                if _ok_stamp is None or _ok_stamp[1] == self._base_generation.get(_ok_stamp[0], 0):
+                    self._pool_pre_guest_failures.pop(_bident, None)
                 episode_recovered = True
                 # Episode token: a rebuild decision taken before this point is abandoned, because
                 # the base demonstrably just produced a valid result.
@@ -2429,7 +2442,15 @@ class WarmPool:
         # invalidated the base and dropped a healthy warm snapshot after the pool had recovered
         # (upstream, PR #82). The SPAWN path passes its own counter explicitly, because consecutive
         # restore failures are a different signal from consecutive job failures.
+        _consumed_pre_guest: frozenset = frozenset()
         if self._snapshot_rebuild_after <= 0:
+            # --- D: the escape hatch must not leak. _maybe_rebuild_base returns here, so nothing
+            # ever consumes the evidence set; a continuously wedged tier producing no successes
+            # then added one slot id per failed job, for the life of the process. The previous
+            # integer counter could not grow. Drop it rather than accumulate a ledger nobody will
+            # ever read.
+            with self._lock:
+                self._pool_pre_guest_failures.clear()
             return False
         success_token: int | None = None
         # "" is the whole-runtime base: the SPAWN path passes its own counter and does not consume
@@ -2454,7 +2475,8 @@ class WarmPool:
                 # repairs itself, which is exactly how a warm tier rots into a cold-only one.
                 _pre = max(self._pool_pre_guest_failures.items(),
                            key=lambda kv: len(kv[1]), default=("", set()))
-                _pre_crossed = len(_pre[1]) >= self._pre_guest_rebuild_after
+                _pre_crossed = (self._pre_guest_rebuild_after > 0
+                                and len(_pre[1]) >= self._pre_guest_rebuild_after)
                 if _worst[1] < self._snapshot_rebuild_after and not _pre_crossed:
                     return False
                 if _pre_crossed and _worst[1] < self._snapshot_rebuild_after:
@@ -2470,7 +2492,9 @@ class WarmPool:
                 # tier's repair discard the evidence another tier was still accumulating.
                 episode_ident, pool_failures = _worst
                 self._pool_consecutive_failures.pop(episode_ident, None)
-                self._pool_pre_guest_failures.pop(episode_ident, None)
+                # Kept so a FAILED repair can hand it back; see _invalidate_now.
+                _consumed_pre_guest = frozenset(
+                    self._pool_pre_guest_failures.pop(episode_ident, set()))
                 # Token captured WITH the decision. Consuming the streak closed the read/decide
                 # gap, but drop() still runs outside the lock: a clean release landing in that
                 # window is proof the base just produced a valid result, and rebuilding it then
@@ -2573,10 +2597,10 @@ class WarmPool:
                 )
                 return False
             return self._invalidate_now(drop, reason, pool_failures, success_token, now,
-                                        episode_ident)
+                                        episode_ident, _consumed_pre_guest)
 
     def _invalidate_now(self, drop, reason, pool_failures, success_token, now,
-                        episode_ident):  # noqa: ANN001, ANN201
+                        episode_ident, pre_guest_slots=frozenset()):  # noqa: ANN001, ANN201
         """Perform the invalidation. CALLER MUST HOLD ``self._invalidation_lock``."""
         try:
             # Pass the trigger through when the runtime accepts it: a cascade can only attribute a
@@ -2611,6 +2635,15 @@ class WarmPool:
                     self._pool_consecutive_failures[episode_ident] = max(
                         self._pool_consecutive_failures.get(episode_ident, 0), pool_failures
                     )
+                    # ...and the PRE-GUEST evidence with it. Restoring only the integer streak
+                    # made the fast path a one-shot: its crossing count (3) is far below the
+                    # ordinary threshold (48), so a failed repair meant the same unrepaired base
+                    # had to accumulate three fresh distinct slots all over again before it would
+                    # even retry -- three more jobs lost per failed attempt, which is precisely
+                    # what this path exists to stop.
+                    if pre_guest_slots:
+                        self._pool_pre_guest_failures.setdefault(episode_ident, set()).update(
+                            pre_guest_slots)
             return False
         with self._lock:
             if reason == "spawn":

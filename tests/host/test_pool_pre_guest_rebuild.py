@@ -164,3 +164,72 @@ def test_phase_timer_reports_which_phases_ran():
     t = _PhaseTimer("j")
     t.mark("go")
     assert t.reached("go") and not t.reached("guest")
+
+
+# --- review round 1 on #90 -------------------------------------------------------------------
+def test_the_fast_path_is_off_by_default():
+    """The signal is EVIDENCE, not proof: `guest` is marked only after the guest COMPLETES, so a
+    document that hangs a fresh slot is indistinguishable from a slot that never ran (issue #91).
+    Three such documents with no interleaved success would invalidate a healthy base, so this
+    must not be on by default while the signal stays ambiguous."""
+    from blastbox.host.pool_config import PoolConfig
+    assert PoolConfig.pre_guest_rebuild_after == 0
+    rt = _Wedged()
+    pool = WarmPool(runtime=rt, warm_size=24, concurrent_ceiling=32, spawn_rate_limit=1000.0)
+    assert pool._pre_guest_rebuild_after == 0
+    for slot in _claim_distinct(pool, 6):
+        _fail(pool, slot, stage="pre_guest")
+    assert rt.base_invalidations == 0, "disabled means disabled"
+
+
+def test_a_threshold_of_one_is_floored_to_two():
+    """A threshold of 1 would rebuild the base on a single hung document."""
+    rt = _Wedged()
+    pool = _pool(rt, pre_guest_rebuild_after=1)
+    assert pool._pre_guest_rebuild_after == 2
+
+
+def test_the_escape_hatch_does_not_leak_evidence():
+    """With BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER=0, _maybe_rebuild_base returns before anything
+    consumes the set -- so a continuously wedged tier producing no successes added one slot id
+    per failed job, for the life of the process. The integer counter it replaced could not grow."""
+    rt = _Wedged()
+    pool = _pool(rt, pre_guest_rebuild_after=3, snapshot_rebuild_after=0)
+    for slot in _claim_distinct(pool, 8):
+        _fail(pool, slot, stage="pre_guest")
+    total = sum(len(v) for v in pool._pool_pre_guest_failures.values())
+    assert total == 0, f"evidence accumulated with repair disabled: {total} slot ids retained"
+
+
+def test_a_failed_repair_hands_the_evidence_back():
+    """The crossing count (3) is far below the ordinary threshold (48), so restoring only the
+    integer streak made the fast path a one-shot: the same unrepaired base had to accumulate
+    three fresh distinct slots again before it would even retry."""
+    class _RepairFails(_Wedged):
+        def invalidate_base(self):
+            raise OSError("could not drop the base artifact")
+
+    rt = _RepairFails()
+    pool = _pool(rt, pre_guest_rebuild_after=3)
+    for slot in _claim_distinct(pool, 3):
+        _fail(pool, slot, stage="pre_guest")
+    retained = len(pool._pool_pre_guest_failures.get("", set()))
+    assert retained >= 3, (
+        f"a failed repair must not discard the evidence that justified it (kept {retained})")
+
+
+def test_a_success_from_a_retired_generation_does_not_clear_current_evidence():
+    """The failure side is generation-guarded; this side was not. A long-running job from an
+    already-invalidated generation completing later wiped evidence the REPLACEMENT base had
+    accumulated under the same identity."""
+    rt = _Wedged()
+    pool = _pool(rt, pre_guest_rebuild_after=3)
+    stale, a, b = _claim_distinct(pool, 3)
+    _fail(pool, a, stage="pre_guest")
+    _fail(pool, b, stage="pre_guest")
+    # retire the generation `stale` was restored from, then let it succeed late
+    ident, gen = pool._slot_base.get(stale.slot_id, ("", 0))
+    pool._base_generation[ident] = gen + 1
+    pool.release(stale, dirty=False)
+    assert len(pool._pool_pre_guest_failures.get("", set())) == 2, (
+        "a success from a retired base must not clear the current base's evidence")

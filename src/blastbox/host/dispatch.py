@@ -190,11 +190,23 @@ def warm_fault_stage(warm_clean: bool, warm_fault: "str | None",
                      phases: "_PhaseTimer") -> "str | None":
     """WHERE a warm run failed, when that changes what the failure is evidence ABOUT.
 
-    A worker fault whose ``guest`` phase never ran means the slot never executed anything: it did
-    not fail on this document, it failed to become able to run one. Three distinct slots doing
-    that convict the warm base outright, where ordinary worker faults need 2 x warm_size (48 at
-    warm_size=24) because they might be the samples. Without the distinction a wedged base costs
-    those 48 jobs, each burning the full worker timeout, before the tier repairs itself.
+    A worker fault whose ``guest`` phase never ran is EVIDENCE the slot never executed anything --
+    it did not fail on this document, it failed to become able to run one. That is the shape a
+    wedged warm base produces, and the reason the fast path exists: ordinary worker faults need
+    2 x warm_size (48 at warm_size=24) because they might be the samples, so a wedged base
+    otherwise costs 48 jobs at the full worker timeout before the tier repairs itself.
+
+    NOT PROOF, and the difference matters. ``guest`` is marked only AFTER wait_for_done returns,
+    so a guest that DID start and then hung on a nasty document lands here too. The control
+    protocol has no start/ack frame to separate them, and on the FC tier the output disk is only
+    rdumped after wait_for_done, so an empty output dir does not separate them either. Closing
+    that needs a guest-side signal (issue #91).
+
+    Until then the fast path is OPT-IN: three consecutive documents that each hang a fresh slot,
+    with no successful release anywhere in the pool between them, would otherwise invalidate a
+    perfectly healthy base. That is rare -- any clean release clears the evidence -- and its cost
+    is bounded (one unnecessary rebuild, cooldown-limited), but it is a regression this fix must
+    not introduce by default when the signal is known to be ambiguous.
 
     A free function so the decision is testable without standing up a dispatch.
     """
