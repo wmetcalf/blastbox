@@ -83,7 +83,8 @@ def _accepts_kwarg(fn: Any, name: str) -> bool:
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
-def release_kwargs(fn: Any, *, dirty: bool, fault: str | None = None) -> dict[str, Any]:
+def release_kwargs(fn: Any, *, dirty: bool, fault: str | None = None,
+                   fault_stage: str | None = None) -> dict[str, Any]:
     """The subset of ``dirty``/``fault`` that this ``release`` callable actually accepts.
 
     Introspection ONLY, deliberately separate from the call. Every seam here used to degrade with
@@ -104,7 +105,7 @@ def release_kwargs(fn: Any, *, dirty: bool, fault: str | None = None) -> dict[st
     except (TypeError, ValueError):
         return {}
     if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return {"dirty": dirty, "fault": fault}
+        return {"dirty": dirty, "fault": fault, "fault_stage": fault_stage}
     out: dict[str, Any] = {}
     if "dirty" in params:
         out["dirty"] = dirty
@@ -112,6 +113,12 @@ def release_kwargs(fn: Any, *, dirty: bool, fault: str | None = None) -> dict[st
     # force-resets the slot, it just does not advance it toward eviction.
     if "fault" in params:
         out["fault"] = fault
+    # Same rule one step further: a pool that predates the stage attribution simply does not get
+    # it, and behaves exactly as before. Passing it blind would raise TypeError, which the ladder
+    # this function replaced used to swallow as a "compatibility fallback" -- releasing the same
+    # slot twice.
+    if "fault_stage" in params:
+        out["fault_stage"] = fault_stage
     return out
 
 
@@ -247,6 +254,7 @@ class WarmPool:
         max_evictions_per_window: int | None = None,
         eviction_window_s: float = 600.0,
         snapshot_rebuild_after: int | None = None,
+        pre_guest_rebuild_after: int = 3,
         base_rebuild_cooldown_s: float = 300.0,
     ) -> None:
         self._runtime = runtime
@@ -303,6 +311,15 @@ class WarmPool:
         # The previous form said "0 disables" in the comment while treating <=0 as "use the derived
         # default", so rebuilds were on by default and there was no way to turn them off at all
         # (upstream, PR #82). Same sentinel convention as max_evictions_per_window above.
+        # How many DISTINCT slots must fail before their guest ever executes before the base is
+        # judged poisoned. Deliberately tiny next to snapshot_rebuild_after (2 x warm_size, so 48
+        # at warm_size=24): that threshold is sized for failures that might be the DOCUMENTS, and
+        # has to be, since a run of malformed samples must not cost a healthy base. A slot that
+        # never reached its guest carries no such ambiguity -- three different slots restored from
+        # one base, none of which could execute anything, is the base. Waiting for 48 of those
+        # means 48 real jobs burning the full worker timeout apiece before the tier self-heals,
+        # which is how a warm tier silently degrades to cold-only for hours.
+        self._pre_guest_rebuild_after = max(2, int(pre_guest_rebuild_after))
         self._rebuild_after_explicit = snapshot_rebuild_after is not None
         self._snapshot_rebuild_after = (
             max(4, 2 * max(1, warm_size)) if snapshot_rebuild_after is None
@@ -314,6 +331,11 @@ class WarmPool:
         # forever, and since blame_tier_for_slot no longer repairs on its own, nothing else would
         # ever fix it (upstream, PR #82).
         self._pool_consecutive_failures: dict[str, int] = {}
+        # base identity -> the DISTINCT slots that failed before their guest ever executed.
+        # Kept apart from the general failure streak because it is far stronger evidence: a slot
+        # whose guest never ran did not fail ON a document, it failed to become able to run one.
+        # Distinct slots, because one wedged worker is not a wedged base.
+        self._pool_pre_guest_failures: dict[str, set[str]] = {}
         self._base_rebuilds = 0
         # Rebuilding the base is a full sandbox BOOT (seconds), unlike a slot respawn which is a
         # cheap snapshot restore. Slot respawn churn is already bounded by the spawn token bucket;
@@ -718,7 +740,8 @@ class WarmPool:
             return True
 
     def release(self, slot: Slot, *, dirty: bool = False,
-                fault: "str | None" = None) -> None:
+                fault: "str | None" = None,
+                fault_stage: "str | None" = None) -> None:
         """Finish a job on ``slot``.
 
         Default (no ``recycle`` on the runtime): ASSIGNED → DRAINING → reap (warm ≠ reuse); the
@@ -790,6 +813,10 @@ class WarmPool:
                 self._slot_failures.pop(hkey, None)
                 episode_recovered = True
                 self._pool_consecutive_failures.pop(_bident, None)
+                # One served job proves the base can execute, which is exactly what the
+                # pre-guest evidence claims it cannot. It must clear too, or a single
+                # stale episode would eventually rebuild a base that is demonstrably fine.
+                self._pool_pre_guest_failures.pop(_bident, None)
                 slot_failures = 0
                 # ...and it proves the RESTORED BASE is responsive too, so it must clear the
                 # restore-side evidence as well. Leaving these meant restore deaths separated by
@@ -817,6 +844,13 @@ class WarmPool:
                 if _stamp is None or _stamp[1] == self._base_generation.get(_stamp[0], 0):
                     self._pool_consecutive_failures[_bident] = (
                         self._pool_consecutive_failures.get(_bident, 0) + 1)
+                    # A worker fault whose guest NEVER EXECUTED is evidence about the base, not
+                    # about the sample: the slot did not fail on a document, it failed to become
+                    # able to run one. Same generation guard as above -- a slot restored from a
+                    # retired base must not convict the one now installed.
+                    if fault_stage == "pre_guest":
+                        self._pool_pre_guest_failures.setdefault(_bident, set()).add(
+                            slot.slot_id)
                 else:
                     logger.info(
                         "pool.failure_from_retired_generation slot_id=%s spawned_generation=%d "
@@ -831,6 +865,10 @@ class WarmPool:
                 self._slot_failures.pop(hkey, None)
                 self._slot_last_success[hkey] = self._clock()
                 self._pool_consecutive_failures.pop(_bident, None)
+                # One served job proves the base can execute, which is exactly what the
+                # pre-guest evidence claims it cannot. It must clear too, or a single
+                # stale episode would eventually rebuild a base that is demonstrably fine.
+                self._pool_pre_guest_failures.pop(_bident, None)
                 episode_recovered = True
                 # Episode token: a rebuild decision taken before this point is abandoned, because
                 # the base demonstrably just produced a valid result.
@@ -1363,12 +1401,13 @@ class WarmPool:
                 and not self._slot_last_success.get(self._health_key_by_slot.get(sid, sid))
             )
             pool_failures = max(self._pool_consecutive_failures.values(), default=0)
+            pre_guest = max((len(v) for v in self._pool_pre_guest_failures.values()), default=0)
             rebuilds = self._base_rebuilds
         if failing or pool_failures:
             logger.info(
                 "pool.health slots_failing=%d worst_consecutive=%d never_succeeded=%d "
-                "pool_consecutive_failures=%d base_rebuilds=%d",
-                failing, worst, never_ok, pool_failures, rebuilds,
+                "pool_consecutive_failures=%d pre_guest_failures=%d base_rebuilds=%d",
+                failing, worst, never_ok, pool_failures, pre_guest, rebuilds,
             )
         record_pool_state(
             spawning=counts[SlotState.SPAWNING],
@@ -2407,12 +2446,31 @@ class WarmPool:
             with self._lock:
                 _worst = max(self._pool_consecutive_failures.items(),
                              key=lambda kv: kv[1], default=("", 0))
-                if _worst[1] < self._snapshot_rebuild_after:
+                # TWO thresholds, because there are two qualities of evidence. The ordinary
+                # streak counts worker faults that MIGHT be the documents, so it is sized to
+                # tolerate a run of bad samples (2 x warm_size). Slots that never reached their
+                # guest carry no such ambiguity, and demanding the same count of them means the
+                # tier eats ~48 real jobs -- each burning the full worker timeout -- before it
+                # repairs itself, which is exactly how a warm tier rots into a cold-only one.
+                _pre = max(self._pool_pre_guest_failures.items(),
+                           key=lambda kv: len(kv[1]), default=("", set()))
+                _pre_crossed = len(_pre[1]) >= self._pre_guest_rebuild_after
+                if _worst[1] < self._snapshot_rebuild_after and not _pre_crossed:
                     return False
+                if _pre_crossed and _worst[1] < self._snapshot_rebuild_after:
+                    logger.error(
+                        "pool.base_rebuild_pre_guest base=%s slots=%d threshold=%d -- %d DISTINCT "
+                        "slots restored from this base failed before their guest ever executed; "
+                        "that is the base, not the samples",
+                        _pre[0] or "<default>", len(_pre[1]), self._pre_guest_rebuild_after,
+                        len(_pre[1]),
+                    )
+                    _worst = (_pre[0], len(_pre[1]))
                 # Consume ONLY the episode that crossed. Zeroing every base's counter let one
                 # tier's repair discard the evidence another tier was still accumulating.
                 episode_ident, pool_failures = _worst
                 self._pool_consecutive_failures.pop(episode_ident, None)
+                self._pool_pre_guest_failures.pop(episode_ident, None)
                 # Token captured WITH the decision. Consuming the streak closed the read/decide
                 # gap, but drop() still runs outside the lock: a clean release landing in that
                 # window is proof the base just produced a valid result, and rebuilding it then
@@ -2450,6 +2508,7 @@ class WarmPool:
                     self._spawn_consecutive_failures = 0
                 else:
                     self._pool_consecutive_failures.pop(episode_ident, None)
+                    self._pool_pre_guest_failures.pop(episode_ident, None)
             return False
         if reason == "spawn":
             with self._lock:

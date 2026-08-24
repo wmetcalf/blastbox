@@ -186,6 +186,23 @@ MAX_MATERIALISE_ATTEMPTS = 3
 _BLOB_RETRY_BACKOFF_S = 30.0
 
 
+def warm_fault_stage(warm_clean: bool, warm_fault: "str | None",
+                     phases: "_PhaseTimer") -> "str | None":
+    """WHERE a warm run failed, when that changes what the failure is evidence ABOUT.
+
+    A worker fault whose ``guest`` phase never ran means the slot never executed anything: it did
+    not fail on this document, it failed to become able to run one. Three distinct slots doing
+    that convict the warm base outright, where ordinary worker faults need 2 x warm_size (48 at
+    warm_size=24) because they might be the samples. Without the distinction a wedged base costs
+    those 48 jobs, each burning the full worker timeout, before the tier repairs itself.
+
+    A free function so the decision is testable without standing up a dispatch.
+    """
+    if warm_clean or warm_fault != "worker":
+        return None
+    return None if phases.reached("guest") else "pre_guest"
+
+
 class _PhaseTimer:
     """Host-side wall-clock per phase for ONE warm dispatch, keyed by job_id.
 
@@ -217,6 +234,11 @@ class _PhaseTimer:
         self._start = now
         self._last = now
         self._phases: list[tuple[str, float]] = []
+
+    def reached(self, name: str) -> bool:
+        """Did this phase ever run? Used to tell a slot that failed ON a document from one that
+        never became able to run one -- evidence of very different strength about the warm base."""
+        return any(n == name for n, _ in self._phases)
 
     def mark(self, name: str) -> None:
         """Close the phase that ended at this line and open the next one."""
@@ -1713,10 +1735,18 @@ class Dispatcher:
             # invalidated (upstream, PR #82). A warm run that failed AGAINST this worker is worker
             # evidence; the engine reporting a bad sample is not, and is already excluded because
             # warm_clean covers only the clean DONE path.
+            # WHERE it failed, not just that it did. A worker fault whose `guest` phase never
+            # ran means the slot never executed anything -- it did not fail on this document, it
+            # failed to become able to run one. Three distinct slots doing that convict the base
+            # outright, where ordinary worker faults need 2 x warm_size (48 at warm_size=24) to
+            # allow for a run of bad samples. Without this distinction a wedged base costs those
+            # 48 jobs, each burning the full worker timeout, before the tier repairs itself.
+            _stage = warm_fault_stage(warm_clean, warm_fault, phases)
             self._pool.release(slot, **release_kwargs(          # type: ignore[union-attr]
                 self._pool.release,                                # type: ignore[union-attr]
                 dirty=not warm_clean,
                 fault=None if warm_clean else warm_fault,
+                fault_stage=_stage,
             ))
             # release() reaps AND replaces the microVM (warm != reuse), so this is the respawn
             # cost -- the phase most likely to dominate a cycle whose extraction is milliseconds.

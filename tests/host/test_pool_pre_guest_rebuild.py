@@ -1,0 +1,166 @@
+"""A warm base that wedges must not cost 48 real jobs before it repairs itself.
+
+Observed in production (toolz2, 2026-08-24): both warm tiers wedged after ~4 days idle. Every job
+was handed to a slot whose guest never executed --
+
+    warm_phases outcome=failed total=300.622 go=0.004 release=300.372     # no `guest=` phase
+    pool.health pool_consecutive_failures=5 base_rebuilds=0
+
+-- and burned the full 300s worker timeout. The pool was behaving as configured: the base-rebuild
+threshold is 2 x warm_size (48 at warm_size=24), sized so a run of malformed samples cannot
+destroy a healthy base. But a slot that never reached its guest did not fail ON a sample; it
+failed to become able to run one, and that ambiguity is absent. Waiting for 48 of those means the
+tier silently degrades to cold-only for hours, which is most of what a warm tier is for.
+"""
+import threading
+from pathlib import Path
+from uuid import uuid4
+
+from blastbox.host.pool import Slot, SlotState, WarmPool, release_kwargs
+
+
+class _Wedged:
+    """Alive, recyclable, never able to execute — the production shape."""
+
+    kind = "test"
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.base_invalidations = 0
+
+    def spawn(self) -> Slot:
+        sid = str(uuid4())
+        return Slot(slot_id=sid, control_dir=Path(f"/fake/c/{sid}"),
+                    input_dir=Path(f"/fake/i/{sid}"), output_dir=Path(f"/fake/o/{sid}"),
+                    state=SlotState.WARMING, spawned_at=0.0)
+
+    def is_ready(self, slot): return True
+    def is_alive(self, slot): return True
+    def recycle(self, slot): return None
+    def reap(self, slot): return None
+
+    def invalidate_base(self) -> None:
+        with self._lock:
+            self.base_invalidations += 1
+
+
+def _pool(rt, **kw):
+    """PROD-LIKE sizing on purpose. warm_size=24 puts the ordinary threshold at 2 x 24 = 48, far
+    above the pre-guest bar, so a test that trips can only have tripped the fast path. At
+    warm_size=2 the ordinary threshold is 4 and the two are indistinguishable -- which is exactly
+    how the first version of this test passed for the wrong reason."""
+    return WarmPool(runtime=rt, warm_size=24, concurrent_ceiling=32, spawn_rate_limit=1000.0, **kw)
+
+
+def _claim_distinct(pool, n):
+    """n slots claimed BEFORE any is released -- otherwise the pool re-hands the same one, and
+    'three failures' quietly becomes 'one slot three times', which proves nothing about the base."""
+    for _ in range(10):
+        pool.tick()
+    slots = [pool.claim(timeout_s=0) for _ in range(n)]
+    assert all(s is not None for s in slots), "expected IDLE slots to claim"
+    assert len({s.slot_id for s in slots}) == n, "expected DISTINCT slots"
+    return slots
+
+
+def _fail(pool, slot, *, stage):
+    pool.release(slot, dirty=True, fault="worker", fault_stage=stage)
+
+
+def test_three_slots_that_never_reach_their_guest_convict_the_base():
+    """The fix. Three DISTINCT slots, none able to execute anything, is the base -- not 48 jobs
+    later, which at a 300s worker timeout is hours of a warm tier serving nothing."""
+    rt = _Wedged()
+    pool = _pool(rt, pre_guest_rebuild_after=3)
+    for slot in _claim_distinct(pool, 3):
+        _fail(pool, slot, stage="pre_guest")
+    assert rt.base_invalidations >= 1
+    assert max(pool._pool_consecutive_failures.values(), default=0) < 48, (
+        "must have tripped the pre-guest path, not the ordinary threshold")
+
+
+def test_the_same_slot_failing_repeatedly_does_not_convict_the_base():
+    """One wedged worker is not a wedged base -- the evidence has to be DISTINCT slots.
+
+    max_consecutive_failures is raised so one slot CAN fail past the pre-guest threshold; at the
+    default of 2 it burns out first and the test would pass without exercising the rule at all.
+    """
+    rt = _Wedged()
+    pool = _pool(rt, pre_guest_rebuild_after=3, max_consecutive_failures=0)
+    slot = _claim_distinct(pool, 1)[0]
+    for _ in range(6):
+        _fail(pool, slot, stage="pre_guest")
+    assert len(pool._pool_pre_guest_failures.get("", set())) <= 1, (
+        "one slot must contribute at most one piece of evidence")
+    assert rt.base_invalidations == 0
+
+
+def test_failures_inside_the_guest_still_need_the_full_threshold():
+    """A run of malformed samples must not destroy a healthy base. That ambiguity is why the
+    ordinary threshold is 2 x warm_size, and this fix must not lower it."""
+    rt = _Wedged()
+    pool = _pool(rt, pre_guest_rebuild_after=3)
+    for slot in _claim_distinct(pool, 6):
+        _fail(pool, slot, stage=None)      # failed IN the guest: could be the document
+    assert rt.base_invalidations == 0
+
+
+def test_a_served_job_clears_the_pre_guest_evidence():
+    """One success proves the base CAN execute, which is what the evidence claims it cannot."""
+    rt = _Wedged()
+    pool = _pool(rt, pre_guest_rebuild_after=3)
+    a, b, c, d = _claim_distinct(pool, 4)
+    _fail(pool, a, stage="pre_guest")
+    _fail(pool, b, stage="pre_guest")
+    pool.release(c, dirty=False)                    # a clean, served job
+    _fail(pool, d, stage="pre_guest")
+    assert rt.base_invalidations == 0, "the streak must restart after a served job"
+
+
+def test_the_threshold_is_configurable():
+    rt = _Wedged()
+    pool = _pool(rt, pre_guest_rebuild_after=2)
+    for slot in _claim_distinct(pool, 2):
+        _fail(pool, slot, stage="pre_guest")
+    assert rt.base_invalidations >= 1
+
+
+def test_the_kwarg_is_only_passed_to_pools_that_accept_it():
+    """A pool predating the attribution must behave exactly as before, not raise TypeError -- the
+    ladder this seam replaced swallowed that as a 'fallback' and released a slot twice."""
+    def old_release(slot, *, dirty=False, fault=None): ...
+    def new_release(slot, *, dirty=False, fault=None, fault_stage=None): ...
+    assert release_kwargs(old_release, dirty=True, fault="worker", fault_stage="pre_guest") == {
+        "dirty": True, "fault": "worker"}
+    assert release_kwargs(new_release, dirty=True, fault="worker", fault_stage="pre_guest") == {
+        "dirty": True, "fault": "worker", "fault_stage": "pre_guest"}
+
+
+# --- the dispatch-side half: deciding WHEN a failure is pre-guest ----------------------------
+def test_warm_fault_stage_reports_pre_guest_only_when_the_guest_never_ran():
+    """The pool half is useless if the dispatcher never reports the stage. This is the exact
+    production shape: signal_go succeeded, wait_for_done timed out, `guest` was never marked."""
+    from blastbox.host.dispatch import _PhaseTimer, warm_fault_stage
+
+    wedged = _PhaseTimer("j")
+    for ph in ("slot_claim", "fetch", "stage", "go"):
+        wedged.mark(ph)                       # ...then wait_for_done times out; no `guest`
+    assert warm_fault_stage(False, "worker", wedged) == "pre_guest"
+
+    ran = _PhaseTimer("j")
+    for ph in ("slot_claim", "fetch", "stage", "go", "guest"):
+        ran.mark(ph)
+    assert warm_fault_stage(False, "worker", ran) is None, (
+        "a failure AFTER the guest executed could be the document")
+
+    # a clean run, and a job-attributed fault, are never base evidence
+    assert warm_fault_stage(True, None, wedged) is None
+    assert warm_fault_stage(False, "job", wedged) is None
+    assert warm_fault_stage(False, None, wedged) is None
+
+
+def test_phase_timer_reports_which_phases_ran():
+    from blastbox.host.dispatch import _PhaseTimer
+    t = _PhaseTimer("j")
+    t.mark("go")
+    assert t.reached("go") and not t.reached("guest")
