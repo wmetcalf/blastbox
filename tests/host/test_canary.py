@@ -142,3 +142,23 @@ def test_a_healthy_store_passes_both_modes(tmp_path):
     d = _make(_local(tmp_path))
     assert d.self_test(gate=True) is True
     assert d.self_test(gate=False) is True
+
+
+class _FakeS3:
+    """Shape-compatible stand-in for S3BlobStore's identifying attributes."""
+
+    class _Client:
+        class meta:  # noqa: N801
+            endpoint_url = "http://172.18.101.15:9000"
+
+    def __init__(self):
+        self._bucket, self._prefix, self._s3 = "blastbox", "pr83run", self._Client()
+
+
+def test_describe_names_bucket_prefix_and_endpoint():
+    """`S3BlobStore(blastbox)` does not distinguish a working deployment from one pointed at the
+    wrong host. The prefix separates two stacks sharing a bucket; the endpoint is the thing you
+    check when a write cannot connect."""
+    d = describe_blob_store(_FakeS3())
+    assert "blastbox/pr83run" in d
+    assert "172.18.101.15:9000" in d

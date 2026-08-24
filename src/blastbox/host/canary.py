@@ -68,11 +68,21 @@ def describe_blob_store(store: Any) -> str:
     can notice while reading a boot log.
     """
     name = type(store).__name__
-    for attr in ("url", "_url", "bucket", "_bucket"):
-        target = getattr(store, attr, None)
-        if target:
-            endpoint = getattr(store, "_endpoint", None) or getattr(store, "endpoint", None)
-            return f"{name}({target}{' via ' + str(endpoint) if endpoint else ''})"
+    bucket = getattr(store, "_bucket", None) or getattr(store, "bucket", None)
+    if bucket:
+        # Prefix and endpoint BOTH matter and neither is on the object as a plain attribute: the
+        # prefix separates two stacks sharing a bucket, and the endpoint is the thing you actually
+        # check when a write cannot connect. Without them the line said `S3BlobStore(blastbox)`,
+        # which does not distinguish a working deployment from one pointed at the wrong host.
+        prefix = getattr(store, "_prefix", "") or ""
+        endpoint = None
+        client = getattr(store, "_s3", None)
+        try:
+            endpoint = client.meta.endpoint_url if client is not None else None
+        except Exception:  # noqa: BLE001
+            endpoint = None
+        target = f"{bucket}/{prefix}" if prefix else str(bucket)
+        return f"{name}({target}{' via ' + str(endpoint) if endpoint else ''})"
     # `local_root` is a PROPERTY on LocalBlobStore, so a callable() test skips it and the line
     # degrades to the bare class name -- which defeats the point: the whole reason to log the local
     # backend is to show WHICH directory it silently fell back to. Handle both shapes.
