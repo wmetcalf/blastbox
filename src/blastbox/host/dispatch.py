@@ -674,7 +674,7 @@ class Dispatcher:
             # BEFORE the round-trip. A LocalBlobStore round-trips perfectly -- it reads back its
             # own directory -- so the write/read test cannot see the single worst deployment bug
             # this fleet has had. Only the COMBINATION (shared queue, private store) reveals it.
-            check_store_coherence(self._job_store, self._blobs)
+            check_store_coherence(self._job_store, self._blobs, self._job_root)
             _log.info("canary.ok %s", blob_roundtrip(self._blobs))
             return True
         except CanaryFailure as exc:
@@ -715,6 +715,8 @@ class Dispatcher:
                 stop=stop,
                 maintenance_interval_s=maintenance_interval_s,
                 concurrency=int(concurrency),
+                canary=canary,
+                canary_interval_s=canary_interval_s,
             )
             return
         last_maint = time.monotonic()
@@ -756,9 +758,16 @@ class Dispatcher:
         stop: "Callable[[], bool] | None",
         maintenance_interval_s: float,
         concurrency: int,
+        canary: bool = True,
+        canary_interval_s: float = 900.0,
     ) -> None:
         """N dispatch-loop threads claim+dispatch independently; maintenance runs from
-        this coordinator thread (a global sweep — must NOT run N times concurrently)."""
+        this coordinator thread (a global sweep — must NOT run N times concurrently).
+
+        The periodic canary runs here too, for the same reason maintenance does: one coordinator,
+        not N. Without it BLASTBOX_CANARY_INTERVAL_S was silently ignored for every concurrent
+        dispatcher -- they probed once at boot and never noticed a store that broke afterwards,
+        which is precisely the shape (multi-worker, shared queue) most likely to have one."""
         stop_evt = threading.Event()
 
         def _should_stop() -> bool:
@@ -785,6 +794,7 @@ class Dispatcher:
         for t in threads:
             t.start()
         last_maint = time.monotonic()
+        last_canary = time.monotonic()
         try:
             while not _should_stop():
                 if (
@@ -793,6 +803,16 @@ class Dispatcher:
                 ):
                     last_maint = time.monotonic()
                     self._run_maintenance()
+                if canary and canary_interval_s > 0 \
+                        and time.monotonic() - last_canary >= canary_interval_s:
+                    try:
+                        self.self_test(gate=False)
+                    except Exception:  # noqa: BLE001
+                        _log.exception("canary raised; continuing to serve")
+                    # Re-stamped from COMPLETION -- the round-trip can block for the store's own
+                    # timeout, so stamping first would re-probe every pass exactly when the store
+                    # is least able to answer.
+                    last_canary = time.monotonic()
                 time.sleep(min(poll_interval_s, 1.0))
         finally:
             stop_evt.set()

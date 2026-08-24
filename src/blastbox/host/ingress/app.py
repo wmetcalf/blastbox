@@ -302,6 +302,22 @@ def build_app(
     _blob_store = blob_store if blob_store is not None else build_blob_store_from_env(
         {**os.environ, "BLASTBOX_JOB_ROOT": str(_job_root)}
     )
+    # Log WHERE results will be served from, in the same shape the dispatchers log where they
+    # write. A dispatcher and an API pointed at different buckets/prefixes both pass their own
+    # self-tests and every real job still 404s, so the two lines being greppable side by side is
+    # what makes that drift findable. (Making it FAIL rather than merely visible needs an identity
+    # the two processes exchange through something they already share; the JobStore protocol has
+    # no seam for that today.)
+    try:
+        import logging as _logging
+
+        from blastbox.host.canary import blob_target_fingerprint
+
+        _logging.getLogger("blastbox.host.ingress").info(
+            "canary.blob_store %s (serving results from here)",
+            blob_target_fingerprint(_blob_store))
+    except Exception:  # noqa: BLE001 - a log line must never stop the API booting
+        pass
 
     # Engine allowlist
     _allowed_engines: set[str]

@@ -119,8 +119,9 @@ _Redis.__name__ = "RedisJobStore"
 class _Dispatcher:
     """Minimal stand-in exercising Dispatcher.self_test's real body."""
 
-    def __init__(self, store, job_store=None):
+    def __init__(self, store, job_store=None, job_root=None):
         self._blobs = store
+        self._job_root = job_root
         # Defaults to a SINGLE-NODE queue so these cases exercise the round-trip path; the
         # coherence tests override it. A shared queue here would short-circuit before the
         # round-trip and quietly stop these tests from testing what they name.
@@ -129,9 +130,9 @@ class _Dispatcher:
     self_test = None  # bound below
 
 
-def _make(store, job_store=None):
+def _make(store, job_store=None, job_root=None):
     from blastbox.host.dispatch import Dispatcher
-    d = _Dispatcher(store, job_store)
+    d = _Dispatcher(store, job_store, job_root)
     d.self_test = Dispatcher.self_test.__get__(d, _Dispatcher)
     return d
 
@@ -184,50 +185,76 @@ def test_describe_names_bucket_prefix_and_endpoint():
 
 
 # --- the check the round-trip cannot make ----------------------------------------------------
-def test_a_shared_queue_with_a_local_blob_store_is_refused(tmp_path):
+def test_a_shared_queue_with_a_PRIVATE_local_store_is_refused(tmp_path):
     """The 17k incident, and the one shape a round-trip provably cannot catch.
 
     A LocalBlobStore reads back its own directory, so it passes every liveness test while sealing
     results the API cannot read. Only the COMBINATION -- jobs claimed from a queue other processes
-    fill, results written where only this container can see them -- reveals it.
+    fill, results written to this node's private default -- reveals it.
     """
     from blastbox.host.canary import check_store_coherence
     with pytest.raises(CanaryFailure) as ei:
-        check_store_coherence(_Postgres(), _local(tmp_path))
+        check_store_coherence(_Postgres(), _local(tmp_path), tmp_path / "jobs")
     msg = str(ei.value)
-    assert "SHARED queue" in msg and "LOCAL blob store" in msg
+    assert "SHARED queue" in msg and "PRIVATE local blob store" in msg
     assert "BLASTBOX_BLOB_URL" in msg and "404" in msg
+
+
+def test_a_shared_queue_with_a_DELIBERATELY_SHARED_local_root_is_allowed(tmp_path):
+    """Multi-node on a LAN with BLASTBOX_BLOB_LOCAL_ROOT on an NFS export is a DOCUMENTED,
+    supported deployment (docs/specs/2026-07-21-distributed-blob-storage-design.md, "Mode 2").
+
+    Refusing it would break a valid configuration by default, fail-closed. A check that invents a
+    reason to reject a working deployment is worse than the bug it hunts, so the discriminator is
+    "nobody pointed this anywhere" -- still on the factory default beside job_root -- not "the
+    backend class is local".
+    """
+    from blastbox.host.canary import check_store_coherence
+    nfs = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "nfs-export")
+    check_store_coherence(_Postgres(), nfs, tmp_path / "jobs")
+
+
+def test_without_job_root_it_says_it_could_not_check(tmp_path, caplog):
+    """The private-vs-shared distinction needs job_root; guessing would refuse the NFS deployment.
+
+    But it must SAY it skipped. A check that quietly did not run looks identical to one that
+    passed, which is the reporting failure underneath this entire class of bug.
+    """
+    import logging
+    from blastbox.host.canary import check_store_coherence
+    with caplog.at_level(logging.WARNING, logger="blastbox.canary"):
+        check_store_coherence(_Postgres(), _local(tmp_path), None)
+    assert any("coherence_skipped" in r.message for r in caplog.records), caplog.records
 
 
 def test_redis_counts_as_shared(tmp_path):
     from blastbox.host.canary import check_store_coherence
     with pytest.raises(CanaryFailure):
-        check_store_coherence(_Redis(), _local(tmp_path))
+        check_store_coherence(_Redis(), _local(tmp_path), tmp_path / "jobs")
 
 
 def test_a_single_node_deployment_is_left_alone(tmp_path):
     """SQLite queue + local blobs is a perfectly good configuration, not a bug."""
     from blastbox.host.canary import check_store_coherence
-    check_store_coherence(_Sqlite(), _local(tmp_path))
+    check_store_coherence(_Sqlite(), _local(tmp_path), tmp_path / "jobs")
 
 
 def test_an_unrecognised_job_store_never_triggers_the_failure(tmp_path):
     """Conservative on purpose: a store we cannot classify must not produce a false refusal that
     stops a valid deployment from booting."""
     from blastbox.host.canary import check_store_coherence
-    check_store_coherence(object(), _local(tmp_path))
+    check_store_coherence(object(), _local(tmp_path), tmp_path / "jobs")
 
 
-def test_a_shared_queue_with_a_remote_store_passes():
+def test_a_shared_queue_with_a_remote_store_passes(tmp_path):
     from blastbox.host.canary import check_store_coherence
-    check_store_coherence(_Postgres(), _FakeS3())
+    check_store_coherence(_Postgres(), _FakeS3(), tmp_path / "jobs")
 
 
 def test_the_dispatcher_gate_refuses_the_incoherent_pair(tmp_path):
     """It must fire through self_test, not just standalone -- and BEFORE the round-trip, which
     would otherwise pass and let the dispatcher serve."""
-    d = _make(_local(tmp_path))
-    d._job_store = _Postgres()
+    d = _make(_local(tmp_path), _Postgres(), tmp_path / "jobs")
     with pytest.raises(CanaryFailure) as ei:
         d.self_test(gate=True)
     assert "SHARED queue" in str(ei.value)

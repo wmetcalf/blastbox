@@ -415,6 +415,33 @@ def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gat
         return None
 
 
+def _canary_settings() -> "tuple[bool, float]":
+    """(enabled, interval) for the startup/periodic store self-test.
+
+    DISABLED ON EXPLICIT FALSE ONLY. An affirmative allowlist ("1"/"true"/...) turns a typo -- or
+    the set-but-empty shape compose produces for an unset variable -- into a silent OFF, which
+    fails OPEN on a check whose entire value is failing closed: an operator who fat-fingers `treu`
+    would silently get the unfetchable-result failure mode back, with no warning.
+    """
+    log = logging.getLogger("blastbox.host.cli")
+    raw = os.environ.get("BLASTBOX_CANARY")
+    val = (raw or "").strip().lower()
+    if val in ("0", "false", "no", "off"):
+        enabled = False
+    else:
+        enabled = True
+        if raw is not None and val not in ("1", "true", "yes", "on", ""):
+            log.warning("BLASTBOX_CANARY=%r is not a recognised boolean; leaving the startup "
+                        "canary ENABLED (set 0/false/no/off to disable)", raw)
+    try:
+        interval = float(os.environ.get("BLASTBOX_CANARY_INTERVAL_S", "900"))
+    except ValueError:
+        log.warning("BLASTBOX_CANARY_INTERVAL_S=%r is not a number; using 900",
+                    os.environ.get("BLASTBOX_CANARY_INTERVAL_S"))
+        interval = 900.0
+    return enabled, interval
+
+
 def _dispatch_cmd(args: argparse.Namespace) -> int:
     from blastbox.host.dispatch import Dispatcher
     from blastbox.host.jobs.factory import build_job_store_from_env
@@ -506,6 +533,27 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
             concurrency=int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1"),
             job_retention_s=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"),
         )
+        # The network branch returns below without ever reaching Dispatcher.run_forever, so the
+        # startup gate has to be applied HERE as well. These are the aws/static/cascade tiers --
+        # the distributed ones, whose results necessarily travel through a shared blob store, and
+        # therefore the ones where an unwritable or unreadable store is most likely and most
+        # expensive. Before pool.start(), so a misconfigured deployment does not spawn microVMs
+        # it is only going to fail jobs on.
+        _vm_canary, _ = _canary_settings()
+        if _vm_canary:
+            from blastbox.host.canary import (
+                blob_roundtrip,
+                check_store_coherence,
+                describe_blob_store,
+            )
+            _vmlog = logging.getLogger("blastbox.host.cli")
+            _vmblobs = getattr(vm, "_blobs", None)
+            if _vmblobs is None:
+                _vmlog.warning("canary: this dispatcher exposes no blob store; skipping")
+            else:
+                _vmlog.info("canary.blob_store %s", describe_blob_store(_vmblobs))
+                check_store_coherence(store, _vmblobs, job_root)
+                _vmlog.info("canary.ok %s", blob_roundtrip(_vmblobs))
         pool.start()   # validation passed -> now spawn/warm slots (nothing to leak on an earlier raise)
         try:
             # One-shot orphan sweep on start (aws-ec2-hibernate only; guarded by hasattr). A fresh run's
@@ -610,15 +658,7 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         # and every deployment bug this catches previously surfaced only as DONE jobs whose
         # artifacts 404'd. Provided as an escape hatch for a store that is deliberately unavailable
         # at boot, not as something a normal deployment should set.
-        canary = (os.environ.get("BLASTBOX_CANARY", "1").strip().lower()
-                  in ("1", "true", "yes", "on"))
-        try:
-            canary_interval_s = float(os.environ.get("BLASTBOX_CANARY_INTERVAL_S", "900"))
-        except ValueError:
-            logging.getLogger("blastbox.host.cli").warning(
-                "BLASTBOX_CANARY_INTERVAL_S=%r is not a number; using 900",
-                os.environ.get("BLASTBOX_CANARY_INTERVAL_S"))
-            canary_interval_s = 900.0
+        canary, canary_interval_s = _canary_settings()
         dispatcher.run_forever(
             poll_interval_s=args.poll_interval,
             concurrency=dispatch_concurrency,
