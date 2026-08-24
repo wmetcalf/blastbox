@@ -605,9 +605,25 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
             except Exception:
                 logging.getLogger("blastbox.host.cli").warning(
                     "node self-sizer: could not restore pool after skipped sizing", exc_info=True)
+        # BLASTBOX_CANARY=0 disables the startup self-test. It defaults ON and fails closed: a
+        # dispatcher that cannot round-trip a result through its own blob store cannot serve a job,
+        # and every deployment bug this catches previously surfaced only as DONE jobs whose
+        # artifacts 404'd. Provided as an escape hatch for a store that is deliberately unavailable
+        # at boot, not as something a normal deployment should set.
+        canary = (os.environ.get("BLASTBOX_CANARY", "1").strip().lower()
+                  in ("1", "true", "yes", "on"))
+        try:
+            canary_interval_s = float(os.environ.get("BLASTBOX_CANARY_INTERVAL_S", "900"))
+        except ValueError:
+            logging.getLogger("blastbox.host.cli").warning(
+                "BLASTBOX_CANARY_INTERVAL_S=%r is not a number; using 900",
+                os.environ.get("BLASTBOX_CANARY_INTERVAL_S"))
+            canary_interval_s = 900.0
         dispatcher.run_forever(
             poll_interval_s=args.poll_interval,
             concurrency=dispatch_concurrency,
+            canary=canary,
+            canary_interval_s=canary_interval_s,
         )
     finally:
         # Stop the POOL first (reap its slots) while the sizer thread is STILL heartbeating, so

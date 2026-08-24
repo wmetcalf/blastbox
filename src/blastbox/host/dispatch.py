@@ -55,6 +55,7 @@ from blastbox.contract.envelope import (
 )
 from blastbox.errors import HOST_RESOURCE_ERRNOS, OutputTrustError, OutputTrustUnknown, WarmTimeout, sanitize_public_error
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
+from blastbox.host.canary import CanaryFailure, blob_roundtrip, describe_blob_store
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.runtime.docker import (
     RuntimeSelection,
@@ -647,6 +648,33 @@ class Dispatcher:
         self._dispatch_claimed_job(job, warm_reserved=reserved)
         return True
 
+    def self_test(self, *, gate: bool) -> bool:
+        """Prove this dispatcher can actually store and serve a result, before it claims a job.
+
+        ``gate=True`` (startup) RAISES on failure. A dispatcher whose store is misconfigured cannot
+        do its job, and the useful failure is a loud one at boot: the alternative -- which is what
+        happened -- is a stack that looks healthy, claims thousands of jobs and marks them DONE
+        with results nobody can fetch. A crash-loop with the remedy in the log is strictly better
+        than that, and it is the same class of error as a bad database URL, which already fails
+        closed.
+
+        ``gate=False`` (periodic) only logs. Once the process is serving, a store that goes away is
+        a BROWNOUT, not a config error, and taking the dispatcher down over it would destroy warm
+        capacity for something that heals on its own -- exactly what issue #79 exists to prevent.
+        The periodic pass is there to make a store that broke *since* boot visible in the log
+        rather than at the next collection.
+        """
+        _log.info("canary.blob_store %s", describe_blob_store(self._blobs))
+        try:
+            _log.info("canary.ok %s", blob_roundtrip(self._blobs))
+            return True
+        except CanaryFailure as exc:
+            if gate:
+                _log.error("canary.FAILED refusing to serve — %s", exc)
+                raise
+            _log.error("canary.FAILED (already serving; not gating) — %s", exc)
+            return False
+
     def run_forever(
         self,
         *,
@@ -654,6 +682,8 @@ class Dispatcher:
         stop: Callable[[], bool] | None = None,
         maintenance_interval_s: float = 60.0,
         concurrency: int = 1,
+        canary: bool = True,
+        canary_interval_s: float = 900.0,
     ) -> None:
         """Continuously claim and dispatch jobs until ``stop()`` returns True.
 
@@ -666,6 +696,10 @@ class Dispatcher:
         concurrent worker is one more in-flight detonation, so size
         ``BLASTBOX_WORKER_MEMORY * concurrency`` to the host's RAM.
         """
+        # BEFORE the first claim, and before the concurrent fan-out -- a self-test that runs after
+        # work has been claimed is not a gate, it is a report.
+        if canary:
+            self.self_test(gate=True)
         if max(1, int(concurrency)) > 1:
             self._run_forever_concurrent(
                 poll_interval_s=poll_interval_s,
@@ -675,6 +709,7 @@ class Dispatcher:
             )
             return
         last_maint = time.monotonic()
+        last_canary = time.monotonic()
         while True:
             if stop is not None and stop():
                 break
@@ -687,6 +722,18 @@ class Dispatcher:
                 # returns it to the queue. Log and keep serving.
                 _log.exception("dispatch_once failed; continuing")
                 progressed = False
+            if canary and canary_interval_s > 0 \
+                    and time.monotonic() - last_canary >= canary_interval_s:
+                try:
+                    self.self_test(gate=False)
+                except Exception:  # noqa: BLE001
+                    _log.exception("canary raised; continuing to serve")
+                # Re-stamp from COMPLETION, not from the check above: the round-trip can itself
+                # block for the store's timeout during a brownout, and stamping before it would
+                # make the interval measure from a point already in the past -- so a slow store
+                # would be re-probed immediately, every loop, exactly when it is least able to
+                # answer.
+                last_canary = time.monotonic()
             if maintenance_interval_s > 0 and time.monotonic() - last_maint >= maintenance_interval_s:
                 last_maint = time.monotonic()
                 self._run_maintenance()
