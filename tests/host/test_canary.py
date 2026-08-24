@@ -340,6 +340,18 @@ def test_the_probe_uses_the_dispatchers_scratch_not_the_system_tmp(tmp_path, mon
     assert scratch.exists()
 
 
+def test_an_unusable_configured_job_root_fails_the_gate(tmp_path):
+    """The inverse trap of the one above: falling back to the system temp dir when an explicit
+    root is unusable let the probe PASS while real dispatch would fail later creating its
+    input/output dirs under that same root. An unusable job_root must fail the gate."""
+    blocked = tmp_path / "not-a-dir"
+    blocked.write_text("a file where the job root should be")
+    with pytest.raises(CanaryFailure) as ei:
+        blob_roundtrip(_local(tmp_path), scratch_dir=blocked / "jobs")
+    msg = str(ei.value)
+    assert "job root is unusable" in msg and "BLASTBOX_JOB_ROOT" in msg
+
+
 @pytest.mark.parametrize("raw,expected", [
     ("-1", 900.0), ("-0.5", 900.0),   # finite, passes isfinite, then `> 0` silently disables
     ("0", 0.0), ("5", 5.0),

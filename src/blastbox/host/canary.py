@@ -166,8 +166,20 @@ def _roundtrip_once(store: Any, job_id: str, keep_failed: bool, scratch_dir: Any
         try:
             parent = Path(scratch_dir)
             parent.mkdir(parents=True, exist_ok=True)
-        except Exception:  # noqa: BLE001 - fall back to the system temp dir
-            parent = None
+        except Exception as exc:  # noqa: BLE001
+            # NO FALLBACK when a root was explicitly supplied. Quietly staging in the system temp
+            # dir instead let the probe pass -- and the dispatcher start claiming -- while real
+            # dispatch would fail later creating its input/output dirs under that same unusable
+            # root (a volume that did not mount, a read-only parent). The gate exists to catch
+            # exactly that, so an unusable job_root has to fail it. The system temp dir is only
+            # for callers that supplied no scratch at all.
+            raise CanaryFailure(
+                f"the configured job root is unusable ({scratch_dir})",
+                "the dispatcher stages every job under this path, so it cannot serve while it is "
+                "unwritable -- check the volume actually mounted and that the container's uid can "
+                "write to it (BLASTBOX_JOB_ROOT)",
+                exc,
+            ) from exc
     with TemporaryDirectory(prefix="blastbox-canary-", dir=parent) as tmp:
         out_dir = Path(tmp) / "output"
         out_dir.mkdir(parents=True)
