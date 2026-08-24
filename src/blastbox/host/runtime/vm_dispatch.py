@@ -985,9 +985,6 @@ class VmJobDispatcher:
             if self._stop.wait(max(0.05, min(waits))):
                 return
             now = time.monotonic()
-            if self._maintenance_interval_s > 0 and now - last_maint >= self._maintenance_interval_s:
-                last_maint = now
-                self._run_maintenance()
             # The periodic store self-test rides the maintenance timer, for the same reason
             # maintenance does: one place, on a cadence, off the claim path. Without it the
             # network tiers (aws/static/cascade) probed the blob store once at startup and never
@@ -1003,6 +1000,9 @@ class VmJobDispatcher:
                 # timeout, so stamping first would re-probe every pass precisely when the store
                 # is least able to answer.
                 last_canary = time.monotonic()
+            if self._maintenance_interval_s > 0 and now - last_maint >= self._maintenance_interval_s:
+                last_maint = now
+                self._run_maintenance()
 
     def run(self) -> None:
         """Block, claiming + processing jobs on ``concurrency`` threads until :meth:`stop`. Also runs

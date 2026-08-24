@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import socket
 import time
 import uuid
@@ -56,10 +57,30 @@ class CanaryFailure(RuntimeError):
     def __init__(self, what: str, remedy: str, cause: BaseException | None = None) -> None:
         msg = f"{what}\n  fix: {remedy}"
         if cause is not None:
-            msg += f"\n  cause: {type(cause).__name__}: {cause}"
+            # REDACTED. Redacting the endpoint in the description was not enough: botocore's
+            # connection and request errors quote the full URL they tried, so an endpoint carrying
+            # user-info or a query token reappeared verbatim here -- and, through exception
+            # chaining, in every startup traceback too. Same secret, one layer down.
+            msg += f"\n  cause: {type(cause).__name__}: {redact_secrets(str(cause))}"
         super().__init__(msg)
         self.what = what
         self.remedy = remedy
+
+
+_URL_RE = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s\"\'<>]+")
+
+
+def redact_secrets(text: str) -> str:
+    """Rewrite every URL in ``text`` through :func:`_safe_endpoint`.
+
+    Used on any message that reaches a log or a traceback. The exception a store raises is written
+    by botocore, not by us, so the only safe assumption is that it echoes whatever URL it was
+    handed -- credentials included.
+    """
+    try:
+        return _URL_RE.sub(lambda m: _safe_endpoint(m.group(0)), text)
+    except Exception:  # noqa: BLE001 - never let redaction raise
+        return "<redaction failed>"
 
 
 def _safe_endpoint(url: Any) -> str:
@@ -205,7 +226,7 @@ def _roundtrip_once(store: Any, job_id: str, keep_failed: bool, scratch_dir: Any
                 "unwritable -- check the volume actually mounted and that the container's uid can "
                 "write to it (BLASTBOX_JOB_ROOT)",
                 exc,
-            ) from exc
+            ) from None
     with TemporaryDirectory(prefix="blastbox-canary-", dir=parent) as tmp:
         out_dir = Path(tmp) / "output"
         out_dir.mkdir(parents=True)
@@ -226,7 +247,7 @@ def _roundtrip_once(store: Any, job_id: str, keep_failed: bool, scratch_dir: Any
                 "THIS container, and that this container has a network route to the endpoint "
                 "(dispatchers on an `internal: true` docker network cannot reach an off-box store)",
                 exc,
-            ) from exc
+            ) from None
 
         try:
             present = store.has_output(job_id)
@@ -237,7 +258,7 @@ def _roundtrip_once(store: Any, job_id: str, keep_failed: bool, scratch_dir: Any
                 "the write succeeded but the store could not be queried; check read permissions "
                 "for the same credentials",
                 exc,
-            ) from exc
+            ) from None
         if not present:
             if not keep_failed:
                 _cleanup(store, job_id)
@@ -259,13 +280,15 @@ def _roundtrip_once(store: Any, job_id: str, keep_failed: bool, scratch_dir: Any
             if racey:
                 # The delete is what collides, and this is exactly where it lands: another
                 # process's cleanup between our has_output and our open_output.
-                raise _RaceySuspicion(f"read-back of {job_id} failed: {exc}") from exc
+                # Redacted too: this message is logged on the retry path.
+                raise _RaceySuspicion(
+                    f"read-back of {job_id} failed: {redact_secrets(str(exc))}") from None
             raise CanaryFailure(
                 f"blob store READ-BACK failed ({describe_blob_store(store)})",
                 "results are being written but cannot be served; check read permissions and that "
                 "the API resolves the same bucket/prefix",
                 exc,
-            ) from exc
+            ) from None
 
         if got != payload:
             _cleanup(store, job_id)

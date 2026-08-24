@@ -567,3 +567,83 @@ def test_the_network_loop_sleeps_to_the_canary_deadline_not_the_floor():
     t.join(timeout=3)
     # Sleeping to the canary deadline: one wait. Spinning at the floor: ~12 in 0.6s.
     assert _CountingEvent.waits <= 3, f"loop spun {_CountingEvent.waits} times instead of sleeping"
+
+
+# --- round 8: the secret one layer down, ordering, and a log behind a toggle ------------------
+class _EndpointEchoingStore(LocalBlobStore):
+    """Botocore quotes the URL it tried. That URL is ours, credentials and all."""
+
+    def put_output(self, job_id, out_dir):
+        raise OSError('Could not connect to the endpoint URL: '
+                      '"https://AKIAKEY:sup3r-s3cret@minio.internal:9000/b/k?token=zzz"')
+
+
+def test_a_stores_exception_cannot_leak_the_endpoint_credentials(tmp_path):
+    """Redacting describe_blob_store() was not enough: the CAUSE carries the same URL, and it
+    reaches both the message and (through chaining) every startup traceback."""
+    with pytest.raises(CanaryFailure) as ei:
+        blob_roundtrip(_EndpointEchoingStore(tmp_path / "jobs", blob_root=tmp_path / "blobs"))
+    msg = str(ei.value)
+    for secret in ("sup3r-s3cret", "AKIAKEY", "token=zzz"):
+        assert secret not in msg, f"{secret!r} leaked into the CanaryFailure message"
+    assert "minio.internal:9000" in msg, "the endpoint identity must survive redaction"
+    assert ei.value.__cause__ is None, "the raw exception must not be chained into tracebacks"
+
+
+@pytest.mark.parametrize("text,gone,kept", [
+    ('connect to "https://u:p@h:9000/x?t=1"', "p@h", "h:9000"),
+    ("no urls here at all", "://", "no urls here"),
+    ('two: http://a:b@h1/ and https://c:d@h2/?k=v', "b@h1", "h1"),
+])
+def test_redaction_scrubs_every_url_in_a_message(text, gone, kept):
+    from blastbox.host.canary import redact_secrets
+    got = redact_secrets(text)
+    assert gone not in got
+    assert kept in got
+
+
+def test_the_blob_target_is_logged_even_with_the_canary_disabled(tmp_path, caplog):
+    """BLASTBOX_CANARY=0 skipped self_test entirely — and with it the ONLY line naming the
+    backend, bucket, prefix and endpoint. The ingress logs its read target regardless, so the
+    side-by-side comparison broke precisely in the deployments that opted out."""
+    import logging
+    import threading
+    from blastbox.host.dispatch import Dispatcher
+
+    d = _make(_local(tmp_path), _Sqlite(), tmp_path / "jobs")
+    d._run_forever_serial = lambda *a, **k: None
+    d.self_test = lambda gate: pytest.fail("self_test must not run when canary=False")
+    with caplog.at_level(logging.INFO, logger="blastbox.host.dispatch"):
+        Dispatcher.run_forever(d, poll_interval_s=0.01, maintenance_interval_s=0, canary=False)
+    assert any("canary.blob_store" in r.message for r in caplog.records), \
+        "the blob target must be logged regardless of the toggle"
+    _ = threading
+
+
+def test_a_slow_maintenance_sweep_cannot_delay_the_canary():
+    """Both run on one coordinator thread. _run_maintenance can retry thousands of pending uploads
+    through the very store that is down, so with maintenance first an object-store outage could
+    postpone by minutes the check whose whole job is reporting that outage."""
+    import threading
+    import time as _time
+    from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
+
+    order = []
+
+    class _Stub:
+        _maintenance_interval_s = 0.05
+        _canary_interval_s = 0.05
+        def __init__(self):
+            self._stop = threading.Event()
+            self._canary_cb = lambda: order.append("canary")
+        def _run_maintenance(self):
+            order.append("maintenance")
+            _time.sleep(0.4)          # a sweep stuck retrying uploads through a dead store
+
+    st = _Stub()
+    t = threading.Thread(target=VmJobDispatcher._maintenance_loop.__get__(st, _Stub), daemon=True)
+    t.start()
+    _time.sleep(0.35)
+    st._stop.set()
+    t.join(timeout=3)
+    assert order and order[0] == "canary", f"maintenance ran first and blocked the canary: {order}"

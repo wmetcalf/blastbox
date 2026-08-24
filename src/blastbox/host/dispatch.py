@@ -671,7 +671,6 @@ class Dispatcher:
         The periodic pass is there to make a store that broke *since* boot visible in the log
         rather than at the next collection.
         """
-        _log.info("canary.blob_store %s", describe_blob_store(self._blobs))
         try:
             # BEFORE the round-trip. A LocalBlobStore round-trips perfectly -- it reads back its
             # own directory -- so the write/read test cannot see the single worst deployment bug
@@ -719,6 +718,12 @@ class Dispatcher:
         """
         # BEFORE the first claim, and before the concurrent fan-out -- a self-test that runs after
         # work has been claimed is not a gate, it is a report.
+        # OUTSIDE the toggle. This is the only line naming the backend, bucket, prefix and
+        # endpoint for a file dispatcher, and the point of logging it is the side-by-side
+        # comparison with the ingress -- which logs its read target regardless. Hiding it behind
+        # BLASTBOX_CANARY=0 broke that comparison in exactly the deployments that opted out,
+        # including the documented one where the store is deliberately absent at boot.
+        _log.info("canary.blob_store %s", describe_blob_store(self._blobs))
         if canary:
             self.self_test(gate=True)
         if max(1, int(concurrency)) > 1:
@@ -822,12 +827,11 @@ class Dispatcher:
         last_canary = time.monotonic()
         try:
             while not _should_stop():
-                if (
-                    maintenance_interval_s > 0
-                    and time.monotonic() - last_maint >= maintenance_interval_s
-                ):
-                    last_maint = time.monotonic()
-                    self._run_maintenance()
+                # CANARY FIRST. Both run on this one coordinator thread, so a maintenance sweep
+                # starting at or before the canary deadline blocks it -- and _run_maintenance can
+                # retry thousands of pending uploads through the very store that is down, so an
+                # object-store outage could postpone by many minutes the check whose whole job is
+                # reporting that outage. Maintenance must not be able to hide it.
                 if canary and canary_interval_s > 0 \
                         and time.monotonic() - last_canary >= canary_interval_s:
                     try:
@@ -838,6 +842,12 @@ class Dispatcher:
                     # timeout, so stamping first would re-probe every pass exactly when the store
                     # is least able to answer.
                     last_canary = time.monotonic()
+                if (
+                    maintenance_interval_s > 0
+                    and time.monotonic() - last_maint >= maintenance_interval_s
+                ):
+                    last_maint = time.monotonic()
+                    self._run_maintenance()
                 time.sleep(min(poll_interval_s, 1.0))
         finally:
             stop_evt.set()
