@@ -50,8 +50,14 @@ host = [
 s3 = [
     "boto3>=1.34",
 ]
+# The ClamAV engine's clamd client. Lives in the WORKER image, not the host: the daemon
+# is a unix socket inside the guest, so nothing on the host ever imports this.
+clamav = [
+    "clamd>=1.0.2",
+]
 dev = [
-    "blastbox[host]",            # the http/ingress tests need the host stack (fastapi, etc.)
+    "blastbox[host]",
+    "blastbox[clamav]",            # the http/ingress tests need the host stack (fastapi, etc.)
     "pytest>=8.0.0",
     "mypy>=1.9.0",
     # 0.16 expanded ruff's default rule set -> 244 pre-existing violations across the

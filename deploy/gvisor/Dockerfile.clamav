@@ -1,0 +1,57 @@
+# gVisor C/R warm-tier rootfs for ClamAV — the KVM-less warm path, built on top of
+# clamav-cold-worker:dev. The container is CHECKPOINTED once the daemon has loaded its
+# signature database and RESTORED per job.
+#
+# WHY THIS ENGINE WANTS WARM MORE THAN MOST. clamd parses roughly a gigabyte of
+# signatures before it can answer anything — tens of seconds and hundreds of megabytes
+# of RSS. Cold, that cost is paid once per sample and dominates the scan itself. The
+# checkpoint is taken AT READY, so a restore comes up with the database already resident
+# and answers the first sample in milliseconds. This is the same trade as the RedTusk
+# warm JVM: load the expensive thing once, restore many disposable copies of it.
+#
+# WHY SLOT REUSE IS DEFENSIBLE HERE, in the terms WarmPool already sets out —
+# `jobs_per_recycle` is an ENGINE-THREAT DECISION, not a tuning knob. This engine never
+# EXECUTES the sample; it parses it. The threat is a malformed file against ClamAV's own
+# parsers, which is real and is exactly what the runsc boundary is for, but it is not the
+# sample obtaining execution the way a document is in LibreOffice or a page is in a
+# browser. Restore-per-job is still the default; a restored copy is discarded after its
+# sample either way.
+#
+# NO ACCEPT-RETRY LD_PRELOAD SHIM (unlike Dockerfile.shim for clippyshot): that shim
+# fixes soffice's osl_acceptPipe returning EINTR after a restore. clamd's socket is
+# accepted by the *client* side here — the worker connects out to a unix socket in its
+# own guest — and a fresh connect() after restore has no such retry problem.
+#
+# Build context = blastbox repo root:
+#   docker build --build-arg BASE=clamav-cold-worker:dev \
+#     -f deploy/gvisor/Dockerfile.clamav -t clamav-warm:gvisor .
+ARG BASE=clamav-cold-worker:dev
+FROM ${BASE}
+ARG ENGINE=blastbox.engines.clamav:ClamAVEngine
+USER root
+
+# blastbox gVisor warm agent. run_warm.py imports `engines` from its own dir
+# (sys.path[0]); the engine name is baked into a FILE because Docker ENV is dropped by
+# `docker export`. The bind-mount destinations (/in ro, /out rw, /ctrl rw) MUST exist at
+# build time — the rootfs is restored read-only, so runsc cannot create them.
+COPY deploy/gvisor/run_warm.py /opt/blastbox/run_warm.py
+COPY deploy/firecracker/engines.py /opt/blastbox/engines.py
+RUN printf '%s' "${ENGINE}" > /opt/blastbox/engine \
+    && mkdir -p /in /out /ctrl \
+    # /run/clamav must exist and be writable IN THE ROOTFS: the daemon's socket is
+    # created there before the checkpoint, and a restored rootfs is read-only.
+    && install -d -o clamav -g clamav /run/clamav \
+    # Strip setuid/setgid — nothing in this image needs to escalate.
+    && find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true
+
+# The warm entrypoint is supplied by the host via BLASTBOX_GVISOR_WARM_ARGV; it must go
+# through the clamav entrypoint so the daemon is up and ANSWERING before the checkpoint
+# is taken. Checkpointing a slot whose database is still loading would freeze a daemon
+# that answers `OK` to everything — every restore from that image would then report every
+# sample clean, which is the false negative this whole engine is built to refuse, made
+# permanent and baked into an artifact.
+#   BLASTBOX_GVISOR_WARM_ARGV='["/usr/local/bin/clamav-entrypoint","python3","/opt/blastbox/run_warm.py"]'
+
+LABEL org.opencontainers.image.title="clamav-warm-gvisor" \
+      org.opencontainers.image.description="ClamAV warm-database gVisor C/R rootfs (runsc checkpoint/restore; KVM-less warm tier)" \
+      org.opencontainers.image.version="0.1.0"
