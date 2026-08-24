@@ -975,13 +975,17 @@ class VmJobDispatcher:
             # ran about every 60s and 90 ran about every 120s. A configured cadence that silently
             # becomes a different cadence is its own small lie.
             now = time.monotonic()
-            waits = [self._maintenance_interval_s - (now - last_maint)]
+            waits = []
+            if self._maintenance_interval_s > 0:
+                waits.append(self._maintenance_interval_s - (now - last_maint))
             if self._canary_cb is not None and self._canary_interval_s > 0:
                 waits.append(self._canary_interval_s - (now - last_canary))
+            if not waits:
+                return
             if self._stop.wait(max(0.05, min(waits))):
                 return
             now = time.monotonic()
-            if now - last_maint >= self._maintenance_interval_s:
+            if self._maintenance_interval_s > 0 and now - last_maint >= self._maintenance_interval_s:
                 last_maint = now
                 self._run_maintenance()
             # The periodic store self-test rides the maintenance timer, for the same reason
@@ -1009,7 +1013,11 @@ class VmJobDispatcher:
         with ThreadPoolExecutor(max_workers=self._concurrency + 1, thread_name_prefix="vmclaim") as ex:
             for _ in range(self._concurrency):
                 ex.submit(self._worker_loop)
-            if self._maintenance_interval_s > 0:
+            # EITHER timer is reason enough to run the loop. Gating solely on maintenance meant
+            # a deployment that disables it (the constructor explicitly supports that) silently
+            # got no periodic canary either, however it was configured.
+            if self._maintenance_interval_s > 0 or (
+                    self._canary_cb is not None and self._canary_interval_s > 0):
                 ex.submit(self._maintenance_loop)
             try:
                 self._stop.wait()

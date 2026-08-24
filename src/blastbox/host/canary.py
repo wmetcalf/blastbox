@@ -31,6 +31,7 @@ import logging
 import socket
 import time
 import uuid
+from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -61,6 +62,31 @@ class CanaryFailure(RuntimeError):
         self.remedy = remedy
 
 
+def _safe_endpoint(url: Any) -> str:
+    """An endpoint with any embedded secret removed, for logging.
+
+    `client.meta.endpoint_url` echoes whatever was configured, and both the ingress and every
+    dispatcher log it unconditionally at startup. A `BLASTBOX_BLOB_ENDPOINT_URL` carrying URI
+    user-info (`http://key:secret@host:9000`) or a query token would therefore be copied into
+    every log sink that collects boot output -- a credential disclosure produced by the code whose
+    job is to make misconfiguration visible.
+    """
+    text = str(url or "")
+    if not text:
+        return ""
+    try:
+        parts = urlsplit(text)
+        host = parts.hostname or ""
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        redacted = "***@" if (parts.username or parts.password) else ""
+        # query and fragment dropped entirely: neither identifies the endpoint, and either can
+        # carry a token.
+        return urlunsplit((parts.scheme, f"{redacted}{host}", parts.path, "", ""))
+    except Exception:  # noqa: BLE001 - never let a log line raise
+        return "<unparseable endpoint>"
+
+
 def describe_blob_store(store: Any) -> str:
     """One line naming the backend AND its target, for the startup log.
 
@@ -80,7 +106,7 @@ def describe_blob_store(store: Any) -> str:
         endpoint = None
         client = getattr(store, "_s3", None)
         try:
-            endpoint = client.meta.endpoint_url if client is not None else None
+            endpoint = _safe_endpoint(client.meta.endpoint_url) if client is not None else None
         except Exception:  # noqa: BLE001
             endpoint = None
         target = f"{bucket}/{prefix}" if prefix else str(bucket)

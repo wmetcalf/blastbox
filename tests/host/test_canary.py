@@ -459,3 +459,111 @@ def test_co_located_dispatchers_get_distinct_keys():
     c = canary_job_id("cold|redtusk|/var/lib/redtusk/jobs")
     assert a != b
     assert a == c, "must stay stable across restarts"
+
+
+# --- round 7: credential disclosure, and a loop gated on the wrong timer ----------------------
+class _S3WithSecretEndpoint(_FakeS3):
+    class _Client:
+        class meta:  # noqa: N801
+            endpoint_url = "https://AKIAEXAMPLE:s3cr3t-p4ssw0rd@minio.internal:9000/?token=abc123"
+
+    def __init__(self):
+        super().__init__()
+        self._s3 = self._Client()
+
+
+def test_the_startup_line_never_carries_credentials():
+    """`client.meta.endpoint_url` echoes whatever was configured, and this line is logged
+    unconditionally by both the ingress and every dispatcher — so an endpoint carrying URI
+    user-info or a query token would be copied into every sink collecting boot output."""
+    d = describe_blob_store(_S3WithSecretEndpoint())
+    for secret in ("s3cr3t-p4ssw0rd", "AKIAEXAMPLE", "abc123", "token="):
+        assert secret not in d, f"{secret!r} leaked into {d!r}"
+    # still useful: you can tell WHICH endpoint it is
+    assert "minio.internal:9000" in d and "blastbox/pr83run" in d
+    assert "***@" in d, "the presence of embedded credentials should still be visible"
+
+
+@pytest.mark.parametrize("url,expect_in,expect_out", [
+    ("http://host:9000", "host:9000", "@"),
+    ("http://u:p@host:9000", "***@host:9000", "p@host"),
+    ("https://host/path?token=zzz", "host/path", "zzz"),
+    ("", "", "x"),
+])
+def test_endpoint_redaction_keeps_identity_and_drops_secrets(url, expect_in, expect_out):
+    from blastbox.host.canary import _safe_endpoint
+    got = _safe_endpoint(url)
+    assert expect_in in got
+    assert expect_out not in got or expect_out == "x" and not got
+
+
+def test_the_network_canary_ticks_with_maintenance_disabled():
+    """The constructor explicitly supports maintenance_interval_s <= 0. The loop previously
+    divided its wait on that interval and only ran maintenance, so such a deployment got no
+    periodic canary at all — however it was configured."""
+    import threading
+    import time as _time
+    from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
+
+    class _Stub:
+        _maintenance_interval_s = 0.0          # maintenance OFF
+        _canary_interval_s = 0.05              # canary ON
+        def __init__(self):
+            self._stop = threading.Event()
+            self.ticks = 0
+            self._canary_cb = self._tick
+        def _tick(self):
+            self.ticks += 1
+        def _run_maintenance(self):
+            raise AssertionError("maintenance is disabled and must not run")
+
+    st = _Stub()
+    t = threading.Thread(target=VmJobDispatcher._maintenance_loop.__get__(st, _Stub), daemon=True)
+    t.start()
+    _time.sleep(0.5)
+    st._stop.set()
+    t.join(timeout=3)
+    assert st.ticks >= 3, f"canary ticked {st.ticks} times with maintenance disabled"
+
+
+def test_the_network_loop_is_submitted_when_only_the_canary_is_enabled():
+    import inspect
+    from blastbox.host.runtime import vm_dispatch
+    src = inspect.getsource(vm_dispatch.VmJobDispatcher.run)
+    assert "_canary_cb is not None and self._canary_interval_s > 0" in src, (
+        "run() must submit the loop when the canary alone is enabled")
+
+
+def test_the_network_loop_sleeps_to_the_canary_deadline_not_the_floor():
+    """With maintenance disabled its deadline is permanently in the past, so including it in the
+    wait computation pins every iteration to the 0.05s floor: the loop busy-spins for the whole
+    interval instead of sleeping to the next canary. Ticking is unaffected, which is exactly why
+    this needs its own test."""
+    import threading
+    import time as _time
+    from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
+
+    class _CountingEvent(threading.Event):
+        waits = 0
+        def wait(self, timeout=None):
+            type(self).waits += 1
+            return super().wait(timeout)
+
+    class _Stub:
+        _maintenance_interval_s = 0.0        # OFF -> its deadline is always overdue
+        _canary_interval_s = 5.0             # far away
+        def __init__(self):
+            self._stop = _CountingEvent()
+            self._canary_cb = lambda: None
+        def _run_maintenance(self):
+            raise AssertionError("maintenance is disabled")
+
+    _CountingEvent.waits = 0
+    st = _Stub()
+    t = threading.Thread(target=VmJobDispatcher._maintenance_loop.__get__(st, _Stub), daemon=True)
+    t.start()
+    _time.sleep(0.6)
+    st._stop.set()
+    t.join(timeout=3)
+    # Sleeping to the canary deadline: one wait. Spinning at the floor: ~12 in 0.6s.
+    assert _CountingEvent.waits <= 3, f"loop spun {_CountingEvent.waits} times instead of sleeping"
