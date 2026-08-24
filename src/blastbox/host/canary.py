@@ -182,3 +182,50 @@ def _cleanup(store: Any, job_id: str) -> None:
     except Exception as exc:  # noqa: BLE001
         _log.warning("canary.cleanup_failed job_id=%s: %s: %s — leftover object left in the store",
                      job_id, type(exc).__name__, exc)
+
+
+def is_shared_job_store(job_store: Any) -> bool:
+    """Does this dispatcher claim from a queue OTHER processes also use?
+
+    Postgres and Redis are shared by construction -- something else is serving the results. SQLite
+    and in-memory are single-process. Deliberately conservative: an unrecognised store answers
+    False, so a store we cannot classify never triggers the coherence failure below.
+    """
+    name = type(job_store).__name__
+    if name == "RedisJobStore":
+        return True
+    driver = getattr(job_store, "_driver", None)
+    if driver is not None:
+        return str(driver).lower() in ("postgres", "postgresql", "mysql")
+    return False
+
+
+def is_local_blob_store(store: Any) -> bool:
+    return type(store).__name__ == "LocalBlobStore"
+
+
+def check_store_coherence(job_store: Any, blob_store: Any) -> None:
+    """A SHARED QUEUE IMPLIES A SHARED BLOB STORE. Raise when they disagree.
+
+    This is the check that catches the incident the round-trip cannot. A LocalBlobStore round-trips
+    perfectly -- it writes and reads its own directory -- so a dispatcher that silently fell back
+    to one passes every liveness test while being completely broken: it seals results into a
+    directory the API cannot read, jobs reach DONE, and every artifact 404s. That is exactly what
+    happened to 17,626 jobs, and it was invisible for days.
+
+    The tell is not the blob store on its own; it is the COMBINATION. Claiming jobs from a Postgres
+    queue means other processes put them there and something else will serve the results, so a
+    blob store only this container can read cannot possibly be right. A single-node deployment
+    (SQLite or in-memory queue) with a local blob store is a perfectly good configuration and is
+    left alone.
+    """
+    if is_shared_job_store(job_store) and is_local_blob_store(blob_store):
+        raise CanaryFailure(
+            f"this dispatcher claims from a SHARED queue ({type(job_store).__name__}) but stores "
+            f"results in a LOCAL blob store ({describe_blob_store(blob_store)})",
+            "set BLASTBOX_BLOB_URL (and BLASTBOX_BLOB_ENDPOINT_URL + AWS_* credentials) on THIS "
+            "container -- it is almost certainly set on the API and missing here. Results written "
+            "to a local store are unreadable by whatever serves them: jobs reach DONE and their "
+            "artifacts 404. Set BLASTBOX_CANARY=0 only if this really is a single-node deployment "
+            "sharing a queue for another reason",
+        )

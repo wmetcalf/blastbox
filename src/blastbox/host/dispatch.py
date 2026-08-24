@@ -55,7 +55,12 @@ from blastbox.contract.envelope import (
 )
 from blastbox.errors import HOST_RESOURCE_ERRNOS, OutputTrustError, OutputTrustUnknown, WarmTimeout, sanitize_public_error
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
-from blastbox.host.canary import CanaryFailure, blob_roundtrip, describe_blob_store
+from blastbox.host.canary import (
+    CanaryFailure,
+    blob_roundtrip,
+    check_store_coherence,
+    describe_blob_store,
+)
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.runtime.docker import (
     RuntimeSelection,
@@ -666,6 +671,10 @@ class Dispatcher:
         """
         _log.info("canary.blob_store %s", describe_blob_store(self._blobs))
         try:
+            # BEFORE the round-trip. A LocalBlobStore round-trips perfectly -- it reads back its
+            # own directory -- so the write/read test cannot see the single worst deployment bug
+            # this fleet has had. Only the COMBINATION (shared queue, private store) reveals it.
+            check_store_coherence(self._job_store, self._blobs)
             _log.info("canary.ok %s", blob_roundtrip(self._blobs))
             return True
         except CanaryFailure as exc:
