@@ -56,7 +56,7 @@ def _vsock_ready_check_factory(vsock_path: Path,
     # restore liveness alone -- so nothing after the base build ever sees READY again. And the
     # base VM IS the image the slots run: every slot is a restore of this very guest. Without
     # this, a base wedged from its first restore never populates the set and the repair is inert.
-    signal = VsockReadySignal(ack_capable=ack_capable)
+    signal = VsockReadySignal(ack_capable=ack_capable, defer_ack=True)
     faux = Slot(
         slot_id="warm-base",
         control_dir=base_dir,
@@ -526,5 +526,5 @@ def select_snapshot_runtime(
         ack_sampler=lambda: ack_capable.generation,
     )
     backend = FcSnapshotBackend.from_env(base_dir, launcher, mem_dir=mem_dir)
-    manager = SnapshotManager(base_dir, backend)
+    manager = SnapshotManager(base_dir, backend, ack_capable=ack_capable)
     return SnapshotSlotRuntime(cfg, manager, settle_s=settle_s, ack_capable=ack_capable)

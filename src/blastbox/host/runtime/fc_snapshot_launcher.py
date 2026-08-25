@@ -147,6 +147,7 @@ class _Handle:
     def __init__(
         self, proc, api, vsock_uds: str, ready_check=None, mem_dir: Path | None = None,
         base_outdisk: Path | None = None, stranded: list[str] | None = None,
+        ack_generation: "int | None" = None,
     ) -> None:
         self.proc = proc
         self.api = api
@@ -163,6 +164,9 @@ class _Handle:
         # shared in, because SnapshotManager kills and abandons this handle after a failed
         # checkpoint -- anything recorded here alone would be discarded with it (PR #82).
         self._stranded_partials: list[str] = stranded if stranded is not None else []
+        # Stamped by the launcher before the spawn; read by SnapshotManager to confirm the
+        # deferred ACK advertisement once this build's artifact is PUBLISHED.
+        self.ack_generation: "int | None" = ack_generation
 
     def wait_ready(self, timeout_s: float) -> None:
         if self._ready_check is not None:
@@ -538,6 +542,7 @@ class FcSnapshotLauncher:
             # after a failed checkpoint, so anything recorded on the handle itself is discarded
             # with it and the next build starts empty -- the retry could never fire (PR #82).
             stranded=self._stranded_partials,
+            ack_generation=ack_gen,
         )
 
     def sweep_orphan_generations(self) -> int:

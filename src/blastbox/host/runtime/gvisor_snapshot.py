@@ -325,7 +325,20 @@ class GvisorBootHandle:
         # base wedged from its first restore never completes a job either. Read it here, while
         # the base is still the live container that wrote it.
         if self._ack_capable is not None and read_base_ack_capability(self._ctrl):
-            self._ack_capable.learn(self._ack_gen)
+            # OBSERVE, not learn. Readiness proves this guest speaks the protocol; it does not
+            # prove the pool will ever run a slot from it. checkpoint() may still fail, in which
+            # case SnapshotManager publishes nothing -- and a capability taught here would
+            # outlive a base that never existed. If the worker bundle is then rolled back, the
+            # retry's plain readiness marker cannot clear it, and the older image's missing start
+            # markers are read as PROVEN non-starts: a document hang invalidates an
+            # ACK-incapable base instead of staying UNKNOWN. Confirmed in checkpoint().
+            self._ack_capable.observe(self._ack_gen)
+
+    @property
+    def ack_generation(self) -> "int | None":
+        """The generation this build was stamped with. Read by SnapshotManager to confirm the
+        deferred ACK advertisement once -- and only once -- this build's artifact is PUBLISHED."""
+        return self._ack_gen
 
     def checkpoint(self, dest_dir: Path) -> object:
         # Retry anything a previous failed checkpoint could not remove; no artifact was returned

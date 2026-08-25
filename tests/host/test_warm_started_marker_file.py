@@ -224,7 +224,57 @@ def test_the_gvisor_base_build_records_ack_capability(tmp_path):
     h._ack_capable = seen
     h._ack_gen = seen.generation          # the generation this build started under
     GvisorBootHandle.wait_ready(h, 1.0)
-    assert seen, "the base's advertisement must be recorded at build time"
+    assert not seen, (
+        "readiness must only OBSERVE: checkpoint() has not run, so there is no artifact yet and "
+        "no base a slot could be restored from")
+    seen.confirm(h._ack_gen)                           # ...the build then checkpoints
+    assert seen, "the base's advertisement must be believed once its artifact exists"
+
+
+def test_a_gvisor_build_that_never_checkpoints_teaches_nothing(tmp_path):
+    """Readiness proves the guest speaks the protocol; it does not prove the pool will ever run a
+    slot from it. A base that advertises and then fails to checkpoint publishes no artifact -- but
+    used to leave the capability permanently true. Roll the worker bundle back before the retry
+    and the older image's missing start markers are read as PROVEN non-starts, so a
+    document-induced hang invalidates an ACK-incapable base instead of staying UNKNOWN."""
+    from blastbox.host.runtime.gvisor_snapshot import GvisorBootHandle
+
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    FileWarmControl(ctrl).signal_ready()               # this base DOES advertise
+
+    seen = AckCapability()
+    h = object.__new__(GvisorBootHandle)
+    h._ctrl = ctrl
+    h._ready = lambda _d, _t: None
+    h._ack_capable = seen
+    h._ack_gen = seen.generation
+    GvisorBootHandle.wait_ready(h, 1.0)                # ...and then its checkpoint fails
+
+    assert not seen, (
+        "a build that published no artifact taught the capability anyway")
+
+
+def test_a_confirmation_from_a_superseded_build_is_ignored(tmp_path):
+    """An invalidation during the build moves the generation and makes SnapshotManager reject the
+    artifact via _build_epoch. The confirmation must be discarded on the same evidence."""
+    from blastbox.host.runtime.gvisor_snapshot import GvisorBootHandle
+
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    FileWarmControl(ctrl).signal_ready()
+
+    seen = AckCapability()
+    h = object.__new__(GvisorBootHandle)
+    h._ctrl = ctrl
+    h._ready = lambda _d, _t: None
+    h._ack_capable = seen
+    h._ack_gen = seen.generation
+    GvisorBootHandle.wait_ready(h, 1.0)
+    seen.reset()                                       # invalidate_base landed mid-build
+    seen.confirm(h._ack_gen)                           # the doomed build checkpoints anyway
+
+    assert not seen, "a build whose artifact was rejected still taught its replacement"
 
 
 def test_an_older_gvisor_base_teaches_nothing(tmp_path):

@@ -326,11 +326,19 @@ class AckCapability:
     A retired control's late ack is ignored rather than believed.
     """
 
-    __slots__ = ("_gen", "_capable", "_lock")
+    __slots__ = ("_gen", "_capable", "_lock", "_pending")
 
     def __init__(self) -> None:
         self._gen = 0
         self._capable = False
+        # Generations whose BASE BUILD advertised but whose artifact has not been shown to be
+        # usable yet. A build learns at READINESS, which is necessarily before checkpoint() has
+        # decided whether there is a publishable artifact at all -- so believing it there let a
+        # build that never published teach the capability permanently. If the worker bundle is
+        # then rolled back, the retry's plain readiness marker cannot clear that, and the older
+        # image's missing start markers are read as PROVEN non-starts: a document-induced hang
+        # invalidates an ACK-incapable base instead of staying UNKNOWN.
+        self._pending: set = set()
         # LOCKED, because the compare and the mutation are one decision. Unsynchronised, a slot
         # reporting its ack could pass `generation == self._gen`, have invalidate_base() bump the
         # generation and clear the flag underneath it, and then set _capable=True anyway --
@@ -352,11 +360,36 @@ class AckCapability:
             if generation is None or generation == self._gen:
                 self._capable = True
 
+    def observe(self, generation: "int | None" = None) -> None:
+        """A base build ADVERTISED the protocol -- recorded, deliberately not yet believed.
+
+        Only :meth:`confirm` promotes this, and only once the build has produced a usable
+        artifact. Readiness proves the guest speaks the protocol; it does not prove the pool will
+        ever run a slot from that guest.
+        """
+        with self._lock:
+            self._pending.add(generation)
+
+    def confirm(self, generation: "int | None" = None) -> None:
+        """The build that advertised checkpointed successfully: believe it now.
+
+        Generation-gated exactly like :meth:`learn` -- an invalidation during the build moves the
+        generation, the manager rejects the artifact via ``_build_epoch``, and this confirmation
+        is then correctly ignored.
+        """
+        with self._lock:
+            if generation in self._pending and (generation is None or generation == self._gen):
+                self._capable = True
+            self._pending.discard(generation)
+
     def reset(self) -> None:
         """A new base is being built: whatever the old one advertised no longer applies."""
         with self._lock:
             self._gen += 1
             self._capable = False
+            # Pending observations belong to the base being replaced. Keeping them would let a
+            # build that advertised BEFORE the invalidation confirm itself afterwards.
+            self._pending.clear()
 
 
 class HostWarmControl:

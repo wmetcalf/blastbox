@@ -660,13 +660,18 @@ class VsockReadySignal:
     """
 
     def __init__(self, *, max_bytes: int = _READY_MAX_BYTES,
-                 ack_capable: "AckCapability | None" = None) -> None:
+                 ack_capable: "AckCapability | None" = None,
+                 defer_ack: bool = False) -> None:
         # Shared with the runtime's warm controls. Populated HERE, at readiness, so a base that is
         # wedged from its very first slot -- no job ever completes, so no ack is ever seen -- is
         # still known to be ack-capable and can arm the fast repair. Learning it only from a
         # completed ack left the repair inert on exactly the poisoned-from-the-outset base it
         # exists to fix, which is what a dispatcher restarting onto a bad artifact produces.
         self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
+        # BASE-BUILD listeners defer: their advertisement is only believed once the build has a
+        # usable artifact (see AckCapability.observe/confirm). Per-slot listeners do not -- a
+        # live slot's READY is about an artifact that already published.
+        self._defer_ack = defer_ack
         self._max_bytes = max_bytes
         self._slots: dict[str, _VsockReadyState] = {}
         self._lock = threading.Lock()
@@ -801,7 +806,10 @@ class VsockReadySignal:
                         if READY_ACK_SUFFIX in buf:
                             # Learned BEFORE any job, which is what makes the fast repair usable
                             # on a base that was already poisoned when this dispatcher started.
-                            self._ack_capable.learn(ack_generation)
+                            if self._defer_ack:
+                                self._ack_capable.observe(ack_generation)
+                            else:
+                                self._ack_capable.learn(ack_generation)
                         _log.info("fc.vsock_ready_received slot_id=%s ack_capable=%s",
                                   slot_id, READY_ACK_SUFFIX in buf)
                         state.ready.set()

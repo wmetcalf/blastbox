@@ -337,7 +337,7 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
 
     snapshot_parent = resolve_mem_dir() or Path(gcfg.root).parent
     base_dir = _secure_snapshot_base(snapshot_parent / "gvisor-snapshot")
-    mgr = SnapshotManager(base_dir, backend)
+    mgr = SnapshotManager(base_dir, backend, ack_capable=ack_capable)
     return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle(), ack_capable=ack_capable)
 
 
