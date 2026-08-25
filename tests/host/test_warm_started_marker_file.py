@@ -332,7 +332,9 @@ def test_the_gvisor_capability_is_reset_when_the_bundle_is_replaced():
 
     rt = object.__new__(GvisorSnapshotSlotRuntime)
     rt._ack_capable = _capable()
-    rt._manager = type("M", (), {"invalidate": lambda self: None})()
+    # `_mgr`, not `_manager` -- this test only passed before because the reset ran BEFORE the
+    # manager was touched, so the wrong name never mattered.
+    rt._mgr = type("M", (), {"invalidate": lambda self: None})()
     try:
         GvisorSnapshotSlotRuntime.invalidate_base(rt)
     except Exception:
@@ -545,3 +547,38 @@ def test_the_probe_allocates_a_real_data_block(tmp_path):
     _ = real
     assert written and all(d for d in written), (
         f"the probe must write a non-empty payload, got {written!r}")
+
+
+def test_the_capability_reset_happens_after_the_artifact_is_retired():
+    """Resetting first opens a window where the old artifact is still acquirable while the
+    generation has already advanced -- so a spawn racing the invalidation gets the RETIRED
+    artifact stamped with the NEW generation, and its late ack teaches the replacement a
+    capability only the old image had.
+
+    Ordering is the observable: the manager's invalidate() must run BEFORE the generation moves.
+    """
+    from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
+    from blastbox.host.runtime.gvisor_snapshot_runtime import GvisorSnapshotSlotRuntime
+
+    class _RecordingCapability(AckCapability):
+        """AckCapability uses __slots__, so the hook has to be a subclass, not a patch."""
+
+        def __init__(self, order):
+            super().__init__()
+            self._order = order
+
+        def reset(self):
+            self._order.append("reset")
+            super().reset()
+
+    for cls, mgr_attr in ((SnapshotSlotRuntime, "_manager"),
+                          (GvisorSnapshotSlotRuntime, "_mgr")):
+        order: list = []
+        rt = object.__new__(cls)
+        rt._ack_capable = _RecordingCapability(order)
+        setattr(rt, mgr_attr, type("M", (), {
+            "invalidate": lambda self, _o=order: (_o.append("invalidate"), True)[1]})())
+        cls.invalidate_base(rt)
+        assert order == ["invalidate", "reset"], (
+            f"{cls.__name__}: the artifact must be retired before the generation moves, "
+            f"got {order}")

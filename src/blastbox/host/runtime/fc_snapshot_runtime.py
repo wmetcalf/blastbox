@@ -262,12 +262,29 @@ class SnapshotSlotRuntime:
         # and controls then read a missing ack as proof of no start, letting three
         # document-induced hangs convict a healthy older base instead of staying UNKNOWN, which
         # is exactly what the mixed-version contract promises. Re-learned at the next base build.
-        self._ack_capable.reset()
+        # RESET AFTER THE ARTIFACT IS RETIRED, not before. Resetting first opens a window in
+        # which the old artifact is still acquirable while the generation has already advanced:
+        # a spawn racing this gets the RETIRED artifact stamped with the NEW generation, so its
+        # late ack teaches the replacement a capability only the old image had.
+        #
+        # Ordering it after makes the residual error safe instead of dangerous. A spawn that
+        # acquired the old artifact sampled the OLD generation (spawn samples before restore), so
+        # its ack is ignored -- correct. A spawn that starts after invalidate but samples before
+        # this reset gets the old generation while running the NEW artifact, so its ack is
+        # discarded too: the new base's advertisement is merely missed, leaving capability
+        # UNKNOWN, which convicts nothing.
+        #
+        # It does NOT close the class. The stamp and the artifact are still two separate pieces
+        # of state kept in sync by hand, which is what has produced a finding every round; the
+        # structural fix is to derive the stamp from the acquired artifact (SnapshotManager
+        # already bumps _build_epoch atomically inside invalidate() under _build_lock), so the
+        # two cannot drift. That changes a locking contract and wants review.
         drop = getattr(self._manager, "invalidate", None)
         if not callable(drop):
             _log.warning("snapshot.invalidate_unsupported manager=%s", type(self._manager).__name__)
             return
         discarded = drop()
+        self._ack_capable.reset()
         _log.warning("snapshot.base_invalidated had_artifact=%s -- next spawn rebuilds the base",
                      bool(discarded))
 
