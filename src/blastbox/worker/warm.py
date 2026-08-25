@@ -360,6 +360,23 @@ class AckCapability:
             if generation is None or generation == self._gen:
                 self._capable = True
 
+    def begin_build(self) -> None:
+        """A new BUILD ATTEMPT is starting: forget what the last one advertised.
+
+        Pending observations are keyed by generation, and consecutive build ATTEMPTS share one:
+        a failed build is retried by SnapshotManager.ensure_build_started() with no invalidation
+        in between, so nothing advances the generation. Without this, attempt 1 advertising and
+        then failing to checkpoint left its observation behind, and attempt 2 -- which may be a
+        ROLLED-BACK, ACK-incapable worker -- published successfully and consumed it. The new base
+        is then marked capable on the strength of an image it never ran, its missing start markers
+        read as proven non-starts, and a healthy mixed-version base is invalidated.
+
+        Concurrent builds would clear each other here; that direction is safe (a missed
+        advertisement leaves capability UNKNOWN, which convicts nothing).
+        """
+        with self._lock:
+            self._pending.clear()
+
     def observe(self, generation: "int | None" = None) -> None:
         """A base build ADVERTISED the protocol -- recorded, deliberately not yet believed.
 

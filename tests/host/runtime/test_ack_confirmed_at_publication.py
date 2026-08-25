@@ -26,15 +26,17 @@ from blastbox.worker.warm import AckCapability
 class _Boot:
     """A base build that advertises ACK at readiness, as a real one does."""
 
-    def __init__(self, cap, gen, *, checkpoint_fails=False, on_ready=None):
+    def __init__(self, cap, gen, *, checkpoint_fails=False, on_ready=None, advertises=True):
         self.ack_generation = gen
         self._cap = cap
         self._fails = checkpoint_fails
         self._on_ready = on_ready
+        self._advertises = advertises
         self.killed = False
 
     def wait_ready(self, timeout_s):
-        self._cap.observe(self.ack_generation)      # the guest advertises
+        if self._advertises:
+            self._cap.observe(self.ack_generation)  # the guest advertises
         if self._on_ready is not None:
             self._on_ready()
 
@@ -142,3 +144,59 @@ def test_pending_observations_do_not_accumulate(tmp_path):
         cap.reset()
     assert len(cap._pending) <= 1, (
         f"pending observations accumulated across rebuilds: {len(cap._pending)}")
+
+
+def test_a_failed_attempt_does_not_teach_the_retry(tmp_path):
+    """Pending observations are keyed by GENERATION, and consecutive build ATTEMPTS share one:
+    ensure_build_started() retries a failed build with no invalidation in between, so nothing
+    advances the generation.
+
+    Attempt 1 advertises and then fails to checkpoint. Attempt 2 is a ROLLED-BACK, ACK-incapable
+    worker and publishes fine. Without scoping, attempt 2's confirm() consumes attempt 1's
+    observation and the new base is marked capable on the strength of an image it never ran --
+    after which its missing start markers are read as proven non-starts and a healthy
+    mixed-version base is invalidated. That is the failure the deferred-confirmation fix was
+    supposed to prevent, one layer in."""
+    cap = AckCapability()
+
+    class _TwoAttempts:
+        """One backend, two boot handles: the first advertises and dies, the second is silent."""
+
+        def __init__(self):
+            self.n = 0
+
+        def boot_base(self):
+            self.n += 1
+            if self.n == 1:
+                return _Boot(cap, cap.generation, checkpoint_fails=True)
+            return _Boot(cap, cap.generation, advertises=False)
+
+    backend = _TwoAttempts()
+    mgr = SnapshotManager(Path(tmp_path), backend, ack_capable=cap)
+
+    with pytest.raises(SnapshotBuildError):
+        mgr.build()                       # attempt 1: advertised, then failed
+    assert not cap, "precondition: a failed build teaches nothing"
+
+    mgr.build()                           # attempt 2: silent, and publishes
+    assert not cap, (
+        "the rolled-back base inherited a capability advertised by the attempt it replaced")
+
+
+def test_a_retry_that_advertises_is_still_believed(tmp_path):
+    """Control: scoping must not throw away the retry's OWN advertisement."""
+    cap = AckCapability()
+
+    class _TwoAttempts:
+        def __init__(self):
+            self.n = 0
+
+        def boot_base(self):
+            self.n += 1
+            return _Boot(cap, cap.generation, checkpoint_fails=(self.n == 1))
+
+    mgr = SnapshotManager(Path(tmp_path), _TwoAttempts(), ack_capable=cap)
+    with pytest.raises(SnapshotBuildError):
+        mgr.build()
+    mgr.build()
+    assert cap, "the retry advertised and published; that must be believed"

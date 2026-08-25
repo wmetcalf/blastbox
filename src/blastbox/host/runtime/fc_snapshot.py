@@ -37,6 +37,7 @@ class _AckConfirmable(Protocol):
     it here would tie the snapshot manager to the worker package for a one-method call.
     """
 
+    def begin_build(self) -> None: ...
     def confirm(self, generation: "int | None" = ...) -> None: ...
 
 _log = logging.getLogger("blastbox.host.runtime.fc_snapshot")
@@ -299,6 +300,11 @@ class SnapshotManager:
         # needed here — there is nothing to kill until it returns a BootHandle.
         with self._build_lock:
             epoch = self._build_epoch
+        # SCOPE the ACK advertisement to THIS attempt. A retry shares the generation of the
+        # attempt it replaces (nothing invalidates in between), so a failed build's observation
+        # would otherwise be available for a later, possibly ACK-incapable, build to confirm.
+        if self._ack_capable is not None:
+            self._ack_capable.begin_build()
         try:
             boot = self._backend.boot_base()
         except SnapshotError:
