@@ -448,3 +448,46 @@ def test_a_control_stamps_the_generation_it_was_built_under(tmp_path):
     assert host._ack_gen == cap.generation
     cap.reset()
     assert host._ack_gen != cap.generation, "the control is now stale by construction"
+
+
+def test_an_old_slot_claimed_after_a_reset_keeps_its_own_generation(tmp_path):
+    """The stamp has to travel with the SLOT, not the job. A base invalidation leaves
+    old-generation slots IDLE and claimable, so a control built at claim time took the NEW
+    generation -- and that slot's ack then re-taught the replacement base a capability only the
+    retired image had. If the replacement is a rolled-back worker without the protocol, its
+    missing markers are read as proof of no start and three document hangs convict it."""
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    cap = AckCapability()
+    old_gen = cap.generation
+
+    cap.reset()                                   # the base is replaced while a slot is idle
+    # the OLD slot is claimed afterwards and carries its own stamp
+    stale_ctl = HostWarmControl(ctrl, ack_capable=cap, ack_generation=old_gen)
+    assert stale_ctl._ack_gen == old_gen
+
+    FileWarmControl(ctrl).signal_ready()          # its worker advertises, late
+    (ctrl / "go.json").write_text(
+        json.dumps({"ack": True, "input_path": "/", "output_dir": "/", "params": {}}))
+    try:
+        stale_ctl.wait_for_done(timeout_s=0.2)
+    except Exception:
+        pass
+    assert bool(cap) is False, (
+        "a slot from the retired generation must not teach the base that replaced it")
+
+
+def test_a_slot_spawned_after_the_reset_does_teach_the_new_base(tmp_path):
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    cap = AckCapability()
+    cap.reset()
+    fresh = HostWarmControl(ctrl, ack_capable=cap, ack_generation=cap.generation)
+    FileWarmControl(ctrl).signal_ready()
+    (ctrl / "go.json").write_text(
+        json.dumps({"ack": True, "input_path": "/", "output_dir": "/", "params": {}}))
+    try:
+        fresh.wait_for_done(timeout_s=0.2)
+    except Exception:
+        pass
+    assert bool(cap) is True, "the current generation's advertisement must still count"

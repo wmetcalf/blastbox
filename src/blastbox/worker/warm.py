@@ -358,12 +358,15 @@ class HostWarmControl:
     guest_started: "bool | None" = None
 
     def __init__(self, control_dir: Path,
-                 *, ack_capable: "AckCapability | None" = None) -> None:
+                 *, ack_capable: "AckCapability | None" = None,
+                 ack_generation: "int | None" = None) -> None:
         self._dir = control_dir
         # Shared with the runtime; true once the CURRENT base has been seen to advertise.
         self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
-        # Stamped at construction so a late ack from a retired generation cannot teach the new one.
-        self._ack_gen = self._ack_capable.generation
+        # The SLOT's generation, taken at spawn -- see VsockHostWarmControl for why construction
+        # time is the wrong moment. Falls back only when the caller cannot say.
+        self._ack_gen = (ack_generation if ack_generation is not None
+                         else self._ack_capable.generation)
 
     def _atomic_write(self, name: str, content: str) -> None:
         """Write *content* to ``control_dir/<name>`` atomically AND symlink-safely.

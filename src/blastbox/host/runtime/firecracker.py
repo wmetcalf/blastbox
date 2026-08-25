@@ -866,11 +866,16 @@ class VsockHostWarmControl:
         connect_timeout_s: float = 10.0,
         connect_fn: "Callable[[], socket.socket] | None" = None,
         ack_capable: "AckCapability | None" = None,
+        ack_generation: "int | None" = None,
     ) -> None:
-        # Shared with the runtime (see host_warm_control): non-empty once ANY slot has acked.
+        # Shared with the runtime (see host_warm_control); true once the CURRENT base advertised.
         self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
-        # Stamped now, so a late ack from a retired generation cannot teach the new one.
-        self._ack_gen = self._ack_capable.generation
+        # The SLOT's generation, taken at SPAWN. Reading it here instead meant an old-generation
+        # slot -- left IDLE and claimable by a base invalidation -- picked up the NEW stamp when a
+        # job claimed it, and its ack then re-taught the replacement base a capability that only
+        # the retired image had. Falls back to the current generation only when nobody can say.
+        self._ack_gen = (ack_generation if ack_generation is not None
+                         else self._ack_capable.generation)
         self._uds = Path(vsock_uds)
         self._job_port = job_port
         self._connect_timeout = connect_timeout_s
@@ -1230,6 +1235,11 @@ class FirecrackerSlotRuntime:
         with self._lock:
             self._procs[slot_id] = fc_proc
 
+        # Stamp the generation this slot was SPAWNED from; see Slot.ack_generation.
+
+        slot.ack_generation = self._ack_capable.generation
+
+
         return slot
 
     def is_ready(self, slot: Slot) -> bool:
@@ -1315,7 +1325,8 @@ class FirecrackerSlotRuntime:
         ack meaningful. Until then it just means "older worker", which must not convict anything.
         """
         vsock_uds = self._scratch_root / slot.slot_id / "vsock.sock"
-        return VsockHostWarmControl(vsock_uds, ack_capable=self._ack_capable)
+        return VsockHostWarmControl(vsock_uds, ack_capable=self._ack_capable,
+                                    ack_generation=slot.ack_generation)
 
     def stage_warm_input(self, slot: Slot, staged_input_path: Path) -> Path:
         """FC input travels over vsock (signal_go reads this path), NOT through a

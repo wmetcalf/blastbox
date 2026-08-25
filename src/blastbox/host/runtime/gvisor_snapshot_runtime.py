@@ -83,6 +83,8 @@ class GvisorSnapshotSlotRuntime:
             input_dir=wd / "in",
             output_dir=wd / "out",
             state=SlotState.WARMING,
+            # The generation this slot was SPAWNED from; see Slot.ack_generation.
+            ack_generation=self._ack_capable.generation,
         )
 
     def is_ready(self, slot: Slot) -> bool:
@@ -90,6 +92,7 @@ class GvisorSnapshotSlotRuntime:
             handle = self._handles.get(slot.slot_id)
             restored_at = self._restored_at.get(slot.slot_id)
         if handle is None:
+
             return False
         # Hold WARMING for a short post-restore settle window (mirrors the FC tier);
         # in a steady-state pool it overlaps background pre-warming, adding no per-job latency.
@@ -181,7 +184,8 @@ class GvisorSnapshotSlotRuntime:
     def host_warm_control(self, slot: Slot) -> GvisorHostWarmControl:
         # Shared across slots: one warm base image, so start-marker capability is a property of
         # the image, not of a job. Per-control it would be learned and immediately forgotten.
-        return GvisorHostWarmControl(slot.control_dir, ack_capable=self._ack_capable)
+        return GvisorHostWarmControl(slot.control_dir, ack_capable=self._ack_capable,
+                                     ack_generation=getattr(slot, "ack_generation", None))
 
     def stage_warm_input(self, slot: Slot, staged_input_path: Path) -> Path:
         dst = Path(slot.input_dir) / Path(staged_input_path).name
@@ -242,9 +246,11 @@ class GvisorHostWarmControl:
     SANDBOX_IN = Path("/in")
     SANDBOX_OUT = Path("/out")
 
-    def __init__(self, control_dir: Path, *, ack_capable: "AckCapability | None" = None) -> None:
+    def __init__(self, control_dir: Path, *, ack_capable: "AckCapability | None" = None,
+                 ack_generation: "int | None" = None) -> None:
         from blastbox.worker.warm import HostWarmControl
-        self._inner = HostWarmControl(control_dir, ack_capable=ack_capable)
+        self._inner = HostWarmControl(control_dir, ack_capable=ack_capable,
+                                      ack_generation=ack_generation)
 
     @property
     def guest_started(self) -> "bool | None":

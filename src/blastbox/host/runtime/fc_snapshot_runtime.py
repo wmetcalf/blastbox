@@ -214,6 +214,8 @@ class SnapshotSlotRuntime:
             output_dir=output_dir,
             state=SlotState.WARMING,
             spawned_at=0.0,
+            # The generation this slot was SPAWNED from; see Slot.ack_generation.
+            ack_generation=self._ack_capable.generation,
         )
 
     def is_ready(self, slot: Slot) -> bool:
@@ -225,6 +227,7 @@ class SnapshotSlotRuntime:
             handle = self._handles.get(slot.slot_id)
             restored_at = self._restored_at.get(slot.slot_id)
         if handle is None:
+
             return False
         if not self._proc_alive(handle):
             return False
@@ -339,7 +342,8 @@ class SnapshotSlotRuntime:
         from blastbox.host.runtime.firecracker import VsockHostWarmControl
 
         vsock_uds = Path(slot.output_dir).parent / REL_VSOCK
-        return VsockHostWarmControl(vsock_uds, ack_capable=self._ack_capable)
+        return VsockHostWarmControl(vsock_uds, ack_capable=self._ack_capable,
+                                    ack_generation=getattr(slot, "ack_generation", None))
 
     def stage_warm_input(self, slot: Slot, staged_input_path: Path) -> Path:
         """FC input travels over vsock (signal_go reads this path), not via a shared

@@ -70,6 +70,12 @@ class Slot:
     container_id: str | None = None
     spawned_at: float = 0.0
     jobs: int = 0            # cumulative jobs served (reuse mode: drives recycle/reprovision)
+    # Which warm-base generation this slot was SPAWNED from, for the start-signal capability.
+    # Stamped here rather than read when a job builds its control: a base invalidation leaves
+    # old-generation slots IDLE and claimable, so a control built at claim time would take the
+    # NEW generation -- and that slot's ack would then re-teach the replacement base a capability
+    # the retired image had. The property has to travel with the slot, not with the job.
+    ack_generation: "int | None" = None
 
 
 def _accepts_kwarg(fn: Any, name: str) -> bool:
