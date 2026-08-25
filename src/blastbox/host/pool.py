@@ -847,14 +847,17 @@ class WarmPool:
                 # a successfully validated engine run still counted as consecutive (PR #82).
                 self._spawn_consecutive_failures = 0
                 self._promoted_unproven.discard(slot.slot_id)
-                self._clean_release_count += 1
-                # GENERATION-GUARDED, like the evidence it arbitrates. A long-running slot from
-                # a retired generation succeeding late still bumped this, which marked the CURRENT
-                # base's decision stale and abandoned its repair -- while the evidence that
-                # justified it had already been consumed. Same stamp check as the pre-guest clear.
+                # GENERATION-GUARDED, like the evidence it arbitrates -- and BOTH counters, not
+                # just the per-base one. A long-running slot from a retired generation succeeding
+                # late still bumped the pool-wide counter, which is the fallback token for a
+                # single-base runtime and for an unattributed spawn episode: that unrelated
+                # success marked the CURRENT base's decision stale and cancelled a repair of a
+                # base which had produced no usable worker at all, while the evidence justifying
+                # it had already been consumed. Guarding one of the two only moved the hole.
                 _tok_stamp = self._slot_base.get(slot.slot_id)
                 if _tok_stamp is None or _tok_stamp[1] == self._base_generation.get(
                         _tok_stamp[0], 0):
+                    self._clean_release_count += 1
                     self._clean_release_by_base[_bident] = (
                         self._clean_release_by_base.get(_bident, 0) + 1)
             elif dirty and fault == "worker":
@@ -910,14 +913,17 @@ class WarmPool:
                 episode_recovered = True
                 # Episode token: a rebuild decision taken before this point is abandoned, because
                 # the base demonstrably just produced a valid result.
-                self._clean_release_count += 1
-                # GENERATION-GUARDED, like the evidence it arbitrates. A long-running slot from
-                # a retired generation succeeding late still bumped this, which marked the CURRENT
-                # base's decision stale and abandoned its repair -- while the evidence that
-                # justified it had already been consumed. Same stamp check as the pre-guest clear.
+                # GENERATION-GUARDED, like the evidence it arbitrates -- and BOTH counters, not
+                # just the per-base one. A long-running slot from a retired generation succeeding
+                # late still bumped the pool-wide counter, which is the fallback token for a
+                # single-base runtime and for an unattributed spawn episode: that unrelated
+                # success marked the CURRENT base's decision stale and cancelled a repair of a
+                # base which had produced no usable worker at all, while the evidence justifying
+                # it had already been consumed. Guarding one of the two only moved the hole.
                 _tok_stamp = self._slot_base.get(slot.slot_id)
                 if _tok_stamp is None or _tok_stamp[1] == self._base_generation.get(
                         _tok_stamp[0], 0):
+                    self._clean_release_count += 1
                     self._clean_release_by_base[_bident] = (
                         self._clean_release_by_base.get(_bident, 0) + 1)
                 # A served job is the only conclusive proof that the base yields a usable worker,
@@ -2552,6 +2558,19 @@ class WarmPool:
             # count earlier, so a concurrent clean release can land between then and here -- and
             # skipping the token meant that path invalidated a base which had just produced a
             # valid result, the very case the token was added to prevent (PR #82).
+            # SNAPSHOT FIRST, then ask the runtime. _spawn_success_scope() calls out to the
+            # cascade, which takes its own lock and can block; a clean release landing during
+            # that call would otherwise be INCLUDED in the token sampled afterwards. The token
+            # would then already contain the recovery, every later staleness check would compare
+            # equal, and the frozen tier would be invalidated despite having proved itself
+            # healthy inside the decision window -- with the successful worker already released
+            # and gone, so the usable-worker check downstream cannot see it either.
+            #
+            # Reading counters the scope has not selected yet is free: the scope only picks WHICH
+            # entries to total, and this snapshot fixes the moment they are read.
+            with self._lock:
+                _pre_by_base = dict(self._clean_release_by_base)
+                _pre_pool = self._clean_release_count
             # OUTSIDE self._lock: this calls into the runtime, which takes its own lock, and
             # self._lock is a plain Lock. Ordering the two the other way is a deadlock.
             if reason == "spawn" and not episode_ident:
@@ -2567,11 +2586,13 @@ class WarmPool:
                 # (correctly targeted) repair -- after which the cooldown path zeroes the
                 # retained spawn streak, making the tier earn a whole fresh threshold-sized batch
                 # of failures before it is reconsidered.
+                # ...derived from the PRE-QUERY snapshot, so a release during the runtime call
+                # is a change the staleness checks can still see.
                 if success_scope:
-                    success_token = self._scoped_clean_releases(success_scope)
+                    success_token = sum(_pre_by_base.get(i, 0) for i in success_scope)
                 else:
-                    success_token = (self._clean_release_by_base.get(episode_ident, 0)
-                                     if episode_ident else self._clean_release_count)
+                    success_token = (_pre_by_base.get(episode_ident, 0)
+                                     if episode_ident else _pre_pool)
         now = self._clock()
         with self._lock:
             last = self._last_base_rebuild_at

@@ -949,3 +949,63 @@ def test_a_spawn_episode_is_still_retained_by_its_own_caller():
     pool = _pool(_TieredWedge(), pre_guest_rebuild_after=3)
     assert pool._restore_episode("", 3, frozenset({"x"}), "spawn", token=0) is False
     assert not pool._pool_consecutive_failures.get("")
+
+
+def test_a_release_during_the_runtime_query_is_not_swallowed_by_the_token():
+    """_spawn_success_scope() calls out to the cascade, which takes its own lock and can block.
+    Sampling the token AFTER that call folded any clean release landing during it into the token
+    itself: every later staleness check then compares equal, and the frozen tier is invalidated
+    despite having proved itself healthy inside the decision window -- with the successful worker
+    already released, so nothing downstream can see it either."""
+    rt = _ScopedWedge(guilty=("tierB",))
+    pool = _pool(rt, snapshot_rebuild_after=2, base_rebuild_cooldown_s=0)
+
+    # tierB completes a job WHILE the pool is asking the cascade which tiers to target.
+    def _guilty_and_meanwhile_a_success():
+        with pool._lock:
+            pool._clean_release_by_base["tierB"] = (
+                pool._clean_release_by_base.get("tierB", 0) + 1)
+        return ["tierB"]
+
+    rt.spawn_guilty_identities = _guilty_and_meanwhile_a_success
+
+    assert pool._maybe_rebuild_base(5, reason="spawn") is False, (
+        "tierB produced a valid result inside the decision window; the token must have been "
+        "captured before the query, so that release is still visible as a change")
+    assert rt.base_invalidations == 0
+
+
+def test_a_retired_generation_success_does_not_move_the_pool_wide_token():
+    """_clean_release_by_base was generation-guarded; _clean_release_count was not -- and the
+    pool-wide counter IS the fallback token for a single-base runtime and for an unattributed
+    spawn episode. An old assigned slot finishing late therefore cancelled the repair of a
+    replacement base that had produced no usable worker at all."""
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3)
+    slot = _claim_distinct(pool, 1)[0]
+
+    # Stamp the slot to a RETIRED generation of its base, then let it succeed.
+    with pool._lock:
+        pool._slot_base[slot.slot_id] = ("tierB", 0)
+        pool._base_generation["tierB"] = 1          # the base has since been rebuilt
+        before = pool._clean_release_count
+
+    pool.release(slot, dirty=False)
+
+    assert pool._clean_release_count == before, (
+        "a slot from a retired generation moved the pool-wide recovery token")
+
+
+def test_a_current_generation_success_still_moves_the_pool_wide_token():
+    """Control: the guard must not deafen the counter to real recoveries."""
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3)
+    slot = _claim_distinct(pool, 1)[0]
+    with pool._lock:
+        pool._slot_base[slot.slot_id] = ("tierB", 1)
+        pool._base_generation["tierB"] = 1          # SAME generation
+        before = pool._clean_release_count
+
+    pool.release(slot, dirty=False)
+
+    assert pool._clean_release_count == before + 1
