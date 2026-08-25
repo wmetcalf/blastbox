@@ -13,6 +13,8 @@ document-induced hang invalidates a perfectly healthy base instead of staying UN
 
 from pathlib import Path
 
+import types
+
 import pytest
 
 from blastbox.host.runtime.fc_snapshot import (
@@ -291,9 +293,6 @@ def test_the_capability_is_installed_with_the_artifact_not_after_it(tmp_path):
     cap = AckCapability()
     seen = []
 
-    class _WatchingBackend(_Backend):
-        pass
-
     mgr = _mgr(tmp_path, cap, _Boot(cap, EPOCH0))
     real = type(mgr)._install_ack
 
@@ -303,11 +302,10 @@ def test_the_capability_is_installed_with_the_artifact_not_after_it(tmp_path):
         seen.append((self._artifact is not None, self._build_lock.locked()))
         return real(self, epoch)
 
-    type(mgr)._install_ack = _spy
-    try:
-        mgr.build()
-    finally:
-        type(mgr)._install_ack = real
+    # Patch the INSTANCE, not the class: pytest-randomly is installed and reorders execution,
+    # so a global patch on SnapshotManager is cross-test shared state waiting to bite.
+    mgr._install_ack = types.MethodType(_spy, mgr)
+    mgr.build()
 
     assert seen == [(True, True)], (
         f"the capability must be installed under the SAME lock that assigns the artifact, got {seen}")
@@ -675,3 +673,71 @@ def test_both_snapshot_runtimes_forward_the_slot_epoch_to_the_control():
     inner = getattr(ctl, "_inner", ctl)
     assert inner._ack_gen == 4, (
         "the gVisor runtime dropped the slot's artifact epoch on the way to the control")
+
+
+def test_a_failed_restore_drops_its_pinned_epoch(tmp_path):
+    """The _unpin() path -- a restore that never produced a handle. Deleting its _pin_epoch.pop
+    was silent across the whole suite: the reap-path test only ever reaps slots that DID restore,
+    so the failed-restore leak (one dict entry per failed restore, forever) had no coverage."""
+    from blastbox.host.runtime.fc_snapshot import SnapshotRestoreError
+
+    cap = AckCapability(artifact_scoped=True)
+    mgr = _mgr(tmp_path, cap, _Boot(cap, EPOCH0))
+    mgr.build()
+
+    def _boom(wd, art):
+        raise SnapshotRestoreError("restore failed")
+
+    mgr._backend.restore_in = _boom
+    for i in range(15):
+        with pytest.raises(SnapshotRestoreError):
+            mgr.restore(f"doomed-{i}")
+
+    assert mgr._pin_epoch == {}, (
+        f"failed restores left {len(mgr._pin_epoch)} epoch entries behind")
+    assert mgr._pins == {}, "…and their pins too"
+
+
+def test_a_manager_without_pinned_epoch_is_loud(tmp_path, caplog):
+    """getattr(manager, "pinned_epoch", lambda _s: None) degrades silently, and in snapshot mode
+    that is fatal to the feature rather than fail-safe: every slot carries ack_generation=None,
+    capable_for(None) is False for the life of the process, and the fast repair never runs. The
+    sampler seam got a defensive auto-bind on this exact reasoning; this side is called
+    unconditionally, so it must at least say so."""
+    import logging
+    import threading
+
+    from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
+
+    wd = tmp_path / "slots" / "s"
+    wd.mkdir(parents=True)
+    (wd / "vsock.sock").touch()
+
+    class _Handle:
+        vsock_uds = str(wd / "vsock.sock")
+
+        def kill(self):
+            pass
+
+    class _OldManager:                       # no pinned_epoch at all
+        def acquire_built(self):
+            pass
+
+        def restore(self, slot_id):
+            return _Handle()
+
+    rt = object.__new__(SnapshotSlotRuntime)
+    rt._manager = _OldManager()
+    rt._ack_capable = AckCapability(artifact_scoped=True)
+    rt._settle_s = 0.0
+    rt._clock = lambda: 0.0
+    rt._restored_at = {}
+    rt._handles = {}
+    rt._lock = threading.Lock()
+
+    with caplog.at_level(logging.WARNING):
+        slot = SnapshotSlotRuntime.spawn(rt)
+
+    assert slot.ack_generation is None
+    assert any("manager_without_pinned_epoch" in r.message for r in caplog.records), (
+        "the runtime disabled the fast repair without saying so")

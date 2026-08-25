@@ -331,7 +331,7 @@ def test_a_host_filesystem_failure_is_not_charged_to_the_base(tmp_path):
         "a host-filesystem failure must carry host_io so it is not blamed on the worker")
 
 
-def test_the_snapshot_capability_is_reset_when_the_base_is_replaced():
+def test_a_replaced_base_does_not_inherit_the_previous_capability():
     """The set outlived the generation that taught it, so a rootfs rolled back to an OLDER worker
     kept the previous "yes" -- and controls then read a missing ack as proof of no start, letting
     three document hangs convict a healthy older base instead of staying UNKNOWN."""
@@ -385,21 +385,35 @@ def test_a_writable_control_dir_still_reports_a_wedged_guest(tmp_path):
     assert host.guest_started is False
 
 
-def test_the_gvisor_capability_is_reset_when_the_bundle_is_replaced():
+def test_invalidate_base_leaves_the_capability_to_publication():
     from blastbox.host.runtime.gvisor_snapshot_runtime import GvisorSnapshotSlotRuntime
 
-    # The counterpart: because retirement is publication's job, invalidate_base() must NOT also
-    # reach for the capability. Two writers of one fact, sequenced by hand at each call site, is
-    # what issue #92 removed -- after it had produced eight distinct defects.
-    import inspect
+    """Because retirement is publication's job, invalidate_base() must not also write the
+    capability. Two writers of one fact, sequenced by hand at each call site, is what issue #92
+    removed -- after it had produced eight distinct defects.
 
+    Asserted BEHAVIOURALLY. This was a grep over inspect.getsource() for "_ack_capable", which is
+    a lint check wearing a test's name: it passes if a second writer returns through a helper, a
+    renamed attribute, or the manager. What actually matters is that invalidate_base leaves the
+    published capability exactly as it found it.
+    """
     from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
 
-    for cls in (SnapshotSlotRuntime, GvisorSnapshotSlotRuntime):
-        src = inspect.getsource(cls.invalidate_base)
-        assert "_ack_capable" not in src, (
-            f"{cls.__name__}.invalidate_base still writes the capability; the artifact's epoch "
-            f"already moved, and a second writer reintroduces the drift")
+    for cls, mgr_attr in ((SnapshotSlotRuntime, "_manager"),
+                          (GvisorSnapshotSlotRuntime, "_mgr")):
+        cap = AckCapability(artifact_scoped=True)
+        cap.observe(3)
+        cap.publish(3)
+        assert cap.capable_for(3) is True, "precondition: the live artifact advertised"
+
+        rt = object.__new__(cls)
+        rt._ack_capable = cap
+        setattr(rt, mgr_attr, type("M", (), {"invalidate": lambda self: True})())
+        cls.invalidate_base(rt)
+
+        assert cap.capable_for(3) is True, (
+            f"{cls.__name__}.invalidate_base wrote the capability; retirement belongs to the "
+            f"next publish(), and a second writer reintroduces the drift #92 removed")
 
 
 def test_the_writability_probe_actually_probes(tmp_path):

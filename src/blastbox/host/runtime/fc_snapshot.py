@@ -522,9 +522,16 @@ class SnapshotManager:
         Never raises -- reap must not be taken down by cleanup.
         """
         with self._build_lock:
-            # BEFORE the early return. Only a FAILED restore went through _unpin(), so on the
-            # normal reap path the epoch entry was never dropped: one dict entry per slot ever
-            # restored, for the life of a dispatcher that recycles slots continuously.
+            # Only a FAILED restore goes through _unpin(), so without this line the normal reap
+            # path never dropped the epoch entry: one dict entry per slot ever restored, for the
+            # life of a dispatcher that recycles slots continuously.
+            #
+            # Placed before the early return DEFENSIVELY, not because a reachable state needs it:
+            # restore(), release() and _unpin() all write _pins and _pin_epoch under one hold of
+            # _build_lock, so an epoch entry without a matching pin should not exist. An earlier
+            # version of this comment claimed the ordering was load-bearing; a reviewer showed it
+            # is not, and an unreachable justification is worse than none -- it is what stops the
+            # next person deleting a line that has become wrong.
             self._pin_epoch.pop(str(slot_id), None)
             artifact = self._pins.pop(str(slot_id), None)
             if artifact is None:

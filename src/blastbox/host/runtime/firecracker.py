@@ -728,8 +728,7 @@ class VsockReadySignal:
             # when the base is replaced could teach the new generation with the old base's
             # advertisement -- the same slot-vs-job confusion, one layer out. The caller may have
             # sampled it EARLIER still (before a slow launch); prefer that.
-            _gen = (ack_generation if ack_generation is not None
-                    else None)
+            _gen = ack_generation
             thread = threading.Thread(
                 target=self._accept_loop,
                 args=(slot.slot_id, state, _gen),

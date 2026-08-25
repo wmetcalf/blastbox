@@ -89,7 +89,22 @@ class GvisorSnapshotSlotRuntime:
         # completing in between paired the slot with the wrong identity. pinned_epoch() takes a
         # lock and can raise on an injected manager, so it belongs inside this region.
         try:
-            _ack_gen = getattr(self._mgr, "pinned_epoch", lambda _s: None)(slot_id)
+            _pe = getattr(self._mgr, "pinned_epoch", None)
+            if _pe is None:
+                # NOT fail-safe-and-quiet: in snapshot mode this is fatal to the feature. Every
+                # slot then carries ack_generation=None, capable_for(None) is False for the life
+                # of the process, learn(None) discards every real ack, and the missing-start
+                # evidence the fast repair runs on is never produced. The sampler seam got a
+                # defensive auto-bind on exactly this reasoning; the rebuttal used there ("a
+                # backend that never defines it cannot call it either") does not apply here,
+                # because THIS side is called unconditionally.
+                if not getattr(self, "_warned_no_pinned_epoch", False):
+                    self._warned_no_pinned_epoch = True
+                    _log.warning(
+                        "snapshot.manager_without_pinned_epoch manager=%s -- slots cannot be "
+                        "matched to the artifact they restored from, so the pre-guest fast base "
+                        "repair is DISABLED for this runtime", type(self._mgr).__name__)
+            _ack_gen = _pe(slot_id) if _pe is not None else None
             wd = Path(handle.slot_workdir)  # type: ignore[attr-defined]
         except BaseException:
             sandbox_gone = True
@@ -162,23 +177,6 @@ class GvisorSnapshotSlotRuntime:
         # set outlives the generation that taught it, so a bundle rolled back to an older worker
         # kept the previous "yes" and a missing start marker was then read as proof of no start --
         # letting three document-induced hangs convict a healthy mixed-version base.
-        # RESET AFTER THE ARTIFACT IS RETIRED, not before. Resetting first opens a window in
-        # which the old artifact is still acquirable while the generation has already advanced:
-        # a spawn racing this gets the RETIRED artifact stamped with the NEW generation, so its
-        # late ack teaches the replacement a capability only the old image had.
-        #
-        # Ordering it after makes the residual error safe instead of dangerous. A spawn that
-        # acquired the old artifact sampled the OLD generation (spawn samples before restore), so
-        # its ack is ignored -- correct. A spawn that starts after invalidate but samples before
-        # this reset gets the old generation while running the NEW artifact, so its ack is
-        # discarded too: the new base's advertisement is merely missed, leaving capability
-        # UNKNOWN, which convicts nothing.
-        #
-        # It does NOT close the class. The stamp and the artifact are still two separate pieces
-        # of state kept in sync by hand, which is what has produced a finding every round; the
-        # structural fix is to derive the stamp from the acquired artifact (SnapshotManager
-        # already bumps _build_epoch atomically inside invalidate() under _build_lock), so the
-        # two cannot drift. That changes a locking contract and wants review.
         drop = getattr(self._mgr, "invalidate", None)
         if callable(drop):
             drop()
