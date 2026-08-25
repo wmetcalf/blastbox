@@ -305,6 +305,12 @@ WARM_STARTED = "started"
 #: a filesystem with inodes but no data blocks accepts an empty file and fails a real write.
 _PROBE_PAYLOAD = b"blastbox-writability-probe\n"
 
+#: How often the host re-probes ctrl/ writability WHILE waiting for a start marker. The probe is
+#: a real create+rename+unlink, so it is throttled rather than run every 50 ms poll; 1 s samples a
+#: 300 s worker timeout finely enough to catch a blip while costing one tmpfs write per second
+#: per waiting slot.
+_CTRL_PROBE_INTERVAL_S: float = 1.0
+
 
 class AckCapability:
     """Does the CURRENT warm base advertise the start signal? Generation-scoped on purpose.
@@ -383,6 +389,10 @@ class HostWarmControl:
         # time is the wrong moment. Falls back only when the caller cannot say.
         self._ack_gen = (ack_generation if ack_generation is not None
                          else self._ack_capable.generation)
+        #: Latched: ctrl/ was seen UNWRITABLE at some point while this control waited. A storage
+        #: incident that clears before the deadline is otherwise undetectable -- see
+        #: wait_for_done.
+        self._ctrl_io_fault = False
 
     def _atomic_write(self, name: str, content: str) -> None:
         """Write *content* to ``control_dir/<name>`` atomically AND symlink-safely.
@@ -473,6 +483,10 @@ class HostWarmControl:
         from blastbox.contract.envelope import read_confined_regular_bytes
 
         deadline = time.monotonic() + timeout_s
+        # Per-WAIT, not per-control: a control reused for a second job must not inherit the first
+        # job's storage incident and excuse a genuine wedge.
+        self._ctrl_io_fault = False
+        next_ctrl_probe = deadline + 1.0   # replaced below once we know we are waiting
         # LEARN CAPABILITY FIRST, from the READINESS marker rather than from a completed job. A
         # base wedged from its first slot never finishes anything, so learning only from a written
         # start-marker left it permanently UNKNOWN -- inert on exactly the base this repairs. But
@@ -495,6 +509,9 @@ class HostWarmControl:
         # Claiming "never started" anywhere earlier convicts a base for a job nobody listened for.
         if self._ack_capable:
             self.guest_started = False
+            # Only an ack-capable image can produce the "no start marker" verdict that needs
+            # excusing, so only that case pays for the probes.
+            next_ctrl_probe = time.monotonic() + _CTRL_PROBE_INTERVAL_S
 
         while True:
             if self.guest_started is not True and (self._dir / WARM_STARTED).exists():
@@ -526,6 +543,22 @@ class HostWarmControl:
                     err.host_io = True  # type: ignore[attr-defined]
                 raise err from exc
 
+            # SAMPLE WHILE WAITING, and latch. The deadline probe below can only ask "is ctrl/
+            # writable NOW", so a transient ENOSPC/EROFS that silenced the worker's `started` and
+            # `done` writes and then cleared was invisible: the host saw a healthy filesystem and
+            # charged the outage to the worker. The worker cannot tell us -- serve_warm() raises
+            # its host_io WarmTimeout inside the guest, and an unwritable ctrl/ is by definition
+            # a channel it cannot use. Probing the shared filesystem ourselves is the only way to
+            # learn it, and it has to be done DURING the window, not after it.
+            if self.guest_started is False and time.monotonic() >= next_ctrl_probe:
+                writable = self._ctrl_writable()
+                # STAMPED AFTER the probe it throttles, never before. The probe writes to a
+                # filesystem that may be sick and can block for seconds; a stamp taken before the
+                # call it bounds is the exact defect this branch exists to fix, one layer down.
+                next_ctrl_probe = time.monotonic() + _CTRL_PROBE_INTERVAL_S
+                if not writable:
+                    self._ctrl_io_fault = True
+
             if time.monotonic() >= deadline:
                 # HOST-OBSERVABLE ATTRIBUTION. Flagging the worker's own exception is useless
                 # here: serve_warm() catches it and tries to write `idle_timeout`, so nothing the
@@ -533,9 +566,11 @@ class HostWarmControl:
                 # us anything at all, by definition. But we share that filesystem, so we can ask
                 # it ourselves. An unwritable ctrl/ means the silence is the STORAGE, not the
                 # guest, and "never started" would convict a healthy base on every slot at once.
-                if self.guest_started is False and not self._ctrl_writable():
-                    logger.warning("warm.ctrl_unwritable dir=%s — not attributing the missing "
-                                 "start marker to the worker", self._dir)
+                if self.guest_started is False and (self._ctrl_io_fault
+                                                    or not self._ctrl_writable()):
+                    logger.warning("warm.ctrl_unwritable dir=%s latched=%s — not attributing the "
+                                 "missing start marker to the worker",
+                                 self._dir, self._ctrl_io_fault)
                     self.guest_started = None
                     err = WarmTimeout(
                         f"warm worker did not signal done within {timeout_s}s "
