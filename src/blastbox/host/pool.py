@@ -2615,17 +2615,14 @@ class WarmPool:
                 with self._lock:
                     self._pool_consecutive_failures.pop(episode_ident, None)
                     self._pool_pre_guest_failures.pop(episode_ident, None)
-            elif self._base_succeeded_since(episode_ident, success_token, success_scope):
-                # A slot from THIS base completed between the decision and here. That is
-                # conclusive, and restoring failures from before it would let one later failure
-                # rebuild a base that has since proved healthy. Same recheck the stale-decision
-                # guard makes; this branch simply did not make it.
+            # A DIFFERENT base was repaired. This one was never touched, so its evidence is
+            # still valid and discarding it just delays its repair by a whole threshold -- unless
+            # THIS base completed a job in the meantime, which _restore_episode now checks under
+            # the same lock it restores in.
+            elif not self._restore_episode(episode_ident, pool_failures, _consumed_pre_guest,
+                                           reason, token=success_token, scope=success_scope):
                 logger.info("pool.base_rebuild_skipped reason=slot_succeeded_during_cooldown "
                             "base=%s", episode_ident or "<default>")
-            else:
-                # A DIFFERENT base was repaired. This one was never touched, so its evidence is
-                # still valid and discarding it just delays its repair by a whole threshold.
-                self._restore_episode(episode_ident, pool_failures, _consumed_pre_guest, reason)
             return False
         if reason == "spawn":
             with self._lock:
@@ -2699,16 +2696,15 @@ class WarmPool:
                         "pool.base_rebuild_skipped reason=already_repaired_by_the_winner "
                         "base=%s -- discarding evidence from the retired generation",
                         episode_ident or "<default>")
-                elif self._base_succeeded_since(episode_ident, success_token, success_scope):
-                    # A slot from THIS base completed while we waited behind another tier's
-                    # invalidation. That is conclusive: restoring the pre-recovery evidence would
-                    # let a later failure invalidate a base which has since demonstrated it works.
+                # A slot from THIS base completing while we waited behind another tier's
+                # invalidation is conclusive: restoring the pre-recovery evidence would let a
+                # later failure invalidate a base which has since demonstrated it works. Checked
+                # inside the restore, under one lock.
+                elif not self._restore_episode(episode_ident, pool_failures, _consumed_pre_guest,
+                                               reason, token=success_token, scope=success_scope):
                     logger.info(
                         "pool.base_rebuild_skipped reason=slot_succeeded_during_lock_wait "
                         "base=%s", episode_ident or "<default>")
-                else:
-                    self._restore_episode(episode_ident, pool_failures, _consumed_pre_guest,
-                                          reason)
                 return False
             # RE-CHECK, under the lock, before acting. The pre-lock verdict is stale by however
             # long we queued behind another repair -- and a holder whose repair FAILED leaves
@@ -2759,37 +2755,59 @@ class WarmPool:
         tier could succeed and the pool would still invalidate its base. Those fall back to the
         pool-wide counter, which does move.
         """
+        with self._lock:
+            return self._succeeded_since_locked(episode_ident, token, scope)
+
+    def _succeeded_since_locked(self, episode_ident, token, scope=()) -> bool:  # noqa: ANN001
+        """The body of :meth:`_base_succeeded_since`. CALLER MUST HOLD ``self._lock``.
+
+        Split out so the check can share ONE critical section with the restore it guards -- see
+        _restore_episode. self._lock is a plain Lock, not an RLock, so a locked caller must never
+        route through the public wrapper.
+        """
         if token is None:
             return False
-        with self._lock:
-            if scope:
-                # Only the tiers this repair would actually touch. A clean release from a healthy
-                # sibling says nothing about the base being repaired.
-                return self._scoped_clean_releases(scope) != token
-            if not episode_ident:
-                return self._clean_release_count != token
-            return self._clean_release_by_base.get(episode_ident, 0) != token
+        if scope:
+            # Only the tiers this repair would actually touch. A clean release from a healthy
+            # sibling says nothing about the base being repaired.
+            return self._scoped_clean_releases(scope) != token
+        if not episode_ident:
+            return self._clean_release_count != token
+        return self._clean_release_by_base.get(episode_ident, 0) != token
 
     def _restore_episode(self, episode_ident, pool_failures, pre_guest_slots,
-                         reason) -> None:  # noqa: ANN001
+                         reason, token=None, scope=()) -> bool:  # noqa: ANN001
         """Give back evidence consumed for a decision that did NOT repair anything.
 
         The streak is consumed to MAKE the decision, so every path that then declines to act has
         to hand it back -- otherwise a still-poisoned base must earn a fresh threshold-sized batch
         of failures before it is reconsidered, which is the cost this whole fast path exists to
         avoid. Never restores below what has accumulated since.
+
+        ...unless the base RECOVERED in the meantime, which is checked HERE, under the same lock
+        acquisition as the restore itself. Callers used to ask _base_succeeded_since first and
+        restore second; a clean release landing between those two critical sections cleared the
+        live evidence and advanced the token, and the restore then resurrected the pre-recovery
+        failures anyway -- so one later fault could rebuild a base that had just proved it works.
+        A guard in a different critical section from the thing it guards is not a guard.
+
+        Returns True if evidence was handed back, False if it was discarded (recovered, or a
+        spawn episode, which its own caller retains).
         """
         if reason == "spawn":
             # A spawn episode lives in _spawn_consecutive_failures and its own caller retains it;
             # copying its count into the job counter let one later worker fault trigger an
             # immediate job-driven rebuild, which in a cascade carries no tier attribution.
-            return
+            return False
         with self._lock:
+            if self._succeeded_since_locked(episode_ident, token, scope):
+                return False
             self._pool_consecutive_failures[episode_ident] = max(
                 self._pool_consecutive_failures.get(episode_ident, 0), pool_failures)
             if pre_guest_slots:
                 self._pool_pre_guest_failures.setdefault(episode_ident, set()).update(
                     pre_guest_slots)
+            return True
 
     def _invalidate_now(self, drop, reason, pool_failures, success_token, now,
                         episode_ident, pre_guest_slots=frozenset(),
@@ -2856,13 +2874,12 @@ class WarmPool:
                 # fast path immediately: one later worker fault then rebuilds a base that has
                 # since executed a job end to end. A clean release is the strongest evidence the
                 # pool has, and it outranks the evidence collected before it.
-                if self._base_succeeded_since(episode_ident, success_token, success_scope):
+                if not self._restore_episode(episode_ident, pool_failures, pre_guest_slots,
+                                             reason, token=success_token, scope=success_scope):
                     logger.info(
                         "pool.base_rebuild_episode_discarded reason=slot_succeeded_during_repair "
                         "base=%s -- the repair failed, but the base proved it works",
                         episode_ident or "<default>")
-                else:
-                    self._restore_episode(episode_ident, pool_failures, pre_guest_slots, reason)
             return False
         with self._lock:
             if reason == "spawn":

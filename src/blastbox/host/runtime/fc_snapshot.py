@@ -149,6 +149,20 @@ class SnapshotManager:
         return self._artifact is not None
 
     @property
+    def ack_capable(self) -> "_AckConfirmable | None":
+        """The capability this manager confirms into, for runtimes wired around an INJECTED
+        manager.
+
+        The base-readiness listener lives with the backend and the per-slot controls live with
+        the runtime; they only work as one answer if both hold the SAME object. A runtime handed
+        a ready-made manager cannot build that listener itself, so it has to take the manager's.
+        Manufacturing its own left the published base advertising ACK while every restored slot
+        read `capable` as false -- missing starts stay UNKNOWN and the three-slot fast repair is
+        silently disabled on precisely the wiring an operator chose explicitly.
+        """
+        return self._ack_capable
+
+    @property
     def build_error(self) -> Exception | None:
         """The most recent async-build failure (None if never failed / since recovered)."""
         return self._build_error

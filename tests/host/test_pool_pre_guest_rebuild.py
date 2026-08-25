@@ -674,23 +674,26 @@ def test_a_success_during_the_cooldown_discards_the_episode_too():
     Driven through the success predicate rather than by racing a real release: the window is
     between the episode being consumed and the restore, and a release BEFORE that clears the
     evidence outright, so the crossing never happens and the branch is never reached.
+
+    Stubbed at _succeeded_since_locked, which is where the decision is actually taken: the check
+    and the restore now share ONE lock acquisition, so there is no longer a moment between them
+    at which a caller could consult the public predicate. Asserted on the EVIDENCE rather than on
+    whether the restore was called, because "called and declined" is now the correct behaviour.
     """
     rt = _TieredWedge()
     pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=300.0)
     pool._last_base_rebuild_at = pool._clock()
     pool._last_base_rebuild_idents = {"tierA"}        # a DIFFERENT tier is cooling
-    pool._base_succeeded_since = lambda ident, token, scope=(): ident == "tierB"
-
-    restored = []
-    real_restore = pool._restore_episode
-    pool._restore_episode = lambda *a, **k: restored.append(a) or real_restore(*a, **k)
+    pool._succeeded_since_locked = lambda ident, token, scope=(): ident == "tierB"
 
     for slot in _claim_distinct(pool, 3):
         _fail(pool, slot, stage="pre_guest")
 
     assert rt.base_invalidations == 0, "the cooldown must suppress the repair"
-    assert not restored, (
+    assert not pool._pool_pre_guest_failures.get("tierB"), (
         "a base that succeeded since the decision must not have its evidence restored")
+    assert not pool._pool_consecutive_failures.get("tierB"), (
+        "...nor its ordinary streak")
 
 
 def test_a_base_that_did_NOT_succeed_still_gets_its_evidence_back():
@@ -912,3 +915,37 @@ def test_an_unattributed_spawn_repair_still_names_no_target():
     assert pool._maybe_rebuild_base(5, reason="spawn") is True
     assert rt.invalidated == [None], (
         f"an unattributed spawn repair must leave targeting to the cascade, got {rt.invalidated}")
+
+
+def test_the_recovery_check_lives_inside_the_restore():
+    """A guard in a different critical section from the thing it guards is not a guard.
+
+    Callers used to ask _base_succeeded_since (one lock acquisition) and then restore (another). A
+    clean release landing between the two cleared the live evidence and advanced the token, and
+    the restore resurrected the pre-recovery failures anyway -- so one later fault could rebuild a
+    base that had just proved it works. Pinned by making the PUBLIC predicate lie: if the decision
+    still consulted it, the stale 'not recovered' verdict would get the evidence restored."""
+    pool = _pool(_TieredWedge(), pre_guest_rebuild_after=3)
+    pool._base_succeeded_since = lambda *a, **k: False        # the stale pre-lock verdict
+    pool._clean_release_by_base["tierB"] = 9                  # ...but tierB has since recovered
+
+    assert pool._restore_episode("tierB", 3, frozenset({"x"}), "job", token=8) is False, (
+        "the restore trusted a verdict taken in an earlier critical section")
+    assert not pool._pool_pre_guest_failures.get("tierB")
+    assert not pool._pool_consecutive_failures.get("tierB")
+
+
+def test_the_restore_still_hands_evidence_back_when_nothing_recovered():
+    """Control: the guard must not swallow the restore it is protecting."""
+    pool = _pool(_TieredWedge(), pre_guest_rebuild_after=3)
+    pool._clean_release_by_base["tierB"] = 8
+
+    assert pool._restore_episode("tierB", 3, frozenset({"x"}), "job", token=8) is True
+    assert pool._pool_pre_guest_failures.get("tierB") == {"x"}
+    assert pool._pool_consecutive_failures.get("tierB") == 3
+
+
+def test_a_spawn_episode_is_still_retained_by_its_own_caller():
+    pool = _pool(_TieredWedge(), pre_guest_rebuild_after=3)
+    assert pool._restore_episode("", 3, frozenset({"x"}), "spawn", token=0) is False
+    assert not pool._pool_consecutive_failures.get("")

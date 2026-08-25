@@ -200,3 +200,36 @@ def test_a_retry_that_advertises_is_still_believed(tmp_path):
         mgr.build()
     mgr.build()
     assert cap, "the retry advertised and published; that must be believed"
+
+
+def test_an_injected_manager_shares_its_capability_with_the_runtime(tmp_path):
+    """The base-readiness listener lives with the backend/manager; the per-slot controls live
+    with the runtime. They are one answer only if both hold the SAME object.
+
+    A runtime built around an INJECTED manager cannot construct that listener itself, and used to
+    manufacture its own AckCapability instead. The published base then advertised ACK while every
+    restored slot read `capable` as false -- so missing starts stay UNKNOWN and the three-slot
+    fast repair is silently disabled, on precisely the custom wiring an operator chose on
+    purpose."""
+    from blastbox.host.runtime.fc_snapshot_runtime import select_snapshot_runtime
+    from blastbox.host.runtime.gvisor_snapshot_runtime import select_gvisor_snapshot_runtime
+
+    cap = AckCapability()
+    mgr = SnapshotManager(Path(tmp_path), _Backend(_Boot(cap, cap.generation)), ack_capable=cap)
+
+    fc = select_snapshot_runtime(cfg=object(), manager=mgr)
+    assert fc._ack_capable is cap, "the FC runtime manufactured its own capability"
+
+    gv = select_gvisor_snapshot_runtime(manager=mgr)
+    assert gv._ack_capable is cap, "the gVisor runtime manufactured its own capability"
+
+
+def test_a_manager_double_without_the_seam_still_works(tmp_path):
+    """Injected test doubles are not real managers; they must not break the selector."""
+    from blastbox.host.runtime.gvisor_snapshot_runtime import select_gvisor_snapshot_runtime
+
+    class _Double:
+        def build(self): return None
+
+    gv = select_gvisor_snapshot_runtime(manager=_Double())
+    assert gv._ack_capable is not None, "the runtime must fall back to its own capability"

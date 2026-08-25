@@ -464,7 +464,11 @@ def select_snapshot_runtime(
     if manager is not None:
         if cfg is None:
             cfg = FCConfig.from_env()
-        return SnapshotSlotRuntime(cfg, manager, settle_s=settle_s)
+        # Take the INJECTED manager's capability, never a fresh one: see
+        # SnapshotManager.ack_capable. getattr, because a test double may not be a real manager --
+        # and then None keeps today's behaviour (the runtime makes its own).
+        return SnapshotSlotRuntime(cfg, manager, settle_s=settle_s,
+                                   ack_capable=getattr(manager, "ack_capable", None))
 
     if cfg is None:
         try:

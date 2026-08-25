@@ -313,7 +313,11 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
             return 1.0
 
     if manager is not None:
-        return GvisorSnapshotSlotRuntime(manager, settle_s=_settle())
+        # Same wiring gap as the FC twin: the injected manager owns the capability its
+        # base-readiness listener confirms into, so the runtime must share it rather than
+        # manufacture an unrelated one.
+        return GvisorSnapshotSlotRuntime(manager, settle_s=_settle(),
+                                         ack_capable=getattr(manager, "ack_capable", None))
     from blastbox.host.runtime.gvisor_snapshot import GvisorSnapshotBackend
     from blastbox.host.runtime.fc_snapshot import SnapshotManager
     gcfg = cfg or _gvisor_config_from_env(os.environ)
