@@ -213,13 +213,24 @@ def warm_fault_stage(warm_clean: bool, warm_fault: "str | None",
     """
     if warm_clean or warm_fault != "worker":
         return None
-    if phases.reached("guest"):
-        return None
     started = getattr(control, "guest_started", None)
     if started is not False:
         # True = it ran. None = the guest never told us (older image, or a seam with no ack), and
         # guessing there is exactly the mistake this parameter exists to prevent.
         return None
+    # PROOF, and it outranks the completed-work mark -- which is why `phases` is no longer
+    # consulted here. `phases.reached("guest")` means only that wait_for_done RETURNED, i.e. that
+    # some `done` file appeared; the dispatcher discards the status string it carries. A worker
+    # whose wait_for_go() expired writes done="idle_timeout" WITHOUT ever writing `started`, so
+    # the guest phase is marked for a job the guest never took, and that inference was overriding
+    # the definitive signal. Three restored slots that all fail before accepting their jobs then
+    # waited for the much larger ordinary threshold -- defeating the fast repair for precisely the
+    # failure mode it was built for. A worker-controlled completion status is not proof that
+    # detonation executed; an ack-capable image declining to say it started is.
+    #
+    # Safe in the other direction too: both seams REFUSE the job when they cannot promise the
+    # host they started (fc_warm raises if the ACK send fails, serve_warm if the `started` write
+    # fails), so "ack-capable and no start" cannot describe a guest that actually ran.
     return "pre_guest"
 
 

@@ -26,7 +26,7 @@ import logging
 
 from blastbox.errors import is_host_resource_failure
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -476,7 +476,7 @@ class CascadingRuntime:
         return sorted(self._tier_identity(i) for i in guilty)
 
     def invalidate_base(self, *, reason: str | None = None,
-                        only: "str | None" = None) -> "list[str]":
+                        only: "str | Iterable[str] | None" = None) -> "list[str]":
         """Forward base invalidation to every wrapped tier that supports it.
 
         Every tier is attempted even if an earlier one fails -- one poisoned tier must not stop
@@ -522,7 +522,12 @@ class CascadingRuntime:
             # which, so it fell back to the episode-wide guilt set. An unrelated worker fault on
             # healthy tier A followed by three pre-guest failures on B then rebuilt BOTH,
             # removing the fallback capacity that is the entire point of a cascade.
-            _named = {i for i in range(len(self.tiers)) if self._tier_identity(i) == only}
+            # A SET, because a spawn repair now arrives with its targets frozen. Recomputing
+            # them here from the live guilty set meant a tier that became guilty AFTER the
+            # decision -- and then produced a clean release -- was invalidated by a decision that
+            # never examined it, and whose staleness check therefore could not see its success.
+            _wanted = {only} if isinstance(only, str) else {str(x) for x in only}
+            _named = {i for i in range(len(self.tiers)) if self._tier_identity(i) in _wanted}
             if _named:
                 named = _named
             else:

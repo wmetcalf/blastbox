@@ -150,11 +150,32 @@ def test_warm_fault_stage_reports_pre_guest_only_when_the_guest_never_ran():
         wedged.mark(ph)                       # ...then wait_for_done times out; no `guest`
     assert warm_fault_stage(False, "worker", wedged, _Ctl()) == "pre_guest"
 
+    # THE GUEST PHASE DOES NOT RESCUE IT. That mark means only that wait_for_done RETURNED --
+    # some `done` file appeared -- and the dispatcher discards the status string. A worker whose
+    # wait_for_go() expired writes done="idle_timeout" WITHOUT ever writing `started`, so the
+    # phase is marked for a job the guest never took. Letting that override the ack made three
+    # slots that never accepted their jobs wait for the ordinary threshold instead of the fast
+    # repair built for exactly that shape.
     ran = _PhaseTimer("j")
     for ph in ("slot_claim", "fetch", "stage", "go", "guest"):
         ran.mark(ph)
-    assert warm_fault_stage(False, "worker", ran, _Ctl()) is None, (
-        "a failure AFTER the guest executed could be the document")
+    assert warm_fault_stage(False, "worker", ran, _Ctl()) == "pre_guest", (
+        "a worker-written completion status is not proof that detonation executed")
+
+    # ...whereas an ack that DID arrive is proof it ran, phase mark or not.
+    class _Started:
+        guest_started = True
+
+    assert warm_fault_stage(False, "worker", ran, _Started()) is None, (
+        "a failure after the guest executed could be the document")
+    assert warm_fault_stage(False, "worker", wedged, _Started()) is None
+
+    # ...and UNKNOWN still convicts nothing, in either shape.
+    class _Unknown:
+        guest_started = None
+
+    assert warm_fault_stage(False, "worker", ran, _Unknown()) is None
+    assert warm_fault_stage(False, "worker", wedged, _Unknown()) is None
 
     # a clean run, and a job-attributed fault, are never base evidence
     assert warm_fault_stage(True, None, wedged, _Ctl()) is None
@@ -867,3 +888,27 @@ def test_an_unattributed_spawn_cooldown_still_discards_the_streak():
 
     assert pool._maybe_rebuild_base(5, reason="spawn") is False
     assert pool._spawn_consecutive_failures == 0
+
+
+def test_a_spawn_repair_hands_the_cascade_the_scope_it_judged():
+    """The pool judges a spawn repair against success_scope, so the repair must ACT on that same
+    set. Leaving the cascade to recompute its targets at drop() time let a tier that became guilty
+    after the decision be swept into a repair that never weighed it -- and, being absent from
+    success_scope, its clean release could not be seen by the staleness checks either."""
+    rt = _ScopedWedge(guilty=("tierB",))
+    pool = _pool(rt, snapshot_rebuild_after=2, base_rebuild_cooldown_s=0)
+
+    assert pool._maybe_rebuild_base(5, reason="spawn") is True
+    assert rt.invalidated == [("tierB",)], (
+        f"the repair must be handed the judged scope, got {rt.invalidated}")
+
+
+def test_an_unattributed_spawn_repair_still_names_no_target():
+    """No scope -> nothing to freeze, and the cascade's own fallback is correct. Passing only=()
+    would match no tier and silently repair nothing."""
+    rt = _TieredWedge()                       # no spawn_guilty_identities seam
+    pool = _pool(rt, snapshot_rebuild_after=2, base_rebuild_cooldown_s=0)
+
+    assert pool._maybe_rebuild_base(5, reason="spawn") is True
+    assert rt.invalidated == [None], (
+        f"an unattributed spawn repair must leave targeting to the cascade, got {rt.invalidated}")

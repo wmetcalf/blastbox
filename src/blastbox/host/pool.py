@@ -2805,7 +2805,15 @@ class WarmPool:
             _kw: dict[str, Any] = {}
             if _accepts_kwarg(drop, "reason"):
                 _kw["reason"] = reason
-            if reason != "spawn" and episode_ident and _accepts_kwarg(drop, "only"):
+            if reason == "spawn" and success_scope and _accepts_kwarg(drop, "only"):
+                # FREEZE the targets. Without this the cascade recomputed them from its LIVE
+                # guilty set at drop() time, so a tier that became guilty after this decision was
+                # taken got swept into a repair that never weighed it -- and because it was not in
+                # success_scope, the staleness checks could not notice that it had meanwhile
+                # produced a clean release. The result was a healthy sibling's base destroyed by
+                # another tier's episode, which is the fallback capacity a cascade exists to keep.
+                _kw["only"] = tuple(success_scope)
+            elif reason != "spawn" and episode_ident and _accepts_kwarg(drop, "only"):
                 # EVERY job-triggered repair, not only the pre-guest fast path. The ordinary
                 # streak is per-identity too, so the episode that crossed always belongs to one
                 # base -- and a cascade whose _job_guilty was cleared by an unrelated success on
