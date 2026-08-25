@@ -554,3 +554,151 @@ def test_a_failed_tier_invalidation_is_reported_not_swallowed():
     assert invalidated == ["a", "c"], (
         f"one failing tier must not stop the others being repaired (got {invalidated})"
     )
+
+
+def test_the_cascade_names_the_tier_a_spawn_repair_would_target():
+    """The pool's spawn streak is one pool-wide integer with no tier attribution, but the repair
+    it triggers IS narrowed here. The pool therefore has to ask the cascade which tiers a spawn
+    repair would hit, or it judges "should I repair tier B?" against "did ANY tier succeed?" --
+    and a healthy overflow tier absorbing the load, which is precisely what a cascade does when a
+    tier is poisoned, cancels the poisoned tier's repair."""
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.cascade import CascadingRuntime, Tier
+
+    class _Poisoned:
+        def prepare(self): return True
+        def spawn(self): raise RuntimeError("snapshot restore failed: corrupt warm.mem")
+
+    class _Healthy:
+        def __init__(self): self.n = 0
+        def prepare(self): return True
+        def spawn(self):
+            self.n += 1
+            return SimpleNamespace(slot_id=f"ok{self.n}")
+
+    rt = CascadingRuntime(tiers=[Tier(name="fc", runtime=_Poisoned(), capacity=4),
+                                 Tier(name="gv", runtime=_Healthy(), capacity=4)])
+
+    assert rt.spawn_guilty_identities() == [], "no evidence yet -> caller must fall back"
+
+    slot = rt.spawn()          # fc raises, gv absorbs it -- the pool sees a SUCCESS
+    assert slot.slot_id == "ok1"
+
+    assert rt.spawn_guilty_identities() == ["fc#0"], (
+        "the poisoned tier must stay named even though the spawn as a whole succeeded -- that is "
+        "the entire failure mode: the pool cannot see the tier that failed")
+
+
+def test_the_named_tier_is_positional_not_just_the_backend_name():
+    """BLASTBOX_POOL_TIERS accepts a repeated backend with SEPARATE bases, so the scope the pool
+    compares against must distinguish them -- otherwise a clean release on one is read as
+    recovery of the other."""
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.cascade import CascadingRuntime, Tier
+
+    class _Poisoned:
+        def prepare(self): return True
+        def spawn(self): raise RuntimeError("corrupt warm.mem")
+
+    class _Healthy:
+        def prepare(self): return True
+        def spawn(self): return SimpleNamespace(slot_id="ok")
+
+    rt = CascadingRuntime(tiers=[Tier(name="fc", runtime=_Poisoned(), capacity=4),
+                                 Tier(name="fc", runtime=_Healthy(), capacity=4)])
+    rt.spawn()
+    assert rt.spawn_guilty_identities() == ["fc#0"], (
+        "identity must carry the tier POSITION; keyed on the name alone both sibling bases "
+        "collapse to one entry")
+
+
+def test_a_tier_whose_streak_a_repair_cleared_stays_named():
+    """_recently_guilty is the half of the guilty set that outlives the streak.
+
+    A cascade-side repair zeroes _tier_failures to give the rebuild a full window before trying
+    again. If the scope were read from the streak alone, the tier would vanish from it in exactly
+    that window -- the pool would fall back to its pool-wide counter, a healthy sibling's release
+    would look like recovery, and the repair the pool was about to make would be cancelled."""
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.cascade import CascadingRuntime, Tier
+
+    class _T:
+        def prepare(self): return True
+        def spawn(self): return SimpleNamespace(slot_id="s1")
+
+    rt = CascadingRuntime(tiers=[Tier(name="fc", runtime=_T(), capacity=4),
+                                 Tier(name="gv", runtime=_T(), capacity=4)])
+    slot = rt.spawn()
+    assert rt.blame_tier_for_slot(slot.slot_id) is True
+    assert rt.spawn_guilty_identities() == ["fc#0"]
+
+    with rt._lock:
+        rt._tier_failures[0] = 0      # a repair gave tier 0 a fresh window
+
+    assert rt.spawn_guilty_identities() == ["fc#0"], (
+        "a tier whose streak was cleared by a REPAIR, not by a success, must stay attributable")
+
+
+def test_a_spawn_repair_hits_only_the_tiers_it_was_handed():
+    """The pool judges a spawn repair against the tiers guilty AT THAT MOMENT (success_scope), but
+    invalidate_base used to recompute its targets from the LIVE guilty set. A tier that became
+    guilty in between was therefore swept into a repair that never weighed it -- and since it was
+    absent from success_scope, the pool's staleness checks could not see that it had meanwhile
+    produced a clean release. A healthy sibling's base is destroyed by another tier's episode,
+    which is the fallback capacity a cascade exists to preserve."""
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.cascade import CascadingRuntime, Tier
+
+    dropped = []
+
+    def _mk(name):
+        class _T:
+            def prepare(self): return True
+            def spawn(self): return SimpleNamespace(slot_id=f"{name}-1")
+            def invalidate_base(self, **kw):
+                dropped.append(name)
+                return True
+        return _T()
+
+    rt = CascadingRuntime(tiers=[Tier(name="fc", runtime=_mk("fc"), capacity=4),
+                                 Tier(name="gv", runtime=_mk("gv"), capacity=4)])
+    slot = rt.spawn()
+    rt.blame_tier_for_slot(slot.slot_id)          # tier 0 is guilty -> the decision's scope
+    frozen = rt.spawn_guilty_identities()
+    assert frozen == ["fc#0"]
+
+    # ...and now tier 1 becomes guilty too, AFTER the decision was taken.
+    with rt._lock:
+        rt._recently_guilty.add(1)
+
+    rt.invalidate_base(reason="spawn", only=frozen)
+    assert dropped == ["fc"], (
+        f"the repair was handed one tier and hit {dropped}; a tier that became guilty after the "
+        f"decision must not be swept into it")
+
+
+def test_a_single_named_target_still_works():
+    """`only` was a plain string before it could carry a set; both must keep working."""
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.cascade import CascadingRuntime, Tier
+
+    dropped = []
+
+    def _mk(name):
+        class _T:
+            def prepare(self): return True
+            def spawn(self): return SimpleNamespace(slot_id=f"{name}-1")
+            def invalidate_base(self, **kw):
+                dropped.append(name)
+                return True
+        return _T()
+
+    rt = CascadingRuntime(tiers=[Tier(name="fc", runtime=_mk("fc"), capacity=4),
+                                 Tier(name="gv", runtime=_mk("gv"), capacity=4)])
+    rt.invalidate_base(reason="job", only="gv#1")
+    assert dropped == ["gv"]

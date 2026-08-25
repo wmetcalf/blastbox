@@ -19,6 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
+from blastbox.worker.warm import AckCapability
 from blastbox.host.pool import Slot, SlotState
 from blastbox.host.runtime.fc_snapshot import SnapshotError
 
@@ -33,7 +34,12 @@ _DEFAULT_WARM_ARGV = ["python3", "/opt/blastbox/run_warm.py"]
 
 
 class GvisorSnapshotSlotRuntime:
-    def __init__(self, manager, *, settle_s: float = 1.0, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, manager, *, settle_s: float = 1.0,
+                 clock: Callable[[], float] = time.monotonic,
+                 ack_capable: "AckCapability | None" = None) -> None:
+        # Shared with every GvisorHostWarmControl handed out (see host_warm_control) AND with the
+        # base build, which is the only place the advertisement is ever visible on this tier.
+        self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
         self._mgr = manager
         self._settle_s = settle_s
         self._clock = clock
@@ -65,6 +71,9 @@ class GvisorSnapshotSlotRuntime:
         else:
             self._mgr.build()   # a manager without the seam (a test double)
         slot_id = str(uuid.uuid4())
+        # BEFORE the restore -- same ordering as the FC snapshot runtime: the artifact this
+        # slot is pinned to is the one that existed when restore() started.
+        _ack_gen = self._ack_capable.generation
         handle = self._mgr.restore(slot_id)
         wd = Path(handle.slot_workdir)  # type: ignore[attr-defined]
         with self._lock:
@@ -77,6 +86,8 @@ class GvisorSnapshotSlotRuntime:
             input_dir=wd / "in",
             output_dir=wd / "out",
             state=SlotState.WARMING,
+            # The generation this slot was SPAWNED from; see Slot.ack_generation.
+            ack_generation=_ack_gen,
         )
 
     def is_ready(self, slot: Slot) -> bool:
@@ -84,6 +95,7 @@ class GvisorSnapshotSlotRuntime:
             handle = self._handles.get(slot.slot_id)
             restored_at = self._restored_at.get(slot.slot_id)
         if handle is None:
+
             return False
         # Hold WARMING for a short post-restore settle window (mirrors the FC tier);
         # in a steady-state pool it overlaps background pre-warming, adding no per-job latency.
@@ -115,9 +127,31 @@ class GvisorSnapshotSlotRuntime:
         pool's lookup always failed here and sustained failures merely logged
         pool.base_rebuild_unavailable while every replacement kept restoring the poisoned snapshot
         until a dispatcher restart (upstream, PR #82). Same SnapshotManager underneath."""
+        # A NEW BUNDLE MAY BE A DIFFERENT IMAGE. Same reset as the FC snapshot runtime: the
+        # set outlives the generation that taught it, so a bundle rolled back to an older worker
+        # kept the previous "yes" and a missing start marker was then read as proof of no start --
+        # letting three document-induced hangs convict a healthy mixed-version base.
+        # RESET AFTER THE ARTIFACT IS RETIRED, not before. Resetting first opens a window in
+        # which the old artifact is still acquirable while the generation has already advanced:
+        # a spawn racing this gets the RETIRED artifact stamped with the NEW generation, so its
+        # late ack teaches the replacement a capability only the old image had.
+        #
+        # Ordering it after makes the residual error safe instead of dangerous. A spawn that
+        # acquired the old artifact sampled the OLD generation (spawn samples before restore), so
+        # its ack is ignored -- correct. A spawn that starts after invalidate but samples before
+        # this reset gets the old generation while running the NEW artifact, so its ack is
+        # discarded too: the new base's advertisement is merely missed, leaving capability
+        # UNKNOWN, which convicts nothing.
+        #
+        # It does NOT close the class. The stamp and the artifact are still two separate pieces
+        # of state kept in sync by hand, which is what has produced a finding every round; the
+        # structural fix is to derive the stamp from the acquired artifact (SnapshotManager
+        # already bumps _build_epoch atomically inside invalidate() under _build_lock), so the
+        # two cannot drift. That changes a locking contract and wants review.
         drop = getattr(self._mgr, "invalidate", None)
         if callable(drop):
             drop()
+        self._ack_capable.reset()
 
     def reap(self, slot: Slot) -> None:
         with self._lock:
@@ -168,7 +202,10 @@ class GvisorSnapshotSlotRuntime:
     # --- warm-path seam (file-trigger control; output already on the bind mount) ---
 
     def host_warm_control(self, slot: Slot) -> GvisorHostWarmControl:
-        return GvisorHostWarmControl(slot.control_dir)
+        # Shared across slots: one warm base image, so start-marker capability is a property of
+        # the image, not of a job. Per-control it would be learned and immediately forgotten.
+        return GvisorHostWarmControl(slot.control_dir, ack_capable=self._ack_capable,
+                                     ack_generation=getattr(slot, "ack_generation", None))
 
     def stage_warm_input(self, slot: Slot, staged_input_path: Path) -> Path:
         dst = Path(slot.input_dir) / Path(staged_input_path).name
@@ -229,9 +266,18 @@ class GvisorHostWarmControl:
     SANDBOX_IN = Path("/in")
     SANDBOX_OUT = Path("/out")
 
-    def __init__(self, control_dir: Path) -> None:
+    def __init__(self, control_dir: Path, *, ack_capable: "AckCapability | None" = None,
+                 ack_generation: "int | None" = None) -> None:
         from blastbox.worker.warm import HostWarmControl
-        self._inner = HostWarmControl(control_dir)
+        self._inner = HostWarmControl(control_dir, ack_capable=ack_capable,
+                                      ack_generation=ack_generation)
+
+    @property
+    def guest_started(self) -> "bool | None":
+        """Forwarded from the wrapped control: the dispatcher reads it off whatever object
+        host_warm_control returned, and a wrapper that swallows it leaves the whole start signal
+        invisible for this tier."""
+        return self._inner.guest_started
 
     def signal_go(self, spec: object, *, deadline: float | None = None) -> None:
         from blastbox.worker.warm import WarmJobSpec
@@ -267,11 +313,19 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
             return 1.0
 
     if manager is not None:
-        return GvisorSnapshotSlotRuntime(manager, settle_s=_settle())
+        # Same wiring gap as the FC twin: the injected manager owns the capability its
+        # base-readiness listener confirms into, so the runtime must share it rather than
+        # manufacture an unrelated one.
+        return GvisorSnapshotSlotRuntime(manager, settle_s=_settle(),
+                                         ack_capable=getattr(manager, "ack_capable", None))
     from blastbox.host.runtime.gvisor_snapshot import GvisorSnapshotBackend
     from blastbox.host.runtime.fc_snapshot import SnapshotManager
     gcfg = cfg or _gvisor_config_from_env(os.environ)
-    backend = GvisorSnapshotBackend(gcfg)
+    # Created before both so the BASE BUILD and the runtime serving restores share it: the base
+    # advertises the start-marker protocol in `ready`, and that is the only moment it is visible
+    # (a restore gets a fresh ctrl/, and the checkpointed worker resumes past signal_ready).
+    ack_capable = AckCapability()
+    backend = GvisorSnapshotBackend(gcfg, ack_capable=ack_capable)
     if not backend.available():
         if require_available:
             raise GvisorUnavailable("gVisor C/R warm tier required but runsc not found; "
@@ -287,8 +341,8 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
 
     snapshot_parent = resolve_mem_dir() or Path(gcfg.root).parent
     base_dir = _secure_snapshot_base(snapshot_parent / "gvisor-snapshot")
-    mgr = SnapshotManager(base_dir, backend)
-    return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle())
+    mgr = SnapshotManager(base_dir, backend, ack_capable=ack_capable)
+    return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle(), ack_capable=ack_capable)
 
 
 def _secure_snapshot_base(base_dir: Path) -> Path:

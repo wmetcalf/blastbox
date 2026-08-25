@@ -20,12 +20,25 @@ import shutil
 import threading
 import time
 from pathlib import Path
+from typing import Protocol
 
 # _accepts_kwarg is the ONE definition of "does this callable declare that parameter" --
 # imported rather than copied, which is how the same optional-hook check drifted before.
 # pool.py imports nothing from runtime/, so this direction cannot cycle.
 from blastbox.host.pool import RuntimeAtCapacity, _accepts_kwarg
+
 from blastbox.host.runtime.snapshot_backend import RestoreHandle, SnapshotBackend
+
+
+class _AckConfirmable(Protocol):
+    """The slice of AckCapability the manager needs.
+
+    Structural, not an import of the concrete class: worker.warm owns AckCapability and importing
+    it here would tie the snapshot manager to the worker package for a one-method call.
+    """
+
+    def begin_build(self) -> None: ...
+    def confirm(self, generation: "int | None" = ...) -> None: ...
 
 _log = logging.getLogger("blastbox.host.runtime.fc_snapshot")
 
@@ -91,6 +104,7 @@ class SnapshotManager:
         *,
         ready_timeout_s: float = 120.0,
         build_retry_backoff_s: float = 30.0,
+        ack_capable: "_AckConfirmable | None" = None,
     ) -> None:
         self._base_dir = Path(base_dir)
         self._backend = backend
@@ -111,6 +125,9 @@ class SnapshotManager:
         # nothing, and the build then published the very artifact the repair meant to reject --
         # so the second repair request was silently lost (upstream, PR #82).
         self._build_epoch = 0
+        # Optional. Set by the snapshot runtimes so PUBLICATION -- not readiness, and not even a
+        # successful checkpoint -- is what makes a base's ACK advertisement believable.
+        self._ack_capable = ack_capable
         # Base boot handles whose kill() raised. Suppressing it discarded the ONLY reference to a
         # sandbox that may still be running, and the async retry then booted another beside it --
         # untracked, unreapable, for the life of the process (upstream, PR #82).
@@ -130,6 +147,20 @@ class SnapshotManager:
     def is_built(self) -> bool:
         """True once the snapshot artifact exists (atomic reference read)."""
         return self._artifact is not None
+
+    @property
+    def ack_capable(self) -> "_AckConfirmable | None":
+        """The capability this manager confirms into, for runtimes wired around an INJECTED
+        manager.
+
+        The base-readiness listener lives with the backend and the per-slot controls live with
+        the runtime; they only work as one answer if both hold the SAME object. A runtime handed
+        a ready-made manager cannot build that listener itself, so it has to take the manager's.
+        Manufacturing its own left the published base advertising ACK while every restored slot
+        read `capable` as false -- missing starts stay UNKNOWN and the three-slot fast repair is
+        silently disabled on precisely the wiring an operator chose explicitly.
+        """
+        return self._ack_capable
 
     @property
     def build_error(self) -> Exception | None:
@@ -283,6 +314,11 @@ class SnapshotManager:
         # needed here — there is nothing to kill until it returns a BootHandle.
         with self._build_lock:
             epoch = self._build_epoch
+        # SCOPE the ACK advertisement to THIS attempt. A retry shares the generation of the
+        # attempt it replaces (nothing invalidates in between), so a failed build's observation
+        # would otherwise be available for a later, possibly ACK-incapable, build to confirm.
+        if self._ack_capable is not None:
+            self._ack_capable.begin_build()
         try:
             boot = self._backend.boot_base()
         except SnapshotError:
@@ -325,6 +361,20 @@ class SnapshotManager:
             rejected = epoch != self._build_epoch
             if not rejected:
                 self._artifact = artifact
+        if not rejected and self._ack_capable is not None:
+            # THE ONE PLACE the base's ACK advertisement becomes believable. The backends only
+            # OBSERVE it at readiness, which happens long before anyone knows whether this build
+            # yields a usable artifact -- and a build that advertises and then fails to
+            # checkpoint, or gets rejected here, publishes nothing a slot could ever restore
+            # from. Believing it at readiness left the capability permanently true for a base
+            # that never existed; roll the worker bundle back before the retry and the older
+            # image's missing start markers are then read as PROVEN non-starts, so a
+            # document-induced hang invalidates an ACK-incapable base instead of staying UNKNOWN.
+            #
+            # Both backends stamp their boot handle with the generation the build STARTED under
+            # and expose it as `ack_generation`; confirm() is gated on that too, so this cannot
+            # credit the advertisement to a replacement base.
+            self._ack_capable.confirm(getattr(boot, "ack_generation", None))
         if rejected:
             # invalidate() landed while this build was running. Publishing now would install the
             # artifact the repair explicitly rejected; discard it instead and let the next build

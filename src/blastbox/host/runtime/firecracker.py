@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from blastbox.worker.warm import WarmJobSpec
 
+from blastbox.worker.warm import AckCapability
 from blastbox.errors import HOST_RESOURCE_ERRNOS, SandboxError, WarmTimeout
 from blastbox.host.pool import Slot, SlotState
 from blastbox.worker.fc_guest import (
@@ -62,6 +63,8 @@ from blastbox.worker.fc_guest import (
     recv_line,
     send_frame,
     send_frame_from_file,
+    WARM_ACK,
+    READY_ACK_SUFFIX,
 )
 
 __all__ = [
@@ -656,7 +659,19 @@ class VsockReadySignal:
     compromised guest cannot make the host do anything except observe READY.
     """
 
-    def __init__(self, *, max_bytes: int = _READY_MAX_BYTES) -> None:
+    def __init__(self, *, max_bytes: int = _READY_MAX_BYTES,
+                 ack_capable: "AckCapability | None" = None,
+                 defer_ack: bool = False) -> None:
+        # Shared with the runtime's warm controls. Populated HERE, at readiness, so a base that is
+        # wedged from its very first slot -- no job ever completes, so no ack is ever seen -- is
+        # still known to be ack-capable and can arm the fast repair. Learning it only from a
+        # completed ack left the repair inert on exactly the poisoned-from-the-outset base it
+        # exists to fix, which is what a dispatcher restarting onto a bad artifact produces.
+        self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
+        # BASE-BUILD listeners defer: their advertisement is only believed once the build has a
+        # usable artifact (see AckCapability.observe/confirm). Per-slot listeners do not -- a
+        # live slot's READY is about an artifact that already published.
+        self._defer_ack = defer_ack
         self._max_bytes = max_bytes
         self._slots: dict[str, _VsockReadyState] = {}
         self._lock = threading.Lock()
@@ -670,8 +685,15 @@ class VsockReadySignal:
         # ``<uds_path>_<port>`` for guest→host streams.
         return slot.output_dir.parent / f"vsock.sock_{_READY_PORT}"
 
-    def prepare(self, slot: Slot) -> None:
-        """Bind the READY listener for ``slot``.  Call before launching FC."""
+    def prepare(self, slot: Slot, ack_generation: "int | None" = None) -> None:
+        """Bind the READY listener for ``slot``.  Call before launching FC.
+
+        ``ack_generation`` is the generation the caller sampled BEFORE starting the launch this
+        listener belongs to. For a base build that is the only honest stamp: prepare() runs after
+        _spawn() and the API boot sequence, so an invalidate_base() during those seconds would
+        otherwise have this listener teach the REPLACEMENT generation with the retiring base's
+        advertisement. Defaults to sampling here, which is right for a per-slot listener.
+        """
         with self._lock:
             if slot.slot_id in self._slots:
                 return
@@ -702,9 +724,15 @@ class VsockReadySignal:
             state = _VsockReadyState(
                 srv=srv, uds=uds, ready=threading.Event(), stop=threading.Event()
             )
+            # The generation this listener STARTED under. Without it a listener still running
+            # when the base is replaced could teach the new generation with the old base's
+            # advertisement -- the same slot-vs-job confusion, one layer out. The caller may have
+            # sampled it EARLIER still (before a slow launch); prefer that.
+            _gen = (ack_generation if ack_generation is not None
+                    else self._ack_capable.generation)
             thread = threading.Thread(
                 target=self._accept_loop,
-                args=(slot.slot_id, state),
+                args=(slot.slot_id, state, _gen),
                 name=f"fc-vsock-ready-{slot.slot_id[:8]}",
                 daemon=True,
             )
@@ -712,7 +740,8 @@ class VsockReadySignal:
             self._slots[slot.slot_id] = state
             thread.start()
 
-    def _accept_loop(self, slot_id: str, state: _VsockReadyState) -> None:
+    def _accept_loop(self, slot_id: str, state: _VsockReadyState,
+                     ack_generation: "int | None" = None) -> None:
         # Non-blocking via selectors so a guest that connects-but-stalls can never
         # head-of-line-block the listener (delaying READY) or wedge this thread
         # (which would stall reap() and the pool). Connections that do not send
@@ -720,6 +749,8 @@ class VsockReadySignal:
         # so a compromised guest cannot exhaust host fds.
         sel = selectors.DefaultSelector()
         pending: dict[socket.socket, float] = {}
+
+        buffers: dict[socket.socket, bytes] = {}
         try:
             try:
                 sel.register(state.srv, selectors.EVENT_READ)
@@ -744,17 +775,43 @@ class VsockReadySignal:
                         conn.setblocking(False)
                         sel.register(conn, selectors.EVENT_READ)
                         pending[conn] = time.monotonic() + _CONN_GRACE_S
+                        buffers[conn] = b""
                         continue
                     conn = key.fileobj  # type: ignore[assignment]
                     try:
                         data = conn.recv(self._max_bytes)
                     except (BlockingIOError, OSError):
                         data = b""
+                    # ACCUMULATE. This is a SOCK_STREAM: one sendall() of "READY+ack1" can arrive
+                    # as "READY" then "+ack1", and deciding on the first recv() accepted readiness
+                    # and closed the connection -- permanently losing the advertisement on a valid
+                    # split. In snapshot mode this listener is the ONLY place it is ever visible,
+                    # so that loss makes the fast repair inert on a base wedged from its first
+                    # restore. Bounded by _READY_MAX_BYTES and the existing connection grace.
+                    buf = (buffers.get(conn, b"") + data)[: self._max_bytes]
+                    buffers[conn] = buf
+                    _full = _READY_TOKEN + READY_ACK_SUFFIX
+                    _decidable = (
+                        READY_ACK_SUFFIX in buf      # the advertisement arrived
+                        or not data                  # EOF: nothing more is coming
+                        or len(buf) >= len(_full)    # enough bytes that a suffix would be here
+                    )
+                    if _READY_TOKEN in buf and not _decidable:
+                        continue                     # READY seen, suffix may still be in flight
                     sel.unregister(conn)
                     pending.pop(conn, None)
+                    buffers.pop(conn, None)
                     conn.close()
-                    if _READY_TOKEN in data:
-                        _log.info("fc.vsock_ready_received slot_id=%s", slot_id)
+                    if _READY_TOKEN in buf:
+                        if READY_ACK_SUFFIX in buf:
+                            # Learned BEFORE any job, which is what makes the fast repair usable
+                            # on a base that was already poisoned when this dispatcher started.
+                            if self._defer_ack:
+                                self._ack_capable.observe(ack_generation)
+                            else:
+                                self._ack_capable.learn(ack_generation)
+                        _log.info("fc.vsock_ready_received slot_id=%s ack_capable=%s",
+                                  slot_id, READY_ACK_SUFFIX in buf)
                         state.ready.set()
                         return
                 # Drop connections that connected but never sent READY in time.
@@ -762,8 +819,10 @@ class VsockReadySignal:
                 for conn in [c for c, dl in pending.items() if now > dl]:
                     sel.unregister(conn)
                     pending.pop(conn, None)
+                    buffers.pop(conn, None)   # or the buffer outlives the connection
                     conn.close()
         finally:
+            buffers.clear()
             for conn in list(pending):
                 try:
                     sel.unregister(conn)
@@ -816,6 +875,11 @@ class VsockHostWarmControl:
     # The file handshake's equivalent is a host-side write and deliberately does NOT set this.
     signal_is_transport = True
 
+    # None = UNKNOWN (no ack observed: an older guest image, which simply does not send one).
+    # True = the guest confirmed it HAS the job. Never False -- absence of evidence is not
+    # evidence of absence, and the whole point of this field is to stop the caller guessing.
+    guest_started: "bool | None" = None
+
     def __init__(
         self,
         vsock_uds: Path,
@@ -823,7 +887,17 @@ class VsockHostWarmControl:
         job_port: int = _JOB_PORT,
         connect_timeout_s: float = 10.0,
         connect_fn: "Callable[[], socket.socket] | None" = None,
+        ack_capable: "AckCapability | None" = None,
+        ack_generation: "int | None" = None,
     ) -> None:
+        # Shared with the runtime (see host_warm_control); true once the CURRENT base advertised.
+        self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
+        # The SLOT's generation, taken at SPAWN. Reading it here instead meant an old-generation
+        # slot -- left IDLE and claimable by a base invalidation -- picked up the NEW stamp when a
+        # job claimed it, and its ack then re-taught the replacement base a capability that only
+        # the retired image had. Falls back to the current generation only when nobody can say.
+        self._ack_gen = (ack_generation if ack_generation is not None
+                         else self._ack_capable.generation)
         self._uds = Path(vsock_uds)
         self._job_port = job_port
         self._connect_timeout = connect_timeout_s
@@ -879,8 +953,13 @@ class VsockHostWarmControl:
 
     def _signal_go_inner(self, spec: "WarmJobSpec", *, deadline: float | None = None) -> None:
         path = Path(spec.input_path)
+        # ``ack``: ask the guest to send a START frame the moment it has the job, before it
+        # begins work. OPT-IN from the host, and unknown header keys are ignored by the guest's
+        # .get() parsing, so BOTH mixed-version directions stay safe: an old guest never sends one
+        # (the host just never learns the answer), and a new guest never sends one unsolicited, so
+        # an old host is not handed a frame it would mistake for the status.
         header = json.dumps(
-            {"filename": path.name, "params": dict(spec.params)}
+            {"filename": path.name, "params": dict(spec.params), "ack": True}
         ).encode("utf-8")
         conn = self._connect(deadline=deadline)
         self._conn = conn
@@ -889,21 +968,59 @@ class VsockHostWarmControl:
         send_frame(conn, header)
         send_frame_from_file(conn, path, deadline=deadline)
 
+
     def wait_for_done(self, *, timeout_s: float) -> str:
         """Read the guest's status frame; raise WarmTimeout if it never arrives.
 
         Uses an ABSOLUTE deadline (not a per-recv timeout), so a compromised guest
         that dribbles the status frame cannot pin the dispatcher past ``timeout_s``.
+
+        A guest that honours ``ack`` sends START first. That frame is what separates "this slot
+        never executed anything" (the warm base is wedged) from "it started and hung on this
+        document" -- indistinguishable otherwise, because the phase timer only records `guest`
+        once the work COMPLETES. Absent it, ``guest_started`` stays None, meaning "unknown", and
+        nothing downstream is entitled to guess.
         """
         if self._conn is None:
             raise WarmTimeout("signal_go was not called before wait_for_done")
+        # SET ONLY HERE, where the host actually waits to find out. Every earlier placement
+        # claimed "never started" about a job nobody listened for:
+        #   * before the upload -- a guest correctly REFUSING an oversized input frame closes the
+        #     connection, and the broken pipe read as a wedge;
+        #   * after a successful upload -- a transfer that consumed the whole dispatch deadline
+        #     makes the caller return WITHOUT calling this method, so an ack the healthy guest had
+        #     already sent was never read.
+        # Both convict a base for something the guest did right. Reaching this line means we are
+        # about to listen, so a missing ack is genuinely the guest's silence.
+        #
+        # Only meaningful once this image has been SEEN to ack. Before that a missing ack is
+        # indistinguishable from an older worker, and False would be a guess.
+        if self._ack_capable:
+            self.guest_started = False
         deadline = time.monotonic() + timeout_s
         try:
-            return recv_frame(
+            frame = recv_frame(
                 self._conn, max_len=MAX_STATUS_BYTES, deadline=deadline
             ).decode("utf-8")
+            if frame == WARM_ACK:
+                # Ack-capable guest, and it HAS the job. The status is the next frame.
+                self.guest_started = True
+                self._ack_capable.learn(self._ack_gen)
+                frame = recv_frame(
+                    self._conn, max_len=MAX_STATUS_BYTES, deadline=deadline
+                ).decode("utf-8")
+            return frame
         except (OSError, ValueError, ConnectionError) as exc:
-            raise WarmTimeout(f"warm worker did not signal done: {exc}") from exc
+            err = WarmTimeout(f"warm worker did not signal done: {exc}")
+            # HOST-RESOURCE ATTRIBUTION, mirroring signal_go and the file control's `done` read.
+            # An ENOMEM/EMFILE on OUR side of the socket says nothing about the guest -- but we
+            # have already set guest_started=False, so without this the host's own resource
+            # exhaustion is charged to the worker, and three concurrent ones invalidate a healthy
+            # base. Leave the verdict UNKNOWN: we never actually heard from the guest.
+            if isinstance(exc, OSError) and exc.errno in HOST_RESOURCE_ERRNOS:
+                err.host_io = True  # type: ignore[attr-defined]
+                self.guest_started = None
+            raise err from exc
         finally:
             try:
                 self._conn.close()
@@ -990,12 +1107,16 @@ class FirecrackerSlotRuntime:
         subprocess_runner: SubprocessRunner = _default_subprocess_runner,
         ready_signal: ReadySignal | None = None,
     ) -> None:
+        # Shared with every VsockHostWarmControl this runtime hands out: one warm base
+        # image, so ack-capability is a property of the image rather than of a job.
+        self._ack_capable = AckCapability()
         self._cfg = cfg
         self._subprocess_runner = subprocess_runner
         # Default to the live vsock signal — FileReadySignal cannot signal a warm
         # (still-running) slot, so the warm pool could never promote an FC slot.
         self._ready_signal: ReadySignal = (
-            ready_signal if ready_signal is not None else VsockReadySignal()
+            ready_signal if ready_signal is not None
+            else VsockReadySignal(ack_capable=self._ack_capable)
         )
         self._scratch_root = Path(cfg.scratch_root)
         # Per-slot process handles; all mutations under _lock.
@@ -1145,6 +1266,11 @@ class FirecrackerSlotRuntime:
         with self._lock:
             self._procs[slot_id] = fc_proc
 
+        # Stamp the generation this slot was SPAWNED from; see Slot.ack_generation.
+
+        slot.ack_generation = self._ack_capable.generation
+
+
         return slot
 
     def is_ready(self, slot: Slot) -> bool:
@@ -1222,9 +1348,16 @@ class FirecrackerSlotRuntime:
     # ------------------------------------------------------------------
 
     def host_warm_control(self, slot: Slot) -> VsockHostWarmControl:
-        """The vsock warm control for this slot — input/status over vsock."""
+        """The vsock warm control for this slot — input/status over vsock.
+
+        ``ack_capable`` is shared across slots on purpose: every slot restores from the SAME warm
+        base, so whether the guest image speaks the start-ack is a property of the image, not of
+        the job. One ack from any slot proves the image sends them -- and only then is a MISSING
+        ack meaningful. Until then it just means "older worker", which must not convict anything.
+        """
         vsock_uds = self._scratch_root / slot.slot_id / "vsock.sock"
-        return VsockHostWarmControl(vsock_uds)
+        return VsockHostWarmControl(vsock_uds, ack_capable=self._ack_capable,
+                                    ack_generation=slot.ack_generation)
 
     def stage_warm_input(self, slot: Slot, staged_input_path: Path) -> Path:
         """FC input travels over vsock (signal_go reads this path), NOT through a
