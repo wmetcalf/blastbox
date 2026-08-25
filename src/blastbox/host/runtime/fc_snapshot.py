@@ -130,6 +130,10 @@ class SnapshotManager:
         # nothing, and the build then published the very artifact the repair meant to reject --
         # so the second repair request was silently lost (upstream, PR #82).
         self._build_epoch = 0
+        #: The epoch the CURRENT build attempt actually sampled, recorded by build() in the same
+        #: critical section that reads it. _build_worker classifies a failure against this rather
+        #: than against its own earlier read -- see the except handler there.
+        self._attempt_epoch: "int | None" = None
         # Optional. Set by the snapshot runtimes so PUBLICATION -- not readiness, and not even a
         # successful checkpoint -- is what makes a base's ACK advertisement believable.
         self._ack_capable = ack_capable
@@ -262,9 +266,6 @@ class SnapshotManager:
             self._build_thread.start()
 
     def _build_worker(self) -> None:
-        # The epoch this attempt starts under, so a failure can tell "this build is broken" from
-        # "a repair superseded it while it was failing". See the except handler below.
-        started_epoch = self.build_epoch
         try:
             self.build()
         except SnapshotBuildInvalidated:
@@ -281,7 +282,13 @@ class SnapshotManager:
             # returning False, and every job fell to the cold tier for 30s immediately after the
             # repair that was supposed to restore warm capacity.
             with self._build_lock:
-                superseded = started_epoch != self._build_epoch
+                # The epoch THIS ATTEMPT ran under, as build() sampled it -- not a read taken
+                # before build() was even called. None means build() failed before sampling, which
+                # cannot happen today; treat it as NOT superseded, because the safe direction here
+                # is to arm the backoff (a spurious 30s cold window) rather than to skip it (a hot
+                # retry loop of full base boots).
+                _attempt = self._attempt_epoch
+                superseded = _attempt is not None and _attempt != self._build_epoch
                 if not superseded:
                     self._build_error = exc
                     self._retry_not_before = time.monotonic() + self._build_retry_backoff_s
@@ -410,6 +417,11 @@ class SnapshotManager:
         # needed here — there is nothing to kill until it returns a BootHandle.
         with self._build_lock:
             epoch = self._build_epoch
+            # PUBLISHED for _build_worker, from inside the same hold that samples it. The worker
+            # used to take its own read before calling build(); an invalidate() landing between
+            # the two made a genuinely-failed REPLACEMENT build look superseded, so no backoff was
+            # armed and the next tick immediately relaunched another full base boot.
+            self._attempt_epoch = epoch
         # SCOPE the ACK advertisement to THIS attempt. A retry shares the generation of the
         # attempt it replaces (nothing invalidates in between), so a failed build's observation
         # would otherwise be available for a later, possibly ACK-incapable, build to confirm.

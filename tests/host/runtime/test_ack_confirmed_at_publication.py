@@ -741,3 +741,68 @@ def test_a_manager_without_pinned_epoch_is_loud(tmp_path, caplog):
     assert slot.ack_generation is None
     assert any("manager_without_pinned_epoch" in r.message for r in caplog.records), (
         "the runtime disabled the fast repair without saying so")
+
+
+def test_a_failed_replacement_build_still_arms_the_backoff(tmp_path):
+    """_build_worker used to take its OWN read of the epoch before calling build(), while build()
+    samples _build_epoch itself. An invalidate() landing between those two reads made a genuinely
+    failed REPLACEMENT build look superseded: no _build_error recorded, no backoff armed, and the
+    next pool tick immediately relaunched another full base boot -- a hot retry loop of the most
+    expensive operation the tier has.
+
+    The epoch a failure is judged against must be the one the attempt ACTUALLY ran under."""
+    import time as _t
+
+    class _Boom:
+        def wait_ready(self, t):
+            raise RuntimeError("the replacement build genuinely failed")
+
+        def kill(self):
+            pass
+
+    class _Backend2:
+        _epoch_sampler = _launcher = None
+
+        def boot_base(self):
+            return _Boom()
+
+    mgr = SnapshotManager(Path(tmp_path), _Backend2(), build_retry_backoff_s=30.0)
+
+    # A repair lands in the window: after the worker begins, before build() samples the epoch.
+    real_build = mgr.build
+
+    def _invalidate_then_build():
+        mgr.invalidate()
+        return real_build()
+
+    mgr.build = _invalidate_then_build
+    mgr._build_worker()
+
+    assert mgr._build_error is not None, (
+        "the replacement build failed on its own merits and was written off as superseded")
+    assert _t.monotonic() < mgr._retry_not_before, (
+        "no backoff armed -- the next tick relaunches a full base boot immediately")
+
+
+def test_a_build_superseded_mid_flight_still_skips_the_backoff(tmp_path):
+    """Control: a build invalidated WHILE running must still retry at once, not back off."""
+    import time as _t
+
+    class _InvalidatesDuringBoot:
+        def __init__(self, mgr_box):
+            self._box = mgr_box
+            self._epoch_sampler = self._launcher = None
+
+        def boot_base(self):
+            self._box[0].invalidate()          # the repair lands mid-build
+            raise RuntimeError("boot failed after the repair landed")
+
+    box: list = []
+    mgr = SnapshotManager(Path(tmp_path), _InvalidatesDuringBoot(box),
+                          build_retry_backoff_s=30.0)
+    box.append(mgr)
+    mgr._build_worker()
+
+    assert mgr._build_error is None, "a superseded build must not record its error"
+    assert _t.monotonic() >= mgr._retry_not_before, (
+        "a superseded build must not delay the replacement")
