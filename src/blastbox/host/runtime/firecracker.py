@@ -902,18 +902,7 @@ class VsockHostWarmControl:
             conn.settimeout(max(0.0, deadline - time.monotonic()))
         send_frame(conn, header)
         send_frame_from_file(conn, path, deadline=deadline)
-        # ONLY AFTER THE TRANSFER SUCCEEDS. Set before it, this convicted the base for failures
-        # that are input-specific and deterministic: a guest correctly REJECTING a frame larger
-        # than its own MAX_INPUT_BYTES closes the connection, and the resulting broken pipe looked
-        # identical to a wedge -- three oversized documents would then rebuild a healthy base. A
-        # large upload merely exhausting the shared deadline reads the same way. Past this line
-        # the guest demonstrably has the bytes, so a missing ack really is the guest.
-        #
-        # The cost is that a guest which never drains its input stays UNKNOWN rather than
-        # counting. That is the honest answer: from here it is indistinguishable from an input
-        # the guest was right to refuse.
-        if self._ack_capable:
-            self.guest_started = False
+
 
     def wait_for_done(self, *, timeout_s: float) -> str:
         """Read the guest's status frame; raise WarmTimeout if it never arrives.
@@ -929,6 +918,16 @@ class VsockHostWarmControl:
         """
         if self._conn is None:
             raise WarmTimeout("signal_go was not called before wait_for_done")
+        # SET ONLY HERE, where the host actually waits to find out. Every earlier placement
+        # claimed "never started" about a job nobody listened for:
+        #   * before the upload -- a guest correctly REFUSING an oversized input frame closes the
+        #     connection, and the broken pipe read as a wedge;
+        #   * after a successful upload -- a transfer that consumed the whole dispatch deadline
+        #     makes the caller return WITHOUT calling this method, so an ack the healthy guest had
+        #     already sent was never read.
+        # Both convict a base for something the guest did right. Reaching this line means we are
+        # about to listen, so a missing ack is genuinely the guest's silence.
+        #
         # Only meaningful once this image has been SEEN to ack. Before that a missing ack is
         # indistinguishable from an older worker, and False would be a guess.
         if self._ack_capable:

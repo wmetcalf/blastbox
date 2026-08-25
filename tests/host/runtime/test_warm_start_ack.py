@@ -179,3 +179,27 @@ def test_an_input_the_guest_refuses_is_not_blamed_on_the_base(tmp_path):
         ctl.signal_go(WarmJobSpec(input_path=big, output_dir=Path("/tmp"), params={}))
     assert ctl.guest_started is None, (
         "a transfer that never landed says nothing about whether the guest can execute")
+
+
+def test_a_transfer_that_eats_the_deadline_is_not_blamed_on_the_base(tmp_path):
+    """A large but SUCCESSFUL upload can consume the whole dispatch deadline, after which the
+    caller returns without ever calling wait_for_done -- so an ack the healthy guest already sent
+    is never read. Claiming "never started" there convicts a base for a slow document."""
+    from blastbox.worker.warm import WarmJobSpec
+
+    host_sock, guest_sock = socket.socketpair()
+    seen = {"yes"}                                  # image is known to ack
+    ctl = _control(host_sock, ack_capable=seen)
+    big = Path("/tmp/blastbox-ack-deadline-input")
+    big.write_bytes(b"x" * 4096)
+
+    # transfer succeeds; the caller then gives up before waiting (remaining <= 0)
+    ctl.signal_go(WarmJobSpec(input_path=big, output_dir=Path("/tmp"), params={}))
+    assert ctl.guest_started is None, (
+        "the host never listened for the ack, so it cannot claim the guest never started")
+
+
+def test_the_state_is_claimed_only_once_the_host_listens(tmp_path):
+    """The whole rule in one line: signal_go never decides; wait_for_done does."""
+    ctl, status = _run("wedged", ack_capable={"yes"})
+    assert status is None and ctl.guest_started is False
