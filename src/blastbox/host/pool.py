@@ -2590,8 +2590,25 @@ class WarmPool:
                 pool_failures, now - float(last or now), self._base_rebuild_cooldown_s,
             )
             if reason == "spawn":
+                # ONLY when the repair that opened this cooldown actually touched the tier this
+                # streak is about. The justification for discarding -- "if the base were the
+                # problem, the previous rebuild would have fixed it" -- is a statement about ONE
+                # base. In a cascade the cooldown is global, so tier B crossing its threshold
+                # while tier A's repair cools was having its evidence thrown away on the strength
+                # of a repair that never touched it; B then had to sacrifice another
+                # threshold-sized batch of spawns, and a busy cascade repairing siblings can
+                # postpone it indefinitely. success_scope names the tiers a spawn repair would
+                # target, so the overlap is now checkable.
                 with self._lock:
-                    self._spawn_consecutive_failures = 0
+                    _winner = set(self._last_base_rebuild_idents)
+                if not success_scope or (_winner & set(success_scope)):
+                    with self._lock:
+                        self._spawn_consecutive_failures = 0
+                else:
+                    logger.info(
+                        "pool.spawn_streak_retained cooling_repair=%s guilty=%s -- the repair "
+                        "that opened this cooldown did not touch the tier these spawn failures "
+                        "are about", sorted(_winner) or "<none>", list(success_scope))
             elif episode_ident in self._last_base_rebuild_idents:
                 # THIS base was just rebuilt and is still failing, so the cause is elsewhere --
                 # the original reasoning, and it still holds. Drop the evidence.
@@ -2693,8 +2710,21 @@ class WarmPool:
                     self._restore_episode(episode_ident, pool_failures, _consumed_pre_guest,
                                           reason)
                 return False
+            # RE-CHECK, under the lock, before acting. The pre-lock verdict is stale by however
+            # long we queued behind another repair -- and a holder whose repair FAILED leaves
+            # _last_base_rebuild_at untouched, so the cooldown branch above does not fire and
+            # nothing else re-examines recovery on the way past. A current-generation slot from
+            # this base completing during that wait means we would now rebuild a base that has
+            # just proved it works. The evidence is pre-recovery, so it is DISCARDED rather than
+            # restored, exactly as in the branch above.
+            if self._base_succeeded_since(episode_ident, success_token, success_scope):
+                logger.info(
+                    "pool.base_rebuild_skipped reason=slot_succeeded_during_lock_wait base=%s "
+                    "-- no competing repair committed, but this base recovered while we waited",
+                    episode_ident or "<default>")
+                return False
             return self._invalidate_now(drop, reason, pool_failures, success_token, now,
-                                        episode_ident, _consumed_pre_guest)
+                                        episode_ident, _consumed_pre_guest, success_scope)
 
     def _spawn_success_scope(self) -> "tuple[str, ...]":
         """Which base identities a spawn-triggered repair would target, per the runtime.
@@ -2762,7 +2792,8 @@ class WarmPool:
                     pre_guest_slots)
 
     def _invalidate_now(self, drop, reason, pool_failures, success_token, now,
-                        episode_ident, pre_guest_slots=frozenset()):  # noqa: ANN001, ANN201
+                        episode_ident, pre_guest_slots=frozenset(),
+                        success_scope=()):  # noqa: ANN001, ANN201
         """Perform the invalidation. CALLER MUST HOLD ``self._invalidation_lock``."""
         try:
             # Pass the trigger through when the runtime accepts it: a cascade can only attribute a
@@ -2811,7 +2842,19 @@ class WarmPool:
                 # already retained by its own caller -- copying its count into the job counter
                 # meant one later worker fault could trigger an immediate job-driven rebuild, and
                 # in a cascade that repair carries no tier attribution and hits every tier (PR #82).
-                self._restore_episode(episode_ident, pool_failures, pre_guest_slots, reason)
+                #
+                # ...unless the base RECOVERED while this slow repair was failing. The consumed
+                # pre-guest set is threshold-crossed by construction, so restoring it re-arms the
+                # fast path immediately: one later worker fault then rebuilds a base that has
+                # since executed a job end to end. A clean release is the strongest evidence the
+                # pool has, and it outranks the evidence collected before it.
+                if self._base_succeeded_since(episode_ident, success_token, success_scope):
+                    logger.info(
+                        "pool.base_rebuild_episode_discarded reason=slot_succeeded_during_repair "
+                        "base=%s -- the repair failed, but the base proved it works",
+                        episode_ident or "<default>")
+                else:
+                    self._restore_episode(episode_ident, pool_failures, pre_guest_slots, reason)
             return False
         with self._lock:
             if reason == "spawn":

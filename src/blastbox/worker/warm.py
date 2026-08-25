@@ -430,6 +430,30 @@ class HostWarmControl:
         )
         self._atomic_write("go.json", payload)
 
+    def _started_marker_present(self) -> bool:
+        """Is ``ctrl/started`` there, as a REGULAR file, without following a link out of ctrl/?
+
+        ``Path.exists()`` follows symlinks. ctrl/ is WORKER-WRITABLE on the gVisor tier (bind
+        mounted 0o777), so a compromised worker could point `started` at any host path and have
+        this poll stat it -- a control-boundary violation on its own, and against a target on a
+        blocking automount or a FIFO it pins the dispatch thread far outside ``timeout_s``, which
+        is the one thing this loop must never allow. `ready` and `done` have been read through the
+        confined helper since PR #82; this probe was missed.
+
+        A symlinked, special or non-regular marker is NOT a start. It is a worker violating the
+        protocol, and reading it as "the guest ran" would excuse the very base this repairs.
+        """
+        from blastbox.contract.envelope import open_confined_regular_fd
+
+        try:
+            os.close(open_confined_regular_fd(self._dir, WARM_STARTED))
+        except (OSError, ValueError):
+            # FileNotFoundError (not written yet) is the ordinary case and is an OSError;
+            # ELOOP/ENOTDIR (symlink or non-dir component) and ValueError (not a regular file)
+            # are violations. Neither is a start.
+            return False
+        return True
+
     def _ctrl_writable(self) -> bool:
         """Can THIS host still write into the control dir?
 
@@ -514,7 +538,7 @@ class HostWarmControl:
             next_ctrl_probe = time.monotonic() + _CTRL_PROBE_INTERVAL_S
 
         while True:
-            if self.guest_started is not True and (self._dir / WARM_STARTED).exists():
+            if self.guest_started is not True and self._started_marker_present():
                 # The worker picked the job up. Whatever fails after this is about the DOCUMENT,
                 # not about whether the base can produce a working guest.
                 self.guest_started = True

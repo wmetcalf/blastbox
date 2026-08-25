@@ -772,3 +772,98 @@ def test_a_broken_attribution_seam_does_not_stop_a_repair_decision():
     pool = _pool(_Broken(), snapshot_rebuild_after=2, base_rebuild_cooldown_s=0)
     assert pool._spawn_success_scope() == ()
     assert pool._maybe_rebuild_base(5, reason="spawn") is True
+
+
+def test_a_recovery_during_the_lock_wait_is_caught_even_when_the_winner_failed():
+    """The staleness verdict is taken BEFORE queueing on _invalidation_lock, and only the cooldown
+    branch re-examines it -- but that branch is driven by _last_base_rebuild_at, which a holder
+    whose repair FAILED never sets. So a base that completed a job while we queued was rebuilt
+    anyway, with nothing on the path left to notice."""
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=300.0)
+    real = pool._invalidation_lock
+
+    class _HolderFailedButThisBaseRecovered:
+        def __enter__(self):
+            real.acquire()
+            # The holder's repair raised: no _last_base_rebuild_at, no _last_base_rebuild_idents.
+            # Meanwhile a current-generation tierB slot completed cleanly.
+            pool._clean_release_by_base["tierB"] = (
+                pool._clean_release_by_base.get("tierB", 0) + 1)
+            return self
+
+        def __exit__(self, *exc):
+            real.release()
+            return False
+
+    pool._invalidation_lock = _HolderFailedButThisBaseRecovered()
+    assert pool._last_base_rebuild_at is None, "precondition: no repair has committed"
+    for slot in _claim_distinct(pool, 3):
+        _fail(pool, slot, stage="pre_guest")
+
+    assert rt.base_invalidations == 0, (
+        "tierB produced a valid result while this decision queued; rebuilding it now is an "
+        "outage taken against a base that just proved it works")
+
+
+def test_a_failed_repair_does_not_restore_evidence_the_base_has_since_disproved():
+    """The consumed pre-guest set is threshold-crossed by construction, so restoring it re-arms
+    the fast path at once: one later worker fault then rebuilds a base that has since executed a
+    job end to end."""
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=0)
+
+    def _drop(*, reason=None, only=None):
+        # A slow repair that ultimately fails -- and while it ran, a tierB slot completed.
+        pool._clean_release_by_base["tierB"] = (
+            pool._clean_release_by_base.get("tierB", 0) + 1)
+        raise OSError("tierB could not be dropped")
+
+    rt.invalidate_base = _drop
+    for slot in _claim_distinct(pool, 3):
+        _fail(pool, slot, stage="pre_guest")
+
+    assert not pool._pool_pre_guest_failures.get("tierB"), (
+        "pre-recovery pre-guest evidence was handed back to a base that has since produced a "
+        "valid result")
+
+
+def test_a_sibling_tiers_cooldown_does_not_discard_this_tiers_spawn_streak():
+    """The cooldown is global but the justification for discarding is about ONE base: 'if the base
+    were the problem, the previous rebuild would have fixed it'. Tier B crossing while tier A's
+    repair cools had its evidence thrown away on the strength of a repair that never touched it."""
+    rt = _ScopedWedge(guilty=("tierB",))
+    pool = _pool(rt, snapshot_rebuild_after=2, base_rebuild_cooldown_s=300.0)
+    pool._last_base_rebuild_at = pool._clock()
+    pool._last_base_rebuild_idents = {"tierA"}          # a DIFFERENT tier was repaired
+    pool._spawn_consecutive_failures = 5
+
+    assert pool._maybe_rebuild_base(5, reason="spawn") is False   # cooling, correctly
+    assert pool._spawn_consecutive_failures == 5, (
+        "tierB's spawn evidence was discarded because tierA had just been repaired; tierB must "
+        "not sacrifice another threshold-sized batch of spawns for that")
+
+
+def test_a_cooldown_from_this_tiers_own_repair_still_discards_the_streak():
+    """Control: the original reasoning holds when the repair DID touch this tier."""
+    rt = _ScopedWedge(guilty=("tierB",))
+    pool = _pool(rt, snapshot_rebuild_after=2, base_rebuild_cooldown_s=300.0)
+    pool._last_base_rebuild_at = pool._clock()
+    pool._last_base_rebuild_idents = {"tierB"}          # THIS tier was just repaired
+    pool._spawn_consecutive_failures = 5
+
+    assert pool._maybe_rebuild_base(5, reason="spawn") is False
+    assert pool._spawn_consecutive_failures == 0, (
+        "this tier was just rebuilt and still fails, so the cause is elsewhere -- drop it")
+
+
+def test_an_unattributed_spawn_cooldown_still_discards_the_streak():
+    """No attribution -> the old pool-wide behaviour, unchanged."""
+    rt = _TieredWedge()                                 # no spawn_guilty_identities seam
+    pool = _pool(rt, snapshot_rebuild_after=2, base_rebuild_cooldown_s=300.0)
+    pool._last_base_rebuild_at = pool._clock()
+    pool._last_base_rebuild_idents = {"tierA"}
+    pool._spawn_consecutive_failures = 5
+
+    assert pool._maybe_rebuild_base(5, reason="spawn") is False
+    assert pool._spawn_consecutive_failures == 0
