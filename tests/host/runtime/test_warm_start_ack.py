@@ -217,3 +217,37 @@ def test_the_ready_token_advertises_ack_capability_and_stays_old_host_safe():
     assert _READY_TOKEN in advertised, "an older host must still recognise this as READY"
     assert READY_ACK_SUFFIX in advertised
     assert _READY_TOKEN not in READY_ACK_SUFFIX, "the suffix must not itself look like READY"
+
+
+def test_snapshot_mode_learns_capability_from_the_BASE_build():
+    """In snapshot mode restored guests never re-signal readiness -- is_ready() relies on restore
+    liveness alone -- so the base build is the only place the advertisement is ever visible. And
+    the base VM IS the image the slots run: every slot is a restore of that guest. Without this
+    the set stays empty on a base wedged from its first restore, and the repair is inert on
+    exactly the base it exists to fix."""
+    import inspect
+
+    from blastbox.host.runtime import fc_snapshot_runtime as m
+
+    src = inspect.getsource(m.select_fc_snapshot_runtime) \
+        if hasattr(m, "select_fc_snapshot_runtime") else inspect.getsource(m)
+    assert "ack_capable=ack_capable" in src, (
+        "the base-build listener and the restore runtime must share one capability set")
+
+    # the factory really does forward it
+    sig = inspect.signature(m._vsock_ready_check_factory)
+    assert "ack_capable" in sig.parameters
+
+
+def test_the_snapshot_runtime_accepts_a_shared_capability_set():
+    import inspect
+
+    from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
+    assert "ack_capable" in inspect.signature(SnapshotSlotRuntime.__init__).parameters
+    rt = object.__new__(SnapshotSlotRuntime)
+    shared: set[str] = set()
+    rt._ack_capable = shared
+    a = type("S", (), {"output_dir": Path("/tmp/a/out")})()
+    ctl = SnapshotSlotRuntime.host_warm_control(rt, a)
+    shared.add("yes")                      # learned at base build...
+    assert ctl._ack_capable, "...and visible to a control handed out before that"

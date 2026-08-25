@@ -36,7 +36,9 @@ from blastbox.host.runtime.fc_snapshot_launcher import REL_OUTDISK, REL_VSOCK
 _log = logging.getLogger(__name__)
 
 
-def _vsock_ready_check_factory(vsock_path: Path) -> Callable[[float], None]:
+def _vsock_ready_check_factory(vsock_path: Path,
+                               ack_capable: "set[str] | None" = None
+                               ) -> Callable[[float], None]:
     """Build a blocking ``ready_check(timeout_s)`` for the base-VM build.
 
     The base VM warms its engine (e.g. ``unoserver``) then signals READY over vsock;
@@ -47,10 +49,12 @@ def _vsock_ready_check_factory(vsock_path: Path) -> Callable[[float], None]:
     from blastbox.host.runtime.firecracker import VsockReadySignal
 
     base_dir = vsock_path.parent
-    # No shared set here on purpose: this listener watches the WARM-BASE build, not a slot, and
-    # its readiness says nothing about the image the slots will run. Capability is learned from
-    # the per-slot listener (see FirecrackerSlotRuntime) or from a completed ack.
-    signal = VsockReadySignal()
+    # THE ONLY PLACE the advertisement is observable in snapshot mode, and the comment that stood
+    # here claimed the opposite. Restored guests never re-signal readiness -- is_ready() relies on
+    # restore liveness alone -- so nothing after the base build ever sees READY again. And the
+    # base VM IS the image the slots run: every slot is a restore of this very guest. Without
+    # this, a base wedged from its first restore never populates the set and the repair is inert.
+    signal = VsockReadySignal(ack_capable=ack_capable)
     faux = Slot(
         slot_id="warm-base",
         control_dir=base_dir,
@@ -96,11 +100,13 @@ class SnapshotSlotRuntime:
         manager: SnapshotManager,
         *,
         settle_s: float = 1.0,
+        ack_capable: "set[str] | None" = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        # Shared with every VsockHostWarmControl handed out (see host_warm_control):
-        # one warm base image, so ack-capability belongs to the image, not the job.
-        self._ack_capable: set[str] = set()
+        # Shared with every VsockHostWarmControl handed out (see host_warm_control) AND with the
+        # base-build ready listener, which is the only place the advertisement is visible in
+        # snapshot mode -- restored guests never signal readiness again.
+        self._ack_capable: set[str] = ack_capable if ack_capable is not None else set()
         self._cfg = cfg
         self._manager = manager
         # cfg.max_extracted_bytes bounds rdump output; fall back to a 512 MiB default
@@ -468,12 +474,15 @@ def select_snapshot_runtime(
     # handle writes warm.mem there at checkpoint) and the backend (whose restore loads
     # mem from there) so build/restore agree on the mem-file location.
     mem_dir = resolve_mem_dir() or base_dir
+    # Created HERE so the base-build listener and the runtime that serves restores share one set:
+    # the base advertises at build time, every restored slot then reads the answer.
+    ack_capable: set[str] = set()
     launcher = FcSnapshotLauncher(
         cfg,
         base_dir,
         mem_dir=mem_dir,
-        ready_check_factory=_vsock_ready_check_factory,
+        ready_check_factory=lambda p: _vsock_ready_check_factory(p, ack_capable=ack_capable),
     )
     backend = FcSnapshotBackend.from_env(base_dir, launcher, mem_dir=mem_dir)
     manager = SnapshotManager(base_dir, backend)
-    return SnapshotSlotRuntime(cfg, manager, settle_s=settle_s)
+    return SnapshotSlotRuntime(cfg, manager, settle_s=settle_s, ack_capable=ack_capable)

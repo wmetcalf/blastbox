@@ -369,9 +369,16 @@ class HostWarmControl:
         # start-marker left it permanently UNKNOWN -- inert on exactly the base this repairs. But
         # `ready` is written when the slot WARMS, which a wedged base still does, so the
         # advertisement survives the wedge.
+        # CONFINED READ. ctrl/ is WORKER-WRITABLE on the gVisor tier (bind-mounted 0o777), so a
+        # compromised worker could replace `ready` with a FIFO, a symlink to a blocking device, or
+        # a huge file. A plain read_text() follows all three, has no size cap, and runs BEFORE the
+        # timeout loop -- so it could pin the dispatcher indefinitely or exhaust host memory
+        # outside timeout_s entirely. `done` has been read through the confined helper for exactly
+        # this reason since PR #82; this read must be too.
         try:
-            _rdy = (self._dir / "ready").read_text(errors="replace")
-        except OSError:
+            _rdy = read_confined_regular_bytes(
+                self._dir, "ready", max_bytes=4096).decode("utf-8", "replace")
+        except (OSError, ValueError):
             _rdy = ""
         if "ack=1" in _rdy:
             self._ack_capable.add("yes")

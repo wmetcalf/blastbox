@@ -159,3 +159,37 @@ def test_an_older_image_that_advertises_nothing_stays_unknown(tmp_path):
     except Exception:
         pass
     assert host.guest_started is None
+
+
+def test_a_hostile_ready_file_cannot_block_or_exhaust_the_dispatcher(tmp_path):
+    """ctrl/ is WORKER-WRITABLE on the gVisor tier, so `ready` is attacker-controlled. A plain
+    read follows a symlink or FIFO and has no size cap -- and it runs BEFORE the timeout loop, so
+    it could pin the dispatcher outside timeout_s entirely. `done` has been read through the
+    confined helper since PR #82; this read must be too."""
+    import os
+
+    ctrl, src, out = _dirs(tmp_path)
+    outside = tmp_path / "secret"
+    outside.write_text("ack=1\n")
+    os.symlink(outside, ctrl / "ready")            # symlink out of the confined dir
+
+    host = HostWarmControl(ctrl)
+    host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
+    try:
+        host.wait_for_done(timeout_s=0.3)
+    except Exception:
+        pass
+    assert host.guest_started is None, (
+        "a symlinked `ready` must not be followed, and must not teach capability")
+
+
+def test_an_oversized_ready_file_is_refused(tmp_path):
+    ctrl, src, out = _dirs(tmp_path)
+    (ctrl / "ready").write_bytes(b"ack=1\n" + b"x" * 100_000)
+    host = HostWarmControl(ctrl)
+    host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
+    try:
+        host.wait_for_done(timeout_s=0.3)
+    except Exception:
+        pass
+    assert host.guest_started is None, "an oversized ready must be refused, not read"
