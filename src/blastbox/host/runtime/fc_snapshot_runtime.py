@@ -47,6 +47,9 @@ def _vsock_ready_check_factory(vsock_path: Path) -> Callable[[float], None]:
     from blastbox.host.runtime.firecracker import VsockReadySignal
 
     base_dir = vsock_path.parent
+    # No shared set here on purpose: this listener watches the WARM-BASE build, not a slot, and
+    # its readiness says nothing about the image the slots will run. Capability is learned from
+    # the per-slot listener (see FirecrackerSlotRuntime) or from a completed ack.
     signal = VsockReadySignal()
     faux = Slot(
         slot_id="warm-base",

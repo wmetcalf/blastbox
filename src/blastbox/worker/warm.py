@@ -192,7 +192,11 @@ class FileWarmControl:
 
     def signal_ready(self) -> None:
         """Atomically create ``control_dir/ready``."""
-        self._atomic_write("ready", "ready\n")
+        # Advertise the start-marker capability HERE, before any job. Learning it only from a
+        # completed marker leaves a base that is wedged from its first slot permanently UNKNOWN --
+        # so the fast repair can never arm on exactly the base it exists to repair. An older host
+        # only checks that `ready` exists, so the extra line is invisible to it.
+        self._atomic_write("ready", "ready\nack=1\n")
 
     def wait_for_go(self, *, timeout_s: float) -> WarmJobSpec:
         """Poll for ``control_dir/go.json`` until present or ``timeout_s`` elapsed.
@@ -360,6 +364,17 @@ class HostWarmControl:
         from blastbox.contract.envelope import read_confined_regular_bytes
 
         deadline = time.monotonic() + timeout_s
+        # LEARN CAPABILITY FIRST, from the READINESS marker rather than from a completed job. A
+        # base wedged from its first slot never finishes anything, so learning only from a written
+        # start-marker left it permanently UNKNOWN -- inert on exactly the base this repairs. But
+        # `ready` is written when the slot WARMS, which a wedged base still does, so the
+        # advertisement survives the wedge.
+        try:
+            _rdy = (self._dir / "ready").read_text(errors="replace")
+        except OSError:
+            _rdy = ""
+        if "ack=1" in _rdy:
+            self._ack_capable.add("yes")
         # SET ONLY HERE, where the host actually waits to find out -- same rule as the vsock twin.
         # Claiming "never started" anywhere earlier convicts a base for a job nobody listened for.
         if self._ack_capable:

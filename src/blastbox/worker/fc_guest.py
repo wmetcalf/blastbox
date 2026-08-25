@@ -30,6 +30,15 @@ HOST_CID = 2
 # Must match host firecracker._READY_PORT / _READY_TOKEN.
 READY_PORT = 10000
 READY_TOKEN = b"READY"
+#: Appended to READY by a worker that speaks the start-ack. The host's check is a SUBSTRING test
+#: (`READY_TOKEN in data`), so an older host still sees a plain READY and is unaffected -- and a
+#: newer host learns the image is ack-capable BEFORE any job runs.
+#:
+#: That ordering is the whole point. Learning capability from a completed ack means a base that is
+#: wedged from its very first slot -- a dispatcher restarting onto a poisoned artifact, which is
+#: the common case -- never teaches the host anything, so a missing ack stays UNKNOWN forever and
+#: the fast repair can never arm on exactly the base it exists to repair.
+READY_ACK_SUFFIX = b"+ack1"
 # Job control plane: the host connects to the guest on this vsock port to deliver
 # one job (header + input bytes) and read back the status — full-duplex, one
 # connection per job. Must match host firecracker._JOB_PORT.
@@ -184,7 +193,7 @@ def signal_ready_vsock(
     *,
     cid: int = HOST_CID,
     port: int = READY_PORT,
-    token: bytes = READY_TOKEN,
+    token: bytes = READY_TOKEN + READY_ACK_SUFFIX,
     retries: int = 60,
     backoff_s: float = 0.5,
     socket_factory: SocketFactory = _default_vsock_factory,

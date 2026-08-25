@@ -203,3 +203,17 @@ def test_the_state_is_claimed_only_once_the_host_listens(tmp_path):
     """The whole rule in one line: signal_go never decides; wait_for_done does."""
     ctl, status = _run("wedged", ack_capable={"yes"})
     assert status is None and ctl.guest_started is False
+
+
+def test_the_ready_token_advertises_ack_capability_and_stays_old_host_safe():
+    """BOOTSTRAP for the vsock path. Capability learned only from a completed ack leaves a base
+    wedged from its first slot permanently UNKNOWN. The host's readiness check is a SUBSTRING test
+    (`READY_TOKEN in data`), so appending a suffix teaches a new host at readiness while an older
+    one still matches a plain READY."""
+    from blastbox.host.runtime.firecracker import _READY_TOKEN
+    from blastbox.worker.fc_guest import READY_ACK_SUFFIX, READY_TOKEN
+
+    advertised = READY_TOKEN + READY_ACK_SUFFIX
+    assert _READY_TOKEN in advertised, "an older host must still recognise this as READY"
+    assert READY_ACK_SUFFIX in advertised
+    assert _READY_TOKEN not in READY_ACK_SUFFIX, "the suffix must not itself look like READY"

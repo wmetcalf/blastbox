@@ -63,6 +63,7 @@ from blastbox.worker.fc_guest import (
     send_frame,
     send_frame_from_file,
     WARM_ACK,
+    READY_ACK_SUFFIX,
 )
 
 __all__ = [
@@ -657,7 +658,14 @@ class VsockReadySignal:
     compromised guest cannot make the host do anything except observe READY.
     """
 
-    def __init__(self, *, max_bytes: int = _READY_MAX_BYTES) -> None:
+    def __init__(self, *, max_bytes: int = _READY_MAX_BYTES,
+                 ack_capable: "set[str] | None" = None) -> None:
+        # Shared with the runtime's warm controls. Populated HERE, at readiness, so a base that is
+        # wedged from its very first slot -- no job ever completes, so no ack is ever seen -- is
+        # still known to be ack-capable and can arm the fast repair. Learning it only from a
+        # completed ack left the repair inert on exactly the poisoned-from-the-outset base it
+        # exists to fix, which is what a dispatcher restarting onto a bad artifact produces.
+        self._ack_capable: set[str] = ack_capable if ack_capable is not None else set()
         self._max_bytes = max_bytes
         self._slots: dict[str, _VsockReadyState] = {}
         self._lock = threading.Lock()
@@ -755,7 +763,12 @@ class VsockReadySignal:
                     pending.pop(conn, None)
                     conn.close()
                     if _READY_TOKEN in data:
-                        _log.info("fc.vsock_ready_received slot_id=%s", slot_id)
+                        if READY_ACK_SUFFIX in data:
+                            # Learned BEFORE any job, which is what makes the fast repair usable
+                            # on a base that was already poisoned when this dispatcher started.
+                            self._ack_capable.add("yes")
+                        _log.info("fc.vsock_ready_received slot_id=%s ack_capable=%s",
+                                  slot_id, READY_ACK_SUFFIX in data)
                         state.ready.set()
                         return
                 # Drop connections that connected but never sent READY in time.
@@ -1041,7 +1054,8 @@ class FirecrackerSlotRuntime:
         # Default to the live vsock signal — FileReadySignal cannot signal a warm
         # (still-running) slot, so the warm pool could never promote an FC slot.
         self._ready_signal: ReadySignal = (
-            ready_signal if ready_signal is not None else VsockReadySignal()
+            ready_signal if ready_signal is not None
+            else VsockReadySignal(ack_capable=self._ack_capable)
         )
         self._scratch_root = Path(cfg.scratch_root)
         # Per-slot process handles; all mutations under _lock.

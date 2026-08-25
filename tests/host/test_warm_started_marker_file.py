@@ -130,3 +130,32 @@ def test_a_worker_that_cannot_mark_its_start_refuses_the_job(tmp_path, monkeypat
 
     with pytest.raises(WarmTimeout, match="mark job start"):
         guest.wait_for_go(timeout_s=2.0)
+
+
+def test_capability_is_learned_from_readiness_not_from_a_completed_job(tmp_path):
+    """BOOTSTRAP. A base wedged from its very first slot never completes a job, so learning
+    capability only from a written marker left it permanently UNKNOWN -- inert on exactly the
+    poisoned-from-the-outset base this repairs, which is what a dispatcher restarting onto a bad
+    artifact produces. `ready` is written when the slot WARMS, which a wedged base still does."""
+    ctrl, src, out = _dirs(tmp_path)
+    FileWarmControl(ctrl).signal_ready()          # the slot warms...
+    host = HostWarmControl(ctrl)                  # ...with NO prior capability memory
+    host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
+    try:
+        host.wait_for_done(timeout_s=0.3)         # ...and then never executes anything
+    except Exception:
+        pass
+    assert host.guest_started is False, (
+        "readiness advertised the capability, so a missing marker is the guest, not an old image")
+
+
+def test_an_older_image_that_advertises_nothing_stays_unknown(tmp_path):
+    ctrl, src, out = _dirs(tmp_path)
+    (ctrl / "ready").write_text("ready\n")        # old worker: no advertisement
+    host = HostWarmControl(ctrl)
+    host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
+    try:
+        host.wait_for_done(timeout_s=0.3)
+    except Exception:
+        pass
+    assert host.guest_started is None
