@@ -222,6 +222,7 @@ def test_the_gvisor_base_build_records_ack_capability(tmp_path):
     h._ctrl = ctrl
     h._ready = lambda _d, _t: None                     # readiness already satisfied
     h._ack_capable = seen
+    h._ack_gen = seen.generation          # the generation this build started under
     GvisorBootHandle.wait_ready(h, 1.0)
     assert seen, "the base's advertisement must be recorded at build time"
 
@@ -238,6 +239,7 @@ def test_an_older_gvisor_base_teaches_nothing(tmp_path):
     h._ctrl = ctrl
     h._ready = lambda _d, _t: None
     h._ack_capable = seen
+    h._ack_gen = seen.generation          # the generation this build started under
     GvisorBootHandle.wait_ready(h, 1.0)
     assert not seen, "no advertisement means UNKNOWN, which must convict nothing"
 
@@ -491,3 +493,55 @@ def test_a_slot_spawned_after_the_reset_does_teach_the_new_base(tmp_path):
     except Exception:
         pass
     assert bool(cap) is True, "the current generation's advertisement must still count"
+
+
+def test_a_retired_base_build_cannot_teach_the_replacement(tmp_path):
+    """A build still waiting for readiness when invalidate_base() runs is rejected by
+    SnapshotManager's build epoch -- but an UNSTAMPED learn() would still have marked the
+    REPLACEMENT generation capable on the way out. An older bundle without start markers would
+    then inherit a capability it does not have."""
+    from blastbox.host.runtime.gvisor_snapshot import GvisorBootHandle
+
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    FileWarmControl(ctrl).signal_ready()
+
+    cap = AckCapability()
+    h = object.__new__(GvisorBootHandle)
+    h._ctrl = ctrl
+    h._ready = lambda _d, _t: None
+    h._ack_capable = cap
+    h._ack_gen = cap.generation           # this build started under the OLD generation
+    cap.reset()                           # ...and the base was replaced while it waited
+
+    GvisorBootHandle.wait_ready(h, 1.0)
+    assert bool(cap) is False, (
+        "a retired build's advertisement must not describe the base that replaced it")
+
+
+def test_the_probe_allocates_a_real_data_block(tmp_path):
+    """A filesystem out of DATA BLOCKS but with an inode to spare accepts a zero-byte file while
+    the worker's real writes fail with ENOSPC -- so an empty probe reported the mount writable
+    during the exact incident it exists to detect."""
+    import blastbox.worker.warm as warm_mod
+
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    written = []
+    real = warm_mod.atomic_write_confined if hasattr(warm_mod, "atomic_write_confined") else None
+    from blastbox.contract import envelope
+
+    real_write = envelope.atomic_write_confined
+
+    def _spy(base, name, data, **kw):
+        written.append(data)
+        return real_write(base, name, data, **kw)
+
+    envelope.atomic_write_confined = _spy
+    try:
+        assert HostWarmControl(ctrl)._ctrl_writable() is True
+    finally:
+        envelope.atomic_write_confined = real_write
+    _ = real
+    assert written and all(d for d in written), (
+        f"the probe must write a non-empty payload, got {written!r}")

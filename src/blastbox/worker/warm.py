@@ -300,6 +300,11 @@ _HOST_POLL_INTERVAL_S: float = 0.05
 WARM_STARTED = "started"
 
 
+#: Written by the writability probe. Must be non-empty so the probe allocates a data block:
+#: a filesystem with inodes but no data blocks accepts an empty file and fails a real write.
+_PROBE_PAYLOAD = b"blastbox-writability-probe\n"
+
+
 class AckCapability:
     """Does the CURRENT warm base advertise the start signal? Generation-scoped on purpose.
 
@@ -422,7 +427,12 @@ class HostWarmControl:
         # pre-plant against either.
         name = f".bb-probe-{uuid.uuid4().hex}"
         try:
-            atomic_write_confined(self._dir, name, b"", mode=0o600)
+            # NON-EMPTY on purpose. A filesystem out of DATA BLOCKS but with an inode to spare
+            # accepts a zero-byte file while the worker's `started` and `done` writes fail with
+            # ENOSPC -- so an empty probe reported the mount writable during the exact incident it
+            # exists to detect, and the host went back to blaming the guest. Probe the resource
+            # whose failure is being diagnosed.
+            atomic_write_confined(self._dir, name, _PROBE_PAYLOAD, mode=0o600)
         except Exception:  # noqa: BLE001 - OSError, or a confinement violation; both mean "no"
             return False
         # CLEANUP MUST NOT RETURN. A `return` inside a finally silently discards the value the

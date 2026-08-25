@@ -712,9 +712,13 @@ class VsockReadySignal:
             state = _VsockReadyState(
                 srv=srv, uds=uds, ready=threading.Event(), stop=threading.Event()
             )
+            # The generation this listener STARTED under. Without it a listener still running
+            # when the base is replaced could teach the new generation with the old base's
+            # advertisement -- the same slot-vs-job confusion, one layer out.
+            _gen = self._ack_capable.generation
             thread = threading.Thread(
                 target=self._accept_loop,
-                args=(slot.slot_id, state),
+                args=(slot.slot_id, state, _gen),
                 name=f"fc-vsock-ready-{slot.slot_id[:8]}",
                 daemon=True,
             )
@@ -722,7 +726,8 @@ class VsockReadySignal:
             self._slots[slot.slot_id] = state
             thread.start()
 
-    def _accept_loop(self, slot_id: str, state: _VsockReadyState) -> None:
+    def _accept_loop(self, slot_id: str, state: _VsockReadyState,
+                     ack_generation: "int | None" = None) -> None:
         # Non-blocking via selectors so a guest that connects-but-stalls can never
         # head-of-line-block the listener (delaying READY) or wedge this thread
         # (which would stall reap() and the pool). Connections that do not send
@@ -787,7 +792,7 @@ class VsockReadySignal:
                         if READY_ACK_SUFFIX in buf:
                             # Learned BEFORE any job, which is what makes the fast repair usable
                             # on a base that was already poisoned when this dispatcher started.
-                            self._ack_capable.learn()
+                            self._ack_capable.learn(ack_generation)
                         _log.info("fc.vsock_ready_received slot_id=%s ack_capable=%s",
                                   slot_id, READY_ACK_SUFFIX in buf)
                         state.ready.set()

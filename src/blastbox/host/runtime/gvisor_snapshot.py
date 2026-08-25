@@ -304,6 +304,11 @@ class GvisorBootHandle:
         self._ctrl = ctrl_dir
         self._ready = ready_wait
         self._ack_capable: "AckCapability | None" = ack_capable
+        # The generation this BUILD started under. Unstamped, a build still waiting for
+        # readiness when invalidate_base() ran -- one SnapshotManager will go on to reject via
+        # _build_epoch -- could still mark the REPLACEMENT generation capable, and an older
+        # bundle without start markers would inherit a capability it does not have.
+        self._ack_gen = ack_capable.generation if ack_capable is not None else None
 
     def wait_ready(self, timeout_s: float) -> None:
         self._ready(self._ctrl, timeout_s)
@@ -312,7 +317,7 @@ class GvisorBootHandle:
         # base wedged from its first restore never completes a job either. Read it here, while
         # the base is still the live container that wrote it.
         if self._ack_capable is not None and read_base_ack_capability(self._ctrl):
-            self._ack_capable.learn()
+            self._ack_capable.learn(self._ack_gen)
 
     def checkpoint(self, dest_dir: Path) -> object:
         # Retry anything a previous failed checkpoint could not remove; no artifact was returned
