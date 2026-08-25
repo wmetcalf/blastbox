@@ -887,12 +887,6 @@ class VsockHostWarmControl:
             raise
 
     def _signal_go_inner(self, spec: "WarmJobSpec", *, deadline: float | None = None) -> None:
-        # BEFORE the upload. guest_started was only initialised in wait_for_done, so a guest
-        # wedged badly enough that it never drains a large input -- send_frame_from_file exhausting
-        # the deadline, signal_go raising -- left it None, and a DEFINITE never-started failure
-        # went uncounted. A received ack still flips it to True.
-        if self._ack_capable:
-            self.guest_started = False
         path = Path(spec.input_path)
         # ``ack``: ask the guest to send a START frame the moment it has the job, before it
         # begins work. OPT-IN from the host, and unknown header keys are ignored by the guest's
@@ -908,6 +902,18 @@ class VsockHostWarmControl:
             conn.settimeout(max(0.0, deadline - time.monotonic()))
         send_frame(conn, header)
         send_frame_from_file(conn, path, deadline=deadline)
+        # ONLY AFTER THE TRANSFER SUCCEEDS. Set before it, this convicted the base for failures
+        # that are input-specific and deterministic: a guest correctly REJECTING a frame larger
+        # than its own MAX_INPUT_BYTES closes the connection, and the resulting broken pipe looked
+        # identical to a wedge -- three oversized documents would then rebuild a healthy base. A
+        # large upload merely exhausting the shared deadline reads the same way. Past this line
+        # the guest demonstrably has the bytes, so a missing ack really is the guest.
+        #
+        # The cost is that a guest which never drains its input stays UNKNOWN rather than
+        # counting. That is the honest answer: from here it is indistinguishable from an input
+        # the guest was right to refuse.
+        if self._ack_capable:
+            self.guest_started = False
 
     def wait_for_done(self, *, timeout_s: float) -> str:
         """Read the guest's status frame; raise WarmTimeout if it never arrives.

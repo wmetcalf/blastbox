@@ -399,3 +399,24 @@ def test_a_real_rebuild_records_which_base_it_repaired():
     assert rt.base_invalidations == 1, "the cooldown must suppress the second repair"
     assert not pool._pool_pre_guest_failures.get("tierB"), (
         "a base a rebuild did not fix must not keep accumulating toward another")
+
+
+def test_the_repaired_identity_comes_from_what_was_actually_repaired():
+    """Recorded before the lock, a second thread crossing concurrently overwrote it while the
+    first held the lock: the first repaired A and started the cooldown, but the record said B --
+    so B's next failure took the "just rebuilt and still failing" branch and discarded evidence
+    for a tier nothing had touched."""
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=300.0)
+
+    # drop() reports repairing a DIFFERENT tier than the one that crossed
+    def _drop(*, reason=None, only=None):
+        rt.base_invalidations += 1
+        return ["tierA"]
+    rt.invalidate_base = _drop
+
+    for slot in _claim_distinct(pool, 3):
+        _fail(pool, slot, stage="pre_guest")
+    assert rt.base_invalidations == 1
+    assert pool._last_base_rebuild_ident != "tierB", (
+        "tierB was never repaired, so the cooldown must not treat it as just-rebuilt")

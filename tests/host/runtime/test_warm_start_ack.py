@@ -159,3 +159,23 @@ def test_the_snapshot_runtime_shares_ack_capability_across_slots(tmp_path):
 
     ctl_a._ack_capable.add("yes")                     # slot A acks once
     assert ctl_b._ack_capable, "slot B must inherit what slot A proved about the image"
+
+
+def test_an_input_the_guest_refuses_is_not_blamed_on_the_base(tmp_path):
+    """A guest correctly REJECTING a frame larger than its own MAX_INPUT_BYTES closes the
+    connection, and the broken pipe looked identical to a wedge -- so three oversized documents
+    would rebuild a healthy base. The evidence must not begin until the bytes are demonstrably
+    delivered."""
+    from blastbox.worker.warm import WarmJobSpec
+
+    host_sock, guest_sock = socket.socketpair()
+    seen = {"yes"}                                  # this image HAS acked before
+    ctl = _control(host_sock, ack_capable=seen)
+    guest_sock.close()                              # the guest refuses/closes mid-transfer
+
+    big = Path("/tmp/blastbox-ack-test-big")
+    big.write_bytes(b"x" * (1 << 20))
+    with pytest.raises(Exception):
+        ctl.signal_go(WarmJobSpec(input_path=big, output_dir=Path("/tmp"), params={}))
+    assert ctl.guest_started is None, (
+        "a transfer that never landed says nothing about whether the guest can execute")

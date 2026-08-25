@@ -2606,7 +2606,6 @@ class WarmPool:
         with self._lock:
             self._base_rebuilds += 1
             self._rebuilt_this_tick = True
-            self._last_base_rebuild_ident = episode_ident
         # SERIALISE. Held across the whole drop() so a second repair cannot land mid-rebuild; the
         # cooldown check above is re-read inside so the loser of the race sees the winner's result
         # instead of repeating it.
@@ -2696,6 +2695,16 @@ class WarmPool:
                 self._spawn_consecutive_failures = 0
             else:
                 self._pool_consecutive_failures.pop(episode_ident, None)
+            # RECORDED ON COMMIT, not when the decision was taken. Two cascade bases crossing
+            # concurrently both reached the pre-lock bump, so the second thread overwrote the
+            # identity while the first held the lock: the first then repaired A and started the
+            # cooldown, but the record said B -- and B's next failure took the "this base was just
+            # rebuilt and still fails" branch and discarded the evidence for a tier nothing had
+            # touched. Taken from what drop() actually repaired where it says so.
+            _committed = ({str(n) for n in repaired}
+                          if isinstance(repaired, (list, tuple, set, frozenset)) and repaired
+                          else {episode_ident})
+            self._last_base_rebuild_ident = episode_ident if episode_ident in _committed else None
             # Releases landing WHILE drop() ran rebuilt a set after this episode consumed the old
             # one -- charging the retired base's failures to its replacement. With a threshold of
             # 3, two such stragglers plus one genuine failure from the fresh base convict it, and
