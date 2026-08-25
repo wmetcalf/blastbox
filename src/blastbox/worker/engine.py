@@ -18,7 +18,7 @@ from blastbox.contract import (
     Detection,
     Warning,
 )
-from blastbox.contract.nodes import ChildNode
+from blastbox.contract.nodes import _Node
 from blastbox.limits import Limits
 
 
@@ -31,7 +31,13 @@ class DetonationResult:
     The harness takes care of hashing, path-confinement, and sealing.
     """
 
-    payload: ChildNode
+    # _Node, not ChildNode: ChildNode is the STATIC four-member union, but
+    # contract.register_node_type() exists precisely so an engine can add its own payload
+    # node, and Envelope.payload's annotation is rebuilt at registration. Annotating the
+    # narrow union made every engine that uses the documented mechanism fail mypy, which
+    # pushed authors back to stuffing typed data into Record.fields -- the thing the registry
+    # exists to avoid.
+    payload: _Node
     """The typed payload node tree (Page, Record, EmbeddedResource, …)."""
 
     artifacts: list[DeclaredArtifact]
