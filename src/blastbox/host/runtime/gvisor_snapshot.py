@@ -315,7 +315,7 @@ class GvisorBootHandle:
         # read as proof the guest never ran, and a healthy base is invalidated on repeat.
         self._ack_gen = (
             ack_generation if ack_generation is not None
-            else (ack_capable.generation if ack_capable is not None else None)
+            else None
         )
 
     def wait_ready(self, timeout_s: float) -> None:
@@ -559,6 +559,7 @@ class GvisorSnapshotBackend:
         run_text: Callable[[list[str]], str] = _default_run_text,
         ready_wait: Callable[[Path, float], None] = _default_ready_wait,
         ack_capable: "AckCapability | None" = None,
+        epoch_sampler: "Callable[[], int | None] | None" = None,
         probe: Callable[[], bool] | None = None,
         cr_capable: Callable[[str], bool] = _default_cr_capable,
     ) -> None:
@@ -567,6 +568,10 @@ class GvisorSnapshotBackend:
         self._run_text = run_text
         self._ready = ready_wait
         self._ack_capable: "AckCapability | None" = ack_capable
+        # Reads SnapshotManager.build_epoch. Injected because the backend is constructed before
+        # the manager, and because the backend must not own an identity of its own -- that is the
+        # two-counter mistake issue #92 removes.
+        self._epoch_sampler: "Callable[[], int | None] | None" = epoch_sampler
         self._probe = probe
         self._cr_capable = cr_capable
         # Durable across boot handles: SnapshotManager kills and abandons a handle after a failed
@@ -594,7 +599,7 @@ class GvisorSnapshotBackend:
         # BEFORE `runsc run` -- see GvisorBootHandle.__init__. The generation that is current when
         # the build STARTS is the one this base can honestly speak for; anything sampled after the
         # launch may already belong to the base that replaced it.
-        ack_gen = self._ack_capable.generation if self._ack_capable is not None else None
+        ack_gen = self._epoch_sampler() if self._epoch_sampler is not None else None
         # Unique per build so two pool processes sharing this -root parent (e.g. a
         # restart-overlap: the old process still tearing down while the new one boots)
         # don't collide on a fixed base bundle dir / cid and stomp each other's base.

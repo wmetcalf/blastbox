@@ -73,7 +73,12 @@ class GvisorSnapshotSlotRuntime:
         slot_id = str(uuid.uuid4())
         # BEFORE the restore -- same ordering as the FC snapshot runtime: the artifact this
         # slot is pinned to is the one that existed when restore() started.
-        _ack_gen = self._ack_capable.generation
+        # The epoch of the artifact this slot will restore from, sampled BEFORE restore(): that
+        # call pins the artifact current when it STARTED, so a rebuild landing during it leaves
+        # this slot on the retired image. Sampling afterwards would stamp it with the
+        # replacement's identity. Erring early is safe -- a stale stamp answers capable_for()
+        # False, and UNKNOWN convicts nothing.
+        _ack_gen = getattr(self._mgr, "build_epoch", None)
         handle = self._mgr.restore(slot_id)
         wd = Path(handle.slot_workdir)  # type: ignore[attr-defined]
         with self._lock:
@@ -151,7 +156,8 @@ class GvisorSnapshotSlotRuntime:
         drop = getattr(self._mgr, "invalidate", None)
         if callable(drop):
             drop()
-        self._ack_capable.reset()
+        # NO capability reset -- see the FC twin. invalidate() already moved the artifact's
+        # identity; publish() decides what the replacement is capable of (issue #92).
 
     def reap(self, slot: Slot) -> None:
         with self._lock:
@@ -325,7 +331,11 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
     # advertises the start-marker protocol in `ready`, and that is the only moment it is visible
     # (a restore gets a fresh ctrl/, and the checkpointed worker resumes past signal_ready).
     ack_capable = AckCapability()
-    backend = GvisorSnapshotBackend(gcfg, ack_capable=ack_capable)
+    # Late-bound: the backend is built before the manager, but only SAMPLES the epoch at
+    # boot_base() time, long after it exists.
+    _mgr_ref: list = []
+    backend = GvisorSnapshotBackend(gcfg, ack_capable=ack_capable,
+                                    epoch_sampler=lambda: _mgr_ref[0].build_epoch if _mgr_ref else None)
     if not backend.available():
         if require_available:
             raise GvisorUnavailable("gVisor C/R warm tier required but runsc not found; "
@@ -342,6 +352,7 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
     snapshot_parent = resolve_mem_dir() or Path(gcfg.root).parent
     base_dir = _secure_snapshot_base(snapshot_parent / "gvisor-snapshot")
     mgr = SnapshotManager(base_dir, backend, ack_capable=ack_capable)
+    _mgr_ref.append(mgr)
     return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle(), ack_capable=ack_capable)
 
 

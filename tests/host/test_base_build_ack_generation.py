@@ -27,15 +27,19 @@ from blastbox.host.runtime.fc_snapshot_launcher import (
 
 def test_the_gvisor_base_is_stamped_before_runsc_run(tmp_path, monkeypatch):
     cap = AckCapability()
-    started_at = cap.generation
+    # The build epoch now comes from SnapshotManager, the one identity that moves atomically with
+    # the artifact (issue #92). The backend only SAMPLES it -- it owns no counter of its own.
+    epoch = [7]
+    started_at = epoch[0]
 
     monkeypatch.setattr(gs, "_prepare_slot_dirs", lambda cfg, base: base.mkdir(parents=True))
     monkeypatch.setattr(gs, "_write_oci_config", lambda cfg, base, in_ro=True: None)
     monkeypatch.setattr(gs, "_runsc", lambda cfg: ["runsc"])
 
     def _run(argv, **kw):
-        # THE WINDOW: the base is replaced while `runsc run` is still going.
-        cap.reset()
+        # THE WINDOW: the base is replaced while `runsc run` is still going, so the manager's
+        # epoch moves under the build.
+        epoch[0] += 1
         return 0
 
     be = object.__new__(gs.GvisorSnapshotBackend)
@@ -43,6 +47,7 @@ def test_the_gvisor_base_is_stamped_before_runsc_run(tmp_path, monkeypatch):
     be._run = _run
     be._ready = lambda ctrl, tmo: None
     be._ack_capable = cap
+    be._epoch_sampler = lambda: epoch[0]
     be._stranded_partials = []
 
     handle = be.boot_base()
@@ -51,15 +56,17 @@ def test_the_gvisor_base_is_stamped_before_runsc_run(tmp_path, monkeypatch):
         "the handle carries the generation current when the build FINISHED; a build that is "
         "already being discarded must not be able to teach its replacement")
     # And the consequence: its advertisement is ignored, so capability stays UNKNOWN.
-    cap.learn(handle._ack_gen)
-    assert not cap, "a retired build taught the replacement generation"
+    cap.observe(handle._ack_gen)
+    cap.publish(epoch[0])          # the REPLACEMENT is what actually publishes
+    assert not cap.capable_for(epoch[0]), "a retired build taught the replacement epoch"
 
 
 def test_the_fc_base_is_stamped_before_the_microvm_spawns(tmp_path, monkeypatch):
     import blastbox.host.runtime.fc_snapshot_launcher as fsl
 
     cap = AckCapability()
-    started_at = cap.generation
+    epoch = [7]
+    started_at = epoch[0]
     seen: dict = {}
 
     monkeypatch.setattr(fsl, "api_boot_sequence", lambda cfg: [])
@@ -71,7 +78,7 @@ def test_the_fc_base_is_stamped_before_the_microvm_spawns(tmp_path, monkeypatch)
     lch._mem_dir = tmp_path
     lch._make_outdisk = lambda p: None
     lch._copy_outdisk = lambda a, b: None
-    lch._ack_sampler = lambda: cap.generation
+    lch._ack_sampler = lambda: epoch[0]
 
     def _factory(path, ack_generation=None):
         seen["gen"] = ack_generation
@@ -82,7 +89,7 @@ def test_the_fc_base_is_stamped_before_the_microvm_spawns(tmp_path, monkeypatch)
     def _spawn(workdir):
         workdir.mkdir(parents=True, exist_ok=True)
         # THE WINDOW: the base is replaced during the (slow) microVM launch + API boot.
-        cap.reset()
+        epoch[0] += 1
         return (type("P", (), {"pid": 1})(),
                 type("A", (), {"put": lambda self, *a, **k: None})())
 
@@ -93,8 +100,9 @@ def test_the_fc_base_is_stamped_before_the_microvm_spawns(tmp_path, monkeypatch)
     assert seen["gen"] == started_at, (
         "the READY listener was stamped with the generation current at BIND time, after the "
         "spawn -- so an invalidation during the launch is credited to the replacement")
-    cap.learn(seen["gen"])
-    assert not cap, "a retired base build taught the replacement generation"
+    cap.observe(seen["gen"])
+    cap.publish(epoch[0])          # the REPLACEMENT is what actually publishes
+    assert not cap.capable_for(epoch[0]), "a retired base build taught the replacement epoch"
 
 
 @pytest.mark.parametrize("factory, expected", [

@@ -22,6 +22,8 @@ from blastbox.host.runtime.fc_snapshot import (
 )
 from blastbox.worker.warm import AckCapability
 
+EPOCH0 = 0   # SnapshotManager starts at build epoch 0
+
 
 class _Boot:
     """A base build that advertises ACK at readiness, as a real one does."""
@@ -64,17 +66,17 @@ def _mgr(tmp_path, cap, boot):
 def test_a_published_build_confirms_its_advertisement(tmp_path):
     """Positive control -- without this the others pass on a capability that is never set."""
     cap = AckCapability()
-    mgr = _mgr(tmp_path, cap, _Boot(cap, cap.generation))
+    mgr = _mgr(tmp_path, cap, _Boot(cap, EPOCH0))
     mgr.build()
-    assert cap, "a base that advertised AND published must be believed"
+    assert cap.capable_for(EPOCH0), "a base that advertised AND published must be believed"
 
 
 def test_a_build_whose_checkpoint_fails_confirms_nothing(tmp_path):
     cap = AckCapability()
-    boot = _Boot(cap, cap.generation, checkpoint_fails=True)
+    boot = _Boot(cap, EPOCH0, checkpoint_fails=True)
     with pytest.raises(SnapshotBuildError):
         _mgr(tmp_path, cap, boot).build()
-    assert not cap, (
+    assert not cap.capable_for(EPOCH0), (
         "the build advertised and then produced no artifact; nothing can ever be restored from "
         "it, so its capability must not outlive it")
 
@@ -86,14 +88,15 @@ def test_a_build_rejected_at_publication_confirms_nothing(tmp_path):
     mgr = None
 
     def _invalidate_midflight():
-        mgr.invalidate()                 # bumps _build_epoch; this build is now doomed
-        cap.reset()                      # ...as the runtimes do on invalidate_base
+        mgr.invalidate()                 # bumps _build_epoch; this build is now doomed.
+        # No cap.reset() any more, and that is the point: there is one identity, and
+        # invalidate() already moved it (issue #92).
 
-    boot = _Boot(cap, cap.generation, on_ready=_invalidate_midflight)
+    boot = _Boot(cap, EPOCH0, on_ready=_invalidate_midflight)
     mgr = _mgr(tmp_path, cap, boot)
     with pytest.raises(SnapshotBuildInvalidated):
         mgr.build()
-    assert not cap, "a build whose artifact was rejected still taught its replacement"
+    assert not cap.capable_for(EPOCH0), "a build whose artifact was rejected still taught its replacement"
 
 
 def test_a_build_that_never_advertised_stays_unknown(tmp_path):
@@ -105,8 +108,8 @@ def test_a_build_that_never_advertised_stays_unknown(tmp_path):
         def wait_ready(self, timeout_s):
             pass                          # no observe()
 
-    _mgr(tmp_path, cap, _Silent(cap, cap.generation)).build()
-    assert not cap, "publication must confirm an advertisement, never manufacture one"
+    _mgr(tmp_path, cap, _Silent(cap, EPOCH0)).build()
+    assert not cap.capable_for(EPOCH0), "publication must confirm an advertisement, never manufacture one"
 
 
 def test_a_rejection_alone_blocks_the_confirmation(tmp_path):
@@ -122,14 +125,14 @@ def test_a_rejection_alone_blocks_the_confirmation(tmp_path):
 
     def _artifact_retired_but_generation_not_yet_moved():
         mgr.invalidate()          # drop(): _build_epoch moves, this build is doomed
-        # ...and reset() has NOT run yet, so cap.generation is unchanged.
+        # ...and reset() has NOT run yet, so EPOCH0 is unchanged.
 
-    boot = _Boot(cap, cap.generation, on_ready=_artifact_retired_but_generation_not_yet_moved)
+    boot = _Boot(cap, EPOCH0, on_ready=_artifact_retired_but_generation_not_yet_moved)
     mgr = _mgr(tmp_path, cap, boot)
     with pytest.raises(SnapshotBuildInvalidated):
         mgr.build()
 
-    assert not cap, (
+    assert not cap.capable_for(EPOCH0), (
         "the artifact was discarded, so no slot can ever be restored from this base -- its "
         "advertisement must not be credited to whatever replaces it")
 
@@ -139,9 +142,9 @@ def test_pending_observations_do_not_accumulate(tmp_path):
     is one dict entry per generation for the life of the dispatcher -- small, but unbounded, and a
     warm tier rebuilds for days."""
     cap = AckCapability()
-    for _ in range(50):
-        cap.observe(cap.generation)
-        cap.reset()
+    for e in range(50):
+        cap.observe(e)
+        cap.publish(e)          # each rebuild installs a new artifact
     assert len(cap._pending) <= 1, (
         f"pending observations accumulated across rebuilds: {len(cap._pending)}")
 
@@ -168,18 +171,18 @@ def test_a_failed_attempt_does_not_teach_the_retry(tmp_path):
         def boot_base(self):
             self.n += 1
             if self.n == 1:
-                return _Boot(cap, cap.generation, checkpoint_fails=True)
-            return _Boot(cap, cap.generation, advertises=False)
+                return _Boot(cap, EPOCH0, checkpoint_fails=True)
+            return _Boot(cap, EPOCH0, advertises=False)
 
     backend = _TwoAttempts()
     mgr = SnapshotManager(Path(tmp_path), backend, ack_capable=cap)
 
     with pytest.raises(SnapshotBuildError):
         mgr.build()                       # attempt 1: advertised, then failed
-    assert not cap, "precondition: a failed build teaches nothing"
+    assert not cap.capable_for(EPOCH0), "precondition: a failed build teaches nothing"
 
     mgr.build()                           # attempt 2: silent, and publishes
-    assert not cap, (
+    assert not cap.capable_for(EPOCH0), (
         "the rolled-back base inherited a capability advertised by the attempt it replaced")
 
 
@@ -193,13 +196,13 @@ def test_a_retry_that_advertises_is_still_believed(tmp_path):
 
         def boot_base(self):
             self.n += 1
-            return _Boot(cap, cap.generation, checkpoint_fails=(self.n == 1))
+            return _Boot(cap, EPOCH0, checkpoint_fails=(self.n == 1))
 
     mgr = SnapshotManager(Path(tmp_path), _TwoAttempts(), ack_capable=cap)
     with pytest.raises(SnapshotBuildError):
         mgr.build()
     mgr.build()
-    assert cap, "the retry advertised and published; that must be believed"
+    assert cap.capable_for(EPOCH0), "the retry advertised and published; that must be believed"
 
 
 def test_an_injected_manager_shares_its_capability_with_the_runtime(tmp_path):
@@ -215,7 +218,7 @@ def test_an_injected_manager_shares_its_capability_with_the_runtime(tmp_path):
     from blastbox.host.runtime.gvisor_snapshot_runtime import select_gvisor_snapshot_runtime
 
     cap = AckCapability()
-    mgr = SnapshotManager(Path(tmp_path), _Backend(_Boot(cap, cap.generation)), ack_capable=cap)
+    mgr = SnapshotManager(Path(tmp_path), _Backend(_Boot(cap, EPOCH0)), ack_capable=cap)
 
     fc = select_snapshot_runtime(cfg=object(), manager=mgr)
     assert fc._ack_capable is cap, "the FC runtime manufactured its own capability"

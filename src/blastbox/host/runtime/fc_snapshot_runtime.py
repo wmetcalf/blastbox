@@ -173,7 +173,12 @@ class SnapshotSlotRuntime:
         # invalidation landing during that slow call leaves this slot on the RETIRED image --
         # but sampling the generation afterwards stamped it with the replacement's, and an ack
         # from the retired image would then teach the new base a capability it may not have.
-        _ack_gen = self._ack_capable.generation
+        # The epoch of the artifact this slot will restore from, sampled BEFORE restore(): that
+        # call pins the artifact current when it STARTED, so a rebuild landing during it leaves
+        # this slot on the retired image. Sampling afterwards would stamp it with the
+        # replacement's identity. Erring early is safe -- a stale stamp answers capable_for()
+        # False, and UNKNOWN convicts nothing.
+        _ack_gen = getattr(self._manager, "build_epoch", None)
         handle = self._manager.restore(slot_id)
         # The launcher restores in base_dir/slots/<id>; the vsock UDS lives there, so
         # its parent IS the per-slot workdir (vsock.sock + outdisk.ext4 + fc-api.sock).
@@ -287,7 +292,10 @@ class SnapshotSlotRuntime:
             _log.warning("snapshot.invalidate_unsupported manager=%s", type(self._manager).__name__)
             return
         discarded = drop()
-        self._ack_capable.reset()
+        # NO capability reset. invalidate() moved SnapshotManager._build_epoch atomically with
+        # retiring the artifact, so the identity has already changed; the next publish() decides
+        # what the replacement is capable of. Sequencing a second reset correctly against this
+        # drop was its own defect class (issue #92).
         _log.warning("snapshot.base_invalidated had_artifact=%s -- next spawn rebuilds the base",
                      bool(discarded))
 
@@ -517,6 +525,9 @@ def select_snapshot_runtime(
     # Created HERE so the base-build listener and the runtime that serves restores share one set:
     # the base advertises at build time, every restored slot then reads the answer.
     ack_capable = AckCapability()
+    # Late-bound: the launcher is built before the manager, but only ever SAMPLES the
+    # epoch at boot_base() time, long after the manager exists.
+    _mgr_ref: list = []
     launcher = FcSnapshotLauncher(
         cfg,
         base_dir,
@@ -527,8 +538,9 @@ def select_snapshot_runtime(
         ),
         # Lets boot_base stamp the build with the generation current when it STARTED. The
         # launcher owns no capability of its own, so it cannot sample this itself.
-        ack_sampler=lambda: ack_capable.generation,
+        ack_sampler=lambda: _mgr_ref[0].build_epoch if _mgr_ref else None,
     )
     backend = FcSnapshotBackend.from_env(base_dir, launcher, mem_dir=mem_dir)
     manager = SnapshotManager(base_dir, backend, ack_capable=ack_capable)
+    _mgr_ref.append(manager)
     return SnapshotSlotRuntime(cfg, manager, settle_s=settle_s, ack_capable=ack_capable)

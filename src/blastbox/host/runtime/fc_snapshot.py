@@ -30,7 +30,7 @@ from blastbox.host.pool import RuntimeAtCapacity, _accepts_kwarg
 from blastbox.host.runtime.snapshot_backend import RestoreHandle, SnapshotBackend
 
 
-class _AckConfirmable(Protocol):
+class _AckPublishable(Protocol):
     """The slice of AckCapability the manager needs.
 
     Structural, not an import of the concrete class: worker.warm owns AckCapability and importing
@@ -38,7 +38,7 @@ class _AckConfirmable(Protocol):
     """
 
     def begin_build(self) -> None: ...
-    def confirm(self, generation: "int | None" = ...) -> None: ...
+    def publish(self, epoch: "int | None") -> None: ...
 
 _log = logging.getLogger("blastbox.host.runtime.fc_snapshot")
 
@@ -104,7 +104,7 @@ class SnapshotManager:
         *,
         ready_timeout_s: float = 120.0,
         build_retry_backoff_s: float = 30.0,
-        ack_capable: "_AckConfirmable | None" = None,
+        ack_capable: "_AckPublishable | None" = None,
     ) -> None:
         self._base_dir = Path(base_dir)
         self._backend = backend
@@ -149,7 +149,19 @@ class SnapshotManager:
         return self._artifact is not None
 
     @property
-    def ack_capable(self) -> "_AckConfirmable | None":
+    def build_epoch(self) -> int:
+        """Identity of the artifact currently installed (or of the build in flight).
+
+        Bumped inside invalidate() under _build_lock, atomically with retiring the artifact, and
+        re-read there to reject a build superseded while it ran. It is therefore the only
+        identity in the system that cannot drift from the thing it names -- which is why the ACK
+        capability is keyed by it rather than by a counter of its own (issue #92).
+        """
+        with self._build_lock:
+            return self._build_epoch
+
+    @property
+    def ack_capable(self) -> "_AckPublishable | None":
         """The capability this manager confirms into, for runtimes wired around an INJECTED
         manager.
 
@@ -371,10 +383,11 @@ class SnapshotManager:
             # image's missing start markers are then read as PROVEN non-starts, so a
             # document-induced hang invalidates an ACK-incapable base instead of staying UNKNOWN.
             #
-            # Both backends stamp their boot handle with the generation the build STARTED under
-            # and expose it as `ack_generation`; confirm() is gated on that too, so this cannot
-            # credit the advertisement to a replacement base.
-            self._ack_capable.confirm(getattr(boot, "ack_generation", None))
+            # Published under the epoch THIS build captured at its start, which is also the
+            # epoch its backend stamped the boot handle with -- so an artifact that advertised is
+            # believed, and one that stayed silent RETIRES the previous base's capability instead
+            # of inheriting it.
+            self._ack_capable.publish(epoch)
         if rejected:
             # invalidate() landed while this build was running. Publishing now would install the
             # artifact the repair explicitly rejected; discard it instead and let the next build

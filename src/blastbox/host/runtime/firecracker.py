@@ -729,7 +729,7 @@ class VsockReadySignal:
             # advertisement -- the same slot-vs-job confusion, one layer out. The caller may have
             # sampled it EARLIER still (before a slow launch); prefer that.
             _gen = (ack_generation if ack_generation is not None
-                    else self._ack_capable.generation)
+                    else None)
             thread = threading.Thread(
                 target=self._accept_loop,
                 args=(slot.slot_id, state, _gen),
@@ -897,7 +897,7 @@ class VsockHostWarmControl:
         # job claimed it, and its ack then re-taught the replacement base a capability that only
         # the retired image had. Falls back to the current generation only when nobody can say.
         self._ack_gen = (ack_generation if ack_generation is not None
-                         else self._ack_capable.generation)
+                         else None)
         self._uds = Path(vsock_uds)
         self._job_port = job_port
         self._connect_timeout = connect_timeout_s
@@ -995,7 +995,7 @@ class VsockHostWarmControl:
         #
         # Only meaningful once this image has been SEEN to ack. Before that a missing ack is
         # indistinguishable from an older worker, and False would be a guess.
-        if self._ack_capable:
+        if self._ack_capable.capable_for(self._ack_gen):
             self.guest_started = False
         deadline = time.monotonic() + timeout_s
         try:
@@ -1268,7 +1268,10 @@ class FirecrackerSlotRuntime:
 
         # Stamp the generation this slot was SPAWNED from; see Slot.ack_generation.
 
-        slot.ack_generation = self._ack_capable.generation
+        # The PLAIN FC runtime has no artifact lifecycle -- every slot is a fresh boot, so there
+        # is one image and nothing to tell apart. None means exactly that, and capable_for()
+        # answers with the flag alone.
+        slot.ack_generation = None
 
 
         return slot
