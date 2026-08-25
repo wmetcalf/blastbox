@@ -806,3 +806,71 @@ def test_a_build_superseded_mid_flight_still_skips_the_backoff(tmp_path):
     assert mgr._build_error is None, "a superseded build must not record its error"
     assert _t.monotonic() >= mgr._retry_not_before, (
         "a superseded build must not delay the replacement")
+
+
+def test_a_failure_before_the_epoch_is_sampled_is_judged_genuine(tmp_path):
+    """_retry_undead_bases(), _base_dir.mkdir() and _sweep_retired() all run BEFORE build() samples
+    the epoch. Publishing the sample to instance state meant such a failure left the PREVIOUS
+    attempt's epoch behind -- STALE, not None -- so the None-guard never fired, an invalidation
+    between attempts made it compare unequal, and a persistent ENOSPC was reclassified as
+    'superseded' and retried on every single tick.
+
+    The epoch now travels ON the failure, so a failure raised before the sample carries nothing and
+    absence reads as genuine."""
+    import time as _t
+
+    class _Boom:
+        def wait_ready(self, t):
+            raise RuntimeError("attempt 1 fails")
+
+        def kill(self):
+            pass
+
+    class _Backend3:
+        _epoch_sampler = _launcher = None
+
+        def boot_base(self):
+            return _Boom()
+
+    mgr = SnapshotManager(Path(tmp_path), _Backend3(), build_retry_backoff_s=30.0)
+    mgr._build_worker()                       # attempt 1 samples epoch 0 and fails
+    mgr.invalidate()                          # a repair lands BETWEEN attempts -> epoch 1
+    mgr._retry_not_before = 0.0
+    mgr._build_error = None
+
+    def _enospc(*a, **k):
+        raise OSError("ENOSPC")
+
+    mgr._base_dir = type("P", (), {"mkdir": _enospc,
+                                   "__truediv__": lambda s, o: s})()
+    mgr._build_worker()                       # attempt 2 dies BEFORE the sample
+
+    assert mgr._build_error is not None, (
+        "a pre-sample failure was written off as superseded using the previous attempt's epoch")
+    assert _t.monotonic() < mgr._retry_not_before, (
+        "no backoff armed -- a persistent filesystem fault is retried on every tick")
+
+
+def test_a_failure_after_the_sample_still_carries_its_epoch(tmp_path):
+    """Control: the attribute must actually be attached, or the test above passes for free."""
+    class _Boom:
+        def wait_ready(self, t):
+            raise RuntimeError("boom")
+
+        def kill(self):
+            pass
+
+    class _Backend4:
+        _epoch_sampler = _launcher = None
+
+        def boot_base(self):
+            return _Boom()
+
+    mgr = SnapshotManager(Path(tmp_path), _Backend4(), build_retry_backoff_s=30.0)
+    try:
+        mgr.build()
+    except Exception as exc:
+        assert getattr(exc, "attempt_epoch", None) == 0, (
+            "the failure did not carry the epoch its attempt ran under")
+    else:
+        raise AssertionError("expected the build to fail")
