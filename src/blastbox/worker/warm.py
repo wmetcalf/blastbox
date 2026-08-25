@@ -234,6 +234,17 @@ class FileWarmControl:
                     raise ValueError(f"output_dir does not exist: {output_dir}")
 
                 params: dict[str, str] = data.get("params", {})
+                # Mark that we HAVE the job, before any work starts. `done` arriving late is
+                # indistinguishable from a guest that never woke up, so without this a wedged
+                # base is only found by failing 2 x warm_size real jobs at the full timeout.
+                # Only when asked, and never fatal: an unwritable marker must not fail a job the
+                # worker can still do -- the host just keeps guest_started as it was, which is
+                # UNKNOWN, which convicts nothing.
+                if data.get("ack"):
+                    try:
+                        self._atomic_write(WARM_STARTED, "1")
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("warm.started_marker failed: %s", exc)
                 return WarmJobSpec(
                     input_path=input_path,
                     output_dir=output_dir,
@@ -261,6 +272,14 @@ class FileWarmControl:
 _HOST_POLL_INTERVAL_S: float = 0.05
 
 
+#: Written by the worker the moment it HAS a job and before it starts work. The file-protocol
+#: twin of the vsock WARM_ACK frame, and it exists for the same reason: `done` arriving late is
+#: indistinguishable from a guest that never woke up, so without this a wedged gVisor base is
+#: only discovered by failing 2 x warm_size real jobs at the full worker timeout. Unlike the
+#: vsock ack there is no ordering hazard -- an old host simply never looks at the file.
+WARM_STARTED = "started"
+
+
 class HostWarmControl:
     """Host-side counterpart to ``FileWarmControl``.
 
@@ -269,14 +288,22 @@ class HostWarmControl:
     * ``go.json``  — written (atomically) by the host when a job is assigned;
                      contains ``{"input_path": "...", "output_dir": "...",
                      "params": {...}}``.
+    * ``started``  — written by the worker when it picks the job up, if go.json asked
+                     (``"ack": true``); proves the guest ran, as opposed to never waking.
     * ``done``     — written by the worker; contains the status string.
 
     All writes use a temp-file + ``os.replace`` (atomic rename), symmetric
     with ``FileWarmControl``.
     """
 
-    def __init__(self, control_dir: Path) -> None:
+    #: None = UNKNOWN (no marker seen: an older worker image). True = the worker confirmed it
+    #: has the job. Never guessed -- twin of firecracker.VsockHostWarmControl.guest_started.
+    guest_started: "bool | None" = None
+
+    def __init__(self, control_dir: Path, *, ack_capable: "set[str] | None" = None) -> None:
         self._dir = control_dir
+        # Shared with the runtime: non-empty once ANY slot from this image has marked a start.
+        self._ack_capable = ack_capable if ack_capable is not None else set()
 
     def _atomic_write(self, name: str, content: str) -> None:
         """Write *content* to ``control_dir/<name>`` atomically AND symlink-safely.
@@ -304,6 +331,9 @@ class HostWarmControl:
         """
         payload = json.dumps(
             {
+                # Ask the worker to mark that it picked the job up. Unknown keys are ignored by
+                # older workers, which then simply never write the marker.
+                "ack": True,
                 "input_path": str(spec.input_path),
                 "output_dir": str(spec.output_dir),
                 "params": spec.params,
@@ -322,8 +352,17 @@ class HostWarmControl:
         from blastbox.contract.envelope import read_confined_regular_bytes
 
         deadline = time.monotonic() + timeout_s
+        # SET ONLY HERE, where the host actually waits to find out -- same rule as the vsock twin.
+        # Claiming "never started" anywhere earlier convicts a base for a job nobody listened for.
+        if self._ack_capable:
+            self.guest_started = False
 
         while True:
+            if self.guest_started is not True and (self._dir / WARM_STARTED).exists():
+                # The worker picked the job up. Whatever fails after this is about the DOCUMENT,
+                # not about whether the base can produce a working guest.
+                self.guest_started = True
+                self._ack_capable.add("yes")
             try:
                 # Symlink-safe, capped, confined read: ctrl/ is WORKER-WRITABLE on the gVisor tier,
                 # so a hostile worker could symlink `done` at a host file (info disclosure) or a

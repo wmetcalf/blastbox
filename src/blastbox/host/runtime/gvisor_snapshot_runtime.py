@@ -34,6 +34,8 @@ _DEFAULT_WARM_ARGV = ["python3", "/opt/blastbox/run_warm.py"]
 
 class GvisorSnapshotSlotRuntime:
     def __init__(self, manager, *, settle_s: float = 1.0, clock: Callable[[], float] = time.monotonic) -> None:
+        # Shared with every GvisorHostWarmControl handed out (see host_warm_control).
+        self._ack_capable: set[str] = set()
         self._mgr = manager
         self._settle_s = settle_s
         self._clock = clock
@@ -168,7 +170,9 @@ class GvisorSnapshotSlotRuntime:
     # --- warm-path seam (file-trigger control; output already on the bind mount) ---
 
     def host_warm_control(self, slot: Slot) -> GvisorHostWarmControl:
-        return GvisorHostWarmControl(slot.control_dir)
+        # Shared across slots: one warm base image, so start-marker capability is a property of
+        # the image, not of a job. Per-control it would be learned and immediately forgotten.
+        return GvisorHostWarmControl(slot.control_dir, ack_capable=self._ack_capable)
 
     def stage_warm_input(self, slot: Slot, staged_input_path: Path) -> Path:
         dst = Path(slot.input_dir) / Path(staged_input_path).name
@@ -229,9 +233,16 @@ class GvisorHostWarmControl:
     SANDBOX_IN = Path("/in")
     SANDBOX_OUT = Path("/out")
 
-    def __init__(self, control_dir: Path) -> None:
+    def __init__(self, control_dir: Path, *, ack_capable: "set[str] | None" = None) -> None:
         from blastbox.worker.warm import HostWarmControl
-        self._inner = HostWarmControl(control_dir)
+        self._inner = HostWarmControl(control_dir, ack_capable=ack_capable)
+
+    @property
+    def guest_started(self) -> "bool | None":
+        """Forwarded from the wrapped control: the dispatcher reads it off whatever object
+        host_warm_control returned, and a wrapper that swallows it leaves the whole start signal
+        invisible for this tier."""
+        return self._inner.guest_started
 
     def signal_go(self, spec: object, *, deadline: float | None = None) -> None:
         from blastbox.worker.warm import WarmJobSpec
