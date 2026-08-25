@@ -169,17 +169,13 @@ class SnapshotSlotRuntime:
         else:
             self._manager.build()   # a manager without the seam (a test double)
         slot_id = str(uuid.uuid4())
-        # BEFORE the restore. restore() pins the artifact it started against, so a base
-        # invalidation landing during that slow call leaves this slot on the RETIRED image --
-        # but sampling the generation afterwards stamped it with the replacement's, and an ack
-        # from the retired image would then teach the new base a capability it may not have.
-        # The epoch of the artifact this slot will restore from, sampled BEFORE restore(): that
-        # call pins the artifact current when it STARTED, so a rebuild landing during it leaves
-        # this slot on the retired image. Sampling afterwards would stamp it with the
-        # replacement's identity. Erring early is safe -- a stale stamp answers capable_for()
-        # False, and UNKNOWN convicts nothing.
-        _ack_gen = getattr(self._manager, "build_epoch", None)
         handle = self._manager.restore(slot_id)
+        # The epoch of the artifact restore() ACTUALLY PINNED for this slot, read after the fact
+        # from the manager. Sampling build_epoch beforehand answered "what is current now", and an
+        # invalidation plus replacement build completing in between paired the slot with the wrong
+        # identity -- capable_for() then answered False forever and the fast repair was silently
+        # off for that slot during exactly the rebuild churn it exists for.
+        _ack_gen = getattr(self._manager, "pinned_epoch", lambda _s: None)(slot_id)
         # The launcher restores in base_dir/slots/<id>; the vsock UDS lives there, so
         # its parent IS the per-slot workdir (vsock.sock + outdisk.ext4 + fc-api.sock).
         # vsock_uds is a concrete-FC-handle accessor not on the generic RestoreHandle

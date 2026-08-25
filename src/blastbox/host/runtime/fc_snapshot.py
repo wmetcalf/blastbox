@@ -117,6 +117,11 @@ class SnapshotManager:
         # leaves a .mem roughly the size of guest RAM (gigabytes, often on /dev/shm), so repeated
         # rebuild episodes exhaust the tmpfs and every later build fails on ENOSPC.
         self._pins: dict[str, object] = {}          # slot_id -> the artifact it mapped
+        #: slot_id -> the build epoch of the artifact restore() actually pinned for it.
+        #: Recorded in the SAME critical section as the selection, because reading the epoch
+        #: separately (before or after) lets an invalidate+rebuild land in between and pair a
+        #: slot with the wrong identity.
+        self._pin_epoch: dict[str, int] = {}
         self._refs: dict[int, int] = {}             # id(artifact) -> live restores
         self._retired: dict[int, object] = {}       # id(artifact) -> superseded, awaiting drain
         # Build epoch. invalidate() bumps it; a build that started under an older epoch has been
@@ -128,6 +133,21 @@ class SnapshotManager:
         # Optional. Set by the snapshot runtimes so PUBLICATION -- not readiness, and not even a
         # successful checkpoint -- is what makes a base's ACK advertisement believable.
         self._ack_capable = ack_capable
+        if ack_capable is not None:
+            # BIND THE EPOCH SOURCE OURSELVES. The backend stamps each base build with an epoch
+            # it must SAMPLE from this manager; an embedder assembling the stack by hand
+            # (backend + manager, both handed the same capability) had no reason to know about a
+            # new optional sampler, so every advertisement was recorded under None while
+            # publication used an integer -- the capability could never become true and the fast
+            # repair was silently off. It used to work because the backend sampled the
+            # capability's own counter, which no longer exists (issue #92). Wiring that only
+            # holds when the caller remembers is not wiring.
+            for _attr in ("_epoch_sampler", "_ack_sampler"):
+                if getattr(backend, _attr, "missing") is None:
+                    setattr(backend, _attr, lambda: self.build_epoch)
+                _l = getattr(backend, "_launcher", None)
+                if _l is not None and getattr(_l, _attr, "missing") is None:
+                    setattr(_l, _attr, lambda: self.build_epoch)
         # Base boot handles whose kill() raised. Suppressing it discarded the ONLY reference to a
         # sandbox that may still be running, and the async retry then booted another beside it --
         # untracked, unreapable, for the life of the process (upstream, PR #82).
@@ -147,6 +167,38 @@ class SnapshotManager:
     def is_built(self) -> bool:
         """True once the snapshot artifact exists (atomic reference read)."""
         return self._artifact is not None
+
+    def _install_ack(self, epoch: int) -> None:
+        """Make this artifact's ACK advertisement believable. CALLER MUST HOLD ``_build_lock``.
+
+        THE ONE PLACE it becomes true. Backends only OBSERVE at readiness, long before anyone
+        knows whether the build yields a usable artifact: a build that advertises and then fails
+        to checkpoint, or is rejected here, publishes nothing a slot could restore from.
+
+        Called INSIDE the same critical section that assigns ``_artifact``, because the two are
+        one fact. Publishing after the lock was released left a window in which prepare() /
+        acquire_built() could expose and restore the new artifact while the capability still
+        described the previous epoch -- a job dispatched there evaluates capable_for() at
+        wait_for_done() time, reads UNKNOWN, and cannot contribute the missing-start evidence the
+        fast repair needs. Fail-safe, but it disables the repair during exactly the rebuild churn
+        it exists for.
+
+        AckCapability never calls out, so taking its lock under _build_lock cannot invert.
+        """
+        assert self._ack_capable is not None
+        self._ack_capable.publish(epoch)
+
+    def pinned_epoch(self, slot_id: object) -> "int | None":
+        """The build epoch of the artifact ``restore()`` actually pinned for this slot.
+
+        Read this INSTEAD of :attr:`build_epoch` when stamping a slot. build_epoch answers "what
+        is current now", and between that read and restore()'s selection an invalidation plus a
+        replacement build can complete -- the slot then runs the new artifact carrying the old
+        epoch, capable_for() answers False forever, and the fast repair path is silently disabled
+        for it during exactly the rebuild churn it exists to handle.
+        """
+        with self._build_lock:
+            return self._pin_epoch.get(str(slot_id))
 
     @property
     def build_epoch(self) -> int:
@@ -373,21 +425,8 @@ class SnapshotManager:
             rejected = epoch != self._build_epoch
             if not rejected:
                 self._artifact = artifact
-        if not rejected and self._ack_capable is not None:
-            # THE ONE PLACE the base's ACK advertisement becomes believable. The backends only
-            # OBSERVE it at readiness, which happens long before anyone knows whether this build
-            # yields a usable artifact -- and a build that advertises and then fails to
-            # checkpoint, or gets rejected here, publishes nothing a slot could ever restore
-            # from. Believing it at readiness left the capability permanently true for a base
-            # that never existed; roll the worker bundle back before the retry and the older
-            # image's missing start markers are then read as PROVEN non-starts, so a
-            # document-induced hang invalidates an ACK-incapable base instead of staying UNKNOWN.
-            #
-            # Published under the epoch THIS build captured at its start, which is also the
-            # epoch its backend stamped the boot handle with -- so an artifact that advertised is
-            # believed, and one that stayed silent RETIRES the previous base's capability instead
-            # of inheriting it.
-            self._ack_capable.publish(epoch)
+                if self._ack_capable is not None:
+                    self._install_ack(epoch)
         if rejected:
             # invalidate() landed while this build was running. Publishing now would install the
             # artifact the repair explicitly rejected; discard it instead and let the next build
@@ -531,6 +570,7 @@ class SnapshotManager:
             if artifact is None:
                 raise SnapshotRestoreError("snapshot not built; call build() first")
             self._pins[sid] = artifact
+            self._pin_epoch[sid] = self._build_epoch
             self._refs[id(artifact)] = self._refs.get(id(artifact), 0) + 1
         try:
             return self._backend.restore_in(slot_workdir, artifact)
@@ -581,6 +621,7 @@ class SnapshotManager:
         with self._build_lock:
             if self._pins.get(sid) is artifact:
                 self._pins.pop(sid, None)
+                self._pin_epoch.pop(sid, None)
             key = id(artifact)
             self._refs[key] = self._refs.get(key, 1) - 1
             if self._refs[key] <= 0:

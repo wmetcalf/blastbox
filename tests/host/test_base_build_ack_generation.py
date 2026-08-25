@@ -119,3 +119,85 @@ def test_a_legacy_ready_factory_is_never_handed_the_new_kwarg(factory, expected)
 def test_no_stamp_means_no_kwarg():
     assert _ready_factory_kwargs(lambda p, ack_generation=None: None,
                                  ack_generation=None) == {}
+
+
+def test_the_snapshot_runtime_stamps_the_slot_with_the_pinned_epoch(tmp_path):
+    """The RUNTIME half of the same invariant. Testing only the manager left this wiring free to
+    go back to sampling build_epoch before restore() -- a mutation proved it -- which is the
+    'fix inert in the runtime it was written for' miss this PR has hit repeatedly.
+
+    build_epoch answers "what is current now"; an invalidation plus replacement build completing
+    between that read and restore()'s selection pairs the slot with the wrong artifact, and
+    capable_for() then answers False forever for it."""
+    from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
+
+    wd = tmp_path / "slots" / "s"
+    wd.mkdir(parents=True)
+    (wd / "vsock.sock").touch()
+
+    class _Handle:
+        vsock_uds = str(wd / "vsock.sock")
+
+        def kill(self):
+            pass
+
+    class _Manager:
+        """A rebuild landed between a build_epoch read and restore()'s selection."""
+        build_epoch = 9                      # what is current NOW
+        def acquire_built(self):
+            pass
+        def restore(self, slot_id):
+            return _Handle()
+        def pinned_epoch(self, slot_id):
+            return 4                         # what this slot ACTUALLY restored from
+
+    rt = object.__new__(SnapshotSlotRuntime)
+    rt._manager = _Manager()
+    rt._ack_capable = AckCapability()
+    rt._settle_s = 0.0
+    rt._clock = lambda: 0.0
+    rt._restored_at = {}
+    rt._handles = {}
+    rt._lock = __import__("threading").Lock()
+
+    slot = SnapshotSlotRuntime.spawn(rt)
+    assert slot.ack_generation == 4, (
+        f"the slot must carry the epoch restore() pinned, not the current one; got "
+        f"{slot.ack_generation}")
+
+
+def test_the_gvisor_runtime_also_stamps_the_slot_with_the_pinned_epoch(tmp_path):
+    """The twin. Every round of this work that fixed one backend and left the other untested had
+    the untested one come back as the next finding, so the gVisor half is pinned explicitly."""
+    import threading
+
+    from blastbox.host.runtime.gvisor_snapshot_runtime import GvisorSnapshotSlotRuntime
+
+    wd = tmp_path / "slots" / "s"
+    wd.mkdir(parents=True)
+
+    class _Handle:
+        slot_workdir = str(wd)
+
+    class _Manager:
+        build_epoch = 9                      # what is current NOW
+        def acquire_built(self):
+            pass
+        def restore(self, slot_id):
+            return _Handle()
+        def pinned_epoch(self, slot_id):
+            return 4                         # what this slot ACTUALLY restored from
+
+    rt = object.__new__(GvisorSnapshotSlotRuntime)
+    rt._mgr = _Manager()
+    rt._ack_capable = AckCapability()
+    rt._settle_s = 0.0
+    rt._clock = lambda: 0.0
+    rt._restored_at = {}
+    rt._handles = {}
+    rt._lock = threading.Lock()
+
+    slot = GvisorSnapshotSlotRuntime.spawn(rt)
+    assert slot.ack_generation == 4, (
+        f"the slot must carry the epoch restore() pinned, not the current one; got "
+        f"{slot.ack_generation}")

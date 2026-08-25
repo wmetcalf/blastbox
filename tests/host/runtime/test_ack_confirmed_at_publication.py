@@ -236,3 +236,99 @@ def test_a_manager_double_without_the_seam_still_works(tmp_path):
 
     gv = select_gvisor_snapshot_runtime(manager=_Double())
     assert gv._ack_capable is not None, "the runtime must fall back to its own capability"
+
+
+def test_an_unstamped_ack_teaches_nothing_in_snapshot_mode():
+    """capable_for(None) is UNKNOWN, so learn(None) must be too.
+
+    Accepting it let a late ack from a retired -- or simply unidentifiable -- slot resurrect
+    capability for a SILENT replacement, after which that replacement's missing markers read as
+    proven non-starts and convict a healthy base. A caller that cannot say which artifact its slot
+    came from has not supplied evidence about any artifact."""
+    cap = AckCapability()
+    cap.publish(1)                       # a silent artifact is installed
+    assert cap.capable_for(1) is False
+
+    cap.learn(None)                      # an unidentifiable slot acks
+    assert cap.capable_for(1) is False, (
+        "an unstamped ack resurrected capability for a base that never advertised")
+
+    cap.learn(1)                         # ...a properly stamped one still teaches
+    assert cap.capable_for(1) is True
+
+
+def test_an_unstamped_ack_still_teaches_the_plain_runtime():
+    """With no artifact lifecycle there is one image and nothing to tell apart, so an unstamped
+    ack is the only kind there is."""
+    cap = AckCapability()                # never published: the plain FC runtime
+    cap.learn(None)
+    assert bool(cap) is True
+    assert cap.capable_for(None) is True
+
+
+def test_the_slot_is_stamped_with_the_artifact_restore_actually_pinned(tmp_path):
+    """build_epoch answers "what is current now". Between that read and restore()'s selection an
+    invalidation plus a replacement build can complete, pairing the slot with the wrong identity:
+    capable_for() then answers False forever and the fast repair is silently off for that slot
+    during exactly the rebuild churn it exists for."""
+    cap = AckCapability()
+    mgr = _mgr(tmp_path, cap, _Boot(cap, EPOCH0))
+    mgr.build()
+
+    class _Handle:
+        slot_workdir = str(tmp_path)
+
+    mgr._backend.restore_in = lambda wd, art: _Handle()
+    mgr.restore("slot-a")
+    assert mgr.pinned_epoch("slot-a") == 0, "the epoch must be the one restore() pinned"
+    assert mgr.pinned_epoch("never-restored") is None
+
+
+def test_the_capability_is_installed_with_the_artifact_not_after_it(tmp_path):
+    """prepare()/acquire_built() can expose and restore the new artifact the instant _artifact is
+    assigned. Publishing after the lock was released left a window where a job dispatched against
+    the NEW base evaluated capable_for() against the PREVIOUS epoch and read UNKNOWN."""
+    cap = AckCapability()
+    seen = []
+
+    class _WatchingBackend(_Backend):
+        pass
+
+    mgr = _mgr(tmp_path, cap, _Boot(cap, EPOCH0))
+    real = type(mgr)._install_ack
+
+    def _spy(self, epoch):
+        # At this instant the artifact is already assigned; the capability must be too by the
+        # time the lock is released.
+        seen.append((self._artifact is not None, self._build_lock.locked()))
+        return real(self, epoch)
+
+    type(mgr)._install_ack = _spy
+    try:
+        mgr.build()
+    finally:
+        type(mgr)._install_ack = real
+
+    assert seen == [(True, True)], (
+        f"the capability must be installed under the SAME lock that assigns the artifact, got {seen}")
+
+
+def test_a_hand_assembled_stack_gets_its_epoch_source_wired(tmp_path):
+    """An embedder builds backend + manager directly and hands both the same capability. There is
+    no reason for them to know about an internal epoch sampler, and without it every advertisement
+    is recorded under None while publication uses an integer -- so the capability can never become
+    true and the fast repair is silently off. Wiring that only holds when the caller remembers is
+    not wiring."""
+    cap = AckCapability()
+
+    class _BackendNeedingASampler(_Backend):
+        def __init__(self, boot):
+            super().__init__(boot)
+            self._epoch_sampler = None
+
+    be = _BackendNeedingASampler(_Boot(cap, EPOCH0))
+    assert be._epoch_sampler is None
+    mgr = SnapshotManager(Path(tmp_path), be, ack_capable=cap)
+
+    assert be._epoch_sampler is not None, "the manager must bind its own epoch source"
+    assert be._epoch_sampler() == mgr.build_epoch

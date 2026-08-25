@@ -381,9 +381,22 @@ class AckCapability:
             return self._capable and epoch == self._epoch
 
     def learn(self, epoch: "int | None" = None) -> None:
-        """A LIVE slot acked: evidence about the artifact it was restored from."""
+        """A LIVE slot acked: evidence about the artifact it was restored from.
+
+        In snapshot mode an UNSTAMPED ack (``epoch is None``) teaches nothing, exactly as
+        :meth:`capable_for` answers UNKNOWN for it. Accepting it here meant a late ack from a
+        retired -- or simply unidentifiable -- slot could resurrect capability for a SILENT
+        replacement, after which that replacement's missing markers read as proven non-starts and
+        convict a healthy base. A caller that cannot say which artifact its slot came from has not
+        supplied evidence about any artifact.
+
+        With no artifact lifecycle at all (the plain FC runtime) there is one image and nothing to
+        tell apart, so an unstamped ack is the only kind there is and it does teach.
+        """
         with self._lock:
-            if epoch is None or self._epoch is None or epoch == self._epoch:
+            if self._epoch is None:
+                self._capable = True
+            elif epoch is not None and epoch == self._epoch:
                 self._capable = True
 
     def begin_build(self) -> None:
