@@ -896,8 +896,10 @@ class VsockHostWarmControl:
         # slot -- left IDLE and claimable by a base invalidation -- picked up the NEW stamp when a
         # job claimed it, and its ack then re-taught the replacement base a capability that only
         # the retired image had. Falls back to the current generation only when nobody can say.
-        self._ack_gen = (ack_generation if ack_generation is not None
-                         else None)
+        # None is MEANINGFUL now: "no artifact lifecycle" for the plain FC tier, and
+        # "unidentifiable, teaches nothing" for a snapshot slot. There is no current-generation
+        # fallback to reach for any more -- that was the second counter #92 deleted.
+        self._ack_gen = ack_generation
         self._uds = Path(vsock_uds)
         self._job_port = job_port
         self._connect_timeout = connect_timeout_s

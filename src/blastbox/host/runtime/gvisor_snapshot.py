@@ -313,10 +313,8 @@ class GvisorBootHandle:
         # advertisement had already taught a generation it knows nothing about -- so a
         # replacement bundle WITHOUT the protocol inherits `capable`, its absent start markers
         # read as proof the guest never ran, and a healthy base is invalidated on repeat.
-        self._ack_gen = (
-            ack_generation if ack_generation is not None
-            else None
-        )
+        # None is MEANINGFUL: an unidentifiable build teaches nothing (#92).
+        self._ack_gen = ack_generation
 
     def wait_ready(self, timeout_s: float) -> None:
         self._ready(self._ctrl, timeout_s)

@@ -471,8 +471,9 @@ class HostWarmControl:
         self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
         # The SLOT's generation, taken at spawn -- see VsockHostWarmControl for why construction
         # time is the wrong moment. Falls back only when the caller cannot say.
-        self._ack_gen = (ack_generation if ack_generation is not None
-                         else None)
+        # None is MEANINGFUL: "no artifact lifecycle" (plain tier) or "unidentifiable, teaches
+        # nothing" (snapshot slot). No current-generation fallback exists to reach for (#92).
+        self._ack_gen = ack_generation
         #: Latched: ctrl/ was seen UNWRITABLE at some point while this control waited. A storage
         #: incident that clears before the deadline is otherwise undetectable -- see
         #: wait_for_done.

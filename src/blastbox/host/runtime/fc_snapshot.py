@@ -144,10 +144,10 @@ class SnapshotManager:
             # holds when the caller remembers is not wiring.
             for _attr in ("_epoch_sampler", "_ack_sampler"):
                 if getattr(backend, _attr, "missing") is None:
-                    setattr(backend, _attr, lambda: self.build_epoch)
+                    setattr(backend, _attr, self._epoch_unlocked)
                 _l = getattr(backend, "_launcher", None)
                 if _l is not None and getattr(_l, _attr, "missing") is None:
-                    setattr(_l, _attr, lambda: self.build_epoch)
+                    setattr(_l, _attr, self._epoch_unlocked)
         # Base boot handles whose kill() raised. Suppressing it discarded the ONLY reference to a
         # sandbox that may still be running, and the async retry then booted another beside it --
         # untracked, unreapable, for the life of the process (upstream, PR #82).
@@ -187,6 +187,19 @@ class SnapshotManager:
         """
         assert self._ack_capable is not None
         self._ack_capable.publish(epoch)
+
+    def _epoch_unlocked(self) -> int:
+        """The build epoch WITHOUT taking _build_lock. For the sampler callbacks only.
+
+        The bound sampler is invoked by the BACKEND from inside boot_base(), which today never
+        holds _build_lock -- but the callback closes over `self`, so `lambda: self.build_epoch`
+        re-enters this manager's lock, and _build_lock is a plain Lock: any future caller that
+        samples while holding it self-deadlocks the build thread outright. Reading the int
+        directly is atomic under the GIL and cannot deadlock, and the value is exactly what the
+        property would have returned the instant after releasing. Two reviewers circled this
+        independently; the hazard is not worth keeping for a lock that buys nothing here.
+        """
+        return self._build_epoch
 
     def pinned_epoch(self, slot_id: object) -> "int | None":
         """The build epoch of the artifact ``restore()`` actually pinned for this slot.
@@ -249,6 +262,9 @@ class SnapshotManager:
             self._build_thread.start()
 
     def _build_worker(self) -> None:
+        # The epoch this attempt starts under, so a failure can tell "this build is broken" from
+        # "a repair superseded it while it was failing". See the except handler below.
+        started_epoch = self.build_epoch
         try:
             self.build()
         except SnapshotBuildInvalidated:
@@ -256,14 +272,30 @@ class SnapshotManager:
             # the next tick should start the replacement build straight away.
             _log.info("snapshot.build_rejected reason=invalidated_mid_build; retrying at once")
         except Exception as exc:  # noqa: BLE001 — surface + back off; the pool falls back to cold
+            # SUPERSEDED-CHECK, in the same critical section that arms the backoff. invalidate()
+            # deliberately clears _retry_not_before ("this is a deliberate rebuild request, not a
+            # retry of a build that just failed") -- but it does so under a SEPARATE hold, and the
+            # async build spends its whole boot+wait_ready window outside the lock. A repair
+            # landing after this build failed but before it reached here was then overwritten:
+            # the replacement build was refused for build_retry_backoff_s, prepare() kept
+            # returning False, and every job fell to the cold tier for 30s immediately after the
+            # repair that was supposed to restore warm capacity.
             with self._build_lock:
-                self._build_error = exc
-                self._retry_not_before = time.monotonic() + self._build_retry_backoff_s
-            _log.warning(
-                "warm snapshot build failed; cold fallback active, retry after %.0fs: %s",
-                self._build_retry_backoff_s,
-                exc,
-            )
+                superseded = started_epoch != self._build_epoch
+                if not superseded:
+                    self._build_error = exc
+                    self._retry_not_before = time.monotonic() + self._build_retry_backoff_s
+            if superseded:
+                _log.info(
+                    "snapshot.build_failed_but_superseded reason=repair_landed_during_failure "
+                    "-- not arming the backoff; the replacement build starts at once: %s", exc,
+                )
+            else:
+                _log.warning(
+                    "warm snapshot build failed; cold fallback active, retry after %.0fs: %s",
+                    self._build_retry_backoff_s,
+                    exc,
+                )
         else:
             with self._build_lock:
                 self._build_error = None

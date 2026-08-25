@@ -366,3 +366,31 @@ def test_capability_learn_and_reset_are_mutually_exclusive():
 
     assert finished.wait(2.0), "learn() must proceed once the lock is released"
     assert bool(cap) is True
+
+
+def test_snapshot_mode_capability_is_epoch_scoped_end_to_end(tmp_path):
+    """EVERY other capability assertion in this file uses learn() with no epoch and bare
+    truthiness, so after the #92 refactor they all exercise only the plain, no-artifact path --
+    this file has zero publish() calls. Proof: hardcoding snapshot-mode capable_for() to
+    `return False` left all 19 of them green. So the tests named for snapshot behaviour stopped
+    covering it, and this one restores that coverage."""
+    from blastbox.worker.warm import AckCapability, HostWarmControl
+
+    cap = AckCapability(artifact_scoped=True)
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+
+    # Nothing published yet: a control cannot be judged, whatever it acks.
+    early = HostWarmControl(ctrl, ack_capable=cap, ack_generation=0)
+    cap.learn(early._ack_gen)
+    assert cap.capable_for(0) is False, "capability before any artifact must be UNKNOWN"
+
+    # The base build advertises and its artifact is installed.
+    cap.observe(0)
+    cap.publish(0)
+    assert cap.capable_for(0) is True
+
+    # A slot from the RETIRED artifact is not judged by the current one, and vice versa.
+    cap.publish(1)                                  # a silent replacement
+    assert cap.capable_for(1) is False, "a silent replacement must not inherit"
+    assert cap.capable_for(0) is False, "a retired epoch is no longer the published one"

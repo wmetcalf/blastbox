@@ -356,7 +356,12 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
     # Created before both so the BASE BUILD and the runtime serving restores share it: the base
     # advertises the start-marker protocol in `ready`, and that is the only moment it is visible
     # (a restore gets a fresh ctrl/, and the checkpointed worker resumes past signal_ready).
-    ack_capable = AckCapability()
+    # ARTIFACT-SCOPED, like the runtime fallback. This is the capability the manager
+    # publishes into, so before its first publish() it must answer UNKNOWN rather than
+    # behave like the plain, no-artifact FC tier -- where one learn() would make it capable
+    # for EVERY epoch. Scoping only the fallback protected the misconfigured wiring and
+    # left the configured one open.
+    ack_capable = AckCapability(artifact_scoped=True)
     # Late-bound: the backend is built before the manager, but only SAMPLES the epoch at
     # boot_base() time, long after it exists.
     _mgr_ref: list = []

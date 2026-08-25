@@ -528,7 +528,12 @@ def select_snapshot_runtime(
     mem_dir = resolve_mem_dir() or base_dir
     # Created HERE so the base-build listener and the runtime that serves restores share one set:
     # the base advertises at build time, every restored slot then reads the answer.
-    ack_capable = AckCapability()
+    # ARTIFACT-SCOPED, like the runtime fallback. This is the capability the manager
+    # publishes into, so before its first publish() it must answer UNKNOWN rather than
+    # behave like the plain, no-artifact FC tier -- where one learn() would make it capable
+    # for EVERY epoch. Scoping only the fallback protected the misconfigured wiring and
+    # left the configured one open.
+    ack_capable = AckCapability(artifact_scoped=True)
     # Late-bound: the launcher is built before the manager, but only ever SAMPLES the
     # epoch at boot_base() time, long after the manager exists.
     _mgr_ref: list = []

@@ -504,3 +504,120 @@ def test_a_gvisor_epoch_lookup_failure_does_not_leak_the_sandbox():
 
     assert killed, "the live sandbox was left running with no Slot to reap it"
     assert released, "the generation pin was stranded"
+
+
+def test_a_repair_does_not_inherit_a_failed_builds_backoff(tmp_path):
+    """invalidate() clears _retry_not_before because a deliberate repair is not a retry of a build
+    that just failed. But it does so under a SEPARATE lock hold, and the async build spends its
+    whole boot+wait_ready window outside the lock -- so a repair landing after a build failed but
+    before its except handler ran was overwritten. The replacement build was then refused for
+    build_retry_backoff_s, prepare() kept returning False, and every job fell to the cold tier for
+    30s immediately after the repair meant to restore warm capacity."""
+    import threading
+    import time as _t
+
+    booted = threading.Event()
+
+    class _NeverReady:
+        def wait_ready(self, t):
+            raise RuntimeError("never ready")
+
+        def kill(self):
+            pass
+
+    class _Backend:
+        _epoch_sampler = _launcher = None
+
+        def boot_base(self):
+            booted.set()
+            _t.sleep(0.05)
+            return _NeverReady()
+
+    mgr = SnapshotManager(Path(tmp_path), _Backend(), build_retry_backoff_s=30.0)
+    mgr.ensure_build_started()
+    assert booted.wait(5)
+    _t.sleep(0.02)
+    mgr.invalidate()                      # the deliberate repair, landing mid-failure
+    _t.sleep(0.4)
+
+    assert _t.monotonic() >= mgr._retry_not_before, (
+        "the repair inherited the failed build's cold window")
+    assert mgr._build_error is None, "the superseded build's error was resurrected"
+
+
+def test_a_genuinely_failed_build_still_backs_off(tmp_path):
+    """Control: the superseded-check must not disarm the backoff for a build nothing superseded."""
+    import time as _t
+
+    class _NeverReady:
+        def wait_ready(self, t):
+            raise RuntimeError("never ready")
+
+        def kill(self):
+            pass
+
+    class _Backend:
+        _epoch_sampler = _launcher = None
+
+        def boot_base(self):
+            return _NeverReady()
+
+    mgr = SnapshotManager(Path(tmp_path), _Backend(), build_retry_backoff_s=30.0)
+    mgr.ensure_build_started()
+    for _ in range(200):
+        if mgr._build_error is not None:
+            break
+        _t.sleep(0.01)
+    assert mgr._build_error is not None, "a real failure must still be recorded"
+    assert _t.monotonic() < mgr._retry_not_before, "a real failure must still back off"
+
+
+def test_the_production_capabilities_are_artifact_scoped():
+    """Scoping only the runtime FALLBACK protected the misconfigured wiring and left the
+    configured one open: the capabilities select_*() hands to SnapshotManager -- the ones publish()
+    actually moves -- were unscoped, so before the first publish one learn() made capable_for()
+    answer True for EVERY epoch."""
+    import inspect
+
+    from blastbox.host.runtime import fc_snapshot_runtime as fcm
+    from blastbox.host.runtime import gvisor_snapshot_runtime as gvm
+
+    for mod in (fcm, gvm):
+        src = inspect.getsource(mod)
+        bare = [ln.strip() for ln in src.splitlines()
+                if "AckCapability()" in ln and "ack_capable is not None" not in ln]
+        assert not bare, (
+            f"{mod.__name__} builds an UNSCOPED snapshot capability: {bare}")
+
+
+def test_the_bound_epoch_sampler_does_not_re_enter_the_build_lock():
+    """The sampler the manager binds into the backend closes over `self`. Bound as
+    `lambda: self.build_epoch` it re-enters _build_lock -- a PLAIN Lock -- so any caller that
+    samples while holding it self-deadlocks the build thread. Nothing does today; this pins it so
+    nothing starts."""
+    import threading
+    from pathlib import Path as _P
+
+    from blastbox.host.runtime.fc_snapshot import SnapshotManager
+    from blastbox.worker.warm import AckCapability
+
+    class _Backend:
+        _epoch_sampler = None
+        _ack_sampler = None
+
+    be = _Backend()
+    mgr = SnapshotManager(_P("/tmp"), be, ack_capable=AckCapability(artifact_scoped=True))
+    assert be._epoch_sampler is not None, "precondition: the manager bound its epoch source"
+
+    # Sample WHILE holding _build_lock. A re-locking sampler hangs here forever.
+    done = threading.Event()
+    result = {}
+
+    def _sample_under_the_lock():
+        with mgr._build_lock:
+            result["epoch"] = be._epoch_sampler()
+        done.set()
+
+    threading.Thread(target=_sample_under_the_lock, daemon=True).start()
+    assert done.wait(2.0), "the bound sampler re-entered _build_lock and deadlocked"
+    assert result["epoch"] == 0
