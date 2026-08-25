@@ -842,8 +842,15 @@ class WarmPool:
                 self._spawn_consecutive_failures = 0
                 self._promoted_unproven.discard(slot.slot_id)
                 self._clean_release_count += 1
-                self._clean_release_by_base[_bident] = (
-                    self._clean_release_by_base.get(_bident, 0) + 1)
+                # GENERATION-GUARDED, like the evidence it arbitrates. A long-running slot from
+                # a retired generation succeeding late still bumped this, which marked the CURRENT
+                # base's decision stale and abandoned its repair -- while the evidence that
+                # justified it had already been consumed. Same stamp check as the pre-guest clear.
+                _tok_stamp = self._slot_base.get(slot.slot_id)
+                if _tok_stamp is None or _tok_stamp[1] == self._base_generation.get(
+                        _tok_stamp[0], 0):
+                    self._clean_release_by_base[_bident] = (
+                        self._clean_release_by_base.get(_bident, 0) + 1)
             elif dirty and fault == "worker":
                 # ONLY worker-attributed failures are evidence about the slot. Counting job faults
                 # here is what let two bad samples in a row destroy a warm worker with a hundred
@@ -898,8 +905,15 @@ class WarmPool:
                 # Episode token: a rebuild decision taken before this point is abandoned, because
                 # the base demonstrably just produced a valid result.
                 self._clean_release_count += 1
-                self._clean_release_by_base[_bident] = (
-                    self._clean_release_by_base.get(_bident, 0) + 1)
+                # GENERATION-GUARDED, like the evidence it arbitrates. A long-running slot from
+                # a retired generation succeeding late still bumped this, which marked the CURRENT
+                # base's decision stale and abandoned its repair -- while the evidence that
+                # justified it had already been consumed. Same stamp check as the pre-guest clear.
+                _tok_stamp = self._slot_base.get(slot.slot_id)
+                if _tok_stamp is None or _tok_stamp[1] == self._base_generation.get(
+                        _tok_stamp[0], 0):
+                    self._clean_release_by_base[_bident] = (
+                        self._clean_release_by_base.get(_bident, 0) + 1)
                 # A served job is the only conclusive proof that the base yields a usable worker,
                 # so it — not promotion — is what clears the restore-failure streak.
                 self._spawn_consecutive_failures = 0
@@ -2618,14 +2632,19 @@ class WarmPool:
                     "pool.base_rebuild_skipped reason=another_repair_just_completed "
                     "reason_kind=%s", reason,
                 )
-                # HAND THE EPISODE BACK. Two cascade bases can cross concurrently: both threads
-                # consume their evidence before contending for _invalidation_lock, and the loser
-                # lands here. Its tier was never repaired -- the winner repaired a DIFFERENT one --
-                # so dropping the evidence makes the still-poisoned tier earn a whole fresh
-                # threshold-sized batch of failures after the cooldown before it is even
-                # reconsidered. Same restore the failed-repair path already does, for the other
-                # early return out of this decision.
-                self._restore_episode(episode_ident, pool_failures, _consumed_pre_guest, reason)
+                # Hand the episode back ONLY if the winner repaired a DIFFERENT base. Two
+                # crossings for the SAME base also race -- six assigned slots can fail while a
+                # slow invalidation runs -- and there the loser's evidence is all from the
+                # generation that was just replaced. Restoring it into the fresh base lets a
+                # single later failure rebuild something that was never given a chance to work.
+                if episode_ident in self._last_base_rebuild_idents:
+                    logger.info(
+                        "pool.base_rebuild_skipped reason=already_repaired_by_the_winner "
+                        "base=%s -- discarding evidence from the retired generation",
+                        episode_ident or "<default>")
+                else:
+                    self._restore_episode(episode_ident, pool_failures, _consumed_pre_guest,
+                                          reason)
                 return False
             return self._invalidate_now(drop, reason, pool_failures, success_token, now,
                                         episode_ident, _consumed_pre_guest)
@@ -2682,6 +2701,14 @@ class WarmPool:
                 with self._lock:
                     for _name in {str(n) for n in _repaired}:
                         self._base_generation[_name] = self._base_generation.get(_name, 0) + 1
+                        # ...and their evidence goes with them. The generation advances here, so
+                        # these tiers HAVE been replaced -- but the success-path cleanup never
+                        # runs on this branch, so below-threshold evidence recorded against the
+                        # old artifact survived into the new one: two failures from the retired
+                        # tier plus one from its replacement immediately convict the fresh base.
+                        self._pool_consecutive_failures.pop(_name, None)
+                        self._pool_pre_guest_failures.pop(_name, None)
+                    self._last_base_rebuild_idents |= {str(n) for n in _repaired}
             logger.exception("pool.base_rebuild_error pool_consecutive_failures=%d", pool_failures)
             # RESTORE the consumed episode. The streak was consumed to make the decision, but the
             # repair did not happen -- so making the poisoned base wait for another full

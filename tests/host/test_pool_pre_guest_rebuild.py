@@ -461,3 +461,86 @@ def test_every_tier_a_repair_committed_is_recorded():
     assert pool._last_base_rebuild_idents == {"tierA", "tierB"}
     assert not pool._pool_consecutive_failures.get("tierA"), (
         "tierA was rebuilt by this repair, so its pre-rebuild streak must not survive it")
+
+
+def test_a_retired_generations_success_does_not_bump_the_per_base_token():
+    """The per-base token arbitrates whether a decision went stale. A long-running slot from an
+    already-retired generation succeeding late still bumped it, which marks the CURRENT base's
+    decision stale and abandons its repair -- after the evidence justifying it was consumed.
+
+    Asserted on the token itself: the staleness window (a success landing between a decision's
+    capture and its check) is not drivable from a test, and an end-to-end version passed for an
+    unrelated reason.
+    """
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3)
+    current, stale = _claim_distinct(pool, 2)
+
+    pool.release(current, dirty=False)
+    assert pool._clean_release_by_base.get("tierB") == 1, "a current-generation success counts"
+
+    ident, gen = pool._slot_base.get(stale.slot_id, ("tierB", 0))
+    pool._slot_base[stale.slot_id] = (ident, gen - 1)      # retired generation
+    pool.release(stale, dirty=False)
+    assert pool._clean_release_by_base.get("tierB") == 1, (
+        "a success from a base that has already been replaced says nothing about the current one")
+
+
+def test_the_loser_discards_evidence_when_the_winner_repaired_THIS_base():
+    """Two crossings for the SAME base race: six assigned slots can fail while a slow
+    invalidation runs. The loser's evidence is then all from the generation just replaced, and
+    restoring it into the fresh base lets one later failure rebuild something never given a
+    chance to work.
+
+    The winner is simulated by a lock that completes the repair as the loser acquires it -- which
+    is exactly the window, and the only way to reach the serialized skip rather than the outer
+    cooldown check.
+    """
+    import threading
+
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=300.0)
+
+    real = pool._invalidation_lock
+
+    class _WinnerFinishesFirst:
+        def __enter__(self):
+            real.acquire()
+            pool._last_base_rebuild_at = pool._clock()      # the winner just committed...
+            pool._last_base_rebuild_idents = {"tierB"}      # ...on THIS base
+            return self
+        def __exit__(self, *exc):
+            real.release()
+            return False
+
+    pool._invalidation_lock = _WinnerFinishesFirst()
+    _ = threading
+    for slot in _claim_distinct(pool, 3):
+        _fail(pool, slot, stage="pre_guest")
+    assert rt.base_invalidations == 0, "the winner's cooldown must suppress the loser"
+    assert not pool._pool_pre_guest_failures.get("tierB"), (
+        "evidence from the generation the winner replaced must not survive into the new one")
+
+
+def test_a_partial_repair_clears_the_evidence_of_the_tiers_it_did_replace():
+    """A spawn-driven cascade invalidation can repair tier A and fail tier B. The exception path
+    advances A's generation -- so A HAS been replaced -- but the success-path cleanup never runs,
+    leaving below-threshold evidence against the old artifact to convict the new one."""
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3)
+
+    class _PartialFail(Exception):
+        repaired = ["tierA"]
+
+    def _drop(*, reason=None, only=None):
+        raise _PartialFail("tierB could not be dropped")
+    rt.invalidate_base = _drop
+
+    sib, a, b, c = _claim_distinct(pool, 4)
+    rt._ident[sib.slot_id] = "tierA"
+    _fail(pool, sib, stage="pre_guest")              # evidence against the OLD tierA
+    assert pool._pool_pre_guest_failures.get("tierA")
+    for slot in (a, b, c):
+        _fail(pool, slot, stage="pre_guest")         # tierB crosses; the repair partially fails
+    assert not pool._pool_pre_guest_failures.get("tierA"), (
+        "tierA's generation advanced, so evidence against its retired artifact must go with it")
