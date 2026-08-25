@@ -351,3 +351,33 @@ def test_the_writability_probe_actually_probes(tmp_path):
         assert host._ctrl_writable() is False, "a read-only dir must report unwritable"
     finally:
         ctrl.chmod(stat.S_IRWXU)
+
+
+def test_the_probe_cannot_be_used_to_truncate_a_host_file(tmp_path):
+    """ctrl/ is a 0o777 bind mount on the gVisor tier. A predictable probe name plus a plain
+    write_bytes() hands the worker an arbitrary-truncation primitive: pre-plant a symlink, wait
+    for any timeout, and the HOST opens the target with O_TRUNC. A health probe must not be a
+    write gadget."""
+    import os
+
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    victim = tmp_path / "victim"
+    victim.write_text("PRECIOUS")
+
+    # every name the probe could plausibly use, pre-planted as a symlink to the victim
+    for name in (f".bb-probe-{os.getpid()}", ".bb-probe", "probe"):
+        (ctrl / name).symlink_to(victim)
+
+    host = HostWarmControl(ctrl)
+    assert host._ctrl_writable() is True, "a writable dir is still writable"
+    assert victim.read_text() == "PRECIOUS", "the probe must never follow a planted symlink"
+
+
+def test_the_probe_leaves_nothing_behind(tmp_path):
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    host = HostWarmControl(ctrl)
+    for _ in range(5):
+        assert host._ctrl_writable() is True
+    assert not list(ctrl.iterdir()), f"probe residue: {list(ctrl.iterdir())}"

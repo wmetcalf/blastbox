@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 import re
 import time
 from dataclasses import dataclass, field
@@ -367,12 +368,34 @@ class HostWarmControl:
         silences every worker at once, so treating that silence as "the guest never started"
         convicts a healthy base across the whole pool during a storage incident.
         """
-        probe = self._dir / f".bb-probe-{os.getpid()}"
+        from blastbox.contract.envelope import atomic_write_confined
+
+        # CONFINED, and the name is RANDOM. `.bb-probe-<pid>` was predictable, and write_bytes()
+        # follows a symlink -- so a worker could pre-plant one in this 0o777 bind mount and have
+        # the host truncate any file it can reach, the moment a timeout ran this check. That is a
+        # host-side arbitrary-truncation primitive handed over by a health probe. The confined
+        # helper creates its temp relative to a dirfd with O_CREAT|O_EXCL|O_NOFOLLOW and renames
+        # over the destination without following it; the random name means there is nothing to
+        # pre-plant against either.
+        name = f".bb-probe-{uuid.uuid4().hex}"
         try:
-            probe.write_bytes(b"")
-            probe.unlink()
+            atomic_write_confined(self._dir, name, b"", mode=0o600)
         except OSError:
             return False
+        except Exception:  # noqa: BLE001 - a confinement violation is not a storage verdict
+            return False
+        finally:
+            # Unlinked through a dirfd for the same reason: never resolve this path by string.
+            try:
+                dfd = os.open(self._dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            except OSError:
+                return True
+            try:
+                os.unlink(name, dir_fd=dfd)
+            except OSError:
+                pass
+            finally:
+                os.close(dfd)
         return True
 
     def wait_for_done(self, *, timeout_s: float) -> str:
