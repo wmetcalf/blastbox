@@ -456,6 +456,25 @@ class CascadingRuntime:
         # see (upstream, PR #82).
         return True
 
+    def spawn_guilty_identities(self) -> "list[str]":
+        """Identities of the tiers a SPAWN-triggered repair would target RIGHT NOW.
+
+        invalidate_base(reason="spawn") narrows to exactly this set, but the pool decides
+        *whether* to call it at all -- and its own spawn streak is a single pool-wide integer
+        with no tier attribution, so it was comparing "has ANY tier released cleanly?" against a
+        repair aimed at ONE tier. A healthy sibling absorbing the load then cancelled the guilty
+        tier's repair. The pool needs the same set this method selects to ask its question about
+        the right base.
+
+        An empty list means "no per-tier evidence": the caller must fall back to its pool-wide
+        view rather than read an empty scope as "nothing has succeeded".
+        """
+        with self._lock:
+            guilty = ({i for i, n in enumerate(self._tier_failures) if n > 0}
+                      | self._recently_guilty)
+        # _tier_identity reads only the immutable tier list, so it is safe outside the lock.
+        return sorted(self._tier_identity(i) for i in guilty)
+
     def invalidate_base(self, *, reason: str | None = None,
                         only: "str | None" = None) -> "list[str]":
         """Forward base invalidation to every wrapped tier that supports it.

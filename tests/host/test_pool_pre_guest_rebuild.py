@@ -658,7 +658,7 @@ def test_a_success_during_the_cooldown_discards_the_episode_too():
     pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=300.0)
     pool._last_base_rebuild_at = pool._clock()
     pool._last_base_rebuild_idents = {"tierA"}        # a DIFFERENT tier is cooling
-    pool._base_succeeded_since = lambda ident, token: ident == "tierB"
+    pool._base_succeeded_since = lambda ident, token, scope=(): ident == "tierB"
 
     restored = []
     real_restore = pool._restore_episode
@@ -679,7 +679,7 @@ def test_a_base_that_did_NOT_succeed_still_gets_its_evidence_back():
     pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=300.0)
     pool._last_base_rebuild_at = pool._clock()
     pool._last_base_rebuild_idents = {"tierA"}
-    pool._base_succeeded_since = lambda ident, token: False
+    pool._base_succeeded_since = lambda ident, token, scope=(): False
 
     for slot in _claim_distinct(pool, 3):
         _fail(pool, slot, stage="pre_guest")
@@ -687,3 +687,88 @@ def test_a_base_that_did_NOT_succeed_still_gets_its_evidence_back():
     assert rt.base_invalidations == 0
     assert len(pool._pool_pre_guest_failures.get("tierB", set())) >= 3, (
         "no success means the evidence is still valid and must be handed back")
+
+
+class _ScopedWedge(_TieredWedge):
+    """A cascade that can say which tiers a SPAWN repair would target -- as the real one can."""
+
+    def __init__(self, guilty=("tierB",)):
+        super().__init__()
+        self.guilty = list(guilty)
+
+    def spawn_guilty_identities(self):
+        return list(self.guilty)
+
+
+def _release_during_the_decision(pool, ident):
+    """Land a clean release on `ident` strictly between the token capture and the staleness check.
+
+    _maybe_rebuild_base captures the token, then calls self._clock() once, then judges staleness --
+    so the clock is the one seam that sits inside that window.
+    """
+    real, fired = pool._clock, []
+
+    def _clock():
+        if not fired:
+            fired.append(1)
+            with pool._lock:
+                pool._clean_release_count += 1
+                pool._clean_release_by_base[ident] = (
+                    pool._clean_release_by_base.get(ident, 0) + 1)
+        return real()
+
+    pool._clock = _clock
+    return fired
+
+
+def test_a_sibling_tiers_success_does_not_cancel_the_guilty_tiers_spawn_repair():
+    """The spawn streak is ONE pool-wide integer, but the repair it triggers is narrowed by the
+    cascade to the guilty tiers. Judging it against the pool-wide clean-release counter therefore
+    asked the wrong question: a healthy sibling absorbing the load -- which is exactly what a
+    cascade does when a tier is poisoned -- looked like the guilty tier recovering, and cancelled
+    its repair."""
+    rt = _ScopedWedge(guilty=("tierB",))
+    pool = _pool(rt, snapshot_rebuild_after=2, base_rebuild_cooldown_s=0)
+    fired = _release_during_the_decision(pool, "tierA")      # a DIFFERENT tier succeeds
+
+    assert pool._maybe_rebuild_base(5, reason="spawn") is True, (
+        "tierA's success cancelled tierB's repair; tierB produced no successful slot at all")
+    assert fired, "the injected sibling release never landed — the test proves nothing"
+    assert rt.base_invalidations == 1
+
+
+def test_the_guilty_tiers_own_success_still_cancels_its_spawn_repair():
+    """Fail-closed control: the guard must keep working for the tier it is actually about."""
+    rt = _ScopedWedge(guilty=("tierB",))
+    pool = _pool(rt, snapshot_rebuild_after=2, base_rebuild_cooldown_s=0)
+    fired = _release_during_the_decision(pool, "tierB")      # the GUILTY tier succeeds
+
+    assert pool._maybe_rebuild_base(5, reason="spawn") is False, (
+        "a base that produced a valid result while being judged must not be rebuilt")
+    assert fired
+    assert rt.base_invalidations == 0
+
+
+def test_a_runtime_without_the_seam_keeps_the_pool_wide_token():
+    """One base means pool-wide IS the right scope; a runtime that cannot attribute must not
+    silently lose the guard that the pool-wide counter provides."""
+    rt = _TieredWedge()                                      # no spawn_guilty_identities
+    pool = _pool(rt, snapshot_rebuild_after=2, base_rebuild_cooldown_s=0)
+    assert pool._spawn_success_scope() == ()
+    fired = _release_during_the_decision(pool, "tierA")
+
+    assert pool._maybe_rebuild_base(5, reason="spawn") is False, (
+        "with no attribution the pool-wide counter is all there is, and it moved")
+    assert fired
+
+
+def test_a_broken_attribution_seam_does_not_stop_a_repair_decision():
+    """The seam is an optimisation. A runtime that raises must degrade to pool-wide, not crash
+    the maintenance tick that is trying to repair a wedged tier."""
+    class _Broken(_TieredWedge):
+        def spawn_guilty_identities(self):
+            raise RuntimeError("cascade lock timed out")
+
+    pool = _pool(_Broken(), snapshot_rebuild_after=2, base_rebuild_cooldown_s=0)
+    assert pool._spawn_success_scope() == ()
+    assert pool._maybe_rebuild_base(5, reason="spawn") is True

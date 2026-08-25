@@ -2487,6 +2487,11 @@ class WarmPool:
                 self._pool_pre_guest_failures.clear()
             return False
         success_token: int | None = None
+        # The base identities the token is ABOUT. Empty means the token is pool-wide. Only a
+        # spawn episode can need this: it carries no episode_ident, yet the repair it triggers is
+        # narrowed by the cascade to the guilty tiers -- so the pool must ask its
+        # "did it already recover?" question about those tiers, not about the whole pool.
+        success_scope: tuple[str, ...] = ()
         # "" is the whole-runtime base: the SPAWN path passes its own counter and does not consume
         # a per-identity episode, so it has no identity of its own to restore on failure.
         episode_ident = ""
@@ -2547,12 +2552,26 @@ class WarmPool:
             # count earlier, so a concurrent clean release can land between then and here -- and
             # skipping the token meant that path invalidated a base which had just produced a
             # valid result, the very case the token was added to prevent (PR #82).
+            # OUTSIDE self._lock: this calls into the runtime, which takes its own lock, and
+            # self._lock is a plain Lock. Ordering the two the other way is a deadlock.
+            if reason == "spawn" and not episode_ident:
+                success_scope = self._spawn_success_scope()
             with self._lock:
                 # Spawn episodes are unattributed (episode_ident == ""), and nothing is ever
                 # recorded under "" in the per-base ledger -- so this must read the pool-wide
                 # counter or the guard can never fire. See _base_succeeded_since.
-                success_token = (self._clean_release_by_base.get(episode_ident, 0)
-                                 if episode_ident else self._clean_release_count)
+                #
+                # SCOPED when the runtime can say which tiers a spawn repair would hit. The
+                # pool-wide counter moves on ANY tier's clean release, so a healthy sibling
+                # absorbing the load looked like recovery of the poisoned tier and cancelled its
+                # (correctly targeted) repair -- after which the cooldown path zeroes the
+                # retained spawn streak, making the tier earn a whole fresh threshold-sized batch
+                # of failures before it is reconsidered.
+                if success_scope:
+                    success_token = self._scoped_clean_releases(success_scope)
+                else:
+                    success_token = (self._clean_release_by_base.get(episode_ident, 0)
+                                     if episode_ident else self._clean_release_count)
         now = self._clock()
         with self._lock:
             last = self._last_base_rebuild_at
@@ -2579,7 +2598,7 @@ class WarmPool:
                 with self._lock:
                     self._pool_consecutive_failures.pop(episode_ident, None)
                     self._pool_pre_guest_failures.pop(episode_ident, None)
-            elif self._base_succeeded_since(episode_ident, success_token):
+            elif self._base_succeeded_since(episode_ident, success_token, success_scope):
                 # A slot from THIS base completed between the decision and here. That is
                 # conclusive, and restoring failures from before it would let one later failure
                 # rebuild a base that has since proved healthy. Same recheck the stale-decision
@@ -2626,7 +2645,7 @@ class WarmPool:
             return False
         # NOT under self._lock: the helper takes it, and this is a plain Lock, not an RLock --
         # nesting them deadlocks the dispatcher outright.
-        stale = self._base_succeeded_since(episode_ident, success_token)
+        stale = self._base_succeeded_since(episode_ident, success_token, success_scope)
         if stale:
             logger.info(
                 "pool.base_rebuild_skipped reason=slot_succeeded_during_decision — the base "
@@ -2663,7 +2682,7 @@ class WarmPool:
                         "pool.base_rebuild_skipped reason=already_repaired_by_the_winner "
                         "base=%s -- discarding evidence from the retired generation",
                         episode_ident or "<default>")
-                elif self._base_succeeded_since(episode_ident, success_token):
+                elif self._base_succeeded_since(episode_ident, success_token, success_scope):
                     # A slot from THIS base completed while we waited behind another tier's
                     # invalidation. That is conclusive: restoring the pre-recovery evidence would
                     # let a later failure invalidate a base which has since demonstrated it works.
@@ -2677,7 +2696,31 @@ class WarmPool:
             return self._invalidate_now(drop, reason, pool_failures, success_token, now,
                                         episode_ident, _consumed_pre_guest)
 
-    def _base_succeeded_since(self, episode_ident, token) -> bool:  # noqa: ANN001
+    def _spawn_success_scope(self) -> "tuple[str, ...]":
+        """Which base identities a spawn-triggered repair would target, per the runtime.
+
+        Best effort and OPTIONAL: a runtime with one base (or no such seam) returns nothing and
+        the caller keeps the pool-wide counter, which for a single base is exactly right.
+        """
+        fn = getattr(self._runtime, "spawn_guilty_identities", None)
+        if not callable(fn):
+            return ()
+        try:
+            return tuple(sorted(str(x) for x in (fn() or ())))
+        except Exception:  # noqa: BLE001 - a broken seam must not stop a repair decision
+            logger.warning("pool.spawn_guilty_identities_failed -- falling back to the "
+                           "pool-wide success token", exc_info=True)
+            return ()
+
+    def _scoped_clean_releases(self, scope) -> int:  # noqa: ANN001
+        """Clean releases across ``scope``. CALLER MUST HOLD ``self._lock``.
+
+        A sum, because these counters only ever increase: any one of the scoped bases producing a
+        clean result moves it, and nothing else can.
+        """
+        return sum(self._clean_release_by_base.get(i, 0) for i in scope)
+
+    def _base_succeeded_since(self, episode_ident, token, scope=()) -> bool:  # noqa: ANN001
         """Has this base produced a clean release since ``token`` was captured?
 
         Spawn episodes carry no identity (``episode_ident`` is ""), and a cascade records clean
@@ -2689,6 +2732,10 @@ class WarmPool:
         if token is None:
             return False
         with self._lock:
+            if scope:
+                # Only the tiers this repair would actually touch. A clean release from a healthy
+                # sibling says nothing about the base being repaired.
+                return self._scoped_clean_releases(scope) != token
             if not episode_ident:
                 return self._clean_release_count != token
             return self._clean_release_by_base.get(episode_ident, 0) != token
