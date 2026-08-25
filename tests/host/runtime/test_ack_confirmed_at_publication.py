@@ -332,3 +332,74 @@ def test_a_hand_assembled_stack_gets_its_epoch_source_wired(tmp_path):
 
     assert be._epoch_sampler is not None, "the manager must bind its own epoch source"
     assert be._epoch_sampler() == mgr.build_epoch
+
+
+def test_the_pinned_epoch_is_dropped_when_the_slot_is_reaped(tmp_path):
+    """Only a FAILED restore went through _unpin(), so on the normal reap path the epoch entry
+    was never dropped -- one dict entry per slot ever restored, for the life of a dispatcher that
+    recycles slots continuously."""
+    cap = AckCapability()
+    mgr = _mgr(tmp_path, cap, _Boot(cap, EPOCH0))
+    mgr.build()
+
+    class _Handle:
+        slot_workdir = str(tmp_path)
+
+    mgr._backend.restore_in = lambda wd, art: _Handle()
+    for i in range(25):
+        mgr.restore(f"slot-{i}")
+    assert len(mgr._pin_epoch) == 25
+
+    for i in range(25):
+        mgr.release(f"slot-{i}")
+    assert mgr._pin_epoch == {}, (
+        f"reaped slots left {len(mgr._pin_epoch)} epoch entries behind")
+
+
+def test_a_raising_pinned_epoch_does_not_strand_the_microvm(tmp_path):
+    """restore() has already returned a live microVM and reserved its generation pin, but no Slot
+    exists yet -- so anything that raises between those points strands both until the process
+    restarts. An injected manager's pinned_epoch() takes a lock and can raise."""
+    from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
+
+    killed = []
+    wd = tmp_path / "slots" / "s"
+    wd.mkdir(parents=True)
+    (wd / "vsock.sock").touch()
+
+    class _Handle:
+        vsock_uds = str(wd / "vsock.sock")
+
+        def kill(self):
+            killed.append(True)
+
+    class _Manager:
+        build_epoch = 3
+        released: list = []
+
+        def acquire_built(self):
+            pass
+
+        def restore(self, slot_id):
+            return _Handle()
+
+        def pinned_epoch(self, slot_id):
+            raise RuntimeError("manager lock timed out")
+
+        def release(self, slot_id):
+            self.released.append(slot_id)
+
+    rt = object.__new__(SnapshotSlotRuntime)
+    rt._manager = _Manager()
+    rt._ack_capable = AckCapability()
+    rt._settle_s = 0.0
+    rt._clock = lambda: 0.0
+    rt._restored_at = {}
+    rt._handles = {}
+    rt._lock = __import__("threading").Lock()
+
+    with pytest.raises(RuntimeError):
+        SnapshotSlotRuntime.spawn(rt)
+
+    assert killed, "the live microVM was left running with no Slot to reap it"
+    assert _Manager.released, "the generation pin was stranded"

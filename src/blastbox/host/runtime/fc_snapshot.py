@@ -490,6 +490,10 @@ class SnapshotManager:
         Never raises -- reap must not be taken down by cleanup.
         """
         with self._build_lock:
+            # BEFORE the early return. Only a FAILED restore went through _unpin(), so on the
+            # normal reap path the epoch entry was never dropped: one dict entry per slot ever
+            # restored, for the life of a dispatcher that recycles slots continuously.
+            self._pin_epoch.pop(str(slot_id), None)
             artifact = self._pins.pop(str(slot_id), None)
             if artifact is None:
                 return

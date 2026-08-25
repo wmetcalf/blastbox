@@ -79,11 +79,14 @@ class GvisorSnapshotSlotRuntime:
         # invalidation plus replacement build completing in between paired the slot with the wrong
         # identity -- capable_for() then answered False forever and the fast repair was silently
         # off for that slot during exactly the rebuild churn it exists for.
-        _ack_gen = getattr(self._mgr, "pinned_epoch", lambda _s: None)(slot_id)
         wd = Path(handle.slot_workdir)  # type: ignore[attr-defined]
         with self._lock:
             self._handles[slot_id] = handle
             self._restored_at[slot_id] = self._clock()
+        # AFTER the handle is registered: until it is, nothing can reap this sandbox, and
+        # pinned_epoch() takes a lock and can raise on an injected manager. Same reasoning as the
+        # FC twin's cleanup region.
+        _ack_gen = getattr(self._mgr, "pinned_epoch", lambda _s: None)(slot_id)
         _log.info("gvisor_snapshot.spawn slot_id=%s workdir=%s", slot_id, wd)
         return Slot(
             slot_id=slot_id,

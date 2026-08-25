@@ -175,7 +175,6 @@ class SnapshotSlotRuntime:
         # invalidation plus replacement build completing in between paired the slot with the wrong
         # identity -- capable_for() then answered False forever and the fast repair was silently
         # off for that slot during exactly the rebuild churn it exists for.
-        _ack_gen = getattr(self._manager, "pinned_epoch", lambda _s: None)(slot_id)
         # The launcher restores in base_dir/slots/<id>; the vsock UDS lives there, so
         # its parent IS the per-slot workdir (vsock.sock + outdisk.ext4 + fc-api.sock).
         # vsock_uds is a concrete-FC-handle accessor not on the generic RestoreHandle
@@ -186,6 +185,11 @@ class SnapshotSlotRuntime:
         # (reading vsock_uds, or mkdir hitting ENOSPC) would strand the pin AND leak a running
         # microVM, permanently, until the process restarts.
         try:
+            # INSIDE the cleanup region. restore() has already returned a live microVM and
+            # reserved its generation pin, but no Slot exists yet -- so anything that raises here
+            # strands both, permanently, until the process restarts. An injected manager's
+            # pinned_epoch() can raise, and it takes a lock, so it is not exempt.
+            _ack_gen = getattr(self._manager, "pinned_epoch", lambda _s: None)(slot_id)
             slot_workdir = Path(handle.vsock_uds).parent  # type: ignore[attr-defined]
             output_dir = slot_workdir / "out"
             input_dir = slot_workdir / "in"
