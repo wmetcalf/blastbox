@@ -534,9 +534,6 @@ def select_snapshot_runtime(
     # for EVERY epoch. Scoping only the fallback protected the misconfigured wiring and
     # left the configured one open.
     ack_capable = AckCapability(artifact_scoped=True)
-    # Late-bound: the launcher is built before the manager, but only ever SAMPLES the
-    # epoch at boot_base() time, long after the manager exists.
-    _mgr_ref: list = []
     launcher = FcSnapshotLauncher(
         cfg,
         base_dir,
@@ -547,9 +544,13 @@ def select_snapshot_runtime(
         ),
         # Lets boot_base stamp the build with the generation current when it STARTED. The
         # launcher owns no capability of its own, so it cannot sample this itself.
-        ack_sampler=lambda: _mgr_ref[0].build_epoch if _mgr_ref else None,
+        # ack_sampler deliberately LEFT UNSET. SnapshotManager.__init__ binds its own epoch
+        # source into the backend and its launcher when the attribute is None -- the same
+        # auto-bind the hand-assembled-embedder path relies on and which IS tested. A bespoke
+        # `lambda: _mgr_ref[0].build_epoch` here was non-None, so the auto-bind skipped it: belt
+        # and braces never overlapped on the ONE path production actually takes, and deleting
+        # either _mgr_ref.append line left the whole suite green.
     )
     backend = FcSnapshotBackend.from_env(base_dir, launcher, mem_dir=mem_dir)
     manager = SnapshotManager(base_dir, backend, ack_capable=ack_capable)
-    _mgr_ref.append(manager)
     return SnapshotSlotRuntime(cfg, manager, settle_s=settle_s, ack_capable=ack_capable)

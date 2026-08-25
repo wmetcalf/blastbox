@@ -621,3 +621,57 @@ def test_the_bound_epoch_sampler_does_not_re_enter_the_build_lock():
     threading.Thread(target=_sample_under_the_lock, daemon=True).start()
     assert done.wait(2.0), "the bound sampler re-entered _build_lock and deadlocked"
     assert result["epoch"] == 0
+
+
+def test_the_manager_binds_the_epoch_source_through_to_the_launcher(tmp_path):
+    """The FC backend delegates the base build to a LAUNCHER, and it is the launcher that samples
+    the epoch. Binding only the backend leaves the sampler that actually runs unset -- so the base
+    advertises observe(None) while the manager publishes an integer, capable_for() is False
+    forever, and the three-slot fast repair is silently dead on the real tier."""
+    cap = AckCapability(artifact_scoped=True)
+
+    class _Launcher:
+        _ack_sampler = None
+        _epoch_sampler = None
+
+    class _BackendWithLauncher(_Backend):
+        def __init__(self, boot):
+            super().__init__(boot)
+            self._launcher = _Launcher()
+            self._epoch_sampler = None
+            self._ack_sampler = None
+
+    be = _BackendWithLauncher(_Boot(cap, EPOCH0))
+    mgr = SnapshotManager(Path(tmp_path), be, ack_capable=cap)
+
+    assert be._launcher._ack_sampler is not None, "the LAUNCHER's sampler was never bound"
+    assert be._launcher._ack_sampler() == mgr.build_epoch
+    assert be._epoch_sampler is not None and be._epoch_sampler() == mgr.build_epoch
+
+
+def test_both_snapshot_runtimes_forward_the_slot_epoch_to_the_control():
+    """The last hop. spawn() stamps the slot and AckCapability.capable_for() is pinned
+    exhaustively, but nothing asserted that host_warm_control FORWARDS the stamp into the control
+    that evaluates it. Replacing both forwarding sites with ack_generation=None left the entire
+    suite green -- and a control whose _ack_gen is None answers capable_for(None) == False against
+    an artifact-scoped capability, so guest_started never becomes False and the fast repair is
+    inert on both warm tiers."""
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
+    from blastbox.host.runtime.gvisor_snapshot_runtime import GvisorSnapshotSlotRuntime
+
+    slot = SimpleNamespace(slot_id="s1", ack_generation=4,
+                           control_dir=Path("/tmp/x/ctrl"), output_dir=Path("/tmp/x/out"))
+
+    fc = object.__new__(SnapshotSlotRuntime)
+    fc._ack_capable = AckCapability(artifact_scoped=True)
+    assert SnapshotSlotRuntime.host_warm_control(fc, slot)._ack_gen == 4, (
+        "the FC runtime dropped the slot's artifact epoch on the way to the control")
+
+    gv = object.__new__(GvisorSnapshotSlotRuntime)
+    gv._ack_capable = AckCapability(artifact_scoped=True)
+    ctl = GvisorSnapshotSlotRuntime.host_warm_control(gv, slot)
+    inner = getattr(ctl, "_inner", ctl)
+    assert inner._ack_gen == 4, (
+        "the gVisor runtime dropped the slot's artifact epoch on the way to the control")

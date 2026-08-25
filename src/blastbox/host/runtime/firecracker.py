@@ -669,7 +669,7 @@ class VsockReadySignal:
         # exists to fix, which is what a dispatcher restarting onto a bad artifact produces.
         self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
         # BASE-BUILD listeners defer: their advertisement is only believed once the build has a
-        # usable artifact (see AckCapability.observe/confirm). Per-slot listeners do not -- a
+        # usable artifact (see AckCapability.observe/publish). Per-slot listeners do not -- a
         # live slot's READY is about an artifact that already published.
         self._defer_ack = defer_ack
         self._max_bytes = max_bytes

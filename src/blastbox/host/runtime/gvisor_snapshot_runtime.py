@@ -362,11 +362,8 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
     # for EVERY epoch. Scoping only the fallback protected the misconfigured wiring and
     # left the configured one open.
     ack_capable = AckCapability(artifact_scoped=True)
-    # Late-bound: the backend is built before the manager, but only SAMPLES the epoch at
-    # boot_base() time, long after it exists.
-    _mgr_ref: list = []
-    backend = GvisorSnapshotBackend(gcfg, ack_capable=ack_capable,
-                                    epoch_sampler=lambda: _mgr_ref[0].build_epoch if _mgr_ref else None)
+    # epoch_sampler deliberately LEFT UNSET -- SnapshotManager binds it (see the FC twin).
+    backend = GvisorSnapshotBackend(gcfg, ack_capable=ack_capable)
     if not backend.available():
         if require_available:
             raise GvisorUnavailable("gVisor C/R warm tier required but runsc not found; "
@@ -383,7 +380,6 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
     snapshot_parent = resolve_mem_dir() or Path(gcfg.root).parent
     base_dir = _secure_snapshot_base(snapshot_parent / "gvisor-snapshot")
     mgr = SnapshotManager(base_dir, backend, ack_capable=ack_capable)
-    _mgr_ref.append(mgr)
     return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle(), ack_capable=ack_capable)
 
 

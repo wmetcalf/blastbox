@@ -70,11 +70,20 @@ class Slot:
     container_id: str | None = None
     spawned_at: float = 0.0
     jobs: int = 0            # cumulative jobs served (reuse mode: drives recycle/reprovision)
-    # Which warm-base generation this slot was SPAWNED from, for the start-signal capability.
+    # Which warm-base ARTIFACT this slot was restored from, as SnapshotManager's build epoch --
+    # specifically SnapshotManager.pinned_epoch(slot_id), the epoch restore() ACTUALLY PINNED, not
+    # whatever was current when spawn started. Since #92 the artifact's epoch is the only ACK
+    # identity there is; there is no separate capability counter to stamp from.
+    #
+    # None is MEANINGFUL, and reads two ways: on the PLAIN FC tier there is no artifact lifecycle
+    # (every slot is a fresh boot), so one image and nothing to tell apart; on a SNAPSHOT tier it
+    # means UNIDENTIFIABLE -- it teaches nothing and answers capable_for() as UNKNOWN, which
+    # convicts nothing.
+    #
     # Stamped here rather than read when a job builds its control: a base invalidation leaves
-    # old-generation slots IDLE and claimable, so a control built at claim time would take the
-    # NEW generation -- and that slot's ack would then re-teach the replacement base a capability
-    # the retired image had. The property has to travel with the slot, not with the job.
+    # old-artifact slots IDLE and claimable, so a control built at claim time would take the NEW
+    # epoch -- and that slot's ack would then re-teach the replacement base a capability only the
+    # retired image had. The property has to travel with the slot, not with the job.
     ack_generation: "int | None" = None
 
 
