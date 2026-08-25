@@ -5,7 +5,6 @@ gVisor tier -- one of the two that wedged in production -- still needs 2 x warm_
 the full worker timeout to discover a poisoned base. Unlike the vsock ack there is no ordering
 hazard: an old host simply never looks at the file, and an old worker simply never writes it.
 """
-from pathlib import Path
 
 from blastbox.worker.warm import (
     WARM_STARTED,
@@ -16,10 +15,14 @@ from blastbox.worker.warm import (
 
 
 def _dirs(tmp_path):
-    ctrl = tmp_path / "ctrl"; ctrl.mkdir()
-    ind = tmp_path / "in"; ind.mkdir()
-    out = tmp_path / "out"; out.mkdir()
-    src = ind / "doc.bin"; src.write_bytes(b"x")
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    ind = tmp_path / "in"
+    ind.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+    src = ind / "doc.bin"
+    src.write_bytes(b"x")
     return ctrl, src, out
 
 
