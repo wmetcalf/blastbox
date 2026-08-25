@@ -255,8 +255,15 @@ class FileWarmControl:
                         self._atomic_write(WARM_STARTED, "1")
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("warm.started_marker failed: %s — refusing the job", exc)
-                        raise WarmTimeout(
-                            f"could not mark job start: {exc}") from exc
+                        # HOST-I/O ATTRIBUTION, the same flag `done` already carries. ctrl/ is a
+                        # bind mount: if the HOST filesystem is full, read-only or erroring, this
+                        # write fails on every slot at once -- and the host has already set
+                        # guest_started=False, so without this the storage incident would convict
+                        # a perfectly healthy base three slots later. The abort is still right;
+                        # blaming the worker for it is not.
+                        _exc = WarmTimeout(f"could not mark job start: {exc}")
+                        _exc.host_io = True  # type: ignore[attr-defined]
+                        raise _exc from exc
                 return WarmJobSpec(
                     input_path=input_path,
                     output_dir=output_dir,

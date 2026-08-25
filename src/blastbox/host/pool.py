@@ -2573,6 +2573,13 @@ class WarmPool:
                 with self._lock:
                     self._pool_consecutive_failures.pop(episode_ident, None)
                     self._pool_pre_guest_failures.pop(episode_ident, None)
+            elif self._base_succeeded_since(episode_ident, success_token):
+                # A slot from THIS base completed between the decision and here. That is
+                # conclusive, and restoring failures from before it would let one later failure
+                # rebuild a base that has since proved healthy. Same recheck the stale-decision
+                # guard makes; this branch simply did not make it.
+                logger.info("pool.base_rebuild_skipped reason=slot_succeeded_during_cooldown "
+                            "base=%s", episode_ident or "<default>")
             else:
                 # A DIFFERENT base was repaired. This one was never touched, so its evidence is
                 # still valid and discarding it just delays its repair by a whole threshold.

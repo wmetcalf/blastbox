@@ -6,6 +6,8 @@ the full worker timeout to discover a poisoned base. Unlike the vsock ack there 
 hazard: an old host simply never looks at the file, and an old worker simply never writes it.
 """
 
+import json
+
 from blastbox.worker.warm import (
     WARM_STARTED,
     FileWarmControl,
@@ -229,3 +231,50 @@ def test_an_older_gvisor_base_teaches_nothing(tmp_path):
     h._ack_capable = seen
     GvisorBootHandle.wait_ready(h, 1.0)
     assert not seen, "no advertisement means UNKNOWN, which must convict nothing"
+
+
+def test_a_host_filesystem_failure_is_not_charged_to_the_base(tmp_path):
+    """ctrl/ is a bind mount. If the HOST filesystem is full, read-only or erroring, the marker
+    write fails on every slot at once -- and the host has already set guest_started=False, so
+    without host-I/O attribution a storage incident convicts a healthy base three slots later."""
+    from blastbox.errors import WarmTimeout
+    from blastbox.worker.warm import FileWarmControl
+
+    import pytest
+
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    src = tmp_path / "doc.bin"
+    src.write_bytes(b"x")
+    out = tmp_path / "out"
+    out.mkdir()
+    (ctrl / "go.json").write_text(
+        json.dumps({"ack": True, "input_path": str(src), "output_dir": str(out), "params": {}}))
+
+    guest = FileWarmControl(ctrl)
+
+    def _boom(name, content):
+        raise OSError(28, "No space left on device")
+    guest._atomic_write = _boom
+
+    with pytest.raises(WarmTimeout) as ei:
+        guest.wait_for_go(timeout_s=1.0)
+    assert getattr(ei.value, "host_io", False) is True, (
+        "a host-filesystem failure must carry host_io so it is not blamed on the worker")
+
+
+def test_the_snapshot_capability_is_reset_when_the_base_is_replaced():
+    """The set outlived the generation that taught it, so a rootfs rolled back to an OLDER worker
+    kept the previous "yes" -- and controls then read a missing ack as proof of no start, letting
+    three document hangs convict a healthy older base instead of staying UNKNOWN."""
+    from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
+
+    rt = object.__new__(SnapshotSlotRuntime)
+    rt._ack_capable = {"yes"}
+    rt._manager = type("M", (), {"invalidate": lambda self: None})()
+    try:
+        SnapshotSlotRuntime.invalidate_base(rt)
+    except Exception:
+        pass
+    assert not rt._ack_capable, (
+        "a new base may be a different image; capability must be re-learned, not inherited")

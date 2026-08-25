@@ -251,3 +251,46 @@ def test_the_snapshot_runtime_accepts_a_shared_capability_set():
     ctl = SnapshotSlotRuntime.host_warm_control(rt, a)
     shared.add("yes")                      # learned at base build...
     assert ctl._ack_capable, "...and visible to a control handed out before that"
+
+
+def test_a_split_readiness_advertisement_is_not_lost():
+    """SOCK_STREAM: one sendall() of READY+ack1 can arrive as READY then +ack1. Deciding on the
+    first recv() accepted readiness and closed the connection, permanently losing the
+    advertisement -- and in snapshot mode this listener is the ONLY place it is ever visible, so
+    a base wedged from its first restore would fall back to the ordinary large threshold."""
+    import socket as _socket
+    import threading
+    import time as _t
+
+    from blastbox.host.runtime.firecracker import VsockReadySignal, _VsockReadyState
+    from blastbox.worker.fc_guest import READY_ACK_SUFFIX, READY_TOKEN
+
+    seen: set[str] = set()
+    sig = VsockReadySignal(ack_capable=seen)
+    srv_path = Path("/tmp") / f"bb-ready-{_t.time_ns()}.sock"
+    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    srv.bind(str(srv_path))
+    srv.listen(4)
+    srv.setblocking(False)
+
+    st = _VsockReadyState.__new__(_VsockReadyState)
+    st.srv = srv
+    st.ready = threading.Event()
+    st.stop = threading.Event() if hasattr(_VsockReadyState, "stop") else threading.Event()
+
+    t = threading.Thread(target=sig._accept_loop, args=("slot-1", st), daemon=True)
+    t.start()
+    try:
+        c = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        c.connect(str(srv_path))
+        c.sendall(READY_TOKEN)                 # ...deliberately split
+        _t.sleep(0.2)
+        c.sendall(READY_ACK_SUFFIX)
+        c.close()
+        assert st.ready.wait(5.0), "readiness must still be recognised across the split"
+        assert seen, "a split advertisement must still teach the capability"
+    finally:
+        st.ready.set()
+        t.join(timeout=3.0)
+        srv.close()
+        srv_path.unlink(missing_ok=True)

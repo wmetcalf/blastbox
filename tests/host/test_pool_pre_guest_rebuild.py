@@ -643,3 +643,47 @@ def test_the_success_check_does_not_deadlock_when_called_under_no_lock():
     t = threading.Thread(target=_run, daemon=True)
     t.start()
     assert done.wait(2.0), "the success check deadlocked"
+
+
+def test_a_success_during_the_cooldown_discards_the_episode_too():
+    """The lock-wait branch got this recheck; the COOLDOWN branch did not. A slot from this base
+    completing between the decision and the restore is conclusive either way -- restoring failures
+    from before it lets one later failure rebuild a base that has since proved healthy.
+
+    Driven through the success predicate rather than by racing a real release: the window is
+    between the episode being consumed and the restore, and a release BEFORE that clears the
+    evidence outright, so the crossing never happens and the branch is never reached.
+    """
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=300.0)
+    pool._last_base_rebuild_at = pool._clock()
+    pool._last_base_rebuild_idents = {"tierA"}        # a DIFFERENT tier is cooling
+    pool._base_succeeded_since = lambda ident, token: ident == "tierB"
+
+    restored = []
+    real_restore = pool._restore_episode
+    pool._restore_episode = lambda *a, **k: restored.append(a) or real_restore(*a, **k)
+
+    for slot in _claim_distinct(pool, 3):
+        _fail(pool, slot, stage="pre_guest")
+
+    assert rt.base_invalidations == 0, "the cooldown must suppress the repair"
+    assert not restored, (
+        "a base that succeeded since the decision must not have its evidence restored")
+
+
+def test_a_base_that_did_NOT_succeed_still_gets_its_evidence_back():
+    """The other half: without an intervening success the episode must still be handed back, or a
+    tier cooling behind another one loses a whole threshold of evidence for nothing."""
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=300.0)
+    pool._last_base_rebuild_at = pool._clock()
+    pool._last_base_rebuild_idents = {"tierA"}
+    pool._base_succeeded_since = lambda ident, token: False
+
+    for slot in _claim_distinct(pool, 3):
+        _fail(pool, slot, stage="pre_guest")
+
+    assert rt.base_invalidations == 0
+    assert len(pool._pool_pre_guest_failures.get("tierB", set())) >= 3, (
+        "no success means the evidence is still valid and must be handed back")

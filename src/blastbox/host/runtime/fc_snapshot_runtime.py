@@ -248,6 +248,12 @@ class SnapshotSlotRuntime:
         born wedged. ``reap()`` deliberately preserves ``warm.snapshot``/``warm.mem``, so without
         this the only cure is a dispatcher restart.
         """
+        # A NEW BASE MAY BE A DIFFERENT IMAGE. The capability set outlived the generation
+        # that taught it, so a rootfs rolled back to an older worker kept the previous "yes" --
+        # and controls then read a missing ack as proof of no start, letting three
+        # document-induced hangs convict a healthy older base instead of staying UNKNOWN, which
+        # is exactly what the mixed-version contract promises. Re-learned at the next base build.
+        self._ack_capable.clear()
         drop = getattr(self._manager, "invalidate", None)
         if not callable(drop):
             _log.warning("snapshot.invalidate_unsupported manager=%s", type(self._manager).__name__)

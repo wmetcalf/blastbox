@@ -729,6 +729,8 @@ class VsockReadySignal:
         # so a compromised guest cannot exhaust host fds.
         sel = selectors.DefaultSelector()
         pending: dict[socket.socket, float] = {}
+
+        buffers: dict[socket.socket, bytes] = {}
         try:
             try:
                 sel.register(state.srv, selectors.EVENT_READ)
@@ -753,22 +755,40 @@ class VsockReadySignal:
                         conn.setblocking(False)
                         sel.register(conn, selectors.EVENT_READ)
                         pending[conn] = time.monotonic() + _CONN_GRACE_S
+                        buffers[conn] = b""
                         continue
                     conn = key.fileobj  # type: ignore[assignment]
                     try:
                         data = conn.recv(self._max_bytes)
                     except (BlockingIOError, OSError):
                         data = b""
+                    # ACCUMULATE. This is a SOCK_STREAM: one sendall() of "READY+ack1" can arrive
+                    # as "READY" then "+ack1", and deciding on the first recv() accepted readiness
+                    # and closed the connection -- permanently losing the advertisement on a valid
+                    # split. In snapshot mode this listener is the ONLY place it is ever visible,
+                    # so that loss makes the fast repair inert on a base wedged from its first
+                    # restore. Bounded by _READY_MAX_BYTES and the existing connection grace.
+                    buf = (buffers.get(conn, b"") + data)[: self._max_bytes]
+                    buffers[conn] = buf
+                    _full = _READY_TOKEN + READY_ACK_SUFFIX
+                    _decidable = (
+                        READY_ACK_SUFFIX in buf      # the advertisement arrived
+                        or not data                  # EOF: nothing more is coming
+                        or len(buf) >= len(_full)    # enough bytes that a suffix would be here
+                    )
+                    if _READY_TOKEN in buf and not _decidable:
+                        continue                     # READY seen, suffix may still be in flight
                     sel.unregister(conn)
                     pending.pop(conn, None)
+                    buffers.pop(conn, None)
                     conn.close()
-                    if _READY_TOKEN in data:
-                        if READY_ACK_SUFFIX in data:
+                    if _READY_TOKEN in buf:
+                        if READY_ACK_SUFFIX in buf:
                             # Learned BEFORE any job, which is what makes the fast repair usable
                             # on a base that was already poisoned when this dispatcher started.
                             self._ack_capable.add("yes")
                         _log.info("fc.vsock_ready_received slot_id=%s ack_capable=%s",
-                                  slot_id, READY_ACK_SUFFIX in data)
+                                  slot_id, READY_ACK_SUFFIX in buf)
                         state.ready.set()
                         return
                 # Drop connections that connected but never sent READY in time.
@@ -776,8 +796,10 @@ class VsockReadySignal:
                 for conn in [c for c, dl in pending.items() if now > dl]:
                     sel.unregister(conn)
                     pending.pop(conn, None)
+                    buffers.pop(conn, None)   # or the buffer outlives the connection
                     conn.close()
         finally:
+            buffers.clear()
             for conn in list(pending):
                 try:
                     sel.unregister(conn)
