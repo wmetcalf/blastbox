@@ -278,3 +278,76 @@ def test_the_snapshot_capability_is_reset_when_the_base_is_replaced():
         pass
     assert not rt._ack_capable, (
         "a new base may be a different image; capability must be re-learned, not inherited")
+
+
+def test_an_unwritable_control_dir_is_not_read_as_a_wedged_guest(tmp_path, monkeypatch):
+    """Flagging the WORKER's exception is useless: serve_warm() catches it and tries to write
+    `idle_timeout`, so nothing the worker knows reaches the host -- and a full or read-only ctrl/
+    means it cannot tell the host anything at all, by definition. But the host shares that
+    filesystem, so it asks itself: an unwritable ctrl/ silences every worker at once, and reading
+    that silence as "never started" convicts a healthy base across the whole pool."""
+    import pytest
+
+    from blastbox.errors import WarmTimeout
+
+    ctrl, src, out = _dirs(tmp_path)
+    host = HostWarmControl(ctrl, ack_capable={"yes"})     # image known to mark starts
+    host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
+    monkeypatch.setattr(type(host), "_ctrl_writable", lambda self: False)
+
+    with pytest.raises(WarmTimeout) as ei:
+        host.wait_for_done(timeout_s=0.3)
+    assert getattr(ei.value, "host_io", False) is True
+    assert host.guest_started is None, (
+        "a storage incident must leave the answer UNKNOWN, not 'the guest never started'")
+
+
+def test_a_writable_control_dir_still_reports_a_wedged_guest(tmp_path):
+    """The other half: with the filesystem healthy, silence really is the guest."""
+    import pytest
+
+    from blastbox.errors import WarmTimeout
+
+    ctrl, src, out = _dirs(tmp_path)
+    host = HostWarmControl(ctrl, ack_capable={"yes"})
+    host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
+    with pytest.raises(WarmTimeout):
+        host.wait_for_done(timeout_s=0.3)
+    assert host.guest_started is False
+
+
+def test_the_gvisor_capability_is_reset_when_the_bundle_is_replaced():
+    from blastbox.host.runtime.gvisor_snapshot_runtime import GvisorSnapshotSlotRuntime
+
+    rt = object.__new__(GvisorSnapshotSlotRuntime)
+    rt._ack_capable = {"yes"}
+    rt._manager = type("M", (), {"invalidate": lambda self: None})()
+    try:
+        GvisorSnapshotSlotRuntime.invalidate_base(rt)
+    except Exception:
+        pass
+    assert not rt._ack_capable, "a replaced bundle must re-advertise, not inherit"
+
+
+def test_the_writability_probe_actually_probes(tmp_path):
+    """The attribution is only as good as this. Patched out in the test above, so the probe
+    itself needs its own: a read-only control dir must report unwritable."""
+    import os
+    import stat
+
+    import pytest
+
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permissions, so this cannot be exercised")
+
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    host = HostWarmControl(ctrl)
+    assert host._ctrl_writable() is True, "a normal dir is writable"
+    assert not any(ctrl.iterdir()), "the probe must not leave its temp file behind"
+
+    ctrl.chmod(stat.S_IRUSR | stat.S_IXUSR)          # read-only
+    try:
+        assert host._ctrl_writable() is False, "a read-only dir must report unwritable"
+    finally:
+        ctrl.chmod(stat.S_IRWXU)

@@ -360,6 +360,21 @@ class HostWarmControl:
         )
         self._atomic_write("go.json", payload)
 
+    def _ctrl_writable(self) -> bool:
+        """Can THIS host still write into the control dir?
+
+        The question a missing start marker cannot answer on its own: a full or read-only ctrl/
+        silences every worker at once, so treating that silence as "the guest never started"
+        convicts a healthy base across the whole pool during a storage incident.
+        """
+        probe = self._dir / f".bb-probe-{os.getpid()}"
+        try:
+            probe.write_bytes(b"")
+            probe.unlink()
+        except OSError:
+            return False
+        return True
+
     def wait_for_done(self, *, timeout_s: float) -> str:
         """Poll ``control_dir/done`` until present or ``timeout_s`` elapsed.
 
@@ -425,6 +440,21 @@ class HostWarmControl:
                 raise err from exc
 
             if time.monotonic() >= deadline:
+                # HOST-OBSERVABLE ATTRIBUTION. Flagging the worker's own exception is useless
+                # here: serve_warm() catches it and tries to write `idle_timeout`, so nothing the
+                # worker knows ever reaches us -- and if ctrl/ is full or read-only it cannot tell
+                # us anything at all, by definition. But we share that filesystem, so we can ask
+                # it ourselves. An unwritable ctrl/ means the silence is the STORAGE, not the
+                # guest, and "never started" would convict a healthy base on every slot at once.
+                if self.guest_started is False and not self._ctrl_writable():
+                    logger.warning("warm.ctrl_unwritable dir=%s — not attributing the missing "
+                                 "start marker to the worker", self._dir)
+                    self.guest_started = None
+                    err = WarmTimeout(
+                        f"warm worker did not signal done within {timeout_s}s "
+                        f"(control dir is unwritable)")
+                    err.host_io = True  # type: ignore[attr-defined]
+                    raise err
                 raise WarmTimeout(
                     f"warm worker did not signal done within {timeout_s}s"
                 )

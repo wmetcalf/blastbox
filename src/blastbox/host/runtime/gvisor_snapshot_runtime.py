@@ -120,6 +120,11 @@ class GvisorSnapshotSlotRuntime:
         pool's lookup always failed here and sustained failures merely logged
         pool.base_rebuild_unavailable while every replacement kept restoring the poisoned snapshot
         until a dispatcher restart (upstream, PR #82). Same SnapshotManager underneath."""
+        # A NEW BUNDLE MAY BE A DIFFERENT IMAGE. Same reset as the FC snapshot runtime: the
+        # set outlives the generation that taught it, so a bundle rolled back to an older worker
+        # kept the previous "yes" and a missing start marker was then read as proof of no start --
+        # letting three document-induced hangs convict a healthy mixed-version base.
+        self._ack_capable.clear()
         drop = getattr(self._mgr, "invalidate", None)
         if callable(drop):
             drop()
