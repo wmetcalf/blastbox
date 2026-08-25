@@ -237,14 +237,22 @@ class FileWarmControl:
                 # Mark that we HAVE the job, before any work starts. `done` arriving late is
                 # indistinguishable from a guest that never woke up, so without this a wedged
                 # base is only found by failing 2 x warm_size real jobs at the full timeout.
-                # Only when asked, and never fatal: an unwritable marker must not fail a job the
-                # worker can still do -- the host just keeps guest_started as it was, which is
-                # UNKNOWN, which convicts nothing.
+                #
+                # A FAILED WRITE ABORTS THE JOB, exactly as the vsock ack does -- and the comment
+                # that first stood here, claiming the host would keep UNKNOWN, was wrong in the
+                # same way it was wrong there. Once another slot has taught the runtime that this
+                # image marks starts, the host initialises later controls to "not started"; a
+                # swallowed write failure then means the worker runs the document while the host
+                # records False, and three such filesystem hiccups on distinct slots convict a
+                # base whose workers all ran. If we cannot promise the host we started, we do not
+                # start.
                 if data.get("ack"):
                     try:
                         self._atomic_write(WARM_STARTED, "1")
                     except Exception as exc:  # noqa: BLE001
-                        logger.warning("warm.started_marker failed: %s", exc)
+                        logger.warning("warm.started_marker failed: %s — refusing the job", exc)
+                        raise WarmTimeout(
+                            f"could not mark job start: {exc}") from exc
                 return WarmJobSpec(
                     input_path=input_path,
                     output_dir=output_dir,

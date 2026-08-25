@@ -108,3 +108,25 @@ def test_the_gvisor_runtime_shares_capability_across_slots(tmp_path):
     ca = GvisorSnapshotSlotRuntime.host_warm_control(rt, a)
     cb = GvisorSnapshotSlotRuntime.host_warm_control(rt, b)
     assert ca._inner._ack_capable is cb._inner._ack_capable
+
+
+def test_a_worker_that_cannot_mark_its_start_refuses_the_job(tmp_path, monkeypatch):
+    """The same rule as the vsock ack, which this reintroduced by copying its first, wrong
+    comment: once the image is known to mark starts the host initialises to "not started", so a
+    swallowed write failure means the worker runs while the host records False -- and three
+    filesystem hiccups on distinct slots convict a base whose workers all ran."""
+    import pytest
+
+    from blastbox.errors import WarmTimeout
+
+    ctrl, src, out = _dirs(tmp_path)
+    HostWarmControl(ctrl).signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
+
+    guest = FileWarmControl(ctrl)
+    def _boom(name, content):
+        if name == WARM_STARTED:
+            raise OSError("no space left on device")
+    monkeypatch.setattr(guest, "_atomic_write", _boom)
+
+    with pytest.raises(WarmTimeout, match="mark job start"):
+        guest.wait_for_go(timeout_s=2.0)
