@@ -341,9 +341,17 @@ class AckCapability:
       rather than believed.
     """
 
-    __slots__ = ("_epoch", "_capable", "_lock", "_pending")
+    __slots__ = ("_epoch", "_capable", "_lock", "_pending", "_scoped")
 
-    def __init__(self) -> None:
+    def __init__(self, *, artifact_scoped: bool = False) -> None:
+        #: True when this capability describes SNAPSHOT ARTIFACTS, even before the first one is
+        #: published. Without it, a capability that has not published yet is indistinguishable
+        #: from the plain (no-artifact) runtime -- and a snapshot runtime handed a manager with
+        #: no capability of its own built exactly that: a fallback nothing ever publishes into,
+        #: so every ack taught it unconditionally, capable_for() answered True for ANY epoch, and
+        #: (with reset() gone) nothing ever cleared it. A replacement built from an older worker
+        #: is then convicted for markers it never promised to write.
+        self._scoped = artifact_scoped
         #: Epoch of the artifact that is CURRENTLY published. None means no artifact lifecycle at
         #: all -- the plain (non-snapshot) FC runtime boots every slot fresh, so there is one
         #: image and nothing to tell apart.
@@ -377,7 +385,9 @@ class AckCapability:
         """
         with self._lock:
             if self._epoch is None:
-                return self._capable
+                # Nothing published yet. For an artifact-scoped capability that is UNKNOWN, not
+                # "ask the flag" -- there is no artifact for the flag to be about.
+                return False if self._scoped else self._capable
             return self._capable and epoch == self._epoch
 
     def learn(self, epoch: "int | None" = None) -> None:
@@ -394,7 +404,7 @@ class AckCapability:
         tell apart, so an unstamped ack is the only kind there is and it does teach.
         """
         with self._lock:
-            if self._epoch is None:
+            if self._epoch is None and not self._scoped:
                 self._capable = True
             elif epoch is not None and epoch == self._epoch:
                 self._capable = True

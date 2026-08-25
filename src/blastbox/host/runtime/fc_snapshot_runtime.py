@@ -110,7 +110,11 @@ class SnapshotSlotRuntime:
         # Shared with every VsockHostWarmControl handed out (see host_warm_control) AND with the
         # base-build ready listener, which is the only place the advertisement is visible in
         # snapshot mode -- restored guests never signal readiness again.
-        self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
+        # artifact_scoped: this runtime restores SNAPSHOT ARTIFACTS. A fallback built here
+        # is one the manager never publishes into, so without this it would sit in plain
+        # mode forever -- capable for every epoch, cleared by nothing.
+        self._ack_capable = (ack_capable if ack_capable is not None
+                             else AckCapability(artifact_scoped=True))
         self._cfg = cfg
         self._manager = manager
         # cfg.max_extracted_bytes bounds rdump output; fall back to a 512 MiB default

@@ -403,3 +403,104 @@ def test_a_raising_pinned_epoch_does_not_strand_the_microvm(tmp_path):
 
     assert killed, "the live microVM was left running with no Slot to reap it"
     assert _Manager.released, "the generation pin was stranded"
+
+
+def test_a_snapshot_runtimes_fallback_capability_is_never_plain_mode():
+    """A snapshot runtime handed a manager with no capability of its own used to build a fallback
+    that the manager NEVER publishes into. Its _epoch stayed None -- indistinguishable from the
+    plain, no-artifact runtime -- so any ack taught it unconditionally, capable_for() answered
+    True for EVERY epoch, and with reset() deleted nothing ever cleared it. A replacement built
+    from an older worker without start markers is then convicted for markers it never promised."""
+    # TWO INDEPENDENT GUARDS, asserted independently. Checking only the end result let each one
+    # mask the other's absence: learn() refusing to teach hides capable_for()'s fallback, and
+    # capable_for() refusing to answer hides that learn() taught. Mutating either alone then
+    # changed nothing observable, which is a test proving neither.
+
+    # GUARD 1 -- learn() must not set the flag at all.
+    scoped = AckCapability(artifact_scoped=True)
+    scoped.learn(None)                       # an ack from some restored slot
+    assert bool(scoped) is False, (
+        "an unstamped ack taught an artifact-scoped capability that has published nothing")
+
+    # GUARD 2 -- even WITH the flag set, capable_for() must answer UNKNOWN while nothing is
+    # published. Forced directly, so this assertion does not depend on guard 1.
+    forced = AckCapability(artifact_scoped=True)
+    object.__setattr__(forced, "_capable", True)
+    assert forced.capable_for(7) is False, (
+        "an artifact-scoped capability answered from the bare flag with no artifact published")
+    assert forced.capable_for(None) is False
+
+    plain = AckCapability()                  # the plain FC runtime: no artifact lifecycle
+    plain.learn(None)
+    assert plain.capable_for(None) is True, "the no-artifact runtime must still learn"
+
+
+def test_a_scoped_capability_still_works_once_an_artifact_publishes():
+    """Control: scoping must not deafen it permanently."""
+    cap = AckCapability(artifact_scoped=True)
+    cap.observe(2)
+    cap.publish(2)
+    assert cap.capable_for(2) is True
+    assert cap.capable_for(1) is False
+
+
+def test_both_snapshot_runtimes_build_scoped_fallbacks():
+    """The wiring half: the runtimes must ASK for a scoped fallback, or the guard above is inert
+    in the place it exists for."""
+    from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
+    from blastbox.host.runtime.gvisor_snapshot_runtime import GvisorSnapshotSlotRuntime
+
+    fc = object.__new__(SnapshotSlotRuntime)
+    SnapshotSlotRuntime.__init__(fc, object(), object(), ack_capable=None)
+    gv = object.__new__(GvisorSnapshotSlotRuntime)
+    GvisorSnapshotSlotRuntime.__init__(gv, object(), ack_capable=None)
+
+    for name, rt in (("fc", fc), ("gvisor", gv)):
+        rt._ack_capable.learn(None)
+        assert rt._ack_capable.capable_for(3) is False, (
+            f"{name}: the fallback fell into plain mode and is capable for any epoch")
+
+
+def test_a_gvisor_epoch_lookup_failure_does_not_leak_the_sandbox():
+    """Registering the handle in _handles does NOT make it reapable: every lookup there is keyed
+    by a Slot the pool already holds, and nothing enumerates the dict for orphans. With no Slot
+    returned, a live sandbox and its generation pin are unreachable for the life of the process."""
+    import threading
+
+    from blastbox.host.runtime.gvisor_snapshot_runtime import GvisorSnapshotSlotRuntime
+
+    killed, released = [], []
+
+    class _Handle:
+        slot_workdir = "/tmp/does-not-matter"
+
+        def kill(self):
+            killed.append(True)
+
+    class _Manager:
+        def acquire_built(self):
+            pass
+
+        def restore(self, slot_id):
+            return _Handle()
+
+        def pinned_epoch(self, slot_id):
+            raise RuntimeError("manager lock timed out")
+
+        def release(self, slot_id):
+            released.append(slot_id)
+
+    rt = object.__new__(GvisorSnapshotSlotRuntime)
+    rt._mgr = _Manager()
+    rt._ack_capable = AckCapability(artifact_scoped=True)
+    rt._settle_s = 0.0
+    rt._clock = lambda: 0.0
+    rt._restored_at = {}
+    rt._handles = {}
+    rt._lock = threading.Lock()
+
+    with pytest.raises(RuntimeError):
+        GvisorSnapshotSlotRuntime.spawn(rt)
+
+    assert killed, "the live sandbox was left running with no Slot to reap it"
+    assert released, "the generation pin was stranded"

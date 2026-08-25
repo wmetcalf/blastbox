@@ -9,6 +9,7 @@ SlotRuntime + warm-path seam so the dispatcher's per-slot job flow is identical.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import shutil
@@ -39,7 +40,11 @@ class GvisorSnapshotSlotRuntime:
                  ack_capable: "AckCapability | None" = None) -> None:
         # Shared with every GvisorHostWarmControl handed out (see host_warm_control) AND with the
         # base build, which is the only place the advertisement is ever visible on this tier.
-        self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
+        # artifact_scoped: this runtime restores SNAPSHOT ARTIFACTS. A fallback built here
+        # is one the manager never publishes into, so without this it would sit in plain
+        # mode forever -- capable for every epoch, cleared by nothing.
+        self._ack_capable = (ack_capable if ack_capable is not None
+                             else AckCapability(artifact_scoped=True))
         self._mgr = manager
         self._settle_s = settle_s
         self._clock = clock
@@ -71,22 +76,40 @@ class GvisorSnapshotSlotRuntime:
         else:
             self._mgr.build()   # a manager without the seam (a test double)
         slot_id = str(uuid.uuid4())
-        # BEFORE the restore -- same ordering as the FC snapshot runtime: the artifact this
-        # slot is pinned to is the one that existed when restore() started.
         handle = self._mgr.restore(slot_id)
-        # The epoch of the artifact restore() ACTUALLY PINNED for this slot, read after the fact
-        # from the manager. Sampling build_epoch beforehand answered "what is current now", and an
-        # invalidation plus replacement build completing in between paired the slot with the wrong
-        # identity -- capable_for() then answered False forever and the fast repair was silently
-        # off for that slot during exactly the rebuild churn it exists for.
-        wd = Path(handle.slot_workdir)  # type: ignore[attr-defined]
+        # EVERYTHING between a successful restore and RETURNING THE SLOT must clean up after
+        # itself, exactly as in the FC twin. Registering the handle in _handles is NOT enough and
+        # the earlier comment here claiming otherwise was wrong: every _handles lookup is keyed by
+        # a Slot the pool already holds (is_ready/reap/release), and nothing ever enumerates the
+        # dict for orphans -- so with no Slot returned, a live sandbox and its generation pin are
+        # unreachable for the life of the process.
+        #
+        # The epoch of the artifact restore() ACTUALLY PINNED for this slot. Sampling build_epoch
+        # beforehand answered "what is current now", and an invalidation plus replacement build
+        # completing in between paired the slot with the wrong identity. pinned_epoch() takes a
+        # lock and can raise on an injected manager, so it belongs inside this region.
+        try:
+            _ack_gen = getattr(self._mgr, "pinned_epoch", lambda _s: None)(slot_id)
+            wd = Path(handle.slot_workdir)  # type: ignore[attr-defined]
+        except BaseException:
+            sandbox_gone = True
+            try:
+                handle.kill()  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                # Same rule as reap(): a kill() that raised leaves the sandbox possibly ALIVE and
+                # still mapping this generation, so releasing the pin would let a later
+                # invalidation unlink its checkpoint underneath.
+                sandbox_gone = False
+                _log.warning("gvisor_snapshot.spawn_cleanup_kill_error slot_id=%s: %s",
+                             slot_id, exc)
+            release = getattr(self._mgr, "release", None)
+            if callable(release) and sandbox_gone:
+                with contextlib.suppress(Exception):
+                    release(slot_id)
+            raise
         with self._lock:
             self._handles[slot_id] = handle
             self._restored_at[slot_id] = self._clock()
-        # AFTER the handle is registered: until it is, nothing can reap this sandbox, and
-        # pinned_epoch() takes a lock and can raise on an injected manager. Same reasoning as the
-        # FC twin's cleanup region.
-        _ack_gen = getattr(self._mgr, "pinned_epoch", lambda _s: None)(slot_id)
         _log.info("gvisor_snapshot.spawn slot_id=%s workdir=%s", slot_id, wd)
         return Slot(
             slot_id=slot_id,
