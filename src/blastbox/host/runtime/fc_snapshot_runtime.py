@@ -166,6 +166,11 @@ class SnapshotSlotRuntime:
         else:
             self._manager.build()   # a manager without the seam (a test double)
         slot_id = str(uuid.uuid4())
+        # BEFORE the restore. restore() pins the artifact it started against, so a base
+        # invalidation landing during that slow call leaves this slot on the RETIRED image --
+        # but sampling the generation afterwards stamped it with the replacement's, and an ack
+        # from the retired image would then teach the new base a capability it may not have.
+        _ack_gen = self._ack_capable.generation
         handle = self._manager.restore(slot_id)
         # The launcher restores in base_dir/slots/<id>; the vsock UDS lives there, so
         # its parent IS the per-slot workdir (vsock.sock + outdisk.ext4 + fc-api.sock).
@@ -215,7 +220,7 @@ class SnapshotSlotRuntime:
             state=SlotState.WARMING,
             spawned_at=0.0,
             # The generation this slot was SPAWNED from; see Slot.ack_generation.
-            ack_generation=self._ack_capable.generation,
+            ack_generation=_ack_gen,
         )
 
     def is_ready(self, slot: Slot) -> bool:

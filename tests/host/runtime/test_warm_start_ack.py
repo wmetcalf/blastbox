@@ -303,3 +303,66 @@ def test_a_split_readiness_advertisement_is_not_lost():
         t.join(timeout=3.0)
         srv.close()
         srv_path.unlink(missing_ok=True)
+
+
+def test_a_host_resource_error_leaves_the_verdict_unknown(tmp_path):
+    """ENOMEM/EMFILE on OUR side of the socket says nothing about the guest -- but guest_started
+    is already False by then, so without attribution the host's own resource exhaustion is
+    charged to the worker and three concurrent ones invalidate a healthy base."""
+    import errno
+    import socket
+
+    from blastbox.errors import WarmTimeout
+    from blastbox.worker.warm import WarmJobSpec
+
+    host_sock, guest_sock = socket.socketpair()
+    ctl = _control(host_sock, ack_capable=_capable())
+    tmp = Path("/tmp/blastbox-hostres-input")
+    tmp.write_bytes(b"x")
+    ctl.signal_go(WarmJobSpec(input_path=tmp, output_dir=Path("/tmp"), params={}))
+
+    class _Boom:
+        def recv(self, *a, **k):
+            raise OSError(errno.ENOMEM, "Cannot allocate memory")
+        def close(self): pass
+        def settimeout(self, *a): pass
+    ctl._conn = _Boom()
+
+    with pytest.raises(WarmTimeout) as ei:
+        ctl.wait_for_done(timeout_s=1.0)
+    assert getattr(ei.value, "host_io", False) is True
+    assert ctl.guest_started is None, "we never heard from the guest, so the answer is UNKNOWN"
+    guest_sock.close()
+
+
+def test_capability_learn_and_reset_are_mutually_exclusive():
+    """The compare and the mutation are one decision. Unsynchronised, a slot could pass the
+    generation check, have invalidate_base() bump it underneath, and set capable=True anyway --
+    re-enabling capability for a replacement that never advertised it.
+
+    Asserted on the exclusion itself rather than by racing threads: the window is a few
+    instructions wide and a probabilistic test for it reports "passed" almost every time it is
+    actually broken.
+    """
+    import threading
+
+    from blastbox.worker.warm import AckCapability
+
+    cap = AckCapability()
+    entered = threading.Event()
+    finished = threading.Event()
+
+    def _learn():
+        entered.set()
+        cap.learn()
+        finished.set()
+
+    with cap._lock:                      # hold it: nothing may mutate while we do
+        t = threading.Thread(target=_learn, daemon=True)
+        t.start()
+        assert entered.wait(2.0)
+        assert not finished.wait(0.3), (
+            "learn() ran while the capability was locked — the check and the set are not atomic")
+
+    assert finished.wait(2.0), "learn() must proceed once the lock is released"
+    assert bool(cap) is True

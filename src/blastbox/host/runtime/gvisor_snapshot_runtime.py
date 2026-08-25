@@ -71,6 +71,9 @@ class GvisorSnapshotSlotRuntime:
         else:
             self._mgr.build()   # a manager without the seam (a test double)
         slot_id = str(uuid.uuid4())
+        # BEFORE the restore -- same ordering as the FC snapshot runtime: the artifact this
+        # slot is pinned to is the one that existed when restore() started.
+        _ack_gen = self._ack_capable.generation
         handle = self._mgr.restore(slot_id)
         wd = Path(handle.slot_workdir)  # type: ignore[attr-defined]
         with self._lock:
@@ -84,7 +87,7 @@ class GvisorSnapshotSlotRuntime:
             output_dir=wd / "out",
             state=SlotState.WARMING,
             # The generation this slot was SPAWNED from; see Slot.ack_generation.
-            ack_generation=self._ack_capable.generation,
+            ack_generation=_ack_gen,
         )
 
     def is_ready(self, slot: Slot) -> bool:

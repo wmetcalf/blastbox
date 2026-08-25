@@ -23,6 +23,7 @@ import logging
 import os
 import uuid
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -319,27 +320,37 @@ class AckCapability:
     A retired control's late ack is ignored rather than believed.
     """
 
-    __slots__ = ("_gen", "_capable")
+    __slots__ = ("_gen", "_capable", "_lock")
 
     def __init__(self) -> None:
         self._gen = 0
         self._capable = False
+        # LOCKED, because the compare and the mutation are one decision. Unsynchronised, a slot
+        # reporting its ack could pass `generation == self._gen`, have invalidate_base() bump the
+        # generation and clear the flag underneath it, and then set _capable=True anyway --
+        # re-enabling capability for a replacement that never advertised it. The window is small
+        # and the consequence is a healthy base rebuilt repeatedly.
+        self._lock = threading.Lock()
 
     def __bool__(self) -> bool:
-        return self._capable
+        with self._lock:
+            return self._capable
 
     @property
     def generation(self) -> int:
-        return self._gen
+        with self._lock:
+            return self._gen
 
     def learn(self, generation: "int | None" = None) -> None:
-        if generation is None or generation == self._gen:
-            self._capable = True
+        with self._lock:
+            if generation is None or generation == self._gen:
+                self._capable = True
 
     def reset(self) -> None:
         """A new base is being built: whatever the old one advertised no longer applies."""
-        self._gen += 1
-        self._capable = False
+        with self._lock:
+            self._gen += 1
+            self._capable = False
 
 
 class HostWarmControl:

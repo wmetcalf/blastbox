@@ -994,7 +994,16 @@ class VsockHostWarmControl:
                 ).decode("utf-8")
             return frame
         except (OSError, ValueError, ConnectionError) as exc:
-            raise WarmTimeout(f"warm worker did not signal done: {exc}") from exc
+            err = WarmTimeout(f"warm worker did not signal done: {exc}")
+            # HOST-RESOURCE ATTRIBUTION, mirroring signal_go and the file control's `done` read.
+            # An ENOMEM/EMFILE on OUR side of the socket says nothing about the guest -- but we
+            # have already set guest_started=False, so without this the host's own resource
+            # exhaustion is charged to the worker, and three concurrent ones invalidate a healthy
+            # base. Leave the verdict UNKNOWN: we never actually heard from the guest.
+            if isinstance(exc, OSError) and exc.errno in HOST_RESOURCE_ERRNOS:
+                err.host_io = True  # type: ignore[attr-defined]
+                self.guest_started = None
+            raise err from exc
         finally:
             try:
                 self._conn.close()
