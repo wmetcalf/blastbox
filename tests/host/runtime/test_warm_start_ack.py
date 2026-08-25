@@ -11,6 +11,7 @@ upgraded separately here, and the FC vsock protocol has deliberately stayed byte
 releases. The ack is therefore opt-in from the host (`"ack": true` in the job header) and sent
 only on request.
 """
+from blastbox.worker.warm import AckCapability
 import json
 import socket
 import struct
@@ -21,6 +22,14 @@ import pytest
 
 from blastbox.host.runtime.firecracker import VsockHostWarmControl
 from blastbox.worker.fc_guest import WARM_ACK
+
+
+def _capable():
+    """An AckCapability that has already been taught — the "this image advertises" fixture."""
+    c = AckCapability()
+    c.learn()
+    return c
+
 
 
 def _read_frame(sock):
@@ -98,7 +107,7 @@ def test_a_guest_that_starts_and_then_HANGS_is_not_blamed_on_the_base():
 
 
 def test_a_wedged_guest_reports_not_started_once_the_image_is_known_to_ack():
-    seen = {"yes"}                             # this image has acked before
+    seen = _capable()                             # this image has acked before
     ctl, status = _run("wedged", ack_capable=seen)
     assert status is None
     assert ctl.guest_started is False, "no ack from an ack-capable image means it never ran"
@@ -134,7 +143,7 @@ def test_the_header_asks_for_the_ack():
     ("acks_then_done", True), ("acks_then_hangs", True), ("old_worker", None),
 ])
 def test_capability_memory_is_learned_from_any_slot(behaviour, expect):
-    seen: set[str] = set()
+    seen = AckCapability()
     ctl, _ = _run(behaviour, ack_capable=seen)
     assert ctl.guest_started is expect
     assert bool(seen) is (expect is True), "an ack must teach the runtime the image is capable"
@@ -149,7 +158,7 @@ def test_the_snapshot_runtime_shares_ack_capability_across_slots(tmp_path):
     from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
 
     rt = object.__new__(SnapshotSlotRuntime)          # no VM setup needed for this seam
-    rt._ack_capable = set()
+    rt._ack_capable = AckCapability()
     slot_a = type("S", (), {"output_dir": tmp_path / "a" / "out"})()
     slot_b = type("S", (), {"output_dir": tmp_path / "b" / "out"})()
 
@@ -157,7 +166,7 @@ def test_the_snapshot_runtime_shares_ack_capability_across_slots(tmp_path):
     ctl_b = SnapshotSlotRuntime.host_warm_control(rt, slot_b)
     assert ctl_a._ack_capable is ctl_b._ack_capable, "capability must be shared, not per-control"
 
-    ctl_a._ack_capable.add("yes")                     # slot A acks once
+    ctl_a._ack_capable.learn()                     # slot A acks once
     assert ctl_b._ack_capable, "slot B must inherit what slot A proved about the image"
 
 
@@ -169,7 +178,7 @@ def test_an_input_the_guest_refuses_is_not_blamed_on_the_base(tmp_path):
     from blastbox.worker.warm import WarmJobSpec
 
     host_sock, guest_sock = socket.socketpair()
-    seen = {"yes"}                                  # this image HAS acked before
+    seen = _capable()                                  # this image HAS acked before
     ctl = _control(host_sock, ack_capable=seen)
     guest_sock.close()                              # the guest refuses/closes mid-transfer
 
@@ -188,7 +197,7 @@ def test_a_transfer_that_eats_the_deadline_is_not_blamed_on_the_base(tmp_path):
     from blastbox.worker.warm import WarmJobSpec
 
     host_sock, guest_sock = socket.socketpair()
-    seen = {"yes"}                                  # image is known to ack
+    seen = _capable()                                  # image is known to ack
     ctl = _control(host_sock, ack_capable=seen)
     big = Path("/tmp/blastbox-ack-deadline-input")
     big.write_bytes(b"x" * 4096)
@@ -201,7 +210,7 @@ def test_a_transfer_that_eats_the_deadline_is_not_blamed_on_the_base(tmp_path):
 
 def test_the_state_is_claimed_only_once_the_host_listens(tmp_path):
     """The whole rule in one line: signal_go never decides; wait_for_done does."""
-    ctl, status = _run("wedged", ack_capable={"yes"})
+    ctl, status = _run("wedged", ack_capable=_capable())
     assert status is None and ctl.guest_started is False
 
 
@@ -245,11 +254,11 @@ def test_the_snapshot_runtime_accepts_a_shared_capability_set():
     from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
     assert "ack_capable" in inspect.signature(SnapshotSlotRuntime.__init__).parameters
     rt = object.__new__(SnapshotSlotRuntime)
-    shared: set[str] = set()
+    shared = AckCapability()
     rt._ack_capable = shared
     a = type("S", (), {"output_dir": Path("/tmp/a/out")})()
     ctl = SnapshotSlotRuntime.host_warm_control(rt, a)
-    shared.add("yes")                      # learned at base build...
+    shared.learn()                      # learned at base build...
     assert ctl._ack_capable, "...and visible to a control handed out before that"
 
 
@@ -265,7 +274,7 @@ def test_a_split_readiness_advertisement_is_not_lost():
     from blastbox.host.runtime.firecracker import VsockReadySignal, _VsockReadyState
     from blastbox.worker.fc_guest import READY_ACK_SUFFIX, READY_TOKEN
 
-    seen: set[str] = set()
+    seen = AckCapability()
     sig = VsockReadySignal(ack_capable=seen)
     srv_path = Path("/tmp") / f"bb-ready-{_t.time_ns()}.sock"
     srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)

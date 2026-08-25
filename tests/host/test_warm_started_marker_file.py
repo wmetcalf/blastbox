@@ -6,6 +6,7 @@ the full worker timeout to discover a poisoned base. Unlike the vsock ack there 
 hazard: an old host simply never looks at the file, and an old worker simply never writes it.
 """
 
+from blastbox.worker.warm import AckCapability
 import json
 
 from blastbox.worker.warm import (
@@ -14,6 +15,14 @@ from blastbox.worker.warm import (
     HostWarmControl,
     WarmJobSpec,
 )
+
+
+def _capable():
+    """An AckCapability that has already been taught — the "this image advertises" fixture."""
+    c = AckCapability()
+    c.learn()
+    return c
+
 
 
 def _dirs(tmp_path):
@@ -40,7 +49,7 @@ def test_the_worker_marks_the_job_before_it_starts(tmp_path):
 
 def test_the_host_reads_the_marker_and_reports_started(tmp_path):
     ctrl, src, out = _dirs(tmp_path)
-    seen = {"yes"}                                   # image known to mark
+    seen = _capable()                                   # image known to mark
     host = HostWarmControl(ctrl, ack_capable=seen)
     host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
     guest = FileWarmControl(ctrl)
@@ -53,7 +62,7 @@ def test_the_host_reads_the_marker_and_reports_started(tmp_path):
 
 def test_a_wedged_worker_reports_not_started(tmp_path):
     ctrl, src, out = _dirs(tmp_path)
-    host = HostWarmControl(ctrl, ack_capable={"yes"})
+    host = HostWarmControl(ctrl, ack_capable=_capable())
     host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
     try:
         host.wait_for_done(timeout_s=0.3)            # nothing ever picks it up
@@ -77,7 +86,7 @@ def test_an_older_worker_stays_unknown(tmp_path):
 
 def test_capability_is_learned_and_shared(tmp_path):
     ctrl, src, out = _dirs(tmp_path)
-    seen: set[str] = set()
+    seen = AckCapability()
     host = HostWarmControl(ctrl, ack_capable=seen)
     host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
     guest = FileWarmControl(ctrl)
@@ -93,7 +102,7 @@ def test_the_gvisor_wrapper_forwards_the_signal(tmp_path):
     from blastbox.host.runtime.gvisor_snapshot_runtime import GvisorHostWarmControl
 
     ctrl, _src, _out = _dirs(tmp_path)
-    seen = {"yes"}
+    seen = _capable()
     w = GvisorHostWarmControl(ctrl, ack_capable=seen)
     assert w.guest_started is None
     w._inner.guest_started = True
@@ -104,7 +113,7 @@ def test_the_gvisor_runtime_shares_capability_across_slots(tmp_path):
     from blastbox.host.runtime.gvisor_snapshot_runtime import GvisorSnapshotSlotRuntime
 
     rt = object.__new__(GvisorSnapshotSlotRuntime)
-    rt._ack_capable = set()
+    rt._ack_capable = AckCapability()
     a = type("S", (), {"control_dir": tmp_path / "a"})()
     b = type("S", (), {"control_dir": tmp_path / "b"})()
     ca = GvisorSnapshotSlotRuntime.host_warm_control(rt, a)
@@ -208,7 +217,7 @@ def test_the_gvisor_base_build_records_ack_capability(tmp_path):
     ctrl.mkdir()
     FileWarmControl(ctrl).signal_ready()               # the base advertises
 
-    seen: set[str] = set()
+    seen = AckCapability()
     h = object.__new__(GvisorBootHandle)
     h._ctrl = ctrl
     h._ready = lambda _d, _t: None                     # readiness already satisfied
@@ -224,7 +233,7 @@ def test_an_older_gvisor_base_teaches_nothing(tmp_path):
     ctrl.mkdir()
     (ctrl / "ready").write_text("ready\n")             # old image: no advertisement
 
-    seen: set[str] = set()
+    seen = AckCapability()
     h = object.__new__(GvisorBootHandle)
     h._ctrl = ctrl
     h._ready = lambda _d, _t: None
@@ -270,7 +279,7 @@ def test_the_snapshot_capability_is_reset_when_the_base_is_replaced():
     from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
 
     rt = object.__new__(SnapshotSlotRuntime)
-    rt._ack_capable = {"yes"}
+    rt._ack_capable = _capable()
     rt._manager = type("M", (), {"invalidate": lambda self: None})()
     try:
         SnapshotSlotRuntime.invalidate_base(rt)
@@ -291,7 +300,7 @@ def test_an_unwritable_control_dir_is_not_read_as_a_wedged_guest(tmp_path, monke
     from blastbox.errors import WarmTimeout
 
     ctrl, src, out = _dirs(tmp_path)
-    host = HostWarmControl(ctrl, ack_capable={"yes"})     # image known to mark starts
+    host = HostWarmControl(ctrl, ack_capable=_capable())     # image known to mark starts
     host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
     monkeypatch.setattr(type(host), "_ctrl_writable", lambda self: False)
 
@@ -309,7 +318,7 @@ def test_a_writable_control_dir_still_reports_a_wedged_guest(tmp_path):
     from blastbox.errors import WarmTimeout
 
     ctrl, src, out = _dirs(tmp_path)
-    host = HostWarmControl(ctrl, ack_capable={"yes"})
+    host = HostWarmControl(ctrl, ack_capable=_capable())
     host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
     with pytest.raises(WarmTimeout):
         host.wait_for_done(timeout_s=0.3)
@@ -320,7 +329,7 @@ def test_the_gvisor_capability_is_reset_when_the_bundle_is_replaced():
     from blastbox.host.runtime.gvisor_snapshot_runtime import GvisorSnapshotSlotRuntime
 
     rt = object.__new__(GvisorSnapshotSlotRuntime)
-    rt._ack_capable = {"yes"}
+    rt._ack_capable = _capable()
     rt._manager = type("M", (), {"invalidate": lambda self: None})()
     try:
         GvisorSnapshotSlotRuntime.invalidate_base(rt)
@@ -381,3 +390,61 @@ def test_the_probe_leaves_nothing_behind(tmp_path):
     for _ in range(5):
         assert host._ctrl_writable() is True
     assert not list(ctrl.iterdir()), f"probe residue: {list(ctrl.iterdir())}"
+
+
+def test_a_failed_probe_stays_failed_even_if_cleanup_also_fails(tmp_path, monkeypatch):
+    """A `return` inside a finally discards the value the try block already produced. With both
+    the write and the cleanup failing -- ctrl/ gone, or EIO -- the cleanup's True overrode the
+    probe's False, and the host blamed the guest for a control-filesystem outage."""
+    import os
+
+    from blastbox.contract import envelope
+
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    host = HostWarmControl(ctrl)
+
+    def _no_write(*a, **k):
+        raise OSError(5, "I/O error")
+    monkeypatch.setattr(envelope, "atomic_write_confined", _no_write)
+
+    real_open = os.open
+    def _no_open(path, *a, **k):
+        if str(path) == str(ctrl):
+            raise OSError(5, "I/O error")
+        return real_open(path, *a, **k)
+    monkeypatch.setattr(os, "open", _no_open)
+
+    assert host._ctrl_writable() is False, (
+        "a failed probe must stay failed when the cleanup fails too")
+
+
+def test_a_retired_control_cannot_resurrect_a_stale_capability():
+    """Clearing the set on invalidate was not enough: an old-generation slot still assigned keeps
+    its control, and when its ack finally arrives that control put "yes" straight back -- so a
+    replacement base built from a rolled-back worker WITHOUT the protocol inherited a capability
+    it does not have, and its missing markers were then read as proof of no start."""
+    cap = AckCapability()
+    old_gen = cap.generation
+    cap.learn(old_gen)
+    assert bool(cap) is True
+
+    cap.reset()                                   # a new base is built...
+    assert bool(cap) is False, "a replaced base must re-advertise"
+
+    cap.learn(old_gen)                            # ...and the RETIRED control's ack lands late
+    assert bool(cap) is False, (
+        "a late ack from a retired generation must not teach the base that replaced it")
+
+    cap.learn(cap.generation)                     # the new base advertising still works
+    assert bool(cap) is True
+
+
+def test_a_control_stamps_the_generation_it_was_built_under(tmp_path):
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    cap = AckCapability()
+    host = HostWarmControl(ctrl, ack_capable=cap)
+    assert host._ack_gen == cap.generation
+    cap.reset()
+    assert host._ack_gen != cap.generation, "the control is now stale by construction"

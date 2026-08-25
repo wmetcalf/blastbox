@@ -300,6 +300,43 @@ _HOST_POLL_INTERVAL_S: float = 0.05
 WARM_STARTED = "started"
 
 
+class AckCapability:
+    """Does the CURRENT warm base advertise the start signal? Generation-scoped on purpose.
+
+    A plain shared set could not express "this answer belonged to the base we just replaced".
+    Clearing it on invalidate was not enough: an old-generation slot still assigned keeps its
+    control, and when its ack finally arrives that control puts "yes" straight back -- so a
+    replacement base built from a rolled-back worker without the protocol inherits a capability
+    it does not have, and its missing start markers are then read as proof of no start. Three
+    document hangs later, a healthy mixed-version base is invalidated.
+
+    Every control stamps the generation it was created under and can only teach THAT generation.
+    A retired control's late ack is ignored rather than believed.
+    """
+
+    __slots__ = ("_gen", "_capable")
+
+    def __init__(self) -> None:
+        self._gen = 0
+        self._capable = False
+
+    def __bool__(self) -> bool:
+        return self._capable
+
+    @property
+    def generation(self) -> int:
+        return self._gen
+
+    def learn(self, generation: "int | None" = None) -> None:
+        if generation is None or generation == self._gen:
+            self._capable = True
+
+    def reset(self) -> None:
+        """A new base is being built: whatever the old one advertised no longer applies."""
+        self._gen += 1
+        self._capable = False
+
+
 class HostWarmControl:
     """Host-side counterpart to ``FileWarmControl``.
 
@@ -320,10 +357,13 @@ class HostWarmControl:
     #: has the job. Never guessed -- twin of firecracker.VsockHostWarmControl.guest_started.
     guest_started: "bool | None" = None
 
-    def __init__(self, control_dir: Path, *, ack_capable: "set[str] | None" = None) -> None:
+    def __init__(self, control_dir: Path,
+                 *, ack_capable: "AckCapability | None" = None) -> None:
         self._dir = control_dir
-        # Shared with the runtime: non-empty once ANY slot from this image has marked a start.
-        self._ack_capable = ack_capable if ack_capable is not None else set()
+        # Shared with the runtime; true once the CURRENT base has been seen to advertise.
+        self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
+        # Stamped at construction so a late ack from a retired generation cannot teach the new one.
+        self._ack_gen = self._ack_capable.generation
 
     def _atomic_write(self, name: str, content: str) -> None:
         """Write *content* to ``control_dir/<name>`` atomically AND symlink-safely.
@@ -380,22 +420,22 @@ class HostWarmControl:
         name = f".bb-probe-{uuid.uuid4().hex}"
         try:
             atomic_write_confined(self._dir, name, b"", mode=0o600)
+        except Exception:  # noqa: BLE001 - OSError, or a confinement violation; both mean "no"
+            return False
+        # CLEANUP MUST NOT RETURN. A `return` inside a finally silently discards the value the
+        # try block already produced -- so when the write failed AND this open failed (ctrl/ gone,
+        # or the filesystem returning EIO), the cleanup's True overrode the probe's False and the
+        # host went on to blame the guest for a control-filesystem outage. Best-effort, no verdict.
+        try:
+            dfd = os.open(self._dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         except OSError:
-            return False
-        except Exception:  # noqa: BLE001 - a confinement violation is not a storage verdict
-            return False
+            return True          # the write DID succeed; only the tidy-up could not run
+        try:
+            os.unlink(name, dir_fd=dfd)
+        except OSError:
+            pass
         finally:
-            # Unlinked through a dirfd for the same reason: never resolve this path by string.
-            try:
-                dfd = os.open(self._dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            except OSError:
-                return True
-            try:
-                os.unlink(name, dir_fd=dfd)
-            except OSError:
-                pass
-            finally:
-                os.close(dfd)
+            os.close(dfd)
         return True
 
     def wait_for_done(self, *, timeout_s: float) -> str:
@@ -426,7 +466,7 @@ class HostWarmControl:
         except (OSError, ValueError):
             _rdy = ""
         if "ack=1" in _rdy:
-            self._ack_capable.add("yes")
+            self._ack_capable.learn(self._ack_gen)
         # SET ONLY HERE, where the host actually waits to find out -- same rule as the vsock twin.
         # Claiming "never started" anywhere earlier convicts a base for a job nobody listened for.
         if self._ack_capable:
@@ -437,7 +477,7 @@ class HostWarmControl:
                 # The worker picked the job up. Whatever fails after this is about the DOCUMENT,
                 # not about whether the base can produce a working guest.
                 self.guest_started = True
-                self._ack_capable.add("yes")
+                self._ack_capable.learn(self._ack_gen)
             try:
                 # Symlink-safe, capped, confined read: ctrl/ is WORKER-WRITABLE on the gVisor tier,
                 # so a hostile worker could symlink `done` at a host file (info disclosure) or a

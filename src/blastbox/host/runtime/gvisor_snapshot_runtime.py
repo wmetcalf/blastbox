@@ -19,6 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
+from blastbox.worker.warm import AckCapability
 from blastbox.host.pool import Slot, SlotState
 from blastbox.host.runtime.fc_snapshot import SnapshotError
 
@@ -35,10 +36,10 @@ _DEFAULT_WARM_ARGV = ["python3", "/opt/blastbox/run_warm.py"]
 class GvisorSnapshotSlotRuntime:
     def __init__(self, manager, *, settle_s: float = 1.0,
                  clock: Callable[[], float] = time.monotonic,
-                 ack_capable: "set[str] | None" = None) -> None:
+                 ack_capable: "AckCapability | None" = None) -> None:
         # Shared with every GvisorHostWarmControl handed out (see host_warm_control) AND with the
         # base build, which is the only place the advertisement is ever visible on this tier.
-        self._ack_capable: set[str] = ack_capable if ack_capable is not None else set()
+        self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
         self._mgr = manager
         self._settle_s = settle_s
         self._clock = clock
@@ -124,7 +125,7 @@ class GvisorSnapshotSlotRuntime:
         # set outlives the generation that taught it, so a bundle rolled back to an older worker
         # kept the previous "yes" and a missing start marker was then read as proof of no start --
         # letting three document-induced hangs convict a healthy mixed-version base.
-        self._ack_capable.clear()
+        self._ack_capable.reset()
         drop = getattr(self._mgr, "invalidate", None)
         if callable(drop):
             drop()
@@ -241,7 +242,7 @@ class GvisorHostWarmControl:
     SANDBOX_IN = Path("/in")
     SANDBOX_OUT = Path("/out")
 
-    def __init__(self, control_dir: Path, *, ack_capable: "set[str] | None" = None) -> None:
+    def __init__(self, control_dir: Path, *, ack_capable: "AckCapability | None" = None) -> None:
         from blastbox.worker.warm import HostWarmControl
         self._inner = HostWarmControl(control_dir, ack_capable=ack_capable)
 
@@ -293,7 +294,7 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
     # Created before both so the BASE BUILD and the runtime serving restores share it: the base
     # advertises the start-marker protocol in `ready`, and that is the only moment it is visible
     # (a restore gets a fresh ctrl/, and the checkpointed worker resumes past signal_ready).
-    ack_capable: set[str] = set()
+    ack_capable = AckCapability()
     backend = GvisorSnapshotBackend(gcfg, ack_capable=ack_capable)
     if not backend.available():
         if require_available:

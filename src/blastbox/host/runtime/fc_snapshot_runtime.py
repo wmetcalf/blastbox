@@ -29,6 +29,7 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
+from blastbox.worker.warm import AckCapability
 from blastbox.host.pool import Slot, SlotState
 from blastbox.host.runtime.fc_snapshot import SnapshotError, SnapshotManager
 from blastbox.host.runtime.fc_snapshot_launcher import REL_OUTDISK, REL_VSOCK
@@ -37,7 +38,7 @@ _log = logging.getLogger(__name__)
 
 
 def _vsock_ready_check_factory(vsock_path: Path,
-                               ack_capable: "set[str] | None" = None
+                               ack_capable: "AckCapability | None" = None
                                ) -> Callable[[float], None]:
     """Build a blocking ``ready_check(timeout_s)`` for the base-VM build.
 
@@ -100,13 +101,13 @@ class SnapshotSlotRuntime:
         manager: SnapshotManager,
         *,
         settle_s: float = 1.0,
-        ack_capable: "set[str] | None" = None,
+        ack_capable: "AckCapability | None" = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         # Shared with every VsockHostWarmControl handed out (see host_warm_control) AND with the
         # base-build ready listener, which is the only place the advertisement is visible in
         # snapshot mode -- restored guests never signal readiness again.
-        self._ack_capable: set[str] = ack_capable if ack_capable is not None else set()
+        self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
         self._cfg = cfg
         self._manager = manager
         # cfg.max_extracted_bytes bounds rdump output; fall back to a 512 MiB default
@@ -253,7 +254,7 @@ class SnapshotSlotRuntime:
         # and controls then read a missing ack as proof of no start, letting three
         # document-induced hangs convict a healthy older base instead of staying UNKNOWN, which
         # is exactly what the mixed-version contract promises. Re-learned at the next base build.
-        self._ack_capable.clear()
+        self._ack_capable.reset()
         drop = getattr(self._manager, "invalidate", None)
         if not callable(drop):
             _log.warning("snapshot.invalidate_unsupported manager=%s", type(self._manager).__name__)
@@ -482,7 +483,7 @@ def select_snapshot_runtime(
     mem_dir = resolve_mem_dir() or base_dir
     # Created HERE so the base-build listener and the runtime that serves restores share one set:
     # the base advertises at build time, every restored slot then reads the answer.
-    ack_capable: set[str] = set()
+    ack_capable = AckCapability()
     launcher = FcSnapshotLauncher(
         cfg,
         base_dir,

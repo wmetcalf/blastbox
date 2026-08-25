@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from blastbox.worker.warm import WarmJobSpec
 
+from blastbox.worker.warm import AckCapability
 from blastbox.errors import HOST_RESOURCE_ERRNOS, SandboxError, WarmTimeout
 from blastbox.host.pool import Slot, SlotState
 from blastbox.worker.fc_guest import (
@@ -659,13 +660,13 @@ class VsockReadySignal:
     """
 
     def __init__(self, *, max_bytes: int = _READY_MAX_BYTES,
-                 ack_capable: "set[str] | None" = None) -> None:
+                 ack_capable: "AckCapability | None" = None) -> None:
         # Shared with the runtime's warm controls. Populated HERE, at readiness, so a base that is
         # wedged from its very first slot -- no job ever completes, so no ack is ever seen -- is
         # still known to be ack-capable and can arm the fast repair. Learning it only from a
         # completed ack left the repair inert on exactly the poisoned-from-the-outset base it
         # exists to fix, which is what a dispatcher restarting onto a bad artifact produces.
-        self._ack_capable: set[str] = ack_capable if ack_capable is not None else set()
+        self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
         self._max_bytes = max_bytes
         self._slots: dict[str, _VsockReadyState] = {}
         self._lock = threading.Lock()
@@ -786,7 +787,7 @@ class VsockReadySignal:
                         if READY_ACK_SUFFIX in buf:
                             # Learned BEFORE any job, which is what makes the fast repair usable
                             # on a base that was already poisoned when this dispatcher started.
-                            self._ack_capable.add("yes")
+                            self._ack_capable.learn()
                         _log.info("fc.vsock_ready_received slot_id=%s ack_capable=%s",
                                   slot_id, READY_ACK_SUFFIX in buf)
                         state.ready.set()
@@ -864,10 +865,12 @@ class VsockHostWarmControl:
         job_port: int = _JOB_PORT,
         connect_timeout_s: float = 10.0,
         connect_fn: "Callable[[], socket.socket] | None" = None,
-        ack_capable: "set[str] | None" = None,
+        ack_capable: "AckCapability | None" = None,
     ) -> None:
         # Shared with the runtime (see host_warm_control): non-empty once ANY slot has acked.
-        self._ack_capable = ack_capable if ack_capable is not None else set()
+        self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
+        # Stamped now, so a late ack from a retired generation cannot teach the new one.
+        self._ack_gen = self._ack_capable.generation
         self._uds = Path(vsock_uds)
         self._job_port = job_port
         self._connect_timeout = connect_timeout_s
@@ -975,7 +978,7 @@ class VsockHostWarmControl:
             if frame == WARM_ACK:
                 # Ack-capable guest, and it HAS the job. The status is the next frame.
                 self.guest_started = True
-                self._ack_capable.add("yes")
+                self._ack_capable.learn(self._ack_gen)
                 frame = recv_frame(
                     self._conn, max_len=MAX_STATUS_BYTES, deadline=deadline
                 ).decode("utf-8")
@@ -1070,7 +1073,7 @@ class FirecrackerSlotRuntime:
     ) -> None:
         # Shared with every VsockHostWarmControl this runtime hands out: one warm base
         # image, so ack-capability is a property of the image rather than of a job.
-        self._ack_capable: set[str] = set()
+        self._ack_capable = AckCapability()
         self._cfg = cfg
         self._subprocess_runner = subprocess_runner
         # Default to the live vsock signal — FileReadySignal cannot signal a warm

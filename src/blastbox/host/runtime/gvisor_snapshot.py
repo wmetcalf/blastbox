@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from blastbox.worker.warm import AckCapability
 from blastbox.host.runtime.snapshot_backend import (
     generation_owner,
     hold_owner_lease,
@@ -289,7 +290,7 @@ class GvisorBootHandle:
         base_dir: Path,
         ctrl_dir: Path,
         ready_wait: Callable[[Path, float], None],
-        ack_capable: "set[str] | None" = None,
+        ack_capable: "AckCapability | None" = None,
         stranded: list[str] | None = None,
     ) -> None:
         # Partial checkpoint directories whose cleanup failed. OWNED BY THE BACKEND and shared in:
@@ -302,7 +303,7 @@ class GvisorBootHandle:
         self._base = base_dir
         self._ctrl = ctrl_dir
         self._ready = ready_wait
-        self._ack_capable: "set[str] | None" = ack_capable
+        self._ack_capable: "AckCapability | None" = ack_capable
 
     def wait_ready(self, timeout_s: float) -> None:
         self._ready(self._ctrl, timeout_s)
@@ -311,7 +312,7 @@ class GvisorBootHandle:
         # base wedged from its first restore never completes a job either. Read it here, while
         # the base is still the live container that wrote it.
         if self._ack_capable is not None and read_base_ack_capability(self._ctrl):
-            self._ack_capable.add("yes")
+            self._ack_capable.learn()
 
     def checkpoint(self, dest_dir: Path) -> object:
         # Retry anything a previous failed checkpoint could not remove; no artifact was returned
@@ -531,7 +532,7 @@ class GvisorSnapshotBackend:
         run: Callable[..., int] = _default_run,
         run_text: Callable[[list[str]], str] = _default_run_text,
         ready_wait: Callable[[Path, float], None] = _default_ready_wait,
-        ack_capable: "set[str] | None" = None,
+        ack_capable: "AckCapability | None" = None,
         probe: Callable[[], bool] | None = None,
         cr_capable: Callable[[str], bool] = _default_cr_capable,
     ) -> None:
@@ -539,7 +540,7 @@ class GvisorSnapshotBackend:
         self._run = run
         self._run_text = run_text
         self._ready = ready_wait
-        self._ack_capable: "set[str] | None" = ack_capable
+        self._ack_capable: "AckCapability | None" = ack_capable
         self._probe = probe
         self._cr_capable = cr_capable
         # Durable across boot handles: SnapshotManager kills and abandons a handle after a failed
