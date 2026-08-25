@@ -372,7 +372,7 @@ def test_a_cooldown_from_THIS_base_still_discards_its_evidence():
     rt = _TieredWedge()
     pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=300.0)
     pool._last_base_rebuild_at = pool._clock()
-    pool._last_base_rebuild_ident = "tierB"          # ...and it was THIS one
+    pool._last_base_rebuild_idents = {"tierB"}       # ...and it was THIS one
     for slot in _claim_distinct(pool, 3):
         _fail(pool, slot, stage="pre_guest")
     assert rt.base_invalidations == 0
@@ -390,7 +390,7 @@ def test_a_real_rebuild_records_which_base_it_repaired():
     for slot in _claim_distinct(pool, 3):
         _fail(pool, slot, stage="pre_guest")
     assert rt.base_invalidations == 1, "the first crossing must actually repair"
-    assert pool._last_base_rebuild_ident == "tierB", "the repair must record its target"
+    assert pool._last_base_rebuild_idents == {"tierB"}, "the repair must record its target"
 
     # ...and now the SAME base keeps failing inside the cooldown: evidence must be discarded,
     # which only works if the identity above was recorded.
@@ -418,5 +418,46 @@ def test_the_repaired_identity_comes_from_what_was_actually_repaired():
     for slot in _claim_distinct(pool, 3):
         _fail(pool, slot, stage="pre_guest")
     assert rt.base_invalidations == 1
-    assert pool._last_base_rebuild_ident != "tierB", (
+    assert "tierB" not in pool._last_base_rebuild_idents, (
         "tierB was never repaired, so the cooldown must not treat it as just-rebuilt")
+
+
+def test_an_ordinary_repair_also_names_its_tier():
+    """`only` was supplied for the pre-guest fast path alone. An ordinary streak is per-identity
+    too, and a cascade whose _job_guilty was cleared by an unrelated success on tier A would fall
+    back to rebuilding EVERY tier -- destroying A's base because B failed."""
+    rt = _TieredWedge()
+    # ordinary threshold is small here so plain worker faults cross it
+    pool = _pool(rt, pre_guest_rebuild_after=0, snapshot_rebuild_after=3)
+    for slot in _claim_distinct(pool, 3):
+        _fail(pool, slot, stage=None)              # ordinary worker faults, no pre-guest evidence
+    assert rt.invalidated == ["tierB"], (
+        f"an ordinary repair must name the tier that crossed, got {rt.invalidated}")
+
+
+def test_every_tier_a_repair_committed_is_recorded():
+    """One invalidation can repair several tiers. Recording only the trigger left the others'
+    streaks in place, so a later failure read them as unrepaired, restored evidence predating
+    their rebuild, and invalidated a tier that had just been rebuilt."""
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=300.0)
+
+    def _drop(*, reason=None, only=None):
+        rt.base_invalidations += 1
+        return ["tierA", "tierB"]                  # the repair covered BOTH
+    rt.invalidate_base = _drop
+
+    a, b, c, sib1, sib2 = _claim_distinct(pool, 5)
+    # tierA accumulates a real ordinary streak of its own...
+    rt._ident[sib1.slot_id] = "tierA"
+    rt._ident[sib2.slot_id] = "tierA"
+    _fail(pool, sib1, stage=None)
+    _fail(pool, sib2, stage=None)
+    assert pool._pool_consecutive_failures.get("tierA") == 2, "precondition: tierA has a streak"
+
+    # ...and tierB's crossing triggers a repair that covers BOTH tiers.
+    for slot in (a, b, c):
+        _fail(pool, slot, stage="pre_guest")
+    assert pool._last_base_rebuild_idents == {"tierA", "tierB"}
+    assert not pool._pool_consecutive_failures.get("tierA"), (
+        "tierA was rebuilt by this repair, so its pre-rebuild streak must not survive it")

@@ -422,7 +422,7 @@ class WarmPool:
         # cause is elsewhere" reasoning is only sound about the SAME base; in a cascade the
         # previous repair may have been a different tier entirely, and discarding this tier's
         # evidence on that basis makes a still-poisoned tier earn a fresh threshold-sized batch.
-        self._last_base_rebuild_ident: str | None = None
+        self._last_base_rebuild_idents: set[str] = set()
         # Slots promoted to IDLE that have not yet completed a job. Their promotion cleared the
         # restore-failure streak provisionally; a confirmed death before first use revokes that.
         self._promoted_unproven: set[str] = set()
@@ -2544,7 +2544,7 @@ class WarmPool:
             if reason == "spawn":
                 with self._lock:
                     self._spawn_consecutive_failures = 0
-            elif self._last_base_rebuild_ident == episode_ident:
+            elif episode_ident in self._last_base_rebuild_idents:
                 # THIS base was just rebuilt and is still failing, so the cause is elsewhere --
                 # the original reasoning, and it still holds. Drop the evidence.
                 with self._lock:
@@ -2664,7 +2664,12 @@ class WarmPool:
             _kw: dict[str, Any] = {}
             if _accepts_kwarg(drop, "reason"):
                 _kw["reason"] = reason
-            if pre_guest_slots and episode_ident and _accepts_kwarg(drop, "only"):
+            if reason != "spawn" and episode_ident and _accepts_kwarg(drop, "only"):
+                # EVERY job-triggered repair, not only the pre-guest fast path. The ordinary
+                # streak is per-identity too, so the episode that crossed always belongs to one
+                # base -- and a cascade whose _job_guilty was cleared by an unrelated success on
+                # tier A would otherwise fall back to rebuilding EVERY tier, destroying A's base
+                # because B failed. Spawn repairs keep their own attribution and are excluded.
                 _kw["only"] = episode_ident
             repaired = drop(**_kw)
         except Exception as exc:
@@ -2701,10 +2706,16 @@ class WarmPool:
             # cooldown, but the record said B -- and B's next failure took the "this base was just
             # rebuilt and still fails" branch and discarded the evidence for a tier nothing had
             # touched. Taken from what drop() actually repaired where it says so.
+            # ALL of them. One invalidation can repair several tiers -- ordinary failures may
+            # have blamed more than one -- and recording only the trigger left the others' streaks
+            # in place: a later failure then read them as a different, unrepaired base, restored
+            # evidence predating their rebuild, and invalidated a tier that had just been rebuilt.
             _committed = ({str(n) for n in repaired}
                           if isinstance(repaired, (list, tuple, set, frozenset)) and repaired
                           else {episode_ident})
-            self._last_base_rebuild_ident = episode_ident if episode_ident in _committed else None
+            self._last_base_rebuild_idents = set(_committed)
+            for _done in _committed:
+                self._pool_consecutive_failures.pop(_done, None)
             # Releases landing WHILE drop() ran rebuilt a set after this episode consumed the old
             # one -- charging the retired base's failures to its replacement. With a threshold of
             # 3, two such stragglers plus one genuine failure from the fresh base convict it, and
