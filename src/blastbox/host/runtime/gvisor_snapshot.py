@@ -229,6 +229,26 @@ def _default_cr_capable(runsc_bin: str) -> bool:
     return "checkpoint" in out and "restore" in out
 
 
+def read_base_ack_capability(ctrl_dir: Path) -> bool:
+    """Does the warm BASE advertise the start-marker protocol?
+
+    Read once, at base build, and that is the only chance: a gVisor restore gets a FRESH ctrl/
+    bind dir, and the checkpointed worker resumes PAST its one-time signal_ready(), so it never
+    writes `ready` again. Learning the capability from a restored slot is therefore impossible,
+    and learning it from a completed job fails on precisely the base that is wedged from its
+    first restore -- the one the fast repair exists for.
+
+    Confined like every other read of this worker-writable directory: `ready` is written by the
+    base container, and ctrl/ is bind-mounted 0o777.
+    """
+    from blastbox.contract.envelope import read_confined_regular_bytes
+    try:
+        raw = read_confined_regular_bytes(ctrl_dir, "ready", max_bytes=4096)
+    except (OSError, ValueError):
+        return False
+    return "ack=1" in raw.decode("utf-8", "replace")
+
+
 def _default_ready_wait(ctrl_dir: Path, timeout_s: float) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -269,6 +289,7 @@ class GvisorBootHandle:
         base_dir: Path,
         ctrl_dir: Path,
         ready_wait: Callable[[Path, float], None],
+        ack_capable: "set[str] | None" = None,
         stranded: list[str] | None = None,
     ) -> None:
         # Partial checkpoint directories whose cleanup failed. OWNED BY THE BACKEND and shared in:
@@ -281,9 +302,16 @@ class GvisorBootHandle:
         self._base = base_dir
         self._ctrl = ctrl_dir
         self._ready = ready_wait
+        self._ack_capable: "set[str] | None" = ack_capable
 
     def wait_ready(self, timeout_s: float) -> None:
         self._ready(self._ctrl, timeout_s)
+        # THE ONLY CHANCE to learn it. A restore gets a fresh ctrl/ and the checkpointed worker
+        # resumes past its one-time signal_ready(), so `ready` is never written again -- and a
+        # base wedged from its first restore never completes a job either. Read it here, while
+        # the base is still the live container that wrote it.
+        if self._ack_capable is not None and read_base_ack_capability(self._ctrl):
+            self._ack_capable.add("yes")
 
     def checkpoint(self, dest_dir: Path) -> object:
         # Retry anything a previous failed checkpoint could not remove; no artifact was returned
@@ -503,6 +531,7 @@ class GvisorSnapshotBackend:
         run: Callable[..., int] = _default_run,
         run_text: Callable[[list[str]], str] = _default_run_text,
         ready_wait: Callable[[Path, float], None] = _default_ready_wait,
+        ack_capable: "set[str] | None" = None,
         probe: Callable[[], bool] | None = None,
         cr_capable: Callable[[str], bool] = _default_cr_capable,
     ) -> None:
@@ -510,6 +539,7 @@ class GvisorSnapshotBackend:
         self._run = run
         self._run_text = run_text
         self._ready = ready_wait
+        self._ack_capable: "set[str] | None" = ack_capable
         self._probe = probe
         self._cr_capable = cr_capable
         # Durable across boot handles: SnapshotManager kills and abandons a handle after a failed
@@ -568,7 +598,9 @@ class GvisorSnapshotBackend:
                 raise
             shutil.rmtree(base, ignore_errors=True)
             raise
-        return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready, stranded=self._stranded_partials)
+        return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready,
+                                ack_capable=self._ack_capable,
+                                stranded=self._stranded_partials)
 
     def restore_in(self, slot_workdir: Path, artifact: object) -> GvisorRestoreHandle:
         wd = Path(slot_workdir)

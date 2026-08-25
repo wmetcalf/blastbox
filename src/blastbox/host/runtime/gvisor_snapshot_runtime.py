@@ -33,9 +33,12 @@ _DEFAULT_WARM_ARGV = ["python3", "/opt/blastbox/run_warm.py"]
 
 
 class GvisorSnapshotSlotRuntime:
-    def __init__(self, manager, *, settle_s: float = 1.0, clock: Callable[[], float] = time.monotonic) -> None:
-        # Shared with every GvisorHostWarmControl handed out (see host_warm_control).
-        self._ack_capable: set[str] = set()
+    def __init__(self, manager, *, settle_s: float = 1.0,
+                 clock: Callable[[], float] = time.monotonic,
+                 ack_capable: "set[str] | None" = None) -> None:
+        # Shared with every GvisorHostWarmControl handed out (see host_warm_control) AND with the
+        # base build, which is the only place the advertisement is ever visible on this tier.
+        self._ack_capable: set[str] = ack_capable if ack_capable is not None else set()
         self._mgr = manager
         self._settle_s = settle_s
         self._clock = clock
@@ -282,7 +285,11 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
     from blastbox.host.runtime.gvisor_snapshot import GvisorSnapshotBackend
     from blastbox.host.runtime.fc_snapshot import SnapshotManager
     gcfg = cfg or _gvisor_config_from_env(os.environ)
-    backend = GvisorSnapshotBackend(gcfg)
+    # Created before both so the BASE BUILD and the runtime serving restores share it: the base
+    # advertises the start-marker protocol in `ready`, and that is the only moment it is visible
+    # (a restore gets a fresh ctrl/, and the checkpointed worker resumes past signal_ready).
+    ack_capable: set[str] = set()
+    backend = GvisorSnapshotBackend(gcfg, ack_capable=ack_capable)
     if not backend.available():
         if require_available:
             raise GvisorUnavailable("gVisor C/R warm tier required but runsc not found; "
@@ -299,7 +306,7 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
     snapshot_parent = resolve_mem_dir() or Path(gcfg.root).parent
     base_dir = _secure_snapshot_base(snapshot_parent / "gvisor-snapshot")
     mgr = SnapshotManager(base_dir, backend)
-    return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle())
+    return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle(), ack_capable=ack_capable)
 
 
 def _secure_snapshot_base(base_dir: Path) -> Path:

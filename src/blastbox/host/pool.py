@@ -2507,7 +2507,12 @@ class WarmPool:
                                 and len(_pre[1]) >= self._pre_guest_rebuild_after)
                 if _worst[1] < self._snapshot_rebuild_after and not _pre_crossed:
                     return False
-                if _pre_crossed and _worst[1] < self._snapshot_rebuild_after:
+                # A CROSSED pre-guest episode outranks an ordinary streak, even one that has also
+                # crossed. Selecting the ordinary one meant a tier whose slots are PROVEN unable
+                # to execute waited behind a tier that merely accumulated failures -- and kept
+                # waiting, because every later decision made the same choice while the global
+                # cooldown ran. Proof beats a count.
+                if _pre_crossed:
                     logger.error(
                         "pool.base_rebuild_pre_guest base=%s slots=%d threshold=%d -- %d DISTINCT "
                         "slots restored from this base failed before their guest ever executed; "
@@ -2537,7 +2542,11 @@ class WarmPool:
             # skipping the token meant that path invalidated a base which had just produced a
             # valid result, the very case the token was added to prevent (PR #82).
             with self._lock:
-                success_token = self._clean_release_by_base.get(episode_ident, 0)
+                # Spawn episodes are unattributed (episode_ident == ""), and nothing is ever
+                # recorded under "" in the per-base ledger -- so this must read the pool-wide
+                # counter or the guard can never fire. See _base_succeeded_since.
+                success_token = (self._clean_release_by_base.get(episode_ident, 0)
+                                 if episode_ident else self._clean_release_count)
         now = self._clock()
         with self._lock:
             last = self._last_base_rebuild_at
@@ -2602,10 +2611,9 @@ class WarmPool:
                 "rebuild it", pool_failures, type(self._runtime).__name__,
             )
             return False
-        with self._lock:
-            # Scoped to the base being judged -- see _clean_release_by_base.
-            stale = (success_token is not None
-                     and success_token != self._clean_release_by_base.get(episode_ident, 0))
+        # NOT under self._lock: the helper takes it, and this is a plain Lock, not an RLock --
+        # nesting them deadlocks the dispatcher outright.
+        stale = self._base_succeeded_since(episode_ident, success_token)
         if stale:
             logger.info(
                 "pool.base_rebuild_skipped reason=slot_succeeded_during_decision — the base "
@@ -2642,12 +2650,35 @@ class WarmPool:
                         "pool.base_rebuild_skipped reason=already_repaired_by_the_winner "
                         "base=%s -- discarding evidence from the retired generation",
                         episode_ident or "<default>")
+                elif self._base_succeeded_since(episode_ident, success_token):
+                    # A slot from THIS base completed while we waited behind another tier's
+                    # invalidation. That is conclusive: restoring the pre-recovery evidence would
+                    # let a later failure invalidate a base which has since demonstrated it works.
+                    logger.info(
+                        "pool.base_rebuild_skipped reason=slot_succeeded_during_lock_wait "
+                        "base=%s", episode_ident or "<default>")
                 else:
                     self._restore_episode(episode_ident, pool_failures, _consumed_pre_guest,
                                           reason)
                 return False
             return self._invalidate_now(drop, reason, pool_failures, success_token, now,
                                         episode_ident, _consumed_pre_guest)
+
+    def _base_succeeded_since(self, episode_ident, token) -> bool:  # noqa: ANN001
+        """Has this base produced a clean release since ``token`` was captured?
+
+        Spawn episodes carry no identity (``episode_ident`` is ""), and a cascade records clean
+        releases under a TIER name -- never under "" -- so a per-base token could not move for
+        them and the stale-decision guard was dead on that path: an in-flight slot from the guilty
+        tier could succeed and the pool would still invalidate its base. Those fall back to the
+        pool-wide counter, which does move.
+        """
+        if token is None:
+            return False
+        with self._lock:
+            if not episode_ident:
+                return self._clean_release_count != token
+            return self._clean_release_by_base.get(episode_ident, 0) != token
 
     def _restore_episode(self, episode_ident, pool_failures, pre_guest_slots,
                          reason) -> None:  # noqa: ANN001

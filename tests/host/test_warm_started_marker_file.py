@@ -193,3 +193,39 @@ def test_an_oversized_ready_file_is_refused(tmp_path):
     except Exception:
         pass
     assert host.guest_started is None, "an oversized ready must be refused, not read"
+
+
+def test_the_gvisor_base_build_records_ack_capability(tmp_path):
+    """The ONLY chance on this tier. A restore gets a fresh ctrl/ and the checkpointed worker
+    resumes past its one-time signal_ready(), so `ready` is never written again -- and a base
+    wedged from its first restore never completes a job either. Read it while the base is still
+    the live container that wrote it."""
+    from blastbox.host.runtime.gvisor_snapshot import GvisorBootHandle
+
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    FileWarmControl(ctrl).signal_ready()               # the base advertises
+
+    seen: set[str] = set()
+    h = object.__new__(GvisorBootHandle)
+    h._ctrl = ctrl
+    h._ready = lambda _d, _t: None                     # readiness already satisfied
+    h._ack_capable = seen
+    GvisorBootHandle.wait_ready(h, 1.0)
+    assert seen, "the base's advertisement must be recorded at build time"
+
+
+def test_an_older_gvisor_base_teaches_nothing(tmp_path):
+    from blastbox.host.runtime.gvisor_snapshot import GvisorBootHandle
+
+    ctrl = tmp_path / "ctrl"
+    ctrl.mkdir()
+    (ctrl / "ready").write_text("ready\n")             # old image: no advertisement
+
+    seen: set[str] = set()
+    h = object.__new__(GvisorBootHandle)
+    h._ctrl = ctrl
+    h._ready = lambda _d, _t: None
+    h._ack_capable = seen
+    GvisorBootHandle.wait_ready(h, 1.0)
+    assert not seen, "no advertisement means UNKNOWN, which must convict nothing"

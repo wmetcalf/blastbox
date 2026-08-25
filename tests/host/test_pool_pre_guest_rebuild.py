@@ -544,3 +544,102 @@ def test_a_partial_repair_clears_the_evidence_of_the_tiers_it_did_replace():
         _fail(pool, slot, stage="pre_guest")         # tierB crosses; the repair partially fails
     assert not pool._pool_pre_guest_failures.get("tierA"), (
         "tierA's generation advanced, so evidence against its retired artifact must go with it")
+
+
+def test_a_crossed_pre_guest_episode_outranks_an_ordinary_streak():
+    """A tier whose slots are PROVEN unable to execute must not wait behind one that merely
+    accumulated failures.
+
+    tierA's streak has to still be AT the ordinary threshold when tierB crosses -- otherwise the
+    selection never has to choose and the test passes for the wrong reason. So tierA's repair
+    FAILS, which restores its streak, exactly the case the review named ("its previous
+    invalidation failed"). tierB's own ordinary streak stays far below the threshold, so the
+    pre-guest path is the only way it can ever be repaired.
+    """
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3, snapshot_rebuild_after=10,
+                 base_rebuild_cooldown_s=0)
+
+    def _drop(*, reason=None, only=None):
+        if only == "tierA":
+            raise OSError("tierA could not be dropped")     # streak is restored
+        rt.invalidated.append(only)
+        rt.base_invalidations += 1
+        return [only]
+    rt.invalidate_base = _drop
+
+    slots = _claim_distinct(pool, 13)
+    for s_ in slots[:10]:
+        rt._ident[s_.slot_id] = "tierA"
+        _fail(pool, s_, stage=None)
+    assert pool._pool_consecutive_failures.get("tierA", 0) >= 10, (
+        "precondition: tierA's streak survived its failed repair")
+
+    for s_ in slots[10:]:
+        _fail(pool, s_, stage="pre_guest")
+    assert "tierB" in rt.invalidated, (
+        f"the proven-poisoned tier must be selected over a mere streak, got {rt.invalidated}")
+
+
+def test_a_success_during_the_lock_wait_discards_the_losing_episode():
+    """A slot from THIS base completing while we waited behind another tier's invalidation is
+    conclusive. Restoring the pre-recovery evidence would let a later failure invalidate a base
+    that has since demonstrated it works."""
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=300.0)
+    real = pool._invalidation_lock
+
+    class _WinnerRepairsAnotherTier:
+        def __enter__(self):
+            real.acquire()
+            pool._last_base_rebuild_at = pool._clock()
+            pool._last_base_rebuild_idents = {"tierA"}          # a DIFFERENT tier
+            # ...and meanwhile a tierB slot completed cleanly
+            pool._clean_release_by_base["tierB"] = (
+                pool._clean_release_by_base.get("tierB", 0) + 1)
+            return self
+        def __exit__(self, *exc):
+            real.release()
+            return False
+
+    pool._invalidation_lock = _WinnerRepairsAnotherTier()
+    for slot in _claim_distinct(pool, 3):
+        _fail(pool, slot, stage="pre_guest")
+    assert rt.base_invalidations == 0
+    assert not pool._pool_pre_guest_failures.get("tierB"), (
+        "a base that succeeded during the wait must not keep its pre-recovery evidence")
+
+
+def test_a_spawn_episode_uses_the_pool_wide_success_token():
+    """Spawn episodes are unattributed (episode_ident == ""), and a cascade records clean
+    releases under a TIER name -- never under "" -- so a per-base token could never move for
+    them and the stale-decision guard was dead on that path."""
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3)
+    pool._clean_release_count = 7
+    # an unattributed episode compares against the pool-wide counter...
+    assert pool._base_succeeded_since("", 7) is False
+    assert pool._base_succeeded_since("", 6) is True
+    # ...while an attributed one uses its own ledger
+    pool._clean_release_by_base["tierB"] = 2
+    assert pool._base_succeeded_since("tierB", 2) is False
+    assert pool._base_succeeded_since("tierB", 1) is True
+
+
+def test_the_success_check_does_not_deadlock_when_called_under_no_lock():
+    """_base_succeeded_since takes self._lock, which is a plain Lock, not an RLock. Calling it
+    from inside an existing `with self._lock:` hung the dispatcher outright -- caught only
+    because the suite stopped finishing."""
+    import threading
+
+    rt = _TieredWedge()
+    pool = _pool(rt, pre_guest_rebuild_after=3)
+    done = threading.Event()
+
+    def _run():
+        pool._base_succeeded_since("tierB", 0)
+        done.set()
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    assert done.wait(2.0), "the success check deadlocked"
