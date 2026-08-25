@@ -38,7 +38,8 @@ _log = logging.getLogger(__name__)
 
 
 def _vsock_ready_check_factory(vsock_path: Path,
-                               ack_capable: "AckCapability | None" = None
+                               ack_capable: "AckCapability | None" = None,
+                               ack_generation: "int | None" = None,
                                ) -> Callable[[float], None]:
     """Build a blocking ``ready_check(timeout_s)`` for the base-VM build.
 
@@ -63,7 +64,9 @@ def _vsock_ready_check_factory(vsock_path: Path,
         output_dir=base_dir / "out",  # parent == base_dir → listener on base/vsock.sock_<port>
         state=SlotState.WARMING,
     )
-    signal.prepare(faux)  # bind the listener now (before the guest's READY retries)
+    # ack_generation was sampled by the launcher BEFORE it spawned this base; binding happens
+    # after the spawn, so sampling at bind time could stamp a generation this base never was.
+    signal.prepare(faux, ack_generation=ack_generation)  # bind before the guest's READY retries
 
     def _wait(timeout_s: float) -> None:
         deadline = time.monotonic() + timeout_s
@@ -514,7 +517,13 @@ def select_snapshot_runtime(
         cfg,
         base_dir,
         mem_dir=mem_dir,
-        ready_check_factory=lambda p: _vsock_ready_check_factory(p, ack_capable=ack_capable),
+        ready_check_factory=(
+            lambda p, ack_generation=None: _vsock_ready_check_factory(
+                p, ack_capable=ack_capable, ack_generation=ack_generation)
+        ),
+        # Lets boot_base stamp the build with the generation current when it STARTED. The
+        # launcher owns no capability of its own, so it cannot sample this itself.
+        ack_sampler=lambda: ack_capable.generation,
     )
     backend = FcSnapshotBackend.from_env(base_dir, launcher, mem_dir=mem_dir)
     manager = SnapshotManager(base_dir, backend)

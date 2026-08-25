@@ -291,6 +291,7 @@ class GvisorBootHandle:
         ctrl_dir: Path,
         ready_wait: Callable[[Path, float], None],
         ack_capable: "AckCapability | None" = None,
+        ack_generation: "int | None" = None,
         stranded: list[str] | None = None,
     ) -> None:
         # Partial checkpoint directories whose cleanup failed. OWNED BY THE BACKEND and shared in:
@@ -304,11 +305,18 @@ class GvisorBootHandle:
         self._ctrl = ctrl_dir
         self._ready = ready_wait
         self._ack_capable: "AckCapability | None" = ack_capable
-        # The generation this BUILD started under. Unstamped, a build still waiting for
-        # readiness when invalidate_base() ran -- one SnapshotManager will go on to reject via
-        # _build_epoch -- could still mark the REPLACEMENT generation capable, and an older
-        # bundle without start markers would inherit a capability it does not have.
-        self._ack_gen = ack_capable.generation if ack_capable is not None else None
+        # The generation this BUILD started under -- INJECTED by boot_base, which samples it
+        # before `runsc run`. Sampling it here was too late: constructing this handle is the LAST
+        # thing boot_base does, so an invalidate_base() landing during the (slow) launch advanced
+        # the generation first, and the retiring build stamped itself with the REPLACEMENT's.
+        # SnapshotManager then rejects its artifact via _build_epoch, but its readiness
+        # advertisement had already taught a generation it knows nothing about -- so a
+        # replacement bundle WITHOUT the protocol inherits `capable`, its absent start markers
+        # read as proof the guest never ran, and a healthy base is invalidated on repeat.
+        self._ack_gen = (
+            ack_generation if ack_generation is not None
+            else (ack_capable.generation if ack_capable is not None else None)
+        )
 
     def wait_ready(self, timeout_s: float) -> None:
         self._ready(self._ctrl, timeout_s)
@@ -570,6 +578,10 @@ class GvisorSnapshotBackend:
         # cold permanently. Same fix as the FC launcher; a retry is worthless if the condition it
         # fixes is what stops you reaching it (upstream, PR #82).
         _retry_stranded_partials(self._stranded_partials)
+        # BEFORE `runsc run` -- see GvisorBootHandle.__init__. The generation that is current when
+        # the build STARTS is the one this base can honestly speak for; anything sampled after the
+        # launch may already belong to the base that replaced it.
+        ack_gen = self._ack_capable.generation if self._ack_capable is not None else None
         # Unique per build so two pool processes sharing this -root parent (e.g. a
         # restart-overlap: the old process still tearing down while the new one boots)
         # don't collide on a fixed base bundle dir / cid and stomp each other's base.
@@ -606,6 +618,7 @@ class GvisorSnapshotBackend:
             raise
         return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready,
                                 ack_capable=self._ack_capable,
+                                ack_generation=ack_gen,
                                 stranded=self._stranded_partials)
 
     def restore_in(self, slot_workdir: Path, artifact: object) -> GvisorRestoreHandle:

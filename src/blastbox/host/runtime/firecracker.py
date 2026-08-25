@@ -680,8 +680,15 @@ class VsockReadySignal:
         # ``<uds_path>_<port>`` for guest→host streams.
         return slot.output_dir.parent / f"vsock.sock_{_READY_PORT}"
 
-    def prepare(self, slot: Slot) -> None:
-        """Bind the READY listener for ``slot``.  Call before launching FC."""
+    def prepare(self, slot: Slot, ack_generation: "int | None" = None) -> None:
+        """Bind the READY listener for ``slot``.  Call before launching FC.
+
+        ``ack_generation`` is the generation the caller sampled BEFORE starting the launch this
+        listener belongs to. For a base build that is the only honest stamp: prepare() runs after
+        _spawn() and the API boot sequence, so an invalidate_base() during those seconds would
+        otherwise have this listener teach the REPLACEMENT generation with the retiring base's
+        advertisement. Defaults to sampling here, which is right for a per-slot listener.
+        """
         with self._lock:
             if slot.slot_id in self._slots:
                 return
@@ -714,8 +721,10 @@ class VsockReadySignal:
             )
             # The generation this listener STARTED under. Without it a listener still running
             # when the base is replaced could teach the new generation with the old base's
-            # advertisement -- the same slot-vs-job confusion, one layer out.
-            _gen = self._ack_capable.generation
+            # advertisement -- the same slot-vs-job confusion, one layer out. The caller may have
+            # sampled it EARLIER still (before a slow launch); prefer that.
+            _gen = (ack_generation if ack_generation is not None
+                    else self._ack_capable.generation)
             thread = threading.Thread(
                 target=self._accept_loop,
                 args=(slot.slot_id, state, _gen),
