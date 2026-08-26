@@ -4528,7 +4528,14 @@ def test_a_maintenance_husk_whose_reap_fails_is_retried_not_stranded():
 
     pool._drain_deferred_reaps()
     with pool._lock:
-        assert slot.slot_id in pool._deferred_reap, "a maintenance husk was stranded, not requeued"
+        assert slot.slot_id in pool._deferred_reap_next, (
+            "a maintenance husk was stranded, not requeued")
+        assert slot.slot_id not in pool._deferred_reap, (
+            "the requeue was released into the SAME batch, which four concurrent reapers eat")
+    pool._reap_deferred()                       # the tick releases it for the next pass
+    with pool._lock:
+        assert slot.slot_id in pool._deferred_reap or pool._reaper_threads, (
+            "the next tick must pick the husk back up")
         assert pool._maintain_reap_tries[slot.slot_id] == 1
         assert pool._slots[slot.slot_id].state == SlotState.DRAINING, (
             "an UNUSABLE slot must never be handed back as claimable")
@@ -4552,6 +4559,9 @@ def test_the_maintenance_reap_retry_is_bounded():
         pool._maintain_reap_tries[slot.slot_id] = 0
 
     for _ in range(pool._maintain_reap_max_tries + 2):
+        with pool._lock:                        # what _reap_deferred does on the tick thread
+            pool._deferred_reap |= pool._deferred_reap_next
+            pool._deferred_reap_next.clear()
         pool._drain_deferred_reaps()
 
     with pool._lock:
@@ -4582,8 +4592,43 @@ def test_a_successful_maintenance_reap_clears_its_budget():
         pool._deferred_reap.add(slot.slot_id)
         pool._maintain_reap_tries[slot.slot_id] = 0
 
-    pool._drain_deferred_reaps()      # fails -> requeued
+    pool._drain_deferred_reaps()      # fails -> held in _deferred_reap_next
+    with pool._lock:                  # the tick releases it
+        pool._deferred_reap |= pool._deferred_reap_next
+        pool._deferred_reap_next.clear()
     pool._drain_deferred_reaps()      # succeeds
     with pool._lock:
         assert slot.slot_id not in pool._maintain_reap_tries, "budget not cleared on success"
         assert slot.slot_id not in pool._deferred_reap
+
+
+def test_a_requeue_is_not_eaten_by_its_own_reaper_batch():
+    """_MAX_REAPERS is 4, so a batch runs up to four concurrent drains over one queue. Releasing
+    requeues at the END OF A DRAIN meant the first worker to empty the queue handed them straight
+    to a sibling still looping -- the whole retry budget spent inside one batch, against a control
+    plane that is by hypothesis browning out. The release belongs on the tick thread."""
+    class _RT:
+        def spawn(self): return _maint_slot()
+        def is_ready(self, s): return True
+        def reap(self, s, **kw): raise OSError("brownout")
+
+    pool = _maint_pool(_RT())
+    slot = _maint_slot()
+    with pool._lock:
+        pool._slots[slot.slot_id] = slot
+        slot.state = SlotState.DRAINING
+        pool._deferred_reap.add(slot.slot_id)
+        pool._maintain_reap_tries[slot.slot_id] = 0
+
+    # One drain, as a single worker in a batch would run it.
+    pool._drain_deferred_reaps()
+    with pool._lock:
+        assert slot.slot_id not in pool._deferred_reap, (
+            "a sibling reaper in the same batch could consume this immediately")
+        assert slot.slot_id in pool._deferred_reap_next
+
+    # A second worker in the SAME batch finds nothing to do -- which is the point.
+    pool._drain_deferred_reaps()
+    with pool._lock:
+        assert pool._maintain_reap_tries[slot.slot_id] == 1, (
+            "the budget was spent twice inside one batch")

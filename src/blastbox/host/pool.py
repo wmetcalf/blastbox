@@ -1295,6 +1295,14 @@ class WarmPool:
         wedged reaper can never leak a live worker past shutdown."""
         with self._lock:
             now = self._clock()
+            # RELEASE LAST TICK'S REQUEUES HERE, not at the end of a drain. _MAX_REAPERS is 4, so
+            # a batch runs up to four concurrent drains: the first worker to empty the queue used
+            # to merge _deferred_reap_next immediately, and a sibling still looping consumed it on
+            # the spot -- the whole retry budget spent inside ONE batch, against a control plane
+            # that is by hypothesis browning out. Merging on the TICK thread, before this batch is
+            # sized, makes a requeue cost a tick no matter how many workers run.
+            self._deferred_reap |= self._deferred_reap_next
+            self._deferred_reap_next.clear()
             self._reaper_threads = [e for e in self._reaper_threads if e[0].is_alive()]
             # Count only reapers that are still making progress. One wedged in a hung terminate is
             # abandoned (Python can't interrupt it) but must not hold a slot in the pool forever,
@@ -1375,16 +1383,8 @@ class WarmPool:
         while True:
             with self._lock:
                 if entry_box and entry_box[0][2]:
-                    # Retired while wedged: a replacement owns the queue now. Hand it anything
-                    # requeued during this pass rather than dropping it.
-                    self._deferred_reap |= self._deferred_reap_next
-                    self._deferred_reap_next.clear()
-                    return
+                    return          # retired while wedged: a replacement owns the queue now
                 if not self._deferred_reap:
-                    # Pass over. Release what THIS pass requeued, for the next tick to pick up --
-                    # see _deferred_reap_next for why it is not fed straight back in.
-                    self._deferred_reap |= self._deferred_reap_next
-                    self._deferred_reap_next.clear()
                     return
                 slot_id = next(iter(self._deferred_reap))
                 self._deferred_reap.discard(slot_id)
