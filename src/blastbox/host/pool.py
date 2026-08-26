@@ -677,6 +677,12 @@ class WarmPool:
             # a restarted pool's first tick re-terminate a resource whose disposal already failed —
             # exactly what _drain_deferred_reaps' contract forbids.
             self._deferred_reap.clear()
+            # ...and the HOLDING set, for the same reason. _deferred_reap_next carries ids whose
+            # disposal just FAILED; leaving them queued would let a restarted pool's first tick
+            # re-terminate a resource that may still be live -- exactly what this clear exists to
+            # prevent, and exactly what the quarantine rule forbids. Added in the same commit as
+            # the holding set, which shipped without either of its lifecycle obligations.
+            self._deferred_reap_next.clear()
             to_reap = list(self._slots.values())
             for slot in to_reap:
                 slot.state = SlotState.DRAINING
@@ -1456,9 +1462,14 @@ class WarmPool:
                             # the window's whole allowance can be consumed without evicting
                             # anything (upstream, PR #82).
                             self._refund_eviction_unlocked(slot.slot_id)
+                            # NAME THE STATE. The target became conditional (a never-ready slot
+                            # goes back to WARMING, not IDLE) and during a brownout that is the
+                            # COMMON branch -- so a fixed "IDLE" told the operator the opposite of
+                            # what happened, on the exact log line they read to understand why
+                            # capacity is not recovering.
                             logger.warning("pool.deferred_escalation_undone slot_id=%s — could not "
-                                           "dispose a suspected slot; returning it to IDLE",
-                                           slot.slot_id)
+                                           "dispose a suspected slot; returning it to %s",
+                                           slot.slot_id, cur.state.name)
                     self._suspected_unknown.discard(slot.slot_id)
             # Stamp PROGRESS: this reaper just finished a disposal, so it is working, not wedged.
             if entry_box:
@@ -2657,6 +2668,9 @@ class WarmPool:
         # entry per completed job -- the same unbounded growth this method exists to prevent.
         self._maintain_last.pop(slot_id, None)
         self._maintain_reap_tries.pop(slot_id, None)
+        # The holding set is keyed by slot_id like every sibling here. Without this it is the one
+        # map in this method's list that grows for the life of the process.
+        self._deferred_reap_next.discard(slot_id)
         if self._maintain_cursor == slot_id:
             self._maintain_cursor = None
         self._never_ready.discard(slot_id)
@@ -3681,7 +3695,8 @@ class WarmPool:
                             # IS confirmed dead for the rest of the window (upstream, PR #82).
                             self._refund_eviction_unlocked(slot.slot_id)
                     logger.warning("pool.health_escalation_undone slot_id=%s — could not dispose a "
-                                   "merely-suspected slot; returning it to IDLE", slot.slot_id)
+                                   "merely-suspected slot; returning it to %s",
+                                   slot.slot_id, slot.state.name)
             finally:
                 if reaped:
                     with self._lock:

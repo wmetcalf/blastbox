@@ -107,6 +107,19 @@ class DeferredTier:
     pos: int = -1
     readiness_timeout_s: float = 0.0
     resume_timeout_s: "float | None" = None
+    #: The tier's DECLARED transport facts. Same reasoning as the timeouts above: we could not
+    #: learn whether the tier is UP, but what transport it speaks is a config fact we already
+    #: have. Without them the cascade's two hard uniformity invariants are computed over the
+    #: ADMITTED tiers alone, so a startup throttle silently converts a configuration the docs
+    #: promise to reject into one that boots -- and then loses the tier ~60s later when
+    #: _transport_conflict refuses it at the late door instead.
+    #: None means UNKNOWN, not "file". _declared_budgets is best-effort: a tier whose config is
+    #: broken enough that even a probe-free build fails contributes nothing. Defaulting to "file"
+    #: there would INVENT a mismatch against a network cascade and refuse a valid configuration at
+    #: startup -- turning a transient build failure into an outage, which is worse than the gap it
+    #: closes. Unknown transports are simply not counted.
+    dispatch_style: "str | None" = None
+    ssl_context: "Any | None" = None
     cli_timeout_s: "float | None" = None
 
 
@@ -136,6 +149,8 @@ def _declared_budgets(name: str, *, warm_snapshot: bool) -> dict:
     except Exception as exc:  # noqa: BLE001 -- unreachable tier config, never fatal at startup
         _log.debug("cascade: could not read declared budgets for deferred tier %r: %s", name, exc)
         return out
+    out["dispatch_style"] = getattr(rt, "dispatch_style", "file")
+    out["ssl_context"] = getattr(rt, "ssl_context", None)
     cfg = getattr(rt, "cfg", None)
     ready = getattr(rt, "readiness_timeout_s", None)
     if ready is not None:
@@ -188,7 +203,12 @@ class CascadingRuntime:
     def dispatch_style(self) -> str:
         """The common dispatch style of the tiers. A job can't use two transports, so a cascade that
         mixes network-endpoint (aws/static) and file-handshake (fc/gvisor) tiers is a misconfig."""
+        # DEFERRED TIERS COUNT. They are declared in BLASTBOX_POOL_TIERS and will be admitted the
+        # moment the control plane answers, so a mismatch is a misconfiguration NOW -- the whole
+        # point of this fail-fast. Computing over the admitted tiers alone meant a merely THROTTLED
+        # tier let the dispatcher boot on a config that is documented to be refused.
         styles = {getattr(t.runtime, "dispatch_style", "file") for t in self.tiers}
+        styles |= {d.dispatch_style for d in self._deferred if d.dispatch_style is not None}
         if len(styles) > 1:
             raise CascadeMisconfigured(
                 f"cascade tiers mix dispatch styles {sorted(styles)} -- all must be the same "
@@ -203,6 +223,9 @@ class CascadingRuntime:
         context, so a cascade mixing them is a misconfig (fail-fast, like dispatch_style)."""
         ctxs = [getattr(t.runtime, "ssl_context", None) for t in self.tiers
                 if getattr(t.runtime, "dispatch_style", "file") == "network"]
+        # ...including the tiers we have not admitted yet; see dispatch_style.
+        ctxs += [d.ssl_context for d in self._deferred if d.dispatch_style == "network"]
+        # (a deferred tier whose transport we could not read is absent from both lists above)
         has_ctx = [c is not None for c in ctxs]
         if any(has_ctx) and not all(has_ctx):
             raise CascadeMisconfigured(

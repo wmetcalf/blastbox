@@ -825,9 +825,51 @@ def test_a_deferred_tier_with_a_foreign_transport_is_refused_at_admission(monkey
         return FakeRuntime(name)          # dispatch_style defaults to "file"
 
     monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    # A tier whose DECLARED transport is readable is now refused at STARTUP, not 60s later: the
+    # mismatch is a configuration fact, available without a control-plane answer, and the docs
+    # promise fail-fast. Deferring it meant the dispatcher booted on a config documented to be
+    # refused and then silently lost the operator's declared burst capacity at the late door.
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
     assert [d.name for d in rt._deferred] == ["aws-ec2"]
-    assert rt.dispatch_style == "file"
+    assert rt._deferred[0].dispatch_style == "network", (
+        "the declared transport is a config fact and must be recorded without a probe")
+
+    # The invariant is a PROPERTY, and cli.py reads it at startup to choose the file vs network
+    # dispatcher. Reading it must now refuse, rather than answering "file" and letting the process
+    # boot on a cascade whose declared members cannot share one transport.
+    with pytest.raises(CascadeMisconfigured, match="dispatch styles"):
+        _ = rt.dispatch_style
+
+
+def test_a_deferred_tier_of_UNKNOWN_transport_is_still_refused_at_admission(monkeypatch):
+    """The late door still matters, for the case startup genuinely cannot see.
+
+    _declared_budgets is best-effort: a tier whose config is broken enough that even a probe-FREE
+    build fails contributes no transport at all. Counting that as "file" would invent a mismatch
+    and refuse a VALID cascade at startup, so unknown is left uncounted -- which means such a tier
+    IS deferred, and _transport_conflict has to catch it when it finally answers.
+    """
+    from blastbox.host import pool_config
+
+    class _NetworkTier(FakeRuntime):
+        dispatch_style = "network"
+
+    state = {"up": False}
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):
+        if name == "aws-ec2":
+            if require_available and not state["up"]:
+                raise AwsProbeTimeout("sts: timed out")
+            if not require_available:
+                raise RuntimeError("config too broken to build probe-free")   # transport UNKNOWN
+            return _NetworkTier(name)
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
+    assert [d.name for d in rt._deferred] == ["aws-ec2"]
+    assert rt._deferred[0].dispatch_style is None, "unknown must not be recorded as 'file'"
+    assert rt.dispatch_style == "file", "an unknown transport must not change the cascade's style"
 
     state["up"] = True
     rt._last_admit_attempt = None

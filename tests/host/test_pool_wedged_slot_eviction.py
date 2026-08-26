@@ -4679,3 +4679,43 @@ def test_a_retry_is_held_while_any_reaper_is_still_draining():
     with pool._lock:
         assert slot.slot_id not in pool._deferred_reap_next, (
             "an idle batch must release the held retry")
+
+
+def test_stop_clears_the_retry_holding_set_too():
+    """stop() clears _deferred_reap with an explicit rationale: leaving an id queued would let a
+    restarted pool's first tick re-terminate a resource whose disposal already failed. The holding
+    set carries exactly those ids, and shipped without that clear -- so a husk requeued during a
+    brownout survived stop()/start() and was re-terminated on the next boot, against a resource
+    that may still be live."""
+    class _RT:
+        def spawn(self): return _maint_slot()
+        def is_ready(self, s): return True
+        def reap(self, s, **kw): return None
+
+    pool = _maint_pool(_RT())
+    with pool._lock:
+        pool._deferred_reap_next.add("held-1")
+        pool._deferred_reap.add("queued-1")
+
+    pool.stop()
+
+    with pool._lock:
+        assert not pool._deferred_reap, "the queue must be cleared on stop"
+        assert not pool._deferred_reap_next, (
+            "the holding set survived stop(); a restarted pool re-terminates its ids")
+
+
+def test_forget_slot_health_drops_the_holding_set_entry():
+    """Every sibling map in _forget_slot_health is keyed by slot_id and popped there. The holding
+    set was the one that grew for the life of the process."""
+    class _RT:
+        def spawn(self): return _maint_slot()
+        def is_ready(self, s): return True
+        def reap(self, s, **kw): return None
+
+    pool = _maint_pool(_RT())
+    with pool._lock:
+        pool._deferred_reap_next.add("gone-1")
+        pool._forget_slot_health("gone-1")
+        assert "gone-1" not in pool._deferred_reap_next, (
+            "a slot that no longer exists left an entry behind")
