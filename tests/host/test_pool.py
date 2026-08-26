@@ -3954,3 +3954,41 @@ def test_a_failed_maintenance_reap_is_not_requeued_after_shutdown():
         f"{pool._deferred_reap_next} was published after shutdown -- a restarted pool would "
         f"re-terminate a resource whose disposal already failed"
     )
+
+
+def test_a_suspected_slot_is_not_republished_during_shutdown():
+    """The companion arm of the shutdown guard.
+
+    A merely-SUSPECTED slot has no maintenance retry budget, so `_tries` is None and it reaches the
+    escalation-undo instead of the requeue. Restoring it mid-shutdown puts it back to IDLE -- which
+    is CLAIMABLE -- after its disposal has already failed and after stop() may have skipped it
+    because a reaper owned it. A pool restarted on the same object could then hand a job to a
+    resource whose termination failed. Requeue and restore owe shutdown the same thing.
+    """
+    class _Throttled(_FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        def reap(self, slot):    # noqa: ANN001
+            self.attempts += 1
+            raise OSError("terminate-instances: throttled")
+
+    rt = _Throttled()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6)
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots))
+    pool._slots[sid].state = SlotState.DRAINING
+    pool._suspected_unknown.add(sid)          # escalated on suspicion, never confirmed dead
+    pool._deferred_reap.add(sid)
+
+    pool._stop_event.set()
+    pool._drain_deferred_reaps()
+    for entry in list(pool._reaper_threads):
+        entry[0].join(timeout=5)
+
+    assert rt.attempts == 1, "the disposal must actually have been attempted and failed"
+    assert pool._slots[sid].state == SlotState.DRAINING, (
+        f"slot was republished as {pool._slots[sid].state.name} during shutdown after its "
+        f"disposal failed -- IDLE is claimable"
+    )

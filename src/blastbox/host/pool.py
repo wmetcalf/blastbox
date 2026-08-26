@@ -1418,7 +1418,7 @@ class WarmPool:
                 logger.exception("pool.reap_deferred_error slot_id=%s — quarantining", slot.slot_id)
                 with self._lock:
                     _tries = self._maintain_reap_tries.get(slot.slot_id)
-                    if _tries is not None and self._stop_event.is_set():
+                    if self._stop_event.is_set():
                         # SHUTTING DOWN: publish nothing. stop() sets _stop_event before it clears
                         # both queues, but it reaches that clear after a reaper JOIN THAT CAN TIME
                         # OUT ("deferred reaper still running -- proceeding") -- so this reaper is
@@ -1429,10 +1429,19 @@ class WarmPool:
                         # side of it. Checking the event under the same lock the clear takes makes
                         # the two orders exhaustive -- set-then-clear wipes us, clear-then-set stops
                         # us here. stop() disposes every tracked slot itself, so nothing is lost.
+                        #
+                        # Guards the WHOLE chain, not just the maintenance arm. The first version of
+                        # this check was `_tries is not None and ...`, which left the branch below --
+                        # the _suspected_unknown RESTORE, reached precisely when _tries is None --
+                        # bypassing it: a slot whose disposal had just failed was put back to IDLE or
+                        # WARMING mid-shutdown, and IDLE is CLAIMABLE, so a restarted pool could hand
+                        # a job to a resource whose termination failed. Requeue and restore are the
+                        # same obligation to shutdown, so they take the same guard.
                         self._maintain_reap_tries.pop(slot.slot_id, None)
                         logger.warning(
-                            "pool.maintain_reap_dropped slot_id=%s -- shutting down; the husk stays "
-                            "quarantined for stop() rather than being requeued", slot.slot_id)
+                            "pool.reap_retry_dropped_at_shutdown slot_id=%s -- shutting down; the "
+                            "husk stays quarantined (DRAINING) for stop() rather than being "
+                            "requeued or republished", slot.slot_id)
                     elif _tries is not None and _tries < self._maintain_reap_max_tries:
                         # A MAINTENANCE husk still within budget: put it back on the queue.
                         # Deliberately NOT restored to IDLE -- it was judged UNUSABLE, so it must
