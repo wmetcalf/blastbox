@@ -2186,7 +2186,14 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             # The lost-response case this branch exists for is NOT lost: an unanswered stop sets
             # _park_attempted (_freeze_park(park_attempted=True)), and an accepted one sets
             # _hib_started at issue time. Both are recorded before we ever see `stopping`.
-            if not (phase in ("hibernating", "parked")
+            # "parked" is NOT in that list. resume() does no phase bookkeeping on purpose (see the
+            # note in Ec2HibernateRuntime.resume), so a slot whose resume ACCEPTED start-instances
+            # and then browned out is handed back with _phase still "parked" while the instance is
+            # actually RUNNING. If anything else then stops it, treating that stale value as proof
+            # of a current hibernation writes fresh markers and publishes a never-hibernated image
+            # -- the same adoption this guard was added to close, entered through a phase that
+            # describes the PAST. "hibernating" is different: it is written when WE issue the stop.
+            if not (phase == "hibernating"
                     or sid in self._park_attempted
                     or sid in self._hib_started):
                 _log.warning("ec2-hibernate: slot %s is 'stopping' with no hibernation of ours "
@@ -2483,11 +2490,21 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 raise AwsWorkerError(f"ec2-hibernate slot {slot.slot_id} is {st!r}; cannot resume")
             if st == "stopped":
                 self._aws("ec2", "start-instances", "--instance-ids", str(slot.resource_id))
-            # NOTE: no phase bookkeeping here. An earlier revision set _phase="warming" so an
-            # is_alive() reconciler could re-park a slot whose resume browned out after the start
-            # was accepted -- but that reconciler was removed from this branch (see issue #80), and
-            # _phase is read only by is_ready(), which the pool calls for WARMING slots only. So the
-            # write had no reader and only advertised machinery that is not here.
+            # THE SLOT IS NO LONGER PARKED FROM HERE. Either we just accepted a start, or it was
+            # already awake -- so drop the phase instead of leaving "parked" behind it.
+            #
+            # An earlier revision dropped this write with the note that "_phase is read only by
+            # is_ready(), which the pool calls for WARMING slots only", so it had no reader. It has
+            # readers now: the `stopped` adoption predicate and the `stopping` evidence guard both
+            # consult the phase. A resume that ACCEPTED start-instances and then browned out used
+            # to hand the slot back with _phase still "parked" while the instance was RUNNING, so
+            # if anything else stopped it later that stale value read as proof of a hibernation of
+            # ours and the never-hibernated image was published as a warm slot.
+            #
+            # Placed AFTER the start call on purpose. Clearing it earlier would erase the evidence
+            # of a slot that is still genuinely parked whenever the describe or the start raises --
+            # and an unrecognised parked slot is not adopted, so it gets retired instead.
+            self._phase.pop(slot.slot_id, None)
             self._resolve_ip(slot, refresh=True)   # private IP retained, but re-describe to be safe
         # The runtime's resume_timeout_s is a CEILING; the dispatcher's remaining claim window wins
         # when it is shorter, so one unreachable slot cannot burn the whole window and starve the

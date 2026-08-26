@@ -376,7 +376,7 @@ _GUARD_EXITS = '''
             self.reap(s)
 '''
 
-_GUARD_SPLITS_BOTH_CASES = '''
+_ARMS_RECONVERGE = '''
     def f(self, s):
         rt = R()
         ok = rt.is_ready(s)
@@ -386,6 +386,17 @@ _GUARD_SPLITS_BOTH_CASES = '''
             self.close_episode(s)
         if not ok:
             self.reap(s)
+'''
+
+_USE_CONFINED_TO_THE_ELSE = '''
+    def f(self, s):
+        rt = R()
+        ok = rt.is_ready(s)
+        if ok is None:
+            self.open_episode(s)
+        else:
+            if not ok:
+                self.reap(s)
 '''
 
 
@@ -415,5 +426,16 @@ def test_strict_mode_accepts_a_guard_that_exits():
     assert not _strict(_GUARD_EXITS)
 
 
-def test_strict_mode_accepts_an_if_else_that_handles_both_cases():
-    assert not _strict(_GUARD_SPLITS_BOTH_CASES)
+def test_strict_mode_still_reports_arms_that_reconverge_onto_the_use():
+    """An `else` is not elimination. Both arms handle their own case and then RECONVERGE, so None
+    still arrives at `if not ok: reap(s)` -- and that one destroys something. The first version of
+    this advisory accepted any `orelse`, and the test written beside it asserted the false negative
+    as correct; the fixture is unchanged, only the expectation was wrong."""
+    assert _strict(_ARMS_RECONVERGE), (
+        "an if/else whose arms reconverge was suppressed, but None reaches the reap"
+    )
+
+
+def test_strict_mode_accepts_a_use_confined_to_the_else_arm():
+    """The genuinely safe split: the use sits INSIDE the else, where None cannot be."""
+    assert not _strict(_USE_CONFINED_TO_THE_ELSE)

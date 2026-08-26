@@ -4231,3 +4231,45 @@ def test_our_own_stop_is_still_adopted_from_stopping():
     now[0] += 5.0
     state[0] = "stopped"
     assert rt.is_ready(slot) is True
+
+
+def test_a_half_succeeded_resume_does_not_leave_a_stale_parked_phase():
+    """resume() used to do no phase bookkeeping, on the reasoning that nothing read _phase. Two
+    readers exist now -- the `stopped` adoption predicate and the `stopping` evidence guard -- so a
+    resume that ACCEPTED start-instances and then browned out handed the slot back with _phase
+    still "parked" while the instance was RUNNING. If anything else stopped it later, that stale
+    value read as proof of a hibernation of ours and the never-hibernated image was published as a
+    warm slot."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState, AwsWorkerSlot
+    now = [1000.0]
+    state = ["stopped"]
+    rt, _ = _hibernate_rt(state=state, healthy=[False],
+                          clock=lambda: now.__setitem__(0, now[0] + 0.5) or now[0],
+                          resume_timeout_s=2.0)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt._phase["s"] = "parked"                     # legitimately parked before the resume
+
+    state[0] = "running"                          # start-instances took; the agent never answers
+    with pytest.raises((AwsUnknownState, Exception)):
+        rt.resume(slot)
+
+    assert rt._phase.get("s") != "parked", (
+        "the resume woke the instance but left the phase saying parked -- a later stop by anyone "
+        "else would be adopted as ours"
+    )
+
+
+def test_a_parked_slot_seen_stopping_is_not_our_hibernation_either():
+    """Defence in depth for the phase we now keep honest. A slot we parked is STOPPED; seeing it
+    'stopping' means somebody started it and stopped it again, which is not a hibernation of ours
+    and carries no image we captured. Only "hibernating" -- written when WE issue the stop -- is
+    evidence of a parking in flight."""
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    now = [1000.0]
+    rt, _ = _hibernate_rt(state=["stopping"], healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt._phase["s"] = "parked"
+
+    assert rt.is_ready(slot) is False
+    assert "s" not in rt._hib_started, "a parked phase manufactured fresh in-flight parking evidence"
+    assert "s" not in rt._park_since

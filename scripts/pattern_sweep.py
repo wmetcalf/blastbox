@@ -308,9 +308,17 @@ def guards_none(fn, name, before=None, use_node=None, paths=None, rebinds=None,
             if use_node is not None and _contains(owner.body, use_node):
                 return True
             continue
-        # `if x is None:` -- the branch must exit, rebind, or be paired with an else that shows
-        # the author split both cases deliberately.
-        if _branch_settles(owner.body, name) or owner.orelse:
+        # `if x is None:` -- the branch must EXIT or REBIND, or the use must be confined to the
+        # else arm where None cannot be. The presence of an `else` is NOT elimination on its own:
+        #     if ok is None: open_episode()
+        #     else:          close_episode()
+        #     if not ok:     reap()          <- None still arrives, and this one DESTROYS
+        # Both arms reconverge, so a split that handles each case for its own purposes says
+        # nothing about the use that follows. Accepting `orelse` wholesale suppressed exactly
+        # that shape -- and the test added alongside it asserted the false negative as correct.
+        if _branch_settles(owner.body, name):
+            return True
+        if use_node is not None and owner.orelse and _contains(owner.orelse, use_node):
             return True
     return False
 
