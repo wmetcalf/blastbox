@@ -4097,3 +4097,86 @@ def test_a_throttled_retry_stays_unknown_while_the_park_is_unresolved():
     t[0] += 1.0
     assert rt.is_ready(slot) is None, (
         "a throttled retry answered False, closing the pool's UNKNOWN episode")
+
+
+# --- an empty rc=0 from a STATE query is silence, not a death certificate ------------------
+
+def test_a_blank_describe_is_no_answer_rather_than_a_dead_instance():
+    """rc=0 with empty stdout parsed to {}, so State.Name read as "" and _running() -- a plain
+    bool -- returned a CONFIRMED False. That reaps a live instance on the strength of silence."""
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True])
+    fake.responses["ec2 describe-instances"] = lambda argv: _cp(stdout="")   # rc=0, said nothing
+    assert rt.is_alive(AwsWorkerSlot(slot_id="s", resource_id="i-1")) is None
+
+
+def test_a_blank_get_microvm_is_no_answer_rather_than_a_dead_microvm():
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    rt, fake = _lambda_rt({"lambda-microvms get-microvm": lambda argv: _cp(stdout="")})
+    assert rt.is_alive(AwsWorkerSlot(slot_id="s", resource_id="mv-1")) is None
+
+
+# --- the tri-state has to survive the trip OUT to the pool ---------------------------------
+
+def test_an_unobtainable_agent_probe_leaves_readiness_unknown_not_negative():
+    """_agent_healthy() returning None means the probe could not be MADE (no address yet, budget
+    already spent) -- host-side and correlated. Reported as a definitive not-ready it ends the
+    pool's warming-unknown episode, so warming_timeout_s resumes aging over a probe that never
+    happened and the whole WARMING population is evicted while every guest boots fine."""
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    now = [1000.0]
+    rt, _ = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: now[0])
+    rt._agent_healthy = lambda s: None            # the probe could not be made at all
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt.is_ready(slot)                             # first observation only opens the episode
+    now[0] += 5.0
+    assert rt.is_ready(slot) is None
+
+
+# --- a refusal describes ONE attempt, and cannot reach back past an earlier one -------------
+
+def test_a_later_refusal_does_not_disprove_an_earlier_unresolved_stop():
+    """Stop #1's response was lost (unresolved -- it may well have been accepted). Stop #2 was
+    refused with IncorrectInstanceState, which is the EXPECTED answer once #1 is taking effect.
+    Letting #2's refusal veto adoption rejects a genuinely hibernated worker, image and all."""
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    now = [1000.0]
+    rt, _ = _hibernate_rt(state=["stopped"], healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt._park_attempted.add(slot.slot_id)          # stop #1: issued, no verdict ever returned
+    rt._park_refused.add(slot.slot_id)            # stop #2: definitively refused
+    assert rt.is_ready(slot) is True
+    assert rt._phase.get(slot.slot_id) == "parked"
+
+
+def test_a_refusal_with_no_unresolved_attempt_still_refuses_adoption():
+    """The guard it must NOT weaken: nothing of ours is outstanding, so whatever stopped this
+    instance, it was not us succeeding -- there is no captured image and no warm process."""
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    now = [1000.0]
+    rt, _ = _hibernate_rt(state=["stopped"], healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt._phase[slot.slot_id] = "hibernating"       # evidence we drove it...
+    rt._park_refused.add(slot.slot_id)            # ...but every attempt was refused
+    assert rt.is_ready(slot) is False
+
+
+# --- stamp-before-call, on the two liveness memos ------------------------------------------
+
+def test_the_liveness_memo_is_stamped_when_the_describe_returns():
+    """Stamped from before the call, a 25s describe writes a memo already 25s old against a 5s
+    TTL, so the next 0.1s tick re-probes -- per idle slot, on the pool's sole tick thread."""
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    now = [1000.0]
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: now[0])
+    inner = fake.responses["ec2 describe-instances"]
+
+    def slow(argv):                                # degraded but ANSWERING control plane
+        now[0] += 25.0
+        return inner(argv)
+
+    fake.responses["ec2 describe-instances"] = slow
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt.is_alive(slot)
+    stamp, _ = rt._live_cache["s"]
+    assert now[0] - stamp < rt._liveness_cache_s, "the memo was born expired"

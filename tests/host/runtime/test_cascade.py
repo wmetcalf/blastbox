@@ -1226,3 +1226,55 @@ def test_a_single_named_target_still_works():
                                  Tier(name="gv", runtime=_mk("gv"), capacity=4)])
     rt.invalidate_base(reason="job", only="gv#1")
     assert dropped == ["gv"]
+
+
+def test_a_probe_that_outruns_its_own_window_still_excludes_a_second_one(monkeypatch):
+    """The rate limit is a time gate, and a time gate only bounds when a probe may START.
+
+    The completion re-stamp in _admit_deferred exists precisely because the probe -- two aws-cli
+    calls, each able to burn the full cli_timeout_s -- routinely outruns _admit_retry_s. Once it
+    does, the window reopens while the first caller is still inside d.build(), so a second probe
+    starts against the same deferred snapshot: duplicate round trips on the pool's sole
+    maintenance thread, and the loser's freshly built runtime dropped by the _admitted_deferred
+    re-check with nothing to close it. Only an in-flight flag actually excludes it.
+
+    MUTATION: delete the `if self._admit_inflight: return 0` guard -> the re-entrant probe runs,
+    admits the tier itself and returns 1, and this fails.
+    """
+    from blastbox.host import pool_config
+
+    state = {"up": False}
+    holder: dict = {}
+    reentered: list[int] = []
+    now = [1000.0]
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):  # noqa: ANN001
+        if name == "aws-ec2":
+            if require_available and not state["up"]:
+                raise AwsProbeTimeout("sts: timed out")
+            rt = holder.get("rt")
+            if rt is not None and not holder.get("reentered_once"):
+                holder["reentered_once"] = True
+                # This probe outruns its own rate-limit window, so the TIME gate would let a
+                # second caller straight through. Only the in-flight flag can refuse it.
+                now[0] += 10 * (rt._admit_retry_s or 1.0)
+                reentered.append(rt._admit_deferred())
+            return FakeRuntime(name)
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:4"}.get)
+    holder["rt"] = rt
+    rt._clock = lambda: now[0]        # type: ignore[method-assign]
+    assert [d.name for d in rt._deferred] == ["aws-ec2"]
+
+    state["up"] = True
+    rt._last_admit_attempt = None
+    admitted = rt._admit_deferred()
+
+    assert reentered == [0], (
+        f"a second admission probe ran while the first was still inside build() and admitted "
+        f"{reentered} tier(s) of its own -- the time gate cannot exclude a concurrent caller"
+    )
+    assert admitted == 1
+    assert len([t for t in rt.tiers if t.name == "aws-ec2"]) == 1

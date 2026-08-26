@@ -1455,6 +1455,21 @@ class WarmPool:
                             cur.state = (SlotState.WARMING
                                          if slot.slot_id in self._never_ready
                                          else SlotState.IDLE)
+                            if cur.state == SlotState.WARMING:
+                                # A slot RE-ENTERING warming gets a fresh warming window, exactly
+                                # as one entering it from a spawn does. Restored with its original
+                                # spawned_at the deadline is already in the past, so _health_check
+                                # re-condemns it on the very next tick and the reaper re-issues a
+                                # terminate whose predecessor ALREADY FAILED -- against the same
+                                # browning-out control plane, with the eviction token refunded
+                                # every time, so nothing rate-limits it. Measured before this line:
+                                # 27 terminate attempts on ONE slot over 200s, versus 1. That is
+                                # precisely the "never re-terminate a resource whose disposal
+                                # already failed" rule, broken by the undo meant to uphold it. The
+                                # sibling half of this hazard is described at _never_ready's
+                                # definition: splitting the field fixed the PROVEN-idle slot and
+                                # left the never-ready one still carrying a dead clock.
+                                cur.spawned_at = self._clock()
                             # REFUND: the demotion spent a token to evict this slot and we have
                             # just put it back, so the budget bought nothing. This is the path the
                             # deferred reaper takes, and it is the COMMON one during a brownout --
@@ -3316,7 +3331,17 @@ class WarmPool:
         if not usable:
             logger.warning("pool.maintain_idle_unusable slot_id=%s — retiring", slot_id)
             try:
-                self.retire(cand, fault="worker")
+                # fault=None, not "worker". A maintenance hook returning False says "unusable",
+                # not "the worker died": the only in-tree producer is Ec2HibernateRuntime, whose
+                # False is _PARK_GIVE_UP -- a stop/describe budget expiring, i.e. CONTROL-PLANE
+                # evidence, and its brownout credit is capped so a long enough outage always
+                # reaches it. fault="worker" charges _slot_failures, the per-base restore-failure
+                # streak and _blame_tiers, and the rotation reaches every IDLE slot in the tier, so
+                # one correlated outage could drive _maybe_rebuild_base and discard a healthy
+                # snapshot base on zero confirmed worker deaths. This is the same attribution the
+                # WARMING path filters out with `confirmed = [...]`; the maintenance path must not
+                # re-introduce it. The slot is still retired -- only the blame is withheld.
+                self.retire(cand, fault=None)
             except Exception:
                 # Retirement itself RAISED. A slot stranded in ASSIGNED is capacity lost forever
                 # (_spawn_to_deficit counts it as active), so hand it back and let the ordinary
@@ -3665,38 +3690,13 @@ class WarmPool:
                 # reap raised (worker not disposed — may still run): quarantine, don't pop (like
                 # release()), so a live worker isn't orphaned off pool accounting.
                 logger.exception("pool.health_reap_error slot_id=%s — quarantining", slot.slot_id)
-                if slot.slot_id in suspected:
-                    # ...unless this slot was only SUSPECTED (escalated after a long UNKNOWN). The
-                    # disposal runs through the SAME control plane that made it unknown, so during
-                    # a brownout it fails too — and a quarantined DRAINING slot is retried by
-                    # nothing, keeps counting against concurrent_ceiling, and never recovers. That
-                    # is strictly worse than the wedge escalation exists to fix: the wedge healed
-                    # when the brownout ended, this does not. We could not confirm it dead and could
-                    # not dispose of it, so we know nothing: put it back and let the cycle resume
-                    # (issue #77 marla-loop 2).
-                    with self._lock:
-                        cur = self._slots.get(slot.slot_id)
-                        if cur is not None and cur.state == SlotState.DRAINING:
-                            # Back to what it WAS, not unconditionally to IDLE. Since expired
-                            # warming-unknowns became `suspected`, this undo can apply to a slot
-                            # that never passed is_ready() -- and IDLE is CLAIMABLE. A disposable
-                            # EC2/Lambda resource that merely describes as `running` would then be
-                            # handed to a job before its agent or auth token is up, failing user
-                            # jobs during the very recovery this restore exists to help. WARMING
-                            # re-enters promotion and has to EARN idle by being ready.
-                            cur.state = (SlotState.WARMING
-                                         if slot.slot_id in self._never_ready
-                                         else SlotState.IDLE)
-                            # REFUND the token. The demotion spent one to evict this slot, and we
-                            # have just put it back -- so the budget paid for nothing. During a
-                            # brownout every disposal goes through the same unresponsive control
-                            # plane and fails, so the window's whole allowance could be consumed
-                            # without a single eviction, blocking the replacement of a slot that
-                            # IS confirmed dead for the rest of the window (upstream, PR #82).
-                            self._refund_eviction_unlocked(slot.slot_id)
-                    logger.warning("pool.health_escalation_undone slot_id=%s — could not dispose a "
-                                   "merely-suspected slot; returning it to %s",
-                                   slot.slot_id, slot.state.name)
+                # No escalation-undo here, deliberately: `to_reap` has exactly ONE producer, the
+                # `else` arm of `if slot.slot_id in suspected` above, so a suspected slot never
+                # reaches this loop -- it is handed to the deferred reapers, which own the undo
+                # (see _drain_deferred_reaps). The `in suspected` test this branch used to make was
+                # therefore always False: a defensive path that read as protection, could not run,
+                # and drew two rounds of fixes onto itself while the live copy went unexamined.
+                # test_a_suspected_slot_is_never_reaped_on_the_tick_thread pins the routing.
             finally:
                 if reaped:
                     with self._lock:

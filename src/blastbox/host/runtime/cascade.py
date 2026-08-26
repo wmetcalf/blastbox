@@ -288,6 +288,9 @@ class CascadingRuntime:
         self._admit_retry_s = float(admit_retry_s)
         self._clock = clock
         self._last_admit_attempt: float | None = None
+        #: True while an admission probe is running. The time gate alone cannot exclude a
+        #: concurrent caller, because the probe can outrun its own window (see _admit_deferred).
+        self._admit_inflight = False
         # Consecutive per-tier spawn failures before that tier's base is invalidated. 0 disables
         # per-tier repair (the tier then stays broken until something else notices, which behind
         # a working fallback is "never").
@@ -334,19 +337,37 @@ class CascadingRuntime:
 
         Rate-limited: the probe is an STS round trip, and spawn() is on the pool's tick thread.
         """
-        admitted_count = 0
         with self._lock:
             if not self._deferred:
+                return 0
+            if self._admit_inflight:
+                # An IN-FLIGHT probe excludes a second one; the stamp cannot. A time gate bounds
+                # when a probe may START, and this probe is two aws-cli calls that can each burn
+                # the full cli_timeout_s -- the completion re-stamp below exists precisely because
+                # they outrun _admit_retry_s. Once they do, the window reopens while the first
+                # caller is still inside d.build(), and the next tick probes the same tier again:
+                # duplicate round trips on the pool's sole maintenance thread, and the loser's
+                # freshly built runtime is dropped on the floor by the _admitted_deferred re-check
+                # with nothing to close it. The old comment here claimed this exclusion; only the
+                # flag actually provides it.
                 return 0
             now = self._clock()
             if self._last_admit_attempt is not None and \
                     (now - self._last_admit_attempt) < self._admit_retry_s:
                 return 0
-            # Provisional stamp: keeps a CONCURRENT caller out while this probe runs. The
-            # authoritative stamp is taken AFTER the probes return, below.
             self._last_admit_attempt = now
+            self._admit_inflight = True
             pending = list(self._deferred)
 
+        try:
+            return self._admit_probe(pending)
+        finally:
+            with self._lock:
+                self._admit_inflight = False
+
+    def _admit_probe(self, pending: "list[DeferredTier]") -> int:
+        """The probe half of _admit_deferred, which owns the in-flight flag and the gate."""
+        admitted_count = 0
         still: list[DeferredTier] = []
         for d in pending:
             try:

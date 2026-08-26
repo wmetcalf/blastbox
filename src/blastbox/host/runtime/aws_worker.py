@@ -868,7 +868,11 @@ class AwsDisposableRuntime:
             return None
         except (AwsWorkerError, OSError):
             alive = False
-        self._live_cache[slot.slot_id] = (now, alive)
+        # Stamped at COMPLETION, for the same reason as the UNKNOWN arm above: `now` was read
+        # BEFORE the describe this cache exists to throttle, so a degraded-but-answering control
+        # plane (a 25s describe against a 5s TTL) wrote a memo that was already expired and the
+        # next 0.1s tick re-probed anyway -- per idle slot, on the pool's sole tick thread.
+        self._live_cache[slot.slot_id] = (self._clock(), alive)
         return alive
 
     def is_alive_for_claim(self, slot: AwsWorkerSlot, *, budget_s: float | None = None) -> "bool | None":
@@ -879,7 +883,6 @@ class AwsDisposableRuntime:
         Force a fresh describe here (dropping the describe cache too, since a tier's ``_running`` may read
         it); the ~5s cache still throttles the background ~10Hz poll. The pool calls this at claim iff the
         runtime provides it (optional protocol method; file/libvirt tiers fall back to ``is_alive``)."""
-        now = self._clock()
         self._desc_cache.pop(slot.slot_id, None)   # force a fresh get-instance/get-microvm this call
         # Bound the describe to the claim-probe budget (issue #77): this call is on job-dispatch
         # latency and holds the dispatcher's warm-gate reservation, so it must not wait out the full
@@ -896,7 +899,8 @@ class AwsDisposableRuntime:
                 return None
             except (AwsWorkerError, OSError):
                 alive = False
-        self._live_cache[slot.slot_id] = (now, alive)   # keep the background-tick cache coherent
+        # Stamped at COMPLETION (see is_alive): `now` predates the claim probe it is memoising.
+        self._live_cache[slot.slot_id] = (self._clock(), alive)   # keep the background-tick cache coherent
         return alive
 
     def reap(self, slot: AwsWorkerSlot) -> None:
@@ -987,7 +991,12 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
         return []
 
     def _describe(self, slot: AwsWorkerSlot) -> dict[str, Any]:
-        return self._aws("lambda-microvms", "get-microvm", "--microvm-identifier", str(slot.resource_id))
+        # expect_output: this is the STATE query every liveness verdict is read from. Without it an
+        # empty rc=0 parsed to {}, `state` read as "", and _running() -- a plain bool -- returned
+        # False: a CONFIRMED death manufactured out of silence, which reaps a healthy worker. Both
+        # callers already convert AwsUnknownState (AwsNoVerdict's base) into UNKNOWN correctly.
+        return self._aws("lambda-microvms", "get-microvm", "--microvm-identifier",
+                         str(slot.resource_id), expect_output=True)
 
     def _running(self, slot: AwsWorkerSlot) -> bool:
         st = str(self._describe(slot).get("state", "")).lower()
@@ -1613,7 +1622,10 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
         return slot
 
     def _describe(self, slot: AwsWorkerSlot) -> dict[str, Any]:
-        resp = self._aws("ec2", "describe-instances", "--instance-ids", str(slot.resource_id))
+        # expect_output: same as the Lambda tier's _describe -- an empty rc=0 became {}, so
+        # State.Name read as "" and _running() returned a definitive False for a live instance.
+        resp = self._aws("ec2", "describe-instances", "--instance-ids", str(slot.resource_id),
+                         expect_output=True)
         for res in resp.get("Reservations", []):
             for inst in res.get("Instances", []):
                 if inst.get("InstanceId") == slot.resource_id:
@@ -2134,7 +2146,15 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             # whatever stopped it, it was not us succeeding. Adopting it advertises capacity that
             # cannot serve, and a claim then spends the whole resume budget starting an instance
             # whose agent was never up. Evidence of an ATTEMPT is not evidence of a PARK.
-            if attempted and sid in self._park_refused:
+            # ...but only when the refusal accounts for EVERY attempt. _park_attempted marks a stop
+            # WE ISSUED that got no verdict (see _freeze_park(park_attempted=True)), and such an
+            # attempt may well have been ACCEPTED with its response lost. A later retry refused with
+            # IncorrectInstanceState -- the expected answer when the FIRST stop is already taking
+            # effect -- says nothing about that earlier attempt, so letting it veto adoption rejects
+            # a genuinely hibernated worker (image and all) and leaves it to be timed out and reaped.
+            # The mirror of the stale-marker bug below: there a refusal outlived its attempt, here it
+            # reaches back past one. A refusal only ever describes the attempt that produced it.
+            if attempted and sid in self._park_refused and sid not in self._park_attempted:
                 _log.warning("ec2-hibernate: slot %s is 'stopped' but its hibernation was "
                              "REFUSED -- not a parked warm slot", sid)
                 attempted = False
@@ -2237,7 +2257,16 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 # yet" it kept aging the give-up clock until a healthy instance was retired. Same
                 # freeze as an unanswered stop -- an absent answer is not evidence.
                 self._freeze_park(sid, now)
-                return "warming", False
+                # ready=None, NOT False -- the same rule the AwsNoVerdict branch below already
+                # states and this branch did not follow. is_ready() forwards this value, and
+                # _promote_warming ends the slot's warming-unknown episode on ANY definitive
+                # answer, so a False here resumes aging warming_timeout_s over a probe that never
+                # happened. _agent_healthy returns None for maximally CORRELATED host-side causes
+                # (no address yet, probe budget already spent), so one host fault would evict every
+                # WARMING instance in the tier while each guest was booting fine. Freezing our own
+                # give-up clock and then handing the pool a verdict we do not have just moves the
+                # drain one layer up.
+                return "warming", None
             if not healthy:
                 # A DEFINITIVE "not warm yet" closes the episode. Opening the freeze here without a
                 # closer left _park_expired pinned to the first UNKNOWN timestamp for good: an
