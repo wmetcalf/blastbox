@@ -222,13 +222,14 @@ def test_the_gvisor_base_build_records_ack_capability(tmp_path):
     h._ctrl = ctrl
     h._ready = lambda _d, _t: None                     # readiness already satisfied
     h._ack_capable = seen
-    h._ack_gen = seen.generation          # the generation this build started under
+    h._ack_gen = 0                        # the build epoch this build started under
     GvisorBootHandle.wait_ready(h, 1.0)
-    assert not seen, (
+    assert not seen.capable_for(h._ack_gen), (
         "readiness must only OBSERVE: checkpoint() has not run, so there is no artifact yet and "
         "no base a slot could be restored from")
-    seen.confirm(h._ack_gen)                           # ...the build then checkpoints
-    assert seen, "the base's advertisement must be believed once its artifact exists"
+    seen.publish(h._ack_gen)                           # ...the build then publishes
+    assert seen.capable_for(h._ack_gen), (
+        "the base's advertisement must be believed once its artifact is published")
 
 
 def test_a_gvisor_build_that_never_checkpoints_teaches_nothing(tmp_path):
@@ -248,10 +249,10 @@ def test_a_gvisor_build_that_never_checkpoints_teaches_nothing(tmp_path):
     h._ctrl = ctrl
     h._ready = lambda _d, _t: None
     h._ack_capable = seen
-    h._ack_gen = seen.generation
+    h._ack_gen = 0
     GvisorBootHandle.wait_ready(h, 1.0)                # ...and then its checkpoint fails
 
-    assert not seen, (
+    assert not seen.capable_for(h._ack_gen), (
         "a build that published no artifact taught the capability anyway")
 
 
@@ -269,12 +270,16 @@ def test_a_confirmation_from_a_superseded_build_is_ignored(tmp_path):
     h._ctrl = ctrl
     h._ready = lambda _d, _t: None
     h._ack_capable = seen
-    h._ack_gen = seen.generation
+    h._ack_gen = 0
     GvisorBootHandle.wait_ready(h, 1.0)
-    seen.reset()                                       # invalidate_base landed mid-build
-    seen.confirm(h._ack_gen)                           # the doomed build checkpoints anyway
+    # invalidate_base landed mid-build: SnapshotManager bumped _build_epoch and the REPLACEMENT
+    # build -- a rolled-back image that never advertised -- is what actually publishes.
+    seen.publish(1)
 
-    assert not seen, "a build whose artifact was rejected still taught its replacement"
+    assert not seen.capable_for(1), (
+        "the replacement inherited a capability advertised by the build it superseded")
+    assert not seen.capable_for(h._ack_gen), (
+        "the superseded build's own epoch is no longer published, so it answers UNKNOWN")
 
 
 def test_an_older_gvisor_base_teaches_nothing(tmp_path):
@@ -289,9 +294,11 @@ def test_an_older_gvisor_base_teaches_nothing(tmp_path):
     h._ctrl = ctrl
     h._ready = lambda _d, _t: None
     h._ack_capable = seen
-    h._ack_gen = seen.generation          # the generation this build started under
+    h._ack_gen = 0                        # the build epoch this build started under
     GvisorBootHandle.wait_ready(h, 1.0)
-    assert not seen, "no advertisement means UNKNOWN, which must convict nothing"
+    seen.publish(h._ack_gen)          # it publishes fine; it simply never advertised
+    assert not seen.capable_for(h._ack_gen), (
+        "no advertisement means UNKNOWN, which must convict nothing")
 
 
 def test_a_host_filesystem_failure_is_not_charged_to_the_base(tmp_path):
@@ -324,20 +331,21 @@ def test_a_host_filesystem_failure_is_not_charged_to_the_base(tmp_path):
         "a host-filesystem failure must carry host_io so it is not blamed on the worker")
 
 
-def test_the_snapshot_capability_is_reset_when_the_base_is_replaced():
+def test_a_replaced_base_does_not_inherit_the_previous_capability():
     """The set outlived the generation that taught it, so a rootfs rolled back to an OLDER worker
     kept the previous "yes" -- and controls then read a missing ack as proof of no start, letting
     three document hangs convict a healthy older base instead of staying UNKNOWN."""
-    from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
 
-    rt = object.__new__(SnapshotSlotRuntime)
-    rt._ack_capable = _capable()
-    rt._manager = type("M", (), {"invalidate": lambda self: None})()
-    try:
-        SnapshotSlotRuntime.invalidate_base(rt)
-    except Exception:
-        pass
-    assert not rt._ack_capable, (
+    # The retirement now happens at PUBLICATION, not in invalidate_base(): installing an artifact
+    # sets the flag to whatever THAT artifact advertised, so a silent replacement clears it with
+    # nothing to sequence. Getting that ordering right by hand was its own defect (issue #92).
+    cap = AckCapability()
+    cap.observe(0)
+    cap.publish(0)
+    assert cap.capable_for(0) is True
+
+    cap.publish(1)                        # a rolled-back image, which never advertised
+    assert cap.capable_for(1) is False, (
         "a new base may be a different image; capability must be re-learned, not inherited")
 
 
@@ -377,19 +385,35 @@ def test_a_writable_control_dir_still_reports_a_wedged_guest(tmp_path):
     assert host.guest_started is False
 
 
-def test_the_gvisor_capability_is_reset_when_the_bundle_is_replaced():
+def test_invalidate_base_leaves_the_capability_to_publication():
     from blastbox.host.runtime.gvisor_snapshot_runtime import GvisorSnapshotSlotRuntime
 
-    rt = object.__new__(GvisorSnapshotSlotRuntime)
-    rt._ack_capable = _capable()
-    # `_mgr`, not `_manager` -- this test only passed before because the reset ran BEFORE the
-    # manager was touched, so the wrong name never mattered.
-    rt._mgr = type("M", (), {"invalidate": lambda self: None})()
-    try:
-        GvisorSnapshotSlotRuntime.invalidate_base(rt)
-    except Exception:
-        pass
-    assert not rt._ack_capable, "a replaced bundle must re-advertise, not inherit"
+    """Because retirement is publication's job, invalidate_base() must not also write the
+    capability. Two writers of one fact, sequenced by hand at each call site, is what issue #92
+    removed -- after it had produced eight distinct defects.
+
+    Asserted BEHAVIOURALLY. This was a grep over inspect.getsource() for "_ack_capable", which is
+    a lint check wearing a test's name: it passes if a second writer returns through a helper, a
+    renamed attribute, or the manager. What actually matters is that invalidate_base leaves the
+    published capability exactly as it found it.
+    """
+    from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
+
+    for cls, mgr_attr in ((SnapshotSlotRuntime, "_manager"),
+                          (GvisorSnapshotSlotRuntime, "_mgr")):
+        cap = AckCapability(artifact_scoped=True)
+        cap.observe(3)
+        cap.publish(3)
+        assert cap.capable_for(3) is True, "precondition: the live artifact advertised"
+
+        rt = object.__new__(cls)
+        rt._ack_capable = cap
+        setattr(rt, mgr_attr, type("M", (), {"invalidate": lambda self: True})())
+        cls.invalidate_base(rt)
+
+        assert cap.capable_for(3) is True, (
+            f"{cls.__name__}.invalidate_base wrote the capability; retirement belongs to the "
+            f"next publish(), and a second writer reintroduces the drift #92 removed")
 
 
 def test_the_writability_probe_actually_probes(tmp_path):
@@ -479,29 +503,34 @@ def test_a_retired_control_cannot_resurrect_a_stale_capability():
     replacement base built from a rolled-back worker WITHOUT the protocol inherited a capability
     it does not have, and its missing markers were then read as proof of no start."""
     cap = AckCapability()
-    old_gen = cap.generation
-    cap.learn(old_gen)
-    assert bool(cap) is True
+    old_epoch, new_epoch = 0, 1
+    cap.observe(old_epoch)
+    cap.publish(old_epoch)
+    assert cap.capable_for(old_epoch) is True
 
-    cap.reset()                                   # a new base is built...
-    assert bool(cap) is False, "a replaced base must re-advertise"
+    # A new base is built from a ROLLED-BACK image that never advertises. Publishing it is the
+    # whole retirement: there is no separate reset to sequence against the artifact swap.
+    cap.publish(new_epoch)
+    assert cap.capable_for(new_epoch) is False, "a replaced base must re-advertise"
 
-    cap.learn(old_gen)                            # ...and the RETIRED control's ack lands late
-    assert bool(cap) is False, (
-        "a late ack from a retired generation must not teach the base that replaced it")
+    cap.learn(old_epoch)                          # the RETIRED control's ack lands late
+    assert cap.capable_for(new_epoch) is False, (
+        "a late ack from a retired epoch must not teach the base that replaced it")
 
-    cap.learn(cap.generation)                     # the new base advertising still works
-    assert bool(cap) is True
+    cap.learn(new_epoch)                          # the new base advertising still works
+    assert cap.capable_for(new_epoch) is True
 
 
 def test_a_control_stamps_the_generation_it_was_built_under(tmp_path):
     ctrl = tmp_path / "ctrl"
     ctrl.mkdir()
     cap = AckCapability()
-    host = HostWarmControl(ctrl, ack_capable=cap)
-    assert host._ack_gen == cap.generation
-    cap.reset()
-    assert host._ack_gen != cap.generation, "the control is now stale by construction"
+    cap.publish(0)
+    host = HostWarmControl(ctrl, ack_capable=cap, ack_generation=0)
+    assert host._ack_gen == 0
+    cap.publish(1)                                # the base is replaced
+    assert not cap.capable_for(host._ack_gen), (
+        "the control is stale by construction: its epoch is no longer the published one")
 
 
 def test_an_old_slot_claimed_after_a_reset_keeps_its_own_generation(tmp_path):
@@ -513,9 +542,11 @@ def test_an_old_slot_claimed_after_a_reset_keeps_its_own_generation(tmp_path):
     ctrl = tmp_path / "ctrl"
     ctrl.mkdir()
     cap = AckCapability()
-    old_gen = cap.generation
+    old_gen = 0
+    cap.observe(old_gen)
+    cap.publish(old_gen)                          # the old base advertised and was installed
 
-    cap.reset()                                   # the base is replaced while a slot is idle
+    cap.publish(1)                                # replaced (silently) while a slot is idle
     # the OLD slot is claimed afterwards and carries its own stamp
     stale_ctl = HostWarmControl(ctrl, ack_capable=cap, ack_generation=old_gen)
     assert stale_ctl._ack_gen == old_gen
@@ -527,16 +558,16 @@ def test_an_old_slot_claimed_after_a_reset_keeps_its_own_generation(tmp_path):
         stale_ctl.wait_for_done(timeout_s=0.2)
     except Exception:
         pass
-    assert bool(cap) is False, (
-        "a slot from the retired generation must not teach the base that replaced it")
+    assert cap.capable_for(1) is False, (
+        "a slot from the retired epoch must not teach the base that replaced it")
 
 
 def test_a_slot_spawned_after_the_reset_does_teach_the_new_base(tmp_path):
     ctrl = tmp_path / "ctrl"
     ctrl.mkdir()
     cap = AckCapability()
-    cap.reset()
-    fresh = HostWarmControl(ctrl, ack_capable=cap, ack_generation=cap.generation)
+    cap.publish(1)                                # the current artifact
+    fresh = HostWarmControl(ctrl, ack_capable=cap, ack_generation=1)
     FileWarmControl(ctrl).signal_ready()
     (ctrl / "go.json").write_text(
         json.dumps({"ack": True, "input_path": "/", "output_dir": "/", "params": {}}))
@@ -544,7 +575,7 @@ def test_a_slot_spawned_after_the_reset_does_teach_the_new_base(tmp_path):
         fresh.wait_for_done(timeout_s=0.2)
     except Exception:
         pass
-    assert bool(cap) is True, "the current generation's advertisement must still count"
+    assert cap.capable_for(1) is True, "the current epoch's advertisement must still count"
 
 
 def test_a_retired_base_build_cannot_teach_the_replacement(tmp_path):
@@ -563,11 +594,13 @@ def test_a_retired_base_build_cannot_teach_the_replacement(tmp_path):
     h._ctrl = ctrl
     h._ready = lambda _d, _t: None
     h._ack_capable = cap
-    h._ack_gen = cap.generation           # this build started under the OLD generation
-    cap.reset()                           # ...and the base was replaced while it waited
+    h._ack_gen = 0                        # this build started under the OLD epoch
 
-    GvisorBootHandle.wait_ready(h, 1.0)
-    assert bool(cap) is False, (
+    GvisorBootHandle.wait_ready(h, 1.0)   # it advertises on the way out
+    # ...but the base was replaced while it waited, so the REPLACEMENT is what publishes.
+    cap.publish(1)
+
+    assert cap.capable_for(1) is False, (
         "a retired build's advertisement must not describe the base that replaced it")
 
 
@@ -599,36 +632,55 @@ def test_the_probe_allocates_a_real_data_block(tmp_path):
         f"the probe must write a non-empty payload, got {written!r}")
 
 
-def test_the_capability_reset_happens_after_the_artifact_is_retired():
-    """Resetting first opens a window where the old artifact is still acquirable while the
-    generation has already advanced -- so a spawn racing the invalidation gets the RETIRED
-    artifact stamped with the NEW generation, and its late ack teaches the replacement a
-    capability only the old image had.
+def test_a_spawn_racing_an_invalidation_cannot_be_taught_by_the_retired_artifact():
+    """Resetting first used to open a window where the old artifact was still acquirable while
+    the generation had already advanced -- a spawn racing the invalidation got the RETIRED
+    artifact stamped with the NEW generation, and its late ack taught the replacement a capability
+    only the old image had. Ordering two writers correctly was the fix, and it did not hold.
 
-    Ordering is the observable: the manager's invalidate() must run BEFORE the generation moves.
+    There is now ONE writer. A slot carries the epoch of the artifact it restored from, and an ack
+    naming an epoch that is not the published one is ignored -- so the race has no window to land
+    in rather than a small one.
     """
-    from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
-    from blastbox.host.runtime.gvisor_snapshot_runtime import GvisorSnapshotSlotRuntime
+    cap = AckCapability()
+    cap.observe(0)
+    cap.publish(0)                        # the old artifact advertised
 
-    class _RecordingCapability(AckCapability):
-        """AckCapability uses __slots__, so the hook has to be a subclass, not a patch."""
+    racing_slot_epoch = 0                 # the racing spawn got the RETIRED artifact
+    cap.publish(1)                        # the replacement (silent) is installed
 
-        def __init__(self, order):
-            super().__init__()
-            self._order = order
+    cap.learn(racing_slot_epoch)          # its ack lands late
+    assert cap.capable_for(1) is False, (
+        "the retired artifact's slot taught the base that replaced it")
+    assert cap.capable_for(racing_slot_epoch) is False, (
+        "and its own epoch is no longer published, so it answers UNKNOWN rather than True")
 
-        def reset(self):
-            self._order.append("reset")
-            super().reset()
 
-    for cls, mgr_attr in ((SnapshotSlotRuntime, "_manager"),
-                          (GvisorSnapshotSlotRuntime, "_mgr")):
-        order: list = []
-        rt = object.__new__(cls)
-        rt._ack_capable = _RecordingCapability(order)
-        setattr(rt, mgr_attr, type("M", (), {
-            "invalidate": lambda self, _o=order: (_o.append("invalidate"), True)[1]})())
-        cls.invalidate_base(rt)
-        assert order == ["invalidate", "reset"], (
-            f"{cls.__name__}: the artifact must be retired before the generation moves, "
-            f"got {order}")
+def test_a_slot_from_an_older_artifact_is_not_judged_by_the_current_one():
+    """The direction the old design could not express at all, and the reason capability is keyed
+    by the artifact rather than held as a flag.
+
+    The CURRENT base advertises, so the flag is true. A slot still running from the PREVIOUS
+    artifact then fails. Judging it by the current base's capability reads its missing start
+    marker as a proven non-start -- base evidence -- and convicts a base that slot was never
+    restored from. Its own artifact is no longer published, so the only honest answer is UNKNOWN.
+    """
+    cap = AckCapability()
+    cap.observe(1)
+    cap.publish(1)                        # the CURRENT artifact advertises
+    assert cap.capable_for(1) is True
+    assert bool(cap) is True              # ...so a bare flag read says "capable"
+
+    assert cap.capable_for(0) is False, (
+        "a slot from the retired artifact was judged by the current base's advertisement")
+
+
+def test_a_slot_with_no_artifact_identity_stays_unknown():
+    """A control that cannot say WHICH artifact its slot came from must not borrow the current
+    answer -- that borrowing is how a retired slot convicted its replacement."""
+    cap = AckCapability()
+    cap.observe(3)
+    cap.publish(3)
+    assert cap.capable_for(3) is True
+    assert cap.capable_for(None) is False, (
+        "an unstamped control inherited the published artifact's capability")

@@ -441,9 +441,11 @@ class FcSnapshotLauncher:
         self._make_outdisk = make_outdisk
         self._copy_outdisk = copy_outdisk
         self._ready_check_factory = ready_check_factory
-        # Reads the CURRENT ack generation. Injected because the launcher owns no AckCapability;
-        # boot_base calls it before spawning so the build is stamped with the generation it
-        # actually started under (see boot_base).
+        # Reads SnapshotManager's BUILD EPOCH -- the identity of the artifact itself, which is
+        # the only ACK identity there is since #92 (there is no capability counter to point
+        # this at any more). Injected because the launcher is constructed before the manager;
+        # the manager binds it in SnapshotManager.__init__. boot_base calls it before spawning
+        # so the build is stamped with the epoch it actually started under.
         self._ack_sampler = ack_sampler
 
     def _spawn(self, workdir: Path):

@@ -110,7 +110,11 @@ class SnapshotSlotRuntime:
         # Shared with every VsockHostWarmControl handed out (see host_warm_control) AND with the
         # base-build ready listener, which is the only place the advertisement is visible in
         # snapshot mode -- restored guests never signal readiness again.
-        self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
+        # artifact_scoped: this runtime restores SNAPSHOT ARTIFACTS. A fallback built here
+        # is one the manager never publishes into, so without this it would sit in plain
+        # mode forever -- capable for every epoch, cleared by nothing.
+        self._ack_capable = (ack_capable if ack_capable is not None
+                             else AckCapability(artifact_scoped=True))
         self._cfg = cfg
         self._manager = manager
         # cfg.max_extracted_bytes bounds rdump output; fall back to a 512 MiB default
@@ -169,12 +173,12 @@ class SnapshotSlotRuntime:
         else:
             self._manager.build()   # a manager without the seam (a test double)
         slot_id = str(uuid.uuid4())
-        # BEFORE the restore. restore() pins the artifact it started against, so a base
-        # invalidation landing during that slow call leaves this slot on the RETIRED image --
-        # but sampling the generation afterwards stamped it with the replacement's, and an ack
-        # from the retired image would then teach the new base a capability it may not have.
-        _ack_gen = self._ack_capable.generation
         handle = self._manager.restore(slot_id)
+        # The epoch of the artifact restore() ACTUALLY PINNED for this slot, read after the fact
+        # from the manager. Sampling build_epoch beforehand answered "what is current now", and an
+        # invalidation plus replacement build completing in between paired the slot with the wrong
+        # identity -- capable_for() then answered False forever and the fast repair was silently
+        # off for that slot during exactly the rebuild churn it exists for.
         # The launcher restores in base_dir/slots/<id>; the vsock UDS lives there, so
         # its parent IS the per-slot workdir (vsock.sock + outdisk.ext4 + fc-api.sock).
         # vsock_uds is a concrete-FC-handle accessor not on the generic RestoreHandle
@@ -185,6 +189,27 @@ class SnapshotSlotRuntime:
         # (reading vsock_uds, or mkdir hitting ENOSPC) would strand the pin AND leak a running
         # microVM, permanently, until the process restarts.
         try:
+            # INSIDE the cleanup region. restore() has already returned a live microVM and
+            # reserved its generation pin, but no Slot exists yet -- so anything that raises here
+            # strands both, permanently, until the process restarts. An injected manager's
+            # pinned_epoch() can raise, and it takes a lock, so it is not exempt.
+            _pe = getattr(self._manager, "pinned_epoch", None)
+            if _pe is None:
+                # NOT fail-safe-and-quiet: in snapshot mode this is fatal to the feature.
+                # Every slot then carries ack_generation=None, capable_for(None) is False
+                # for the life of the process, learn(None) discards every real ack, and the
+                # missing-start evidence the fast repair runs on is never produced. The
+                # sampler seam got a defensive auto-bind on exactly this reasoning; the
+                # rebuttal used there ("a backend that never defines it cannot call it")
+                # does not apply, because THIS side is called unconditionally.
+                if not getattr(self, "_warned_no_pinned_epoch", False):
+                    self._warned_no_pinned_epoch = True
+                    _log.warning(
+                        "snapshot.manager_without_pinned_epoch manager=%s -- slots cannot be "
+                        "matched to the artifact they restored from, so the pre-guest fast "
+                        "base repair is DISABLED for this runtime",
+                        type(self._manager).__name__)
+            _ack_gen = _pe(slot_id) if _pe is not None else None
             slot_workdir = Path(handle.vsock_uds).parent  # type: ignore[attr-defined]
             output_dir = slot_workdir / "out"
             input_dir = slot_workdir / "in"
@@ -265,29 +290,15 @@ class SnapshotSlotRuntime:
         # and controls then read a missing ack as proof of no start, letting three
         # document-induced hangs convict a healthy older base instead of staying UNKNOWN, which
         # is exactly what the mixed-version contract promises. Re-learned at the next base build.
-        # RESET AFTER THE ARTIFACT IS RETIRED, not before. Resetting first opens a window in
-        # which the old artifact is still acquirable while the generation has already advanced:
-        # a spawn racing this gets the RETIRED artifact stamped with the NEW generation, so its
-        # late ack teaches the replacement a capability only the old image had.
-        #
-        # Ordering it after makes the residual error safe instead of dangerous. A spawn that
-        # acquired the old artifact sampled the OLD generation (spawn samples before restore), so
-        # its ack is ignored -- correct. A spawn that starts after invalidate but samples before
-        # this reset gets the old generation while running the NEW artifact, so its ack is
-        # discarded too: the new base's advertisement is merely missed, leaving capability
-        # UNKNOWN, which convicts nothing.
-        #
-        # It does NOT close the class. The stamp and the artifact are still two separate pieces
-        # of state kept in sync by hand, which is what has produced a finding every round; the
-        # structural fix is to derive the stamp from the acquired artifact (SnapshotManager
-        # already bumps _build_epoch atomically inside invalidate() under _build_lock), so the
-        # two cannot drift. That changes a locking contract and wants review.
         drop = getattr(self._manager, "invalidate", None)
         if not callable(drop):
             _log.warning("snapshot.invalidate_unsupported manager=%s", type(self._manager).__name__)
             return
         discarded = drop()
-        self._ack_capable.reset()
+        # NO capability reset. invalidate() moved SnapshotManager._build_epoch atomically with
+        # retiring the artifact, so the identity has already changed; the next publish() decides
+        # what the replacement is capable of. Sequencing a second reset correctly against this
+        # drop was its own defect class (issue #92).
         _log.warning("snapshot.base_invalidated had_artifact=%s -- next spawn rebuilds the base",
                      bool(discarded))
 
@@ -516,7 +527,12 @@ def select_snapshot_runtime(
     mem_dir = resolve_mem_dir() or base_dir
     # Created HERE so the base-build listener and the runtime that serves restores share one set:
     # the base advertises at build time, every restored slot then reads the answer.
-    ack_capable = AckCapability()
+    # ARTIFACT-SCOPED, like the runtime fallback. This is the capability the manager
+    # publishes into, so before its first publish() it must answer UNKNOWN rather than
+    # behave like the plain, no-artifact FC tier -- where one learn() would make it capable
+    # for EVERY epoch. Scoping only the fallback protected the misconfigured wiring and
+    # left the configured one open.
+    ack_capable = AckCapability(artifact_scoped=True)
     launcher = FcSnapshotLauncher(
         cfg,
         base_dir,
@@ -527,7 +543,12 @@ def select_snapshot_runtime(
         ),
         # Lets boot_base stamp the build with the generation current when it STARTED. The
         # launcher owns no capability of its own, so it cannot sample this itself.
-        ack_sampler=lambda: ack_capable.generation,
+        # ack_sampler deliberately LEFT UNSET. SnapshotManager.__init__ binds its own epoch
+        # source into the backend and its launcher when the attribute is None -- the same
+        # auto-bind the hand-assembled-embedder path relies on and which IS tested. A bespoke
+        # `lambda: _mgr_ref[0].build_epoch` here was non-None, so the auto-bind skipped it: belt
+        # and braces never overlapped on the ONE path production actually takes, and deleting
+        # either _mgr_ref.append line left the whole suite green.
     )
     backend = FcSnapshotBackend.from_env(base_dir, launcher, mem_dir=mem_dir)
     manager = SnapshotManager(base_dir, backend, ack_capable=ack_capable)

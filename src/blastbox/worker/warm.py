@@ -313,99 +313,133 @@ _CTRL_PROBE_INTERVAL_S: float = 1.0
 
 
 class AckCapability:
-    """Does the CURRENT warm base advertise the start signal? Generation-scoped on purpose.
+    """Does the artifact a slot was RESTORED FROM advertise the start signal?
 
-    A plain shared set could not express "this answer belonged to the base we just replaced".
-    Clearing it on invalidate was not enough: an old-generation slot still assigned keeps its
-    control, and when its ack finally arrives that control puts "yes" straight back -- so a
-    replacement base built from a rolled-back worker without the protocol inherits a capability
-    it does not have, and its missing start markers are then read as proof of no start. Three
-    document hangs later, a healthy mixed-version base is invalidated.
+    Keyed by the PUBLISHED ARTIFACT, identified by ``SnapshotManager._build_epoch`` -- which that
+    manager already bumps inside ``invalidate()``, under ``_build_lock``, ATOMICALLY with retiring
+    the artifact, and re-reads under the same lock to reject a build that was superseded while it
+    ran.
 
-    Every control stamps the generation it was created under and can only teach THAT generation.
-    A retired control's late ack is ignored rather than believed.
+    This class used to keep a SECOND counter of its own, advanced from the runtime wrappers at a
+    different moment under a different lock. Nothing held the two in step except hand-written
+    ordering at each call site, and that produced eight distinct defects in PR #90 -- the set
+    outliving the base, a retired control resurrecting it, the stamp taken at claim instead of
+    spawn, ``reset()`` running before the artifact was retired, the stamp sampled after the
+    launch, a build that never published teaching its generation, and a failed build teaching its
+    own retry. Each fix closed one drift window and exposed the next, because the key was always
+    something ADJACENT to the artifact rather than the artifact itself (issue #92).
+
+    There is now one identity, and it is the artifact's. The properties that used to need
+    careful ordering are facts:
+
+    * a build that never publishes cannot teach anything -- only :meth:`publish` promotes, and it
+      is called at the one point where the artifact becomes live;
+    * publishing an artifact that did NOT advertise clears the flag, so a replacement built from
+      a rolled-back worker cannot inherit its predecessor's capability. That is what ``reset()``
+      was for, and why there is no longer a ``reset()`` to call in the wrong order;
+    * a retired slot's late ack names an epoch that is no longer published, so it is ignored
+      rather than believed.
     """
 
-    __slots__ = ("_gen", "_capable", "_lock", "_pending")
+    __slots__ = ("_epoch", "_capable", "_lock", "_pending", "_scoped")
 
-    def __init__(self) -> None:
-        self._gen = 0
+    def __init__(self, *, artifact_scoped: bool = False) -> None:
+        #: True when this capability describes SNAPSHOT ARTIFACTS, even before the first one is
+        #: published. Without it, a capability that has not published yet is indistinguishable
+        #: from the plain (no-artifact) runtime -- and a snapshot runtime handed a manager with
+        #: no capability of its own built exactly that: a fallback nothing ever publishes into,
+        #: so every ack taught it unconditionally, capable_for() answered True for ANY epoch, and
+        #: (with reset() gone) nothing ever cleared it. A replacement built from an older worker
+        #: is then convicted for markers it never promised to write.
+        self._scoped = artifact_scoped
+        #: Epoch of the artifact that is CURRENTLY published. None means no artifact lifecycle at
+        #: all -- the plain (non-snapshot) FC runtime boots every slot fresh, so there is one
+        #: image and nothing to tell apart.
+        self._epoch: "int | None" = None
         self._capable = False
-        # Generations whose BASE BUILD advertised but whose artifact has not been shown to be
-        # usable yet. A build learns at READINESS, which is necessarily before checkpoint() has
-        # decided whether there is a publishable artifact at all -- so believing it there let a
-        # build that never published teach the capability permanently. If the worker bundle is
-        # then rolled back, the retry's plain readiness marker cannot clear that, and the older
-        # image's missing start markers are read as PROVEN non-starts: a document-induced hang
-        # invalidates an ACK-incapable base instead of staying UNKNOWN.
+        #: Epochs whose base build ADVERTISED but whose artifact has not been shown usable yet.
+        #: Readiness necessarily precedes checkpoint(), so believing it there let a build that
+        #: never published teach the capability permanently.
         self._pending: set = set()
         # LOCKED, because the compare and the mutation are one decision. Unsynchronised, a slot
-        # reporting its ack could pass `generation == self._gen`, have invalidate_base() bump the
-        # generation and clear the flag underneath it, and then set _capable=True anyway --
-        # re-enabling capability for a replacement that never advertised it. The window is small
-        # and the consequence is a healthy base rebuilt repeatedly.
+        # reporting its ack could pass the epoch check, have publish() install a different
+        # artifact underneath it, and then set _capable=True anyway -- re-enabling capability for
+        # a replacement that never advertised it.
         self._lock = threading.Lock()
 
     def __bool__(self) -> bool:
+        """Capability of the currently published artifact.
+
+        Prefer :meth:`capable_for`: a caller holding a slot knows WHICH artifact it restored from,
+        and that is the question worth asking.
+        """
         with self._lock:
             return self._capable
 
-    @property
-    def generation(self) -> int:
-        with self._lock:
-            return self._gen
+    def capable_for(self, epoch: "int | None") -> bool:
+        """Did the artifact of THIS epoch advertise the protocol?
 
-    def learn(self, generation: "int | None" = None) -> None:
+        The question a slot actually has. An epoch that is no longer the published one answers
+        False -- not because that base was incapable, but because this capability is not about it,
+        and UNKNOWN convicts nothing.
+        """
         with self._lock:
-            if generation is None or generation == self._gen:
+            if self._epoch is None:
+                # Nothing published yet. For an artifact-scoped capability that is UNKNOWN, not
+                # "ask the flag" -- there is no artifact for the flag to be about.
+                return False if self._scoped else self._capable
+            return self._capable and epoch == self._epoch
+
+    def learn(self, epoch: "int | None" = None) -> None:
+        """A LIVE slot acked: evidence about the artifact it was restored from.
+
+        In snapshot mode an UNSTAMPED ack (``epoch is None``) teaches nothing, exactly as
+        :meth:`capable_for` answers UNKNOWN for it. Accepting it here meant a late ack from a
+        retired -- or simply unidentifiable -- slot could resurrect capability for a SILENT
+        replacement, after which that replacement's missing markers read as proven non-starts and
+        convict a healthy base. A caller that cannot say which artifact its slot came from has not
+        supplied evidence about any artifact.
+
+        With no artifact lifecycle at all (the plain FC runtime) there is one image and nothing to
+        tell apart, so an unstamped ack is the only kind there is and it does teach.
+        """
+        with self._lock:
+            if self._epoch is None and not self._scoped:
+                self._capable = True
+            elif epoch is not None and epoch == self._epoch:
                 self._capable = True
 
     def begin_build(self) -> None:
         """A new BUILD ATTEMPT is starting: forget what the last one advertised.
 
-        Pending observations are keyed by generation, and consecutive build ATTEMPTS share one:
-        a failed build is retried by SnapshotManager.ensure_build_started() with no invalidation
-        in between, so nothing advances the generation. Without this, attempt 1 advertising and
-        then failing to checkpoint left its observation behind, and attempt 2 -- which may be a
-        ROLLED-BACK, ACK-incapable worker -- published successfully and consumed it. The new base
-        is then marked capable on the strength of an image it never ran, its missing start markers
-        read as proven non-starts, and a healthy mixed-version base is invalidated.
-
-        Concurrent builds would clear each other here; that direction is safe (a missed
-        advertisement leaves capability UNKNOWN, which convicts nothing).
+        A failed build is retried by ``ensure_build_started()`` with no invalidation in between,
+        so attempts share an epoch. Without this, attempt 1 advertising and then failing to
+        checkpoint left its observation behind for attempt 2 -- possibly a ROLLED-BACK,
+        ACK-incapable worker -- to publish and consume.
         """
         with self._lock:
             self._pending.clear()
 
-    def observe(self, generation: "int | None" = None) -> None:
-        """A base build ADVERTISED the protocol -- recorded, deliberately not yet believed.
+    def observe(self, epoch: "int | None" = None) -> None:
+        """A base build ADVERTISED -- recorded, deliberately not yet believed.
 
-        Only :meth:`confirm` promotes this, and only once the build has produced a usable
-        artifact. Readiness proves the guest speaks the protocol; it does not prove the pool will
-        ever run a slot from that guest.
+        Readiness proves the guest speaks the protocol. It does not prove the pool will ever run
+        a slot from that guest: checkpoint() can still fail, and a good checkpoint is discarded
+        when an invalidation landed while the build ran.
         """
         with self._lock:
-            self._pending.add(generation)
+            self._pending.add(epoch)
 
-    def confirm(self, generation: "int | None" = None) -> None:
-        """The build that advertised checkpointed successfully: believe it now.
+    def publish(self, epoch: "int | None") -> None:
+        """The manager INSTALLED the artifact built under ``epoch``. Believe it, or stop believing.
 
-        Generation-gated exactly like :meth:`learn` -- an invalidation during the build moves the
-        generation, the manager rejects the artifact via ``_build_epoch``, and this confirmation
-        is then correctly ignored.
+        The whole arbitration, in one place: the flag becomes whatever THIS artifact advertised.
+        An artifact that stayed silent therefore RETIRES its predecessor's capability rather than
+        inheriting it, with no separate reset to sequence correctly.
         """
         with self._lock:
-            if generation in self._pending and (generation is None or generation == self._gen):
-                self._capable = True
-            self._pending.discard(generation)
-
-    def reset(self) -> None:
-        """A new base is being built: whatever the old one advertised no longer applies."""
-        with self._lock:
-            self._gen += 1
-            self._capable = False
-            # Pending observations belong to the base being replaced. Keeping them would let a
-            # build that advertised BEFORE the invalidation confirm itself afterwards.
+            self._capable = epoch in self._pending
+            self._epoch = epoch
             self._pending.clear()
 
 
@@ -437,8 +471,9 @@ class HostWarmControl:
         self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
         # The SLOT's generation, taken at spawn -- see VsockHostWarmControl for why construction
         # time is the wrong moment. Falls back only when the caller cannot say.
-        self._ack_gen = (ack_generation if ack_generation is not None
-                         else self._ack_capable.generation)
+        # None is MEANINGFUL: "no artifact lifecycle" (plain tier) or "unidentifiable, teaches
+        # nothing" (snapshot slot). No current-generation fallback exists to reach for (#92).
+        self._ack_gen = ack_generation
         #: Latched: ctrl/ was seen UNWRITABLE at some point while this control waited. A storage
         #: incident that clears before the deadline is otherwise undetectable -- see
         #: wait_for_done.
@@ -581,7 +616,7 @@ class HostWarmControl:
             self._ack_capable.learn(self._ack_gen)
         # SET ONLY HERE, where the host actually waits to find out -- same rule as the vsock twin.
         # Claiming "never started" anywhere earlier convicts a base for a job nobody listened for.
-        if self._ack_capable:
+        if self._ack_capable.capable_for(self._ack_gen):
             self.guest_started = False
             # Only an ack-capable image can produce the "no start marker" verdict that needs
             # excusing, so only that case pays for the probes.

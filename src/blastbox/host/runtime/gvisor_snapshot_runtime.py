@@ -9,6 +9,7 @@ SlotRuntime + warm-path seam so the dispatcher's per-slot job flow is identical.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import shutil
@@ -39,7 +40,11 @@ class GvisorSnapshotSlotRuntime:
                  ack_capable: "AckCapability | None" = None) -> None:
         # Shared with every GvisorHostWarmControl handed out (see host_warm_control) AND with the
         # base build, which is the only place the advertisement is ever visible on this tier.
-        self._ack_capable = ack_capable if ack_capable is not None else AckCapability()
+        # artifact_scoped: this runtime restores SNAPSHOT ARTIFACTS. A fallback built here
+        # is one the manager never publishes into, so without this it would sit in plain
+        # mode forever -- capable for every epoch, cleared by nothing.
+        self._ack_capable = (ack_capable if ack_capable is not None
+                             else AckCapability(artifact_scoped=True))
         self._mgr = manager
         self._settle_s = settle_s
         self._clock = clock
@@ -71,11 +76,52 @@ class GvisorSnapshotSlotRuntime:
         else:
             self._mgr.build()   # a manager without the seam (a test double)
         slot_id = str(uuid.uuid4())
-        # BEFORE the restore -- same ordering as the FC snapshot runtime: the artifact this
-        # slot is pinned to is the one that existed when restore() started.
-        _ack_gen = self._ack_capable.generation
         handle = self._mgr.restore(slot_id)
-        wd = Path(handle.slot_workdir)  # type: ignore[attr-defined]
+        # EVERYTHING between a successful restore and RETURNING THE SLOT must clean up after
+        # itself, exactly as in the FC twin. Registering the handle in _handles is NOT enough and
+        # the earlier comment here claiming otherwise was wrong: every _handles lookup is keyed by
+        # a Slot the pool already holds (is_ready/reap/release), and nothing ever enumerates the
+        # dict for orphans -- so with no Slot returned, a live sandbox and its generation pin are
+        # unreachable for the life of the process.
+        #
+        # The epoch of the artifact restore() ACTUALLY PINNED for this slot. Sampling build_epoch
+        # beforehand answered "what is current now", and an invalidation plus replacement build
+        # completing in between paired the slot with the wrong identity. pinned_epoch() takes a
+        # lock and can raise on an injected manager, so it belongs inside this region.
+        try:
+            _pe = getattr(self._mgr, "pinned_epoch", None)
+            if _pe is None:
+                # NOT fail-safe-and-quiet: in snapshot mode this is fatal to the feature. Every
+                # slot then carries ack_generation=None, capable_for(None) is False for the life
+                # of the process, learn(None) discards every real ack, and the missing-start
+                # evidence the fast repair runs on is never produced. The sampler seam got a
+                # defensive auto-bind on exactly this reasoning; the rebuttal used there ("a
+                # backend that never defines it cannot call it either") does not apply here,
+                # because THIS side is called unconditionally.
+                if not getattr(self, "_warned_no_pinned_epoch", False):
+                    self._warned_no_pinned_epoch = True
+                    _log.warning(
+                        "snapshot.manager_without_pinned_epoch manager=%s -- slots cannot be "
+                        "matched to the artifact they restored from, so the pre-guest fast base "
+                        "repair is DISABLED for this runtime", type(self._mgr).__name__)
+            _ack_gen = _pe(slot_id) if _pe is not None else None
+            wd = Path(handle.slot_workdir)  # type: ignore[attr-defined]
+        except BaseException:
+            sandbox_gone = True
+            try:
+                handle.kill()  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                # Same rule as reap(): a kill() that raised leaves the sandbox possibly ALIVE and
+                # still mapping this generation, so releasing the pin would let a later
+                # invalidation unlink its checkpoint underneath.
+                sandbox_gone = False
+                _log.warning("gvisor_snapshot.spawn_cleanup_kill_error slot_id=%s: %s",
+                             slot_id, exc)
+            release = getattr(self._mgr, "release", None)
+            if callable(release) and sandbox_gone:
+                with contextlib.suppress(Exception):
+                    release(slot_id)
+            raise
         with self._lock:
             self._handles[slot_id] = handle
             self._restored_at[slot_id] = self._clock()
@@ -131,27 +177,11 @@ class GvisorSnapshotSlotRuntime:
         # set outlives the generation that taught it, so a bundle rolled back to an older worker
         # kept the previous "yes" and a missing start marker was then read as proof of no start --
         # letting three document-induced hangs convict a healthy mixed-version base.
-        # RESET AFTER THE ARTIFACT IS RETIRED, not before. Resetting first opens a window in
-        # which the old artifact is still acquirable while the generation has already advanced:
-        # a spawn racing this gets the RETIRED artifact stamped with the NEW generation, so its
-        # late ack teaches the replacement a capability only the old image had.
-        #
-        # Ordering it after makes the residual error safe instead of dangerous. A spawn that
-        # acquired the old artifact sampled the OLD generation (spawn samples before restore), so
-        # its ack is ignored -- correct. A spawn that starts after invalidate but samples before
-        # this reset gets the old generation while running the NEW artifact, so its ack is
-        # discarded too: the new base's advertisement is merely missed, leaving capability
-        # UNKNOWN, which convicts nothing.
-        #
-        # It does NOT close the class. The stamp and the artifact are still two separate pieces
-        # of state kept in sync by hand, which is what has produced a finding every round; the
-        # structural fix is to derive the stamp from the acquired artifact (SnapshotManager
-        # already bumps _build_epoch atomically inside invalidate() under _build_lock), so the
-        # two cannot drift. That changes a locking contract and wants review.
         drop = getattr(self._mgr, "invalidate", None)
         if callable(drop):
             drop()
-        self._ack_capable.reset()
+        # NO capability reset -- see the FC twin. invalidate() already moved the artifact's
+        # identity; publish() decides what the replacement is capable of (issue #92).
 
     def reap(self, slot: Slot) -> None:
         with self._lock:
@@ -324,7 +354,13 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
     # Created before both so the BASE BUILD and the runtime serving restores share it: the base
     # advertises the start-marker protocol in `ready`, and that is the only moment it is visible
     # (a restore gets a fresh ctrl/, and the checkpointed worker resumes past signal_ready).
-    ack_capable = AckCapability()
+    # ARTIFACT-SCOPED, like the runtime fallback. This is the capability the manager
+    # publishes into, so before its first publish() it must answer UNKNOWN rather than
+    # behave like the plain, no-artifact FC tier -- where one learn() would make it capable
+    # for EVERY epoch. Scoping only the fallback protected the misconfigured wiring and
+    # left the configured one open.
+    ack_capable = AckCapability(artifact_scoped=True)
+    # epoch_sampler deliberately LEFT UNSET -- SnapshotManager binds it (see the FC twin).
     backend = GvisorSnapshotBackend(gcfg, ack_capable=ack_capable)
     if not backend.available():
         if require_available:
