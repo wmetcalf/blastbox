@@ -3637,30 +3637,30 @@ def test_an_unusable_slot_is_never_claimable_between_maintenance_and_retirement(
     seen: list = []
 
     class _UnusableRuntime(_FakeRuntime):
-        def __init__(self, pool_ref: dict) -> None:
-            super().__init__()
-            self.pool_ref = pool_ref
-            self.verdict_given = False
-
         def maintain_idle(self, slot: Slot) -> bool:
-            self.verdict_given = True
             return False        # terminal: hibernation stuck past its timeout
 
-        def base_identity(self, slot: Slot) -> str:
-            # Called by retire(fault="worker") during failure attribution, i.e. BEFORE the lock
-            # that flips the slot to DRAINING. This is the exact window the bug opened.
-            # base_identity is also called on the spawn path, so only record AFTER the verdict --
-            # an unscoped recorder passes for the wrong reason (it reads a WARMING slot).
-            if self.verdict_given:
-                pool = self.pool_ref["pool"]
-                live = pool._slots.get(slot.slot_id)
-                seen.append(live.state if live else None)
-            return "base"
-
-    ref: dict = {}
-    rt = _UnusableRuntime(ref)
+    rt = _UnusableRuntime()
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
-    ref["pool"] = pool
+
+    # Observe at retire() ENTRY -- the closing edge of the window. The hook has returned its
+    # unusable verdict by then, and the slot must still be un-claimable.
+    #
+    # This used to observe through runtime.base_identity(), on the reasoning that retire() calls
+    # it during failure attribution. retire() only does that under `fault == "worker"`, and this
+    # call site was later changed to fault=None (a park give-up is control-plane evidence, not a
+    # worker death) -- so the recorder stopped firing from retire entirely and only the SPAWN
+    # path reached it, sampling the WARMING replacement. Measured: seen == [WARMING], i.e.
+    # exactly the "passes for the wrong reason (it reads a WARMING slot)" case the old comment
+    # claimed to have excluded. The assertion held while pinning nothing.
+    _orig_retire = pool.retire
+
+    def _spy(slot: Slot, *, fault: "str | None" = None) -> None:
+        live = pool._slots.get(slot.slot_id)
+        seen.append(live.state if live else None)
+        return _orig_retire(slot, fault=fault)
+
+    pool.retire = _spy          # type: ignore[method-assign]
     pool.tick()
     pool.tick()
 
