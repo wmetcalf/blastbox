@@ -2173,6 +2173,25 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             self._park_refused.discard(sid)
             return "parked", True
         if st == "stopping":
+            # ...but only if it is OUR stop. `stopping` means something is stopping this instance,
+            # not that we asked: an operator or boot automation stopping a WARMING instance produces
+            # exactly the same observation. Adopting it unconditionally MANUFACTURED the very
+            # evidence the `stopped` adoption below requires -- it writes _phase, _hib_started and
+            # _park_since, three of that predicate's four sources -- so the next observation walked
+            # straight through the guard and published an image that was never hibernated. The pool
+            # then advertises capacity that cannot serve and a claim burns the whole resume budget
+            # on an instance whose agent was never up. Evidence has to come from something other
+            # than the branch that consumes it.
+            #
+            # The lost-response case this branch exists for is NOT lost: an unanswered stop sets
+            # _park_attempted (_freeze_park(park_attempted=True)), and an accepted one sets
+            # _hib_started at issue time. Both are recorded before we ever see `stopping`.
+            if not (phase in ("hibernating", "parked")
+                    or sid in self._park_attempted
+                    or sid in self._hib_started):
+                _log.warning("ec2-hibernate: slot %s is 'stopping' with no hibernation of ours "
+                             "outstanding -- not adopting it as a parking in flight", sid)
+                return phase, False
             # A hibernate is in flight -- possibly one whose response we lost, which is why the
             # phase is adopted from the observation rather than trusted.
             if phase != "hibernating":

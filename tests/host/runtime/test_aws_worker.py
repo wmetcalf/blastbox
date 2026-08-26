@@ -3029,6 +3029,11 @@ def test_a_hibernation_stuck_in_stopping_is_eventually_given_up_on():
     rt, _ = _hibernate_rt(state=state, healthy=healthy, clock=lambda: ticks[0],
                           hibernate_timeout_s=300.0)
     slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    # OUR hibernation, not an operator's. An accepted stop stamps _hib_started (and _phase) at
+    # issue time, and a no-verdict one stamps _park_attempted, so a real `stopping` we care about
+    # is never evidence-free. Without one of those markers this is an instance somebody ELSE
+    # stopped, which is deliberately not adopted and so has no give-up clock to expire.
+    rt._hib_started[slot.slot_id] = 1000.0
 
     assert rt.maintain_idle(slot) is True          # in flight, still plausible
     ticks[0] += 301.0
@@ -3684,7 +3689,11 @@ def test_crediting_never_puts_the_park_clock_in_the_future():
     rt, _ = _hibernate_rt(state=["stopping"], healthy=[True], hibernate_timeout_s=300.0)
     slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
 
-    rt._freeze_park(slot.slot_id, 1000.0)        # a stop with no verdict, and NO _park_since
+    # park_attempted=True: this models a STOP WE ISSUED whose response was lost, which is what
+    # the docstring describes and what _try_park's AwsNoVerdict handler actually records. A bare
+    # freeze is the observation-only kind (an unreadable describe), which is deliberately NOT
+    # parking evidence -- so it would not reach the crediting path this test is about.
+    rt._freeze_park(slot.slot_id, 1000.0, park_attempted=True)   # no verdict, and NO _park_since
     assert slot.slot_id not in rt._park_since, "the lost-response case starts with no clock"
 
     now = 8200.0                                 # 7200s later, AWS finally answers 'stopping'
@@ -4180,3 +4189,45 @@ def test_the_liveness_memo_is_stamped_when_the_describe_returns():
     rt.is_alive(slot)
     stamp, _ = rt._live_cache["s"]
     assert now[0] - stamp < rt._liveness_cache_s, "the memo was born expired"
+
+
+def test_an_operator_stop_is_not_adopted_as_our_hibernation():
+    """`stopping` means SOMETHING is stopping the instance, not that we asked.
+
+    The branch used to write _phase, _hib_started and _park_since unconditionally -- three of the
+    four sources the `stopped` adoption predicate consults -- so an instance stopped by an operator
+    or by boot automation manufactured its own evidence and was then published as a parked warm
+    slot. There is no captured image behind it: the pool advertises capacity that cannot serve and
+    a claim burns the whole resume budget starting an instance whose agent was never up.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    now = [1000.0]
+    state = ["stopping"]
+    rt, _ = _hibernate_rt(state=state, healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    assert rt.is_ready(slot) is False                  # nothing of ours is outstanding
+    assert "s" not in rt._hib_started, "the observation invented hibernation evidence"
+    assert "s" not in rt._park_since, "the observation started a park episode we never asked for"
+
+    now[0] += 5.0
+    state[0] = "stopped"
+    assert rt.is_ready(slot) is False, "adopted an operator-stopped instance as a parked warm slot"
+    assert rt._phase.get("s") != "parked"
+
+
+def test_our_own_stop_is_still_adopted_from_stopping():
+    """The guard it must NOT break: the lost-response case. An unanswered stop records
+    _park_attempted before `stopping` is ever observed, so it remains adoptable."""
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    now = [1000.0]
+    state = ["stopping"]
+    rt, _ = _hibernate_rt(state=state, healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt._park_attempted.add("s")                        # we issued a stop; the response was lost
+
+    assert rt.is_ready(slot) is False                  # still stopping -- not ready yet
+    assert rt._phase.get("s") == "hibernating", "our own in-flight hibernation was not adopted"
+    now[0] += 5.0
+    state[0] = "stopped"
+    assert rt.is_ready(slot) is True

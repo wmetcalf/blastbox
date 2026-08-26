@@ -240,7 +240,8 @@ def dominates(paths, guard_node, use_node, ordered=True):
                for a, b in zip(g, u[:len(g)]))
 
 
-def guards_none(fn, name, before=None, use_node=None, paths=None, rebinds=None):
+def guards_none(fn, name, before=None, use_node=None, paths=None, rebinds=None,
+                strict=False):
     """Does ``fn`` discriminate the three states of ``name`` BEFORE ``before_line``?
 
     Any IDENTITY comparison against None, False or True counts. Looking only for `is None` was too
@@ -281,9 +282,66 @@ def guards_none(fn, name, before=None, use_node=None, paths=None, rebinds=None):
         if rebinds and before is not None \
                 and any((n.lineno, n.col_offset) < rb < before for rb in rebinds):
             continue
-        if any(isinstance(o, (ast.Is, ast.IsNot)) for o in n.ops) and \
+        if not (any(isinstance(o, (ast.Is, ast.IsNot)) for o in n.ops) and
                 any(isinstance(c, ast.Constant) and c.value in (None, False, True)
-                    for c in n.comparators):
+                    for c in n.comparators)):
+            continue
+        # ...and the guard must actually ELIMINATE the unknown path, not merely mention it.
+        # Finding the comparison was the whole test, so
+        #     if ok is None: log("unknown")        # notes it, changes nothing
+        #     if not ok: return                    # None still arrives here
+        # was reported CLEAN -- the sweep green-lighting the exact UNKNOWN-to-False collapse it
+        # exists to gate. A guard earns its suppression only if, on the path to the use, the
+        # None case cannot arrive:
+        #   * `x is None` (or `== None`): the branch must EXIT (return/raise/continue/break) or
+        #     REBIND x, so control reaching the use has already excluded None;
+        #   * `x is not None`: the use must sit INSIDE that branch, where None cannot be.
+        if not strict:
+            return True
+        # STRICT (advisory only): does the guard actually ELIMINATE the unknown path?
+        owner = _enclosing_if(fn, n)
+        if owner is None:
+            # A ternary: `None if x is None else bool(x)`. The use in the arm the guard selects
+            # is safe, and that IS the correct idiom -- accept it.
+            return True
+        if any(isinstance(o, ast.IsNot) for o in n.ops):
+            if use_node is not None and _contains(owner.body, use_node):
+                return True
+            continue
+        # `if x is None:` -- the branch must exit, rebind, or be paired with an else that shows
+        # the author split both cases deliberately.
+        if _branch_settles(owner.body, name) or owner.orelse:
+            return True
+    return False
+
+
+_TERMINATORS = (ast.Return, ast.Raise, ast.Continue, ast.Break)
+
+
+def _enclosing_if(fn, node):
+    """The `if` whose TEST contains `node`, if any."""
+    for st in ast.walk(fn):
+        if isinstance(st, (ast.If, ast.IfExp)) and any(x is node for x in ast.walk(st.test)):
+            return st if isinstance(st, ast.If) else None
+    return None
+
+
+def _contains(stmts, node):
+    return any(x is node for st in stmts for x in ast.walk(st))
+
+
+def _branch_settles(stmts, name):
+    """True if this branch exits, or rebinds `name` to something narrower."""
+    for st in stmts:
+        if isinstance(st, _TERMINATORS):
+            return True
+        if isinstance(st, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            tgts = st.targets if isinstance(st, ast.Assign) else [st.target]
+            if any(isinstance(t, ast.Name) and t.id == name for t in tgts):
+                return True
+        # an if/else where BOTH arms settle also settles
+        if isinstance(st, ast.If) and st.orelse \
+                and _branch_settles(st.body, name) and _branch_settles(st.orelse, name):
             return True
     return False
 
@@ -316,7 +374,7 @@ def bound_name(p, call):
     return None
 
 
-def find_p1(trees, tri):
+def find_p1(trees, tri, strict=False):
     # Only names declared tri-state SOMEWHERE, but reported only when the receiver is plausibly
     # one of those classes: `self` (the declaring class or a subclass) or a name that is not an
     # obvious stdlib object. Anything called on a `thread`/`proc`-ish receiver is skipped.
@@ -410,7 +468,8 @@ def find_p1(trees, tri):
                     if guards_none(fn, var,
                                    before=(lineno, unode.col_offset) if consumes_none else None,
                                    use_node=unode, paths=fpaths,
-                                   rebinds=rebinds if consumes_none else None):
+                                   rebinds=rebinds if consumes_none else None,
+                                   strict=strict):
                         continue
                     decl = ", ".join(f"{c}@{loc}" for c, loc in by_name[nm][:2])
                     if nm in ambiguous:
@@ -665,6 +724,20 @@ def main():
     # EXIT NONZERO on a real finding, so this can gate. A constant exit 0 meant no CI step or
     # wrapper could tell "clean" from "findings" from "crashed before scanning" -- while the
     # output was being cited as evidence the branch is correct.
+    strict_hits = find_p1(trees, tri, strict=True)
+    weak = [h for h in strict_hits if h not in p1]
+    print("\n=== P1b guard present but the UNKNOWN path is not eliminated  [ADVISORY]\n")
+    if not weak:
+        print("  none")
+    for loc, nm, ctx, decl in weak:
+        print(f"  {loc:26} {nm}  used as `{ctx}`   ({decl})")
+    print("  NOTE: advisory only, and NOT gated on. P1 accepts a tri-state comparison as a guard;\n"
+          "  this pass additionally demands the guarded branch EXIT, REBIND, or carry an else --\n"
+          "  i.e. that None provably cannot reach the use. It cannot tell a None that falls through\n"
+          "  to a SAFE path (declining to promote, declining to return early) from one that falls\n"
+          "  through to a DESTRUCTIVE one (reap, evict, mark dead), and only the second is a bug.\n"
+          "  Gating on it reported four hits on this tree, every one of them correct code. Read\n"
+          "  these by hand; what you are looking for is a False that DESTROYS something.")
     return 1 if (p1 or p2) else 0
 
 

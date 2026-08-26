@@ -352,3 +352,68 @@ def test_a_scan_that_found_no_declarations_refuses_to_report_clean(tmp_path, mon
     monkeypatch.setattr(ps, "ROOT", tmp_path)
     assert ps.main() == 2
     assert "NO tri-state declarations found" in capsys.readouterr().out
+
+
+# --- P1b: a guard that MENTIONS the unknown without eliminating it -------------------------
+
+_NOTES_BUT_DOES_NOT_GUARD = '''
+    def f(self, s):
+        rt = R()
+        ok = rt.is_ready(s)
+        if ok is None:
+            self.log("unknown")
+        if not ok:
+            self.reap(s)
+'''
+
+_GUARD_EXITS = '''
+    def f(self, s):
+        rt = R()
+        ok = rt.is_ready(s)
+        if ok is None:
+            return "unknown"
+        if not ok:
+            self.reap(s)
+'''
+
+_GUARD_SPLITS_BOTH_CASES = '''
+    def f(self, s):
+        rt = R()
+        ok = rt.is_ready(s)
+        if ok is None:
+            self.open_episode(s)
+        else:
+            self.close_episode(s)
+        if not ok:
+            self.reap(s)
+'''
+
+
+def _strict(body: str):
+    tree = ast.parse(PREAMBLE + "\nclass P:\n" + body)
+    trees = {"probe.py": tree}
+    return ps.find_p1(trees, ps.tri_state_defs(trees), strict=True)
+
+
+def test_the_gate_still_accepts_a_bare_mention_so_it_stays_precise():
+    """P1 GATES, so it must not fire on correct code. Demanding elimination there reported four
+    hits on this tree, every one correct -- a ternary, an if/else split, and two `if ok:` positives
+    where None declining the safe branch is the intended behaviour."""
+    assert not sweep(_NOTES_BUT_DOES_NOT_GUARD)
+
+
+def test_strict_mode_reports_a_guard_that_only_mentions_the_unknown():
+    """`if ok is None: log()` changes nothing -- None still reaches `if not ok: reap(s)`, and that
+    False DESTROYS something. The gating pass accepts the comparison as a guard; strict mode is
+    what makes the hole visible."""
+    assert _strict(_NOTES_BUT_DOES_NOT_GUARD), (
+        "strict mode green-lit a guard that lets None fall through to a reap"
+    )
+
+
+def test_strict_mode_accepts_a_guard_that_exits():
+    assert not _strict(_GUARD_EXITS)
+
+
+def test_strict_mode_accepts_an_if_else_that_handles_both_cases():
+    assert not _strict(_GUARD_SPLITS_BOTH_CASES)
