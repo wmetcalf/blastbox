@@ -190,6 +190,19 @@ class AwsThrottled(AwsNoVerdict):
     the tier may be used at all (issue #79)."""
 
 
+class AwsNotExecuted(AwsNoVerdict):
+    """The aws process never STARTED, so nothing was asked and nothing was attempted.
+
+    Still an AwsNoVerdict -- we learned nothing, and every caller that defers or freezes on
+    silence must keep doing so. But it is NOT the "we issued a call and it went unanswered"
+    flavour, and one caller turns that distinction into EVIDENCE: _try_park records an
+    unanswered stop with park_attempted=True, and _park_attempted is later accepted as proof
+    that a `stopped` instance holds a warm image we captured. A fork that failed (EMFILE,
+    ENOMEM, the binary briefly absent mid-upgrade) issued no stop at all, so counting it as an
+    attempt lets an instance stopped by an operator be adopted as a parked warm slot with
+    nothing behind it. _freeze_park's own docstring already draws this line."""
+
+
 class AwsProbeTimeout(AwsNoVerdict):
     """The control plane didn't answer in time — the timeout flavour of AwsUnknownState. Raised
     whether or not a probe budget was in scope (a 120s cli_timeout_s expiring is no more evidence
@@ -674,7 +687,7 @@ class AwsDisposableRuntime:
             # briefly absent mid-`pip install -U awscli`). That says nothing whatsoever about the
             # worker, and it is maximally CORRELATED -- every slot and every thread hits it at once,
             # so collapsing it to "dead" wipes the tier (issue #77 marla-loop).
-            raise AwsNoVerdict(f"aws {service} {op}: cannot execute ({exc})") from exc
+            raise AwsNotExecuted(f"aws {service} {op}: cannot execute ({exc})") from exc
         except subprocess.TimeoutExpired as exc:
             # UNKNOWN in every scope (issue #77 round 2): a timeout means the control plane never
             # answered. Outside a probe this used to be a plain AwsWorkerError, and resume()'s
@@ -2316,6 +2329,16 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 # the `stopped` adoption reads _park_since as proof a warm image exists.
                 parked = self._try_park(slot)
                 answered = parked is not None
+            except AwsNotExecuted:
+                # The stop never left this host, so there is no attempt to record. Freeze the
+                # give-up clock (we learned nothing, and the cause is maximally correlated --
+                # every slot and thread hits a fork failure at once), but park_attempted stays
+                # FALSE: _park_attempted is read as proof that a `stopped` instance holds a warm
+                # image we captured, and a call that never ran captured nothing. Same rule the
+                # observation-only freezes already follow, and the same class as the `stopping`
+                # branch that used to manufacture its own evidence.
+                self._freeze_park(sid, now)
+                return self._phase.get(sid, "warming"), None
             except AwsNoVerdict:
                 # Freeze the give-up clock for as long as the stop API keeps not answering, and
                 # never START it on a non-answer: an unanswered stop is no evidence at all about

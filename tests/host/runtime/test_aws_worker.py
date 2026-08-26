@@ -4273,3 +4273,52 @@ def test_a_parked_slot_seen_stopping_is_not_our_hibernation_either():
     assert rt.is_ready(slot) is False
     assert "s" not in rt._hib_started, "a parked phase manufactured fresh in-flight parking evidence"
     assert "s" not in rt._park_since
+
+
+def test_a_stop_that_never_left_the_host_is_not_a_hibernation_attempt():
+    """_aws raises AwsNoVerdict when the aws PROCESS could not start -- EMFILE, ENOMEM on fork,
+    the binary briefly absent mid-upgrade. _try_park recorded every AwsNoVerdict with
+    park_attempted=True, and _park_attempted is later read as proof that a `stopped` instance
+    holds a warm image WE captured. A fork that failed issued no stop at all, so an instance
+    stopped by an operator was adopted as a parked warm slot with nothing behind it -- the same
+    evidence-manufacturing shape as the `stopping` branch, one door over."""
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    now = [1000.0]
+    state = ["running"]
+    rt, fake = _hibernate_rt(state=state, healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    def _cannot_fork(argv):    # noqa: ANN001 -- the host cannot start the process at all
+        raise OSError(24, "Too many open files")
+
+    fake.responses["ec2 stop-instances"] = _cannot_fork
+    rt._phase["s"] = "hibernating"          # we are trying to park it
+    rt.is_ready(slot)
+    now[0] += 5.0
+    rt.is_ready(slot)
+
+    assert "s" not in rt._park_attempted, (
+        "a stop that never left the host was recorded as an attempt, which is later read as "
+        "proof of a captured warm image"
+    )
+    assert "s" in rt._park_unknown_since, "the give-up clock must still freeze -- we learned nothing"
+
+
+def test_a_stop_that_was_issued_and_went_unanswered_IS_still_an_attempt():
+    """The guard it must not weaken: a stop that really was sent and got no answer may well have
+    been accepted, and that is the lost-response case the adoption path depends on."""
+    from blastbox.host.runtime.aws_worker import AwsProbeTimeout, AwsWorkerSlot
+    now = [1000.0]
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    def _no_answer(argv):      # noqa: ANN001 -- the call went out; nothing came back
+        raise AwsProbeTimeout("aws ec2 stop-instances: timed out")
+
+    fake.responses["ec2 stop-instances"] = _no_answer
+    rt._phase["s"] = "hibernating"
+    rt.is_ready(slot)
+    now[0] += 5.0
+    rt.is_ready(slot)
+
+    assert "s" in rt._park_attempted, "a genuine unresolved stop must stay recorded as an attempt"
