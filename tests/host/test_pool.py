@@ -3915,3 +3915,42 @@ def test_a_maintenance_hook_that_cannot_tell_does_not_retire_the_slot():
 
     assert rt.reaps == 0, "a slot was retired on a maintenance answer of UNKNOWN"
     assert sid in pool._slots and pool._slots[sid].state == SlotState.IDLE
+
+
+def test_a_failed_maintenance_reap_is_not_requeued_after_shutdown():
+    """stop() sets _stop_event, then joins the reapers with a TIMEOUT it can exceed ("deferred
+    reaper still running -- proceeding"), and only then clears both queues. A reaper that outlives
+    that join and fails its disposal afterwards would repopulate the holding set behind the clear,
+    so a pool restarted on the same object releases the id on its first tick and re-terminates a
+    resource whose disposal already failed -- the quarantine rule, broken from the far side of the
+    clear meant to enforce it."""
+    class _Throttled(_FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        def reap(self, slot):    # noqa: ANN001
+            self.attempts += 1
+            raise OSError("terminate-instances: throttled")
+
+    rt = _Throttled()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6)
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots))
+    pool._slots[sid].state = SlotState.DRAINING
+    pool._maintain_reap_tries[sid] = 0        # a maintenance husk still within its retry budget
+    pool._deferred_reap.add(sid)
+
+    pool._stop_event.set()                    # shutdown has begun and the queues were cleared
+    pool._drain_deferred_reaps()
+    for entry in list(pool._reaper_threads):
+        entry[0].join(timeout=5)
+
+    assert rt.attempts == 1, (
+        f"the disposal was attempted {rt.attempts} times -- this test only means something if the "
+        f"reaper actually ran and FAILED, which is what publishes the retry"
+    )
+    assert not pool._deferred_reap_next, (
+        f"{pool._deferred_reap_next} was published after shutdown -- a restarted pool would "
+        f"re-terminate a resource whose disposal already failed"
+    )
