@@ -3891,3 +3891,73 @@ def test_an_unknown_agent_probe_does_not_age_the_park_clock():
         "an unprobeable agent aged the park clock to give-up and the slot was retired; the host "
         "not being able to open a socket is not evidence about the worker"
     )
+
+
+def test_a_refused_hibernation_is_not_parking_evidence():
+    """`stopped` is adopted as a parked warm slot only on evidence that WE parked it. The evidence
+    set included _park_since -- but _park_since was started for a DEFINITIVE REFUSAL too, because
+    the call site collapsed the three-way answer with `_try_park(...) is not None` (False is not
+    None). So a slot AWS flatly refused to hibernate, later stopped by an operator or an
+    autoscaler, was adopted as parked: the pool advertises capacity that cannot serve, and a claim
+    spends the whole resume budget starting an instance whose agent was never captured.
+
+    A refusal still spends the give-up budget -- it IS a verdict -- but it is not evidence of a
+    park."""
+    state, healthy = ["running"], [True]
+    t = [1000.0]
+    # ADVANCING clock: the describe is cached per liveness window, so a constant clock would leave
+    # the second pass looking at the stale `running` and prove nothing.
+    rt, fake = _hibernate_rt(state=state, healthy=healthy, clock=lambda: t[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    # AWS definitively REFUSES the hibernation.
+    rt._try_park = lambda s: False
+    rt.is_ready(slot)
+    assert "s" in rt._park_refused, "a definitive refusal must be recorded as such"
+    assert "s" in rt._park_since, "...and must still run the give-up clock"
+
+    # Something else stops the instance.
+    state[0] = "stopped"
+    t[0] += 60.0
+    assert rt.is_ready(slot) is not True, (
+        "an instance AWS refused to hibernate was adopted as a parked warm slot")
+    assert rt._phase.get("s") != "parked"
+
+
+def test_an_accepted_hibernation_is_still_adopted_when_stopped():
+    """Control: the evidence rule must not reject a real park."""
+    state, healthy = ["running"], [True]
+    t = [1000.0]
+    rt, _ = _hibernate_rt(state=state, healthy=healthy, clock=lambda: t[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    rt._try_park = lambda s: True                     # AWS ACCEPTS
+    rt.is_ready(slot)
+    assert "s" not in rt._park_refused
+
+    state[0] = "stopped"
+    t[0] += 60.0
+    assert rt.is_ready(slot) is True, "a genuinely parked slot must still be adopted"
+    assert rt._phase.get("s") == "parked"
+
+
+def test_a_refusal_followed_by_an_acceptance_clears_the_mark():
+    """A tier that refuses while the hibinit agent lays down its reserve, then accepts, is parked
+    for real -- the refusal must not disqualify it forever."""
+    state, healthy = ["running"], [True]
+    t = [1000.0]
+    rt, _ = _hibernate_rt(state=state, healthy=healthy, clock=lambda: t[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    rt._try_park = lambda s: False
+    rt.is_ready(slot)
+    assert "s" in rt._park_refused
+
+    t[0] += 60.0
+    rt._try_park = lambda s: True
+    rt.is_ready(slot)
+    assert "s" not in rt._park_refused, "an accepted attempt must clear the refusal mark"
+
+    state[0] = "stopped"
+    t[0] += 60.0
+    assert rt.is_ready(slot) is True

@@ -1754,6 +1754,12 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # LOST-RESPONSE hibernate was thrown away by the thaw. Two questions, two fields -- the
         # same lesson as _warming_unknown_credit vs _never_ready on the pool side.
         self._park_attempted: set[str] = set()
+        #: Slots whose hibernation attempt was DEFINITIVELY REFUSED (AccessDenied,
+        #: InvalidParameter, "not ready to hibernate yet"). Distinct from _park_attempted, which
+        #: also covers UNRESOLVED attempts: a refusal is a verdict that no image was captured, so
+        #: a later `stopped` -- an operator, an autoscaler, anything -- must not be adopted as a
+        #: parked warm slot. Cleared the moment an attempt is ACCEPTED.
+        self._park_refused: set[str] = set()
         # Slot ids this runtime has already reaped. Disposal runs on the pool's dedicated reaper
         # threads while is_ready / maintain_idle drive the park machine on the tick thread, so a
         # write that started before the reap can land after it and RESURRECT per-slot entries for a
@@ -2108,6 +2114,14 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                          or sid in self._park_since
                          or sid in self._park_unknown_since
                          or sid in self._park_attempted)
+            # ...but a slot AWS DEFINITIVELY REFUSED to hibernate has no captured image, so
+            # whatever stopped it, it was not us succeeding. Adopting it advertises capacity that
+            # cannot serve, and a claim then spends the whole resume budget starting an instance
+            # whose agent was never up. Evidence of an ATTEMPT is not evidence of a PARK.
+            if attempted and sid in self._park_refused:
+                _log.warning("ec2-hibernate: slot %s is 'stopped' but its hibernation was "
+                             "REFUSED -- not a parked warm slot", sid)
+                attempted = False
             if not attempted:
                 _log.warning("ec2-hibernate: slot %s is 'stopped' with no hibernation ever "
                              "attempted -- not a parked warm slot", sid)
@@ -2120,6 +2134,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             self._park_unknown_since.pop(sid, None)   # episode over; nothing to credit it to
             self._park_credit.pop(sid, None)
             self._park_attempted.discard(sid)
+            self._park_refused.discard(sid)
             return "parked", True
         if st == "stopping":
             # A hibernate is in flight -- possibly one whose response we lost, which is why the
@@ -2223,7 +2238,13 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             # and re-issuing it is harmless: the operation is idempotent by design, because an
             # accepted-but-lost response must be safe to repeat.
             try:
-                answered = self._try_park(slot) is not None
+                # KEEP THE THREE-WAY ANSWER. `_try_park(...) is not None` collapsed ACCEPTED and
+                # REFUSED into one "answered" bucket. That is right for the give-up clock -- a
+                # refusal IS a verdict and must spend the budget -- but wrong as evidence of
+                # parking: it set _park_since for a slot AWS had flatly refused to hibernate, and
+                # the `stopped` adoption reads _park_since as proof a warm image exists.
+                parked = self._try_park(slot)
+                answered = parked is not None
             except AwsNoVerdict:
                 # Freeze the give-up clock for as long as the stop API keeps not answering, and
                 # never START it on a non-answer: an unanswered stop is no evidence at all about
@@ -2248,6 +2269,11 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 # AWS is talking to us again.
                 self._thaw_park(sid, now)
                 self._park_since.setdefault(sid, now)
+                # The give-up clock runs either way (above); parking EVIDENCE does not.
+                if parked is False:
+                    self._park_refused.add(sid)
+                else:
+                    self._park_refused.discard(sid)
             return self._phase.get(sid, "warming"), False
         # pending / rebooting / anything else: still coming up.
         return phase, False
@@ -2518,6 +2544,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                   self._park_since, self._park_unknown_since, self._park_credit):
             d.pop(slot.slot_id, None)
         self._park_attempted.discard(slot.slot_id)
+        self._park_refused.discard(slot.slot_id)
 
     def sweep_orphans(self, *, max_age_s: float | None = None, now: float | None = None,
                       dry_run: bool = False) -> list[str]:
