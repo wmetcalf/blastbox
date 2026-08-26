@@ -70,6 +70,21 @@ class Slot:
     container_id: str | None = None
     spawned_at: float = 0.0
     jobs: int = 0            # cumulative jobs served (reuse mode: drives recycle/reprovision)
+    # Which warm-base ARTIFACT this slot was restored from, as SnapshotManager's build epoch --
+    # specifically SnapshotManager.pinned_epoch(slot_id), the epoch restore() ACTUALLY PINNED, not
+    # whatever was current when spawn started. Since #92 the artifact's epoch is the only ACK
+    # identity there is; there is no separate capability counter to stamp from.
+    #
+    # None is MEANINGFUL, and reads two ways: on the PLAIN FC tier there is no artifact lifecycle
+    # (every slot is a fresh boot), so one image and nothing to tell apart; on a SNAPSHOT tier it
+    # means UNIDENTIFIABLE -- it teaches nothing and answers capable_for() as UNKNOWN, which
+    # convicts nothing.
+    #
+    # Stamped here rather than read when a job builds its control: a base invalidation leaves
+    # old-artifact slots IDLE and claimable, so a control built at claim time would take the NEW
+    # epoch -- and that slot's ack would then re-teach the replacement base a capability only the
+    # retired image had. The property has to travel with the slot, not with the job.
+    ack_generation: "int | None" = None
 
 
 def _accepts_kwarg(fn: Any, name: str) -> bool:
@@ -83,7 +98,8 @@ def _accepts_kwarg(fn: Any, name: str) -> bool:
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
-def release_kwargs(fn: Any, *, dirty: bool, fault: str | None = None) -> dict[str, Any]:
+def release_kwargs(fn: Any, *, dirty: bool, fault: str | None = None,
+                   fault_stage: str | None = None) -> dict[str, Any]:
     """The subset of ``dirty``/``fault`` that this ``release`` callable actually accepts.
 
     Introspection ONLY, deliberately separate from the call. Every seam here used to degrade with
@@ -104,7 +120,7 @@ def release_kwargs(fn: Any, *, dirty: bool, fault: str | None = None) -> dict[st
     except (TypeError, ValueError):
         return {}
     if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return {"dirty": dirty, "fault": fault}
+        return {"dirty": dirty, "fault": fault, "fault_stage": fault_stage}
     out: dict[str, Any] = {}
     if "dirty" in params:
         out["dirty"] = dirty
@@ -112,6 +128,12 @@ def release_kwargs(fn: Any, *, dirty: bool, fault: str | None = None) -> dict[st
     # force-resets the slot, it just does not advance it toward eviction.
     if "fault" in params:
         out["fault"] = fault
+    # Same rule one step further: a pool that predates the stage attribution simply does not get
+    # it, and behaves exactly as before. Passing it blind would raise TypeError, which the ladder
+    # this function replaced used to swallow as a "compatibility fallback" -- releasing the same
+    # slot twice.
+    if "fault_stage" in params:
+        out["fault_stage"] = fault_stage
     return out
 
 
@@ -257,6 +279,7 @@ class WarmPool:
         max_evictions_per_window: int | None = None,
         eviction_window_s: float = 600.0,
         snapshot_rebuild_after: int | None = None,
+        pre_guest_rebuild_after: int = 3,
         base_rebuild_cooldown_s: float = 300.0,
     ) -> None:
         self._runtime = runtime
@@ -313,6 +336,18 @@ class WarmPool:
         # The previous form said "0 disables" in the comment while treating <=0 as "use the derived
         # default", so rebuilds were on by default and there was no way to turn them off at all
         # (upstream, PR #82). Same sentinel convention as max_evictions_per_window above.
+        # How many DISTINCT slots must fail before their guest ever executes before the base is
+        # judged poisoned. Deliberately tiny next to snapshot_rebuild_after (2 x warm_size, so 48
+        # at warm_size=24): that threshold is sized for failures that might be the DOCUMENTS, and
+        # has to be, since a run of malformed samples must not cost a healthy base. A slot that
+        # never reached its guest carries no such ambiguity -- three different slots restored from
+        # one base, none of which could execute anything, is the base. Waiting for 48 of those
+        # means 48 real jobs burning the full worker timeout apiece before the tier self-heals,
+        # which is how a warm tier silently degrades to cold-only for hours.
+        # 0 disables the fast path entirely (the default; see PoolConfig). Anything enabled is
+        # floored at 2 -- a threshold of 1 would rebuild the base on a single hung document.
+        _pg = int(pre_guest_rebuild_after)
+        self._pre_guest_rebuild_after = 0 if _pg <= 0 else max(2, _pg)
         self._rebuild_after_explicit = snapshot_rebuild_after is not None
         self._snapshot_rebuild_after = (
             max(4, 2 * max(1, warm_size)) if snapshot_rebuild_after is None
@@ -324,6 +359,11 @@ class WarmPool:
         # forever, and since blame_tier_for_slot no longer repairs on its own, nothing else would
         # ever fix it (upstream, PR #82).
         self._pool_consecutive_failures: dict[str, int] = {}
+        # base identity -> the DISTINCT slots that failed before their guest ever executed.
+        # Kept apart from the general failure streak because it is far stronger evidence: a slot
+        # whose guest never ran did not fail ON a document, it failed to become able to run one.
+        # Distinct slots, because one wedged worker is not a wedged base.
+        self._pool_pre_guest_failures: dict[str, set[str]] = {}
         self._base_rebuilds = 0
         # Rebuilding the base is a full sandbox BOOT (seconds), unlike a slot respawn which is a
         # cheap snapshot restore. Slot respawn churn is already bounded by the spawn token bucket;
@@ -399,6 +439,16 @@ class WarmPool:
         # Monotonic count of CLEAN releases. Read as an episode token so a rebuild decision can
         # be abandoned if a slot succeeded while it was being made.
         self._clean_release_count = 0
+        # Per-base clean releases. The pool-wide counter cannot arbitrate a cascade: a job
+        # completing on healthy tier A changed it while tier B's repair was being judged, so B's
+        # decision was abandoned as "the base just produced a valid result" -- about a base that
+        # produced nothing of the kind. B then had to sacrifice three more distinct jobs.
+        self._clean_release_by_base: dict[str, int] = {}
+        # WHICH base the last rebuild targeted. The cooldown's "a rebuild did not fix it, so the
+        # cause is elsewhere" reasoning is only sound about the SAME base; in a cascade the
+        # previous repair may have been a different tier entirely, and discarding this tier's
+        # evidence on that basis makes a still-poisoned tier earn a fresh threshold-sized batch.
+        self._last_base_rebuild_idents: set[str] = set()
         # Slots promoted to IDLE that have not yet completed a job. Their promotion cleared the
         # restore-failure streak provisionally; a confirmed death before first use revokes that.
         self._promoted_unproven: set[str] = set()
@@ -755,7 +805,8 @@ class WarmPool:
             return True
 
     def release(self, slot: Slot, *, dirty: bool = False,
-                fault: "str | None" = None) -> None:
+                fault: "str | None" = None,
+                fault_stage: "str | None" = None) -> None:
         """Finish a job on ``slot``.
 
         Default (no ``recycle`` on the runtime): ASSIGNED → DRAINING → reap (warm ≠ reuse); the
@@ -827,13 +878,34 @@ class WarmPool:
                 self._slot_failures.pop(hkey, None)
                 episode_recovered = True
                 self._pool_consecutive_failures.pop(_bident, None)
+                # One served job proves the base can execute, which is exactly what the
+                # pre-guest evidence claims it cannot -- but only for the base that SERVED it.
+                # The failure side is generation-guarded and this side was not: a long-running
+                # job from generation A, completing after A was invalidated, wiped evidence that
+                # replacement generation B had accumulated under the same identity, delaying the
+                # repair of a base which produced none of that success. Same guard, both sides.
+                _ok_stamp = self._slot_base.get(slot.slot_id)
+                if _ok_stamp is None or _ok_stamp[1] == self._base_generation.get(_ok_stamp[0], 0):
+                    self._pool_pre_guest_failures.pop(_bident, None)
                 slot_failures = 0
                 # ...and it proves the RESTORED BASE is responsive too, so it must clear the
                 # restore-side evidence as well. Leaving these meant restore deaths separated by
                 # a successfully validated engine run still counted as consecutive (PR #82).
                 self._spawn_consecutive_failures = 0
                 self._promoted_unproven.discard(slot.slot_id)
-                self._clean_release_count += 1
+                # GENERATION-GUARDED, like the evidence it arbitrates -- and BOTH counters, not
+                # just the per-base one. A long-running slot from a retired generation succeeding
+                # late still bumped the pool-wide counter, which is the fallback token for a
+                # single-base runtime and for an unattributed spawn episode: that unrelated
+                # success marked the CURRENT base's decision stale and cancelled a repair of a
+                # base which had produced no usable worker at all, while the evidence justifying
+                # it had already been consumed. Guarding one of the two only moved the hole.
+                _tok_stamp = self._slot_base.get(slot.slot_id)
+                if _tok_stamp is None or _tok_stamp[1] == self._base_generation.get(
+                        _tok_stamp[0], 0):
+                    self._clean_release_count += 1
+                    self._clean_release_by_base[_bident] = (
+                        self._clean_release_by_base.get(_bident, 0) + 1)
             elif dirty and fault == "worker":
                 # ONLY worker-attributed failures are evidence about the slot. Counting job faults
                 # here is what let two bad samples in a row destroy a warm worker with a hundred
@@ -854,6 +926,13 @@ class WarmPool:
                 if _stamp is None or _stamp[1] == self._base_generation.get(_stamp[0], 0):
                     self._pool_consecutive_failures[_bident] = (
                         self._pool_consecutive_failures.get(_bident, 0) + 1)
+                    # A worker fault whose guest NEVER EXECUTED is evidence about the base, not
+                    # about the sample: the slot did not fail on a document, it failed to become
+                    # able to run one. Same generation guard as above -- a slot restored from a
+                    # retired base must not convict the one now installed.
+                    if fault_stage == "pre_guest":
+                        self._pool_pre_guest_failures.setdefault(_bident, set()).add(
+                            slot.slot_id)
                 else:
                     logger.info(
                         "pool.failure_from_retired_generation slot_id=%s spawned_generation=%d "
@@ -868,10 +947,31 @@ class WarmPool:
                 self._slot_failures.pop(hkey, None)
                 self._slot_last_success[hkey] = self._clock()
                 self._pool_consecutive_failures.pop(_bident, None)
+                # One served job proves the base can execute, which is exactly what the
+                # pre-guest evidence claims it cannot -- but only for the base that SERVED it.
+                # The failure side is generation-guarded and this side was not: a long-running
+                # job from generation A, completing after A was invalidated, wiped evidence that
+                # replacement generation B had accumulated under the same identity, delaying the
+                # repair of a base which produced none of that success. Same guard, both sides.
+                _ok_stamp = self._slot_base.get(slot.slot_id)
+                if _ok_stamp is None or _ok_stamp[1] == self._base_generation.get(_ok_stamp[0], 0):
+                    self._pool_pre_guest_failures.pop(_bident, None)
                 episode_recovered = True
                 # Episode token: a rebuild decision taken before this point is abandoned, because
                 # the base demonstrably just produced a valid result.
-                self._clean_release_count += 1
+                # GENERATION-GUARDED, like the evidence it arbitrates -- and BOTH counters, not
+                # just the per-base one. A long-running slot from a retired generation succeeding
+                # late still bumped the pool-wide counter, which is the fallback token for a
+                # single-base runtime and for an unattributed spawn episode: that unrelated
+                # success marked the CURRENT base's decision stale and cancelled a repair of a
+                # base which had produced no usable worker at all, while the evidence justifying
+                # it had already been consumed. Guarding one of the two only moved the hole.
+                _tok_stamp = self._slot_base.get(slot.slot_id)
+                if _tok_stamp is None or _tok_stamp[1] == self._base_generation.get(
+                        _tok_stamp[0], 0):
+                    self._clean_release_count += 1
+                    self._clean_release_by_base[_bident] = (
+                        self._clean_release_by_base.get(_bident, 0) + 1)
                 # A served job is the only conclusive proof that the base yields a usable worker,
                 # so it — not promotion — is what clears the restore-failure streak.
                 self._spawn_consecutive_failures = 0
@@ -1427,12 +1527,13 @@ class WarmPool:
                 and not self._slot_last_success.get(self._health_key_by_slot.get(sid, sid))
             )
             pool_failures = max(self._pool_consecutive_failures.values(), default=0)
+            pre_guest = max((len(v) for v in self._pool_pre_guest_failures.values()), default=0)
             rebuilds = self._base_rebuilds
         if failing or pool_failures:
             logger.info(
                 "pool.health slots_failing=%d worst_consecutive=%d never_succeeded=%d "
-                "pool_consecutive_failures=%d base_rebuilds=%d",
-                failing, worst, never_ok, pool_failures, rebuilds,
+                "pool_consecutive_failures=%d pre_guest_failures=%d base_rebuilds=%d",
+                failing, worst, never_ok, pool_failures, pre_guest, rebuilds,
             )
         record_pool_state(
             spawning=counts[SlotState.SPAWNING],
@@ -2538,9 +2639,22 @@ class WarmPool:
         # invalidated the base and dropped a healthy warm snapshot after the pool had recovered
         # (upstream, PR #82). The SPAWN path passes its own counter explicitly, because consecutive
         # restore failures are a different signal from consecutive job failures.
+        _consumed_pre_guest: frozenset = frozenset()
         if self._snapshot_rebuild_after <= 0:
+            # --- D: the escape hatch must not leak. _maybe_rebuild_base returns here, so nothing
+            # ever consumes the evidence set; a continuously wedged tier producing no successes
+            # then added one slot id per failed job, for the life of the process. The previous
+            # integer counter could not grow. Drop it rather than accumulate a ledger nobody will
+            # ever read.
+            with self._lock:
+                self._pool_pre_guest_failures.clear()
             return False
         success_token: int | None = None
+        # The base identities the token is ABOUT. Empty means the token is pool-wide. Only a
+        # spawn episode can need this: it carries no episode_ident, yet the repair it triggers is
+        # narrowed by the cascade to the guilty tiers -- so the pool must ask its
+        # "did it already recover?" question about those tiers, not about the whole pool.
+        success_scope: tuple[str, ...] = ()
         # "" is the whole-runtime base: the SPAWN path passes its own counter and does not consume
         # a per-identity episode, so it has no identity of its own to restore on failure.
         episode_ident = ""
@@ -2555,17 +2669,44 @@ class WarmPool:
             with self._lock:
                 _worst = max(self._pool_consecutive_failures.items(),
                              key=lambda kv: kv[1], default=("", 0))
-                if _worst[1] < self._snapshot_rebuild_after:
+                # TWO thresholds, because there are two qualities of evidence. The ordinary
+                # streak counts worker faults that MIGHT be the documents, so it is sized to
+                # tolerate a run of bad samples (2 x warm_size). Slots that never reached their
+                # guest carry no such ambiguity, and demanding the same count of them means the
+                # tier eats ~48 real jobs -- each burning the full worker timeout -- before it
+                # repairs itself, which is exactly how a warm tier rots into a cold-only one.
+                _pre = max(self._pool_pre_guest_failures.items(),
+                           key=lambda kv: len(kv[1]), default=("", set()))
+                _pre_crossed = (self._pre_guest_rebuild_after > 0
+                                and len(_pre[1]) >= self._pre_guest_rebuild_after)
+                if _worst[1] < self._snapshot_rebuild_after and not _pre_crossed:
                     return False
+                # A CROSSED pre-guest episode outranks an ordinary streak, even one that has also
+                # crossed. Selecting the ordinary one meant a tier whose slots are PROVEN unable
+                # to execute waited behind a tier that merely accumulated failures -- and kept
+                # waiting, because every later decision made the same choice while the global
+                # cooldown ran. Proof beats a count.
+                if _pre_crossed:
+                    logger.error(
+                        "pool.base_rebuild_pre_guest base=%s slots=%d threshold=%d -- %d DISTINCT "
+                        "slots restored from this base failed before their guest ever executed; "
+                        "that is the base, not the samples",
+                        _pre[0] or "<default>", len(_pre[1]), self._pre_guest_rebuild_after,
+                        len(_pre[1]),
+                    )
+                    _worst = (_pre[0], len(_pre[1]))
                 # Consume ONLY the episode that crossed. Zeroing every base's counter let one
                 # tier's repair discard the evidence another tier was still accumulating.
                 episode_ident, pool_failures = _worst
                 self._pool_consecutive_failures.pop(episode_ident, None)
+                # Kept so a FAILED repair can hand it back; see _invalidate_now.
+                _consumed_pre_guest = frozenset(
+                    self._pool_pre_guest_failures.pop(episode_ident, set()))
                 # Token captured WITH the decision. Consuming the streak closed the read/decide
                 # gap, but drop() still runs outside the lock: a clean release landing in that
                 # window is proof the base just produced a valid result, and rebuilding it then
                 # is an unnecessary outage during recovery (upstream, PR #82).
-                success_token = self._clean_release_count
+                success_token = self._clean_release_by_base.get(episode_ident, 0)
         else:
             pool_failures = streak
             if pool_failures < self._snapshot_rebuild_after:
@@ -2574,8 +2715,41 @@ class WarmPool:
             # count earlier, so a concurrent clean release can land between then and here -- and
             # skipping the token meant that path invalidated a base which had just produced a
             # valid result, the very case the token was added to prevent (PR #82).
+            # SNAPSHOT FIRST, then ask the runtime. _spawn_success_scope() calls out to the
+            # cascade, which takes its own lock and can block; a clean release landing during
+            # that call would otherwise be INCLUDED in the token sampled afterwards. The token
+            # would then already contain the recovery, every later staleness check would compare
+            # equal, and the frozen tier would be invalidated despite having proved itself
+            # healthy inside the decision window -- with the successful worker already released
+            # and gone, so the usable-worker check downstream cannot see it either.
+            #
+            # Reading counters the scope has not selected yet is free: the scope only picks WHICH
+            # entries to total, and this snapshot fixes the moment they are read.
             with self._lock:
-                success_token = self._clean_release_count
+                _pre_by_base = dict(self._clean_release_by_base)
+                _pre_pool = self._clean_release_count
+            # OUTSIDE self._lock: this calls into the runtime, which takes its own lock, and
+            # self._lock is a plain Lock. Ordering the two the other way is a deadlock.
+            if reason == "spawn" and not episode_ident:
+                success_scope = self._spawn_success_scope()
+            with self._lock:
+                # Spawn episodes are unattributed (episode_ident == ""), and nothing is ever
+                # recorded under "" in the per-base ledger -- so this must read the pool-wide
+                # counter or the guard can never fire. See _base_succeeded_since.
+                #
+                # SCOPED when the runtime can say which tiers a spawn repair would hit. The
+                # pool-wide counter moves on ANY tier's clean release, so a healthy sibling
+                # absorbing the load looked like recovery of the poisoned tier and cancelled its
+                # (correctly targeted) repair -- after which the cooldown path zeroes the
+                # retained spawn streak, making the tier earn a whole fresh threshold-sized batch
+                # of failures before it is reconsidered.
+                # ...derived from the PRE-QUERY snapshot, so a release during the runtime call
+                # is a change the staleness checks can still see.
+                if success_scope:
+                    success_token = sum(_pre_by_base.get(i, 0) for i in success_scope)
+                else:
+                    success_token = (_pre_by_base.get(episode_ident, 0)
+                                     if episode_ident else _pre_pool)
         now = self._clock()
         with self._lock:
             last = self._last_base_rebuild_at
@@ -2593,11 +2767,40 @@ class WarmPool:
                 "likely NOT the warm base (check inputs/disk/dependencies)",
                 pool_failures, now - float(last or now), self._base_rebuild_cooldown_s,
             )
-            with self._lock:
-                if reason == "spawn":
-                    self._spawn_consecutive_failures = 0
+            if reason == "spawn":
+                # ONLY when the repair that opened this cooldown actually touched the tier this
+                # streak is about. The justification for discarding -- "if the base were the
+                # problem, the previous rebuild would have fixed it" -- is a statement about ONE
+                # base. In a cascade the cooldown is global, so tier B crossing its threshold
+                # while tier A's repair cools was having its evidence thrown away on the strength
+                # of a repair that never touched it; B then had to sacrifice another
+                # threshold-sized batch of spawns, and a busy cascade repairing siblings can
+                # postpone it indefinitely. success_scope names the tiers a spawn repair would
+                # target, so the overlap is now checkable.
+                with self._lock:
+                    _winner = set(self._last_base_rebuild_idents)
+                if not success_scope or (_winner & set(success_scope)):
+                    with self._lock:
+                        self._spawn_consecutive_failures = 0
                 else:
+                    logger.info(
+                        "pool.spawn_streak_retained cooling_repair=%s guilty=%s -- the repair "
+                        "that opened this cooldown did not touch the tier these spawn failures "
+                        "are about", sorted(_winner) or "<none>", list(success_scope))
+            elif episode_ident in self._last_base_rebuild_idents:
+                # THIS base was just rebuilt and is still failing, so the cause is elsewhere --
+                # the original reasoning, and it still holds. Drop the evidence.
+                with self._lock:
                     self._pool_consecutive_failures.pop(episode_ident, None)
+                    self._pool_pre_guest_failures.pop(episode_ident, None)
+            # A DIFFERENT base was repaired. This one was never touched, so its evidence is
+            # still valid and discarding it just delays its repair by a whole threshold -- unless
+            # THIS base completed a job in the meantime, which _restore_episode now checks under
+            # the same lock it restores in.
+            elif not self._restore_episode(episode_ident, pool_failures, _consumed_pre_guest,
+                                           reason, token=success_token, scope=success_scope):
+                logger.info("pool.base_rebuild_skipped reason=slot_succeeded_during_cooldown "
+                            "base=%s", episode_ident or "<default>")
             return False
         if reason == "spawn":
             with self._lock:
@@ -2632,8 +2835,9 @@ class WarmPool:
                 "rebuild it", pool_failures, type(self._runtime).__name__,
             )
             return False
-        with self._lock:
-            stale = success_token is not None and success_token != self._clean_release_count
+        # NOT under self._lock: the helper takes it, and this is a plain Lock, not an RLock --
+        # nesting them deadlocks the dispatcher outright.
+        stale = self._base_succeeded_since(episode_ident, success_token, success_scope)
         if stale:
             logger.info(
                 "pool.base_rebuild_skipped reason=slot_succeeded_during_decision — the base "
@@ -2660,21 +2864,159 @@ class WarmPool:
                     "pool.base_rebuild_skipped reason=another_repair_just_completed "
                     "reason_kind=%s", reason,
                 )
+                # Hand the episode back ONLY if the winner repaired a DIFFERENT base. Two
+                # crossings for the SAME base also race -- six assigned slots can fail while a
+                # slow invalidation runs -- and there the loser's evidence is all from the
+                # generation that was just replaced. Restoring it into the fresh base lets a
+                # single later failure rebuild something that was never given a chance to work.
+                if episode_ident in self._last_base_rebuild_idents:
+                    logger.info(
+                        "pool.base_rebuild_skipped reason=already_repaired_by_the_winner "
+                        "base=%s -- discarding evidence from the retired generation",
+                        episode_ident or "<default>")
+                # A slot from THIS base completing while we waited behind another tier's
+                # invalidation is conclusive: restoring the pre-recovery evidence would let a
+                # later failure invalidate a base which has since demonstrated it works. Checked
+                # inside the restore, under one lock.
+                elif not self._restore_episode(episode_ident, pool_failures, _consumed_pre_guest,
+                                               reason, token=success_token, scope=success_scope):
+                    logger.info(
+                        "pool.base_rebuild_skipped reason=slot_succeeded_during_lock_wait "
+                        "base=%s", episode_ident or "<default>")
+                return False
+            # RE-CHECK, under the lock, before acting. The pre-lock verdict is stale by however
+            # long we queued behind another repair -- and a holder whose repair FAILED leaves
+            # _last_base_rebuild_at untouched, so the cooldown branch above does not fire and
+            # nothing else re-examines recovery on the way past. A current-generation slot from
+            # this base completing during that wait means we would now rebuild a base that has
+            # just proved it works. The evidence is pre-recovery, so it is DISCARDED rather than
+            # restored, exactly as in the branch above.
+            if self._base_succeeded_since(episode_ident, success_token, success_scope):
+                logger.info(
+                    "pool.base_rebuild_skipped reason=slot_succeeded_during_lock_wait base=%s "
+                    "-- no competing repair committed, but this base recovered while we waited",
+                    episode_ident or "<default>")
                 return False
             return self._invalidate_now(drop, reason, pool_failures, success_token, now,
-                                        episode_ident)
+                                        episode_ident, _consumed_pre_guest, success_scope)
+
+    def _spawn_success_scope(self) -> "tuple[str, ...]":
+        """Which base identities a spawn-triggered repair would target, per the runtime.
+
+        Best effort and OPTIONAL: a runtime with one base (or no such seam) returns nothing and
+        the caller keeps the pool-wide counter, which for a single base is exactly right.
+        """
+        fn = getattr(self._runtime, "spawn_guilty_identities", None)
+        if not callable(fn):
+            return ()
+        try:
+            return tuple(sorted(str(x) for x in (fn() or ())))
+        except Exception:  # noqa: BLE001 - a broken seam must not stop a repair decision
+            logger.warning("pool.spawn_guilty_identities_failed -- falling back to the "
+                           "pool-wide success token", exc_info=True)
+            return ()
+
+    def _scoped_clean_releases(self, scope) -> int:  # noqa: ANN001
+        """Clean releases across ``scope``. CALLER MUST HOLD ``self._lock``.
+
+        A sum, because these counters only ever increase: any one of the scoped bases producing a
+        clean result moves it, and nothing else can.
+        """
+        return sum(self._clean_release_by_base.get(i, 0) for i in scope)
+
+    def _base_succeeded_since(self, episode_ident, token, scope=()) -> bool:  # noqa: ANN001
+        """Has this base produced a clean release since ``token`` was captured?
+
+        Spawn episodes carry no identity (``episode_ident`` is ""), and a cascade records clean
+        releases under a TIER name -- never under "" -- so a per-base token could not move for
+        them and the stale-decision guard was dead on that path: an in-flight slot from the guilty
+        tier could succeed and the pool would still invalidate its base. Those fall back to the
+        pool-wide counter, which does move.
+        """
+        with self._lock:
+            return self._succeeded_since_locked(episode_ident, token, scope)
+
+    def _succeeded_since_locked(self, episode_ident, token, scope=()) -> bool:  # noqa: ANN001
+        """The body of :meth:`_base_succeeded_since`. CALLER MUST HOLD ``self._lock``.
+
+        Split out so the check can share ONE critical section with the restore it guards -- see
+        _restore_episode. self._lock is a plain Lock, not an RLock, so a locked caller must never
+        route through the public wrapper.
+        """
+        if token is None:
+            return False
+        if scope:
+            # Only the tiers this repair would actually touch. A clean release from a healthy
+            # sibling says nothing about the base being repaired.
+            return self._scoped_clean_releases(scope) != token
+        if not episode_ident:
+            return self._clean_release_count != token
+        return self._clean_release_by_base.get(episode_ident, 0) != token
+
+    def _restore_episode(self, episode_ident, pool_failures, pre_guest_slots,
+                         reason, token=None, scope=()) -> bool:  # noqa: ANN001
+        """Give back evidence consumed for a decision that did NOT repair anything.
+
+        The streak is consumed to MAKE the decision, so every path that then declines to act has
+        to hand it back -- otherwise a still-poisoned base must earn a fresh threshold-sized batch
+        of failures before it is reconsidered, which is the cost this whole fast path exists to
+        avoid. Never restores below what has accumulated since.
+
+        ...unless the base RECOVERED in the meantime, which is checked HERE, under the same lock
+        acquisition as the restore itself. Callers used to ask _base_succeeded_since first and
+        restore second; a clean release landing between those two critical sections cleared the
+        live evidence and advanced the token, and the restore then resurrected the pre-recovery
+        failures anyway -- so one later fault could rebuild a base that had just proved it works.
+        A guard in a different critical section from the thing it guards is not a guard.
+
+        Returns True if evidence was handed back, False if it was discarded (recovered, or a
+        spawn episode, which its own caller retains).
+        """
+        if reason == "spawn":
+            # A spawn episode lives in _spawn_consecutive_failures and its own caller retains it;
+            # copying its count into the job counter let one later worker fault trigger an
+            # immediate job-driven rebuild, which in a cascade carries no tier attribution.
+            return False
+        with self._lock:
+            if self._succeeded_since_locked(episode_ident, token, scope):
+                return False
+            self._pool_consecutive_failures[episode_ident] = max(
+                self._pool_consecutive_failures.get(episode_ident, 0), pool_failures)
+            if pre_guest_slots:
+                self._pool_pre_guest_failures.setdefault(episode_ident, set()).update(
+                    pre_guest_slots)
+            return True
 
     def _invalidate_now(self, drop, reason, pool_failures, success_token, now,
-                        episode_ident):  # noqa: ANN001, ANN201
+                        episode_ident, pre_guest_slots=frozenset(),
+                        success_scope=()):  # noqa: ANN001, ANN201
         """Perform the invalidation. CALLER MUST HOLD ``self._invalidation_lock``."""
         try:
             # Pass the trigger through when the runtime accepts it: a cascade can only attribute a
             # SPAWN-driven repair to a tier. Introspection, not except-TypeError -- a TypeError
             # from inside drop() must never be mistaken for an older signature.
+            # `only`: the pre-guest fast path convicted ONE base identity, and a cascade can act
+            # on that instead of rebuilding every tier in the episode. Introspection, same as
+            # `reason` -- a TypeError from inside drop() must never be read as an old signature.
+            _kw: dict[str, Any] = {}
             if _accepts_kwarg(drop, "reason"):
-                repaired = drop(reason=reason)
-            else:
-                repaired = drop()
+                _kw["reason"] = reason
+            if reason == "spawn" and success_scope and _accepts_kwarg(drop, "only"):
+                # FREEZE the targets. Without this the cascade recomputed them from its LIVE
+                # guilty set at drop() time, so a tier that became guilty after this decision was
+                # taken got swept into a repair that never weighed it -- and because it was not in
+                # success_scope, the staleness checks could not notice that it had meanwhile
+                # produced a clean release. The result was a healthy sibling's base destroyed by
+                # another tier's episode, which is the fallback capacity a cascade exists to keep.
+                _kw["only"] = tuple(success_scope)
+            elif reason != "spawn" and episode_ident and _accepts_kwarg(drop, "only"):
+                # EVERY job-triggered repair, not only the pre-guest fast path. The ordinary
+                # streak is per-identity too, so the episode that crossed always belongs to one
+                # base -- and a cascade whose _job_guilty was cleared by an unrelated success on
+                # tier A would otherwise fall back to rebuilding EVERY tier, destroying A's base
+                # because B failed. Spawn repairs keep their own attribution and are excluded.
+                _kw["only"] = episode_ident
+            repaired = drop(**_kw)
         except Exception as exc:
             # A PARTIAL repair still replaced some artifacts. Retire their slots even though the
             # call failed overall, or those tiers' old slots keep reporting failures against a
@@ -2685,6 +3027,14 @@ class WarmPool:
                 with self._lock:
                     for _name in {str(n) for n in _repaired}:
                         self._base_generation[_name] = self._base_generation.get(_name, 0) + 1
+                        # ...and their evidence goes with them. The generation advances here, so
+                        # these tiers HAVE been replaced -- but the success-path cleanup never
+                        # runs on this branch, so below-threshold evidence recorded against the
+                        # old artifact survived into the new one: two failures from the retired
+                        # tier plus one from its replacement immediately convict the fresh base.
+                        self._pool_consecutive_failures.pop(_name, None)
+                        self._pool_pre_guest_failures.pop(_name, None)
+                    self._last_base_rebuild_idents |= {str(n) for n in _repaired}
             logger.exception("pool.base_rebuild_error pool_consecutive_failures=%d", pool_failures)
             # RESTORE the consumed episode. The streak was consumed to make the decision, but the
             # repair did not happen -- so making the poisoned base wait for another full
@@ -2696,16 +3046,48 @@ class WarmPool:
                 # already retained by its own caller -- copying its count into the job counter
                 # meant one later worker fault could trigger an immediate job-driven rebuild, and
                 # in a cascade that repair carries no tier attribution and hits every tier (PR #82).
-                with self._lock:
-                    self._pool_consecutive_failures[episode_ident] = max(
-                        self._pool_consecutive_failures.get(episode_ident, 0), pool_failures
-                    )
+                #
+                # ...unless the base RECOVERED while this slow repair was failing. The consumed
+                # pre-guest set is threshold-crossed by construction, so restoring it re-arms the
+                # fast path immediately: one later worker fault then rebuilds a base that has
+                # since executed a job end to end. A clean release is the strongest evidence the
+                # pool has, and it outranks the evidence collected before it.
+                if not self._restore_episode(episode_ident, pool_failures, pre_guest_slots,
+                                             reason, token=success_token, scope=success_scope):
+                    logger.info(
+                        "pool.base_rebuild_episode_discarded reason=slot_succeeded_during_repair "
+                        "base=%s -- the repair failed, but the base proved it works",
+                        episode_ident or "<default>")
             return False
         with self._lock:
             if reason == "spawn":
                 self._spawn_consecutive_failures = 0
             else:
                 self._pool_consecutive_failures.pop(episode_ident, None)
+            # RECORDED ON COMMIT, not when the decision was taken. Two cascade bases crossing
+            # concurrently both reached the pre-lock bump, so the second thread overwrote the
+            # identity while the first held the lock: the first then repaired A and started the
+            # cooldown, but the record said B -- and B's next failure took the "this base was just
+            # rebuilt and still fails" branch and discarded the evidence for a tier nothing had
+            # touched. Taken from what drop() actually repaired where it says so.
+            # ALL of them. One invalidation can repair several tiers -- ordinary failures may
+            # have blamed more than one -- and recording only the trigger left the others' streaks
+            # in place: a later failure then read them as a different, unrepaired base, restored
+            # evidence predating their rebuild, and invalidated a tier that had just been rebuilt.
+            _committed = ({str(n) for n in repaired}
+                          if isinstance(repaired, (list, tuple, set, frozenset)) and repaired
+                          else {episode_ident})
+            self._last_base_rebuild_idents = set(_committed)
+            for _done in _committed:
+                self._pool_consecutive_failures.pop(_done, None)
+            # Releases landing WHILE drop() ran rebuilt a set after this episode consumed the old
+            # one -- charging the retired base's failures to its replacement. With a threshold of
+            # 3, two such stragglers plus one genuine failure from the fresh base convict it, and
+            # with the cooldown disabled that is a back-to-back rebuild. The generation the commit
+            # installs starts with no inherited evidence.
+            for _name in ({str(n) for n in repaired} if isinstance(
+                    repaired, (list, tuple, set, frozenset)) else {episode_ident}):
+                self._pool_pre_guest_failures.pop(_name, None)
             # NB _base_rebuilds was already bumped before drop() (it is the in-flight fence).
             # The COMMITTED generation advances only here, on the success path: a drop() that
             # raised leaves the tier's artifact in place, and stamping its live slots as retired

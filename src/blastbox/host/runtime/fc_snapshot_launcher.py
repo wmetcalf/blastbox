@@ -16,6 +16,7 @@ the full snapshot→restore→convert round-trip works pixel-identically (see th
 """
 from __future__ import annotations
 
+import inspect
 import shutil
 import logging
 import os
@@ -146,6 +147,7 @@ class _Handle:
     def __init__(
         self, proc, api, vsock_uds: str, ready_check=None, mem_dir: Path | None = None,
         base_outdisk: Path | None = None, stranded: list[str] | None = None,
+        ack_generation: "int | None" = None,
     ) -> None:
         self.proc = proc
         self.api = api
@@ -162,6 +164,9 @@ class _Handle:
         # shared in, because SnapshotManager kills and abandons this handle after a failed
         # checkpoint -- anything recorded here alone would be discarded with it (PR #82).
         self._stranded_partials: list[str] = stranded if stranded is not None else []
+        # Stamped by the launcher before the spawn; read by SnapshotManager to confirm the
+        # deferred ACK advertisement once this build's artifact is PUBLISHED.
+        self.ack_generation: "int | None" = ack_generation
 
     def wait_ready(self, timeout_s: float) -> None:
         if self._ready_check is not None:
@@ -374,6 +379,33 @@ def _default_copy_outdisk(src: Path, dst: Path) -> None:
         shutil.copyfile(src, dst)
 
 
+def _ready_factory_kwargs(fn: Any, *, ack_generation: "int | None") -> "dict[str, Any]":
+    """``{"ack_generation": ...}`` if this factory accepts it, else ``{}``.
+
+    Introspection ONLY, deliberately separate from the call -- same reasoning as
+    ``pool.release_kwargs``. Wrapping the factory call in ``except TypeError`` instead cannot
+    tell "this factory predates the kwarg" from "the factory raised TypeError for a real
+    reason", and the fallback would silently rebind the READY listener a second time.
+
+    ``ready_check_factory`` is a public seam: test doubles and the CRaC launcher pass plain
+    one-argument callables, and they must keep working.
+    """
+    if ack_generation is None:
+        return {}
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):     # builtins / C callables expose no signature
+        return {}
+    params = sig.parameters.values()
+    if any(pm.kind is inspect.Parameter.VAR_KEYWORD for pm in params):
+        return {"ack_generation": ack_generation}
+    return {"ack_generation": ack_generation} if any(
+        pm.name == "ack_generation"
+        and pm.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        for pm in params
+    ) else {}
+
+
 class FcSnapshotLauncher:
     """Spawns ``firecracker --api-sock`` processes for snapshot build + restore.
 
@@ -392,7 +424,8 @@ class FcSnapshotLauncher:
         wait_socket: Callable[[Path], None] | None = None,
         make_outdisk: Callable[[Path], None] = _default_make_outdisk,
         copy_outdisk: Callable[[Path, Path], None] = _default_copy_outdisk,
-        ready_check_factory: Callable[[Path], Callable[[float], None]] | None = None,
+        ready_check_factory: Callable[..., Callable[[float], None]] | None = None,
+        ack_sampler: "Callable[[], int | None] | None" = None,
     ) -> None:
         self._cfg = cfg
         self._base_dir = Path(base_dir)
@@ -408,6 +441,12 @@ class FcSnapshotLauncher:
         self._make_outdisk = make_outdisk
         self._copy_outdisk = copy_outdisk
         self._ready_check_factory = ready_check_factory
+        # Reads SnapshotManager's BUILD EPOCH -- the identity of the artifact itself, which is
+        # the only ACK identity there is since #92 (there is no capability counter to point
+        # this at any more). Injected because the launcher is constructed before the manager;
+        # the manager binds it in SnapshotManager.__init__. boot_base calls it before spawning
+        # so the build is stamped with the epoch it actually started under.
+        self._ack_sampler = ack_sampler
 
     def _spawn(self, workdir: Path):
         workdir.mkdir(parents=True, exist_ok=True)
@@ -443,6 +482,12 @@ class FcSnapshotLauncher:
         # the retired-generation sweep: a retry is worthless if the condition it fixes is what
         # stops you reaching it (upstream, PR #82).
         _retry_stranded_partials(self._stranded_partials)
+        # BEFORE _spawn. The READY listener is bound after the spawn and the whole API boot
+        # sequence, so sampling the generation at bind time meant a base invalidation landing
+        # during those seconds stamped this RETIRING build with the REPLACEMENT's generation --
+        # and its advertisement then taught the new base a capability only the old image had.
+        # A replacement without the protocol is then convicted for its missing start markers.
+        ack_gen = self._ack_sampler() if self._ack_sampler is not None else None
         # A BUILD-UNIQUE base workdir, never the fixed base/. Two dispatchers sharing scratch_root
         # -- the rolling-deployment overlap this whole module is hardened for -- both booted from
         # base/outdisk.ext4 and both RECREATED it. If B remade that path after A booted but before
@@ -460,7 +505,10 @@ class FcSnapshotLauncher:
             for path, body in api_boot_sequence(self._cfg):
                 api.put(path, body)
             ready = (
-                self._ready_check_factory(workdir / REL_VSOCK)
+                self._ready_check_factory(
+                    workdir / REL_VSOCK,
+                    **_ready_factory_kwargs(self._ready_check_factory, ack_generation=ack_gen),
+                )
                 if self._ready_check_factory
                 else None
             )
@@ -496,6 +544,7 @@ class FcSnapshotLauncher:
             # after a failed checkpoint, so anything recorded on the handle itself is discarded
             # with it and the next build starts empty -- the retry could never fire (PR #82).
             stranded=self._stranded_partials,
+            ack_generation=ack_gen,
         )
 
     def sweep_orphan_generations(self) -> int:

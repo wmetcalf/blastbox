@@ -6,6 +6,8 @@ tiny local AF_UNIX server that plays firecracker's role.
 """
 from __future__ import annotations
 
+import json
+import struct
 import socket
 import threading
 
@@ -302,3 +304,92 @@ def test_fsync_output_dir_and_sync_run_even_if_a_file_fsync_raises(tmp_path, mon
 
     assert fsynced_dir["hit"], "directory fsync was skipped after a per-file fsync error"
     assert sync_called["hit"], "os.sync() global flush was not reached"
+
+
+# ---------------------------------------------------------------------------
+# Start-ack: the real guest, not a stand-in
+# ---------------------------------------------------------------------------
+
+
+def test_the_guest_acks_before_it_starts_work_when_asked(tmp_path):
+    """The host asks with `"ack": true`; the guest must answer BEFORE detonating.
+
+    That frame is the only thing separating "this slot never executed anything" (a wedged warm
+    base) from "it started and hung on this document" -- the phase timer records `guest` only
+    once the work COMPLETES, so both otherwise look like a timeout with no guest phase.
+    """
+    from blastbox.worker.fc_guest import WARM_ACK
+
+    host_end, guest_end = socket.socketpair()
+    src = tmp_path / "doc.bin"
+    src.write_bytes(b"payload")
+    host = VsockHostWarmControl(tmp_path / "vsock.sock", connect_fn=lambda: host_end)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    guest = VsockWarmControl(tmp_path / "in", outdir, listener=_FakeListener(guest_end))
+
+    host.signal_go(WarmJobSpec(input_path=src, output_dir=tmp_path / "ho", params={}))
+    guest.wait_for_go(timeout_s=5.0)          # the REAL guest: it should ack in here
+    guest.signal_done(status="ok")
+
+    assert host.wait_for_done(timeout_s=5.0) == "ok", "the status must still arrive after the ack"
+    assert host.guest_started is True, "the guest confirmed it had the job before starting"
+    assert WARM_ACK                            # the sentinel is shared, not duplicated
+
+
+def test_the_guest_stays_silent_when_the_host_does_not_ask(tmp_path):
+    """An OLDER host sends no `ack` key. A guest that volunteered the frame anyway would hand
+    that host something it would read as the status -- so the ack must be strictly on request."""
+    host_end, guest_end = socket.socketpair()
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    guest = VsockWarmControl(tmp_path / "in", outdir, listener=_FakeListener(guest_end))
+
+    # An old host's header: no "ack" key at all.
+    header = json.dumps({"filename": "doc.bin", "params": {}}).encode()
+    _send(host_end, header)
+    _send(host_end, b"payload")
+    guest.wait_for_go(timeout_s=5.0)
+    guest.signal_done(status="ok")
+
+    # The FIRST frame the old host reads must be the status, not an ack.
+    assert _recv(host_end) == b"ok"
+
+
+def _send(sock, payload: bytes) -> None:
+    sock.sendall(struct.pack(">Q", len(payload)) + payload)
+
+
+def _recv(sock) -> bytes:
+    (n,) = struct.unpack(">Q", _recv_n(sock, 8))
+    return _recv_n(sock, n)
+
+
+def _recv_n(sock, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("closed")
+        buf += chunk
+    return buf
+
+
+def test_a_guest_that_cannot_ack_refuses_the_job(tmp_path):
+    """Once ANY slot from an image has acked, the host initialises later controls to "not
+    started". So a swallowed ack-send failure means the guest detonates while the host records
+    guest_started=False -- and three such connection races on distinct slots would convict a base
+    whose guests all ran perfectly. If we cannot promise the host we started, we must not start.
+    """
+    host_end, guest_end = socket.socketpair()
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    guest = VsockWarmControl(tmp_path / "in", outdir, listener=_FakeListener(guest_end))
+
+    header = json.dumps({"filename": "doc.bin", "params": {}, "ack": True}).encode()
+    _send(host_end, header)
+    _send(host_end, b"payload")
+    host_end.close()                     # the ack send will fail
+
+    with pytest.raises(WarmTimeout, match="acknowledge"):
+        guest.wait_for_go(timeout_s=5.0)

@@ -66,6 +66,13 @@ class PoolConfig:
     max_consecutive_failures: int | None = None
     # 0 disables automatic base invalidation entirely; None derives 2*warm_size.
     snapshot_rebuild_after: int | None = None
+    # Distinct slots that must fail before their guest ever executes before the base is judged
+    # poisoned. Separate from snapshot_rebuild_after, which is sized to tolerate a run of bad
+    # DOCUMENTS. Default ON, because the signal is PROOF rather than inference: the guest sends a
+    # START frame the moment it has the job, so a document that hangs a healthy slot reports
+    # guest_started=True and is never attributed to the base, and a worker image too old to send
+    # one leaves the answer UNKNOWN, which also never convicts. 0 disables the fast path.
+    pre_guest_rebuild_after: int = 3
     # None derives max(2, warm_size).
     max_evictions_per_window: int | None = None
     # How long a slot may stay CONTINUOUSLY unknown before it can be replaced; 0 disables.
@@ -125,6 +132,8 @@ class PoolConfig:
                 "BLASTBOX_POOL_MAX_CONSECUTIVE_FAILURES", cls.max_consecutive_failures),
             "snapshot_rebuild_after": _opt_int(
                 "BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", cls.snapshot_rebuild_after),
+            "pre_guest_rebuild_after": _opt_int(
+                "BLASTBOX_POOL_PRE_GUEST_REBUILD_AFTER", cls.pre_guest_rebuild_after),
             "max_evictions_per_window": _opt_int(
                 "BLASTBOX_POOL_MAX_EVICTIONS_PER_WINDOW", cls.max_evictions_per_window),
             "unknown_grace_s": _opt_float(
@@ -304,6 +313,7 @@ def build_warm_pool(
         # unset knob must not be forwarded at all -- passing a copied literal is exactly how this
         # config drifted from the pool's own default once already.
         snapshot_rebuild_after=cfg.snapshot_rebuild_after,
+        pre_guest_rebuild_after=cfg.pre_guest_rebuild_after,
         max_evictions_per_window=cfg.max_evictions_per_window,
         **_configured_only(cfg),
     )

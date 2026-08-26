@@ -38,6 +38,7 @@ from blastbox.worker.fc_guest import (
     recv_frame,
     send_frame,
     signal_ready_vsock,
+    WARM_ACK,
 )
 from blastbox.worker.warm import WarmJobSpec, _RestoreAwareDeadline
 
@@ -151,6 +152,28 @@ class VsockWarmControl:
                 pass
             self._conn = None
             raise WarmTimeout(f"job header/input read failed: {exc}") from exc
+
+        # ACK BEFORE WORK. The host asked (`"ack": true`) and this is the only moment that
+        # distinguishes "the guest has the job" from "the guest never woke up" -- once detonation
+        # starts, a hang looks identical to a wedge from the outside. Sent only on request, so a
+        # guest running against an older host never emits a frame that host would read as status.
+        if header.get("ack"):
+            try:
+                send_frame(conn, WARM_ACK.encode("utf-8"))
+            except OSError as exc:
+                # NOT best-effort, and the comment that used to sit here was simply wrong: once
+                # ANY slot from this image has acked, the host initialises later controls to
+                # "not started", so a swallowed send failure means the guest detonates while the
+                # host records guest_started=False. Three such connection races on distinct slots
+                # would then convict a base whose guests all ran perfectly. If we cannot promise
+                # the host we started, we must not start.
+                _log.warning("fc_warm.ack send failed: %s — refusing the job", exc)
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                self._conn = None
+                raise WarmTimeout(f"could not acknowledge job start: {exc}") from exc
 
         self._input_dir.mkdir(parents=True, exist_ok=True)
         input_path = self._input_dir / _safe_name(header.get("filename", "input"))

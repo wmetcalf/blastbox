@@ -28,7 +28,7 @@ import time
 
 from blastbox.errors import is_host_resource_failure
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -705,7 +705,27 @@ class CascadingRuntime:
         # see (upstream, PR #82).
         return True
 
-    def invalidate_base(self, *, reason: str | None = None) -> "list[str]":
+    def spawn_guilty_identities(self) -> "list[str]":
+        """Identities of the tiers a SPAWN-triggered repair would target RIGHT NOW.
+
+        invalidate_base(reason="spawn") narrows to exactly this set, but the pool decides
+        *whether* to call it at all -- and its own spawn streak is a single pool-wide integer
+        with no tier attribution, so it was comparing "has ANY tier released cleanly?" against a
+        repair aimed at ONE tier. A healthy sibling absorbing the load then cancelled the guilty
+        tier's repair. The pool needs the same set this method selects to ask its question about
+        the right base.
+
+        An empty list means "no per-tier evidence": the caller must fall back to its pool-wide
+        view rather than read an empty scope as "nothing has succeeded".
+        """
+        with self._lock:
+            guilty = ({i for i, n in enumerate(self._tier_failures) if n > 0}
+                      | self._recently_guilty)
+        # _tier_identity reads only the immutable tier list, so it is safe outside the lock.
+        return sorted(self._tier_identity(i) for i in guilty)
+
+    def invalidate_base(self, *, reason: str | None = None,
+                        only: "str | Iterable[str] | None" = None) -> "list[str]":
         """Forward base invalidation to every wrapped tier that supports it.
 
         Every tier is attempted even if an earlier one fails -- one poisoned tier must not stop
@@ -714,6 +734,7 @@ class CascadingRuntime:
         untouched, so the next repair attempt was delayed for the whole cooldown and the tier
         kept failing (upstream, PR #82).
         """
+
         # Prefer the tiers that actually FAILED. The pool's global streak cannot attribute:
         # when one snapshot tier throws repeatedly while a later healthy tier is merely FULL, the
         # spawn still ends as CascadeSpawnFailed, and invalidating every wrapped base then
@@ -744,6 +765,23 @@ class CascadingRuntime:
             # started its cooldown (upstream, PR #82).
             with self._lock:
                 named = set(self._job_guilty)
+        if only:
+            # NAMED TARGET WINS. The pre-guest fast path convicts exactly ONE tier -- it counted
+            # distinct slots restored from that specific base -- but arrived with no way to say
+            # which, so it fell back to the episode-wide guilt set. An unrelated worker fault on
+            # healthy tier A followed by three pre-guest failures on B then rebuilt BOTH,
+            # removing the fallback capacity that is the entire point of a cascade.
+            # A SET, because a spawn repair now arrives with its targets frozen. Recomputing
+            # them here from the live guilty set meant a tier that became guilty AFTER the
+            # decision -- and then produced a clean release -- was invalidated by a decision that
+            # never examined it, and whose staleness check therefore could not see its success.
+            _wanted = {only} if isinstance(only, str) else {str(x) for x in only}
+            _named = {i for i in range(len(self.tiers)) if self._tier_identity(i) in _wanted}
+            if _named:
+                named = _named
+            else:
+                _log.warning("cascade.invalidate_base target %r matches no tier; "
+                             "falling back to the episode's guilt set", only)
         if named:
             targets = [t for i, t in enumerate(self.tiers) if i in named]
         elif reason == "spawn":
