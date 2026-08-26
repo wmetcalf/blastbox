@@ -1168,20 +1168,29 @@ def _claim_resumable_slot(pool: Any, timeout_s: float, *,
             # So the thaw gets its OWN budget, granted outside the claim window: the slot stays
             # ASSIGNED and the job waits. The claim window keeps bounding how long we SCAN for a
             # slot; it no longer bounds how long a worker is allowed to wake up.
+            # ...but a thaw may not START outside the window either. pool.claim BLOCKS to its own
+            # deadline and never returns early, so it can hand back a slot exactly as the scan
+            # window closes -- and the declared-budget branch then began a fresh resume_timeout_s
+            # (180s for ec2-hibernate) for a caller whose window was already gone. The
+            # no-declared-budget branch refused precisely that, so whether the guard applied
+            # depended on which TIER you were on rather than on the clock. Overrunning the window
+            # is the deliberate part; starting after it is not.
+            remaining_window = deadline - clock()
+            if remaining_window <= 0:
+                # Hand the slot back untouched rather than starting a resume we cannot afford --
+                # attempting one with no budget is how a never-probed healthy slot got destroyed
+                # (issue #77 round 5).
+                unclaim = getattr(pool, "unclaim", None)
+                if callable(unclaim):
+                    with contextlib.suppress(Exception):
+                        unclaim(slot)
+                break
             if thaw_budget_s is not None:
                 budget_for_resume = float(thaw_budget_s)
             else:
-                # No declared thaw budget (a tier with no resume seam, or a fast one): unchanged.
-                budget_for_resume = deadline - clock()
-                if budget_for_resume <= 0:
-                    # The window closed while we were probing. Hand the slot back untouched rather
-                    # than starting a resume we cannot afford -- attempting one with no budget is
-                    # how a never-probed healthy slot got destroyed (issue #77 round 5).
-                    unclaim = getattr(pool, "unclaim", None)
-                    if callable(unclaim):
-                        with contextlib.suppress(Exception):
-                            unclaim(slot)
-                    break
+                # No declared thaw budget (a tier with no resume seam, or a fast one): unchanged --
+                # whatever is left of the window, which the check above has proven is positive.
+                budget_for_resume = remaining_window
             try:
                 _resume_on_claim(pool, slot, budget_s=budget_for_resume)
                 return slot

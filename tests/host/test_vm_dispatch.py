@@ -1678,3 +1678,70 @@ def test_a_thaw_budget_longer_than_the_job_budget_is_still_granted(tmp_path):
         f"the tier's declared thaw was withheld ({granted!r}) -- which does not withhold a budget, "
         f"it substitutes the CLAIM REMAINDER and re-creates the #81 truncation."
     )
+
+
+class _SlowClaimPool(_RetryPool):
+    """A pool whose claim() consumes the window, as the real one does: WarmPool.claim BLOCKS
+    until its own deadline and never returns early."""
+
+    def __init__(self, slots, resume, clock_box, advance):  # noqa: ANN001
+        super().__init__(slots, resume)
+        self._t = clock_box
+        self._adv = advance
+
+    def claim(self, *, timeout_s):  # noqa: ANN001
+        self._t[0] += self._adv
+        return super().claim(timeout_s=timeout_s)
+
+
+def test_a_thaw_is_not_STARTED_after_the_scan_window_has_closed():
+    """A declared thaw budget may OVERRUN the claim window -- that is issue #81's fix -- but it
+    may not BEGIN outside it. claim() can hand back a slot exactly as the window closes, and the
+    declared-budget branch then started a fresh 180s resume for a caller whose scan window was
+    already gone. The no-declared-budget branch refused exactly that, so whether the guard applied
+    depended on which tier you were on rather than on the clock.
+    """
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.vm_dispatch import _claim_resumable_slot
+
+    a = SimpleNamespace(slot_id="A")
+    t = [0.0]
+    pool = _SlowClaimPool([a], lambda s: None, t, advance=5.0)   # eats the whole 5s window
+
+    got = _claim_resumable_slot(pool, 5.0, thaw_budget_s=180.0, clock=lambda: t[0])
+
+    assert got is None, "a slot was returned for a scan window that had already closed"
+    assert pool.resume_calls == [], (
+        f"a resume was started after the window closed: {pool.resume_calls}"
+    )
+    assert pool.assigned == set(), f"the slot was left ASSIGNED: {pool.assigned}"
+
+
+def test_a_thaw_begun_in_time_still_gets_its_whole_declared_budget(monkeypatch):
+    """The guard must not re-truncate the thaw. ec2-hibernate declares resume_timeout_s=180 while
+    warm_claim_timeout_s defaults to 60, so handing the resume what is LEFT of the window is the
+    configuration contradiction issue #81 removed -- a truncated window ending in silence was read
+    as a confirmed failure and the instance terminated."""
+    from types import SimpleNamespace
+
+    import blastbox.host.runtime.vm_dispatch as vd
+
+    seen: dict = {}
+
+    def _fake_resume(pool, slot, *, budget_s):  # noqa: ANN001
+        seen["budget"] = budget_s
+
+    monkeypatch.setattr(vd, "_resume_on_claim", _fake_resume)
+
+    a = SimpleNamespace(slot_id="A")
+    t = [0.0]
+    pool = _SlowClaimPool([a], lambda s: None, t, advance=1.0)   # 4s of window left
+
+    got = vd._claim_resumable_slot(pool, 5.0, thaw_budget_s=180.0, clock=lambda: t[0])
+
+    assert got is a
+    assert seen["budget"] == 180.0, (
+        f"the thaw was truncated to {seen['budget']}s of remaining window instead of its declared "
+        f"180s budget"
+    )
