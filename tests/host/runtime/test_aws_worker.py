@@ -4020,3 +4020,80 @@ def test_a_real_unsupported_instance_type_is_still_a_verdict():
         rt._service_available()
     assert not isinstance(ei.value, AwsNoVerdict), "a real refusal must stay a verdict"
     assert "does not support hibernation" in str(ei.value)
+
+
+def test_an_observation_only_freeze_is_not_parking_evidence():
+    """_park_unknown_since is opened by OBSERVATION-only freezes too -- an unreadable agent probe
+    while the public IP is still unassigned, an unreadable describe -- with park_attempted=False.
+    Those say nothing about whether we ever asked EC2 to hibernate, so counting them as evidence
+    let an instance stopped by an operator or boot automation be adopted as a parked warm slot
+    whose image was never captured."""
+    state, healthy = ["running"], [True]
+    t = [1000.0]
+    rt, fake = _hibernate_rt(state=state, healthy=healthy, clock=lambda: t[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    # An observation-only freeze: we could not read the agent, we never asked to hibernate.
+    rt._freeze_park("s", t[0])
+    assert "s" in rt._park_unknown_since
+    assert "s" not in rt._park_attempted, "precondition: no hibernation was attempted"
+
+    state[0] = "stopped"
+    t[0] += 60.0
+    assert rt.is_ready(slot) is not True, (
+        "an observation-only freeze was read as proof we parked the instance")
+
+
+def test_a_newer_attempt_supersedes_an_older_refusal():
+    """A transient 'not ready to hibernate yet' refusal must not outlive the attempt it described.
+    If a later stop is ACCEPTED but its response is lost, the stale refusal made the `stopped`
+    adoption reject a genuinely hibernated worker -- which then stays non-ready until the pool
+    times it out and reaps it."""
+    from blastbox.host.runtime.aws_worker import AwsNoVerdict
+
+    state, healthy = ["running"], [True]
+    t = [1000.0]
+    rt, _ = _hibernate_rt(state=state, healthy=healthy, clock=lambda: t[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    rt._try_park = lambda s: False                 # refused
+    rt.is_ready(slot)
+    assert "s" in rt._park_refused
+
+    def _lost(s):
+        raise AwsNoVerdict("stop accepted, response lost")
+
+    t[0] += 60.0
+    rt._try_park = _lost                           # a NEWER attempt, unresolved
+    rt.is_ready(slot)
+    assert "s" not in rt._park_refused, "the stale refusal outlived the attempt it described"
+
+    state[0] = "stopped"
+    t[0] += 60.0
+    assert rt.is_ready(slot) is True, "a genuinely hibernated worker was rejected"
+
+
+def test_a_throttled_retry_stays_unknown_while_the_park_is_unresolved():
+    """_try_park returns None when _hib_attempt is throttling (~5s), meaning 'not asked' -- not
+    'not ready'. Returning a definitive False closed WarmPool's warming-UNKNOWN episode, so
+    warming_timeout_s resumed aging: during a sustained stop-API brownout only ONE poll per retry
+    interval stayed UNKNOWN and the tier's WARMING slots timed out and were reaped anyway."""
+    from blastbox.host.runtime.aws_worker import AwsNoVerdict
+
+    state, healthy = ["running"], [True]
+    t = [1000.0]
+    rt, _ = _hibernate_rt(state=state, healthy=healthy, clock=lambda: t[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    def _no_verdict(s):
+        raise AwsNoVerdict("stop API silent")
+
+    rt._try_park = _no_verdict
+    assert rt.is_ready(slot) is None               # the failing pass is UNKNOWN
+    assert "s" in rt._park_unknown_since
+
+    # The very next poll, inside the retry throttle: "not asked".
+    rt._try_park = lambda s: None
+    t[0] += 1.0
+    assert rt.is_ready(slot) is None, (
+        "a throttled retry answered False, closing the pool's UNKNOWN episode")

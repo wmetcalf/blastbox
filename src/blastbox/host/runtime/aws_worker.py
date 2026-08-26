@@ -2122,8 +2122,14 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             attempted = (phase in ("hibernating", "parked")
                          or sid in self._hib_started
                          or sid in self._park_since
-                         or sid in self._park_unknown_since
                          or sid in self._park_attempted)
+            # _park_unknown_since is deliberately NOT in that list. It is opened by
+            # OBSERVATION-ONLY freezes too -- _agent_healthy() returning None while a public IP is
+            # still unassigned, an unreadable describe -- with park_attempted=False. Those say
+            # nothing about whether we ever asked EC2 to hibernate, so counting them let an
+            # instance stopped by an operator or boot automation be adopted as a parked warm slot
+            # whose image was never captured. A genuine unresolved ATTEMPT sets _park_attempted
+            # (see _freeze_park(park_attempted=True)) and is still covered.
             # ...but a slot AWS DEFINITIVELY REFUSED to hibernate has no captured image, so
             # whatever stopped it, it was not us succeeding. Adopting it advertises capacity that
             # cannot serve, and a claim then spends the whole resume budget starting an instance
@@ -2266,6 +2272,13 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 # freezing on THAT is the mirror bug: _park_since never starts, the give-up clock
                 # is frozen forever, the slot is republished every pass, and the instance runs and
                 # bills indefinitely. A refusal is a verdict; only silence is not.
+                # A NEWER attempt supersedes an older refusal. Without this, a transient "not
+                # ready to hibernate yet" refusal outlived the attempt it described: a later stop
+                # that was ACCEPTED but whose response was lost left the stale mark in place, and
+                # the `stopped` adoption then rejected a genuinely hibernated worker -- which stays
+                # non-ready until the pool times it out and reaps it. The marker has to describe
+                # the LATEST attempt, not any attempt.
+                self._park_refused.discard(sid)
                 self._freeze_park(sid, now, park_attempted=True)
                 # ready=None, NOT False. This return feeds is_ready, and a definitive False there
                 # tells the POOL something we do not know: _promote_warming ends the slot's
@@ -2284,6 +2297,15 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                     self._park_refused.add(sid)
                 else:
                     self._park_refused.discard(sid)
+            if sid in self._park_unknown_since:
+                # NOT ASKED, and an unresolved park episode is still open: _try_park returned None
+                # because _hib_attempt is throttling retries (~5s), not because we learned
+                # anything. Returning a definitive False here closes WarmPool's warming-UNKNOWN
+                # episode, so warming_timeout_s resumes aging -- and during a sustained stop-API
+                # brownout only ONE poll per retry interval stayed UNKNOWN, so the tier's WARMING
+                # slots timed out and were reaped anyway. The tri-state has to survive the
+                # THROTTLE as well as the call.
+                return self._phase.get(sid, "warming"), None
             return self._phase.get(sid, "warming"), False
         # pending / rebooting / anything else: still coming up.
         return phase, False
