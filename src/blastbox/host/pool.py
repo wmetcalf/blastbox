@@ -1295,14 +1295,6 @@ class WarmPool:
         wedged reaper can never leak a live worker past shutdown."""
         with self._lock:
             now = self._clock()
-            # RELEASE LAST TICK'S REQUEUES HERE, not at the end of a drain. _MAX_REAPERS is 4, so
-            # a batch runs up to four concurrent drains: the first worker to empty the queue used
-            # to merge _deferred_reap_next immediately, and a sibling still looping consumed it on
-            # the spot -- the whole retry budget spent inside ONE batch, against a control plane
-            # that is by hypothesis browning out. Merging on the TICK thread, before this batch is
-            # sized, makes a requeue cost a tick no matter how many workers run.
-            self._deferred_reap |= self._deferred_reap_next
-            self._deferred_reap_next.clear()
             self._reaper_threads = [e for e in self._reaper_threads if e[0].is_alive()]
             # Count only reapers that are still making progress. One wedged in a hung terminate is
             # abandoned (Python can't interrupt it) but must not hold a slot in the pool forever,
@@ -1319,9 +1311,26 @@ class WarmPool:
                     # _MAX_REAPER_THREADS (issue #77 round 3). It cannot be interrupted, but it can
                     # be told to stop after its current disposal.
                     entry[2] = True
+            # RELEASE THE HELD RETRIES only once no reaper is still draining. This is the third
+            # boundary tried for this and the first that is actually the right one:
+            #
+            #   loop   (32fe210)  requeue fed straight back into the same `while` -- one worker ate
+            #                     the whole budget in a tight loop.
+            #   batch  (4f8b630)  merged at end-of-drain -- a SIBLING in the same 4-way batch ate it.
+            #   tick   (4f8b630)  merged at tick start -- but poll_interval is 0.1s and a reaper
+            #                     blocked in a terminate lives for SECONDS, so ~10 merges a second
+            #                     landed straight into a batch that was still running.
+            #
+            # `live` below is exactly "reapers still making progress", which is the condition all
+            # three were reaching for. A permanently wedged reaper is retired from that count above,
+            # so this cannot deadlock: the release resumes once the batch is genuinely done.
+            #
             # Two bounds: _MAX_REAPERS caps CONCURRENT PROGRESS (wedged ones don't count, so a stuck
             # disposal can't halt the queue), and _MAX_REAPER_THREADS caps TOTAL live threads
             # (wedged ones DO count, so a permanently-hung runtime can't spawn threads forever).
+            if live == 0 and self._deferred_reap_next:
+                self._deferred_reap |= self._deferred_reap_next
+                self._deferred_reap_next.clear()
             headroom = min(self._MAX_REAPERS - live,
                            self._MAX_REAPER_THREADS - len(self._reaper_threads))
             want = min(len(self._deferred_reap), headroom)

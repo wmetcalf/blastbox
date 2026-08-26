@@ -4559,9 +4559,10 @@ def test_the_maintenance_reap_retry_is_bounded():
         pool._maintain_reap_tries[slot.slot_id] = 0
 
     for _ in range(pool._maintain_reap_max_tries + 2):
-        with pool._lock:                        # what _reap_deferred does on the tick thread
-            pool._deferred_reap |= pool._deferred_reap_next
-            pool._deferred_reap_next.clear()
+        with pool._lock:                        # what _reap_deferred does once the batch is idle
+            if not pool._reaper_threads:
+                pool._deferred_reap |= pool._deferred_reap_next
+                pool._deferred_reap_next.clear()
         pool._drain_deferred_reaps()
 
     with pool._lock:
@@ -4593,9 +4594,10 @@ def test_a_successful_maintenance_reap_clears_its_budget():
         pool._maintain_reap_tries[slot.slot_id] = 0
 
     pool._drain_deferred_reaps()      # fails -> held in _deferred_reap_next
-    with pool._lock:                  # the tick releases it
-        pool._deferred_reap |= pool._deferred_reap_next
-        pool._deferred_reap_next.clear()
+    with pool._lock:                  # released once no reaper is still draining
+        if not pool._reaper_threads:
+            pool._deferred_reap |= pool._deferred_reap_next
+            pool._deferred_reap_next.clear()
     pool._drain_deferred_reaps()      # succeeds
     with pool._lock:
         assert slot.slot_id not in pool._maintain_reap_tries, "budget not cleared on success"
@@ -4632,3 +4634,48 @@ def test_a_requeue_is_not_eaten_by_its_own_reaper_batch():
     with pool._lock:
         assert pool._maintain_reap_tries[slot.slot_id] == 1, (
             "the budget was spent twice inside one batch")
+
+
+def test_a_retry_is_held_while_any_reaper_is_still_draining():
+    """poll_interval is 0.1s and a reaper blocked in a terminate lives for SECONDS, so releasing at
+    tick start merged the held retries ~10 times a second straight into a batch that was still
+    running -- a sibling consumed them at once and the bounded budget was spent inside the same
+    outage. The release has to wait for the batch to be genuinely idle, not merely for a tick."""
+    class _RT:
+        def spawn(self): return _maint_slot()
+        def is_ready(self, s): return True
+        def reap(self, s, **kw): raise OSError("brownout")
+
+    pool = _maint_pool(_RT())
+    slot = _maint_slot()
+    with pool._lock:
+        pool._slots[slot.slot_id] = slot
+        slot.state = SlotState.DRAINING
+        pool._deferred_reap.add(slot.slot_id)
+        pool._maintain_reap_tries[slot.slot_id] = 0
+
+    pool._drain_deferred_reaps()                  # fails -> held
+    with pool._lock:
+        assert slot.slot_id in pool._deferred_reap_next
+
+    # A reaper from the batch is STILL RUNNING. Ticks keep firing (10/s in production).
+    class _StillDraining:
+        def is_alive(self): return True
+
+    with pool._lock:
+        pool._reaper_threads.append([_StillDraining(), pool._clock(), False])
+
+    for _ in range(10):                           # a second's worth of ticks
+        pool._reap_deferred()
+    with pool._lock:
+        assert slot.slot_id in pool._deferred_reap_next, (
+            "the retry was released into a batch that was still draining")
+        assert slot.slot_id not in pool._deferred_reap
+
+    # The batch finishes -> the retry becomes available again.
+    with pool._lock:
+        pool._reaper_threads.clear()
+    pool._reap_deferred()
+    with pool._lock:
+        assert slot.slot_id not in pool._deferred_reap_next, (
+            "an idle batch must release the held retry")
