@@ -4489,3 +4489,101 @@ def test_retire_without_a_fault_records_nothing() -> None:
     pool.retire(slot)
 
     assert rt.invalidated == 0
+
+
+_maint_ids = iter(f"m{i}" for i in range(1000))
+
+
+def _maint_slot():
+    return Slot(slot_id=next(_maint_ids), control_dir="/c", input_dir="/i", output_dir="/o",
+                state=SlotState.IDLE)
+
+
+def _maint_pool(rt, **kw):
+    return WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=4, spawn_rate_limit=1000.0, **kw)
+
+
+def test_a_maintenance_husk_whose_reap_fails_is_retried_not_stranded():
+    """retire() swallows its own reap error and returns normally, leaving the slot tracked and
+    DRAINING -- and a maintenance husk is NOT in _suspected_unknown, so the deferred reaper's undo
+    never applied to it. Nothing retried the disposal, so one correlated termination brownout
+    stranded every retired slot, each still counting against concurrent_ceiling, until the process
+    restarted."""
+    class _RT:
+        def __init__(self): self.reaps = 0
+        def spawn(self): return _maint_slot()
+        def is_ready(self, s): return True
+        def reap(self, s, **kw):
+            self.reaps += 1
+            raise OSError("terminate API brownout")
+
+    rt = _RT()
+    pool = _maint_pool(rt)
+    slot = _maint_slot()
+    with pool._lock:
+        pool._slots[slot.slot_id] = slot
+        slot.state = SlotState.DRAINING
+        pool._deferred_reap.add(slot.slot_id)
+        pool._maintain_reap_tries[slot.slot_id] = 0     # armed by the maintenance retire path
+
+    pool._drain_deferred_reaps()
+    with pool._lock:
+        assert slot.slot_id in pool._deferred_reap, "a maintenance husk was stranded, not requeued"
+        assert pool._maintain_reap_tries[slot.slot_id] == 1
+        assert pool._slots[slot.slot_id].state == SlotState.DRAINING, (
+            "an UNUSABLE slot must never be handed back as claimable")
+
+
+def test_the_maintenance_reap_retry_is_bounded():
+    """Unbounded retry is the hazard the quarantine rule exists to prevent: repeated disposal
+    failure may mean the resource is genuinely still alive. After the budget the slot stays
+    quarantined -- but loudly, not silently."""
+    class _RT:
+        def spawn(self): return _maint_slot()
+        def is_ready(self, s): return True
+        def reap(self, s, **kw): raise OSError("still failing")
+
+    pool = _maint_pool(_RT())
+    slot = _maint_slot()
+    with pool._lock:
+        pool._slots[slot.slot_id] = slot
+        slot.state = SlotState.DRAINING
+        pool._deferred_reap.add(slot.slot_id)
+        pool._maintain_reap_tries[slot.slot_id] = 0
+
+    for _ in range(pool._maintain_reap_max_tries + 2):
+        pool._drain_deferred_reaps()
+
+    with pool._lock:
+        assert slot.slot_id not in pool._deferred_reap, "retry must stop at the budget"
+        assert slot.slot_id not in pool._maintain_reap_tries, "the budget entry must be cleaned up"
+        assert pool._slots[slot.slot_id].state == SlotState.DRAINING
+
+
+def test_a_successful_maintenance_reap_clears_its_budget():
+    """Control: the common case -- a transient failure that heals -- must dispose and leave nothing
+    behind."""
+    class _RT:
+        def __init__(self): self.fail = True
+        def spawn(self): return _maint_slot()
+        def is_ready(self, s): return True
+        def reap(self, s, **kw):
+            if self.fail:
+                self.fail = False
+                raise OSError("transient")
+            return None
+
+    rt = _RT()
+    pool = _maint_pool(rt)
+    slot = _maint_slot()
+    with pool._lock:
+        pool._slots[slot.slot_id] = slot
+        slot.state = SlotState.DRAINING
+        pool._deferred_reap.add(slot.slot_id)
+        pool._maintain_reap_tries[slot.slot_id] = 0
+
+    pool._drain_deferred_reaps()      # fails -> requeued
+    pool._drain_deferred_reaps()      # succeeds
+    with pool._lock:
+        assert slot.slot_id not in pool._maintain_reap_tries, "budget not cleared on success"
+        assert slot.slot_id not in pool._deferred_reap

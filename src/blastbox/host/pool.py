@@ -521,6 +521,26 @@ class WarmPool:
         # Rotation cursor + per-slot cooldown for _maintain_idle (issue #80 follow-up).
         self._maintain_cursor: "str | None" = None
         self._maintain_last: dict[str, float] = {}
+        #: slot_id -> deferred-reap attempts already spent on a MAINTENANCE-retired husk.
+        #: Quarantine-on-failed-reap is the repo-wide rule ("never re-terminate a resource whose
+        #: disposal already failed") and it is right when we know nothing about the resource. But a
+        #: maintenance husk is not in _suspected_unknown, so NOTHING retried it: one correlated
+        #: termination brownout stranded every retired slot as tracked DRAINING, each still
+        #: counting against concurrent_ceiling, until the process restarted. A bounded retry keeps
+        #: the "do not hammer an unknown resource" property while letting the COMMON case -- a
+        #: transient control-plane failure, which is the premise of issue #79 -- heal itself.
+        self._maintain_reap_tries: dict[str, int] = {}
+        #: Husks requeued DURING a drain. _drain_deferred_reaps is a `while` that empties the
+        #: queue, so adding straight back to _deferred_reap made the SAME pass retry immediately --
+        #: the whole budget burned in a tight loop against a control plane that is, by hypothesis,
+        #: browning out. Held here and merged when the pass ends, so a retry costs one tick, which
+        #: is the spacing that makes it a retry rather than a hammer. (Caught by the test, not by
+        #: reading: the first implementation had exactly that bug.)
+        self._deferred_reap_next: set[str] = set()
+        #: Attempts a maintenance husk gets before we stop and say so LOUDLY. Not unbounded: if
+        #: disposal keeps failing the resource may genuinely still be alive, and re-terminating it
+        #: forever is the hazard the quarantine rule exists to prevent.
+        self._maintain_reap_max_tries: int = 3
         # Slots escalated on SUSPICION (a long UNKNOWN) rather than a confirmed verdict. Disposal is
         # asynchronous now, so this must outlive the tick that queued it -- the reaper needs to know
         # not to strand a slot it merely could not dispose of.
@@ -1355,8 +1375,16 @@ class WarmPool:
         while True:
             with self._lock:
                 if entry_box and entry_box[0][2]:
-                    return          # retired while wedged: a replacement owns the queue now
+                    # Retired while wedged: a replacement owns the queue now. Hand it anything
+                    # requeued during this pass rather than dropping it.
+                    self._deferred_reap |= self._deferred_reap_next
+                    self._deferred_reap_next.clear()
+                    return
                 if not self._deferred_reap:
+                    # Pass over. Release what THIS pass requeued, for the next tick to pick up --
+                    # see _deferred_reap_next for why it is not fed straight back in.
+                    self._deferred_reap |= self._deferred_reap_next
+                    self._deferred_reap_next.clear()
                     return
                 slot_id = next(iter(self._deferred_reap))
                 self._deferred_reap.discard(slot_id)
@@ -1370,10 +1398,32 @@ class WarmPool:
                 self._reap_and_count(slot, require_tracked=True, pop_on_success=True)
                 with self._lock:
                     self._suspected_unknown.discard(slot.slot_id)
+                    self._maintain_reap_tries.pop(slot.slot_id, None)
             except Exception:
                 logger.exception("pool.reap_deferred_error slot_id=%s — quarantining", slot.slot_id)
                 with self._lock:
-                    if slot.slot_id in self._suspected_unknown:
+                    _tries = self._maintain_reap_tries.get(slot.slot_id)
+                    if _tries is not None and _tries < self._maintain_reap_max_tries:
+                        # A MAINTENANCE husk still within budget: put it back on the queue.
+                        # Deliberately NOT restored to IDLE -- it was judged UNUSABLE, so it must
+                        # never be claimable again. It stays DRAINING and is retried as a husk.
+                        self._maintain_reap_tries[slot.slot_id] = _tries + 1
+                        self._deferred_reap_next.add(slot.slot_id)
+                        logger.warning(
+                            "pool.maintain_reap_retry slot_id=%s attempt=%d/%d -- disposal failed; "
+                            "requeued", slot.slot_id, _tries + 1, self._maintain_reap_max_tries)
+                    elif _tries is not None:
+                        # Budget spent. STOP -- repeated failure may mean the resource is genuinely
+                        # still alive, which is exactly what the quarantine rule protects against.
+                        # But say so at ERROR: a silently held slot is a pool running below
+                        # capacity for no visible reason, which is how this went unnoticed.
+                        self._maintain_reap_tries.pop(slot.slot_id, None)
+                        logger.error(
+                            "pool.maintain_reap_abandoned slot_id=%s after %d attempts -- the slot "
+                            "stays quarantined (DRAINING) and keeps counting against "
+                            "concurrent_ceiling; the resource may still exist and needs an "
+                            "operator", slot.slot_id, self._maintain_reap_max_tries)
+                    elif slot.slot_id in self._suspected_unknown:
                         # Only SUSPECTED, and we could not dispose of it either -- so we know
                         # nothing. Quarantining it as DRAINING is retried by nothing and keeps
                         # counting against the ceiling, which is worse than the wedge escalation
@@ -2597,6 +2647,7 @@ class WarmPool:
         # before being claimed, so without this a long-lived dispatcher accumulates one permanent
         # entry per completed job -- the same unbounded growth this method exists to prevent.
         self._maintain_last.pop(slot_id, None)
+        self._maintain_reap_tries.pop(slot_id, None)
         if self._maintain_cursor == slot_id:
             self._maintain_cursor = None
         self._never_ready.discard(slot_id)
@@ -3266,6 +3317,10 @@ class WarmPool:
                 cur = self._slots.get(slot_id)
                 if cur is not None and cur.state == SlotState.DRAINING:
                     self._deferred_reap.add(slot_id)
+                    # Arm the retry budget. Its PRESENCE is also what marks this husk as
+                    # maintenance-retired for _drain_deferred_reaps, which otherwise cannot tell it
+                    # from a suspected-unknown slot.
+                    self._maintain_reap_tries[slot_id] = 0
                     logger.warning(
                         "pool.maintain_idle_retire_unconfirmed slot_id=%s — terminate did not "
                         "confirm; queued for the deferred reaper", slot_id)
