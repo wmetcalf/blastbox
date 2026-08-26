@@ -687,6 +687,21 @@ class AwsDisposableRuntime:
             # briefly absent mid-`pip install -U awscli`). That says nothing whatsoever about the
             # worker, and it is maximally CORRELATED -- every slot and every thread hits it at once,
             # so collapsing it to "dead" wipes the tier (issue #77 marla-loop).
+            # ...but only RESOURCE exhaustion is undecided. A missing or non-executable binary
+            # (ENOENT/EACCES) is a permanent HOST MISCONFIGURATION, and _is_undecided_availability
+            # matches AwsNoVerdict across the MRO -- so returning the undecided flavour for it made
+            # the cascade defer the tier and re-probe it every admit interval forever, two aws-cli
+            # round trips a time, instead of reporting the fault. That contradicts the startup path,
+            # where "missing credentials is a VERDICT" and the tier is dropped. A binary that is not
+            # there will not be there on the next tick either: answer definitively so the operator
+            # sees it, and so the deferred-tier path drops it as confirmed unusable.
+            # isinstance alone is exact here: CPython maps ENOENT -> FileNotFoundError and
+            # EACCES/EPERM -> PermissionError at construction, while EMFILE and ENOMEM stay a bare
+            # OSError. An extra errno check beside it was unreachable, so it is not here.
+            if isinstance(exc, (FileNotFoundError, PermissionError)):
+                raise AwsWorkerError(
+                    f"aws {service} {op}: the AWS CLI is missing or not executable ({exc}) -- "
+                    f"this is a host configuration fault, not a transient one") from exc
             raise AwsNotExecuted(f"aws {service} {op}: cannot execute ({exc})") from exc
         except subprocess.TimeoutExpired as exc:
             # UNKNOWN in every scope (issue #77 round 2): a timeout means the control plane never

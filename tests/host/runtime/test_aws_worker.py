@@ -4322,3 +4322,40 @@ def test_a_stop_that_was_issued_and_went_unanswered_IS_still_an_attempt():
     rt.is_ready(slot)
 
     assert "s" in rt._park_attempted, "a genuine unresolved stop must stay recorded as an attempt"
+
+
+def test_a_missing_aws_binary_is_a_verdict_not_a_transient():
+    """_is_undecided_availability matches AwsNoVerdict across the MRO, so answering the undecided
+    flavour for a missing binary made the cascade defer the tier and re-probe it every admit
+    interval for the life of the process. A binary that is not there will not be there next tick;
+    the startup path already says "missing credentials is a VERDICT" and drops the tier."""
+    from blastbox.host.runtime.aws_worker import AwsUnknownState, AwsWorkerError
+    from blastbox.host.runtime.cascade import _is_undecided_availability
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True])
+
+    def _no_binary(argv):   # noqa: ANN001
+        raise FileNotFoundError(2, "No such file or directory: 'aws'")
+
+    fake.responses["ec2 describe-instances"] = _no_binary
+    with pytest.raises(AwsWorkerError) as ei:
+        rt._describe(AwsWorkerSlot(slot_id="s", resource_id="i-1"))
+    assert not isinstance(ei.value, AwsUnknownState), "a missing CLI must not read as UNKNOWN"
+    assert not _is_undecided_availability(ei.value), (
+        "the cascade would defer this tier and re-probe a missing binary forever"
+    )
+
+
+def test_a_fork_failure_from_resource_exhaustion_is_still_undecided():
+    """The half that must NOT become a verdict: EMFILE/ENOMEM are transient and maximally
+    correlated -- every slot and thread hits them at once, so a verdict there wipes the tier."""
+    from blastbox.host.runtime.aws_worker import AwsNotExecuted
+    from blastbox.host.runtime.cascade import _is_undecided_availability
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True])
+
+    def _emfile(argv):      # noqa: ANN001
+        raise OSError(24, "Too many open files")
+
+    fake.responses["ec2 describe-instances"] = _emfile
+    with pytest.raises(AwsNotExecuted) as ei:
+        rt._describe(AwsWorkerSlot(slot_id="s", resource_id="i-1"))
+    assert _is_undecided_availability(ei.value), "a fork failure must stay deferrable"
