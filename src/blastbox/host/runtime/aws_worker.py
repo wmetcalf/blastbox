@@ -959,7 +959,9 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
 
     def _service_available(self) -> bool:
         # entitlement probe: list-microvms returns cleanly iff the account is enabled for the service.
-        self._aws("lambda-microvms", "list-microvms")
+        # expect_output: this is a DOCUMENT query, so an empty rc=0 is no answer at all. Without it
+        # a blank response read as "entitled" and admitted the tier with no verdict behind it.
+        self._aws("lambda-microvms", "list-microvms", expect_output=True)
         return True
 
     def _launch(self) -> AwsWorkerSlot:
@@ -1542,7 +1544,9 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
         self.cfg: Ec2Config = cfg
 
     def _service_available(self) -> bool:
-        self._aws("ec2", "describe-instances", "--max-items", "1")
+        # expect_output: same reason as the Lambda probe -- a blank rc=0 answered nothing, and
+        # returning True on it admitted EC2 without a service verdict.
+        self._aws("ec2", "describe-instances", "--max-items", "1", expect_output=True)
         return True
 
     def _launch(self) -> AwsWorkerSlot:
@@ -1772,7 +1776,13 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # launch->warm->stop-fails->reap->respawn forever. Verify the instance type supports hibernation
         # and the root volume can hold the RAM image.
         super()._service_available()   # describe-instances probe
-        d = self._aws("ec2", "describe-instance-types", "--instance-types", self.cfg.instance_type)
+        # expect_output, and here it matters MOST: an empty rc=0 parsed to {}, so `its` was empty
+        # and the check below raised "does not support hibernation" -- a definitive VERDICT that
+        # permanently drops the tier (or blocks pool startup) on what was actually a blank answer.
+        # That is precisely the transient-read-as-dead class issue #79 exists to remove. As
+        # AwsNoVerdict (an AwsUnknownState) the cascade defers and re-probes instead.
+        d = self._aws("ec2", "describe-instance-types", "--instance-types", self.cfg.instance_type,
+                      expect_output=True)
         its = d.get("InstanceTypes", [])
         if not its or not its[0].get("HibernationSupported"):
             raise AwsWorkerError(

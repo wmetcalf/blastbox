@@ -3961,3 +3961,62 @@ def test_a_refusal_followed_by_an_acceptance_clears_the_mark():
     state[0] = "stopped"
     t[0] += 60.0
     assert rt.is_ready(slot) is True
+
+
+def test_an_empty_service_probe_is_no_verdict_not_availability():
+    """A DOCUMENT query that answers with nothing has not answered. Only sts get-caller-identity
+    opted into expect_output, so an empty rc=0 from the service probes parsed to {} and every
+    caller read it as a real answer:
+
+      * lambda list-microvms / ec2 describe-instances -> `return True`, so the tier was ADMITTED
+        with no service verdict behind it;
+      * ec2 describe-instance-types -> `its == []` -> "does not support hibernation", a definitive
+        verdict that permanently DROPS the hibernate tier (or blocks pool startup) on what was
+        actually a blank answer. That is the transient-read-as-dead class issue #79 removes.
+
+    AwsNoVerdict is an AwsUnknownState, so the cascade defers and re-probes instead."""
+    from blastbox.host.runtime.aws_worker import AwsNoVerdict
+
+    # Lambda entitlement probe
+    rt, _ = _snapstart_rt({**_IDENT, "lambda-microvms list-microvms": _cp(stdout="   ")})
+    with pytest.raises(AwsNoVerdict):
+        rt._service_available()
+
+    # ordinary EC2: the describe-instances probe is the FIRST thing the hibernate probe runs
+    # (via super()), so a blank there must surface as no-verdict rather than "available".
+    rt2, fake2 = _hibernate_rt(state=["running"], healthy=[True])
+    fake2.responses["ec2 describe-instances"] = _cp(stdout="")
+    with pytest.raises(AwsNoVerdict):
+        rt2._service_available()
+
+
+def test_an_empty_instance_type_probe_does_not_condemn_the_tier():
+    """The worst of the three: a blank describe-instance-types was read as 'this instance type
+    cannot hibernate', which is a VERDICT and drops the tier for the life of the process."""
+    from blastbox.host.runtime.aws_worker import AwsNoVerdict, AwsWorkerError
+
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True])
+    fake.responses["ec2 describe-instances"] = {"Reservations": []}
+    fake.responses["ec2 describe-instance-types"] = _cp(stdout="")
+
+    with pytest.raises(AwsNoVerdict) as ei:
+        rt._service_available()
+    assert not (isinstance(ei.value, AwsWorkerError)
+                and "does not support hibernation" in str(ei.value)), (
+        "a blank answer was condemned as an unsupported instance type")
+
+
+def test_a_real_unsupported_instance_type_is_still_a_verdict():
+    """Control: the definitive error must survive. A tier that genuinely cannot hibernate should
+    fail loud at pool build, not be deferred and re-probed forever."""
+    from blastbox.host.runtime.aws_worker import AwsNoVerdict, AwsWorkerError
+
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True])
+    fake.responses["ec2 describe-instances"] = {"Reservations": []}
+    fake.responses["ec2 describe-instance-types"] = {
+        "InstanceTypes": [{"HibernationSupported": False, "MemoryInfo": {"SizeInMiB": 512}}]}
+
+    with pytest.raises(AwsWorkerError) as ei:
+        rt._service_available()
+    assert not isinstance(ei.value, AwsNoVerdict), "a real refusal must stay a verdict"
+    assert "does not support hibernation" in str(ei.value)
