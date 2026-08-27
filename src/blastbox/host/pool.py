@@ -3509,69 +3509,36 @@ class WarmPool:
                 # out from under a running job. The window was widened by fault="worker" doing
                 # failure attribution before it takes the lock.
         if not usable:
-            # SHUTTING DOWN, or already taken: retire nothing. stop() disposes every tracked slot
-            # itself, so a retire here is a SECOND terminate on a resource stop() has already
-            # disposed of or quarantined after a failed disposal -- issued straight from the tick
-            # thread, bypassing both the deferred queue and the reaper threads, which is why
-            # guarding those two did not close it.
+            # HAND IT TO THE DEFERRED REAPER; do not dispose inline.
             #
-            # Decided UNDER THE LOCK, and on the slot's state rather than on the event alone. A
-            # bare `_stop_event.is_set()` here was check-then-act: stop() could begin immediately
-            # after it, reap the slot, leave it quarantined after a failed disposal and RETURN,
-            # all before this thread reached retire(). stop() flips every slot to DRAINING under
-            # this same lock before it reaps, so "is it still the ASSIGNED slot I reserved?" is
-            # the compare-and-swap that closes the window; the event check alone never could.
+            # Two rounds of guards here were both check-then-act, and the second one only READ the
+            # slot's state -- it took no ownership, so stop() could still flip, reap, fail, quarantine
+            # and return in the window between the check and retire(), and the maintenance thread then
+            # issued a SECOND terminate against a resource whose disposal had already failed. A read
+            # under a lock is not a compare-and-swap.
+            #
+            # The reaper path already solves every part of this, atomically and in one place: the
+            # chokepoint refuses to queue once shutdown has begun, _reap_and_count takes _reaping
+            # ownership under the lock so a concurrent stop() skips the slot rather than duplicating
+            # the terminate, and the retry budget bounds how many disposals a husk may cost. It also
+            # takes the control-plane call off the tick thread, which is where it never belonged.
+            #
+            # retire(fault=None) was only ever "reap and untrack" here -- the blame was already
+            # withheld, because a maintenance False is _PARK_GIVE_UP, i.e. CONTROL-PLANE evidence, and
+            # charging it to the worker would drive _maybe_rebuild_base and discard a healthy snapshot
+            # base on zero confirmed deaths. So there is nothing in retire() this path still needs.
             with self._lock:
                 cur = self._slots.get(slot_id)
-                _taken = (self._stop_event.is_set() or cur is None or cur is not cand
-                          or cur.state != SlotState.ASSIGNED)
-            if _taken:
-                logger.warning("pool.maintain_idle_retire_skipped_at_shutdown slot_id=%s", slot_id)
-                return
-        if not usable:
-            logger.warning("pool.maintain_idle_unusable slot_id=%s — retiring", slot_id)
-            try:
-                # fault=None, not "worker". A maintenance hook returning False says "unusable",
-                # not "the worker died": the only in-tree producer is Ec2HibernateRuntime, whose
-                # False is _PARK_GIVE_UP -- a stop/describe budget expiring, i.e. CONTROL-PLANE
-                # evidence, and its brownout credit is capped so a long enough outage always
-                # reaches it. fault="worker" charges _slot_failures, the per-base restore-failure
-                # streak and _blame_tiers, and the rotation reaches every IDLE slot in the tier, so
-                # one correlated outage could drive _maybe_rebuild_base and discard a healthy
-                # snapshot base on zero confirmed worker deaths. This is the same attribution the
-                # WARMING path filters out with `confirmed = [...]`; the maintenance path must not
-                # re-introduce it. The slot is still retired -- only the blame is withheld.
-                self.retire(cand, fault=None)
-            except Exception:
-                # Retirement itself RAISED. A slot stranded in ASSIGNED is capacity lost forever
-                # (_spawn_to_deficit counts it as active), so hand it back and let the ordinary
-                # health path judge it -- the same rule the hook-raised case follows above.
-                logger.exception(
-                    "pool.maintain_idle_retire_error slot_id=%s — handing the slot back", slot_id)
-                with self._lock:
-                    cur = self._slots.get(slot_id)
-                    if cur is cand and cur.state == SlotState.ASSIGNED:
-                        cur.state = SlotState.IDLE
-                        self._idle_event.set()
-            # ...but that except is NOT the common failure. retire() catches its own reap error,
-            # logs pool.retire_reap_error, and returns NORMALLY with the slot left tracked and
-            # DRAINING -- so the handler above never fires and nothing retries the disposal. A
-            # tracked DRAINING husk keeps counting against concurrent_ceiling, so during a
-            # correlated termination brownout every retired slot is stranded and its replacement
-            # never spawns, until the process restarts. Hand it to the deferred reaper, which is
-            # the machinery that already exists for "disposal failed, try again off the tick
-            # thread" (issue #75).
-            with self._lock:
-                cur = self._slots.get(slot_id)
-                if cur is not None and cur.state == SlotState.DRAINING:
-                    self._queue_deferred_reap_unlocked(slot_id, why="maintenance-husk")
-                    # Arm the retry budget. Its PRESENCE is also what marks this husk as
-                    # maintenance-retired for _drain_deferred_reaps, which otherwise cannot tell it
-                    # from a suspected-unknown slot.
+                if cur is not cand or cur.state != SlotState.ASSIGNED:
+                    # stop() or a claimant already took it, in the same critical section that would
+                    # have queued it. Nothing to do -- and nothing raced.
+                    logger.warning("pool.maintain_idle_retire_skipped slot_id=%s", slot_id)
+                    return
+                cur.state = SlotState.DRAINING          # unclaimable from here, in the SAME lock
+                if self._queue_deferred_reap_unlocked(slot_id, why="maintenance-husk"):
                     self._maintain_reap_tries[slot_id] = 0
-                    logger.warning(
-                        "pool.maintain_idle_retire_unconfirmed slot_id=%s — terminate did not "
-                        "confirm; queued for the deferred reaper", slot_id)
+                    logger.warning("pool.maintain_idle_unusable slot_id=%s -- queued for the deferred "
+                                   "reaper", slot_id)
 
     def _warming_unknown_credit_s(self, slot_id: str) -> float:
         """Warming time that was never an observation of the worker, so cannot be spent on it.

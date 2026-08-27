@@ -3621,57 +3621,39 @@ def test_maintenance_is_rate_limited_per_slot_not_run_on_every_tick() -> None:
 
 
 def test_an_unusable_slot_is_never_claimable_between_maintenance_and_retirement() -> None:
-    """issue #80 follow-up: the exclusive window must not end one instruction before the
-    destructive act.
+    """An unusable slot must never be handed to a claimant between the verdict and its disposal.
 
-    The first version republished the slot to IDLE and called ``_idle_event.set()`` -- actively
-    WAKING a blocked claimant -- and only then called ``retire()``. ``retire`` is not a CAS: it
-    overwrites whatever state it finds, ASSIGNED included. So a claimant could take the slot,
-    pass ``is_alive_for_claim``, start a job, and have the instance terminated under it.
+    The observation point has moved twice. It first watched runtime.base_identity(), which
+    retire(fault="worker") called -- and stopped calling once this site became fault=None, so the
+    recorder only ever saw the WARMING replacement. It then watched retire() entry. Maintenance no
+    longer calls retire() at all: it flips the slot to DRAINING and queues it for the deferred
+    reaper in ONE critical section, because two rounds of guards there were check-then-act.
 
-    Asserted as an INVARIANT on the slot's state rather than by racing a real claimant: `claim`
-    is only able to take a slot that is IDLE, so "never IDLE between the verdict and retirement"
-    is the property, and checking it directly is deterministic instead of timing-dependent.
-
-    MUTATION: restore the unconditional `cur.state = SlotState.IDLE` in the finally block -> the
-    observed state below is IDLE and this fails.
+    So the property is now stronger and simpler to state: after the pass, the slot is DRAINING --
+    never IDLE, never still ASSIGNED -- and its disposal is owned by the reaper.
     """
-    seen: list = []
+    acted_on: list = []
 
     class _UnusableRuntime(_FakeRuntime):
-        def maintain_idle(self, slot: Slot) -> bool:
-            return False        # terminal: hibernation stuck past its timeout
+        def maintain_idle(self, slot: Slot, *, budget_s=None) -> bool:    # noqa: ANN001
+            acted_on.append(slot.slot_id)   # the slot the PASS chose, not whichever _slots
+            return False                    # iterates first -- a replacement may already exist
 
     rt = _UnusableRuntime()
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
-
-    # Observe at retire() ENTRY -- the closing edge of the window. The hook has returned its
-    # unusable verdict by then, and the slot must still be un-claimable.
-    #
-    # This used to observe through runtime.base_identity(), on the reasoning that retire() calls
-    # it during failure attribution. retire() only does that under `fault == "worker"`, and this
-    # call site was later changed to fault=None (a park give-up is control-plane evidence, not a
-    # worker death) -- so the recorder stopped firing from retire entirely and only the SPAWN
-    # path reached it, sampling the WARMING replacement. Measured: seen == [WARMING], i.e.
-    # exactly the "passes for the wrong reason (it reads a WARMING slot)" case the old comment
-    # claimed to have excluded. The assertion held while pinning nothing.
-    _orig_retire = pool.retire
-
-    def _spy(slot: Slot, *, fault: "str | None" = None) -> None:
-        live = pool._slots.get(slot.slot_id)
-        seen.append(live.state if live else None)
-        return _orig_retire(slot, fault=fault)
-
-    pool.retire = _spy          # type: ignore[method-assign]
     pool.tick()
     pool.tick()
 
-    assert seen, "retire() never ran, so the window was never exercised"
-    assert seen[0] != SlotState.IDLE, (
-        f"slot was {seen[0]} -- claimable -- between the unusable verdict and retirement; a "
-        f"claimant taking it here has its instance terminated mid-job"
+    pool._maintain_idle()
+
+    assert len(acted_on) == 1, f"the maintenance pass ran {len(acted_on)} times, not once"
+    sid = acted_on[0]
+    state = pool._slots[sid].state
+    assert state is SlotState.DRAINING, (
+        f"slot was {state} after an unusable verdict; anything claimable here hands a caller a "
+        f"worker that is about to be terminated"
     )
-
+    assert sid in pool._deferred_reap, "the husk was left with nobody owning its disposal"
 
 def test_maintenance_rotates_so_every_idle_slot_is_eventually_reconciled() -> None:
     """issue #80: 'ONE slot per tick' has to mean a DIFFERENT slot per tick.
@@ -4517,10 +4499,15 @@ def test_maintenance_does_not_retire_a_slot_shutdown_already_took():
 
     pool._maintain_idle()
 
-    assert rt.terminates == 0, (
-        "maintenance retired a slot that shutdown had already taken -- a second terminate on a "
-        "resource whose disposal may have already failed"
+    # Disposal is no longer inline, so counting terminates proves nothing here -- both the guarded
+    # and unguarded versions score zero because the reaper has not run. What must not happen is the
+    # HAND-OFF: queuing a slot another owner already took is what produces the second terminate,
+    # one drain later.
+    assert sid not in pool._deferred_reap, (
+        "maintenance queued a slot that shutdown had already taken -- the reaper will issue a "
+        "second terminate against a resource whose disposal may have already failed"
     )
+    assert rt.terminates == 0
 
 
 def test_the_tick_gives_the_runtime_its_periodic_beat():

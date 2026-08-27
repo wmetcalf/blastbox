@@ -397,7 +397,9 @@ class CascadingRuntime:
         _admit_deferred() remains the SYNCHRONOUS primitive for callers that want to block.
         """
         with self._lock:
-            if self._admit_closing or self._admit_inflight or not self._deferred:
+            if self._admit_closing or self._admit_inflight:
+                return
+            if not self._deferred and not self._sweep_owed:
                 return
             if self._admit_thread is not None and self._admit_thread.is_alive():
                 return
@@ -439,6 +441,17 @@ class CascadingRuntime:
         owed to nobody: the tier is already appended and gone from _deferred, so reopen() has
         nothing to retry it from.
         """
+        self._admit_deferred_async()
+
+    def _run_owed_sweeps(self) -> None:
+        """Settle sweeps skipped because shutdown landed mid-publish. BACKGROUND ONLY.
+
+        An EC2 sweep is an uncached describe plus potentially several serial terminates, each able
+        to burn the full CLI timeout. Running them from poll() -- which the pool calls on its sole
+        tick thread -- blocked promotion, health checks, reaping and replacement spawning for the
+        duration, under a comment claiming it never blocks the tick. It was the same mistake the
+        admission probe itself was moved off that thread to fix, made in the fix for it.
+        """
         with self._lock:
             if self._admit_closing:
                 return
@@ -449,12 +462,12 @@ class CascadingRuntime:
                 continue
             try:
                 fn()
-            except Exception:  # noqa: BLE001 -- best-effort, and never blocks the tick
+            except Exception:  # noqa: BLE001 -- best-effort
                 _log.warning("cascade: deferred orphan sweep failed", exc_info=True)
-        self._admit_deferred_async()
 
     def _admit_probe_bg(self, pending: "list[DeferredTier]") -> None:
         try:
+            self._run_owed_sweeps()
             self._admit_probe(pending)
         except Exception:  # noqa: BLE001 -- must not die silently on a background thread
             _log.warning("cascade: deferred admission probe failed", exc_info=True)

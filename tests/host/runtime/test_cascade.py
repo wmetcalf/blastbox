@@ -1728,6 +1728,7 @@ def test_a_sweep_skipped_at_shutdown_is_owed_and_run_after_reopen(monkeypatch):
 
     rt.reopen()
     rt.poll()
+    _await_admission(rt)          # the sweep runs on the background worker, not the tick thread
     assert swept == ["aws-ec2"], (
         "the owed sweep never ran after restart, so a predecessor's parked instances keep "
         "accruing cost with the setting apparently enabled"
