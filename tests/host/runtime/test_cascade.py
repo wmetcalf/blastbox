@@ -948,12 +948,22 @@ def test_a_slow_deferred_probe_does_not_delay_a_spawn_the_primary_can_serve(monk
     assert [d.name for d in rt._deferred] == ["aws-ec2"]
     probes.clear()
 
+    import time
+
+    t0 = time.monotonic()
     for _ in range(4):                            # every one of these the PRIMARY can serve
         rt.spawn()
+    elapsed = time.monotonic() - t0
+    _await_admission(rt)
 
-    assert probes == [], (
-        f"{len(probes)} deferred availability probes ran while the primary tier still had "
-        f"capacity; each is a synchronous cloud call on the pool's only maintenance thread"
+    # The property is that the SPAWN is not delayed -- not that no probe ran. The probe used to be
+    # withheld until the primary was exhausted precisely because it was a synchronous cloud call on
+    # the pool's only maintenance thread; it runs off-thread now, so withholding it bought nothing
+    # and cost everything the deferred tier was waiting for (its ~60s re-probe cadence, and the
+    # post-admission orphan sweep, never ran at all while the primary kept up).
+    assert elapsed < 0.5, (
+        f"four spawns the primary could serve took {elapsed:.2f}s; a deferred availability probe "
+        f"is delaying the spawn path"
     )
 
 
@@ -994,17 +1004,17 @@ def test_a_recovered_tier_is_admitted_on_a_later_spawn(monkeypatch):
     # exhaustion -- rather than on the next spawn regardless.
     for _ in range(4):                # gvisor:4
         rt.spawn()
-    assert [t.name for t in rt.tiers] == ["gvisor"], "no probe while the primary can still serve"
-
-    # Exhaustion is what makes the probe worth paying for -- and THIS spawn still fails, because
-    # the probe now runs off the tick thread. That is the trade: the pool retries in ~0.1s and gets
-    # the tier then, instead of every pool activity freezing for as long as a browning-out control
-    # plane takes to answer. One tick of delay for no stall.
-    with pytest.raises(CascadeExhausted):
-        rt.spawn()
     _await_admission(rt)
-    assert [t.name for t in rt.tiers] == ["gvisor", "aws-ec2"], "the recovered tier must be admitted"
-    assert rt.spawn() is not None, "the tier must be usable on the next spawn"
+    # The probe is off-thread and rate-limited now, so it runs on every spawn rather than waiting
+    # for exhaustion -- withholding it meant a pool whose primary keeps up never probed at all.
+    assert [t.name for t in rt.tiers] == ["gvisor", "aws-ec2"], (
+        "the recovered tier should be admitted as soon as a probe answers, not only once the "
+        "primary is exhausted"
+    )
+
+    # ...and it is immediately usable: the primary is full at 4, so this spawn lands on the tier
+    # that just joined.
+    assert rt.spawn() is not None, "the recovered tier was admitted but cannot take a spawn"
     assert rt._deferred == []
     # Per-tier bookkeeping must grow with the tier list, or the next spawn indexes off the end.
     assert len(rt._counts) == len(rt.tiers)
@@ -1606,3 +1616,77 @@ def test_a_probe_that_finishes_after_close_does_not_publish_its_tier(monkeypatch
 
     assert [t.name for t in rt.tiers] == ["gvisor"], "a tier was published into a closed cascade"
     assert swept == [], "the orphan sweep ran during teardown"
+
+
+def test_a_tier_discarded_during_shutdown_stays_deferred(monkeypatch):
+    """`continue` dropped the entry from `still`, and the assignment at the end of the probe
+    rebuilds _deferred from `still` alone -- so a tier whose build finished after close() was
+    permanently DELETED. reopen() cannot recover an entry that no longer exists, so a restarted
+    pool silently lost its configured overflow capacity."""
+    from blastbox.host import pool_config
+    from blastbox.host.runtime.cascade import DeferredTier
+
+    built: list = []
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name",
+                        lambda name, **kw: FakeRuntime(name))
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
+
+    def _build_after_close():
+        rt.close()
+        built.append("a")
+        return FakeRuntime("aws-ec2")
+
+    def _second_build():
+        built.append("b")
+        return FakeRuntime("aws-lambda")
+
+    pending = [DeferredTier(name="aws-ec2", capacity=4, reason="x", build=_build_after_close, pos=1),
+               DeferredTier(name="aws-lambda", capacity=2, reason="x", build=_second_build, pos=2)]
+    rt._deferred = list(pending)
+    rt._admit_probe(pending)
+
+    assert [d.name for d in rt._deferred] == ["aws-ec2", "aws-lambda"], (
+        f"tiers were dropped instead of staying deferred: {[d.name for d in rt._deferred]}"
+    )
+    assert built == ["a"], (
+        "the pass kept building tiers after shutdown was already known -- control-plane calls we "
+        "knew we would discard"
+    )
+
+
+def test_the_post_admission_sweep_is_skipped_when_shutdown_lands_mid_publish(monkeypatch):
+    """The closing check happens under the lock BEFORE the append; the sweep runs after it and
+    outside the lock. Shutdown landing in that window still let a probe issue describe/terminate
+    calls after stop() had exhausted its deadline and proceeded. A latch has to be read at the
+    point of use, not only at the point of decision."""
+    from blastbox.host import pool_config
+    from blastbox.host.runtime.cascade import DeferredTier
+
+    swept: list = []
+
+    class _Sweeper(FakeRuntime):
+        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+            swept.append(self.name)
+            return []
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name",
+                        lambda name, **kw: FakeRuntime(name))
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
+
+    class _ClosesOnAppend(list):
+        """Shutdown lands in the window BETWEEN the publish and the out-of-lock sweep."""
+
+        def append(self, item):    # noqa: ANN001, ANN201
+            super().append(item)
+            # Set the latch the way close() does, but WITHOUT re-entering _lock: this runs
+            # while _admit_probe still HOLDS it and the lock is not reentrant, so calling
+            # close() here deadlocks. In production close() lands from another thread.
+            rt._admit_closing = True
+
+    rt.tiers = _ClosesOnAppend(rt.tiers)    # type: ignore[assignment]
+    rt._deferred = [DeferredTier(name="aws-ec2", capacity=4, reason="x",
+                                 build=lambda: _Sweeper("aws-ec2"), pos=1)]
+    rt._admit_probe(list(rt._deferred))
+
+    assert swept == [], "the orphan sweep ran after shutdown had already been latched"

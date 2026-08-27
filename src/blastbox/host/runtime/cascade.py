@@ -460,7 +460,7 @@ class CascadingRuntime:
         """The probe half of _admit_deferred, which owns the in-flight flag and the gate."""
         admitted_count = 0
         still: list[DeferredTier] = []
-        for d in pending:
+        for _i, d in enumerate(pending):
             try:
                 rt = d.build()
             except Exception as exc:  # noqa: BLE001 -- classified immediately below
@@ -501,12 +501,21 @@ class CascadingRuntime:
                     # has finished with, and the orphan sweep below would issue describe/terminate
                     # calls during teardown. Discard the runtime we just built instead -- closing
                     # it if it knows how -- rather than handing it to a pool that has stopped.
+                    #
+                    # KEEP IT DEFERRED, and stop the pass. `continue` dropped d from `still`, and
+                    # the assignment at the end of this method rebuilds _deferred from `still`
+                    # alone -- so the tier was permanently DELETED, and reopen() cannot recover an
+                    # entry that no longer exists: a restarted pool silently lost its configured
+                    # overflow capacity. Breaking also stops us starting the remaining builds,
+                    # which are control-plane calls we already know we will discard.
                     _log.info("cascade: discarding tier %r built during shutdown", d.name)
                     _c = getattr(rt, "close", None)
                     if callable(_c):
                         with contextlib.suppress(Exception):
                             _c()
-                    continue
+                    still.append(d)
+                    still.extend(pending[_i + 1:])
+                    break
                 self.tiers.append(Tier(name=d.name, runtime=rt, capacity=d.capacity))
                 self._admitted_deferred.add(d.pos)
                 admitted_count += 1
@@ -525,6 +534,17 @@ class CascadingRuntime:
             # must neither hold the cascade nor fail an admission that has already succeeded.
             # sweep_orphans is itself opt-in (a no-op unless orphan_max_age_s > 0), so this costs
             # nothing at all when the knob is off. Once per tier, because admission happens once.
+            # ...and recheck the latch HERE too. The check above happens under the lock before
+            # the append; this sweep runs after it and OUTSIDE the lock, so shutdown landing in
+            # that window still let a probe issue describe/terminate calls after stop() had
+            # exhausted its deadline and proceeded. A latch has to be read at the point of use,
+            # not only at the point of decision.
+            with self._lock:
+                _closing = self._admit_closing
+            if _closing:
+                _log.info("cascade: skipping the post-admission sweep for %r -- shutting down",
+                          d.name)
+                continue
             _sweep = getattr(rt, "sweep_orphans", None)
             if callable(_sweep):
                 try:
@@ -585,33 +605,16 @@ class CascadingRuntime:
         cascade's whole ordering. Now it is only probed once the admitted tiers cannot serve, which
         is exactly when a new one would help.
         """
-        try:
-            return self._spawn_from_admitted()
-        except (CascadeExhausted, CascadeSpawnFailed) as first:
-            with self._lock:
-                if not self._deferred:
-                    raise
-                before = len(self.tiers)
-            # Kick the probe OFF this thread and let the original verdict stand. Admission is
-            # never synchronous from here any more: the pool retries in ~0.1s and picks the tier
-            # up then, which costs one tick instead of freezing promotion, health checks, reaping
-            # and replacement spawning for as long as a browning-out control plane takes.
-            self._admit_deferred_async()
-            raise
-            # Retry ONLY the newly admitted tiers. Re-running the whole list would re-attempt the
-            # ones that just failed and charge their per-tier failure streaks a second time for a
-            # single spawn -- and those streaks drive base invalidation.
-            try:
-                return self._spawn_from_admitted(start=before)
-            except CascadeExhausted:
-                # The retry ATTEMPTED nothing (the new tier is at capacity or still building its
-                # base), so it has no verdict of its own and raises the capacity type. Re-raising
-                # that would DOWNGRADE a CascadeSpawnFailed: CascadeExhausted is a
-                # RuntimeAtCapacity, which the pool treats as backpressure -- no failure streak, no
-                # _maybe_rebuild_base -- so a corrupt base would read as "we are busy" and never be
-                # repaired, on the very tick where the evidence was strongest. The first verdict is
-                # the real one, and it keeps its original cause.
-                raise first from first.__cause__
+        # Probe FIRST, on every spawn, and do not wait for the primary to be exhausted. The
+        # laziness this replaces was justified by the probe being a SYNCHRONOUS cloud call that
+        # "must never delay a spawn a healthy PRIMARY can serve" -- and it is not synchronous any
+        # more. Keeping the trigger behind exhaustion meant a pool whose primary keeps satisfying
+        # its warm target never probed at all: the deferred tier stayed deferred for the life of
+        # the process, its documented ~60s re-probe cadence never ran, and the post-admission
+        # orphan sweep never happened, so a predecessor's parked instances accrued cost forever.
+        # It is rate-limited and off-thread; calling it here costs nothing.
+        self._admit_deferred_async()
+        return self._spawn_from_admitted()
 
     def _spawn_from_admitted(self, start: int = 0) -> Any:
         last_exc: Exception | None = None
