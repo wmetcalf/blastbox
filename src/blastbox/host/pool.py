@@ -665,6 +665,19 @@ class WarmPool:
         # caller's timeout stops meaning what it says.
         stop_deadline = self._clock() + stop_timeout_s
         self._stop_event.set()
+        # LATCH the runtime's background work HERE, not at close() below. close() both latches and
+        # joins, and it runs only after the tick and reaper joins have already spent the shared
+        # allowance -- so a cascade admission worker kept starting deferred builds and owed sweeps
+        # throughout those waits, and by the time close() was reached `_remaining` could be 0, which
+        # latches without being able to join. stop() then returned with that daemon still inside a
+        # control-plane call. Latching costs nothing and stops new work immediately; the JOIN stays
+        # below, on whatever budget is genuinely left.
+        _begin = getattr(self._runtime, "begin_close", None)
+        if callable(_begin):
+            try:
+                _begin()
+            except Exception:  # noqa: BLE001 -- a latch failure must not block shutdown
+                logger.warning("pool.runtime_begin_close_failed", exc_info=True)
         if self._thread is not None:
             # Fast path returns immediately when the daemon has already exited (no spawn in flight).
             self._thread.join(timeout=min(10.0, stop_timeout_s))
@@ -3623,15 +3636,32 @@ class WarmPool:
             # its documented destruction point keeps blocking its own replacement for another ~300s.
             # is_alive() cannot carry this: the health check only probes IDLE slots.
             _terminal = getattr(self._runtime, "is_warming_terminal", None)
-            stuck_warming = [
+            _over_budget = [
                 s for s in self._slots.values()
                 if s.state == SlotState.WARMING
-                and ((self._warming_timeout_s > 0
-                      and (now - s.spawned_at
-                           - self._warming_unknown_credit_s(s.slot_id)) > self._warming_timeout_s
-                      and not self._warming_unknown_unexpired(s.slot_id, now))
-                     or (callable(_terminal) and self._runtime_says_terminal(_terminal, s)))
+                and self._warming_timeout_s > 0
+                and (now - s.spawned_at
+                     - self._warming_unknown_credit_s(s.slot_id)) > self._warming_timeout_s
+                and not self._warming_unknown_unexpired(s.slot_id, now)
             ]
+            # Retired because the RUNTIME gave up, not because the pool's budget ran out. Tracked
+            # separately because the two carry different evidence: the pool's timeout is an
+            # observation about a slot that never became usable, while a park give-up is
+            # CONTROL-PLANE evidence. The guide states that distinction as a promise -- a give-up
+            # has "no worker-fault attribution ... deliberately does NOT charge the tier's failure
+            # streak and never triggers base repair" -- and folding these into one list broke it:
+            # a correlated stop-API brownout would have blamed the tier for every slot at once and
+            # could discard a healthy base on zero confirmed deaths.
+            _terminal_ids = set()
+            if callable(_terminal):
+                _terminal_ids = {
+                    s.slot_id for s in self._slots.values()
+                    if s.state == SlotState.WARMING
+                    and s not in _over_budget
+                    and self._runtime_says_terminal(_terminal, s)
+                }
+            stuck_warming = _over_budget + [
+                s for s in self._slots.values() if s.slot_id in _terminal_ids]
             # Which of those timed out on SILENCE rather than on an answer. `_warming_unknown_since`
             # holds an entry only while the last observation was UNKNOWN (any definitive answer,
             # either way, pops it in _promote_warming), so membership here IS the discriminator.
@@ -3699,7 +3729,9 @@ class WarmPool:
             # never answered is not evidence about the worker -- charging it means one brownout
             # can invalidate a good base on zero confirmed deaths. Same rule the warming timeout
             # itself follows: only spend it on an observation.
-            confirmed = [s for s in evicting if s.slot_id not in warming_unknown_expired]
+            confirmed = [s for s in evicting
+                         if s.slot_id not in warming_unknown_expired
+                         and s.slot_id not in _terminal_ids]
             self._blame_tiers([s.slot_id for s in confirmed])
             with self._lock:
                 self._spawn_consecutive_failures += len(confirmed)

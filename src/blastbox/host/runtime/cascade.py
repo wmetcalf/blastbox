@@ -519,6 +519,20 @@ class CascadingRuntime:
         with self._lock:
             self._admit_closing = False
 
+    def begin_close(self) -> None:
+        """Latch WITHOUT joining, so shutdown can stop new admission work immediately.
+
+        `close()` does both, and the pool can only call it after the tick and reaper joins have
+        already spent the shared shutdown allowance -- which left this worker free to start fresh
+        deferred builds and owed sweeps throughout those waits, and then left close() with a zero
+        remaining budget to join what it had just latched. Separating the two lets stop() stop the
+        bleeding at t=0 and still join on whatever budget genuinely remains.
+
+        Idempotent, and safe to call without a matching close(): reopen() clears the latch.
+        """
+        with self._lock:
+            self._admit_closing = True
+
     def close(self, *, timeout_s: "float | None" = None) -> None:
         """Stop starting admission probes and join one already in flight.
 

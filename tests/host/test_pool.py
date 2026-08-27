@@ -4693,3 +4693,80 @@ def test_a_raising_or_unknown_terminal_hook_never_destroys_a_warming_slot() -> N
         assert cur is not None and cur.state is SlotState.WARMING, (
             f"a {mode} terminal hook destroyed a healthy WARMING slot; an absent answer is not "
             f"evidence, and during a correlated brownout every slot answers this way at once")
+
+
+def test_a_park_give_up_is_not_charged_to_the_restore_failure_streak() -> None:
+    """The guide states this as a promise, and folding the two eviction reasons into one list broke it.
+
+    `hibernate_timeout_s` is documented as carrying "**no worker-fault attribution** — a park
+    give-up is control-plane evidence, so it deliberately does NOT charge the tier's failure streak
+    and never triggers base repair". Retiring terminal WARMING slots through the same list as the
+    pool's own warming timeout made every one of them a CONFIRMED restore failure: `_blame_tiers`,
+    `_spawn_consecutive_failures`, and from there `_maybe_rebuild_base`, which can discard a healthy
+    snapshot. The cause is correlated, so a stop-API brownout hits every slot in the tier at once --
+    a good base invalidated on zero confirmed deaths.
+
+    Same rule the warming timeout itself already follows for its unknown-expired slots: only spend
+    the streak on an observation.
+
+    MUTATION: drop `_terminal_ids` from the `confirmed` filter -> the streak advances and this fails.
+    """
+    class _GivesUp(_FakeRuntime):
+        def is_ready(self, slot: Slot) -> "bool | None":
+            return False
+
+        def is_warming_terminal(self, slot: Slot) -> bool:
+            return True
+
+    pool = WarmPool(runtime=_GivesUp(), warm_size=2, spawn_rate_limit=100.0,
+                    warming_timeout_s=600.0)
+    pool._spawn_to_deficit(ready=True)
+    for s in pool._slots.values():
+        s.state = SlotState.WARMING
+    before = pool._spawn_consecutive_failures
+
+    pool._health_check()
+
+    assert pool._spawn_consecutive_failures == before, (
+        f"a park give-up advanced the restore-failure streak "
+        f"({before} -> {pool._spawn_consecutive_failures}); the guide promises it does not, and "
+        f"the streak drives base invalidation on a correlated control-plane fault")
+    # ...but the slots ARE still retired: excluding them from the streak must not keep them alive.
+    assert all(s.state is SlotState.DRAINING for s in pool._slots.values()) or not pool._slots, (
+        "the terminal slots were not retired at all")
+
+
+def test_shutdown_latches_runtime_background_work_before_spending_the_join_budget() -> None:
+    """`close()` latches AND joins, and it only runs after the joins have eaten the allowance.
+
+    So a cascade admission worker kept starting deferred builds and owed sweeps through the tick
+    and reaper joins, and by the time close() was reached the remaining budget could be zero --
+    latching something it no longer had time to join. stop() then returned with that daemon still
+    inside a control-plane call, which is the shape this branch has been eliminating everywhere
+    else.
+
+    MUTATION: delete the begin_close() call from stop() -> the latch is not set until close(), and
+    the ordering assert fails.
+    """
+    order: list[str] = []
+
+    class _LatchRecordingRuntime(_FakeRuntime):
+        def begin_close(self) -> None:
+            order.append("latched")
+
+        def close(self, *, timeout_s: "float | None" = None) -> None:
+            order.append("closed")
+
+        def reap(self, slot: Slot) -> None:
+            order.append("reap")
+
+    pool = WarmPool(runtime=_LatchRecordingRuntime(), warm_size=1, spawn_rate_limit=100.0)
+    pool.start()
+    pool.stop(stop_timeout_s=2.0)
+
+    assert "latched" in order, (
+        "stop() never latched the runtime's background work, so an admission worker keeps issuing "
+        "control-plane calls for the whole shutdown")
+    assert order.index("latched") < order.index("closed"), (
+        f"the latch ran no earlier than close() ({order}); the point is to stop new work BEFORE "
+        f"the joins consume the shared budget, not after")

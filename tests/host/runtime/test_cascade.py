@@ -1988,3 +1988,53 @@ def test_the_terminal_warming_hook_reaches_the_owning_tier_through_the_cascade(m
     # ...and a slot this cascade does not own is never terminal.
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
     assert rt.is_warming_terminal(SimpleNamespace(slot_id="not-ours")) is False
+
+
+def test_begin_close_stops_new_admission_work_without_joining(monkeypatch):
+    """Latching and joining are separate concerns, and shutdown needs them at different times.
+
+    `close()` does both, and the pool can only reach it after the tick and reaper joins have spent
+    the shared shutdown allowance -- so this worker stayed free to start fresh deferred builds and
+    owed sweeps throughout those waits, and close() then arrived with nothing left to join with.
+    `begin_close()` is the latch alone: the pool calls it the instant shutdown starts, and still
+    joins later on whatever budget genuinely remains.
+
+    MUTATION: make begin_close() a no-op -> admission proceeds after shutdown began.
+    """
+    from blastbox.host import pool_config
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name",
+                        lambda name, **kw: FakeRuntime(name))
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
+
+    swept: list[str] = []
+
+    class _Sweeper:
+        name = "aws-ec2"
+
+        def sweep_orphans(self, **kw) -> None:  # noqa: ANN003
+            swept.append("swept")
+
+    with rt._lock:
+        rt._sweep_owed = [_Sweeper()]
+        rt._admit_closing = False
+        rt._last_admit_attempt = None
+
+    rt.begin_close()
+
+    with rt._lock:
+        assert rt._admit_closing is True, (
+            "begin_close() did not latch, so the admission worker keeps starting control-plane "
+            "work for the whole of stop()'s join budget")
+
+    # ...and the latch must actually suppress work, not merely be recorded.
+    rt._admit_deferred_async()
+    rt._run_owed_sweeps()
+    assert swept == [], (
+        f"work ran after begin_close() latched ({swept}); the owed sweep is a describe plus serial "
+        f"terminates, issued against a runtime that is shutting down")
+
+    # reopen() clears it, so a start() after a stop() is not permanently wedged.
+    rt.reopen()
+    with rt._lock:
+        assert rt._admit_closing is False, "reopen() must clear the latch begin_close() set"
