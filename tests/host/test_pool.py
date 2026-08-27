@@ -4544,3 +4544,65 @@ def test_a_runtime_poll_that_raises_does_not_break_the_tick():
 
     pool = WarmPool(runtime=_BadPoll(), warm_size=0, spawn_rate_limit=1e6)
     pool.tick()          # must not raise
+
+
+def test_a_stop_landing_between_the_latch_and_the_lock_makes_no_maintenance_writes() -> None:
+    """The shutdown latch was read BEFORE _lock was acquired, so it was a hint, not a gate.
+
+    `_maintain_idle` returns early when _stop_event is set. But that read happens at the top of the
+    function and the pass then acquires _lock separately, so a stop() arriving in between let the
+    ENTIRE pass proceed: it stamps _maintain_last, flips a live slot IDLE -> ASSIGNED, and runs an
+    AWS-calling hook -- all of it landing behind stop()'s clears, with no later pass to serve any of
+    it. That is precisely the leak the early return was added to close (_maintain_last being
+    re-created after _forget_slot_health collected it); moving the read up only narrowed the window.
+
+    stop() sets _stop_event and THEN takes _lock for its clears, so the fix is to observe the latch
+    and claim the slot in ONE critical section: either we see the latch and write nothing, or we
+    reserve first and stop()'s clears run over a state that already contains the reservation.
+
+    Driven here by making the lock itself the race: _stop_event is set at the moment
+    `with self._lock` is entered, which is exactly the interleaving the outer check cannot see.
+
+    MUTATION: delete the recheck inside `with self._lock` -> the hook runs, the slot goes ASSIGNED
+    and _maintain_last is stamped, all during shutdown.
+    """
+    calls: list[str] = []
+
+    class _CountingRuntime(_FakeRuntime):
+        def maintain_idle(self, slot: Slot) -> bool:
+            calls.append(slot.slot_id)
+            return True
+
+    pool = WarmPool(runtime=_CountingRuntime(), warm_size=1, spawn_rate_limit=100.0,
+                    maintain_interval_s=0.0)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    slot.state = SlotState.IDLE
+
+    real_lock = pool._lock
+
+    class _StopOnAcquire:
+        """stop() lands after the fast-path read, while this pass is taking the lock."""
+
+        def __enter__(self):                     # noqa: ANN204
+            pool._stop_event.set()
+            return real_lock.__enter__()
+
+        def __exit__(self, *exc):                # noqa: ANN002, ANN204
+            return real_lock.__exit__(*exc)
+
+    pool._lock = _StopOnAcquire()                # type: ignore[assignment]
+    try:
+        pool._maintain_idle()
+    finally:
+        pool._lock = real_lock
+
+    assert calls == [], (
+        f"the maintenance hook ran during shutdown ({calls}); it makes control-plane calls whose "
+        f"results land behind stop()'s clears and are never read")
+    assert slot.state == SlotState.IDLE, (
+        "a slot was reserved ASSIGNED during shutdown; _spawn_to_deficit counts it as active, so "
+        "it is capacity lost with no later pass to hand it back")
+    assert pool._maintain_last == {}, (
+        f"_maintain_last was stamped during shutdown ({pool._maintain_last}); this is the exact "
+        f"re-creation-after-_forget_slot_health leak the latch exists to prevent")

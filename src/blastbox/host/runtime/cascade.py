@@ -456,7 +456,17 @@ class CascadingRuntime:
             if self._admit_closing:
                 return
             owed, self._sweep_owed = self._sweep_owed, []
-        for rt in owed:
+        for i, rt in enumerate(owed):
+            # Recheck the latch between entries, not just once before the drain. A sweep is an
+            # uncached describe plus serial terminates, so a full drain can outlive the close()
+            # that arrives mid-loop -- and because the drain already emptied the ledger, every
+            # entry not yet reached would be silently forgotten rather than settled on reopen().
+            # Hand the untouched remainder back so it stays owed, exactly like _admit_probe's
+            # `still` list does for unprocessed tiers.
+            with self._lock:
+                if self._admit_closing:
+                    self._sweep_owed.extend(owed[i:])
+                    return
             fn = getattr(rt, "sweep_orphans", None)
             if not callable(fn):
                 continue

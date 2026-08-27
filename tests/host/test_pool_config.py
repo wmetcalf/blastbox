@@ -549,3 +549,39 @@ def test_an_unpinned_injected_cascade_follows_the_derived_policy(monkeypatch):
     pool = build_warm_pool(PoolConfig.from_env(warm_size=8, concurrent_ceiling=16), runtime=rt)
     assert pool is not None
     assert rt.tier_rebuild_after == pool._snapshot_rebuild_after == 16
+
+
+def test_a_config_float_that_parses_but_cannot_mean_anything_is_rejected(monkeypatch):
+    """Every numeric knob, not just the two that had a caller-side clamp.
+
+    A float knob has exactly two ways to parse and still be meaningless, and each breaks a
+    DIFFERENT direction of the comparison it feeds:
+      * NEGATIVE interval/grace -> `now - last >= interval` is ALWAYS true, so the thing the knob
+        rate-limits runs every tick. On an ec2-hibernate pool that means an uncached describe per
+        tick, i.e. the pool manufactures the throttling the limit exists to prevent.
+      * NaN -> every comparison against it is False, so whatever the knob gates silently never
+        happens. BLASTBOX_POOL_UNKNOWN_GRACE_S=nan did BOTH at once: WARMING slots got no brownout
+        exemption, and idle UNKNOWN slots never aged out.
+
+    Only maintain_interval_s and maintain_budget_s were clamped, and only because they were added
+    with a clamp; the four older knobs (spawn_rate, warming_timeout_s, unknown_grace_s,
+    capacity_starved_after_s) took anything float() accepted. Validating at each CONSUMER is what
+    produced that gap, so the check lives in the env readers -- which already raise on an
+    unparseable value, making this the same contract, not a new one.
+
+    MUTATION: delete the isfinite/`< 0` guard in _float/_opt_float and every case here is accepted.
+    """
+    knobs = ["BLASTBOX_POOL_SPAWN_RATE", "BLASTBOX_POOL_WARMING_TIMEOUT_S",
+             "BLASTBOX_POOL_UNKNOWN_GRACE_S", "BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S",
+             "BLASTBOX_POOL_MAINTAIN_INTERVAL_S", "BLASTBOX_POOL_MAINTAIN_BUDGET_S"]
+    for key in knobs:
+        for bad in ("nan", "inf", "-inf", "-1"):
+            monkeypatch.setenv(key, bad)
+            with pytest.raises(ValueError, match="finite"):
+                PoolConfig.from_env()
+            monkeypatch.delenv(key)
+
+    for key in knobs:            # 0 stays legal -- it is the documented "disabled"
+        monkeypatch.setenv(key, "0")
+        PoolConfig.from_env()
+        monkeypatch.delenv(key)

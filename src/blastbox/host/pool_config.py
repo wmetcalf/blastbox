@@ -8,6 +8,7 @@ slot runtime. The pool is OPT-IN: ``BLASTBOX_POOL_RUNTIME`` defaults to ``none``
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Any
 from dataclasses import dataclass
@@ -103,9 +104,21 @@ class PoolConfig:
             if not raw:
                 return default
             try:
-                return float(raw)
+                v = float(raw)
             except ValueError as exc:
                 raise ValueError(f"invalid float for {key}={raw!r}: {exc}") from exc
+            if not math.isfinite(v) or v < 0:
+                # These readers already raise on an unparseable value, so a value that PARSES but
+                # cannot mean anything raises too -- an operator typo should fail at startup, not
+                # quietly change behaviour. Both directions bite: a NEGATIVE interval makes
+                # `now - last >= interval` always true (an ec2-hibernate pool then describes on
+                # every tick and manufactures the throttling the limit exists to avoid), and a NaN
+                # makes every comparison against it False, which silently disables whatever the
+                # knob gates. BLASTBOX_POOL_UNKNOWN_GRACE_S=nan did both at once: no brownout
+                # exemption for WARMING slots, and idle unknowns that never age out. Use 0 for
+                # "disabled" -- that is what the guide documents.
+                raise ValueError(f"invalid value for {key}={raw!r}: must be finite and >= 0")
+            return v
 
         def _bool(key: str, default: bool) -> bool:
             raw = os.environ.get(key, "").strip().lower()
@@ -129,9 +142,21 @@ class PoolConfig:
             if not raw:
                 return default
             try:
-                return float(raw)
+                v = float(raw)
             except ValueError as exc:
                 raise ValueError(f"invalid float for {key}={raw!r}: {exc}") from exc
+            if not math.isfinite(v) or v < 0:
+                # These readers already raise on an unparseable value, so a value that PARSES but
+                # cannot mean anything raises too -- an operator typo should fail at startup, not
+                # quietly change behaviour. Both directions bite: a NEGATIVE interval makes
+                # `now - last >= interval` always true (an ec2-hibernate pool then describes on
+                # every tick and manufactures the throttling the limit exists to avoid), and a NaN
+                # makes every comparison against it False, which silently disables whatever the
+                # knob gates. BLASTBOX_POOL_UNKNOWN_GRACE_S=nan did both at once: no brownout
+                # exemption for WARMING slots, and idle unknowns that never age out. Use 0 for
+                # "disabled" -- that is what the guide documents.
+                raise ValueError(f"invalid value for {key}={raw!r}: must be finite and >= 0")
+            return v
 
         values: dict[str, object] = {
             "max_consecutive_failures": _opt_int(

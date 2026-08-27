@@ -3430,6 +3430,16 @@ class WarmPool:
         if not callable(hook):
             return
         with self._lock:
+            # RECHECK the latch under the lock. The early return above is only a fast path: it
+            # reads _stop_event before acquiring _lock, so a stop() landing in that window let the
+            # whole pass proceed anyway and write its cooldown stamp and ASSIGNED reservation
+            # BEHIND stop()'s clears -- the exact leak the early return was added to close, just
+            # narrower. stop() sets the event before it takes _lock for those clears, so observing
+            # the latch and claiming the slot in ONE critical section is what actually orders them:
+            # either we see the latch and make no writes, or we reserve first and stop() then runs
+            # its clears over a state that already includes the reservation.
+            if self._stop_event.is_set():
+                return
             now = self._clock()
             # ROTATE. `next(... if state is IDLE)` over an insertion-ordered dict returns the SAME
             # slot every tick, because the hook hands it back as IDLE without changing the order --

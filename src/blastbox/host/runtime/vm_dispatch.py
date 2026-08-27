@@ -22,6 +22,7 @@ import json
 import contextlib
 import inspect
 import logging
+import math
 import os
 import threading
 import time
@@ -1261,6 +1262,19 @@ def build_remote_vm_dispatcher(
     _resume_to = getattr(getattr(pool.runtime, "cfg", None), "resume_timeout_s", None)
     if _resume_to is None:
         _resume_to = getattr(pool.runtime, "resume_timeout_s", None)
+    if _resume_to is not None and not math.isfinite(float(_resume_to)):
+        # Sanitize ONCE, here, because _resume_to feeds THREE consumers -- the sizing warning
+        # below, _thaw_budget, and the _validate_timeout_s watchdog allowance -- and a non-finite
+        # value breaks each differently. `inf > 0` is True, so it passed the thaw guard and became
+        # an infinite resume deadline; it then also made _validate_timeout_s infinite, which
+        # disables the heartbeat watchdog outright -- a wedged resume is then unrecoverable rather
+        # than merely slow. Guarding only the thaw site would have left that second one live.
+        # Treat it as UNDECLARED: that path is bounded (the claim remainder) and recoverable.
+        logger.warning(
+            "vm_dispatch: %s declares a non-finite resume_timeout_s=%r -- ignoring it; the thaw "
+            "falls back to the claim remainder. A resume budget must be a finite number of seconds.",
+            tier, _resume_to)
+        _resume_to = None
     if _resume_to is not None and float(_resume_to) >= worker_timeout_s:
         # Informational, not a defect. The premise -- "a slow wake can abandon the claim thread with
         # a live billing slot" -- was true when the thaw ran on the claim window's remainder; the

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import math
 import contextlib
 import pytest
 
@@ -1745,3 +1746,51 @@ def test_a_thaw_begun_in_time_still_gets_its_whole_declared_budget(monkeypatch):
         f"the thaw was truncated to {seen['budget']}s of remaining window instead of its declared "
         f"180s budget"
     )
+
+
+def test_an_infinite_declared_resume_timeout_does_not_become_an_infinite_thaw_deadline(tmp_path, monkeypatch):
+    """`inf > 0` is True, so the guard that was meant to accept only a real budget accepted inf.
+
+    The thaw budget bounds the resume the claim seam grants OUTSIDE the claim window. Set to inf it
+    stops being a bound at all: the watchdog that exists to recover a wedged resume can never fire,
+    and the seam waits forever on a microvm that is not coming back -- with the slot held, so the
+    tier loses that capacity permanently rather than for one claim. (NaN was never reachable here:
+    every comparison against NaN is False, so `nan > 0` already fell through.)
+
+    A non-finite budget is not a budget, so it falls back to the same path an UNDECLARED timeout
+    takes -- thaw_budget_s=None, the claim remainder -- which is bounded and recoverable.
+
+    MUTATION: drop the math.isfinite() term and thaw_budget_s comes through as inf.
+    """
+    from blastbox.host.runtime import vm_dispatch as _vd
+    from blastbox.host.runtime.vm_dispatch import NoWarmSlot, build_remote_vm_dispatcher
+    seen = {}
+
+    def _capture(pool, timeout_s, *, thaw_budget_s=None):  # noqa: ANN001, ANN202
+        seen["thaw"] = thaw_budget_s
+        return None                                   # no slot -> NoWarmSlot, ends the call early
+
+    monkeypatch.setattr(_vd, "_claim_resumable_slot", _capture)
+
+    class _InfResumePool:
+        runtime = type("R", (), {"ssl_context": None, "resume_timeout_s": float("inf")})()
+
+        def claim(self, *, timeout_s):  # noqa: ANN001, ANN202
+            return None
+
+        def release(self, slot, *, dirty=False):  # noqa: ANN001
+            pass
+
+    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _InfResumePool(),
+                                    tier="aws-ec2-hibernate", engine="clippyshot",
+                                    limits=_FAKE_LIMITS, worker_timeout_s=300.0,
+                                    warm_claim_timeout_s=0.05)
+    with pytest.raises(NoWarmSlot):
+        vm._validate(tmp_path / "in.bin")
+
+    assert seen["thaw"] is None, (
+        f"thaw_budget_s={seen['thaw']}; an infinite thaw deadline means the resume watchdog can "
+        f"never fire, so a wedged resume holds the slot forever instead of for one claim")
+    assert math.isfinite(vm._validate_timeout_s), (
+        f"_validate_timeout_s={vm._validate_timeout_s}; the watchdog allowance is built from the "
+        f"same budget, so an infinite thaw disables the heartbeat watchdog outright")

@@ -1838,3 +1838,53 @@ def test_no_build_starts_once_shutdown_is_latched(monkeypatch):
     assert [d.name for d in rt._deferred] == ["aws-ec2", "aws-lambda"], (
         "tiers were dropped rather than kept deferred for a restart"
     )
+
+
+def test_a_close_landing_mid_drain_leaves_the_unswept_runtimes_still_owed(monkeypatch):
+    """The owed-sweep ledger drained ALL entries, then checked the latch never again.
+
+    `_run_owed_sweeps` took the whole ledger under the lock, emptied it, and iterated. Each entry is
+    an uncached describe plus potentially several serial terminates, each able to burn the full CLI
+    timeout -- so a drain can easily outlive a close() that arrives mid-loop. Two things then go
+    wrong at once: the sweeps keep firing after shutdown (the latch is supposed to stop them), and
+    because the ledger was already emptied, every entry not yet reached is silently FORGOTTEN rather
+    than settled on the next reopen(). The ledger exists precisely because a sweep skipped at
+    shutdown must not be a one-shot, so dropping the remainder re-creates the bug it was built for.
+
+    MUTATION: hoist the recheck back out of the loop (or drop the `_sweep_owed.extend(owed[i:])`)
+    and the second runtime is swept during shutdown / vanishes from the ledger.
+    """
+    swept: list[str] = []
+
+    class _Sweeper:
+        def __init__(self, name: str, on_sweep=None) -> None:
+            self.name, self._on_sweep = name, on_sweep
+
+        def sweep_orphans(self, **kw) -> None:
+            swept.append(self.name)
+            if self._on_sweep is not None:
+                self._on_sweep()
+
+    from blastbox.host import pool_config
+    monkeypatch.setattr(pool_config, "select_runtime_by_name",
+                        lambda name, **kw: FakeRuntime(name))
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
+
+    def _close_lands_now() -> None:
+        with rt._lock:
+            rt._admit_closing = True
+
+    first, second = _Sweeper("first", _close_lands_now), _Sweeper("second")
+    with rt._lock:
+        rt._sweep_owed = [first, second]
+        rt._admit_closing = False
+
+    rt._run_owed_sweeps()
+
+    assert swept == ["first"], (
+        f"swept={swept}; the drain kept sweeping after close() latched -- each of these is an "
+        f"uncached describe plus serial terminates issued against a shutting-down runtime")
+    assert [s.name for s in rt._sweep_owed] == ["second"], (
+        f"still owed={[getattr(s, 'name', s) for s in rt._sweep_owed]}; the un-run sweep was "
+        f"dropped by the drain that emptied the ledger, so reopen() will never settle it and the "
+        f"orphaned instances it would have found keep billing")
