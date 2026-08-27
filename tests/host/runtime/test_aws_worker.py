@@ -4513,3 +4513,70 @@ def test_a_resuming_slot_is_not_evidence_of_a_hibernation_we_performed():
 
     assert rt.is_ready(slot) is False, "a resuming slot found stopped was adopted as parked"
     assert rt._phase.get("s") != "parked"
+
+
+def test_an_outage_before_recovery_still_goes_through_the_credit_cap():
+    """_park_expired's cap exists so a brownout is ridden out and an OUTAGE is not -- but an
+    interval that is never MEASURED is never capped.
+
+    A lost-response stop records the attempt and deliberately leaves _park_since absent. If AWS
+    then recovers by reporting `stopping`, anchoring the episode at that recovery excluded the
+    entire preceding outage from the budget instead of crediting it and hitting the cap. Measured
+    with hibernate_timeout_s=300 and a 3000s outage: give-up fired 3310s after the episode began
+    rather than 600s, leaving the slot unclaimable for another full timeout after recovery.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    now = [1000.0]
+    state = ["running"]
+    rt, _ = _hibernate_rt(state=state, healthy=[True], clock=lambda: now[0],
+                          hibernate_timeout_s=300.0)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    rt._freeze_park("s", now[0], park_attempted=True)     # we issued it; no verdict came back
+    assert "s" not in rt._park_since, "the lost-response case starts with no clock"
+
+    now[0] = 4000.0                                       # 3000s of silence...
+    state[0] = "stopping"                                 # ...then AWS answers again
+    rt.is_ready(slot)
+
+    assert rt._park_since.get("s") == 1000.0, (
+        f"episode anchored at {rt._park_since.get('s')} (the recovery) instead of 1000.0 (the "
+        f"attempt), so the outage never reaches the credit cap"
+    )
+
+    fired = next((t for t in range(1000, 40001, 10)
+                  if (now.__setitem__(0, float(t)) or rt._park_expired("s", float(t)))), None)
+    assert fired is not None and fired - 1000 <= 700, (
+        f"give-up fired {None if fired is None else fired - 1000}s after the episode began; the "
+        f"budget is 300s plus at most 300s of credited silence, so the outage bypassed the cap"
+    )
+
+
+def test_an_observation_only_freeze_does_not_anchor_the_park_episode():
+    """The half the anchor must not overreach. _park_unknown_since is opened by OBSERVATION-ONLY
+    freezes too -- an unreadable describe, an agent socket that would not open -- and those say
+    nothing about when we asked EC2 to hibernate. Only _park_attempted marks a stop WE ISSUED.
+
+    Anchoring on any freeze would date the episode from an unrelated earlier observation, so a
+    slot that had only just begun parking would reach give-up immediately and be retired.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    now = [1000.0]
+    state = ["running"]
+    rt, _ = _hibernate_rt(state=state, healthy=[True], clock=lambda: now[0],
+                          hibernate_timeout_s=300.0)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    rt._freeze_park("s", 1000.0)                  # observation-only: NOT a stop we issued
+    assert "s" not in rt._park_attempted
+
+    now[0] = 4000.0                               # much later, an accepted stop of ours
+    rt._phase["s"] = "hibernating"
+    rt._hib_started["s"] = 3900.0
+    state[0] = "stopping"
+    rt.is_ready(slot)
+
+    assert rt._park_since.get("s") == 4000.0, (
+        f"episode anchored at {rt._park_since.get('s')} -- an unrelated observation from 3000s "
+        f"earlier -- so a slot that had just begun parking is already past its give-up budget"
+    )

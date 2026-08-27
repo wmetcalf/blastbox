@@ -2314,7 +2314,23 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             # Start the episode clock from the OBSERVATION when we have none. The lost-response
             # case is precisely the one where we never recorded issuing the stop, so keying the
             # escape only on our own attempt record left exactly that case unable to ever expire.
-            self._park_since.setdefault(sid, now)
+            #
+            # ...but anchor it at the ATTEMPT when there was one. _park_attempted means we issued a
+            # stop and got no verdict, and _park_unknown_since is when that happened -- so the
+            # episode began THEN, not when AWS started answering again. Anchoring at the recovery
+            # let the whole outage skip _park_expired's credit cap: the cap exists so a brownout is
+            # ridden out and an OUTAGE is not, and an interval that is never measured is never
+            # capped. Measured with hibernate_timeout_s=300 and a 3000s outage: give-up fired 3310s
+            # after the episode began instead of 600s (300 of budget + at most 300 of credited
+            # silence), leaving the slot unclaimable for another full timeout after recovery.
+            #
+            # This anchors EARLIER, which is the opposite of the bug _thaw_park's docstring
+            # describes: that one shifted the origin FORWARD by the credit and put _park_since in
+            # the future. Reading the attempt time is not the same operation.
+            _episode_began = now
+            if sid in self._park_attempted:
+                _episode_began = self._park_unknown_since.get(sid, now)
+            self._park_since.setdefault(sid, _episode_began)
             # Seeing 'stopping' IS the stop API answering: whatever we could not get a verdict on
             # was in fact accepted. Close the episode -- THROUGH _thaw_park, so the outage is
             # credited exactly as the answered-stop path credits it. This used to be a bare pop,
