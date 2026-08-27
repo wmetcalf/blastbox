@@ -7,6 +7,8 @@ synchronous via tick().
 """
 from __future__ import annotations
 
+import pytest
+
 import threading
 import time
 from pathlib import Path
@@ -4455,3 +4457,30 @@ def test_a_restarted_pool_can_admit_deferred_tiers_again():
         assert events == ["reopen", "close", "reopen"] or events[-1] == "reopen"
     finally:
         pool.stop(stop_timeout_s=0.0)
+
+
+@pytest.mark.parametrize(("given", "expected"), [
+    (-5.0, 0.0),                 # negative defeats the rate limit outright
+    (float("nan"), 5.0),         # every comparison against NaN is False -> nothing ever eligible
+    (float("inf"), 5.0),
+    (12.0, 12.0),
+])
+def test_the_maintenance_interval_is_validated(given, expected):
+    """Both maintenance knobs are operator-settable from the environment now, so an out-of-range
+    one breaks the guarantee its own doc row makes.
+
+    Negative: `now - last >= interval` is always true, so an ec2-hibernate pool describes on EVERY
+    tick and manufactures the control-plane throttling the limit exists to avoid. Non-finite is the
+    inverse -- no slot is ever eligible, so a half-resumed instance is never reconciled and just
+    keeps running and billing, silently, with maintenance apparently configured.
+    """
+    pool = WarmPool(runtime=_FakeRuntime(), warm_size=1, spawn_rate_limit=1e6,
+                    maintain_interval_s=given)
+    assert pool._maintain_interval_s == expected
+
+
+def test_the_maintenance_budget_is_validated_the_same_way():
+    """The budget was clamped and the interval was not, in the same commit that added both."""
+    pool = WarmPool(runtime=_FakeRuntime(), warm_size=1, spawn_rate_limit=1e6,
+                    maintain_budget_s=float("nan"))
+    assert pool._maintain_budget_s == 5.0

@@ -21,6 +21,7 @@ available is logged and skipped, so local capacity still comes up if the cloud t
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import inspect
 import logging
@@ -402,7 +403,20 @@ class CascadingRuntime:
             t = threading.Thread(target=self._admit_probe_bg, args=(pending,),
                                  name="blastbox-cascade-admit", daemon=True)
             self._admit_thread = t
+        try:
             t.start()
+        except Exception:
+            # The host could not give us a thread (RuntimeError: can't start new thread -- a
+            # temporary process/thread-allowance exhaustion). Roll the flags BACK: they are only
+            # cleared in _admit_probe_bg's finally, which never runs if the worker never started,
+            # so every later call would return at the in-flight guard and the overflow tier could
+            # never recover even once host resources came back. Setting state before the operation
+            # that can fail it needs an undo on the failing path -- the same obligation the close
+            # latch needed a reopen() for.
+            with self._lock:
+                self._admit_inflight = False
+                self._admit_thread = None
+            _log.warning("cascade: could not start the admission probe thread", exc_info=True)
 
     def _admit_probe_bg(self, pending: "list[DeferredTier]") -> None:
         try:
@@ -480,6 +494,18 @@ class CascadingRuntime:
                 if conflict is not None:
                     _log.error("cascade: deferred tier %r became available but cannot be admitted: "
                                "%s -- dropping it. Run it in a separate pool.", d.name, conflict)
+                    continue
+                if self._admit_closing:
+                    # stop() exhausted its deadline while d.build() was still blocked, so close()
+                    # latched and RETURNED without us. Publishing now mutates a cascade the pool
+                    # has finished with, and the orphan sweep below would issue describe/terminate
+                    # calls during teardown. Discard the runtime we just built instead -- closing
+                    # it if it knows how -- rather than handing it to a pool that has stopped.
+                    _log.info("cascade: discarding tier %r built during shutdown", d.name)
+                    _c = getattr(rt, "close", None)
+                    if callable(_c):
+                        with contextlib.suppress(Exception):
+                            _c()
                     continue
                 self.tiers.append(Tier(name=d.name, runtime=rt, capacity=d.capacity))
                 self._admitted_deferred.add(d.pos)

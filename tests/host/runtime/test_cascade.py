@@ -1543,3 +1543,66 @@ def test_reopen_lets_a_restarted_pool_admit_deferred_tiers_again(monkeypatch):
         "the cascade stayed latched shut after reopen(), so a restarted pool can never recover "
         "its overflow tiers"
     )
+
+
+def test_a_thread_that_cannot_start_does_not_lock_admission_out_forever(monkeypatch):
+    """The flags are only cleared in the worker's finally, which never runs if the worker never
+    started -- so a host that briefly cannot give us a thread (RuntimeError: can't start new
+    thread) left every later call returning at the in-flight guard, and the overflow tier could
+    never recover even once host resources came back."""
+    import threading
+
+    from blastbox.host import pool_config
+    from blastbox.host.runtime.cascade import DeferredTier
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name",
+                        lambda name, **kw: FakeRuntime(name))
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
+    rt._admit_retry_s = 0.0
+    rt._deferred = [DeferredTier(name="aws-ec2", capacity=4, reason="undecided",
+                                 build=lambda: FakeRuntime("aws-ec2"), pos=1)]
+
+    real_start = threading.Thread.start
+
+    def _no_threads(self):    # noqa: ANN001
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", _no_threads)
+    rt._admit_deferred_async()
+    assert rt._admit_inflight is False, "the in-flight flag was left set by a failed start"
+    assert rt._admit_thread is None
+
+    monkeypatch.setattr(threading.Thread, "start", real_start)
+    rt._admit_deferred_async()                 # host recovered -- admission must be possible again
+    _await_admission(rt)
+    assert [t.name for t in rt.tiers] == ["gvisor", "aws-ec2"]
+
+
+def test_a_probe_that_finishes_after_close_does_not_publish_its_tier(monkeypatch):
+    """stop() can exhaust its shared deadline while d.build() is still blocked, so close() latches
+    and RETURNS without the probe. Publishing then mutates a cascade the pool has finished with,
+    and the post-admission orphan sweep would issue describe/terminate calls during teardown."""
+    from blastbox.host import pool_config
+    from blastbox.host.runtime.cascade import DeferredTier
+
+    swept: list = []
+
+    class _Sweeper(FakeRuntime):
+        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+            swept.append(self.name)
+            return []
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name",
+                        lambda name, **kw: FakeRuntime(name))
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
+
+    def _build_after_close():
+        rt.close()                        # shutdown lands while we are still building
+        return _Sweeper("aws-ec2")
+
+    rt._deferred = [DeferredTier(name="aws-ec2", capacity=4, reason="undecided",
+                                 build=_build_after_close, pos=1)]
+    rt._admit_probe(list(rt._deferred))
+
+    assert [t.name for t in rt.tiers] == ["gvisor"], "a tier was published into a closed cascade"
+    assert swept == [], "the orphan sweep ran during teardown"

@@ -28,6 +28,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -85,6 +86,26 @@ class Slot:
     # epoch -- and that slot's ack would then re-teach the replacement base a capability only the
     # retired image had. The property has to travel with the slot, not with the job.
     ack_generation: "int | None" = None
+
+
+def _finite_nonneg(value: Any, default: float) -> float:
+    """A non-negative, FINITE seconds value, or ``default``.
+
+    Both maintenance knobs are operator-settable from the environment now, and an out-of-range one
+    breaks the guarantee its own doc row makes. Negative defeats a rate limit outright -- `now -
+    last >= interval` is then always true, so an ec2-hibernate pool describes on EVERY tick and
+    manufactures the control-plane throttling the limit exists to avoid. Non-finite is the inverse:
+    every comparison against NaN is False, so NO slot is ever eligible and a half-resumed instance
+    is never reconciled -- it just keeps running and billing, silently, with maintenance apparently
+    configured.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(v):
+        return default
+    return max(0.0, v)
 
 
 def _accepts_kwarg(fn: Any, name: str) -> bool:
@@ -415,7 +436,7 @@ class WarmPool:
         self._warm_size = warm_size
         self._concurrent_ceiling = concurrent_ceiling
         self._poll_interval = poll_interval
-        self._maintain_interval_s = maintain_interval_s
+        self._maintain_interval_s = _finite_nonneg(maintain_interval_s, 5.0)
         self._clock = clock
         self._burst_size = burst_size
         self._burst_trigger_s = burst_trigger_s
@@ -485,7 +506,7 @@ class WarmPool:
         #: and the rotation reaches a different slot each tick, so a control-plane brownout stalls
         #: that thread continuously rather than once. Expiry is not a verdict: the bounded call
         #: raises UNKNOWN and the slot is reconsidered on a later rotation.
-        self._maintain_budget_s = max(0.0, float(maintain_budget_s))
+        self._maintain_budget_s = _finite_nonneg(maintain_budget_s, 5.0)
         self._spawns_in_flight = 0
 
         # Background thread
