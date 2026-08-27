@@ -1239,6 +1239,34 @@ class CascadingRuntime:
     def materialize_warm_output(self, slot: Any) -> None:
         self._delegate(slot, "materialize_warm_output")(slot)
 
+    def is_warming_terminal(self, slot: Any) -> bool:
+        """Delegate the OPTIONAL terminal-warming verdict to the slot's OWNING tier.
+
+        Same reason `maintain_idle`, `resume` and `is_alive_for_claim` need explicit passthroughs:
+        in every documented deployment the pool holds the CASCADE, not the tier, and it resolves
+        this hook with `getattr(self._runtime, "is_warming_terminal", None)`. Without this the hook
+        added for the park give-up was inert behind a cascade -- i.e. inert in exactly the
+        deployment it was written for -- and a hibernate slot past its park budget went back to
+        waiting out the cascade's 600s readiness timeout, billing and blocking its replacement.
+
+        FALSE for an unknown slot or a tier with no such notion, never True: this verdict RETIRES a
+        WARMING slot, so "no opinion" and "we could not tell" must both mean "leave it alone".
+        """
+        tier = self._tier_of(slot)
+        if tier is None:
+            _log.debug("cascade: is_warming_terminal for unknown slot %r -- treating as not terminal",
+                       getattr(slot, "slot_id", slot))
+            return False
+        fn = getattr(tier.runtime, "is_warming_terminal", None)
+        if not callable(fn):
+            return False
+        try:
+            return fn(slot) is True
+        except Exception:  # noqa: BLE001 -- a hook fault is not evidence about the slot
+            _log.debug("cascade: is_warming_terminal(%r) failed -- treating as not terminal",
+                       getattr(slot, "slot_id", slot), exc_info=True)
+            return False
+
     def maintain_idle(self, slot: Any, *, budget_s: "float | None" = None) -> bool:
         """Delegate the OPTIONAL idle-reconciliation seam (issue #80) to the slot's OWNING tier.
 

@@ -1933,3 +1933,58 @@ def test_a_failed_admission_thread_start_does_not_burn_the_retry_window(monkeypa
         f"_last_admit_attempt={rt._last_admit_attempt!r} after a probe that never started; the "
         f"time gate now refuses every retry for a full _admit_retry_s window that no probe used")
     assert rt._admit_inflight is False, "sanity: the in-flight flag is still rolled back"
+
+
+def test_the_terminal_warming_hook_reaches_the_owning_tier_through_the_cascade(monkeypatch):
+    """The hook was added to the runtime and not to the wrapper the pool actually holds.
+
+    In every documented deployment the pool holds the CASCADE, not the tier -- the `maintain_idle`
+    passthrough three methods down says exactly that, and it exists for exactly this reason. So the
+    park give-up hook added last round was inert precisely where it was needed: a hibernate slot
+    past its 300s park budget went back to waiting out the cascade's 600s readiness timeout,
+    billing and blocking its own replacement, which is the failure the hook was written to end.
+
+    FALSE, never True, for an unknown slot or a tier with no such notion: this verdict RETIRES a
+    WARMING slot, so "no opinion" and "we could not tell" must both mean leave it alone.
+
+    MUTATION: delete CascadingRuntime.is_warming_terminal -> the pool's getattr misses and the
+    delegation assert fails.
+    """
+    from blastbox.host import pool_config
+
+    class _Terminal(FakeRuntime):
+        def is_warming_terminal(self, slot) -> bool:  # noqa: ANN001
+            return True
+
+    class _Exploding(FakeRuntime):
+        def is_warming_terminal(self, slot):  # noqa: ANN001, ANN201
+            raise RuntimeError("describe blew up")
+
+    class _Truthy(FakeRuntime):
+        def is_warming_terminal(self, slot):  # noqa: ANN001, ANN201
+            return "hibernating"              # truthy, but not a verdict
+
+    made: dict = {}
+
+    def _fake_select(name, **kw):  # noqa: ANN001, ANN202
+        rt = made.get(name) or FakeRuntime(name)
+        return rt
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", _fake_select)
+
+    for label, cls, expected in (("terminal", _Terminal, True),
+                                 ("raising", _Exploding, False),
+                                 ("truthy-not-True", _Truthy, False),
+                                 ("no-such-hook", FakeRuntime, False)):
+        made["gvisor"] = cls("gvisor")
+        rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
+        assert hasattr(rt, "is_warming_terminal"), (
+            "CascadingRuntime has no is_warming_terminal, so the pool's getattr never reaches the "
+            "owning tier -- the hook is inert in every documented deployment")
+        slot = rt.spawn()
+        got = rt.is_warming_terminal(slot)
+        assert got is expected, f"{label}: cascade returned {got!r}, expected {expected!r}"
+
+    # ...and a slot this cascade does not own is never terminal.
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
+    assert rt.is_warming_terminal(SimpleNamespace(slot_id="not-ours")) is False
