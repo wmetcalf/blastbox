@@ -3641,8 +3641,11 @@ def test_an_unusable_slot_is_never_claimable_between_maintenance_and_retirement(
 
     rt = _UnusableRuntime()
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
-    pool.tick()
-    pool.tick()
+    # NOT tick(): tick() runs the maintenance pass AND the deferred reaper, so the slot would be
+    # queued and disposed before this test could look at it. Drive the one pass under test.
+    pool._spawn_to_deficit(ready=True)
+    for slot in list(pool._slots.values()):
+        slot.state = SlotState.IDLE
 
     pool._maintain_idle()
 
@@ -3706,6 +3709,12 @@ def test_a_slot_reported_unusable_is_retired() -> None:
     pool.tick()
     slot_id = next(iter(pool._slots))
     pool.tick()
+    # The disposal is handed to the deferred reaper rather than run inline, so the terminate no
+    # longer happens on the tick thread. The GUARANTEE is unchanged -- capacity comes back -- it
+    # just arrives a drain later.
+    pool._drain_deferred_reaps()
+    for entry in list(pool._reaper_threads):
+        entry[0].join(timeout=5)
 
     assert slot_id in rt.reaped or slot_id not in pool._slots, (
         "an unusable slot must be retired so a replacement can spawn"
