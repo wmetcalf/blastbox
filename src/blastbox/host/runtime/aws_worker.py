@@ -700,6 +700,20 @@ class AwsDisposableRuntime:
         stay out of a slot that has already been disposed of."""
         return False
 
+    @contextlib.contextmanager
+    def _park_writes(self, sid: str) -> "collections.abc.Iterator[bool]":
+        """Default chokepoint: no tombstone here, so there is nothing to serialize -- always live.
+
+        Overridden by ec2-hibernate, where it takes `_park_lock`. The shared cache publications
+        below go through it so they are atomic ON THE TIER THAT HAS A REAPER and free everywhere
+        else. Guarding them with a bare `_slot_is_gone()` was not enough: that predicate is only
+        meaningful while the lock is held -- its own docstring says so -- so checking it unlocked
+        left exactly the window it was added to close, one step narrower. The reaper can install
+        the tombstone and clear the caches between the check and the assignment, and the liveness
+        and claim paths never reach `_park_step`'s re-entry sweep to undo it.
+        """
+        yield True
+
     def _describe_cached(self, slot: "AwsWorkerSlot", ttl: float) -> dict[str, Any]:
         now = self._clock()
         cached = self._desc_cache.get(slot.slot_id)
@@ -720,16 +734,18 @@ class AwsDisposableRuntime:
             # Adding this map to reap()'s locked sweep does NOT fix the race: the write lands
             # AFTER reap has run, so there is nothing left for reap to clear. The PUBLICATION is
             # what has to know, because ids are per-spawn UUIDs and reap is their only collector.
-            if not self._slot_is_gone(slot.slot_id):
-                self._desc_fail_at[slot.slot_id] = self._clock()
+            with self._park_writes(slot.slot_id) as _live:
+                if _live:
+                    self._desc_fail_at[slot.slot_id] = self._clock()
             raise
         self._desc_fail_at.pop(slot.slot_id, None)
         # Stamped from COMPLETION. `now` was read before the call, so a describe slower than the
         # TTL produced a cache entry that was ALREADY EXPIRED when it landed -- the next caller
         # paid for another full control-plane wait to learn the same thing, which is precisely
         # what the cache exists to prevent. Seventh instance of stamp-before-call on this branch.
-        if not self._slot_is_gone(slot.slot_id):
-            self._desc_cache[slot.slot_id] = (self._clock(), desc)
+        with self._park_writes(slot.slot_id) as _live:
+            if _live:
+                self._desc_cache[slot.slot_id] = (self._clock(), desc)
         return desc
 
     def _describe(self, slot: "AwsWorkerSlot") -> dict[str, Any]:   # concrete tiers override
@@ -1075,8 +1091,9 @@ class AwsDisposableRuntime:
             # Tombstone-aware like the describe caches: this runs on the tick thread
             # (is_alive) and on dispatcher claim threads (is_alive_for_claim), either
             # of which can be inside a 30s describe when the reaper disposes the slot.
-            if not self._slot_is_gone(slot.slot_id):
-                self._live_cache[slot.slot_id] = (self._clock(), None)
+            with self._park_writes(slot.slot_id) as _live:
+                if _live:
+                    self._live_cache[slot.slot_id] = (self._clock(), None)
             return None
         except (AwsWorkerError, OSError):
             alive = False
@@ -1084,8 +1101,9 @@ class AwsDisposableRuntime:
         # BEFORE the describe this cache exists to throttle, so a degraded-but-answering control
         # plane (a 25s describe against a 5s TTL) wrote a memo that was already expired and the
         # next 0.1s tick re-probed anyway -- per idle slot, on the pool's sole tick thread.
-        if not self._slot_is_gone(slot.slot_id):
-            self._live_cache[slot.slot_id] = (self._clock(), alive)
+        with self._park_writes(slot.slot_id) as _live:
+            if _live:
+                self._live_cache[slot.slot_id] = (self._clock(), alive)
         return alive
 
     def is_alive_for_claim(self, slot: AwsWorkerSlot, *, budget_s: float | None = None) -> "bool | None":
@@ -1113,8 +1131,9 @@ class AwsDisposableRuntime:
             except (AwsWorkerError, OSError):
                 alive = False
         # Stamped at COMPLETION (see is_alive): `now` predates the claim probe it is memoising.
-        if not self._slot_is_gone(slot.slot_id):   # keep the background-tick cache coherent
-            self._live_cache[slot.slot_id] = (self._clock(), alive)
+        with self._park_writes(slot.slot_id) as _live:   # keep the background-tick cache coherent
+            if _live:
+                self._live_cache[slot.slot_id] = (self._clock(), alive)
         return alive
 
     def reap(self, slot: AwsWorkerSlot) -> None:
@@ -2478,6 +2497,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         """
         self._desc_cache.pop(sid, None)
         self._desc_fail_at.pop(sid, None)
+        self._live_cache.pop(sid, None)
         for d in (self._phase, self._hib_attempt, self._hib_started,
                   self._park_since, self._park_unknown_since, self._park_credit):
             d.pop(sid, None)
@@ -3111,9 +3131,14 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             # sweeps it, but is only reachable from _park_step re-entry, and the failing-describe
             # path never gets there: is_ready() describes BEFORE _park_step, so the exception
             # short-circuits out. Clear it here, inside the tombstone, like every other map.
-            for d in (self._phase, self._desc_cache, self._desc_fail_at, self._hib_attempt,
-                      self._hib_started, self._park_since, self._park_unknown_since,
-                      self._park_credit):
+            # _live_cache belongs here too, and guarding its publication was NOT sufficient on its
+            # own: super().reap() pops the caches BEFORE it takes this lock, so a publication that
+            # legitimately holds the lock can re-add the entry in that gap, and this sweep -- which
+            # runs after -- is the only thing that can remove it again. Both halves are needed: the
+            # lock makes the check-and-write atomic, this list makes the tombstone authoritative.
+            for d in (self._phase, self._desc_cache, self._desc_fail_at, self._live_cache,
+                      self._hib_attempt, self._hib_started, self._park_since,
+                      self._park_unknown_since, self._park_credit):
                 d.pop(slot.slot_id, None)
             self._park_attempted.discard(slot.slot_id)
             self._park_refused.discard(slot.slot_id)

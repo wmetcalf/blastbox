@@ -469,3 +469,60 @@ def test_is_True_outside_the_contract_is_not_reported():
     fail-closed, so an UNKNOWN worker must not count toward "this tier is usable". The collapse is
     a contract violation, not a bad idiom -- gating on the idiom alone reported `available()`."""
     assert not sweep(_COERCES_OUTSIDE_CONTRACT)
+
+
+def test_the_checker_passes_on_a_clean_tree_but_still_gates_a_real_collapse(tmp_path):
+    """A gate that fails on a clean tree is a gate nobody keeps green.
+
+    The tri-state index is keyed by method NAME, so the moment
+    `StaticPoolRuntime.available() -> bool | None` was added, all four AWS `rt.available()` factory
+    checks were reported as tri-state collapses -- on receivers whose `available()` returns a plain
+    bool. `python scripts/pattern_sweep.py .` exited 1 on an unmodified tree.
+
+    The naive fix -- skip any name that is ALSO declared `-> bool` somewhere -- is much worse than
+    the bug. `available`, `is_alive` and `is_ready` are all in that set, i.e. precisely the three
+    methods the checker exists to police, so it silently retires itself. Both halves are asserted
+    here, because the first version of the fix passed the first half and failed the second.
+
+    The resolution is receiver-aware: `self.X()` resolves to the enclosing class, and a local built
+    from a constructor resolves to that class. Only a genuinely unresolved receiver falls back to
+    annotate-don't-gate.
+    """
+    import shutil
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+
+    def _sweep(root: Path) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, str(repo / "scripts" / "pattern_sweep.py"), str(root)],
+                              capture_output=True, text=True, timeout=300)
+
+    clean = _sweep(repo)
+    assert clean.returncode == 0, (
+        "pattern_sweep exits nonzero on an unmodified tree, so it cannot gate anything:\n"
+        + "\n".join(ln for ln in clean.stdout.splitlines() if "available()" in ln)[:2000])
+
+    # ...and it must still catch a genuine collapse.
+    work = tmp_path / "src"
+    shutil.copytree(repo / "src", work)
+    target = work / "blastbox" / "host" / "runtime" / "cascade.py"
+    src = target.read_text()
+    marker = "    def is_ready(self"
+    assert marker in src, "fixture: cascade.py no longer declares is_ready as expected"
+    target.write_text(src.replace(
+        marker,
+        "    def _deliberately_collapsed(self, slot):\n"
+        "        if not self.is_alive(slot):   # UNKNOWN read as dead\n"
+        "            return 'reap'\n"
+        "        return 'keep'\n\n" + marker, 1))
+
+    dirty = _sweep(tmp_path)
+    assert dirty.returncode != 0, (
+        "a deliberately collapsed `if not self.is_alive(slot)` was NOT reported; suppressing every "
+        "receiver-ambiguous name retires the checker on exactly the methods it exists to police")
+    p1 = dirty.stdout.split("=== P1")[1].split("=== P2")[0] if "=== P1" in dirty.stdout else ""
+    assert "self.is_alive()" in p1 and "used as `not <call>`" in p1, (
+        "the collapse was not reported in the GATED P1 section (the report names the call site, "
+        f"not the enclosing function):\n{p1[:1200]}")

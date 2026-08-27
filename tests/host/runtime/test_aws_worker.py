@@ -5389,3 +5389,87 @@ def test_every_float_knob_on_every_aws_tier_rejects_a_non_duration():
         "AWS config knobs accepted a value that cannot mean a duration; a NaN budget makes every "
         "deadline comparison False, so the tier neither times out nor succeeds:\n  "
         + "\n  ".join(offenders))
+
+
+def test_cache_publication_holds_the_lock_it_checks_the_tombstone_under():
+    """`_slot_is_gone()` is only meaningful while `_park_lock` is held -- its own docstring says so.
+
+    The previous round guarded the describe/liveness cache publications with a bare
+    `_slot_is_gone()` call, which is a check-then-act with no lock: the reaper can install the
+    tombstone and clear the caches between the check and the assignment. That narrowed the window
+    rather than closing it, and the liveness and claim paths never reach `_park_step`'s re-entry
+    sweep to undo the damage. Same defect class as the one this whole chokepoint exists for --
+    reported again, one layer down.
+
+    All five publications now go through `_park_writes()`, which on this tier takes the lock and on
+    every other tier is a free no-op yielding True.
+
+    MUTATION: publish outside the chokepoint (bare `_slot_is_gone()`) -> the reaper interleaves.
+    """
+    import threading
+
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+
+    now = [1000.0]
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    fake.responses["ec2 terminate-instances"] = {}
+
+    import contextlib
+
+    done = threading.Event()
+    released = threading.Event()
+    real_gone = rt._slot_is_gone
+    real_writes = rt._park_writes
+
+    def _release_the_reaper() -> None:
+        """Let the reaper run AT the liveness decision, then give it a moment to finish.
+
+        Under the chokepoint this happens with _park_lock held, so the reaper cannot get in until
+        the publication is done. Without it -- a bare `_slot_is_gone()` check -- nothing holds it
+        back and the write lands after the slot's only cleanup. The describe itself stays OUTSIDE
+        the lock either way; holding a lock across I/O is a separate bug this must not reintroduce.
+        """
+        if released.is_set():
+            return
+        released.set()
+        threading.Thread(target=lambda: (rt.reap(slot), done.set()), daemon=True).start()
+        done.wait(timeout=0.25)
+
+    # THE WINDOW IS BETWEEN THE CHECK AND THE ASSIGNMENT, and `self._clock()` is evaluated exactly
+    # there -- `_live_cache[sid] = (self._clock(), alive)`. Releasing the reaper at the CHECK
+    # instead proves nothing: the reaper finishes, the check then observes the tombstone, and even
+    # the unguarded shape correctly declines to write. (That version of this test passed against a
+    # deliberately unguarded build.) Hooking the clock reproduces the real interleaving: under the
+    # chokepoint the lock is held here so the reaper blocks; unguarded, it runs to completion and
+    # the write lands after the tombstone sweep, where nothing will ever collect it.
+    armed = {"go": False}
+    real_clock = rt._clock
+
+    def _hooked_clock():  # noqa: ANN202
+        if armed["go"]:
+            _release_the_reaper()
+        return real_clock()
+
+    def _hooked_gone(sid):  # noqa: ANN001, ANN202 -- the UNGUARDED shape calls this
+        armed["go"] = True
+        return real_gone(sid)
+
+    @contextlib.contextmanager
+    def _hooked_writes(sid):  # noqa: ANN001, ANN202 -- the CHOKEPOINT shape calls this
+        with real_writes(sid) as live:
+            armed["go"] = True
+            yield live
+
+    # Hook every shape, so this drives whichever implementation is present rather than passing
+    # vacuously when the hook it happens to patch is the one not in use.
+    rt._slot_is_gone = _hooked_gone          # type: ignore[method-assign]
+    rt._park_writes = _hooked_writes         # type: ignore[method-assign]
+    rt._clock = _hooked_clock                # type: ignore[method-assign]
+    rt.is_alive(slot)
+    assert released.is_set(), "no publication hook fired; the test drove nothing"
+    assert done.wait(timeout=5.0), "the reaper never finished; the lock is not being released"
+
+    assert "s" not in rt._live_cache and "s" not in rt._desc_cache, (
+        f"a cache entry survived for a reaped slot (live={rt._live_cache.get('s')!r}, "
+        f"desc={rt._desc_cache.get('s')!r}); ids are per-spawn UUIDs, so this is permanent")

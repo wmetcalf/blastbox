@@ -750,6 +750,16 @@ def test_static_availability_is_tri_state_so_a_transient_local_fault_defers_not_
     rt._health_ok = lambda w, timeout=None: False                     # everyone answered, all sick
     assert rt.available() is False, "a fleet that answered and is down is still a verdict"
 
+    # MIXED: one definitive no, one unaskable. `all(v is None)` required EVERY probe to be silent
+    # before answering UNKNOWN, so this came out False -- which contradicts what False promises
+    # here ("every box answered") and is read by the cascade as CONFIRMED unavailability, dropping
+    # the overflow tier permanently over a worker it never managed to ask. A tri-state OR: False
+    # only when every worker definitively said no.
+    rt._health_ok = lambda w, timeout=None: False if w.host == "10.0.0.1" else None
+    assert rt.available() is None, (
+        "a fleet with one unhealthy and one UNOBSERVABLE worker reported a definitive verdict; the "
+        "unobservable one may be healthy, and the cascade drops the tier for the process lifetime")
+
     rt._health_ok = lambda w, timeout=None: w.host == "10.0.0.1"      # one healthy
     assert rt.available() is True
 

@@ -253,9 +253,17 @@ class StaticPoolRuntime:
         verdicts = [self._health_ok(w) for w in self.cfg.workers]
         if any(v is True for v in verdicts):
             return True
-        if verdicts and all(v is None for v in verdicts):
-            return None      # nobody answered: UNKNOWN, not down
-        return False
+        if not verdicts:
+            return False     # nothing configured -- a verdict, and fail-closed
+        # A tri-state OR, not "all or nothing". Requiring EVERY probe to be None before answering
+        # UNKNOWN meant one box answering unhealthy while another was unreachable came out as
+        # False -- which contradicts what False promises here ("every box answered and none was
+        # healthy") and is read by the cascade as confirmed unavailability, permanently dropping
+        # the overflow tier over a worker it never managed to ask. False only when every worker
+        # DEFINITIVELY said no.
+        if all(v is False for v in verdicts):
+            return False
+        return None          # at least one worker unobservable: UNKNOWN, not down
 
     # -- SlotRuntime protocol ----------------------------------------------
     def worker_identity(self, slot: object) -> str | None:

@@ -392,6 +392,42 @@ def _branch_settles(stmts, name):
     return False
 
 
+def _enclosing_class(parents, node):
+    """The ClassDef name enclosing `node`, or None."""
+    cur = node
+    while cur in parents:
+        cur = parents[cur]
+        if isinstance(cur, ast.ClassDef):
+            return cur.name
+    return None
+
+
+def receiver_class(fn, var, trees_by_class=None):
+    """Best-effort: the CLASS of `var`, from a `var = ClassName(...)` binding in `fn`.
+
+    The tri-state index is keyed by method NAME, which cannot distinguish
+    `StaticPoolRuntime.available() -> bool | None` from `AwsDisposableRuntime.available() -> bool`.
+    For the shape that actually occurs in the factories -- a local built one line above the check --
+    the constructor IS the declaration, so resolving it turns a name match into a receiver match.
+    Returns None when the binding is not a plain constructor call (attribute receivers, parameters,
+    re-binding), which the caller must treat as "unknown", never as "safe".
+    """
+    if fn is None or not var:
+        return None
+    found = None
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name) and tgt.id == var:
+                    fnc = node.value.func
+                    nm = fnc.id if isinstance(fnc, ast.Name) else (
+                        fnc.attr if isinstance(fnc, ast.Attribute) else None)
+                    if nm is None or (found is not None and found != nm):
+                        return None      # rebound to something else -> ambiguous, stay unknown
+                    found = nm
+    return found
+
+
 def enclosing_funcs(tree):
     return [n for n in ast.walk(tree)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
@@ -464,6 +500,10 @@ def find_p1(trees, tri, strict=False):
                 wctx = bool_context(parents.get(p), p, None)
                 if wctx:
                     decl = ", ".join(f"{c}@{loc}" for c, loc in by_name[nm][:2])
+                    if nm in ambiguous:
+                        if not strict:
+                            continue          # see the call path below: name-only match, no gate
+                        decl += "  [NAME ALSO DECLARED -> bool elsewhere; verify the receiver]"
                     hits.append((f"{path}:{n.lineno}", f"({p.target.id} := {recv or '?'}.{nm})",
                                  wctx.replace("<var>", "<walrus>"), decl))
                     continue
@@ -510,6 +550,33 @@ def find_p1(trees, tri, strict=False):
                 continue
             if ctx:
                 decl = ", ".join(f"{c}@{loc}" for c, loc in by_name[nm][:2])
+                if nm in ambiguous:
+                    # RECEIVER-AMBIGUOUS: the name is declared `-> bool` somewhere too, and this
+                    # path matches on the NAME alone. Gating blindly reported all four AWS
+                    # `rt.available()` factory checks the moment StaticPoolRuntime.available()
+                    # became tri-state -- correct code, on receivers returning a plain bool -- so
+                    # the advertised clean-tree gate could not pass.
+                    #
+                    # But suppressing every ambiguous name is far worse: `available`, `is_alive` and
+                    # `is_ready` are ALL ambiguous, i.e. exactly the three the checker exists for,
+                    # so blanket suppression silently retires it. (Verified: a deliberately
+                    # collapsed `if not self.is_alive(slot)` then went unreported.)
+                    #
+                    # So RESOLVE the receiver. The factories build the object one line above the
+                    # check, so the constructor names the class; if that class declares the method
+                    # `-> bool`, this call is not a tri-state use at all. Only an UNRESOLVED
+                    # receiver falls back to annotate-don't-gate.
+                    # `self.is_alive(...)` is the MOST resolvable receiver, not the least: it is
+                    # the enclosing class. Treating it as unknown is what let a deliberately
+                    # collapsed `if not self.is_alive(slot)` slip through the first version of this.
+                    owner = (_enclosing_class(parents, n) if recv == "self"
+                             else receiver_class(_enclosing_fn(parents, n), recv))
+                    if owner is not None and (owner, nm) not in tri:
+                        continue                      # receiver's own declaration is plain bool
+                    if owner is None:
+                        if not strict:
+                            continue
+                        decl += "  [NAME ALSO DECLARED -> bool elsewhere; verify the receiver]"
                 hits.append((f"{path}:{n.lineno}", f"{recv or '?'}.{nm}", ctx, decl))
             elif bound_name(p, n) is not None:
                 # INDIRECT use: `healthy = rt.is_ready(slot)` ... `if not healthy:`. Only the
