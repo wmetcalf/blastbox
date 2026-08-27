@@ -1278,3 +1278,40 @@ def test_a_probe_that_outruns_its_own_window_still_excludes_a_second_one(monkeyp
     )
     assert admitted == 1
     assert len([t for t in rt.tiers if t.name == "aws-ec2"]) == 1
+
+
+def test_the_cascade_forwards_the_startup_orphan_sweep_to_its_tiers(monkeypatch):
+    """The CLI resolves the sweep with getattr(pool.runtime, "sweep_orphans", None). Whenever
+    BLASTBOX_POOL_TIERS is set -- the shape the configuration guide's own examples use -- that
+    runtime is the CASCADE, which had neither the attribute nor a __getattr__. So an operator who
+    enabled BLASTBOX_EC2_ORPHAN_MAX_AGE_S got the documented reclamation only on a single-runtime
+    deployment: in a cascade the getattr returned None and the sweep silently never ran, while a
+    crashed predecessor's parked instances kept accruing EBS cost with the setting apparently on.
+    """
+    from blastbox.host import pool_config
+
+    swept: list = []
+
+    class _Sweeper(FakeRuntime):
+        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+            swept.append(self.name)
+            return ["i-orphan"]
+
+    class _Raiser(FakeRuntime):
+        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+            raise RuntimeError("describe-instances: throttled")
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):  # noqa: ANN001
+        if name == "aws-ec2":
+            return _Sweeper(name)
+        if name == "aws-lambda":
+            return _Raiser(name)
+        return FakeRuntime(name)          # gvisor has no sweep at all
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-lambda:2,aws-ec2:4"}.get)
+
+    killed = rt.sweep_orphans()
+
+    assert swept == ["aws-ec2"], f"the sweep did not reach the tier that provides one: {swept}"
+    assert killed == ["i-orphan"], "the cascade dropped what the tier reclaimed"

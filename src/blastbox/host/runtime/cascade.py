@@ -424,6 +424,34 @@ class CascadingRuntime:
             self._deferred = [x for x in still if x.pos not in self._admitted_deferred]
         return admitted_count
 
+    def sweep_orphans(self, **kw: Any) -> list:
+        """Forward the one-shot startup reclamation to every tier that provides one.
+
+        The CLI resolves this with ``getattr(pool.runtime, "sweep_orphans", None)``, and whenever
+        BLASTBOX_POOL_TIERS is set -- the configuration the guide's own examples use -- that runtime
+        is THIS cascade, which had neither the attribute nor a __getattr__. So an operator who
+        enabled BLASTBOX_EC2_ORPHAN_MAX_AGE_S got the documented "the dispatcher runs
+        sweep_orphans()" only on a single-runtime deployment; in a cascade the getattr returned None
+        and the sweep silently never ran, leaving a crashed predecessor's parked instances accruing
+        encrypted-root-EBS cost indefinitely with the setting apparently on.
+
+        Best-effort, matching the CLI's own guard: one tier failing must not stop the others, and a
+        sweep hiccup must never block dispatch.
+        """
+        killed: list = []
+        for tier in self.tiers:
+            fn = getattr(tier.runtime, "sweep_orphans", None)
+            if not callable(fn):
+                continue
+            try:
+                got = fn(**kw)
+            except Exception:  # noqa: BLE001 -- a sweep hiccup must not block startup
+                _log.warning("cascade: orphan sweep failed on tier %r", tier.name, exc_info=True)
+                continue
+            if got:
+                killed.extend(got)
+        return killed
+
     # -- SlotRuntime protocol ----------------------------------------------
     def spawn(self) -> Any:
         """Spawn on the first tier that can take it, admitting a recovered tier only if none can.
