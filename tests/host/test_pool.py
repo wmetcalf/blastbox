@@ -4484,3 +4484,67 @@ def test_the_maintenance_budget_is_validated_the_same_way():
     pool = WarmPool(runtime=_FakeRuntime(), warm_size=1, spawn_rate_limit=1e6,
                     maintain_budget_s=float("nan"))
     assert pool._maintain_budget_s == 5.0
+
+
+def test_maintenance_does_not_retire_a_slot_shutdown_already_took():
+    """The bare `_stop_event.is_set()` guard was CHECK-THEN-ACT: stop() could begin immediately
+    after it, reap the slot, leave it quarantined after a failed disposal and RETURN, all before
+    the maintenance thread reached retire() -- a second terminate on a resource whose disposal had
+    already failed. stop() flips every slot to DRAINING under the pool lock before reaping, so
+    "is it still the ASSIGNED slot I reserved?" is the compare-and-swap that closes the window.
+    """
+    class _Unusable(_FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminates = 0
+
+        def maintain_idle(self, slot, *, budget_s=None):    # noqa: ANN001
+            # stop() wins the race while the hook is running: it flips the slot to DRAINING
+            # under the lock, exactly as the real stop() does before reaping.
+            with self.pool._lock:
+                self.pool._slots[slot.slot_id].state = SlotState.DRAINING
+            return False
+
+        def reap(self, slot):    # noqa: ANN001
+            self.terminates += 1
+
+    rt = _Unusable()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6)
+    rt.pool = pool           # type: ignore[attr-defined]
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots))
+    pool._slots[sid].state = SlotState.IDLE
+
+    pool._maintain_idle()
+
+    assert rt.terminates == 0, (
+        "maintenance retired a slot that shutdown had already taken -- a second terminate on a "
+        "resource whose disposal may have already failed"
+    )
+
+
+def test_the_tick_gives_the_runtime_its_periodic_beat():
+    """The deferred-admission probe had exactly ONE caller, spawn(), and _spawn_to_deficit does not
+    call spawn() at all while the primary already satisfies the warm target. On an idle-but-healthy
+    deployment the probe therefore never ran: the advertised ~60s re-probe cadence was inert and a
+    deferred tier's post-admission orphan sweep never happened. A cadence needs a clock."""
+    beats: list = []
+
+    class _Beating(_FakeRuntime):
+        def poll(self):    # noqa: ANN201
+            beats.append(1)
+
+    pool = WarmPool(runtime=_Beating(), warm_size=0, spawn_rate_limit=1e6)
+    pool.tick()
+    pool.tick()
+
+    assert len(beats) == 2, f"the runtime got {len(beats)} beats from 2 ticks"
+
+
+def test_a_runtime_poll_that_raises_does_not_break_the_tick():
+    class _BadPoll(_FakeRuntime):
+        def poll(self):    # noqa: ANN201
+            raise RuntimeError("probe scheduling blew up")
+
+    pool = WarmPool(runtime=_BadPoll(), warm_size=0, spawn_rate_limit=1e6)
+    pool.tick()          # must not raise

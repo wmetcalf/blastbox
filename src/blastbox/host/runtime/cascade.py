@@ -304,6 +304,14 @@ class CascadingRuntime:
         #: class of bug arrived there seven times: never START one once closing, and JOIN it.
         self._admit_thread: "threading.Thread | None" = None
         self._admit_closing = False
+        #: Tiers admitted whose post-admission orphan sweep was SKIPPED because shutdown
+        #: landed mid-publish. Without this the skip was permanent: the tier stays
+        #: appended and leaves _deferred, so reopen() has neither an entry to retry nor
+        #: any record that the sweep is still owed -- and the CLI's one-shot startup
+        #: sweep already ran before the tier existed. With BLASTBOX_EC2_ORPHAN_MAX_AGE_S
+        #: on, a predecessor's parked instances would accrue cost indefinitely across the
+        #: stop/start lifecycle this runtime now supports.
+        self._sweep_owed: list = []
         # Consecutive per-tier spawn failures before that tier's base is invalidated. 0 disables
         # per-tier repair (the tier then stays broken until something else notices, which behind
         # a working fallback is "never").
@@ -417,6 +425,33 @@ class CascadingRuntime:
                 self._admit_inflight = False
                 self._admit_thread = None
             _log.warning("cascade: could not start the admission probe thread", exc_info=True)
+
+    def poll(self) -> None:
+        """The pool's periodic beat. Optional hook, called from WarmPool.tick().
+
+        spawn() was the ONLY caller of the admission probe, and _spawn_to_deficit does not call
+        spawn() at all while the primary already satisfies the warm target -- so on an idle-but-
+        healthy deployment the probe never ran: the advertised ~60s re-probe cadence was inert and
+        a deferred tier's post-admission orphan sweep never happened. A cadence needs a clock, not
+        a demand signal.
+
+        Also settles any sweep skipped because shutdown landed mid-publish, which is otherwise
+        owed to nobody: the tier is already appended and gone from _deferred, so reopen() has
+        nothing to retry it from.
+        """
+        with self._lock:
+            if self._admit_closing:
+                return
+            owed, self._sweep_owed = self._sweep_owed, []
+        for rt in owed:
+            fn = getattr(rt, "sweep_orphans", None)
+            if not callable(fn):
+                continue
+            try:
+                fn()
+            except Exception:  # noqa: BLE001 -- best-effort, and never blocks the tick
+                _log.warning("cascade: deferred orphan sweep failed", exc_info=True)
+        self._admit_deferred_async()
 
     def _admit_probe_bg(self, pending: "list[DeferredTier]") -> None:
         try:
@@ -542,8 +577,10 @@ class CascadingRuntime:
             with self._lock:
                 _closing = self._admit_closing
             if _closing:
-                _log.info("cascade: skipping the post-admission sweep for %r -- shutting down",
+                _log.info("cascade: deferring the post-admission sweep for %r -- shutting down",
                           d.name)
+                with self._lock:
+                    self._sweep_owed.append(rt)
                 continue
             _sweep = getattr(rt, "sweep_orphans", None)
             if callable(_sweep):

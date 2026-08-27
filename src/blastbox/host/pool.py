@@ -1268,6 +1268,19 @@ class WarmPool:
         # ONCE per tick (this also kicks the async build) and gate both burst + spawn on it, so
         # the (up to ready_timeout_s) build never blocks this loop and demand misses during the
         # build window don't spuriously trip burst the instant the tier becomes ready.
+        # Give the runtime its periodic beat. CascadingRuntime uses it to run the rate-limited
+        # deferred-admission probe, which otherwise had exactly ONE caller -- spawn() -- and
+        # _spawn_to_deficit does not call spawn() at all while the primary already satisfies the
+        # warm target. So on an idle-but-healthy deployment the probe never ran: the advertised
+        # ~60s re-probe cadence was inert and the tier's post-admission orphan sweep never
+        # happened, leaving a predecessor's parked instances accruing cost. Best-effort and
+        # non-blocking, like every other optional runtime seam here.
+        _poll = getattr(self._runtime, "poll", None)
+        if callable(_poll):
+            try:
+                _poll()
+            except Exception:  # noqa: BLE001 -- a runtime's beat must never break the tick
+                logger.warning("pool.runtime_poll_failed", exc_info=True)
         ready = self._runtime_ready()
         self._promote_warming()
         self._health_check()
@@ -3495,15 +3508,26 @@ class WarmPool:
                 # retire() is not a CAS, it overwrites ASSIGNED, so the instance was terminated
                 # out from under a running job. The window was widened by fault="worker" doing
                 # failure attribution before it takes the lock.
-        if not usable and self._stop_event.is_set():
-            # SHUTTING DOWN: retire nothing. stop() disposes every tracked slot itself, so a
-            # retire here is a SECOND terminate on a resource stop() has already disposed of
-            # or quarantined after a failed disposal -- issued straight from the tick thread,
-            # bypassing both the deferred queue and the reaper threads, which is why guarding
-            # those two did not close it. The slot stays ASSIGNED and unclaimable, which is
-            # exactly what a shutting-down pool wants; stop() reaps it regardless of state.
-            logger.warning("pool.maintain_idle_retire_skipped_at_shutdown slot_id=%s", slot_id)
-            return
+        if not usable:
+            # SHUTTING DOWN, or already taken: retire nothing. stop() disposes every tracked slot
+            # itself, so a retire here is a SECOND terminate on a resource stop() has already
+            # disposed of or quarantined after a failed disposal -- issued straight from the tick
+            # thread, bypassing both the deferred queue and the reaper threads, which is why
+            # guarding those two did not close it.
+            #
+            # Decided UNDER THE LOCK, and on the slot's state rather than on the event alone. A
+            # bare `_stop_event.is_set()` here was check-then-act: stop() could begin immediately
+            # after it, reap the slot, leave it quarantined after a failed disposal and RETURN,
+            # all before this thread reached retire(). stop() flips every slot to DRAINING under
+            # this same lock before it reaps, so "is it still the ASSIGNED slot I reserved?" is
+            # the compare-and-swap that closes the window; the event check alone never could.
+            with self._lock:
+                cur = self._slots.get(slot_id)
+                _taken = (self._stop_event.is_set() or cur is None or cur is not cand
+                          or cur.state != SlotState.ASSIGNED)
+            if _taken:
+                logger.warning("pool.maintain_idle_retire_skipped_at_shutdown slot_id=%s", slot_id)
+                return
         if not usable:
             logger.warning("pool.maintain_idle_unusable slot_id=%s — retiring", slot_id)
             try:

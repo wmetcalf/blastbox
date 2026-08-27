@@ -1690,3 +1690,68 @@ def test_the_post_admission_sweep_is_skipped_when_shutdown_lands_mid_publish(mon
     rt._admit_probe(list(rt._deferred))
 
     assert swept == [], "the orphan sweep ran after shutdown had already been latched"
+
+
+def test_a_sweep_skipped_at_shutdown_is_owed_and_run_after_reopen(monkeypatch):
+    """The skip was permanent. The tier stays appended and leaves _deferred, so reopen() has
+    neither an entry to retry nor any record that the sweep is still owed -- and the CLI's one-shot
+    startup sweep already ran before that tier existed. With BLASTBOX_EC2_ORPHAN_MAX_AGE_S on, a
+    predecessor's parked instances would accrue cost indefinitely across the stop/start lifecycle
+    this runtime now supports."""
+    from blastbox.host import pool_config
+    from blastbox.host.runtime.cascade import DeferredTier
+
+    swept: list = []
+
+    class _Sweeper(FakeRuntime):
+        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+            swept.append(self.name)
+            return []
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name",
+                        lambda name, **kw: FakeRuntime(name))
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
+    rt._admit_retry_s = 0.0
+
+    class _ClosesOnAppend(list):
+        def append(self, item):    # noqa: ANN001, ANN201
+            super().append(item)
+            rt._admit_closing = True      # shutdown lands between publish and sweep
+
+    rt.tiers = _ClosesOnAppend(rt.tiers)    # type: ignore[assignment]
+    rt._deferred = [DeferredTier(name="aws-ec2", capacity=4, reason="x",
+                                 build=lambda: _Sweeper("aws-ec2"), pos=1)]
+    rt._admit_probe(list(rt._deferred))
+
+    assert swept == [], "the sweep ran during teardown"
+    assert rt._sweep_owed, "the skipped sweep was forgotten rather than recorded as owed"
+
+    rt.reopen()
+    rt.poll()
+    assert swept == ["aws-ec2"], (
+        "the owed sweep never ran after restart, so a predecessor's parked instances keep "
+        "accruing cost with the setting apparently enabled"
+    )
+
+
+def test_poll_probes_without_any_spawn(monkeypatch):
+    """A cadence needs a clock, not a demand signal."""
+    from blastbox.host import pool_config
+
+    state = {"up": False}
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):  # noqa: ANN001
+        if name == "aws-ec2":
+            if require_available and not state["up"]:
+                raise AwsProbeTimeout("sts: timed out")
+            return FakeRuntime(name)
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:4"}.get)
+    rt._admit_retry_s = 0.0
+    state["up"] = True
+
+    rt.poll()                      # no spawn() anywhere -- the pool is idle and healthy
+    _await_admission(rt)
+    assert [t.name for t in rt.tiers] == ["gvisor", "aws-ec2"]
