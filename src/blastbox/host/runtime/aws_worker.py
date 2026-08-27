@@ -1915,6 +1915,10 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
     #: Returned by _park_step_locked to mean "I need an agent probe, which must NOT run under the
     #: lock". The wrapper drops the lock, probes, and re-enters with the answer.
     _PROBE_PENDING = "\x00probe-pending"
+    #: Same hand-back for the stop-instances call. `_try_park` blocks for the aws-cli budget, so
+    #: running it inside the locked pass would block the reaper thread on _park_lock for the length
+    #: of a control-plane brownout -- the same defect as the probe, one call deeper.
+    _PARK_PENDING = "\x00park-pending"
     _ALIVE_STATES = ("pending", "running", "stopping", "stopped")
     _DEAD_STATES = ("shutting-down", "terminated")
     _uptime_backstop = True   # a wall-clock shutdown TTL would fire on resume; use a monotonic uptime timer
@@ -2354,9 +2358,13 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         hibernate, we never saw the reply, and our own record is the one thing we cannot trust.
         """
         healthy: "bool | None | Any" = _UNPROBED
-        for _ in (0, 1):     # at most one probe: the second pass is handed the answer
+        park_outcome: Any = _UNPROBED
+        # At most one probe AND one stop, so the third pass is always handed both answers and the
+        # loop cannot spin: probe -> stop -> settle.
+        for _ in (0, 1, 2):
             with self._park_writes(slot.slot_id) as live:
                 if not live:
+                    self._forget_slot_locked(slot.slot_id)
                     # The reaper disposed of this slot while the tick thread was inside a describe.
                     # Every write below (_phase, _hib_started, _park_since) would re-create per-slot
                     # state for an id that no longer exists, and ids are per-spawn UUIDs so nothing
@@ -2364,17 +2372,139 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                     # the DOMINANT writer of exactly the entries reap() clears -- and checking here
                     # without HOLDING the lock only moved the race, it did not close it.
                     return self._phase.get(slot.slot_id, "warming"), False
-                out = self._park_step_locked(slot, st, now, healthy=healthy)
-                if out[0] != self._PROBE_PENDING:
+                out = self._park_step_locked(slot, st, now, healthy=healthy,
+                                              park_outcome=park_outcome)
+                if out[0] not in (self._PROBE_PENDING, self._PARK_PENDING):
                     return out
-            # LOCK RELEASED for the probe. Re-entering through _park_writes rather than carrying the
-            # earlier liveness answer forward is the whole point: that answer went stale the instant
-            # the lock dropped, and the slot can be reaped while we sit in the HTTP round trip.
-            healthy = self._agent_healthy(slot)
+                pending = out[0]
+            # LOCK RELEASED for the slow call. Re-entering through _park_writes rather than carrying
+            # the earlier liveness answer forward is the whole point: that answer went stale the
+            # instant the lock dropped, and the slot can be reaped while we sit in the round trip.
+            if pending == self._PROBE_PENDING:
+                healthy = self._agent_healthy(slot)
+                continue
+            # The stop is a MUTATION, so its result is settled directly rather than by re-running
+            # the machine: _try_park advances _phase, and a second pass carrying the `st` observed
+            # BEFORE the stop would read our own hibernate as a came-back-running recovery and throw
+            # the evidence away. (The existing suite caught exactly that.)
+            try:
+                park_outcome = ("ok", self._try_park(slot))
+            except (AwsNotExecuted, AwsNoVerdict, AwsUnknownState) as exc:
+                # Carried, not handled: the handlers write park state, so they belong under the
+                # lock. Re-raised inside _settle_park_locked at the original call site.
+                park_outcome = ("exc", exc)
+            with self._park_writes(slot.slot_id) as live:
+                if not live:
+                    self._forget_slot_locked(slot.slot_id)
+                    return self._phase.get(slot.slot_id, "warming"), False
+                return self._settle_park_locked(slot, now, park_outcome)
         return self._phase.get(slot.slot_id, "warming"), None
 
+    def _forget_slot_locked(self, sid: str) -> None:
+        """Purge state a slow UNLOCKED call may have re-published after reap. ``_park_lock`` HELD.
+
+        The probe and the stop run with the lock released, and both write through caches the reaper
+        clears: `_describe_cached` publishes `_desc_cache[sid]` on success and `_desc_fail_at[sid]`
+        on failure. If reap() completes while one of those is in flight, the write lands AFTER the
+        slot's only cleanup -- and since ids are per-spawn UUIDs, nothing collects it again. The
+        tombstone stops the PARK maps being re-created but says nothing about the describe caches,
+        so re-entry finding the slot gone does the final sweep here.
+        """
+        self._desc_cache.pop(sid, None)
+        self._desc_fail_at.pop(sid, None)
+        for d in (self._phase, self._hib_attempt, self._hib_started,
+                  self._park_since, self._park_unknown_since, self._park_credit):
+            d.pop(sid, None)
+        self._park_attempted.discard(sid)
+        self._park_refused.discard(sid)
+
+    def _settle_park_locked(self, slot: AwsWorkerSlot, now: float,
+                            park_outcome: Any) -> "tuple[str, bool | None]":
+        """Apply the outcome of a stop-instances issued with the lock RELEASED.
+
+        Called INSTEAD of re-running _park_step_locked. Re-entering the whole machine after
+        the stop was wrong in a way the tests caught: _try_park advances _phase to
+        "hibernating", so the second pass -- still holding the `st` observed BEFORE the stop
+        ("running") -- took the came-back-running recovery branch and discarded the very park
+        evidence the stop had just created. The machine must not re-interpret a state string
+        that predates its own mutation; only the settlement re-runs.
+
+        ``_park_lock`` HELD and ``slot`` known live.
+        """
+        sid = slot.slot_id
+        try:
+            _kind, _payload = park_outcome
+            if _kind == "exc":
+                # Re-raise the captured exception HERE so the existing handlers below -- which
+                # are the state writes, and must stay locked -- are unchanged.
+                raise _payload
+            # KEEP THE THREE-WAY ANSWER. `_try_park(...) is not None` collapsed ACCEPTED and
+            # REFUSED into one "answered" bucket. That is right for the give-up clock -- a
+            # refusal IS a verdict and must spend the budget -- but wrong as evidence of
+            # parking: it set _park_since for a slot AWS had flatly refused to hibernate, and
+            # the `stopped` adoption reads _park_since as proof a warm image exists.
+            parked = _payload
+            answered = parked is not None
+        except AwsNotExecuted:
+            # The stop never left this host, so there is no attempt to record. Freeze the
+            # give-up clock (we learned nothing, and the cause is maximally correlated --
+            # every slot and thread hits a fork failure at once), but park_attempted stays
+            # FALSE: _park_attempted is read as proof that a `stopped` instance holds a warm
+            # image we captured, and a call that never ran captured nothing. Same rule the
+            # observation-only freezes already follow, and the same class as the `stopping`
+            # branch that used to manufacture its own evidence.
+            self._freeze_park(sid, now)
+            return self._phase.get(sid, "warming"), None
+        except AwsNoVerdict:
+            # Freeze the give-up clock for as long as the stop API keeps not answering, and
+            # never START it on a non-answer: an unanswered stop is no evidence at all about
+            # this slot, and spending the park budget on it drains every healthy hibernate
+            # worker during a stop-API brownout (issue #79).
+            #
+            # AwsNoVerdict, NOT AwsUnknownState. AWS answering "AccessDenied" or
+            # "InvalidParameter" to stop-instances arrives as a bare AwsUnknownState, and
+            # freezing on THAT is the mirror bug: _park_since never starts, the give-up clock
+            # is frozen forever, the slot is republished every pass, and the instance runs and
+            # bills indefinitely. A refusal is a verdict; only silence is not.
+            # A NEWER attempt supersedes an older refusal. Without this, a transient "not
+            # ready to hibernate yet" refusal outlived the attempt it described: a later stop
+            # that was ACCEPTED but whose response was lost left the stale mark in place, and
+            # the `stopped` adoption then rejected a genuinely hibernated worker -- which stays
+            # non-ready until the pool times it out and reaps it. The marker has to describe
+            # the LATEST attempt, not any attempt.
+            self._park_refused.discard(sid)
+            self._freeze_park(sid, now, park_attempted=True)
+            # ready=None, NOT False. This return feeds is_ready, and a definitive False there
+            # tells the POOL something we do not know: _promote_warming ends the slot's
+            # warming-unknown episode on any definitive answer, so the warming timeout resumes
+            # aging and the tier's WARMING population is evicted over a stop API that never
+            # answered. Freezing OUR clock while handing the pool a verdict we do not have just
+            # moves the same drain one layer up -- the tri-state has to be honoured on the way
+            # out as well as on the way in.
+            return self._phase.get(sid, "warming"), None
+        if answered:
+            # AWS is talking to us again.
+            self._thaw_park(sid, now)
+            self._park_since.setdefault(sid, now)
+            # The give-up clock runs either way (above); parking EVIDENCE does not.
+            if parked is False:
+                self._park_refused.add(sid)
+            else:
+                self._park_refused.discard(sid)
+        if sid in self._park_unknown_since:
+            # NOT ASKED, and an unresolved park episode is still open: _try_park returned None
+            # because _hib_attempt is throttling retries (~5s), not because we learned
+            # anything. Returning a definitive False here closes WarmPool's warming-UNKNOWN
+            # episode, so warming_timeout_s resumes aging -- and during a sustained stop-API
+            # brownout only ONE poll per retry interval stayed UNKNOWN, so the tier's WARMING
+            # slots timed out and were reaped anyway. The tri-state has to survive the
+            # THROTTLE as well as the call.
+            return self._phase.get(sid, "warming"), None
+        return self._phase.get(sid, "warming"), False
+
     def _park_step_locked(self, slot: AwsWorkerSlot, st: str, now: float, *,
-                          healthy: "bool | None | Any" = _UNPROBED) -> "tuple[str, bool | None]":
+                          healthy: "bool | None | Any" = _UNPROBED,
+                          park_outcome: Any = _UNPROBED) -> "tuple[str, bool | None]":
         """``_park_step`` with ``_park_lock`` HELD and ``slot`` known live. See that method.
 
         ``healthy`` is an agent-probe result the caller took UNLOCKED, or ``_UNPROBED`` when it has
@@ -2598,70 +2728,12 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             # boot to lay down the hibernation reserve. Only a SUCCESSFUL stop advances the phase,
             # and re-issuing it is harmless: the operation is idempotent by design, because an
             # accepted-but-lost response must be safe to repeat.
-            try:
-                # KEEP THE THREE-WAY ANSWER. `_try_park(...) is not None` collapsed ACCEPTED and
-                # REFUSED into one "answered" bucket. That is right for the give-up clock -- a
-                # refusal IS a verdict and must spend the budget -- but wrong as evidence of
-                # parking: it set _park_since for a slot AWS had flatly refused to hibernate, and
-                # the `stopped` adoption reads _park_since as proof a warm image exists.
-                parked = self._try_park(slot)
-                answered = parked is not None
-            except AwsNotExecuted:
-                # The stop never left this host, so there is no attempt to record. Freeze the
-                # give-up clock (we learned nothing, and the cause is maximally correlated --
-                # every slot and thread hits a fork failure at once), but park_attempted stays
-                # FALSE: _park_attempted is read as proof that a `stopped` instance holds a warm
-                # image we captured, and a call that never ran captured nothing. Same rule the
-                # observation-only freezes already follow, and the same class as the `stopping`
-                # branch that used to manufacture its own evidence.
-                self._freeze_park(sid, now)
-                return self._phase.get(sid, "warming"), None
-            except AwsNoVerdict:
-                # Freeze the give-up clock for as long as the stop API keeps not answering, and
-                # never START it on a non-answer: an unanswered stop is no evidence at all about
-                # this slot, and spending the park budget on it drains every healthy hibernate
-                # worker during a stop-API brownout (issue #79).
-                #
-                # AwsNoVerdict, NOT AwsUnknownState. AWS answering "AccessDenied" or
-                # "InvalidParameter" to stop-instances arrives as a bare AwsUnknownState, and
-                # freezing on THAT is the mirror bug: _park_since never starts, the give-up clock
-                # is frozen forever, the slot is republished every pass, and the instance runs and
-                # bills indefinitely. A refusal is a verdict; only silence is not.
-                # A NEWER attempt supersedes an older refusal. Without this, a transient "not
-                # ready to hibernate yet" refusal outlived the attempt it described: a later stop
-                # that was ACCEPTED but whose response was lost left the stale mark in place, and
-                # the `stopped` adoption then rejected a genuinely hibernated worker -- which stays
-                # non-ready until the pool times it out and reaps it. The marker has to describe
-                # the LATEST attempt, not any attempt.
-                self._park_refused.discard(sid)
-                self._freeze_park(sid, now, park_attempted=True)
-                # ready=None, NOT False. This return feeds is_ready, and a definitive False there
-                # tells the POOL something we do not know: _promote_warming ends the slot's
-                # warming-unknown episode on any definitive answer, so the warming timeout resumes
-                # aging and the tier's WARMING population is evicted over a stop API that never
-                # answered. Freezing OUR clock while handing the pool a verdict we do not have just
-                # moves the same drain one layer up -- the tri-state has to be honoured on the way
-                # out as well as on the way in.
-                return self._phase.get(sid, "warming"), None
-            if answered:
-                # AWS is talking to us again.
-                self._thaw_park(sid, now)
-                self._park_since.setdefault(sid, now)
-                # The give-up clock runs either way (above); parking EVIDENCE does not.
-                if parked is False:
-                    self._park_refused.add(sid)
-                else:
-                    self._park_refused.discard(sid)
-            if sid in self._park_unknown_since:
-                # NOT ASKED, and an unresolved park episode is still open: _try_park returned None
-                # because _hib_attempt is throttling retries (~5s), not because we learned
-                # anything. Returning a definitive False here closes WarmPool's warming-UNKNOWN
-                # episode, so warming_timeout_s resumes aging -- and during a sustained stop-API
-                # brownout only ONE poll per retry interval stayed UNKNOWN, so the tier's WARMING
-                # slots timed out and were reaped anyway. The tri-state has to survive the
-                # THROTTLE as well as the call.
-                return self._phase.get(sid, "warming"), None
-            return self._phase.get(sid, "warming"), False
+            if park_outcome is _UNPROBED:
+                # stop-instances is an AWS mutation bounded only by the cli budget. Issue it from
+                # the wrapper with the lock RELEASED; the exception handling below still runs under
+                # the lock, because it writes park state.
+                return self._PARK_PENDING, None
+            return self._settle_park_locked(slot, now, park_outcome)
         # pending / rebooting / anything else: still coming up.
         return phase, False
 

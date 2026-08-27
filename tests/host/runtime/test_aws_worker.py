@@ -5024,3 +5024,142 @@ def test_the_agent_probe_never_runs_while_the_park_lock_is_held():
         "_park_lock was HELD while the agent probe ran: _resolve_ip() can issue an uncached describe "
         "and the health check is an HTTP round trip, so reap() on the reaper thread blocks on "
         "disposal for the length of a control-plane brownout")
+
+
+def test_no_locked_method_can_reach_a_blocking_call_even_transitively():
+    """The audit that missed this checked DIRECT calls only.
+
+    Hoisting `_agent_healthy` out of the lock looked like it fixed the "no I/O under _park_lock"
+    problem, and a direct-call audit agreed. It was wrong one level down: `_park_step_locked` still
+    reached `_try_park` -> `self._aws("ec2", "stop-instances", ...)`, an AWS mutation bounded only
+    by the CLI budget. So the reaper thread could still block on disposal for the length of a
+    control-plane brownout -- the exact stall the hoist was supposed to remove, hidden behind one
+    more call frame.
+
+    A depth-1 check cannot express the invariant. The invariant is TRANSITIVE: nothing reachable
+    from a `*_locked` method may block, because everything reachable runs with `_park_lock` held and
+    `reap()` -- on the pool's dedicated reaper thread -- waits behind it.
+
+    MUTATION: call `self._agent_healthy(slot)` or `self._try_park(slot)` from any `*_locked` method
+    and this fails, naming the path.
+    """
+    import ast
+    from pathlib import Path
+
+    from blastbox.host.runtime import aws_worker as _aw
+
+    BLOCKING = {"_aws", "_describe", "_describe_cached", "_resolve_ip", "_http_probe",
+                "_agent_healthy", "_try_park"}
+
+    tree = ast.parse(Path(_aw.__file__).read_text())
+    parent: dict = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
+
+    def _holds_lock(node) -> bool:  # noqa: ANN001
+        cur = node
+        while cur in parent:
+            cur = parent[cur]
+            if isinstance(cur, ast.With):
+                for item in cur.items:
+                    ce = item.context_expr
+                    if isinstance(ce, ast.Call) and isinstance(ce.func, ast.Attribute) \
+                            and ce.func.attr == "_park_writes":
+                        return True
+                    if isinstance(ce, ast.Attribute) and ce.attr == "_park_lock":
+                        return True
+        return False
+
+    calls: dict = {}
+    locked: list[str] = []
+    # ENTRY POINTS are both halves of the convention: a `*_locked` method, and any `with
+    # _park_writes(...)` block anywhere -- including inside an otherwise-unlocked function. Scanning
+    # only `*_locked` names is what let the first version of this test pass while the wrapper made
+    # an AWS call from inside its own `with` block.
+    inline: set = set()
+    for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
+        for fn in cls.body:
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            calls.setdefault(fn.name, set()).update(
+                n.func.attr for n in ast.walk(fn)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and isinstance(n.func.value, ast.Name) and n.func.value.id == "self")
+            if fn.name.endswith("_locked"):
+                locked.append(fn.name)
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
+                        and isinstance(n.func.value, ast.Name) and n.func.value.id == "self" \
+                        and _holds_lock(n):
+                    inline.add(n.func.attr)
+
+    assert locked, "sanity: the lock convention uses a _locked suffix; none were found"
+
+    def paths_to_blocking(start: str) -> list[str]:
+        found, seen = [], set()
+
+        def walk(name: str, trail: list[str]) -> None:
+            for callee in sorted(calls.get(name, ())):
+                if callee in seen:
+                    continue
+                seen.add(callee)
+                if callee in BLOCKING:
+                    found.append(" -> ".join(trail + [callee]))
+                else:
+                    walk(callee, trail + [callee])
+
+        walk(start, [start])
+        return found
+
+    offenders = {}
+    for m in sorted(set(locked) | inline):
+        if m in BLOCKING:
+            offenders[m] = [f"{m} (called directly while the lock is held)"]
+        elif (p := paths_to_blocking(m)):
+            offenders[m] = p
+    assert not offenders, (
+        "a method that runs with _park_lock held can reach a blocking call, so reap() on the "
+        "reaper thread blocks behind it for the length of a control-plane brownout:\n  "
+        + "\n  ".join(f"{m}: {' | '.join(p)}" for m, p in offenders.items()))
+
+
+def test_a_describe_landing_after_reap_leaves_no_cache_entry_behind():
+    """The tombstone guards the PARK maps. It says nothing about the describe caches.
+
+    Moving the probe and the stop outside the lock is what makes disposal responsive, but it also
+    means `_describe_cached` can be in flight when `reap()` completes: it publishes
+    `_desc_cache[sid]` on success and `_desc_fail_at[sid]` on failure, and both are cleared by reap.
+    A write landing afterwards re-creates an entry for a per-spawn UUID that nothing collects again,
+    so the leak is permanent and grows once per race.
+
+    Re-entry already re-checks liveness, but detecting the tombstone is not the same as undoing what
+    the unlocked call published -- so re-entry finding the slot gone now does a final synchronized
+    sweep of exactly those caches.
+
+    MUTATION: drop the `_forget_slot_locked` call from the not-live paths and the entry survives.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+
+    now = [1000.0]
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    fake.responses["ec2 terminate-instances"] = {}
+    rt._park_since["s"] = 900.0
+
+    def _probe_then_reap(*a, **kw):  # noqa: ANN002, ANN003, ANN202
+        # ORDER MATTERS. The reaper completes FIRST, and the in-flight describe publishes its cache
+        # entry afterwards -- that is the race. Writing before the reap would just be cleared by it,
+        # and the test would pass without the fix (it did, first time round).
+        rt.reap(slot)
+        rt._desc_cache["s"] = (now[0], {"InstanceId": "i-1", "State": {"Name": "running"}})
+        rt._desc_fail_at["s"] = now[0]
+        return True
+
+    rt._agent_healthy = _probe_then_reap  # type: ignore[method-assign]
+    rt._park_step(slot, "running", now[0])
+
+    assert "s" not in rt._desc_cache, (
+        f"_desc_cache still holds an entry for a reaped slot ({rt._desc_cache.get('s')!r}); ids are "
+        f"per-spawn UUIDs, so reap() was its only collector and this entry is now permanent")
+    assert "s" not in rt._desc_fail_at, "_desc_fail_at leaked an entry for a reaped slot"
