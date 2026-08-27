@@ -28,6 +28,7 @@ Design notes:
 from __future__ import annotations
 
 import collections
+import math
 import json
 import logging
 import os
@@ -374,9 +375,14 @@ class AwsWorkerConfig:
         # claim reports UNKNOWN and no AWS slot is ever claimable — silently, tier green in metrics.
         # (0 used to mean "disable the bound"; it must not brick instead.) On the BASE so every tier
         # inherits it; subclasses with their own __post_init__ MUST chain to this.
-        if self.claim_probe_timeout_s <= 0:
+        # `not isfinite(...)` as well as `<= 0`: NaN fails EVERY comparison, so `nan <= 0` is False
+        # and a NaN sailed through the guard that exists to stop exactly this. It then poisons the
+        # deadline (`clock() + nan` is nan) and every comparison against it, so the probe neither
+        # expires nor bounds anything -- the silent brick this clamp was added to prevent, reached by
+        # the one input the clamp did not test for. `inf` is the same shape from the other side.
+        if not math.isfinite(self.claim_probe_timeout_s) or self.claim_probe_timeout_s <= 0:
             object.__setattr__(self, "claim_probe_timeout_s", 5.0)
-        if self.health_probe_timeout_s <= 0:
+        if not math.isfinite(self.health_probe_timeout_s) or self.health_probe_timeout_s <= 0:
             object.__setattr__(self, "health_probe_timeout_s", 30.0)
         # Same class of brick, one floor below: _probe_timeout() DECLINES to probe under
         # _MIN_PROBE_S, so a configured probe_timeout_s beneath it would decline unconditionally and
@@ -441,6 +447,8 @@ class LambdaMicroVmConfig(AwsWorkerConfig):
             allow_default_egress=(_env(get, "BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS") or "").strip().lower()
                                  in ("1", "true", "yes", "on"),
             auth_token_ttl_min=int(_env(get, "BLASTBOX_LAMBDA_AUTH_TTL_MIN", "15") or "15"),
+            health_probe_timeout_s=float(
+                _env(get, "BLASTBOX_AWS_HEALTH_PROBE_TIMEOUT_S", "30") or "30"),
             max_duration_s=int(_env(get, "BLASTBOX_AWS_MAX_DURATION_S", "3600") or "3600"),
             **overrides,
         )
@@ -482,6 +490,8 @@ class Ec2Config(AwsWorkerConfig):
             user_data_b64=_env(get, "BLASTBOX_EC2_USER_DATA_B64"),
             self_terminate=(_env(get, "BLASTBOX_EC2_SELF_TERMINATE", "1") or "1").strip().lower()
             not in ("0", "false", "no", "off"),   # strip/lower so False/NO/Off actually disable the backstop
+            health_probe_timeout_s=float(
+                _env(get, "BLASTBOX_AWS_HEALTH_PROBE_TIMEOUT_S", "30") or "30"),
             max_duration_s=int(_env(get, "BLASTBOX_AWS_MAX_DURATION_S", "3600") or "3600"),
             **overrides,
         )
@@ -1944,6 +1954,11 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # slot that is gone -- ids are per-spawn UUIDs, so those never come back. Bounded by
         # construction: capped, FIFO, and only ever consulted to suppress a late write.
         self._reaped_ids: "collections.OrderedDict[str, None]" = collections.OrderedDict()
+        #: Serializes the tombstone against every park-bookkeeping write. The tombstone alone was
+        #: never enough: it made a late write DETECTABLE but not PREVENTABLE, because the check and
+        #: the write it guards sat in different critical sections -- i.e. in none at all. Reentrant
+        #: because the park machine calls its own helpers (_freeze_park/_thaw_park) while stepping.
+        self._park_lock = threading.RLock()
 
     def _service_available(self) -> bool:
         # fail LOUD (once, at pool build) on a hibernation-incapable config instead of churning
@@ -2049,7 +2064,10 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # nothing once the call outruns its own window. Fourth site on this branch with this exact
         # shape (_last_admit_attempt, _maintain_last, and the two here), so it is worth naming:
         # a throttle stamp belongs in a finally, not before the thing it throttles.
-        self._hib_attempt[slot.slot_id] = now
+        with self._park_writes(slot.slot_id) as live:
+            if not live:
+                return None      # reaped mid-flight; do not re-create its bookkeeping
+            self._hib_attempt[slot.slot_id] = now
         refused = False
         try:
             self._aws("ec2", "stop-instances", "--instance-ids", str(slot.resource_id), "--hibernate")
@@ -2087,12 +2105,22 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             # it is in flight -- reap() then installs the tombstone and clears the dicts, and this
             # finally writes one straight back. Same for the _phase/_hib_started assignments below.
             # A tombstone consulted only on entry cannot see a reap that happens during the call.
-            if not self._slot_is_gone(slot.slot_id):
-                self._hib_attempt[slot.slot_id] = self._clock()
-        if self._slot_is_gone(slot.slot_id):
-            return None      # reaped while the stop was in flight; do not re-create its state
-        if refused:
-            return False
+            with self._park_writes(slot.slot_id) as live:
+                if live:
+                    self._hib_attempt[slot.slot_id] = self._clock()
+        with self._park_writes(slot.slot_id) as live:
+            # LIVENESS FIRST, then the refusal. A refusal is still an answer ABOUT A SLOT, and a
+            # slot reaped during the stop has no answer to report -- returning False there let
+            # _park_step take the refusal at face value and re-create _park_since/_park_refused for
+            # a gone per-spawn UUID (covered by test_a_refused_stop_for_a_reaped_slot_recreates_no_state).
+            if not live:
+                return None  # reaped while the stop was in flight; do not re-create its state
+            if refused:
+                return False
+            return self._record_park_accepted_locked(slot)
+
+    def _record_park_accepted_locked(self, slot: AwsWorkerSlot) -> bool:
+        """Publish an ACCEPTED hibernate. ``_park_lock`` HELD and ``slot`` known live."""
         self._desc_cache.pop(slot.slot_id, None)   # force a fresh describe next poll
         self._phase[slot.slot_id] = "hibernating"
         # self._clock(), NOT the pre-call `now`. This is when the stop was ACCEPTED, and the
@@ -2183,8 +2211,36 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
     _REAPED_IDS_MAX = 4096
 
     def _slot_is_gone(self, sid: str) -> bool:
-        """True once this runtime has reaped ``sid`` -- so a late write must not re-create it."""
+        """True once this runtime has reaped ``sid`` -- so a late write must not re-create it.
+
+        ONLY meaningful while ``_park_lock`` is held. Read outside it, the answer is stale the
+        instant it is returned: the reaper thread can install the tombstone between this call and
+        whatever write it was supposed to authorize. Go through :meth:`_park_writes`.
+        """
         return sid in self._reaped_ids
+
+    @contextlib.contextmanager
+    def _park_writes(self, sid: str) -> "collections.abc.Iterator[bool]":
+        """THE chokepoint for park bookkeeping. Yields True while ``sid`` is still live.
+
+        Disposal runs on the pool's dedicated reaper thread while the park machine runs on the tick
+        thread, so "is this slot still alive?" and "write the entry that answer authorizes" have to
+        happen in ONE critical section. They did not: every writer called `_slot_is_gone` and then
+        wrote, and a reap landing in between installed the tombstone and cleared the maps, after
+        which the in-flight write re-created entries for a slot that is gone. Slot ids are per-spawn
+        UUIDs, so nothing ever removes them again -- each race leaks bookkeeping permanently, and
+        the leak is unbounded across a shutdown/maintenance storm.
+
+        Ordering it inside ``reap`` (tombstone before the pops) fixed the half of the window where
+        the write started AFTER the tombstone. This closes the other half, where the write started
+        before it and could not have seen it at any price.
+
+        Holding a lock across the whole park step is safe because the step is pure bookkeeping: it
+        decides from an ALREADY-OBSERVED state and issues no AWS calls. The two writers that DO call
+        AWS (`_try_park`, `resume`) take it only around their writes, never around the call.
+        """
+        with self._park_lock:
+            yield sid not in self._reaped_ids
 
     def _freeze_park(self, sid: str, now: float, *, park_attempted: bool = False) -> None:
         """Open a no-verdict episode: we asked and learned nothing about this slot's parking.
@@ -2194,11 +2250,12 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         opened because the agent socket or the describe was unreadable is NOT that, and must not be
         mistaken for it.
         """
-        if self._slot_is_gone(sid):
-            return
-        self._park_unknown_since.setdefault(sid, now)
-        if park_attempted:
-            self._park_attempted.add(sid)
+        with self._park_writes(sid) as live:
+            if not live:
+                return
+            self._park_unknown_since.setdefault(sid, now)
+            if park_attempted:
+                self._park_attempted.add(sid)
 
     def _thaw_park(self, sid: str, now: float) -> None:
         """Close it, banking the unobservable interval in the CREDIT LEDGER.
@@ -2226,8 +2283,13 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         A ledger has neither problem: _park_since stays a FACT that never moves, and the cap is
         applied once, to the total, in _park_expired.
         """
+        with self._park_writes(sid) as live:
+            return self._thaw_park_locked(sid, now, live=live)
+
+    def _thaw_park_locked(self, sid: str, now: float, *, live: bool) -> None:
+        """``_thaw_park`` with ``_park_lock`` HELD. See that method."""
         stalled = self._park_unknown_since.pop(sid, None)
-        if stalled is None or self._slot_is_gone(sid):
+        if stalled is None or not live:
             return
         if sid in self._park_attempted and sid not in self._park_since:
             # A stop we ISSUED but never got a verdict on is a park attempt, and this answer is the
@@ -2283,14 +2345,20 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         lost ``stop-instances`` response is precisely what corrupts the phase: EC2 accepted the
         hibernate, we never saw the reply, and our own record is the one thing we cannot trust.
         """
+        with self._park_writes(slot.slot_id) as live:
+            if not live:
+                # The reaper disposed of this slot while the tick thread was inside a describe. Every
+                # write below (_phase, _hib_started, _park_since) would re-create per-slot state for
+                # an id that no longer exists, and ids are per-spawn UUIDs so nothing removes it
+                # again. Guarding the two credit helpers was not enough: _park_step is the DOMINANT
+                # writer of exactly the entries reap() clears -- and checking here without HOLDING
+                # the lock only moved the race, it did not close it.
+                return self._phase.get(slot.slot_id, "warming"), False
+            return self._park_step_locked(slot, st, now)
+
+    def _park_step_locked(self, slot: AwsWorkerSlot, st: str, now: float) -> "tuple[str, bool | None]":
+        """``_park_step`` with ``_park_lock`` HELD and ``slot`` known live. See that method."""
         sid = slot.slot_id
-        if self._slot_is_gone(sid):
-            # The reaper disposed of this slot while the tick thread was inside a describe. Every
-            # write below (_phase, _hib_started, _park_since) would re-create per-slot state for an
-            # id that no longer exists, and ids are per-spawn UUIDs so nothing removes it again.
-            # Guarding the two credit helpers was not enough: _park_step is the DOMINANT writer of
-            # exactly the entries reap() clears.
-            return self._phase.get(sid, "warming"), False
         phase = self._phase.get(sid, "warming")
         if st in self._DEAD_STATES:
             return phase, False          # is_alive/_health_check reaps it
@@ -2720,7 +2788,9 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             # Placed AFTER the start call on purpose. Clearing it earlier would erase the evidence
             # of a slot that is still genuinely parked whenever the describe or the start raises --
             # and an unrecognised parked slot is not adopted, so it gets retired instead.
-            self._phase[slot.slot_id] = "resuming"
+            with self._park_writes(slot.slot_id) as live:
+                if live:
+                    self._phase[slot.slot_id] = "resuming"
             self._resolve_ip(slot, refresh=True)   # private IP retained, but re-describe to be safe
         # The runtime's resume_timeout_s is a CEILING; the dispatcher's remaining claim window wins
         # when it is shorter, so one unreachable slot cannot burn the whole window and starve the
@@ -2850,14 +2920,17 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # Tombstone FIRST. Written after the pops it left a window in which a concurrent write
         # could re-create exactly what was just removed -- the guard not yet in force for the pops
         # it exists to protect.
-        self._reaped_ids[slot.slot_id] = None
-        while len(self._reaped_ids) > self._REAPED_IDS_MAX:
-            self._reaped_ids.popitem(last=False)
-        for d in (self._phase, self._desc_cache, self._hib_attempt, self._hib_started,
-                  self._park_since, self._park_unknown_since, self._park_credit):
-            d.pop(slot.slot_id, None)
-        self._park_attempted.discard(slot.slot_id)
-        self._park_refused.discard(slot.slot_id)
+        # Under the lock: a reader that has already passed its liveness check must not be able to
+        # interleave between the tombstone and the pops it authorizes.
+        with self._park_lock:
+            self._reaped_ids[slot.slot_id] = None
+            while len(self._reaped_ids) > self._REAPED_IDS_MAX:
+                self._reaped_ids.popitem(last=False)
+            for d in (self._phase, self._desc_cache, self._hib_attempt, self._hib_started,
+                      self._park_since, self._park_unknown_since, self._park_credit):
+                d.pop(slot.slot_id, None)
+            self._park_attempted.discard(slot.slot_id)
+            self._park_refused.discard(slot.slot_id)
 
     def sweep_orphans(self, *, max_age_s: float | None = None, now: float | None = None,
                       dry_run: bool = False) -> list[str]:

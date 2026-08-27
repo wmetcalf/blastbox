@@ -4760,3 +4760,204 @@ def test_a_rate_limit_is_both_retryable_and_never_performed():
     assert isinstance(ei.value, AwsThrottled), "a rate limit must stay the retryable type"
     assert isinstance(ei.value, AwsNotExecuted), "a rate limit was refused, not performed"
     assert isinstance(ei.value, AwsNoVerdict)
+
+
+def test_a_reap_landing_mid_park_step_cannot_be_outrun_by_the_step():
+    """The tombstone made a late write DETECTABLE, not PREVENTABLE.
+
+    Disposal runs on the pool's dedicated reaper thread; the park machine runs on the tick thread.
+    Every park writer asked `_slot_is_gone(sid)` and then wrote, with nothing holding the two
+    together — so a reap landing in that gap installed the tombstone, cleared every per-slot map,
+    and THEN the in-flight step wrote its entries straight back. Slot ids are per-spawn UUIDs, so
+    reap() is the only thing that ever collects them: whatever is re-created after it survives for
+    the life of the process, and a shutdown/maintenance storm leaks one set per race.
+
+    Ordering the tombstone before the pops inside reap() (an earlier round) closed the half of the
+    window where the write STARTED after the tombstone. It could not close this half, where the
+    write started before it and could not have observed it at any price. Only a lock spanning the
+    check and the write does that, which is what `_park_writes` is.
+
+    Here the reaper thread is released while the tick thread is INSIDE `_park_step`. With the
+    chokepoint the reap serializes after the step and its clears win, so nothing is left behind.
+
+    MUTATION: drop the `with self._park_lock` from `_park_writes` and the reap interleaves — the
+    step then re-creates `_phase` for a reaped id and this fails.
+    """
+    import threading
+
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+
+    now = [1000.0]
+    rt, fake = _hibernate_rt(state=["stopped"], healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    fake.responses["ec2 terminate-instances"] = {}
+
+    # A slot with an ACCEPTED hibernation on record, so `stopped` is adopted as parked and the
+    # step is a writer rather than a no-op.
+    rt._park_attempted.add("s")
+    rt._hib_started["s"] = 900.0
+    rt._park_since["s"] = 900.0
+
+    entered = threading.Event()
+    reaper_done = threading.Event()
+    raced_box: list[bool] = []
+
+    def _reap_on_the_reaper_thread() -> None:
+        rt.reap(slot)
+        reaper_done.set()
+
+    real_step = rt._park_step_locked
+
+    def _step_with_a_reap_in_flight(*a, **kw):  # noqa: ANN002, ANN003, ANN202
+        # Called with _park_lock HELD, i.e. exactly the window the old code left open.
+        if not entered.is_set():
+            entered.set()
+            t = threading.Thread(target=_reap_on_the_reaper_thread, daemon=True)
+            t.start()
+            # The reaper must not be able to complete while the step holds the lock. If it does,
+            # the interleaving under test has occurred.
+            reaper_done.wait(timeout=0.25)
+            raced_box.append(reaper_done.is_set())
+        return real_step(*a, **kw)
+
+    rt._park_step_locked = _step_with_a_reap_in_flight  # type: ignore[method-assign]
+    rt._park_step(slot, "stopped", now[0])
+
+    # THE invariant, asserted directly. A reap that completes while the step is mid-flight is the
+    # race itself; everything downstream (which entries get resurrected) depends on which branch the
+    # step happens to take, so asserting on leftover state alone would pass for the wrong reason --
+    # reap() clears the very evidence the `stopped` branch needs, so the step declines to adopt and
+    # writes nothing. Whether the reaper could OVERLAP at all is the property the lock provides.
+    raced = bool(raced_box and raced_box[0])
+    assert not raced, (
+        "reap() ran to completion on the reaper thread while the tick thread was inside _park_step: "
+        "the liveness check and the writes it authorizes are in different critical sections, so the "
+        "step can write entries back after reap() cleared them")
+
+    assert reaper_done.wait(timeout=5.0), "the reaper thread never finished; the lock is not being released"
+
+    assert "s" not in rt._phase, (
+        f"_phase still holds {rt._phase.get('s')!r} for a reaped slot: the park step wrote it back "
+        f"after reap() cleared it. Ids are per-spawn UUIDs, so nothing will ever collect this again")
+    for name in ("_hib_started", "_park_since", "_park_credit", "_park_unknown_since"):
+        assert "s" not in getattr(rt, name), f"{name} was re-created for a reaped slot"
+    assert "s" not in rt._park_attempted, "_park_attempted was re-created for a reaped slot"
+
+
+def test_every_park_state_write_goes_through_the_lock():
+    """Structural. The defect class this closes has now recurred for five consecutive review rounds
+    (claim-probe, admission, `_maintain_idle`, `_run_owed_sweeps`, and this one), always as the same
+    shape: state is read, the write that depends on it happens later, and nothing holds the two
+    together. Fixing instances has not stopped it, so this fails at WRITE time instead.
+
+    The rule: inside Ec2HibernateRuntime, a write to park bookkeeping is legal only where
+    `_park_lock` is provably held — lexically inside `with self._park_writes(...)` / `with
+    self._park_lock`, or inside a `*_locked` helper, which by convention documents that its caller
+    holds it. The second half of the check enforces that convention: every call to a `*_locked`
+    helper must itself sit inside one of those `with` blocks, so the suffix cannot become a lie.
+
+    Same shape as the `_queue_deferred_reap_unlocked` chokepoint test: a seventh writer added
+    without the lock fails here rather than in production, months later, as a leak.
+    """
+    import ast
+    from pathlib import Path
+
+    from blastbox.host.runtime import aws_worker as _aw
+
+    GUARDED = {"_phase", "_park_since", "_hib_started", "_park_attempted", "_park_refused",
+               "_park_credit", "_park_unknown_since", "_hib_attempt", "_reaped_ids"}
+    MUTATORS = {"pop", "discard", "setdefault", "clear", "popitem", "add", "update"}
+
+    src = Path(_aw.__file__).read_text()
+    tree = ast.parse(src)
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Ec2HibernateRuntime")
+
+    parent: dict = {}
+    for node in ast.walk(cls):
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
+
+    def _locked_context(node) -> bool:  # noqa: ANN001
+        """True if `node` is lexically inside a with-block that takes _park_lock."""
+        cur = node
+        while cur in parent:
+            cur = parent[cur]
+            if isinstance(cur, ast.With):
+                for item in cur.items:
+                    call = item.context_expr
+                    if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) \
+                            and call.func.attr == "_park_writes":
+                        return True
+                    if isinstance(call, ast.Attribute) and call.attr == "_park_lock":
+                        return True
+            if isinstance(cur, ast.FunctionDef) and cur.name.endswith("_locked"):
+                return True
+        return False
+
+    def _fn_of(node) -> str:  # noqa: ANN001
+        cur = node
+        while cur in parent:
+            cur = parent[cur]
+            if isinstance(cur, ast.FunctionDef):
+                return cur.name
+        return "<class body>"
+
+    unguarded = []
+    for node in ast.walk(cls):
+        target = None
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute) \
+                and node.value.attr in GUARDED and isinstance(node.ctx, (ast.Store, ast.Del)):
+            target = node.value.attr
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr in MUTATORS and isinstance(node.func.value, ast.Attribute) \
+                and node.func.value.attr in GUARDED:
+            target = node.func.value.attr
+        if target and not _locked_context(node):
+            unguarded.append(f"{_fn_of(node)}() writes self.{target} at line {node.lineno}")
+
+    assert not unguarded, (
+        "park bookkeeping written without _park_lock held — a reap on the reaper thread can clear "
+        "these maps between the liveness check and the write, permanently re-creating state for a "
+        "per-spawn UUID that nothing collects again:\n  " + "\n  ".join(unguarded))
+
+    # ...and the `_locked` suffix must not be able to become a lie.
+    bad_calls = []
+    for node in ast.walk(cls):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr.endswith("_locked") and not _locked_context(node):
+            bad_calls.append(f"{_fn_of(node)}() calls {node.func.attr}() at line {node.lineno}")
+    assert not bad_calls, (
+        "a *_locked helper is called from outside the lock, so its name no longer documents "
+        "anything:\n  " + "\n  ".join(bad_calls))
+
+
+def test_the_health_probe_ceiling_is_configurable_and_cannot_be_set_to_nothing():
+    """It is a BASE AwsWorkerConfig field, so it is `BLASTBOX_AWS_*` and every AWS tier inherits it.
+
+    The guide advertised this ceiling as tunable while the field was a fixed 30s default that no
+    reader ever touched. It matters during exactly the failure it is documented for: each IDLE
+    health probe occupies the pool's SINGLE tick thread, so during a control-plane brownout an
+    operator who cannot shorten it cannot stop the stall either.
+
+    The clamp also has to reject NaN, not just `<= 0`. NaN fails every comparison, so `nan <= 0` is
+    False and it sailed straight through the guard written to prevent this: `clock() + nan` is nan,
+    every comparison against the deadline is False, and the probe then neither expires nor bounds
+    anything -- a silent brick reached through the one input the clamp did not test.
+
+    MUTATION: drop the from_env wiring -> 45 is ignored. Drop the isfinite() term -> nan survives.
+    """
+    from blastbox.host.runtime.aws_worker import Ec2Config, Ec2HibernateConfig
+
+    for cfg_cls in (Ec2Config, Ec2HibernateConfig):
+        env = {"BLASTBOX_EC2_AMI": "ami-x", "BLASTBOX_AWS_HEALTH_PROBE_TIMEOUT_S": "45"}
+        assert cfg_cls.from_env(env.get).health_probe_timeout_s == 45.0, (
+            f"{cfg_cls.__name__} ignores BLASTBOX_AWS_HEALTH_PROBE_TIMEOUT_S; the guide documents it "
+            f"as the probe ceiling, so an operator shortening it during a brownout changes nothing")
+
+        for bad in ("nan", "inf", "0", "-5"):
+            env = {"BLASTBOX_EC2_AMI": "ami-x", "BLASTBOX_AWS_HEALTH_PROBE_TIMEOUT_S": bad}
+            got = cfg_cls.from_env(env.get).health_probe_timeout_s
+            assert got == 30.0, (
+                f"{cfg_cls.__name__} accepted health_probe_timeout_s={bad!r} -> {got!r}; an "
+                f"unbounded or never-expiring probe is the tick-thread stall this bound exists to "
+                f"prevent, so a meaningless value must fall back to the default")
