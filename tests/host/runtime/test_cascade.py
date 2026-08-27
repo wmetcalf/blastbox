@@ -1888,3 +1888,48 @@ def test_a_close_landing_mid_drain_leaves_the_unswept_runtimes_still_owed(monkey
         f"still owed={[getattr(s, 'name', s) for s in rt._sweep_owed]}; the un-run sweep was "
         f"dropped by the drain that emptied the ledger, so reopen() will never settle it and the "
         f"orphaned instances it would have found keep billing")
+
+
+def test_a_failed_admission_thread_start_does_not_burn_the_retry_window(monkeypatch):
+    """The rollback undid two of the three fields set before `t.start()`.
+
+    `_admit_inflight` and `_admit_thread` are restored when the host cannot give us a thread, and
+    the comment there states the rule exactly: "Setting state before the operation that can fail it
+    needs an undo on the failing path." `_last_admit_attempt` is set in the same critical section
+    and was not undone -- so a probe that never ran still consumes a full `_admit_retry_s` (60s)
+    window, and a transient thread-allowance exhaustion costs 60s of extra outage on top of itself,
+    for the overflow tier that is already missing.
+
+    MUTATION: drop the `_last_admit_attempt = prev_admit_attempt` restore -> the stamp survives and
+    the next attempt is refused by the time gate.
+    """
+    from blastbox.host import pool_config
+    from blastbox.host.runtime import cascade as _cascade_mod
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name",
+                        lambda name, **kw: FakeRuntime(name))
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
+    with rt._lock:
+        rt._sweep_owed = [FakeRuntime("aws-ec2")]     # something to do, so the gate is reached
+        rt._last_admit_attempt = None
+
+    class _UnstartableThread:
+        """Only the cascade's own thread fails; patching threading.Thread.start globally would
+        break pytest's internals along with it."""
+
+        def __init__(self, *a, **kw) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+        def is_alive(self) -> bool:
+            return False
+
+    monkeypatch.setattr(_cascade_mod.threading, "Thread", _UnstartableThread)
+    rt._admit_deferred_async()                        # must not raise
+
+    assert rt._last_admit_attempt is None, (
+        f"_last_admit_attempt={rt._last_admit_attempt!r} after a probe that never started; the "
+        f"time gate now refuses every retry for a full _admit_retry_s window that no probe used")
+    assert rt._admit_inflight is False, "sanity: the in-flight flag is still rolled back"

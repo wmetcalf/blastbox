@@ -411,6 +411,7 @@ class CascadingRuntime:
             if self._last_admit_attempt is not None and \
                     (now - self._last_admit_attempt) < self._admit_retry_s:
                 return
+            prev_admit_attempt = self._last_admit_attempt
             self._last_admit_attempt = now
             self._admit_inflight = True
             pending = list(self._deferred)
@@ -430,6 +431,12 @@ class CascadingRuntime:
             with self._lock:
                 self._admit_inflight = False
                 self._admit_thread = None
+                # ...and the RATE-LIMIT STAMP, the third piece of state set before the thing that
+                # failed. Leaving it set burns a full _admit_retry_s window on a probe that never
+                # ran, so a transient thread-allowance exhaustion costs 60s of extra outage on top
+                # of itself -- for the overflow tier that is already missing. The comment above
+                # states this rule; it had been applied to two of the three fields.
+                self._last_admit_attempt = prev_admit_attempt
             _log.warning("cascade: could not start the admission probe thread", exc_info=True)
 
     def poll(self) -> None:
