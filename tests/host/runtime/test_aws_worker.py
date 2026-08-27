@@ -4627,3 +4627,30 @@ def test_the_pools_budget_actually_bounds_the_aws_calls():
         f"aws calls were bounded at {max(timeouts)}s despite a 2.0s pool budget -- the tick thread "
         f"can be held for the runtime's own ceiling instead"
     )
+
+
+def test_sibling_hibernate_tiers_do_not_sweep_each_others_live_parked_slots():
+    """A cascade may hold several aws-ec2-hibernate positions -- "aws-ec2:4,aws-ec2:16" is a
+    supported configuration, which is why _tier_identity is f"{name}#{idx}".
+
+    sweep_orphans filters on the SHARED blastbox-tier tag and spares only instances carrying its
+    own run id. With a fresh id per runtime CONSTRUCTION, a sibling in the same process read the
+    other's live parked slots as foreign and terminated them -- destroying warm capacity that was
+    working. Unreachable while the sweep ran only at CLI startup (nothing is parked yet); reachable
+    the moment a tier admitted mid-run started sweeping.
+
+    The fence is per PROCESS, which is what the guide describes: "not carrying THIS DISPATCHER
+    PROCESS'S blastbox-run id".
+    """
+    rt_a, fake_a = _sweep_rt(orphan_max_age_s=3600.0)
+    rt_b, _ = _sweep_rt(orphan_max_age_s=3600.0)
+
+    assert rt_a._run_id == rt_b._run_id, (
+        "sibling tiers in one process carry different ownership fences, so each reads the other's "
+        "live parked slots as an orphan"
+    )
+
+    # ...and the sweep spares an instance tagged by the sibling.
+    killed = rt_a.sweep_orphans(now=_gmt_epoch("2026-07-11 00:00:00") + 7200)
+    swept_ours = [i for i in killed if i == "i-ours"]
+    assert not swept_ours, f"the sweep terminated this process's own parked slot: {killed}"

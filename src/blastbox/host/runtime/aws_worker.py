@@ -57,6 +57,12 @@ AwsRunner = Callable[[Sequence[str], float], subprocess.CompletedProcess]
 # that needs a plain yes/no coerces with `is True` (issue #77 marla-loop 3).
 HttpProbe = Callable[[str, dict[str, str], float], "bool | None"]
 
+#: ONE ownership fence per PROCESS. A restarted dispatcher gets a new one, so its predecessor's
+#: parked slots correctly read as orphans; every runtime built inside ONE process shares it, so
+#: sibling hibernate tiers never sweep each other's live parked slots.
+_PROCESS_RUN_ID = uuid.uuid4().hex[:16]
+
+
 class AwsWorkerError(RuntimeError):
     """An AWS CLI call failed or returned an unusable response."""
 
@@ -583,7 +589,18 @@ class AwsDisposableRuntime:
         # fresh per process (not env-overridable): a restarted dispatcher gets a new id, so its
         # predecessor's parked slots correctly read as orphans; a stable id would make them look
         # "ours" and never be swept.
-        self._run_id = uuid.uuid4().hex[:16]
+        # ...and it is ONE id for the whole process, not one per runtime INSTANCE. The comment
+        # above always said "per-PROCESS"; the code generated a fresh id per construction, and a
+        # cascade may legitimately hold several aws-ec2-hibernate positions ("aws-ec2:4,aws-ec2:16"
+        # -- _tier_identity is f"{name}#{idx}" precisely because names repeat). sweep_orphans
+        # filters on the shared blastbox-tier tag and spares only its OWN run id, so sibling tiers
+        # in one process read each other's live parked slots as foreign and terminate them.
+        #
+        # That was unreachable while the sweep ran only at CLI startup -- nothing is parked yet, as
+        # the CLI's own comment says -- and became reachable the moment a tier admitted mid-run
+        # started sweeping. A per-process id is also what docs/CONFIGURATION.md describes: "not
+        # carrying THIS DISPATCHER PROCESS'S blastbox-run id".
+        self._run_id = _PROCESS_RUN_ID
 
     def _describe_cached(self, slot: "AwsWorkerSlot", ttl: float) -> dict[str, Any]:
         now = self._clock()
