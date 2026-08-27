@@ -1032,7 +1032,7 @@ class CascadingRuntime:
     def materialize_warm_output(self, slot: Any) -> None:
         self._delegate(slot, "materialize_warm_output")(slot)
 
-    def maintain_idle(self, slot: Any) -> bool:
+    def maintain_idle(self, slot: Any, *, budget_s: "float | None" = None) -> bool:
         """Delegate the OPTIONAL idle-reconciliation seam (issue #80) to the slot's OWNING tier.
 
         The pool resolves this hook with ``getattr(self._runtime, "maintain_idle", None)``, and in
@@ -1053,6 +1053,11 @@ class CascadingRuntime:
         fn = getattr(tier.runtime, "maintain_idle", None)
         if not callable(fn):
             return True
+        # Forward the pool's tick-thread budget when the tier accepts one. Introspection rather
+        # than try/TypeError, for the reason reap() now states: a TypeError from INSIDE a tier's
+        # maintain_idle must never be mistaken for an older signature and retried.
+        if budget_s is not None and _accepts_kwarg(fn, "budget_s"):
+            return fn(slot, budget_s=budget_s) is not False
         return fn(slot) is not False
 
     def resume(self, slot: Any, *, budget_s: float | None = None) -> None:

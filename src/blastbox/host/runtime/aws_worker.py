@@ -2504,8 +2504,20 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # pending / rebooting / anything else: still coming up.
         return phase, False
 
-    def maintain_idle(self, slot: AwsWorkerSlot) -> bool:
+    def maintain_idle(self, slot: AwsWorkerSlot, *, budget_s: "float | None" = None) -> bool:
         """Reconcile one IDLE slot against reality, under the pool's exclusive window (issue #80).
+
+        ``budget_s`` is the POOL's bound on how long this may occupy its single tick thread. The
+        runtime's own health_probe_timeout_s (30s) is a sensible ceiling for a background probe and
+        far too long for the thread that also drives promotion, health checks, reaping and
+        replacement spawning -- and the rotation reaches a DIFFERENT slot each tick, so during a
+        control-plane brownout the stall is continuous rather than one-off. Who owns the thread
+        decides how long it may be held, so the pool passes the number.
+
+        Expiry needs no new machinery: the bounded call raises AwsProbeTimeout (an AwsUnknownState),
+        which the handler below already treats as "we could not look, change nothing" -- so the slot
+        is simply reconsidered on a later rotation. Deferring on expiry IS the existing tri-state
+        behaviour, reached by a shorter clock.
 
         Returns False when the slot is UNUSABLE and should be retired.
 
@@ -2521,7 +2533,8 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # the configured bound. Third time this exact sibling-scope mistake has been made on this
         # branch: the nesting composes only from INSIDE.
         try:
-            with self._health_probe_budget():
+            with (self._call_budget(budget_s) if budget_s is not None
+                  else self._health_probe_budget()):
                 try:
                     # UNCACHED: reconciliation must not act on a stale describe.
                     st = self._state(slot)

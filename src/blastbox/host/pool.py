@@ -260,6 +260,7 @@ class WarmPool:
         concurrent_ceiling: int = 16,
         spawn_rate_limit: float = 4.0,
         spawn_concurrency: int = 1,
+        maintain_budget_s: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
         poll_interval: float = 0.1,
         # Minimum seconds between maintain_idle passes on the SAME slot. The hook may issue
@@ -478,6 +479,13 @@ class WarmPool:
         # published must still count against concurrent_ceiling, or a batch would
         # overshoot the cap by however many spawns are in flight.
         self._spawn_concurrency = max(1, int(spawn_concurrency))
+        #: How long ONE maintenance pass may occupy the tick thread. The runtime's own probe
+        #: ceiling (health_probe_timeout_s, 30s) is sized for a background probe, not for the
+        #: thread that also drives promotion, health checks, reaping and replacement spawning --
+        #: and the rotation reaches a different slot each tick, so a control-plane brownout stalls
+        #: that thread continuously rather than once. Expiry is not a verdict: the bounded call
+        #: raises UNKNOWN and the slot is reconsidered on a later rotation.
+        self._maintain_budget_s = max(0.0, float(maintain_budget_s))
         self._spawns_in_flight = 0
 
         # Background thread
@@ -3398,7 +3406,9 @@ class WarmPool:
 
         usable = True
         try:
-            usable = hook(cand) is not False
+            usable = (hook(cand, budget_s=self._maintain_budget_s)
+                      if self._maintain_budget_s > 0 and _accepts_kwarg(hook, "budget_s")
+                      else hook(cand)) is not False
         except Exception:
             # An exception is not a verdict about the slot -- same rule as everywhere else here.
             # Hand it back and let the ordinary health path judge it.

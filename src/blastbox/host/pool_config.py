@@ -77,6 +77,12 @@ class PoolConfig:
     max_evictions_per_window: int | None = None
     # How long a slot may stay CONTINUOUSLY unknown before it can be replaced; 0 disables.
     unknown_grace_s: float | None = None
+    #: Tick-thread bounds for the idle-maintenance seam. Both were hardcoded in WarmPool and
+    #: unreachable from the environment, so the two knobs that bound this pool's control-plane
+    #: CALL RATE and its per-pass tick-thread HOLD were the only ones an operator could not turn
+    #: down during an incident -- while every comparable knob on the same page is tunable.
+    maintain_interval_s: float | None = None
+    maintain_budget_s: float | None = None
     # How long the pool may be unable to spawn for capacity reasons before that is an outage
     # rather than backpressure; 0 disables the alert.
     capacity_starved_after_s: float | None = None
@@ -138,6 +144,10 @@ class PoolConfig:
                 "BLASTBOX_POOL_MAX_EVICTIONS_PER_WINDOW", cls.max_evictions_per_window),
             "unknown_grace_s": _opt_float(
                 "BLASTBOX_POOL_UNKNOWN_GRACE_S", cls.unknown_grace_s),
+            "maintain_interval_s": _opt_float(
+                "BLASTBOX_POOL_MAINTAIN_INTERVAL_S", cls.maintain_interval_s),
+            "maintain_budget_s": _opt_float(
+                "BLASTBOX_POOL_MAINTAIN_BUDGET_S", cls.maintain_budget_s),
             "capacity_starved_after_s": _opt_float(
                 "BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S", cls.capacity_starved_after_s),
             "runtime": os.environ.get("BLASTBOX_POOL_RUNTIME", cls.runtime).strip().lower(),
@@ -221,6 +231,8 @@ def _configured_only(cfg: PoolConfig) -> dict[str, Any]:
         "max_consecutive_failures": cfg.max_consecutive_failures,
         "unknown_grace_s": cfg.unknown_grace_s,
         "capacity_starved_after_s": cfg.capacity_starved_after_s,
+        "maintain_interval_s": cfg.maintain_interval_s,
+        "maintain_budget_s": cfg.maintain_budget_s,
     }
     return {k: v for k, v in candidates.items() if v is not None}
 

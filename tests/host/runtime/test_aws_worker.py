@@ -4580,3 +4580,50 @@ def test_an_observation_only_freeze_does_not_anchor_the_park_episode():
         f"episode anchored at {rt._park_since.get('s')} -- an unrelated observation from 3000s "
         f"earlier -- so a slot that had just begun parking is already past its give-up budget"
     )
+
+
+def test_the_maintenance_budget_expiring_is_UNKNOWN_not_a_verdict():
+    """Deferring on expiry needs no new machinery. The bounded call raises AwsProbeTimeout (an
+    AwsUnknownState), which maintain_idle's existing handler already treats as "we could not look,
+    change nothing" -- so the slot stays usable and is reconsidered on a later rotation. A False
+    here RETIRES it, which would turn a short tick-thread budget into a slot-destroying one."""
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True])
+
+    def _too_slow(argv):    # noqa: ANN001 -- the control plane outruns the pool's tick budget
+        raise AwsProbeTimeout("aws ec2 describe-instances: exceeded the maintenance budget")
+
+    fake.responses["ec2 describe-instances"] = _too_slow
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    assert rt.maintain_idle(slot, budget_s=0.5) is not False, (
+        "a budget expiry was reported as UNUSABLE, so the pool retires a slot it never managed "
+        "to look at"
+    )
+
+
+def test_the_pools_budget_actually_bounds_the_aws_calls():
+    """Not just accepted -- APPLIED. The budget only means anything if it reaches the subprocess
+    timeout, so this captures what _aws hands the runner rather than trusting the signature.
+
+    Without it the pass falls back to health_probe_timeout_s (30s), which is sized for a background
+    probe and is far too long to hold the pool's single tick thread.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True])
+    timeouts: list = []
+    inner = rt._run_aws
+
+    def _capture(argv, timeout):    # noqa: ANN001
+        timeouts.append(timeout)
+        return inner(argv, timeout)
+
+    rt._run_aws = _capture          # type: ignore[method-assign]
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    rt.maintain_idle(slot, budget_s=2.0)
+    assert timeouts, "no aws call was made, so the budget proves nothing"
+    assert max(timeouts) <= 2.0, (
+        f"aws calls were bounded at {max(timeouts)}s despite a 2.0s pool budget -- the tick thread "
+        f"can be held for the runtime's own ceiling instead"
+    )

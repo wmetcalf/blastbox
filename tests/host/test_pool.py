@@ -4322,3 +4322,47 @@ def test_a_slow_base_identity_does_not_stall_the_pool_on_the_concurrent_path_eit
     assert blocked < 0.5, (
         f"a non-blocking claim waited {blocked:.2f}s on the concurrent publish path"
     )
+
+
+def test_the_maintenance_pass_is_bounded_by_the_pools_budget_not_the_runtimes():
+    """The runtime's own probe ceiling (health_probe_timeout_s, 30s) is sized for a BACKGROUND
+    probe. This runs on the pool's single tick thread -- the one that also drives promotion, health
+    checks, reaping and replacement spawning -- and the rotation reaches a different slot each tick,
+    so a control-plane brownout stalls that thread continuously rather than once. Whoever owns the
+    thread decides how long it may be held, so the pool passes the number.
+    """
+    seen: list = []
+
+    class _Budgeted(_FakeRuntime):
+        def maintain_idle(self, slot, *, budget_s=None):    # noqa: ANN001
+            seen.append(budget_s)
+            return True
+
+    rt = _Budgeted()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6, maintain_budget_s=2.5)
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots))
+    pool._slots[sid].state = SlotState.IDLE
+    pool._maintain_idle()
+
+    assert seen == [2.5], f"the hook was called with {seen}; the pool's budget was not applied"
+
+
+def test_a_hook_without_a_budget_parameter_is_still_supported():
+    """Introspection, not try/TypeError: a TypeError from INSIDE a hook must never be mistaken for
+    an older signature and retried -- the same rule cascade.reap now follows."""
+    seen: list = []
+
+    class _OldSignature(_FakeRuntime):
+        def maintain_idle(self, slot):    # noqa: ANN001 -- no budget_s
+            seen.append(slot.slot_id)
+            return True
+
+    rt = _OldSignature()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6, maintain_budget_s=2.5)
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots))
+    pool._slots[sid].state = SlotState.IDLE
+    pool._maintain_idle()
+
+    assert len(seen) == 1, "a hook without budget_s was not called at all"
