@@ -208,9 +208,9 @@ class StaticPoolRuntime:
         verdict, and it hits every worker on the same tick. NB a refusal or reset is NOT that: those
         are real answers about the box and still return False -- an earlier version of this
         docstring had that backwards.
-        Callers that need a plain bool coerce with ``is True``; only is_alive() forwards the
-        UNKNOWN, so the pool can keep the slot and bound how long it stays that way rather than
-        marking the whole tier dead at once (issue #77 marla-loop 2)."""
+        is_alive(), is_alive_for_claim() and is_ready() all FORWARD the UNKNOWN, so the pool can
+        keep the slot and bound how long it stays that way rather than marking the whole tier dead
+        at once (issue #77 marla-loop 2). Anything that coerces to a plain bool must say why."""
         url = self._base_url(w) + self.cfg.health_path
         headers = {"X-aws-proxy-auth": w.token} if w.token else {}
         try:
@@ -307,8 +307,17 @@ class StaticPoolRuntime:
             )
         raise StaticPoolUnhealthy("no free static worker is currently healthy")
 
-    def is_ready(self, slot: StaticWorkerSlot) -> bool:
-        return self._health_ok(self.cfg.workers[slot.worker_index]) is True
+    def is_ready(self, slot: StaticWorkerSlot) -> "bool | None":
+        """Tri-state, like every other SlotRuntime on this contract (pool.py: "None = UNKNOWN").
+
+        This coerced with ``is True`` back when readiness was a plain bool. It is not any more:
+        WarmPool suspends warming_timeout_s for the duration of an unknown episode, and only a None
+        opens one. Collapsing here meant a LOCAL fault -- EMFILE/ENOMEM, the host's own networking
+        being reconfigured -- read as a definitive "not ready" for every static worker on the same
+        tick, so the tier's whole WARMING population aged out and was evicted, each one charged as a
+        confirmed restore failure. That is issue #79's failure verbatim, on the tier nobody
+        converted. _health_ok was already tri-state; it just was not forwarded."""
+        return self._health_ok(self.cfg.workers[slot.worker_index])
 
     def is_alive(self, slot: StaticWorkerSlot) -> "bool | None":
         """always-on boxes: "alive" == reachable. Tri-state (issue #77 marla-loop 2).

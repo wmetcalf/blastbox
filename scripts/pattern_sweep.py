@@ -16,12 +16,20 @@ import ast
 import pathlib
 import sys
 
+# Every module that IMPLEMENTS the SlotRuntime protocol belongs here, not just the ones where a
+# bug was found once. The list held five files and missed StaticPoolRuntime.is_ready -- a live
+# UNKNOWN-to-False collapse on the tier the configuration guide uses in its own canonical example
+# -- because static_pool.py was never opened. A checker for a protocol has to scan its implementers.
 FILES = [
     "src/blastbox/host/pool.py",
     "src/blastbox/host/runtime/aws_worker.py",
     "src/blastbox/host/runtime/cascade.py",
     "src/blastbox/host/runtime/vm_dispatch.py",
     "src/blastbox/host/dispatch.py",
+    "src/blastbox/host/runtime/static_pool.py",
+    "src/blastbox/host/runtime/libvirt_vm.py",
+    "src/blastbox/host/runtime/gvisor_snapshot_runtime.py",
+    "src/blastbox/host/runtime/remote_http.py",
 ]
 ROOT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
 
@@ -33,6 +41,24 @@ def ann_text(node):
         return ast.unparse(node)
     except Exception:
         return ""
+
+
+#: Methods whose CONTRACT is tri-state (pool.py: "None = UNKNOWN"). A coercion inside one of these
+#: breaks the promise its own caller relies on; the same coercion elsewhere is deliberate narrowing.
+_TRI_STATE_CONTRACT = frozenset({"is_ready", "is_alive", "is_alive_for_claim"})
+
+
+def _enclosing_fn(parents, node):
+    """The FunctionDef `node` sits in, walking the parent map. There is no `fn` in scope on the
+    direct-call path, and reaching for one silently picked up a stale outer binding that made the
+    whole check vacuous -- caught only because the validation ran BOTH directions: clean tree still
+    clean, AND the reverted collapse still reported."""
+    cur = parents.get(node)
+    while cur is not None:
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return cur
+        cur = parents.get(cur)
+    return None
 
 
 def tri_state_defs(trees):
@@ -135,6 +161,18 @@ def bool_context(p, n, fn):
         return "<var> ? a : b"
     if isinstance(p, ast.Assert) and p.test is n:
         return "assert <var>"
+    if isinstance(p, ast.Compare) and p.left is n and len(p.ops) == 1 \
+            and isinstance(p.ops[0], (ast.Is, ast.IsNot)) \
+            and isinstance(p.comparators[0], ast.Constant) and p.comparators[0].value is True:
+        # `x is True` / `x is not True` COERCE: None is not True, so the UNKNOWN silently becomes
+        # the negative branch -- and this is the idiom the codebase recommends for coercion, so it
+        # is where a collapse is most likely to be written deliberately and then outlive its
+        # reason. StaticPoolRuntime.is_ready did exactly that: `return self._health_ok(...) is True`
+        # against a tri-state contract, invisible to this checker until the context was named.
+        # `is None` / `is not None` are deliberately NOT here -- those are the GUARD, not the
+        # collapse -- and neither is `is False`, which is an explicit test guards_none already
+        # handles.
+        return "<var> is True"
     if isinstance(p, ast.BoolOp) and n in p.values:
         return "and/or"
     if isinstance(p, ast.Call) and called_name(p) == "bool" and n in p.args:
@@ -437,8 +475,39 @@ def find_p1(trees, tri, strict=False):
                 ctx = "and/or"
             elif isinstance(p, ast.Call) and called_name(p) == "bool":
                 ctx = "bool(<call>)"
+            elif isinstance(p, ast.Compare) and p.left is n and len(p.ops) == 1 \
+                    and isinstance(p.ops[0], (ast.Is, ast.IsNot)) \
+                    and isinstance(p.comparators[0], ast.Constant) \
+                    and p.comparators[0].value is True:
+                # `return self._health_ok(...) is True` -- coerced straight out of the function,
+                # with no local to guard and no branch to discriminate in. This is the exact shape
+                # of the StaticPoolRuntime.is_ready collapse, and the reason it survived: the
+                # module was unscanned AND the idiom was unnamed. Both had to be fixed to see it.
+                #
+                # ...but ONLY inside a method that is itself contracted tri-state. `is True` is also
+                # the correct fail-closed idiom when the question is genuinely binary --
+                # StaticPoolRuntime.available() is `any(self._health_ok(w) is True ...)`, and an
+                # UNKNOWN worker must NOT count toward "this tier is usable". The collapse is a
+                # CONTRACT violation, not a bad idiom: it matters exactly when the enclosing method
+                # owes its caller the third state. Gating on the idiom alone reported available(),
+                # which is the kind of false positive that trains you to skim past this script.
+                _owner = _enclosing_fn(parents, n)
+                if _owner is None or _owner.name not in _TRI_STATE_CONTRACT:
+                    continue
+                ctx = "<call> is True"
             elif isinstance(p, (ast.While,)) and p.test is n:
                 ctx = "while <call>:"
+            # A BARE POSITIVE TEST is the safe shape, and the assigned-variable path above already
+            # treats it as one ("if <var>:" is excluded from consumes_none). `if rt.is_ready(s):`
+            # with no else means None declines the affirmative action -- which is exactly what "not
+            # ready yet" should do, and is why spawn_ready()'s polling loop is correct. Reporting it
+            # from the GATE while the identical shape on a local was exempt was an inconsistency,
+            # not a finding. It becomes dangerous only with an else that does something
+            # destructive, and that is the safe-versus-destructive distinction P1b exists for and
+            # states it cannot make -- so these go to the advisory, not the gate.
+            if ctx in ("if <call>:", "while <call>:") and not getattr(p, "orelse", None) \
+                    and not strict:
+                continue
             if ctx:
                 decl = ", ".join(f"{c}@{loc}" for c, loc in by_name[nm][:2])
                 hits.append((f"{path}:{n.lineno}", f"{recv or '?'}.{nm}", ctx, decl))
@@ -472,7 +541,13 @@ def find_p1(trees, tri, strict=False):
                     #   `not x` / `and`/`or` CONSUME the None branch on the spot, so only a guard
                     #     that already ran can save them. This is the shape the review cited:
                     #     `if not healthy: return` followed by a now-useless `if healthy is None:`.
-                    consumes_none = uctx != "if <var>:"
+                    # "<var> is True" joins "if <var>:" as ORDER-INDEPENDENT. The discrimination
+                    # for this idiom is written INSIDE the branch it opens --
+                    #     if verdict is not True:
+                    #         if verdict is False: ...   # <- the real discriminator
+                    # -- which a preceding-guard rule structurally cannot see. Demanding order here
+                    # reported static_pool.spawn(), which discriminates correctly.
+                    consumes_none = uctx not in ("if <var>:", "<var> is True")
                     if guards_none(fn, var,
                                    before=(lineno, unode.col_offset) if consumes_none else None,
                                    use_node=unode, paths=fpaths,

@@ -439,3 +439,33 @@ def test_strict_mode_still_reports_arms_that_reconverge_onto_the_use():
 def test_strict_mode_accepts_a_use_confined_to_the_else_arm():
     """The genuinely safe split: the use sits INSIDE the else, where None cannot be."""
     assert not _strict(_USE_CONFINED_TO_THE_ELSE)
+
+
+# --- `is True` is a coercion, and it matters inside a tri-state contract ---------------------
+
+_COERCES_INSIDE_CONTRACT = '''
+    def is_ready(self, s):
+        rt = R()
+        return rt.is_ready(s) is True
+'''
+
+_COERCES_OUTSIDE_CONTRACT = '''
+    def available(self):
+        rt = R()
+        return any(rt.is_ready(w) is True for w in self.workers)
+'''
+
+
+def test_is_True_inside_a_tri_state_method_is_reported():
+    """`return self._health_ok(...) is True` was a live UNKNOWN-to-False collapse in
+    StaticPoolRuntime.is_ready, and it survived because BOTH halves were missing: the module was
+    not in FILES, and `is True` was not a named boolean context. Fixing either one alone still
+    reported clean -- verified by reverting the fix and re-running with each half in place."""
+    assert sweep(_COERCES_INSIDE_CONTRACT)
+
+
+def test_is_True_outside_the_contract_is_not_reported():
+    """The same idiom is CORRECT where the question is genuinely binary: availability is
+    fail-closed, so an UNKNOWN worker must not count toward "this tier is usable". The collapse is
+    a contract violation, not a bad idiom -- gating on the idiom alone reported `available()`."""
+    assert not sweep(_COERCES_OUTSIDE_CONTRACT)

@@ -693,3 +693,34 @@ def test_the_pool_tells_a_reusing_runtime_about_burnout():
         f"the pool convicted the box but never told the runtime, so it stays in rotation "
         f"(burn_out calls: {burned})"
     )
+
+
+def test_is_ready_forwards_UNKNOWN_rather_than_calling_it_not_ready():
+    """SlotRuntime.is_ready is tri-state ("None = UNKNOWN") and WarmPool suspends warming_timeout_s
+    only while an unknown episode is open -- which only a None opens.
+
+    This coerced with `is True` from back when readiness was a plain bool. A LOCAL fault (EMFILE,
+    ENOMEM, the host's networking being reconfigured) makes _health_ok return None for EVERY worker
+    on the same tick, so the collapse read as a definitive "not ready" fleet-wide: the tier's whole
+    WARMING population aged out and was evicted, each charged as a confirmed restore failure. That
+    is issue #79's failure on the tier nobody converted.
+    """
+    class _CannotAsk:
+        def __call__(self, url, headers, timeout):   # noqa: ANN001 -- local exhaustion, not a verdict
+            raise OSError(24, "Too many open files")
+
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765"), http_probe=_CannotAsk())
+    slot = StaticWorkerSlot(slot_id="s", worker_index=0)
+
+    assert rt._health_ok(rt.cfg.workers[0]) is None, "the probe could not be attempted"
+    assert rt.is_ready(slot) is None, (
+        "UNKNOWN was flattened to a definitive not-ready; one host-side fault evicts the tier"
+    )
+
+
+def test_is_ready_still_answers_definitively_when_the_box_does():
+    """The half it must not break: a real answer from the box stays a real answer."""
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765"), http_probe=FakeProbe(all_ok=True))
+    assert rt.is_ready(StaticWorkerSlot(slot_id="s", worker_index=0)) is True
+    rt2 = StaticPoolRuntime(_cfg("10.0.0.1:8765"), http_probe=FakeProbe(healthy=set()))
+    assert rt2.is_ready(StaticWorkerSlot(slot_id="s", worker_index=0)) is False
