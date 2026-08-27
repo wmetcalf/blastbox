@@ -957,6 +957,18 @@ def test_a_slow_deferred_probe_does_not_delay_a_spawn_the_primary_can_serve(monk
     )
 
 
+def _await_admission(rt, timeout: float = 5.0) -> None:
+    """Admission probes run OFF the caller's thread now, so spawn() no longer admits inline.
+
+    The CONTRACT is unchanged -- a recovered tier is admitted, and probes stay rate-limited -- but
+    the pool observes it one tick later instead of paying for a synchronous cloud call on its sole
+    tick thread. Tests that used to read rt.tiers straight after a spawn wait here instead.
+    """
+    t = getattr(rt, "_admit_thread", None)
+    if t is not None:
+        t.join(timeout=timeout)
+
+
 def test_a_recovered_tier_is_admitted_on_a_later_spawn(monkeypatch):
     """The re-probe is the actual fix: without it the tier stays gone until the process restarts."""
     from blastbox.host import pool_config
@@ -984,8 +996,15 @@ def test_a_recovered_tier_is_admitted_on_a_later_spawn(monkeypatch):
         rt.spawn()
     assert [t.name for t in rt.tiers] == ["gvisor"], "no probe while the primary can still serve"
 
-    rt.spawn()                        # primary exhausted -> now the probe is worth paying for
+    # Exhaustion is what makes the probe worth paying for -- and THIS spawn still fails, because
+    # the probe now runs off the tick thread. That is the trade: the pool retries in ~0.1s and gets
+    # the tier then, instead of every pool activity freezing for as long as a browning-out control
+    # plane takes to answer. One tick of delay for no stall.
+    with pytest.raises(CascadeExhausted):
+        rt.spawn()
+    _await_admission(rt)
     assert [t.name for t in rt.tiers] == ["gvisor", "aws-ec2"], "the recovered tier must be admitted"
+    assert rt.spawn() is not None, "the tier must be usable on the next spawn"
     assert rt._deferred == []
     # Per-tier bookkeeping must grow with the tier list, or the next spawn indexes off the end.
     assert len(rt._counts) == len(rt.tiers)
@@ -1013,11 +1032,13 @@ def test_admission_is_rate_limited(monkeypatch):
 
     def _spawn():
         # The local tier fills at capacity 4; CascadeExhausted is irrelevant here -- the admission
-        # probe runs BEFORE the tier loop, and that is what we are counting.
+        # probe is what we are counting. It runs on its OWN thread now, so join before counting:
+        # the rate limit is unchanged, only the thread it runs on is.
         try:
             rt.spawn()
         except CascadeExhausted:
             pass
+        _await_admission(rt)
 
     for _ in range(5):
         _spawn()
@@ -1435,3 +1456,62 @@ def test_a_tier_whose_reap_predates_the_dirty_kwarg_is_still_supported(monkeypat
     slot = rt.spawn()
     rt.reap(slot, dirty=True)
     assert len(seen) == 1
+
+
+def test_admission_probes_do_not_run_on_the_callers_thread(monkeypatch):
+    """d.build() is an STS round trip plus a service probe, each able to burn cli_timeout_s, and
+    spawn() reaches admission from the pool's SINGLE tick thread -- the one that also drives
+    promotion, health checks, reaping and replacement spawning. Probing there froze all of them for
+    as long as the control plane took to answer, repeatedly, during exactly the overflow brownout
+    the deferral machine exists to survive."""
+    import time
+
+    from blastbox.host import pool_config
+
+    state = {"up": False}
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):  # noqa: ANN001
+        if name == "aws-ec2":
+            if require_available and not state["up"]:
+                raise AwsProbeTimeout("sts: timed out")
+            time.sleep(1.5)               # a slow availability probe on a recovering control plane
+            return FakeRuntime(name)
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:1,aws-ec2:4"}.get)
+    rt._admit_retry_s = 0.0
+    rt.spawn()                            # fill the primary (capacity 1)
+    state["up"] = True
+
+    t0 = time.monotonic()
+    with pytest.raises(CascadeExhausted):
+        rt.spawn()                        # triggers admission
+    blocked = time.monotonic() - t0
+
+    assert blocked < 0.5, (
+        f"spawn() blocked {blocked:.2f}s on an availability probe; on the pool's tick thread that "
+        f"stalls promotion, health checks, reaping and replacement spawning together"
+    )
+    _await_admission(rt)
+    assert [t.name for t in rt.tiers] == ["gvisor", "aws-ec2"]
+
+
+def test_close_joins_an_admission_probe_and_refuses_to_start_new_ones(monkeypatch):
+    """The lifecycle half. Without a join the probe is a daemon issuing control-plane calls while
+    the process tears down -- precisely the shape that made the pool's reaper threads a recurring
+    bug on this branch (seven instances)."""
+    from blastbox.host import pool_config
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name",
+                        lambda name, **kw: FakeRuntime(name))
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
+    from blastbox.host.runtime.cascade import DeferredTier
+
+    rt._deferred = [DeferredTier(name="aws-ec2", capacity=4, reason="undecided",
+                                 build=lambda: FakeRuntime("aws-ec2"), pos=1)]
+    rt._admit_retry_s = 0.0
+
+    rt.close()
+    rt._admit_deferred_async()
+    assert rt._admit_thread is None, "a probe was started after close()"

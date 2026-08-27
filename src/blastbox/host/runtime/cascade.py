@@ -292,6 +292,17 @@ class CascadingRuntime:
         #: True while an admission probe is running. The time gate alone cannot exclude a
         #: concurrent caller, because the probe can outrun its own window (see _admit_deferred).
         self._admit_inflight = False
+        #: The admission probe runs on its OWN thread. It is `d.build()` -- an STS round trip
+        #: plus a service probe, each able to burn cli_timeout_s -- and spawn() reaches it from
+        #: the pool's SINGLE tick thread, the one that also drives promotion, health checks,
+        #: reaping and replacement spawning. Probing there froze all of them for as long as a
+        #: browning-out control plane took to answer, repeatedly, during exactly the overflow
+        #: brownout the deferral machine exists to survive.
+        #:
+        #: Shutdown discipline is deliberate and copies the pool's reapers, because that same
+        #: class of bug arrived there seven times: never START one once closing, and JOIN it.
+        self._admit_thread: "threading.Thread | None" = None
+        self._admit_closing = False
         # Consecutive per-tier spawn failures before that tier's base is invalidated. 0 disables
         # per-tier repair (the tier then stays broken until something else notices, which behind
         # a working fallback is "never").
@@ -365,6 +376,57 @@ class CascadingRuntime:
         finally:
             with self._lock:
                 self._admit_inflight = False
+
+    def _admit_deferred_async(self) -> None:
+        """Start the admission probe OFF the caller's thread and return immediately.
+
+        spawn() reaches admission from the pool's tick thread, so probing there stalls the entire
+        pool for as long as the control plane takes to answer. Nothing is admitted by the time this
+        returns, so the caller's spawn still fails -- but the pool retries on its next tick (~0.1s)
+        and picks the tier up then, which is a far cheaper way to wait than holding the thread.
+
+        _admit_deferred() remains the SYNCHRONOUS primitive for callers that want to block.
+        """
+        with self._lock:
+            if self._admit_closing or self._admit_inflight or not self._deferred:
+                return
+            if self._admit_thread is not None and self._admit_thread.is_alive():
+                return
+            now = self._clock()
+            if self._last_admit_attempt is not None and \
+                    (now - self._last_admit_attempt) < self._admit_retry_s:
+                return
+            self._last_admit_attempt = now
+            self._admit_inflight = True
+            pending = list(self._deferred)
+            t = threading.Thread(target=self._admit_probe_bg, args=(pending,),
+                                 name="blastbox-cascade-admit", daemon=True)
+            self._admit_thread = t
+            t.start()
+
+    def _admit_probe_bg(self, pending: "list[DeferredTier]") -> None:
+        try:
+            self._admit_probe(pending)
+        except Exception:  # noqa: BLE001 -- must not die silently on a background thread
+            _log.warning("cascade: deferred admission probe failed", exc_info=True)
+        finally:
+            with self._lock:
+                self._admit_inflight = False
+
+    def close(self) -> None:
+        """Stop starting admission probes and join one already in flight.
+
+        Optional lifecycle hook, resolved by getattr like every other optional seam on this
+        runtime. Without a join the probe is a daemon making control-plane calls while the process
+        tears down -- precisely the shape that made the pool's reaper threads a recurring bug.
+        """
+        with self._lock:
+            self._admit_closing = True
+            t = self._admit_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=self._admit_retry_s or 5.0)
+            if t.is_alive():
+                _log.warning("cascade: admission probe still running at close -- proceeding")
 
     def _admit_probe(self, pending: "list[DeferredTier]") -> int:
         """The probe half of _admit_deferred, which owns the in-flight flag and the gate."""
@@ -490,8 +552,12 @@ class CascadingRuntime:
                 if not self._deferred:
                     raise
                 before = len(self.tiers)
-            if self._admit_deferred() <= 0:
-                raise                      # nothing joined; the original verdict stands
+            # Kick the probe OFF this thread and let the original verdict stand. Admission is
+            # never synchronous from here any more: the pool retries in ~0.1s and picks the tier
+            # up then, which costs one tick instead of freezing promotion, health checks, reaping
+            # and replacement spawning for as long as a browning-out control plane takes.
+            self._admit_deferred_async()
+            raise
             # Retry ONLY the newly admitted tiers. Re-running the whole list would re-attempt the
             # ones that just failed and charge their per-tier failure streaks a second time for a
             # single spawn -- and those streaks drive base invalidation.

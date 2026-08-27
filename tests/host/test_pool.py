@@ -4366,3 +4366,31 @@ def test_a_hook_without_a_budget_parameter_is_still_supported():
     pool._maintain_idle()
 
     assert len(seen) == 1, "a hook without budget_s was not called at all"
+
+
+def test_stop_closes_a_runtime_that_has_background_work():
+    """CascadingRuntime runs its admission probe on a thread and joins it in close(). Without this
+    call that daemon keeps making control-plane calls while the process tears down -- the shape
+    that made this file's own reaper threads a recurring bug."""
+    closed: list = []
+
+    class _HasBackgroundWork(_FakeRuntime):
+        def close(self):    # noqa: ANN201
+            closed.append(True)
+
+    pool = WarmPool(runtime=_HasBackgroundWork(), warm_size=1, spawn_rate_limit=1e6)
+    pool._spawn_to_deficit(ready=True)
+    pool.stop()
+
+    assert closed == [True], "stop() left the runtime's background work running"
+
+
+def test_a_runtime_close_that_raises_does_not_block_shutdown():
+    """Best-effort, like every other optional seam here: shutdown must complete regardless."""
+    class _BadClose(_FakeRuntime):
+        def close(self):    # noqa: ANN201
+            raise RuntimeError("cannot join")
+
+    pool = WarmPool(runtime=_BadClose(), warm_size=1, spawn_rate_limit=1e6)
+    pool._spawn_to_deficit(ready=True)
+    pool.stop()          # must not raise

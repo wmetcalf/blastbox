@@ -695,6 +695,18 @@ class WarmPool:
             for slot in to_reap:
                 slot.state = SlotState.DRAINING
 
+        # Let the runtime stop its own background work, if it has any. Optional hook, resolved by
+        # getattr like every other seam here. CascadingRuntime runs its admission probe on a thread
+        # and joins it in close(); without this call that daemon keeps making control-plane calls
+        # while the process tears down -- the shape that made this file's own reapers a recurring
+        # bug. Best-effort: a runtime that cannot close must not block shutdown.
+        _close = getattr(self._runtime, "close", None)
+        if callable(_close):
+            try:
+                _close()
+            except Exception:  # noqa: BLE001
+                logger.warning("pool.runtime_close_failed", exc_info=True)
+
         for slot in to_reap:
             try:
                 # require_tracked: after a reaper-join TIMEOUT this list is a snapshot — a reaper
