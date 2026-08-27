@@ -591,6 +591,16 @@ class WarmPool:
         if self._thread is not None:
             return
         self._stop_event.clear()
+        # Symmetric with stop()'s close(): a runtime that latched itself shut needs telling that the
+        # pool is running again. CascadingRuntime.close() sets a flag that refuses new admission
+        # probes, and without this the flag was permanent -- a restarted pool could never admit its
+        # configured overflow tiers again until the whole runtime object was reconstructed.
+        _open = getattr(self._runtime, "reopen", None)
+        if callable(_open):
+            try:
+                _open()
+            except Exception:  # noqa: BLE001 -- best-effort, exactly like close()
+                logger.warning("pool.runtime_reopen_failed", exc_info=True)
         with self._lock:
             self._started_at = self._clock()
         self._thread = threading.Thread(
@@ -700,10 +710,19 @@ class WarmPool:
         # and joins it in close(); without this call that daemon keeps making control-plane calls
         # while the process tears down -- the shape that made this file's own reapers a recurring
         # bug. Best-effort: a runtime that cannot close must not block shutdown.
+        # ...INSIDE the shared budget. This is a third join, and stop() promises ONE budget for
+        # the whole shutdown -- so calling close() with its own timeout meant stop(stop_timeout_s=0)
+        # could still wait out CascadingRuntime's default join (_admit_retry_s, 60s) after the tick
+        # and reaper joins had already spent the allowance. The caller's number stops meaning what
+        # it says, which is the exact hazard the shared stop_deadline was introduced for.
         _close = getattr(self._runtime, "close", None)
         if callable(_close):
+            _remaining = max(0.0, stop_deadline - self._clock())
             try:
-                _close()
+                if _accepts_kwarg(_close, "timeout_s"):
+                    _close(timeout_s=_remaining)
+                else:
+                    _close()
             except Exception:  # noqa: BLE001
                 logger.warning("pool.runtime_close_failed", exc_info=True)
 

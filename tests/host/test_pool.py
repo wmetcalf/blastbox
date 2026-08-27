@@ -4394,3 +4394,64 @@ def test_a_runtime_close_that_raises_does_not_block_shutdown():
     pool = WarmPool(runtime=_BadClose(), warm_size=1, spawn_rate_limit=1e6)
     pool._spawn_to_deficit(ready=True)
     pool.stop()          # must not raise
+
+
+def test_closing_the_runtime_stays_inside_the_shutdown_budget():
+    """stop() promises ONE budget for the whole shutdown, shared by every join it makes. The
+    runtime close hook was a THIRD join with its own default (CascadingRuntime uses _admit_retry_s,
+    60s), so stop(stop_timeout_s=0) could still wait roughly a minute after the tick and reaper
+    joins had already spent the allowance -- and the caller's number stops meaning what it says."""
+    import time
+
+    seen: list = []
+
+    class _SlowClose(_FakeRuntime):
+        def close(self, *, timeout_s=None):    # noqa: ANN001
+            seen.append(timeout_s)
+            time.sleep(min(0.2, timeout_s if timeout_s is not None else 0.2))
+
+    pool = WarmPool(runtime=_SlowClose(), warm_size=1, spawn_rate_limit=1e6)
+    pool._spawn_to_deficit(ready=True)
+
+    t0 = time.monotonic()
+    pool.stop(stop_timeout_s=0.0)
+    elapsed = time.monotonic() - t0
+
+    assert seen and seen[0] == 0.0, (
+        f"close() was handed {seen} instead of the remaining shutdown allowance"
+    )
+    assert elapsed < 1.0, f"stop(stop_timeout_s=0) took {elapsed:.2f}s"
+
+
+def test_a_restarted_pool_can_admit_deferred_tiers_again():
+    """close() latches the runtime shut so no new admission probe starts during shutdown. Without a
+    way back the latch was PERMANENT: start() only clears the pool's own stop event, so a stopped
+    and restarted pool could never admit its configured overflow tiers again until the whole
+    runtime object was reconstructed."""
+    events: list = []
+
+    class _Latching(_FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.closed = False
+
+        def close(self, *, timeout_s=None):    # noqa: ANN001
+            self.closed = True
+            events.append("close")
+
+        def reopen(self):    # noqa: ANN201
+            self.closed = False
+            events.append("reopen")
+
+    rt = _Latching()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6)
+    pool.start()
+    pool.stop(stop_timeout_s=0.0)
+    assert rt.closed, "stop() did not close the runtime"
+
+    pool.start()
+    try:
+        assert not rt.closed, "the runtime stayed latched shut across a restart"
+        assert events == ["reopen", "close", "reopen"] or events[-1] == "reopen"
+    finally:
+        pool.stop(stop_timeout_s=0.0)

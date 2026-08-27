@@ -413,7 +413,18 @@ class CascadingRuntime:
             with self._lock:
                 self._admit_inflight = False
 
-    def close(self) -> None:
+    def reopen(self) -> None:
+        """Undo close(). The pool calls this from start(), symmetric with close() from stop().
+
+        close() latches _admit_closing so no new probe begins during shutdown. Without a way back,
+        the latch was PERMANENT: a WarmPool that is stopped and started again -- which start() fully
+        supports, it only clears its own stop event -- could never admit its configured overflow
+        tiers again until the whole runtime object was reconstructed.
+        """
+        with self._lock:
+            self._admit_closing = False
+
+    def close(self, *, timeout_s: "float | None" = None) -> None:
         """Stop starting admission probes and join one already in flight.
 
         Optional lifecycle hook, resolved by getattr like every other optional seam on this
@@ -424,7 +435,10 @@ class CascadingRuntime:
             self._admit_closing = True
             t = self._admit_thread
         if t is not None and t.is_alive():
-            t.join(timeout=self._admit_retry_s or 5.0)
+            # The POOL's remaining shutdown allowance when it gives us one. stop() promises a single
+            # budget for the whole shutdown, and a join with its own default (60s) broke that.
+            _budget = self._admit_retry_s or 5.0 if timeout_s is None else max(0.0, timeout_s)
+            t.join(timeout=_budget)
             if t.is_alive():
                 _log.warning("cascade: admission probe still running at close -- proceeding")
 

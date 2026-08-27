@@ -1515,3 +1515,31 @@ def test_close_joins_an_admission_probe_and_refuses_to_start_new_ones(monkeypatc
     rt.close()
     rt._admit_deferred_async()
     assert rt._admit_thread is None, "a probe was started after close()"
+
+
+def test_reopen_lets_a_restarted_pool_admit_deferred_tiers_again(monkeypatch):
+    """close() latches the cascade so no new admission probe begins during shutdown. Without a way
+    back the latch is PERMANENT, and WarmPool.start() fully supports restarting a stopped pool --
+    it only clears its own stop event -- so the configured overflow tiers could never be admitted
+    again until the whole runtime object was reconstructed."""
+    from blastbox.host import pool_config
+    from blastbox.host.runtime.cascade import DeferredTier
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name",
+                        lambda name, **kw: FakeRuntime(name))
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
+    rt._admit_retry_s = 0.0
+    rt._deferred = [DeferredTier(name="aws-ec2", capacity=4, reason="undecided",
+                                 build=lambda: FakeRuntime("aws-ec2"), pos=1)]
+
+    rt.close()
+    rt._admit_deferred_async()
+    assert rt._admit_thread is None, "a probe started while closed"
+
+    rt.reopen()
+    rt._admit_deferred_async()
+    _await_admission(rt)
+    assert [t.name for t in rt.tiers] == ["gvisor", "aws-ec2"], (
+        "the cascade stayed latched shut after reopen(), so a restarted pool can never recover "
+        "its overflow tiers"
+    )
