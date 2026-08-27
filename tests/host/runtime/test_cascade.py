@@ -1756,3 +1756,53 @@ def test_poll_probes_without_any_spawn(monkeypatch):
     rt.poll()                      # no spawn() anywhere -- the pool is idle and healthy
     _await_admission(rt)
     assert [t.name for t in rt.tiers] == ["gvisor", "aws-ec2"]
+
+
+def test_a_failed_post_admission_sweep_stays_owed(monkeypatch):
+    """The tier has already left _deferred by the time the sweep runs, so nothing else remembers
+    the sweep is owed -- and both sweep callers are one-shot, so logging the failure alone forfeits
+    reclamation until the next process restart. The blank-inventory AwsNoVerdict added a fresh way
+    to reach this handler, which made the gap reachable rather than theoretical."""
+    from blastbox.host import pool_config
+    from blastbox.host.runtime.cascade import DeferredTier
+
+    attempts: list = []
+
+    class _FailsThenWorks(FakeRuntime):
+        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("describe-instances: empty response (rc=0)")
+            return ["i-predecessor"]
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name",
+                        lambda name, **kw: FakeRuntime(name))
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
+    rt._admit_retry_s = 0.0
+    rt._deferred = [DeferredTier(name="aws-ec2", capacity=4, reason="x",
+                                 build=lambda: _FailsThenWorks("aws-ec2"), pos=1)]
+    rt._admit_probe(list(rt._deferred))
+
+    assert attempts == [1], "the sweep should have been attempted once"
+    assert rt._sweep_owed, "a failed sweep was logged and forgotten"
+
+    rt._run_owed_sweeps()
+    assert len(attempts) == 2, "the owed sweep was never retried"
+    assert not rt._sweep_owed, "a successful retry must clear the debt"
+
+
+def test_a_failed_retry_is_still_owed(monkeypatch):
+    """The ledger must not be a one-shot either -- that is the problem it exists to solve."""
+    from blastbox.host import pool_config
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name",
+                        lambda name, **kw: FakeRuntime(name))
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
+
+    class _AlwaysFails(FakeRuntime):
+        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+            raise RuntimeError("still throttled")
+
+    rt._sweep_owed = [_AlwaysFails("aws-ec2")]
+    rt._run_owed_sweeps()
+    assert rt._sweep_owed, "a retry that failed dropped the debt"

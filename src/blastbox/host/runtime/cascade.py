@@ -463,7 +463,11 @@ class CascadingRuntime:
             try:
                 fn()
             except Exception:  # noqa: BLE001 -- best-effort
-                _log.warning("cascade: deferred orphan sweep failed", exc_info=True)
+                # Requeue: a retry that fails is still owed. Dropping it here would make the
+                # ledger a one-shot too, which is the problem it exists to solve.
+                with self._lock:
+                    self._sweep_owed.append(rt)
+                _log.warning("cascade: deferred orphan sweep failed -- still owed", exc_info=True)
 
     def _admit_probe_bg(self, pending: "list[DeferredTier]") -> None:
         try:
@@ -600,8 +604,15 @@ class CascadingRuntime:
                 try:
                     _sweep()
                 except Exception:  # noqa: BLE001 -- a sweep hiccup must not unwind an admission
-                    _log.warning("cascade: orphan sweep failed on newly admitted tier %r",
-                                 d.name, exc_info=True)
+                    # ...but it must not DISCARD the sweep either. The tier has already left
+                    # _deferred by now, so nothing else remembers this is owed -- and both sweep
+                    # callers are one-shot, so logging alone forfeits reclamation until the next
+                    # process restart. The blank-inventory AwsNoVerdict added a fresh way to reach
+                    # this handler, which is what made the gap reachable rather than theoretical.
+                    with self._lock:
+                        self._sweep_owed.append(rt)
+                    _log.warning("cascade: orphan sweep failed on newly admitted tier %r -- kept "
+                                 "owed for a later beat", d.name, exc_info=True)
         with self._lock:
             # Re-stamp from COMPLETION, not from the start. The probe is two aws-cli calls that can
             # each burn the full cli_timeout_s during the very outage that caused the deferral, so

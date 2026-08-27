@@ -204,14 +204,6 @@ class AwsNoVerdict(AwsUnknownState):
     fail to get an answer -- including the ones added next."""
 
 
-class AwsThrottled(AwsNoVerdict):
-    """AWS rate-limited us (or was momentarily unavailable) -- the retryable flavour of UNKNOWN.
-
-    Split out because availability asks a different question from liveness: a throttle is the one
-    non-answer that clearly warrants a retry, whereas an auth error is a real verdict about whether
-    the tier may be used at all (issue #79)."""
-
-
 class AwsNotExecuted(AwsNoVerdict):
     """The aws process never STARTED, so nothing was asked and nothing was attempted.
 
@@ -223,6 +215,24 @@ class AwsNotExecuted(AwsNoVerdict):
     ENOMEM, the binary briefly absent mid-upgrade) issued no stop at all, so counting it as an
     attempt lets an instance stopped by an operator be adopted as a parked warm slot with
     nothing behind it. _freeze_park's own docstring already draws this line."""
+
+
+class AwsThrottled(AwsNotExecuted):
+    """AWS rate-limited us (or was momentarily unavailable) -- the retryable flavour of UNKNOWN.
+
+    Split out because availability asks a different question from liveness: a throttle is the one
+    non-answer that clearly warrants a retry, whereas an auth error is a real verdict about whether
+    the tier may be used at all (issue #79).
+
+
+    A throttle is a REJECTION, not a lost response: AWS refused the request rather than performing
+    it, so nothing was attempted. That distinction only matters to one caller -- _try_park records
+    an unresolved attempt as _park_attempted, which the `stopped` and `stopping` doors later accept
+    as proof that the instance holds a hibernation image WE captured. A throttled stop captured
+    nothing, so an instance an operator later stopped normally was published as an unusable warm
+    slot. Same shape as the clock-skew and failed-fork cases; this one reached the ordinary
+    unresolved-attempt arm because AwsThrottled was a SIBLING of AwsNotExecuted rather than a
+    subclass of it."""
 
 
 class AwsCliMissing(AwsNotExecuted):

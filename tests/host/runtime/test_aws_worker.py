@@ -4679,3 +4679,43 @@ def test_a_genuinely_empty_inventory_is_still_a_clean_sweep():
     rt, fake = _sweep_rt(orphan_max_age_s=3600.0)
     fake.responses["ec2 describe-instances"] = {"Reservations": []}
     assert rt.sweep_orphans(now=_gmt_epoch("2026-07-11 00:00:00") + 7200) == []
+
+
+def test_a_throttled_stop_is_a_rejection_not_an_unresolved_attempt():
+    """A throttle is a REJECTION: AWS refused the request rather than performing it, so nothing was
+    attempted and nothing was captured. Recorded as an unresolved attempt it became _park_attempted,
+    which the `stopped` and `stopping` doors accept as proof the instance holds a hibernation image
+    WE captured -- so an instance an operator later stopped normally was published as an unusable
+    warm slot.
+
+    Third instance of this shape (failed fork, clock skew, throttle). This one reached the ordinary
+    unresolved-attempt arm because AwsThrottled was a SIBLING of AwsNotExecuted, not a subclass.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    now = [1000.0]
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    fake.responses["ec2 stop-instances"] = lambda argv: _cp(
+        rc=254, stderr="An error occurred (RequestLimitExceeded) when calling StopInstances")
+    rt._phase["s"] = "hibernating"
+    rt.is_ready(slot)
+    now[0] += 5.0
+    rt.is_ready(slot)
+
+    assert "s" not in rt._park_attempted, (
+        "a throttled stop AWS never performed was recorded as an unresolved attempt"
+    )
+    assert "s" in rt._park_unknown_since, "we still learned nothing, so the clock must freeze"
+
+
+def test_a_throttle_still_leaves_tier_availability_undecided():
+    """It must stay RETRYABLE -- a throttle is the one non-answer that clearly warrants a retry."""
+    from blastbox.host.runtime.aws_worker import AwsNoVerdict
+    from blastbox.host.runtime.cascade import _is_undecided_availability
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True])
+    for k in list(fake.responses):
+        fake.responses[k] = lambda argv: _cp(
+            rc=254, stderr="An error occurred (ThrottlingException) when calling GetCallerIdentity")
+    with pytest.raises(AwsNoVerdict) as ei:
+        rt.available()
+    assert _is_undecided_availability(ei.value), "a throttle must stay deferrable"
