@@ -2828,9 +2828,17 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         if not (max_age > 0):
             return []
         now = time.time() if now is None else now
+        # expect_output: this is the sweep's INVENTORY, and an empty inventory is the same shape as
+        # a successful sweep that found nothing. Without it a blank rc=0 parsed to {}, Reservations
+        # came back empty, and the sweep reported success having reclaimed nothing -- and both
+        # callers are ONE-SHOT (dispatcher start, and a tier's admission), so a single transient
+        # blank-output incident silently forfeits reclamation until the next process restart, with
+        # the predecessor's hibernated instances accruing EBS cost the whole time. Raising instead
+        # lets the callers' existing handlers report a FAILED sweep, which is the truth.
         resp = self._aws("ec2", "describe-instances", "--filters",
                          f"Name=tag:{_TAG_TIER},Values={self.kind}",
-                         "Name=instance-state-name,Values=stopping,stopped")
+                         "Name=instance-state-name,Values=stopping,stopped",
+                         expect_output=True)
         killed: list[str] = []
         for res in resp.get("Reservations", []):
             for inst in res.get("Instances", []):

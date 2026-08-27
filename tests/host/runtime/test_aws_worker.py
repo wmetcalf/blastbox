@@ -4654,3 +4654,28 @@ def test_sibling_hibernate_tiers_do_not_sweep_each_others_live_parked_slots():
     killed = rt_a.sweep_orphans(now=_gmt_epoch("2026-07-11 00:00:00") + 7200)
     swept_ours = [i for i in killed if i == "i-ours"]
     assert not swept_ours, f"the sweep terminated this process's own parked slot: {killed}"
+
+
+def test_a_blank_orphan_inventory_is_a_failed_sweep_not_an_empty_one():
+    """An empty inventory and a blank response are the same shape once `{}` is parsed: Reservations
+    comes back empty and the sweep reports success having reclaimed nothing.
+
+    Both callers are ONE-SHOT -- dispatcher start, and a tier's admission -- so a single transient
+    blank-output incident silently forfeits reclamation until the next process restart, with the
+    predecessor's hibernated instances accruing EBS cost throughout. A sweep that could not read
+    its inventory has not swept.
+    """
+    from blastbox.host.runtime.aws_worker import AwsNoVerdict
+    rt, fake = _sweep_rt(orphan_max_age_s=3600.0)
+    fake.responses["ec2 describe-instances"] = lambda argv: _cp(stdout="")   # rc=0, said nothing
+
+    with pytest.raises(AwsNoVerdict):
+        rt.sweep_orphans(now=_gmt_epoch("2026-07-11 00:00:00") + 7200)
+
+
+def test_a_genuinely_empty_inventory_is_still_a_clean_sweep():
+    """The half it must not break: a real answer with no matching instances reclaims nothing and
+    is not an error."""
+    rt, fake = _sweep_rt(orphan_max_age_s=3600.0)
+    fake.responses["ec2 describe-instances"] = {"Reservations": []}
+    assert rt.sweep_orphans(now=_gmt_epoch("2026-07-11 00:00:00") + 7200) == []
