@@ -176,7 +176,11 @@ def _is_undecided_availability(exc: BaseException) -> bool:
     cur: BaseException | None = exc
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
-        if any(c.__name__ in ("AwsNoVerdict", "AwsThrottled", "AwsProbeTimeout")
+        # StaticPoolNoVerdict is the static tier's member of this set: same meaning ("we could not
+        # ask"), so same treatment. Matched by NAME so this module keeps no import dependency on the
+        # runtimes, which are optional and may not be installed.
+        if any(c.__name__ in ("AwsNoVerdict", "AwsThrottled", "AwsProbeTimeout",
+                              "StaticPoolNoVerdict")
                for c in type(cur).__mro__):
             return True
         cur = cur.__cause__ or cur.__context__

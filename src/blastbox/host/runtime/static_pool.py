@@ -50,6 +50,20 @@ class StaticPoolUnavailable(RuntimeError):
     """No worker is configured / reachable -- the tier must not be selected."""
 
 
+class StaticPoolNoVerdict(StaticPoolUnavailable):
+    """We could not ASK. Distinct from "we asked and the fleet is down", which is the base class.
+
+    The cascade defers a tier whose availability probe reached no verdict and re-probes it, instead
+    of dropping it for the life of the process. That machine keys off the exception, so a transient
+    local fault (EMFILE, a NIC being reconfigured) has to be raised as something other than a
+    verdict -- otherwise static gets the pre-#79 behaviour on the tier the guide uses as its
+    canonical cascade example: primary -> CascadeMisconfigured at boot, overflow -> skipped for the
+    process lifetime with the pool still reporting green.
+
+    Subclasses StaticPoolUnavailable so every existing `except StaticPoolUnavailable` still catches
+    it -- this narrows the meaning, it does not change who handles it."""
+
+
 def _env(get: Callable[[str], str | None], key: str, default: str | None = None) -> str | None:
     v = get(key)
     return v if (v is not None and v != "") else default
@@ -225,9 +239,23 @@ class StaticPoolRuntime:
             return None
 
     # -- fail-closed availability ------------------------------------------
-    def available(self) -> bool:
-        """True iff at least one registered worker answers /healthz (fail-closed)."""
-        return any(self._health_ok(w) is True for w in self.cfg.workers)
+    def available(self) -> "bool | None":
+        """TRI-STATE, matching `_health_ok` and `is_ready`: True = a box answered healthy,
+        False = every box answered and none was healthy, None = nobody ANSWERED.
+
+        `any(... is True ...)` collapsed the third case into the second, which is issue #79's exact
+        shape: an unreachable control plane read as a definitive "this tier is down". This PR
+        converted `is_ready` here for that reason and left `available()`, which is the half the
+        cascade's deferral machine actually consults.
+
+        Still fail-closed for selection -- None is not "available" -- but the CALLER can now tell
+        the two apart and defer rather than discard."""
+        verdicts = [self._health_ok(w) for w in self.cfg.workers]
+        if any(v is True for v in verdicts):
+            return True
+        if verdicts and all(v is None for v in verdicts):
+            return None      # nobody answered: UNKNOWN, not down
+        return False
 
     # -- SlotRuntime protocol ----------------------------------------------
     def worker_identity(self, slot: object) -> str | None:
@@ -408,6 +436,11 @@ def select_static_pool_runtime(
     ctx = dispatch_ssl_context_from_env(getter)
     probe = http_probe or (make_tls_probe(ctx) if ctx else None)
     rt = StaticPoolRuntime(cfg, http_probe=probe, ssl_context=ctx)
-    if require_available and not rt.available():
-        raise StaticPoolUnavailable("no configured static worker answered /healthz")
+    if require_available:
+        _avail = rt.available()
+        if _avail is None:
+            raise StaticPoolNoVerdict(
+                "no configured static worker could be probed (no verdict) -- deferring, not dropping")
+        if not _avail:
+            raise StaticPoolUnavailable("no configured static worker answered /healthz")
     return rt

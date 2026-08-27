@@ -4902,6 +4902,22 @@ def test_every_park_state_write_goes_through_the_lock():
                 return cur.name
         return "<class body>"
 
+    # ALIASES. `for d in (self._phase, self._park_since): d.pop(sid, None)` is not a hypothetical
+    # idiom -- it is the one aws_worker.py already uses for park bookkeeping, in BOTH reap() and
+    # _forget_slot_locked(). A guard that only matches `self.<map>.pop(...)` is therefore blind to
+    # the exact shape the next writer is most likely to copy from the file, and would report clean.
+    # So bind loop targets iterating a tuple of guarded maps, and treat writes through them as
+    # writes to the maps themselves.
+    aliases: dict = {}
+    for node in ast.walk(cls):
+        if isinstance(node, ast.For) and isinstance(node.target, ast.Name) \
+                and isinstance(node.iter, (ast.Tuple, ast.List)):
+            named = [e.attr for e in node.iter.elts
+                     if isinstance(e, ast.Attribute) and e.attr in GUARDED]
+            if named:
+                for inner in ast.walk(node):
+                    aliases[id(inner)] = (node.target.id, named)
+
     unguarded = []
     for node in ast.walk(cls):
         target = None
@@ -4909,9 +4925,14 @@ def test_every_park_state_write_goes_through_the_lock():
                 and node.value.attr in GUARDED and isinstance(node.ctx, (ast.Store, ast.Del)):
             target = node.value.attr
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
-                and node.func.attr in MUTATORS and isinstance(node.func.value, ast.Attribute) \
-                and node.func.value.attr in GUARDED:
-            target = node.func.value.attr
+                and node.func.attr in MUTATORS:
+            base = node.func.value
+            if isinstance(base, ast.Attribute) and base.attr in GUARDED:
+                target = base.attr
+            elif isinstance(base, ast.Name) and id(node) in aliases:
+                alias_name, named = aliases[id(node)]
+                if base.id == alias_name:
+                    target = "/".join(named) + f" (via alias `{alias_name}`)"
         if target and not _locked_context(node):
             unguarded.append(f"{_fn_of(node)}() writes self.{target} at line {node.lineno}")
 
@@ -5163,3 +5184,150 @@ def test_a_describe_landing_after_reap_leaves_no_cache_entry_behind():
         f"_desc_cache still holds an entry for a reaped slot ({rt._desc_cache.get('s')!r}); ids are "
         f"per-spawn UUIDs, so reap() was its only collector and this entry is now permanent")
     assert "s" not in rt._desc_fail_at, "_desc_fail_at leaked an entry for a reaped slot"
+
+
+def test_the_hibernate_tier_rejects_a_timeout_that_cannot_mean_a_duration():
+    """Third round of this class, on the tier that had none of the hardening.
+
+    `Ec2HibernateConfig` defined no `__post_init__`, so its four float knobs took anything `float()`
+    accepted -- while the BASE config validates the probe budgets, `orphan_max_age_s` is explicitly
+    NaN-hardened, and every pool knob is checked at its reader. This branch is what made
+    `hibernate_timeout_s` load-bearing TWICE in `_park_expired`: as the credit cap
+    `min(credit + live, hibernate_timeout_s)` and as the threshold.
+
+    NaN wins both comparisons: `min(x, nan)` is x and `x > nan` is False, so the give-up escape can
+    NEVER fire -- the escape whose own comment says that without it the slot is unclaimable forever
+    AND blocks its own replacement, so a warm_size=1 tier stays dead until someone intervenes.
+    A NEGATIVE value inverts it: `min(0, -1)` is -1, so `age > -1` holds at age 0 and every slot in
+    the tier is retired on its first observation.
+
+    MUTATION: delete Ec2HibernateConfig.__post_init__ -> nan/inf/-1 survive and both asserts fail.
+    """
+    from blastbox.host.runtime.aws_worker import Ec2HibernateConfig
+
+    for bad in ("nan", "inf", "-inf", "-1", "0"):
+        cfg = Ec2HibernateConfig.from_env(
+            {"BLASTBOX_EC2_AMI": "ami-x", "BLASTBOX_EC2_HIBERNATE_TIMEOUT_S": bad}.get)
+        assert cfg.hibernate_timeout_s == 300.0, (
+            f"hibernate_timeout_s={bad!r} was accepted as {cfg.hibernate_timeout_s!r}")
+    # a real value still wins
+    assert Ec2HibernateConfig.from_env(
+        {"BLASTBOX_EC2_AMI": "ami-x", "BLASTBOX_EC2_HIBERNATE_TIMEOUT_S": "45"}.get
+    ).hibernate_timeout_s == 45.0
+    # ...and chaining to the base must not have been lost by defining __post_init__ here
+    assert Ec2HibernateConfig.from_env(
+        {"BLASTBOX_EC2_AMI": "ami-x", "BLASTBOX_AWS_HEALTH_PROBE_TIMEOUT_S": "nan"}.get
+    ).health_probe_timeout_s == 30.0, "subclass __post_init__ silently replaced the base's clamp"
+
+    # BEHAVIOUR: the give-up escape still fires for a genuinely stuck slot.
+    now = [1000.0]
+    rt, _ = _hibernate_rt(state=["stopping"], healthy=[True], clock=lambda: now[0],
+                          hibernate_timeout_s=float("nan"))
+    rt._park_since["s"] = 0.0
+    assert rt._park_expired("s", now[0]) is True, (
+        "a slot stuck for 1000s never expires, so it is unclaimable forever and blocks its own "
+        "replacement -- the exact failure the give-up escape exists to end")
+
+
+def test_a_failing_describe_that_loses_to_the_reaper_leaves_no_desc_fail_at_entry():
+    """`_desc_fail_at` is popped by super().reap() -- which runs BEFORE the tombstone.
+
+    So the pop is not inside the critical section that makes it stick. A `_describe_cached` FAILURE
+    still in flight lands `_desc_fail_at[sid] = clock()` after the slot's only cleanup, and slot ids
+    are per-spawn UUIDs, so the entry is permanent -- one leaked per race.
+
+    `_forget_slot_locked` does sweep it, but is only reachable from `_park_step` re-entry, and this
+    path never gets there: `is_ready()` describes BEFORE `_park_step`, so a describe failure
+    short-circuits straight out to the exception handler.
+
+    MUTATION: drop `_desc_fail_at` from reap()'s locked tuple -> the entry survives.
+    """
+    from blastbox.host.runtime.aws_worker import AwsProbeTimeout, AwsWorkerSlot
+
+    now = [1000.0]
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    fake.responses["ec2 terminate-instances"] = {}
+
+    def _reaper_wins_then_the_describe_fails(*a, **kw):  # noqa: ANN002, ANN003, ANN202
+        rt.reap(slot)                                    # disposal completes first...
+        raise AwsProbeTimeout("describe-instances: timed out")   # ...then our call fails
+
+    rt._describe = _reaper_wins_then_the_describe_fails  # type: ignore[method-assign]
+    rt.is_ready(slot)
+
+    assert "s" not in rt._desc_fail_at, (
+        f"_desc_fail_at leaked {rt._desc_fail_at.get('s')!r} for a slot already tombstoned "
+        f"({list(rt._reaped_ids)}); nothing collects a per-spawn UUID after reap()")
+
+
+def test_the_park_clock_is_anchored_when_the_calls_finished_not_when_the_pass_started():
+    """`is_ready` samples `now` once and opens no budget scope; the pass then blocks twice.
+
+    The wrapper releases `_park_lock` for the agent probe AND for stop-instances, each able to burn
+    the full `cli_timeout_s` (120s) -- and unlike `maintain_idle`, `is_ready` wraps the pass in no
+    `_call_budget`. Settling against the pre-call `now` therefore charges the LATENCY of those calls
+    to the operator's `hibernate_timeout_s` budget: a 240s pass anchors `_park_since` 240s in the
+    past, so 80% of a 300s window is spent before the first attempt is even counted. Under the
+    correlated throttling this branch exists to survive, every slot hits it together and the tier
+    churns instances instead of parking them.
+
+    The file already states this rule three lines away in `_record_park_accepted_locked` ("self.
+    _clock(), NOT the pre-call `now` ... stamping the pre-call value let the duration of the stop
+    itself consume the whole window"). It was applied to `_hib_started` and not to its siblings.
+
+    MUTATION: drop the fresh `now = self._clock()` from `_settle_park_locked` -> _park_since is
+    anchored at the start of the pass again and this fails.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+
+    clock = [1000.0]
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: clock[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    def _slow_refused_stop(argv):  # noqa: ANN001 -- the probe + stop burn 240s of real time
+        clock[0] += 240.0
+        return _cp(rc=254,
+                   stderr="An error occurred (UnsupportedOperation): not ready to hibernate yet")
+
+    fake.responses["ec2 stop-instances"] = _slow_refused_stop
+    rt._park_step(slot, "running", clock[0])
+
+    started = rt._park_since.get("s")
+    assert started is not None, "sanity: a refused attempt should still open the give-up clock"
+    lag = clock[0] - started
+    assert lag < 1.0, (
+        f"the park episode was anchored {lag:.0f}s in the past, so that much of the "
+        f"{rt.cfg.hibernate_timeout_s:.0f}s parking budget is consumed by call latency rather than "
+        f"by parking attempts")
+
+
+def test_a_liveness_probe_that_loses_to_the_reaper_leaves_no_live_cache_entry():
+    """`_live_cache` was the last per-slot map whose publication was not tombstone-aware.
+
+    The base `reap()` pops it BEFORE issuing the slow terminate, and it is written from two threads
+    that can both be mid-describe at that moment: the pool tick thread (`is_alive`, via
+    `_health_check`) and dispatcher claim threads (`is_alive_for_claim`). A write landing after
+    disposal re-creates an entry for a per-spawn UUID -- and on a disposable-warm tier that mints a
+    slot per job, that is once per race, forever.
+
+    MUTATION: remove the `_slot_is_gone` guard from the `is_alive` publication -> the entry survives.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+
+    now = [1000.0]
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    fake.responses["ec2 terminate-instances"] = {}
+
+    def _reaper_wins_mid_probe(*a, **kw):  # noqa: ANN002, ANN003, ANN202
+        rt.reap(slot)                       # disposal completes while we are "in the describe"
+        return {"InstanceId": "i-1", "State": {"Name": "running"}}
+
+    rt._describe = _reaper_wins_mid_probe  # type: ignore[method-assign]
+    rt.is_alive(slot)
+
+    assert "s" not in rt._live_cache, (
+        f"_live_cache leaked {rt._live_cache.get('s')!r} for a slot already tombstoned "
+        f"({list(rt._reaped_ids)}); the base reap popped it before the terminate, so nothing "
+        f"collects it now")

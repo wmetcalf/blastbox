@@ -724,3 +724,41 @@ def test_is_ready_still_answers_definitively_when_the_box_does():
     assert rt.is_ready(StaticWorkerSlot(slot_id="s", worker_index=0)) is True
     rt2 = StaticPoolRuntime(_cfg("10.0.0.1:8765"), http_probe=FakeProbe(healthy=set()))
     assert rt2.is_ready(StaticWorkerSlot(slot_id="s", worker_index=0)) is False
+
+
+def test_static_availability_is_tri_state_so_a_transient_local_fault_defers_not_drops():
+    """This branch converted `_health_ok` and `is_ready` here to tri-state and left `available()`.
+
+    That is the half the cascade's deferral machine actually consults. `any(... is True ...)` turns
+    "we could not ASK any box" into a definitive "this tier is down", which is issue #79's failure
+    verbatim on the tier the configuration guide uses as its canonical cascade example
+    (`static:8,aws-ec2:16`). As primary it raised CascadeMisconfigured at boot -- the message
+    reserved for a permanent misconfiguration -- for an EMFILE that would have cleared in seconds;
+    as overflow it was skipped for the whole process lifetime with the pool still reporting green.
+
+    MUTATION: restore `any(self._health_ok(w) is True ...)` -> None collapses to False and the
+    no-verdict case raises the plain StaticPoolUnavailable again.
+    """
+    from blastbox.host.runtime.cascade import _is_undecided_availability
+    from blastbox.host.runtime.static_pool import StaticPoolNoVerdict, StaticPoolUnavailable
+
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"), http_probe=FakeProbe(all_ok=True))
+
+    rt._health_ok = lambda w, timeout=None: None                      # nobody answered
+    assert rt.available() is None, "an unaskable fleet must be UNKNOWN, not down"
+
+    rt._health_ok = lambda w, timeout=None: False                     # everyone answered, all sick
+    assert rt.available() is False, "a fleet that answered and is down is still a verdict"
+
+    rt._health_ok = lambda w, timeout=None: w.host == "10.0.0.1"      # one healthy
+    assert rt.available() is True
+
+    # ...and the cascade must classify the no-verdict case as DEFERRABLE, not as a verdict.
+    assert issubclass(StaticPoolNoVerdict, StaticPoolUnavailable), (
+        "every existing `except StaticPoolUnavailable` must still catch it")
+    assert _is_undecided_availability(StaticPoolNoVerdict("nobody answered")) is True, (
+        "the cascade treats a static no-verdict as a VERDICT, so the tier is dropped for the "
+        "process lifetime instead of deferred and re-probed")
+    assert _is_undecided_availability(StaticPoolUnavailable("fleet is down")) is False, (
+        "a real 'the fleet is down' verdict must NOT be deferred, or an unusable tier is retried "
+        "forever")

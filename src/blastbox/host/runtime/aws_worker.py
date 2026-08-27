@@ -660,6 +660,12 @@ class AwsDisposableRuntime:
         # carrying THIS DISPATCHER PROCESS'S blastbox-run id".
         self._run_id = _PROCESS_RUN_ID
 
+    def _slot_is_gone(self, sid: str) -> bool:
+        """Default: this runtime keeps no tombstone, so nothing is ever "gone". Overridden by tiers
+        that DO keep one (ec2-hibernate), which is what lets the shared describe-cache writes below
+        stay out of a slot that has already been disposed of."""
+        return False
+
     def _describe_cached(self, slot: "AwsWorkerSlot", ttl: float) -> dict[str, Any]:
         now = self._clock()
         cached = self._desc_cache.get(slot.slot_id)
@@ -677,14 +683,19 @@ class AwsDisposableRuntime:
             # the memo already expired the moment it was written, and the very next caller reissues
             # the describe this memo exists to prevent. Fifth site on this branch where a timestamp
             # guarding a slow call was taken before it instead of after.
-            self._desc_fail_at[slot.slot_id] = self._clock()
+            # Adding this map to reap()'s locked sweep does NOT fix the race: the write lands
+            # AFTER reap has run, so there is nothing left for reap to clear. The PUBLICATION is
+            # what has to know, because ids are per-spawn UUIDs and reap is their only collector.
+            if not self._slot_is_gone(slot.slot_id):
+                self._desc_fail_at[slot.slot_id] = self._clock()
             raise
         self._desc_fail_at.pop(slot.slot_id, None)
         # Stamped from COMPLETION. `now` was read before the call, so a describe slower than the
         # TTL produced a cache entry that was ALREADY EXPIRED when it landed -- the next caller
         # paid for another full control-plane wait to learn the same thing, which is precisely
         # what the cache exists to prevent. Seventh instance of stamp-before-call on this branch.
-        self._desc_cache[slot.slot_id] = (self._clock(), desc)
+        if not self._slot_is_gone(slot.slot_id):
+            self._desc_cache[slot.slot_id] = (self._clock(), desc)
         return desc
 
     def _describe(self, slot: "AwsWorkerSlot") -> dict[str, Any]:   # concrete tiers override
@@ -1027,7 +1038,11 @@ class AwsDisposableRuntime:
             # otherwise be written already-expired, so the next tick re-probes immediately and the
             # sole tick thread burns health_probe_timeout_s per idle slot for the whole outage
             # (upstream P2).
-            self._live_cache[slot.slot_id] = (self._clock(), None)
+            # Tombstone-aware like the describe caches: this runs on the tick thread
+            # (is_alive) and on dispatcher claim threads (is_alive_for_claim), either
+            # of which can be inside a 30s describe when the reaper disposes the slot.
+            if not self._slot_is_gone(slot.slot_id):
+                self._live_cache[slot.slot_id] = (self._clock(), None)
             return None
         except (AwsWorkerError, OSError):
             alive = False
@@ -1035,7 +1050,8 @@ class AwsDisposableRuntime:
         # BEFORE the describe this cache exists to throttle, so a degraded-but-answering control
         # plane (a 25s describe against a 5s TTL) wrote a memo that was already expired and the
         # next 0.1s tick re-probed anyway -- per idle slot, on the pool's sole tick thread.
-        self._live_cache[slot.slot_id] = (self._clock(), alive)
+        if not self._slot_is_gone(slot.slot_id):
+            self._live_cache[slot.slot_id] = (self._clock(), alive)
         return alive
 
     def is_alive_for_claim(self, slot: AwsWorkerSlot, *, budget_s: float | None = None) -> "bool | None":
@@ -1063,7 +1079,8 @@ class AwsDisposableRuntime:
             except (AwsWorkerError, OSError):
                 alive = False
         # Stamped at COMPLETION (see is_alive): `now` predates the claim probe it is memoising.
-        self._live_cache[slot.slot_id] = (self._clock(), alive)   # keep the background-tick cache coherent
+        if not self._slot_is_gone(slot.slot_id):   # keep the background-tick cache coherent
+            self._live_cache[slot.slot_id] = (self._clock(), alive)
         return alive
 
     def reap(self, slot: AwsWorkerSlot) -> None:
@@ -1885,6 +1902,31 @@ class Ec2HibernateConfig(Ec2Config):
     # precedent. Recommend a positive value >= peak park duration (e.g. 3600) to reclaim leaked EBS cost.
     orphan_max_age_s: float = 0.0
 
+    def __post_init__(self) -> None:
+        # CHAIN FIRST: the base validates the probe budgets, and a subclass defining
+        # __post_init__ silently replaces it otherwise (the base says so in its own comment).
+        super().__post_init__()
+        # Same class as the probe budgets and every pool knob: a float that PARSES but cannot mean a
+        # duration. This tier had none of it, and this PR made hibernate_timeout_s load-bearing
+        # twice in _park_expired -- as the credit cap `min(credit + live, hibernate_timeout_s)` AND
+        # as the threshold. NaN wins both: `min(x, nan)` is x and `x > nan` is False, so the give-up
+        # escape can NEVER fire -- the escape whose own comment says that without it the slot is
+        # unclaimable forever AND blocks its own replacement. A NEGATIVE value inverts it instead:
+        # `min(0, -1)` is -1, so `age > -1` is true at age 0 and every slot in the tier is retired
+        # on first observation. Neither is a configuration anyone can mean.
+        # resume_poll_s is an INTERVAL, not a budget: 0 legitimately means "re-probe with no
+        # delay". Only the three BUDGETS must be strictly positive -- a zero budget is the silent
+        # brick, a zero interval is just a fast loop.
+        for _name, _default, _allow_zero in (("ready_timeout_s", 600.0, False),
+                                             ("resume_timeout_s", 180.0, False),
+                                             ("resume_poll_s", 5.0, True),
+                                             ("hibernate_timeout_s", 300.0, False)):
+            _v = getattr(self, _name)
+            if not math.isfinite(_v) or _v < 0 or (_v == 0 and not _allow_zero):
+                _log.warning("ec2-hibernate: ignoring %s=%r (must be finite and > 0); using %s",
+                             _name, _v, _default)
+                object.__setattr__(self, _name, _default)
+
     @classmethod
     def from_env(cls, get: Callable[[str], str | None], **overrides: Any) -> Ec2HibernateConfig:
         import dataclasses
@@ -2432,6 +2474,18 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         ``_park_lock`` HELD and ``slot`` known live.
         """
         sid = slot.slot_id
+        # FRESH CLOCK, not the caller's pre-call `now`. `is_ready` samples `now` once and opens no
+        # budget scope (unlike maintain_idle), and the wrapper then makes up to TWO unbounded calls
+        # with it frozen -- the agent probe and stop-instances, each able to burn cli_timeout_s
+        # (120s). Settling against that stale value charges the LATENCY of those calls to the
+        # operator's 300s parking budget: measured, a 240s pass anchors _park_since 240s in the
+        # past, so 80% of the window is gone before the first attempt is even counted, and the tier
+        # churns instances instead of parking them during exactly the brownout it must survive.
+        # This is the rule the file already states in _record_park_accepted_locked -- "self._clock(),
+        # NOT the pre-call `now` ... stamping the pre-call value let the duration of the stop itself
+        # consume the whole window" -- applied to that fix's siblings, reached from the same wrapper
+        # after the same stop.
+        now = self._clock()
         try:
             _kind, _payload = park_outcome
             if _kind == "exc":
@@ -3027,8 +3081,15 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             self._reaped_ids[slot.slot_id] = None
             while len(self._reaped_ids) > self._REAPED_IDS_MAX:
                 self._reaped_ids.popitem(last=False)
-            for d in (self._phase, self._desc_cache, self._hib_attempt, self._hib_started,
-                      self._park_since, self._park_unknown_since, self._park_credit):
+            # _desc_fail_at is popped by super().reap() too, but that runs BEFORE this critical
+            # section -- so a _describe_cached FAILURE still in flight lands its
+            # `_desc_fail_at[sid] = clock()` after the slot's only cleanup. `_forget_slot_locked`
+            # sweeps it, but is only reachable from _park_step re-entry, and the failing-describe
+            # path never gets there: is_ready() describes BEFORE _park_step, so the exception
+            # short-circuits out. Clear it here, inside the tombstone, like every other map.
+            for d in (self._phase, self._desc_cache, self._desc_fail_at, self._hib_attempt,
+                      self._hib_started, self._park_since, self._park_unknown_since,
+                      self._park_credit):
                 d.pop(slot.slot_id, None)
             self._park_attempted.discard(slot.slot_id)
             self._park_refused.discard(slot.slot_id)
