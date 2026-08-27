@@ -472,6 +472,14 @@ class CascadingRuntime:
     def _admit_probe_bg(self, pending: "list[DeferredTier]") -> None:
         try:
             self._run_owed_sweeps()
+            # RECHECK between the phases. The sweeps above are control-plane calls that can outlast
+            # close()'s join deadline, so this thread can resume here after stop() has returned --
+            # and _admit_probe's first action is d.build(), an unchecked STS + service probe. Its
+            # own closing check happens only AFTER that build completes, so shutdown landing during
+            # the sweep phase still bought fresh control-plane calls during teardown.
+            with self._lock:
+                if self._admit_closing:
+                    return
             self._admit_probe(pending)
         except Exception:  # noqa: BLE001 -- must not die silently on a background thread
             _log.warning("cascade: deferred admission probe failed", exc_info=True)
@@ -513,6 +521,14 @@ class CascadingRuntime:
         admitted_count = 0
         still: list[DeferredTier] = []
         for _i, d in enumerate(pending):
+            with self._lock:
+                if self._admit_closing:
+                    # Checked BEFORE the build, not after it. The post-build check cannot stop a
+                    # probe that is already in flight, and each entry is a fresh STS + service
+                    # round trip -- so a multi-entry pass kept buying control-plane calls during
+                    # teardown, one per remaining tier.
+                    still.extend(pending[_i:])
+                    break
             try:
                 rt = d.build()
             except Exception as exc:  # noqa: BLE001 -- classified immediately below

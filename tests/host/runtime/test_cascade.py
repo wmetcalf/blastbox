@@ -1806,3 +1806,35 @@ def test_a_failed_retry_is_still_owed(monkeypatch):
     rt._sweep_owed = [_AlwaysFails("aws-ec2")]
     rt._run_owed_sweeps()
     assert rt._sweep_owed, "a retry that failed dropped the debt"
+
+
+def test_no_build_starts_once_shutdown_is_latched(monkeypatch):
+    """The owed sweeps run before the probe on the same worker, and they are control-plane calls
+    that can outlast close()'s join deadline -- so the thread can resume after stop() has returned.
+    _admit_probe's closing check happened only AFTER d.build(), which cannot stop a probe already
+    in flight, and each pending entry is a fresh STS + service round trip."""
+    from blastbox.host import pool_config
+    from blastbox.host.runtime.cascade import DeferredTier
+
+    builds: list = []
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name",
+                        lambda name, **kw: FakeRuntime(name))
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
+
+    def _mk(name):
+        def _build():
+            builds.append(name)
+            return FakeRuntime(name)
+        return _build
+
+    pending = [DeferredTier(name="aws-ec2", capacity=4, reason="x", build=_mk("aws-ec2"), pos=1),
+               DeferredTier(name="aws-lambda", capacity=2, reason="x", build=_mk("aws-lambda"), pos=2)]
+    rt._deferred = list(pending)
+    rt.close()                       # shutdown latched BEFORE the probe starts
+    rt._admit_probe(pending)
+
+    assert builds == [], f"builds ran during teardown: {builds}"
+    assert [d.name for d in rt._deferred] == ["aws-ec2", "aws-lambda"], (
+        "tiers were dropped rather than kept deferred for a restart"
+    )

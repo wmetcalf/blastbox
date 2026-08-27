@@ -144,6 +144,25 @@ _NOT_EXECUTED_AWS_MARKERS = (
     "requesttimetooskewed",            # clock skew: rejected at signature validation
 )
 
+#: Definite RATE LIMITS: AWS answers these BEFORE performing the action, so a mutating call that
+#: gets one provably did not run. An explicit list rather than "everything retryable", because the
+#: retryable set also carries RequestTimeout, InternalError, generic 5xx and connection failures --
+#: every one of which may mean the request WAS performed and only its reply was lost.
+_RATE_LIMIT_AWS_MARKERS = (
+    "throttling",                      # Throttling / ThrottlingException (most services)
+    "toomanyrequests",                 # TooManyRequestsException -- Lambda's own throttle
+    "requestlimitexceeded",            # EC2
+    "requestthrottled",                # STS and friends
+    "slowdown",
+    "provisionedthroughputexceeded",
+)
+
+
+def _is_rate_limit_aws_error(stderr: str) -> bool:
+    """True for a definite rate-limit rejection -- refused before the action was performed."""
+    low = (stderr or "").lower()
+    return any(marker in low for marker in _RATE_LIMIT_AWS_MARKERS)
+
 
 def _is_not_executed_aws_error(stderr: str) -> bool:
     """True if AWS rejected the request before performing it, so the action provably did not run."""
@@ -217,7 +236,7 @@ class AwsNotExecuted(AwsNoVerdict):
     nothing behind it. _freeze_park's own docstring already draws this line."""
 
 
-class AwsThrottled(AwsNotExecuted):
+class AwsThrottled(AwsNoVerdict):
     """AWS rate-limited us (or was momentarily unavailable) -- the retryable flavour of UNKNOWN.
 
     Split out because availability asks a different question from liveness: a throttle is the one
@@ -225,14 +244,28 @@ class AwsThrottled(AwsNotExecuted):
     the tier may be used at all (issue #79).
 
 
-    A throttle is a REJECTION, not a lost response: AWS refused the request rather than performing
-    it, so nothing was attempted. That distinction only matters to one caller -- _try_park records
-    an unresolved attempt as _park_attempted, which the `stopped` and `stopping` doors later accept
-    as proof that the instance holds a hibernation image WE captured. A throttled stop captured
-    nothing, so an instance an operator later stopped normally was published as an unusable warm
-    slot. Same shape as the clock-skew and failed-fork cases; this one reached the ordinary
-    unresolved-attempt arm because AwsThrottled was a SIBLING of AwsNotExecuted rather than a
-    subclass of it."""
+    NOT an AwsNotExecuted, and the attempt to make it one was a mistake worth recording. A
+    definite RATE LIMIT is indeed a rejection -- but this class also carries RequestTimeout,
+    InternalError, generic 5xx and connection failures, and none of those proves a mutating request
+    was never performed. Treating them all as not-executed destroyed the LOST-RESPONSE case: a
+    stop-instances that AWS accepted and whose reply vanished recorded no _park_attempted, so the
+    later `stopping`/`stopped` observations were rejected as somebody else's stop and a genuinely
+    hibernated warm slot aged out and was reaped. The rejection/ambiguity split is a property of
+    the specific error CODE, not of this class, so it lives in the marker lists below."""
+
+
+class AwsRateLimited(AwsThrottled, AwsNotExecuted):
+    """A definite rate-limit rejection: BOTH retryable AND never-performed.
+
+    It has to be both, and picking one was wrong in each direction. A bare AwsThrottled put a
+    mutating call AWS had REFUSED onto _try_park's unresolved-attempt arm, so a throttled stop was
+    recorded as evidence of a hibernation image that was never captured. Making AwsThrottled itself
+    an AwsNotExecuted then swept in RequestTimeout, InternalError and connection failures, which
+    destroyed the LOST-RESPONSE case -- a stop AWS accepted whose reply vanished recorded no
+    attempt, so the genuinely hibernated slot was rejected at the `stopped` door and reaped.
+
+    The rejection/ambiguity split is a property of the error CODE, so it lives in the marker lists;
+    this type just carries both facts to the two callers that each need one of them."""
 
 
 class AwsCliMissing(AwsNotExecuted):
@@ -784,12 +817,16 @@ class AwsDisposableRuntime:
             # DEFAULT: we did not get a confirmed answer, so we do not have one. Never death.
             # Throttles get their own type. Everything else stays a plain AwsUnknownState: still
             # not evidence a worker died, but not a reason to keep re-probing a tier either.
-            if _is_not_executed_aws_error(stderr):
-                # Checked FIRST: strictly stronger than "throttled". Both are retryable
-                # non-answers about the resource, but this one also says the call did not
-                # run -- the difference between "we may have parked it" and "we certainly
-                # did not", and _try_park turns the former into evidence.
-                exc_cls: type[AwsWorkerError] = AwsNotExecuted
+            # ORDER: most specific first. A definite RATE LIMIT is both retryable and
+            # never-performed, so it gets the type that carries both facts. Clock skew is
+            # never-performed but not a throttle. Everything else retryable is AMBIGUOUS about
+            # whether the call ran -- RequestTimeout, InternalError, generic 5xx, connection
+            # failures -- and must stay an ordinary non-answer, or the lost-response case loses
+            # the evidence that keeps a genuinely hibernated slot from being reaped.
+            if _is_rate_limit_aws_error(stderr):
+                exc_cls: type[AwsWorkerError] = AwsRateLimited
+            elif _is_not_executed_aws_error(stderr):
+                exc_cls = AwsNotExecuted
             elif _is_throttle_aws_error(stderr):
                 exc_cls = AwsThrottled
             else:

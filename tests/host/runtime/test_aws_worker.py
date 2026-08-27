@@ -4719,3 +4719,44 @@ def test_a_throttle_still_leaves_tier_availability_undecided():
     with pytest.raises(AwsNoVerdict) as ei:
         rt.available()
     assert _is_undecided_availability(ei.value), "a throttle must stay deferrable"
+
+
+def test_an_ambiguous_failure_still_records_the_lost_response_attempt():
+    """The half the previous commit broke, and the more dangerous direction.
+
+    RequestTimeout, InternalError, generic 5xx and connection failures are all RETRYABLE, but none
+    of them proves a mutating call was never performed -- a stop-instances AWS ACCEPTED whose reply
+    vanished looks exactly like this. Recording no _park_attempted for it means the later
+    `stopping`/`stopped` observations are read as somebody else's stop, so a genuinely hibernated
+    warm slot is rejected and eventually reaped: warm capacity destroyed, versus the phantom-marker
+    cost of the opposite error.
+    """
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    now = [1000.0]
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    fake.responses["ec2 stop-instances"] = lambda argv: _cp(
+        rc=254, stderr="An error occurred (RequestTimeout) when calling StopInstances")
+    rt._phase["s"] = "hibernating"
+    rt.is_ready(slot)
+    now[0] += 5.0
+    rt.is_ready(slot)
+
+    assert "s" in rt._park_attempted, (
+        "an ambiguous failure recorded no attempt -- a stop AWS accepted whose reply was lost now "
+        "has no evidence, so the hibernated slot is rejected as a foreign stop and reaped"
+    )
+
+
+def test_a_rate_limit_is_both_retryable_and_never_performed():
+    """It has to be both, and picking one was wrong in each direction."""
+    from blastbox.host.runtime.aws_worker import (AwsNoVerdict, AwsNotExecuted, AwsRateLimited,
+                                                  AwsThrottled)
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True])
+    fake.responses["ec2 describe-instances"] = lambda argv: _cp(
+        rc=254, stderr="An error occurred (RequestLimitExceeded) when calling DescribeInstances")
+    with pytest.raises(AwsRateLimited) as ei:
+        rt._describe(AwsWorkerSlot(slot_id="s", resource_id="i-1"))
+    assert isinstance(ei.value, AwsThrottled), "a rate limit must stay the retryable type"
+    assert isinstance(ei.value, AwsNotExecuted), "a rate limit was refused, not performed"
+    assert isinstance(ei.value, AwsNoVerdict)
