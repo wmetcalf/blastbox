@@ -3992,3 +3992,69 @@ def test_a_suspected_slot_is_not_republished_during_shutdown():
         f"slot was republished as {pool._slots[sid].state.name} during shutdown after its "
         f"disposal failed -- IDLE is claimable"
     )
+
+
+def test_every_deferred_reap_producer_goes_through_the_chokepoint() -> None:
+    """The structural half of the fix, and the half that makes the class stop recurring.
+
+    Six times on this branch the same bug arrived as a NEW producer of _deferred_reap that did not
+    know the shutdown rule. Guarding each site correctly was never the property we needed -- every
+    instance was a site with no guard at all. So the decision lives in exactly one method, and this
+    test fails the moment a seventh producer writes to the set directly.
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "src/blastbox/host/pool.py").read_text()
+    tree = ast.parse(src)
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "add":
+            continue
+        recv = node.func.value
+        if isinstance(recv, ast.Attribute) and recv.attr == "_deferred_reap":
+            fn = next((f for f in ast.walk(tree)
+                       if isinstance(f, ast.FunctionDef)
+                       and f.lineno <= node.lineno <= (f.end_lineno or 0)), None)
+            name = fn.name if fn else "<module>"
+            if name != "_queue_deferred_reap_unlocked":
+                offenders.append(f"{name}() at pool.py:{node.lineno}")
+
+    assert not offenders, (
+        "these write to _deferred_reap directly instead of _queue_deferred_reap_unlocked, so they "
+        "do not inherit the shutdown guard:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_the_maintenance_producer_publishes_nothing_after_shutdown() -> None:
+    """The behavioural half: _maintain_idle's requeue was the producer that had no guard.
+
+    stop() joins the TICK thread with a budget it may exceed, then clears the queue; a maintenance
+    pass still inside a slow hook lands its add behind that clear, and a pool restarted on the same
+    object re-terminates a resource whose disposal already failed.
+    """
+    now = [1000.0]
+
+    class _Unusable(_FakeRuntime):
+        def maintain_idle(self, slot):    # noqa: ANN001
+            return False
+
+        def reap(self, slot):             # noqa: ANN001
+            raise OSError("terminate-instances: throttled")
+
+    rt = _Unusable()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6, clock=lambda: now[0])
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots))
+    pool._slots[sid].state = SlotState.IDLE
+
+    pool._stop_event.set()                # shutdown has begun and the queues were cleared
+    now[0] += 10.0
+    pool._maintain_idle()
+
+    assert not pool._deferred_reap, (
+        f"{pool._deferred_reap} was published after shutdown -- a restarted pool would re-terminate "
+        f"a resource whose disposal already failed"
+    )

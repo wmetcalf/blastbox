@@ -1388,6 +1388,29 @@ class WarmPool:
                 vals.append(float(v))
         return max(vals) if vals else None
 
+    def _queue_deferred_reap_unlocked(self, slot_id: str, *, why: str) -> bool:
+        """THE one place that decides whether a failed disposal may be queued for another attempt.
+
+        Caller must hold ``_lock``. Returns True if the id was queued.
+
+        This exists because the same bug arrived six times, always the same way: a NEW producer of
+        this queue not knowing the shutdown rule. stop() sets _stop_event, joins the tick thread
+        and the reapers with budgets it is ALLOWED TO EXCEED (it logs "still running -- proceeding"
+        and carries on), and only then clears the queue. Any writer still running lands its add
+        BEHIND that clear, so a pool restarted on the same object re-terminates a resource whose
+        disposal already failed -- the one thing every reap path in this file promises not to do.
+
+        Two producers remembered the rule and one did not, and which was which changed as the
+        branch grew. Centralising the decision is the fix: "the guard is correct at each call site"
+        was never the property we needed, because every instance was a site with no guard at all.
+        test_every_deferred_reap_producer_goes_through_the_chokepoint pins this as the only writer.
+        """
+        if self._stop_event.is_set():
+            logger.debug("pool.defer_reap_skipped_after_stop slot_id=%s why=%s", slot_id, why)
+            return False
+        self._deferred_reap.add(slot_id)
+        return True
+
     def _drain_deferred_reaps(self, entry_box: "list | None" = None) -> None:
         """Dispose every queued husk, one at a time, off the tick + claim paths.
 
@@ -2003,14 +2026,9 @@ class WarmPool:
                     self._spawn_consecutive_failures += 1
                     claim_unproven_death = True
                     warm_failures = self._spawn_consecutive_failures
-                if self._stop_event.is_set():
-                    # stop() already drained the queue; re-adding here (the probe above takes
-                    # seconds, so stop() can land mid-probe) resurrects a husk stop() quarantined
-                    # after a failed reap, and the next drain terminates it a SECOND time -- the
-                    # contract _drain_deferred_reaps documents as forbidden (issue #77 marla-loop).
-                    logger.debug("pool.defer_reap_skipped_after_stop slot_id=%s", candidate.slot_id)
-                else:
-                    self._deferred_reap.add(candidate.slot_id)
+                # The probe above takes seconds, so stop() can land mid-probe; the chokepoint
+                # holds that rule for every producer now.
+                self._queue_deferred_reap_unlocked(candidate.slot_id, why="claim-probe")
 
             if claim_unproven_death:
                 # ATTRIBUTE FIRST, while the cascade still owns this slot's mapping -- the reap is
@@ -3388,7 +3406,7 @@ class WarmPool:
             with self._lock:
                 cur = self._slots.get(slot_id)
                 if cur is not None and cur.state == SlotState.DRAINING:
-                    self._deferred_reap.add(slot_id)
+                    self._queue_deferred_reap_unlocked(slot_id, why="maintenance-husk")
                     # Arm the retry budget. Its PRESENCE is also what marks this husk as
                     # maintenance-retired for _drain_deferred_reaps, which otherwise cannot tell it
                     # from a suspected-unknown slot.
@@ -3690,7 +3708,7 @@ class WarmPool:
                         # them serially here would stall promotion, spawning and reaping on the sole
                         # tick thread for minutes. That is the wedge #77 exists to fix, and #76
                         # already built the bounded reapers for exactly this. Hand it to them.
-                        self._deferred_reap.add(slot.slot_id)
+                        self._queue_deferred_reap_unlocked(slot.slot_id, why="suspected")
                     else:
                         to_reap.append(slot)
 
