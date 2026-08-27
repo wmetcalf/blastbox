@@ -4097,3 +4097,133 @@ def test_the_last_permitted_disposal_is_not_requeued_for_one_more():
         f"is compared against the stored count instead of the one that just failed"
     )
     assert sid not in pool._maintain_reap_tries, "an abandoned husk must not keep its retry budget"
+
+
+def test_no_new_reaper_thread_starts_once_shutdown_has_begun():
+    """The THREAD half of the shutdown rule, and the seventh instance of this class.
+
+    stop() snapshots _reaper_threads and joins that snapshot within its budget, because a reaper is
+    a daemon and a process exiting mid-terminate leaks the worker. A reaper created after that
+    snapshot is joined by nothing: it issues a terminate while the process tears down, against a
+    resource stop() has already disposed of or quarantined. Guarding only the queue left this open
+    -- a tick thread inside a slow maintenance hook returns after stop() and spawns reapers anyway.
+    """
+    class _Slow(_FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminates = 0
+
+        def reap(self, slot):    # noqa: ANN001
+            self.terminates += 1
+
+    rt = _Slow()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6)
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots))
+    pool._slots[sid].state = SlotState.DRAINING
+    pool._deferred_reap.add(sid)          # queued before shutdown, as a real race leaves it
+
+    pool._stop_event.set()
+    pool._reap_deferred()
+    for entry in list(pool._reaper_threads):
+        entry[0].join(timeout=5)
+
+    assert not pool._reaper_threads, (
+        f"{len(pool._reaper_threads)} reaper thread(s) started after shutdown; stop() has already "
+        f"joined its snapshot, so nothing will ever join these"
+    )
+    assert rt.terminates == 0, "a terminate was issued by a reaper stop() cannot account for"
+
+
+def test_no_maintenance_pass_starts_once_shutdown_has_begun():
+    """Guarding the individual writes was not enough: the pass stamps the per-slot cooldown at its
+    TOP, before the hook runs, so a pass entered after stop() re-created an entry _forget_slot_health
+    had already collected. Nothing a maintenance pass does during shutdown serves a later pass."""
+    class _Unusable(_FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.hooks = 0
+
+        def maintain_idle(self, slot):    # noqa: ANN001
+            self.hooks += 1
+            return False
+
+    rt = _Unusable()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6)
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots))
+    pool._slots[sid].state = SlotState.IDLE
+
+    pool._stop_event.set()
+    pool._maintain_idle()
+
+    assert rt.hooks == 0, "a maintenance hook ran during shutdown"
+    assert not pool._maintain_last, "the pass stamped a cooldown nothing will ever collect"
+
+
+def test_a_maintenance_verdict_does_not_retire_during_shutdown():
+    """The retire is issued straight from the tick thread, bypassing BOTH the deferred queue and
+    the reaper threads -- which is why guarding those two did not close it. stop() disposes every
+    tracked slot itself, so this would be a second terminate on a resource it already handled."""
+    class _Unusable(_FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminates = 0
+
+        def maintain_idle(self, slot):    # noqa: ANN001
+            self.pool._stop_event.set()   # stop() lands while the hook is running
+            return False
+
+        def reap(self, slot):             # noqa: ANN001
+            self.terminates += 1
+
+    rt = _Unusable()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6)
+    rt.pool = pool                        # type: ignore[attr-defined]
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots))
+    pool._slots[sid].state = SlotState.IDLE
+
+    pool._maintain_idle()
+    assert rt.terminates == 0, "retired a slot mid-shutdown; stop() disposes them itself"
+
+
+def test_forget_slot_health_collects_every_per_slot_map():
+    """These two were the only per-slot maps missing from it. Their sole cleanup was the
+    not-in-_slots sweep at the top of _health_check, which stops running the moment stop() is
+    called -- so each stop()/brownout cycle stranded one entry per slot, keyed by a per-spawn UUID.
+    """
+    pool = WarmPool(runtime=_FakeRuntime(), warm_size=1, spawn_rate_limit=1e6)
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots))
+    pool._unknown_since[sid] = 1.0
+    pool._warming_unknown_since[sid] = 1.0
+
+    pool._forget_slot_health(sid)
+
+    assert sid not in pool._unknown_since
+    assert sid not in pool._warming_unknown_since
+
+
+def test_a_slot_reaped_during_its_readiness_probe_is_not_resurrected():
+    """is_ready() is a control-plane call, so stop() can pop the slot and run _forget_slot_health
+    inside that window. Writing the unknown-episode maps afterwards re-creates exactly what the
+    forget just removed -- and _warming_unknown_since's only other cleanup is a sweep that stops
+    running the moment stop() is called, so the entry would be permanent."""
+    class _ReapedMidProbe(_FakeRuntime):
+        def is_ready(self, slot):    # noqa: ANN001
+            with self.pool._lock:    # stop() wins the race while we are "in" the probe
+                self.pool._slots.pop(slot.slot_id, None)
+                self.pool._forget_slot_health(slot.slot_id)
+            return None              # ...and only then does the probe answer UNKNOWN
+
+    rt = _ReapedMidProbe()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6)
+    rt.pool = pool                   # type: ignore[attr-defined]
+    pool._spawn_to_deficit(ready=True)
+    pool._promote_warming()
+
+    assert not pool._warming_unknown_since, (
+        f"{pool._warming_unknown_since} re-created for a slot that was already reaped and forgotten"
+    )
+    assert not pool._warming_unknown_credit

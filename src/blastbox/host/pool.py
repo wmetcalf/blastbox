@@ -1300,6 +1300,19 @@ class WarmPool:
         queued and are drained when it finishes. stop() reaps every tracked slot regardless, so a
         wedged reaper can never leak a live worker past shutdown."""
         with self._lock:
+            if self._stop_event.is_set():
+                # SHUTTING DOWN: start no new reapers. stop() snapshots _reaper_threads and joins
+                # THAT SNAPSHOT within its budget, precisely because a reaper is a daemon and a
+                # process exiting mid-terminate leaks the worker. A reaper created after the
+                # snapshot is joined by nothing: it issues a terminate while the process tears
+                # down, against a resource stop() has already disposed of or quarantined, and
+                # stop()'s orphan count cannot see it either.
+                #
+                # Same rule as _queue_deferred_reap_unlocked, applied to THREADS rather than queue
+                # entries. Guarding only the queue left this door open: a tick thread still inside
+                # a slow maintenance hook returns after stop() and spawns reapers regardless of
+                # what the queue says, which is how the seventh instance of this class arrived.
+                return
             now = self._clock()
             self._reaper_threads = [e for e in self._reaper_threads if e[0].is_alive()]
             # Count only reapers that are still making progress. One wedged in a hung terminate is
@@ -2096,6 +2109,13 @@ class WarmPool:
             # the same "measure the interval you actually mean" rule, applied at one end.
             probe_ended = self._clock()
             with self._lock:
+                if slot.slot_id not in self._slots:
+                    # Reaped while we were inside is_ready(). The probe took a control-plane call,
+                    # so stop() can pop the slot and run _forget_slot_health in that window, and
+                    # these writes would re-create exactly what the forget just removed -- after
+                    # the only cleanup either map gets. A tombstone consulted only on entry cannot
+                    # see a reap that happens during the call.
+                    continue
                 if ready is None:
                     self._warming_unknown_since.setdefault(slot.slot_id, probe_began)
                 else:
@@ -2729,6 +2749,12 @@ class WarmPool:
         # entry per completed job -- the same unbounded growth this method exists to prevent.
         self._maintain_last.pop(slot_id, None)
         self._maintain_reap_tries.pop(slot_id, None)
+        # These two were the only per-slot maps NOT listed here. Their sole cleanup was the
+        # "k not in self._slots" sweep at the top of _health_check, which stops running the moment
+        # stop() is called -- so every stop()/brownout cycle stranded one entry per slot, keyed by a
+        # per-spawn UUID, for the life of the process object.
+        self._unknown_since.pop(slot_id, None)
+        self._warming_unknown_since.pop(slot_id, None)
         # The holding set is keyed by slot_id like every sibling here. Without this it is the one
         # map in this method's list that grows for the life of the process.
         self._deferred_reap_next.discard(slot_id)
@@ -3301,6 +3327,14 @@ class WarmPool:
         ONE slot per tick. Taking every IDLE slot at once would empty the claimable pool for the
         duration of an AWS round trip.
         """
+        if self._stop_event.is_set():
+            # No maintenance pass during shutdown. Every write it makes -- the provisional
+            # cooldown stamp, the ASSIGNED reservation, the retire, the requeue -- lands
+            # behind stop()'s clears, and there is no later pass for any of it to serve.
+            # Guarding the individual writes left the one at the TOP of the pass (taken
+            # before the hook runs) still writing, which is how _maintain_last kept being
+            # re-created after _forget_slot_health had already collected it.
+            return
         hook = getattr(self._runtime, "maintain_idle", None)
         if not callable(hook):
             return
@@ -3366,7 +3400,14 @@ class WarmPool:
                 # a concurrent stop()/reap removes the slot, and this write lands after that, so an
                 # unconditional re-stamp re-created an entry nothing cleans up again. _maintain_last
                 # has no not-in-_slots sweep, unlike its neighbours.
-                if cur is not None:
+                #
+                # TRACKED-NESS IS NOT ENOUGH. A slot whose reap RAISED stays tracked on purpose --
+                # that is the quarantine policy -- while _forget_slot_health may already have run
+                # for it, so `cur is not None` still admits the write this guard exists to stop.
+                # And during shutdown there is no later maintenance pass for the stamp to throttle,
+                # so the entry would simply be permanent: no sweep, and _forget_slot_health will not
+                # run again for a slot stop() left behind.
+                if cur is not None and not self._stop_event.is_set():
                     self._maintain_last[slot_id] = self._clock()
                 # NOT usable -> deliberately left ASSIGNED, i.e. unclaimable, and handed straight
                 # to retire() below. Republishing it first (and worse, waking claimants with
@@ -3374,6 +3415,15 @@ class WarmPool:
                 # retire() is not a CAS, it overwrites ASSIGNED, so the instance was terminated
                 # out from under a running job. The window was widened by fault="worker" doing
                 # failure attribution before it takes the lock.
+        if not usable and self._stop_event.is_set():
+            # SHUTTING DOWN: retire nothing. stop() disposes every tracked slot itself, so a
+            # retire here is a SECOND terminate on a resource stop() has already disposed of
+            # or quarantined after a failed disposal -- issued straight from the tick thread,
+            # bypassing both the deferred queue and the reaper threads, which is why guarding
+            # those two did not close it. The slot stays ASSIGNED and unclaimable, which is
+            # exactly what a shutting-down pool wants; stop() reaps it regardless of state.
+            logger.warning("pool.maintain_idle_retire_skipped_at_shutdown slot_id=%s", slot_id)
+            return
         if not usable:
             logger.warning("pool.maintain_idle_unusable slot_id=%s — retiring", slot_id)
             try:
