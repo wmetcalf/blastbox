@@ -4412,3 +4412,39 @@ def test_a_blank_token_response_is_no_answer_rather_than_a_dead_worker():
     rt, fake = _lambda_rt({"lambda-microvms create-microvm-auth-token": lambda argv: _cp(stdout="")})
     with pytest.raises(AwsNoVerdict):
         rt._mint_token(AwsWorkerSlot(slot_id="s", resource_id="mv-1"))
+
+
+def test_a_clock_skew_rejection_is_not_a_hibernation_attempt():
+    """RequestTimeTooSkewed is rejected at signature validation, so a stop-instances that gets it
+    provably never ran. Recorded as an unresolved ATTEMPT it became evidence that a later `stopped`
+    instance held a hibernation image we captured -- and there was no image, because there was no
+    stop. Third instance of this shape: the `stopping` branch, a failed fork, and now a request
+    AWS refused before performing."""
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    now = [1000.0]
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    fake.responses["ec2 stop-instances"] = lambda argv: _cp(
+        rc=254, stderr="An error occurred (RequestTimeTooSkewed) when calling StopInstances")
+    rt._phase["s"] = "hibernating"
+    rt.is_ready(slot)
+    now[0] += 5.0
+    rt.is_ready(slot)
+
+    assert "s" not in rt._park_attempted, (
+        "a stop AWS refused before performing was recorded as an unresolved attempt"
+    )
+    assert "s" in rt._park_unknown_since, "we still learned nothing, so the clock must freeze"
+
+
+def test_a_clock_skew_rejection_still_leaves_tier_availability_undecided():
+    """It must stay RETRYABLE: clock skew is fixed by NTP, not by dropping the tier."""
+    from blastbox.host.runtime.aws_worker import AwsNoVerdict
+    from blastbox.host.runtime.cascade import _is_undecided_availability
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True])
+    for k in list(fake.responses):
+        fake.responses[k] = lambda argv: _cp(
+            rc=254, stderr="An error occurred (RequestTimeTooSkewed) when calling GetCallerIdentity")
+    with pytest.raises(AwsNoVerdict) as ei:
+        rt.available()
+    assert _is_undecided_availability(ei.value), "clock skew must stay deferrable, not drop the tier"

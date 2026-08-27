@@ -117,7 +117,6 @@ _THROTTLE_AWS_MARKERS = (
     # ANSWERED refusal that advances the give-up clock -- both the opposite of what a timeout means.
     # "We did not get an answer" is exactly this list's subject.
     "requesttimeout",                  # RequestTimeout / RequestTimeoutException
-    "requesttimetooskewed",            # clock skew: retryable, says nothing about the resource
     "internalerror",                   # 500 InternalError / InternalFailure
     "internalfailure",
     "serviceexception",                # generic 5xx service fault
@@ -127,6 +126,23 @@ _THROTTLE_AWS_MARKERS = (
     "could not connect to the endpoint url",
     "endpointconnectionerror",
 )
+
+
+#: Errors where AWS REFUSED THE REQUEST BEFORE PERFORMING IT. Still no verdict about the resource
+#: -- and still retryable, so availability keeps deferring rather than dropping the tier -- but for
+#: a MUTATING call they carry one fact an ordinary non-answer does not: the action did not happen.
+#: RequestTimeTooSkewed is rejected at signature validation, so a stop-instances that gets it never
+#: ran. Recorded as an unresolved ATTEMPT it became evidence that a later `stopped` instance held a
+#: hibernation image we captured -- and there was no image, because there was no stop.
+_NOT_EXECUTED_AWS_MARKERS = (
+    "requesttimetooskewed",            # clock skew: rejected at signature validation
+)
+
+
+def _is_not_executed_aws_error(stderr: str) -> bool:
+    """True if AWS rejected the request before performing it, so the action provably did not run."""
+    low = (stderr or "").lower()
+    return any(marker in low for marker in _NOT_EXECUTED_AWS_MARKERS)
 
 
 def _is_throttle_aws_error(stderr: str) -> bool:
@@ -741,7 +757,16 @@ class AwsDisposableRuntime:
             # DEFAULT: we did not get a confirmed answer, so we do not have one. Never death.
             # Throttles get their own type. Everything else stays a plain AwsUnknownState: still
             # not evidence a worker died, but not a reason to keep re-probing a tier either.
-            exc_cls = AwsThrottled if _is_throttle_aws_error(stderr) else AwsUnknownState
+            if _is_not_executed_aws_error(stderr):
+                # Checked FIRST: strictly stronger than "throttled". Both are retryable
+                # non-answers about the resource, but this one also says the call did not
+                # run -- the difference between "we may have parked it" and "we certainly
+                # did not", and _try_park turns the former into evidence.
+                exc_cls: type[AwsWorkerError] = AwsNotExecuted
+            elif _is_throttle_aws_error(stderr):
+                exc_cls = AwsThrottled
+            else:
+                exc_cls = AwsUnknownState
             raise exc_cls(
                 f"aws {service} {op}: unconfirmed failure (rc={cp.returncode}): {stderr[:200]}")
         out = (cp.stdout or "").strip()
