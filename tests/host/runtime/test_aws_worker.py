@@ -4324,12 +4324,13 @@ def test_a_stop_that_was_issued_and_went_unanswered_IS_still_an_attempt():
     assert "s" in rt._park_attempted, "a genuine unresolved stop must stay recorded as an attempt"
 
 
-def test_a_missing_aws_binary_is_a_verdict_not_a_transient():
-    """_is_undecided_availability matches AwsNoVerdict across the MRO, so answering the undecided
-    flavour for a missing binary made the cascade defer the tier and re-probe it every admit
-    interval for the life of the process. A binary that is not there will not be there next tick;
-    the startup path already says "missing credentials is a VERDICT" and drops the tier."""
-    from blastbox.host.runtime.aws_worker import AwsUnknownState, AwsWorkerError
+def test_a_missing_cli_stays_UNKNOWN_at_the_probe_layer():
+    """Where the verdict must NOT live. This assertion originally read the other way -- it required
+    _describe() itself to answer definitively -- and that is what drained a tier: _aws() is shared
+    by every slot, and is_ready/is_alive read a definitive error as "this slot is not up". The
+    tier-level verdict belongs to available(), which is the only caller asking about the tier;
+    see test_a_missing_cli_is_still_a_verdict_about_the_TIER."""
+    from blastbox.host.runtime.aws_worker import AwsCliMissing, AwsUnknownState
     from blastbox.host.runtime.cascade import _is_undecided_availability
     rt, fake = _hibernate_rt(state=["running"], healthy=[True])
 
@@ -4337,12 +4338,12 @@ def test_a_missing_aws_binary_is_a_verdict_not_a_transient():
         raise FileNotFoundError(2, "No such file or directory: 'aws'")
 
     fake.responses["ec2 describe-instances"] = _no_binary
-    with pytest.raises(AwsWorkerError) as ei:
+    with pytest.raises(AwsCliMissing) as ei:
         rt._describe(AwsWorkerSlot(slot_id="s", resource_id="i-1"))
-    assert not isinstance(ei.value, AwsUnknownState), "a missing CLI must not read as UNKNOWN"
-    assert not _is_undecided_availability(ei.value), (
-        "the cascade would defer this tier and re-probe a missing binary forever"
+    assert isinstance(ei.value, AwsUnknownState), (
+        "a shared-path error that reads as definitive confirms every slot dead at once"
     )
+    assert _is_undecided_availability(ei.value)
 
 
 def test_a_fork_failure_from_resource_exhaustion_is_still_undecided():
@@ -4359,3 +4360,55 @@ def test_a_fork_failure_from_resource_exhaustion_is_still_undecided():
     with pytest.raises(AwsNotExecuted) as ei:
         rt._describe(AwsWorkerSlot(slot_id="s", resource_id="i-1"))
     assert _is_undecided_availability(ei.value), "a fork failure must stay deferrable"
+
+
+def test_a_missing_cli_does_not_confirm_the_death_of_every_slot():
+    """The CLI is shared by every slot, and is_ready/is_alive read a definitive error as "this slot
+    is not up". Answering definitively from the shared _aws() path therefore confirmed the whole
+    tier dead at once -- and the terminates that followed failed for the same missing binary, so
+    every slot was quarantined DRAINING with the tier at zero even after the CLI came back."""
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True])
+
+    def _no_binary(argv):   # noqa: ANN001
+        raise FileNotFoundError(2, "No such file or directory: 'aws'")
+
+    for k in list(fake.responses):
+        fake.responses[k] = _no_binary
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    assert rt.is_alive(slot) is None, "a missing CLI confirmed this worker dead"
+    assert rt.is_ready(slot) is None, "a missing CLI confirmed this worker not-ready"
+
+
+def test_a_missing_cli_is_still_a_verdict_about_the_TIER():
+    """The other half: availability is a question about the tier, not a worker. A binary that is
+    absent now will be absent next tick, so deferring and re-probing it forever reports nothing."""
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True])
+
+    def _no_binary(argv):   # noqa: ANN001
+        raise PermissionError(13, "Permission denied: 'aws'")
+
+    for k in list(fake.responses):
+        fake.responses[k] = _no_binary
+    assert rt.available() is False, "a missing CLI must be a verdict about the tier"
+
+
+def test_a_fork_failure_still_leaves_tier_availability_undecided():
+    """Control: EMFILE/ENOMEM are transient and correlated, so availability must stay UNDECIDED."""
+    from blastbox.host.runtime.aws_worker import AwsNoVerdict
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True])
+
+    def _emfile(argv):      # noqa: ANN001
+        raise OSError(24, "Too many open files")
+
+    for k in list(fake.responses):
+        fake.responses[k] = _emfile
+    with pytest.raises(AwsNoVerdict):
+        rt.available()
+
+
+def test_a_blank_token_response_is_no_answer_rather_than_a_dead_worker():
+    from blastbox.host.runtime.aws_worker import AwsNoVerdict, AwsWorkerSlot
+    rt, fake = _lambda_rt({"lambda-microvms create-microvm-auth-token": lambda argv: _cp(stdout="")})
+    with pytest.raises(AwsNoVerdict):
+        rt._mint_token(AwsWorkerSlot(slot_id="s", resource_id="mv-1"))

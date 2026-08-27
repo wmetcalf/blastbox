@@ -203,6 +203,22 @@ class AwsNotExecuted(AwsNoVerdict):
     nothing behind it. _freeze_park's own docstring already draws this line."""
 
 
+class AwsCliMissing(AwsNotExecuted):
+    """The aws binary is absent or not executable -- permanent, and yet STILL not a verdict about
+    any worker.
+
+    Both halves matter, and getting only the first one right drained a tier. A missing CLI will be
+    missing on the next tick too, so the TIER-SELECTION probe must answer definitively or the
+    cascade defers and re-probes it for the life of the process. But is_ready/is_alive turn a
+    definitive error into "this slot is not up", and the CLI is shared by every slot -- so raising
+    a plain AwsWorkerError from the shared _aws() path made one missing binary confirm the death
+    of the entire tier at once, and the terminates that followed failed for the same reason,
+    quarantining every slot as DRAINING with the tier stuck at zero even after the CLI came back.
+
+    So: an AwsNoVerdict (liveness stays UNKNOWN and destroys nothing) that ``available()`` alone
+    converts into a verdict."""
+
+
 class AwsProbeTimeout(AwsNoVerdict):
     """The control plane didn't answer in time — the timeout flavour of AwsUnknownState. Raised
     whether or not a probe budget was in scope (a 120s cli_timeout_s expiring is no more evidence
@@ -698,8 +714,14 @@ class AwsDisposableRuntime:
             # isinstance alone is exact here: CPython maps ENOENT -> FileNotFoundError and
             # EACCES/EPERM -> PermissionError at construction, while EMFILE and ENOMEM stay a bare
             # OSError. An extra errno check beside it was unreachable, so it is not here.
+            #
+            # Both flavours are AwsNoVerdict, DELIBERATELY. This path is shared by every slot
+            # probe, and is_ready/is_alive read a definitive error as "this slot is not up" -- so
+            # answering definitively here confirmed the death of the whole tier on one missing
+            # binary. available() is the only caller that turns AwsCliMissing into a verdict,
+            # because it is the only one asking about the TIER rather than about a worker.
             if isinstance(exc, (FileNotFoundError, PermissionError)):
-                raise AwsWorkerError(
+                raise AwsCliMissing(
                     f"aws {service} {op}: the AWS CLI is missing or not executable ({exc}) -- "
                     f"this is a host configuration fault, not a transient one") from exc
             raise AwsNotExecuted(f"aws {service} {op}: cannot execute ({exc})") from exc
@@ -757,6 +779,15 @@ class AwsDisposableRuntime:
             if not ident.get("Account"):
                 return False
             return self._service_available()
+        except AwsCliMissing:
+            # A VERDICT about the tier, even though it is no verdict about any worker. The binary
+            # will be missing on the next probe too, so deferring and re-probing it every admit
+            # interval for the life of the process reports nothing and costs two CLI round trips a
+            # time. Same rule the docstring already applies to missing credentials.
+            _log.error("%s: the AWS CLI is missing or not executable -- treating this tier as "
+                       "unavailable. This is a host configuration fault and needs an operator.",
+                       self.kind)
+            return False
         except AwsNoVerdict:
             # PROPAGATE, don't flatten. The caller decides whether to retry or defer the tier, and
             # it cannot make that call if a brownout is indistinguishable from missing credentials.
@@ -1039,7 +1070,13 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
         resp = self._aws("lambda-microvms", "create-microvm-auth-token",
                          "--microvm-identifier", str(slot.resource_id),
                          "--expiration-in-minutes", str(self.cfg.auth_token_ttl_min),
-                         "--allowed-ports", f"port={self.cfg.agent_port}")  # tagged-union list shorthand
+                         "--allowed-ports", f"port={self.cfg.agent_port}",  # tagged-union list shorthand
+                         # expect_output: another DOCUMENT query. A blank rc=0 parsed to {}, so no
+                         # token was found and the bare AwsWorkerError below became a DEFINITIVE
+                         # not-ready during warming and a definitive False at claim -- draining a
+                         # healthy Lambda worker per blank answer, slot by slot, on an incident that
+                         # said nothing about any of them.
+                         expect_output=True)
         tok = resp.get("authToken") or resp.get("token") or resp.get("Token")
         # The live `aws` CLI returned a bare JWE string (validated end-to-end: /healthz 200 with this as
         # the X-aws-proxy-auth header). The API reference models authToken as a header-name -> value MAP,
