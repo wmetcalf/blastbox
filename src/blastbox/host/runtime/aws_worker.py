@@ -341,6 +341,11 @@ def _default_http_probe(url: str, headers: dict[str, str], timeout: float) -> "b
 # Config
 # ---------------------------------------------------------------------------
 
+#: "no agent probe has been taken yet" -- distinct from None, which is a REAL tri-state probe result
+#: meaning UNKNOWN. Conflating the two would make an unknown answer trigger an endless re-probe.
+_UNPROBED: Any = object()
+
+
 def _env(get: Callable[[str], str | None], key: str, default: str | None = None) -> str | None:
     v = get(key)
     return v if (v is not None and v != "") else default
@@ -1907,6 +1912,9 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
     hibernate/start because EC2 saves+restores RAM."""
 
     kind = "aws-ec2-hibernate"
+    #: Returned by _park_step_locked to mean "I need an agent probe, which must NOT run under the
+    #: lock". The wrapper drops the lock, probes, and re-enters with the answer.
+    _PROBE_PENDING = "\x00probe-pending"
     _ALIVE_STATES = ("pending", "running", "stopping", "stopped")
     _DEAD_STATES = ("shutting-down", "terminated")
     _uptime_backstop = True   # a wall-clock shutdown TTL would fire on resume; use a monotonic uptime timer
@@ -2345,19 +2353,34 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         lost ``stop-instances`` response is precisely what corrupts the phase: EC2 accepted the
         hibernate, we never saw the reply, and our own record is the one thing we cannot trust.
         """
-        with self._park_writes(slot.slot_id) as live:
-            if not live:
-                # The reaper disposed of this slot while the tick thread was inside a describe. Every
-                # write below (_phase, _hib_started, _park_since) would re-create per-slot state for
-                # an id that no longer exists, and ids are per-spawn UUIDs so nothing removes it
-                # again. Guarding the two credit helpers was not enough: _park_step is the DOMINANT
-                # writer of exactly the entries reap() clears -- and checking here without HOLDING
-                # the lock only moved the race, it did not close it.
-                return self._phase.get(slot.slot_id, "warming"), False
-            return self._park_step_locked(slot, st, now)
+        healthy: "bool | None | Any" = _UNPROBED
+        for _ in (0, 1):     # at most one probe: the second pass is handed the answer
+            with self._park_writes(slot.slot_id) as live:
+                if not live:
+                    # The reaper disposed of this slot while the tick thread was inside a describe.
+                    # Every write below (_phase, _hib_started, _park_since) would re-create per-slot
+                    # state for an id that no longer exists, and ids are per-spawn UUIDs so nothing
+                    # removes it again. Guarding the two credit helpers was not enough: _park_step is
+                    # the DOMINANT writer of exactly the entries reap() clears -- and checking here
+                    # without HOLDING the lock only moved the race, it did not close it.
+                    return self._phase.get(slot.slot_id, "warming"), False
+                out = self._park_step_locked(slot, st, now, healthy=healthy)
+                if out[0] != self._PROBE_PENDING:
+                    return out
+            # LOCK RELEASED for the probe. Re-entering through _park_writes rather than carrying the
+            # earlier liveness answer forward is the whole point: that answer went stale the instant
+            # the lock dropped, and the slot can be reaped while we sit in the HTTP round trip.
+            healthy = self._agent_healthy(slot)
+        return self._phase.get(slot.slot_id, "warming"), None
 
-    def _park_step_locked(self, slot: AwsWorkerSlot, st: str, now: float) -> "tuple[str, bool | None]":
-        """``_park_step`` with ``_park_lock`` HELD and ``slot`` known live. See that method."""
+    def _park_step_locked(self, slot: AwsWorkerSlot, st: str, now: float, *,
+                          healthy: "bool | None | Any" = _UNPROBED) -> "tuple[str, bool | None]":
+        """``_park_step`` with ``_park_lock`` HELD and ``slot`` known live. See that method.
+
+        ``healthy`` is an agent-probe result the caller took UNLOCKED, or ``_UNPROBED`` when it has
+        not probed yet -- in which case this returns ``(_PROBE_PENDING, None)`` instead of probing,
+        because the probe is network I/O and must not run under ``_park_lock``.
+        """
         sid = slot.slot_id
         phase = self._phase.get(sid, "warming")
         if st in self._DEAD_STATES:
@@ -2536,7 +2559,13 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 _log.warning("ec2-hibernate: %s never parked after %.0fs -- giving up on it",
                              sid, now - self._park_since.get(sid, now))
                 return self._PARK_GIVE_UP, False
-            healthy = self._agent_healthy(slot)
+            if healthy is _UNPROBED:
+                # The agent probe is NETWORK I/O: _resolve_ip() can issue an uncached describe and
+                # the health check is an HTTP round trip. Running it here holds _park_lock across
+                # both, so the reaper thread blocks on disposal for the length of a control-plane
+                # brownout -- the tick-thread stall this branch exists to remove, transplanted onto
+                # the reaper thread. Hand it back to the wrapper, which runs it unlocked.
+                return self._PROBE_PENDING, None
             if healthy is None:
                 # UNKNOWN, not unhealthy. _agent_healthy is tri-state and a bare falsy check
                 # flattened it: the host failing to OPEN the health socket (correlated local fd

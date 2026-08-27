@@ -4961,3 +4961,66 @@ def test_the_health_probe_ceiling_is_configurable_and_cannot_be_set_to_nothing()
                 f"{cfg_cls.__name__} accepted health_probe_timeout_s={bad!r} -> {got!r}; an "
                 f"unbounded or never-expiring probe is the tick-thread stall this bound exists to "
                 f"prevent, so a meaningless value must fall back to the default")
+
+
+def test_the_agent_probe_never_runs_while_the_park_lock_is_held():
+    """A correctness lock must not become an availability bug.
+
+    `_agent_healthy()` is network I/O twice over: `_resolve_ip()` can issue an UNCACHED describe,
+    and the health check is an HTTP round trip. Taking `_park_lock` across the whole park step put
+    both inside the critical section, so `reap()` on the reaper thread blocked on disposal for as
+    long as a control-plane brownout lasted -- the exact tick-thread stall this branch exists to
+    remove, transplanted onto the reaper thread. The fix for a race must not serialize disposal
+    behind a network call.
+
+    So the step hands the probe back: on reaching that branch unprobed it returns `_PROBE_PENDING`,
+    the wrapper drops the lock, probes, and RE-ENTERS through `_park_writes` -- re-entry rather than
+    carrying the old liveness answer forward, because the slot can be reaped during the probe and
+    that answer is stale the moment the lock is released.
+
+    Checked from ANOTHER thread on purpose: `_park_lock` is reentrant, so a same-thread acquire
+    would succeed even while held and prove nothing.
+
+    MUTATION: call `self._agent_healthy(slot)` inline in `_park_step_locked` instead of returning
+    `_PROBE_PENDING` -> the probing thread holds the lock and this fails.
+    """
+    import threading
+
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+
+    now = [1000.0]
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    # phase stays "warming": the `running` branch returns early for hibernating/parked/resuming,
+    # and the probe only happens on the still-warming path.
+    rt._park_since["s"] = 900.0          # a live clock, well inside hibernate_timeout_s (300s)
+
+    lock_free_during_probe: list[bool] = []
+    real_probe = rt._agent_healthy
+
+    def _probe_and_check_the_lock(*a, **kw):  # noqa: ANN002, ANN003, ANN202
+        got = []
+
+        def _try_from_another_thread() -> None:
+            # RLock is reentrant, so this MUST be a different thread to mean anything.
+            acquired = rt._park_lock.acquire(timeout=0.25)
+            got.append(acquired)
+            if acquired:
+                rt._park_lock.release()
+
+        t = threading.Thread(target=_try_from_another_thread)
+        t.start()
+        t.join(timeout=5.0)
+        lock_free_during_probe.append(bool(got and got[0]))
+        return real_probe(*a, **kw)
+
+    rt._agent_healthy = _probe_and_check_the_lock  # type: ignore[method-assign]
+    rt._park_step(slot, "running", now[0])
+
+    assert lock_free_during_probe, (
+        "the agent probe never ran, so this test proved nothing about the lock; the park step no "
+        "longer reaches its probe branch and the test needs rewriting against one that does")
+    assert all(lock_free_during_probe), (
+        "_park_lock was HELD while the agent probe ran: _resolve_ip() can issue an uncached describe "
+        "and the health check is an HTTP round trip, so reap() on the reaper thread blocks on "
+        "disposal for the length of a control-plane brownout")
