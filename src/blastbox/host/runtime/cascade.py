@@ -27,6 +27,7 @@ import logging
 import time
 
 from blastbox.errors import is_host_resource_failure
+from blastbox.host.pool import _accepts_kwarg
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -969,10 +970,19 @@ class CascadingRuntime:
         # slot->tier mapping (a later stop()/retry can terminate it) and doesn't undercount capacity
         # while the worker is still live. Forward `dirty` to a tier reap that accepts it (static
         # quarantine); tiers whose reap ignores it (disposable) just dispose the whole worker.
-        try:
-            self.tiers[i].runtime.reap(slot, dirty=dirty)
-        except TypeError:
-            self.tiers[i].runtime.reap(slot)
+        # INTROSPECTION, not except-TypeError. The bare except was meant to detect an OLD SIGNATURE
+        # that does not accept `dirty`, but it cannot tell that apart from a TypeError raised by the
+        # BODY of a reap that accepted the kwarg and had already issued its terminate -- so the
+        # disposal ran a SECOND time against the same cloud resource, which is the one thing every
+        # reap path in this file promises not to do. pool.py resolves the same question with
+        # inspect.signature (_reap_takes_dirty) and _invalidate_now says why in as many words: "a
+        # TypeError from inside drop() must never be mistaken for an older signature". This was the
+        # one dispose path still doing it the unsafe way.
+        _reap = self.tiers[i].runtime.reap
+        if _accepts_kwarg(_reap, "dirty"):
+            _reap(slot, dirty=dirty)
+        else:
+            _reap(slot)
         with self._lock:
             self._owner.pop(slot.slot_id, None)
             self._counts[i] = max(0, self._counts[i] - 1)

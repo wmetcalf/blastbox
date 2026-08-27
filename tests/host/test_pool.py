@@ -4227,3 +4227,98 @@ def test_a_slot_reaped_during_its_readiness_probe_is_not_resurrected():
         f"{pool._warming_unknown_since} re-created for a slot that was already reaped and forgotten"
     )
     assert not pool._warming_unknown_credit
+
+
+def test_a_slow_base_identity_does_not_stall_the_whole_pool():
+    """base_identity() is a RUNTIME callout -- on a CascadingRuntime it takes the cascade's own
+    lock, and on any runtime resolving identity remotely it is arbitrary-latency. _lock is
+    non-reentrant and every public entry point takes it, so resolving identity INSIDE the publish
+    lock made one slow lookup stall claim(), release(), tick() and stop() together. Measured: a 2s
+    base_identity made a NON-BLOCKING claim(timeout_s=0.0) on an already-IDLE slot block for 3.7s.
+
+    Asserts the DURATION, not that the claim succeeded -- a claim can return a slot and still have
+    waited out the callout, and an earlier version of this test passed against both the fixed and
+    the broken code for exactly that reason.
+
+    This file already states the rule where _health_key is resolved: the optional worker_identity()
+    hook belongs to the runtime and must not run under the pool lock. Only the generation STAMP
+    needs it.
+    """
+    import threading
+    import time
+
+    class _SlowIdentity(_FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.slow = False
+
+        def base_identity(self, slot):    # noqa: ANN001
+            if self.slow:
+                time.sleep(2.0)           # a cascade/remote identity lookup that stalls
+            return "tierA"
+
+    rt = _SlowIdentity()
+    pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=4,
+                    clock=time.monotonic, spawn_rate_limit=1e6)
+    pool.tick()
+    pool.tick()
+    assert any(s.state == SlotState.IDLE for s in pool._slots.values()), "need a warm IDLE slot"
+
+    pool.resize(warm_size=4)
+    rt.slow = True
+    publisher = threading.Thread(target=pool.tick, daemon=True)
+    publisher.start()
+    time.sleep(0.3)                       # let it get INTO the callout
+
+    t0 = time.monotonic()
+    pool.claim(timeout_s=0.0)             # non-blocking, on a slot that is already IDLE
+    blocked = time.monotonic() - t0
+    publisher.join(timeout=10)
+
+    assert blocked < 0.5, (
+        f"a non-blocking claim waited {blocked:.2f}s for a runtime identity lookup; the pool lock "
+        f"is held across the callout, so claim/release/tick/stop all stall together"
+    )
+
+
+def test_a_slow_base_identity_does_not_stall_the_pool_on_the_concurrent_path_either():
+    """The sibling of the test above, for spawn_concurrency > 1.
+
+    There are TWO publish sites and the default (spawn_concurrency=1) only exercises the serial
+    one, so a fix applied to just that one passes the whole suite -- which is exactly how the
+    serial path's _never_ready discard came to be unverified earlier on this branch.
+    """
+    import threading
+    import time
+
+    class _SlowIdentity(_FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.slow = False
+
+        def base_identity(self, slot):    # noqa: ANN001
+            if self.slow:
+                time.sleep(2.0)
+            return "tierA"
+
+    rt = _SlowIdentity()
+    pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=6, spawn_concurrency=3,
+                    clock=time.monotonic, spawn_rate_limit=1e6)
+    pool.tick()
+    pool.tick()
+    assert any(s.state == SlotState.IDLE for s in pool._slots.values()), "need a warm IDLE slot"
+
+    pool.resize(warm_size=6)
+    rt.slow = True
+    publisher = threading.Thread(target=pool.tick, daemon=True)
+    publisher.start()
+    time.sleep(0.3)
+
+    t0 = time.monotonic()
+    pool.claim(timeout_s=0.0)
+    blocked = time.monotonic() - t0
+    publisher.join(timeout=10)
+
+    assert blocked < 0.5, (
+        f"a non-blocking claim waited {blocked:.2f}s on the concurrent publish path"
+    )

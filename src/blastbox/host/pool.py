@@ -2391,11 +2391,20 @@ class WarmPool:
         spawn was in flight (publishing then leaks a live microVM/instance), and a concurrent
         resize() may have lowered the ceiling underneath us.
         """
+        # Resolved OUTSIDE the lock. base_identity() is a RUNTIME callout -- on a
+        # CascadingRuntime it takes the cascade's own lock, and on any runtime that
+        # resolves identity remotely it is an arbitrary-latency call. _lock is
+        # non-reentrant and every public entry point takes it, so one slow identity
+        # lookup stalls claim(), release(), tick() and stop() together: measured, a 2s
+        # base_identity made a NON-BLOCKING claim(timeout_s=0.0) on an already-IDLE slot
+        # block for 3.7s. It also establishes a WarmPool._lock -> CascadingRuntime._lock
+        # ordering nothing else in this file respects. The rule is already stated where
+        # _health_key is resolved. Only the STAMP needs the lock, and it still has it.
+        _ident = self._base_identity(slot)
         with self._lock:
             drop = self._stop_event.is_set() or len(self._slots) >= self._concurrent_ceiling
             if not drop:
                 self._slots[slot.slot_id] = slot
-                _ident = self._base_identity(slot)
                 self._slot_base[slot.slot_id] = (_ident, gen_at_spawn.get(_ident, 0))
         if not drop:
             return
@@ -2588,6 +2597,16 @@ class WarmPool:
             #     here this in-flight slot would land one past the new cap (RAM overshoot on a
             #     tight node) until a later tick reaps it.
             # Either way: don't publish, reap the just-created slot instead.
+            # Resolved OUTSIDE the lock. base_identity() is a RUNTIME callout -- on a
+            # CascadingRuntime it takes the cascade's own lock, and on any runtime that
+            # resolves identity remotely it is an arbitrary-latency call. _lock is
+            # non-reentrant and every public entry point takes it, so one slow identity
+            # lookup stalls claim(), release(), tick() and stop() together: measured, a 2s
+            # base_identity made a NON-BLOCKING claim(timeout_s=0.0) on an already-IDLE slot
+            # block for 3.7s. It also establishes a WarmPool._lock -> CascadingRuntime._lock
+            # ordering nothing else in this file respects. The rule is already stated where
+            # _health_key is resolved. Only the STAMP needs the lock, and it still has it.
+            _ident = self._base_identity(slot)
             with self._lock:
                 drop = self._stop_event.is_set() or len(self._slots) >= self._concurrent_ceiling
                 if not drop:
@@ -2595,7 +2614,6 @@ class WarmPool:
                     # STAMP the generation this slot came from, under the same lock that
                     # publishes it, so a later failure can be told apart from one produced by
                     # the base currently installed.
-                    _ident = self._base_identity(slot)
                     # ...from the ledger as it was when this restore STARTED, not as it is now.
                     self._slot_base[slot.slot_id] = (
                         _ident, _gen_at_spawn.get(_ident, 0)

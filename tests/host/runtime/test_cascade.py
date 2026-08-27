@@ -1385,3 +1385,53 @@ def test_a_failing_sweep_does_not_unwind_the_admission_that_earned_it(monkeypatc
     assert rt._admit_deferred() == 1, "a failing sweep unwound an admission that had succeeded"
     assert [t.name for t in rt.tiers] == ["gvisor", "aws-ec2"]
     assert not rt._deferred, "the tier must not be left deferred after a successful admission"
+
+
+def test_a_TypeError_from_inside_a_tier_reap_is_not_mistaken_for_an_old_signature(monkeypatch):
+    """`except TypeError: reap(slot)` was meant to detect a tier whose reap predates the `dirty`
+    kwarg. It cannot tell that apart from a TypeError raised by the BODY of a reap that accepted
+    the kwarg and had ALREADY issued its terminate -- so the disposal ran a second time against the
+    same cloud resource, which is the one thing every reap path here promises not to do.
+
+    pool.py resolves the same question by introspection, and _invalidate_now states the rule: "a
+    TypeError from inside drop() must never be mistaken for an older signature".
+    """
+    from blastbox.host import pool_config
+
+    calls: list = []
+
+    class _RaisesInside(FakeRuntime):
+        def reap(self, slot, dirty: bool = False):   # noqa: ANN001 -- accepts the kwarg
+            calls.append(dirty)
+            raise TypeError("boto3: unhashable type raised from inside the terminate call")
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name",
+                        lambda name, **kw: _RaisesInside(name))
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:2"}.get)
+    slot = rt.spawn()
+
+    with pytest.raises(TypeError):
+        rt.reap(slot, dirty=True)
+
+    assert calls == [True], (
+        f"the tier's reap ran {len(calls)} times for one cascade.reap() -- the retry re-terminated "
+        f"a resource whose disposal had already been issued"
+    )
+
+
+def test_a_tier_whose_reap_predates_the_dirty_kwarg_is_still_supported(monkeypatch):
+    """The compatibility the old except-TypeError was there for, kept."""
+    from blastbox.host import pool_config
+
+    seen: list = []
+
+    class _OldSignature(FakeRuntime):
+        def reap(self, slot):    # noqa: ANN001 -- no `dirty`
+            seen.append(slot.slot_id)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name",
+                        lambda name, **kw: _OldSignature(name))
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:2"}.get)
+    slot = rt.spawn()
+    rt.reap(slot, dirty=True)
+    assert len(seen) == 1
