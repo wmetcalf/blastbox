@@ -613,3 +613,36 @@ def test_a_config_float_that_parses_but_cannot_mean_anything_is_rejected(monkeyp
         monkeypatch.setenv(key, "12.5")
         assert getattr(PoolConfig.from_env(), attr) == 12.5
         monkeypatch.delenv(key)
+
+
+def test_late_added_knobs_cannot_rebind_a_positional_callers_arguments():
+    """`maintain_interval_s` and `maintain_budget_s` were inserted into the MIDDLE of the dataclass.
+
+    PoolConfig permits positional construction and nothing forbade it, so a caller passing its
+    arguments positionally had them silently shift by two: the value meant for
+    `capacity_starved_after_s` landed in `maintain_interval_s`, the capacity-starvation alert
+    quietly returned to its default, and the maintenance seam was scheduled on a number never
+    intended for it. No error, no warning -- the failure is that it keeps working.
+
+    Keyword-only is the same guard the AWS config already states for its own late addition
+    ("DECLARED LAST so adding it can't silently rebind a positional caller's later fields").
+
+    MUTATION: drop kw_only from either field -> the positional value lands in the wrong attribute.
+    """
+    import dataclasses
+
+    kw_only = {f.name for f in dataclasses.fields(PoolConfig) if f.kw_only}
+    assert {"maintain_interval_s", "maintain_budget_s"} <= kw_only, (
+        "the mid-dataclass additions are still positional, so every existing positional caller "
+        "silently rebinds its later arguments")
+
+    # The behavioural half: a positional call must still bind what it always bound.
+    positional = [f for f in dataclasses.fields(PoolConfig) if not f.kw_only]
+    idx = next(i for i, f in enumerate(positional) if f.name == "capacity_starved_after_s")
+    args = [f.default for f in positional[:idx]] + [321.0]
+    cfg = PoolConfig(*args)
+    assert cfg.capacity_starved_after_s == 321.0, (
+        f"a positional argument intended for capacity_starved_after_s bound to something else "
+        f"(got capacity_starved_after_s={cfg.capacity_starved_after_s!r}, "
+        f"maintain_interval_s={cfg.maintain_interval_s!r})")
+    assert cfg.maintain_interval_s is None, "the maintenance knob absorbed a positional argument"

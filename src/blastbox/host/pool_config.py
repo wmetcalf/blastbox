@@ -11,7 +11,7 @@ import logging
 import math
 import os
 from typing import Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 
 from blastbox.host.pool import SlotRuntime, WarmPool
 
@@ -82,8 +82,16 @@ class PoolConfig:
     #: unreachable from the environment, so the two knobs that bound this pool's control-plane
     #: CALL RATE and its per-pass tick-thread HOLD were the only ones an operator could not turn
     #: down during an incident -- while every comparable knob on the same page is tunable.
-    maintain_interval_s: float | None = None
-    maintain_budget_s: float | None = None
+    # KEYWORD-ONLY, because they were inserted into the MIDDLE of a positional dataclass. A caller
+    # passing this config positionally -- the dataclass permits it and nothing here forbade it --
+    # had its 14th argument silently rebound from capacity_starved_after_s to maintain_interval_s:
+    # no error, the capacity-starvation alert quietly back at its default, and maintenance
+    # scheduled on a number that was never meant for it. Declaring them kw_only keeps every
+    # existing positional call binding exactly what it always did, and is the same guard the AWS
+    # config states for its own late additions ("DECLARED LAST so adding it can't silently rebind
+    # a positional caller's later fields").
+    maintain_interval_s: float | None = dc_field(default=None, kw_only=True)
+    maintain_budget_s: float | None = dc_field(default=None, kw_only=True)
     # How long the pool may be unable to spawn for capacity reasons before that is an outage
     # rather than backpressure; 0 disables the alert.
     capacity_starved_after_s: float | None = None

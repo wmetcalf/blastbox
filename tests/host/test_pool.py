@@ -4770,3 +4770,49 @@ def test_shutdown_latches_runtime_background_work_before_spending_the_join_budge
     assert order.index("latched") < order.index("closed"), (
         f"the latch ran no earlier than close() ({order}); the point is to stop new work BEFORE "
         f"the joins consume the shared budget, not after")
+
+
+def test_the_runtime_is_closed_only_after_its_slots_have_been_reaped() -> None:
+    """`close()` is the JOIN half of shutdown, and `SlotRuntime` does not define its semantics.
+
+    Running it before the reap loop meant a conforming injected runtime whose close() tears down
+    the session its own reap() uses had every reap raise -- so stop() reported live remote workers
+    as orphans and left their slots DRAINING while the workers kept running. Nothing in shutdown
+    needs the runtime closed first: new background work already stopped at begin_close().
+
+    MUTATION: move the close() block back above the reap loop -> reap sees a closed runtime.
+    """
+    events: list[str] = []
+
+    class _SessionRuntime(_FakeRuntime):
+        closed = False
+
+        def begin_close(self) -> None:
+            events.append("latch")
+
+        def close(self, *, timeout_s: "float | None" = None) -> None:
+            self.closed = True
+            events.append("close")
+
+        def reap(self, slot: Slot) -> None:
+            if self.closed:
+                events.append("reap-after-close")
+                raise RuntimeError("session already closed")
+            events.append("reap")
+
+    rt = _SessionRuntime()
+    pool = WarmPool(runtime=rt, warm_size=2, spawn_rate_limit=100.0)
+    pool._spawn_to_deficit(ready=True)
+    for s in pool._slots.values():
+        s.state = SlotState.IDLE
+
+    orphans = pool.stop(stop_timeout_s=2.0)
+
+    assert "reap-after-close" not in events, (
+        f"a slot was reaped after the runtime was closed ({events}); a runtime whose close() drops "
+        f"the session its reap() needs then leaks every live worker")
+    assert events.index("close") > events.index("reap"), (
+        f"close() ran before the reap loop ({events})")
+    assert orphans == 0, f"slots were leaked as orphans ({orphans}) because reap failed after close"
+    # ...and the LATCH still runs first: this must not undo the earlier shutdown-ordering fix.
+    assert events[0] == "latch", f"the shutdown latch no longer runs first ({events})"

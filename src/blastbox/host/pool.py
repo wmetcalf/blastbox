@@ -739,6 +739,29 @@ class WarmPool:
             for slot in to_reap:
                 slot.state = SlotState.DRAINING
 
+        for slot in to_reap:
+            try:
+                # require_tracked: after a reaper-join TIMEOUT this list is a snapshot — a reaper
+                # may have disposed+popped a slot since. Verifying membership in the same critical
+                # section that takes ownership stops a SECOND terminate on that worker. A False
+                # return leaves nothing to pop and the slot is already out of _slots, so it is
+                # correctly NOT counted as an orphan below.
+                disposed = self._reap_and_count(slot, require_tracked=True)
+            except Exception:
+                logger.exception("pool.reap_error_on_stop slot_id=%s — quarantining (still DRAINING, "
+                                 "never claimable)", slot.slot_id)
+            else:
+                if disposed:   # skip-because-another-thread-owns-it (False) -> leave it for that thread
+                    with self._lock:
+                        self._slots.pop(slot.slot_id, None)
+                        self._forget_slot_health(slot.slot_id)
+
+        # AFTER the reap loop, not before it. close() is the JOIN half of shutdown -- the LATCH
+        # already ran at _stop_event.set() -- and SlotRuntime does not define close() semantics.
+        # A conforming injected runtime whose close() tears down the session its own reap() needs
+        # therefore had every reap raise, and stop() then reported live remote workers as orphans
+        # while leaving their slots DRAINING. Nothing here needs the runtime closed first: new
+        # background work stopped at the latch, so deferring this costs only ordering.
         # Let the runtime stop its own background work, if it has any. Optional hook, resolved by
         # getattr like every other seam here. CascadingRuntime runs its admission probe on a thread
         # and joins it in close(); without this call that daemon keeps making control-plane calls
@@ -759,23 +782,6 @@ class WarmPool:
                     _close()
             except Exception:  # noqa: BLE001
                 logger.warning("pool.runtime_close_failed", exc_info=True)
-
-        for slot in to_reap:
-            try:
-                # require_tracked: after a reaper-join TIMEOUT this list is a snapshot — a reaper
-                # may have disposed+popped a slot since. Verifying membership in the same critical
-                # section that takes ownership stops a SECOND terminate on that worker. A False
-                # return leaves nothing to pop and the slot is already out of _slots, so it is
-                # correctly NOT counted as an orphan below.
-                disposed = self._reap_and_count(slot, require_tracked=True)
-            except Exception:
-                logger.exception("pool.reap_error_on_stop slot_id=%s — quarantining (still DRAINING, "
-                                 "never claimable)", slot.slot_id)
-            else:
-                if disposed:   # skip-because-another-thread-owns-it (False) -> leave it for that thread
-                    with self._lock:
-                        self._slots.pop(slot.slot_id, None)
-                        self._forget_slot_health(slot.slot_id)
 
         # Whatever remains in _slots failed to reap (or is owned by another thread mid-dispose) —
         # a still-live VM the caller must keep reserving for. A wedged background thread means
