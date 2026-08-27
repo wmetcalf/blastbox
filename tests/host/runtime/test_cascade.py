@@ -1315,3 +1315,73 @@ def test_the_cascade_forwards_the_startup_orphan_sweep_to_its_tiers(monkeypatch)
 
     assert swept == ["aws-ec2"], f"the sweep did not reach the tier that provides one: {swept}"
     assert killed == ["i-orphan"], "the cascade dropped what the tier reclaimed"
+
+
+def test_a_tier_admitted_after_a_brownout_gets_its_orphan_sweep(monkeypatch):
+    """The CLI's sweep is ONE-SHOT at dispatcher start and runs before a deferred tier exists in
+    self.tiers, so forwarding to the admitted tiers reclaims nothing for a tier that was undecided
+    at startup and admitted afterwards. It would stay unreclaimed for the life of the process --
+    exactly the recovered-brownout path the deferral machine exists to serve. Admission is the
+    first moment the tier exists, so it is the startup sweep's equivalent for it."""
+    from blastbox.host import pool_config
+
+    swept: list = []
+    state = {"up": False}
+
+    class _Sweeper(FakeRuntime):
+        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+            swept.append(self.name)
+            return ["i-predecessor"]
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):  # noqa: ANN001
+        if name == "aws-ec2":
+            if require_available and not state["up"]:
+                raise AwsProbeTimeout("sts: timed out")
+            return _Sweeper(name)
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:4"}.get)
+    assert [d.name for d in rt._deferred] == ["aws-ec2"], "the tier must start out deferred"
+
+    rt.sweep_orphans()                    # the CLI's startup sweep: the tier does not exist yet
+    assert swept == [], "a deferred tier cannot be swept before it is admitted"
+
+    state["up"] = True
+    rt._last_admit_attempt = None
+    assert rt._admit_deferred() == 1
+
+    assert swept == ["aws-ec2"], (
+        "the tier was admitted without ever being swept, so a predecessor's leaked parked "
+        "instances accrue EBS cost until the next process restart"
+    )
+
+
+def test_a_failing_sweep_does_not_unwind_the_admission_that_earned_it(monkeypatch):
+    """The tier is already in self.tiers by the time the sweep runs, and the sweep is opportunistic
+    housekeeping -- a throttled describe on a recovering control plane is the NORMAL case here,
+    since the tier was deferred by a brownout in the first place. Letting that propagate would turn
+    the recovery this whole machine exists for into a failed admission."""
+    from blastbox.host import pool_config
+
+    state = {"up": False}
+
+    class _BadSweeper(FakeRuntime):
+        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+            raise RuntimeError("describe-instances: Throttling")
+
+    def fake_select(name, *, warm_snapshot=False, require_available=True):  # noqa: ANN001
+        if name == "aws-ec2":
+            if require_available and not state["up"]:
+                raise AwsProbeTimeout("sts: timed out")
+            return _BadSweeper(name)
+        return FakeRuntime(name)
+
+    monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
+    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:4"}.get)
+    state["up"] = True
+    rt._last_admit_attempt = None
+
+    assert rt._admit_deferred() == 1, "a failing sweep unwound an admission that had succeeded"
+    assert [t.name for t in rt.tiers] == ["gvisor", "aws-ec2"]
+    assert not rt._deferred, "the tier must not be left deferred after a successful admission"

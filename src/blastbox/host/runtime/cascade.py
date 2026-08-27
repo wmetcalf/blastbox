@@ -411,6 +411,24 @@ class CascadingRuntime:
                 self._tier_failures.append(0)
             _log.info("cascade: deferred tier %r became available -- admitted at position %d "
                       "(was undecided at startup: %s)", d.name, len(self.tiers) - 1, d.reason)
+            # ...and sweep it ONCE, here. The CLI's sweep is one-shot at dispatcher start and runs
+            # before this tier exists in self.tiers, so forwarding to the ADMITTED tiers reclaims
+            # nothing for a tier that was deferred through a brownout and admitted afterwards -- it
+            # would stay unreclaimed for the life of the process, which is precisely the recovered
+            # -brownout path this deferral machine exists to serve. Admission is the first moment
+            # the tier exists, so it is the startup sweep's real equivalent for it.
+            #
+            # OUTSIDE the lock and best-effort: this is a describe + terminate round trip, and it
+            # must neither hold the cascade nor fail an admission that has already succeeded.
+            # sweep_orphans is itself opt-in (a no-op unless orphan_max_age_s > 0), so this costs
+            # nothing at all when the knob is off. Once per tier, because admission happens once.
+            _sweep = getattr(rt, "sweep_orphans", None)
+            if callable(_sweep):
+                try:
+                    _sweep()
+                except Exception:  # noqa: BLE001 -- a sweep hiccup must not unwind an admission
+                    _log.warning("cascade: orphan sweep failed on newly admitted tier %r",
+                                 d.name, exc_info=True)
         with self._lock:
             # Re-stamp from COMPLETION, not from the start. The probe is two aws-cli calls that can
             # each burn the full cli_timeout_s during the very outage that caused the deferral, so
