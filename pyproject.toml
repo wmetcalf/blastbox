@@ -55,6 +55,11 @@ s3 = [
 clamav = [
     "clamd>=1.0.2",
 ]
+# The Magika content-type engine (model + onnxruntime). Worker-image only, like clamav —
+# nothing on the host imports it.
+magika = [
+    "magika>=1.0.0",
+]
 dev = [
     "blastbox[host]",
     "blastbox[clamav]",            # the http/ingress tests need the host stack (fastapi, etc.)

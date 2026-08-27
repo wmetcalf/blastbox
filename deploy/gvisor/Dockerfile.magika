@@ -1,0 +1,38 @@
+# gVisor C/R warm-tier rootfs for Magika, built on top of magika-cold-worker:dev. The
+# container is CHECKPOINTED with the model loaded and RESTORED per job.
+#
+# THE WARM CASE IS MILD HERE AND WORTH STATING HONESTLY. Loading the model costs ~77ms
+# against ~13ms per scan — a 6x startup tax, not ClamAV's 1GB-database three orders of
+# magnitude. Warm is still the right tier for throughput, but a cold Magika worker is
+# perfectly usable, which is NOT true of a cold ClamAV one. Do not copy the "obviously
+# needs warm" reasoning from that engine to this one.
+#
+# NO READINESS ENTRYPOINT, unlike the ClamAV rootfs. That one must block until its daemon
+# answers, because checkpointing a half-loaded clamd freezes a scanner that reports every
+# sample clean. Magika has no daemon and no separate readiness state: the model is loaded
+# in-process on first use, and the cold image already proved at BUILD time that it loads.
+# A restore that somehow lacked it would raise MagikaUnavailable and seal `engine_error`
+# — loud, not silently wrong.
+#
+# Build context = blastbox repo root:
+#   docker build --build-arg BASE=magika-cold-worker:dev \
+#     -f deploy/gvisor/Dockerfile.magika -t magika-warm:gvisor .
+ARG BASE=magika-cold-worker:dev
+FROM ${BASE}
+ARG ENGINE=blastbox.engines.magika:MagikaEngine
+USER root
+
+COPY deploy/gvisor/run_warm.py /opt/blastbox/run_warm.py
+COPY deploy/firecracker/engines.py /opt/blastbox/engines.py
+RUN printf '%s' "${ENGINE}" > /opt/blastbox/engine \
+    && mkdir -p /in /out /ctrl \
+    && chown 10001:10001 /out /ctrl \
+    && find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true
+
+USER 10001:10001
+
+# BLASTBOX_GVISOR_WARM_ARGV='["python3","/opt/blastbox/run_warm.py"]'
+
+LABEL org.opencontainers.image.title="magika-warm-gvisor" \
+      org.opencontainers.image.description="Magika warm-model gVisor C/R rootfs (runsc checkpoint/restore)" \
+      org.opencontainers.image.version="0.1.0"
