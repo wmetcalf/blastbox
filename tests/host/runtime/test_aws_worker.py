@@ -4469,3 +4469,47 @@ def test_a_refused_stop_for_a_reaped_slot_recreates_no_state():
     assert rt._try_park(slot) is None, "a reaped slot must not report an answered refusal"
     assert "s" not in rt._park_refused
     assert "s" not in rt._park_since
+
+
+def test_a_half_succeeded_resume_leaves_a_clock_even_though_it_leaves_no_evidence():
+    """The regression that clearing the phase introduced.
+
+    "parked" was doing two jobs: EVIDENCE that we hibernated the slot (which the stopped/stopping
+    doors consult) and a MARKER that the slot may be mid-resume (which is what starts the give-up
+    clock when it comes back running). Popping the phase fixed the first and destroyed the second:
+    the phase read "warming", the running branch was skipped, _park_since was never started, and
+    _park_step returns before _try_park is ever reached -- so nothing re-hibernates a running,
+    billing instance for the life of the process.
+    """
+    from blastbox.host.runtime.aws_worker import AwsUnknownState, AwsWorkerSlot
+    now = [1000.0]
+    state = ["stopped"]
+    rt, _ = _hibernate_rt(state=state, healthy=[False],
+                          clock=lambda: now.__setitem__(0, now[0] + 0.5) or now[0],
+                          resume_timeout_s=2.0)
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt._phase["s"] = "parked"
+
+    state[0] = "running"                       # start-instances took; the agent never answers
+    with pytest.raises((AwsUnknownState, Exception)):
+        rt.resume(slot)
+    assert rt._phase.get("s") == "resuming", "the mid-resume marker was lost"
+
+    rt.is_ready(slot)                          # maintenance observes the running, unclaimed slot
+    assert "s" in rt._park_since, (
+        "no give-up clock was started for a running instance nothing will re-hibernate; it bills "
+        "until demand happens to claim and retire it"
+    )
+
+
+def test_a_resuming_slot_is_not_evidence_of_a_hibernation_we_performed():
+    """The property the phase-clearing fix established, which the new marker must not undo: a
+    resume moved this slot OUT of parked, so whatever stops it afterwards was not us."""
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    now = [1000.0]
+    rt, _ = _hibernate_rt(state=["stopped"], healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+    rt._phase["s"] = "resuming"
+
+    assert rt.is_ready(slot) is False, "a resuming slot found stopped was adopted as parked"
+    assert rt._phase.get("s") != "parked"

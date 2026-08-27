@@ -1840,7 +1840,15 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
     def __init__(self, cfg: Ec2HibernateConfig, **kw: Any) -> None:
         super().__init__(cfg, **kw)   # base provides _desc_cache + _describe_cached
         self.cfg: Ec2HibernateConfig = cfg
-        self._phase: dict[str, str] = {}   # slot_id -> "warming" | "hibernating" | "parked"
+        #: slot_id -> "warming" | "hibernating" | "resuming" | "parked".
+        #:
+        #: "parked" carried TWO meanings and that is what broke: (a) we hibernated this slot, which
+        #: is EVIDENCE the `stopped`/`stopping` doors consult, and (b) this slot was parked and may
+        #: be mid-resume, which is what starts the give-up clock when it comes back running.
+        #: Clearing it on resume fixed (a) -- a stale "parked" was being read as proof of a
+        #: hibernation we did not perform -- and silently destroyed (b). "resuming" is meaning (b)
+        #: alone: never evidence, always a clock.
+        self._phase: dict[str, str] = {}
         self._hib_attempt: dict[str, float] = {}   # slot_id -> last stop --hibernate attempt (throttle)
         self._hib_started: dict[str, float] = {}   # slot_id -> when it entered the hibernating phase
         # slot_id -> when this slot FIRST began trying to park. Survives re-drives (see
@@ -2329,8 +2337,14 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 return self._PARK_GIVE_UP, False
             return "hibernating", False
         if st == "running":
-            if phase in ("hibernating", "parked"):
-                # Two ways to be awake when we did not expect it:
+            if phase in ("hibernating", "parked", "resuming"):
+                # THREE ways to be awake when we did not expect it:
+                #  - resuming: a resume that ACCEPTED start-instances and then lost its describe or
+                #    its health probe. The slot is running and unclaimed, and this is the only
+                #    marker that says so -- without it the phase reads "warming", this branch is
+                #    skipped, _park_since is never started, and _park_step returns above before
+                #    _try_park is ever reached, so nothing re-hibernates a running, billing
+                #    instance for the life of the process.
                 #  - hibernating: the stop was ACCEPTED and then failed asynchronously
                 #  - parked: THE MOTIVATING CASE (issue #80). resume() half-succeeded --
                 #    start-instances landed, a later describe browned out, the claim was handed back
@@ -2613,7 +2627,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             # Placed AFTER the start call on purpose. Clearing it earlier would erase the evidence
             # of a slot that is still genuinely parked whenever the describe or the start raises --
             # and an unrecognised parked slot is not adopted, so it gets retired instead.
-            self._phase.pop(slot.slot_id, None)
+            self._phase[slot.slot_id] = "resuming"
             self._resolve_ip(slot, refresh=True)   # private IP retained, but re-describe to be safe
         # The runtime's resume_timeout_s is a CEILING; the dispatcher's remaining claim window wins
         # when it is shorter, so one unreachable slot cannot burn the whole window and starve the
