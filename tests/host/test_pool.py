@@ -4606,3 +4606,90 @@ def test_a_stop_landing_between_the_latch_and_the_lock_makes_no_maintenance_writ
     assert pool._maintain_last == {}, (
         f"_maintain_last was stamped during shutdown ({pool._maintain_last}); this is the exact "
         f"re-creation-after-_forget_slot_health leak the latch exists to prevent")
+
+
+def test_a_runtime_may_declare_a_warming_slot_terminal_before_the_pools_own_budget() -> None:
+    """Two clocks disagreed silently, and the shorter one had no way to say so.
+
+    ec2-hibernate gives up on parking at `hibernate_timeout_s` (300s) and reports not-ready. The
+    pool evicts a WARMING slot only at `warming_timeout_s` (600s), and only reaps on a False
+    readiness result when the slot is already DRAINING -- so a running, billing instance that had
+    reached its documented destruction point kept blocking its own replacement for another ~300s.
+    The guide states the opposite: "on expiry the slot is RETIRED ... Size it as the point at which
+    you want the slot destroyed."
+
+    `is_alive()` could not carry the signal because the health check only probes IDLE slots, so the
+    runtime declares it: an optional `is_warming_terminal(slot)` hook, consulted alongside the
+    pool's own budget. Explicit True only -- a raising or UNKNOWN hook must never destroy a slot,
+    because "we could not tell" is exactly the brownout this branch exists to survive.
+
+    MUTATION: drop the `_terminal` clause from the stuck_warming comprehension -> the slot survives
+    the health check and this fails.
+    """
+    class _TerminalWhenAsked(_FakeRuntime):
+        terminal: bool = False
+
+        def is_ready(self, slot: Slot) -> "bool | None":
+            return False                      # never promotes on its own
+
+        def is_warming_terminal(self, slot: Slot) -> bool:
+            return self.terminal
+
+    rt = _TerminalWhenAsked()
+    # A warming budget far longer than the runtime's own give-up point.
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, warming_timeout_s=600.0)
+    pool._spawn_to_deficit(ready=True)
+    slot = next(iter(pool._slots.values()))
+    slot.state = SlotState.WARMING
+
+    pool._health_check()
+    assert slot.slot_id in pool._slots, (
+        "sanity: a WARMING slot inside both budgets must not be evicted")
+
+    rt.terminal = True                        # the runtime gives up
+    pool._health_check()
+
+    cur = pool._slots.get(slot.slot_id)
+    assert cur is None or cur.state is SlotState.DRAINING, (
+        "a WARMING slot the runtime declared terminal was left alone until warming_timeout_s; it is "
+        "a running, billing instance past its documented destruction point, blocking its own "
+        "replacement")
+
+
+def test_a_raising_or_unknown_terminal_hook_never_destroys_a_warming_slot() -> None:
+    """"We could not tell" is not "destroy it" -- the whole point of this branch.
+
+    MUTATION: use `hook(slot)` instead of `hook(slot) is True`, or drop the try/except, and a
+    truthy-but-not-True or a raising hook starts reaping healthy slots.
+    """
+    class _BadHook(_FakeRuntime):
+        mode = "raise"
+
+        def is_ready(self, slot: Slot) -> "bool | None":
+            return False
+
+        def is_warming_terminal(self, slot: Slot):  # noqa: ANN201
+            if self.mode == "raise":
+                raise RuntimeError("describe blew up")
+            if self.mode == "truthy":
+                # A hook that hands back the PHASE rather than a verdict -- the obvious way to
+                # write this wrong, given the runtime's own state machine is phase-valued. `bool()`
+                # would read it as "destroy"; identity does not. None alone cannot catch this,
+                # because bool(None) is already False.
+                return "hibernating"
+            return None                        # UNKNOWN
+
+    for mode in ("raise", "unknown", "truthy"):
+        rt = _BadHook()
+        rt.mode = mode
+        pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, warming_timeout_s=600.0)
+        pool._spawn_to_deficit(ready=True)
+        slot = next(iter(pool._slots.values()))
+        slot.state = SlotState.WARMING
+
+        pool._health_check()
+
+        cur = pool._slots.get(slot.slot_id)
+        assert cur is not None and cur.state is SlotState.WARMING, (
+            f"a {mode} terminal hook destroyed a healthy WARMING slot; an absent answer is not "
+            f"evidence, and during a correlated brownout every slot answers this way at once")

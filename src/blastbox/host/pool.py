@@ -3583,6 +3583,14 @@ class WarmPool:
             return False
         return (now - since) <= self._unknown_grace_s
 
+    def _runtime_says_terminal(self, hook: "Any", slot: "Slot") -> bool:
+        """True only on an explicit True. A raising or UNKNOWN hook must never destroy a slot."""
+        try:
+            return hook(slot) is True
+        except Exception:  # noqa: BLE001 -- a hook fault is not evidence about the slot
+            logger.debug("pool.is_warming_terminal_error slot_id=%s", slot.slot_id, exc_info=True)
+            return False
+
     def _health_check(self) -> None:
         """Evict dead IDLE slots AND stuck WARMING slots so the spawn loop replaces them.
 
@@ -3608,13 +3616,21 @@ class WarmPool:
             if self._warming_unknown_credit:
                 for gone in [k for k in self._warming_unknown_credit if k not in self._slots]:
                     self._warming_unknown_credit.pop(gone, None)
+            # A runtime may declare a WARMING slot TERMINAL before the pool's own budget expires.
+            # Without this the two clocks disagree silently: ec2-hibernate gives up on parking at
+            # hibernate_timeout_s (300s) and reports not-ready, but the pool only evicts WARMING on
+            # warming_timeout_s (600s) -- so a running, billing instance that has already reached
+            # its documented destruction point keeps blocking its own replacement for another ~300s.
+            # is_alive() cannot carry this: the health check only probes IDLE slots.
+            _terminal = getattr(self._runtime, "is_warming_terminal", None)
             stuck_warming = [
                 s for s in self._slots.values()
                 if s.state == SlotState.WARMING
-                and self._warming_timeout_s > 0
-                and (now - s.spawned_at
-                     - self._warming_unknown_credit_s(s.slot_id)) > self._warming_timeout_s
-                and not self._warming_unknown_unexpired(s.slot_id, now)
+                and ((self._warming_timeout_s > 0
+                      and (now - s.spawned_at
+                           - self._warming_unknown_credit_s(s.slot_id)) > self._warming_timeout_s
+                      and not self._warming_unknown_unexpired(s.slot_id, now))
+                     or (callable(_terminal) and self._runtime_says_terminal(_terminal, s)))
             ]
             # Which of those timed out on SILENCE rather than on an answer. `_warming_unknown_since`
             # holds an entry only while the last observation was UNKNOWN (any definitive answer,

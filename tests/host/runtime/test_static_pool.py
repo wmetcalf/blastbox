@@ -772,3 +772,36 @@ def test_static_availability_is_tri_state_so_a_transient_local_fault_defers_not_
     assert _is_undecided_availability(StaticPoolUnavailable("fleet is down")) is False, (
         "a real 'the fleet is down' verdict must NOT be deferred, or an unusable tier is retried "
         "forever")
+
+
+def test_availability_stops_probing_once_a_worker_answers_healthy():
+    """The tri-state rewrite silently traded a short-circuit for a full fleet scan.
+
+    `any(self._health_ok(w) is True for w in ...)` stopped at the first healthy box. Collecting
+    every verdict into a list before deciding does not: each unreachable worker burns
+    `probe_timeout_s`, so a 100-worker fleet whose FIRST entry is healthy issued 100 probes to
+    learn something it knew after one. That cost lands on dispatcher startup and on every
+    deferred-tier admission probe -- minutes, for an answer already in hand.
+
+    MUTATION: restore the eager `verdicts = [...]` comprehension -> 100 probes, not 1.
+    """
+    probed: list[str] = []
+    rt = StaticPoolRuntime(_cfg(*[f"10.0.0.{i}:8765" for i in range(1, 40)]),
+                           http_probe=FakeProbe(all_ok=True))
+
+    def _first_is_healthy(w, timeout=None):  # noqa: ANN001, ANN202
+        probed.append(w.host)
+        return True if w.host == "10.0.0.1" else None
+
+    rt._health_ok = _first_is_healthy  # type: ignore[method-assign]
+    assert rt.available() is True
+    assert len(probed) == 1, (
+        f"probed {len(probed)} of {len(rt.cfg.workers)} workers after the first already answered "
+        f"healthy; each unreachable box costs probe_timeout_s, on dispatcher startup")
+
+    # ...and the tri-state answers still hold, which is what the short-circuit must not cost.
+    probed.clear()
+    rt._health_ok = lambda w, timeout=None: False if w.host == "10.0.0.1" else None
+    assert rt.available() is None, "one unobservable worker must not read as a fleet verdict"
+    rt._health_ok = lambda w, timeout=None: False
+    assert rt.available() is False, "a fleet that all answered no is still a verdict"

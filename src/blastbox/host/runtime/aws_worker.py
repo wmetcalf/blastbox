@@ -2901,6 +2901,23 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             return True
         return phase != self._PARK_GIVE_UP
 
+    def is_warming_terminal(self, slot: AwsWorkerSlot) -> bool:
+        """True once this slot has passed the WHOLE-EPISODE park give-up point.
+
+        The guide says of hibernate_timeout_s: "on expiry the slot is RETIRED ... Size it as the
+        point at which you want the slot destroyed." That held on the IDLE path -- maintain_idle
+        returns False and the pool reaps -- but maintain_idle only ever runs on IDLE slots. A slot
+        still WARMING reported plain not-ready and then waited out warming_timeout_s (600s against
+        a 300s park budget), so a running, billing instance sat past its documented destruction
+        point for another five minutes, blocking its own replacement.
+
+        Reads recorded state only: no probe, no lock held by the caller, and never True on an
+        UNKNOWN -- _park_expired credits no-verdict episodes, so a brownout cannot age a slot into
+        this.
+        """
+        return (self._phase.get(slot.slot_id) == self._PARK_GIVE_UP
+                or self._park_expired(slot.slot_id, self._clock()))
+
     def is_ready(self, slot: AwsWorkerSlot) -> "bool | None":
         # Per-slot state machine, polled by the pool during WARMING: boot -> warm -> hibernate -> parked.
         # TRI-STATE like the base class: None = the control plane didn't answer. This tier has the

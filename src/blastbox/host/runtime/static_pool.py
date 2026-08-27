@@ -250,20 +250,26 @@ class StaticPoolRuntime:
 
         Still fail-closed for selection -- None is not "available" -- but the CALLER can now tell
         the two apart and defer rather than discard."""
-        verdicts = [self._health_ok(w) for w in self.cfg.workers]
-        if any(v is True for v in verdicts):
-            return True
-        if not verdicts:
+        # SHORT-CIRCUIT on the first healthy worker. The tri-state rewrite collected every verdict
+        # eagerly before deciding, which quietly cost what the old `any(... is True ...)` never did:
+        # each unreachable box burns probe_timeout_s, so a 100-worker fleet whose FIRST worker is
+        # healthy issued 100 probes to learn something it knew after one. That lands on dispatcher
+        # startup and on every deferred-tier admission probe. Only whether a NON-healthy answer was
+        # ever unknown has to be remembered, so one flag replaces the list.
+        saw_unknown = False
+        any_worker = False
+        for w in self.cfg.workers:
+            any_worker = True
+            v = self._health_ok(w)
+            if v is True:
+                return True
+            if v is None:
+                saw_unknown = True
+        if not any_worker:
             return False     # nothing configured -- a verdict, and fail-closed
-        # A tri-state OR, not "all or nothing". Requiring EVERY probe to be None before answering
-        # UNKNOWN meant one box answering unhealthy while another was unreachable came out as
-        # False -- which contradicts what False promises here ("every box answered and none was
-        # healthy") and is read by the cascade as confirmed unavailability, permanently dropping
-        # the overflow tier over a worker it never managed to ask. False only when every worker
-        # DEFINITIVELY said no.
-        if all(v is False for v in verdicts):
-            return False
-        return None          # at least one worker unobservable: UNKNOWN, not down
+        return None if saw_unknown else False
+        # (A tri-state OR: True on any healthy, False only when every worker DEFINITIVELY said no,
+        # None when any was unobservable -- one unreachable box must not read as a fleet verdict.)
 
     # -- SlotRuntime protocol ----------------------------------------------
     def worker_identity(self, slot: object) -> str | None:

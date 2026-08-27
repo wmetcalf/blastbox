@@ -593,9 +593,20 @@ def test_a_config_float_that_parses_but_cannot_mean_anything_is_rejected(monkeyp
                 f"{defaults[key]!r}")
             monkeypatch.delenv(key)
 
-    for key, attr in attrs.items():   # 0 stays legal -- it is the documented "disabled"
+    # 0 stays legal -- it is the documented "disabled" -- EXCEPT for the one knob where
+    # "disabled" would mean the UNBOUNDED rate. `now - last >= 0` is true on every tick, so
+    # BLASTBOX_POOL_MAINTAIN_INTERVAL_S=0 removes the rate limit instead of the seam: an uncached
+    # describe per idle slot at ~10Hz, manufacturing the throttling the knob exists to prevent,
+    # for an operator who typed 0 meaning "off" -- mid-incident, which is when they reach for it.
+    zero_is_not_off = {"BLASTBOX_POOL_MAINTAIN_INTERVAL_S"}
+    for key, attr in attrs.items():
         monkeypatch.setenv(key, "0")
-        assert getattr(PoolConfig.from_env(), attr) == 0.0
+        got = getattr(PoolConfig.from_env(), attr)
+        if key in zero_is_not_off:
+            assert got != 0.0, (
+                f"{key}=0 was honoured as a zero cooldown, i.e. maintenance on EVERY tick")
+        else:
+            assert got == 0.0
         monkeypatch.delenv(key)
 
     for key, attr in attrs.items():   # ...and a real value is still honoured

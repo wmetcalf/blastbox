@@ -99,6 +99,15 @@ class PoolConfig:
             except ValueError as exc:
                 raise ValueError(f"invalid integer for {key}={raw!r}: {exc}") from exc
 
+        #: Knobs where 0 is NOT a meaningful setting. For a rate limit "disabled" would mean the
+        #: UNBOUNDED rate -- `now - last >= 0` is true on every tick, so an ec2-hibernate pool
+        #: issues an uncached describe per idle slot at ~10Hz and manufactures the throttling the
+        #: knob exists to prevent. That is the opposite of what an operator typing 0 intends, and
+        #: they reach for it exactly when it hurts most: mid-incident. The internal default stands
+        #: in instead. (Constructing WarmPool directly with 0 still means "no cooldown" -- the
+        #: tests use it deliberately; this guards the ENV surface, which is what humans type.)
+        _ZERO_IS_NOT_OFF = {"BLASTBOX_POOL_MAINTAIN_INTERVAL_S"}
+
         def _float(key: str, default: float) -> float:
             raw = os.environ.get(key, "").strip()
             if not raw:
@@ -125,6 +134,11 @@ class PoolConfig:
                 _log.warning(
                     "pool config: ignoring %s=%r (must be finite and >= 0); using %r. "
                     "Use 0 to disable.", key, raw, default)
+                return default
+            if v == 0 and key in _ZERO_IS_NOT_OFF:
+                _log.warning(
+                    "pool config: %s=0 would remove the rate limit rather than disable the seam "
+                    "(every tick, ~10Hz); using %r. Raise it to slow the pool down.", key, default)
                 return default
             return v
 
@@ -171,6 +185,11 @@ class PoolConfig:
                 _log.warning(
                     "pool config: ignoring %s=%r (must be finite and >= 0); using %r. "
                     "Use 0 to disable.", key, raw, default)
+                return default
+            if v == 0 and key in _ZERO_IS_NOT_OFF:
+                _log.warning(
+                    "pool config: %s=0 would remove the rate limit rather than disable the seam "
+                    "(every tick, ~10Hz); using %r. Raise it to slow the pool down.", key, default)
                 return default
             return v
 
