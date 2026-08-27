@@ -569,19 +569,36 @@ def test_a_config_float_that_parses_but_cannot_mean_anything_is_rejected(monkeyp
     produced that gap, so the check lives in the env readers -- which already raise on an
     unparseable value, making this the same contract, not a new one.
 
-    MUTATION: delete the isfinite/`< 0` guard in _float/_opt_float and every case here is accepted.
+    Warn-and-fall-back rather than raise, matching the house convention already documented for
+    BLASTBOX_CANARY_INTERVAL_S ("non-finite (nan, inf) and negative values fall back to 900 with a
+    warning") and this branch's own Ec2HibernateConfig. Raising would turn a bad value in a LIVE
+    deployment into a process that will not start -- a worse failure than the one being prevented.
+
+    MUTATION: delete the isfinite/`< 0` guard in _float/_opt_float and every case here is honoured.
     """
-    knobs = ["BLASTBOX_POOL_SPAWN_RATE", "BLASTBOX_POOL_WARMING_TIMEOUT_S",
-             "BLASTBOX_POOL_UNKNOWN_GRACE_S", "BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S",
-             "BLASTBOX_POOL_MAINTAIN_INTERVAL_S", "BLASTBOX_POOL_MAINTAIN_BUDGET_S"]
-    for key in knobs:
+    attrs = {"BLASTBOX_POOL_SPAWN_RATE": "spawn_rate_limit",
+             "BLASTBOX_POOL_WARMING_TIMEOUT_S": "warming_timeout_s",
+             "BLASTBOX_POOL_UNKNOWN_GRACE_S": "unknown_grace_s",
+             "BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S": "capacity_starved_after_s",
+             "BLASTBOX_POOL_MAINTAIN_INTERVAL_S": "maintain_interval_s",
+             "BLASTBOX_POOL_MAINTAIN_BUDGET_S": "maintain_budget_s"}
+    defaults = {k: getattr(PoolConfig.from_env(), a) for k, a in attrs.items()}
+
+    for key, attr in attrs.items():
         for bad in ("nan", "inf", "-inf", "-1"):
             monkeypatch.setenv(key, bad)
-            with pytest.raises(ValueError, match="finite"):
-                PoolConfig.from_env()
+            got = getattr(PoolConfig.from_env(), attr)
+            assert got == defaults[key] or (got is None and defaults[key] is None), (
+                f"{key}={bad!r} was honoured as {got!r} instead of falling back to "
+                f"{defaults[key]!r}")
             monkeypatch.delenv(key)
 
-    for key in knobs:            # 0 stays legal -- it is the documented "disabled"
+    for key, attr in attrs.items():   # 0 stays legal -- it is the documented "disabled"
         monkeypatch.setenv(key, "0")
-        PoolConfig.from_env()
+        assert getattr(PoolConfig.from_env(), attr) == 0.0
+        monkeypatch.delenv(key)
+
+    for key, attr in attrs.items():   # ...and a real value is still honoured
+        monkeypatch.setenv(key, "12.5")
+        assert getattr(PoolConfig.from_env(), attr) == 12.5
         monkeypatch.delenv(key)

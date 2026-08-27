@@ -11,8 +11,9 @@ them (see *Per-engine params* below), never the whole environment.
 > Booleans are truthy unless one of `"" 0 false no`.
 >
 > **Numeric warm-pool knobs are validated at startup.** A value that parses as a float but
-> cannot mean a duration — `nan`, `inf`, `-inf`, or any negative — raises at config load
-> instead of being accepted. Both directions used to misbehave silently: a *negative*
+> cannot mean a duration — `nan`, `inf`, `-inf`, or any negative — is **ignored with a warning**
+> and the default is used (the same convention as `BLASTBOX_CANARY_INTERVAL_S`), rather than
+> being honoured. Both directions used to misbehave silently: a *negative*
 > interval makes `now - last >= interval` always true, so the thing it rate-limits runs every
 > tick; `nan` makes every comparison against it false, so whatever it gates never happens. Use
 > **`0`** for "disabled" — that is the documented off switch for these knobs.

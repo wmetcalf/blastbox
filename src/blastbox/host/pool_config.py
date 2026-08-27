@@ -108,16 +108,24 @@ class PoolConfig:
             except ValueError as exc:
                 raise ValueError(f"invalid float for {key}={raw!r}: {exc}") from exc
             if not math.isfinite(v) or v < 0:
-                # These readers already raise on an unparseable value, so a value that PARSES but
-                # cannot mean anything raises too -- an operator typo should fail at startup, not
-                # quietly change behaviour. Both directions bite: a NEGATIVE interval makes
-                # `now - last >= interval` always true (an ec2-hibernate pool then describes on
-                # every tick and manufactures the throttling the limit exists to avoid), and a NaN
-                # makes every comparison against it False, which silently disables whatever the
-                # knob gates. BLASTBOX_POOL_UNKNOWN_GRACE_S=nan did both at once: no brownout
-                # exemption for WARMING slots, and idle unknowns that never age out. Use 0 for
-                # "disabled" -- that is what the guide documents.
-                raise ValueError(f"invalid value for {key}={raw!r}: must be finite and >= 0")
+                # WARN AND FALL BACK -- the house convention, already documented for
+                # BLASTBOX_CANARY_INTERVAL_S ("non-finite (nan, inf) and negative values fall back
+                # to 900 with a warning"). Raising here instead was inconsistent twice over: with
+                # that knob, and with this branch's own Ec2HibernateConfig.__post_init__, which
+                # warns. It also turned a bad value in a LIVE deployment into a process that will
+                # not start, which is a worse failure than the one being prevented.
+                #
+                # The value still cannot be honoured. Both directions misbehave silently: a
+                # NEGATIVE interval makes `now - last >= interval` always true (an ec2-hibernate
+                # pool then describes every tick and manufactures the throttling the limit exists
+                # to avoid), and NaN makes every comparison against it False, which disables
+                # whatever the knob gates. BLASTBOX_POOL_UNKNOWN_GRACE_S=nan did both at once: no
+                # brownout exemption for WARMING slots, and idle unknowns that never aged out.
+                # `0` is the documented "disabled" value.
+                _log.warning(
+                    "pool config: ignoring %s=%r (must be finite and >= 0); using %r. "
+                    "Use 0 to disable.", key, raw, default)
+                return default
             return v
 
         def _bool(key: str, default: bool) -> bool:
@@ -146,16 +154,24 @@ class PoolConfig:
             except ValueError as exc:
                 raise ValueError(f"invalid float for {key}={raw!r}: {exc}") from exc
             if not math.isfinite(v) or v < 0:
-                # These readers already raise on an unparseable value, so a value that PARSES but
-                # cannot mean anything raises too -- an operator typo should fail at startup, not
-                # quietly change behaviour. Both directions bite: a NEGATIVE interval makes
-                # `now - last >= interval` always true (an ec2-hibernate pool then describes on
-                # every tick and manufactures the throttling the limit exists to avoid), and a NaN
-                # makes every comparison against it False, which silently disables whatever the
-                # knob gates. BLASTBOX_POOL_UNKNOWN_GRACE_S=nan did both at once: no brownout
-                # exemption for WARMING slots, and idle unknowns that never age out. Use 0 for
-                # "disabled" -- that is what the guide documents.
-                raise ValueError(f"invalid value for {key}={raw!r}: must be finite and >= 0")
+                # WARN AND FALL BACK -- the house convention, already documented for
+                # BLASTBOX_CANARY_INTERVAL_S ("non-finite (nan, inf) and negative values fall back
+                # to 900 with a warning"). Raising here instead was inconsistent twice over: with
+                # that knob, and with this branch's own Ec2HibernateConfig.__post_init__, which
+                # warns. It also turned a bad value in a LIVE deployment into a process that will
+                # not start, which is a worse failure than the one being prevented.
+                #
+                # The value still cannot be honoured. Both directions misbehave silently: a
+                # NEGATIVE interval makes `now - last >= interval` always true (an ec2-hibernate
+                # pool then describes every tick and manufactures the throttling the limit exists
+                # to avoid), and NaN makes every comparison against it False, which disables
+                # whatever the knob gates. BLASTBOX_POOL_UNKNOWN_GRACE_S=nan did both at once: no
+                # brownout exemption for WARMING slots, and idle unknowns that never aged out.
+                # `0` is the documented "disabled" value.
+                _log.warning(
+                    "pool config: ignoring %s=%r (must be finite and >= 0); using %r. "
+                    "Use 0 to disable.", key, raw, default)
+                return default
             return v
 
         values: dict[str, object] = {
