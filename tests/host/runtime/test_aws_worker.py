@@ -5331,3 +5331,61 @@ def test_a_liveness_probe_that_loses_to_the_reaper_leaves_no_live_cache_entry():
         f"_live_cache leaked {rt._live_cache.get('s')!r} for a slot already tombstoned "
         f"({list(rt._reaped_ids)}); the base reap popped it before the terminate, so nothing "
         f"collects it now")
+
+
+def test_every_float_knob_on_every_aws_tier_rejects_a_non_duration():
+    """Enumerated from the FIELD LIST, which is the point.
+
+    This defect class was reported on four consecutive review rounds -- the pool knobs, the
+    dispatcher thaw budget, the shared health-probe ceiling, the hibernate budget, and finally
+    LambdaSnapStartConfig.resume_timeout_s, the one tier nobody had reached. Every round fixed the
+    reported field and left its siblings, because each guard enumerated NAMES. A NaN resume budget
+    makes `min(cfg.resume_timeout_s, budget_s)` NaN, the deadline comparisons never enter the
+    polling loop, and every claimed warm slot comes back UNKNOWN -- the tier requeues jobs forever
+    while reporting green.
+
+    So this test enumerates fields too. A new float knob, or a whole new AWS tier, is covered the
+    day it is declared rather than the round after someone reports it.
+
+    MUTATION: add a float field with a default to any AwsWorkerConfig subclass and skip it in the
+    base clamp -> this fails, naming the field.
+    """
+    import dataclasses
+    import inspect
+    import math
+
+    from blastbox.host.runtime import aws_worker as _aw
+
+    exempt = _aw._DURATION_EXEMPT
+    allow_zero = _aw._DURATION_ALLOW_ZERO
+
+    tiers = [obj for obj in vars(_aw).values()
+             if inspect.isclass(obj) and dataclasses.is_dataclass(obj)
+             and issubclass(obj, _aw.AwsWorkerConfig)]
+    assert len(tiers) >= 4, f"sanity: expected every AWS tier config, found {len(tiers)}"
+
+    bad_values = (float("nan"), float("inf"), float("-inf"), -1.0)
+    offenders = []
+    for cls in tiers:
+        required = {f.name: ("ami-x" if "image_id" in f.name else "x")
+                    for f in dataclasses.fields(cls)
+                    if f.default is dataclasses.MISSING
+                    and f.default_factory is dataclasses.MISSING}  # type: ignore[misc]
+        for field in dataclasses.fields(cls):
+            if field.name in exempt or not isinstance(field.default, float):
+                continue
+            for bad in bad_values:
+                if bad == -1.0 and field.name in allow_zero:
+                    pass          # still illegal: allow_zero permits 0, never negative
+                got = getattr(cls(**{**required, field.name: bad}), field.name)
+                if not math.isfinite(got) or got < 0 or (got == 0 and field.name not in allow_zero):
+                    offenders.append(f"{cls.__name__}.{field.name} kept {bad!r} as {got!r}")
+            # ...and a legal value must still survive the clamp
+            kept = getattr(cls(**{**required, field.name: 7.0}), field.name)
+            if kept != 7.0 and field.name != "probe_timeout_s":   # probe has a documented floor
+                offenders.append(f"{cls.__name__}.{field.name} clobbered a legal 7.0 -> {kept!r}")
+
+    assert not offenders, (
+        "AWS config knobs accepted a value that cannot mean a duration; a NaN budget makes every "
+        "deadline comparison False, so the tier neither times out nor succeeds:\n  "
+        + "\n  ".join(offenders))

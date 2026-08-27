@@ -28,6 +28,7 @@ Design notes:
 from __future__ import annotations
 
 import collections
+import dataclasses
 import math
 import json
 import logging
@@ -197,6 +198,11 @@ def _is_confirmed_dead_aws_error(stderr: str) -> bool:
 # control-plane-CONFIRMED-running worker is a real failure (issue #77 marla-loop 2).
 # The shortest agent probe worth issuing. Below this we decline and report UNKNOWN rather than
 # manufacture a verdict from a socket we never really gave a chance (issue #77 marla-loop 4).
+#: Float fields that are NOT durations, so the "finite and positive" rule does not apply.
+_DURATION_EXEMPT: frozenset[str] = frozenset()
+#: Durations where 0 is a documented value ("off" / "no delay"), not a mistyped brick.
+_DURATION_ALLOW_ZERO: frozenset[str] = frozenset({"orphan_max_age_s", "resume_poll_s"})
+
 _MIN_PROBE_S = 0.25
 
 
@@ -385,10 +391,38 @@ class AwsWorkerConfig:
         # deadline (`clock() + nan` is nan) and every comparison against it, so the probe neither
         # expires nor bounds anything -- the silent brick this clamp was added to prevent, reached by
         # the one input the clamp did not test for. `inf` is the same shape from the other side.
-        if not math.isfinite(self.claim_probe_timeout_s) or self.claim_probe_timeout_s <= 0:
-            object.__setattr__(self, "claim_probe_timeout_s", 5.0)
-        if not math.isfinite(self.health_probe_timeout_s) or self.health_probe_timeout_s <= 0:
-            object.__setattr__(self, "health_probe_timeout_s", 30.0)
+        #
+        # DRIVEN OFF THE FIELD LIST, not off a hand-written list of names. This defect class has now
+        # been reported on four consecutive review rounds -- the pool knobs, the dispatcher thaw
+        # budget, the shared health-probe ceiling, this tier's hibernate budget, and finally
+        # LambdaSnapStartConfig.resume_timeout_s, which was the one tier nobody had got to yet. Each
+        # round fixed the reported field and left its siblings, because the guard enumerated names.
+        # Enumerating `dataclasses.fields(type(self))` instead means a knob is covered because it
+        # EXISTS, so a new float field -- or a new tier -- is protected the day it is added rather
+        # than the round after it is reported.
+        for _f in dataclasses.fields(type(self)):
+            if _f.name in _DURATION_EXEMPT:
+                continue
+            # Gate on the DECLARED FIELD TYPE, not on the value's type. Two different mistakes
+            # otherwise: checking `isinstance(value, float)` skips a caller who passed
+            # `claim_probe_timeout_s=0` as an int (silently un-fixing issue #77), while accepting
+            # any int sweeps in `max_duration_s` and `auth_token_ttl_min` -- int fields carrying
+            # AWS's own bounds, with their own clamp that maps 0 to 1, which this would overwrite
+            # with the default. A duration is a field declared `float`; those two are not.
+            if str(_f.type).replace(" ", "") not in ("float", "float|None"):
+                continue
+            _v = getattr(self, _f.name, None)
+            if not isinstance(_v, (int, float)) or isinstance(_v, bool):
+                continue
+            _dflt = _f.default if isinstance(_f.default, (int, float)) else None
+            if _dflt is None:
+                continue
+            _floor_ok = _v >= 0 if _f.name in _DURATION_ALLOW_ZERO else _v > 0
+            if not math.isfinite(_v) or not _floor_ok:
+                _log.warning("%s: ignoring %s=%r (must be finite and %s); using %r",
+                             type(self).__name__, _f.name,
+                             _v, ">= 0" if _f.name in _DURATION_ALLOW_ZERO else "> 0", _dflt)
+                object.__setattr__(self, _f.name, float(_dflt))
         # Same class of brick, one floor below: _probe_timeout() DECLINES to probe under
         # _MIN_PROBE_S, so a configured probe_timeout_s beneath it would decline unconditionally and
         # no slot would ever become ready (issue #77 marla-loop 4). Guard it beside its siblings.
@@ -1914,18 +1948,8 @@ class Ec2HibernateConfig(Ec2Config):
         # unclaimable forever AND blocks its own replacement. A NEGATIVE value inverts it instead:
         # `min(0, -1)` is -1, so `age > -1` is true at age 0 and every slot in the tier is retired
         # on first observation. Neither is a configuration anyone can mean.
-        # resume_poll_s is an INTERVAL, not a budget: 0 legitimately means "re-probe with no
-        # delay". Only the three BUDGETS must be strictly positive -- a zero budget is the silent
-        # brick, a zero interval is just a fast loop.
-        for _name, _default, _allow_zero in (("ready_timeout_s", 600.0, False),
-                                             ("resume_timeout_s", 180.0, False),
-                                             ("resume_poll_s", 5.0, True),
-                                             ("hibernate_timeout_s", 300.0, False)):
-            _v = getattr(self, _name)
-            if not math.isfinite(_v) or _v < 0 or (_v == 0 and not _allow_zero):
-                _log.warning("ec2-hibernate: ignoring %s=%r (must be finite and > 0); using %s",
-                             _name, _v, _default)
-                object.__setattr__(self, _name, _default)
+        # (Nothing tier-specific left to clamp: the base now covers every float field this class
+        # declares, including hibernate_timeout_s, resume_timeout_s and resume_poll_s.)
 
     @classmethod
     def from_env(cls, get: Callable[[str], str | None], **overrides: Any) -> Ec2HibernateConfig:
