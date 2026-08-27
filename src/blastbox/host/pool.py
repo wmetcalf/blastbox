@@ -1465,7 +1465,11 @@ class WarmPool:
                             "pool.reap_retry_dropped_at_shutdown slot_id=%s -- shutting down; the "
                             "husk stays quarantined (DRAINING) for stop() rather than being "
                             "requeued or republished", slot.slot_id)
-                    elif _tries is not None and _tries < self._maintain_reap_max_tries:
+                    # _tries + 1: the comparison has to count THIS failure. Reading the stored value
+                    # tested the budget before the attempt that just failed was counted, so a budget of
+                    # 3 ran four deferred terminates (stored 0, 1, 2 and 3) -- one mutating call per husk
+                    # beyond the advertised bound, aimed at the control plane already failing to dispose.
+                    elif _tries is not None and _tries + 1 < self._maintain_reap_max_tries:
                         # A MAINTENANCE husk still within budget: put it back on the queue.
                         # Deliberately NOT restored to IDLE -- it was judged UNUSABLE, so it must
                         # never be claimable again. It stays DRAINING and is retried as a husk.

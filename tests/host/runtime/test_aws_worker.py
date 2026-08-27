@@ -4448,3 +4448,24 @@ def test_a_clock_skew_rejection_still_leaves_tier_availability_undecided():
     with pytest.raises(AwsNoVerdict) as ei:
         rt.available()
     assert _is_undecided_availability(ei.value), "clock skew must stay deferrable, not drop the tier"
+
+
+def test_a_refused_stop_for_a_reaped_slot_recreates_no_state():
+    """stop-instances is the SLOW call, so a stop()/resize can reap the slot while it is in flight.
+    The success path checks the tombstone afterwards; the REFUSAL path returned before reaching that
+    check, so _park_step took the answer at face value and recreated _park_since/_park_refused for a
+    per-spawn UUID that no longer exists and that nothing will ever collect."""
+    from blastbox.host.runtime.aws_worker import AwsWorkerSlot
+    now = [1000.0]
+    rt, fake = _hibernate_rt(state=["running"], healthy=[True], clock=lambda: now[0])
+    slot = AwsWorkerSlot(slot_id="s", resource_id="i-1")
+
+    def _refused_then_reaped(argv):   # noqa: ANN001 -- the slot is reaped DURING the call
+        rt.reap(slot)                 # installs the tombstone, exactly as a real stop()/resize does
+        return _cp(rc=254, stderr="An error occurred (InvalidParameterValue) calling StopInstances")
+
+    fake.responses["ec2 terminate-instances"] = {}      # the reap must SUCCEED to leave a tombstone
+    fake.responses["ec2 stop-instances"] = _refused_then_reaped
+    assert rt._try_park(slot) is None, "a reaped slot must not report an answered refusal"
+    assert "s" not in rt._park_refused
+    assert "s" not in rt._park_since

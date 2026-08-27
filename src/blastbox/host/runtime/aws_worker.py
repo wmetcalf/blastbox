@@ -1978,6 +1978,7 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         # shape (_last_admit_attempt, _maintain_last, and the two here), so it is worth naming:
         # a throttle stamp belongs in a finally, not before the thing it throttles.
         self._hib_attempt[slot.slot_id] = now
+        refused = False
         try:
             self._aws("ec2", "stop-instances", "--instance-ids", str(slot.resource_id), "--hibernate")
         except AwsNoVerdict as exc:
@@ -1998,7 +1999,13 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         except AwsWorkerError as exc:
             _log.info("ec2-hibernate: stop --hibernate %s refused (%s); will retry until give-up",
                       slot.slot_id, str(exc)[:120])
-            return False
+            # Fall through to the ONE tombstone check below rather than returning here. Returning
+            # ran the finally and then left, skipping that check entirely -- so a slot reaped while
+            # this stop was in flight came back as an ANSWERED refusal, and _park_step recreated
+            # _park_since and _park_refused for a per-spawn UUID that no longer exists and that
+            # nothing will ever collect. The success path already routes through the check; the
+            # refusal path has the same obligation and now shares the same exit.
+            refused = True
         finally:
             # Re-stamp from COMPLETION. See the provisional stamp above: the whole point of the
             # throttle is that a slow call must not be re-issued the instant it returns.
@@ -2012,6 +2019,8 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 self._hib_attempt[slot.slot_id] = self._clock()
         if self._slot_is_gone(slot.slot_id):
             return None      # reaped while the stop was in flight; do not re-create its state
+        if refused:
+            return False
         self._desc_cache.pop(slot.slot_id, None)   # force a fresh describe next poll
         self._phase[slot.slot_id] = "hibernating"
         # self._clock(), NOT the pre-call `now`. This is when the stop was ACCEPTED, and the

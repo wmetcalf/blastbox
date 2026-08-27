@@ -4058,3 +4058,42 @@ def test_the_maintenance_producer_publishes_nothing_after_shutdown() -> None:
         f"{pool._deferred_reap} was published after shutdown -- a restarted pool would re-terminate "
         f"a resource whose disposal already failed"
     )
+
+
+def test_the_last_permitted_disposal_is_not_requeued_for_one_more():
+    """The budget is a promise about MUTATING CALLS against a control plane already failing to
+    dispose of the thing, so the comparison has to count THIS failure.
+
+    Reading the stored count tested the budget one attempt early: with a budget of 3, a husk whose
+    third disposal had just failed (stored value 2) was requeued for a FOURTH. Driven at the
+    boundary, because that is where the off-by-one lives.
+    """
+    class _NeverDisposes(_FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminates = 0
+
+        def reap(self, slot):             # noqa: ANN001
+            self.terminates += 1
+            raise OSError("terminate-instances: throttled")
+
+    rt = _NeverDisposes()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6)
+    pool._spawn_to_deficit(ready=True)
+    sid = next(iter(pool._slots))
+    pool._slots[sid].state = SlotState.DRAINING
+    budget = pool._maintain_reap_max_tries
+    # The attempt about to run is the LAST one the budget allows.
+    pool._maintain_reap_tries[sid] = budget - 1
+    pool._deferred_reap.add(sid)
+
+    pool._drain_deferred_reaps()
+    for entry in list(pool._reaper_threads):
+        entry[0].join(timeout=5)
+
+    assert rt.terminates == 1, "the attempt under test must actually have run and failed"
+    assert sid not in pool._deferred_reap_next, (
+        f"a husk whose disposal #{budget} just failed was requeued for #{budget + 1}; the budget "
+        f"is compared against the stored count instead of the one that just failed"
+    )
+    assert sid not in pool._maintain_reap_tries, "an abandoned husk must not keep its retry budget"
