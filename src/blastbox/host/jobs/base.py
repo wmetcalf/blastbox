@@ -308,7 +308,6 @@ class JobStore(Protocol):
 
 
 @runtime_checkable
-@runtime_checkable
 class BlobTargetRegistry(Protocol):
     """OPTIONAL registry proving every process on one queue writes results to the SAME blob target.
 
@@ -359,6 +358,7 @@ class BlobTargetRegistry(Protocol):
         ...
 
 
+@runtime_checkable
 class PageHashSearch(Protocol):
     """OPTIONAL per-page perceptual-hash index + similarity search surface.
 

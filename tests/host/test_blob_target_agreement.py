@@ -172,3 +172,29 @@ def test_local_stores_are_not_compared_by_path(backend):
     assert check_blob_target_agreement(q, LocalBlobStore("/mnt/a/blobs"), role="dispatcher") is None
     assert check_blob_target_agreement(q, LocalBlobStore("/mnt/b/blobs"), role="ingress") is None
     assert q.get_blob_target() is None, "a local store must not register a target at all"
+
+
+def test_every_protocol_used_with_isinstance_stays_runtime_checkable():
+    """A guard that runs WITHOUT Postgres, because the one that caught this does not.
+
+    `PageHashSearch` lost its `@runtime_checkable` when this feature was added: the new Protocol
+    was inserted between that decorator and the class it decorated, so the decorator silently
+    transferred to the new class and `isinstance(store, PageHashSearch)` began raising TypeError
+    at runtime. Nothing local failed -- the existing regression test for it is Postgres-gated and
+    skips on SQLite -- so it took a CI job with a real database to surface a one-line edit.
+
+    Consumers gate on isinstance for all three of these (the dispatcher's on-DONE indexer, the
+    /v1/similar route, and now the blob-target check), so losing the decorator is a runtime break,
+    not a typing nicety. Asserted directly rather than by inspecting decorators, since the thing
+    that matters is that the call does not raise.
+    """
+    from blastbox.host.jobs import base
+
+    store = InMemoryJobStore()
+    for name in ("JobStore", "PageHashSearch", "BlobTargetRegistry"):
+        proto = getattr(base, name)
+        try:
+            isinstance(store, proto)
+        except TypeError as exc:  # pragma: no cover - the failure this exists to prevent
+            pytest.fail(f"isinstance() against {name} raises: {exc}. It lost @runtime_checkable, "
+                        f"and every consumer that gates on it breaks at runtime.")
