@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import math
+import contextlib
 import pytest
 
 from blastbox.host.jobs.base import Job, JobStatus
@@ -1506,3 +1508,289 @@ def test_the_release_seam_forwards_the_fault_attribution(tmp_path, monkeypatch):
     release(object(), True, "job")
     assert seen == [(True, "worker"), (True, "job")], (
         f"the seam dropped the attribution on its way to the pool: {seen}")
+
+
+class _BudgetRecordingPool(_RetryPool):
+    """Records the budget_s each resume was actually granted."""
+
+    def __init__(self, slots, resume):  # noqa: ANN001
+        super().__init__(slots, resume)
+        from types import SimpleNamespace
+        self.budgets: list[float | None] = []
+        self.runtime = SimpleNamespace(
+            resume=lambda s, *, budget_s=None: self._resume_b(s, budget_s))
+
+    def _resume_b(self, slot, budget_s):  # noqa: ANN001
+        self.resume_calls.append(slot.slot_id)
+        self.budgets.append(budget_s)
+        return self._resume_impl(slot, budget_s)
+
+
+def test_the_thaw_gets_its_declared_budget_not_the_claim_window_remainder():
+    """issue #81: ec2-hibernate declares resume_timeout_s=180 -- its own statement of how long a
+    healthy hibernated instance may take to thaw -- while warm_claim_timeout_s defaults to 60. The
+    tier could therefore NEVER receive the budget it says it needs, and a truncated window ending
+    in silence was read as a confirmed failure and the instance terminated.
+    """
+    from types import SimpleNamespace
+    from blastbox.host.runtime.vm_dispatch import _claim_resumable_slot
+
+    a = SimpleNamespace(slot_id="A")
+    pool = _BudgetRecordingPool([a], lambda slot, budget_s: None)
+    t = [0.0]
+    got = _claim_resumable_slot(pool, 60.0, thaw_budget_s=180.0,
+                                clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0])
+    assert got is a
+    assert pool.budgets == [180.0], (
+        f"the thaw was truncated to the claim window: got {pool.budgets}, expected the declared 180s"
+    )
+
+
+def test_a_slow_but_healthy_thaw_is_no_longer_convicted():
+    """The reproduction from the issue: an instance whose agent answers at t=75s returned OK when
+    given its configured 180s window, but raised and was TERMINATED at the 60s window.
+    """
+    from types import SimpleNamespace
+    from blastbox.host.runtime.aws_worker import AwsWorkerError
+    from blastbox.host.runtime.vm_dispatch import _claim_resumable_slot
+
+    AGENT_ANSWERS_AT = 75.0
+
+    def resume(slot, budget_s):  # noqa: ANN001
+        if budget_s is None or budget_s < AGENT_ANSWERS_AT:
+            # What the truncated window produced: silence, reported as a real verdict.
+            raise AwsWorkerError(f"ec2-hibernate slot {slot.slot_id}: agent silent after "
+                                 f"{budget_s}s")
+        return None
+
+    a = SimpleNamespace(slot_id="A")
+    pool = _BudgetRecordingPool([a], resume)
+    t = [0.0]
+    got = _claim_resumable_slot(pool, 60.0, thaw_budget_s=180.0,
+                                clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0])
+    assert got is a, "a healthy instance that needed 75s was convicted inside a 60s window"
+    assert pool.released == [], "and terminated: release(dirty=True) -> terminate-instances"
+
+
+def test_without_a_declared_thaw_budget_the_old_behaviour_is_unchanged():
+    """Tiers with no resume seam (or a fast one that declares nothing) must keep sharing the claim
+    window -- the split must not silently grant unbounded time to every runtime."""
+    from types import SimpleNamespace
+    from blastbox.host.runtime.vm_dispatch import _claim_resumable_slot
+
+    a = SimpleNamespace(slot_id="A")
+    pool = _BudgetRecordingPool([a], lambda slot, budget_s: None)
+    t = [0.0]
+    got = _claim_resumable_slot(pool, 5.0, thaw_budget_s=None,
+                                clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0])
+    assert got is a
+    assert pool.budgets and pool.budgets[0] is not None and pool.budgets[0] <= 5.0, (
+        f"expected the claim-window remainder, got {pool.budgets}"
+    )
+
+
+def test_the_declared_thaw_budget_is_actually_wired_through_the_factory(tmp_path):
+    """The unit tests above call _claim_resumable_slot directly, so they cannot see whether the
+    dispatcher ever PASSES the tier's declared budget. That plumbing -- cfg.resume_timeout_s ->
+    _thaw_budget -> thaw_budget_s -> resume(budget_s=) -- is exactly where a fix silently fails to
+    take effect, so assert the value that actually reaches the runtime (issue #81).
+    """
+    from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+
+    seen: dict = {}
+    slot = SimpleNamespace(slot_id="s1", url="http://x", auth_token=None, agent_port=8765)
+
+    def resume(s, *, budget_s=None):  # noqa: ANN001
+        seen["budget"] = budget_s
+        raise RuntimeError("stop here -- we only care about the budget that was granted")
+
+    claimed = {"n": 0}
+
+    def claim(*, timeout_s):  # noqa: ANN001
+        claimed["n"] += 1
+        return slot if claimed["n"] == 1 else None
+
+    pool = SimpleNamespace(
+        runtime=SimpleNamespace(ssl_context=None,
+                                cfg=SimpleNamespace(resume_timeout_s=180.0),
+                                resume=resume),
+        claim=claim,
+        release=lambda s, dirty=False, **kw: None,
+        unclaim=lambda s: None,
+    )
+    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
+                                    tier="aws-ec2-hibernate", engine="clippyshot",
+                                    limits=_FAKE_LIMITS, worker_timeout_s=300.0,
+                                    warm_claim_timeout_s=60.0)
+    with contextlib.suppress(Exception):
+        vm._validate(tmp_path / "in.bin")
+
+    assert seen.get("budget") == 180.0, (
+        f"the tier declared 180s but the dispatcher granted {seen.get('budget')!r} -- the claim "
+        "window truncated it, which is the whole bug"
+    )
+
+
+def test_a_thaw_budget_longer_than_the_job_budget_is_still_granted(tmp_path):
+    """A tier declaring a thaw longer than the entire job budget cannot be honoured: granting it
+    would let one wake-up eat the job. Fall back rather than pretend, and keep the operator warning.
+    
+    CHANGED 2026-08-21: this asserted the OPPOSITE, on the premise that granting the declared thaw
+    "would let one wake-up eat the job". That premise is false in this code. Detonation is bounded
+    separately by timeout=worker_timeout_s, and validate_timeout_s adds the FULL _resume_to on top
+    of the claim wait and the job budget UNCONDITIONALLY -- so the watchdog already reserves a 600s
+    thaw whether or not _thaw_budget was set. Withholding it therefore withheld nothing: it
+    substituted the claim remainder, which is the #81 truncation, and one full-duration silent
+    probe inside that remainder while describe still says `running` is a CONVICTING verdict in
+    aws_worker.resume -- so the healthy parked instance was released dirty and terminated.
+    """
+    from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+
+    seen: dict = {}
+    slot = SimpleNamespace(slot_id="s1", url="http://x", auth_token=None, agent_port=8765)
+
+    def resume(s, *, budget_s=None):  # noqa: ANN001
+        seen["budget"] = budget_s
+        raise RuntimeError("stop")
+
+    claimed = {"n": 0}
+
+    def claim(*, timeout_s):  # noqa: ANN001
+        claimed["n"] += 1
+        return slot if claimed["n"] == 1 else None
+
+    pool = SimpleNamespace(
+        runtime=SimpleNamespace(ssl_context=None,
+                                cfg=SimpleNamespace(resume_timeout_s=600.0),   # > worker_timeout_s
+                                resume=resume),
+        claim=claim,
+        release=lambda s, dirty=False, **kw: None,
+        unclaim=lambda s: None,
+    )
+    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
+                                    tier="aws-ec2-hibernate", engine="clippyshot",
+                                    limits=_FAKE_LIMITS, worker_timeout_s=300.0,
+                                    warm_claim_timeout_s=60.0)
+    with contextlib.suppress(Exception):
+        vm._validate(tmp_path / "in.bin")
+
+    granted = seen.get("budget")
+    assert granted == 600.0, (
+        f"the tier's declared thaw was withheld ({granted!r}) -- which does not withhold a budget, "
+        f"it substitutes the CLAIM REMAINDER and re-creates the #81 truncation."
+    )
+
+
+class _SlowClaimPool(_RetryPool):
+    """A pool whose claim() consumes the window, as the real one does: WarmPool.claim BLOCKS
+    until its own deadline and never returns early."""
+
+    def __init__(self, slots, resume, clock_box, advance):  # noqa: ANN001
+        super().__init__(slots, resume)
+        self._t = clock_box
+        self._adv = advance
+
+    def claim(self, *, timeout_s):  # noqa: ANN001
+        self._t[0] += self._adv
+        return super().claim(timeout_s=timeout_s)
+
+
+def test_a_thaw_is_not_STARTED_after_the_scan_window_has_closed():
+    """A declared thaw budget may OVERRUN the claim window -- that is issue #81's fix -- but it
+    may not BEGIN outside it. claim() can hand back a slot exactly as the window closes, and the
+    declared-budget branch then started a fresh 180s resume for a caller whose scan window was
+    already gone. The no-declared-budget branch refused exactly that, so whether the guard applied
+    depended on which tier you were on rather than on the clock.
+    """
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.vm_dispatch import _claim_resumable_slot
+
+    a = SimpleNamespace(slot_id="A")
+    t = [0.0]
+    pool = _SlowClaimPool([a], lambda s: None, t, advance=5.0)   # eats the whole 5s window
+
+    got = _claim_resumable_slot(pool, 5.0, thaw_budget_s=180.0, clock=lambda: t[0])
+
+    assert got is None, "a slot was returned for a scan window that had already closed"
+    assert pool.resume_calls == [], (
+        f"a resume was started after the window closed: {pool.resume_calls}"
+    )
+    assert pool.assigned == set(), f"the slot was left ASSIGNED: {pool.assigned}"
+
+
+def test_a_thaw_begun_in_time_still_gets_its_whole_declared_budget(monkeypatch):
+    """The guard must not re-truncate the thaw. ec2-hibernate declares resume_timeout_s=180 while
+    warm_claim_timeout_s defaults to 60, so handing the resume what is LEFT of the window is the
+    configuration contradiction issue #81 removed -- a truncated window ending in silence was read
+    as a confirmed failure and the instance terminated."""
+    from types import SimpleNamespace
+
+    import blastbox.host.runtime.vm_dispatch as vd
+
+    seen: dict = {}
+
+    def _fake_resume(pool, slot, *, budget_s):  # noqa: ANN001
+        seen["budget"] = budget_s
+
+    monkeypatch.setattr(vd, "_resume_on_claim", _fake_resume)
+
+    a = SimpleNamespace(slot_id="A")
+    t = [0.0]
+    pool = _SlowClaimPool([a], lambda s: None, t, advance=1.0)   # 4s of window left
+
+    got = vd._claim_resumable_slot(pool, 5.0, thaw_budget_s=180.0, clock=lambda: t[0])
+
+    assert got is a
+    assert seen["budget"] == 180.0, (
+        f"the thaw was truncated to {seen['budget']}s of remaining window instead of its declared "
+        f"180s budget"
+    )
+
+
+def test_an_infinite_declared_resume_timeout_does_not_become_an_infinite_thaw_deadline(tmp_path, monkeypatch):
+    """`inf > 0` is True, so the guard that was meant to accept only a real budget accepted inf.
+
+    The thaw budget bounds the resume the claim seam grants OUTSIDE the claim window. Set to inf it
+    stops being a bound at all: the watchdog that exists to recover a wedged resume can never fire,
+    and the seam waits forever on a microvm that is not coming back -- with the slot held, so the
+    tier loses that capacity permanently rather than for one claim. (NaN was never reachable here:
+    every comparison against NaN is False, so `nan > 0` already fell through.)
+
+    A non-finite budget is not a budget, so it falls back to the same path an UNDECLARED timeout
+    takes -- thaw_budget_s=None, the claim remainder -- which is bounded and recoverable.
+
+    MUTATION: drop the math.isfinite() term and thaw_budget_s comes through as inf.
+    """
+    from blastbox.host.runtime import vm_dispatch as _vd
+    from blastbox.host.runtime.vm_dispatch import NoWarmSlot, build_remote_vm_dispatcher
+    seen = {}
+
+    def _capture(pool, timeout_s, *, thaw_budget_s=None):  # noqa: ANN001, ANN202
+        seen["thaw"] = thaw_budget_s
+        return None                                   # no slot -> NoWarmSlot, ends the call early
+
+    monkeypatch.setattr(_vd, "_claim_resumable_slot", _capture)
+
+    class _InfResumePool:
+        runtime = type("R", (), {"ssl_context": None, "resume_timeout_s": float("inf")})()
+
+        def claim(self, *, timeout_s):  # noqa: ANN001, ANN202
+            return None
+
+        def release(self, slot, *, dirty=False):  # noqa: ANN001
+            pass
+
+    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _InfResumePool(),
+                                    tier="aws-ec2-hibernate", engine="clippyshot",
+                                    limits=_FAKE_LIMITS, worker_timeout_s=300.0,
+                                    warm_claim_timeout_s=0.05)
+    with pytest.raises(NoWarmSlot):
+        vm._validate(tmp_path / "in.bin")
+
+    assert seen["thaw"] is None, (
+        f"thaw_budget_s={seen['thaw']}; an infinite thaw deadline means the resume watchdog can "
+        f"never fire, so a wedged resume holds the slot forever instead of for one claim")
+    assert math.isfinite(vm._validate_timeout_s), (
+        f"_validate_timeout_s={vm._validate_timeout_s}; the watchdog allowance is built from the "
+        f"same budget, so an infinite thaw disables the heartbeat watchdog outright")

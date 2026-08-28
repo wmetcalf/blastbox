@@ -28,6 +28,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -85,6 +86,26 @@ class Slot:
     # epoch -- and that slot's ack would then re-teach the replacement base a capability only the
     # retired image had. The property has to travel with the slot, not with the job.
     ack_generation: "int | None" = None
+
+
+def _finite_nonneg(value: Any, default: float) -> float:
+    """A non-negative, FINITE seconds value, or ``default``.
+
+    Both maintenance knobs are operator-settable from the environment now, and an out-of-range one
+    breaks the guarantee its own doc row makes. Negative defeats a rate limit outright -- `now -
+    last >= interval` is then always true, so an ec2-hibernate pool describes on EVERY tick and
+    manufactures the control-plane throttling the limit exists to avoid. Non-finite is the inverse:
+    every comparison against NaN is False, so NO slot is ever eligible and a half-resumed instance
+    is never reconciled -- it just keeps running and billing, silently, with maintenance apparently
+    configured.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(v):
+        return default
+    return max(0.0, v)
 
 
 def _accepts_kwarg(fn: Any, name: str) -> bool:
@@ -158,8 +179,14 @@ class SlotRuntime(Protocol):
         """Launch a warm worker; returns a SPAWNING/WARMING slot."""
         ...
 
-    def is_ready(self, slot: Slot) -> bool:
-        """True once the worker has signalled ready (control_dir/ready)."""
+    def is_ready(self, slot: Slot) -> "bool | None":
+        """Tri-state readiness: True = ready, False = CONFIRMED not ready yet, None = UNKNOWN.
+
+        None means the runtime could not find out (a throttled control plane), NOT that the worker
+        failed to come up. The pool suppresses the warming timeout for the duration of an unknown
+        episode, so a brownout cannot terminate a tier's entire WARMING population (issue #79).
+        Local runtimes poll a process or a file and simply never return None.
+        """
         ...
 
     def is_alive(self, slot: Slot) -> "bool | None":
@@ -254,8 +281,13 @@ class WarmPool:
         concurrent_ceiling: int = 16,
         spawn_rate_limit: float = 4.0,
         spawn_concurrency: int = 1,
+        maintain_budget_s: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
         poll_interval: float = 0.1,
+        # Minimum seconds between maintain_idle passes on the SAME slot. The hook may issue
+        # uncached control-plane calls and the tick runs at ~10Hz; 5.0 matches the liveness cache
+        # TTL the AWS runtimes already use to keep that same tick from storming DescribeInstances.
+        maintain_interval_s: float = 5.0,
         burst_size: int = 4,
         burst_trigger_s: float = 3.0,
         burst_drain_s: float = 60.0,
@@ -404,6 +436,7 @@ class WarmPool:
         self._warm_size = warm_size
         self._concurrent_ceiling = concurrent_ceiling
         self._poll_interval = poll_interval
+        self._maintain_interval_s = _finite_nonneg(maintain_interval_s, 5.0)
         self._clock = clock
         self._burst_size = burst_size
         self._burst_trigger_s = burst_trigger_s
@@ -467,6 +500,13 @@ class WarmPool:
         # published must still count against concurrent_ceiling, or a batch would
         # overshoot the cap by however many spawns are in flight.
         self._spawn_concurrency = max(1, int(spawn_concurrency))
+        #: How long ONE maintenance pass may occupy the tick thread. The runtime's own probe
+        #: ceiling (health_probe_timeout_s, 30s) is sized for a background probe, not for the
+        #: thread that also drives promotion, health checks, reaping and replacement spawning --
+        #: and the rotation reaches a different slot each tick, so a control-plane brownout stalls
+        #: that thread continuously rather than once. Expiry is not a verdict: the bounded call
+        #: raises UNKNOWN and the slot is reconsidered on a later rotation.
+        self._maintain_budget_s = _finite_nonneg(maintain_budget_s, 5.0)
         self._spawns_in_flight = 0
 
         # Background thread
@@ -484,6 +524,52 @@ class WarmPool:
         # slot_id -> when it FIRST went UNKNOWN and stayed that way (cleared by any definitive
         # answer). Bounds how long "we can't tell" may keep a slot alive; see _health_check.
         self._unknown_since: dict[str, float] = {}
+        # The same idea for the WARMING path: slot_id -> when is_ready() FIRST returned UNKNOWN and
+        # kept doing so. A brownout longer than warming_timeout_s used to terminate every WARMING
+        # instance in a tier -- instances booting fine whose only fault was that the control plane
+        # would not describe them (issue #79). Cleared by any definitive ready/not-ready answer, so
+        # a tier that IS answering still ages its slots out normally; bounded by _unknown_grace_s so
+        # a control plane that never returns cannot wedge the tier at zero capacity forever.
+        self._warming_unknown_since: dict[str, float] = {}
+        # slot_id -> total warming time already spent inside CLOSED unknown episodes. The exemption
+        # suspends the VERDICT, but the age it is measured against keeps running: after a brownout
+        # the slot is past warming_timeout_s by construction, so the first definitive answer --
+        # including the "not ready yet" a healthy ec2-hibernate machine returns for most of its
+        # boot->park sequence -- evicts a worker we had only just regained the ability to observe.
+        # Credit that unobservable time back, so the budget is spent on OBSERVATIONS, which is what
+        # warming_timeout_s claims to measure (issue #79).
+        self._warming_unknown_credit: dict[str, float] = {}
+        # Slots that have NEVER been promoted, i.e. never returned a ready verdict. A separate,
+        # single-meaning marker on purpose: the undo path needs "has this slot ever been ready?"
+        # and briefly borrowed _warming_unknown_credit for it. That dict is a timeout LEDGER with a
+        # different lifetime -- it survives promotion -- so it silently became a permanent
+        # "was once warming-unknown" flag, and a PROVEN idle slot was restored to WARMING with a
+        # stale spawned_at, tripping the warming timeout on the next tick and being charged as a
+        # CONFIRMED restore failure. Two questions, two fields.
+        self._never_ready: set[str] = set()
+        # Rotation cursor + per-slot cooldown for _maintain_idle (issue #80 follow-up).
+        self._maintain_cursor: "str | None" = None
+        self._maintain_last: dict[str, float] = {}
+        #: slot_id -> deferred-reap attempts already spent on a MAINTENANCE-retired husk.
+        #: Quarantine-on-failed-reap is the repo-wide rule ("never re-terminate a resource whose
+        #: disposal already failed") and it is right when we know nothing about the resource. But a
+        #: maintenance husk is not in _suspected_unknown, so NOTHING retried it: one correlated
+        #: termination brownout stranded every retired slot as tracked DRAINING, each still
+        #: counting against concurrent_ceiling, until the process restarted. A bounded retry keeps
+        #: the "do not hammer an unknown resource" property while letting the COMMON case -- a
+        #: transient control-plane failure, which is the premise of issue #79 -- heal itself.
+        self._maintain_reap_tries: dict[str, int] = {}
+        #: Husks requeued DURING a drain. _drain_deferred_reaps is a `while` that empties the
+        #: queue, so adding straight back to _deferred_reap made the SAME pass retry immediately --
+        #: the whole budget burned in a tight loop against a control plane that is, by hypothesis,
+        #: browning out. Held here and merged when the pass ends, so a retry costs one tick, which
+        #: is the spacing that makes it a retry rather than a hammer. (Caught by the test, not by
+        #: reading: the first implementation had exactly that bug.)
+        self._deferred_reap_next: set[str] = set()
+        #: Attempts a maintenance husk gets before we stop and say so LOUDLY. Not unbounded: if
+        #: disposal keeps failing the resource may genuinely still be alive, and re-terminating it
+        #: forever is the hazard the quarantine rule exists to prevent.
+        self._maintain_reap_max_tries: int = 3
         # Slots escalated on SUSPICION (a long UNKNOWN) rather than a confirmed verdict. Disposal is
         # asynchronous now, so this must outlive the tick that queued it -- the reaper needs to know
         # not to strand a slot it merely could not dispose of.
@@ -526,6 +612,16 @@ class WarmPool:
         if self._thread is not None:
             return
         self._stop_event.clear()
+        # Symmetric with stop()'s close(): a runtime that latched itself shut needs telling that the
+        # pool is running again. CascadingRuntime.close() sets a flag that refuses new admission
+        # probes, and without this the flag was permanent -- a restarted pool could never admit its
+        # configured overflow tiers again until the whole runtime object was reconstructed.
+        _open = getattr(self._runtime, "reopen", None)
+        if callable(_open):
+            try:
+                _open()
+            except Exception:  # noqa: BLE001 -- best-effort, exactly like close()
+                logger.warning("pool.runtime_reopen_failed", exc_info=True)
         with self._lock:
             self._started_at = self._clock()
         self._thread = threading.Thread(
@@ -569,6 +665,19 @@ class WarmPool:
         # caller's timeout stops meaning what it says.
         stop_deadline = self._clock() + stop_timeout_s
         self._stop_event.set()
+        # LATCH the runtime's background work HERE, not at close() below. close() both latches and
+        # joins, and it runs only after the tick and reaper joins have already spent the shared
+        # allowance -- so a cascade admission worker kept starting deferred builds and owed sweeps
+        # throughout those waits, and by the time close() was reached `_remaining` could be 0, which
+        # latches without being able to join. stop() then returned with that daemon still inside a
+        # control-plane call. Latching costs nothing and stops new work immediately; the JOIN stays
+        # below, on whatever budget is genuinely left.
+        _begin = getattr(self._runtime, "begin_close", None)
+        if callable(_begin):
+            try:
+                _begin()
+            except Exception:  # noqa: BLE001 -- a latch failure must not block shutdown
+                logger.warning("pool.runtime_begin_close_failed", exc_info=True)
         if self._thread is not None:
             # Fast path returns immediately when the daemon has already exited (no spawn in flight).
             self._thread.join(timeout=min(10.0, stop_timeout_s))
@@ -620,6 +729,12 @@ class WarmPool:
             # a restarted pool's first tick re-terminate a resource whose disposal already failed —
             # exactly what _drain_deferred_reaps' contract forbids.
             self._deferred_reap.clear()
+            # ...and the HOLDING set, for the same reason. _deferred_reap_next carries ids whose
+            # disposal just FAILED; leaving them queued would let a restarted pool's first tick
+            # re-terminate a resource that may still be live -- exactly what this clear exists to
+            # prevent, and exactly what the quarantine rule forbids. Added in the same commit as
+            # the holding set, which shipped without either of its lifecycle obligations.
+            self._deferred_reap_next.clear()
             to_reap = list(self._slots.values())
             for slot in to_reap:
                 slot.state = SlotState.DRAINING
@@ -640,6 +755,33 @@ class WarmPool:
                     with self._lock:
                         self._slots.pop(slot.slot_id, None)
                         self._forget_slot_health(slot.slot_id)
+
+        # AFTER the reap loop, not before it. close() is the JOIN half of shutdown -- the LATCH
+        # already ran at _stop_event.set() -- and SlotRuntime does not define close() semantics.
+        # A conforming injected runtime whose close() tears down the session its own reap() needs
+        # therefore had every reap raise, and stop() then reported live remote workers as orphans
+        # while leaving their slots DRAINING. Nothing here needs the runtime closed first: new
+        # background work stopped at the latch, so deferring this costs only ordering.
+        # Let the runtime stop its own background work, if it has any. Optional hook, resolved by
+        # getattr like every other seam here. CascadingRuntime runs its admission probe on a thread
+        # and joins it in close(); without this call that daemon keeps making control-plane calls
+        # while the process tears down -- the shape that made this file's own reapers a recurring
+        # bug. Best-effort: a runtime that cannot close must not block shutdown.
+        # ...INSIDE the shared budget. This is a third join, and stop() promises ONE budget for
+        # the whole shutdown -- so calling close() with its own timeout meant stop(stop_timeout_s=0)
+        # could still wait out CascadingRuntime's default join (_admit_retry_s, 60s) after the tick
+        # and reaper joins had already spent the allowance. The caller's number stops meaning what
+        # it says, which is the exact hazard the shared stop_deadline was introduced for.
+        _close = getattr(self._runtime, "close", None)
+        if callable(_close):
+            _remaining = max(0.0, stop_deadline - self._clock())
+            try:
+                if _accepts_kwarg(_close, "timeout_s"):
+                    _close(timeout_s=_remaining)
+                else:
+                    _close()
+            except Exception:  # noqa: BLE001
+                logger.warning("pool.runtime_close_failed", exc_info=True)
 
         # Whatever remains in _slots failed to reap (or is owned by another thread mid-dispose) —
         # a still-live VM the caller must keep reserving for. A wedged background thread means
@@ -1014,6 +1156,7 @@ class WarmPool:
         if callable(self._recycle) and tracked and not burned_out and not (
             self._max_jobs_per_slot and jobs >= self._max_jobs_per_slot
         ):
+            recycled = True
             try:
                 if dirty or jobs % self._jobs_per_recycle == 0:
                     # Reset in place while the slot stays ASSIGNED. ASSIGNED is counted as active
@@ -1022,10 +1165,28 @@ class WarmPool:
                     # (_promote_warming only touches WARMING) — so the background tick cannot hand
                     # this slot out mid-reset. Flip to IDLE only once the reset completes.
                     self._recycle(slot)  # e.g. VM snapshot-revert (seconds-long)
+            except Exception:
+                # A recycle failure IS a real reason to reap: the slot was not reset, so the next
+                # job would inherit a contaminated or wedged worker. Fail-safe, keep it.
+                logger.exception("pool.recycle_error slot_id=%s", slot.slot_id)
+                recycled = False
+            if recycled:
+                try:
+                    alive = self._runtime.is_alive(slot)
+                except Exception:
+                    # UNKNOWN, not dead -- the same rule the health tick and the claim probe now
+                    # apply. This used to share the recycle handler's `except`, so an unenumerated
+                    # exception from a liveness probe reaped a slot that had just been reset
+                    # successfully and had served its job fine. A runtime's exception enumeration is
+                    # never complete, and the reuse path runs once PER JOB, so this was charged at
+                    # job rate rather than per tick (issue #79).
+                    logger.exception("pool.release_is_alive_error slot_id=%s — treating as unknown",
+                                     slot.slot_id)
+                    alive = None
                 # `is not False`: an UNKNOWN post-job liveness answer must not destroy the slot
                 # either. Republish it -- the claim-time fresh probe still gates hand-out, and the
                 # unknown-escalation clock bounds how long it can stay that way.
-                if self._runtime.is_alive(slot) is not False:
+                if alive is not False:
                     with self._lock:
                         # Only publish to IDLE if the slot is STILL the ASSIGNED one we're recycling.
                         # A concurrent stop() flips slots to DRAINING under the lock before reaping; if
@@ -1036,8 +1197,6 @@ class WarmPool:
                             self._last_idle_at = self._clock()
                             self._idle_event.set()
                             return
-            except Exception:
-                logger.exception("pool.recycle_error slot_id=%s", slot.slot_id)
             # recycle failed / slot died / max-jobs reached → fall through to reap (fail-safe)
 
         with self._lock:
@@ -1128,6 +1287,19 @@ class WarmPool:
         # ONCE per tick (this also kicks the async build) and gate both burst + spawn on it, so
         # the (up to ready_timeout_s) build never blocks this loop and demand misses during the
         # build window don't spuriously trip burst the instant the tier becomes ready.
+        # Give the runtime its periodic beat. CascadingRuntime uses it to run the rate-limited
+        # deferred-admission probe, which otherwise had exactly ONE caller -- spawn() -- and
+        # _spawn_to_deficit does not call spawn() at all while the primary already satisfies the
+        # warm target. So on an idle-but-healthy deployment the probe never ran: the advertised
+        # ~60s re-probe cadence was inert and the tier's post-admission orphan sweep never
+        # happened, leaving a predecessor's parked instances accruing cost. Best-effort and
+        # non-blocking, like every other optional runtime seam here.
+        _poll = getattr(self._runtime, "poll", None)
+        if callable(_poll):
+            try:
+                _poll()
+            except Exception:  # noqa: BLE001 -- a runtime's beat must never break the tick
+                logger.warning("pool.runtime_poll_failed", exc_info=True)
         ready = self._runtime_ready()
         self._promote_warming()
         self._health_check()
@@ -1139,6 +1311,7 @@ class WarmPool:
         # holding node RAM, and this file's policy is to keep counting it (see _spawn_to_deficit's
         # headroom + the quarantine comments) rather than risk over-committing the node.
         self._drain_runtime_repairs()
+        self._maintain_idle()
         self._reap_deferred()
         self._update_burst(ready)
         # CONSUME the flag and commit to the decision in one locked step. Checking it here and
@@ -1219,6 +1392,19 @@ class WarmPool:
         queued and are drained when it finishes. stop() reaps every tracked slot regardless, so a
         wedged reaper can never leak a live worker past shutdown."""
         with self._lock:
+            if self._stop_event.is_set():
+                # SHUTTING DOWN: start no new reapers. stop() snapshots _reaper_threads and joins
+                # THAT SNAPSHOT within its budget, precisely because a reaper is a daemon and a
+                # process exiting mid-terminate leaks the worker. A reaper created after the
+                # snapshot is joined by nothing: it issues a terminate while the process tears
+                # down, against a resource stop() has already disposed of or quarantined, and
+                # stop()'s orphan count cannot see it either.
+                #
+                # Same rule as _queue_deferred_reap_unlocked, applied to THREADS rather than queue
+                # entries. Guarding only the queue left this door open: a tick thread still inside
+                # a slow maintenance hook returns after stop() and spawns reapers regardless of
+                # what the queue says, which is how the seventh instance of this class arrived.
+                return
             now = self._clock()
             self._reaper_threads = [e for e in self._reaper_threads if e[0].is_alive()]
             # Count only reapers that are still making progress. One wedged in a hung terminate is
@@ -1236,9 +1422,26 @@ class WarmPool:
                     # _MAX_REAPER_THREADS (issue #77 round 3). It cannot be interrupted, but it can
                     # be told to stop after its current disposal.
                     entry[2] = True
+            # RELEASE THE HELD RETRIES only once no reaper is still draining. This is the third
+            # boundary tried for this and the first that is actually the right one:
+            #
+            #   loop   (32fe210)  requeue fed straight back into the same `while` -- one worker ate
+            #                     the whole budget in a tight loop.
+            #   batch  (4f8b630)  merged at end-of-drain -- a SIBLING in the same 4-way batch ate it.
+            #   tick   (4f8b630)  merged at tick start -- but poll_interval is 0.1s and a reaper
+            #                     blocked in a terminate lives for SECONDS, so ~10 merges a second
+            #                     landed straight into a batch that was still running.
+            #
+            # `live` below is exactly "reapers still making progress", which is the condition all
+            # three were reaching for. A permanently wedged reaper is retired from that count above,
+            # so this cannot deadlock: the release resumes once the batch is genuinely done.
+            #
             # Two bounds: _MAX_REAPERS caps CONCURRENT PROGRESS (wedged ones don't count, so a stuck
             # disposal can't halt the queue), and _MAX_REAPER_THREADS caps TOTAL live threads
             # (wedged ones DO count, so a permanently-hung runtime can't spawn threads forever).
+            if live == 0 and self._deferred_reap_next:
+                self._deferred_reap |= self._deferred_reap_next
+                self._deferred_reap_next.clear()
             headroom = min(self._MAX_REAPERS - live,
                            self._MAX_REAPER_THREADS - len(self._reaper_threads))
             want = min(len(self._deferred_reap), headroom)
@@ -1290,6 +1493,29 @@ class WarmPool:
                 vals.append(float(v))
         return max(vals) if vals else None
 
+    def _queue_deferred_reap_unlocked(self, slot_id: str, *, why: str) -> bool:
+        """THE one place that decides whether a failed disposal may be queued for another attempt.
+
+        Caller must hold ``_lock``. Returns True if the id was queued.
+
+        This exists because the same bug arrived six times, always the same way: a NEW producer of
+        this queue not knowing the shutdown rule. stop() sets _stop_event, joins the tick thread
+        and the reapers with budgets it is ALLOWED TO EXCEED (it logs "still running -- proceeding"
+        and carries on), and only then clears the queue. Any writer still running lands its add
+        BEHIND that clear, so a pool restarted on the same object re-terminates a resource whose
+        disposal already failed -- the one thing every reap path in this file promises not to do.
+
+        Two producers remembered the rule and one did not, and which was which changed as the
+        branch grew. Centralising the decision is the fix: "the guard is correct at each call site"
+        was never the property we needed, because every instance was a site with no guard at all.
+        test_every_deferred_reap_producer_goes_through_the_chokepoint pins this as the only writer.
+        """
+        if self._stop_event.is_set():
+            logger.debug("pool.defer_reap_skipped_after_stop slot_id=%s why=%s", slot_id, why)
+            return False
+        self._deferred_reap.add(slot_id)
+        return True
+
     def _drain_deferred_reaps(self, entry_box: "list | None" = None) -> None:
         """Dispose every queued husk, one at a time, off the tick + claim paths.
 
@@ -1315,17 +1541,91 @@ class WarmPool:
                 self._reap_and_count(slot, require_tracked=True, pop_on_success=True)
                 with self._lock:
                     self._suspected_unknown.discard(slot.slot_id)
+                    self._maintain_reap_tries.pop(slot.slot_id, None)
             except Exception:
                 logger.exception("pool.reap_deferred_error slot_id=%s — quarantining", slot.slot_id)
                 with self._lock:
-                    if slot.slot_id in self._suspected_unknown:
+                    _tries = self._maintain_reap_tries.get(slot.slot_id)
+                    if self._stop_event.is_set():
+                        # SHUTTING DOWN: publish nothing. stop() sets _stop_event before it clears
+                        # both queues, but it reaches that clear after a reaper JOIN THAT CAN TIME
+                        # OUT ("deferred reaper still running -- proceeding") -- so this reaper is
+                        # still alive with the clear already behind it, and an add here survives
+                        # shutdown. A pool restarted on the same object then releases the id on its
+                        # first tick and re-terminates a resource whose disposal ALREADY FAILED:
+                        # precisely what the clear exists to prevent, reintroduced from the other
+                        # side of it. Checking the event under the same lock the clear takes makes
+                        # the two orders exhaustive -- set-then-clear wipes us, clear-then-set stops
+                        # us here. stop() disposes every tracked slot itself, so nothing is lost.
+                        #
+                        # Guards the WHOLE chain, not just the maintenance arm. The first version of
+                        # this check was `_tries is not None and ...`, which left the branch below --
+                        # the _suspected_unknown RESTORE, reached precisely when _tries is None --
+                        # bypassing it: a slot whose disposal had just failed was put back to IDLE or
+                        # WARMING mid-shutdown, and IDLE is CLAIMABLE, so a restarted pool could hand
+                        # a job to a resource whose termination failed. Requeue and restore are the
+                        # same obligation to shutdown, so they take the same guard.
+                        self._maintain_reap_tries.pop(slot.slot_id, None)
+                        logger.warning(
+                            "pool.reap_retry_dropped_at_shutdown slot_id=%s -- shutting down; the "
+                            "husk stays quarantined (DRAINING) for stop() rather than being "
+                            "requeued or republished", slot.slot_id)
+                    # _tries + 1: the comparison has to count THIS failure. Reading the stored value
+                    # tested the budget before the attempt that just failed was counted, so a budget of
+                    # 3 ran four deferred terminates (stored 0, 1, 2 and 3) -- one mutating call per husk
+                    # beyond the advertised bound, aimed at the control plane already failing to dispose.
+                    elif _tries is not None and _tries + 1 < self._maintain_reap_max_tries:
+                        # A MAINTENANCE husk still within budget: put it back on the queue.
+                        # Deliberately NOT restored to IDLE -- it was judged UNUSABLE, so it must
+                        # never be claimable again. It stays DRAINING and is retried as a husk.
+                        self._maintain_reap_tries[slot.slot_id] = _tries + 1
+                        self._deferred_reap_next.add(slot.slot_id)
+                        logger.warning(
+                            "pool.maintain_reap_retry slot_id=%s attempt=%d/%d -- disposal failed; "
+                            "requeued", slot.slot_id, _tries + 1, self._maintain_reap_max_tries)
+                    elif _tries is not None:
+                        # Budget spent. STOP -- repeated failure may mean the resource is genuinely
+                        # still alive, which is exactly what the quarantine rule protects against.
+                        # But say so at ERROR: a silently held slot is a pool running below
+                        # capacity for no visible reason, which is how this went unnoticed.
+                        self._maintain_reap_tries.pop(slot.slot_id, None)
+                        logger.error(
+                            "pool.maintain_reap_abandoned slot_id=%s after %d attempts -- the slot "
+                            "stays quarantined (DRAINING) and keeps counting against "
+                            "concurrent_ceiling; the resource may still exist and needs an "
+                            "operator", slot.slot_id, self._maintain_reap_max_tries)
+                    elif slot.slot_id in self._suspected_unknown:
                         # Only SUSPECTED, and we could not dispose of it either -- so we know
                         # nothing. Quarantining it as DRAINING is retried by nothing and keeps
                         # counting against the ceiling, which is worse than the wedge escalation
                         # exists to fix (that one healed when the brownout ended). Put it back.
                         cur = self._slots.get(slot.slot_id)
                         if cur is not None and cur.state == SlotState.DRAINING:
-                            cur.state = SlotState.IDLE
+                            # Back to what it WAS, not unconditionally to IDLE. Since expired
+                            # warming-unknowns became `suspected`, this undo can apply to a slot
+                            # that never passed is_ready() -- and IDLE is CLAIMABLE. A disposable
+                            # EC2/Lambda resource that merely describes as `running` would then be
+                            # handed to a job before its agent or auth token is up, failing user
+                            # jobs during the very recovery this restore exists to help. WARMING
+                            # re-enters promotion and has to EARN idle by being ready.
+                            cur.state = (SlotState.WARMING
+                                         if slot.slot_id in self._never_ready
+                                         else SlotState.IDLE)
+                            if cur.state == SlotState.WARMING:
+                                # A slot RE-ENTERING warming gets a fresh warming window, exactly
+                                # as one entering it from a spawn does. Restored with its original
+                                # spawned_at the deadline is already in the past, so _health_check
+                                # re-condemns it on the very next tick and the reaper re-issues a
+                                # terminate whose predecessor ALREADY FAILED -- against the same
+                                # browning-out control plane, with the eviction token refunded
+                                # every time, so nothing rate-limits it. Measured before this line:
+                                # 27 terminate attempts on ONE slot over 200s, versus 1. That is
+                                # precisely the "never re-terminate a resource whose disposal
+                                # already failed" rule, broken by the undo meant to uphold it. The
+                                # sibling half of this hazard is described at _never_ready's
+                                # definition: splitting the field fixed the PROVEN-idle slot and
+                                # left the never-ready one still carrying a dead clock.
+                                cur.spawned_at = self._clock()
                             # REFUND: the demotion spent a token to evict this slot and we have
                             # just put it back, so the budget bought nothing. This is the path the
                             # deferred reaper takes, and it is the COMMON one during a brownout --
@@ -1333,9 +1633,14 @@ class WarmPool:
                             # the window's whole allowance can be consumed without evicting
                             # anything (upstream, PR #82).
                             self._refund_eviction_unlocked(slot.slot_id)
+                            # NAME THE STATE. The target became conditional (a never-ready slot
+                            # goes back to WARMING, not IDLE) and during a brownout that is the
+                            # COMMON branch -- so a fixed "IDLE" told the operator the opposite of
+                            # what happened, on the exact log line they read to understand why
+                            # capacity is not recovering.
                             logger.warning("pool.deferred_escalation_undone slot_id=%s — could not "
-                                           "dispose a suspected slot; returning it to IDLE",
-                                           slot.slot_id)
+                                           "dispose a suspected slot; returning it to %s",
+                                           slot.slot_id, cur.state.name)
                     self._suspected_unknown.discard(slot.slot_id)
             # Stamp PROGRESS: this reaper just finished a disposal, so it is working, not wedged.
             if entry_box:
@@ -1830,14 +2135,9 @@ class WarmPool:
                     self._spawn_consecutive_failures += 1
                     claim_unproven_death = True
                     warm_failures = self._spawn_consecutive_failures
-                if self._stop_event.is_set():
-                    # stop() already drained the queue; re-adding here (the probe above takes
-                    # seconds, so stop() can land mid-probe) resurrects a husk stop() quarantined
-                    # after a failed reap, and the next drain terminates it a SECOND time -- the
-                    # contract _drain_deferred_reaps documents as forbidden (issue #77 marla-loop).
-                    logger.debug("pool.defer_reap_skipped_after_stop slot_id=%s", candidate.slot_id)
-                else:
-                    self._deferred_reap.add(candidate.slot_id)
+                # The probe above takes seconds, so stop() can land mid-probe; the chokepoint
+                # holds that rule for every producer now.
+                self._queue_deferred_reap_unlocked(candidate.slot_id, why="claim-probe")
 
             if claim_unproven_death:
                 # ATTRIBUTE FIRST, while the cascade still owns this slot's mapping -- the reap is
@@ -1872,18 +2172,73 @@ class WarmPool:
         newly_idle: list[str] = []
         for slot in warming:
             raised = False
+            # Sampled BEFORE the probe. An UNKNOWN episode covers time we could not observe the
+            # worker, and that includes time spent BLOCKED INSIDE a probe that then produced no
+            # verdict -- an aws describe can burn its full timeout before raising. Stamping on
+            # return excluded exactly that interval, so a later definitive answer judged the slot
+            # as though the outage had been observed warming time. (The mirror of the rate-limit
+            # stamps elsewhere on this branch: a throttle is measured from COMPLETION, an episode
+            # from its START. Both are "measure the interval you actually mean".)
+            probe_began = self._clock()
             try:
                 ready = self._runtime.is_ready(slot)
             except Exception:
-                logger.exception("pool.is_ready_error slot_id=%s", slot.slot_id)
-                ready = False
+                # An exception is not evidence the instance failed to boot, for the same reason it
+                # isn't on the liveness paths: a runtime's exception enumeration is never complete.
+                # It stays non-promoting (as before) but now also counts as UNKNOWN, so the warming
+                # timeout does not convict a slot we could not ask about (issue #79).
+                logger.exception("pool.is_ready_error slot_id=%s — treating as unknown", slot.slot_id)
+                ready = None
                 raised = True
+            # TRI-STATE, same contract as _probe_alive and the health tick: True = ready,
+            # False = CONFIRMED not ready, None = UNKNOWN. Record/clear the unknown episode BEFORE
+            # acting, so _health_check's warming-timeout decision sees this pass's observation.
+            # OPENING an episode uses the probe's START; CLOSING one uses its COMPLETION. Both
+            # ends must include the time spent blocked inside the probe, and one variable cannot
+            # serve both: a 30s describe that then answers `pending` was credited nothing for those
+            # 30s, and _health_check runs immediately afterwards and could evict on them. I fixed
+            # the opening half two rounds ago and left the closing half reading the same value --
+            # the same "measure the interval you actually mean" rule, applied at one end.
+            probe_ended = self._clock()
+            with self._lock:
+                if slot.slot_id not in self._slots:
+                    # Reaped while we were inside is_ready(). The probe took a control-plane call,
+                    # so stop() can pop the slot and run _forget_slot_health in that window, and
+                    # these writes would re-create exactly what the forget just removed -- after
+                    # the only cleanup either map gets. A tombstone consulted only on entry cannot
+                    # see a reap that happens during the call.
+                    continue
+                if ready is None:
+                    self._warming_unknown_since.setdefault(slot.slot_id, probe_began)
+                else:
+                    # A definitive answer -- in EITHER direction -- ends the episode. "Not ready yet"
+                    # is a real observation of the worker, so it must resume aging it; only the
+                    # absence of an answer is exempt.
+                    since = self._warming_unknown_since.pop(slot.slot_id, None)
+                    if since is not None:
+                        # Bank what the episode cost. Aging RESUMES here (the slot is observable
+                        # again), it does not restart: only the unobservable interval is credited.
+                        self._warming_unknown_credit[slot.slot_id] = (
+                            self._warming_unknown_credit.get(slot.slot_id, 0.0)
+                            + max(0.0, probe_ended - since))
             if ready:
                 with self._lock:
                     # Only promote if still WARMING (concurrent stop could clear it)
                     if slot.slot_id in self._slots and slot.state == SlotState.WARMING:
                         slot.state = SlotState.IDLE
                         newly_idle.append(slot.slot_id)
+                        # The slot has now been READY. Both of these are WARMING-scoped: the credit
+                        # exists only to offset the warming timeout, and leaving it behind turned a
+                        # timeout ledger into a permanent state-history flag that the undo path
+                        # then misread.
+                        self._never_ready.discard(slot.slot_id)
+                        self._warming_unknown_credit.pop(slot.slot_id, None)
+                        # ...and the IDLE unknown clock. A warming slot whose eviction was
+                        # rate-limited seeds _unknown_since as a fallback; promotion cleared only
+                        # the WARMING one, so the stale stamp survived into IDLE and the first
+                        # indeterminate liveness check after promotion read as an outage that had
+                        # already been running for minutes.
+                        self._unknown_since.pop(slot.slot_id, None)
                         # Promotion is EVIDENCE, not proof, so it does NOT clear the
                         # restore-failure streak. A poisoned snapshot can restore a process that
                         # survives long enough to pass is_ready() and then dies while IDLE:
@@ -1892,7 +2247,10 @@ class WarmPool:
                         # the streak oscillated and invalidate_base() was never reached. A SERVED
                         # JOB is the proof, and that is where the reset lives (upstream, PR #82).
                         self._promoted_unproven.add(slot.slot_id)
-            elif slot.state == SlotState.DRAINING and not raised:
+            elif ready is False and slot.state == SlotState.DRAINING and not raised:
+                # `ready is False`, not merely falsy: UNKNOWN is falsy too, and letting it in here
+                # would reap a slot precisely because we could not ask about it -- the bug this
+                # tri-state exists to prevent, re-entering through the back door (issue #79).
                 # is_ready returned False AND the slot is DRAINING. Usually the runtime's finalize
                 # failed closed and reaped the VM ITSELF; but DRAINING can ALSO be set EXTERNALLY (a
                 # concurrent stop() flips every slot to DRAINING before reaping) while a slow finalize
@@ -2031,6 +2389,7 @@ class WarmPool:
                     continue        # a gate declined it; nothing was created
                 slot.state = SlotState.WARMING
                 slot.spawned_at = self._clock()
+                self._never_ready.add(slot.slot_id)   # cleared by the first ready promotion
                 record_slot_spawned()
                 spawned += 1
                 self._publish_or_reap_spawned(slot, gen_at_spawn)
@@ -2124,11 +2483,20 @@ class WarmPool:
         spawn was in flight (publishing then leaks a live microVM/instance), and a concurrent
         resize() may have lowered the ceiling underneath us.
         """
+        # Resolved OUTSIDE the lock. base_identity() is a RUNTIME callout -- on a
+        # CascadingRuntime it takes the cascade's own lock, and on any runtime that
+        # resolves identity remotely it is an arbitrary-latency call. _lock is
+        # non-reentrant and every public entry point takes it, so one slow identity
+        # lookup stalls claim(), release(), tick() and stop() together: measured, a 2s
+        # base_identity made a NON-BLOCKING claim(timeout_s=0.0) on an already-IDLE slot
+        # block for 3.7s. It also establishes a WarmPool._lock -> CascadingRuntime._lock
+        # ordering nothing else in this file respects. The rule is already stated where
+        # _health_key is resolved. Only the STAMP needs the lock, and it still has it.
+        _ident = self._base_identity(slot)
         with self._lock:
             drop = self._stop_event.is_set() or len(self._slots) >= self._concurrent_ceiling
             if not drop:
                 self._slots[slot.slot_id] = slot
-                _ident = self._base_identity(slot)
                 self._slot_base[slot.slot_id] = (_ident, gen_at_spawn.get(_ident, 0))
         if not drop:
             return
@@ -2143,6 +2511,14 @@ class WarmPool:
             slot.state = SlotState.DRAINING
             with self._lock:
                 self._slots[slot.slot_id] = slot
+            return
+        # Successfully reaped and never published: the slot never enters _slots, so neither
+        # _forget_slot_health nor the sweeps (which key on "not in _slots") will ever see it, and
+        # its _never_ready marker would live for the process lifetime. Repeated shutdown/resize
+        # races therefore accumulate one UUID per discarded worker. Same leak class as
+        # _suspected_unknown -- introduced in the same commit that fixed that one.
+        with self._lock:
+            self._never_ready.discard(slot.slot_id)
 
     def _spawn_to_deficit(self, ready: bool = True, *,
                           expect_generation: int | None = None) -> None:
@@ -2264,6 +2640,7 @@ class WarmPool:
                     self._capacity_starved_logged = False
                 slot.state = SlotState.WARMING
                 slot.spawned_at = self._clock()
+                self._never_ready.add(slot.slot_id)   # cleared by the first ready promotion
                 record_slot_spawned()
             except RuntimeAtCapacity as exc:
                 # NOT a restore failure, so it must NOT touch the streak. prepare() reports ready
@@ -2312,6 +2689,16 @@ class WarmPool:
             #     here this in-flight slot would land one past the new cap (RAM overshoot on a
             #     tight node) until a later tick reaps it.
             # Either way: don't publish, reap the just-created slot instead.
+            # Resolved OUTSIDE the lock. base_identity() is a RUNTIME callout -- on a
+            # CascadingRuntime it takes the cascade's own lock, and on any runtime that
+            # resolves identity remotely it is an arbitrary-latency call. _lock is
+            # non-reentrant and every public entry point takes it, so one slow identity
+            # lookup stalls claim(), release(), tick() and stop() together: measured, a 2s
+            # base_identity made a NON-BLOCKING claim(timeout_s=0.0) on an already-IDLE slot
+            # block for 3.7s. It also establishes a WarmPool._lock -> CascadingRuntime._lock
+            # ordering nothing else in this file respects. The rule is already stated where
+            # _health_key is resolved. Only the STAMP needs the lock, and it still has it.
+            _ident = self._base_identity(slot)
             with self._lock:
                 drop = self._stop_event.is_set() or len(self._slots) >= self._concurrent_ceiling
                 if not drop:
@@ -2319,7 +2706,6 @@ class WarmPool:
                     # STAMP the generation this slot came from, under the same lock that
                     # publishes it, so a later failure can be told apart from one produced by
                     # the base currently installed.
-                    _ident = self._base_identity(slot)
                     # ...from the ledger as it was when this restore STARTED, not as it is now.
                     self._slot_base[slot.slot_id] = (
                         _ident, _gen_at_spawn.get(_ident, 0)
@@ -2338,6 +2724,15 @@ class WarmPool:
                     slot.state = SlotState.DRAINING
                     with self._lock:
                         self._slots[slot.slot_id] = slot
+                else:
+                    # Reaped and never published: nothing keyed on "not in _slots" can ever see it,
+                    # so the marker would live for the process lifetime. The SAME discard was added
+                    # to _publish_or_reap_spawned -- and only there, which is the CONCURRENT path.
+                    # This is the serial one, entered whenever spawn_concurrency == 1, i.e. the
+                    # default and the one that actually ships. Fixing the sibling and not this is
+                    # the missing-companion-change shape in its purest form.
+                    with self._lock:
+                        self._never_ready.discard(slot.slot_id)
                 break
 
     def _effective_target_unlocked(self) -> int:
@@ -2458,6 +2853,30 @@ class WarmPool:
         # exactly how its failures could never accumulate. Bounded either way: a reused identity
         # is one entry per registered worker.
         self._slot_base.pop(slot_id, None)
+        # The maintenance cooldown map is keyed by per-spawn slot id. ec2-hibernate slots are
+        # disposable after one job and every promoted slot normally passes through maintenance
+        # before being claimed, so without this a long-lived dispatcher accumulates one permanent
+        # entry per completed job -- the same unbounded growth this method exists to prevent.
+        self._maintain_last.pop(slot_id, None)
+        self._maintain_reap_tries.pop(slot_id, None)
+        # These two were the only per-slot maps NOT listed here. Their sole cleanup was the
+        # "k not in self._slots" sweep at the top of _health_check, which stops running the moment
+        # stop() is called -- so every stop()/brownout cycle stranded one entry per slot, keyed by a
+        # per-spawn UUID, for the life of the process object.
+        self._unknown_since.pop(slot_id, None)
+        self._warming_unknown_since.pop(slot_id, None)
+        # The holding set is keyed by slot_id like every sibling here. Without this it is the one
+        # map in this method's list that grows for the life of the process.
+        self._deferred_reap_next.discard(slot_id)
+        if self._maintain_cursor == slot_id:
+            self._maintain_cursor = None
+        self._never_ready.discard(slot_id)
+        self._warming_unknown_credit.pop(slot_id, None)
+        # _suspected_unknown was the one new per-slot collection with neither a sweep nor an entry
+        # here: its only removals are inside _drain_deferred_reaps, which early-outs when the slot
+        # has already left _slots -- so stop(), which clears _deferred_reap and pops every slot,
+        # leaked one id per suspected slot. Ids are per-spawn UUIDs, so it grew without bound.
+        self._suspected_unknown.discard(slot_id)
         key = self._health_key_by_slot.pop(slot_id, slot_id)
         if key == slot_id:
             self._slot_failures.pop(slot_id, None)
@@ -2994,6 +3413,203 @@ class WarmPool:
             except Exception as exc:  # noqa: BLE001 -- attribution must never break the tick
                 logger.warning("pool.tier_blame_failed slot_id=%s: %s", slot_id, exc)
 
+    def _maintain_idle(self) -> None:
+        """Grant a runtime an EXCLUSIVE window on one IDLE slot for state-changing maintenance.
+
+        Some tiers have upkeep that mutates the worker rather than merely observing it -- the
+        motivating case is ec2-hibernate re-parking an instance whose resume half-succeeded, left
+        RUNNING and billing while the pool believes it is hibernated (issue #80). That work cannot
+        live on a liveness probe: ``is_alive`` runs on IDLE slots with nothing excluding a
+        concurrent ``claim``, so the first version of this raced a claimant and could hibernate an
+        instance out from under a job. Ownership has to come from the POOL, which is the only thing
+        that can make a slot unclaimable.
+
+        The contract is deliberately small:
+          * CAS IDLE -> ASSIGNED under the lock, so ``claim`` (which only picks IDLE) cannot take it
+          * run the hook OUTSIDE the lock -- it makes AWS calls and would otherwise stall every
+            claim, promotion and health check behind it
+          * hand the slot back even when the hook raises; a slot stranded in ASSIGNED is capacity
+            lost forever, and ``_spawn_to_deficit`` counts it as active so nothing replaces it
+          * a hook that reports the slot UNUSABLE gets it retired, so a terminal state (a
+            hibernation stuck in `stopping` past its timeout) returns capacity instead of parking
+            a permanently unclaimable slot
+
+        ONE slot per tick. Taking every IDLE slot at once would empty the claimable pool for the
+        duration of an AWS round trip.
+        """
+        if self._stop_event.is_set():
+            # No maintenance pass during shutdown. Every write it makes -- the provisional
+            # cooldown stamp, the ASSIGNED reservation, the retire, the requeue -- lands
+            # behind stop()'s clears, and there is no later pass for any of it to serve.
+            # Guarding the individual writes left the one at the TOP of the pass (taken
+            # before the hook runs) still writing, which is how _maintain_last kept being
+            # re-created after _forget_slot_health had already collected it.
+            return
+        hook = getattr(self._runtime, "maintain_idle", None)
+        if not callable(hook):
+            return
+        with self._lock:
+            # RECHECK the latch under the lock. The early return above is only a fast path: it
+            # reads _stop_event before acquiring _lock, so a stop() landing in that window let the
+            # whole pass proceed anyway and write its cooldown stamp and ASSIGNED reservation
+            # BEHIND stop()'s clears -- the exact leak the early return was added to close, just
+            # narrower. stop() sets the event before it takes _lock for those clears, so observing
+            # the latch and claiming the slot in ONE critical section is what actually orders them:
+            # either we see the latch and make no writes, or we reserve first and stop() then runs
+            # its clears over a state that already includes the reservation.
+            if self._stop_event.is_set():
+                return
+            now = self._clock()
+            # ROTATE. `next(... if state is IDLE)` over an insertion-ordered dict returns the SAME
+            # slot every tick, because the hook hands it back as IDLE without changing the order --
+            # so slots 2..N were never reconciled at all, and the stranded RUNNING instance this
+            # hook exists to find is not usually slot 1.
+            idle = [s for s in self._slots.values() if s.state == SlotState.IDLE]
+            if not idle:
+                return
+            start = 0
+            if self._maintain_cursor is not None:
+                for i, s in enumerate(idle):
+                    if s.slot_id == self._maintain_cursor:
+                        start = (i + 1) % len(idle)
+                        break
+            cand = None
+            for k in range(len(idle)):
+                s = idle[(start + k) % len(idle)]
+                # RATE LIMIT. The hook is allowed to make uncached control-plane calls, and tick()
+                # runs at ~10Hz; without a per-slot interval an ec2-hibernate pool issues an
+                # unthrottled describe-instances every 0.1s forever and manufactures the very
+                # brownout the rest of this class exists to survive.
+                if now - self._maintain_last.get(s.slot_id, 0.0) >= self._maintain_interval_s:
+                    cand = s
+                    break
+            if cand is None:
+                return
+            # Reserve it BEFORE releasing the lock. This is the whole point of the seam.
+            cand.state = SlotState.ASSIGNED
+            slot_id = cand.slot_id
+            self._maintain_cursor = slot_id
+            # PROVISIONAL stamp: keeps this slot out of a concurrent pass while the hook runs. The
+            # authoritative one is taken from COMPLETION in the finally below -- the hook makes
+            # control-plane calls bounded by health_probe_timeout_s (default 30s) against a
+            # cooldown that defaults to 5s, so a stalled describe leaves this stamp six times
+            # older than the cooldown by the time it returns and the next tick starts another one
+            # immediately. Rate-limiting a call by when it STARTED throttles nothing once the call
+            # outruns its own window (same defect as _last_admit_attempt in cascade.py).
+            self._maintain_last[slot_id] = now
+
+        usable = True
+        try:
+            usable = (hook(cand, budget_s=self._maintain_budget_s)
+                      if self._maintain_budget_s > 0 and _accepts_kwarg(hook, "budget_s")
+                      else hook(cand)) is not False
+        except Exception:
+            # An exception is not a verdict about the slot -- same rule as everywhere else here.
+            # Hand it back and let the ordinary health path judge it.
+            logger.exception("pool.maintain_idle_error slot_id=%s — handing the slot back", slot_id)
+        finally:
+            with self._lock:
+                cur = self._slots.get(slot_id)
+                # Only restore the slot we actually reserved, and only if nothing else moved it
+                # (a concurrent stop() flips slots to DRAINING; republishing would hand out a slot
+                # that is about to be disposed).
+                if cur is cand and cur.state == SlotState.ASSIGNED and usable:
+                    cur.state = SlotState.IDLE
+                    self._last_idle_at = self._clock()
+                    self._idle_event.set()
+                # Re-stamp from COMPLETION, not from the start. See the provisional stamp above.
+                # Only while the slot is still TRACKED: _forget_slot_health pops _maintain_last when
+                # a concurrent stop()/reap removes the slot, and this write lands after that, so an
+                # unconditional re-stamp re-created an entry nothing cleans up again. _maintain_last
+                # has no not-in-_slots sweep, unlike its neighbours.
+                #
+                # TRACKED-NESS IS NOT ENOUGH. A slot whose reap RAISED stays tracked on purpose --
+                # that is the quarantine policy -- while _forget_slot_health may already have run
+                # for it, so `cur is not None` still admits the write this guard exists to stop.
+                # And during shutdown there is no later maintenance pass for the stamp to throttle,
+                # so the entry would simply be permanent: no sweep, and _forget_slot_health will not
+                # run again for a slot stop() left behind.
+                if cur is not None and not self._stop_event.is_set():
+                    self._maintain_last[slot_id] = self._clock()
+                # NOT usable -> deliberately left ASSIGNED, i.e. unclaimable, and handed straight
+                # to retire() below. Republishing it first (and worse, waking claimants with
+                # _idle_event.set()) opened a window in which a claimant could take the slot:
+                # retire() is not a CAS, it overwrites ASSIGNED, so the instance was terminated
+                # out from under a running job. The window was widened by fault="worker" doing
+                # failure attribution before it takes the lock.
+        if not usable:
+            # HAND IT TO THE DEFERRED REAPER; do not dispose inline.
+            #
+            # Two rounds of guards here were both check-then-act, and the second one only READ the
+            # slot's state -- it took no ownership, so stop() could still flip, reap, fail, quarantine
+            # and return in the window between the check and retire(), and the maintenance thread then
+            # issued a SECOND terminate against a resource whose disposal had already failed. A read
+            # under a lock is not a compare-and-swap.
+            #
+            # The reaper path already solves every part of this, atomically and in one place: the
+            # chokepoint refuses to queue once shutdown has begun, _reap_and_count takes _reaping
+            # ownership under the lock so a concurrent stop() skips the slot rather than duplicating
+            # the terminate, and the retry budget bounds how many disposals a husk may cost. It also
+            # takes the control-plane call off the tick thread, which is where it never belonged.
+            #
+            # retire(fault=None) was only ever "reap and untrack" here -- the blame was already
+            # withheld, because a maintenance False is _PARK_GIVE_UP, i.e. CONTROL-PLANE evidence, and
+            # charging it to the worker would drive _maybe_rebuild_base and discard a healthy snapshot
+            # base on zero confirmed deaths. So there is nothing in retire() this path still needs.
+            with self._lock:
+                cur = self._slots.get(slot_id)
+                if cur is not cand or cur.state != SlotState.ASSIGNED:
+                    # stop() or a claimant already took it, in the same critical section that would
+                    # have queued it. Nothing to do -- and nothing raced.
+                    logger.warning("pool.maintain_idle_retire_skipped slot_id=%s", slot_id)
+                    return
+                cur.state = SlotState.DRAINING          # unclaimable from here, in the SAME lock
+                if self._queue_deferred_reap_unlocked(slot_id, why="maintenance-husk"):
+                    self._maintain_reap_tries[slot_id] = 0
+                    logger.warning("pool.maintain_idle_unusable slot_id=%s -- queued for the deferred "
+                                   "reaper", slot_id)
+
+    def _warming_unknown_credit_s(self, slot_id: str) -> float:
+        """Warming time that was never an observation of the worker, so cannot be spent on it.
+
+        Call with ``_lock`` held. CLOSED episodes only, and capped at ``_unknown_grace_s`` -- the
+        same bound the exemption itself carries, for the same reason: ride out a brownout, do not
+        ride out an outage, and do not let a flapping control plane disable the timeout entirely.
+        Crediting a LIVE episode would be worse than the bug it fixes: the effective age would stop
+        advancing exactly when the outage stops being excusable, so the grace could never expire
+        and the tier would wedge at zero capacity.
+        """
+        if self._unknown_grace_s <= 0:
+            return 0.0
+        return min(self._warming_unknown_credit.get(slot_id, 0.0), self._unknown_grace_s)
+
+    def _warming_unknown_unexpired(self, slot_id: str, now: float) -> bool:
+        """True while a WARMING slot is inside a live, still-plausible UNKNOWN episode.
+
+        Call with ``_lock`` held. The warming timeout is a statement about the WORKER ("it never
+        came up"), so it may only be spent on evidence about the worker. While ``is_ready`` is
+        returning UNKNOWN we have none -- the control plane simply isn't answering -- and a
+        brownout longer than ``warming_timeout_s`` would otherwise terminate the tier's entire
+        WARMING population at once (issue #79).
+
+        Bounded by ``_unknown_grace_s``, the same knob the IDLE path uses, because the opposite
+        failure is just as real: an unbounded exemption means a control plane that never returns
+        wedges the tier at zero capacity while is_healthy() still reports True. Ride out a
+        brownout; do not ride out an outage. A grace of 0 disables the exemption entirely.
+        """
+        since = self._warming_unknown_since.get(slot_id)
+        if since is None or self._unknown_grace_s <= 0:
+            return False
+        return (now - since) <= self._unknown_grace_s
+
+    def _runtime_says_terminal(self, hook: "Any", slot: "Slot") -> bool:
+        """True only on an explicit True. A raising or UNKNOWN hook must never destroy a slot."""
+        try:
+            return hook(slot) is True
+        except Exception:  # noqa: BLE001 -- a hook fault is not evidence about the slot
+            logger.debug("pool.is_warming_terminal_error slot_id=%s", slot.slot_id, exc_info=True)
+            return False
+
     def _health_check(self) -> None:
         """Evict dead IDLE slots AND stuck WARMING slots so the spawn loop replaces them.
 
@@ -3011,12 +3627,58 @@ class WarmPool:
             if self._unknown_since:
                 for gone in [k for k in self._unknown_since if k not in self._slots]:
                     self._unknown_since.pop(gone, None)
-            stuck_warming = [
+            # Drop warming-unknown bookkeeping for slots that have left the pool, same leak the
+            # _unknown_since sweep above closes.
+            if self._warming_unknown_since:
+                for gone in [k for k in self._warming_unknown_since if k not in self._slots]:
+                    self._warming_unknown_since.pop(gone, None)
+            if self._warming_unknown_credit:
+                for gone in [k for k in self._warming_unknown_credit if k not in self._slots]:
+                    self._warming_unknown_credit.pop(gone, None)
+            # A runtime may declare a WARMING slot TERMINAL before the pool's own budget expires.
+            # Without this the two clocks disagree silently: ec2-hibernate gives up on parking at
+            # hibernate_timeout_s (300s) and reports not-ready, but the pool only evicts WARMING on
+            # warming_timeout_s (600s) -- so a running, billing instance that has already reached
+            # its documented destruction point keeps blocking its own replacement for another ~300s.
+            # is_alive() cannot carry this: the health check only probes IDLE slots.
+            _terminal = getattr(self._runtime, "is_warming_terminal", None)
+            _over_budget = [
                 s for s in self._slots.values()
                 if s.state == SlotState.WARMING
                 and self._warming_timeout_s > 0
-                and now - s.spawned_at > self._warming_timeout_s
+                and (now - s.spawned_at
+                     - self._warming_unknown_credit_s(s.slot_id)) > self._warming_timeout_s
+                and not self._warming_unknown_unexpired(s.slot_id, now)
             ]
+            # Retired because the RUNTIME gave up, not because the pool's budget ran out. Tracked
+            # separately because the two carry different evidence: the pool's timeout is an
+            # observation about a slot that never became usable, while a park give-up is
+            # CONTROL-PLANE evidence. The guide states that distinction as a promise -- a give-up
+            # has "no worker-fault attribution ... deliberately does NOT charge the tier's failure
+            # streak and never triggers base repair" -- and folding these into one list broke it:
+            # a correlated stop-API brownout would have blamed the tier for every slot at once and
+            # could discard a healthy base on zero confirmed deaths.
+            _terminal_ids = set()
+            if callable(_terminal):
+                _terminal_ids = {
+                    s.slot_id for s in self._slots.values()
+                    if s.state == SlotState.WARMING
+                    and s not in _over_budget
+                    and self._runtime_says_terminal(_terminal, s)
+                }
+            stuck_warming = _over_budget + [
+                s for s in self._slots.values() if s.slot_id in _terminal_ids]
+            # Which of those timed out on SILENCE rather than on an answer. `_warming_unknown_since`
+            # holds an entry only while the last observation was UNKNOWN (any definitive answer,
+            # either way, pops it in _promote_warming), so membership here IS the discriminator.
+            # The IDLE path already escalates its expired unknowns "on suspicion, not on a verdict";
+            # WARMING did not, so during one brownout an unanswered slot was charged to the
+            # restore-failure streak, reaped synchronously on the tick thread, and -- when that
+            # terminate failed against the same control plane -- left DRAINING forever with its
+            # eviction token spent.
+            warming_unknown_expired = {
+                s.slot_id for s in stuck_warming if s.slot_id in self._warming_unknown_since
+            }
 
         dead: list[Slot] = list(stuck_warming)
         # Deaths of slots that were promoted but never served a job are restore failures too:
@@ -3030,7 +3692,7 @@ class WarmPool:
         # Slots we escalated because we could not TELL, as opposed to ones AWS/libvirt confirmed
         # dead. If disposing of a merely-suspected slot also fails, we have learned nothing and must
         # not strand it (see the reap loop below).
-        suspected: set[str] = set()
+        suspected: set[str] = set(warming_unknown_expired)
         # Slots that already hold an eviction token (reserved when their timeout was detected),
         # so the demotion loop must not charge them again.
         budgeted: set[str] = set()
@@ -3068,9 +3730,17 @@ class WarmPool:
                     "slots stay WARMING and are NOT counted as restore failures", len(capped),
                 )
             evicting = [s for s in stuck_warming if s.slot_id in budgeted]
-            self._blame_tiers([s.slot_id for s in evicting])
+            # The streak is RESTORE-FAILURE evidence, and it drives _maybe_rebuild_base, which
+            # can discard a healthy snapshot. A slot that timed out because the control plane
+            # never answered is not evidence about the worker -- charging it means one brownout
+            # can invalidate a good base on zero confirmed deaths. Same rule the warming timeout
+            # itself follows: only spend it on an observation.
+            confirmed = [s for s in evicting
+                         if s.slot_id not in warming_unknown_expired
+                         and s.slot_id not in _terminal_ids]
+            self._blame_tiers([s.slot_id for s in confirmed])
             with self._lock:
-                self._spawn_consecutive_failures += len(evicting)
+                self._spawn_consecutive_failures += len(confirmed)
                 warm_failures = self._spawn_consecutive_failures
             if self._maybe_rebuild_base(warm_failures, reason="spawn"):
                 # HALT THE TICK. The artifact is gone, so the very next runtime.spawn() runs
@@ -3227,7 +3897,7 @@ class WarmPool:
                         # them serially here would stall promotion, spawning and reaping on the sole
                         # tick thread for minutes. That is the wedge #77 exists to fix, and #76
                         # already built the bounded reapers for exactly this. Hand it to them.
-                        self._deferred_reap.add(slot.slot_id)
+                        self._queue_deferred_reap_unlocked(slot.slot_id, why="suspected")
                     else:
                         to_reap.append(slot)
 
@@ -3251,28 +3921,13 @@ class WarmPool:
                 # reap raised (worker not disposed — may still run): quarantine, don't pop (like
                 # release()), so a live worker isn't orphaned off pool accounting.
                 logger.exception("pool.health_reap_error slot_id=%s — quarantining", slot.slot_id)
-                if slot.slot_id in suspected:
-                    # ...unless this slot was only SUSPECTED (escalated after a long UNKNOWN). The
-                    # disposal runs through the SAME control plane that made it unknown, so during
-                    # a brownout it fails too — and a quarantined DRAINING slot is retried by
-                    # nothing, keeps counting against concurrent_ceiling, and never recovers. That
-                    # is strictly worse than the wedge escalation exists to fix: the wedge healed
-                    # when the brownout ended, this does not. We could not confirm it dead and could
-                    # not dispose of it, so we know nothing: put it back and let the cycle resume
-                    # (issue #77 marla-loop 2).
-                    with self._lock:
-                        cur = self._slots.get(slot.slot_id)
-                        if cur is not None and cur.state == SlotState.DRAINING:
-                            cur.state = SlotState.IDLE
-                            # REFUND the token. The demotion spent one to evict this slot, and we
-                            # have just put it back -- so the budget paid for nothing. During a
-                            # brownout every disposal goes through the same unresponsive control
-                            # plane and fails, so the window's whole allowance could be consumed
-                            # without a single eviction, blocking the replacement of a slot that
-                            # IS confirmed dead for the rest of the window (upstream, PR #82).
-                            self._refund_eviction_unlocked(slot.slot_id)
-                    logger.warning("pool.health_escalation_undone slot_id=%s — could not dispose a "
-                                   "merely-suspected slot; returning it to IDLE", slot.slot_id)
+                # No escalation-undo here, deliberately: `to_reap` has exactly ONE producer, the
+                # `else` arm of `if slot.slot_id in suspected` above, so a suspected slot never
+                # reaches this loop -- it is handed to the deferred reapers, which own the undo
+                # (see _drain_deferred_reaps). The `in suspected` test this branch used to make was
+                # therefore always False: a defensive path that read as protection, could not run,
+                # and drew two rounds of fixes onto itself while the live copy went unexamined.
+                # test_a_suspected_slot_is_never_reaped_on_the_tick_thread pins the routing.
             finally:
                 if reaped:
                     with self._lock:

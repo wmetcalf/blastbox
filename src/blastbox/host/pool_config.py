@@ -8,9 +8,10 @@ slot runtime. The pool is OPT-IN: ``BLASTBOX_POOL_RUNTIME`` defaults to ``none``
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 
 from blastbox.host.pool import SlotRuntime, WarmPool
 
@@ -77,6 +78,20 @@ class PoolConfig:
     max_evictions_per_window: int | None = None
     # How long a slot may stay CONTINUOUSLY unknown before it can be replaced; 0 disables.
     unknown_grace_s: float | None = None
+    #: Tick-thread bounds for the idle-maintenance seam. Both were hardcoded in WarmPool and
+    #: unreachable from the environment, so the two knobs that bound this pool's control-plane
+    #: CALL RATE and its per-pass tick-thread HOLD were the only ones an operator could not turn
+    #: down during an incident -- while every comparable knob on the same page is tunable.
+    # KEYWORD-ONLY, because they were inserted into the MIDDLE of a positional dataclass. A caller
+    # passing this config positionally -- the dataclass permits it and nothing here forbade it --
+    # had its 14th argument silently rebound from capacity_starved_after_s to maintain_interval_s:
+    # no error, the capacity-starvation alert quietly back at its default, and maintenance
+    # scheduled on a number that was never meant for it. Declaring them kw_only keeps every
+    # existing positional call binding exactly what it always did, and is the same guard the AWS
+    # config states for its own late additions ("DECLARED LAST so adding it can't silently rebind
+    # a positional caller's later fields").
+    maintain_interval_s: float | None = dc_field(default=None, kw_only=True)
+    maintain_budget_s: float | None = dc_field(default=None, kw_only=True)
     # How long the pool may be unable to spawn for capacity reasons before that is an outage
     # rather than backpressure; 0 disables the alert.
     capacity_starved_after_s: float | None = None
@@ -92,14 +107,48 @@ class PoolConfig:
             except ValueError as exc:
                 raise ValueError(f"invalid integer for {key}={raw!r}: {exc}") from exc
 
+        #: Knobs where 0 is NOT a meaningful setting. For a rate limit "disabled" would mean the
+        #: UNBOUNDED rate -- `now - last >= 0` is true on every tick, so an ec2-hibernate pool
+        #: issues an uncached describe per idle slot at ~10Hz and manufactures the throttling the
+        #: knob exists to prevent. That is the opposite of what an operator typing 0 intends, and
+        #: they reach for it exactly when it hurts most: mid-incident. The internal default stands
+        #: in instead. (Constructing WarmPool directly with 0 still means "no cooldown" -- the
+        #: tests use it deliberately; this guards the ENV surface, which is what humans type.)
+        _ZERO_IS_NOT_OFF = {"BLASTBOX_POOL_MAINTAIN_INTERVAL_S"}
+
         def _float(key: str, default: float) -> float:
             raw = os.environ.get(key, "").strip()
             if not raw:
                 return default
             try:
-                return float(raw)
+                v = float(raw)
             except ValueError as exc:
                 raise ValueError(f"invalid float for {key}={raw!r}: {exc}") from exc
+            if not math.isfinite(v) or v < 0:
+                # WARN AND FALL BACK -- the house convention, already documented for
+                # BLASTBOX_CANARY_INTERVAL_S ("non-finite (nan, inf) and negative values fall back
+                # to 900 with a warning"). Raising here instead was inconsistent twice over: with
+                # that knob, and with this branch's own Ec2HibernateConfig.__post_init__, which
+                # warns. It also turned a bad value in a LIVE deployment into a process that will
+                # not start, which is a worse failure than the one being prevented.
+                #
+                # The value still cannot be honoured. Both directions misbehave silently: a
+                # NEGATIVE interval makes `now - last >= interval` always true (an ec2-hibernate
+                # pool then describes every tick and manufactures the throttling the limit exists
+                # to avoid), and NaN makes every comparison against it False, which disables
+                # whatever the knob gates. BLASTBOX_POOL_UNKNOWN_GRACE_S=nan did both at once: no
+                # brownout exemption for WARMING slots, and idle unknowns that never aged out.
+                # `0` is the documented "disabled" value.
+                _log.warning(
+                    "pool config: ignoring %s=%r (must be finite and >= 0); using %r. "
+                    "Use 0 to disable.", key, raw, default)
+                return default
+            if v == 0 and key in _ZERO_IS_NOT_OFF:
+                _log.warning(
+                    "pool config: %s=0 would remove the rate limit rather than disable the seam "
+                    "(every tick, ~10Hz); using %r. Raise it to slow the pool down.", key, default)
+                return default
+            return v
 
         def _bool(key: str, default: bool) -> bool:
             raw = os.environ.get(key, "").strip().lower()
@@ -123,9 +172,34 @@ class PoolConfig:
             if not raw:
                 return default
             try:
-                return float(raw)
+                v = float(raw)
             except ValueError as exc:
                 raise ValueError(f"invalid float for {key}={raw!r}: {exc}") from exc
+            if not math.isfinite(v) or v < 0:
+                # WARN AND FALL BACK -- the house convention, already documented for
+                # BLASTBOX_CANARY_INTERVAL_S ("non-finite (nan, inf) and negative values fall back
+                # to 900 with a warning"). Raising here instead was inconsistent twice over: with
+                # that knob, and with this branch's own Ec2HibernateConfig.__post_init__, which
+                # warns. It also turned a bad value in a LIVE deployment into a process that will
+                # not start, which is a worse failure than the one being prevented.
+                #
+                # The value still cannot be honoured. Both directions misbehave silently: a
+                # NEGATIVE interval makes `now - last >= interval` always true (an ec2-hibernate
+                # pool then describes every tick and manufactures the throttling the limit exists
+                # to avoid), and NaN makes every comparison against it False, which disables
+                # whatever the knob gates. BLASTBOX_POOL_UNKNOWN_GRACE_S=nan did both at once: no
+                # brownout exemption for WARMING slots, and idle unknowns that never aged out.
+                # `0` is the documented "disabled" value.
+                _log.warning(
+                    "pool config: ignoring %s=%r (must be finite and >= 0); using %r. "
+                    "Use 0 to disable.", key, raw, default)
+                return default
+            if v == 0 and key in _ZERO_IS_NOT_OFF:
+                _log.warning(
+                    "pool config: %s=0 would remove the rate limit rather than disable the seam "
+                    "(every tick, ~10Hz); using %r. Raise it to slow the pool down.", key, default)
+                return default
+            return v
 
         values: dict[str, object] = {
             "max_consecutive_failures": _opt_int(
@@ -138,6 +212,10 @@ class PoolConfig:
                 "BLASTBOX_POOL_MAX_EVICTIONS_PER_WINDOW", cls.max_evictions_per_window),
             "unknown_grace_s": _opt_float(
                 "BLASTBOX_POOL_UNKNOWN_GRACE_S", cls.unknown_grace_s),
+            "maintain_interval_s": _opt_float(
+                "BLASTBOX_POOL_MAINTAIN_INTERVAL_S", cls.maintain_interval_s),
+            "maintain_budget_s": _opt_float(
+                "BLASTBOX_POOL_MAINTAIN_BUDGET_S", cls.maintain_budget_s),
             "capacity_starved_after_s": _opt_float(
                 "BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S", cls.capacity_starved_after_s),
             "runtime": os.environ.get("BLASTBOX_POOL_RUNTIME", cls.runtime).strip().lower(),
@@ -221,6 +299,8 @@ def _configured_only(cfg: PoolConfig) -> dict[str, Any]:
         "max_consecutive_failures": cfg.max_consecutive_failures,
         "unknown_grace_s": cfg.unknown_grace_s,
         "capacity_starved_after_s": cfg.capacity_starved_after_s,
+        "maintain_interval_s": cfg.maintain_interval_s,
+        "maintain_budget_s": cfg.maintain_budget_s,
     }
     return {k: v for k, v in candidates.items() if v is not None}
 

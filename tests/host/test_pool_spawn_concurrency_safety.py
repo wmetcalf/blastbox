@@ -291,7 +291,6 @@ def test_no_slot_is_left_unaccounted_after_a_reap_failure(monkeypatch):
         raise OSError("terminate failed")
 
     monkeypatch.setattr(pool, "_reap_and_count", failing_reap)
-    original = pool._publish_or_reap_spawned
     monkeypatch.setattr(pool, "_publish_or_reap_spawned",
                         lambda slot, gen: (_ for _ in ()).throw(ValueError("publish failed")))
     pool.tick()

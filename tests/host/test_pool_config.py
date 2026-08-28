@@ -549,3 +549,100 @@ def test_an_unpinned_injected_cascade_follows_the_derived_policy(monkeypatch):
     pool = build_warm_pool(PoolConfig.from_env(warm_size=8, concurrent_ceiling=16), runtime=rt)
     assert pool is not None
     assert rt.tier_rebuild_after == pool._snapshot_rebuild_after == 16
+
+
+def test_a_config_float_that_parses_but_cannot_mean_anything_is_rejected(monkeypatch):
+    """Every numeric knob, not just the two that had a caller-side clamp.
+
+    A float knob has exactly two ways to parse and still be meaningless, and each breaks a
+    DIFFERENT direction of the comparison it feeds:
+      * NEGATIVE interval/grace -> `now - last >= interval` is ALWAYS true, so the thing the knob
+        rate-limits runs every tick. On an ec2-hibernate pool that means an uncached describe per
+        tick, i.e. the pool manufactures the throttling the limit exists to prevent.
+      * NaN -> every comparison against it is False, so whatever the knob gates silently never
+        happens. BLASTBOX_POOL_UNKNOWN_GRACE_S=nan did BOTH at once: WARMING slots got no brownout
+        exemption, and idle UNKNOWN slots never aged out.
+
+    Only maintain_interval_s and maintain_budget_s were clamped, and only because they were added
+    with a clamp; the four older knobs (spawn_rate, warming_timeout_s, unknown_grace_s,
+    capacity_starved_after_s) took anything float() accepted. Validating at each CONSUMER is what
+    produced that gap, so the check lives in the env readers -- which already raise on an
+    unparseable value, making this the same contract, not a new one.
+
+    Warn-and-fall-back rather than raise, matching the house convention already documented for
+    BLASTBOX_CANARY_INTERVAL_S ("non-finite (nan, inf) and negative values fall back to 900 with a
+    warning") and this branch's own Ec2HibernateConfig. Raising would turn a bad value in a LIVE
+    deployment into a process that will not start -- a worse failure than the one being prevented.
+
+    MUTATION: delete the isfinite/`< 0` guard in _float/_opt_float and every case here is honoured.
+    """
+    attrs = {"BLASTBOX_POOL_SPAWN_RATE": "spawn_rate_limit",
+             "BLASTBOX_POOL_WARMING_TIMEOUT_S": "warming_timeout_s",
+             "BLASTBOX_POOL_UNKNOWN_GRACE_S": "unknown_grace_s",
+             "BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S": "capacity_starved_after_s",
+             "BLASTBOX_POOL_MAINTAIN_INTERVAL_S": "maintain_interval_s",
+             "BLASTBOX_POOL_MAINTAIN_BUDGET_S": "maintain_budget_s"}
+    defaults = {k: getattr(PoolConfig.from_env(), a) for k, a in attrs.items()}
+
+    for key, attr in attrs.items():
+        for bad in ("nan", "inf", "-inf", "-1"):
+            monkeypatch.setenv(key, bad)
+            got = getattr(PoolConfig.from_env(), attr)
+            assert got == defaults[key] or (got is None and defaults[key] is None), (
+                f"{key}={bad!r} was honoured as {got!r} instead of falling back to "
+                f"{defaults[key]!r}")
+            monkeypatch.delenv(key)
+
+    # 0 stays legal -- it is the documented "disabled" -- EXCEPT for the one knob where
+    # "disabled" would mean the UNBOUNDED rate. `now - last >= 0` is true on every tick, so
+    # BLASTBOX_POOL_MAINTAIN_INTERVAL_S=0 removes the rate limit instead of the seam: an uncached
+    # describe per idle slot at ~10Hz, manufacturing the throttling the knob exists to prevent,
+    # for an operator who typed 0 meaning "off" -- mid-incident, which is when they reach for it.
+    zero_is_not_off = {"BLASTBOX_POOL_MAINTAIN_INTERVAL_S"}
+    for key, attr in attrs.items():
+        monkeypatch.setenv(key, "0")
+        got = getattr(PoolConfig.from_env(), attr)
+        if key in zero_is_not_off:
+            assert got != 0.0, (
+                f"{key}=0 was honoured as a zero cooldown, i.e. maintenance on EVERY tick")
+        else:
+            assert got == 0.0
+        monkeypatch.delenv(key)
+
+    for key, attr in attrs.items():   # ...and a real value is still honoured
+        monkeypatch.setenv(key, "12.5")
+        assert getattr(PoolConfig.from_env(), attr) == 12.5
+        monkeypatch.delenv(key)
+
+
+def test_late_added_knobs_cannot_rebind_a_positional_callers_arguments():
+    """`maintain_interval_s` and `maintain_budget_s` were inserted into the MIDDLE of the dataclass.
+
+    PoolConfig permits positional construction and nothing forbade it, so a caller passing its
+    arguments positionally had them silently shift by two: the value meant for
+    `capacity_starved_after_s` landed in `maintain_interval_s`, the capacity-starvation alert
+    quietly returned to its default, and the maintenance seam was scheduled on a number never
+    intended for it. No error, no warning -- the failure is that it keeps working.
+
+    Keyword-only is the same guard the AWS config already states for its own late addition
+    ("DECLARED LAST so adding it can't silently rebind a positional caller's later fields").
+
+    MUTATION: drop kw_only from either field -> the positional value lands in the wrong attribute.
+    """
+    import dataclasses
+
+    kw_only = {f.name for f in dataclasses.fields(PoolConfig) if f.kw_only}
+    assert {"maintain_interval_s", "maintain_budget_s"} <= kw_only, (
+        "the mid-dataclass additions are still positional, so every existing positional caller "
+        "silently rebinds its later arguments")
+
+    # The behavioural half: a positional call must still bind what it always bound.
+    positional = [f for f in dataclasses.fields(PoolConfig) if not f.kw_only]
+    idx = next(i for i, f in enumerate(positional) if f.name == "capacity_starved_after_s")
+    args = [f.default for f in positional[:idx]] + [321.0]
+    cfg = PoolConfig(*args)
+    assert cfg.capacity_starved_after_s == 321.0, (
+        f"a positional argument intended for capacity_starved_after_s bound to something else "
+        f"(got capacity_starved_after_s={cfg.capacity_starved_after_s!r}, "
+        f"maintain_interval_s={cfg.maintain_interval_s!r})")
+    assert cfg.maintain_interval_s is None, "the maintenance knob absorbed a positional argument"

@@ -665,7 +665,6 @@ def _snapshot_pool(**kw):
         spawns = 0
 
         def spawn(self):
-            from blastbox.host.pool import Slot, SlotState
             _Rt.spawns += 1
             raise RuntimeError("restore failed")
 
@@ -708,7 +707,6 @@ def test_gvisor_invalidate_base_reaches_the_snapshot_manager():
 def test_cascade_invalidate_base_reaches_every_wrapped_tier():
     """In production the pool holds the CASCADE, not the snapshot runtime, so without delegation
     the lookup fails and a poisoned base is never rebuilt (upstream, PR #82)."""
-    from types import SimpleNamespace
 
     from blastbox.host.runtime.cascade import CascadingRuntime
 
@@ -4491,3 +4489,233 @@ def test_retire_without_a_fault_records_nothing() -> None:
     pool.retire(slot)
 
     assert rt.invalidated == 0
+
+
+_maint_ids = iter(f"m{i}" for i in range(1000))
+
+
+def _maint_slot():
+    return Slot(slot_id=next(_maint_ids), control_dir="/c", input_dir="/i", output_dir="/o",
+                state=SlotState.IDLE)
+
+
+def _maint_pool(rt, **kw):
+    return WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=4, spawn_rate_limit=1000.0, **kw)
+
+
+def test_a_maintenance_husk_whose_reap_fails_is_retried_not_stranded():
+    """retire() swallows its own reap error and returns normally, leaving the slot tracked and
+    DRAINING -- and a maintenance husk is NOT in _suspected_unknown, so the deferred reaper's undo
+    never applied to it. Nothing retried the disposal, so one correlated termination brownout
+    stranded every retired slot, each still counting against concurrent_ceiling, until the process
+    restarted."""
+    class _RT:
+        def __init__(self): self.reaps = 0
+        def spawn(self): return _maint_slot()
+        def is_ready(self, s): return True
+        def reap(self, s, **kw):
+            self.reaps += 1
+            raise OSError("terminate API brownout")
+
+    rt = _RT()
+    pool = _maint_pool(rt)
+    slot = _maint_slot()
+    with pool._lock:
+        pool._slots[slot.slot_id] = slot
+        slot.state = SlotState.DRAINING
+        pool._deferred_reap.add(slot.slot_id)
+        pool._maintain_reap_tries[slot.slot_id] = 0     # armed by the maintenance retire path
+
+    pool._drain_deferred_reaps()
+    with pool._lock:
+        assert slot.slot_id in pool._deferred_reap_next, (
+            "a maintenance husk was stranded, not requeued")
+        assert slot.slot_id not in pool._deferred_reap, (
+            "the requeue was released into the SAME batch, which four concurrent reapers eat")
+    pool._reap_deferred()                       # the tick releases it for the next pass
+    with pool._lock:
+        assert slot.slot_id in pool._deferred_reap or pool._reaper_threads, (
+            "the next tick must pick the husk back up")
+        assert pool._maintain_reap_tries[slot.slot_id] == 1
+        assert pool._slots[slot.slot_id].state == SlotState.DRAINING, (
+            "an UNUSABLE slot must never be handed back as claimable")
+
+
+def test_the_maintenance_reap_retry_is_bounded():
+    """Unbounded retry is the hazard the quarantine rule exists to prevent: repeated disposal
+    failure may mean the resource is genuinely still alive. After the budget the slot stays
+    quarantined -- but loudly, not silently."""
+    class _RT:
+        def spawn(self): return _maint_slot()
+        def is_ready(self, s): return True
+        def reap(self, s, **kw): raise OSError("still failing")
+
+    pool = _maint_pool(_RT())
+    slot = _maint_slot()
+    with pool._lock:
+        pool._slots[slot.slot_id] = slot
+        slot.state = SlotState.DRAINING
+        pool._deferred_reap.add(slot.slot_id)
+        pool._maintain_reap_tries[slot.slot_id] = 0
+
+    for _ in range(pool._maintain_reap_max_tries + 2):
+        with pool._lock:                        # what _reap_deferred does once the batch is idle
+            if not pool._reaper_threads:
+                pool._deferred_reap |= pool._deferred_reap_next
+                pool._deferred_reap_next.clear()
+        pool._drain_deferred_reaps()
+
+    with pool._lock:
+        assert slot.slot_id not in pool._deferred_reap, "retry must stop at the budget"
+        assert slot.slot_id not in pool._maintain_reap_tries, "the budget entry must be cleaned up"
+        assert pool._slots[slot.slot_id].state == SlotState.DRAINING
+
+
+def test_a_successful_maintenance_reap_clears_its_budget():
+    """Control: the common case -- a transient failure that heals -- must dispose and leave nothing
+    behind."""
+    class _RT:
+        def __init__(self): self.fail = True
+        def spawn(self): return _maint_slot()
+        def is_ready(self, s): return True
+        def reap(self, s, **kw):
+            if self.fail:
+                self.fail = False
+                raise OSError("transient")
+            return None
+
+    rt = _RT()
+    pool = _maint_pool(rt)
+    slot = _maint_slot()
+    with pool._lock:
+        pool._slots[slot.slot_id] = slot
+        slot.state = SlotState.DRAINING
+        pool._deferred_reap.add(slot.slot_id)
+        pool._maintain_reap_tries[slot.slot_id] = 0
+
+    pool._drain_deferred_reaps()      # fails -> held in _deferred_reap_next
+    with pool._lock:                  # released once no reaper is still draining
+        if not pool._reaper_threads:
+            pool._deferred_reap |= pool._deferred_reap_next
+            pool._deferred_reap_next.clear()
+    pool._drain_deferred_reaps()      # succeeds
+    with pool._lock:
+        assert slot.slot_id not in pool._maintain_reap_tries, "budget not cleared on success"
+        assert slot.slot_id not in pool._deferred_reap
+
+
+def test_a_requeue_is_not_eaten_by_its_own_reaper_batch():
+    """_MAX_REAPERS is 4, so a batch runs up to four concurrent drains over one queue. Releasing
+    requeues at the END OF A DRAIN meant the first worker to empty the queue handed them straight
+    to a sibling still looping -- the whole retry budget spent inside one batch, against a control
+    plane that is by hypothesis browning out. The release belongs on the tick thread."""
+    class _RT:
+        def spawn(self): return _maint_slot()
+        def is_ready(self, s): return True
+        def reap(self, s, **kw): raise OSError("brownout")
+
+    pool = _maint_pool(_RT())
+    slot = _maint_slot()
+    with pool._lock:
+        pool._slots[slot.slot_id] = slot
+        slot.state = SlotState.DRAINING
+        pool._deferred_reap.add(slot.slot_id)
+        pool._maintain_reap_tries[slot.slot_id] = 0
+
+    # One drain, as a single worker in a batch would run it.
+    pool._drain_deferred_reaps()
+    with pool._lock:
+        assert slot.slot_id not in pool._deferred_reap, (
+            "a sibling reaper in the same batch could consume this immediately")
+        assert slot.slot_id in pool._deferred_reap_next
+
+    # A second worker in the SAME batch finds nothing to do -- which is the point.
+    pool._drain_deferred_reaps()
+    with pool._lock:
+        assert pool._maintain_reap_tries[slot.slot_id] == 1, (
+            "the budget was spent twice inside one batch")
+
+
+def test_a_retry_is_held_while_any_reaper_is_still_draining():
+    """poll_interval is 0.1s and a reaper blocked in a terminate lives for SECONDS, so releasing at
+    tick start merged the held retries ~10 times a second straight into a batch that was still
+    running -- a sibling consumed them at once and the bounded budget was spent inside the same
+    outage. The release has to wait for the batch to be genuinely idle, not merely for a tick."""
+    class _RT:
+        def spawn(self): return _maint_slot()
+        def is_ready(self, s): return True
+        def reap(self, s, **kw): raise OSError("brownout")
+
+    pool = _maint_pool(_RT())
+    slot = _maint_slot()
+    with pool._lock:
+        pool._slots[slot.slot_id] = slot
+        slot.state = SlotState.DRAINING
+        pool._deferred_reap.add(slot.slot_id)
+        pool._maintain_reap_tries[slot.slot_id] = 0
+
+    pool._drain_deferred_reaps()                  # fails -> held
+    with pool._lock:
+        assert slot.slot_id in pool._deferred_reap_next
+
+    # A reaper from the batch is STILL RUNNING. Ticks keep firing (10/s in production).
+    class _StillDraining:
+        def is_alive(self): return True
+
+    with pool._lock:
+        pool._reaper_threads.append([_StillDraining(), pool._clock(), False])
+
+    for _ in range(10):                           # a second's worth of ticks
+        pool._reap_deferred()
+    with pool._lock:
+        assert slot.slot_id in pool._deferred_reap_next, (
+            "the retry was released into a batch that was still draining")
+        assert slot.slot_id not in pool._deferred_reap
+
+    # The batch finishes -> the retry becomes available again.
+    with pool._lock:
+        pool._reaper_threads.clear()
+    pool._reap_deferred()
+    with pool._lock:
+        assert slot.slot_id not in pool._deferred_reap_next, (
+            "an idle batch must release the held retry")
+
+
+def test_stop_clears_the_retry_holding_set_too():
+    """stop() clears _deferred_reap with an explicit rationale: leaving an id queued would let a
+    restarted pool's first tick re-terminate a resource whose disposal already failed. The holding
+    set carries exactly those ids, and shipped without that clear -- so a husk requeued during a
+    brownout survived stop()/start() and was re-terminated on the next boot, against a resource
+    that may still be live."""
+    class _RT:
+        def spawn(self): return _maint_slot()
+        def is_ready(self, s): return True
+        def reap(self, s, **kw): return None
+
+    pool = _maint_pool(_RT())
+    with pool._lock:
+        pool._deferred_reap_next.add("held-1")
+        pool._deferred_reap.add("queued-1")
+
+    pool.stop()
+
+    with pool._lock:
+        assert not pool._deferred_reap, "the queue must be cleared on stop"
+        assert not pool._deferred_reap_next, (
+            "the holding set survived stop(); a restarted pool re-terminates its ids")
+
+
+def test_forget_slot_health_drops_the_holding_set_entry():
+    """Every sibling map in _forget_slot_health is keyed by slot_id and popped there. The holding
+    set was the one that grew for the life of the process."""
+    class _RT:
+        def spawn(self): return _maint_slot()
+        def is_ready(self, s): return True
+        def reap(self, s, **kw): return None
+
+    pool = _maint_pool(_RT())
+    with pool._lock:
+        pool._deferred_reap_next.add("gone-1")
+        pool._forget_slot_health("gone-1")
+        assert "gone-1" not in pool._deferred_reap_next, (
+            "a slot that no longer exists left an entry behind")

@@ -27,6 +27,9 @@ Design notes:
 
 from __future__ import annotations
 
+import collections
+import dataclasses
+import math
 import json
 import logging
 import os
@@ -55,6 +58,12 @@ AwsRunner = Callable[[Sequence[str], float], subprocess.CompletedProcess]
 # answered, and the answer was no". Only the health/liveness paths forward the None; everything
 # that needs a plain yes/no coerces with `is True` (issue #77 marla-loop 3).
 HttpProbe = Callable[[str, dict[str, str], float], "bool | None"]
+
+#: ONE ownership fence per PROCESS. A restarted dispatcher gets a new one, so its predecessor's
+#: parked slots correctly read as orphans; every runtime built inside ONE process shares it, so
+#: sibling hibernate tiers never sweep each other's live parked slots.
+_PROCESS_RUN_ID = uuid.uuid4().hex[:16]
+
 
 class AwsWorkerError(RuntimeError):
     """An AWS CLI call failed or returned an unusable response."""
@@ -91,6 +100,89 @@ _CONFIRMED_DEAD_AWS_MARKERS = (
 )
 
 
+# Which aws-cli failures are RETRYABLE RATE LIMITING?
+#
+# A second allowlist, and deliberately NOT the complement of the one above. That list answers "is
+# this WORKER gone?", where defaulting to UNKNOWN is the safe direction. This one answers "can this
+# TIER be used at all?", where the safe direction is the opposite: availability is probed once at
+# construction, so treating an unrecognised error as retryable re-probes a genuinely misconfigured
+# tier forever, while treating a throttle as a verdict silently removes real capacity for the whole
+# process lifetime (issue #79).
+#
+# Both lists are bounded and enumerable because both hold AWS ERROR CODES, never prose -- the rule
+# the confirmed-dead list learned the hard way when "does not exist" matched InvalidAccessKeyId.
+_THROTTLE_AWS_MARKERS = (
+    "throttling",                      # Throttling / ThrottlingException (most services)
+    "toomanyrequests",                 # TooManyRequestsException -- Lambda's own throttle
+    "requestlimitexceeded",            # EC2
+    "requestthrottled",                # STS and friends
+    "slowdown",
+    "provisionedthroughputexceeded",
+    "serviceunavailable",              # 503: the service is down, not our entitlement
+    # Server-side timeouts. These arrived here late and the omission mattered more once this list
+    # started deciding AwsNoVerdict vs AwsUnknownState: a RequestTimeout fell through to the bare
+    # class, so `available()` read it as a DEFINITIVE unusable tier and _try_park read it as an
+    # ANSWERED refusal that advances the give-up clock -- both the opposite of what a timeout means.
+    # "We did not get an answer" is exactly this list's subject.
+    "requesttimeout",                  # RequestTimeout / RequestTimeoutException
+    "internalerror",                   # 500 InternalError / InternalFailure
+    "internalfailure",
+    "serviceexception",                # generic 5xx service fault
+    "priorrequestnotcomplete",
+    "transientfailure",
+    "connectionerror",                 # botocore surfaces socket faults with this text
+    "could not connect to the endpoint url",
+    "endpointconnectionerror",
+)
+
+
+#: Errors where AWS REFUSED THE REQUEST BEFORE PERFORMING IT. Still no verdict about the resource
+#: -- and still retryable, so availability keeps deferring rather than dropping the tier -- but for
+#: a MUTATING call they carry one fact an ordinary non-answer does not: the action did not happen.
+#: RequestTimeTooSkewed is rejected at signature validation, so a stop-instances that gets it never
+#: ran. Recorded as an unresolved ATTEMPT it became evidence that a later `stopped` instance held a
+#: hibernation image we captured -- and there was no image, because there was no stop.
+_NOT_EXECUTED_AWS_MARKERS = (
+    "requesttimetooskewed",            # clock skew: rejected at signature validation
+)
+
+#: Definite RATE LIMITS: AWS answers these BEFORE performing the action, so a mutating call that
+#: gets one provably did not run. An explicit list rather than "everything retryable", because the
+#: retryable set also carries RequestTimeout, InternalError, generic 5xx and connection failures --
+#: every one of which may mean the request WAS performed and only its reply was lost.
+_RATE_LIMIT_AWS_MARKERS = (
+    "throttling",                      # Throttling / ThrottlingException (most services)
+    "toomanyrequests",                 # TooManyRequestsException -- Lambda's own throttle
+    "requestlimitexceeded",            # EC2
+    "requestthrottled",                # STS and friends
+    "slowdown",
+    "provisionedthroughputexceeded",
+)
+
+
+def _is_rate_limit_aws_error(stderr: str) -> bool:
+    """True for a definite rate-limit rejection -- refused before the action was performed."""
+    low = (stderr or "").lower()
+    return any(marker in low for marker in _RATE_LIMIT_AWS_MARKERS)
+
+
+def _is_not_executed_aws_error(stderr: str) -> bool:
+    """True if AWS rejected the request before performing it, so the action provably did not run."""
+    low = (stderr or "").lower()
+    return any(marker in low for marker in _NOT_EXECUTED_AWS_MARKERS)
+
+
+def _is_throttle_aws_error(stderr: str) -> bool:
+    """True if AWS rate-limited us or was momentarily unavailable -- a retryable non-answer.
+
+    An auth failure is deliberately NOT here. ``AccessDenied`` tells us nothing about whether a
+    worker died, so the liveness path rightly calls it UNKNOWN -- but it is a perfectly definitive
+    answer about whether we may USE a tier. Same error, opposite meaning, different question.
+    """
+    low = (stderr or "").lower()
+    return any(marker in low for marker in _THROTTLE_AWS_MARKERS)
+
+
 def _is_confirmed_dead_aws_error(stderr: str) -> bool:
     """True ONLY if AWS positively told us the resource is gone.
 
@@ -106,6 +198,11 @@ def _is_confirmed_dead_aws_error(stderr: str) -> bool:
 # control-plane-CONFIRMED-running worker is a real failure (issue #77 marla-loop 2).
 # The shortest agent probe worth issuing. Below this we decline and report UNKNOWN rather than
 # manufacture a verdict from a socket we never really gave a chance (issue #77 marla-loop 4).
+#: Float fields that are NOT durations, so the "finite and positive" rule does not apply.
+_DURATION_EXEMPT: frozenset[str] = frozenset()
+#: Durations where 0 is a documented value ("off" / "no delay"), not a mistyped brick.
+_DURATION_ALLOW_ZERO: frozenset[str] = frozenset({"orphan_max_age_s", "resume_poll_s"})
+
 _MIN_PROBE_S = 0.25
 
 
@@ -119,7 +216,82 @@ class AwsUnknownState(AwsWorkerError):
     Every caller that can destroy a slot must treat this as "skip / try again", never "reap"."""
 
 
-class AwsProbeTimeout(AwsUnknownState):
+class AwsNoVerdict(AwsUnknownState):
+    """We never got an ANSWER AT ALL -- about the worker OR about the tier (issue #79 round 2).
+
+    ``AwsUnknownState`` says "this is not evidence a WORKER died". That is a weaker claim than this
+    one, and availability asks the stronger question: ``AccessDenied`` and ``ExpiredToken`` tell us
+    nothing about a worker but are perfectly definitive about whether a tier may be USED, so they
+    must stay a verdict there. A call that never reached AWS, or whose response could not be read,
+    is a verdict about nothing -- and availability is probed ONCE, so spending it as "unentitled"
+    drops the tier for the whole process lifetime (or, for the primary, refuses to start).
+
+    The parent of the throttle/timeout flavours, so ``except AwsNoVerdict`` covers every way we can
+    fail to get an answer -- including the ones added next."""
+
+
+class AwsNotExecuted(AwsNoVerdict):
+    """The aws process never STARTED, so nothing was asked and nothing was attempted.
+
+    Still an AwsNoVerdict -- we learned nothing, and every caller that defers or freezes on
+    silence must keep doing so. But it is NOT the "we issued a call and it went unanswered"
+    flavour, and one caller turns that distinction into EVIDENCE: _try_park records an
+    unanswered stop with park_attempted=True, and _park_attempted is later accepted as proof
+    that a `stopped` instance holds a warm image we captured. A fork that failed (EMFILE,
+    ENOMEM, the binary briefly absent mid-upgrade) issued no stop at all, so counting it as an
+    attempt lets an instance stopped by an operator be adopted as a parked warm slot with
+    nothing behind it. _freeze_park's own docstring already draws this line."""
+
+
+class AwsThrottled(AwsNoVerdict):
+    """AWS rate-limited us (or was momentarily unavailable) -- the retryable flavour of UNKNOWN.
+
+    Split out because availability asks a different question from liveness: a throttle is the one
+    non-answer that clearly warrants a retry, whereas an auth error is a real verdict about whether
+    the tier may be used at all (issue #79).
+
+
+    NOT an AwsNotExecuted, and the attempt to make it one was a mistake worth recording. A
+    definite RATE LIMIT is indeed a rejection -- but this class also carries RequestTimeout,
+    InternalError, generic 5xx and connection failures, and none of those proves a mutating request
+    was never performed. Treating them all as not-executed destroyed the LOST-RESPONSE case: a
+    stop-instances that AWS accepted and whose reply vanished recorded no _park_attempted, so the
+    later `stopping`/`stopped` observations were rejected as somebody else's stop and a genuinely
+    hibernated warm slot aged out and was reaped. The rejection/ambiguity split is a property of
+    the specific error CODE, not of this class, so it lives in the marker lists below."""
+
+
+class AwsRateLimited(AwsThrottled, AwsNotExecuted):
+    """A definite rate-limit rejection: BOTH retryable AND never-performed.
+
+    It has to be both, and picking one was wrong in each direction. A bare AwsThrottled put a
+    mutating call AWS had REFUSED onto _try_park's unresolved-attempt arm, so a throttled stop was
+    recorded as evidence of a hibernation image that was never captured. Making AwsThrottled itself
+    an AwsNotExecuted then swept in RequestTimeout, InternalError and connection failures, which
+    destroyed the LOST-RESPONSE case -- a stop AWS accepted whose reply vanished recorded no
+    attempt, so the genuinely hibernated slot was rejected at the `stopped` door and reaped.
+
+    The rejection/ambiguity split is a property of the error CODE, so it lives in the marker lists;
+    this type just carries both facts to the two callers that each need one of them."""
+
+
+class AwsCliMissing(AwsNotExecuted):
+    """The aws binary is absent or not executable -- permanent, and yet STILL not a verdict about
+    any worker.
+
+    Both halves matter, and getting only the first one right drained a tier. A missing CLI will be
+    missing on the next tick too, so the TIER-SELECTION probe must answer definitively or the
+    cascade defers and re-probes it for the life of the process. But is_ready/is_alive turn a
+    definitive error into "this slot is not up", and the CLI is shared by every slot -- so raising
+    a plain AwsWorkerError from the shared _aws() path made one missing binary confirm the death
+    of the entire tier at once, and the terminates that followed failed for the same reason,
+    quarantining every slot as DRAINING with the tier stuck at zero even after the CLI came back.
+
+    So: an AwsNoVerdict (liveness stays UNKNOWN and destroys nothing) that ``available()`` alone
+    converts into a verdict."""
+
+
+class AwsProbeTimeout(AwsNoVerdict):
     """The control plane didn't answer in time — the timeout flavour of AwsUnknownState. Raised
     whether or not a probe budget was in scope (a 120s cli_timeout_s expiring is no more evidence
     of death than a 5s claim budget expiring)."""
@@ -175,6 +347,11 @@ def _default_http_probe(url: str, headers: dict[str, str], timeout: float) -> "b
 # Config
 # ---------------------------------------------------------------------------
 
+#: "no agent probe has been taken yet" -- distinct from None, which is a REAL tri-state probe result
+#: meaning UNKNOWN. Conflating the two would make an unknown answer trigger an endless re-probe.
+_UNPROBED: Any = object()
+
+
 def _env(get: Callable[[str], str | None], key: str, default: str | None = None) -> str | None:
     v = get(key)
     return v if (v is not None and v != "") else default
@@ -209,10 +386,43 @@ class AwsWorkerConfig:
         # claim reports UNKNOWN and no AWS slot is ever claimable — silently, tier green in metrics.
         # (0 used to mean "disable the bound"; it must not brick instead.) On the BASE so every tier
         # inherits it; subclasses with their own __post_init__ MUST chain to this.
-        if self.claim_probe_timeout_s <= 0:
-            object.__setattr__(self, "claim_probe_timeout_s", 5.0)
-        if self.health_probe_timeout_s <= 0:
-            object.__setattr__(self, "health_probe_timeout_s", 30.0)
+        # `not isfinite(...)` as well as `<= 0`: NaN fails EVERY comparison, so `nan <= 0` is False
+        # and a NaN sailed through the guard that exists to stop exactly this. It then poisons the
+        # deadline (`clock() + nan` is nan) and every comparison against it, so the probe neither
+        # expires nor bounds anything -- the silent brick this clamp was added to prevent, reached by
+        # the one input the clamp did not test for. `inf` is the same shape from the other side.
+        #
+        # DRIVEN OFF THE FIELD LIST, not off a hand-written list of names. This defect class has now
+        # been reported on four consecutive review rounds -- the pool knobs, the dispatcher thaw
+        # budget, the shared health-probe ceiling, this tier's hibernate budget, and finally
+        # LambdaSnapStartConfig.resume_timeout_s, which was the one tier nobody had got to yet. Each
+        # round fixed the reported field and left its siblings, because the guard enumerated names.
+        # Enumerating `dataclasses.fields(type(self))` instead means a knob is covered because it
+        # EXISTS, so a new float field -- or a new tier -- is protected the day it is added rather
+        # than the round after it is reported.
+        for _f in dataclasses.fields(type(self)):
+            if _f.name in _DURATION_EXEMPT:
+                continue
+            # Gate on the DECLARED FIELD TYPE, not on the value's type. Two different mistakes
+            # otherwise: checking `isinstance(value, float)` skips a caller who passed
+            # `claim_probe_timeout_s=0` as an int (silently un-fixing issue #77), while accepting
+            # any int sweeps in `max_duration_s` and `auth_token_ttl_min` -- int fields carrying
+            # AWS's own bounds, with their own clamp that maps 0 to 1, which this would overwrite
+            # with the default. A duration is a field declared `float`; those two are not.
+            if str(_f.type).replace(" ", "") not in ("float", "float|None"):
+                continue
+            _v = getattr(self, _f.name, None)
+            if not isinstance(_v, (int, float)) or isinstance(_v, bool):
+                continue
+            _dflt = _f.default if isinstance(_f.default, (int, float)) else None
+            if _dflt is None:
+                continue
+            _floor_ok = _v >= 0 if _f.name in _DURATION_ALLOW_ZERO else _v > 0
+            if not math.isfinite(_v) or not _floor_ok:
+                _log.warning("%s: ignoring %s=%r (must be finite and %s); using %r",
+                             type(self).__name__, _f.name,
+                             _v, ">= 0" if _f.name in _DURATION_ALLOW_ZERO else "> 0", _dflt)
+                object.__setattr__(self, _f.name, float(_dflt))
         # Same class of brick, one floor below: _probe_timeout() DECLINES to probe under
         # _MIN_PROBE_S, so a configured probe_timeout_s beneath it would decline unconditionally and
         # no slot would ever become ready (issue #77 marla-loop 4). Guard it beside its siblings.
@@ -276,6 +486,8 @@ class LambdaMicroVmConfig(AwsWorkerConfig):
             allow_default_egress=(_env(get, "BLASTBOX_LAMBDA_ALLOW_DEFAULT_EGRESS") or "").strip().lower()
                                  in ("1", "true", "yes", "on"),
             auth_token_ttl_min=int(_env(get, "BLASTBOX_LAMBDA_AUTH_TTL_MIN", "15") or "15"),
+            health_probe_timeout_s=float(
+                _env(get, "BLASTBOX_AWS_HEALTH_PROBE_TIMEOUT_S", "30") or "30"),
             max_duration_s=int(_env(get, "BLASTBOX_AWS_MAX_DURATION_S", "3600") or "3600"),
             **overrides,
         )
@@ -317,6 +529,8 @@ class Ec2Config(AwsWorkerConfig):
             user_data_b64=_env(get, "BLASTBOX_EC2_USER_DATA_B64"),
             self_terminate=(_env(get, "BLASTBOX_EC2_SELF_TERMINATE", "1") or "1").strip().lower()
             not in ("0", "false", "no", "off"),   # strip/lower so False/NO/Off actually disable the backstop
+            health_probe_timeout_s=float(
+                _env(get, "BLASTBOX_AWS_HEALTH_PROBE_TIMEOUT_S", "30") or "30"),
             max_duration_s=int(_env(get, "BLASTBOX_AWS_MAX_DURATION_S", "3600") or "3600"),
             **overrides,
         )
@@ -457,21 +671,81 @@ class AwsDisposableRuntime:
         # cache the READINESS get-microvm/describe-instances too (is_ready is polled ~10Hz during WARMING,
         # and its endpoint-resolution describe is uncached) so a booting slot doesn't spam the control plane.
         self._desc_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        # slot_id -> when a describe last FAILED. Only successes are cached, so without this a
+        # second caller on the same pass re-issues a describe that has just failed and pays another
+        # full timeout for the same non-answer -- on the pool's single maintenance thread.
+        self._desc_fail_at: dict[str, float] = {}
         # Per-PROCESS ownership fence for the aws-ec2-hibernate orphan sweep. A leaked STOPPED slot
         # from a CRASHED dispatcher isn't bounded by the guest uptime timer (it's frozen while
         # hibernated), so sweep_orphans() reclaims stopped slots NOT carrying this id. Deliberately
         # fresh per process (not env-overridable): a restarted dispatcher gets a new id, so its
         # predecessor's parked slots correctly read as orphans; a stable id would make them look
         # "ours" and never be swept.
-        self._run_id = uuid.uuid4().hex[:16]
+        # ...and it is ONE id for the whole process, not one per runtime INSTANCE. The comment
+        # above always said "per-PROCESS"; the code generated a fresh id per construction, and a
+        # cascade may legitimately hold several aws-ec2-hibernate positions ("aws-ec2:4,aws-ec2:16"
+        # -- _tier_identity is f"{name}#{idx}" precisely because names repeat). sweep_orphans
+        # filters on the shared blastbox-tier tag and spares only its OWN run id, so sibling tiers
+        # in one process read each other's live parked slots as foreign and terminate them.
+        #
+        # That was unreachable while the sweep ran only at CLI startup -- nothing is parked yet, as
+        # the CLI's own comment says -- and became reachable the moment a tier admitted mid-run
+        # started sweeping. A per-process id is also what docs/CONFIGURATION.md describes: "not
+        # carrying THIS DISPATCHER PROCESS'S blastbox-run id".
+        self._run_id = _PROCESS_RUN_ID
+
+    def _slot_is_gone(self, sid: str) -> bool:
+        """Default: this runtime keeps no tombstone, so nothing is ever "gone". Overridden by tiers
+        that DO keep one (ec2-hibernate), which is what lets the shared describe-cache writes below
+        stay out of a slot that has already been disposed of."""
+        return False
+
+    @contextlib.contextmanager
+    def _park_writes(self, sid: str) -> "collections.abc.Iterator[bool]":
+        """Default chokepoint: no tombstone here, so there is nothing to serialize -- always live.
+
+        Overridden by ec2-hibernate, where it takes `_park_lock`. The shared cache publications
+        below go through it so they are atomic ON THE TIER THAT HAS A REAPER and free everywhere
+        else. Guarding them with a bare `_slot_is_gone()` was not enough: that predicate is only
+        meaningful while the lock is held -- its own docstring says so -- so checking it unlocked
+        left exactly the window it was added to close, one step narrower. The reaper can install
+        the tombstone and clear the caches between the check and the assignment, and the liveness
+        and claim paths never reach `_park_step`'s re-entry sweep to undo it.
+        """
+        yield True
 
     def _describe_cached(self, slot: "AwsWorkerSlot", ttl: float) -> dict[str, Any]:
         now = self._clock()
         cached = self._desc_cache.get(slot.slot_id)
         if cached is not None and (now - cached[0]) < ttl:
             return cached[1]
-        desc = self._describe(slot)
-        self._desc_cache[slot.slot_id] = (now, desc)
+        try:
+            desc = self._describe(slot)
+        except (AwsWorkerError, OSError):
+            # Remember that the LOOKUP failed, not merely that it did not succeed: "we already
+            # tried and could not read this state" is information, and re-deriving it costs another
+            # control-plane call we do not have the budget for.
+            #
+            # Stamped from COMPLETION, not the pre-call `now`. A failed describe is the SLOW case --
+            # it usually failed by timing out -- so a 30s failure against this 5s memo would leave
+            # the memo already expired the moment it was written, and the very next caller reissues
+            # the describe this memo exists to prevent. Fifth site on this branch where a timestamp
+            # guarding a slow call was taken before it instead of after.
+            # Adding this map to reap()'s locked sweep does NOT fix the race: the write lands
+            # AFTER reap has run, so there is nothing left for reap to clear. The PUBLICATION is
+            # what has to know, because ids are per-spawn UUIDs and reap is their only collector.
+            with self._park_writes(slot.slot_id) as _live:
+                if _live:
+                    self._desc_fail_at[slot.slot_id] = self._clock()
+            raise
+        self._desc_fail_at.pop(slot.slot_id, None)
+        # Stamped from COMPLETION. `now` was read before the call, so a describe slower than the
+        # TTL produced a cache entry that was ALREADY EXPIRED when it landed -- the next caller
+        # paid for another full control-plane wait to learn the same thing, which is precisely
+        # what the cache exists to prevent. Seventh instance of stamp-before-call on this branch.
+        with self._park_writes(slot.slot_id) as _live:
+            if _live:
+                self._desc_cache[slot.slot_id] = (self._clock(), desc)
         return desc
 
     def _describe(self, slot: "AwsWorkerSlot") -> dict[str, Any]:   # concrete tiers override
@@ -558,7 +832,8 @@ class AwsDisposableRuntime:
             self._tls.probe_deadline = prev
 
     def _aws(self, service: str, op: str, *args: str,
-             timeout_s: float | None = None) -> dict[str, Any]:
+             timeout_s: float | None = None,
+             expect_output: bool = False) -> dict[str, Any]:
         argv = self.cfg.aws_argv(service, op, *args)
         # A claim-probe budget set by is_alive_for_claim on THIS thread wins over the default. It is
         # thread-local on purpose: the background tick calls _aws concurrently and must keep the full
@@ -580,7 +855,28 @@ class AwsDisposableRuntime:
             # briefly absent mid-`pip install -U awscli`). That says nothing whatsoever about the
             # worker, and it is maximally CORRELATED -- every slot and every thread hits it at once,
             # so collapsing it to "dead" wipes the tier (issue #77 marla-loop).
-            raise AwsUnknownState(f"aws {service} {op}: cannot execute ({exc})") from exc
+            # ...but only RESOURCE exhaustion is undecided. A missing or non-executable binary
+            # (ENOENT/EACCES) is a permanent HOST MISCONFIGURATION, and _is_undecided_availability
+            # matches AwsNoVerdict across the MRO -- so returning the undecided flavour for it made
+            # the cascade defer the tier and re-probe it every admit interval forever, two aws-cli
+            # round trips a time, instead of reporting the fault. That contradicts the startup path,
+            # where "missing credentials is a VERDICT" and the tier is dropped. A binary that is not
+            # there will not be there on the next tick either: answer definitively so the operator
+            # sees it, and so the deferred-tier path drops it as confirmed unusable.
+            # isinstance alone is exact here: CPython maps ENOENT -> FileNotFoundError and
+            # EACCES/EPERM -> PermissionError at construction, while EMFILE and ENOMEM stay a bare
+            # OSError. An extra errno check beside it was unreachable, so it is not here.
+            #
+            # Both flavours are AwsNoVerdict, DELIBERATELY. This path is shared by every slot
+            # probe, and is_ready/is_alive read a definitive error as "this slot is not up" -- so
+            # answering definitively here confirmed the death of the whole tier on one missing
+            # binary. available() is the only caller that turns AwsCliMissing into a verdict,
+            # because it is the only one asking about the TIER rather than about a worker.
+            if isinstance(exc, (FileNotFoundError, PermissionError)):
+                raise AwsCliMissing(
+                    f"aws {service} {op}: the AWS CLI is missing or not executable ({exc}) -- "
+                    f"this is a host configuration fault, not a transient one") from exc
+            raise AwsNotExecuted(f"aws {service} {op}: cannot execute ({exc})") from exc
         except subprocess.TimeoutExpired as exc:
             # UNKNOWN in every scope (issue #77 round 2): a timeout means the control plane never
             # answered. Outside a probe this used to be a plain AwsWorkerError, and resume()'s
@@ -595,10 +891,34 @@ class AwsDisposableRuntime:
             if _is_confirmed_dead_aws_error(stderr):
                 raise AwsWorkerError(f"aws {service} {op} failed (rc={cp.returncode}): {stderr[:400]}")
             # DEFAULT: we did not get a confirmed answer, so we do not have one. Never death.
-            raise AwsUnknownState(
+            # Throttles get their own type. Everything else stays a plain AwsUnknownState: still
+            # not evidence a worker died, but not a reason to keep re-probing a tier either.
+            # ORDER: most specific first. A definite RATE LIMIT is both retryable and
+            # never-performed, so it gets the type that carries both facts. Clock skew is
+            # never-performed but not a throttle. Everything else retryable is AMBIGUOUS about
+            # whether the call ran -- RequestTimeout, InternalError, generic 5xx, connection
+            # failures -- and must stay an ordinary non-answer, or the lost-response case loses
+            # the evidence that keeps a genuinely hibernated slot from being reaped.
+            if _is_rate_limit_aws_error(stderr):
+                exc_cls: type[AwsWorkerError] = AwsRateLimited
+            elif _is_not_executed_aws_error(stderr):
+                exc_cls = AwsNotExecuted
+            elif _is_throttle_aws_error(stderr):
+                exc_cls = AwsThrottled
+            else:
+                exc_cls = AwsUnknownState
+            raise exc_cls(
                 f"aws {service} {op}: unconfirmed failure (rc={cp.returncode}): {stderr[:200]}")
         out = (cp.stdout or "").strip()
         if not out:
+            if expect_output:
+                # A QUERY that answered with nothing has not answered. Only _aws can tell this
+                # apart from valid-JSON-that-happens-to-be-empty: both reach the caller as {}, and
+                # `{}` from a parsed document is a real verdict (no Account -> bad credentials)
+                # that existing tests pin. Callers that need a document opt in; mutating calls
+                # (stop-instances, terminate-instances) legitimately return nothing on rc=0 and
+                # must not raise -- raising for everything broke exactly those.
+                raise AwsNoVerdict(f"aws {service} {op}: empty response (rc=0)")
             return {}
         try:
             return json.loads(out)
@@ -606,16 +926,43 @@ class AwsDisposableRuntime:
             # We could not PARSE the answer -- a truncated pipe, a CLI upgraded mid-flight, a
             # proxy's error page. That is not the worker telling us it is gone, and whatever caused
             # it applies to every call on this host at once (upstream P2).
-            raise AwsUnknownState(f"aws {service} {op}: unparseable response") from exc
+            raise AwsNoVerdict(f"aws {service} {op}: unparseable response") from exc
 
     # -- fail-closed availability ------------------------------------------
     def available(self) -> bool:
-        """True iff creds resolve (sts get-caller-identity) AND the tier's service probe passes."""
+        """True iff creds resolve (sts get-caller-identity) AND the tier's service probe passes.
+
+        Raises ``AwsUnknownState`` when we could not TELL. That distinction is the whole point:
+        availability is checked ONCE, at construction, and a False here makes the cascade drop the
+        tier for the entire process lifetime. So a few seconds of STS throttling at dispatcher
+        start silently removed the AWS burst tier until a restart -- with the pool still reporting
+        green -- and, when it was the primary tier, stopped the dispatcher from starting at all
+        (issue #79). "Throttled" is not "unentitled"; only the latter is a verdict.
+        """
         try:
-            ident = self._aws("sts", "get-caller-identity")
+            ident = self._aws("sts", "get-caller-identity", expect_output=True)
             if not ident.get("Account"):
                 return False
             return self._service_available()
+        except AwsCliMissing:
+            # A VERDICT about the tier, even though it is no verdict about any worker. The binary
+            # will be missing on the next probe too, so deferring and re-probing it every admit
+            # interval for the life of the process reports nothing and costs two CLI round trips a
+            # time. Same rule the docstring already applies to missing credentials.
+            _log.error("%s: the AWS CLI is missing or not executable -- treating this tier as "
+                       "unavailable. This is a host configuration fault and needs an operator.",
+                       self.kind)
+            return False
+        except AwsNoVerdict:
+            # PROPAGATE, don't flatten. The caller decides whether to retry or defer the tier, and
+            # it cannot make that call if a brownout is indistinguishable from missing credentials.
+            # EVERY no-answer, not just rate limiting and timeouts: a truncated or unreadable
+            # response, or a host that could not even start the aws process, is equally not a
+            # verdict, and one of them at startup dropped the tier for the whole process lifetime.
+            # Still NARROW where it counts -- a bare AwsUnknownState covers AccessDenied and
+            # friends, which say nothing about a WORKER but are a definitive answer about a TIER,
+            # and retrying those forever would be the mirror-image bug.
+            raise
         except (AwsWorkerError, OSError):
             return False
 
@@ -630,14 +977,88 @@ class AwsDisposableRuntime:
         _log.info("%s: spawned slot=%s resource=%s", self.kind, slot.slot_id, slot.resource_id)
         return slot
 
-    def is_ready(self, slot: AwsWorkerSlot) -> bool:
+    def is_ready(self, slot: AwsWorkerSlot) -> "bool | None":
+        """TRI-STATE: True = ready, False = CONFIRMED not ready yet, None = UNKNOWN.
+
+        "Could not ask" used to collapse into "not ready yet" here, on the reasoning that the pool
+        just retries next tick. It does -- but ``_health_check`` ALSO evicts any WARMING slot older
+        than ``warming_timeout_s`` (300s lambda / 600s ec2-hibernate) and reaps it. So a brownout
+        outlasting the readiness budget terminated every WARMING instance in the tier: instances
+        booting perfectly well whose only fault was that AWS would not describe them. Spawns are
+        throttled during the same event, so the tier then held at zero (issue #79).
+
+        UNKNOWN is not a verdict about the worker, so it must not be spent as one. The pool now
+        suppresses the warming timeout for the duration of an unknown episode -- bounded, so a
+        control plane that never comes back still lets the slot age out rather than wedging the
+        tier (the same trade ``_unknown_grace_s`` makes on the IDLE path).
+        """
         try:
-            # "could not ask" is not-ready-yet here; the pool retries next tick. Only resume() and
-            # the liveness paths care about the difference (issue #77 marla-loop 3).
-            return self._health_ok(slot) is True
+            ok = self._health_ok(slot)
+        except AwsUnknownState as exc:
+            # Includes AwsProbeTimeout. But NOT every unconfirmed call means we failed to observe
+            # the WORKER: minting a token needs a running microVM, so a slot that is merely still
+            # `pending` fails the mint with an unconfirmed error even though the describe answered
+            # perfectly and told us, definitively, that it is not ready yet. Treating that as
+            # UNKNOWN would suppress the warming timeout for an instance that never boots -- the
+            # exact wedge this exemption is bounded to avoid.
+            #
+            # So: UNKNOWN here means "we could not observe the instance's state", nothing weaker.
+            # If the state is still readable, we DID observe the worker and the downstream failure
+            # is a consequence of the state we read.
+            if self._observed_not_running(slot):
+                _log.debug("%s: is_ready(%s) not ready (observed non-running state; %s)",
+                           self.kind, slot.slot_id, exc)
+                return False
+            _log.debug("%s: is_ready(%s) unknown: %s", self.kind, slot.slot_id, exc)
+            return None
         except (AwsWorkerError, OSError) as exc:
+            # A verdict chosen at the raise site: a definitive answer that this slot is not up.
             _log.debug("%s: is_ready(%s) probe error: %s", self.kind, slot.slot_id, exc)
             return False
+        # _health_ok is itself tri-state; preserve its UNKNOWN rather than flattening it to False.
+        return None if ok is None else (ok is True)
+
+    def _observed_not_running(self, slot: AwsWorkerSlot) -> bool:
+        """True only when we READ the state and it is definitively not running yet.
+
+        This is the discriminator the caller actually needs, and the one the old
+        ``_state_observable`` only appeared to implement: it returned ``bool(describe)``, i.e.
+        "the describe answered at all", and never looked at WHAT it said. The justification in the
+        caller is that a still-``pending`` instance legitimately fails the token mint -- but a
+        RUNNING instance whose mint is merely THROTTLED took the same branch and became a
+        definitive ``False``. The warming timeout then kept aging and terminated the tier's entire
+        healthy WARMING population over a throttled token API: issue #79's exact failure, inside
+        the change that fixes issue #79.
+
+        Served from the same describe cache ``_health_ok`` just used, so the common path costs no
+        extra API call -- and during a real brownout the underlying describe fails too, which is
+        precisely the signal we want: unreadable -> False here -> the caller returns UNKNOWN.
+
+        A FAILED describe is not cached, though, so during that brownout the readiness path would
+        re-issue the describe that just failed and wait out a second full ``cli_timeout_s`` for the
+        same non-answer -- per warming slot, on the pool's sole maintenance thread. Whether the
+        state was readable is exactly what the readiness path already learned, so read it from the
+        failure memo instead of buying it again, and budget the call we do still make.
+        """
+        sid = slot.slot_id
+        now = self._clock()
+        cached = self._desc_cache.get(sid)
+        if (cached is None or (now - cached[0]) >= self._liveness_cache_s) and \
+                (now - self._desc_fail_at.get(sid, -1e18)) < self._liveness_cache_s:
+            return False    # the readiness path just tried to read the state and could not
+        try:
+            with self._call_budget(self.cfg.health_probe_timeout_s):
+                desc = self._describe_cached(slot, self._liveness_cache_s)
+        except (AwsWorkerError, OSError):
+            return False
+        if not desc:
+            return False
+        st = self._desc_state_name(desc)
+        if st is None:
+            # Unrecognised shape: we cannot say it is NOT running, so we must not manufacture a
+            # death out of that. Caller answers UNKNOWN.
+            return False
+        return st not in self._RUNNING_STATES
 
     def is_alive(self, slot: AwsWorkerSlot) -> "bool | None":
         # cache for _liveness_cache_s so the pool's fast tick (~0.1s) doesn't issue an AWS describe per
@@ -667,11 +1088,22 @@ class AwsDisposableRuntime:
             # otherwise be written already-expired, so the next tick re-probes immediately and the
             # sole tick thread burns health_probe_timeout_s per idle slot for the whole outage
             # (upstream P2).
-            self._live_cache[slot.slot_id] = (self._clock(), None)
+            # Tombstone-aware like the describe caches: this runs on the tick thread
+            # (is_alive) and on dispatcher claim threads (is_alive_for_claim), either
+            # of which can be inside a 30s describe when the reaper disposes the slot.
+            with self._park_writes(slot.slot_id) as _live:
+                if _live:
+                    self._live_cache[slot.slot_id] = (self._clock(), None)
             return None
         except (AwsWorkerError, OSError):
             alive = False
-        self._live_cache[slot.slot_id] = (now, alive)
+        # Stamped at COMPLETION, for the same reason as the UNKNOWN arm above: `now` was read
+        # BEFORE the describe this cache exists to throttle, so a degraded-but-answering control
+        # plane (a 25s describe against a 5s TTL) wrote a memo that was already expired and the
+        # next 0.1s tick re-probed anyway -- per idle slot, on the pool's sole tick thread.
+        with self._park_writes(slot.slot_id) as _live:
+            if _live:
+                self._live_cache[slot.slot_id] = (self._clock(), alive)
         return alive
 
     def is_alive_for_claim(self, slot: AwsWorkerSlot, *, budget_s: float | None = None) -> "bool | None":
@@ -682,7 +1114,6 @@ class AwsDisposableRuntime:
         Force a fresh describe here (dropping the describe cache too, since a tier's ``_running`` may read
         it); the ~5s cache still throttles the background ~10Hz poll. The pool calls this at claim iff the
         runtime provides it (optional protocol method; file/libvirt tiers fall back to ``is_alive``)."""
-        now = self._clock()
         self._desc_cache.pop(slot.slot_id, None)   # force a fresh get-instance/get-microvm this call
         # Bound the describe to the claim-probe budget (issue #77): this call is on job-dispatch
         # latency and holds the dispatcher's warm-gate reservation, so it must not wait out the full
@@ -699,12 +1130,16 @@ class AwsDisposableRuntime:
                 return None
             except (AwsWorkerError, OSError):
                 alive = False
-        self._live_cache[slot.slot_id] = (now, alive)   # keep the background-tick cache coherent
+        # Stamped at COMPLETION (see is_alive): `now` predates the claim probe it is memoising.
+        with self._park_writes(slot.slot_id) as _live:   # keep the background-tick cache coherent
+            if _live:
+                self._live_cache[slot.slot_id] = (self._clock(), alive)
         return alive
 
     def reap(self, slot: AwsWorkerSlot) -> None:
         self._live_cache.pop(slot.slot_id, None)
         self._desc_cache.pop(slot.slot_id, None)
+        self._desc_fail_at.pop(slot.slot_id, None)
         self._mint_fail_at.pop(slot.slot_id, None)
         self._mint_fail_exc.pop(slot.slot_id, None)
         if slot.resource_id is None:
@@ -721,6 +1156,15 @@ class AwsDisposableRuntime:
 
     def _running(self, slot: AwsWorkerSlot) -> bool:
         raise NotImplementedError
+
+    # States in which the worker is up and a downstream call SHOULD have succeeded. Anything else
+    # that is readable explains a failed mint/health call as a consequence of the state.
+    _RUNNING_STATES = ("running", "active", "ready")
+
+    def _desc_state_name(self, desc: dict) -> "str | None":
+        """The lower-cased state string from a RAW description, or None if this tier's shape has
+        none. None means "cannot tell", which callers must treat as UNKNOWN -- never as a death."""
+        return None
 
     def _terminate(self, slot: AwsWorkerSlot) -> None:
         raise NotImplementedError
@@ -752,7 +1196,9 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
 
     def _service_available(self) -> bool:
         # entitlement probe: list-microvms returns cleanly iff the account is enabled for the service.
-        self._aws("lambda-microvms", "list-microvms")
+        # expect_output: this is a DOCUMENT query, so an empty rc=0 is no answer at all. Without it
+        # a blank response read as "entitled" and admitted the tier with no verdict behind it.
+        self._aws("lambda-microvms", "list-microvms", expect_output=True)
         return True
 
     def _launch(self) -> AwsWorkerSlot:
@@ -778,11 +1224,19 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
         return []
 
     def _describe(self, slot: AwsWorkerSlot) -> dict[str, Any]:
-        return self._aws("lambda-microvms", "get-microvm", "--microvm-identifier", str(slot.resource_id))
+        # expect_output: this is the STATE query every liveness verdict is read from. Without it an
+        # empty rc=0 parsed to {}, `state` read as "", and _running() -- a plain bool -- returned
+        # False: a CONFIRMED death manufactured out of silence, which reaps a healthy worker. Both
+        # callers already convert AwsUnknownState (AwsNoVerdict's base) into UNKNOWN correctly.
+        return self._aws("lambda-microvms", "get-microvm", "--microvm-identifier",
+                         str(slot.resource_id), expect_output=True)
 
     def _running(self, slot: AwsWorkerSlot) -> bool:
         st = str(self._describe(slot).get("state", "")).lower()
-        return st in ("running", "active", "ready")
+        return st in self._RUNNING_STATES
+
+    def _desc_state_name(self, desc: dict) -> "str | None":
+        return str(desc.get("state", "")).lower() or None
 
     def _mint_token(self, slot: AwsWorkerSlot) -> str:
         # minted fresh at probe/detonation time with a short TTL + scoped to the agent port (both
@@ -790,7 +1244,13 @@ class LambdaMicroVmRuntime(AwsDisposableRuntime):
         resp = self._aws("lambda-microvms", "create-microvm-auth-token",
                          "--microvm-identifier", str(slot.resource_id),
                          "--expiration-in-minutes", str(self.cfg.auth_token_ttl_min),
-                         "--allowed-ports", f"port={self.cfg.agent_port}")  # tagged-union list shorthand
+                         "--allowed-ports", f"port={self.cfg.agent_port}",  # tagged-union list shorthand
+                         # expect_output: another DOCUMENT query. A blank rc=0 parsed to {}, so no
+                         # token was found and the bare AwsWorkerError below became a DEFINITIVE
+                         # not-ready during warming and a definitive False at claim -- draining a
+                         # healthy Lambda worker per blank answer, slot by slot, on an incident that
+                         # said nothing about any of them.
+                         expect_output=True)
         tok = resp.get("authToken") or resp.get("token") or resp.get("Token")
         # The live `aws` CLI returned a bare JWE string (validated end-to-end: /healthz 200 with this as
         # the X-aws-proxy-auth header). The API reference models authToken as a header-name -> value MAP,
@@ -1332,7 +1792,9 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
         self.cfg: Ec2Config = cfg
 
     def _service_available(self) -> bool:
-        self._aws("ec2", "describe-instances", "--max-items", "1")
+        # expect_output: same reason as the Lambda probe -- a blank rc=0 answered nothing, and
+        # returning True on it admitted EC2 without a service verdict.
+        self._aws("ec2", "describe-instances", "--max-items", "1", expect_output=True)
         return True
 
     def _launch(self) -> AwsWorkerSlot:
@@ -1399,7 +1861,10 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
         return slot
 
     def _describe(self, slot: AwsWorkerSlot) -> dict[str, Any]:
-        resp = self._aws("ec2", "describe-instances", "--instance-ids", str(slot.resource_id))
+        # expect_output: same as the Lambda tier's _describe -- an empty rc=0 became {}, so
+        # State.Name read as "" and _running() returned a definitive False for a live instance.
+        resp = self._aws("ec2", "describe-instances", "--instance-ids", str(slot.resource_id),
+                         expect_output=True)
         for res in resp.get("Reservations", []):
             for inst in res.get("Instances", []):
                 if inst.get("InstanceId") == slot.resource_id:
@@ -1408,6 +1873,9 @@ class DisposableEc2Runtime(AwsDisposableRuntime):
 
     def _running(self, slot: AwsWorkerSlot) -> bool:
         return str(self._describe(slot).get("State", {}).get("Name", "")) == "running"
+
+    def _desc_state_name(self, desc: dict) -> "str | None":
+        return str(desc.get("State", {}).get("Name", "")).lower() or None
 
     def _health_ok(self, slot: AwsWorkerSlot) -> "bool | None":
         if slot.ip is None:
@@ -1487,6 +1955,21 @@ class Ec2HibernateConfig(Ec2Config):
     # precedent. Recommend a positive value >= peak park duration (e.g. 3600) to reclaim leaked EBS cost.
     orphan_max_age_s: float = 0.0
 
+    def __post_init__(self) -> None:
+        # CHAIN FIRST: the base validates the probe budgets, and a subclass defining
+        # __post_init__ silently replaces it otherwise (the base says so in its own comment).
+        super().__post_init__()
+        # Same class as the probe budgets and every pool knob: a float that PARSES but cannot mean a
+        # duration. This tier had none of it, and this PR made hibernate_timeout_s load-bearing
+        # twice in _park_expired -- as the credit cap `min(credit + live, hibernate_timeout_s)` AND
+        # as the threshold. NaN wins both: `min(x, nan)` is x and `x > nan` is False, so the give-up
+        # escape can NEVER fire -- the escape whose own comment says that without it the slot is
+        # unclaimable forever AND blocks its own replacement. A NEGATIVE value inverts it instead:
+        # `min(0, -1)` is -1, so `age > -1` is true at age 0 and every slot in the tier is retired
+        # on first observation. Neither is a configuration anyone can mean.
+        # (Nothing tier-specific left to clamp: the base now covers every float field this class
+        # declares, including hibernate_timeout_s, resume_timeout_s and resume_poll_s.)
+
     @classmethod
     def from_env(cls, get: Callable[[str], str | None], **overrides: Any) -> Ec2HibernateConfig:
         import dataclasses
@@ -1514,6 +1997,13 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
     hibernate/start because EC2 saves+restores RAM."""
 
     kind = "aws-ec2-hibernate"
+    #: Returned by _park_step_locked to mean "I need an agent probe, which must NOT run under the
+    #: lock". The wrapper drops the lock, probes, and re-enters with the answer.
+    _PROBE_PENDING = "\x00probe-pending"
+    #: Same hand-back for the stop-instances call. `_try_park` blocks for the aws-cli budget, so
+    #: running it inside the locked pass would block the reaper thread on _park_lock for the length
+    #: of a control-plane brownout -- the same defect as the probe, one call deeper.
+    _PARK_PENDING = "\x00park-pending"
     _ALIVE_STATES = ("pending", "running", "stopping", "stopped")
     _DEAD_STATES = ("shutting-down", "terminated")
     _uptime_backstop = True   # a wall-clock shutdown TTL would fire on resume; use a monotonic uptime timer
@@ -1521,16 +2011,64 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
     def __init__(self, cfg: Ec2HibernateConfig, **kw: Any) -> None:
         super().__init__(cfg, **kw)   # base provides _desc_cache + _describe_cached
         self.cfg: Ec2HibernateConfig = cfg
-        self._phase: dict[str, str] = {}   # slot_id -> "warming" | "hibernating" | "parked"
+        #: slot_id -> "warming" | "hibernating" | "resuming" | "parked".
+        #:
+        #: "parked" carried TWO meanings and that is what broke: (a) we hibernated this slot, which
+        #: is EVIDENCE the `stopped`/`stopping` doors consult, and (b) this slot was parked and may
+        #: be mid-resume, which is what starts the give-up clock when it comes back running.
+        #: Clearing it on resume fixed (a) -- a stale "parked" was being read as proof of a
+        #: hibernation we did not perform -- and silently destroyed (b). "resuming" is meaning (b)
+        #: alone: never evidence, always a clock.
+        self._phase: dict[str, str] = {}
         self._hib_attempt: dict[str, float] = {}   # slot_id -> last stop --hibernate attempt (throttle)
         self._hib_started: dict[str, float] = {}   # slot_id -> when it entered the hibernating phase
+        # slot_id -> when this slot FIRST began trying to park. Survives re-drives (see
+        # _park_expired) and is cleared only when the instance actually reaches 'stopped'.
+        self._park_since: dict[str, float] = {}
+        # slot_id -> when the stop API last stopped ANSWERING. While this is set the give-up clock
+        # above is frozen: a brownout is the control plane failing, not the slot failing to park.
+        self._park_unknown_since: dict[str, float] = {}
+        # slot_id -> seconds already banked from CLOSED no-verdict episodes. Kept separate from
+        # _park_since so that stays a FACT (when parking first began) rather than a running total
+        # that can be pushed into the future; the cap is applied to this ledger in _park_expired.
+        self._park_credit: dict[str, float] = {}
+        # Episodes opened by a park ATTEMPT (a stop we issued and got no verdict on), as opposed to
+        # ones opened because the agent or the describe was unobservable. Both live in
+        # _park_unknown_since, and conflating them cost twice: boot-time agent-unknown episodes
+        # were credited against a give-up clock that did not exist yet, and the only evidence of a
+        # LOST-RESPONSE hibernate was thrown away by the thaw. Two questions, two fields -- the
+        # same lesson as _warming_unknown_credit vs _never_ready on the pool side.
+        self._park_attempted: set[str] = set()
+        #: Slots whose hibernation attempt was DEFINITIVELY REFUSED (AccessDenied,
+        #: InvalidParameter, "not ready to hibernate yet"). Distinct from _park_attempted, which
+        #: also covers UNRESOLVED attempts: a refusal is a verdict that no image was captured, so
+        #: a later `stopped` -- an operator, an autoscaler, anything -- must not be adopted as a
+        #: parked warm slot. Cleared the moment an attempt is ACCEPTED.
+        self._park_refused: set[str] = set()
+        # Slot ids this runtime has already reaped. Disposal runs on the pool's dedicated reaper
+        # threads while is_ready / maintain_idle drive the park machine on the tick thread, so a
+        # write that started before the reap can land after it and RESURRECT per-slot entries for a
+        # slot that is gone -- ids are per-spawn UUIDs, so those never come back. Bounded by
+        # construction: capped, FIFO, and only ever consulted to suppress a late write.
+        self._reaped_ids: "collections.OrderedDict[str, None]" = collections.OrderedDict()
+        #: Serializes the tombstone against every park-bookkeeping write. The tombstone alone was
+        #: never enough: it made a late write DETECTABLE but not PREVENTABLE, because the check and
+        #: the write it guards sat in different critical sections -- i.e. in none at all. Reentrant
+        #: because the park machine calls its own helpers (_freeze_park/_thaw_park) while stepping.
+        self._park_lock = threading.RLock()
 
     def _service_available(self) -> bool:
         # fail LOUD (once, at pool build) on a hibernation-incapable config instead of churning
         # launch->warm->stop-fails->reap->respawn forever. Verify the instance type supports hibernation
         # and the root volume can hold the RAM image.
         super()._service_available()   # describe-instances probe
-        d = self._aws("ec2", "describe-instance-types", "--instance-types", self.cfg.instance_type)
+        # expect_output, and here it matters MOST: an empty rc=0 parsed to {}, so `its` was empty
+        # and the check below raised "does not support hibernation" -- a definitive VERDICT that
+        # permanently drops the tier (or blocks pool startup) on what was actually a blank answer.
+        # That is precisely the transient-read-as-dead class issue #79 exists to remove. As
+        # AwsNoVerdict (an AwsUnknownState) the cascade defers and re-probes instead.
+        d = self._aws("ec2", "describe-instance-types", "--instance-types", self.cfg.instance_type,
+                      expect_output=True)
         its = d.get("InstanceTypes", [])
         if not its or not its[0].get("HibernationSupported"):
             raise AwsWorkerError(
@@ -1598,63 +2136,828 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
             return None
         return answer
 
-    def _try_park(self, slot: AwsWorkerSlot) -> bool:
-        """Issue the THROTTLED ``stop --hibernate`` that parks a warmed slot. True iff it was accepted.
+    def _try_park(self, slot: AwsWorkerSlot) -> "bool | None":
+        """Issue the THROTTLED ``stop --hibernate`` that parks a warmed slot.
+
+        Returns True iff AWS ACCEPTED it, False iff AWS REFUSED it, and None iff we did not ask at
+        all (inside the throttle window). Raises ``AwsUnknownState`` when the stop API gave us no
+        verdict -- a throttle or a timeout. The three are deliberately distinct: only an ANSWER may
+        spend the caller's give-up budget.
 
         Throttled because the pool polls is_ready at ~10Hz, and TOLERANT of "not ready to hibernate
         yet" (the ec2-hibinit-agent needs ~1-2min after boot to lay down the hibernation reserve):
         a failed attempt leaves the phase alone so a later tick retries. Only a SUCCESSFUL stop
         advances to "hibernating"."""
         now = self._clock()
+        if self._slot_is_gone(slot.slot_id):
+            return None      # reaped mid-flight; do not re-create its bookkeeping
         if now - self._hib_attempt.get(slot.slot_id, 0.0) < self._liveness_cache_s:
-            return False
-        self._hib_attempt[slot.slot_id] = now
+            return None      # we did not ask, so this pass learned nothing either way
+        # PROVISIONAL stamp; the authoritative one is taken from COMPLETION in the finally below.
+        # The interval is _liveness_cache_s (5s) but stop-instances is bounded by the health-probe
+        # budget (30s), or cli_timeout_s (120s) unbudgeted -- so stamping only on entry left the
+        # mark six to twenty-four times older than the interval by the time the call returned, and
+        # the next pass re-issued it immediately. Rate-limiting a call by when it STARTED throttles
+        # nothing once the call outruns its own window. Fourth site on this branch with this exact
+        # shape (_last_admit_attempt, _maintain_last, and the two here), so it is worth naming:
+        # a throttle stamp belongs in a finally, not before the thing it throttles.
+        with self._park_writes(slot.slot_id) as live:
+            if not live:
+                return None      # reaped mid-flight; do not re-create its bookkeeping
+            self._hib_attempt[slot.slot_id] = now
+        refused = False
         try:
             self._aws("ec2", "stop-instances", "--instance-ids", str(slot.resource_id), "--hibernate")
-        except AwsWorkerError as exc:
-            _log.info("ec2-hibernate: stop --hibernate %s not ready yet (%s); will retry",
+        except AwsNoVerdict as exc:
+            # NO VERDICT: throttled, or the control plane never answered. NOT "this slot refuses to
+            # park" -- the difference decides whether the give-up clock may keep running, and
+            # stop-instances brownouts are CORRELATED, so reading them as refusals retires every
+            # healthy hibernate worker in the tier at once (issue #79).
+            #
+            # AwsNoVerdict, not AwsUnknownState: AWS ANSWERING "AccessDenied" or "InvalidParameter"
+            # arrives as a bare AwsUnknownState, and re-raising that froze the give-up clock
+            # forever -- the slot was republished every pass while the instance ran and billed
+            # indefinitely. A refusal is a verdict; only silence is not. An answered refusal falls
+            # through to the handler below, ages the clock, and is retired at give-up like any
+            # other slot that will not park.
+            _log.info("ec2-hibernate: stop --hibernate %s got no verdict (%s); will retry",
                       slot.slot_id, str(exc)[:120])
-            return False
+            raise
+        except AwsWorkerError as exc:
+            _log.info("ec2-hibernate: stop --hibernate %s refused (%s); will retry until give-up",
+                      slot.slot_id, str(exc)[:120])
+            # Fall through to the ONE tombstone check below rather than returning here. Returning
+            # ran the finally and then left, skipping that check entirely -- so a slot reaped while
+            # this stop was in flight came back as an ANSWERED refusal, and _park_step recreated
+            # _park_since and _park_refused for a per-spawn UUID that no longer exists and that
+            # nothing will ever collect. The success path already routes through the check; the
+            # refusal path has the same obligation and now shares the same exit.
+            refused = True
+        finally:
+            # Re-stamp from COMPLETION. See the provisional stamp above: the whole point of the
+            # throttle is that a slow call must not be re-issued the instant it returns.
+            #
+            # ...but only if the slot still exists. The entry check at the top of this method is not
+            # enough: stop-instances is the SLOW call, and a stop()/resize can reap the slot while
+            # it is in flight -- reap() then installs the tombstone and clears the dicts, and this
+            # finally writes one straight back. Same for the _phase/_hib_started assignments below.
+            # A tombstone consulted only on entry cannot see a reap that happens during the call.
+            with self._park_writes(slot.slot_id) as live:
+                if live:
+                    self._hib_attempt[slot.slot_id] = self._clock()
+        with self._park_writes(slot.slot_id) as live:
+            # LIVENESS FIRST, then the refusal. A refusal is still an answer ABOUT A SLOT, and a
+            # slot reaped during the stop has no answer to report -- returning False there let
+            # _park_step take the refusal at face value and re-create _park_since/_park_refused for
+            # a gone per-spawn UUID (covered by test_a_refused_stop_for_a_reaped_slot_recreates_no_state).
+            if not live:
+                return None  # reaped while the stop was in flight; do not re-create its state
+            if refused:
+                return False
+            return self._record_park_accepted_locked(slot)
+
+    def _record_park_accepted_locked(self, slot: AwsWorkerSlot) -> bool:
+        """Publish an ACCEPTED hibernate. ``_park_lock`` HELD and ``slot`` known live."""
         self._desc_cache.pop(slot.slot_id, None)   # force a fresh describe next poll
         self._phase[slot.slot_id] = "hibernating"
-        self._hib_started[slot.slot_id] = now
+        # self._clock(), NOT the pre-call `now`. This is when the stop was ACCEPTED, and the
+        # stale-`running` settle window is measured from it -- so stamping the pre-call value let
+        # the duration of the stop itself consume the whole window: a throttled 30s stop against a
+        # 5s window left ZERO settle time, i.e. the guard was a no-op for exactly the throttled
+        # case it exists for. Sixth instance of stamp-before-call on this branch, three lines below
+        # the sibling that gets it right and the comment saying a stamp "belongs in a finally".
+        self._hib_started[slot.slot_id] = self._clock()
         return True
 
-    def is_ready(self, slot: AwsWorkerSlot) -> bool:
+    def is_alive_for_claim(self, slot: AwsWorkerSlot, *, budget_s: float | None = None
+                           ) -> "bool | None":
+        """Reject a slot whose hibernation is IN FLIGHT (issue #80, finding 1).
+
+        If EC2 accepts ``stop-instances --hibernate`` but the response is lost, the instance is
+        ``stopping`` -- which EC2 counts as alive and whose agent still answers. A claimant would
+        resume it, succeed against that still-live agent, and the pending hibernation would then
+        complete DURING the job. The previous attempt guarded this with the phase bookkeeping, which
+        is exactly the state a lost response corrupts, so it guarded nothing.
+
+        UNKNOWN rather than False: a stopping instance is not dead, and a claim probe must never
+        destroy one. It is simply not claimable right now, and either reaches `stopped` (claimable
+        again) or is escaped by the maintenance window's timeout.
+        """
+        # CORROBORATE the describe with what we already know. maintain_idle issues
+        # `stop-instances --hibernate` and records the phase synchronously, then reports the slot
+        # usable -- so the pool republishes it as IDLE and wakes claimants one instruction later.
+        # DescribeInstances is eventually consistent and still answers "running" for a short
+        # window after the stop is accepted, so the describe below cannot be the only guard: the
+        # claim succeeds, the job POSTs, and the accepted hibernation completes mid-detonation.
+        #
+        # Deliberately an OR, and deliberately only in this direction: this can make the probe
+        # more conservative (skip a claim) and never authorise one. That is what makes it safe to
+        # lean on bookkeeping a lost response can corrupt -- a phase wrongly reading "hibernating"
+        # costs a skipped claim, which the park give-up timeout escapes; the inverse would cost a
+        # job. (The earlier attempt guarded this with phase state ALONE, which is why the describe
+        # check exists at all; the two together are strictly stronger than either.)
+        if self._phase.get(slot.slot_id) == "hibernating":
+            _log.info("ec2-hibernate: slot %s has a hibernate in flight -- not claimable this scan",
+                      slot.slot_id)
+            return None
+        if slot.slot_id in self._park_unknown_since:
+            # A park attempt we never got a verdict on. The LOST-RESPONSE case leaves the phase at
+            # "warming" (only a SUCCESSFUL stop advances it) and EC2 can still describe the
+            # instance as `running` for a window afterwards -- so both checks above pass and the
+            # slot is handed to a job that the accepted hibernation then suspends underneath.
+            # Unknown means unknown: not claimable until something answers. One-directional like
+            # the phase check, so a stale entry costs a skipped claim, never a bad claim, and the
+            # bound in _park_expired keeps it from costing that forever.
+            _log.info("ec2-hibernate: slot %s has an unresolved park attempt -- not claimable "
+                      "this scan", slot.slot_id)
+            return None
+        # ONE scope around BOTH describes. _claim_probe_budget only mins against an OUTER LIVE
+        # scope (`prev = getattr(self._tls, "probe_deadline", None)`); once a scope exits it
+        # restores prev to None, so a second sibling scope computes a FRESH clock()+bound. An
+        # earlier attempt at this fix simply wrapped the super() call in its own scope, which left
+        # the two describes with a full budget each exactly as before -- is_alive_for_claim(
+        # budget_s=5) blocking ~10s while holding the dispatcher's warm-gate reservation. The
+        # nesting the docstring describes only works from INSIDE, so the whole body has to be in
+        # one scope and super()'s own nested scope then mins against it.
+        with self._claim_probe_budget(budget_s):
+            try:
+                self._desc_cache.pop(slot.slot_id, None)
+                if self._state(slot) == "stopping":
+                    _log.info("ec2-hibernate: slot %s is 'stopping' (hibernate in flight) -- "
+                              "not claimable this scan", slot.slot_id)
+                    return None
+            except AwsUnknownState:
+                return None   # could not tell -> skip, never destroy
+            except (AwsWorkerError, OSError):
+                pass          # fall through to the ordinary probe, which has its own verdict rules
+            return super().is_alive_for_claim(slot, budget_s=budget_s)
+
+    _PARK_GIVE_UP = "give-up"
+
+    # ---- the give-up clock's no-verdict episode -------------------------------------------
+    #
+    # ONE opener and ONE closer, deliberately. This started as a single freeze in _try_park and
+    # grew to three writers (that site, the agent probe, is_ready's describe handler) and TWO
+    # closers that disagreed: the answered-stop closer credited the outage back, the `stopping`
+    # closer popped the freeze bare. So a brownout was charged in full to the episode whenever
+    # recovery observed `stopping` -- the HEALTHY state, meaning the hibernate was progressing --
+    # while a recovery observing `running` was forgiven. The failing state was pardoned and the
+    # succeeding one retired. A fourth spot fix would not have made three writers agree; a single
+    # pair does, by construction.
+
+    _REAPED_IDS_MAX = 4096
+
+    def _slot_is_gone(self, sid: str) -> bool:
+        """True once this runtime has reaped ``sid`` -- so a late write must not re-create it.
+
+        ONLY meaningful while ``_park_lock`` is held. Read outside it, the answer is stale the
+        instant it is returned: the reaper thread can install the tombstone between this call and
+        whatever write it was supposed to authorize. Go through :meth:`_park_writes`.
+        """
+        return sid in self._reaped_ids
+
+    @contextlib.contextmanager
+    def _park_writes(self, sid: str) -> "collections.abc.Iterator[bool]":
+        """THE chokepoint for park bookkeeping. Yields True while ``sid`` is still live.
+
+        Disposal runs on the pool's dedicated reaper thread while the park machine runs on the tick
+        thread, so "is this slot still alive?" and "write the entry that answer authorizes" have to
+        happen in ONE critical section. They did not: every writer called `_slot_is_gone` and then
+        wrote, and a reap landing in between installed the tombstone and cleared the maps, after
+        which the in-flight write re-created entries for a slot that is gone. Slot ids are per-spawn
+        UUIDs, so nothing ever removes them again -- each race leaks bookkeeping permanently, and
+        the leak is unbounded across a shutdown/maintenance storm.
+
+        Ordering it inside ``reap`` (tombstone before the pops) fixed the half of the window where
+        the write started AFTER the tombstone. This closes the other half, where the write started
+        before it and could not have seen it at any price.
+
+        Holding a lock across the whole park step is safe because the step is pure bookkeeping: it
+        decides from an ALREADY-OBSERVED state and issues no AWS calls. The two writers that DO call
+        AWS (`_try_park`, `resume`) take it only around their writes, never around the call.
+        """
+        with self._park_lock:
+            yield sid not in self._reaped_ids
+
+    def _freeze_park(self, sid: str, now: float, *, park_attempted: bool = False) -> None:
+        """Open a no-verdict episode: we asked and learned nothing about this slot's parking.
+
+        ``park_attempted`` means the silence was a STOP WE ISSUED going unanswered -- which is
+        itself evidence that this slot was being parked, and is the lost-response case. A freeze
+        opened because the agent socket or the describe was unreadable is NOT that, and must not be
+        mistaken for it.
+        """
+        with self._park_writes(sid) as live:
+            if not live:
+                return
+            self._park_unknown_since.setdefault(sid, now)
+            if park_attempted:
+                self._park_attempted.add(sid)
+
+    def _thaw_park(self, sid: str, now: float) -> None:
+        """Close it, banking the unobservable interval in the CREDIT LEDGER.
+
+        Every recovery path goes through here, so they cannot drift apart again. Crediting is what
+        makes the freeze honest: hibernate_timeout_s asks "has this SLOT spent too long failing to
+        park?", and time in which the control plane would not answer is not time the slot spent
+        failing.
+
+        Banked, NOT applied to _park_since. Shifting the origin forward was wrong twice over:
+
+          * UNBOUNDED. _park_expired caps a LIVE freeze, so the cap only ever governed an OPEN
+            episode; closing one added the whole interval with no cap at all. A partial brownout --
+            silence broken by one answered pass every so often -- therefore reset the effective age
+            on every cycle. Measured: 6.9h of wall clock, effective age pinned at 5s, the slot never
+            retired and the instance billing throughout. That is precisely the failure the cap was
+            introduced to end, re-entered through the closer instead of the opener.
+          * ORDER-DEPENDENT. It only worked if _park_since already existed, so the two closers had
+            to disagree about whether to setdefault first -- and the `stopping` one credited against
+            a clock it had created in the same breath, landing _park_since in the FUTURE by the
+            length of the outage (measured: the give-up escape fired at 7510s instead of 310s, and
+            logged "stuck for 310s" while doing it). I had written a comment calling that ordering
+            deliberate.
+
+        A ledger has neither problem: _park_since stays a FACT that never moves, and the cap is
+        applied once, to the total, in _park_expired.
+        """
+        with self._park_writes(sid) as live:
+            return self._thaw_park_locked(sid, now, live=live)
+
+    def _thaw_park_locked(self, sid: str, now: float, *, live: bool) -> None:
+        """``_thaw_park`` with ``_park_lock`` HELD. See that method."""
+        stalled = self._park_unknown_since.pop(sid, None)
+        if stalled is None or not live:
+            return
+        if sid in self._park_attempted and sid not in self._park_since:
+            # A stop we ISSUED but never got a verdict on is a park attempt, and this answer is the
+            # moment to start timing it -- from when the attempt began. Without this the thaw
+            # destroyed the only evidence a lost-response hibernate ever happened: the `stopped`
+            # that followed was refused as "no hibernation ever attempted", a genuinely parked slot
+            # was discarded, and _park_since never existed so give-up could never fire either.
+            self._park_since[sid] = stalled
+        started = self._park_since.get(sid)
+        if started is None:
+            # Nothing was being timed during the silence, so there is no clock to credit. Crediting
+            # anyway banked the whole BOOT warm-up window -- every poll before the address resolves
+            # freezes on `_agent_healthy() is None` -- and then subtracted it from a clock that
+            # starts afterwards, buying up to a second hibernate_timeout_s of free suppression that
+            # an operator could not configure away.
+            return
+        # Only the part of the silence that overlapped the clock can be credited to it.
+        self._park_credit[sid] = (
+            self._park_credit.get(sid, 0.0) + max(0.0, now - max(stalled, started)))
+
+    def _park_expired(self, sid: str, now: float) -> bool:
+        """Has this slot spent longer than hibernate_timeout_s trying to PARK, across all attempts?
+
+        Measured from the first attempt of the episode and NOT reset by a re-drive, so a slot that
+        keeps accepting the stop and waking back up still reaches the escape instead of cycling
+        forever (issue #80).
+        """
+        started = self._park_since.get(sid)
+        if started is None:
+            return False
+        # ONE cap, applied ONCE, to the TOTAL: banked credit from closed episodes plus whatever a
+        # currently-open one has accrued. Capping only the OPEN episode was the hole -- closing one
+        # banked its whole interval uncapped, so a partial brownout (silence, one answered pass,
+        # repeat) reset the effective age every cycle and the give-up escape never fired: 6.9h of
+        # wall clock with the age pinned at 5s. Ride out a brownout; do not ride out an outage.
+        # This is the same shape the pool uses for _warming_unknown_credit_s, deliberately.
+        frozen_at = self._park_unknown_since.get(sid)
+        live = max(0.0, now - frozen_at) if frozen_at is not None else 0.0
+        credited = min(self._park_credit.get(sid, 0.0) + live, self.cfg.hibernate_timeout_s)
+        return (now - started - credited) > self.cfg.hibernate_timeout_s
+
+    def _park_step(self, slot: AwsWorkerSlot, st: str, now: float) -> "tuple[str, bool | None]":
+        """Advance the boot -> warm -> hibernate -> parked machine ONE step from an OBSERVED state.
+
+        Returns ``(phase, ready)``; ``ready`` is the is_ready verdict (True = parked and claimable).
+
+        ONE machine, driven from BOTH the WARMING poll and the IDLE maintenance window (issue #80).
+        The previous attempt bolted a second, partial copy onto the idle path, and the transitions
+        it was missing -- the timeout escape and the back-to-running recovery that the warming copy
+        already had -- became the next review round's findings. There is no second copy now.
+
+        REALITY-DRIVEN, not bookkeeping-driven. Every transition is decided from ``st``, because a
+        lost ``stop-instances`` response is precisely what corrupts the phase: EC2 accepted the
+        hibernate, we never saw the reply, and our own record is the one thing we cannot trust.
+        """
+        healthy: "bool | None | Any" = _UNPROBED
+        park_outcome: Any = _UNPROBED
+        # At most one probe AND one stop, so the third pass is always handed both answers and the
+        # loop cannot spin: probe -> stop -> settle.
+        for _ in (0, 1, 2):
+            with self._park_writes(slot.slot_id) as live:
+                if not live:
+                    self._forget_slot_locked(slot.slot_id)
+                    # The reaper disposed of this slot while the tick thread was inside a describe.
+                    # Every write below (_phase, _hib_started, _park_since) would re-create per-slot
+                    # state for an id that no longer exists, and ids are per-spawn UUIDs so nothing
+                    # removes it again. Guarding the two credit helpers was not enough: _park_step is
+                    # the DOMINANT writer of exactly the entries reap() clears -- and checking here
+                    # without HOLDING the lock only moved the race, it did not close it.
+                    return self._phase.get(slot.slot_id, "warming"), False
+                out = self._park_step_locked(slot, st, now, healthy=healthy,
+                                              park_outcome=park_outcome)
+                if out[0] not in (self._PROBE_PENDING, self._PARK_PENDING):
+                    return out
+                pending = out[0]
+            # LOCK RELEASED for the slow call. Re-entering through _park_writes rather than carrying
+            # the earlier liveness answer forward is the whole point: that answer went stale the
+            # instant the lock dropped, and the slot can be reaped while we sit in the round trip.
+            if pending == self._PROBE_PENDING:
+                healthy = self._agent_healthy(slot)
+                continue
+            # The stop is a MUTATION, so its result is settled directly rather than by re-running
+            # the machine: _try_park advances _phase, and a second pass carrying the `st` observed
+            # BEFORE the stop would read our own hibernate as a came-back-running recovery and throw
+            # the evidence away. (The existing suite caught exactly that.)
+            try:
+                park_outcome = ("ok", self._try_park(slot))
+            except (AwsNotExecuted, AwsNoVerdict, AwsUnknownState) as exc:
+                # Carried, not handled: the handlers write park state, so they belong under the
+                # lock. Re-raised inside _settle_park_locked at the original call site.
+                park_outcome = ("exc", exc)
+            with self._park_writes(slot.slot_id) as live:
+                if not live:
+                    self._forget_slot_locked(slot.slot_id)
+                    return self._phase.get(slot.slot_id, "warming"), False
+                return self._settle_park_locked(slot, now, park_outcome)
+        return self._phase.get(slot.slot_id, "warming"), None
+
+    def _forget_slot_locked(self, sid: str) -> None:
+        """Purge state a slow UNLOCKED call may have re-published after reap. ``_park_lock`` HELD.
+
+        The probe and the stop run with the lock released, and both write through caches the reaper
+        clears: `_describe_cached` publishes `_desc_cache[sid]` on success and `_desc_fail_at[sid]`
+        on failure. If reap() completes while one of those is in flight, the write lands AFTER the
+        slot's only cleanup -- and since ids are per-spawn UUIDs, nothing collects it again. The
+        tombstone stops the PARK maps being re-created but says nothing about the describe caches,
+        so re-entry finding the slot gone does the final sweep here.
+        """
+        self._desc_cache.pop(sid, None)
+        self._desc_fail_at.pop(sid, None)
+        self._live_cache.pop(sid, None)
+        for d in (self._phase, self._hib_attempt, self._hib_started,
+                  self._park_since, self._park_unknown_since, self._park_credit):
+            d.pop(sid, None)
+        self._park_attempted.discard(sid)
+        self._park_refused.discard(sid)
+
+    def _settle_park_locked(self, slot: AwsWorkerSlot, now: float,
+                            park_outcome: Any) -> "tuple[str, bool | None]":
+        """Apply the outcome of a stop-instances issued with the lock RELEASED.
+
+        Called INSTEAD of re-running _park_step_locked. Re-entering the whole machine after
+        the stop was wrong in a way the tests caught: _try_park advances _phase to
+        "hibernating", so the second pass -- still holding the `st` observed BEFORE the stop
+        ("running") -- took the came-back-running recovery branch and discarded the very park
+        evidence the stop had just created. The machine must not re-interpret a state string
+        that predates its own mutation; only the settlement re-runs.
+
+        ``_park_lock`` HELD and ``slot`` known live.
+        """
+        sid = slot.slot_id
+        # FRESH CLOCK, not the caller's pre-call `now`. `is_ready` samples `now` once and opens no
+        # budget scope (unlike maintain_idle), and the wrapper then makes up to TWO unbounded calls
+        # with it frozen -- the agent probe and stop-instances, each able to burn cli_timeout_s
+        # (120s). Settling against that stale value charges the LATENCY of those calls to the
+        # operator's 300s parking budget: measured, a 240s pass anchors _park_since 240s in the
+        # past, so 80% of the window is gone before the first attempt is even counted, and the tier
+        # churns instances instead of parking them during exactly the brownout it must survive.
+        # This is the rule the file already states in _record_park_accepted_locked -- "self._clock(),
+        # NOT the pre-call `now` ... stamping the pre-call value let the duration of the stop itself
+        # consume the whole window" -- applied to that fix's siblings, reached from the same wrapper
+        # after the same stop.
+        now = self._clock()
+        try:
+            _kind, _payload = park_outcome
+            if _kind == "exc":
+                # Re-raise the captured exception HERE so the existing handlers below -- which
+                # are the state writes, and must stay locked -- are unchanged.
+                raise _payload
+            # KEEP THE THREE-WAY ANSWER. `_try_park(...) is not None` collapsed ACCEPTED and
+            # REFUSED into one "answered" bucket. That is right for the give-up clock -- a
+            # refusal IS a verdict and must spend the budget -- but wrong as evidence of
+            # parking: it set _park_since for a slot AWS had flatly refused to hibernate, and
+            # the `stopped` adoption reads _park_since as proof a warm image exists.
+            parked = _payload
+            answered = parked is not None
+        except AwsNotExecuted:
+            # The stop never left this host, so there is no attempt to record. Freeze the
+            # give-up clock (we learned nothing, and the cause is maximally correlated --
+            # every slot and thread hits a fork failure at once), but park_attempted stays
+            # FALSE: _park_attempted is read as proof that a `stopped` instance holds a warm
+            # image we captured, and a call that never ran captured nothing. Same rule the
+            # observation-only freezes already follow, and the same class as the `stopping`
+            # branch that used to manufacture its own evidence.
+            self._freeze_park(sid, now)
+            return self._phase.get(sid, "warming"), None
+        except AwsNoVerdict:
+            # Freeze the give-up clock for as long as the stop API keeps not answering, and
+            # never START it on a non-answer: an unanswered stop is no evidence at all about
+            # this slot, and spending the park budget on it drains every healthy hibernate
+            # worker during a stop-API brownout (issue #79).
+            #
+            # AwsNoVerdict, NOT AwsUnknownState. AWS answering "AccessDenied" or
+            # "InvalidParameter" to stop-instances arrives as a bare AwsUnknownState, and
+            # freezing on THAT is the mirror bug: _park_since never starts, the give-up clock
+            # is frozen forever, the slot is republished every pass, and the instance runs and
+            # bills indefinitely. A refusal is a verdict; only silence is not.
+            # A NEWER attempt supersedes an older refusal. Without this, a transient "not
+            # ready to hibernate yet" refusal outlived the attempt it described: a later stop
+            # that was ACCEPTED but whose response was lost left the stale mark in place, and
+            # the `stopped` adoption then rejected a genuinely hibernated worker -- which stays
+            # non-ready until the pool times it out and reaps it. The marker has to describe
+            # the LATEST attempt, not any attempt.
+            self._park_refused.discard(sid)
+            self._freeze_park(sid, now, park_attempted=True)
+            # ready=None, NOT False. This return feeds is_ready, and a definitive False there
+            # tells the POOL something we do not know: _promote_warming ends the slot's
+            # warming-unknown episode on any definitive answer, so the warming timeout resumes
+            # aging and the tier's WARMING population is evicted over a stop API that never
+            # answered. Freezing OUR clock while handing the pool a verdict we do not have just
+            # moves the same drain one layer up -- the tri-state has to be honoured on the way
+            # out as well as on the way in.
+            return self._phase.get(sid, "warming"), None
+        if answered:
+            # AWS is talking to us again.
+            self._thaw_park(sid, now)
+            self._park_since.setdefault(sid, now)
+            # The give-up clock runs either way (above); parking EVIDENCE does not.
+            if parked is False:
+                self._park_refused.add(sid)
+            else:
+                self._park_refused.discard(sid)
+        if sid in self._park_unknown_since:
+            # NOT ASKED, and an unresolved park episode is still open: _try_park returned None
+            # because _hib_attempt is throttling retries (~5s), not because we learned
+            # anything. Returning a definitive False here closes WarmPool's warming-UNKNOWN
+            # episode, so warming_timeout_s resumes aging -- and during a sustained stop-API
+            # brownout only ONE poll per retry interval stayed UNKNOWN, so the tier's WARMING
+            # slots timed out and were reaped anyway. The tri-state has to survive the
+            # THROTTLE as well as the call.
+            return self._phase.get(sid, "warming"), None
+        return self._phase.get(sid, "warming"), False
+
+    def _park_step_locked(self, slot: AwsWorkerSlot, st: str, now: float, *,
+                          healthy: "bool | None | Any" = _UNPROBED,
+                          park_outcome: Any = _UNPROBED) -> "tuple[str, bool | None]":
+        """``_park_step`` with ``_park_lock`` HELD and ``slot`` known live. See that method.
+
+        ``healthy`` is an agent-probe result the caller took UNLOCKED, or ``_UNPROBED`` when it has
+        not probed yet -- in which case this returns ``(_PROBE_PENDING, None)`` instead of probing,
+        because the probe is network I/O and must not run under ``_park_lock``.
+        """
+        sid = slot.slot_id
+        phase = self._phase.get(sid, "warming")
+        if st in self._DEAD_STATES:
+            return phase, False          # is_alive/_health_check reaps it
+        if st == "stopped":
+            # Hibernated, whatever we believed -- but only if a hibernation was ever ATTEMPTED.
+            # Adopting `stopped` unconditionally treats any stopped instance as a parked warm slot,
+            # including one that never got that far: a failed boot, or an operator stopping it by
+            # hand. There is no warmed process captured in that image, so the pool advertises
+            # capacity that cannot serve, and a claim spends the whole resume budget starting an
+            # instance whose agent was never up. Require evidence: a phase we drove, a started
+            # hibernation, an open give-up episode, or an unresolved attempt.
+            attempted = (phase in ("hibernating", "parked")
+                         or sid in self._hib_started
+                         or sid in self._park_since
+                         or sid in self._park_attempted)
+            # _park_unknown_since is deliberately NOT in that list. It is opened by
+            # OBSERVATION-ONLY freezes too -- _agent_healthy() returning None while a public IP is
+            # still unassigned, an unreadable describe -- with park_attempted=False. Those say
+            # nothing about whether we ever asked EC2 to hibernate, so counting them let an
+            # instance stopped by an operator or boot automation be adopted as a parked warm slot
+            # whose image was never captured. A genuine unresolved ATTEMPT sets _park_attempted
+            # (see _freeze_park(park_attempted=True)) and is still covered.
+            # ...but a slot AWS DEFINITIVELY REFUSED to hibernate has no captured image, so
+            # whatever stopped it, it was not us succeeding. Adopting it advertises capacity that
+            # cannot serve, and a claim then spends the whole resume budget starting an instance
+            # whose agent was never up. Evidence of an ATTEMPT is not evidence of a PARK.
+            # ...but only when the refusal accounts for EVERY attempt. _park_attempted marks a stop
+            # WE ISSUED that got no verdict (see _freeze_park(park_attempted=True)), and such an
+            # attempt may well have been ACCEPTED with its response lost. A later retry refused with
+            # IncorrectInstanceState -- the expected answer when the FIRST stop is already taking
+            # effect -- says nothing about that earlier attempt, so letting it veto adoption rejects
+            # a genuinely hibernated worker (image and all) and leaves it to be timed out and reaped.
+            # The mirror of the stale-marker bug below: there a refusal outlived its attempt, here it
+            # reaches back past one. A refusal only ever describes the attempt that produced it.
+            if attempted and sid in self._park_refused and sid not in self._park_attempted:
+                _log.warning("ec2-hibernate: slot %s is 'stopped' but its hibernation was "
+                             "REFUSED -- not a parked warm slot", sid)
+                attempted = False
+            if not attempted:
+                _log.warning("ec2-hibernate: slot %s is 'stopped' with no hibernation ever "
+                             "attempted -- not a parked warm slot", sid)
+                return phase, False        # not ready; the health path judges it
+            # The lost-response case lands here correctly: the stop DID take, so adopt reality
+            # rather than re-issuing it.
+            self._phase[sid] = "parked"
+            self._hib_started.pop(sid, None)
+            self._park_since.pop(sid, None)     # parked: the give-up clock is done
+            self._park_unknown_since.pop(sid, None)   # episode over; nothing to credit it to
+            self._park_credit.pop(sid, None)
+            self._park_attempted.discard(sid)
+            self._park_refused.discard(sid)
+            return "parked", True
+        if st == "stopping":
+            # ...but only if it is OUR stop. `stopping` means something is stopping this instance,
+            # not that we asked: an operator or boot automation stopping a WARMING instance produces
+            # exactly the same observation. Adopting it unconditionally MANUFACTURED the very
+            # evidence the `stopped` adoption below requires -- it writes _phase, _hib_started and
+            # _park_since, three of that predicate's four sources -- so the next observation walked
+            # straight through the guard and published an image that was never hibernated. The pool
+            # then advertises capacity that cannot serve and a claim burns the whole resume budget
+            # on an instance whose agent was never up. Evidence has to come from something other
+            # than the branch that consumes it.
+            #
+            # The lost-response case this branch exists for is NOT lost: an unanswered stop sets
+            # _park_attempted (_freeze_park(park_attempted=True)), and an accepted one sets
+            # _hib_started at issue time. Both are recorded before we ever see `stopping`.
+            # "parked" is NOT in that list. resume() does no phase bookkeeping on purpose (see the
+            # note in Ec2HibernateRuntime.resume), so a slot whose resume ACCEPTED start-instances
+            # and then browned out is handed back with _phase still "parked" while the instance is
+            # actually RUNNING. If anything else then stops it, treating that stale value as proof
+            # of a current hibernation writes fresh markers and publishes a never-hibernated image
+            # -- the same adoption this guard was added to close, entered through a phase that
+            # describes the PAST. "hibernating" is different: it is written when WE issue the stop.
+            if not (phase == "hibernating"
+                    or sid in self._park_attempted
+                    or sid in self._hib_started):
+                _log.warning("ec2-hibernate: slot %s is 'stopping' with no hibernation of ours "
+                             "outstanding -- not adopting it as a parking in flight", sid)
+                return phase, False
+            # A hibernate is in flight -- possibly one whose response we lost, which is why the
+            # phase is adopted from the observation rather than trusted.
+            if phase != "hibernating":
+                self._phase[sid] = "hibernating"
+            self._hib_started.setdefault(sid, now)
+            # Start the episode clock from the OBSERVATION when we have none. The lost-response
+            # case is precisely the one where we never recorded issuing the stop, so keying the
+            # escape only on our own attempt record left exactly that case unable to ever expire.
+            #
+            # ...but anchor it at the ATTEMPT when there was one. _park_attempted means we issued a
+            # stop and got no verdict, and _park_unknown_since is when that happened -- so the
+            # episode began THEN, not when AWS started answering again. Anchoring at the recovery
+            # let the whole outage skip _park_expired's credit cap: the cap exists so a brownout is
+            # ridden out and an OUTAGE is not, and an interval that is never measured is never
+            # capped. Measured with hibernate_timeout_s=300 and a 3000s outage: give-up fired 3310s
+            # after the episode began instead of 600s (300 of budget + at most 300 of credited
+            # silence), leaving the slot unclaimable for another full timeout after recovery.
+            #
+            # This anchors EARLIER, which is the opposite of the bug _thaw_park's docstring
+            # describes: that one shifted the origin FORWARD by the credit and put _park_since in
+            # the future. Reading the attempt time is not the same operation.
+            _episode_began = now
+            if sid in self._park_attempted:
+                _episode_began = self._park_unknown_since.get(sid, now)
+            self._park_since.setdefault(sid, _episode_began)
+            # Seeing 'stopping' IS the stop API answering: whatever we could not get a verdict on
+            # was in fact accepted. Close the episode -- THROUGH _thaw_park, so the outage is
+            # credited exactly as the answered-stop path credits it. This used to be a bare pop,
+            # which charged the whole brownout to the give-up clock on the one observation that
+            # means the hibernate is SUCCEEDING.
+            #
+            # Order no longer matters here. It used to, and the comment that lived on this line
+            # asserted the ordering was deliberate -- "ordered after the setdefault so a
+            # lost-response episode has something to credit against". That was the bug written down
+            # as intent: crediting an interval to a clock that did not exist during it put
+            # _park_since in the FUTURE by the whole outage, and the escape fired at 7510s instead
+            # of 310s while logging "stuck for 310s". The ledger removed the dependency entirely.
+            self._thaw_park(sid, now)
+            if self._park_expired(sid, now):
+                # AWS documents instances getting stuck in `stopping`. Without this escape the slot
+                # is unclaimable forever AND blocks its own replacement, so a warm_size=1 tier stays
+                # dead until someone intervenes (issue #80, finding 2).
+                _log.warning("ec2-hibernate: %s stuck in 'stopping' for %.0fs -- giving up on it",
+                             sid, now - self._park_since.get(sid, now))
+                return self._PARK_GIVE_UP, False
+            return "hibernating", False
+        if st == "running":
+            if phase in ("hibernating", "parked", "resuming"):
+                # THREE ways to be awake when we did not expect it:
+                #  - resuming: a resume that ACCEPTED start-instances and then lost its describe or
+                #    its health probe. The slot is running and unclaimed, and this is the only
+                #    marker that says so -- without it the phase reads "warming", this branch is
+                #    skipped, _park_since is never started, and _park_step returns above before
+                #    _try_park is ever reached, so nothing re-hibernates a running, billing
+                #    instance for the life of the process.
+                #  - hibernating: the stop was ACCEPTED and then failed asynchronously
+                #  - parked: THE MOTIVATING CASE (issue #80). resume() half-succeeded --
+                #    start-instances landed, a later describe browned out, the claim was handed back
+                #    non-destructively -- so the instance is RUNNING while the pool counts a parked
+                #    warm slot and EC2 bills a running one, with nothing to re-hibernate it. Also
+                #    the ordinary post-job state, since a slot that served a job is awake.
+                # ...but NOT on a stop that is still in flight. DescribeInstances is eventually
+                # consistent -- this file relies on that elsewhere -- so a `running` reading can
+                # simply be stale for a window after the stop was accepted. Re-driving on it wipes
+                # `hibernating`, which is the claim gate: is_alive_for_claim then sees phase
+                # "warming" and another stale `running`, authorises the claim, and the accepted
+                # hibernation suspends the instance mid-job. Wait out the settle window (the same
+                # _liveness_cache_s the rest of the file throttles on) before believing `running`
+                # over a stop we know landed; a genuinely failed hibernate is still re-driven, just
+                # one poll later.
+                started_at = self._hib_started.get(sid)
+                if phase == "hibernating" and started_at is not None \
+                        and (now - started_at) < self._liveness_cache_s:
+                    _log.debug("ec2-hibernate: %s reads running %.1fs after an accepted stop -- "
+                               "treating as an eventually-consistent describe, not a wake-up",
+                               sid, now - started_at)
+                    return "hibernating", False
+                _log.info("ec2-hibernate: %s is running but recorded %s -- re-driving to warm", sid, phase)
+                self._phase[sid] = "warming"
+                self._hib_started.pop(sid, None)
+                # Deliberately do NOT clear _park_since. Re-driving resets the per-ATTEMPT clock;
+                # the give-up clock measures the whole episode. Resetting it here would let an
+                # instance that keeps accepting the stop and waking up again cycle
+                # running -> stop -> running forever, never reaching the escape -- finding 2
+                # inverted, and a hole an existing test caught.
+                #
+                # ...but START it if it is not running. A slot that reached `parked` had
+                # _park_since POPPED, so coming back RUNNING after a partial resume left no clock
+                # at all: if the resumed agent then stays unhealthy, _park_step returns above
+                # before _try_park is ever reached, so no later path starts one either, and
+                # maintenance republishes a running, billing instance indefinitely. Setting it
+                # here starts the episode at the observation that opened it.
+                self._park_since.setdefault(sid, now)
+                return "warming", False      # observe once more before acting again
+            if self._park_expired(sid, now):
+                _log.warning("ec2-hibernate: %s never parked after %.0fs -- giving up on it",
+                             sid, now - self._park_since.get(sid, now))
+                return self._PARK_GIVE_UP, False
+            if healthy is _UNPROBED:
+                # The agent probe is NETWORK I/O: _resolve_ip() can issue an uncached describe and
+                # the health check is an HTTP round trip. Running it here holds _park_lock across
+                # both, so the reaper thread blocks on disposal for the length of a control-plane
+                # brownout -- the tick-thread stall this branch exists to remove, transplanted onto
+                # the reaper thread. Hand it back to the wrapper, which runs it unlocked.
+                return self._PROBE_PENDING, None
+            if healthy is None:
+                # UNKNOWN, not unhealthy. _agent_healthy is tri-state and a bare falsy check
+                # flattened it: the host failing to OPEN the health socket (correlated local fd
+                # exhaustion, for instance) says nothing about the worker, but read as "not warm
+                # yet" it kept aging the give-up clock until a healthy instance was retired. Same
+                # freeze as an unanswered stop -- an absent answer is not evidence.
+                self._freeze_park(sid, now)
+                # ready=None, NOT False -- the same rule the AwsNoVerdict branch below already
+                # states and this branch did not follow. is_ready() forwards this value, and
+                # _promote_warming ends the slot's warming-unknown episode on ANY definitive
+                # answer, so a False here resumes aging warming_timeout_s over a probe that never
+                # happened. _agent_healthy returns None for maximally CORRELATED host-side causes
+                # (no address yet, probe budget already spent), so one host fault would evict every
+                # WARMING instance in the tier while each guest was booting fine. Freezing our own
+                # give-up clock and then handing the pool a verdict we do not have just moves the
+                # drain one layer up.
+                return "warming", None
+            if not healthy:
+                # A DEFINITIVE "not warm yet" closes the episode. Opening the freeze here without a
+                # closer left _park_expired pinned to the first UNKNOWN timestamp for good: an
+                # agent that went unknown once and was thereafter definitively unhealthy could
+                # never reach give-up, so maintenance republished a running, billing instance
+                # forever. The rule this whole branch runs on is "only SILENCE freezes"; the
+                # closer has to honour it too, or the rule only ever runs in one direction.
+                # (The bound in _park_expired caps the damage; it is not a substitute for closing.)
+                self._thaw_park(sid, now)
+                return "warming", False
+            # Warmed -> PARK it: stop --hibernate. THROTTLED (the pool polls is_ready at ~10Hz) and
+            # TOLERANT of "not ready to hibernate yet" -- the ec2-hibinit-agent needs ~1-2min after
+            # boot to lay down the hibernation reserve. Only a SUCCESSFUL stop advances the phase,
+            # and re-issuing it is harmless: the operation is idempotent by design, because an
+            # accepted-but-lost response must be safe to repeat.
+            if park_outcome is _UNPROBED:
+                # stop-instances is an AWS mutation bounded only by the cli budget. Issue it from
+                # the wrapper with the lock RELEASED; the exception handling below still runs under
+                # the lock, because it writes park state.
+                return self._PARK_PENDING, None
+            return self._settle_park_locked(slot, now, park_outcome)
+        # pending / rebooting / anything else: still coming up.
+        return phase, False
+
+    def maintain_idle(self, slot: AwsWorkerSlot, *, budget_s: "float | None" = None) -> bool:
+        """Reconcile one IDLE slot against reality, under the pool's exclusive window (issue #80).
+
+        ``budget_s`` is the POOL's bound on how long this may occupy its single tick thread. The
+        runtime's own health_probe_timeout_s (30s) is a sensible ceiling for a background probe and
+        far too long for the thread that also drives promotion, health checks, reaping and
+        replacement spawning -- and the rotation reaches a DIFFERENT slot each tick, so during a
+        control-plane brownout the stall is continuous rather than one-off. Who owns the thread
+        decides how long it may be held, so the pool passes the number.
+
+        Expiry needs no new machinery: the bounded call raises AwsProbeTimeout (an AwsUnknownState),
+        which the handler below already treats as "we could not look, change nothing" -- so the slot
+        is simply reconsidered on a later rotation. Deferring on expiry IS the existing tri-state
+        behaviour, reached by a shorter clock.
+
+        Returns False when the slot is UNUSABLE and should be retired.
+
+        The pool has flipped this slot to ASSIGNED for the duration, so ``claim`` cannot take it --
+        which is the property the first attempt lacked, when this ran off ``is_alive`` with nothing
+        excluding a concurrent claimant and could hibernate an instance out from under a job.
+        """
+        # ONE budget across the WHOLE pass, not one per stage. Unbudgeted, _aws falls back to
+        # cli_timeout_s (120s) and this runs on the pool's single maintenance thread -- but two
+        # SIBLING scopes are barely better: _health_probe_budget mins only against an OUTER LIVE
+        # scope, so a describe that nearly exhausts the 30s bound followed by a FRESH scope for
+        # _park_step (an agent probe AND stop-instances) occupies the tick thread for nearly twice
+        # the configured bound. Third time this exact sibling-scope mistake has been made on this
+        # branch: the nesting composes only from INSIDE.
+        try:
+            with (self._call_budget(budget_s) if budget_s is not None
+                  else self._health_probe_budget()):
+                try:
+                    # UNCACHED: reconciliation must not act on a stale describe.
+                    st = self._state(slot)
+                except AwsUnknownState as exc:
+                    # We could not look. Change nothing -- acting on a guess here is how the
+                    # bookkeeping got corrupted in the first place.
+                    #
+                    # ...but DO freeze the give-up clock, exactly as is_ready does. These are the
+                    # two drivers of ONE state machine against ONE control plane, and the freeze
+                    # was applied to only one of them: an IDLE slot's park clock aged straight
+                    # through a describe brownout and the first answered pass retired it. Measured
+                    # on the same 400s outage: is_ready path park_expired=False, maintain_idle path
+                    # park_expired=True and the slot retired.
+                    if isinstance(exc, AwsNoVerdict) and slot.slot_id in self._park_since:
+                        self._freeze_park(slot.slot_id, self._clock())
+                    _log.debug("ec2-hibernate: maintain_idle(%s) unknown: %s", slot.slot_id, exc)
+                    return True
+                phase, _ = self._park_step(slot, st, self._clock())
+        except AwsNoVerdict as exc:
+            # The SECOND no-verdict door. The handler above covers the opening describe; this one
+            # covers everything _park_step itself asks -- notably _agent_healthy, which issues its
+            # own describe when slot.ip is unset (a public-IP slot returned after a partial resume)
+            # and raises when the SHARED maintenance budget is already spent by the first call.
+            # Returning usable without freezing let _park_since age through every inconclusive pass
+            # until give-up retired a healthy running instance. Same rule as everywhere else on
+            # this branch: silence freezes the clock, and it has to freeze at every door.
+            if slot.slot_id in self._park_since:
+                self._freeze_park(slot.slot_id, self._clock())
+            _log.debug("ec2-hibernate: maintain_idle(%s) no verdict: %s", slot.slot_id, exc)
+            return True
+        except (AwsWorkerError, OSError) as exc:
+            _log.debug("ec2-hibernate: maintain_idle(%s) error: %s", slot.slot_id, exc)
+            return True
+        return phase != self._PARK_GIVE_UP
+
+    def is_warming_terminal(self, slot: AwsWorkerSlot) -> bool:
+        """True once this slot has passed the WHOLE-EPISODE park give-up point.
+
+        The guide says of hibernate_timeout_s: "on expiry the slot is RETIRED ... Size it as the
+        point at which you want the slot destroyed." That held on the IDLE path -- maintain_idle
+        returns False and the pool reaps -- but maintain_idle only ever runs on IDLE slots. A slot
+        still WARMING reported plain not-ready and then waited out warming_timeout_s (600s against
+        a 300s park budget), so a running, billing instance sat past its documented destruction
+        point for another five minutes, blocking its own replacement.
+
+        Reads recorded state only: no probe, no lock held by the caller, and never True on an
+        UNKNOWN -- _park_expired credits no-verdict episodes, so a brownout cannot age a slot into
+        this.
+        """
+        return (self._phase.get(slot.slot_id) == self._PARK_GIVE_UP
+                or self._park_expired(slot.slot_id, self._clock()))
+
+    def is_ready(self, slot: AwsWorkerSlot) -> "bool | None":
         # Per-slot state machine, polled by the pool during WARMING: boot -> warm -> hibernate -> parked.
+        # TRI-STATE like the base class: None = the control plane didn't answer. This tier has the
+        # LONGEST warming budget (600s) and therefore the most to lose from folding a brownout into
+        # "not ready" -- every describe below can throttle, and each one used to land in the blanket
+        # handler at the bottom as a False (issue #79).
         try:
             now = self._clock()
-            phase = self._phase.get(slot.slot_id, "warming")
-            if phase == "warming":
-                if str(self._describe_cached(slot, self._liveness_cache_s)
-                       .get("State", {}).get("Name", "")).lower() != "running":
-                    return False
-                if not self._agent_healthy(slot):
-                    return False
-                # Warmed -> PARK it: stop --hibernate. THROTTLE the attempt (the pool polls is_ready at
-                # ~10Hz) -- and TOLERATE "not ready to hibernate yet" (the ec2-hibinit-agent needs ~1-2min
-                # after boot to lay down the hibernation reserve). On a failed/throttled attempt we stay
-                # in "warming" and retry on a later tick; only a SUCCESSFUL stop advances to "hibernating".
-                self._try_park(slot)
+            st = str(self._describe_cached(slot, self._liveness_cache_s)
+                     .get("State", {}).get("Name", "")).lower()
+            phase, ready = self._park_step(slot, st, now)
+            if phase == self._PARK_GIVE_UP:
+                # Stuck past hibernate_timeout_s. Report not-ready and let the warming timeout /
+                # health check replace it, rather than spinning here forever.
                 return False
-            if phase == "hibernating":
-                st = str(self._describe_cached(slot, self._liveness_cache_s)
-                         .get("State", {}).get("Name", "")).lower()
-                if st == "stopped":
-                    self._phase[slot.slot_id] = "parked"
-                    return True
-                # RECOVERY: hibernate can be ACCEPTED then fail async (instance lands back 'running'), or
-                # hang. Don't sit in 'hibernating' forever spinning until warming_timeout -- re-drive from
-                # 'warming' (the stop is re-issued, throttled) if it came back running or blew the budget.
-                started = self._hib_started.get(slot.slot_id, now)
-                if st in self._DEAD_STATES:
-                    return False   # is_alive/_health_check will reap it
-                if st == "running" or (now - started) > self.cfg.hibernate_timeout_s:
-                    _log.info("ec2-hibernate: %s hibernate did not take (state=%s, %.0fs) -- re-driving",
-                              slot.slot_id, st, now - started)
-                    self._phase[slot.slot_id] = "warming"
-                return False
-            return True   # parked -- claimable; resume() wakes it on claim
+            return ready
+        except AwsUnknownState as exc:
+            # FREEZE THE PARK CLOCK TOO, not only the pool's warming timeout. _park_step is never
+            # reached on this path, so an unanswered DESCRIBE left the independent hibernation
+            # timer running: an outage covering the remainder of hibernate_timeout_s -- comfortably
+            # inside the default UNKNOWN grace -- meant the first recovered `running` observation
+            # went straight to _park_expired and retired a HEALTHY slot before even retrying the
+            # park. Same correlated-brownout drain as the stop-API case, through a different door.
+            # Only for a slot whose park episode has actually started; _park_expired ignores the
+            # rest -- and only on AwsNoVerdict, never the broad class.
+            #
+            # That narrowing is the RULE this branch kept learning the hard way: catching the broad
+            # AwsUnknownState is fine when the consequence is "do nothing THIS PASS" (every other
+            # handler in this file returns None and is conservative), and wrong when the
+            # consequence is "suppress a safety timeout INDEFINITELY". A revoked credential makes
+            # describe-instances answer AccessDenied -- a bare AwsUnknownState -- and freezing on
+            # that would park the give-up clock forever while the instance runs and bills.
+            if isinstance(exc, AwsNoVerdict) and slot.slot_id in self._park_since:
+                self._freeze_park(slot.slot_id, self._clock())
+            # A throttled describe tells us NOTHING about whether this instance booted, warmed, or
+            # parked. Returning False here spent the 600s warming budget on the control plane's
+            # silence and then terminated the instance (issue #79). The phase is left untouched, so
+            # the machine resumes from wherever it was once AWS answers again.
+            _log.debug("ec2-hibernate: is_ready(%s) unknown: %s", slot.slot_id, exc)
+            return None
         except (AwsWorkerError, OSError) as exc:
             _log.debug("ec2-hibernate: is_ready(%s) error: %s", slot.slot_id, exc)
             return False
@@ -1687,11 +2990,23 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
                 raise AwsWorkerError(f"ec2-hibernate slot {slot.slot_id} is {st!r}; cannot resume")
             if st == "stopped":
                 self._aws("ec2", "start-instances", "--instance-ids", str(slot.resource_id))
-            # NOTE: no phase bookkeeping here. An earlier revision set _phase="warming" so an
-            # is_alive() reconciler could re-park a slot whose resume browned out after the start
-            # was accepted -- but that reconciler was removed from this branch (see issue #80), and
-            # _phase is read only by is_ready(), which the pool calls for WARMING slots only. So the
-            # write had no reader and only advertised machinery that is not here.
+            # THE SLOT IS NO LONGER PARKED FROM HERE. Either we just accepted a start, or it was
+            # already awake -- so drop the phase instead of leaving "parked" behind it.
+            #
+            # An earlier revision dropped this write with the note that "_phase is read only by
+            # is_ready(), which the pool calls for WARMING slots only", so it had no reader. It has
+            # readers now: the `stopped` adoption predicate and the `stopping` evidence guard both
+            # consult the phase. A resume that ACCEPTED start-instances and then browned out used
+            # to hand the slot back with _phase still "parked" while the instance was RUNNING, so
+            # if anything else stopped it later that stale value read as proof of a hibernation of
+            # ours and the never-hibernated image was published as a warm slot.
+            #
+            # Placed AFTER the start call on purpose. Clearing it earlier would erase the evidence
+            # of a slot that is still genuinely parked whenever the describe or the start raises --
+            # and an unrecognised parked slot is not adopted, so it gets retired instead.
+            with self._park_writes(slot.slot_id) as live:
+                if live:
+                    self._phase[slot.slot_id] = "resuming"
             self._resolve_ip(slot, refresh=True)   # private IP retained, but re-describe to be safe
         # The runtime's resume_timeout_s is a CEILING; the dispatcher's remaining claim window wins
         # when it is shorter, so one unreachable slot cannot burn the whole window and starve the
@@ -1808,9 +3123,42 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         ) from last_exc
 
     def reap(self, slot: AwsWorkerSlot) -> None:
-        for d in (self._phase, self._desc_cache, self._hib_attempt, self._hib_started):
-            d.pop(slot.slot_id, None)
+        # TERMINATE FIRST, forget afterwards. Clearing the bookkeeping up front only holds if the
+        # terminate succeeds: when it raises -- the correlated-brownout case, where the pool KEEPS
+        # the slot and either quarantines or restores it -- the runtime has already thrown away the
+        # evidence that this slot was ever parking. That now matters more than it used to, because
+        # `stopped` is only adopted as a parked warm slot when some park evidence exists (phase,
+        # _hib_started, _park_since or an open episode); a slot whose terminate failed would come
+        # back with all four gone and its own hibernation no longer recognisable, so it would be
+        # reported not-ready forever instead of being reclaimed. super() pops the slot from its own
+        # tracking on success, so the ordering costs nothing on the happy path.
         super().reap(slot)   # terminate-instances (disposable after one untrusted job)
+        # Tombstone FIRST. Written after the pops it left a window in which a concurrent write
+        # could re-create exactly what was just removed -- the guard not yet in force for the pops
+        # it exists to protect.
+        # Under the lock: a reader that has already passed its liveness check must not be able to
+        # interleave between the tombstone and the pops it authorizes.
+        with self._park_lock:
+            self._reaped_ids[slot.slot_id] = None
+            while len(self._reaped_ids) > self._REAPED_IDS_MAX:
+                self._reaped_ids.popitem(last=False)
+            # _desc_fail_at is popped by super().reap() too, but that runs BEFORE this critical
+            # section -- so a _describe_cached FAILURE still in flight lands its
+            # `_desc_fail_at[sid] = clock()` after the slot's only cleanup. `_forget_slot_locked`
+            # sweeps it, but is only reachable from _park_step re-entry, and the failing-describe
+            # path never gets there: is_ready() describes BEFORE _park_step, so the exception
+            # short-circuits out. Clear it here, inside the tombstone, like every other map.
+            # _live_cache belongs here too, and guarding its publication was NOT sufficient on its
+            # own: super().reap() pops the caches BEFORE it takes this lock, so a publication that
+            # legitimately holds the lock can re-add the entry in that gap, and this sweep -- which
+            # runs after -- is the only thing that can remove it again. Both halves are needed: the
+            # lock makes the check-and-write atomic, this list makes the tombstone authoritative.
+            for d in (self._phase, self._desc_cache, self._desc_fail_at, self._live_cache,
+                      self._hib_attempt, self._hib_started, self._park_since,
+                      self._park_unknown_since, self._park_credit):
+                d.pop(slot.slot_id, None)
+            self._park_attempted.discard(slot.slot_id)
+            self._park_refused.discard(slot.slot_id)
 
     def sweep_orphans(self, *, max_age_s: float | None = None, now: float | None = None,
                       dry_run: bool = False) -> list[str]:
@@ -1828,9 +3176,17 @@ class Ec2HibernateRuntime(DisposableEc2Runtime):
         if not (max_age > 0):
             return []
         now = time.time() if now is None else now
+        # expect_output: this is the sweep's INVENTORY, and an empty inventory is the same shape as
+        # a successful sweep that found nothing. Without it a blank rc=0 parsed to {}, Reservations
+        # came back empty, and the sweep reported success having reclaimed nothing -- and both
+        # callers are ONE-SHOT (dispatcher start, and a tier's admission), so a single transient
+        # blank-output incident silently forfeits reclamation until the next process restart, with
+        # the predecessor's hibernated instances accruing EBS cost the whole time. Raising instead
+        # lets the callers' existing handlers report a FAILED sweep, which is the truth.
         resp = self._aws("ec2", "describe-instances", "--filters",
                          f"Name=tag:{_TAG_TIER},Values={self.kind}",
-                         "Name=instance-state-name,Values=stopping,stopped")
+                         "Name=instance-state-name,Values=stopping,stopped",
+                         expect_output=True)
         killed: list[str] = []
         for res in resp.get("Reservations", []):
             for inst in res.get("Instances", []):

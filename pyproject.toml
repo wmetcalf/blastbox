@@ -87,3 +87,9 @@ markers = [
     "docker: exercises the built Docker image",
     "perf: performance benchmark gate; needs a benchmarkable host (skipped otherwise)",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# E402 in tests is CORRECT, not debt. `pytest.importorskip("boto3")` has to run BEFORE the
+# imports it guards, otherwise the module raises at collection time on any machine without the
+# optional dependency instead of skipping. Moving those imports to the top would break the skip.
+"tests/**" = ["E402"]
