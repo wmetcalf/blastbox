@@ -785,6 +785,15 @@ class Dispatcher:
         # BLASTBOX_CANARY=0 broke that comparison in exactly the deployments that opted out,
         # including the documented one where the store is deliberately absent at boot.
         _log.info("canary.blob_store %s", describe_blob_store(self._blobs))
+        # TOPOLOGY ENFORCEMENT IS NOT THE PROBE, and must not share its off switch. BLASTBOX_CANARY
+        # disables the write/read round-trip; BLASTBOX_REQUIRE_SHARED_BLOB_STORE is an explicit hard
+        # requirement, documented as failing closed at startup. Coupling them meant CANARY=0 silently
+        # dropped the requirement too, so a Postgres/Redis dispatcher on a private LocalBlobStore
+        # started happily and produced DONE jobs whose results no other machine can read -- the single
+        # worst deployment bug this fleet has had, re-enabled by an unrelated opt-out. Second thing
+        # found behind this toggle that did not belong to it; the blob-store log was the first.
+        check_store_coherence(self._job_store, self._blobs, self._job_root,
+                              require_shared=self._require_shared_blob_store)
         if canary:
             self.self_test(gate=True)
         if max(1, int(concurrency)) > 1:

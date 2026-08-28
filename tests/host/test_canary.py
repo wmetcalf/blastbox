@@ -867,3 +867,60 @@ def test_the_version_purge_ignores_a_store_that_is_not_s3_shaped(tmp_path):
 
     store = LocalBlobStore(str(tmp_path))
     _cleanup(store, "canary-job")            # must not raise
+
+
+def test_required_shared_storage_is_enforced_even_with_the_canary_disabled(tmp_path):
+    """`BLASTBOX_REQUIRE_SHARED_BLOB_STORE` is a hard requirement, not part of the probe.
+
+    `BLASTBOX_CANARY` turns off the write/read round-trip. Coupling the topology check to that
+    toggle meant `CANARY=0` silently dropped the requirement too -- so a Postgres/Redis dispatcher
+    on a private LocalBlobStore started happily and produced DONE jobs whose results no other
+    machine can read. That is the single worst deployment bug this fleet has had, re-enabled by an
+    unrelated opt-out, and it contradicts the guide's "startup fails closed" promise.
+
+    Driven through `run_forever(canary=False)` rather than `self_test()`, because `self_test` is
+    exactly the thing the toggle skips -- a test that calls it directly cannot see this bug.
+
+    MUTATION: move check_store_coherence back inside `if canary:` -> the dispatcher starts.
+    """
+    from blastbox.host.dispatch import Dispatcher, EngineSpec
+    from blastbox.limits import Limits
+
+    d = Dispatcher(
+        job_store=_Postgres(),                      # SHARED queue...
+        engines={"e": EngineSpec(name="e", image="img:t", worker_argv=[])},
+        limits=Limits.from_env(),
+        job_root=tmp_path,
+    )
+    d._blobs = _local(tmp_path)                     # ...PRIVATE store: the incoherent pair
+    d._require_shared_blob_store = True
+
+    claimed: list[int] = []
+    d.dispatch_once = lambda: claimed.append(1) or False  # type: ignore[method-assign]
+
+    with pytest.raises(CanaryFailure) as ei:
+        d.run_forever(poll_interval_s=0.001, maintenance_interval_s=0,
+                      stop=lambda: True, canary=False)
+    assert "SHARED queue" in str(ei.value)
+    assert claimed == [], "the dispatcher claimed work before the topology gate refused it"
+
+
+def test_the_coherent_case_still_starts_with_the_canary_disabled(tmp_path):
+    """Enforcement must fail CLOSED on the incoherent pair, not fail ALWAYS.
+
+    A shared queue with a shared store, canary off, must still start -- otherwise this guard just
+    breaks every opt-out deployment instead of the misconfigured ones.
+    """
+    from blastbox.host.dispatch import Dispatcher, EngineSpec
+    from blastbox.limits import Limits
+
+    d = Dispatcher(
+        job_store=_Postgres(),
+        engines={"e": EngineSpec(name="e", image="img:t", worker_argv=[])},
+        limits=Limits.from_env(),
+        job_root=tmp_path,
+    )
+    d._blobs = _FakeS3()                            # shared queue + shared store: coherent
+    d._require_shared_blob_store = True
+    d.run_forever(poll_interval_s=0.001, maintenance_interval_s=0,
+                  stop=lambda: True, canary=False)  # must not raise

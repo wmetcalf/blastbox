@@ -1794,3 +1794,58 @@ def test_an_infinite_declared_resume_timeout_does_not_become_an_infinite_thaw_de
     assert math.isfinite(vm._validate_timeout_s), (
         f"_validate_timeout_s={vm._validate_timeout_s}; the watchdog allowance is built from the "
         f"same budget, so an infinite thaw disables the heartbeat watchdog outright")
+
+
+def test_a_slow_maintenance_sweep_does_not_immediately_resweep(tmp_path):
+    """The interval must be measured from when the sweep FINISHED, not when it was due.
+
+    `last_maint` was stamped from `now` -- a value read BEFORE the wait -- and then the sweep ran.
+    `_run_maintenance` retries every pending upload through the blob store, so when that store is
+    unhealthy a sweep routinely outlasts the interval. The next pass then finds the deadline
+    already overdue, `min(waits)` goes negative, the loop waits only its 50ms floor and sweeps
+    again: continuous retries against an unhealthy store, with no interval at all, produced by the
+    interval logic itself.
+
+    The canary three lines above already re-stamps from completion, with a comment saying why. The
+    rule was applied to one and not to its sibling.
+
+    MUTATION: stamp `last_maint = now` before the sweep -> the gaps collapse to the 50ms floor.
+    """
+    import threading
+    import time
+
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
+
+    d = VmJobDispatcher(InMemoryJobStore(), str(tmp_path), lambda p: ({}, True),
+                        worker_tier="libvirt-vm")
+    d._maintenance_interval_s = 0.20
+    d._canary_cb = None
+    d._canary_interval_s = 0.0
+
+    starts: list[float] = []
+    done = threading.Event()
+
+    def _slow_sweep() -> None:
+        starts.append(time.monotonic())
+        if len(starts) >= 3:
+            done.set()
+            return
+        time.sleep(0.30)               # LONGER than the interval
+
+    d._run_maintenance = _slow_sweep   # type: ignore[method-assign]
+    t = threading.Thread(target=d._maintenance_loop, daemon=True)
+    t.start()
+    assert done.wait(timeout=10.0), "the maintenance loop never reached three sweeps"
+    d._stop.set()
+    t.join(timeout=5.0)
+
+    gaps = [b - a for a, b in zip(starts, starts[1:])]
+    assert gaps, "need at least two sweeps to measure a gap"
+    # Sweep takes 0.30s; interval is 0.20s. From COMPLETION the next start is ~0.30+0.20=0.50s.
+    # Stamped from the pre-wait `now`, the deadline is already overdue on return and the next
+    # start follows the 50ms floor -- i.e. ~0.30s, back-to-back sweeps.
+    assert min(gaps) > 0.40, (
+        f"sweeps restarted after {min(gaps):.3f}s despite a 0.20s interval and a 0.30s sweep "
+        f"({[round(g, 3) for g in gaps]}); the deadline was dated from before the sweep, so a slow "
+        f"sweep re-triggers immediately and hammers the store it is already struggling with")

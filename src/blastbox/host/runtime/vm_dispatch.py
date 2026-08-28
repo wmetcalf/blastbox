@@ -1002,8 +1002,16 @@ class VmJobDispatcher:
                 # is least able to answer.
                 last_canary = time.monotonic()
             if self._maintenance_interval_s > 0 and now - last_maint >= self._maintenance_interval_s:
-                last_maint = now
+                # RE-STAMPED FROM COMPLETION, for the same reason as the canary three lines above --
+                # a rule that was applied to the canary and not to its sibling. `now` predates the
+                # wait, so stamping it here dates the deadline from BEFORE a sweep that can run for
+                # minutes: retention retries every pending upload through the same store, so when
+                # the store is down a sweep routinely outlasts the interval. The next pass then
+                # finds the deadline already overdue, min(waits) goes negative, the loop waits its
+                # 50ms floor and sweeps again -- continuous retries against an unhealthy store,
+                # with no interval at all, produced by the interval logic.
                 self._run_maintenance()
+                last_maint = time.monotonic()
 
     def run(self) -> None:
         """Block, claiming + processing jobs on ``concurrency`` threads until :meth:`stop`. Also runs
