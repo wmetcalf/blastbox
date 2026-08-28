@@ -50,6 +50,20 @@ class StaticPoolUnavailable(RuntimeError):
     """No worker is configured / reachable -- the tier must not be selected."""
 
 
+class StaticPoolNoVerdict(StaticPoolUnavailable):
+    """We could not ASK. Distinct from "we asked and the fleet is down", which is the base class.
+
+    The cascade defers a tier whose availability probe reached no verdict and re-probes it, instead
+    of dropping it for the life of the process. That machine keys off the exception, so a transient
+    local fault (EMFILE, a NIC being reconfigured) has to be raised as something other than a
+    verdict -- otherwise static gets the pre-#79 behaviour on the tier the guide uses as its
+    canonical cascade example: primary -> CascadeMisconfigured at boot, overflow -> skipped for the
+    process lifetime with the pool still reporting green.
+
+    Subclasses StaticPoolUnavailable so every existing `except StaticPoolUnavailable` still catches
+    it -- this narrows the meaning, it does not change who handles it."""
+
+
 def _env(get: Callable[[str], str | None], key: str, default: str | None = None) -> str | None:
     v = get(key)
     return v if (v is not None and v != "") else default
@@ -208,9 +222,9 @@ class StaticPoolRuntime:
         verdict, and it hits every worker on the same tick. NB a refusal or reset is NOT that: those
         are real answers about the box and still return False -- an earlier version of this
         docstring had that backwards.
-        Callers that need a plain bool coerce with ``is True``; only is_alive() forwards the
-        UNKNOWN, so the pool can keep the slot and bound how long it stays that way rather than
-        marking the whole tier dead at once (issue #77 marla-loop 2)."""
+        is_alive(), is_alive_for_claim() and is_ready() all FORWARD the UNKNOWN, so the pool can
+        keep the slot and bound how long it stays that way rather than marking the whole tier dead
+        at once (issue #77 marla-loop 2). Anything that coerces to a plain bool must say why."""
         url = self._base_url(w) + self.cfg.health_path
         headers = {"X-aws-proxy-auth": w.token} if w.token else {}
         try:
@@ -225,9 +239,37 @@ class StaticPoolRuntime:
             return None
 
     # -- fail-closed availability ------------------------------------------
-    def available(self) -> bool:
-        """True iff at least one registered worker answers /healthz (fail-closed)."""
-        return any(self._health_ok(w) is True for w in self.cfg.workers)
+    def available(self) -> "bool | None":
+        """TRI-STATE, matching `_health_ok` and `is_ready`: True = a box answered healthy,
+        False = every box answered and none was healthy, None = nobody ANSWERED.
+
+        `any(... is True ...)` collapsed the third case into the second, which is issue #79's exact
+        shape: an unreachable control plane read as a definitive "this tier is down". This PR
+        converted `is_ready` here for that reason and left `available()`, which is the half the
+        cascade's deferral machine actually consults.
+
+        Still fail-closed for selection -- None is not "available" -- but the CALLER can now tell
+        the two apart and defer rather than discard."""
+        # SHORT-CIRCUIT on the first healthy worker. The tri-state rewrite collected every verdict
+        # eagerly before deciding, which quietly cost what the old `any(... is True ...)` never did:
+        # each unreachable box burns probe_timeout_s, so a 100-worker fleet whose FIRST worker is
+        # healthy issued 100 probes to learn something it knew after one. That lands on dispatcher
+        # startup and on every deferred-tier admission probe. Only whether a NON-healthy answer was
+        # ever unknown has to be remembered, so one flag replaces the list.
+        saw_unknown = False
+        any_worker = False
+        for w in self.cfg.workers:
+            any_worker = True
+            v = self._health_ok(w)
+            if v is True:
+                return True
+            if v is None:
+                saw_unknown = True
+        if not any_worker:
+            return False     # nothing configured -- a verdict, and fail-closed
+        return None if saw_unknown else False
+        # (A tri-state OR: True on any healthy, False only when every worker DEFINITIVELY said no,
+        # None when any was unobservable -- one unreachable box must not read as a fleet verdict.)
 
     # -- SlotRuntime protocol ----------------------------------------------
     def worker_identity(self, slot: object) -> str | None:
@@ -307,8 +349,17 @@ class StaticPoolRuntime:
             )
         raise StaticPoolUnhealthy("no free static worker is currently healthy")
 
-    def is_ready(self, slot: StaticWorkerSlot) -> bool:
-        return self._health_ok(self.cfg.workers[slot.worker_index]) is True
+    def is_ready(self, slot: StaticWorkerSlot) -> "bool | None":
+        """Tri-state, like every other SlotRuntime on this contract (pool.py: "None = UNKNOWN").
+
+        This coerced with ``is True`` back when readiness was a plain bool. It is not any more:
+        WarmPool suspends warming_timeout_s for the duration of an unknown episode, and only a None
+        opens one. Collapsing here meant a LOCAL fault -- EMFILE/ENOMEM, the host's own networking
+        being reconfigured -- read as a definitive "not ready" for every static worker on the same
+        tick, so the tier's whole WARMING population aged out and was evicted, each one charged as a
+        confirmed restore failure. That is issue #79's failure verbatim, on the tier nobody
+        converted. _health_ok was already tri-state; it just was not forwarded."""
+        return self._health_ok(self.cfg.workers[slot.worker_index])
 
     def is_alive(self, slot: StaticWorkerSlot) -> "bool | None":
         """always-on boxes: "alive" == reachable. Tri-state (issue #77 marla-loop 2).
@@ -399,6 +450,11 @@ def select_static_pool_runtime(
     ctx = dispatch_ssl_context_from_env(getter)
     probe = http_probe or (make_tls_probe(ctx) if ctx else None)
     rt = StaticPoolRuntime(cfg, http_probe=probe, ssl_context=ctx)
-    if require_available and not rt.available():
-        raise StaticPoolUnavailable("no configured static worker answered /healthz")
+    if require_available:
+        _avail = rt.available()
+        if _avail is None:
+            raise StaticPoolNoVerdict(
+                "no configured static worker could be probed (no verdict) -- deferring, not dropping")
+        if not _avail:
+            raise StaticPoolUnavailable("no configured static worker answered /healthz")
     return rt

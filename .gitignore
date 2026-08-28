@@ -8,7 +8,13 @@ dist/
 
 # Virtualenvs
 .venv/
+.venv
 venv/
+venv
+# NOTE: the bare forms matter. A pattern with a trailing slash matches DIRECTORIES
+# only, so a `.venv` SYMLINK into a scratch worktree sailed past `.venv/` and was
+# committed as a mode-120000 blob -- dangling in every other checkout, and breaking
+# the README setup step because `python3 -m venv .venv` refuses an existing path.
 
 # Tooling caches
 .pytest_cache/

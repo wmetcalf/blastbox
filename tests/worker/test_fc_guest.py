@@ -12,6 +12,7 @@ import struct
 import pytest
 
 from blastbox.worker.fc_guest import (
+    READY_ACK_SUFFIX,
     HOST_CID,
     READY_PORT,
     READY_TOKEN,
@@ -67,7 +68,7 @@ def test_signal_ready_success_sends_token_to_host_cid():
     assert ok is True
     sock = fac.made[0]
     assert sock.connected == (HOST_CID, READY_PORT)
-    assert sock.sent == READY_TOKEN
+    assert sock.sent == READY_TOKEN + READY_ACK_SUFFIX
     assert sock.closed is True
 
 
@@ -81,7 +82,7 @@ def test_signal_ready_retries_then_succeeds():
     ok = signal_ready_vsock(socket_factory=fac, retries=5, backoff_s=0.0)
     assert ok is True
     assert len(fac.made) == 3
-    assert fac.made[-1].sent == READY_TOKEN
+    assert fac.made[-1].sent == READY_TOKEN + READY_ACK_SUFFIX
     # Every socket, including the failed ones, is closed.
     assert all(s.closed for s in fac.made)
 
@@ -106,7 +107,7 @@ def test_run_fc_guest_warms_then_signals():
     ok = run_fc_guest(eng, socket_factory=fac)
     assert ok is True
     assert eng.warmed is True
-    assert fac.made[0].sent == READY_TOKEN
+    assert fac.made[0].sent == READY_TOKEN + READY_ACK_SUFFIX
 
 
 def test_run_fc_guest_warmup_error_is_nonfatal():
@@ -117,7 +118,7 @@ def test_run_fc_guest_warmup_error_is_nonfatal():
     fac = _Factory([_FakeVsock()])
     ok = run_fc_guest(_Engine(), socket_factory=fac)
     assert ok is True  # signalled ready despite the warmup error
-    assert fac.made[0].sent == READY_TOKEN
+    assert fac.made[0].sent == READY_TOKEN + READY_ACK_SUFFIX
 
 
 def test_run_fc_guest_skip_warmup():
@@ -141,6 +142,11 @@ def test_fc_protocol_constants_match_host():
 
     assert READY_PORT == host_fc._READY_PORT
     assert READY_TOKEN == host_fc._READY_TOKEN
+    # The guest now appends a capability suffix. The host's check is a SUBSTRING test, so this is
+    # what actually has to hold -- an older host must still see a READY in what a newer guest
+    # sends, or every slot on it would hang unpromoted.
+    assert host_fc._READY_TOKEN in (READY_TOKEN + READY_ACK_SUFFIX)
+    assert READY_ACK_SUFFIX == host_fc.READY_ACK_SUFFIX
     assert JOB_PORT == host_fc._JOB_PORT
 
 

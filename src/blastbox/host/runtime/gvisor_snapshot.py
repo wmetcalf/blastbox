@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from blastbox.worker.warm import AckCapability
 from blastbox.host.runtime.snapshot_backend import (
     generation_owner,
     hold_owner_lease,
@@ -229,6 +230,26 @@ def _default_cr_capable(runsc_bin: str) -> bool:
     return "checkpoint" in out and "restore" in out
 
 
+def read_base_ack_capability(ctrl_dir: Path) -> bool:
+    """Does the warm BASE advertise the start-marker protocol?
+
+    Read once, at base build, and that is the only chance: a gVisor restore gets a FRESH ctrl/
+    bind dir, and the checkpointed worker resumes PAST its one-time signal_ready(), so it never
+    writes `ready` again. Learning the capability from a restored slot is therefore impossible,
+    and learning it from a completed job fails on precisely the base that is wedged from its
+    first restore -- the one the fast repair exists for.
+
+    Confined like every other read of this worker-writable directory: `ready` is written by the
+    base container, and ctrl/ is bind-mounted 0o777.
+    """
+    from blastbox.contract.envelope import read_confined_regular_bytes
+    try:
+        raw = read_confined_regular_bytes(ctrl_dir, "ready", max_bytes=4096)
+    except (OSError, ValueError):
+        return False
+    return "ack=1" in raw.decode("utf-8", "replace")
+
+
 def _default_ready_wait(ctrl_dir: Path, timeout_s: float) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -269,6 +290,8 @@ class GvisorBootHandle:
         base_dir: Path,
         ctrl_dir: Path,
         ready_wait: Callable[[Path, float], None],
+        ack_capable: "AckCapability | None" = None,
+        ack_generation: "int | None" = None,
         stranded: list[str] | None = None,
     ) -> None:
         # Partial checkpoint directories whose cleanup failed. OWNED BY THE BACKEND and shared in:
@@ -281,9 +304,39 @@ class GvisorBootHandle:
         self._base = base_dir
         self._ctrl = ctrl_dir
         self._ready = ready_wait
+        self._ack_capable: "AckCapability | None" = ack_capable
+        # The generation this BUILD started under -- INJECTED by boot_base, which samples it
+        # before `runsc run`. Sampling it here was too late: constructing this handle is the LAST
+        # thing boot_base does, so an invalidate_base() landing during the (slow) launch advanced
+        # the generation first, and the retiring build stamped itself with the REPLACEMENT's.
+        # SnapshotManager then rejects its artifact via _build_epoch, but its readiness
+        # advertisement had already taught a generation it knows nothing about -- so a
+        # replacement bundle WITHOUT the protocol inherits `capable`, its absent start markers
+        # read as proof the guest never ran, and a healthy base is invalidated on repeat.
+        # None is MEANINGFUL: an unidentifiable build teaches nothing (#92).
+        self._ack_gen = ack_generation
 
     def wait_ready(self, timeout_s: float) -> None:
         self._ready(self._ctrl, timeout_s)
+        # THE ONLY CHANCE to learn it. A restore gets a fresh ctrl/ and the checkpointed worker
+        # resumes past its one-time signal_ready(), so `ready` is never written again -- and a
+        # base wedged from its first restore never completes a job either. Read it here, while
+        # the base is still the live container that wrote it.
+        if self._ack_capable is not None and read_base_ack_capability(self._ctrl):
+            # OBSERVE, not learn. Readiness proves this guest speaks the protocol; it does not
+            # prove the pool will ever run a slot from it. checkpoint() may still fail, in which
+            # case SnapshotManager publishes nothing -- and a capability taught here would
+            # outlive a base that never existed. If the worker bundle is then rolled back, the
+            # retry's plain readiness marker cannot clear it, and the older image's missing start
+            # markers are read as PROVEN non-starts: a document hang invalidates an
+            # ACK-incapable base instead of staying UNKNOWN. Confirmed in checkpoint().
+            self._ack_capable.observe(self._ack_gen)
+
+    @property
+    def ack_generation(self) -> "int | None":
+        """The generation this build was stamped with. Read by SnapshotManager to confirm the
+        deferred ACK advertisement once -- and only once -- this build's artifact is PUBLISHED."""
+        return self._ack_gen
 
     def checkpoint(self, dest_dir: Path) -> object:
         # Retry anything a previous failed checkpoint could not remove; no artifact was returned
@@ -503,6 +556,8 @@ class GvisorSnapshotBackend:
         run: Callable[..., int] = _default_run,
         run_text: Callable[[list[str]], str] = _default_run_text,
         ready_wait: Callable[[Path, float], None] = _default_ready_wait,
+        ack_capable: "AckCapability | None" = None,
+        epoch_sampler: "Callable[[], int | None] | None" = None,
         probe: Callable[[], bool] | None = None,
         cr_capable: Callable[[str], bool] = _default_cr_capable,
     ) -> None:
@@ -510,6 +565,11 @@ class GvisorSnapshotBackend:
         self._run = run
         self._run_text = run_text
         self._ready = ready_wait
+        self._ack_capable: "AckCapability | None" = ack_capable
+        # Reads SnapshotManager.build_epoch. Injected because the backend is constructed before
+        # the manager, and because the backend must not own an identity of its own -- that is the
+        # two-counter mistake issue #92 removes.
+        self._epoch_sampler: "Callable[[], int | None] | None" = epoch_sampler
         self._probe = probe
         self._cr_capable = cr_capable
         # Durable across boot handles: SnapshotManager kills and abandons a handle after a failed
@@ -534,6 +594,10 @@ class GvisorSnapshotBackend:
         # cold permanently. Same fix as the FC launcher; a retry is worthless if the condition it
         # fixes is what stops you reaching it (upstream, PR #82).
         _retry_stranded_partials(self._stranded_partials)
+        # BEFORE `runsc run` -- see GvisorBootHandle.__init__. The generation that is current when
+        # the build STARTS is the one this base can honestly speak for; anything sampled after the
+        # launch may already belong to the base that replaced it.
+        ack_gen = self._epoch_sampler() if self._epoch_sampler is not None else None
         # Unique per build so two pool processes sharing this -root parent (e.g. a
         # restart-overlap: the old process still tearing down while the new one boots)
         # don't collide on a fixed base bundle dir / cid and stomp each other's base.
@@ -568,7 +632,10 @@ class GvisorSnapshotBackend:
                 raise
             shutil.rmtree(base, ignore_errors=True)
             raise
-        return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready, stranded=self._stranded_partials)
+        return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready,
+                                ack_capable=self._ack_capable,
+                                ack_generation=ack_gen,
+                                stranded=self._stranded_partials)
 
     def restore_in(self, slot_workdir: Path, artifact: object) -> GvisorRestoreHandle:
         wd = Path(slot_workdir)

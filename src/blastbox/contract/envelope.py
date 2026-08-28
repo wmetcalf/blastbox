@@ -11,7 +11,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from .leaf import Detection, Warning
-from .nodes import ChildNode, _REBUILD_CALLBACKS, parse_node
+from .nodes import ChildNode, _Node, _REBUILD_CALLBACKS, parse_node
 
 
 class DeclaredArtifact(BaseModel):
@@ -281,7 +281,7 @@ def read_confined_regular_bytes(base: Path, relpath: str, *, max_bytes: int) -> 
 
 def seal_envelope(*, engine: str, outdir: Path, input_sha256: str,
                   detected: Detection, declared: list[DeclaredArtifact],
-                  warnings: list[Warning], payload: ChildNode,
+                  warnings: list[Warning], payload: _Node,
                   status: Literal["ok", "rejected", "engine_error"] = "ok",
                   max_artifact_bytes: int | None = None,
                   max_artifacts: int = _MAX_ARTIFACTS) -> Envelope:
@@ -367,7 +367,9 @@ def seal_envelope(*, engine: str, outdir: Path, input_sha256: str,
         raise ValueError(f"payload has unresolved ArtifactRef(s): {sorted(unresolved)}")
     return Envelope(engine=engine, status=status, input_sha256=input_sha256,
                     detected=detected, artifacts=artifacts, warnings=warnings,
-                    payload=payload)
+                    # The one spot the static type cannot express a runtime-rebuilt
+                    # discriminated union; pydantic validates it on construction.
+                    payload=payload)   # type: ignore[arg-type]
 
 
 def validate_envelope(env: Envelope, *, outdir: Path, max_artifact_bytes: int,

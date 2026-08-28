@@ -15,17 +15,31 @@ toggle, the FcSnapshotArtifact) live in
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import shutil
 import threading
 import time
 from pathlib import Path
+from typing import Protocol
 
 # _accepts_kwarg is the ONE definition of "does this callable declare that parameter" --
 # imported rather than copied, which is how the same optional-hook check drifted before.
 # pool.py imports nothing from runtime/, so this direction cannot cycle.
 from blastbox.host.pool import RuntimeAtCapacity, _accepts_kwarg
+
 from blastbox.host.runtime.snapshot_backend import RestoreHandle, SnapshotBackend
+
+
+class _AckPublishable(Protocol):
+    """The slice of AckCapability the manager needs.
+
+    Structural, not an import of the concrete class: worker.warm owns AckCapability and importing
+    it here would tie the snapshot manager to the worker package for a one-method call.
+    """
+
+    def begin_build(self) -> None: ...
+    def publish(self, epoch: "int | None") -> None: ...
 
 _log = logging.getLogger("blastbox.host.runtime.fc_snapshot")
 
@@ -91,6 +105,7 @@ class SnapshotManager:
         *,
         ready_timeout_s: float = 120.0,
         build_retry_backoff_s: float = 30.0,
+        ack_capable: "_AckPublishable | None" = None,
     ) -> None:
         self._base_dir = Path(base_dir)
         self._backend = backend
@@ -103,6 +118,11 @@ class SnapshotManager:
         # leaves a .mem roughly the size of guest RAM (gigabytes, often on /dev/shm), so repeated
         # rebuild episodes exhaust the tmpfs and every later build fails on ENOSPC.
         self._pins: dict[str, object] = {}          # slot_id -> the artifact it mapped
+        #: slot_id -> the build epoch of the artifact restore() actually pinned for it.
+        #: Recorded in the SAME critical section as the selection, because reading the epoch
+        #: separately (before or after) lets an invalidate+rebuild land in between and pair a
+        #: slot with the wrong identity.
+        self._pin_epoch: dict[str, int] = {}
         self._refs: dict[int, int] = {}             # id(artifact) -> live restores
         self._retired: dict[int, object] = {}       # id(artifact) -> superseded, awaiting drain
         # Build epoch. invalidate() bumps it; a build that started under an older epoch has been
@@ -111,6 +131,24 @@ class SnapshotManager:
         # nothing, and the build then published the very artifact the repair meant to reject --
         # so the second repair request was silently lost (upstream, PR #82).
         self._build_epoch = 0
+        # Optional. Set by the snapshot runtimes so PUBLICATION -- not readiness, and not even a
+        # successful checkpoint -- is what makes a base's ACK advertisement believable.
+        self._ack_capable = ack_capable
+        if ack_capable is not None:
+            # BIND THE EPOCH SOURCE OURSELVES. The backend stamps each base build with an epoch
+            # it must SAMPLE from this manager; an embedder assembling the stack by hand
+            # (backend + manager, both handed the same capability) had no reason to know about a
+            # new optional sampler, so every advertisement was recorded under None while
+            # publication used an integer -- the capability could never become true and the fast
+            # repair was silently off. It used to work because the backend sampled the
+            # capability's own counter, which no longer exists (issue #92). Wiring that only
+            # holds when the caller remembers is not wiring.
+            for _attr in ("_epoch_sampler", "_ack_sampler"):
+                if getattr(backend, _attr, "missing") is None:
+                    setattr(backend, _attr, self._epoch_unlocked)
+                _l = getattr(backend, "_launcher", None)
+                if _l is not None and getattr(_l, _attr, "missing") is None:
+                    setattr(_l, _attr, self._epoch_unlocked)
         # Base boot handles whose kill() raised. Suppressing it discarded the ONLY reference to a
         # sandbox that may still be running, and the async retry then booted another beside it --
         # untracked, unreapable, for the life of the process (upstream, PR #82).
@@ -130,6 +168,77 @@ class SnapshotManager:
     def is_built(self) -> bool:
         """True once the snapshot artifact exists (atomic reference read)."""
         return self._artifact is not None
+
+    def _install_ack(self, epoch: int) -> None:
+        """Make this artifact's ACK advertisement believable. CALLER MUST HOLD ``_build_lock``.
+
+        THE ONE PLACE it becomes true. Backends only OBSERVE at readiness, long before anyone
+        knows whether the build yields a usable artifact: a build that advertises and then fails
+        to checkpoint, or is rejected here, publishes nothing a slot could restore from.
+
+        Called INSIDE the same critical section that assigns ``_artifact``, because the two are
+        one fact. Publishing after the lock was released left a window in which prepare() /
+        acquire_built() could expose and restore the new artifact while the capability still
+        described the previous epoch -- a job dispatched there evaluates capable_for() at
+        wait_for_done() time, reads UNKNOWN, and cannot contribute the missing-start evidence the
+        fast repair needs. Fail-safe, but it disables the repair during exactly the rebuild churn
+        it exists for.
+
+        AckCapability never calls out, so taking its lock under _build_lock cannot invert.
+        """
+        assert self._ack_capable is not None
+        self._ack_capable.publish(epoch)
+
+    def _epoch_unlocked(self) -> int:
+        """The build epoch WITHOUT taking _build_lock. For the sampler callbacks only.
+
+        The bound sampler is invoked by the BACKEND from inside boot_base(), which today never
+        holds _build_lock -- but the callback closes over `self`, so `lambda: self.build_epoch`
+        re-enters this manager's lock, and _build_lock is a plain Lock: any future caller that
+        samples while holding it self-deadlocks the build thread outright. Reading the int
+        directly is atomic under the GIL and cannot deadlock, and the value is exactly what the
+        property would have returned the instant after releasing. Two reviewers circled this
+        independently; the hazard is not worth keeping for a lock that buys nothing here.
+        """
+        return self._build_epoch
+
+    def pinned_epoch(self, slot_id: object) -> "int | None":
+        """The build epoch of the artifact ``restore()`` actually pinned for this slot.
+
+        Read this INSTEAD of :attr:`build_epoch` when stamping a slot. build_epoch answers "what
+        is current now", and between that read and restore()'s selection an invalidation plus a
+        replacement build can complete -- the slot then runs the new artifact carrying the old
+        epoch, capable_for() answers False forever, and the fast repair path is silently disabled
+        for it during exactly the rebuild churn it exists to handle.
+        """
+        with self._build_lock:
+            return self._pin_epoch.get(str(slot_id))
+
+    @property
+    def build_epoch(self) -> int:
+        """Identity of the artifact currently installed (or of the build in flight).
+
+        Bumped inside invalidate() under _build_lock, atomically with retiring the artifact, and
+        re-read there to reject a build superseded while it ran. It is therefore the only
+        identity in the system that cannot drift from the thing it names -- which is why the ACK
+        capability is keyed by it rather than by a counter of its own (issue #92).
+        """
+        with self._build_lock:
+            return self._build_epoch
+
+    @property
+    def ack_capable(self) -> "_AckPublishable | None":
+        """The capability this manager confirms into, for runtimes wired around an INJECTED
+        manager.
+
+        The base-readiness listener lives with the backend and the per-slot controls live with
+        the runtime; they only work as one answer if both hold the SAME object. A runtime handed
+        a ready-made manager cannot build that listener itself, so it has to take the manager's.
+        Manufacturing its own left the published base advertising ACK while every restored slot
+        read `capable` as false -- missing starts stay UNKNOWN and the three-slot fast repair is
+        silently disabled on precisely the wiring an operator chose explicitly.
+        """
+        return self._ack_capable
 
     @property
     def build_error(self) -> Exception | None:
@@ -161,14 +270,36 @@ class SnapshotManager:
             # the next tick should start the replacement build straight away.
             _log.info("snapshot.build_rejected reason=invalidated_mid_build; retrying at once")
         except Exception as exc:  # noqa: BLE001 — surface + back off; the pool falls back to cold
+            # SUPERSEDED-CHECK, in the same critical section that arms the backoff. invalidate()
+            # deliberately clears _retry_not_before ("this is a deliberate rebuild request, not a
+            # retry of a build that just failed") -- but it does so under a SEPARATE hold, and the
+            # async build spends its whole boot+wait_ready window outside the lock. A repair
+            # landing after this build failed but before it reached here was then overwritten:
+            # the replacement build was refused for build_retry_backoff_s, prepare() kept
+            # returning False, and every job fell to the cold tier for 30s immediately after the
+            # repair that was supposed to restore warm capacity.
             with self._build_lock:
-                self._build_error = exc
-                self._retry_not_before = time.monotonic() + self._build_retry_backoff_s
-            _log.warning(
-                "warm snapshot build failed; cold fallback active, retry after %.0fs: %s",
-                self._build_retry_backoff_s,
-                exc,
-            )
+                # Taken from the FAILURE, which carries the epoch its attempt ran under. Absent
+                # means the attempt died before build() ever sampled one (mkdir/ENOSPC and the
+                # sweeps run first), and that is judged GENUINE: the safe direction is a spurious
+                # 30s cold window, not a hot retry loop of full base boots against a persistent
+                # filesystem fault.
+                _attempt = getattr(exc, "attempt_epoch", None)
+                superseded = _attempt is not None and _attempt != self._build_epoch
+                if not superseded:
+                    self._build_error = exc
+                    self._retry_not_before = time.monotonic() + self._build_retry_backoff_s
+            if superseded:
+                _log.info(
+                    "snapshot.build_failed_but_superseded reason=repair_landed_during_failure "
+                    "-- not arming the backoff; the replacement build starts at once: %s", exc,
+                )
+            else:
+                _log.warning(
+                    "warm snapshot build failed; cold fallback active, retry after %.0fs: %s",
+                    self._build_retry_backoff_s,
+                    exc,
+                )
         else:
             with self._build_lock:
                 self._build_error = None
@@ -284,65 +415,88 @@ class SnapshotManager:
         with self._build_lock:
             epoch = self._build_epoch
         try:
-            boot = self._backend.boot_base()
-        except SnapshotError:
-            raise
-        except Exception as exc:
-            raise SnapshotBuildError(f"warm snapshot base boot failed: {exc}") from exc
-        try:
-            boot.wait_ready(self._ready_timeout_s)
-            artifact = boot.checkpoint(self._base_dir)
-        except SnapshotError:
-            # FAILURE paths still tear the base down unconditionally -- there is no artifact to
-            # protect here, and leaving the base microVM running is a straight leak.
-            self._kill_base(boot)
-            raise
-        except BaseException as exc:
-            # BaseException, not Exception. Replacing the original `finally: boot.kill()` with
-            # typed handlers let a KeyboardInterrupt, SystemExit or task cancellation during
-            # wait_ready()/checkpoint() escape WITHOUT tearing the base down, leaving a
-            # Firecracker VM or gVisor base container running -- interrupting the dispatcher
-            # mid-build leaked one every time. Every unsuccessful exit tears down; only the
-            # success path below publishes first (upstream, PR #82).
-            self._kill_base(boot)
-            if isinstance(exc, Exception):   # readiness / checkpoint failure
-                raise SnapshotBuildError(f"warm snapshot build failed: {exc}") from exc
-            raise
+            # SCOPE the ACK advertisement to THIS attempt. A retry shares the generation of the
+            # attempt it replaces (nothing invalidates in between), so a failed build's observation
+            # would otherwise be available for a later, possibly ACK-incapable, build to confirm.
+            if self._ack_capable is not None:
+                self._ack_capable.begin_build()
+            try:
+                boot = self._backend.boot_base()
+            except SnapshotError:
+                raise
+            except Exception as exc:
+                raise SnapshotBuildError(f"warm snapshot base boot failed: {exc}") from exc
+            try:
+                boot.wait_ready(self._ready_timeout_s)
+                artifact = boot.checkpoint(self._base_dir)
+            except SnapshotError:
+                # FAILURE paths still tear the base down unconditionally -- there is no artifact to
+                # protect here, and leaving the base microVM running is a straight leak.
+                self._kill_base(boot)
+                raise
+            except BaseException as exc:
+                # BaseException, not Exception. Replacing the original `finally: boot.kill()` with
+                # typed handlers let a KeyboardInterrupt, SystemExit or task cancellation during
+                # wait_ready()/checkpoint() escape WITHOUT tearing the base down, leaving a
+                # Firecracker VM or gVisor base container running -- interrupting the dispatcher
+                # mid-build leaked one every time. Every unsuccessful exit tears down; only the
+                # success path below publishes first (upstream, PR #82).
+                self._kill_base(boot)
+                if isinstance(exc, Exception):   # readiness / checkpoint failure
+                    raise SnapshotBuildError(f"warm snapshot build failed: {exc}") from exc
+                raise
 
-        # COMPARE AND PUBLISH UNDER ONE LOCK. Checking the epoch and then releasing before
-        # assigning left a window in which invalidate() could bump the epoch, observe
-        # _artifact is None (so it retires nothing), and this build would then publish the very
-        # artifact that repair had just rejected -- losing the request silently and letting
-        # restores keep reproducing the wedge. Locking the CHECK but not the ACT is the same
-        # mistake as reading the failure streak under the lock and deciding outside it, and as
-        # selecting the artifact outside the lock that pins it (upstream, PR #82).
-        #
-        # PUBLISH BEFORE TEARDOWN: if boot.kill() raised, an unassigned artifact could never be
-        # discovered by invalidate() or the reference counting, and every async retry left another
-        # generation-stamped, RAM-sized .mem behind. The snapshot is complete and usable here --
-        # a failure tearing the BASE down says nothing about it.
-        with self._build_lock:
-            rejected = epoch != self._build_epoch
-            if not rejected:
-                self._artifact = artifact
-        if rejected:
-            # invalidate() landed while this build was running. Publishing now would install the
-            # artifact the repair explicitly rejected; discard it instead and let the next build
-            # produce a fresh one.
-            _log.info("snapshot.build_discarded reason=invalidated_while_building")
+            # COMPARE AND PUBLISH UNDER ONE LOCK. Checking the epoch and then releasing before
+            # assigning left a window in which invalidate() could bump the epoch, observe
+            # _artifact is None (so it retires nothing), and this build would then publish the very
+            # artifact that repair had just rejected -- losing the request silently and letting
+            # restores keep reproducing the wedge. Locking the CHECK but not the ACT is the same
+            # mistake as reading the failure streak under the lock and deciding outside it, and as
+            # selecting the artifact outside the lock that pins it (upstream, PR #82).
+            #
+            # PUBLISH BEFORE TEARDOWN: if boot.kill() raised, an unassigned artifact could never be
+            # discovered by invalidate() or the reference counting, and every async retry left another
+            # generation-stamped, RAM-sized .mem behind. The snapshot is complete and usable here --
+            # a failure tearing the BASE down says nothing about it.
+            with self._build_lock:
+                rejected = epoch != self._build_epoch
+                if not rejected:
+                    self._artifact = artifact
+                    if self._ack_capable is not None:
+                        self._install_ack(epoch)
+            if rejected:
+                # invalidate() landed while this build was running. Publishing now would install the
+                # artifact the repair explicitly rejected; discard it instead and let the next build
+                # produce a fresh one.
+                _log.info("snapshot.build_discarded reason=invalidated_while_building")
+                self._kill_base(boot)
+                if not self._discard(artifact):
+                    # Never published and never in _retired, so nothing else can rediscover it: a
+                    # failed cleanup here leaks a generation-stamped snapshot AND its RAM-sized memory
+                    # file, permanently. Park it with the other retirements so the sweep retries.
+                    with self._build_lock:
+                        self._retired[id(artifact)] = artifact
+                raise SnapshotBuildInvalidated("snapshot invalidated while it was being built")
+            # Same on the SUCCESS path: the snapshot is registered and usable either way, but a base
+            # sandbox we could not confirm gone must stay reachable for retry rather than be logged
+            # and forgotten.
             self._kill_base(boot)
-            if not self._discard(artifact):
-                # Never published and never in _retired, so nothing else can rediscover it: a
-                # failed cleanup here leaks a generation-stamped snapshot AND its RAM-sized memory
-                # file, permanently. Park it with the other retirements so the sweep retries.
-                with self._build_lock:
-                    self._retired[id(artifact)] = artifact
-            raise SnapshotBuildInvalidated("snapshot invalidated while it was being built")
-        # Same on the SUCCESS path: the snapshot is registered and usable either way, but a base
-        # sandbox we could not confirm gone must stay reachable for retry rather than be logged
-        # and forgotten.
-        self._kill_base(boot)
-        return artifact
+            return artifact
+        except BaseException as exc:
+            # THE EPOCH TRAVELS WITH THE FAILURE. It used to be published to instance state and
+            # compared later, which is the same split read three earlier fixes on this branch each
+            # reintroduced one layer further in -- and the last one assumed an unsampled attempt
+            # would leave None. It does not: _retry_undead_bases(), _base_dir.mkdir() and
+            # _sweep_retired() all run BEFORE the sample, so a failure there left the PREVIOUS
+            # attempt's epoch behind. Stale, not None, so the None-guard never fired and a
+            # persistent ENOSPC was reclassified as "superseded" and retried every tick.
+            #
+            # Attached to the exception, the value cannot be stale by construction: a failure
+            # before the sample carries nothing, and absence reads as "judge it genuine", which
+            # arms the backoff -- the safe direction.
+            with contextlib.suppress(Exception):   # exotic exceptions may reject attributes
+                exc.attempt_epoch = epoch          # type: ignore[attr-defined]
+            raise
 
     def invalidate(self) -> bool:
         """Discard the built artifact so the next ``build()`` captures a fresh one.
@@ -388,6 +542,17 @@ class SnapshotManager:
         Never raises -- reap must not be taken down by cleanup.
         """
         with self._build_lock:
+            # Only a FAILED restore goes through _unpin(), so without this line the normal reap
+            # path never dropped the epoch entry: one dict entry per slot ever restored, for the
+            # life of a dispatcher that recycles slots continuously.
+            #
+            # Placed before the early return DEFENSIVELY, not because a reachable state needs it:
+            # restore(), release() and _unpin() all write _pins and _pin_epoch under one hold of
+            # _build_lock, so an epoch entry without a matching pin should not exist. An earlier
+            # version of this comment claimed the ordering was load-bearing; a reviewer showed it
+            # is not, and an unreachable justification is worse than none -- it is what stops the
+            # next person deleting a line that has become wrong.
+            self._pin_epoch.pop(str(slot_id), None)
             artifact = self._pins.pop(str(slot_id), None)
             if artifact is None:
                 return
@@ -468,6 +633,7 @@ class SnapshotManager:
             if artifact is None:
                 raise SnapshotRestoreError("snapshot not built; call build() first")
             self._pins[sid] = artifact
+            self._pin_epoch[sid] = self._build_epoch
             self._refs[id(artifact)] = self._refs.get(id(artifact), 0) + 1
         try:
             return self._backend.restore_in(slot_workdir, artifact)
@@ -518,6 +684,7 @@ class SnapshotManager:
         with self._build_lock:
             if self._pins.get(sid) is artifact:
                 self._pins.pop(sid, None)
+                self._pin_epoch.pop(sid, None)
             key = id(artifact)
             self._refs[key] = self._refs.get(key, 1) - 1
             if self._refs[key] <= 0:

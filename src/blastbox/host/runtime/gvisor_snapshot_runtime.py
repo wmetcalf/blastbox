@@ -9,6 +9,7 @@ SlotRuntime + warm-path seam so the dispatcher's per-slot job flow is identical.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import shutil
@@ -19,6 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
+from blastbox.worker.warm import AckCapability
 from blastbox.host.pool import Slot, SlotState
 from blastbox.host.runtime.fc_snapshot import SnapshotError
 
@@ -33,7 +35,16 @@ _DEFAULT_WARM_ARGV = ["python3", "/opt/blastbox/run_warm.py"]
 
 
 class GvisorSnapshotSlotRuntime:
-    def __init__(self, manager, *, settle_s: float = 1.0, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, manager, *, settle_s: float = 1.0,
+                 clock: Callable[[], float] = time.monotonic,
+                 ack_capable: "AckCapability | None" = None) -> None:
+        # Shared with every GvisorHostWarmControl handed out (see host_warm_control) AND with the
+        # base build, which is the only place the advertisement is ever visible on this tier.
+        # artifact_scoped: this runtime restores SNAPSHOT ARTIFACTS. A fallback built here
+        # is one the manager never publishes into, so without this it would sit in plain
+        # mode forever -- capable for every epoch, cleared by nothing.
+        self._ack_capable = (ack_capable if ack_capable is not None
+                             else AckCapability(artifact_scoped=True))
         self._mgr = manager
         self._settle_s = settle_s
         self._clock = clock
@@ -66,7 +77,51 @@ class GvisorSnapshotSlotRuntime:
             self._mgr.build()   # a manager without the seam (a test double)
         slot_id = str(uuid.uuid4())
         handle = self._mgr.restore(slot_id)
-        wd = Path(handle.slot_workdir)  # type: ignore[attr-defined]
+        # EVERYTHING between a successful restore and RETURNING THE SLOT must clean up after
+        # itself, exactly as in the FC twin. Registering the handle in _handles is NOT enough and
+        # the earlier comment here claiming otherwise was wrong: every _handles lookup is keyed by
+        # a Slot the pool already holds (is_ready/reap/release), and nothing ever enumerates the
+        # dict for orphans -- so with no Slot returned, a live sandbox and its generation pin are
+        # unreachable for the life of the process.
+        #
+        # The epoch of the artifact restore() ACTUALLY PINNED for this slot. Sampling build_epoch
+        # beforehand answered "what is current now", and an invalidation plus replacement build
+        # completing in between paired the slot with the wrong identity. pinned_epoch() takes a
+        # lock and can raise on an injected manager, so it belongs inside this region.
+        try:
+            _pe = getattr(self._mgr, "pinned_epoch", None)
+            if _pe is None:
+                # NOT fail-safe-and-quiet: in snapshot mode this is fatal to the feature. Every
+                # slot then carries ack_generation=None, capable_for(None) is False for the life
+                # of the process, learn(None) discards every real ack, and the missing-start
+                # evidence the fast repair runs on is never produced. The sampler seam got a
+                # defensive auto-bind on exactly this reasoning; the rebuttal used there ("a
+                # backend that never defines it cannot call it either") does not apply here,
+                # because THIS side is called unconditionally.
+                if not getattr(self, "_warned_no_pinned_epoch", False):
+                    self._warned_no_pinned_epoch = True
+                    _log.warning(
+                        "snapshot.manager_without_pinned_epoch manager=%s -- slots cannot be "
+                        "matched to the artifact they restored from, so the pre-guest fast base "
+                        "repair is DISABLED for this runtime", type(self._mgr).__name__)
+            _ack_gen = _pe(slot_id) if _pe is not None else None
+            wd = Path(handle.slot_workdir)  # type: ignore[attr-defined]
+        except BaseException:
+            sandbox_gone = True
+            try:
+                handle.kill()  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                # Same rule as reap(): a kill() that raised leaves the sandbox possibly ALIVE and
+                # still mapping this generation, so releasing the pin would let a later
+                # invalidation unlink its checkpoint underneath.
+                sandbox_gone = False
+                _log.warning("gvisor_snapshot.spawn_cleanup_kill_error slot_id=%s: %s",
+                             slot_id, exc)
+            release = getattr(self._mgr, "release", None)
+            if callable(release) and sandbox_gone:
+                with contextlib.suppress(Exception):
+                    release(slot_id)
+            raise
         with self._lock:
             self._handles[slot_id] = handle
             self._restored_at[slot_id] = self._clock()
@@ -77,6 +132,8 @@ class GvisorSnapshotSlotRuntime:
             input_dir=wd / "in",
             output_dir=wd / "out",
             state=SlotState.WARMING,
+            # The generation this slot was SPAWNED from; see Slot.ack_generation.
+            ack_generation=_ack_gen,
         )
 
     def is_ready(self, slot: Slot) -> bool:
@@ -84,6 +141,7 @@ class GvisorSnapshotSlotRuntime:
             handle = self._handles.get(slot.slot_id)
             restored_at = self._restored_at.get(slot.slot_id)
         if handle is None:
+
             return False
         # Hold WARMING for a short post-restore settle window (mirrors the FC tier);
         # in a steady-state pool it overlaps background pre-warming, adding no per-job latency.
@@ -115,9 +173,15 @@ class GvisorSnapshotSlotRuntime:
         pool's lookup always failed here and sustained failures merely logged
         pool.base_rebuild_unavailable while every replacement kept restoring the poisoned snapshot
         until a dispatcher restart (upstream, PR #82). Same SnapshotManager underneath."""
+        # A NEW BUNDLE MAY BE A DIFFERENT IMAGE. Same reset as the FC snapshot runtime: the
+        # set outlives the generation that taught it, so a bundle rolled back to an older worker
+        # kept the previous "yes" and a missing start marker was then read as proof of no start --
+        # letting three document-induced hangs convict a healthy mixed-version base.
         drop = getattr(self._mgr, "invalidate", None)
         if callable(drop):
             drop()
+        # NO capability reset -- see the FC twin. invalidate() already moved the artifact's
+        # identity; publish() decides what the replacement is capable of (issue #92).
 
     def reap(self, slot: Slot) -> None:
         with self._lock:
@@ -168,7 +232,10 @@ class GvisorSnapshotSlotRuntime:
     # --- warm-path seam (file-trigger control; output already on the bind mount) ---
 
     def host_warm_control(self, slot: Slot) -> GvisorHostWarmControl:
-        return GvisorHostWarmControl(slot.control_dir)
+        # Shared across slots: one warm base image, so start-marker capability is a property of
+        # the image, not of a job. Per-control it would be learned and immediately forgotten.
+        return GvisorHostWarmControl(slot.control_dir, ack_capable=self._ack_capable,
+                                     ack_generation=getattr(slot, "ack_generation", None))
 
     def stage_warm_input(self, slot: Slot, staged_input_path: Path) -> Path:
         dst = Path(slot.input_dir) / Path(staged_input_path).name
@@ -229,9 +296,18 @@ class GvisorHostWarmControl:
     SANDBOX_IN = Path("/in")
     SANDBOX_OUT = Path("/out")
 
-    def __init__(self, control_dir: Path) -> None:
+    def __init__(self, control_dir: Path, *, ack_capable: "AckCapability | None" = None,
+                 ack_generation: "int | None" = None) -> None:
         from blastbox.worker.warm import HostWarmControl
-        self._inner = HostWarmControl(control_dir)
+        self._inner = HostWarmControl(control_dir, ack_capable=ack_capable,
+                                      ack_generation=ack_generation)
+
+    @property
+    def guest_started(self) -> "bool | None":
+        """Forwarded from the wrapped control: the dispatcher reads it off whatever object
+        host_warm_control returned, and a wrapper that swallows it leaves the whole start signal
+        invisible for this tier."""
+        return self._inner.guest_started
 
     def signal_go(self, spec: object, *, deadline: float | None = None) -> None:
         from blastbox.worker.warm import WarmJobSpec
@@ -267,11 +343,25 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
             return 1.0
 
     if manager is not None:
-        return GvisorSnapshotSlotRuntime(manager, settle_s=_settle())
+        # Same wiring gap as the FC twin: the injected manager owns the capability its
+        # base-readiness listener confirms into, so the runtime must share it rather than
+        # manufacture an unrelated one.
+        return GvisorSnapshotSlotRuntime(manager, settle_s=_settle(),
+                                         ack_capable=getattr(manager, "ack_capable", None))
     from blastbox.host.runtime.gvisor_snapshot import GvisorSnapshotBackend
     from blastbox.host.runtime.fc_snapshot import SnapshotManager
     gcfg = cfg or _gvisor_config_from_env(os.environ)
-    backend = GvisorSnapshotBackend(gcfg)
+    # Created before both so the BASE BUILD and the runtime serving restores share it: the base
+    # advertises the start-marker protocol in `ready`, and that is the only moment it is visible
+    # (a restore gets a fresh ctrl/, and the checkpointed worker resumes past signal_ready).
+    # ARTIFACT-SCOPED, like the runtime fallback. This is the capability the manager
+    # publishes into, so before its first publish() it must answer UNKNOWN rather than
+    # behave like the plain, no-artifact FC tier -- where one learn() would make it capable
+    # for EVERY epoch. Scoping only the fallback protected the misconfigured wiring and
+    # left the configured one open.
+    ack_capable = AckCapability(artifact_scoped=True)
+    # epoch_sampler deliberately LEFT UNSET -- SnapshotManager binds it (see the FC twin).
+    backend = GvisorSnapshotBackend(gcfg, ack_capable=ack_capable)
     if not backend.available():
         if require_available:
             raise GvisorUnavailable("gVisor C/R warm tier required but runsc not found; "
@@ -287,8 +377,8 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
 
     snapshot_parent = resolve_mem_dir() or Path(gcfg.root).parent
     base_dir = _secure_snapshot_base(snapshot_parent / "gvisor-snapshot")
-    mgr = SnapshotManager(base_dir, backend)
-    return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle())
+    mgr = SnapshotManager(base_dir, backend, ack_capable=ack_capable)
+    return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle(), ack_capable=ack_capable)
 
 
 def _secure_snapshot_base(base_dir: Path) -> Path:

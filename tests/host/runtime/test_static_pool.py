@@ -693,3 +693,115 @@ def test_the_pool_tells_a_reusing_runtime_about_burnout():
         f"the pool convicted the box but never told the runtime, so it stays in rotation "
         f"(burn_out calls: {burned})"
     )
+
+
+def test_is_ready_forwards_UNKNOWN_rather_than_calling_it_not_ready():
+    """SlotRuntime.is_ready is tri-state ("None = UNKNOWN") and WarmPool suspends warming_timeout_s
+    only while an unknown episode is open -- which only a None opens.
+
+    This coerced with `is True` from back when readiness was a plain bool. A LOCAL fault (EMFILE,
+    ENOMEM, the host's networking being reconfigured) makes _health_ok return None for EVERY worker
+    on the same tick, so the collapse read as a definitive "not ready" fleet-wide: the tier's whole
+    WARMING population aged out and was evicted, each charged as a confirmed restore failure. That
+    is issue #79's failure on the tier nobody converted.
+    """
+    class _CannotAsk:
+        def __call__(self, url, headers, timeout):   # noqa: ANN001 -- local exhaustion, not a verdict
+            raise OSError(24, "Too many open files")
+
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765"), http_probe=_CannotAsk())
+    slot = StaticWorkerSlot(slot_id="s", worker_index=0)
+
+    assert rt._health_ok(rt.cfg.workers[0]) is None, "the probe could not be attempted"
+    assert rt.is_ready(slot) is None, (
+        "UNKNOWN was flattened to a definitive not-ready; one host-side fault evicts the tier"
+    )
+
+
+def test_is_ready_still_answers_definitively_when_the_box_does():
+    """The half it must not break: a real answer from the box stays a real answer."""
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765"), http_probe=FakeProbe(all_ok=True))
+    assert rt.is_ready(StaticWorkerSlot(slot_id="s", worker_index=0)) is True
+    rt2 = StaticPoolRuntime(_cfg("10.0.0.1:8765"), http_probe=FakeProbe(healthy=set()))
+    assert rt2.is_ready(StaticWorkerSlot(slot_id="s", worker_index=0)) is False
+
+
+def test_static_availability_is_tri_state_so_a_transient_local_fault_defers_not_drops():
+    """This branch converted `_health_ok` and `is_ready` here to tri-state and left `available()`.
+
+    That is the half the cascade's deferral machine actually consults. `any(... is True ...)` turns
+    "we could not ASK any box" into a definitive "this tier is down", which is issue #79's failure
+    verbatim on the tier the configuration guide uses as its canonical cascade example
+    (`static:8,aws-ec2:16`). As primary it raised CascadeMisconfigured at boot -- the message
+    reserved for a permanent misconfiguration -- for an EMFILE that would have cleared in seconds;
+    as overflow it was skipped for the whole process lifetime with the pool still reporting green.
+
+    MUTATION: restore `any(self._health_ok(w) is True ...)` -> None collapses to False and the
+    no-verdict case raises the plain StaticPoolUnavailable again.
+    """
+    from blastbox.host.runtime.cascade import _is_undecided_availability
+    from blastbox.host.runtime.static_pool import StaticPoolNoVerdict, StaticPoolUnavailable
+
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"), http_probe=FakeProbe(all_ok=True))
+
+    rt._health_ok = lambda w, timeout=None: None                      # nobody answered
+    assert rt.available() is None, "an unaskable fleet must be UNKNOWN, not down"
+
+    rt._health_ok = lambda w, timeout=None: False                     # everyone answered, all sick
+    assert rt.available() is False, "a fleet that answered and is down is still a verdict"
+
+    # MIXED: one definitive no, one unaskable. `all(v is None)` required EVERY probe to be silent
+    # before answering UNKNOWN, so this came out False -- which contradicts what False promises
+    # here ("every box answered") and is read by the cascade as CONFIRMED unavailability, dropping
+    # the overflow tier permanently over a worker it never managed to ask. A tri-state OR: False
+    # only when every worker definitively said no.
+    rt._health_ok = lambda w, timeout=None: False if w.host == "10.0.0.1" else None
+    assert rt.available() is None, (
+        "a fleet with one unhealthy and one UNOBSERVABLE worker reported a definitive verdict; the "
+        "unobservable one may be healthy, and the cascade drops the tier for the process lifetime")
+
+    rt._health_ok = lambda w, timeout=None: w.host == "10.0.0.1"      # one healthy
+    assert rt.available() is True
+
+    # ...and the cascade must classify the no-verdict case as DEFERRABLE, not as a verdict.
+    assert issubclass(StaticPoolNoVerdict, StaticPoolUnavailable), (
+        "every existing `except StaticPoolUnavailable` must still catch it")
+    assert _is_undecided_availability(StaticPoolNoVerdict("nobody answered")) is True, (
+        "the cascade treats a static no-verdict as a VERDICT, so the tier is dropped for the "
+        "process lifetime instead of deferred and re-probed")
+    assert _is_undecided_availability(StaticPoolUnavailable("fleet is down")) is False, (
+        "a real 'the fleet is down' verdict must NOT be deferred, or an unusable tier is retried "
+        "forever")
+
+
+def test_availability_stops_probing_once_a_worker_answers_healthy():
+    """The tri-state rewrite silently traded a short-circuit for a full fleet scan.
+
+    `any(self._health_ok(w) is True for w in ...)` stopped at the first healthy box. Collecting
+    every verdict into a list before deciding does not: each unreachable worker burns
+    `probe_timeout_s`, so a 100-worker fleet whose FIRST entry is healthy issued 100 probes to
+    learn something it knew after one. That cost lands on dispatcher startup and on every
+    deferred-tier admission probe -- minutes, for an answer already in hand.
+
+    MUTATION: restore the eager `verdicts = [...]` comprehension -> 100 probes, not 1.
+    """
+    probed: list[str] = []
+    rt = StaticPoolRuntime(_cfg(*[f"10.0.0.{i}:8765" for i in range(1, 40)]),
+                           http_probe=FakeProbe(all_ok=True))
+
+    def _first_is_healthy(w, timeout=None):  # noqa: ANN001, ANN202
+        probed.append(w.host)
+        return True if w.host == "10.0.0.1" else None
+
+    rt._health_ok = _first_is_healthy  # type: ignore[method-assign]
+    assert rt.available() is True
+    assert len(probed) == 1, (
+        f"probed {len(probed)} of {len(rt.cfg.workers)} workers after the first already answered "
+        f"healthy; each unreachable box costs probe_timeout_s, on dispatcher startup")
+
+    # ...and the tri-state answers still hold, which is what the short-circuit must not cost.
+    probed.clear()
+    rt._health_ok = lambda w, timeout=None: False if w.host == "10.0.0.1" else None
+    assert rt.available() is None, "one unobservable worker must not read as a fleet verdict"
+    rt._health_ok = lambda w, timeout=None: False
+    assert rt.available() is False, "a fleet that all answered no is still a verdict"
