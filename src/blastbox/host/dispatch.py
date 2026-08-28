@@ -850,8 +850,14 @@ class Dispatcher:
                 _log.exception("dispatch_once failed; continuing")
                 progressed = False
             if maintenance_interval_s > 0 and time.monotonic() - last_maint >= maintenance_interval_s:
-                last_maint = time.monotonic()
+                # RE-STAMPED FROM COMPLETION, matching VmJobDispatcher._maintenance_loop. _run_maintenance
+                # retries every pending upload through the blob store, so during an outage a sweep
+                # routinely outlasts the interval -- and a deadline dated from BEFORE it is already
+                # overdue on return, so the next pass re-sweeps immediately. Continuous retries against
+                # an unhealthy store, produced by the interval meant to space them out. Fixed in the VM
+                # loop first; these two are its siblings and were left behind.
                 self._run_maintenance()
+                last_maint = time.monotonic()
             if not progressed:
                 time.sleep(poll_interval_s)
 
@@ -920,8 +926,14 @@ class Dispatcher:
                     maintenance_interval_s > 0
                     and time.monotonic() - last_maint >= maintenance_interval_s
                 ):
-                    last_maint = time.monotonic()
+                    # RE-STAMPED FROM COMPLETION, matching VmJobDispatcher._maintenance_loop. _run_maintenance
+                    # retries every pending upload through the blob store, so during an outage a sweep
+                    # routinely outlasts the interval -- and a deadline dated from BEFORE it is already
+                    # overdue on return, so the next pass re-sweeps immediately. Continuous retries against
+                    # an unhealthy store, produced by the interval meant to space them out. Fixed in the VM
+                    # loop first; these two are its siblings and were left behind.
                     self._run_maintenance()
+                    last_maint = time.monotonic()
                 time.sleep(min(poll_interval_s, 1.0))
         finally:
             stop_evt.set()

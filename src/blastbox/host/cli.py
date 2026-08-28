@@ -574,34 +574,46 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         # expensive. Before pool.start(), so a misconfigured deployment does not spawn microVMs
         # it is only going to fail jobs on.
         _vm_canary, _canary_interval = _canary_settings()
-        if _vm_canary:
-            from blastbox.host.canary import (
-                blob_roundtrip,
-                check_blob_target_agreement,
-                check_store_coherence,
-                describe_blob_store,
-            )
-            _vmlog = logging.getLogger("blastbox.host.cli")
-            _vmblobs = getattr(vm, "_blobs", None)
-            if _vmblobs is None:
+        from blastbox.host.canary import (
+            blob_roundtrip,
+            check_blob_target_agreement,
+            check_store_coherence,
+            describe_blob_store,
+        )
+        _vmlog = logging.getLogger("blastbox.host.cli")
+        _vmblobs = getattr(vm, "_blobs", None)
+        if _vmblobs is None:
+            if _vm_canary:
                 _vmlog.warning("canary: this dispatcher exposes no blob store; skipping")
-            else:
-                _vmlog.info("canary.blob_store %s", describe_blob_store(_vmblobs))
-                check_store_coherence(store, _vmblobs, job_root,
-                                      require_shared=_require_shared_blob_store())
-                check_blob_target_agreement(store, _vmblobs, role="dispatcher")
-                _vmkey = f"{tier or ''}|{next(iter(engines), '')}|{job_root}"
-                _vmlog.info("canary.ok %s", blob_roundtrip(
-                    _vmblobs, key_hint=_vmkey, scratch_dir=job_root))
+        else:
+            # OUTSIDE THE TOGGLE, exactly as Dispatcher.run_forever does for the container path.
+            # That comment states the invariant -- "TOPOLOGY ENFORCEMENT IS NOT THE PROBE, and must
+            # not share its off switch" -- and this sibling was left behind when it was written. So
+            # on aws/static/cascade, BLASTBOX_CANARY=0 silently dropped the hard
+            # BLASTBOX_REQUIRE_SHARED_BLOB_STORE requirement AND the target-agreement check, neither
+            # of which that variable documents any control over. Those are the distributed tiers,
+            # whose results necessarily travel through a shared store -- the ones with the most to
+            # lose. The identity log line moves out too, or the side-by-side grep the guide tells
+            # operators to use disappears in precisely the deployments that opted out.
+            _vmlog.info("canary.blob_store %s", describe_blob_store(_vmblobs))
+            check_store_coherence(store, _vmblobs, job_root,
+                                  require_shared=_require_shared_blob_store())
+            check_blob_target_agreement(store, _vmblobs, role="dispatcher")
+        # ...and the ROUND-TRIP stays gated: that is the probe, and the probe is what the toggle is
+        # documented to control.
+        if _vm_canary and _vmblobs is not None:
+            _vmkey = f"{tier or ''}|{next(iter(engines), '')}|{job_root}"
+            _vmlog.info("canary.ok %s", blob_roundtrip(
+                _vmblobs, key_hint=_vmkey, scratch_dir=job_root))
 
-                def _vm_periodic_canary(_b=_vmblobs, _l=_vmlog, _k=_vmkey, _jr=job_root) -> None:
-                    _l.info("canary.ok %s", blob_roundtrip(
-                        _b, key_hint=_k, scratch_dir=_jr))
+            def _vm_periodic_canary(_b=_vmblobs, _l=_vmlog, _k=_vmkey, _jr=job_root) -> None:
+                _l.info("canary.ok %s", blob_roundtrip(
+                    _b, key_hint=_k, scratch_dir=_jr))
 
-                # Advisory once serving: a store that goes away mid-run is a brownout, not a
-                # config error, and tearing down a warm fleet over it is what #79 exists to stop.
-                vm._canary_cb = _vm_periodic_canary
-                vm._canary_interval_s = _canary_interval
+            # Advisory once serving: a store that goes away mid-run is a brownout, not a
+            # config error, and tearing down a warm fleet over it is what #79 exists to stop.
+            vm._canary_cb = _vm_periodic_canary
+            vm._canary_interval_s = _canary_interval
         pool.start()   # validation passed -> now spawn/warm slots (nothing to leak on an earlier raise)
         try:
             # One-shot orphan sweep on start (aws-ec2-hibernate only; guarded by hasattr). A fresh run's

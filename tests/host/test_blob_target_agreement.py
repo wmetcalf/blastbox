@@ -9,7 +9,6 @@ days because nothing compared the two sides.
 from __future__ import annotations
 
 import tempfile
-import threading
 
 import pytest
 
@@ -31,6 +30,7 @@ class _Store:
 class LocalBlobStore:                      # noqa: D101 - name IS the contract (is_local_blob_store)
     def __init__(self, root: str) -> None:
         self.local_root = root
+        self._bucket = None
 
 
 def _sql() -> SqlJobStore:
@@ -82,32 +82,77 @@ def test_matching_deployments_are_unaffected(backend):
         assert check_blob_target_agreement(q, _Store("results/shared"), role=role) is not None
 
 
-@pytest.mark.parametrize("backend", ALL_BACKENDS)
-def test_a_boot_storm_has_exactly_one_winner(backend):
-    """The registration is a COMPARE-AND-SWAP, not a read followed by a write.
+def test_separate_store_instances_on_one_database_still_see_one_winner(tmp_path):
+    """SEPARATE store objects on ONE database -- the multi-PROCESS shape, which is the only shape
+    that matters here.
 
-    Get-then-put would let every process starting at once read an empty registry, write its own
-    answer, and see no mismatch -- defeating the check on precisely the simultaneous-boot case a
-    fleet actually does. Verified by racing eight claimants through one barrier.
+    The first version of this test raced eight threads through one store object. That cannot fail:
+    both backends guard `claim_blob_target` with a per-instance lock, so the threads serialise on
+    the lock and never reach the database concurrently. A reviewer replaced the CAS with plain
+    get-then-put and ran that test 30 times per backend -- it detected the mutant 0/30. It was
+    asserting the lock works, not that the registration is a compare-and-swap.
+
+    Two store instances sharing one SQLite file have no lock in common, exactly as two processes
+    have none, so the atomicity has to come from the database. Which is the actual claim.
+
+    MUTATION: replace the INSERT/SELECT with `if get_blob_target() is None: insert` -> the second
+    instance registers its own value and both report winning.
     """
-    q = backend()
-    seen: list[str] = []
-    bar = threading.Barrier(8)
+    db = f"sqlite:///{tmp_path}/shared.db"
+    first, second = SqlJobStore(db), SqlJobStore(db)
 
-    def _claim(i: int) -> None:
-        bar.wait()
-        seen.append(q.claim_blob_target(f"s3://results/stack-{i}"))
+    won = first.claim_blob_target("s3://results/stack-a")
+    lost = second.claim_blob_target("s3://results/stack-b")
 
-    threads = [threading.Thread(target=_claim, args=(i,)) for i in range(8)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=10)
+    assert won == "s3://results/stack-a"
+    assert lost == "s3://results/stack-a", (
+        f"a second store instance on the SAME database registered its own target ({lost}); with "
+        f"two real processes both would boot and report agreement on different buckets")
+    assert first.get_blob_target() == second.get_blob_target() == "s3://results/stack-a"
 
-    assert len(seen) == 8
-    assert len(set(seen)) == 1, (
-        f"eight simultaneous claimants recorded {len(set(seen))} different targets ({set(seen)}); "
-        f"a get-then-put registry lets every process register its own and report agreement")
+
+def test_an_unreadable_registry_is_unknown_not_agreement(caplog):
+    """A read-back that comes up empty must NOT be reported as winning.
+
+    Both backends returned the caller's own fingerprint there -- indistinguishable from actually
+    winning. It is reachable: `clear_blob_target()` is the documented migration remedy, and an
+    operator runs it precisely while a mismatched process is crash-looping, so the DELETE lands
+    between that process's losing write and its read; on Redis an `allkeys-*` eviction reaches the
+    same window with nobody involved. The losing side then logged agreement and booted on the wrong
+    target -- the silent split this seam exists to prevent, produced by the seam.
+
+    Asserted at the CANARY, because that is where the consequence lives: a registry answering
+    UNKNOWN must produce "unverified", never "agrees". Testing it per-backend does not work --
+    after a genuine reset a claim legitimately DOES win, so the honest signal is the contract, not
+    the storage.
+
+    MUTATION: return `fingerprint` instead of None on an empty read-back -> the caller reports
+    agreement and boots.
+    """
+    import logging
+
+    class _UnreadableRegistry:
+        """Claims succeed; the read-back never sees them (a reset or eviction landed between)."""
+
+        def claim_blob_target(self, fingerprint):  # noqa: ANN001, ANN201
+            return None
+
+        def get_blob_target(self):  # noqa: ANN201
+            return None
+
+        def clear_blob_target(self) -> None:
+            pass
+
+    with caplog.at_level(logging.WARNING, logger="blastbox.host.canary"):
+        out = check_blob_target_agreement(_UnreadableRegistry(), _Store("results/x"),
+                                          role="ingress")
+
+    assert out is None, f"an unreadable registry was reported as an agreed target ({out})"
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("blob_target_unverified" in m for m in msgs), (
+        f"an unreadable registry must say agreement is UNVERIFIED, not stay silent: {msgs}")
+    assert not any("agrees with the queue" in m for m in msgs), (
+        f"an unreadable registry was reported as agreement: {msgs}")
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -198,3 +243,158 @@ def test_every_protocol_used_with_isinstance_stays_runtime_checkable():
         except TypeError as exc:  # pragma: no cover - the failure this exists to prevent
             pytest.fail(f"isinstance() against {name} raises: {exc}. It lost @runtime_checkable, "
                         f"and every consumer that gates on it breaks at runtime.")
+
+
+@pytest.mark.parametrize("backend", ALL_BACKENDS)
+def test_a_local_store_facing_an_s3_registered_queue_is_refused(backend):
+    """Local-vs-LOCAL is ambiguous; local-vs-S3 is not, and skipping both was too much.
+
+    A host-local directory can never be the bucket another process registered, so this needs no
+    path comparison at all. It is the original 17,626-job incident with one side over --
+    BLASTBOX_BLOB_URL set on the dispatchers, missing on the API -- and the first scoping fix let
+    it pass. It matters most on the ingress: check_store_coherence has three call sites and every
+    one is dispatcher-side, so an API that fell back to a local store had no other check at all.
+
+    MUTATION: return None for every local store before consulting the registry -> the local ingress
+    boots against an S3-registered queue.
+    """
+    q = backend()
+    check_blob_target_agreement(q, _Store("results/stack-a"), role="dispatcher")
+
+    with pytest.raises(CanaryFailure) as ei:
+        check_blob_target_agreement(q, LocalBlobStore("/var/lib/blastbox/blobs"), role="ingress")
+    msg = str(ei.value)
+    assert "results/stack-a" in msg, f"the message must name what the queue holds: {msg}"
+    assert "BLASTBOX_BLOB_URL" in msg, f"the message must name the usual cause: {msg}"
+
+
+@pytest.mark.parametrize("backend", ALL_BACKENDS)
+def test_two_local_stores_still_agree_across_different_mount_points(backend):
+    """...and the NFS shape must still boot: one export, different mount points per host.
+
+    This is the case that got the first version rewritten; the fix for the S3 asymmetry must not
+    resurrect it.
+    """
+    q = backend()
+    assert check_blob_target_agreement(q, LocalBlobStore("/mnt/a/blobs"), role="dispatcher") is None
+    assert check_blob_target_agreement(q, LocalBlobStore("/mnt/b/blobs"), role="ingress") is None
+    assert q.get_blob_target() is None, "a local store must not register a host-local path"
+
+
+def test_the_redis_registry_behaves_like_the_others():
+    """Redis is the only shipped backend that is genuinely shared across machines -- so it is the
+    one where this check ever does real work -- and it had only an attribute-existence assertion.
+
+    The stated reason ("a live Redis is not available here") was wrong: fakeredis is already a test
+    dependency used by four other suites in this repo.
+
+    MUTATION: drop `nx=True` -> last-writer-wins, the loser overwrites and reports agreement.
+    """
+    fakeredis = pytest.importorskip("fakeredis")
+
+    from blastbox.host.jobs.redis_store import RedisJobStore
+
+    q = RedisJobStore(fakeredis.FakeRedis())
+    assert q.get_blob_target() is None
+    assert q.claim_blob_target("s3://results/stack-a") == "s3://results/stack-a"
+    assert q.claim_blob_target("s3://results/stack-b") == "s3://results/stack-a", (
+        "the second claimant overwrote the registry instead of losing to it")
+    assert q.get_blob_target() == "s3://results/stack-a"
+
+    with pytest.raises(CanaryFailure):
+        check_blob_target_agreement(q, _Store("results/stack-b"), role="ingress")
+
+    q.clear_blob_target()
+    assert q.get_blob_target() is None
+    assert check_blob_target_agreement(q, _Store("results/stack-b"), role="ingress")
+
+
+def _s3_with_endpoint(bucket: str, prefix: str, endpoint: str):  # noqa: ANN202
+    """An S3-shaped store whose endpoint is visible to describe_blob_store."""
+    from types import SimpleNamespace
+
+    store = _Store(bucket)
+    store._prefix = prefix
+    store._s3 = SimpleNamespace(meta=SimpleNamespace(endpoint_url=endpoint))
+    return store
+
+
+@pytest.mark.parametrize("backend", ALL_BACKENDS)
+def test_split_endpoint_routing_to_one_bucket_still_agrees(backend):
+    """The endpoint is per-process ROUTING, not where the bytes land.
+
+    The shipped compose does this deliberately: the api reaches MinIO on the host IP while the
+    dispatcher uses the `minio` alias, because the backend network is `internal: true`. One MinIO,
+    one bucket, one prefix, two routes. An identity that included the endpoint refused that stack
+    outright -- both orders, no off switch, and `blob-target reset` could not help because clearing
+    just re-records whichever side boots next. It would have been the fourth time on this branch
+    that a check rejected a working deployment by over-reading an incidental detail.
+
+    MUTATION: make the fingerprint `describe_blob_store(store)` again -> the compose stack refuses
+    to boot.
+    """
+    q = backend()
+    api = _s3_with_endpoint("blastbox", "redtusk", "http://10.1.0.5:9000")
+    dispatcher = _s3_with_endpoint("blastbox", "redtusk", "http://minio:9000")
+
+    assert check_blob_target_agreement(q, api, role="ingress")
+    assert check_blob_target_agreement(q, dispatcher, role="dispatcher"), (
+        "a dispatcher reaching the SAME bucket by a different endpoint was refused; that is the "
+        "shipped compose topology and it has no off switch")
+
+    # ...and a genuine bucket difference is still caught, endpoint notwithstanding.
+    with pytest.raises(CanaryFailure):
+        check_blob_target_agreement(q, _s3_with_endpoint("other", "redtusk", "http://minio:9000"),
+                                    role="dispatcher")
+
+
+def test_sql_reports_unknown_when_the_row_vanishes_between_write_and_read(tmp_path):
+    """The SQL-specific half of the empty-read-back hazard.
+
+    A losing `INSERT ... ON CONFLICT DO NOTHING` takes no row lock, so under READ COMMITTED a
+    concurrent `clear_blob_target()` can commit before this SELECT's snapshot. Returning the
+    caller's own fingerprint there reads as agreement. Driven deterministically by clearing the row
+    between the two statements rather than by racing, since the point is the RETURN VALUE, not the
+    timing.
+
+    MUTATION: `return str(row[0]) if row else fingerprint` -> the loser reports winning.
+    """
+    store = SqlJobStore(f"sqlite:///{tmp_path}/j.db")
+    store.claim_blob_target("s3://results/stack-a")
+
+    real_connect = store._connect
+    cleared = {"done": False}
+
+    class _ClearOnce:
+        """Drops the row after the INSERT, before the SELECT reads it."""
+
+        def __init__(self, conn) -> None:  # noqa: ANN001
+            self._conn = conn
+
+        def execute(self, sql, *a):  # noqa: ANN001, ANN201
+            out = self._conn.execute(sql, *a)
+            if "INSERT INTO blob_target" in sql and not cleared["done"]:
+                cleared["done"] = True
+                self._conn.execute("DELETE FROM blob_target WHERE id = 1")
+            return out
+
+        def __getattr__(self, name):  # noqa: ANN001, ANN204
+            return getattr(self._conn, name)
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def _wrapped():
+        with real_connect() as conn:
+            yield _ClearOnce(conn)
+
+    store._connect = _wrapped  # type: ignore[method-assign]
+    try:
+        out = store.claim_blob_target("s3://results/stack-b")
+    finally:
+        store._connect = real_connect  # type: ignore[method-assign]
+
+    assert out is None, (
+        f"the registry read back empty after our write and we returned {out!r} -- our own value, "
+        f"which the caller cannot tell from winning. That boots the losing side on the wrong "
+        f"target with the gate reporting agreement")

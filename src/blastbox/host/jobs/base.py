@@ -332,12 +332,21 @@ class BlobTargetRegistry(Protocol):
     ``INSERT ... ON CONFLICT DO NOTHING`` on SQL, ``SET NX`` on Redis, the existing lock in memory.
     """
 
-    def claim_blob_target(self, fingerprint: str) -> str:
+    def claim_blob_target(self, fingerprint: str) -> "str | None":
         """Register ``fingerprint`` if none is recorded, and return what is NOW recorded.
 
         Returns ``fingerprint`` when this process won the race (or re-registered the same value),
-        and the OTHER value when a different process got there first. Callers compare the return
-        against what they passed in; equality means agreement, inequality names the conflict.
+        the OTHER value when a different process got there first, and ``None`` when the registry
+        could not be read back at all.
+
+        NONE IS NOT AGREEMENT. Both backends originally returned the caller's own fingerprint when
+        the read-back came up empty -- "assume I won" -- which the caller cannot distinguish from
+        actually winning. That is reachable: a `clear_blob_target()` (the documented migration
+        remedy, which an operator runs precisely while a mismatched process is crash-looping) can
+        commit between a losing write and the read, and on Redis an `allkeys-*` eviction does the
+        same with nobody involved. The losing process then logs agreement and boots on the wrong
+        target -- the exact silent split this seam exists to prevent, produced by the seam. UNKNOWN
+        gets its own value, and the caller treats it as unverified rather than as a verdict.
 
         Atomic: concurrent callers must all observe the same winner.
         """

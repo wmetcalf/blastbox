@@ -232,7 +232,7 @@ class SqlJobStore:
         self._ensure_jobs_indexes()
 
     # -- BlobTargetRegistry -------------------------------------------------------------
-    def claim_blob_target(self, fingerprint: str) -> str:
+    def claim_blob_target(self, fingerprint: str) -> "str | None":
         """CAS in the database: insert-if-absent, then read back whatever is there.
 
         The read is in the SAME transaction as the insert, so a caller that lost the race sees the
@@ -245,7 +245,12 @@ class SqlJobStore:
                 f"INSERT INTO blob_target (id, fingerprint) VALUES (1, {self._param}) "
                 f"ON CONFLICT (id) DO NOTHING", (fingerprint,))
             row = conn.execute("SELECT fingerprint FROM blob_target WHERE id = 1").fetchone()
-        return str(row[0]) if row else fingerprint
+        # EMPTY IS UNKNOWN, NOT "I WON". A losing `ON CONFLICT DO NOTHING` takes no row lock, so
+        # under READ COMMITTED a concurrent clear_blob_target() can commit before this SELECT's
+        # snapshot -- and returning our own fingerprint there reads as agreement to the caller.
+        # An operator runs that clear exactly when a mismatched process is crash-looping, so the
+        # race is not hypothetical: it turns the documented remedy into a silent split.
+        return str(row[0]) if row else None
 
     def get_blob_target(self) -> "str | None":
         with self._lock, self._connect() as conn:

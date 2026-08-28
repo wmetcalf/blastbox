@@ -44,7 +44,7 @@ class InMemoryJobStore:
         self._blob_target: str | None = None
 
     # -- BlobTargetRegistry -------------------------------------------------------------
-    def claim_blob_target(self, fingerprint: str) -> str:
+    def claim_blob_target(self, fingerprint: str) -> "str | None":
         """CAS under the same lock that serialises claim_next. See BlobTargetRegistry."""
         with self._lock:
             if self._blob_target is None:

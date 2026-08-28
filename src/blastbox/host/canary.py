@@ -473,31 +473,55 @@ def check_blob_target_agreement(job_store: Any, blob_store: Any, *, role: str) -
     """
     from blastbox.host.jobs.base import BlobTargetRegistry
 
-    # NON-LOCAL STORES ONLY. A LocalBlobStore fingerprint is a host-local PATH, and comparing
-    # paths across hosts is not evidence of anything: the documented multi-node NFS deployment
-    # legitimately mounts the same export at different mount points, and would be refused for it.
-    # That is the third time this PR would have refused a working deployment by over-reading the
-    # local case -- check_store_coherence was rewritten twice for exactly that, and it already
-    # covers the real local hazard (a PRIVATE local store behind a shared queue). What this check
-    # adds is the case coherence structurally cannot see: two non-local stores that both look fine
-    # and point at different buckets. So it scopes itself to those.
-    if is_local_blob_store(blob_store):
-        _log.info("canary.blob_target %s uses a local store; agreement is covered by the "
-                  "shared-store coherence check, not by target comparison", role)
-        return None
-    mine = blob_target_fingerprint(blob_store)
     if not isinstance(job_store, BlobTargetRegistry):
-        _log.warning("canary.blob_target_unverified %s cannot record a blob target (%s); "
+        _log.warning("canary.blob_target_unverified %s cannot record a blob target; "
                      "dispatcher/ingress agreement is NOT being checked",
-                     type(job_store).__name__, mine)
+                     type(job_store).__name__)
         return None
+
+    # LOCAL STORES DO NOT REGISTER, but they are still CHECKED. A LocalBlobStore fingerprint is a
+    # host-local PATH, so comparing two of them proves nothing -- the documented multi-node NFS
+    # deployment mounts one export at different mount points per host, and an earlier version of
+    # this check refused it for that. But skipping the local case ENTIRELY was too much: local
+    # versus s3:// needs no path comparison at all, because a host-local directory can never be
+    # the bucket another process registered. That is the original incident with one side over --
+    # BLASTBOX_BLOB_URL set on the dispatchers and missing on the API -- and it was passing.
+    #
+    # It matters most here: check_store_coherence has three call sites and every one is
+    # dispatcher-side, so an ingress that fell back to a local store gets no coverage from it. The
+    # log line that said otherwise was wrong.
+    if is_local_blob_store(blob_store):
+        recorded = job_store.get_blob_target()
+        if recorded and not recorded.startswith("local:"):
+            raise CanaryFailure(
+                f"this {role} reads and writes results in a LOCAL directory "
+                f"({describe_blob_store(blob_store)}), but another process on the SAME job queue "
+                f"registered {recorded}",
+                "a host-local directory is not that target and never will be -- results written to "
+                "one are unreadable from the other, so every finished job 404s. Usually this means "
+                "BLASTBOX_BLOB_URL is set on one side and missing on this one. Set it here, or, if "
+                "you are DELIBERATELY migrating, clear the recorded target with "
+                "`blastbox blob-target reset` and restart both sides.",
+                None,
+            )
+        _log.info("canary.blob_target %s uses a local store; not registering a host-local path "
+                  "(the shared-queue hazard is check_store_coherence's job)", role)
+        return None
+
+    mine = blob_target_fingerprint(blob_store)
     agreed = job_store.claim_blob_target(mine)
+    if agreed is None:
+        # UNKNOWN, not agreement. See BlobTargetRegistry.claim_blob_target.
+        _log.warning("canary.blob_target_unverified %s could not read the registry back after "
+                     "registering %s (a concurrent reset, or an evicted key); agreement is NOT "
+                     "confirmed this boot", role, mine)
+        return None
     if agreed == mine:
         _log.info("canary.blob_target %s agrees with the queue (%s)", role, mine)
         return agreed
     raise CanaryFailure(
-        f"this {role} writes results to {mine}, but another process on the SAME job queue "
-        f"registered {agreed}",
+        f"this {role} writes results to {mine} (reached via {describe_blob_store(blob_store)}), "
+        f"but another process on the SAME job queue registered {agreed}",
         "every job finished in this state is unreadable by the other side -- it reaches DONE and "
         "then 404s. Point both at the same bucket/prefix/endpoint, or, if you are DELIBERATELY "
         "migrating, clear the recorded target with `blastbox blob-target reset` and restart both "
@@ -510,12 +534,27 @@ def check_blob_target_agreement(job_store: Any, blob_store: Any, *, role: str) -
 def blob_target_fingerprint(store: Any) -> str:
     """A stable identity for WHERE this process reads and writes results.
 
-    Logged by both `serve` and `dispatch` so a target mismatch between them is greppable across a
-    fleet. It does not PROVE agreement -- the dispatcher's round-trip only ever touches its own
-    store, so `s3://results/stack-b` on dispatch and `s3://results/stack-a` on serve both pass
-    while every real job still 404s. Proving it needs an identity the two processes exchange
-    through something they already share, which today means a seam the JobStore protocol does not
-    have; see the follow-up issue. Until then this at least makes the drift visible instead of
-    silent, which is how the original incident stayed hidden for days.
+    WHERE THE BYTES LAND, not how this process gets there. Bucket and prefix only: the ENDPOINT is
+    per-process routing and legitimately differs between processes sharing one object store. The
+    shipped compose does exactly that on purpose -- the api reaches MinIO on the host IP while the
+    dispatcher uses the `minio` alias, because the backend network is `internal: true` -- so an
+    equality key that included the endpoint refused a documented, working stack outright, with no
+    off switch and no reset that could help (clearing just re-records whichever side boots next).
+    That was the THIRD time on this branch that a check aimed at one thing rejected a working
+    deployment by over-reading an incidental detail.
+
+    The endpoint is still LOGGED, by `describe_blob_store`, on both sides and in the mismatch
+    message -- it is exactly what an operator needs to see. It just is not part of the identity.
+
+    Known limitation, stated rather than hidden: two DIFFERENT object stores that happen to use the
+    same bucket and prefix compare equal here. That is a much rarer misconfiguration than
+    split-endpoint routing, and the alternative is refusing the common documented case to catch the
+    rare one.
     """
-    return describe_blob_store(store)
+    bucket = getattr(store, "_bucket", None) or getattr(store, "bucket", None)
+    if bucket:
+        prefix = getattr(store, "_prefix", "") or ""
+        return f"s3://{bucket}/{prefix}" if prefix else f"s3://{bucket}"
+    # Non-S3 shapes never reach the comparison (local stores are exempt), but a stable string is
+    # still better than a repr that varies per process.
+    return f"{type(store).__name__}()"
