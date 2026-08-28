@@ -450,3 +450,29 @@ def test_a_localblobstore_subclass_is_still_local(backend):
     assert check_blob_target_agreement(q, store, role="dispatcher") is None
     with pytest.raises(CanaryFailure):
         check_blob_target_agreement(q, _Store("results/stack-a"), role="ingress")
+
+
+def test_a_credentialed_blob_url_never_reaches_the_log_or_the_registry():
+    """`S3BlobStore._bucket` is `urlsplit(BLASTBOX_BLOB_URL).netloc`, user-info and all.
+
+    `s3://KEY:SECRET@bucket/prefix` therefore yields a `_bucket` of `KEY:SECRET@bucket`. That is
+    not just a log leak: the same string becomes the target FINGERPRINT, which this feature
+    PERSISTS into the job queue -- so a mistyped URL writes a live credential into Postgres or
+    Redis and leaves it there for every later process to read. `_safe_endpoint` covered the
+    endpoint only and never saw this value.
+
+    MUTATION: drop `_safe_bucket` from either the formatter or the fingerprint -> the secret
+    appears in the startup log, or at rest in the queue.
+    """
+    from blastbox.host.canary import blob_target_fingerprint, describe_blob_store
+
+    leaky = _Store("AKIAKEY:s3cr3t@bucket")
+    leaky._prefix = "prefix"
+
+    described = describe_blob_store(leaky)
+    fingerprint = blob_target_fingerprint(leaky)
+
+    for label, value in (("startup log", described), ("persisted fingerprint", fingerprint)):
+        assert "s3cr3t" not in value and "AKIAKEY" not in value, (
+            f"the {label} carries the credential from BLASTBOX_BLOB_URL: {value}")
+    assert "bucket" in fingerprint, f"the bucket itself must survive redaction: {fingerprint}"

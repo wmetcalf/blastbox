@@ -99,6 +99,19 @@ def redact_secrets(text: str) -> str:
         return "<redaction failed>"
 
 
+def _safe_bucket(bucket: Any) -> str:
+    """A bucket with any embedded URI user-info removed.
+
+    `S3BlobStore` takes `_bucket` from `urlsplit(BLASTBOX_BLOB_URL).netloc`, which keeps user-info
+    verbatim: `s3://KEY:SECRET@bucket/prefix` yields a `_bucket` of `KEY:SECRET@bucket`. That value
+    is not merely logged -- it becomes the target FINGERPRINT, which this feature persists into the
+    job queue, so a mistyped URL would write a live credential into Postgres or Redis and leave it
+    there. `_safe_endpoint` covers the endpoint only; this is the separate value it never saw.
+    """
+    text = str(bucket or "")
+    return text.rsplit("@", 1)[-1] if "@" in text else text
+
+
 def _safe_endpoint(url: Any) -> str:
     """An endpoint with any embedded secret removed, for logging.
 
@@ -140,6 +153,7 @@ def describe_blob_store(store: Any) -> str:
         # check when a write cannot connect. Without them the line said `S3BlobStore(blastbox)`,
         # which does not distinguish a working deployment from one pointed at the wrong host.
         prefix = getattr(store, "_prefix", "") or ""
+        bucket = _safe_bucket(bucket)
         endpoint = None
         client = getattr(store, "_s3", None)
         try:
@@ -577,6 +591,9 @@ def blob_target_fingerprint(store: Any) -> str:
     bucket = getattr(store, "_bucket", None) or getattr(store, "bucket", None)
     if bucket:
         prefix = getattr(store, "_prefix", "") or ""
+        # Stripped BEFORE it becomes an identity: this string is written to the job queue and
+        # outlives every process, so a credential that lands here is a credential at rest.
+        bucket = _safe_bucket(bucket)
         return f"s3://{bucket}/{prefix}" if prefix else f"s3://{bucket}"
     # Non-S3 shapes never reach the comparison (local stores are exempt), but a stable string is
     # still better than a repr that varies per process.

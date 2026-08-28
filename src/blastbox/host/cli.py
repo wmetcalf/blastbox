@@ -598,13 +598,20 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
             _vmlog.info("canary.blob_store %s", describe_blob_store(_vmblobs))
             check_store_coherence(store, _vmblobs, job_root,
                                   require_shared=_require_shared_blob_store())
-            check_blob_target_agreement(store, _vmblobs, role="dispatcher")
+            # (registration deferred until after the probe -- see below)
         # ...and the ROUND-TRIP stays gated: that is the probe, and the probe is what the toggle is
         # documented to control.
         if _vm_canary and _vmblobs is not None:
             _vmkey = f"{tier or ''}|{next(iter(engines), '')}|{job_root}"
             _vmlog.info("canary.ok %s", blob_roundtrip(
                 _vmblobs, key_hint=_vmkey, scratch_dir=job_root))
+        # AFTER the round-trip, same as Dispatcher.run_forever. A network dispatcher pointed at an
+        # unreachable or unauthorized bucket used to claim that target and only then fail its probe,
+        # so correcting the config did not let it restart -- it mismatched its own stale
+        # registration and needed a `blob-target reset` nobody would think to run. Fifth sibling
+        # call site on this branch to need the same fix after the first one got it.
+        if _vmblobs is not None:
+            check_blob_target_agreement(store, _vmblobs, role="dispatcher")
 
             def _vm_periodic_canary(_b=_vmblobs, _l=_vmlog, _k=_vmkey, _jr=job_root) -> None:
                 _l.info("canary.ok %s", blob_roundtrip(
