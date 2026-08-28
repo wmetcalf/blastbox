@@ -473,6 +473,18 @@ def check_blob_target_agreement(job_store: Any, blob_store: Any, *, role: str) -
     """
     from blastbox.host.jobs.base import BlobTargetRegistry
 
+    # NON-LOCAL STORES ONLY. A LocalBlobStore fingerprint is a host-local PATH, and comparing
+    # paths across hosts is not evidence of anything: the documented multi-node NFS deployment
+    # legitimately mounts the same export at different mount points, and would be refused for it.
+    # That is the third time this PR would have refused a working deployment by over-reading the
+    # local case -- check_store_coherence was rewritten twice for exactly that, and it already
+    # covers the real local hazard (a PRIVATE local store behind a shared queue). What this check
+    # adds is the case coherence structurally cannot see: two non-local stores that both look fine
+    # and point at different buckets. So it scopes itself to those.
+    if is_local_blob_store(blob_store):
+        _log.info("canary.blob_target %s uses a local store; agreement is covered by the "
+                  "shared-store coherence check, not by target comparison", role)
+        return None
     mine = blob_target_fingerprint(blob_store)
     if not isinstance(job_store, BlobTargetRegistry):
         _log.warning("canary.blob_target_unverified %s cannot record a blob target (%s); "

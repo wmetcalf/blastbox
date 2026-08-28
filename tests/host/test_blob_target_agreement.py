@@ -20,12 +20,17 @@ from blastbox.host.jobs.sql_store import SqlJobStore
 
 
 class _Store:
-    """A blob store whose fingerprint is whatever we say it is."""
+    """A NON-LOCAL (S3-shaped) blob store whose fingerprint is whatever we say it is."""
 
     def __init__(self, bucket: str) -> None:
         self._bucket = bucket
         self._prefix = ""
         self._s3 = None
+
+
+class LocalBlobStore:                      # noqa: D101 - name IS the contract (is_local_blob_store)
+    def __init__(self, root: str) -> None:
+        self.local_root = root
 
 
 def _sql() -> SqlJobStore:
@@ -146,3 +151,24 @@ def test_a_store_without_the_seam_warns_rather_than_refusing(caplog):
         assert check_blob_target_agreement(_NoSeam(), _Store("results/x"), role="ingress") is None
     assert any("blob_target_unverified" in r.getMessage() for r in caplog.records), (
         "a store without the seam must say so rather than silently skipping the check")
+
+
+@pytest.mark.parametrize("backend", ALL_BACKENDS)
+def test_local_stores_are_not_compared_by_path(backend):
+    """A LocalBlobStore fingerprint is a host-local PATH; comparing paths proves nothing.
+
+    The documented multi-node NFS deployment mounts one export at different mount points per host,
+    so path comparison would refuse it — the third time this PR would have refused a working
+    deployment by over-reading the local case. CI proved it empirically: every ingress test sharing
+    one Postgres with its own tmp_path store was refused after the first.
+
+    The real local hazard (a PRIVATE local store behind a shared queue) is check_store_coherence's
+    job and is unaffected. This check covers what coherence structurally cannot see: two non-local
+    stores that both look fine and point at different buckets.
+
+    MUTATION: drop the is_local_blob_store guard -> two different local paths refuse each other.
+    """
+    q = backend()
+    assert check_blob_target_agreement(q, LocalBlobStore("/mnt/a/blobs"), role="dispatcher") is None
+    assert check_blob_target_agreement(q, LocalBlobStore("/mnt/b/blobs"), role="ingress") is None
+    assert q.get_blob_target() is None, "a local store must not register a target at all"

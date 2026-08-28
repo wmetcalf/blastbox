@@ -104,6 +104,11 @@ starting the other — otherwise you simply record the wrong target again. There
 variable for this on purpose: one set to get past a migration tends to stay set, silently disarming
 the check on a fleet that believes it is protected.
 
+**Non-local stores only.** A `LocalBlobStore` fingerprint is a host-local *path*, and the
+documented multi-node NFS deployment legitimately mounts one export at different mount points per
+host — comparing those paths would refuse a working fleet. The real local hazard, a *private* local
+store behind a shared queue, is what the shared-store coherence check above is for.
+
 A third-party `JobStore` that does not implement the registry logs
 `canary.blob_target_unverified` and starts — absence of the capability is not evidence of
 disagreement.
