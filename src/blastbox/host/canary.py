@@ -325,6 +325,45 @@ def _roundtrip_once(store: Any, job_id: str, keep_failed: bool, scratch_dir: Any
             f"in {1000 * (time.monotonic() - started):.0f}ms")
 
 
+def _purge_versions(store: Any, job_id: str) -> None:
+    """Drop the canary key's NONCURRENT versions and delete markers. Best-effort, S3 only.
+
+    A stable key bounds the number of live objects to one, but it does not bound STORAGE on a
+    versioned bucket: every periodic ``put_output`` writes a new version, and ``delete_job`` lists
+    only current keys and calls ``delete_objects`` without a ``VersionId`` -- which adds a delete
+    marker rather than removing anything. So each interval leaves one noncurrent version plus one
+    marker, per dispatcher, forever, and the probe that exists to prove the store is healthy
+    quietly accretes metadata in it.
+
+    Scoped to the canary's own prefix on purpose. ``delete_job`` is shared with retention and the
+    ingress DELETE route, where "remove every version" is a different decision with a different
+    blast radius; this only touches the key this module wrote.
+
+    Silent on failure, including the permission case: ``s3:ListBucketVersions`` and
+    ``s3:DeleteObjectVersion`` are not implied by the write access the canary needs, and a
+    deployment that withholds them is expected -- the documented remedy there is a lifecycle rule
+    on noncurrent versions. Never raises; the caller is already best-effort.
+    """
+    s3 = getattr(store, "_s3", None)
+    bucket = getattr(store, "_bucket", None)
+    keyfn = getattr(store, "_key", None)
+    if s3 is None or not bucket or not callable(keyfn):
+        return                                   # not an S3-shaped store: nothing to version
+    try:
+        prefix = keyfn("results", job_id) + "/"
+        paginator = s3.get_paginator("list_object_versions")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            stale = [{"Key": v["Key"], "VersionId": v["VersionId"]}
+                     for k in ("Versions", "DeleteMarkers")
+                     for v in (page.get(k) or [])
+                     if v.get("VersionId") and v["VersionId"] != "null"]
+            if stale:
+                s3.delete_objects(Bucket=bucket, Delete={"Objects": stale, "Quiet": True})
+    except Exception as exc:  # noqa: BLE001 -- unversioned bucket, or no version permissions
+        _log.debug("canary.version_purge_skipped job_id=%s: %s: %s",
+                   job_id, type(exc).__name__, redact_secrets(str(exc)))
+
+
 def _cleanup(store: Any, job_id: str) -> None:
     """Best-effort removal of the canary object.
 
@@ -336,6 +375,7 @@ def _cleanup(store: Any, job_id: str) -> None:
     """
     try:
         store.delete_job(job_id)
+        _purge_versions(store, job_id)
     except Exception as exc:  # noqa: BLE001
         # Redacted like every other message: this is a separate exception path, reached after
         # both successful probes and ambiguous writes, and botocore echoes the URL it was handed.

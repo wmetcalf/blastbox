@@ -745,3 +745,125 @@ def test_a_store_that_always_returns_wrong_bytes_still_fails(tmp_path):
         blob_roundtrip(_AlwaysForeignBytes(tmp_path / "jobs", blob_root=tmp_path / "blobs"),
                        key_hint="fc")
     assert "different bytes" in str(ei.value)
+
+
+class _FakeVersionedS3:
+    """An S3-shaped store on a bucket with versioning ENABLED.
+
+    Records what the purge asks for, and models the behaviour that makes the bug invisible without
+    it: delete_job removes only the CURRENT key and leaves every prior version in place.
+    """
+
+    def __init__(self, *, allow_versions: bool = True) -> None:
+        self._bucket = "blastbox"
+        self._prefix = ""
+        self._s3 = self
+        self.versions: list[tuple[str, str]] = []      # (key, version_id) still stored
+        self.deleted: list[dict] = []
+        self.allow_versions = allow_versions
+        self._n = 0
+
+    # -- the bits canary.py introspects -------------------------------------------------
+    def _key(self, *parts: str) -> str:
+        return "/".join(parts)
+
+    def put_output(self, job_id, out_dir) -> None:  # noqa: ANN001
+        self._n += 1
+        self.versions.append((self._key("results", job_id) + "/metadata.json", f"v{self._n}"))
+
+    def delete_job(self, job_id) -> None:  # noqa: ANN001
+        # A versioned bucket: this adds a delete MARKER; prior versions survive.
+        self._n += 1
+        self.versions.append((self._key("results", job_id) + "/metadata.json", f"dm{self._n}"))
+
+    # -- the paginator surface ----------------------------------------------------------
+    def get_paginator(self, op):  # noqa: ANN001, ANN201
+        assert op == "list_object_versions"
+        if not self.allow_versions:
+            raise RuntimeError("AccessDenied: s3:ListBucketVersions")
+        store = self
+
+        class _P:
+            def paginate(self, **kw):  # noqa: ANN003, ANN201
+                pre = kw["Prefix"]
+                yield {"Versions": [{"Key": k, "VersionId": v}
+                                    for k, v in store.versions
+                                    if k.startswith(pre) and not v.startswith("dm")],
+                       "DeleteMarkers": [{"Key": k, "VersionId": v}
+                                         for k, v in store.versions
+                                         if k.startswith(pre) and v.startswith("dm")]}
+        return _P()
+
+    def delete_objects(self, Bucket, Delete):  # noqa: ANN001, ANN201, N803
+        if not self.allow_versions:
+            raise RuntimeError("AccessDenied: s3:DeleteObjectVersion")
+        self.deleted.extend(Delete["Objects"])
+        gone = {(o["Key"], o["VersionId"]) for o in Delete["Objects"]}
+        self.versions = [kv for kv in self.versions if kv not in gone]
+        return {}
+
+
+def test_the_canary_does_not_accrete_versions_on_a_versioned_bucket():
+    """A stable key bounds LIVE objects to one; it does not bound STORAGE.
+
+    On a versioned bucket every periodic put_output writes a new version, and delete_job lists only
+    current keys and calls delete_objects without a VersionId -- which adds a delete marker rather
+    than removing anything. So each interval left one noncurrent version plus one marker, per
+    dispatcher, forever: the probe whose job is proving the store is healthy quietly accreting
+    metadata inside it.
+
+    MUTATION: drop the _purge_versions call from _cleanup -> the version count grows per probe.
+    """
+    from blastbox.host.canary import _cleanup
+
+    store = _FakeVersionedS3()
+    for _ in range(5):                       # five periodic probes
+        store.put_output("canary-job", None)
+        _cleanup(store, "canary-job")
+
+    assert store.versions == [], (
+        f"{len(store.versions)} object versions survived five probes ({store.versions}); on a "
+        f"versioned bucket that grows unbounded, one noncurrent version plus one delete marker "
+        f"per interval per dispatcher")
+    assert store.deleted, "the purge never asked for any version to be deleted"
+    assert all("VersionId" in d for d in store.deleted), (
+        "delete_objects was called without VersionId, which adds another delete marker instead of "
+        "removing a version")
+
+
+def test_denied_version_permissions_do_not_report_a_failed_cleanup(caplog):
+    """`s3:ListBucketVersions` / `s3:DeleteObjectVersion` are not implied by the canary's write access.
+
+    A deployment that withholds them is expected, and the documented remedy there is a lifecycle
+    rule on noncurrent versions. What must NOT happen is the operator being told cleanup failed:
+    `delete_job` succeeded, the live object IS gone, and only the version housekeeping was refused.
+
+    "It must not raise" is too weak a claim to test -- `_cleanup`'s own `except Exception` already
+    guarantees that, so a purge with no handler at all passes it (verified: that mutant survived).
+    The observable difference is the MESSAGE: without the inner handler the refusal surfaces as
+    "leftover object left in the store", which is false and sends the operator looking for an
+    object that is not there.
+
+    MUTATION: remove the except in _purge_versions -> the misleading warning is emitted.
+    """
+    import logging
+
+    from blastbox.host.canary import _cleanup
+
+    store = _FakeVersionedS3(allow_versions=False)
+    store.put_output("canary-job", None)
+    with caplog.at_level(logging.DEBUG, logger="blastbox.host.canary"):
+        _cleanup(store, "canary-job")        # must not raise
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not any("leftover object left in the store" in m for m in warnings), (
+        f"a denied VERSION permission was reported as a failed object cleanup: {warnings}; the "
+        f"object was deleted, and the operator is sent looking for something that is not there")
+
+
+def test_the_version_purge_ignores_a_store_that_is_not_s3_shaped(tmp_path):
+    """LocalBlobStore has no _s3/_bucket, and must not be probed for versions at all."""
+    from blastbox.host.canary import _cleanup
+
+    store = LocalBlobStore(str(tmp_path))
+    _cleanup(store, "canary-job")            # must not raise
