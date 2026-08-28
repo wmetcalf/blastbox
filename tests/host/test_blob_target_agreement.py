@@ -27,10 +27,10 @@ class _Store:
         self._s3 = None
 
 
-class LocalBlobStore:                      # noqa: D101 - name IS the contract (is_local_blob_store)
-    def __init__(self, root: str) -> None:
-        self.local_root = root
-        self._bucket = None
+# The REAL LocalBlobStore, not a look-alike: `is_local_blob_store` is inheritance-aware now, so a
+# stand-in that merely shares the name would be classified non-local and these tests would assert
+# the opposite of production behaviour.
+from blastbox.host.blobs.local import LocalBlobStore  # noqa: E402
 
 
 def _sql() -> SqlJobStore:
@@ -214,9 +214,13 @@ def test_local_stores_are_not_compared_by_path(backend):
     MUTATION: drop the is_local_blob_store guard -> two different local paths refuse each other.
     """
     q = backend()
-    assert check_blob_target_agreement(q, LocalBlobStore("/mnt/a/blobs"), role="dispatcher") is None
-    assert check_blob_target_agreement(q, LocalBlobStore("/mnt/b/blobs"), role="ingress") is None
-    assert q.get_blob_target() is None, "a local store must not register a target at all"
+    assert check_blob_target_agreement(q, LocalBlobStore(tempfile.mkdtemp()), role="dispatcher") is None
+    assert check_blob_target_agreement(q, LocalBlobStore(tempfile.mkdtemp()), role="ingress") is None
+    recorded = q.get_blob_target()
+    assert recorded == "local:", (
+        f"a local store registered {recorded!r}; it must record the path-INDEPENDENT sentinel -- "
+        f"a host-local path is meaningless to compare, but recording nothing made enforcement "
+        f"depend on which side booted first")
 
 
 def test_every_protocol_used_with_isinstance_stays_runtime_checkable():
@@ -262,7 +266,7 @@ def test_a_local_store_facing_an_s3_registered_queue_is_refused(backend):
     check_blob_target_agreement(q, _Store("results/stack-a"), role="dispatcher")
 
     with pytest.raises(CanaryFailure) as ei:
-        check_blob_target_agreement(q, LocalBlobStore("/var/lib/blastbox/blobs"), role="ingress")
+        check_blob_target_agreement(q, LocalBlobStore(tempfile.mkdtemp()), role="ingress")
     msg = str(ei.value)
     assert "results/stack-a" in msg, f"the message must name what the queue holds: {msg}"
     assert "BLASTBOX_BLOB_URL" in msg, f"the message must name the usual cause: {msg}"
@@ -276,9 +280,9 @@ def test_two_local_stores_still_agree_across_different_mount_points(backend):
     resurrect it.
     """
     q = backend()
-    assert check_blob_target_agreement(q, LocalBlobStore("/mnt/a/blobs"), role="dispatcher") is None
-    assert check_blob_target_agreement(q, LocalBlobStore("/mnt/b/blobs"), role="ingress") is None
-    assert q.get_blob_target() is None, "a local store must not register a host-local path"
+    assert check_blob_target_agreement(q, LocalBlobStore(tempfile.mkdtemp()), role="dispatcher") is None
+    assert check_blob_target_agreement(q, LocalBlobStore(tempfile.mkdtemp()), role="ingress") is None
+    assert q.get_blob_target() == "local:", "a local store must record the sentinel, not a path"
 
 
 def test_the_redis_registry_behaves_like_the_others():
@@ -398,3 +402,51 @@ def test_sql_reports_unknown_when_the_row_vanishes_between_write_and_read(tmp_pa
         f"the registry read back empty after our write and we returned {out!r} -- our own value, "
         f"which the caller cannot tell from winning. That boots the losing side on the wrong "
         f"target with the gate reporting agreement")
+
+
+@pytest.mark.parametrize("backend", ALL_BACKENDS)
+def test_a_local_store_booting_first_still_conflicts_with_an_s3_peer(backend):
+    """Enforcement must not depend on WHICH SIDE BOOTS FIRST.
+
+    The previous version returned without claiming anything for a local store, so a local process
+    booting first recorded nothing and the S3 peer then claimed an empty registry -- both started,
+    mismatch undetected, purely because the wrong side won the race to boot. Half-built, in fact:
+    the code already tested `recorded.startswith("local:")` while nothing ever wrote that sentinel.
+
+    A local store now registers a path-INDEPENDENT sentinel. Not a path, because paths across hosts
+    are meaningless (the NFS shape must keep working); not an S3 target, so it conflicts in either
+    order.
+
+    MUTATION: return without claiming for local stores -> the local-first ordering boots both.
+    """
+    q = backend()
+    assert check_blob_target_agreement(q, LocalBlobStore(tempfile.mkdtemp()),
+                                       role="dispatcher") is None
+    with pytest.raises(CanaryFailure):
+        check_blob_target_agreement(q, _Store("results/stack-a"), role="ingress")
+
+
+@pytest.mark.parametrize("backend", ALL_BACKENDS)
+def test_a_localblobstore_subclass_is_still_local(backend):
+    """`Dispatcher(blob_store=...)` is a supported injection seam, so wrapping LocalBlobStore to add
+    instrumentation is something callers legitimately do.
+
+    An exact type-NAME test classified such a wrapper as non-local, which skipped the fail-closed
+    shared-store refusal and let two hosts with identical private paths register and agree. A gate a
+    subclass silently bypasses is not a gate.
+
+    MUTATION: `type(store).__name__ == "LocalBlobStore"` -> the subclass registers an s3-shaped
+    identity and the local-first conflict disappears.
+    """
+    from blastbox.host.blobs.local import LocalBlobStore as RealLocal
+    from blastbox.host.canary import is_local_blob_store
+
+    class Instrumented(RealLocal):
+        pass
+
+    store = Instrumented(tempfile.mkdtemp())
+    assert is_local_blob_store(store) is True
+    q = backend()
+    assert check_blob_target_agreement(q, store, role="dispatcher") is None
+    with pytest.raises(CanaryFailure):
+        check_blob_target_agreement(q, _Store("results/stack-a"), role="ingress")

@@ -400,7 +400,19 @@ def is_shared_job_store(job_store: Any) -> bool:
 
 
 def is_local_blob_store(store: Any) -> bool:
-    return type(store).__name__ == "LocalBlobStore"
+    """True for LocalBlobStore AND its subclasses.
+
+    An exact type-name test let a subclass through -- and `Dispatcher(blob_store=...)` is a
+    supported injection seam, so wrapping LocalBlobStore to add instrumentation is a thing callers
+    legitimately do. Such a wrapper was classified NON-local, which skipped the fail-closed
+    shared-store refusal and let two hosts with identical private paths register and agree. A
+    capability gate that a subclass silently bypasses is not a gate.
+    """
+    try:
+        from blastbox.host.blobs.local import LocalBlobStore
+    except Exception:  # noqa: BLE001 - optional import; fall back to the name test
+        return type(store).__name__ == "LocalBlobStore"
+    return isinstance(store, LocalBlobStore)
 
 
 def check_store_coherence(job_store: Any, blob_store: Any, job_root: Any = None, *,
@@ -450,6 +462,11 @@ def check_store_coherence(job_store: Any, blob_store: Any, job_root: Any = None,
     _log.warning("canary.local_blob_store_with_shared_queue %s — %s", what, remedy)
 
 
+#: What a LOCAL store registers instead of its path. Not an s3:// target, so it conflicts with one
+#: in EITHER boot order, while every local store registers the same value so the NFS shape agrees.
+_LOCAL_SENTINEL = "local:"
+
+
 def check_blob_target_agreement(job_store: Any, blob_store: Any, *, role: str) -> str | None:
     """Prove every process on this queue writes results to the SAME blob target.
 
@@ -491,8 +508,14 @@ def check_blob_target_agreement(job_store: Any, blob_store: Any, *, role: str) -
     # dispatcher-side, so an ingress that fell back to a local store gets no coverage from it. The
     # log line that said otherwise was wrong.
     if is_local_blob_store(blob_store):
-        recorded = job_store.get_blob_target()
-        if recorded and not recorded.startswith("local:"):
+        # REGISTER A SENTINEL, do not just look. Returning without claiming made enforcement
+        # ORDER-DEPENDENT: a local process booting FIRST recorded nothing, so the S3 peer then
+        # claimed an empty registry and both started -- the mismatch undetected because the wrong
+        # side happened to boot first. The sentinel carries no path (paths across hosts are
+        # meaningless, which is why the NFS shape must keep working) but it is not an S3 target, so
+        # it conflicts with one in either order.
+        recorded = job_store.claim_blob_target(_LOCAL_SENTINEL)
+        if recorded is not None and not recorded.startswith(_LOCAL_SENTINEL):
             raise CanaryFailure(
                 f"this {role} reads and writes results in a LOCAL directory "
                 f"({describe_blob_store(blob_store)}), but another process on the SAME job queue "
@@ -504,8 +527,8 @@ def check_blob_target_agreement(job_store: Any, blob_store: Any, *, role: str) -
                 "`blastbox blob-target reset` and restart both sides.",
                 None,
             )
-        _log.info("canary.blob_target %s uses a local store; not registering a host-local path "
-                  "(the shared-queue hazard is check_store_coherence's job)", role)
+        _log.info("canary.blob_target %s uses a local store; registered the path-independent "
+                  "sentinel (the shared-queue hazard is check_store_coherence's job)", role)
         return None
 
     mine = blob_target_fingerprint(blob_store)

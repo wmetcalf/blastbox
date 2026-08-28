@@ -795,11 +795,17 @@ class Dispatcher:
         # found behind this toggle that did not belong to it; the blob-store log was the first.
         check_store_coherence(self._job_store, self._blobs, self._job_root,
                               require_shared=self._require_shared_blob_store)
-        # ...and the half coherence cannot see: that the OTHER side of this queue writes to the
-        # same place. Also outside the toggle, for the same reason -- it is topology, not a probe.
-        check_blob_target_agreement(self._job_store, self._blobs, role="dispatcher")
         if canary:
             self.self_test(gate=True)
+        # ...and the half coherence cannot see: that the OTHER side of this queue writes to the
+        # same place. Also outside the toggle, for the same reason -- it is topology, not a probe.
+        #
+        # AFTER the round-trip, because this one PERSISTS. A dispatcher whose bucket is wrong used
+        # to record that bucket and only then fail its probe -- so fixing the config was not enough
+        # to restart it: the corrected process now mismatched its own predecessor's registration and
+        # needed a `blob-target reset` the operator had no reason to suspect. A target that never
+        # proved it works has no business becoming the one everyone else must match.
+        check_blob_target_agreement(self._job_store, self._blobs, role="dispatcher")
         if max(1, int(concurrency)) > 1:
             self._run_forever_concurrent(
                 poll_interval_s=poll_interval_s,

@@ -307,11 +307,15 @@ def build_app(
     try:
         import logging as _logging
 
-        from blastbox.host.canary import blob_target_fingerprint
+        # The DISPLAY formatter, matching what every dispatcher logs. Agreement is deliberately
+        # endpoint-blind (two routes to one bucket are one target), which makes these log lines the
+        # ONLY way to see endpoint drift -- and logging the fingerprint here dropped the endpoint
+        # from exactly the line the guide tells operators to compare side by side.
+        from blastbox.host.canary import describe_blob_store
 
         _logging.getLogger("blastbox.host.ingress").info(
             "canary.blob_store %s (serving results from here)",
-            blob_target_fingerprint(_blob_store))
+            describe_blob_store(_blob_store))
     except Exception:  # noqa: BLE001 - a LOG LINE must never stop the API booting
         pass
 
