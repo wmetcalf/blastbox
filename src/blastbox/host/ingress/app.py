@@ -303,11 +303,7 @@ def build_app(
         {**os.environ, "BLASTBOX_JOB_ROOT": str(_job_root)}
     )
     # Log WHERE results will be served from, in the same shape the dispatchers log where they
-    # write. A dispatcher and an API pointed at different buckets/prefixes both pass their own
-    # self-tests and every real job still 404s, so the two lines being greppable side by side is
-    # what makes that drift findable. (Making it FAIL rather than merely visible needs an identity
-    # the two processes exchange through something they already share; the JobStore protocol has
-    # no seam for that today.)
+    # write, so the two lines are greppable side by side across a fleet.
     try:
         import logging as _logging
 
@@ -316,8 +312,18 @@ def build_app(
         _logging.getLogger("blastbox.host.ingress").info(
             "canary.blob_store %s (serving results from here)",
             blob_target_fingerprint(_blob_store))
-    except Exception:  # noqa: BLE001 - a log line must never stop the API booting
+    except Exception:  # noqa: BLE001 - a LOG LINE must never stop the API booting
         pass
+
+    # ...and now PROVE it, rather than leaving it to a human comparing two log lines. Registered
+    # through the job queue, which is the only thing this API and its dispatchers are guaranteed to
+    # share. Deliberately NOT inside the try above: that handler exists so a log line cannot stop
+    # the API, and this is not a log line -- serving results from a target no dispatcher writes to
+    # means every finished job 404s, which is the failure this whole seam exists to end. It has to
+    # be able to stop the boot.
+    from blastbox.host.canary import check_blob_target_agreement
+
+    check_blob_target_agreement(_job_store, _blob_store, role="ingress")
 
     # Engine allowlist
     _allowed_engines: set[str]

@@ -58,6 +58,7 @@ from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_wi
 from blastbox.host.canary import (
     CanaryFailure,
     blob_roundtrip,
+    check_blob_target_agreement,
     check_store_coherence,
     describe_blob_store,
 )
@@ -794,6 +795,9 @@ class Dispatcher:
         # found behind this toggle that did not belong to it; the blob-store log was the first.
         check_store_coherence(self._job_store, self._blobs, self._job_root,
                               require_shared=self._require_shared_blob_store)
+        # ...and the half coherence cannot see: that the OTHER side of this queue writes to the
+        # same place. Also outside the toggle, for the same reason -- it is topology, not a probe.
+        check_blob_target_agreement(self._job_store, self._blobs, role="dispatcher")
         if canary:
             self.self_test(gate=True)
         if max(1, int(concurrency)) > 1:

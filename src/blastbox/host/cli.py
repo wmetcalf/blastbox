@@ -577,6 +577,7 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         if _vm_canary:
             from blastbox.host.canary import (
                 blob_roundtrip,
+                check_blob_target_agreement,
                 check_store_coherence,
                 describe_blob_store,
             )
@@ -588,6 +589,7 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
                 _vmlog.info("canary.blob_store %s", describe_blob_store(_vmblobs))
                 check_store_coherence(store, _vmblobs, job_root,
                                       require_shared=_require_shared_blob_store())
+                check_blob_target_agreement(store, _vmblobs, role="dispatcher")
                 _vmkey = f"{tier or ''}|{next(iter(engines), '')}|{job_root}"
                 _vmlog.info("canary.ok %s", blob_roundtrip(
                     _vmblobs, key_hint=_vmkey, scratch_dir=job_root))
@@ -782,6 +784,36 @@ def _bench_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def _blob_target_cmd(args: argparse.Namespace) -> int:
+    """Show or clear the blob target registered on the job queue.
+
+    The escape hatch for the agreement check. A fleet deliberately moving buckets would otherwise
+    be refused by its own recorded fingerprint forever, so clearing has to be POSSIBLE -- and
+    explicit, which is why it is a command rather than an environment variable. An env var set once
+    to get past a migration tends to stay set, and would disarm the check permanently on a fleet
+    that believes it is protected.
+    """
+    from blastbox.host.jobs.base import BlobTargetRegistry
+    from blastbox.host.jobs.factory import build_job_store_from_env
+
+    store = build_job_store_from_env()
+    if not isinstance(store, BlobTargetRegistry):
+        print(f"{type(store).__name__} cannot record a blob target; nothing to show or reset.")
+        return 1
+    if args.blob_target_cmd == "reset":
+        store.clear_blob_target()
+        print("blob target cleared. Both the dispatcher and the ingress will re-register on their "
+              "next start -- start ONE of them first and confirm its target before starting the "
+              "other, or you will simply record the wrong one again.")
+        return 0
+    # READ-ONLY. Reaching for claim_blob_target here would let `show` register its own argument on
+    # an empty queue, after which every real process mismatches it -- a diagnostic that bricks the
+    # thing it is diagnosing. Hence the separate accessor.
+    current = store.get_blob_target()
+    print(current or "(no blob target recorded yet)")
+    return 0
+
+
 def _version_cmd(_: argparse.Namespace) -> int:
     print(f"blastbox {__version__}")
     return 0
@@ -944,6 +976,16 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument("--dry-run", action="store_true",
                     help="report what would be uploaded without touching the blob store")
     pm.set_defaults(func=_migrate_results_cmd)
+
+    pt = sub.add_parser(
+        "blob-target",
+        help="show or reset the blob target recorded on the job queue (see `show`/`reset`)")
+    pts = pt.add_subparsers(dest="blob_target_cmd", required=True)
+    pts.add_parser("show", help="print the blob target every process on this queue must agree on")
+    pts.add_parser(
+        "reset",
+        help="forget it, for a DELIBERATE migration; both sides re-register on next start")
+    pt.set_defaults(func=_blob_target_cmd)
 
     pv = sub.add_parser("version", help="print version and exit")
     pv.set_defaults(func=_version_cmd)

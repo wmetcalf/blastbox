@@ -450,6 +450,51 @@ def check_store_coherence(job_store: Any, blob_store: Any, job_root: Any = None,
     _log.warning("canary.local_blob_store_with_shared_queue %s — %s", what, remedy)
 
 
+def check_blob_target_agreement(job_store: Any, blob_store: Any, *, role: str) -> str | None:
+    """Prove every process on this queue writes results to the SAME blob target.
+
+    The gap `blob_target_fingerprint` could only make visible: `blob_roundtrip` proves a process
+    can write and read ITS OWN store, and `check_store_coherence` catches a private local store
+    behind a shared queue -- but dispatch on `s3://results/stack-b` and serve on
+    `s3://results/stack-a` both pass those and every finished job 404s. That is the original
+    17,626-job incident with a different cause, and it stayed hidden for days because nothing
+    compared the two.
+
+    The queue is the carrier, because it is the only thing the two processes are GUARANTEED to
+    share: if they do not share it, they are not the same deployment and there is nothing to
+    compare. Registration is a compare-and-swap (see :class:`BlobTargetRegistry`) so a boot storm
+    has exactly one winner rather than every process recording its own answer and no one noticing.
+
+    REFUSES on mismatch, both sides, naming both targets and who holds which. A mismatch is not a
+    brownout that heals: every job the fleet finishes in this state is unreadable, and the sooner
+    it stops the fewer there are. Returns the agreed fingerprint, or None when the store predates
+    the registry (a third-party JobStore) -- absence of the seam is not evidence of disagreement,
+    so it warns rather than refusing.
+    """
+    from blastbox.host.jobs.base import BlobTargetRegistry
+
+    mine = blob_target_fingerprint(blob_store)
+    if not isinstance(job_store, BlobTargetRegistry):
+        _log.warning("canary.blob_target_unverified %s cannot record a blob target (%s); "
+                     "dispatcher/ingress agreement is NOT being checked",
+                     type(job_store).__name__, mine)
+        return None
+    agreed = job_store.claim_blob_target(mine)
+    if agreed == mine:
+        _log.info("canary.blob_target %s agrees with the queue (%s)", role, mine)
+        return agreed
+    raise CanaryFailure(
+        f"this {role} writes results to {mine}, but another process on the SAME job queue "
+        f"registered {agreed}",
+        "every job finished in this state is unreadable by the other side -- it reaches DONE and "
+        "then 404s. Point both at the same bucket/prefix/endpoint, or, if you are DELIBERATELY "
+        "migrating, clear the recorded target with `blastbox blob-target reset` and restart both "
+        "sides. Check BLASTBOX_BLOB_URL, BLASTBOX_BLOB_ENDPOINT_URL and BLASTBOX_BLOB_LOCAL_ROOT "
+        "on THIS process against the other one.",
+        None,
+    )
+
+
 def blob_target_fingerprint(store: Any) -> str:
     """A stable identity for WHERE this process reads and writes results.
 

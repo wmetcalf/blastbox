@@ -80,6 +80,35 @@ issue #79 exists to prevent.
 | `BLASTBOX_CANARY_INTERVAL_S` | `900` | How often to re-run the round-trip while serving. Advisory: it logs, it never gates. `0` ⇒ startup only. Non-numeric, **non-finite** (`nan`, `inf`) and **negative** values fall back to 900 with a warning — `float()` accepts all three, and each would silently switch the periodic pass off while the documented disable value is `0`. Network dispatchers (aws/static/cascade) honour this cadence too; their loop wakes on the earlier of this and the maintenance interval. **Versioned buckets:** the probe reuses a stable key, so at most one LIVE object exists — but each re-run still writes a new version and the delete adds a marker, so the canary also best-effort deletes its own noncurrent versions. That needs `s3:ListBucketVersions` + `s3:DeleteObjectVersion`; where those are withheld the purge is skipped silently and the remedy is a lifecycle rule expiring noncurrent versions under the results prefix. |
 | `BLASTBOX_REQUIRE_SHARED_BLOB_STORE` | `0` (advisory) | Declare that this deployment's results **must** be readable by other machines. With it set, a dispatcher claiming from a shared queue (postgres/redis) while writing to a `LocalBlobStore` **refuses to start**. Default is a loud warning instead, because the canary cannot infer the answer: both single-node-on-local-postgres and multi-node-with-`BLASTBOX_BLOB_LOCAL_ROOT`-on-NFS are documented, valid configurations that look identical from inside the process. Set this on a fleet where a local store is never correct. An unrecognised non-empty value is **warned about and treated as unset** rather than silently ignored. |
 
+### Blob-target agreement (dispatcher ↔ ingress)
+
+Every process on one job queue must write and read results at the **same** blob target. The
+round-trip canary only ever touches its own store, so `dispatch` on `s3://results/stack-b` and
+`serve` on `s3://results/stack-a` both pass their own checks while every finished job reaches DONE
+and then 404s.
+
+At startup each process registers its target through the **job queue** — the one thing the two are
+guaranteed to share — and **refuses to start** if another process already registered a different
+one, naming both targets and which side holds which. Registration is a compare-and-swap, so a
+simultaneous boot has exactly one winner rather than each process recording its own answer.
+
+Deliberately migrating targets:
+
+```
+blastbox blob-target show     # what the queue currently requires
+blastbox blob-target reset    # forget it; both sides re-register on next start
+```
+
+After a reset, start **one** side first and confirm its logged `canary.blob_store` line before
+starting the other — otherwise you simply record the wrong target again. There is no environment
+variable for this on purpose: one set to get past a migration tends to stay set, silently disarming
+the check on a fleet that believes it is protected.
+
+A third-party `JobStore` that does not implement the registry logs
+`canary.blob_target_unverified` and starts — absence of the capability is not evidence of
+disagreement.
+
+
 **On a versioned S3 bucket**, set a lifecycle rule expiring noncurrent versions and delete
 markers. `S3BlobStore.delete_job` lists only current keys and deletes without a `VersionId`, so a
 delete adds a marker and leaves the prior version — true for every job result under retention, not

@@ -41,6 +41,23 @@ class InMemoryJobStore:
     def __init__(self) -> None:
         self._jobs: dict[str, Job] = {}
         self._lock = threading.RLock()
+        self._blob_target: str | None = None
+
+    # -- BlobTargetRegistry -------------------------------------------------------------
+    def claim_blob_target(self, fingerprint: str) -> str:
+        """CAS under the same lock that serialises claim_next. See BlobTargetRegistry."""
+        with self._lock:
+            if self._blob_target is None:
+                self._blob_target = fingerprint
+            return self._blob_target
+
+    def get_blob_target(self) -> "str | None":
+        with self._lock:
+            return self._blob_target
+
+    def clear_blob_target(self) -> None:
+        with self._lock:
+            self._blob_target = None
 
     def create(self, job: Job) -> None:
         with self._lock:

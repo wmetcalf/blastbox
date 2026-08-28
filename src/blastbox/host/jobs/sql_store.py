@@ -202,8 +202,19 @@ class SqlJobStore:
             PRIMARY KEY (job_id, page_index)
         )
         """
+        # One row, fixed PK, so the table IS the registry: `INSERT ... ON CONFLICT DO NOTHING`
+        # is then a compare-and-swap the database performs, valid on both Postgres and SQLite
+        # (3.24+). Text, not a foreign key to anything -- it outlives every job by design, since
+        # two processes that started days apart still have to be compared.
+        blob_target_sql = """
+        CREATE TABLE IF NOT EXISTS blob_target (
+            id          INTEGER PRIMARY KEY,
+            fingerprint TEXT NOT NULL
+        )
+        """
         with self._lock, self._connect() as conn:
             conn.execute(sql)
+            conn.execute(blob_target_sql)
             # page_hashes + its indexes are Postgres-only: perceptual-hash search
             # is Postgres + pg_bktree ONLY, so SQLite gets no page_hashes table
             # and supports_hash_search() stays False.
@@ -219,6 +230,31 @@ class SqlJobStore:
         if self._driver == "postgres":
             self._ensure_page_hash_indexes()
         self._ensure_jobs_indexes()
+
+    # -- BlobTargetRegistry -------------------------------------------------------------
+    def claim_blob_target(self, fingerprint: str) -> str:
+        """CAS in the database: insert-if-absent, then read back whatever is there.
+
+        The read is in the SAME transaction as the insert, so a caller that lost the race sees the
+        winner's value rather than its own. Doing it as SELECT-then-INSERT would let two processes
+        booting together both find nothing and both write -- and the mismatch this exists to catch
+        would go unreported precisely when both sides start at once.
+        """
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                f"INSERT INTO blob_target (id, fingerprint) VALUES (1, {self._param}) "
+                f"ON CONFLICT (id) DO NOTHING", (fingerprint,))
+            row = conn.execute("SELECT fingerprint FROM blob_target WHERE id = 1").fetchone()
+        return str(row[0]) if row else fingerprint
+
+    def get_blob_target(self) -> "str | None":
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT fingerprint FROM blob_target WHERE id = 1").fetchone()
+        return str(row[0]) if row else None
+
+    def clear_blob_target(self) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM blob_target WHERE id = 1")
 
     def _ensure_jobs_indexes(self) -> None:
         """Covering index for the hot claim + node-autosizer-backlog predicates
