@@ -816,3 +816,84 @@ def test_a_programmatic_dispatcher_gets_the_periodic_canary_too():
         "re-checks the store after startup")
     assert "getattr(self, \"_canary_cb\", None) is None" in gate, (
         "the gate must not clobber a callback the CLI already installed")
+
+
+def test_a_healthy_local_dispatcher_is_not_flagged_for_a_missing_sample(tmp_path):
+    """`LocalBlobStore.get_sample` raises BlobFetchError("sample not present: …") with NO cause.
+
+    The S3-shaped markers did not match that wording, so every healthy LOCAL dispatcher emitted
+    `sample_read_unverified` -- telling operators their inputs may be unfetchable when nothing is
+    wrong. The same blindness as the S3 wrapper, on the other backend: the fix covered one of two
+    identical cases.
+
+    MUTATION: drop "not present" from the missing-object markers -> healthy local dispatchers are
+    flagged again.
+    """
+    from blastbox.host.blobs.local import LocalBlobStore
+    from blastbox.host.canary import check_sample_read_access
+
+    store = LocalBlobStore(str(tmp_path))
+    with caplog_at_warning() as records:
+        check_sample_read_access(store, role="dispatcher", scratch_dir=tmp_path)
+    assert not [r for r in records if "sample_read_unverified" in r.getMessage()], (
+        "a healthy local dispatcher was told its samples prefix may be unreadable")
+
+
+def test_an_unreadable_local_blob_root_is_reported_not_declared_ok(tmp_path):
+    """`LocalBlobStore.has_output` collapses OSError to False, exactly as the S3 one does.
+
+    So an ingress whose blob root is unreadable by its UID reported `canary.read_ok` -- the same
+    false all-clear the S3 fix removed, still live on the other backend because the fallback path
+    was left alone.
+
+    MUTATION: probe local stores through `has_output` again -> an unreadable root reports ok.
+    """
+    import os
+    import stat
+
+    from blastbox.host.blobs.local import LocalBlobStore
+    from blastbox.host.canary import check_read_access
+
+    root = tmp_path / "blobs"
+    root.mkdir()
+    store = LocalBlobStore(str(root))
+    os.chmod(root, 0)                       # unreadable by this UID
+    try:
+        if os.access(root, os.R_OK):        # running as root: the probe cannot fail
+            pytest.skip("cannot make a directory unreadable as this user")
+        with caplog_at_warning() as records:
+            check_read_access(store, role="ingress")
+        assert any("read_unverified" in r.getMessage() for r in records), (
+            "an unreadable blob root was declared readable; every result open would then fail")
+    finally:
+        os.chmod(root, stat.S_IRWXU)
+
+
+def test_the_canary_key_survives_a_container_replacement(monkeypatch):
+    """Ephemeral container hostnames broke the one-object bound the stable key exists for.
+
+    Recreating the same logical dispatcher changes `socket.gethostname()`, so under the supported
+    PUT/GET-but-no-DELETE policy each rollout left another permanent canary object -- the unbounded
+    growth the stable key was introduced to end.
+
+    MUTATION: derive the key from the hostname alone -> the key changes across replacements.
+    """
+    import socket
+
+    from blastbox.host.canary import canary_job_id
+
+    monkeypatch.setenv("BLASTBOX_DISPATCHER_ID", "redtusk-dispatch-a")
+    monkeypatch.setattr(socket, "gethostname", lambda: "container-aaaa")
+    first = canary_job_id("aws-ec2|clippyshot|/var/lib/blastbox")
+    monkeypatch.setattr(socket, "gethostname", lambda: "container-bbbb")
+    second = canary_job_id("aws-ec2|clippyshot|/var/lib/blastbox")
+    assert first == second, (
+        "the canary key changed when the container was replaced; under a DELETE-denied policy "
+        "that leaves one more permanent object per rollout")
+
+    # ...and without a declared identity the hostname still distinguishes genuine hosts.
+    monkeypatch.delenv("BLASTBOX_DISPATCHER_ID")
+    monkeypatch.setattr(socket, "gethostname", lambda: "host-1")
+    a = canary_job_id("t|e|/root")
+    monkeypatch.setattr(socket, "gethostname", lambda: "host-2")
+    assert a != canary_job_id("t|e|/root"), "two real hosts must not share one canary key"

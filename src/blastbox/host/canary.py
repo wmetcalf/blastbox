@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import logging
 import re
 import socket
@@ -193,7 +194,15 @@ def canary_job_id(key_hint: str = "") -> str:
     co-located dispatchers (host + tier + engine + job_root), and :func:`blob_roundtrip` retries
     once on a unique key when a read-back misses, so the residual race cannot fail a boot.
     """
-    ident = f"{socket.gethostname()}|{key_hint}".encode()
+    # NOT the hostname alone. In Docker/Kubernetes the default container or pod hostname is
+    # ephemeral, so recreating the SAME logical dispatcher produced a different key -- and under
+    # the explicitly supported PUT/GET-but-no-DELETE policy that means one more permanent object
+    # per rollout or crash-loop restart, which is precisely the unbounded growth the stable key was
+    # introduced to end. An operator-declared identity is preferred when present; the hostname
+    # remains the fallback for deployments that set nothing, and the unique-key retry already
+    # handles genuine collisions between concurrent processes.
+    stable = (os.environ.get("BLASTBOX_DISPATCHER_ID") or "").strip() or socket.gethostname()
+    ident = f"{stable}|{key_hint}".encode()
     return f"__canary__{hashlib.sha256(ident).hexdigest()[:16]}"
 
 
@@ -499,8 +508,13 @@ def _missing_not_denied(exc: BaseException) -> bool:
         resp = getattr(cur, "response", None)
         if isinstance(resp, dict):
             code = str(resp.get("Error", {}).get("Code", "")).lower()
+        # "sample not present" / "not present" is LocalBlobStore's phrasing, raised with NO cause
+        # at all -- so the S3-shaped markers alone flagged every healthy local dispatcher. Same
+        # blindness as the S3 wrapper, on the other backend, which is the sibling this fix missed
+        # the first time.
         if code in ("404", "nosuchkey", "notfound", "no_such_key") or \
-                any(m in text for m in ("404", "not found", "nosuchkey", "no such file")):
+                any(m in text for m in ("404", "not found", "nosuchkey", "no such file",
+                                        "not present", "no such key")):
             return True
         if code in ("403", "accessdenied", "invalidaccesskeyid", "signaturedoesnotmatch") or \
                 any(m in text for m in ("403", "access denied", "accessdenied", "forbidden")):
@@ -611,6 +625,27 @@ def check_read_access(store: Any, *, role: str) -> None:
                 "canary.read_unverified %s could not read from %s: %s: %s -- results may not be "
                 "servable from this process. Check its credentials, endpoint and network route; "
                 "the target itself matches what the dispatchers registered.",
+                role, describe_blob_store(store), type(exc).__name__, redact_secrets(str(exc)))
+            return
+        _log.info("canary.read_ok %s can read from %s", role, describe_blob_store(store))
+        return
+
+    # LOCAL stores collapse errors too. `LocalBlobStore.has_output` returns False for an OSError
+    # -- correct for the reclaim, which must not read "unknown" as "durable" -- so an ingress whose
+    # blob root is unreadable by its UID reported read_ok exactly like the S3 case. Bypassing the
+    # helper for S3 and leaving local on it fixed one of two identical backends.
+    root = getattr(store, "local_root", None)
+    if root is not None:
+        try:
+            from pathlib import Path as _P
+            probe_dir = _P(root() if callable(root) else root)
+            probe_dir.mkdir(parents=True, exist_ok=True)
+            next(probe_dir.iterdir(), None)          # LIST: distinguishes absent from unreadable
+        except Exception as exc:  # noqa: BLE001 - advisory
+            _log.warning(
+                "canary.read_unverified %s could not read from %s: %s: %s -- results may not be "
+                "servable from this process. Check the blob root's ownership and permissions for "
+                "this container's UID.",
                 role, describe_blob_store(store), type(exc).__name__, redact_secrets(str(exc)))
             return
         _log.info("canary.read_ok %s can read from %s", role, describe_blob_store(store))

@@ -99,6 +99,11 @@ blastbox blob-target show          # what the queue currently requires
 blastbox blob-target reset --yes   # forget it; both sides re-register on next start
 ```
 
+Set **`BLASTBOX_DISPATCHER_ID`** to a stable name per logical dispatcher when running under
+Docker or Kubernetes. The canary key falls back to the container hostname, which is ephemeral —
+so without it, every rollout writes a new probe key, and on a store that grants PUT/GET but denies
+DELETE that means one more permanent object per restart.
+
 `reset` **refuses without `--yes`**, because agreement is checked only at startup: processes that
 are already running never revalidate, so clearing under a live fleet lets a restarted process adopt
 the new target while the others keep the old one — results written to one store and served from
