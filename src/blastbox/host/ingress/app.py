@@ -302,6 +302,23 @@ def build_app(
     _blob_store = blob_store if blob_store is not None else build_blob_store_from_env(
         {**os.environ, "BLASTBOX_JOB_ROOT": str(_job_root)}
     )
+    # Log WHERE results will be served from, in the same shape the dispatchers log where they
+    # write, so the two lines are greppable side by side across a fleet.
+    try:
+        import logging as _logging
+
+        # The DISPLAY formatter, matching what every dispatcher logs. Agreement is deliberately
+        # endpoint-blind (two routes to one bucket are one target), which makes these log lines the
+        # ONLY way to see endpoint drift -- and logging the fingerprint here dropped the endpoint
+        # from exactly the line the guide tells operators to compare side by side.
+        from blastbox.host.canary import describe_blob_store
+
+        _logging.getLogger("blastbox.host.ingress").info(
+            "canary.blob_store %s (serving results from here)",
+            describe_blob_store(_blob_store))
+    except Exception:  # noqa: BLE001 - a LOG LINE must never stop the API booting
+        pass
+
 
     # Engine allowlist
     _allowed_engines: set[str]
@@ -1085,6 +1102,24 @@ def build_app(
             app.include_router(router)
         if extension.static_ui is not None:
             _mount_static_ui(app, extension.static_ui)
+
+    # LAST, because registration PERSISTS. Proving the API and its dispatchers write to the same
+    # blob target is the point of this call -- but build_app still fails closed after this point on
+    # an empty required engine allowlist and on malformed scratch/maintenance intervals, and an
+    # ingress that never becomes serviceable must not have poisoned the shared registry on its way
+    # out. Otherwise correcting BOTH the bad setting and the blob target still fails, against a
+    # claim left by a process that never served a request, until someone runs `blob-target reset`.
+    #
+    # Deliberately NOT inside the best-effort try that wraps the log line above: that exists so a
+    # LOG cannot stop the API. This is not a log -- serving results from a target no dispatcher
+    # writes to means every finished job 404s, so it has to be able to stop the boot.
+    from blastbox.host.canary import check_blob_target_agreement, check_read_access
+
+    check_blob_target_agreement(_job_store, _blob_store, role="ingress")
+    # ...and that this process can actually READ it. Agreement compares identities; it does not
+    # prove reachability, so an API with stale credentials matches its dispatchers perfectly and
+    # then 404s every artifact.
+    check_read_access(_blob_store, role="ingress")
 
     return app
 

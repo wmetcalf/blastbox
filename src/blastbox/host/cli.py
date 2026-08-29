@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from dataclasses import replace
@@ -415,6 +416,66 @@ def _start_node_sizer(pool, engines, store, tier, concurrency=1, concurrency_gat
         return None
 
 
+def _canary_settings() -> "tuple[bool, float]":
+    """(enabled, interval) for the startup/periodic store self-test.
+
+    DISABLED ON EXPLICIT FALSE ONLY. An affirmative allowlist ("1"/"true"/...) turns a typo -- or
+    the set-but-empty shape compose produces for an unset variable -- into a silent OFF, which
+    fails OPEN on a check whose entire value is failing closed: an operator who fat-fingers `treu`
+    would silently get the unfetchable-result failure mode back, with no warning.
+    """
+    log = logging.getLogger("blastbox.host.cli")
+    raw = os.environ.get("BLASTBOX_CANARY")
+    val = (raw or "").strip().lower()
+    if val in ("0", "false", "no", "off"):
+        enabled = False
+    else:
+        enabled = True
+        if raw is not None and val not in ("1", "true", "yes", "on", ""):
+            log.warning("BLASTBOX_CANARY=%r is not a recognised boolean; leaving the startup "
+                        "canary ENABLED (set 0/false/no/off to disable)", raw)
+    raw_interval = os.environ.get("BLASTBOX_CANARY_INTERVAL_S", "900")
+    try:
+        interval = float(raw_interval)
+    except ValueError:
+        log.warning("BLASTBOX_CANARY_INTERVAL_S=%r is not a number; using 900", raw_interval)
+        interval = 900.0
+    # float() happily accepts "nan" and "inf". Neither raises, and both silently switch the
+    # periodic pass OFF: every `elapsed >= nan` is False, and `elapsed >= inf` never becomes
+    # True. A malformed setting must not disable a check by accident -- that is the same
+    # fail-open shape as the boolean parsing above.
+    # Negative is the same trap one step along: -1 is finite, passes, and then every dispatcher
+    # tests `interval > 0` before scheduling -- so it disables the periodic pass while the
+    # documented disable value is 0. A malformed setting must never turn a check off by accident.
+    if not math.isfinite(interval) or interval < 0:
+        log.warning("BLASTBOX_CANARY_INTERVAL_S=%r is not a usable interval (needs a finite "
+                    "value >= 0, where 0 means startup-only); using 900", raw_interval)
+        interval = 900.0
+    return enabled, interval
+
+
+def _require_shared_blob_store() -> bool:
+    """Has the operator declared this a fleet whose results MUST be shared?
+
+    The canary cannot infer it: both attempts to deduce "can the other processes read this store"
+    from the deployment refused documented single-node and NFS configurations. This is the
+    topology evidence, stated by the person who knows it.
+    """
+    raw = os.environ.get("BLASTBOX_REQUIRE_SHARED_BLOB_STORE")
+    val = (raw or "").strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    # An affirmative allowlist here repeats, in the variable added to FIX that bug, the exact
+    # fail-open shape already fixed for BLASTBOX_CANARY: a typo returns the default silently.
+    # This one is a deliberate topology declaration -- someone set it on purpose -- so a value
+    # that parses as neither must be said out loud rather than quietly ignored.
+    if raw is not None and val not in ("0", "false", "no", "off", ""):
+        logging.getLogger("blastbox.host.cli").warning(
+            "BLASTBOX_REQUIRE_SHARED_BLOB_STORE=%r is not a recognised boolean; treating it as "
+            "NOT set (the shared-store check stays advisory). Use 1/true/yes/on to enforce.", raw)
+    return False
+
+
 def _dispatch_cmd(args: argparse.Namespace) -> int:
     from blastbox.host.dispatch import Dispatcher
     from blastbox.host.jobs.factory import build_job_store_from_env
@@ -506,6 +567,68 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
             concurrency=int(os.environ.get("BLASTBOX_DISPATCH_CONCURRENCY") or "1"),
             job_retention_s=int(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0"),
         )
+        # The network branch returns below without ever reaching Dispatcher.run_forever, so the
+        # startup gate has to be applied HERE as well. These are the aws/static/cascade tiers --
+        # the distributed ones, whose results necessarily travel through a shared blob store, and
+        # therefore the ones where an unwritable or unreadable store is most likely and most
+        # expensive. Before pool.start(), so a misconfigured deployment does not spawn microVMs
+        # it is only going to fail jobs on.
+        _vm_canary, _canary_interval = _canary_settings()
+        from blastbox.host.canary import (
+            blob_roundtrip,
+            check_blob_target_agreement,
+            check_store_coherence,
+            describe_blob_store,
+        )
+        _vmlog = logging.getLogger("blastbox.host.cli")
+        _vmblobs = getattr(vm, "_blobs", None)
+        if _vmblobs is None:
+            if _vm_canary:
+                _vmlog.warning("canary: this dispatcher exposes no blob store; skipping")
+        else:
+            # OUTSIDE THE TOGGLE, exactly as Dispatcher.run_forever does for the container path.
+            # That comment states the invariant -- "TOPOLOGY ENFORCEMENT IS NOT THE PROBE, and must
+            # not share its off switch" -- and this sibling was left behind when it was written. So
+            # on aws/static/cascade, BLASTBOX_CANARY=0 silently dropped the hard
+            # BLASTBOX_REQUIRE_SHARED_BLOB_STORE requirement AND the target-agreement check, neither
+            # of which that variable documents any control over. Those are the distributed tiers,
+            # whose results necessarily travel through a shared store -- the ones with the most to
+            # lose. The identity log line moves out too, or the side-by-side grep the guide tells
+            # operators to use disappears in precisely the deployments that opted out.
+            _vmlog.info("canary.blob_store %s", describe_blob_store(_vmblobs))
+            check_store_coherence(store, _vmblobs, job_root,
+                                  require_shared=_require_shared_blob_store())
+            # (registration deferred until after the probe -- see below)
+        # ...and the ROUND-TRIP stays gated: that is the probe, and the probe is what the toggle is
+        # documented to control.
+        # Computed unconditionally: it is a string, not a probe, and binding it only inside the
+        # canary branch left the periodic-callback default below reading an UNBOUND local whenever
+        # BLASTBOX_CANARY=0 -- so the documented opt-out crashed the dispatcher with
+        # UnboundLocalError before pool.start() instead of skipping the probe.
+        _vmkey = f"{tier or ''}|{next(iter(engines), '')}|{job_root}"
+        if _vm_canary and _vmblobs is not None:
+            _vmlog.info("canary.ok %s", blob_roundtrip(
+                _vmblobs, key_hint=_vmkey, scratch_dir=job_root))
+        # AFTER the round-trip, same as Dispatcher.run_forever. A network dispatcher pointed at an
+        # unreachable or unauthorized bucket used to claim that target and only then fail its probe,
+        # so correcting the config did not let it restart -- it mismatched its own stale
+        # registration and needed a `blob-target reset` nobody would think to run. Fifth sibling
+        # call site on this branch to need the same fix after the first one got it.
+        if _vmblobs is not None:
+            check_blob_target_agreement(store, _vmblobs, role="dispatcher")
+
+            # ...and only INSTALL the periodic probe when the probe is enabled. Registering a
+            # callback that re-runs the round-trip under CANARY=0 would reintroduce the very thing
+            # the operator opted out of, on a timer.
+            def _vm_periodic_canary(_b=_vmblobs, _l=_vmlog, _k=_vmkey, _jr=job_root) -> None:
+                _l.info("canary.ok %s", blob_roundtrip(
+                    _b, key_hint=_k, scratch_dir=_jr))
+
+            # Advisory once serving: a store that goes away mid-run is a brownout, not a
+            # config error, and tearing down a warm fleet over it is what #79 exists to stop.
+            if _vm_canary:
+                vm._canary_cb = _vm_periodic_canary
+                vm._canary_interval_s = _canary_interval
         pool.start()   # validation passed -> now spawn/warm slots (nothing to leak on an earlier raise)
         try:
             # One-shot orphan sweep on start (aws-ec2-hibernate only; guarded by hasattr). A fresh run's
@@ -548,6 +671,7 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
                     "node self-sizer: could not pre-shrink pool before start", exc_info=True)
         pool.start()   # file-handshake warm path: start after tier-identity validation
     dispatcher = Dispatcher(
+        require_shared_blob_store=_require_shared_blob_store(),
         job_store=store,
         engines=engines,
         limits=limits,
@@ -605,9 +729,17 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
             except Exception:
                 logging.getLogger("blastbox.host.cli").warning(
                     "node self-sizer: could not restore pool after skipped sizing", exc_info=True)
+        # BLASTBOX_CANARY=0 disables the startup self-test. It defaults ON and fails closed: a
+        # dispatcher that cannot round-trip a result through its own blob store cannot serve a job,
+        # and every deployment bug this catches previously surfaced only as DONE jobs whose
+        # artifacts 404'd. Provided as an escape hatch for a store that is deliberately unavailable
+        # at boot, not as something a normal deployment should set.
+        canary, canary_interval_s = _canary_settings()
         dispatcher.run_forever(
             poll_interval_s=args.poll_interval,
             concurrency=dispatch_concurrency,
+            canary=canary,
+            canary_interval_s=canary_interval_s,
         )
     finally:
         # Stop the POOL first (reap its slots) while the sizer thread is STILL heartbeating, so
@@ -676,6 +808,61 @@ def _bench_cmd(args: argparse.Namespace) -> int:
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
             json.dump(res.report.to_json(), fh, indent=2)
+    return 0
+
+
+def _blob_target_cmd(args: argparse.Namespace) -> int:
+    """Show or clear the blob target registered on the job queue.
+
+    The escape hatch for the agreement check. A fleet deliberately moving buckets would otherwise
+    be refused by its own recorded fingerprint forever, so clearing has to be POSSIBLE -- and
+    explicit, which is why it is a command rather than an environment variable. An env var set once
+    to get past a migration tends to stay set, and would disarm the check permanently on a fleet
+    that believes it is protected.
+    """
+    from blastbox.host.jobs.base import BlobTargetRegistry
+    from blastbox.host.jobs.factory import build_job_store_from_env
+
+    store = build_job_store_from_env()
+    if not isinstance(store, BlobTargetRegistry):
+        print(f"{type(store).__name__} cannot record a blob target; nothing to show or reset.")
+        return 1
+    if args.blob_target_cmd == "reset":
+        current = store.get_blob_target()
+        # STOP THE FLEET FIRST, and say so before doing anything. Agreement is checked at STARTUP
+        # only -- in Dispatcher.run_forever, the network CLI path and build_app -- so a process that
+        # is already running never revalidates. Clearing under a live fleet therefore lets a
+        # restarted process adopt a NEW target while the old ones keep using the previous one, and
+        # a rolling restart writes results to one store while still serving from the other. That is
+        # the unreadable-results failure this command exists to help you out of, reintroduced by
+        # the command itself.
+        #
+        # Enforcing quiescence is not something this process can do -- it cannot see the fleet --
+        # so the honest move is to make the requirement impossible to miss and require the operator
+        # to affirm it, rather than printing advice after the registry is already gone.
+        if not getattr(args, "yes", False):
+            print("REFUSING: `blob-target reset` is only safe on a STOPPED fleet.\n"
+                  f"  currently registered: {current or '(nothing)'}\n"
+                  "\n"
+                  "Agreement is checked at STARTUP only, so processes that are already running\n"
+                  "will not notice the reset. If you clear this while they are up, a restarted\n"
+                  "process can adopt a new target while the others keep the old one -- results get\n"
+                  "written to one store and served from the other, which is the failure this\n"
+                  "command is meant to help you escape.\n"
+                  "\n"
+                  "Stop every dispatcher and ingress on this queue, then re-run with --yes.\n"
+                  "Afterwards start ONE process first and confirm its logged canary.blob_store\n"
+                  "line before starting the rest, or you will simply record the wrong target.")
+            return 2
+        store.clear_blob_target()
+        print(f"blob target cleared (was: {current or 'nothing'}). Start ONE process first and "
+              f"confirm its target before starting the rest.")
+        return 0
+    # READ-ONLY. Reaching for claim_blob_target here would let `show` register its own argument on
+    # an empty queue, after which every real process mismatches it -- a diagnostic that bricks the
+    # thing it is diagnosing. Hence the separate accessor.
+    current = store.get_blob_target()
+    print(current or "(no blob target recorded yet)")
     return 0
 
 
@@ -841,6 +1028,19 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument("--dry-run", action="store_true",
                     help="report what would be uploaded without touching the blob store")
     pm.set_defaults(func=_migrate_results_cmd)
+
+    pt = sub.add_parser(
+        "blob-target",
+        help="show or reset the blob target recorded on the job queue (see `show`/`reset`)")
+    pts = pt.add_subparsers(dest="blob_target_cmd", required=True)
+    pts.add_parser("show", help="print the blob target every process on this queue must agree on")
+    pt_reset = pts.add_parser(
+        "reset",
+        help="forget it, for a DELIBERATE migration; requires a STOPPED fleet (see --yes)")
+    pt_reset.add_argument(
+        "--yes", action="store_true",
+        help="confirm every dispatcher and ingress on this queue is stopped")
+    pt.set_defaults(func=_blob_target_cmd)
 
     pv = sub.add_parser("version", help="print version and exit")
     pv.set_defaults(func=_version_cmd)

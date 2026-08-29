@@ -154,6 +154,9 @@ class VmJobDispatcher:
         # to run it. interval<=0 disables. orphan_timeout: a RUNNING job not heartbeat-refreshed in
         # this long has a dead owner → FAIL it (keep it comfortably above heartbeat_s).
         self._maintenance_interval_s = float(maintenance_interval_s)
+        # Set by the CLI after construction; None = no periodic self-test.
+        self._canary_cb: "Callable[[], None] | None" = None
+        self._canary_interval_s = 0.0
         self._orphan_timeout_s = max(self._heartbeat_s * 4, float(orphan_timeout_s))
         # sole_owner: this is the ONLY dispatcher on the store (VM-only deployment, no cold/container
         # dispatcher). Then orphan recovery can also reclaim a stale RUNNING job that was claimed but
@@ -966,19 +969,122 @@ class VmJobDispatcher:
             logger.warning("vm_dispatch: stale-queued sweep failed", exc_info=True)
 
     def _maintenance_loop(self) -> None:
-        while not self._stop.wait(self._maintenance_interval_s):
-            self._run_maintenance()
+        last_canary = last_maint = time.monotonic()
+        while True:
+            # Sleep to the EARLIER of the two deadlines. Waiting a fixed maintenance interval
+            # quantised the canary to it: with the CLI's 60s default, BLASTBOX_CANARY_INTERVAL_S=5
+            # ran about every 60s and 90 ran about every 120s. A configured cadence that silently
+            # becomes a different cadence is its own small lie.
+            now = time.monotonic()
+            waits = []
+            if self._maintenance_interval_s > 0:
+                waits.append(self._maintenance_interval_s - (now - last_maint))
+            if self._canary_cb is not None and self._canary_interval_s > 0:
+                waits.append(self._canary_interval_s - (now - last_canary))
+            if not waits:
+                return
+            if self._stop.wait(max(0.05, min(waits))):
+                return
+            now = time.monotonic()
+            # The periodic store self-test rides the maintenance timer, for the same reason
+            # maintenance does: one place, on a cadence, off the claim path. Without it the
+            # network tiers (aws/static/cascade) probed the blob store once at startup and never
+            # again -- BLASTBOX_CANARY_INTERVAL_S was accepted and then silently ignored for
+            # exactly the deployments whose results always travel through a shared store.
+            cb, every = self._canary_cb, self._canary_interval_s
+            if cb is not None and every > 0 and time.monotonic() - last_canary >= every:
+                try:
+                    cb()
+                except Exception:  # noqa: BLE001 — advisory once serving; never kill the loop
+                    logger.warning("vm_dispatch: canary raised; continuing to serve", exc_info=True)
+                # Re-stamped from COMPLETION: the round-trip can block for the store's own
+                # timeout, so stamping first would re-probe every pass precisely when the store
+                # is least able to answer.
+                last_canary = time.monotonic()
+            if self._maintenance_interval_s > 0 and now - last_maint >= self._maintenance_interval_s:
+                # RE-STAMPED FROM COMPLETION, for the same reason as the canary three lines above --
+                # a rule that was applied to the canary and not to its sibling. `now` predates the
+                # wait, so stamping it here dates the deadline from BEFORE a sweep that can run for
+                # minutes: retention retries every pending upload through the same store, so when
+                # the store is down a sweep routinely outlasts the interval. The next pass then
+                # finds the deadline already overdue, min(waits) goes negative, the loop waits its
+                # 50ms floor and sweeps again -- continuous retries against an unhealthy store,
+                # with no interval at all, produced by the interval logic.
+                self._run_maintenance()
+                last_maint = time.monotonic()
+
+    def _startup_gate(self) -> None:
+        """Prove this dispatcher can store a result before it claims a job.
+
+        The same sequence the CLI performs, owned by the dispatcher so a programmatic caller cannot
+        skip it: identity log, store coherence, the round-trip probe, then blob-target registration
+        -- registration LAST, because it persists and a target that never proved it works must not
+        become the one every other process has to match.
+        """
+        blobs = getattr(self, "_blobs", None)
+        if blobs is None:
+            return
+        from blastbox.host.canary import (
+            blob_roundtrip,
+            check_blob_target_agreement,
+            check_sample_read_access,
+            check_store_coherence,
+            describe_blob_store,
+        )
+        from blastbox.host.cli import _canary_settings, _require_shared_blob_store
+
+        enabled, interval = _canary_settings()
+        logger.info("canary.blob_store %s", describe_blob_store(blobs))
+        check_store_coherence(self._store, blobs, self._job_root,
+                              require_shared=_require_shared_blob_store())
+        # Bound unconditionally: binding it inside the canary branch and reading it below is the
+        # UnboundLocalError this branch already shipped once, in the CLI, for the same reason.
+        key = "|".join((str(getattr(self, "_worker_tier", "") or ""), str(self._job_root)))
+        if enabled:
+            logger.info("canary.ok %s", blob_roundtrip(blobs, key_hint=key,
+                                                       scratch_dir=self._job_root))
+            # The round-trip only exercises results/. A policy that grants those and denies the
+            # samples prefix passes it and then fails every job at get_sample.
+            check_sample_read_access(blobs, role="dispatcher", scratch_dir=self._job_root)
+        check_blob_target_agreement(self._store, blobs, role="dispatcher")
+        # ...and the PERIODIC re-check, which the CLI used to install by reaching in and setting
+        # these fields from outside. A programmatic dispatcher got the startup probe and then never
+        # re-checked, against a documented cadence -- the same shape as the startup gate itself
+        # living in one caller. Only when the canary is enabled, and only if nobody has already
+        # wired a callback (the CLI sets its own, richer one before calling run()).
+        if enabled and interval > 0 and getattr(self, "_canary_cb", None) is None:
+            def _periodic(_b=blobs, _k=key, _jr=self._job_root) -> None:
+                logger.info("canary.ok %s", blob_roundtrip(_b, key_hint=_k, scratch_dir=_jr))
+
+            self._canary_cb = _periodic
+            self._canary_interval_s = interval
 
     def run(self) -> None:
         """Block, claiming + processing jobs on ``concurrency`` threads until :meth:`stop`. Also runs
         periodic maintenance (retention + orphan recovery) so a VM-only deployment doesn't accumulate
         terminal output dirs / leave crashed claims RUNNING forever."""
+        # THE GATE LIVES HERE, not only in the CLI. `build_remote_vm_dispatcher(...)` is a supported
+        # factory and constructing VmJobDispatcher directly is supported too, so an embedder calling
+        # run() got no store-coherence enforcement, no blob-target agreement and no round-trip -- it
+        # claimed its first job immediately and failed it, against a documented guarantee that every
+        # dispatcher variant gates before its first claim. Putting it in run() makes the guarantee a
+        # property of the dispatcher rather than of one caller.
+        #
+        # Idempotent: the CLI path runs the same checks before calling run(), and re-running them is
+        # a re-registration of the same identity plus at most one extra round-trip, both cheap and
+        # both harmless. Cheaper than the alternative, which is two entrypoints that must be kept in
+        # step by hand -- a shape this branch has now been bitten by five times.
+        self._startup_gate()
         logger.info("vm_dispatch: claiming from %s (%d workers)", type(self._store).__name__,
                     self._concurrency)
         with ThreadPoolExecutor(max_workers=self._concurrency + 1, thread_name_prefix="vmclaim") as ex:
             for _ in range(self._concurrency):
                 ex.submit(self._worker_loop)
-            if self._maintenance_interval_s > 0:
+            # EITHER timer is reason enough to run the loop. Gating solely on maintenance meant
+            # a deployment that disables it (the constructor explicitly supports that) silently
+            # got no periodic canary either, however it was configured.
+            if self._maintenance_interval_s > 0 or (
+                    self._canary_cb is not None and self._canary_interval_s > 0):
                 ex.submit(self._maintenance_loop)
             try:
                 self._stop.wait()

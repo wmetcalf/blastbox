@@ -80,6 +80,21 @@ class S3BlobStore:
 
         e = os.environ if env is None else env
         parsed = urlparse(url)
+        # REJECT user-info rather than quietly carrying it. `urlparse` puts everything before the
+        # `@` into netloc, so `s3://key:secret@bucket/prefix` yields a BUCKET of
+        # "key:secret@bucket" -- which is not a bucket. Every request then goes to an invalid name
+        # and fails at read time, while the canary's identity comparison (which redacts for display
+        # and for the persisted fingerprint) sees the same "bucket" on both sides and reports
+        # agreement. Redacting the display was necessary -- that string is written into the job
+        # queue -- but it is not sufficient: it made a broken configuration look healthy. Credentials
+        # belong in AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, not in the URL.
+        if "@" in parsed.netloc:
+            raise ValueError(
+                "BLASTBOX_BLOB_URL must not carry credentials: "
+                f"{parsed.scheme}://***@{parsed.netloc.rsplit('@', 1)[-1]}{parsed.path} — the text "
+                "before '@' becomes part of the bucket name and every request fails against it. "
+                "Put credentials in AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (or the instance "
+                "role) and give this variable the bucket alone.")
         self._bucket = parsed.netloc
         self._prefix = parsed.path.strip("/")
         self._job_root = Path(job_root)

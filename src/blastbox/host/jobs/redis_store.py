@@ -67,6 +67,35 @@ class RedisJobStore:
         self._r = client
         self._ttl_seconds = ttl_seconds
 
+    # -- BlobTargetRegistry -------------------------------------------------------------
+    _BLOB_TARGET_KEY = "blastbox:blob_target"
+
+    def claim_blob_target(self, fingerprint: str) -> "str | None":
+        """SET NX then GET -- atomic on the server, so a boot storm has one winner.
+
+        No TTL: this outlives every job and must survive an idle queue, or two processes that
+        started days apart would never be compared. Cleared explicitly (`blastbox blob-target`).
+        """
+        self._r.set(self._BLOB_TARGET_KEY, fingerprint, nx=True)
+        cur = self._r.get(self._BLOB_TARGET_KEY)
+        if cur is None:
+            # SET NX and GET are each atomic; the PAIR is not. A DEL landing between them -- the
+            # documented `blastbox blob-target reset`, run while a mismatched process crash-loops --
+            # leaves this nil. Returning our own fingerprint here reported AGREEMENT to the caller
+            # and booted the losing side on the wrong target. An `allkeys-*` eviction reaches the
+            # same window with no operator involved, since this key carries no TTL.
+            return None
+        return cur.decode() if isinstance(cur, (bytes, bytearray)) else str(cur)
+
+    def get_blob_target(self) -> "str | None":
+        cur = self._r.get(self._BLOB_TARGET_KEY)
+        if cur is None:
+            return None
+        return cur.decode() if isinstance(cur, (bytes, bytearray)) else str(cur)
+
+    def clear_blob_target(self) -> None:
+        self._r.delete(self._BLOB_TARGET_KEY)
+
     def _key(self, job_id: str) -> str:
         return _PREFIX + job_id
 

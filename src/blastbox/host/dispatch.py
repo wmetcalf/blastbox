@@ -55,6 +55,14 @@ from blastbox.contract.envelope import (
 )
 from blastbox.errors import HOST_RESOURCE_ERRNOS, OutputTrustError, OutputTrustUnknown, WarmTimeout, sanitize_public_error
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
+from blastbox.host.canary import (
+    CanaryFailure,
+    blob_roundtrip,
+    check_blob_target_agreement,
+    check_sample_read_access,
+    check_store_coherence,
+    describe_blob_store,
+)
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.runtime.docker import (
     RuntimeSelection,
@@ -429,6 +437,7 @@ class Dispatcher:
         warm_requeue_backoff_s: float = 1.0,
         concurrency_gate: "DynamicConcurrencyGate | None" = None,
         blob_store: BlobStore | None = None,
+        require_shared_blob_store: bool = False,
         put_output_max_attempts: int = _PUT_OUTPUT_MAX_ATTEMPTS,
         put_output_retry_backoff_s: float = _PUT_OUTPUT_RETRY_BACKOFF_S,
         blob_retry_backoff_s: float = _BLOB_RETRY_BACKOFF_S,
@@ -478,6 +487,7 @@ class Dispatcher:
         # has removed the node reservation. The cold path checks this before acquiring the gate.
         self._shutting_down = threading.Event()
         self._job_store = job_store
+        self._require_shared_blob_store = bool(require_shared_blob_store)
         # engines is kept as an immutable mapping snapshot so callers cannot
         # mutate it after construction.
         self._engines: dict[str, EngineSpec] = dict(engines)
@@ -708,6 +718,46 @@ class Dispatcher:
         self._dispatch_claimed_job(job, warm_reserved=reserved)
         return True
 
+    def self_test(self, *, gate: bool) -> bool:
+        """Prove this dispatcher can actually store and serve a result, before it claims a job.
+
+        ``gate=True`` (startup) RAISES on failure. A dispatcher whose store is misconfigured cannot
+        do its job, and the useful failure is a loud one at boot: the alternative -- which is what
+        happened -- is a stack that looks healthy, claims thousands of jobs and marks them DONE
+        with results nobody can fetch. A crash-loop with the remedy in the log is strictly better
+        than that, and it is the same class of error as a bad database URL, which already fails
+        closed.
+
+        ``gate=False`` (periodic) only logs. Once the process is serving, a store that goes away is
+        a BROWNOUT, not a config error, and taking the dispatcher down over it would destroy warm
+        capacity for something that heals on its own -- exactly what issue #79 exists to prevent.
+        The periodic pass is there to make a store that broke *since* boot visible in the log
+        rather than at the next collection.
+        """
+        try:
+            # BEFORE the round-trip. A LocalBlobStore round-trips perfectly -- it reads back its
+            # own directory -- so the write/read test cannot see the single worst deployment bug
+            # this fleet has had. Only the COMBINATION (shared queue, private store) reveals it.
+            check_store_coherence(self._job_store, self._blobs, self._job_root,
+                                  require_shared=self._require_shared_blob_store)
+            # Host+tier alone still collides for two engine-scoped dispatchers on one box, and a
+            # collision costs a retry (see canary_job_id). Fold in the engines and the job_root:
+            # cheap, stable across restarts, and distinct for every dispatcher that could co-exist.
+            key = "|".join((
+                str(getattr(self, "_tier", "") or ""),
+                ",".join(sorted(getattr(self, "_engines", {}) or {})),
+                str(self._job_root),
+            ))
+            _log.info("canary.ok %s", blob_roundtrip(
+                self._blobs, key_hint=key, scratch_dir=self._job_root))
+            return True
+        except CanaryFailure as exc:
+            if gate:
+                _log.error("canary.FAILED refusing to serve — %s", exc)
+                raise
+            _log.error("canary.FAILED (already serving; not gating) — %s", exc)
+            return False
+
     def run_forever(
         self,
         *,
@@ -715,6 +765,8 @@ class Dispatcher:
         stop: Callable[[], bool] | None = None,
         maintenance_interval_s: float = 60.0,
         concurrency: int = 1,
+        canary: bool = True,
+        canary_interval_s: float = 900.0,
     ) -> None:
         """Continuously claim and dispatch jobs until ``stop()`` returns True.
 
@@ -727,15 +779,73 @@ class Dispatcher:
         concurrent worker is one more in-flight detonation, so size
         ``BLASTBOX_WORKER_MEMORY * concurrency`` to the host's RAM.
         """
+        # BEFORE the first claim, and before the concurrent fan-out -- a self-test that runs after
+        # work has been claimed is not a gate, it is a report.
+        # OUTSIDE the toggle. This is the only line naming the backend, bucket, prefix and
+        # endpoint for a file dispatcher, and the point of logging it is the side-by-side
+        # comparison with the ingress -- which logs its read target regardless. Hiding it behind
+        # BLASTBOX_CANARY=0 broke that comparison in exactly the deployments that opted out,
+        # including the documented one where the store is deliberately absent at boot.
+        _log.info("canary.blob_store %s", describe_blob_store(self._blobs))
+        # TOPOLOGY ENFORCEMENT IS NOT THE PROBE, and must not share its off switch. BLASTBOX_CANARY
+        # disables the write/read round-trip; BLASTBOX_REQUIRE_SHARED_BLOB_STORE is an explicit hard
+        # requirement, documented as failing closed at startup. Coupling them meant CANARY=0 silently
+        # dropped the requirement too, so a Postgres/Redis dispatcher on a private LocalBlobStore
+        # started happily and produced DONE jobs whose results no other machine can read -- the single
+        # worst deployment bug this fleet has had, re-enabled by an unrelated opt-out. Second thing
+        # found behind this toggle that did not belong to it; the blob-store log was the first.
+        check_store_coherence(self._job_store, self._blobs, self._job_root,
+                              require_shared=self._require_shared_blob_store)
+        if canary:
+            self.self_test(gate=True)
+            # results/ is writable; inputs are a different prefix and often a different grant.
+            check_sample_read_access(self._blobs, role="dispatcher", scratch_dir=self._job_root)
+        # ...and the half coherence cannot see: that the OTHER side of this queue writes to the
+        # same place. Also outside the toggle, for the same reason -- it is topology, not a probe.
+        #
+        # AFTER the round-trip, because this one PERSISTS. A dispatcher whose bucket is wrong used
+        # to record that bucket and only then fail its probe -- so fixing the config was not enough
+        # to restart it: the corrected process now mismatched its own predecessor's registration and
+        # needed a `blob-target reset` the operator had no reason to suspect. A target that never
+        # proved it works has no business becoming the one everyone else must match.
+        check_blob_target_agreement(self._job_store, self._blobs, role="dispatcher")
         if max(1, int(concurrency)) > 1:
             self._run_forever_concurrent(
                 poll_interval_s=poll_interval_s,
                 stop=stop,
                 maintenance_interval_s=maintenance_interval_s,
                 concurrency=int(concurrency),
+                canary=canary,
+                canary_interval_s=canary_interval_s,
             )
             return
         last_maint = time.monotonic()
+        # OFF THE CLAIM PATH. Checked inline, the probe only ran between jobs: dispatch_once() is
+        # synchronous here, so a single detonation up to the worker timeout (300s by default)
+        # delayed a 60s interval for the whole job, and a continuously busy dispatcher delayed it
+        # again every job. A configured cadence that only holds while idle is not the configured
+        # cadence. The concurrent path already has a coordinator thread for exactly this.
+        canary_stop = threading.Event()
+        canary_thread = None
+        if canary and canary_interval_s > 0:
+            def _canary_tick() -> None:
+                while not canary_stop.wait(canary_interval_s):
+                    try:
+                        self.self_test(gate=False)
+                    except Exception:  # noqa: BLE001 - advisory once serving
+                        _log.exception("canary raised; continuing to serve")
+            canary_thread = threading.Thread(target=_canary_tick, name="blastbox-canary",
+                                             daemon=True)
+            canary_thread.start()
+        try:
+            self._run_forever_serial(poll_interval_s, stop, maintenance_interval_s, last_maint)
+        finally:
+            canary_stop.set()
+            if canary_thread is not None:
+                canary_thread.join(timeout=5.0)
+
+    def _run_forever_serial(self, poll_interval_s: float, stop: "Callable[[], bool] | None",
+                            maintenance_interval_s: float, last_maint: float) -> None:
         while True:
             if stop is not None and stop():
                 break
@@ -749,8 +859,14 @@ class Dispatcher:
                 _log.exception("dispatch_once failed; continuing")
                 progressed = False
             if maintenance_interval_s > 0 and time.monotonic() - last_maint >= maintenance_interval_s:
-                last_maint = time.monotonic()
+                # RE-STAMPED FROM COMPLETION, matching VmJobDispatcher._maintenance_loop. _run_maintenance
+                # retries every pending upload through the blob store, so during an outage a sweep
+                # routinely outlasts the interval -- and a deadline dated from BEFORE it is already
+                # overdue on return, so the next pass re-sweeps immediately. Continuous retries against
+                # an unhealthy store, produced by the interval meant to space them out. Fixed in the VM
+                # loop first; these two are its siblings and were left behind.
                 self._run_maintenance()
+                last_maint = time.monotonic()
             if not progressed:
                 time.sleep(poll_interval_s)
 
@@ -761,9 +877,16 @@ class Dispatcher:
         stop: "Callable[[], bool] | None",
         maintenance_interval_s: float,
         concurrency: int,
+        canary: bool = True,
+        canary_interval_s: float = 900.0,
     ) -> None:
         """N dispatch-loop threads claim+dispatch independently; maintenance runs from
-        this coordinator thread (a global sweep — must NOT run N times concurrently)."""
+        this coordinator thread (a global sweep — must NOT run N times concurrently).
+
+        The periodic canary runs here too, for the same reason maintenance does: one coordinator,
+        not N. Without it BLASTBOX_CANARY_INTERVAL_S was silently ignored for every concurrent
+        dispatcher -- they probed once at boot and never noticed a store that broke afterwards,
+        which is precisely the shape (multi-worker, shared queue) most likely to have one."""
         stop_evt = threading.Event()
 
         def _should_stop() -> bool:
@@ -790,14 +913,36 @@ class Dispatcher:
         for t in threads:
             t.start()
         last_maint = time.monotonic()
+        last_canary = time.monotonic()
         try:
             while not _should_stop():
+                # CANARY FIRST. Both run on this one coordinator thread, so a maintenance sweep
+                # starting at or before the canary deadline blocks it -- and _run_maintenance can
+                # retry thousands of pending uploads through the very store that is down, so an
+                # object-store outage could postpone by many minutes the check whose whole job is
+                # reporting that outage. Maintenance must not be able to hide it.
+                if canary and canary_interval_s > 0 \
+                        and time.monotonic() - last_canary >= canary_interval_s:
+                    try:
+                        self.self_test(gate=False)
+                    except Exception:  # noqa: BLE001
+                        _log.exception("canary raised; continuing to serve")
+                    # Re-stamped from COMPLETION -- the round-trip can block for the store's own
+                    # timeout, so stamping first would re-probe every pass exactly when the store
+                    # is least able to answer.
+                    last_canary = time.monotonic()
                 if (
                     maintenance_interval_s > 0
                     and time.monotonic() - last_maint >= maintenance_interval_s
                 ):
-                    last_maint = time.monotonic()
+                    # RE-STAMPED FROM COMPLETION, matching VmJobDispatcher._maintenance_loop. _run_maintenance
+                    # retries every pending upload through the blob store, so during an outage a sweep
+                    # routinely outlasts the interval -- and a deadline dated from BEFORE it is already
+                    # overdue on return, so the next pass re-sweeps immediately. Continuous retries against
+                    # an unhealthy store, produced by the interval meant to space them out. Fixed in the VM
+                    # loop first; these two are its siblings and were left behind.
                     self._run_maintenance()
+                    last_maint = time.monotonic()
                 time.sleep(min(poll_interval_s, 1.0))
         finally:
             stop_evt.set()

@@ -44,9 +44,16 @@ def _phase_lines(caplog) -> list[str]:
 
 
 def _pairs(line: str) -> list[tuple[str, float]]:
-    """The phase=seconds pairs IN ORDER, duplicates preserved. Non-numeric fields are skipped."""
+    """The phase=seconds pairs IN ORDER, duplicates preserved. Non-numeric fields are skipped.
+
+    The value must run to whitespace or end-of-line. `\b` only required a word boundary, which a
+    hyphen satisfies -- so `job_id=24388167-a7e2-...` captured `24388167` and job_id arrived as a
+    2.4e7-second "phase" that dominated `max(others)`. It looked like it skipped non-numeric
+    fields only because a uuid4 rarely has eight leading digits: measured 2.33%, about one run in
+    43, which is exactly the rate at which this suite failed for no attributable reason.
+    """
     out: list[tuple[str, float]] = []
-    for k, v in re.findall(r"(\w+)=([\d.]+)\b", line):
+    for k, v in re.findall(r"(\w+)=([\d.]+)(?=\s|$)", line):
         try:
             out.append((k, float(v)))
         except ValueError:
@@ -199,3 +206,21 @@ def test_timing_never_breaks_a_dispatch(tmp_path, caplog):
         log.removeHandler(handler)
 
     assert store.get(job.job_id).status == JobStatus.DONE
+
+
+def test_a_job_id_of_all_digits_is_not_read_as_a_phase():
+    """Regression: this suite failed ~1 run in 43 with `job_id` as the slowest "phase".
+
+    uuid4 gives eight leading digits 2.33% of the time; a value pattern ending in a word
+    boundary then captured the first
+    segment. Any test that maxes over the parsed phases inherited the bug, and the failure named
+    a phase that does not exist, so it read as a real timing regression rather than a parse bug.
+    """
+    line = ("warm_phases job_id=24388167-a7e2-4f1a-8074-d1b913fbd57c outcome=done "
+            "total=0.304 slot_claim=0.000 guest=0.300 rdump=0.000 purge=0.001")
+    phases = _parse(line)
+    assert "job_id" not in phases, phases
+    assert phases["guest"] == 0.300
+    assert phases["total"] == 0.304
+    others = {k: v for k, v in phases.items() if k not in ("guest", "total")}
+    assert max(others, key=others.get) != "job_id"
