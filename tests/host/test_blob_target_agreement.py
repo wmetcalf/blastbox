@@ -714,3 +714,105 @@ def test_reset_refuses_without_an_explicit_quiescence_affirmation():
         assert rc == 0 and cleared["n"] == 1, "reset with --yes did not clear"
     finally:
         factory.build_job_store_from_env = real   # type: ignore[assignment]
+
+
+class _WrapsEverything:
+    """The shipped S3 shape: a client, and helpers that hide the real error.
+
+    `has_output` returns False for ANY failure (correct for the age reclaim, fatal for a probe),
+    and `get_sample` re-raises everything as a generic BlobFetchError with the detail in __cause__.
+    """
+
+    _bucket = "results"
+    _prefix = ""
+
+    def __init__(self, exc) -> None:  # noqa: ANN001
+        self._exc = exc
+
+        class _Client:
+            def head_object(_self, **kw):  # noqa: ANN001, ANN003, ANN202, N805
+                raise exc
+
+        self._s3 = _Client()
+
+    def _key(self, *parts: str) -> str:
+        return "/".join(parts)
+
+    def has_output(self, job_id: str) -> bool:
+        return False                       # swallows everything, exactly like the real one
+
+    def get_sample(self, sha256, dest):  # noqa: ANN001, ANN201
+        from blastbox.host.blobs.s3 import BlobFetchError
+        raise BlobFetchError(f"sample fetch failed: {sha256}") from self._exc
+
+
+class _Denied(Exception):
+    response = {"Error": {"Code": "AccessDenied"}}
+
+
+def test_the_read_probe_sees_past_has_output_swallowing_every_error():
+    """`S3BlobStore.has_output` returns False for AccessDenied, bad credentials and connection
+    failures alike -- deliberately, because the age reclaim deletes local trees on its answer.
+
+    A probe built on it therefore never entered the warning path: an unreachable ingress logged
+    `canary.read_ok` and reported read access it had never verified, which is worse than having no
+    probe at all because it makes a claim.
+
+    MUTATION: probe through `has_output` again -> a denied store reports read_ok.
+    """
+    from blastbox.host.canary import check_read_access
+
+    with caplog_at_warning() as records:
+        check_read_access(_WrapsEverything(_Denied()), role="ingress")
+    assert any("read_unverified" in r.getMessage() for r in records), (
+        "a store that denies reads was reported as readable")
+
+    with caplog_at_warning() as ok:
+        check_read_access(_WrapsEverything(FileNotFoundError("404 Not Found")), role="ingress")
+    assert not [r for r in ok if "read_unverified" in r.getMessage()], (
+        "a MISSING probe key was reported as a read failure; not-found proves the read was "
+        "permitted and answered")
+
+
+def test_the_sample_probe_reads_the_wrapped_cause_not_the_generic_message():
+    """`get_sample` re-raises everything as BlobFetchError("sample fetch failed: <sha>").
+
+    Matching on that string classified every healthy S3 dispatcher as `sample_read_unverified` --
+    permanently noisy, and still unable to spot an actually-denied prefix, which is both failure
+    modes at once.
+
+    MUTATION: match on `str(exc)` instead of walking __cause__ -> healthy dispatchers are flagged.
+    """
+    from blastbox.host.canary import check_sample_read_access
+
+    with caplog_at_warning() as healthy:
+        check_sample_read_access(_WrapsEverything(FileNotFoundError("404 NoSuchKey")),
+                                 role="dispatcher")
+    assert not [r for r in healthy if "sample_read_unverified" in r.getMessage()], (
+        "a healthy dispatcher whose probe key is simply absent was flagged as unable to read")
+
+    with caplog_at_warning() as denied:
+        check_sample_read_access(_WrapsEverything(_Denied()), role="dispatcher")
+    assert any("sample_read_unverified" in r.getMessage() for r in denied), (
+        "a denied samples prefix went unreported; every claimed job would fail in get_sample")
+
+
+def test_a_programmatic_dispatcher_gets_the_periodic_canary_too():
+    """The CLI used to install the callback by reaching in and setting private fields.
+
+    A programmatic dispatcher therefore performed the startup probe and then never re-checked,
+    against a documented cadence -- the same shape as the startup gate living in one caller.
+
+    MUTATION: drop the `_canary_cb` wiring from _startup_gate -> programmatic dispatchers never
+    re-probe.
+    """
+    import inspect
+
+    from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
+
+    gate = inspect.getsource(VmJobDispatcher._startup_gate)
+    assert "_canary_cb" in gate and "_canary_interval_s" in gate, (
+        "the dispatcher's own gate never installs the periodic canary, so only the CLI path "
+        "re-checks the store after startup")
+    assert "getattr(self, \"_canary_cb\", None) is None" in gate, (
+        "the gate must not clobber a callback the CLI already installed")

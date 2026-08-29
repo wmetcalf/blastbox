@@ -1033,18 +1033,31 @@ class VmJobDispatcher:
         )
         from blastbox.host.cli import _canary_settings, _require_shared_blob_store
 
-        enabled, _interval = _canary_settings()
+        enabled, interval = _canary_settings()
         logger.info("canary.blob_store %s", describe_blob_store(blobs))
         check_store_coherence(self._store, blobs, self._job_root,
                               require_shared=_require_shared_blob_store())
+        # Bound unconditionally: binding it inside the canary branch and reading it below is the
+        # UnboundLocalError this branch already shipped once, in the CLI, for the same reason.
+        key = "|".join((str(getattr(self, "_worker_tier", "") or ""), str(self._job_root)))
         if enabled:
-            key = "|".join((str(getattr(self, "_worker_tier", "") or ""), str(self._job_root)))
             logger.info("canary.ok %s", blob_roundtrip(blobs, key_hint=key,
                                                        scratch_dir=self._job_root))
             # The round-trip only exercises results/. A policy that grants those and denies the
             # samples prefix passes it and then fails every job at get_sample.
             check_sample_read_access(blobs, role="dispatcher", scratch_dir=self._job_root)
         check_blob_target_agreement(self._store, blobs, role="dispatcher")
+        # ...and the PERIODIC re-check, which the CLI used to install by reaching in and setting
+        # these fields from outside. A programmatic dispatcher got the startup probe and then never
+        # re-checked, against a documented cadence -- the same shape as the startup gate itself
+        # living in one caller. Only when the canary is enabled, and only if nobody has already
+        # wired a callback (the CLI sets its own, richer one before calling run()).
+        if enabled and interval > 0 and getattr(self, "_canary_cb", None) is None:
+            def _periodic(_b=blobs, _k=key, _jr=self._job_root) -> None:
+                logger.info("canary.ok %s", blob_roundtrip(_b, key_hint=_k, scratch_dir=_jr))
+
+            self._canary_cb = _periodic
+            self._canary_interval_s = interval
 
     def run(self) -> None:
         """Block, claiming + processing jobs on ``concurrency`` threads until :meth:`stop`. Also runs

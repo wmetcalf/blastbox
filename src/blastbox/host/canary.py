@@ -481,6 +481,34 @@ def check_store_coherence(job_store: Any, blob_store: Any, job_root: Any = None,
 _LOCAL_SENTINEL = "local:"
 
 
+def _missing_not_denied(exc: BaseException) -> bool:
+    """True when this error means "the object is not there", not "you may not look".
+
+    Walks the CAUSE CHAIN, because the shipped S3 store does not surface the original error:
+    `get_sample` re-raises everything as `BlobFetchError("sample fetch failed: <sha>")` and keeps
+    the botocore detail only in `__cause__`. Matching on `str(exc)` alone therefore saw the same
+    generic text for a missing key and for AccessDenied -- so a probe built on it flagged every
+    healthy S3 dispatcher while still not detecting a denied prefix.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        text = str(cur).lower()
+        code = ""
+        resp = getattr(cur, "response", None)
+        if isinstance(resp, dict):
+            code = str(resp.get("Error", {}).get("Code", "")).lower()
+        if code in ("404", "nosuchkey", "notfound", "no_such_key") or \
+                any(m in text for m in ("404", "not found", "nosuchkey", "no such file")):
+            return True
+        if code in ("403", "accessdenied", "invalidaccesskeyid", "signaturedoesnotmatch") or \
+                any(m in text for m in ("403", "access denied", "accessdenied", "forbidden")):
+            return False
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 def check_sample_read_access(store: Any, *, role: str, scratch_dir: Any = None) -> None:
     """Prove this dispatcher can read the SAMPLES prefix, not just write results.
 
@@ -522,8 +550,10 @@ def check_sample_read_access(store: Any, *, role: str, scratch_dir: Any = None) 
         except Exception as exc:  # noqa: BLE001
             text = redact_secrets(str(exc))
             # A MISSING object is the expected answer and proves the read was allowed. A denial or
-            # a transport failure is the finding.
-            if any(m in text.lower() for m in ("404", "not found", "nosuchkey", "no such file")):
+            # a transport failure is the finding. Decided from the CAUSE CHAIN, not from this
+            # exception's text: the shipped store hides the botocore error behind a generic
+            # BlobFetchError, so the string alone cannot tell the two apart.
+            if _missing_not_denied(exc):
                 _log.info("canary.sample_read_ok %s can read the samples prefix of %s",
                           role, describe_blob_store(store))
                 return
@@ -557,6 +587,35 @@ def check_read_access(store: Any, *, role: str) -> None:
     same reasoning that keeps the periodic canary advisory once serving. The startup GATE is for
     misconfiguration, which agreement already covers; this reports reachability.
     """
+    # NOT `has_output`. The shipped S3 implementation catches EVERY exception and returns False --
+    # deliberately, because the age reclaim deletes local trees on the strength of its answer and a
+    # transient outage must never read as "the durable copy is there". Correct for that caller, and
+    # fatal for this one: a probe built on it never sees AccessDenied, invalid credentials or a
+    # connection failure, so an unreachable ingress logged `canary.read_ok` and reported health it
+    # had not verified. Worse than no probe, which at least does not claim anything.
+    #
+    # So go under it when the store exposes a client, and only fall back to the collapsing helper
+    # for backends that have no other read surface.
+    client = getattr(store, "_s3", None)
+    bucket = getattr(store, "_bucket", None)
+    keyfn = getattr(store, "_key", None)
+    if client is not None and bucket and callable(keyfn):
+        try:
+            client.head_object(Bucket=bucket,
+                               Key=keyfn("results", "blastbox-canary-read-probe", "seal.json"))
+        except Exception as exc:  # noqa: BLE001 - advisory
+            if _missing_not_denied(exc):
+                _log.info("canary.read_ok %s can read from %s", role, describe_blob_store(store))
+                return
+            _log.warning(
+                "canary.read_unverified %s could not read from %s: %s: %s -- results may not be "
+                "servable from this process. Check its credentials, endpoint and network route; "
+                "the target itself matches what the dispatchers registered.",
+                role, describe_blob_store(store), type(exc).__name__, redact_secrets(str(exc)))
+            return
+        _log.info("canary.read_ok %s can read from %s", role, describe_blob_store(store))
+        return
+
     probe = getattr(store, "has_output", None)
     if not callable(probe):
         return

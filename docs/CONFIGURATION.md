@@ -95,9 +95,14 @@ simultaneous boot has exactly one winner rather than each process recording its 
 Deliberately migrating targets:
 
 ```
-blastbox blob-target show     # what the queue currently requires
-blastbox blob-target reset    # forget it; both sides re-register on next start
+blastbox blob-target show          # what the queue currently requires
+blastbox blob-target reset --yes   # forget it; both sides re-register on next start
 ```
+
+`reset` **refuses without `--yes`**, because agreement is checked only at startup: processes that
+are already running never revalidate, so clearing under a live fleet lets a restarted process adopt
+the new target while the others keep the old one — results written to one store and served from
+another. Stop every dispatcher and ingress on this queue first.
 
 After a reset, start **one** side first and confirm its logged `canary.blob_store` line before
 starting the other — otherwise you simply record the wrong target again. There is no environment
