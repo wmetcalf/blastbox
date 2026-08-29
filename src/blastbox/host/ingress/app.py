@@ -1113,9 +1113,13 @@ def build_app(
     # Deliberately NOT inside the best-effort try that wraps the log line above: that exists so a
     # LOG cannot stop the API. This is not a log -- serving results from a target no dispatcher
     # writes to means every finished job 404s, so it has to be able to stop the boot.
-    from blastbox.host.canary import check_blob_target_agreement
+    from blastbox.host.canary import check_blob_target_agreement, check_read_access
 
     check_blob_target_agreement(_job_store, _blob_store, role="ingress")
+    # ...and that this process can actually READ it. Agreement compares identities; it does not
+    # prove reachability, so an API with stale credentials matches its dispatchers perfectly and
+    # then 404s every artifact.
+    check_read_access(_blob_store, role="ingress")
 
     return app
 

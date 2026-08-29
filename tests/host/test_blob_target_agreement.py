@@ -559,3 +559,158 @@ def caplog_at_warning():
         log.removeHandler(handler)
         log.level = prev_level
         logging.disable(prev_disable)
+
+
+def test_a_credentialed_blob_url_is_rejected_at_construction():
+    """Redacting the DISPLAY was necessary but not sufficient.
+
+    `urlparse` puts everything before the `@` into netloc, so `s3://key:secret@bucket/prefix` gives
+    a bucket of `key:secret@bucket` -- not a bucket. Every request fails against it, while the
+    canary (which redacts for display and for the persisted fingerprint) saw the same "bucket" on
+    both sides and reported agreement. A broken configuration made to look healthy by the check
+    meant to catch it.
+
+    MUTATION: drop the `@` guard in S3BlobStore.__init__ -> the invalid bucket is accepted.
+    """
+    from pathlib import Path
+
+    from blastbox.host.blobs.s3 import S3BlobStore
+
+    env = {"AWS_ACCESS_KEY_ID": "x", "AWS_SECRET_ACCESS_KEY": "y", "AWS_DEFAULT_REGION": "us-east-1"}
+    with pytest.raises(ValueError) as ei:
+        S3BlobStore("s3://AKIAEXAMPLE:hunter2swordfish@bucket/prefix",
+                    job_root=Path("/tmp"), env=env)
+    msg = str(ei.value)
+    # A distinctive literal, because "SECRET" also appears in AWS_SECRET_ACCESS_KEY in the remedy.
+    assert "hunter2swordfish" not in msg and "AKIAEXAMPLE" not in msg, (
+        f"the rejection echoed the credential it is rejecting: {msg}")
+    assert "AWS_ACCESS_KEY_ID" in msg, "the message must say where credentials actually belong"
+
+    S3BlobStore("s3://bucket/prefix", job_root=Path("/tmp"), env=env)   # still fine
+
+
+def test_the_vm_dispatcher_gates_itself_rather_than_trusting_the_cli():
+    """`build_remote_vm_dispatcher(...)` is a supported factory, so the gate cannot live in the CLI.
+
+    An embedder calling `run()` got no coherence enforcement, no target agreement and no
+    round-trip: it claimed its first job immediately and failed it, against a documented guarantee
+    that every dispatcher variant gates before its first claim.
+
+    MUTATION: delete the `self._startup_gate()` call from run() -> the gate never runs.
+    """
+    import inspect
+
+    from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
+
+    assert hasattr(VmJobDispatcher, "_startup_gate"), "the dispatcher owns no startup gate"
+    src = inspect.getsource(VmJobDispatcher.run)
+    assert "_startup_gate()" in src, (
+        "VmJobDispatcher.run() does not invoke its own startup gate, so a programmatic caller "
+        "claims jobs without proving it can store a result")
+
+    gate = inspect.getsource(VmJobDispatcher._startup_gate)
+    for step in ("check_store_coherence", "check_blob_target_agreement", "blob_roundtrip"):
+        assert step in gate, f"the dispatcher's gate omits {step}, which the CLI path performs"
+    assert gate.index("check_blob_target_agreement") > gate.index("blob_roundtrip"), (
+        "the dispatcher registers its target before probing it; a target that never proved it "
+        "works must not become the one every other process has to match")
+
+
+def test_a_read_probe_reports_an_unreachable_store_without_refusing_the_boot():
+    """Agreement compares identities; it does not prove this process can reach the store.
+
+    An ingress with stale credentials matches its dispatchers exactly, boots, and 404s every
+    artifact. The probe is advisory on purpose -- a brownout at boot must not turn a recoverable
+    outage into an outage plus a restart loop.
+
+    MUTATION: make check_read_access raise instead of warning -> the API stops booting on a
+    transient store failure.
+    """
+    from blastbox.host.canary import check_read_access
+
+    class _Unreachable:
+        _bucket = "results"
+        _prefix = ""
+        _s3 = None
+
+        def has_output(self, job_id):  # noqa: ANN001, ANN201
+            raise OSError("connection refused")
+
+    with caplog_at_warning() as records:
+        check_read_access(_Unreachable(), role="ingress")     # must not raise
+
+    assert any("read_unverified" in r.getMessage() for r in records), (
+        "an unreachable store was not reported at all")
+
+
+def test_a_denied_samples_prefix_is_reported_but_a_missing_object_is_not():
+    """The round-trip only exercises results/. Inputs are a different prefix and often a different
+    grant, and a dispatcher that cannot fetch inputs fails every job it claims.
+
+    NotFound is the EXPECTED answer and proves the read was permitted; a denial is the finding.
+
+    MUTATION: treat every exception as success -> a denied samples prefix passes silently.
+    """
+    from blastbox.host.canary import check_sample_read_access
+
+    class _Store:
+        _bucket = "results"
+        _prefix = ""
+        _s3 = None
+
+        def __init__(self, exc) -> None:  # noqa: ANN001
+            self._exc = exc
+
+        def get_sample(self, sha, dest):  # noqa: ANN001, ANN201
+            raise self._exc
+
+    with caplog_at_warning() as denied:
+        check_sample_read_access(_Store(PermissionError("AccessDenied on samples/")),
+                                 role="dispatcher")
+    assert any("sample_read_unverified" in r.getMessage() for r in denied), (
+        "a denied samples prefix was not reported; every claimed job would fail in get_sample")
+
+    with caplog_at_warning() as missing:
+        check_sample_read_access(_Store(FileNotFoundError("404 Not Found")), role="dispatcher")
+    assert not [r for r in missing if "sample_read_unverified" in r.getMessage()], (
+        "a MISSING probe object was reported as a permission problem; not-found proves the read "
+        "was allowed and answered")
+
+
+def test_reset_refuses_without_an_explicit_quiescence_affirmation():
+    """Agreement is checked at STARTUP only, so a live fleet never notices a reset.
+
+    Clearing under running processes lets a restarted one adopt a new target while the others keep
+    the old, and a rolling restart then writes to one store and serves from the other -- the
+    failure this command exists to help escape, caused by the command.
+
+    MUTATION: clear unconditionally -> the registry is gone before the operator is warned.
+    """
+    import argparse
+
+    from blastbox.host import cli
+
+    cleared = {"n": 0}
+
+    class _Store:
+        def claim_blob_target(self, fp):  # noqa: ANN001, ANN201
+            return "s3://results/old"
+
+        def get_blob_target(self):  # noqa: ANN201
+            return "s3://results/old"
+
+        def clear_blob_target(self) -> None:
+            cleared["n"] += 1
+
+    import blastbox.host.jobs.factory as factory
+    real = factory.build_job_store_from_env
+    factory.build_job_store_from_env = lambda *a, **k: _Store()   # type: ignore[assignment]
+    try:
+        rc = cli._blob_target_cmd(argparse.Namespace(blob_target_cmd="reset", yes=False))
+        assert rc != 0, "reset without --yes returned success"
+        assert cleared["n"] == 0, "the registry was cleared despite refusing"
+
+        rc = cli._blob_target_cmd(argparse.Namespace(blob_target_cmd="reset", yes=True))
+        assert rc == 0 and cleared["n"] == 1, "reset with --yes did not clear"
+    finally:
+        factory.build_job_store_from_env = real   # type: ignore[assignment]

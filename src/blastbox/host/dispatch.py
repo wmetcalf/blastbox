@@ -59,6 +59,7 @@ from blastbox.host.canary import (
     CanaryFailure,
     blob_roundtrip,
     check_blob_target_agreement,
+    check_sample_read_access,
     check_store_coherence,
     describe_blob_store,
 )
@@ -797,6 +798,8 @@ class Dispatcher:
                               require_shared=self._require_shared_blob_store)
         if canary:
             self.self_test(gate=True)
+            # results/ is writable; inputs are a different prefix and often a different grant.
+            check_sample_read_access(self._blobs, role="dispatcher", scratch_dir=self._job_root)
         # ...and the half coherence cannot see: that the OTHER side of this queue writes to the
         # same place. Also outside the toggle, for the same reason -- it is topology, not a probe.
         #

@@ -1013,10 +1013,55 @@ class VmJobDispatcher:
                 self._run_maintenance()
                 last_maint = time.monotonic()
 
+    def _startup_gate(self) -> None:
+        """Prove this dispatcher can store a result before it claims a job.
+
+        The same sequence the CLI performs, owned by the dispatcher so a programmatic caller cannot
+        skip it: identity log, store coherence, the round-trip probe, then blob-target registration
+        -- registration LAST, because it persists and a target that never proved it works must not
+        become the one every other process has to match.
+        """
+        blobs = getattr(self, "_blobs", None)
+        if blobs is None:
+            return
+        from blastbox.host.canary import (
+            blob_roundtrip,
+            check_blob_target_agreement,
+            check_sample_read_access,
+            check_store_coherence,
+            describe_blob_store,
+        )
+        from blastbox.host.cli import _canary_settings, _require_shared_blob_store
+
+        enabled, _interval = _canary_settings()
+        logger.info("canary.blob_store %s", describe_blob_store(blobs))
+        check_store_coherence(self._store, blobs, self._job_root,
+                              require_shared=_require_shared_blob_store())
+        if enabled:
+            key = "|".join((str(getattr(self, "_worker_tier", "") or ""), str(self._job_root)))
+            logger.info("canary.ok %s", blob_roundtrip(blobs, key_hint=key,
+                                                       scratch_dir=self._job_root))
+            # The round-trip only exercises results/. A policy that grants those and denies the
+            # samples prefix passes it and then fails every job at get_sample.
+            check_sample_read_access(blobs, role="dispatcher", scratch_dir=self._job_root)
+        check_blob_target_agreement(self._store, blobs, role="dispatcher")
+
     def run(self) -> None:
         """Block, claiming + processing jobs on ``concurrency`` threads until :meth:`stop`. Also runs
         periodic maintenance (retention + orphan recovery) so a VM-only deployment doesn't accumulate
         terminal output dirs / leave crashed claims RUNNING forever."""
+        # THE GATE LIVES HERE, not only in the CLI. `build_remote_vm_dispatcher(...)` is a supported
+        # factory and constructing VmJobDispatcher directly is supported too, so an embedder calling
+        # run() got no store-coherence enforcement, no blob-target agreement and no round-trip -- it
+        # claimed its first job immediately and failed it, against a documented guarantee that every
+        # dispatcher variant gates before its first claim. Putting it in run() makes the guarantee a
+        # property of the dispatcher rather than of one caller.
+        #
+        # Idempotent: the CLI path runs the same checks before calling run(), and re-running them is
+        # a re-registration of the same identity plus at most one extra round-trip, both cheap and
+        # both harmless. Cheaper than the alternative, which is two entrypoints that must be kept in
+        # step by hand -- a shape this branch has now been bitten by five times.
+        self._startup_gate()
         logger.info("vm_dispatch: claiming from %s (%d workers)", type(self._store).__name__,
                     self._concurrency)
         with ThreadPoolExecutor(max_workers=self._concurrency + 1, thread_name_prefix="vmclaim") as ex:

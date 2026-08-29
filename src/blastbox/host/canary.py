@@ -481,6 +481,97 @@ def check_store_coherence(job_store: Any, blob_store: Any, job_root: Any = None,
 _LOCAL_SENTINEL = "local:"
 
 
+def check_sample_read_access(store: Any, *, role: str, scratch_dir: Any = None) -> None:
+    """Prove this dispatcher can read the SAMPLES prefix, not just write results.
+
+    `blob_roundtrip` exercises put_output / has_output / open_output -- all under `results/`. A
+    role-separated IAM policy that grants those and denies GetObject on `samples/*` therefore
+    passes the startup gate cleanly, and then every claimed job fails in `get_sample`: the input is
+    not on this node, the claim is released, and after the bounded materialisation attempts the job
+    is terminally failed. A gate that clears a dispatcher which cannot fetch a single input is
+    checking the wrong half of its own job.
+
+    Probes a sha that cannot exist. NotFound proves the read was permitted and answered; a denial
+    or a connection error proves it was not, and those look different at the API level.
+
+    ADVISORY: a samples-prefix outage is recoverable and the dispatcher may still have useful work
+    queued behind it, so this reports rather than refuses -- same posture as the read probe.
+    """
+    getter = getattr(store, "get_sample", None)
+    if not callable(getter):
+        return
+    import tempfile
+    from pathlib import Path as _Path
+
+    probe_sha = "0" * 64          # a valid sha256 shape that no real sample can have
+    # Only stage under the configured root if it EXISTS. This probe is advisory, so it must not be
+    # able to raise out of startup -- and an absent job root made TemporaryDirectory throw
+    # FileNotFoundError straight past the handler below, turning a diagnostic into an outage. The
+    # round-trip's refusal to fall back to /tmp is deliberate and stays; it WRITES the artefact
+    # under test, whereas this only needs somewhere to drop a throwaway destination file.
+    _dir = None
+    try:
+        if scratch_dir is not None and _Path(str(scratch_dir)).is_dir():
+            _dir = str(scratch_dir)
+    except Exception:  # noqa: BLE001
+        _dir = None
+    with tempfile.TemporaryDirectory(prefix="blastbox-canary-sample-", dir=_dir) as tmp:
+        dest = _Path(tmp) / "probe.bin"
+        try:
+            getter(probe_sha, dest)
+        except Exception as exc:  # noqa: BLE001
+            text = redact_secrets(str(exc))
+            # A MISSING object is the expected answer and proves the read was allowed. A denial or
+            # a transport failure is the finding.
+            if any(m in text.lower() for m in ("404", "not found", "nosuchkey", "no such file")):
+                _log.info("canary.sample_read_ok %s can read the samples prefix of %s",
+                          role, describe_blob_store(store))
+                return
+            _log.warning(
+                "canary.sample_read_unverified %s could not read the samples prefix of %s: %s: %s "
+                "-- results are writable but INPUTS may not be fetchable, in which case every "
+                "claimed job fails in get_sample and is terminally failed after its retries. "
+                "Check this container's read permission on the samples/ prefix.",
+                role, describe_blob_store(store), type(exc).__name__, text)
+            return
+    _log.info("canary.sample_read_ok %s can read the samples prefix of %s",
+              role, describe_blob_store(store))
+
+
+def check_read_access(store: Any, *, role: str) -> None:
+    """Prove this process can actually READ from the target it is about to serve.
+
+    Target agreement compares identities; it does not prove this process can reach the store. An
+    ingress with stale credentials or an unreachable endpoint has the same bucket and prefix as its
+    dispatchers, so agreement succeeds, `build_app` starts, and every result route then fails --
+    all artifacts unreadable, which is the exact failure this whole seam exists to end, arrived at
+    through the check meant to prevent it.
+
+    The active round-trip runs in DISPATCHER processes only, and it must stay that way: it WRITES,
+    and an API that writes to the results prefix is a different security posture. So this is a read
+    probe, not a round-trip -- `has_output` against a key that does not exist. A store that answers
+    "no" has proven it can be reached and is permitted to answer; one that raises has not.
+
+    ADVISORY, deliberately. A store that is briefly unreachable at boot is a brownout, and taking
+    the API down for it would turn a recoverable outage into an outage plus a restart loop -- the
+    same reasoning that keeps the periodic canary advisory once serving. The startup GATE is for
+    misconfiguration, which agreement already covers; this reports reachability.
+    """
+    probe = getattr(store, "has_output", None)
+    if not callable(probe):
+        return
+    try:
+        probe("blastbox-canary-read-probe-nonexistent")
+    except Exception as exc:  # noqa: BLE001 - advisory: a brownout must not stop the API booting
+        _log.warning(
+            "canary.read_unverified %s could not read from %s: %s: %s -- results may not be "
+            "servable from this process. Check its credentials, endpoint and network route; the "
+            "target itself matches what the dispatchers registered.",
+            role, describe_blob_store(store), type(exc).__name__, redact_secrets(str(exc)))
+        return
+    _log.info("canary.read_ok %s can read from %s", role, describe_blob_store(store))
+
+
 def check_blob_target_agreement(job_store: Any, blob_store: Any, *, role: str) -> str | None:
     """Prove every process on this queue writes results to the SAME blob target.
 

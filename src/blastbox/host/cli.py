@@ -828,10 +828,35 @@ def _blob_target_cmd(args: argparse.Namespace) -> int:
         print(f"{type(store).__name__} cannot record a blob target; nothing to show or reset.")
         return 1
     if args.blob_target_cmd == "reset":
+        current = store.get_blob_target()
+        # STOP THE FLEET FIRST, and say so before doing anything. Agreement is checked at STARTUP
+        # only -- in Dispatcher.run_forever, the network CLI path and build_app -- so a process that
+        # is already running never revalidates. Clearing under a live fleet therefore lets a
+        # restarted process adopt a NEW target while the old ones keep using the previous one, and
+        # a rolling restart writes results to one store while still serving from the other. That is
+        # the unreadable-results failure this command exists to help you out of, reintroduced by
+        # the command itself.
+        #
+        # Enforcing quiescence is not something this process can do -- it cannot see the fleet --
+        # so the honest move is to make the requirement impossible to miss and require the operator
+        # to affirm it, rather than printing advice after the registry is already gone.
+        if not getattr(args, "yes", False):
+            print("REFUSING: `blob-target reset` is only safe on a STOPPED fleet.\n"
+                  f"  currently registered: {current or '(nothing)'}\n"
+                  "\n"
+                  "Agreement is checked at STARTUP only, so processes that are already running\n"
+                  "will not notice the reset. If you clear this while they are up, a restarted\n"
+                  "process can adopt a new target while the others keep the old one -- results get\n"
+                  "written to one store and served from the other, which is the failure this\n"
+                  "command is meant to help you escape.\n"
+                  "\n"
+                  "Stop every dispatcher and ingress on this queue, then re-run with --yes.\n"
+                  "Afterwards start ONE process first and confirm its logged canary.blob_store\n"
+                  "line before starting the rest, or you will simply record the wrong target.")
+            return 2
         store.clear_blob_target()
-        print("blob target cleared. Both the dispatcher and the ingress will re-register on their "
-              "next start -- start ONE of them first and confirm its target before starting the "
-              "other, or you will simply record the wrong one again.")
+        print(f"blob target cleared (was: {current or 'nothing'}). Start ONE process first and "
+              f"confirm its target before starting the rest.")
         return 0
     # READ-ONLY. Reaching for claim_blob_target here would let `show` register its own argument on
     # an empty queue, after which every real process mismatches it -- a diagnostic that bricks the
@@ -1009,9 +1034,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="show or reset the blob target recorded on the job queue (see `show`/`reset`)")
     pts = pt.add_subparsers(dest="blob_target_cmd", required=True)
     pts.add_parser("show", help="print the blob target every process on this queue must agree on")
-    pts.add_parser(
+    pt_reset = pts.add_parser(
         "reset",
-        help="forget it, for a DELIBERATE migration; both sides re-register on next start")
+        help="forget it, for a DELIBERATE migration; requires a STOPPED fleet (see --yes)")
+    pt_reset.add_argument(
+        "--yes", action="store_true",
+        help="confirm every dispatcher and ingress on this queue is stopped")
     pt.set_defaults(func=_blob_target_cmd)
 
     pv = sub.add_parser("version", help="print version and exit")
