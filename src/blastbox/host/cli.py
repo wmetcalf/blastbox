@@ -601,8 +601,12 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
             # (registration deferred until after the probe -- see below)
         # ...and the ROUND-TRIP stays gated: that is the probe, and the probe is what the toggle is
         # documented to control.
+        # Computed unconditionally: it is a string, not a probe, and binding it only inside the
+        # canary branch left the periodic-callback default below reading an UNBOUND local whenever
+        # BLASTBOX_CANARY=0 -- so the documented opt-out crashed the dispatcher with
+        # UnboundLocalError before pool.start() instead of skipping the probe.
+        _vmkey = f"{tier or ''}|{next(iter(engines), '')}|{job_root}"
         if _vm_canary and _vmblobs is not None:
-            _vmkey = f"{tier or ''}|{next(iter(engines), '')}|{job_root}"
             _vmlog.info("canary.ok %s", blob_roundtrip(
                 _vmblobs, key_hint=_vmkey, scratch_dir=job_root))
         # AFTER the round-trip, same as Dispatcher.run_forever. A network dispatcher pointed at an
@@ -613,14 +617,18 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         if _vmblobs is not None:
             check_blob_target_agreement(store, _vmblobs, role="dispatcher")
 
+            # ...and only INSTALL the periodic probe when the probe is enabled. Registering a
+            # callback that re-runs the round-trip under CANARY=0 would reintroduce the very thing
+            # the operator opted out of, on a timer.
             def _vm_periodic_canary(_b=_vmblobs, _l=_vmlog, _k=_vmkey, _jr=job_root) -> None:
                 _l.info("canary.ok %s", blob_roundtrip(
                     _b, key_hint=_k, scratch_dir=_jr))
 
             # Advisory once serving: a store that goes away mid-run is a brownout, not a
             # config error, and tearing down a warm fleet over it is what #79 exists to stop.
-            vm._canary_cb = _vm_periodic_canary
-            vm._canary_interval_s = _canary_interval
+            if _vm_canary:
+                vm._canary_cb = _vm_periodic_canary
+                vm._canary_interval_s = _canary_interval
         pool.start()   # validation passed -> now spawn/warm slots (nothing to leak on an earlier raise)
         try:
             # One-shot orphan sweep on start (aws-ec2-hibernate only; guarded by hasattr). A fresh run's

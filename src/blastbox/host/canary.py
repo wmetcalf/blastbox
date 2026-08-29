@@ -529,7 +529,16 @@ def check_blob_target_agreement(job_store: Any, blob_store: Any, *, role: str) -
         # meaningless, which is why the NFS shape must keep working) but it is not an S3 target, so
         # it conflicts with one in either order.
         recorded = job_store.claim_blob_target(_LOCAL_SENTINEL)
-        if recorded is not None and not recorded.startswith(_LOCAL_SENTINEL):
+        if recorded is None:
+            # Same contract as the non-local path below: an unreadable read-back is UNKNOWN, not
+            # success. Logging "registered the sentinel" here was false -- a remote process can
+            # then claim the empty registry and start on S3 while this local one is already
+            # serving, and the operator was told the opposite.
+            _log.warning("canary.blob_target_unverified %s could not read the registry back after "
+                         "registering the local sentinel (a concurrent reset, or an evicted key); "
+                         "agreement is NOT confirmed this boot", role)
+            return None
+        if not recorded.startswith(_LOCAL_SENTINEL):
             raise CanaryFailure(
                 f"this {role} reads and writes results in a LOCAL directory "
                 f"({describe_blob_store(blob_store)}), but another process on the SAME job queue "
@@ -546,6 +555,10 @@ def check_blob_target_agreement(job_store: Any, blob_store: Any, *, role: str) -
         return None
 
     mine = blob_target_fingerprint(blob_store)
+    if not mine:
+        _log.warning("canary.blob_target_unverified %s uses %s, which exposes no comparable target "
+                     "identity; agreement is NOT being checked", role, type(blob_store).__name__)
+        return None
     agreed = job_store.claim_blob_target(mine)
     if agreed is None:
         # UNKNOWN, not agreement. See BlobTargetRegistry.claim_blob_target.
@@ -595,6 +608,8 @@ def blob_target_fingerprint(store: Any) -> str:
         # outlives every process, so a credential that lands here is a credential at rest.
         bucket = _safe_bucket(bucket)
         return f"s3://{bucket}/{prefix}" if prefix else f"s3://{bucket}"
-    # Non-S3 shapes never reach the comparison (local stores are exempt), but a stable string is
-    # still better than a repr that varies per process.
-    return f"{type(store).__name__}()"
+    # An UNRECOGNISED shape has no identity we can compare. Returning the class name equated every
+    # instance of it -- two dispatchers on different endpoints of a custom BlobStore would agree
+    # because they share a type, which is worse than not checking. The empty string means "no
+    # identity", and the caller declines to register rather than inventing one.
+    return ""

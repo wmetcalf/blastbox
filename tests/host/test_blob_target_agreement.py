@@ -143,7 +143,7 @@ def test_an_unreadable_registry_is_unknown_not_agreement(caplog):
         def clear_blob_target(self) -> None:
             pass
 
-    with caplog.at_level(logging.WARNING, logger="blastbox.host.canary"):
+    with caplog.at_level(logging.WARNING, logger="blastbox.canary"):
         out = check_blob_target_agreement(_UnreadableRegistry(), _Store("results/x"),
                                           role="ingress")
 
@@ -192,7 +192,7 @@ def test_a_store_without_the_seam_warns_rather_than_refusing(caplog):
     class _NoSeam:
         pass
 
-    with caplog.at_level(logging.WARNING, logger="blastbox.host.canary"):
+    with caplog.at_level(logging.WARNING, logger="blastbox.canary"):
         assert check_blob_target_agreement(_NoSeam(), _Store("results/x"), role="ingress") is None
     assert any("blob_target_unverified" in r.getMessage() for r in caplog.records), (
         "a store without the seam must say so rather than silently skipping the check")
@@ -476,3 +476,86 @@ def test_a_credentialed_blob_url_never_reaches_the_log_or_the_registry():
         assert "s3cr3t" not in value and "AKIAKEY" not in value, (
             f"the {label} carries the credential from BLASTBOX_BLOB_URL: {value}")
     assert "bucket" in fingerprint, f"the bucket itself must survive redaction: {fingerprint}"
+
+
+def test_an_unknown_store_shape_is_unverified_rather_than_equated_by_class():
+    """Two instances of the same custom BlobStore are not the same target.
+
+    An unrecognised shape has no identity we can compare, and returning `ClassName()` equated every
+    instance of it -- an ingress and a dispatcher on two different endpoints of one custom store
+    would "agree" because they share a type. That is worse than not checking, because it reports a
+    guarantee it never established.
+
+    MUTATION: return `f"{type(store).__name__}()"` -> two unrelated instances agree.
+    """
+    import logging
+
+    from blastbox.host.canary import blob_target_fingerprint
+    from blastbox.host.jobs.memory import InMemoryJobStore
+
+    class CustomStore:
+        """Neither local nor S3-shaped."""
+
+    assert blob_target_fingerprint(CustomStore()) == "", (
+        "an unrecognised store was given a comparable identity it does not have")
+
+    q = InMemoryJobStore()
+    logging.disable(logging.NOTSET)
+    assert check_blob_target_agreement(q, CustomStore(), role="dispatcher") is None
+    assert q.get_blob_target() is None, (
+        "an unidentifiable store registered a target; the next process would have to match a value "
+        "that means nothing")
+
+
+@pytest.mark.parametrize("backend", ALL_BACKENDS)
+def test_a_local_claim_that_cannot_be_read_back_is_unverified(backend):
+    """The local path must answer UNKNOWN exactly like the non-local one.
+
+    When the registry read-back comes up empty after the sentinel claim -- a concurrent reset, or a
+    Redis eviction -- the old code treated it as success and logged that the sentinel WAS
+    registered. A remote process could then claim the empty registry and start on S3 while this
+    local process was already serving, recreating the split without even the unverified warning the
+    non-local path emits.
+
+    MUTATION: drop the `recorded is None` branch -> a failed read-back is logged as registered.
+    """
+    q = backend()
+    q.claim_blob_target = lambda fp: None  # type: ignore[method-assign]
+
+    with caplog_at_warning() as records:
+        out = check_blob_target_agreement(q, LocalBlobStore(tempfile.mkdtemp()), role="ingress")
+
+    assert out is None
+    msgs = [r.getMessage() for r in records]
+    assert any("blob_target_unverified" in m for m in msgs), (
+        f"a failed read-back on the local path was not reported as unverified: {msgs}")
+    assert not any("registered the local sentinel" in m for m in msgs), (
+        f"the log claimed the sentinel was registered when it was not: {msgs}")
+
+
+import contextlib  # noqa: E402
+
+
+@contextlib.contextmanager
+def caplog_at_warning():
+    """Collect WARNING records from the canary logger regardless of global logging state."""
+    import logging
+
+    records: list = []
+
+    class _Grab(logging.Handler):
+        def emit(self, record):  # noqa: ANN001
+            records.append(record)
+
+    log = logging.getLogger("blastbox.canary")
+    handler = _Grab()
+    prev_disable = logging.root.manager.disable
+    logging.disable(logging.NOTSET)
+    log.addHandler(handler)
+    prev_level, log.level = log.level, logging.WARNING
+    try:
+        yield records
+    finally:
+        log.removeHandler(handler)
+        log.level = prev_level
+        logging.disable(prev_disable)

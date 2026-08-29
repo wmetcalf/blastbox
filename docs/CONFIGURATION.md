@@ -127,8 +127,12 @@ The startup line names the backend, bucket, prefix and endpoint
 shape for the target it serves results **from** — so a dispatcher and an API pointed at different
 targets are greppable side by side. The probe stages its synthetic output under the dispatcher's
 own job root (not the system temp dir) and uses a key stable per host+tier, so a store that denies
-DELETE leaves exactly one object rather than one per probe. Making that mismatch *fail* rather than merely visible needs
-an identity the two processes exchange through the job store they already share (issue #88).
+DELETE leaves exactly one object rather than one per probe.
+
+That mismatch now **fails** rather than merely being visible: each process registers its blob
+target through the job queue at startup and refuses to start if another process on that queue
+registered a different one, in either boot order, including local-versus-remote. See
+*Blob-target agreement* below for the enforcement, its scope, and the migration command.
 
 ## Runtime selection (docker: runc / runsc)
 

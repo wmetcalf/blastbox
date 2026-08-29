@@ -319,15 +319,6 @@ def build_app(
     except Exception:  # noqa: BLE001 - a LOG LINE must never stop the API booting
         pass
 
-    # ...and now PROVE it, rather than leaving it to a human comparing two log lines. Registered
-    # through the job queue, which is the only thing this API and its dispatchers are guaranteed to
-    # share. Deliberately NOT inside the try above: that handler exists so a log line cannot stop
-    # the API, and this is not a log line -- serving results from a target no dispatcher writes to
-    # means every finished job 404s, which is the failure this whole seam exists to end. It has to
-    # be able to stop the boot.
-    from blastbox.host.canary import check_blob_target_agreement
-
-    check_blob_target_agreement(_job_store, _blob_store, role="ingress")
 
     # Engine allowlist
     _allowed_engines: set[str]
@@ -1111,6 +1102,20 @@ def build_app(
             app.include_router(router)
         if extension.static_ui is not None:
             _mount_static_ui(app, extension.static_ui)
+
+    # LAST, because registration PERSISTS. Proving the API and its dispatchers write to the same
+    # blob target is the point of this call -- but build_app still fails closed after this point on
+    # an empty required engine allowlist and on malformed scratch/maintenance intervals, and an
+    # ingress that never becomes serviceable must not have poisoned the shared registry on its way
+    # out. Otherwise correcting BOTH the bad setting and the blob target still fails, against a
+    # claim left by a process that never served a request, until someone runs `blob-target reset`.
+    #
+    # Deliberately NOT inside the best-effort try that wraps the log line above: that exists so a
+    # LOG cannot stop the API. This is not a log -- serving results from a target no dispatcher
+    # writes to means every finished job 404s, so it has to be able to stop the boot.
+    from blastbox.host.canary import check_blob_target_agreement
+
+    check_blob_target_agreement(_job_store, _blob_store, role="ingress")
 
     return app
 
