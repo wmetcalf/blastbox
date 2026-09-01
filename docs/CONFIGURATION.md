@@ -77,7 +77,7 @@ issue #79 exists to prevent.
 | Var | Default | Notes |
 |---|---|---|
 | `BLASTBOX_CANARY` | `1` (on) | Startup self-test + periodic re-check. **Disabled only by an explicit false** — `0`/`false`/`no`/`off`. Anything else (including a typo, or the set-but-empty value compose produces for an unset variable) leaves it **ENABLED** and logs a warning: an affirmative allowlist would let a fat-fingered `treu` silently fail *open* on a check whose whole value is failing closed. |
-| `BLASTBOX_CANARY_INTERVAL_S` | `900` | How often to re-run the round-trip while serving. Advisory: it logs, it never gates. `0` ⇒ startup only. Non-numeric, **non-finite** (`nan`, `inf`) and **negative** values fall back to 900 with a warning — `float()` accepts all three, and each would silently switch the periodic pass off while the documented disable value is `0`. Network dispatchers (aws/static/cascade) honour this cadence too; their loop wakes on the earlier of this and the maintenance interval. **Versioned buckets:** the probe reuses a stable key, so at most one LIVE object exists — but each re-run still writes a new version and the delete adds a marker, so the canary also best-effort deletes its own noncurrent versions. That needs `s3:ListBucketVersions` + `s3:DeleteObjectVersion`; where those are withheld the purge is skipped silently and the remedy is a lifecycle rule expiring noncurrent versions under the results prefix. |
+| `BLASTBOX_CANARY_INTERVAL_S` | `900` | How often to re-run the round-trip while serving. Advisory: it logs, it never gates. `0` ⇒ startup only. Non-numeric, **non-finite** (`nan`, `inf`) and **negative** values fall back to 900 with a warning — `float()` accepts all three, and each would silently switch the periodic pass off while the documented disable value is `0`. Network dispatchers (aws/static/cascade) honour this cadence too; their loop wakes on the earlier of this and the maintenance interval. **Versioned buckets:** the probe reuses a stable key, so at most one LIVE object exists — but each re-run still writes a new version and the delete adds a marker, so the canary also best-effort deletes its own noncurrent versions. That needs `s3:ListBucketVersions` + `s3:DeleteObjectVersion`; where those are withheld `delete_job` now RAISES first, so `_cleanup` logs `canary.cleanup_failed` and the version purge never runs — the leftover is reported rather than silent, and the remedy is still a lifecycle rule expiring noncurrent versions under the results prefix. The purge lists a page at a time and re-lists after each delete, so it keeps working past the 1000-entry page boundary the canary's stable key reaches in about ten days at this cadence. |
 | `BLASTBOX_REQUIRE_SHARED_BLOB_STORE` | `0` (advisory) | Declare that this deployment's results **must** be readable by other machines. With it set, a dispatcher claiming from a shared queue (postgres/redis) while writing to a `LocalBlobStore` **refuses to start**. Default is a loud warning instead, because the canary cannot infer the answer: both single-node-on-local-postgres and multi-node-with-`BLASTBOX_BLOB_LOCAL_ROOT`-on-NFS are documented, valid configurations that look identical from inside the process. Set this on a fleet where a local store is never correct. An unrecognised non-empty value is **warned about and treated as unset** rather than silently ignored. |
 
 ### Blob-target agreement (dispatcher ↔ ingress)
@@ -124,13 +124,20 @@ A third-party `JobStore` that does not implement the registry logs
 disagreement.
 
 
-**On a versioned S3 bucket**, set a lifecycle rule expiring noncurrent versions and delete
-markers. `S3BlobStore.delete_job` lists only current keys and deletes without a `VersionId`, so a
-delete adds a marker and leaves the prior version — true for every job result under retention, not
-just the canary, which simply makes it periodic (one noncurrent version + one marker per interval
-per dispatcher). Version-aware deletion is tracked in issue #89; the lifecycle rule is the
-standard remedy meanwhile, and `BLASTBOX_CANARY_INTERVAL_S=0` bounds the canary's share to one
-object per boot.
+**On a versioned S3 bucket**, `S3BlobStore.delete_job` is version-aware (issue #89): it probes
+`GetBucketVersioning` once per store and, when versioning is `Enabled` *or* `Suspended`, removes
+every version and delete marker under the job's results prefix rather than adding a marker over
+them. Suspended counts because suspending stops new versions but keeps the ones already made.
+
+That needs **`s3:ListBucketVersions` + `s3:DeleteObjectVersion`** in addition to `s3:DeleteObject`.
+Grant them, or retention will not reclaim: without them the delete raises and the job stays
+retryable rather than being reported as reclaimed. If `GetBucketVersioning` itself is withheld the
+store assumes versioned — the safe default for an operation whose contract is that the bytes are
+gone; the cost of guessing wrong is a wider listing call, not data loss.
+
+A lifecycle rule expiring noncurrent versions is still worth having as a backstop for residue left
+by earlier versions of blastbox (deletes before this fix left a marker plus every prior version),
+and `BLASTBOX_CANARY_INTERVAL_S=0` bounds the canary's share to one object per boot.
 
 The startup line names the backend, bucket, prefix and endpoint
 (`canary.blob_store S3BlobStore(bucket/prefix via http://…)`), and `blastbox serve` logs the same
