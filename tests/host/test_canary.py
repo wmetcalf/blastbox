@@ -900,12 +900,6 @@ class _PaginatingVersionedS3(_FakeVersionedS3):
 
         return _P()
 
-    def delete_objects(self, Bucket, Delete):  # noqa: ANN001, ANN201, N803
-        super().delete_objects(Bucket, Delete)
-        gone = {(o["Key"], o["VersionId"]) for o in Delete["Objects"]}
-        self.versions = [kv for kv in self.versions if kv not in gone]
-        return {}
-
 
 def test_the_version_purge_clears_more_than_one_page(tmp_path):
     """The canary key gains a version every probe, so it outgrows one page in days.

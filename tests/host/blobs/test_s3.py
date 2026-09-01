@@ -304,6 +304,124 @@ def test_delete_job_batches_past_the_1000_key_api_limit(versioned_store, tmp_pat
     assert versions == [] and markers == []
 
 
+def test_versioning_status_is_rechecked_after_the_ttl(versioned_store, tmp_path):
+    """A store outlives a bucket's configuration.
+
+    Caching the answer forever meant versioning enabled after the first delete kept
+    taking the keyless path until the process restarted.
+    """
+    from blastbox.host.blobs import s3 as s3mod
+
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.put_bucket_versioning(
+        Bucket=BUCKET, VersioningConfiguration={"Status": "Suspended"}
+    )
+    # Prime the cache while it reads as versioned (Suspended still counts).
+    assert versioned_store._bucket_is_versioned() is True
+
+    # A bucket cannot be un-versioned once enabled, so drive the recheck through
+    # the API instead: a changed reply must be picked up once the TTL lapses.
+    calls = []
+    real = versioned_store._s3.get_bucket_versioning
+
+    def counting(**kw):
+        calls.append(1)
+        return real(**kw)
+
+    versioned_store._s3.get_bucket_versioning = counting
+    versioned_store._bucket_is_versioned()
+    assert calls == [], "inside the TTL the cached answer must be reused"
+
+    versioned_store._versioned_at -= s3mod._VERSIONING_TTL_S + 1
+    versioned_store._bucket_is_versioned()
+    assert len(calls) == 1, "past the TTL the status must be re-read"
+
+
+def test_an_unreadable_status_is_never_cached(versioned_store):
+    """A transient failure must not pin the store into the versioned path.
+
+    Cached, a single throttle or DNS blip would keep every later delete on the
+    version-aware path (and failing, where the permissions are absent) until the
+    process restarted.
+    """
+    from unittest.mock import patch
+
+    import botocore.exceptions
+
+    boom = botocore.exceptions.ClientError(
+        {"Error": {"Code": "Throttling", "Message": "slow down"}}, "GetBucketVersioning"
+    )
+    with patch.object(versioned_store._s3, "get_bucket_versioning", side_effect=boom):
+        assert versioned_store._bucket_is_versioned() is True
+    assert versioned_store._versioned is None, "the failure must not have been cached"
+
+    # Once the API recovers, the real answer is used.
+    assert versioned_store._bucket_is_versioned() is True
+    assert versioned_store._versioned is True
+
+
+def test_noncurrent_versions_are_deleted_before_the_current_one(versioned_store, tmp_path):
+    """Partial failure must not leave the object invisible but still stored.
+
+    Deleting the current version first makes the key vanish from an ordinary
+    listing while older bytes remain -- the state that looks deleted and is not.
+    """
+    out = tmp_path / "jo" / "output"
+    out.mkdir(parents=True)
+    for body in (b"v1", b"v2", b"v3"):
+        (out / "metadata.json").write_bytes(body)
+        versioned_store.put_output("jo", out)
+
+    latest = {
+        v["VersionId"]
+        for v in _surviving_versions("pfx/results/jo/")[0]
+        if v.get("IsLatest")
+    }
+    assert len(latest) == 1
+
+    seen: list[str] = []
+    real = versioned_store._s3.delete_objects
+
+    def spy(Bucket, Delete):  # noqa: N803 — boto3's parameter names
+        seen.extend(o["VersionId"] for o in Delete["Objects"])
+        return real(Bucket=Bucket, Delete=Delete)
+
+    versioned_store._s3.delete_objects = spy
+    versioned_store.delete_job("jo")
+
+    assert seen, "nothing was deleted"
+    assert seen[-1] in latest, (
+        "the current version must be deleted LAST; order was " + repr(seen)
+    )
+
+
+def test_delete_lists_one_page_at_a_time_rather_than_the_whole_history(
+    versioned_store, tmp_path
+):
+    """Version history is the unbounded thing here; the working set must not be.
+
+    Asserted through the request: a bounded MaxKeys is what keeps a pathological
+    history from being materialised in one go.
+    """
+    out = tmp_path / "jp" / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_bytes(b"x")
+    versioned_store.put_output("jp", out)
+
+    seen_maxkeys: list[int] = []
+    real = versioned_store._s3.list_object_versions
+
+    def spy(**kw):
+        seen_maxkeys.append(kw.get("MaxKeys"))
+        return real(**kw)
+
+    versioned_store._s3.list_object_versions = spy
+    versioned_store.delete_job("jp")
+
+    assert seen_maxkeys, "the versioned path did not list"
+    assert all(m is not None and m <= 1000 for m in seen_maxkeys), seen_maxkeys
+
+
 def test_put_sample_propagates_non_404_errors(store, tmp_path):
     """Non-404 errors in head_object (e.g., AccessDenied) must raise, not be swallowed."""
     from unittest.mock import patch
