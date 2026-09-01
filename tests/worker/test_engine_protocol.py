@@ -58,6 +58,49 @@ def test_an_engine_providing_the_optional_methods_is_recognised():
     assert isinstance(full, SupportsWarmup)
 
 
+def test_optional_methods_reach_an_engine_that_delegates_via_getattr():
+    """The harness must keep using hasattr(), not isinstance().
+
+    A runtime-checkable Protocol resolves members against the CLASS, so a wrapper
+    that forwards optional methods through __getattr__ answers hasattr() True but
+    isinstance() False. Engines load out-of-tree and may well be such wrappers, so
+    swapping the harness guards to isinstance would silently stop calling
+    detect/warmup on them. This pins the asymmetry that makes that a real hazard.
+    """
+
+    class Delegating:
+        name = "wrapped"
+        formats = frozenset({"*"})
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def detonate(self, input: Path, outdir: Path, limits: Limits):
+            raise NotImplementedError
+
+        def __getattr__(self, item):
+            return getattr(self._inner, item)
+
+    w = Delegating(FullEngine())
+    assert hasattr(w, "detect"), "the wrapper does expose detect"
+    assert hasattr(w, "warmup")
+    assert not isinstance(w, SupportsDetect), (
+        "isinstance cannot see __getattr__-delegated methods — this is exactly why "
+        "the harness guards with hasattr"
+    )
+    assert not isinstance(w, SupportsWarmup)
+
+
+def test_the_optional_protocols_require_the_engine_members_too():
+    """SupportsDetect means "an Engine that also detects", not "anything with detect"."""
+
+    class OnlyDetect:
+        def detect(self, input: Path):
+            raise NotImplementedError
+
+    assert not isinstance(OnlyDetect(), SupportsDetect)
+
+
 def test_an_object_missing_a_required_member_is_still_rejected():
     """The protocol must not have been loosened into meaninglessness."""
 

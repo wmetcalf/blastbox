@@ -34,7 +34,6 @@ from blastbox.contract import (
 from blastbox.contract.nodes import Record
 from blastbox.errors import sanitize_public_error
 from blastbox.limits import Limits
-from blastbox.worker.engine import SupportsDetect
 
 if TYPE_CHECKING:
     from blastbox.worker.engine import Engine
@@ -187,7 +186,7 @@ def run_detonation(
 
     # Step 2: optional pre-detection
     detected: Detection | None = None
-    if isinstance(engine, SupportsDetect):
+    if hasattr(engine, "detect"):
         try:
             detected = engine.detect(input_path)
         except Exception as exc:  # noqa: BLE001

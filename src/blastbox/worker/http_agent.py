@@ -42,7 +42,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from blastbox.limits import Limits
-from blastbox.worker.engine import Engine, SupportsWarmup
+from blastbox.worker.engine import Engine
 from blastbox.worker.harness import run_detonation
 from blastbox.worker.load import load_engine
 
@@ -462,7 +462,7 @@ def main(argv: list[str] | None = None) -> int:
     if not spec:
         raise SystemExit("BLASTBOX_ENGINE=module:Class is required")
     engine = load_engine(spec)
-    if isinstance(engine, SupportsWarmup):
+    if hasattr(engine, "warmup"):
         try:
             engine.warmup()
         except Exception as exc:  # noqa: BLE001 -- warmup is best-effort (fail-open to cold)
