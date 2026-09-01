@@ -424,6 +424,13 @@ class S3BlobStore:
         self._versioned_at = now
         return self._versioned
 
+    def _current_keys_page(self, prefix: str) -> list[dict[str, str]]:
+        """One page of CURRENT keys — the keyless delete, correct on an unversioned bucket."""
+        page = self._s3.list_objects_v2(
+            Bucket=self._bucket, Prefix=prefix, MaxKeys=_DELETE_BATCH
+        )
+        return [{"Key": o["Key"]} for o in page.get("Contents", [])]
+
     def _next_delete_page(self, prefix: str) -> list[dict[str, str]]:
         """One page of delete targets under ``prefix``, newest-listing first.
 
@@ -450,14 +457,33 @@ class S3BlobStore:
         not.
         """
         if not self._bucket_is_versioned():
-            page = self._s3.list_objects_v2(
+            return self._current_keys_page(prefix)
+
+        try:
+            page = self._s3.list_object_versions(
                 Bucket=self._bucket, Prefix=prefix, MaxKeys=_DELETE_BATCH
             )
-            return [{"Key": o["Key"]} for o in page.get("Contents", [])]
-
-        page = self._s3.list_object_versions(
-            Bucket=self._bucket, Prefix=prefix, MaxKeys=_DELETE_BATCH
-        )
+        except Exception as exc:  # noqa: BLE001 — typically ListBucketVersions not granted
+            if self._versioned is not None:
+                # The bucket really does report versioning; we simply cannot enumerate
+                # versions. Deleting the current key would write a marker over bytes we
+                # were asked to remove, so refuse rather than report a false reclaim.
+                raise
+            # We never established that this bucket IS versioned -- _bucket_is_versioned
+            # only assumed so because the status read failed. An UNVERSIONED bucket whose
+            # policy grants neither GetBucketVersioning nor ListBucketVersions worked
+            # fine before this change, and must keep working: fall back to the keyless
+            # delete that has always been correct there. Loudly, because if the bucket
+            # IS versioned this silently retains noncurrent versions -- exactly the bug
+            # this method exists to fix.
+            _log.warning(
+                "cannot read bucket versioning OR list versions for %s (%s); falling back "
+                "to a keyless delete. If this bucket is versioned, noncurrent versions are "
+                "being RETAINED — grant s3:GetBucketVersioning (cheap, read-only) or "
+                "s3:ListBucketVersions + s3:DeleteObjectVersion.",
+                self._bucket, type(exc).__name__,
+            )
+            return self._current_keys_page(prefix)
         entries = [*page.get("Versions", []), *page.get("DeleteMarkers", [])]
         entries.sort(key=lambda e: bool(e.get("IsLatest")))
         return [{"Key": e["Key"], "VersionId": e["VersionId"]} for e in entries]

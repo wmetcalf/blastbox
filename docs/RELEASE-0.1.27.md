@@ -20,7 +20,13 @@
 
 **#87 startup canary.** A dispatcher now refuses to claim work until it has proven it can write and read back a result blob. A misconfigured blob target that previously failed at result-upload time now fails at boot, loudly. That is the intent — it is the fix for the class of outage where jobs completed and their results 404'd — but it will surface latent configuration problems as startup failures.
 
-**#94 versioned deletes.** On a bucket with versioning `Enabled` or `Suspended`, `delete_job` now removes every version and delete marker rather than writing a marker over them. This requires **`s3:ListBucketVersions` + `s3:DeleteObjectVersion`** in addition to `s3:DeleteObject`; where they are absent the delete now raises instead of falsely reporting a reclaim. Unversioned buckets are unaffected and take the same path as before. Verified against the MinIO fleet: the `blastbox` bucket reports un-versioned, so the plain path still applies there.
+**#94 versioned deletes.** On a bucket with versioning `Enabled` or `Suspended`, `delete_job` now removes every version and delete marker rather than writing a marker over them.
+
+**IAM, for every S3 deployment — not only versioned ones.** `delete_job` first reads the bucket's versioning status, so **`s3:GetBucketVersioning`** (cheap, read-only) should be granted everywhere. Where it is absent the store assumes versioned and tries to enumerate versions, which needs **`s3:ListBucketVersions` + `s3:DeleteObjectVersion`**.
+
+If *neither* is granted the store falls back to the old keyless delete and logs a warning, so an unversioned bucket with a narrow policy keeps working exactly as before. That fallback applies only when versioning could never be established; on a bucket **confirmed** versioned, an unlistable version history raises instead — a keyless delete there would write a marker over bytes the caller asked to remove and report a reclaim that did not happen.
+
+Verified against the MinIO fleet: the `blastbox` bucket reports unversioned and `GetBucketVersioning` is readable, so the plain path still applies there.
 
 ### Also in this range
 
