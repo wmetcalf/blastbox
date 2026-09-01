@@ -58,8 +58,12 @@ class DetonationResult:
 class Engine(Protocol):
     """Protocol that every blastbox engine must satisfy.
 
-    Only ``name``, ``formats``, and ``detonate`` are required.
-    ``detect`` and ``warmup`` are optional and tested via ``hasattr``.
+    Only ``name``, ``formats``, and ``detonate`` are required — this protocol
+    declares exactly those, so an engine providing them satisfies it both under
+    mypy and under ``isinstance``.
+
+    ``detect`` and ``warmup`` are optional; see :class:`SupportsDetect` and
+    :class:`SupportsWarmup`.
     """
 
     name: str
@@ -93,16 +97,48 @@ class Engine(Protocol):
         """
         ...
 
-    # ---------- optional methods (hasattr-guarded in the harness) ----------
+    # ---------- optional methods ----------
+    #
+    # detect() and warmup() are NOT declared here. A plain method in a Protocol is a
+    # REQUIRED member for structural typing, so declaring them would contradict the
+    # docstring above and every call site: an engine implementing exactly what this
+    # protocol documents as sufficient would fail `isinstance(e, Engine)` at runtime
+    # and be rejected by mypy. They live in their own protocols below -- the same
+    # reasoning that keeps jobs_per_recycle in a comment.
+    #
+    # The harness guards them with hasattr(), NOT isinstance() against those
+    # protocols, and that is deliberate. A runtime-checkable Protocol resolves its
+    # members against the CLASS, so an engine that delegates optional methods
+    # through __getattr__ (a wrapper or proxy -- engines are pluggable and load
+    # out-of-tree) answers hasattr() True but isinstance() False. Swapping the
+    # guards would silently stop calling detect/warmup on exactly those engines.
+    #
+    # See SupportsDetect and SupportsWarmup -- they are for TYPING.
+
+
+@runtime_checkable
+class SupportsDetect(Engine, Protocol):
+    """An engine that ALSO does pre-detonation detection.
+
+    Inherits :class:`Engine` so the name means what it says: without that, any
+    object with a ``detect`` method would satisfy it.
+
+    Use for TYPING. Do not use ``isinstance`` in place of the harness's
+    ``hasattr`` guard -- see the note on the optional methods in ``Engine``.
+    """
 
     def detect(self, input: Path) -> Detection:
-        """Pre-detonation detection (optional).
-
-        If present, called before ``detonate()``; its result feeds
-        ``DetonationResult.detected``.
-        """
+        """Called before ``detonate()``; its result feeds ``DetonationResult.detected``."""
         ...
 
+
+@runtime_checkable
+class SupportsWarmup(Engine, Protocol):
+    """An engine that ALSO wants warm-pool initialisation (warm-pool slice).
+
+    Inherits :class:`Engine` for the same reason as :class:`SupportsDetect`.
+    """
+
     def warmup(self) -> None:
-        """Warm-pool initialisation (optional, warm-pool slice)."""
+        """Called once when a warm worker starts, before it takes its first job."""
         ...
