@@ -375,13 +375,20 @@ def _purge_versions(store: Any, job_id: str) -> None:
     try:
         prefix = keyfn("results", job_id) + "/"
         paginator = s3.get_paginator("list_object_versions")
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            stale = [{"Key": v["Key"], "VersionId": v["VersionId"]}
-                     for k in ("Versions", "DeleteMarkers")
-                     for v in (page.get(k) or [])
-                     if v.get("VersionId") and v["VersionId"] != "null"]
-            if stale:
-                s3.delete_objects(Bucket=bucket, Delete={"Objects": stale, "Quiet": True})
+        # Collect the whole listing BEFORE deleting. Deleting inside the pagination loop
+        # walks a listing being mutated underneath it: the continuation token names an
+        # object the previous batch removed and the remainder is skipped. That is reachable
+        # here -- this key gains a version every probe interval (~96/day per dispatcher at
+        # the 900s default), so the purge would silently stop cleaning past the first page.
+        stale = [{"Key": v["Key"], "VersionId": v["VersionId"]}
+                 for page in paginator.paginate(Bucket=bucket, Prefix=prefix)
+                 for k in ("Versions", "DeleteMarkers")
+                 for v in (page.get(k) or [])
+                 if v.get("VersionId") and v["VersionId"] != "null"]
+        for i in range(0, len(stale), 1000):     # DeleteObjects caps at 1000 keys
+            s3.delete_objects(
+                Bucket=bucket, Delete={"Objects": stale[i:i + 1000], "Quiet": True}
+            )
     except Exception as exc:  # noqa: BLE001 -- unversioned bucket, or no version permissions
         _log.debug("canary.version_purge_skipped job_id=%s: %s: %s",
                    job_id, type(exc).__name__, redact_secrets(str(exc)))

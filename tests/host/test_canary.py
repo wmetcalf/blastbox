@@ -861,6 +861,74 @@ def test_denied_version_permissions_do_not_report_a_failed_cleanup(caplog):
         f"object was deleted, and the operator is sent looking for something that is not there")
 
 
+class _PaginatingVersionedS3(_FakeVersionedS3):
+    """Models S3's continuation-token paging, which is what makes deleting mid-scan lossy.
+
+    A page is sliced from the CURRENT contents at the moment it is requested, exactly
+    like a continuation token resolving against live bucket state. Delete a full page
+    and the next slice starts past what remains, so the tail is never visited.
+    """
+
+    PAGE = 1000
+
+    def get_paginator(self, op):  # noqa: ANN001, ANN201
+        assert op == "list_object_versions"
+        store = self
+
+        class _P:
+            def paginate(self, **kw):  # noqa: ANN003, ANN201
+                pre = kw["Prefix"]
+                offset = 0
+                while True:
+                    live = [(k, v) for k, v in store.versions if k.startswith(pre)]
+                    chunk = live[offset : offset + _PaginatingVersionedS3.PAGE]
+                    if not chunk:
+                        return
+                    yield {
+                        "Versions": [
+                            {"Key": k, "VersionId": v}
+                            for k, v in chunk
+                            if not v.startswith("dm")
+                        ],
+                        "DeleteMarkers": [
+                            {"Key": k, "VersionId": v}
+                            for k, v in chunk
+                            if v.startswith("dm")
+                        ],
+                    }
+                    offset += _PaginatingVersionedS3.PAGE
+
+        return _P()
+
+    def delete_objects(self, Bucket, Delete):  # noqa: ANN001, ANN201, N803
+        super().delete_objects(Bucket, Delete)
+        gone = {(o["Key"], o["VersionId"]) for o in Delete["Objects"]}
+        self.versions = [kv for kv in self.versions if kv not in gone]
+        return {}
+
+
+def test_the_version_purge_clears_more_than_one_page(tmp_path):
+    """The canary key gains a version every probe, so it outgrows one page in days.
+
+    At the 900s default that is ~96 versions/day per dispatcher: past 1000 the purge
+    has to keep working. MUTATION: delete inside the pagination loop instead of after
+    it -> the tail past the first page is skipped and this fails.
+    """
+    from blastbox.host.canary import _purge_versions
+
+    store = _PaginatingVersionedS3()
+    for _ in range(2500):
+        store.put_output("canary-job", tmp_path)
+    assert len(store.versions) == 2500
+
+    _purge_versions(store, "canary-job")
+
+    assert store.versions == [], (
+        f"{len(store.versions)} version(s) survived the purge — everything past the "
+        "first page was skipped"
+    )
+
+
 def test_the_version_purge_ignores_a_store_that_is_not_s3_shaped(tmp_path):
     """LocalBlobStore has no _s3/_bucket, and must not be probed for versions at all."""
     from blastbox.host.canary import _cleanup

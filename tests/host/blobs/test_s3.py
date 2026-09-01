@@ -138,6 +138,172 @@ def test_delete_job_removes_outputs_but_not_samples(store, tmp_path):
     assert s3.list_objects_v2(Bucket=BUCKET, Prefix="pfx/samples/")["KeyCount"] == 1
 
 
+@pytest.fixture
+def versioned_store(tmp_path):
+    """A bucket with versioning ENABLED — the configuration issue #89 is about."""
+    with moto.mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+        s3.put_bucket_versioning(
+            Bucket=BUCKET, VersioningConfiguration={"Status": "Enabled"}
+        )
+        yield S3BlobStore(f"s3://{BUCKET}/pfx", job_root=tmp_path, env={})
+
+
+def _surviving_versions(prefix):
+    """Every version and delete marker still stored under ``prefix``.
+
+    Paginates: list_object_versions caps a page at 1000 entries, so a single call
+    silently under-reports exactly the >1000 case worth testing.
+    """
+    s3 = boto3.client("s3", region_name="us-east-1")
+    versions, markers = [], []
+    for page in s3.get_paginator("list_object_versions").paginate(
+        Bucket=BUCKET, Prefix=prefix
+    ):
+        versions.extend(page.get("Versions", []))
+        markers.extend(page.get("DeleteMarkers", []))
+    return versions, markers
+
+
+def test_delete_job_really_removes_bytes_on_a_versioned_bucket(versioned_store, tmp_path):
+    """A keyless delete on a versioned bucket is not a delete.
+
+    ``list_objects_v2`` reports current versions only, and ``delete_objects``
+    without a ``VersionId`` merely ADDS a delete marker — every prior version
+    stays and keeps costing storage. Retention (``expire_due`` -> ``delete_job``)
+    and the ingress DELETE route both promise the bytes are gone, so this must
+    leave nothing behind.
+    """
+    out = tmp_path / "j8" / "output"
+    out.mkdir(parents=True)
+    # Overwrite the same key so the bucket holds several noncurrent versions,
+    # which is what a re-run of a job produces.
+    for body in (b"first", b"second", b"third"):
+        (out / "metadata.json").write_bytes(body)
+        versioned_store.put_output("j8", out)
+
+    versions, _ = _surviving_versions("pfx/results/j8/")
+    assert len(versions) == 3, "fixture should have produced three versions"
+
+    versioned_store.delete_job("j8")
+
+    versions, markers = _surviving_versions("pfx/results/j8/")
+    assert versions == [], (
+        f"{len(versions)} noncurrent version(s) survived delete_job — the bytes are "
+        "still stored and billed, so retention never reclaims"
+    )
+    assert markers == [], (
+        f"{len(markers)} delete marker(s) left behind — a delete marker is not a deletion"
+    )
+
+
+def test_delete_job_still_works_on_an_unversioned_bucket(store, tmp_path):
+    """The versioned path must not regress the ordinary bucket."""
+    out = tmp_path / "j9" / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_bytes(b"{}")
+    store.put_output("j9", out)
+
+    store.delete_job("j9")
+
+    s3 = boto3.client("s3", region_name="us-east-1")
+    assert s3.list_objects_v2(Bucket=BUCKET, Prefix="pfx/results/j9/")["KeyCount"] == 0
+
+
+@pytest.mark.parametrize(
+    "status,expected",
+    [("Enabled", True), ("Suspended", True), (None, False)],
+)
+def test_bucket_is_versioned_counts_suspended_as_versioned(tmp_path, status, expected):
+    """Suspending stops NEW versions; every version made while enabled survives.
+
+    Tested against the decision directly rather than end-to-end: moto deletes
+    everything on a keyless delete against a Suspended bucket, where real S3
+    writes a null-version delete marker and keeps the noncurrent versions. An
+    end-to-end assertion would therefore pass no matter which branch was taken.
+    """
+    with moto.mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=BUCKET)
+        if status is not None:
+            s3.put_bucket_versioning(
+                Bucket=BUCKET, VersioningConfiguration={"Status": status}
+            )
+        st = S3BlobStore(f"s3://{BUCKET}/pfx", job_root=tmp_path, env={})
+        assert st._bucket_is_versioned() is expected
+
+
+def test_delete_job_clears_the_residue_an_old_keyless_delete_left(versioned_store, tmp_path):
+    """A job "deleted" by the previous implementation must actually clean up.
+
+    The old code issued a keyless delete, which on a versioned bucket adds a
+    delete marker and keeps every prior version. Those buckets exist in the
+    field, so delete_job has to clear markers as well as versions.
+    """
+    out = tmp_path / "jr" / "output"
+    out.mkdir(parents=True)
+    for body in (b"one", b"two"):
+        (out / "metadata.json").write_bytes(body)
+        versioned_store.put_output("jr", out)
+
+    # exactly what the pre-fix delete_job did
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.delete_objects(
+        Bucket=BUCKET, Delete={"Objects": [{"Key": "pfx/results/jr/metadata.json"}]}
+    )
+    versions, markers = _surviving_versions("pfx/results/jr/")
+    assert len(versions) == 2 and len(markers) == 1, "fixture must reproduce the residue"
+
+    versioned_store.delete_job("jr")
+
+    versions, markers = _surviving_versions("pfx/results/jr/")
+    assert versions == [], f"{len(versions)} version(s) survived"
+    assert markers == [], f"{len(markers)} delete marker(s) survived"
+
+
+def test_delete_job_assumes_versioned_when_status_cannot_be_read(versioned_store, tmp_path):
+    """Unable to read the status -> take the safe path, not the lossy one.
+
+    Guessing "unversioned" would silently retain data an operator asked to delete.
+    """
+    from unittest.mock import patch
+
+    import botocore.exceptions
+
+    out = tmp_path / "jd" / "output"
+    out.mkdir(parents=True)
+    for body in (b"a", b"b"):
+        (out / "metadata.json").write_bytes(body)
+        versioned_store.put_output("jd", out)
+
+    denied = botocore.exceptions.ClientError(
+        {"Error": {"Code": "AccessDenied", "Message": "nope"}}, "GetBucketVersioning"
+    )
+    with patch.object(versioned_store._s3, "get_bucket_versioning", side_effect=denied):
+        versioned_store.delete_job("jd")
+
+    versions, markers = _surviving_versions("pfx/results/jd/")
+    assert versions == [] and markers == []
+
+
+def test_delete_job_batches_past_the_1000_key_api_limit(versioned_store, tmp_path):
+    """DeleteObjects caps at 1000 keys; versions + markers can exceed one page."""
+    out = tmp_path / "jb" / "output"
+    out.mkdir(parents=True)
+    for i in range(1100):
+        (out / f"f{i}.json").write_bytes(b"x")
+    versioned_store.put_output("jb", out)
+
+    versions, _ = _surviving_versions("pfx/results/jb/")
+    assert len(versions) > 1000, "fixture must exceed one DeleteObjects call"
+
+    versioned_store.delete_job("jb")
+
+    versions, markers = _surviving_versions("pfx/results/jb/")
+    assert versions == [] and markers == []
+
+
 def test_put_sample_propagates_non_404_errors(store, tmp_path):
     """Non-404 errors in head_object (e.g., AccessDenied) must raise, not be swallowed."""
     from unittest.mock import patch

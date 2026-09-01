@@ -15,7 +15,7 @@ import gzip
 import hashlib
 import io
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from pathlib import Path, PurePosixPath
@@ -36,6 +36,25 @@ from blastbox.observability import get_logger
 _log = get_logger("blastbox.blobs.s3")
 
 _CHUNK = 1024 * 1024
+
+# DeleteObjects accepts at most 1000 keys per call. list_objects_v2 pages happened to
+# respect that on their own; list_object_versions returns versions AND delete markers,
+# whose combined count can exceed one page's worth, so batch explicitly.
+_DELETE_BATCH = 1000
+
+
+def _batched(
+    items: Iterable[dict[str, str]], size: int
+) -> Iterator[list[dict[str, str]]]:
+    """Yield ``items`` in lists of at most ``size`` (itertools.batched is 3.12+)."""
+    batch: list[dict[str, str]] = []
+    for item in items:
+        batch.append(item)
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 # put_output costs one round-trip PER OBJECT, and a result tree is often hundreds of them.
 # Measured on the fleet (200 corpus documents, FC tier, 24 slots): the upload was 39.7% of all
@@ -107,6 +126,8 @@ class S3BlobStore:
         )
         self._upload_pool: ThreadPoolExecutor | None = None
         self._upload_pool_lock = threading.Lock()
+        # Resolved on first delete (one GetBucketVersioning), then reused.
+        self._versioned: bool | None = None
         # botocore's connection pool defaults to 10. Left alone, a fan-out wider than that
         # silently BLOCKS on the pool rather than erroring -- the change would look deployed,
         # measure as no faster, and give no clue why. Size it to the SHARED upload budget, which
@@ -358,6 +379,46 @@ class S3BlobStore:
             return False
         return True
 
+    def _bucket_is_versioned(self) -> bool:
+        """Whether deletes on this bucket need an explicit ``VersionId``.
+
+        ``Suspended`` counts as versioned: suspending stops NEW versions but keeps
+        every version created while it was enabled, so a keyless delete there still
+        leaves those bytes behind.
+
+        If the status cannot be read (typically ``GetBucketVersioning`` not granted)
+        this assumes VERSIONED. That is the safe default for an operation whose whole
+        contract is that the bytes are gone: guessing "unversioned" would silently
+        retain data an operator asked to delete, which is the failure this method
+        exists to prevent. The cost of guessing wrong is a wider listing call, not
+        data loss.
+        """
+        if self._versioned is None:
+            try:
+                status = self._s3.get_bucket_versioning(Bucket=self._bucket).get("Status")
+            except Exception:  # noqa: BLE001 — any failure to read status is "assume versioned"
+                _log.warning(
+                    "could not read bucket versioning for %s; assuming versioned so deletes "
+                    "remove every version (grant s3:GetBucketVersioning to silence this)",
+                    self._bucket,
+                )
+                self._versioned = True
+            else:
+                self._versioned = status in ("Enabled", "Suspended")
+        return self._versioned
+
+    def _all_versions(self, prefix: str) -> Iterator[dict[str, str]]:
+        """Every object version AND delete marker under ``prefix``.
+
+        Delete markers are included deliberately: leaving them behind would keep a
+        tombstone (and a listing entry) for a job whose bytes are gone, and a marker
+        left by an earlier keyless delete is exactly the residue this fixes.
+        """
+        paginator = self._s3.get_paginator("list_object_versions")
+        for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
+            for entry in (*page.get("Versions", []), *page.get("DeleteMarkers", [])):
+                yield {"Key": entry["Key"], "VersionId": entry["VersionId"]}
+
     def delete_job(self, job_id: str) -> None:
         """Drop this job's RESULTS only.
 
@@ -376,13 +437,22 @@ class S3BlobStore:
         or the ingress DELETE route) leaves the job retryable instead.
         """
         prefix = self._key("results", job_id) + "/"
-        paginator = self._s3.get_paginator("list_objects_v2")
         errors: list[dict] = []
-        for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
-            keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
-            if not keys:
-                continue
-            response = self._s3.delete_objects(Bucket=self._bucket, Delete={"Objects": keys})
+        # Collect the FULL listing before deleting anything. Deleting while paginating
+        # walks a listing that is being mutated underneath: the continuation token names
+        # an object the previous batch just removed, and the remainder is skipped. That
+        # is not theoretical -- it silently left 100 of 1100 objects behind in test.
+        if self._bucket_is_versioned():
+            targets = list(self._all_versions(prefix))
+        else:
+            paginator = self._s3.get_paginator("list_objects_v2")
+            targets = [
+                {"Key": o["Key"]}
+                for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix)
+                for o in page.get("Contents", [])
+            ]
+        for batch in _batched(targets, _DELETE_BATCH):
+            response = self._s3.delete_objects(Bucket=self._bucket, Delete={"Objects": batch})
             errors.extend(response.get("Errors") or [])
         if errors:
             first = errors[0]
