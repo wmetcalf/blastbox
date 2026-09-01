@@ -477,6 +477,40 @@ def test_a_confirmed_versioned_bucket_still_refuses_when_versions_cannot_be_list
             versioned_store.delete_job("jv")
 
 
+@pytest.mark.parametrize(
+    "code,transient",
+    [("Throttling", True), ("RequestTimeout", True), ("InternalError", True),
+     ("AccessDenied", False), ("NotImplemented", False)],
+)
+def test_only_a_PERMANENT_denial_may_fall_back_to_a_keyless_delete(
+    store, tmp_path, code, transient
+):
+    """A throttle says nothing about whether the bucket is versioned.
+
+    Treating a transient failure as "unversioned" would issue a keyless delete on
+    a bucket that may well be versioned, silently retaining every version — the
+    exact defect this module exists to fix. Only a settled refusal (no permission,
+    or an endpoint without the versioning APIs) justifies the fallback.
+    """
+    from unittest.mock import patch
+
+    import botocore.exceptions
+
+    out = tmp_path / f"jt{code}" / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_bytes(b"{}")
+    store.put_output(f"jt{code}", out)
+
+    err = botocore.exceptions.ClientError({"Error": {"Code": code, "Message": "x"}}, "op")
+    with patch.object(store._s3, "get_bucket_versioning", side_effect=err), \
+         patch.object(store._s3, "list_object_versions", side_effect=err):
+        if transient:
+            with pytest.raises(botocore.exceptions.ClientError):
+                store.delete_job(f"jt{code}")
+        else:
+            store.delete_job(f"jt{code}")  # falls back, must not raise
+
+
 def test_put_sample_propagates_non_404_errors(store, tmp_path):
     """Non-404 errors in head_object (e.g., AccessDenied) must raise, not be swallowed."""
     from unittest.mock import patch

@@ -129,11 +129,18 @@ disagreement.
 every version and delete marker under the job's results prefix rather than adding a marker over
 them. Suspended counts because suspending stops new versions but keeps the ones already made.
 
-That needs **`s3:ListBucketVersions` + `s3:DeleteObjectVersion`** in addition to `s3:DeleteObject`.
-Grant them, or retention will not reclaim: without them the delete raises and the job stays
-retryable rather than being reported as reclaimed. If `GetBucketVersioning` itself is withheld the
-store assumes versioned — the safe default for an operation whose contract is that the bytes are
-gone; the cost of guessing wrong is a wider listing call, not data loss.
+Grant **`s3:GetBucketVersioning`** on every S3 deployment, versioned or not — it is read-only and
+it is what lets the store take the cheap path knowingly. On a versioned bucket also grant
+**`s3:ListBucketVersions` + `s3:DeleteObjectVersion`**; without them the delete raises and the job
+stays retryable rather than being reported as reclaimed.
+
+If `GetBucketVersioning` is withheld the store assumes versioned — the safe default for an
+operation whose contract is that the bytes are gone. If version listing is *also* permanently
+refused (no permission, or an S3-compatible endpoint without the versioning APIs) it falls back to
+the keyless delete and logs a warning naming the permissions, so an unversioned bucket with a
+narrow policy keeps working. That fallback is scoped deliberately: it does not apply to a bucket
+**confirmed** versioned, and a *transient* failure (throttle, timeout, 5xx) propagates rather than
+being mistaken for "unversioned".
 
 A lifecycle rule expiring noncurrent versions is still worth having as a backstop for residue left
 by earlier versions of blastbox (deletes before this fix left a marker plus every prior version),
