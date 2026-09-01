@@ -49,6 +49,30 @@ _DELETE_BATCH = 1000
 # GetBucketVersioning per job.
 _VERSIONING_TTL_S = 300.0
 
+# Error codes that mean "this principal/endpoint will NEVER answer this call", as
+# opposed to "not right now". Only these justify falling back to a keyless delete:
+# a throttle or timeout says nothing about whether the bucket is versioned, and
+# treating it as unversioned would silently retain versions on one that is.
+# NotImplemented/MethodNotAllowed cover S3-compatible stores without the versioning
+# APIs at all.
+_PERMANENT_DENIALS = frozenset({
+    "AccessDenied", "AllAccessDisabled", "Forbidden", "403",
+    "InvalidAccessKeyId", "SignatureDoesNotMatch", "UnauthorizedAccess",
+    "NotImplemented", "MethodNotAllowed",
+})
+
+
+def _is_permanent_denial(exc: BaseException) -> bool:
+    """Whether ``exc`` is a settled refusal rather than a transient failure."""
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    error = response.get("Error") or {}
+    if str(error.get("Code")) in _PERMANENT_DENIALS:
+        return True
+    status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+    return status in (401, 403, 405, 501)
+
 
 def _batched(
     items: Iterable[dict[str, str]], size: int
@@ -424,6 +448,13 @@ class S3BlobStore:
         self._versioned_at = now
         return self._versioned
 
+    def _current_keys_page(self, prefix: str) -> list[dict[str, str]]:
+        """One page of CURRENT keys — the keyless delete, correct on an unversioned bucket."""
+        page = self._s3.list_objects_v2(
+            Bucket=self._bucket, Prefix=prefix, MaxKeys=_DELETE_BATCH
+        )
+        return [{"Key": o["Key"]} for o in page.get("Contents", [])]
+
     def _next_delete_page(self, prefix: str) -> list[dict[str, str]]:
         """One page of delete targets under ``prefix``, newest-listing first.
 
@@ -450,14 +481,36 @@ class S3BlobStore:
         not.
         """
         if not self._bucket_is_versioned():
-            page = self._s3.list_objects_v2(
+            return self._current_keys_page(prefix)
+
+        try:
+            page = self._s3.list_object_versions(
                 Bucket=self._bucket, Prefix=prefix, MaxKeys=_DELETE_BATCH
             )
-            return [{"Key": o["Key"]} for o in page.get("Contents", [])]
-
-        page = self._s3.list_object_versions(
-            Bucket=self._bucket, Prefix=prefix, MaxKeys=_DELETE_BATCH
-        )
+        except Exception as exc:  # noqa: BLE001 — typically ListBucketVersions not granted
+            if self._versioned is not None or not _is_permanent_denial(exc):
+                # Either the bucket really does report versioning, or this failure is
+                # TRANSIENT (throttle, timeout, 5xx) and says nothing about whether it
+                # is. Both cases must propagate: deleting the current key here would
+                # write a marker over bytes we were asked to remove and report a
+                # reclaim that did not happen.
+                raise
+            # We never established that this bucket IS versioned (_bucket_is_versioned
+            # only assumed so because the status read failed), AND this refusal is
+            # permanent, not transient. An UNVERSIONED bucket whose
+            # policy grants neither GetBucketVersioning nor ListBucketVersions worked
+            # fine before this change, and must keep working: fall back to the keyless
+            # delete that has always been correct there. Loudly, because if the bucket
+            # IS versioned this silently retains noncurrent versions -- exactly the bug
+            # this method exists to fix.
+            _log.warning(
+                "cannot read bucket versioning OR list versions for %s (%s); falling back "
+                "to a keyless delete. If this bucket is versioned, noncurrent versions are "
+                "being RETAINED — grant s3:GetBucketVersioning (cheap, read-only) or "
+                "s3:ListBucketVersions + s3:DeleteObjectVersion.",
+                self._bucket, type(exc).__name__,
+            )
+            return self._current_keys_page(prefix)
         entries = [*page.get("Versions", []), *page.get("DeleteMarkers", [])]
         entries.sort(key=lambda e: bool(e.get("IsLatest")))
         return [{"Key": e["Key"], "VersionId": e["VersionId"]} for e in entries]

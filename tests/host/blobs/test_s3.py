@@ -422,6 +422,95 @@ def test_delete_lists_one_page_at_a_time_rather_than_the_whole_history(
     assert all(m is not None and m <= 1000 for m in seen_maxkeys), seen_maxkeys
 
 
+def test_unversioned_bucket_without_versioning_permissions_still_deletes(store, tmp_path):
+    """The regression this fix must not cause.
+
+    An UNVERSIONED bucket whose policy grants neither GetBucketVersioning nor
+    ListBucketVersions worked fine before version-aware deletes existed. The
+    status read fails -> assume versioned -> list_object_versions ALSO fails, and
+    a hard raise there would break a deployment that was previously fine. Fall
+    back to the keyless delete, which is correct on an unversioned bucket.
+    """
+    from unittest.mock import patch
+
+    import botocore.exceptions
+
+    out = tmp_path / "jn" / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_bytes(b"{}")
+    store.put_output("jn", out)
+
+    denied = botocore.exceptions.ClientError(
+        {"Error": {"Code": "AccessDenied", "Message": "no"}}, "op"
+    )
+    with patch.object(store._s3, "get_bucket_versioning", side_effect=denied), \
+         patch.object(store._s3, "list_object_versions", side_effect=denied):
+        store.delete_job("jn")
+
+    s3 = boto3.client("s3", region_name="us-east-1")
+    assert s3.list_objects_v2(Bucket=BUCKET, Prefix="pfx/results/jn/")["KeyCount"] == 0
+
+
+def test_a_confirmed_versioned_bucket_still_refuses_when_versions_cannot_be_listed(
+    versioned_store, tmp_path
+):
+    """The fallback must NOT extend to a bucket we know is versioned.
+
+    There, a keyless delete writes a marker over bytes we were asked to remove --
+    a false reclaim, which is the whole defect. Refuse instead.
+    """
+    from unittest.mock import patch
+
+    import botocore.exceptions
+
+    out = tmp_path / "jv" / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_bytes(b"{}")
+    versioned_store.put_output("jv", out)
+    assert versioned_store._bucket_is_versioned() is True  # confirmed, not assumed
+
+    denied = botocore.exceptions.ClientError(
+        {"Error": {"Code": "AccessDenied", "Message": "no"}}, "ListBucketVersions"
+    )
+    with patch.object(versioned_store._s3, "list_object_versions", side_effect=denied):
+        with pytest.raises(botocore.exceptions.ClientError):
+            versioned_store.delete_job("jv")
+
+
+@pytest.mark.parametrize(
+    "code,transient",
+    [("Throttling", True), ("RequestTimeout", True), ("InternalError", True),
+     ("AccessDenied", False), ("NotImplemented", False)],
+)
+def test_only_a_PERMANENT_denial_may_fall_back_to_a_keyless_delete(
+    store, tmp_path, code, transient
+):
+    """A throttle says nothing about whether the bucket is versioned.
+
+    Treating a transient failure as "unversioned" would issue a keyless delete on
+    a bucket that may well be versioned, silently retaining every version — the
+    exact defect this module exists to fix. Only a settled refusal (no permission,
+    or an endpoint without the versioning APIs) justifies the fallback.
+    """
+    from unittest.mock import patch
+
+    import botocore.exceptions
+
+    out = tmp_path / f"jt{code}" / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_bytes(b"{}")
+    store.put_output(f"jt{code}", out)
+
+    err = botocore.exceptions.ClientError({"Error": {"Code": code, "Message": "x"}}, "op")
+    with patch.object(store._s3, "get_bucket_versioning", side_effect=err), \
+         patch.object(store._s3, "list_object_versions", side_effect=err):
+        if transient:
+            with pytest.raises(botocore.exceptions.ClientError):
+                store.delete_job(f"jt{code}")
+        else:
+            store.delete_job(f"jt{code}")  # falls back, must not raise
+
+
 def test_put_sample_propagates_non_404_errors(store, tmp_path):
     """Non-404 errors in head_object (e.g., AccessDenied) must raise, not be swallowed."""
     from unittest.mock import patch
