@@ -58,8 +58,12 @@ class DetonationResult:
 class Engine(Protocol):
     """Protocol that every blastbox engine must satisfy.
 
-    Only ``name``, ``formats``, and ``detonate`` are required.
-    ``detect`` and ``warmup`` are optional and tested via ``hasattr``.
+    Only ``name``, ``formats``, and ``detonate`` are required — this protocol
+    declares exactly those, so an engine providing them satisfies it both under
+    mypy and under ``isinstance``.
+
+    ``detect`` and ``warmup`` are optional; see :class:`SupportsDetect` and
+    :class:`SupportsWarmup`.
     """
 
     name: str
@@ -93,16 +97,36 @@ class Engine(Protocol):
         """
         ...
 
-    # ---------- optional methods (hasattr-guarded in the harness) ----------
+    # ---------- optional methods ----------
+    #
+    # detect() and warmup() are NOT declared here. A plain method in a Protocol is a
+    # REQUIRED member for structural typing, so declaring them would contradict the
+    # docstring above and every call site: an engine implementing exactly what this
+    # protocol documents as sufficient would fail `isinstance(e, Engine)` at runtime
+    # and be rejected by mypy. They live in their own protocols below -- the same
+    # reasoning that keeps jobs_per_recycle in a comment.
+    #
+    # See SupportsDetect and SupportsWarmup.
+
+
+@runtime_checkable
+class SupportsDetect(Protocol):
+    """An engine that also does pre-detonation detection.
+
+    Narrow with ``isinstance(engine, SupportsDetect)`` rather than
+    ``hasattr(engine, "detect")``: both work at runtime, but the isinstance form
+    also tells the type checker what it may call.
+    """
 
     def detect(self, input: Path) -> Detection:
-        """Pre-detonation detection (optional).
-
-        If present, called before ``detonate()``; its result feeds
-        ``DetonationResult.detected``.
-        """
+        """Called before ``detonate()``; its result feeds ``DetonationResult.detected``."""
         ...
 
+
+@runtime_checkable
+class SupportsWarmup(Protocol):
+    """An engine that wants warm-pool initialisation (warm-pool slice)."""
+
     def warmup(self) -> None:
-        """Warm-pool initialisation (optional, warm-pool slice)."""
+        """Called once when a warm worker starts, before it takes its first job."""
         ...

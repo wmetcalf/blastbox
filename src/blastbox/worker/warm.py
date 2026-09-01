@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Protocol
 from blastbox.errors import HOST_RESOURCE_ERRNOS
 from blastbox.errors import WarmTimeout
 from blastbox.limits import Limits
+from blastbox.worker.engine import SupportsWarmup
 from blastbox.worker.harness import run_detonation
 
 if TYPE_CHECKING:
@@ -732,7 +733,7 @@ def serve_warm(
     # ------------------------------------------------------------------
     # Step 1: warmup (pre-input — no untrusted data exists at this point)
     # ------------------------------------------------------------------
-    if hasattr(engine, "warmup"):
+    if isinstance(engine, SupportsWarmup):
         try:
             engine.warmup()
         except Exception as exc:  # noqa: BLE001
