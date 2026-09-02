@@ -251,3 +251,79 @@ def test_a_bare_name_does_not_attribute_to_the_description(tmp_path):
     })
     pins = scan(root)
     assert [p.line for p in pins] == [6], [(p.line, p.raw) for p in pins]
+
+
+def test_an_upper_bound_is_not_a_floor(tmp_path):
+    """`blastbox<=0.2,>=0.1.27` guarantees 0.1.27, not 0.2.
+
+    Specifier order is not meaningful, so a leading upper bound must not be
+    read as the version.
+    """
+    root = _repo(tmp_path, {
+        "pyproject.toml": '''
+            [project]
+            name = "c"
+            version = "0.1.0"
+            dependencies = ["blastbox<=0.2,>=0.1.27"]
+        '''
+    })
+    assert [p.floor for p in scan(root)] == ["0.1.27"]
+
+
+def test_only_an_upper_bound_yields_no_floor(tmp_path):
+    root = _repo(tmp_path, {
+        "pyproject.toml": '''
+            [project]
+            name = "c"
+            version = "0.1.0"
+            dependencies = ["blastbox<0.2"]
+        '''
+    })
+    assert [p.floor for p in scan(root)] == [None]
+    assert disagreements(scan(root)) == {}
+
+
+def test_distribution_name_is_case_insensitive(tmp_path):
+    """PEP 508 names are case-insensitive; `Blastbox` is the same project."""
+    root = _repo(tmp_path, {
+        "pyproject.toml": '''
+            [project]
+            name = "c"
+            version = "0.1.0"
+            dependencies = ["Blastbox>=0.1.27,<0.2"]
+        ''',
+        "deploy/docker/Dockerfile.w": '''
+            FROM p
+            RUN pip install "BlastBox==0.1.17"
+        ''',
+    })
+    assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.27"]
+
+
+def test_equal_releases_spelled_differently_are_one_group(tmp_path):
+    """0.1.27 and 0.1.27.0 are the same release -- grouping raw text invents drift."""
+    root = _repo(tmp_path, {
+        "pyproject.toml": '''
+            [project]
+            name = "c"
+            version = "0.1.0"
+            dependencies = ["blastbox>=0.1.27,<0.2"]
+        ''',
+        "deploy/docker/Dockerfile.w": '''
+            FROM p
+            RUN pip install "blastbox==0.1.27.0"
+        ''',
+    })
+    assert sorted(disagreements(scan(root))) == ["0.1.27"]
+
+
+def test_a_directory_symlink_is_not_followed(tmp_path):
+    """is_dir() follows links: a link to / would walk the filesystem."""
+    root = _repo(tmp_path, {"pyproject.toml": PYPROJECT})
+    outside = tmp_path.parent / "outside_repo"
+    (outside / "deploy" / "docker").mkdir(parents=True, exist_ok=True)
+    (outside / "deploy" / "docker" / "Dockerfile.x").write_text(
+        'FROM p\nRUN pip install "blastbox==0.1.1"\n', encoding="utf-8"
+    )
+    (root / "link").symlink_to(outside, target_is_directory=True)
+    assert {p.floor for p in scan(root)} == {"0.1.27"}

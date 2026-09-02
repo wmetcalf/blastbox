@@ -33,12 +33,30 @@ _INSTALL_RE = re.compile(r'\b(?:pip[0-9.]*|uv\s+pip)\s+install\b')
 # `blastbox`, optional extras, then a specifier set. Stops at a PEP 508 marker (`;`),
 # a quote, or whitespace.
 _REQ_RE = re.compile(
-    r'blastbox(?P<extras>\[[a-z0-9,._\-]+\])?\s*'
+    r'(?i:blastbox)(?P<extras>\[[a-zA-Z0-9,._\-]+\])?\s*'
     r'(?P<spec>(?:[=<>!~]=|[<>])\s*[0-9][^"\';\s]*'
     r'(?:\s*,\s*(?:[=<>!~]=|[<>])\s*[0-9][^"\';\s]*)*)'
 )
-_LOCK_RE = re.compile(r'^blastbox(?:\[[a-z0-9,._\-]+\])?\s*==\s*([^\s\;]+)')
+_LOCK_RE = re.compile(r'^(?i:blastbox)(?:\[[a-zA-Z0-9,._\-]+\])?\s*==\s*([^\s\;]+)')
 _ARG_USE_RE = re.compile(r'\$\{?BLASTBOX_VERSION\}?')
+
+
+def _normalise_version(version: str) -> str:
+    """Normalise a PEP 440 release for grouping.
+
+    ``0.1.27`` and ``0.1.27.0`` are the same release; grouping on the raw
+    spelling would report drift between two identical pins. Only the release
+    segment is normalised -- suffixes (rc, post, local) are left alone rather
+    than guessed at.
+    """
+    head, sep, rest = version.partition("+")
+    m = re.match(r"^(\d+(?:\.\d+)*)(.*)$", head)
+    if not m:
+        return version
+    parts = m.group(1).split(".")
+    while len(parts) > 1 and parts[-1] == "0":
+        parts.pop()
+    return ".".join(parts) + m.group(2) + sep + rest
 
 
 class PinScanError(RuntimeError):
@@ -62,16 +80,18 @@ class Pin:
 
     @property
     def floor(self) -> str | None:
-        """The version this pin guarantees.
+        """The version this pin guarantees, normalised.
 
-        For ``==X`` / ``>=X`` / ``~=X`` that is X. A bare upper bound (``<Y``)
-        pins nothing on its own and yields None.
+        Only ``==`` / ``>=`` / ``~=`` are floors. An upper bound (``<``, ``<=``)
+        constrains but guarantees nothing, and must not be read as the version --
+        `blastbox<=0.2,>=0.1.27` guarantees 0.1.27, not 0.2. Order in the
+        specifier is not meaningful, so every part is examined.
         """
         for part in self.specifier.split(","):
             part = part.strip()
-            for op in ("==", ">=", "~=", "<="):
+            for op in ("==", ">=", "~="):
                 if part.startswith(op):
-                    return part[len(op):].strip()
+                    return _normalise_version(part[len(op):].strip())
         return None
 
 
@@ -112,7 +132,7 @@ def _split_requirement(req: str) -> tuple[str, str] | None:
     the version and must not leak into it.
     """
     head = req.split(";", 1)[0].strip()
-    if not head.startswith("blastbox"):
+    if not head.lower().startswith("blastbox"):
         return None
     m = _REQ_RE.match(head)
     if not m:
@@ -170,7 +190,7 @@ def _scan_dockerfile(path: Path) -> list[Pin]:
     logical = _logical_lines(text)
     # An ARG is only a pin if something in the file installs blastbox THROUGH it.
     arg_is_used = any(
-        _INSTALL_RE.search(line) and "blastbox" in line and _ARG_USE_RE.search(line)
+        _INSTALL_RE.search(line) and "blastbox" in line.lower() and _ARG_USE_RE.search(line)
         for _, line in logical
     )
 
@@ -181,7 +201,7 @@ def _scan_dockerfile(path: Path) -> list[Pin]:
             if arg_is_used:
                 out.append(Pin(str(path), lineno, "dockerfile-arg", line.strip(), "==" + arg.group(1)))
             continue
-        if "blastbox" not in line or not _INSTALL_RE.search(line):
+        if "blastbox" not in line.lower() or not _INSTALL_RE.search(line):
             continue
         parsed = _split_requirement(_isolate_requirement(line))
         if parsed:
@@ -194,7 +214,7 @@ def _isolate_requirement(line: str) -> str:
     m = _REQ_RE.search(line)
     if not m:
         return ""
-    start = line.rfind("blastbox", 0, m.end())
+    start = line.lower().rfind("blastbox", 0, m.end())
     return line[start : m.end()]
 
 
@@ -228,6 +248,10 @@ def _walk(root: Path):
         except OSError:
             continue
         for entry in entries:
+            # is_dir() follows symlinks: a link to / would walk the filesystem,
+            # and a link back into the tree would loop. Scan the repo only.
+            if entry.is_symlink():
+                continue
             if entry.is_dir():
                 if entry.name not in _SKIP_DIRS:
                     stack.append(entry)
