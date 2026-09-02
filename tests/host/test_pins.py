@@ -479,3 +479,13 @@ def test_constraints_and_requirements_dir_are_install_paths(tmp_path):
         "requirements/base.txt": "blastbox==0.1.11\n",
     })
     assert sorted(disagreements(scan(root))) == ["0.1.11", "0.1.27", "0.1.9"]
+
+
+def test_constraint_files_with_range_specifiers_are_parsed(tmp_path):
+    """A hashed lock pins with ==, but constraints/requirements files carry any
+    specifier; matching only == skipped them silently."""
+    root = _repo(tmp_path, {
+        "pyproject.toml": PYPROJECT,
+        "constraints.txt": "blastbox>=0.1.9,<0.2\n",
+    })
+    assert sorted(disagreements(scan(root))) == ["0.1.27", "0.1.9"]

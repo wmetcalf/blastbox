@@ -1132,10 +1132,23 @@ def _pins_cmd(args: argparse.Namespace) -> int:
         print("  An upper bound alone constrains nothing; any release below it")
         print("  satisfies these pins, so the repo declares no version at all.")
         return 1
-    if len(groups) == 1:
+    floorless = [p for p in pins if p.floor is None]
+    if len(groups) == 1 and not floorless:
         only = next(iter(groups))
         print(f"OK: {len(pins)} pin(s), all resolve to {only}")
         return 0
+    if len(groups) == 1 and floorless:
+        # A direct reference or a bare upper bound cannot be compared to a
+        # version. Reporting OK because the COMPARABLE pins agree would hide
+        # exactly the pin that is hardest to reason about.
+        only = next(iter(groups))
+        print(f"UNCOMPARABLE: {len(groups and [only])} version group ({only}), but "
+              f"{len(floorless)} pin(s) carry no comparable version:")
+        for pin in floorless:
+            rel = Path(pin.path).relative_to(root)
+            print(f"  {rel}:{pin.line}  {pin.specifier}")
+        print("  These cannot be checked against the rest; verify them by hand.")
+        return 1
     print(f"DRIFT: {len(pins)} pin(s) resolve to {len(groups)} different versions:")
     for version in sorted(groups):
         where = ", ".join(

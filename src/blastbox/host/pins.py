@@ -39,8 +39,13 @@ _REQ_RE = re.compile(
     r'(?P<spec>(?:[=<>!~]=|[<>])\s*v?[0-9][^"\';\s]*'
     r'(?:\s*,\s*(?:[=<>!~]=|[<>])\s*v?[0-9][^"\';\s]*)*)'
 )
-# Leading whitespace is legal in a requirements-format file.
-_LOCK_RE = re.compile(r'^\s*(?i:blastbox)(?:\[[a-zA-Z0-9,._\-]+\])?\s*==\s*([^\s\;]+)')
+# Leading whitespace is legal in a requirements-format file. A hashed lock pins
+# with ==, but constraints.txt and requirements/*.txt legitimately carry any
+# specifier -- matching only == silently skipped them.
+_LOCK_RE = re.compile(
+    r'^\s*(?i:blastbox)(?:\[[a-zA-Z0-9,._\-]+\])?\s*'
+    r'((?:[=<>!~]=|[<>])\s*v?[0-9][^\s;]*(?:\s*,\s*(?:[=<>!~]=|[<>])\s*v?[0-9][^\s;]*)*)'
+)
 _ARG_USE_RE = re.compile(r'\$\{?BLASTBOX_VERSION\}?')
 
 
@@ -298,7 +303,8 @@ def _scan_lock(path: Path) -> list[Pin]:
     for i, raw in enumerate(lines, 1):
         m = _LOCK_RE.match(raw)
         if m:
-            out.append(Pin(str(path), i, "lock", raw.strip(), "==" + m.group(1)))
+            out.append(Pin(str(path), i, "lock", raw.strip(),
+                           re.sub(r"\s+", "", m.group(1))))
     return out
 
 

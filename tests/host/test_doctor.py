@@ -245,7 +245,9 @@ def test_a_hung_project_lookup_does_not_abort_the_survey():
         return subprocess.CompletedProcess(argv, 0, "0.1.27\n", "")
     found = survey(run)
     assert [c.version for c in found] == ["0.1.27"]
-    assert found[0].project.startswith("(none:")
+    # NOT "(none:…)": a container that IS in a compose stack would then be filed
+    # away from its siblings and its drift hidden. A distinct key says so.
+    assert found[0].project.startswith("(unknown-project:")
 
 
 def test_a_no_value_project_label_is_treated_as_absent():
@@ -368,7 +370,10 @@ def test_version_in_image_reads_an_image_not_a_container():
 
     def run(argv):
         argv = list(argv)
+        if "{{.Id}}" in argv:                    # tag -> immutable ID first
+            return subprocess.CompletedProcess(argv, 0, "sha256:pinned\n", "")
         assert argv[:2] == ["docker", "run"], argv
+        assert "sha256:pinned" in argv, "the probe must run the PINNED id"
         return subprocess.CompletedProcess(argv, 0, "0.1.27\n", "")
     assert version_in_image("img", run) == ("0.1.27", "")
 
@@ -403,9 +408,35 @@ def test_an_image_probe_is_confined():
     seen = []
 
     def run(argv):
-        seen.append(list(argv))
-        return subprocess.CompletedProcess(list(argv), 0, "0.1.27\n", "")
+        argv = list(argv)
+        seen.append(argv)
+        if "{{.Id}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, "sha256:pinned\n", "")
+        return subprocess.CompletedProcess(argv, 0, "0.1.27\n", "")
     version_in_image("suspect:img", run)
-    argv = seen[0]
-    for flag in ("--network", "none", "--read-only", "--pids-limit"):
-        assert flag in argv, argv
+    argv = next(a for a in seen if a[:2] == ["docker", "run"])
+    for flag in ("--network", "none", "--read-only", "--pids-limit",
+                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                 "--user", "--memory"):
+        assert flag in argv, (flag, argv)
+
+
+def test_a_banner_before_the_venv_answer_is_ignored():
+    """An /opt interpreter may print a warning before the version; the answer is
+    the LAST line, and the emitted shell must take it."""
+    seen: list[str] = []
+
+    def run(argv):
+        argv = list(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(
+                argv, 0, '{"name":"x","image":"i","status":"Up"}\n', "")
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, "proj\n", "")
+        if argv[3] in ("python3", "python"):
+            return subprocess.CompletedProcess(argv, 127, "", "exec: not found")
+        seen.append(argv[-1])
+        return subprocess.CompletedProcess(argv, 0, "0.1.27", "")
+
+    survey(run)
+    assert "tail -n1" in seen[0], seen[0]

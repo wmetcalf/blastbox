@@ -56,6 +56,17 @@ _DAEMON_ERR = "error response from daemon"
 # means "not a blastbox container" rather than "could not look".
 _NO_INTERPRETER = ("not found", "no such file or directory", "executable file not found")
 
+# Flags for running an image whose provenance is exactly what is in question.
+_CONFINE = (
+    "--network", "none",
+    "--read-only",
+    "--pids-limit", "64",
+    "--memory", "256m",
+    "--cap-drop", "ALL",
+    "--security-opt", "no-new-privileges",
+    "--user", "65534:65534",
+)
+
 
 def _looks_like_missing_interpreter(err: str) -> bool:
     low = err.lower()
@@ -120,9 +131,11 @@ def _project_of(runner: Runner, name: str, image: str = "") -> str:
             "--format", '{{index .Config.Labels "com.docker.compose.project"}}',
         ])
     except subprocess.TimeoutExpired:
-        # One hung inspect must not abort the whole survey; an unknown project
-        # only affects grouping, not the version we report.
-        return f"(none:{name})"
+        # One hung inspect must not abort the whole survey. But do not pretend
+        # this container has no project: if it IS in a compose stack, filing it
+        # under an image/name key would split it from its siblings and hide
+        # drift. A distinct key says "we could not tell".
+        return f"(unknown-project:{name})"
     value = proc.stdout.strip() if proc.returncode == 0 else ""
     # Go templates render a missing key as "<no value>" on some docker builds
     # (this one emits an empty line). Treat both as absent.
@@ -162,8 +175,10 @@ def _version_in(runner: Runner, name: str, status: str) -> tuple[str, str]:
         # lives in an earlier venv when a later one lacks it.
         ["docker", "exec", name, "sh", "-lc",
          'for p in /opt/*/bin/python; do [ -x "$p" ] || continue; '
-         'v=$("$p" - <<\'EOF\'\n' + _PROBE + "EOF\n" + '); '
-         'case "$v" in ""|NOPKG*) continue;; *) printf %s "$v"; exit 0;; esac; '
+         # tail -n1: an interpreter may print a banner or warning before the
+         # answer, and the answer is the LAST line, not the whole stream.
+         'v=$("$p" - <<\'EOF\'\n' + _PROBE + "EOF\n" + ' | tail -n1); '
+         'case "$v" in ""|NOPKG*|PROBEFAIL*) continue;; *) printf %s "$v"; exit 0;; esac; '
          'done; printf NOPKG'],
     ]
     last_err = ""
@@ -216,14 +231,23 @@ def version_in_image(image: str, runner: Runner | None = None) -> tuple[str, str
     (version, detail); version is UNKNOWN when it could not be read.
     """
     run = runner or _run
+    # Pin to one immutable ID: a concurrent pull or rebuild can repoint a tag
+    # between the stamp read and this probe, so the two would describe different
+    # images while appearing to describe one.
+    pinned = run(["docker", "inspect", "--type", "image", image, "--format", "{{.Id}}"])
+    if pinned.returncode == 0 and pinned.stdout.strip():
+        image = pinned.stdout.strip()
     for interp in ("python3", "python"):
         try:
             proc = run([
                 "docker", "run", "--rm",
                 # This EXECUTES an image whose provenance is the thing in
                 # question -- unlike survey(), which execs into a container the
-                # operator already chose to run. Give it nothing.
-                "--network", "none", "--read-only", "--pids-limit", "64",
+                # operator already chose to run. Give it as close to nothing as
+                # docker allows. (Routing this through blastbox's own gVisor/FC
+                # runtime would be stronger still; that is a larger change and
+                # is noted in the module docstring.)
+                *_CONFINE,
                 "--entrypoint", interp, image, "-c", _PROBE,
             ])
         except subprocess.TimeoutExpired:
@@ -238,7 +262,7 @@ def version_in_image(image: str, runner: Runner | None = None) -> tuple[str, str
     try:
         proc = run([
             "docker", "run", "--rm",
-            "--network", "none", "--read-only", "--pids-limit", "64",
+            *_CONFINE,
             "--entrypoint", "sh", image, "-lc",
             'for p in /opt/*/bin/python; do [ -x "$p" ] || continue; '
             'v=$("$p" - <<\'EOF\'\n' + _PROBE + "EOF\n" + '); '
