@@ -1059,6 +1059,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pdoc.set_defaults(func=_doctor_cmd)
 
+    pst = sub.add_parser(
+        "stamp",
+        help="emit docker build flags recording provenance, or read an image's stamp",
+    )
+    pst.add_argument("--read", metavar="IMAGE", help="print the stamp IMAGE carries (exit 1 if unstamped)")
+    pst.add_argument("--repo", default=".", help="source repo whose revision to record (default: .)")
+    pst.add_argument("--base", help="base image to record by DIGEST, not tag")
+    pst.add_argument(
+        "--base-arg", default="BASE_IMAGE",
+        help="Dockerfile ARG that receives the digest-pinned base (default: BASE_IMAGE)",
+    )
+    pst.add_argument(
+        "--blastbox-version",
+        help="blastbox version being installed INTO the image. Defaults to the "
+             "version running this CLI, which is only correct when they match — "
+             "pass it explicitly when stamping a build that pins a different one",
+    )
+    pst.set_defaults(func=_stamp_cmd)
+
     pv = sub.add_parser("version", help="print version and exit")
     pv.set_defaults(func=_version_cmd)
 
@@ -1156,6 +1175,56 @@ def _doctor_cmd(args: argparse.Namespace) -> int:
     versions = {c.version for c in containers if c.known}
     print(f"OK: {len(containers)} container(s), blastbox {', '.join(sorted(versions))}")
     return 0
+
+
+
+def _stamp_cmd(args: argparse.Namespace) -> int:
+    """Emit build flags that record provenance, or read what an image recorded."""
+    from blastbox.host import stamp as st  # noqa: PLC0415 -- CLI-only
+
+    try:
+        if args.read:
+            got = st.read(args.read)
+        else:
+            version = args.blastbox_version or _installed_version()
+            print(" ".join(st.build_args(
+                blastbox_version=version, repo=Path(args.repo),
+                base=args.base, base_arg=args.base_arg,
+            )))
+            return 0
+    except st.StampError as exc:
+        print(f"stamp failed: {exc}")
+        return 2
+    if True:
+        print(f"  blastbox    {got.blastbox}")
+        print(f"  revision    {got.revision}")
+        print(f"  base name     {got.base_name}")
+        print(f"  base digest   {got.base_digest}")
+        print(f"  base image id {got.base_image_id}")
+        if got.reproducible:
+            if got.resolvable():
+                print("\nOK: records what it was built from, and that base is still here")
+                return 0
+            print(
+                "\nSTAMPED BUT UNBUILDABLE: the recorded base is no longer on this\n"
+                "  host. The stamp is intact; the thing it names is gone. Pull or\n"
+                "  rebuild the base before trying to reproduce this image."
+            )
+            return 1
+        print(
+            "\nUNSTAMPED: this image does not record what it was built from.\n"
+            "  A tag can be re-pointed or deleted; without the base DIGEST the\n"
+            "  image cannot be deliberately rebuilt. Measured cost of this gap:\n"
+            "  the base that built redtusk-cold-worker:rows no longer exists."
+        )
+        return 1
+    return 0
+
+
+def _installed_version() -> str:
+    from blastbox import __version__  # noqa: PLC0415 -- CLI-only
+
+    return __version__
 
 
 def main(argv: list[str] | None = None) -> int:
