@@ -1042,10 +1042,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="confirm every dispatcher and ingress on this queue is stopped")
     pt.set_defaults(func=_blob_target_cmd)
 
+    pp = sub.add_parser(
+        "pins",
+        help="report every install-path blastbox pin in a consumer repo (exit 1 on drift)",
+    )
+    pp.add_argument("repo", help="path to the consumer repo (redtusk, clippyshot, ...)")
+    pp.set_defaults(func=_pins_cmd)
+
     pv = sub.add_parser("version", help="print version and exit")
     pv.set_defaults(func=_version_cmd)
 
     return p
+
+
+
+def _pins_cmd(args: argparse.Namespace) -> int:
+    """Report every install-path blastbox pin in a consumer repo.
+
+    Exit 1 when they disagree: that state is the bug (a fleet ran host 0.1.26,
+    cold-worker 0.1.25 and guest 0.1.17 simultaneously), and it is invisible
+    unless something compares the files.
+    """
+    from blastbox.host.pins import disagreements, scan  # noqa: PLC0415 -- CLI-only
+
+    root = Path(args.repo).resolve()
+    if not root.is_dir():
+        print(f"not a directory: {root}")
+        return 2
+    pins = scan(root)
+    if not pins:
+        print(f"no install-path blastbox pins found under {root}")
+        return 0
+
+    groups = disagreements(pins)
+    for pin in pins:
+        rel = Path(pin.path).relative_to(root)
+        print(f"  {pin.floor or '?':<10} {pin.kind:<16} {rel}:{pin.line}")
+    print()
+    if len(groups) <= 1:
+        only = next(iter(groups), "?")
+        print(f"OK: {len(pins)} pin(s), all resolve to {only}")
+        return 0
+    print(f"DRIFT: {len(pins)} pin(s) resolve to {len(groups)} different versions:")
+    for version in sorted(groups):
+        where = ", ".join(
+            f"{Path(p.path).relative_to(root)}:{p.line}" for p in groups[version]
+        )
+        print(f"  {version}: {where}")
+    print()
+    print("A consumer installs blastbox by more than one path (pyproject for the")
+    print("host tier, a Dockerfile ARG for the worker, a hashed lock for the")
+    print("dispatcher image). They drift independently unless something checks.")
+    return 1
 
 
 def main(argv: list[str] | None = None) -> int:
