@@ -501,7 +501,15 @@ def build_args(
             "from into that file as part of the deploy."
         )
     digest = base_digest(base, runner) if base else ""
-    image_id = base_image_id(base, runner) if base and not digest else ""
+    # ALWAYS record the ID when the pin is by reference. It used to be skipped
+    # whenever a repo digest was found, which was harmless while a digest also
+    # became the pin -- but the pin is now the caller's reference, and with the
+    # containerd image store a local image HAS a repo digest, so skipping the ID
+    # left exactly the mutable-tag case with nothing for `base_moved` to compare
+    # against. The check that makes a reference pin trustworthy would have been
+    # silently disabled on the hosts that need it.
+    pinned_by_digest = "@sha256:" in (base or "")
+    image_id = base_image_id(base, runner) if base and not pinned_by_digest else ""
     labels = {
         LABEL_BLASTBOX: blastbox_version,
         LABEL_REVISION: revision,

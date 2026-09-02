@@ -511,3 +511,48 @@ def test_a_probe_that_produced_nothing_is_still_UNKNOWN():
 
     version, _ = version_in_image("redtusk-worker:x", run)
     assert version == UNKNOWN
+
+
+def test_an_interpreter_that_could_not_run_is_not_reported_as_absence():
+    """The confined UID cannot execute a root-only python.
+
+    The fallback shell ends in `printf NOPKG` and exits 0 either way, so a
+    failure to RUN looked exactly like "blastbox is not installed" -- saying
+    "not a blastbox image" about an image nobody could look inside.
+    """
+    from blastbox.host.doctor import UNKNOWN, version_in_image
+
+    def run(argv):
+        argv = list(argv)
+        if "{{.Id}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, "sha256:pinned\n", "")
+        return subprocess.CompletedProcess(argv, 0, "PROBEFAIL\n", "")
+
+    version, detail = version_in_image("img", run)
+    assert version == UNKNOWN, f"got {version!r}"
+    assert detail, "an unreadable probe must say why"
+
+
+def test_the_fallback_shell_distinguishes_absence_from_failure():
+    """The emitted script must set the marker; asserting on its text is not enough."""
+    import re
+
+    from blastbox.host import doctor
+
+    seen = []
+
+    def run(argv):
+        argv = list(argv)
+        if "{{.Id}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, "sha256:pinned\n", "")
+        if "sh" not in argv:            # the direct interpreter attempts
+            return subprocess.CompletedProcess(argv, 1, "", "exec format error")
+        seen.append(argv[-1])           # the fallback shell script
+        return subprocess.CompletedProcess(argv, 0, "PROBEFAIL\n", "")
+
+    version, _ = doctor.version_in_image("img", run)
+    assert seen, "the fallback shell was never reached"
+    script = seen[0]
+    assert "tried=" in script, "no marker distinguishing found-but-failed"
+    assert re.search(r'\[ -n "\$tried" \].*PROBEFAIL', script), script
+    assert version == doctor.UNKNOWN, f"a failed interpreter must not read as absence: {version!r}"

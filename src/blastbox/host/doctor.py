@@ -265,15 +265,26 @@ def version_in_image(image: str, runner: Runner | None = None) -> tuple[str, str
             "docker", "run", "--rm",
             *_CONFINE,
             "--entrypoint", "sh", image, "-lc",
-            'for p in /opt/*/bin/python; do [ -x "$p" ] || continue; '
-            'v=$("$p" - <<\'EOF\'\n' + _PROBE + "EOF\n" + '); '
-            'case "$v" in ""|NOPKG*) continue;; *) printf %s "$v"; exit 0;; esac; '
-            'done; printf NOPKG',
+            # `tried` distinguishes "there was no interpreter to run" from
+            # "an interpreter was there and did not answer" -- the confined UID
+            # cannot execute a root-only python, and reporting that as NOPKG
+            # says "not a blastbox image" about an image nobody could look
+            # inside. Absence and failure are different answers.
+            'tried=; for p in /opt/*/bin/python; do [ -x "$p" ] || continue; '
+            'tried=1; v=$("$p" - <<\'EOF\'\n' + _PROBE + "EOF\n" + '); '
+            'case "$v" in ""|PROBEFAIL*) continue;; NOPKG*) continue;; '
+            '*) printf %s "$v"; exit 0;; esac; '
+            'done; [ -n "$tried" ] && printf PROBEFAIL || printf NOPKG',
         ])
     except subprocess.TimeoutExpired:
         return UNKNOWN, "probe timed out"
     raw = (proc.stdout or "").strip().splitlines()
     line = _sanitise(raw[-1]) if raw else ""
+    # The sentinels are checked BEFORE the "looks like a version" branch: they
+    # are not versions, and matching that branch first returned the literal
+    # string PROBEFAIL to callers as though it were one.
+    if proc.returncode == 0 and line.startswith(_PROBEFAIL):
+        return UNKNOWN, "an interpreter was present but did not answer"
     if proc.returncode == 0 and line and line != NOPKG:
         return line, ""
     if proc.returncode == 0 and line == NOPKG:

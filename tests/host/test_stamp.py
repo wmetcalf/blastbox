@@ -95,6 +95,8 @@ def test_build_args_carry_all_four_facts():
             return subprocess.CompletedProcess(
                 argv, 0,
                 json.dumps(["base@sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c"]), "")
+        if "{{.Id}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, _IID + "\n", "")
         return subprocess.CompletedProcess(argv, 1, "", "")
     args = build_args(blastbox_version="0.1.27", repo=".", base="base:tag", runner=run)
     joined = " ".join(args)
@@ -190,11 +192,17 @@ def _git(sha: str, dirty: bool = False):
             return subprocess.CompletedProcess(
                 argv, 0,
                 json.dumps([f"{repo}@{_BD}"]), "")
+        if "{{.Id}}" in argv:
+            # The image ID is now recorded for every reference pin, because it
+            # is what `base_moved` compares against. Answered explicitly rather
+            # than by a catch-all: a fake that answers anything proves nothing.
+            return subprocess.CompletedProcess(argv, 0, _IID + "\n", "")
         return subprocess.CompletedProcess(argv, 1, "", "")
     return run
 
 
 _BD = "sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c"
+_IID = "sha256:1f4b2c8ae0d5473996a1f0c6b2e8d7a3459c0b1e2d3f4a5b6c7d8e9f0a1b2c3d"
 
 
 def test_a_dirty_build_is_not_reproducible():
@@ -984,3 +992,30 @@ def test_a_failed_probe_is_still_a_disagreement(monkeypatch):
         doctor, "version_in_image", lambda i, r=None: (doctor.UNKNOWN, "probe timed out"))
     agrees, detail = verify_contents("redtusk-worker:x", run)
     assert agrees is False and "probe timed out" in detail
+
+
+def test_a_reference_pin_always_records_the_id_that_makes_it_checkable():
+    """The ID used to be skipped whenever a repo digest was found.
+
+    Harmless while a digest also became the pin -- but the pin is the caller's
+    reference now, and with the containerd image store a LOCAL image has a repo
+    digest, so exactly the mutable-tag case was left with nothing for
+    `base_moved` to compare against. The check that makes a reference pin
+    trustworthy would have been silently disabled on the hosts that need it.
+    """
+    from blastbox.host.stamp import LABEL_BASE_IMAGE_ID
+
+    joined = " ".join(build_args(
+        blastbox_version="0.1.29", repo=".", base="base:tag", runner=_git("5aa1abc")))
+    assert f"{LABEL_BASE_IMAGE_ID}={_IID}" in joined, joined
+
+
+def test_an_explicit_digest_reference_needs_no_id():
+    """Nothing can move, so there is nothing to compare -- do not ask docker."""
+    from blastbox.host.stamp import LABEL_BASE_IMAGE_ID
+
+    joined = " ".join(build_args(
+        blastbox_version="0.1.29", repo=".", base=f"reg.example/base@{_BD}",
+        runner=_git("5aa1abc")))
+    assert f"{LABEL_BASE_IMAGE_ID}=" in joined
+    assert f"{LABEL_BASE_IMAGE_ID}={_IID}" not in joined
