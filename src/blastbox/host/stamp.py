@@ -284,6 +284,56 @@ def base_image_id(image: str, runner: Runner | None = None) -> str:
     raise StampError(f"{image}: cannot resolve an image ID (absent, or docker unavailable)")
 
 
+def _digest_from(image: str, digests_json: str) -> str:
+    """Pick the repo digest belonging to ``image``'s repository, or "".
+
+    Shared by the single-fact and the one-snapshot readers so both apply the
+    same rule: one image can carry digests from several repositories, and a
+    sole entry for the WRONG repository is refused rather than assumed.
+    """
+    try:
+        # Docker reports a nil RepoDigests field as JSON `null`, which decodes
+        # to None and is not iterable.
+        raw = json.loads(digests_json or "[]")
+    except json.JSONDecodeError:
+        raw = []
+    digests = [str(d) for d in (raw or [])]
+    repo = repo_of(image)
+    want = _canonical_repo(repo)
+    matching = [d for d in digests if _canonical_repo(d.split("@", 1)[0]) == want]
+    if matching:
+        return matching[0].split("@", 1)[-1]
+    if digests:
+        raise StampError(
+            f"{image}: {len(digests)} repo digests and none for {repo!r}; "
+            "cannot tell which base this is"
+        )
+    return ""
+
+
+def _inspect_base(image: str, runner: Runner | None = None) -> tuple[str, str]:
+    """``(repo_digest, image_id)`` for ``image``, read from ONE inspect.
+
+    Both facts describe the same image only if they were read at the same
+    moment. Asking twice lets a mutable tag move in between and produces a
+    stamp pairing one image's digest with another's ID.
+    """
+    run = runner or _run
+    proc = run(["docker", "inspect", "--type", "image", image,
+                "--format", "{{json .RepoDigests}}\t{{.Id}}"])
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        raise StampError(
+            f"{image}: cannot resolve a digest (image absent, or docker "
+            "unavailable). Pull or build the base first; stamping 'unknown' "
+            "would look recorded while being unreproducible."
+        )
+    raw = proc.stdout.strip().split("\t")
+    digests_json, image_id = raw[0], (raw[1].strip() if len(raw) > 1 else "")
+    if not image_id:
+        raise StampError(f"{image}: cannot resolve an image ID (absent, or docker unavailable)")
+    return _digest_from(image, digests_json), image_id
+
+
 def base_digest(image: str, runner: Runner | None = None) -> str:
     """The REPO digest of ``image``, or "" when it has none (never pushed).
 
@@ -291,30 +341,10 @@ def base_digest(image: str, runner: Runner | None = None) -> str:
     identifier and belongs in its own label.
     """
     run = runner or _run
-    repo = repo_of(image)
     proc = run(["docker", "inspect", "--type", "image", image,
                 "--format", "{{json .RepoDigests}}"])
     if proc.returncode == 0:
-        try:
-            # Docker reports a nil RepoDigests field as JSON `null`, which
-            # decodes to None and is not iterable.
-            raw = json.loads(proc.stdout.strip() or "[]")
-        except json.JSONDecodeError:
-            raw = []
-        digests = [str(d) for d in (raw or [])]
-        # One image can carry digests from several repositories; take the one
-        # for the repo actually requested. A sole entry that does NOT match is
-        # still the wrong repository, so it is refused rather than assumed.
-        want = _canonical_repo(repo)
-        matching = [d for d in digests if _canonical_repo(d.split("@", 1)[0]) == want]
-        if matching:
-            return matching[0].split("@", 1)[-1]
-        if digests:
-            raise StampError(
-                f"{image}: {len(digests)} repo digests and none for {repo!r}; "
-                "cannot tell which base this is"
-            )
-        return ""
+        return _digest_from(image, proc.stdout.strip())
     raise StampError(
         f"{image}: cannot resolve a digest (image absent, or docker unavailable). "
         "Pull or build the base first; stamping 'unknown' would look recorded "
@@ -500,7 +530,11 @@ def build_args(
             "recorded and cannot be rebuilt; write the revision the tree came "
             "from into that file as part of the deploy."
         )
-    digest = base_digest(base, runner) if base else ""
+    # ONE inspect for both facts. Two separate lookups let a tag change between
+    # them and label image A's digest next to image B's ID -- a stamp that is
+    # internally inconsistent and would send anyone checking it to the wrong
+    # image. The pair is only meaningful read from the same snapshot.
+    digest, snapshot_id = _inspect_base(base, runner) if base else ("", "")
     # ALWAYS record the ID when the pin is by reference. It used to be skipped
     # whenever a repo digest was found, which was harmless while a digest also
     # became the pin -- but the pin is now the caller's reference, and with the
@@ -509,7 +543,7 @@ def build_args(
     # against. The check that makes a reference pin trustworthy would have been
     # silently disabled on the hosts that need it.
     pinned_by_digest = "@sha256:" in (base or "")
-    image_id = base_image_id(base, runner) if base and not pinned_by_digest else ""
+    image_id = snapshot_id if base and not pinned_by_digest else ""
     labels = {
         LABEL_BLASTBOX: blastbox_version,
         LABEL_REVISION: revision,

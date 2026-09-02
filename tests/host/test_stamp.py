@@ -89,14 +89,13 @@ def test_build_args_carry_all_four_facts():
             return subprocess.CompletedProcess(argv, 0, "5aa1abc\n", "")
         if "status" in argv:
             return subprocess.CompletedProcess(argv, 0, "", "")
-        if "{{json .RepoDigests}}" in argv:
-            # repo must match the image asked about: base_digest() refuses a
+        if "{{json .RepoDigests}}\t{{.Id}}" in argv:
+            # repo must match the image asked about: the selector refuses a
             # digest belonging to another repository.
             return subprocess.CompletedProcess(
                 argv, 0,
-                json.dumps(["base@sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c"]), "")
-        if "{{.Id}}" in argv:
-            return subprocess.CompletedProcess(argv, 0, _IID + "\n", "")
+                json.dumps(["base@sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c"])
+                + "\t" + _IID + "\n", "")
         return subprocess.CompletedProcess(argv, 1, "", "")
     args = build_args(blastbox_version="0.1.27", repo=".", base="base:tag", runner=run)
     joined = " ".join(args)
@@ -192,6 +191,13 @@ def _git(sha: str, dirty: bool = False):
             return subprocess.CompletedProcess(
                 argv, 0,
                 json.dumps([f"{repo}@{_BD}"]), "")
+        if "{{json .RepoDigests}}\t{{.Id}}" in argv:
+            # The one-snapshot read: both facts must come from the same inspect,
+            # or a moving tag pairs one image's digest with another's ID.
+            from blastbox.host.stamp import repo_of
+            repo = repo_of(_inspect_ref(argv))
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps([f"{repo}@{_BD}"]) + "\t" + _IID + "\n", "")
         if "{{.Id}}" in argv:
             # The image ID is now recorded for every reference pin, because it
             # is what `base_moved` compares against. Answered explicitly rather
@@ -387,10 +393,10 @@ def test_a_local_only_base_records_the_image_id_and_pins_by_reference():
             return subprocess.CompletedProcess(argv, 0, "5aa1abc\n", "")
         if "status" in argv:
             return subprocess.CompletedProcess(argv, 0, "", "")
-        if "{{json .RepoDigests}}" in argv:
-            return subprocess.CompletedProcess(argv, 0, "[]", "")
-        if "{{.Id}}" in argv:
-            return subprocess.CompletedProcess(argv, 0, "sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf\n", "")
+        if "{{json .RepoDigests}}\t{{.Id}}" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0,
+                "[]\tsha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf\n", "")
         return subprocess.CompletedProcess(argv, 1, "", "")
 
     joined = " ".join(build_args(
@@ -825,6 +831,8 @@ def test_a_local_only_base_is_pinned_by_a_reference_a_builder_can_resolve(tmp_pa
             return subprocess.CompletedProcess(argv, 0, "b" * 40 + "\n", "")
         if "status" in argv:
             return subprocess.CompletedProcess(argv, 0, "", "")
+        if "{{json .RepoDigests}}\t{{.Id}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, "[]\t" + image_id + "\n", "")
         if "{{json .RepoDigests}}" in argv:
             return subprocess.CompletedProcess(argv, 0, "[]", "")
         if "{{.Id}}" in argv:
@@ -977,7 +985,7 @@ def test_an_image_with_no_blastbox_is_not_a_stamp_disagreement(monkeypatch):
 
 
 def test_a_failed_probe_is_still_a_disagreement(monkeypatch):
-    """"Could not check" must not quietly become "checked and fine"."""
+    """A failed probe must not quietly become "checked and fine"."""
     from blastbox.host import doctor
     from blastbox.host.stamp import verify_contents
 
@@ -1019,3 +1027,27 @@ def test_an_explicit_digest_reference_needs_no_id():
         runner=_git("5aa1abc")))
     assert f"{LABEL_BASE_IMAGE_ID}=" in joined
     assert f"{LABEL_BASE_IMAGE_ID}={_IID}" not in joined
+
+
+def test_the_digest_and_the_id_come_from_one_snapshot():
+    """Two lookups let a mutable tag move between them.
+
+    The result labels image A's digest beside image B's ID -- a stamp that is
+    internally inconsistent and sends anyone checking it to the wrong image.
+    """
+    calls = []
+
+    def run(argv):
+        argv = list(argv)
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(argv, 0, "5aa1abc\n", "")
+        if "status" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if "inspect" in argv:
+            calls.append(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, f'["base@{_BD}"]\t{_IID}\n', "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    build_args(blastbox_version="0.1.29", repo=".", base="base:tag", runner=run)
+    assert len(calls) == 1, f"the base was inspected {len(calls)} times: {calls}"
+    assert calls[0] == "{{json .RepoDigests}}\t{{.Id}}", calls[0]

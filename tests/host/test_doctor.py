@@ -556,3 +556,93 @@ def test_the_fallback_shell_distinguishes_absence_from_failure():
     assert "tried=" in script, "no marker distinguishing found-but-failed"
     assert re.search(r'\[ -n "\$tried" \].*PROBEFAIL', script), script
     assert version == doctor.UNKNOWN, f"a failed interpreter must not read as absence: {version!r}"
+
+
+def _emitted_fallback_shell():
+    """The shell script version_in_image would run inside an image."""
+    from blastbox.host.doctor import version_in_image
+
+    seen = []
+
+    def run(argv):
+        argv = list(argv)
+        if "{{.Id}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, "sha256:pinned\n", "")
+        if "sh" not in argv:                       # direct attempts unavailable
+            return subprocess.CompletedProcess(argv, 1, "", "no such file")
+        seen.append(argv[-1])
+        return subprocess.CompletedProcess(argv, 0, "NOPKG\n", "")
+
+    version_in_image("img", run)
+    assert seen, "the fallback shell was never reached"
+    return seen[0]
+
+
+def _run_fallback(tmp_path, interpreters):
+    """EXECUTE the emitted script against fake interpreters.
+
+    Asserting on the script's TEXT is how the previous version of this test
+    passed with the marker deleted: the string `nopkg=` survives in the
+    initialiser even when the assignment inside the loop is gone. The only way
+    to test a shell program is to run it. `/opt/` is rewritten to a temp dir --
+    the glob path differs, the branching logic under test does not.
+
+    ``interpreters`` maps a venv name to what its python prints (or None for
+    an unrunnable one).
+    """
+    script = _emitted_fallback_shell().replace("/opt/", f"{tmp_path}/opt/")
+    for name, output in interpreters.items():
+        d = tmp_path / "opt" / name / "bin"
+        d.mkdir(parents=True)
+        py = d / "python"
+        if output is None:
+            py.write_text("#!/bin/sh\nexit 13\n")     # present, cannot answer
+        else:
+            py.write_text(f"#!/bin/sh\ncat >/dev/null\nprintf %s '{output}'\n")
+        py.chmod(0o755)
+    proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+    return proc.stdout.strip()
+
+
+def test_the_fallback_shell_answers_NOPKG_when_a_python_says_so(tmp_path):
+    """A definite answer must not be downgraded to "could not look"."""
+    assert _run_fallback(tmp_path, {"redtusk": "NOPKG"}) == "NOPKG"
+
+
+def test_the_fallback_shell_answers_PROBEFAIL_when_a_python_cannot_run(tmp_path):
+    """The confined UID cannot execute a root-only interpreter."""
+    assert _run_fallback(tmp_path, {"redtusk": None}) == "PROBEFAIL"
+
+
+def test_the_fallback_shell_answers_NOPKG_when_there_is_no_python_at_all(tmp_path):
+    """An image with no python is not a blastbox image -- RedTusk's worker base."""
+    assert _run_fallback(tmp_path, {}) == "NOPKG"
+
+
+def test_the_fallback_shell_prefers_a_real_version_over_either_sentinel(tmp_path):
+    """One venv answering must win over another that could not run."""
+    out = _run_fallback(tmp_path, {"a": None, "b": "0.1.29"})
+    assert out == "0.1.29", out
+
+
+def test_a_venv_python_reporting_NOPKG_stays_NOPKG():
+    """A definite answer must not be downgraded to "could not look".
+
+    The found-but-failed marker made every NOPKG from a venv interpreter come
+    back as PROBEFAIL, because reaching the end of the loop was treated as
+    failure regardless of WHY the loop ended.
+    """
+    from blastbox.host.doctor import NOPKG, version_in_image
+
+    def run(argv):
+        argv = list(argv)
+        if "{{.Id}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, "sha256:pinned\n", "")
+        if "sh" not in argv:                       # direct attempts unavailable
+            return subprocess.CompletedProcess(argv, 1, "", "no such file")
+        script = argv[-1]
+        assert "nopkg=" in script, "no marker separating 'answered NOPKG' from 'failed'"
+        return subprocess.CompletedProcess(argv, 0, "NOPKG\n", "")
+
+    version, _ = version_in_image("img", run)
+    assert version == NOPKG, f"a venv python answering NOPKG became {version!r}"

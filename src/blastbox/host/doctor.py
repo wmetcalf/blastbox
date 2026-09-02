@@ -270,11 +270,22 @@ def version_in_image(image: str, runner: Runner | None = None) -> tuple[str, str
             # cannot execute a root-only python, and reporting that as NOPKG
             # says "not a blastbox image" about an image nobody could look
             # inside. Absence and failure are different answers.
-            'tried=; for p in /opt/*/bin/python; do [ -x "$p" ] || continue; '
+            # Three outcomes, kept apart. `nopkg` remembers that an
+            # interpreter ANSWERED "not installed" -- without it, a venv python
+            # correctly reporting NOPKG fell through to the found-but-failed
+            # branch and came back as PROBEFAIL, turning a definite answer into
+            # "could not look". No interpreter at all is NOPKG too: an image
+            # with no python is not a blastbox image, which is precisely
+            # RedTusk's pure-JVM worker base.
+            'tried=; nopkg=; for p in /opt/*/bin/python; do [ -x "$p" ] || continue; '
             'tried=1; v=$("$p" - <<\'EOF\'\n' + _PROBE + "EOF\n" + '); '
-            'case "$v" in ""|PROBEFAIL*) continue;; NOPKG*) continue;; '
+            'case "$v" in NOPKG*) nopkg=1; continue;; '
+            '""|PROBEFAIL*) continue;; '
             '*) printf %s "$v"; exit 0;; esac; '
-            'done; [ -n "$tried" ] && printf PROBEFAIL || printf NOPKG',
+            'done; '
+            'if [ -n "$nopkg" ]; then printf NOPKG; '
+            'elif [ -n "$tried" ]; then printf PROBEFAIL; '
+            'else printf NOPKG; fi',
         ])
     except subprocess.TimeoutExpired:
         return UNKNOWN, "probe timed out"
