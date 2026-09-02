@@ -212,3 +212,85 @@ def test_unlabeled_containers_are_not_merged_into_one_project():
     d = drift(survey(run))
     assert len(d) == 2, d
     assert all(len(v) == 1 for v in d.values())
+
+
+def _base_fake(exec_response):
+    """ps + inspect stubs; `exec_response(argv)` answers the probe."""
+    def run(argv):
+        argv = list(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(
+                argv, 0, '{"name":"x","image":"i","status":"Up"}\n', "")
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, "proj\n", "")
+        return exec_response(argv)
+    return run
+
+
+def test_a_hung_project_lookup_does_not_abort_the_survey():
+    """One hung `docker inspect` must not kill the whole run; the project is
+    only used for grouping, not for the version."""
+    def run(argv):
+        argv = list(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(
+                argv, 0, '{"name":"x","image":"i","status":"Up"}\n', "")
+        if argv[:2] == ["docker", "inspect"]:
+            raise subprocess.TimeoutExpired(argv, 60)
+        return subprocess.CompletedProcess(argv, 0, "0.1.27\n", "")
+    found = survey(run)
+    assert [c.version for c in found] == ["0.1.27"]
+    assert found[0].project.startswith("(none:")
+
+
+def test_a_no_value_project_label_is_treated_as_absent():
+    """Some docker builds render a missing key as the literal '<no value>'.
+
+    Grouping every unlabeled container under that string invents drift between
+    unrelated boxes.
+    """
+    def run(argv):
+        argv = list(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(
+                argv, 0,
+                '{"name":"a","image":"i","status":"Up"}\n{"name":"b","image":"i","status":"Up"}\n', "")
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, "<no value>\n", "")
+        return subprocess.CompletedProcess(
+            argv, 0, ("0.1.17" if argv[2] == "a" else "0.1.27") + "\n", "")
+    d = drift(survey(run))
+    assert len(d) == 2, d          # two containers, two projects, no invented drift
+    assert all(len(v) == 1 for v in d.values())
+
+
+def test_a_long_banner_does_not_truncate_the_version():
+    """Sanitising the whole stream truncates at 200 chars; an interpreter that
+    prints a warning first would have its version cut off."""
+    banner = "x" * 400
+    found = survey(_base_fake(
+        lambda argv: subprocess.CompletedProcess(argv, 0, f"{banner}\n0.1.27\n", "")))
+    assert [c.version for c in found] == ["0.1.27"]
+
+
+def test_the_first_venv_with_blastbox_wins():
+    """Running every /opt/*/bin/python and reading the LAST line drops a
+    container whose blastbox lives in an earlier venv."""
+    def exec_response(argv):
+        # the shell loop is expected to stop at the first hit and print only it
+        return subprocess.CompletedProcess(argv, 0, "0.1.27", "")
+    assert [c.version for c in survey(_base_fake(exec_response))] == ["0.1.27"]
+
+
+def test_a_missing_docker_binary_raises_rather_than_reporting_an_empty_fleet():
+    """"docker is not installed" must not read as "nothing is running"."""
+    from unittest.mock import patch
+
+    import pytest as _pytest
+
+    from blastbox.host.doctor import DockerUnavailable
+
+    # Patch the lookup rather than depending on the test host lacking docker.
+    with patch("blastbox.host.doctor.shutil.which", return_value=None):
+        with _pytest.raises(DockerUnavailable):
+            survey()

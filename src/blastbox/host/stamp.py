@@ -187,6 +187,23 @@ def git_revision(repo: Path | str, runner: Runner | None = None) -> str:
     return sha
 
 
+# Docker reports RepoDigests for Hub images in SHORT form ("minio/minio@sha256:…")
+# even when inspected by a fully-qualified reference. Verified against a real
+# daemon: `docker inspect docker.io/minio/minio:latest` returns `minio/minio@…`.
+# Without normalising, stamping a fully-qualified base raises "1 repo digests and
+# none for 'docker.io/minio/minio'".
+_HUB_PREFIXES = ("docker.io/library/", "index.docker.io/library/",
+                 "docker.io/", "index.docker.io/")
+
+
+def _canonical_repo(repo: str) -> str:
+    """Strip Docker Hub's implicit registry/namespace so references compare equal."""
+    for prefix in _HUB_PREFIXES:
+        if repo.startswith(prefix):
+            return repo[len(prefix):]
+    return repo
+
+
 def repo_of(image: str) -> str:
     """The repository part of an image reference, without tag or digest.
 
@@ -234,10 +251,11 @@ def base_digest(image: str, runner: Runner | None = None) -> str:
         digests = [str(d) for d in (raw or [])]
         # One image can carry digests from several repositories; take the one
         # for the repo actually requested, or the sole entry when unambiguous.
-        matching = [d for d in digests if d.split("@", 1)[0] == repo]
+        want = _canonical_repo(repo)
+        matching = [d for d in digests if _canonical_repo(d.split("@", 1)[0]) == want]
         if matching:
             return matching[0].split("@", 1)[-1]
-        if len(digests) == 1 and digests[0].split("@", 1)[0] == repo:
+        if len(digests) == 1 and _canonical_repo(digests[0].split("@", 1)[0]) == want:
             return digests[0].split("@", 1)[-1]
         if digests:
             raise StampError(

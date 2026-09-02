@@ -106,11 +106,21 @@ def _ps(runner: Runner) -> list[dict[str, str]]:
 
 
 def _project_of(runner: Runner, name: str) -> str:
-    proc = runner([
-        "docker", "inspect", name,
-        "--format", '{{index .Config.Labels "com.docker.compose.project"}}',
-    ])
+    try:
+        proc = runner([
+            "docker", "inspect", name,
+            "--format", '{{index .Config.Labels "com.docker.compose.project"}}',
+        ])
+    except subprocess.TimeoutExpired:
+        # One hung inspect must not abort the whole survey; an unknown project
+        # only affects grouping, not the version we report.
+        return f"(none:{name})"
     value = proc.stdout.strip() if proc.returncode == 0 else ""
+    # Go templates render a missing key as "<no value>" on some docker builds
+    # (this one emits an empty line). Treat both as absent -- otherwise every
+    # unlabeled container groups under one pseudo-project and invents drift.
+    if value == "<no value>":
+        value = ""
     # An unlabeled container belongs to no compose project; grouping them all
     # under one key would invent drift between unrelated `docker run` boxes.
     return value or f"(none:{name})"
@@ -135,8 +145,14 @@ def _version_in(runner: Runner, name: str, status: str) -> tuple[str, str]:
         ["docker", "exec", name, "python3", "-c", _PROBE],
         ["docker", "exec", name, "python", "-c", _PROBE],
         # Consumer images install into a venv that is not on exec's PATH.
+        # Stop at the FIRST venv interpreter that reports a version. Running
+        # them all and reading the last line drops a container whose blastbox
+        # lives in an earlier venv when a later one lacks it.
         ["docker", "exec", name, "sh", "-lc",
-         'for p in /opt/*/bin/python; do "$p" - <<\'EOF\'\n' + _PROBE + "EOF\ndone"],
+         'for p in /opt/*/bin/python; do [ -x "$p" ] || continue; '
+         'v=$("$p" - <<\'EOF\'\n' + _PROBE + "EOF\n" + '); '
+         'case "$v" in ""|NOPKG*) continue;; *) printf %s "$v"; exit 0;; esac; '
+         'done; printf NOPKG'],
     ]
     last_err = ""
     saw_nopkg = False
@@ -146,8 +162,11 @@ def _version_in(runner: Runner, name: str, status: str) -> tuple[str, str]:
         except subprocess.TimeoutExpired:
             # A hung docker or interpreter is precisely "we do not know".
             return UNKNOWN, "probe timed out"
-        text = _sanitise((proc.stdout or "").strip())
-        line = text.splitlines()[-1] if text else ""
+        # Take the last line FIRST, then sanitise it. Sanitising the whole
+        # stream truncates at 200 chars, so any interpreter that prints a
+        # banner or warning first would have the version cut off entirely.
+        raw_lines = (proc.stdout or "").strip().splitlines()
+        line = _sanitise(raw_lines[-1]) if raw_lines else ""
         if proc.returncode == 0 and line:
             if line == NOPKG:
                 # This interpreter lacks blastbox, but a venv one may have it.
@@ -174,7 +193,9 @@ def survey(runner: Runner | None = None) -> list[Container]:
     """Every running container that has blastbox installed."""
     run = runner or _run
     if runner is None and shutil.which("docker") is None:
-        return []
+        # Returning [] here is the vacuous pass this module exists to prevent:
+        # "docker is not installed" would read as "nothing is running".
+        raise DockerUnavailable("docker is not installed or not on PATH")
     found: list[Container] = []
     for row in _ps(run):
         name = row.get("name", "")

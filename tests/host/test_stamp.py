@@ -471,3 +471,34 @@ def test_a_sole_digest_from_another_repository_is_refused():
         return subprocess.CompletedProcess(argv, 1, "", "")
     with _pytest.raises(StampError):
         base_digest("wanted/z:tag", run)
+
+
+def test_a_fully_qualified_hub_reference_matches_the_short_repo_digest():
+    """Verified against a real daemon: `docker inspect docker.io/minio/minio:latest`
+    returns RepoDigests as `minio/minio@sha256:…`. Without normalising the implicit
+    Hub registry, stamping a fully-qualified base raised instead of resolving."""
+    def run(argv):
+        argv = list(argv)
+        if "{{json .RepoDigests}}" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps([f"minio/minio@{_D64}"]), "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+    assert base_digest("docker.io/minio/minio:latest", run) == _D64
+    assert base_digest("index.docker.io/minio/minio:latest", run) == _D64
+    assert base_digest("minio/minio:latest", run) == _D64
+
+
+def test_a_genuinely_different_repository_still_raises():
+    """Normalising Hub prefixes must not make unrelated repos compare equal."""
+    import pytest as _pytest
+
+    from blastbox.host.stamp import StampError
+
+    def run(argv):
+        argv = list(argv)
+        if "{{json .RepoDigests}}" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps([f"someone/else@{_D64}"]), "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+    with _pytest.raises(StampError):
+        base_digest("docker.io/minio/minio:latest", run)
