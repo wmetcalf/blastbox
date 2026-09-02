@@ -20,6 +20,7 @@ Two traps this encodes, both hit by hand first:
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from collections.abc import Callable, Sequence
@@ -36,12 +37,18 @@ _PROBE = (
     "import importlib.metadata as m\n"
     "try:\n"
     "    print(m.version('blastbox'))\n"
-    "except Exception:\n"
-    "    print('NOPKG')\n"
+    "except m.PackageNotFoundError:\n"
+    "    print('NOPKG')\n"          # genuinely not installed
+    "except Exception as e:\n"
+    "    print('PROBEFAIL', type(e).__name__)\n"   # metadata unreadable: NOT the same
 )
 
 UNKNOWN = "unknown"
 NOPKG = "NOPKG"
+_PROBEFAIL = "PROBEFAIL"
+# Probe output is attacker-influenced (a compromised worker controls stdout), so
+# it is never printed raw.
+_SAFE = re.compile(r"[^A-Za-z0-9._+:!~<>= -]")
 # docker itself refused (container restarting, paused, gone) as opposed to the
 # command simply not existing inside a running container.
 _DAEMON_ERR = "error response from daemon"
@@ -67,11 +74,25 @@ class Container:
         return self.version != UNKNOWN
 
 
+def _sanitise(text: str) -> str:
+    """Strip control characters from container-controlled output before display."""
+    return _SAFE.sub("", text)[:200]
+
+
+class DockerUnavailable(RuntimeError):
+    """`docker ps` itself failed: the survey saw nothing, which is not "nothing runs"."""
+
+
 def _ps(runner: Runner) -> list[dict[str, str]]:
     fmt = '{"name":"{{.Names}}","image":"{{.Image}}","status":"{{.Status}}"}'
-    proc = runner(["docker", "ps", "--format", fmt])
+    try:
+        proc = runner(["docker", "ps", "--format", fmt])
+    except subprocess.TimeoutExpired as exc:
+        raise DockerUnavailable("docker ps timed out") from exc
     if proc.returncode != 0:
-        return []
+        # Returning [] here makes "the daemon is down" indistinguishable from
+        # "nothing is running", so --expect would pass having verified nothing.
+        raise DockerUnavailable((proc.stderr or "docker ps failed").strip()[:200])
     out: list[dict[str, str]] = []
     for line in proc.stdout.splitlines():
         line = line.strip()
@@ -90,7 +111,9 @@ def _project_of(runner: Runner, name: str) -> str:
         "--format", '{{index .Config.Labels "com.docker.compose.project"}}',
     ])
     value = proc.stdout.strip() if proc.returncode == 0 else ""
-    return value or "-"
+    # An unlabeled container belongs to no compose project; grouping them all
+    # under one key would invent drift between unrelated `docker run` boxes.
+    return value or f"(none:{name})"
 
 
 def _version_in(runner: Runner, name: str, status: str) -> tuple[str, str]:
@@ -116,17 +139,32 @@ def _version_in(runner: Runner, name: str, status: str) -> tuple[str, str]:
          'for p in /opt/*/bin/python; do "$p" - <<\'EOF\'\n' + _PROBE + "EOF\ndone"],
     ]
     last_err = ""
+    saw_nopkg = False
     for argv in attempts:
-        proc = runner(argv)
-        text = (proc.stdout or "").strip()
-        if proc.returncode == 0 and text:
-            return text.splitlines()[-1], ""
-        err = (proc.stderr or "").strip()
+        try:
+            proc = runner(argv)
+        except subprocess.TimeoutExpired:
+            # A hung docker or interpreter is precisely "we do not know".
+            return UNKNOWN, "probe timed out"
+        text = _sanitise((proc.stdout or "").strip())
+        line = text.splitlines()[-1] if text else ""
+        if proc.returncode == 0 and line:
+            if line == NOPKG:
+                # This interpreter lacks blastbox, but a venv one may have it.
+                # Returning here would DROP a container that does run blastbox.
+                saw_nopkg = True
+                continue
+            if line.startswith(_PROBEFAIL):
+                return UNKNOWN, f"metadata unreadable: {line}"
+            return line, ""
+        err = _sanitise((proc.stderr or "").strip())
         if err:
             last_err = err.splitlines()[-1]
         if _DAEMON_ERR in err.lower():
             # docker refused; retrying another interpreter cannot help.
-            return UNKNOWN, err.splitlines()[-1][:140]
+            return UNKNOWN, last_err[:140]
+    if saw_nopkg:
+        return NOPKG, ""
     # Every interpreter attempt failed at the shell level: nothing to inspect,
     # which for a redis or postgres container is simply the truth.
     return NOPKG, last_err[:140]

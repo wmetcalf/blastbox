@@ -1109,12 +1109,22 @@ def _pins_cmd(args: argparse.Namespace) -> int:
 
 def _doctor_cmd(args: argparse.Namespace) -> int:
     """Report the blastbox version every running container is actually on."""
-    from blastbox.host.doctor import UNKNOWN, drift, survey  # noqa: PLC0415 -- CLI-only
+    from blastbox.host.doctor import (  # noqa: PLC0415 -- CLI-only
+        UNKNOWN,
+        DockerUnavailable,
+        drift,
+        survey,
+    )
 
-    containers = survey()
+    try:
+        containers = survey()
+    except DockerUnavailable as exc:
+        print(f"cannot inspect anything: {exc}")
+        return 2
     if not containers:
-        print("no running blastbox containers found (is docker available?)")
-        return 0
+        print("no running blastbox containers found")
+        # With --expect, verifying nothing must not report success.
+        return 1 if args.expect else 0
 
     width = max(len(c.name) for c in containers)
     for c in sorted(containers, key=lambda c: (c.project, c.name)):

@@ -127,3 +127,88 @@ def test_a_venv_only_interpreter_is_found():
             return subprocess.CompletedProcess(argv, 127, "", "exec: python3: not found")
         return subprocess.CompletedProcess(argv, 0, "0.1.27\n", "")
     assert [c.version for c in survey(run)] == ["0.1.27"]
+
+
+def test_keeps_probing_past_a_system_python_without_blastbox():
+    """P1: the system interpreter is often NOT the one with blastbox.
+
+    Consumer images ship a venv at /opt/<name>/bin/python. Returning on the
+    first NOPKG DROPS a container that does run blastbox.
+    """
+    def run(argv):
+        argv = list(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(argv, 0, '{"name":"x","image":"i","status":"Up"}\n', "")
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, "proj\n", "")
+        if argv[3] in ("python3", "python"):
+            return subprocess.CompletedProcess(argv, 0, "NOPKG\n", "")
+        return subprocess.CompletedProcess(argv, 0, "0.1.27\n", "")
+    assert [c.version for c in survey(run)] == ["0.1.27"]
+
+
+def test_docker_ps_failure_raises_instead_of_reporting_an_empty_fleet():
+    """"The daemon is down" must not look like "nothing is running"."""
+    import pytest as _pytest
+
+    from blastbox.host.doctor import DockerUnavailable
+
+    def run(argv):
+        return subprocess.CompletedProcess(list(argv), 1, "", "Cannot connect to the Docker daemon")
+    with _pytest.raises(DockerUnavailable):
+        survey(run)
+
+
+def test_a_probe_timeout_is_UNKNOWN():
+    def run(argv):
+        argv = list(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(argv, 0, '{"name":"x","image":"i","status":"Up"}\n', "")
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, "proj\n", "")
+        raise subprocess.TimeoutExpired(argv, 60)
+    found = survey(run)
+    assert [c.version for c in found] == [UNKNOWN]
+    assert "timed out" in found[0].detail
+
+
+def test_unreadable_metadata_is_UNKNOWN_not_absent():
+    def run(argv):
+        argv = list(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(argv, 0, '{"name":"x","image":"i","status":"Up"}\n', "")
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, "proj\n", "")
+        return subprocess.CompletedProcess(argv, 0, "PROBEFAIL PermissionError\n", "")
+    found = survey(run)
+    assert [c.version for c in found] == [UNKNOWN]
+    assert "metadata unreadable" in found[0].detail
+
+
+def test_container_controlled_output_is_sanitised():
+    """A compromised worker controls stdout; it must not reach the terminal raw."""
+    def run(argv):
+        argv = list(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(argv, 0, '{"name":"x","image":"i","status":"Up"}\n', "")
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, "proj\n", "")
+        return subprocess.CompletedProcess(argv, 0, "0.1.27\x1b[31mEVIL\x07\n", "")
+    version = survey(run)[0].version
+    assert "\x1b" not in version and "\x07" not in version
+
+
+def test_unlabeled_containers_are_not_merged_into_one_project():
+    """Two unrelated `docker run` boxes must not look like one drifting project."""
+    def run(argv):
+        argv = list(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(
+                argv, 0,
+                '{"name":"a","image":"i","status":"Up"}\n{"name":"b","image":"i","status":"Up"}\n', "")
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, "\n", "")
+        return subprocess.CompletedProcess(argv, 0, ("0.1.17" if argv[2] == "a" else "0.1.27") + "\n", "")
+    d = drift(survey(run))
+    assert len(d) == 2, d
+    assert all(len(v) == 1 for v in d.values())
