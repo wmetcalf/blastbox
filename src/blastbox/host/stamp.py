@@ -47,6 +47,10 @@ _SHELL_SAFE = re.compile(r"^[\w@%+=:,./-]*$")
 
 UNKNOWN = "unknown"
 DIRTY_SUFFIX = "-dirty"
+# A recorded identifier must look like one. An externally built or hand-edited
+# image can carry anything in these labels, and "present" is not "valid".
+_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_REVISION_RE = re.compile(r"^[0-9a-f]{7,40}(-dirty)?$")
 
 
 class StampError(RuntimeError):
@@ -97,14 +101,39 @@ class Stamp:
         # The NAME is required alongside the digest: a bare `sha256:...` does
         # not say which repository to pull it from, so it cannot be resolved
         # back to an image on its own.
-        pinned = self.base_digest not in (UNKNOWN, "") or self.base_image_id not in (UNKNOWN, "")
-        return (
+        pinned = _DIGEST_RE.match(self.base_digest or "") or _DIGEST_RE.match(
+            self.base_image_id or ""
+        )
+        return bool(
             pinned
             and self.blastbox not in (UNKNOWN, "")
             and self.base_name not in (UNKNOWN, "")
-            and self.revision not in (UNKNOWN, "")
+            and _REVISION_RE.match(self.revision or "")
             and not self.revision.endswith(DIRTY_SUFFIX)
         )
+
+    def resolvable(self, runner: Runner | None = None) -> bool:
+        """Whether the recorded base is STILL present on this host.
+
+        `reproducible` says the image recorded enough; this says the recorded
+        base can actually be found. They differ exactly in the case that
+        started this work: a perfectly stamped image whose base has since been
+        deleted is not rebuildable, and reporting OK for it would repeat the
+        original failure.
+        """
+        if not self.reproducible:
+            return False
+        run = runner or _run
+        ref = (
+            f"{repo_of(self.base_name)}@{self.base_digest}"
+            if _DIGEST_RE.match(self.base_digest or "")
+            else self.base_image_id
+        )
+        try:
+            proc = run(["docker", "inspect", ref, "--format", "{{.Id}}"])
+        except StampError:
+            return False
+        return proc.returncode == 0
 
 
 REVISION_FILE = ".blastbox-revision"
@@ -139,7 +168,13 @@ def git_revision(repo: Path | str, runner: Runner | None = None) -> str:
         return recorded or UNKNOWN
     sha = head.stdout.strip()
     try:
-        dirty = run(["git", "-C", str(repo), "status", "--porcelain"])
+        # --untracked-files=normal overrides a repo/global
+        # status.showUntrackedFiles=no. Untracked files are build inputs -- a
+        # COPY picks them up -- so hiding them would stamp a dirty tree clean.
+        dirty = run([
+            "git", "-C", str(repo), "status", "--porcelain",
+            "--untracked-files=normal",
+        ])
     except (FileNotFoundError, OSError):
         # git vanished between the two calls; we cannot claim the tree is clean.
         return f"{sha}{DIRTY_SUFFIX}"
@@ -202,7 +237,7 @@ def base_digest(image: str, runner: Runner | None = None) -> str:
         matching = [d for d in digests if d.split("@", 1)[0] == repo]
         if matching:
             return matching[0].split("@", 1)[-1]
-        if len(digests) == 1:
+        if len(digests) == 1 and digests[0].split("@", 1)[0] == repo:
             return digests[0].split("@", 1)[-1]
         if digests:
             raise StampError(

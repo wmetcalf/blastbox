@@ -1202,8 +1202,15 @@ def _stamp_cmd(args: argparse.Namespace) -> int:
         print(f"  base digest   {got.base_digest}")
         print(f"  base image id {got.base_image_id}")
         if got.reproducible:
-            print("\nOK: records the base digest and source revision it was built from")
-            return 0
+            if got.resolvable():
+                print("\nOK: records what it was built from, and that base is still here")
+                return 0
+            print(
+                "\nSTAMPED BUT UNBUILDABLE: the recorded base is no longer on this\n"
+                "  host. The stamp is intact; the thing it names is gone. Pull or\n"
+                "  rebuild the base before trying to reproduce this image."
+            )
+            return 1
         print(
             "\nUNSTAMPED: this image does not record what it was built from.\n"
             "  A tag can be re-pointed or deleted; without the base DIGEST the\n"
