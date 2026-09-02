@@ -1049,6 +1049,16 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("repo", help="path to the consumer repo (redtusk, clippyshot, ...)")
     pp.set_defaults(func=_pins_cmd)
 
+    pdoc = sub.add_parser(
+        "doctor",
+        help="report the blastbox version every running container is actually on",
+    )
+    pdoc.add_argument(
+        "--expect", metavar="VERSION",
+        help="fail unless every container reports this version (local suffixes ignored)",
+    )
+    pdoc.set_defaults(func=_doctor_cmd)
+
     pv = sub.add_parser("version", help="print version and exit")
     pv.set_defaults(func=_version_cmd)
 
@@ -1094,6 +1104,58 @@ def _pins_cmd(args: argparse.Namespace) -> int:
     print("host tier, a Dockerfile ARG for the worker, a hashed lock for the")
     print("dispatcher image). They drift independently unless something checks.")
     return 1
+
+
+
+def _doctor_cmd(args: argparse.Namespace) -> int:
+    """Report the blastbox version every running container is actually on."""
+    from blastbox.host.doctor import (  # noqa: PLC0415 -- CLI-only
+        UNKNOWN,
+        DockerUnavailable,
+        drift,
+        survey,
+    )
+
+    try:
+        containers = survey()
+    except DockerUnavailable as exc:
+        print(f"cannot inspect anything: {exc}")
+        return 2
+    if not containers:
+        print("no running blastbox containers found")
+        # With --expect, verifying nothing must not report success.
+        return 1 if args.expect else 0
+
+    width = max(len(c.name) for c in containers)
+    for c in sorted(containers, key=lambda c: (c.project, c.name)):
+        note = f"  <- {c.detail}" if c.detail else ""
+        print(f"  {c.project:<18} {c.name:<{width}}  {c.image:<26} {c.version}{note}")
+
+    by_project = drift(containers)
+    mixed = {p: v for p, v in by_project.items() if len(v) > 1}
+    unknown = [c for c in containers if c.version == UNKNOWN]
+    print()
+    if unknown:
+        print(f"UNKNOWN: {len(unknown)} container(s) could not be inspected:")
+        for c in unknown:
+            print(f"  {c.name}: {c.detail}")
+        print("  (a container that cannot be read is not a container that agrees)")
+    if mixed:
+        print("DRIFT: a compose project is running more than one blastbox:")
+        for project, versions in sorted(mixed.items()):
+            print(f"  {project}: {', '.join(sorted(versions))}")
+    if args.expect:
+        wrong = [c for c in containers if c.known and c.version.split("+")[0] != args.expect]
+        if wrong:
+            print(f"EXPECTED {args.expect}, but:")
+            for c in wrong:
+                print(f"  {c.name}: {c.version}")
+            return 1
+    if mixed or unknown:
+        return 1
+    versions = {c.version for c in containers if c.known}
+    print(f"OK: {len(containers)} container(s), blastbox {', '.join(sorted(versions))}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
