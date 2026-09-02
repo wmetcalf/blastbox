@@ -1059,6 +1059,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pdoc.set_defaults(func=_doctor_cmd)
 
+    pst = sub.add_parser(
+        "stamp",
+        help="emit docker build flags recording provenance, or read an image's stamp",
+    )
+    pst.add_argument("--read", metavar="IMAGE", help="print the stamp IMAGE carries (exit 1 if unstamped)")
+    pst.add_argument("--repo", default=".", help="source repo whose revision to record (default: .)")
+    pst.add_argument("--base", help="base image to record by DIGEST, not tag")
+    pst.add_argument("--blastbox-version", help="override the recorded blastbox version")
+    pst.set_defaults(func=_stamp_cmd)
+
     pv = sub.add_parser("version", help="print version and exit")
     pv.set_defaults(func=_version_cmd)
 
@@ -1156,6 +1166,41 @@ def _doctor_cmd(args: argparse.Namespace) -> int:
     versions = {c.version for c in containers if c.known}
     print(f"OK: {len(containers)} container(s), blastbox {', '.join(sorted(versions))}")
     return 0
+
+
+
+def _stamp_cmd(args: argparse.Namespace) -> int:
+    """Emit build flags that record provenance, or read what an image recorded."""
+    from blastbox.host import stamp as st  # noqa: PLC0415 -- CLI-only
+
+    if args.read:
+        got = st.read(args.read)
+        print(f"  blastbox    {got.blastbox}")
+        print(f"  revision    {got.revision}")
+        print(f"  base name   {got.base_name}")
+        print(f"  base digest {got.base_digest}")
+        if got.reproducible:
+            print("\nOK: records the base digest and source revision it was built from")
+            return 0
+        print(
+            "\nUNSTAMPED: this image does not record what it was built from.\n"
+            "  A tag can be re-pointed or deleted; without the base DIGEST the\n"
+            "  image cannot be deliberately rebuilt. Measured cost of this gap:\n"
+            "  the base that built redtusk-cold-worker:rows no longer exists."
+        )
+        return 1
+
+    version = args.blastbox_version or _installed_version()
+    print(" ".join(st.build_args(
+        blastbox_version=version, repo=Path(args.repo), base=args.base,
+    )))
+    return 0
+
+
+def _installed_version() -> str:
+    from blastbox import __version__  # noqa: PLC0415 -- CLI-only
+
+    return __version__
 
 
 def main(argv: list[str] | None = None) -> int:
