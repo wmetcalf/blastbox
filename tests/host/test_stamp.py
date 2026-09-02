@@ -150,3 +150,129 @@ def test_no_git_and_no_file_is_unknown_not_a_guess(tmp_path):
     def run(argv):
         return subprocess.CompletedProcess(list(argv), 128, "", "not a git repository")
     assert git_revision(tmp_path, run) == UNKNOWN
+
+
+def _git(sha: str, dirty: bool = False):
+    def run(argv):
+        argv = list(argv)
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(argv, 0, sha + "\n", "")
+        if "status" in argv:
+            return subprocess.CompletedProcess(argv, 0, " M x\n" if dirty else "", "")
+        if "{{json .RepoDigests}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(["b@sha256:bd"]), "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+    return run
+
+
+def test_a_dirty_build_is_not_reproducible():
+    """A `<sha>-dirty` build cannot be rebuilt from that sha.
+
+    The uncommitted changes are recorded nowhere, so claiming reproducibility
+    would be a lie with a plausible-looking sha attached.
+    """
+    from blastbox.host.stamp import Stamp
+
+    assert not Stamp(revision="abc-dirty", base_digest="sha256:bd").reproducible
+    assert Stamp(revision="abc", base_digest="sha256:bd").reproducible
+
+
+def test_base_labels_are_emitted_even_without_a_base():
+    """Docker inherits LABELs; an unset base label carries the PARENT's base.
+
+    Without an explicit empty override the child silently claims its
+    grandparent as its own base.
+    """
+    from blastbox.host.stamp import LABEL_BASE_DIGEST as BD
+    from blastbox.host.stamp import LABEL_BASE_NAME as BN
+
+    joined = " ".join(build_args(blastbox_version="0.1.27", repo=".", runner=_git("s")))
+    assert f"{BN}=" in joined
+    assert f"{BD}=" in joined
+
+
+def test_the_build_is_pinned_to_the_digest_being_stamped():
+    """Resolving a digest then building the mutable tag can stamp image A and
+    build image B -- especially with --pull. Pin the build to what is recorded."""
+    args = build_args(
+        blastbox_version="0.1.27", repo=".", base="base:tag", runner=_git("s"))
+    joined = " ".join(args)
+    assert "--build-arg" in joined
+    assert "BASE_IMAGE=base@sha256:bd" in joined
+
+
+def test_the_pinned_build_arg_name_is_configurable():
+    """Consumer Dockerfiles disagree: BASE_IMAGE here, BASE in the gvisor one."""
+    args = build_args(
+        blastbox_version="0.1.27", repo=".", base="b:t",
+        base_arg="BASE", runner=_git("s"))
+    assert "BASE=b@sha256:bd" in " ".join(args)
+
+
+def test_an_unresolvable_base_raises_instead_of_stamping_unknown():
+    """`base.digest=unknown` looks recorded and cannot be rebuilt."""
+    import pytest as _pytest
+
+    from blastbox.host.stamp import StampError
+
+    def run(argv):
+        return subprocess.CompletedProcess(list(argv), 1, "", "No such image")
+    with _pytest.raises(StampError):
+        base_digest("missing:tag", run)
+
+
+def test_ambiguous_repo_digests_raise_rather_than_guess():
+    """One image can carry digests from several registries."""
+    import pytest as _pytest
+
+    from blastbox.host.stamp import StampError
+
+    def run(argv):
+        argv = list(argv)
+        if "{{json .RepoDigests}}" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps(["other/x@sha256:a", "third/y@sha256:b"]), "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+    with _pytest.raises(StampError):
+        base_digest("wanted/z:tag", run)
+
+
+def test_the_digest_for_the_requested_repository_is_chosen():
+    def run(argv):
+        argv = list(argv)
+        if "{{json .RepoDigests}}" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps(["other/x@sha256:aaa", "wanted/z@sha256:bbb"]), "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+    assert base_digest("wanted/z:tag", run) == "sha256:bbb"
+
+
+def test_an_uninspectable_image_raises_rather_than_reading_as_unstamped():
+    """A mistyped name or stopped daemon must not look like "no stamp"."""
+    import pytest as _pytest
+
+    from blastbox.host.stamp import StampError
+
+    def run(argv):
+        return subprocess.CompletedProcess(list(argv), 1, "", "No such object")
+    with _pytest.raises(StampError):
+        read("typo:tag", run)
+
+
+def test_emitted_args_are_shell_quoted():
+    """The output is meant for command substitution."""
+    args = build_args(
+        blastbox_version="0.1.27 rc1", repo=".", runner=_git("s"))
+    joined = " ".join(args)
+    assert "'org.blastbox.version=0.1.27 rc1'" in joined
+
+
+def test_a_registry_port_is_not_mistaken_for_a_tag():
+    """`host:5000/img` — the colon is a port. A naive rsplit mangles the repo."""
+    from blastbox.host.stamp import repo_of
+
+    assert repo_of("host:5000/img:tag") == "host:5000/img"
+    assert repo_of("host:5000/img") == "host:5000/img"
+    assert repo_of("img:tag") == "img"
+    assert repo_of("img@sha256:abc") == "img"
+    assert repo_of("ns/img:tag") == "ns/img"

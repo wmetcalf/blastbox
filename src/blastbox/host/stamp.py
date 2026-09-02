@@ -22,6 +22,7 @@ plus ``org.blastbox.version`` for the framework version, which OCI has no key fo
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -35,6 +36,15 @@ LABEL_BASE_NAME = "org.opencontainers.image.base.name"
 LABEL_BASE_DIGEST = "org.opencontainers.image.base.digest"
 
 UNKNOWN = "unknown"
+DIRTY_SUFFIX = "-dirty"
+
+
+class StampError(RuntimeError):
+    """A stamp could not be produced or read truthfully.
+
+    Raised rather than degraded: a stamp that says `unknown` where a real value
+    was expected looks stamped and is not, which is worse than no stamp.
+    """
 
 
 def _run(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -54,16 +64,22 @@ class Stamp:
     def reproducible(self) -> bool:
         """Whether this image records enough to be rebuilt deliberately.
 
-        The base DIGEST is the load-bearing part: a tag can be re-pointed or
-        deleted, and that is exactly what happened to the worker base.
+        Requires a base DIGEST -- a tag can be re-pointed or deleted, which is
+        exactly what happened to the worker base -- AND a CLEAN revision. A
+        `<sha>-dirty` build cannot be reproduced from that sha by definition:
+        the uncommitted changes are not recorded anywhere.
         """
-        return self.base_digest != UNKNOWN and self.revision != UNKNOWN
+        return (
+            self.base_digest not in (UNKNOWN, "")
+            and self.revision not in (UNKNOWN, "")
+            and not self.revision.endswith(DIRTY_SUFFIX)
+        )
 
 
 REVISION_FILE = ".blastbox-revision"
 
 
-def git_revision(repo: Path, runner: Runner | None = None) -> str:
+def git_revision(repo: Path | str, runner: Runner | None = None) -> str:
     """The source revision, marked dirty when the tree has uncommitted changes.
 
     A stamp that claims a clean sha for a dirty tree is worse than no stamp: it
@@ -92,51 +108,103 @@ def git_revision(repo: Path, runner: Runner | None = None) -> str:
     return sha
 
 
+def repo_of(image: str) -> str:
+    """The repository part of an image reference, without tag or digest.
+
+    Registry ports make this fiddly: in ``host:5000/img`` the colon is a PORT,
+    not a tag, so a naive rsplit(":") would mangle it. Only a colon in the LAST
+    path segment introduces a tag.
+    """
+    ref = image.split("@", 1)[0]
+    head, slash, last = ref.rpartition("/")
+    if ":" in last:
+        last = last.rsplit(":", 1)[0]
+    return f"{head}{slash}{last}"
+
+
 def base_digest(image: str, runner: Runner | None = None) -> str:
     """The repo digest of ``image``, or its local image ID if never pushed.
 
     A local-only base has no repo digest; its content-addressed image ID is
     still a precise identifier on this host, which is where rebuilds happen.
+
+    Raises StampError when neither can be read -- stamping `unknown` there
+    produces an image that looks recorded and cannot be rebuilt.
     """
     run = runner or _run
+    repo = repo_of(image)
     proc = run(["docker", "inspect", image, "--format", "{{json .RepoDigests}}"])
     if proc.returncode == 0:
         try:
-            digests = json.loads(proc.stdout.strip() or "[]")
+            digests = [str(d) for d in json.loads(proc.stdout.strip() or "[]")]
         except json.JSONDecodeError:
             digests = []
+        # One image can carry digests from several repositories; take the one
+        # for the repo actually requested, or the sole entry when unambiguous.
+        matching = [d for d in digests if d.split("@", 1)[0] == repo]
+        if matching:
+            return matching[0].split("@", 1)[-1]
+        if len(digests) == 1:
+            return digests[0].split("@", 1)[-1]
         if digests:
-            return str(digests[0]).split("@", 1)[-1]
+            raise StampError(
+                f"{image}: {len(digests)} repo digests and none for {repo!r}; "
+                "cannot tell which base this is"
+            )
     proc = run(["docker", "inspect", image, "--format", "{{.Id}}"])
     if proc.returncode == 0 and proc.stdout.strip():
         return proc.stdout.strip()
-    return UNKNOWN
+    raise StampError(
+        f"{image}: cannot resolve a digest (image absent, or docker unavailable). "
+        "Pull or build the base first; stamping 'unknown' would look recorded "
+        "while being unreproducible."
+    )
 
 
 def build_args(
-    *, blastbox_version: str, repo: Path, base: str | None = None,
-    runner: Runner | None = None,
+    *, blastbox_version: str, repo: Path | str, base: str | None = None,
+    base_arg: str = "BASE_IMAGE", runner: Runner | None = None,
 ) -> list[str]:
-    """`docker build` flags that stamp the image. Splice into a build command."""
+    """`docker build` flags that stamp the image, shell-quoted.
+
+    When ``base`` is given, the returned flags ALSO pin the build to the digest
+    being recorded (``--build-arg <base_arg>=name@sha256:...``). Resolving a
+    digest and then letting the build resolve the mutable tag independently --
+    especially with ``--pull`` -- can stamp one image while building on another.
+    Pinning makes the stamp true by construction.
+
+    The base labels are emitted even with no base, as empty values. Docker
+    inherits LABELs from the parent image, so an unset base label would silently
+    carry the PARENT's base digest and claim a grandparent as this image's base.
+    """
     revision = git_revision(repo, runner)
-    args = [
-        "--label", f"{LABEL_BLASTBOX}={blastbox_version}",
-        "--label", f"{LABEL_REVISION}={revision}",
-    ]
+    labels = {
+        LABEL_BLASTBOX: blastbox_version,
+        LABEL_REVISION: revision,
+        LABEL_BASE_NAME: base or "",
+        LABEL_BASE_DIGEST: base_digest(base, runner) if base else "",
+    }
+    args: list[str] = []
+    for key, value in labels.items():
+        args += ["--label", shlex.quote(f"{key}={value}")]
     if base:
-        args += [
-            "--label", f"{LABEL_BASE_NAME}={base}",
-            "--label", f"{LABEL_BASE_DIGEST}={base_digest(base, runner)}",
-        ]
+        pinned = f"{repo_of(base)}@{labels[LABEL_BASE_DIGEST]}"
+        args += ["--build-arg", shlex.quote(f"{base_arg}={pinned}")]
     return args
 
 
 def read(image: str, runner: Runner | None = None) -> Stamp:
-    """The stamp an image carries, if any."""
+    """The stamp an image carries, if any.
+
+    Raises StampError when the image cannot be inspected at all: a mistyped
+    name or a stopped daemon must not read as "this image is unstamped".
+    """
     run = runner or _run
     proc = run(["docker", "inspect", image, "--format", "{{json .Config.Labels}}"])
     if proc.returncode != 0:
-        return Stamp()
+        raise StampError(
+            f"{image}: cannot inspect ({(proc.stderr or '').strip()[:120]})"
+        )
     try:
         labels = json.loads(proc.stdout.strip() or "{}") or {}
     except json.JSONDecodeError:
