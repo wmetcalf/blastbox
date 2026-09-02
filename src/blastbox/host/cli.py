@@ -1055,7 +1055,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pdoc.add_argument(
         "--expect", metavar="VERSION",
-        help="fail unless every container reports this version (local suffixes ignored)",
+        help="fail unless every container reports exactly this version. A PEP 440 "
+             "local suffix (0.1.26+g<sha>) is a DIFFERENT build and does not match "
+             "the bare release; pass the full string to require it",
+    )
+    pdoc.add_argument(
+        "--allow-mixed", action="store_true",
+        help="accept several blastbox versions across the fleet (separate products "
+             "on one host); without it a mixed fleet is reported and exits 1",
     )
     pdoc.set_defaults(func=_doctor_cmd)
 
@@ -1092,26 +1099,56 @@ def _pins_cmd(args: argparse.Namespace) -> int:
     cold-worker 0.1.25 and guest 0.1.17 simultaneously), and it is invisible
     unless something compares the files.
     """
-    from blastbox.host.pins import disagreements, scan  # noqa: PLC0415 -- CLI-only
+    from blastbox.host.pins import PinScanError, disagreements, scan  # noqa: PLC0415
 
     root = Path(args.repo).resolve()
     if not root.is_dir():
         print(f"not a directory: {root}")
         return 2
-    pins = scan(root)
+    try:
+        pins = scan(root)
+    except PinScanError as exc:
+        # Exit 2 == "could not perform the check", matching doctor and stamp.
+        # Sharing DRIFT's exit 1 would make a crashed scan look like a finding.
+        print(f"cannot scan: {exc}")
+        return 2
     if not pins:
-        print(f"no install-path blastbox pins found under {root}")
-        return 0
+        # Verifying nothing is not a pass. The scanner only recognises
+        # pyproject/Dockerfile/requirements-style files, so a repo installing
+        # blastbox another way yields zero pins -- which must not read as OK.
+        print(f"NO PINS FOUND under {root}: nothing was verified.")
+        print("  If this repo installs blastbox, it does so by a path this")
+        print("  scanner does not recognise; that is a gap, not a clean result.")
+        return 1
 
     groups = disagreements(pins)
     for pin in pins:
         rel = Path(pin.path).relative_to(root)
         print(f"  {pin.floor or '?':<10} {pin.kind:<16} {rel}:{pin.line}")
     print()
-    if len(groups) <= 1:
-        only = next(iter(groups), "?")
+    if not groups:
+        # Pins exist but none guarantees a version (upper bounds only).
+        print(f"NO FLOOR: {len(pins)} pin(s), none of which guarantees a version.")
+        print("  An upper bound alone constrains nothing; any release below it")
+        print("  satisfies these pins, so the repo declares no version at all.")
+        return 1
+    floorless = [p for p in pins if p.floor is None]
+    if len(groups) == 1 and not floorless:
+        only = next(iter(groups))
         print(f"OK: {len(pins)} pin(s), all resolve to {only}")
         return 0
+    if len(groups) == 1 and floorless:
+        # A direct reference or a bare upper bound cannot be compared to a
+        # version. Reporting OK because the COMPARABLE pins agree would hide
+        # exactly the pin that is hardest to reason about.
+        only = next(iter(groups))
+        print(f"UNCOMPARABLE: {len(groups and [only])} version group ({only}), but "
+              f"{len(floorless)} pin(s) carry no comparable version:")
+        for pin in floorless:
+            rel = Path(pin.path).relative_to(root)
+            print(f"  {rel}:{pin.line}  {pin.specifier}")
+        print("  These cannot be checked against the rest; verify them by hand.")
+        return 1
     print(f"DRIFT: {len(pins)} pin(s) resolve to {len(groups)} different versions:")
     for version in sorted(groups):
         where = ", ".join(
@@ -1164,7 +1201,7 @@ def _doctor_cmd(args: argparse.Namespace) -> int:
         for project, versions in sorted(mixed.items()):
             print(f"  {project}: {', '.join(sorted(versions))}")
     if args.expect:
-        wrong = [c for c in containers if c.known and c.version.split("+")[0] != args.expect]
+        wrong = [c for c in containers if c.known and c.version != args.expect]
         if wrong:
             print(f"EXPECTED {args.expect}, but:")
             for c in wrong:
@@ -1173,6 +1210,19 @@ def _doctor_cmd(args: argparse.Namespace) -> int:
     if mixed or unknown:
         return 1
     versions = {c.version for c in containers if c.known}
+    if len(versions) > 1:
+        # Never print OK while listing several versions. Distinct compose
+        # projects may legitimately differ (two products on one host), so this
+        # is reported rather than assumed broken -- but it is not "OK", and
+        # --allow-mixed is how an operator states the difference is intended.
+        print(f"MIXED: {len(containers)} container(s) across {len(versions)} versions:")
+        for version in sorted(versions):
+            where = ", ".join(sorted(c.name for c in containers if c.version == version))
+            print(f"  {version}: {where}")
+        if not args.allow_mixed:
+            print("\n  (pass --allow-mixed if separate products on one host are expected)")
+            return 1
+        return 0
     print(f"OK: {len(containers)} container(s), blastbox {', '.join(sorted(versions))}")
     return 0
 
@@ -1182,43 +1232,57 @@ def _stamp_cmd(args: argparse.Namespace) -> int:
     """Emit build flags that record provenance, or read what an image recorded."""
     from blastbox.host import stamp as st  # noqa: PLC0415 -- CLI-only
 
-    try:
-        if args.read:
-            got = st.read(args.read)
-        else:
+    if not args.read:
+        try:
             version = args.blastbox_version or _installed_version()
             print(" ".join(st.build_args(
                 blastbox_version=version, repo=Path(args.repo),
                 base=args.base, base_arg=args.base_arg,
             )))
-            return 0
+        except st.StampError as exc:
+            print(f"stamp failed: {exc}")
+            return 2
+        return 0
+
+    try:
+        got = st.read(args.read)
+        agrees, detail = st.verify_contents(args.read)
+        resolvable = got.resolvable() if got.reproducible else False
     except st.StampError as exc:
+        # "could not perform the check" -- distinct from a real finding, and the
+        # same exit code doctor and pins use for it.
         print(f"stamp failed: {exc}")
         return 2
-    if True:
-        print(f"  blastbox    {got.blastbox}")
-        print(f"  revision    {got.revision}")
-        print(f"  base name     {got.base_name}")
-        print(f"  base digest   {got.base_digest}")
-        print(f"  base image id {got.base_image_id}")
-        if got.reproducible:
-            if got.resolvable():
-                print("\nOK: records what it was built from, and that base is still here")
-                return 0
-            print(
-                "\nSTAMPED BUT UNBUILDABLE: the recorded base is no longer on this\n"
-                "  host. The stamp is intact; the thing it names is gone. Pull or\n"
-                "  rebuild the base before trying to reproduce this image."
-            )
-            return 1
+    print(f"  blastbox    {got.blastbox}")
+    print(f"  revision    {got.revision}")
+    print(f"  base name     {got.base_name}")
+    print(f"  base digest   {got.base_digest}")
+    print(f"  base image id {got.base_image_id}")
+    if not agrees:
         print(
-            "\nUNSTAMPED: this image does not record what it was built from.\n"
-            "  A tag can be re-pointed or deleted; without the base DIGEST the\n"
-            "  image cannot be deliberately rebuilt. Measured cost of this gap:\n"
-            "  the base that built redtusk-cold-worker:rows no longer exists."
+            f"\nSTAMP DISAGREES WITH THE IMAGE: {detail}\n"
+            "  The blastbox label is a self-report written at build time. It\n"
+            "  says one thing; the image contains another, so rebuilding from\n"
+            "  the recorded facts would not reproduce what is here."
         )
         return 1
-    return 0
+    if got.reproducible:
+        if resolvable:
+            print("\nOK: records what it was built from, and that base is still here")
+            return 0
+        print(
+            "\nSTAMPED BUT UNBUILDABLE: the recorded base is no longer on this\n"
+            "  host. The stamp is intact; the thing it names is gone. Pull or\n"
+            "  rebuild the base before trying to reproduce this image."
+        )
+        return 1
+    print(
+        "\nUNSTAMPED: this image does not record what it was built from.\n"
+        "  A tag can be re-pointed or deleted; without the base DIGEST the\n"
+        "  image cannot be deliberately rebuilt. Measured cost of this gap:\n"
+        "  the base that built redtusk-cold-worker:rows no longer exists."
+    )
+    return 1
 
 
 def _installed_version() -> str:

@@ -39,13 +39,24 @@ _REQ_RE = re.compile(
     r'(?P<spec>(?:[=<>!~]=|[<>])\s*v?[0-9][^"\';\s]*'
     r'(?:\s*,\s*(?:[=<>!~]=|[<>])\s*v?[0-9][^"\';\s]*)*)'
 )
-# Leading whitespace is legal in a requirements-format file.
-_LOCK_RE = re.compile(r'^\s*(?i:blastbox)(?:\[[a-zA-Z0-9,._\-]+\])?\s*==\s*([^\s\;]+)')
+# Leading whitespace is legal in a requirements-format file. A hashed lock pins
+# with ==, but constraints.txt and requirements/*.txt legitimately carry any
+# specifier -- matching only == silently skipped them.
+_LOCK_RE = re.compile(
+    r'^\s*(?i:blastbox)(?:\[[a-zA-Z0-9,._\-]+\])?\s*'
+    r'((?:[=<>!~]=|[<>])\s*v?[0-9][^\s;]*(?:\s*,\s*(?:[=<>!~]=|[<>])\s*v?[0-9][^\s;]*)*)'
+)
 _ARG_USE_RE = re.compile(r'\$\{?BLASTBOX_VERSION\}?')
 
 
 def _version_key(version: str) -> tuple[int, ...]:
-    """Sortable release tuple; non-numeric suffixes sort before the release."""
+    """Sortable RELEASE tuple. Suffixes are ignored, not ordered.
+
+    `0.1.27rc1` and `0.1.27` both key to (0, 1, 27) -- this compares releases
+    only. The previous docstring claimed pre-releases sort BEFORE the release,
+    which the truncation never did, so `max()` fell back to written order for
+    such a tie.
+    """
     m = re.match(r"^(\d+(?:\.\d+)*)", version)
     if not m:
         return (0,)
@@ -77,6 +88,14 @@ class PinScanError(RuntimeError):
     pyproject makes a drifted repo report OK, which is the failure this module
     exists to prevent.
     """
+
+
+# `blastbox @ git+https://host/repo@v0.1.30` -- a direct reference. It has no
+# comparison specifier, so the requirement pattern cannot see it, and dropping it
+# silently is the worst outcome: it is the strongest pin a repo can express.
+_DIRECT_REF_RE = re.compile(
+    r"(?<![\w.\-])(?i:blastbox)(?:\[[a-zA-Z0-9,._\-]+\])?\s*@\s*(?P<url>[^\s\"']+)"
+)
 
 
 @dataclass(frozen=True)
@@ -151,6 +170,12 @@ def _split_requirement(req: str) -> tuple[str, str] | None:
     head = req.split(";", 1)[0].strip()
     if not head.lower().startswith("blastbox"):
         return None
+    direct = _DIRECT_REF_RE.match(head)
+    if direct:
+        # Record the reference itself as the specifier. floor() yields None for
+        # it (no comparison operator), so it does not fake a version -- but the
+        # pin is now VISIBLE instead of vanishing.
+        return head.split("@", 1)[0].strip(), "@" + direct.group("url")
     m = _REQ_RE.match(head)
     if not m:
         return None
@@ -167,6 +192,9 @@ def _scan_pyproject(path: Path) -> list[Pin]:
     reqs: list[str] = list(project.get("dependencies") or [])
     for extra_reqs in (project.get("optional-dependencies") or {}).values():
         reqs.extend(extra_reqs)
+    # PEP 735 dependency-groups live at the TOP level, not under [project].
+    for group in (data.get("dependency-groups") or {}).values():
+        reqs.extend(r for r in group if isinstance(r, str))
 
     lines = raw_text.splitlines()
     claimed: set[int] = set()
@@ -230,11 +258,46 @@ def _scan_dockerfile(path: Path) -> list[Pin]:
 
 
 def _isolate_requirements(line: str) -> list[str]:
-    """Every blastbox requirement token on an install command line."""
+    """Every blastbox requirement token on an install command line.
+
+    Includes DIRECT REFERENCES (`blastbox @ git+https://…`): a Dockerfile can
+    install one just as a pyproject can, and dropping it here would repeat the
+    silent-omission bug already fixed for pyproject.
+    """
     out: list[str] = []
     for m in _REQ_RE.finditer(line):
         start = line.lower().rfind("blastbox", 0, m.end())
         out.append(line[start : m.end()])
+    for m in _DIRECT_REF_RE.finditer(line):
+        out.append(m.group(0))
+    return out
+
+
+_TOML_LOCK_NAMES = {"uv.lock", "poetry.lock", "pdm.lock"}
+
+
+def _scan_toml_lock(path: Path) -> list[Pin]:
+    """blastbox pins inside a TOML lock (uv/poetry/pdm).
+
+    These were previously handed to the requirements-format scanner, whose
+    pattern cannot match TOML -- so the file was read, produced nothing, and the
+    repo reported clean. Silent under-reporting is the failure PinScanError
+    exists to prevent.
+    """
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise PinScanError(f"{path}: {exc}") from exc
+    out: list[Pin] = []
+    for pkg in data.get("package") or []:
+        if not isinstance(pkg, dict):
+            continue
+        if str(pkg.get("name", "")).lower() != "blastbox":
+            continue
+        version = str(pkg.get("version", "")).strip()
+        if version:
+            out.append(Pin(str(path), 0, "lock", f"{pkg.get('name')}=={version}",
+                           "==" + version))
     return out
 
 
@@ -247,7 +310,8 @@ def _scan_lock(path: Path) -> list[Pin]:
     for i, raw in enumerate(lines, 1):
         m = _LOCK_RE.match(raw)
         if m:
-            out.append(Pin(str(path), i, "lock", raw.strip(), "==" + m.group(1)))
+            out.append(Pin(str(path), i, "lock", raw.strip(),
+                           re.sub(r"\s+", "", m.group(1))))
     return out
 
 
@@ -291,7 +355,11 @@ def scan(root: Path) -> list[Pin]:
             pins.extend(_scan_pyproject(path))
         elif name.startswith("Dockerfile") or name.endswith((".Dockerfile", ".dockerfile")):
             pins.extend(_scan_dockerfile(path))
-        elif re.fullmatch(r"requirements[\w.\-]*\.(txt|lock)|[\w.\-]+\.lock", name):
+        elif name in _TOML_LOCK_NAMES:
+            pins.extend(_scan_toml_lock(path))
+        elif re.fullmatch(
+            r"(requirements|constraints)[\w.\-]*\.(txt|lock)|[\w.\-]+\.lock", name
+        ) or (path.parent.name == "requirements" and name.endswith(".txt")):
             pins.extend(_scan_lock(path))
     return sorted(pins, key=lambda p: (p.path, p.line))
 

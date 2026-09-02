@@ -421,3 +421,84 @@ def test_an_unreadable_directory_fails_instead_of_under_reporting(tmp_path):
             scan(root)
     finally:
         os.chmod(blocked, 0o755)
+
+
+def test_a_direct_reference_is_a_pin_not_a_silent_drop(tmp_path):
+    """`blastbox @ git+https://...` is the STRONGEST pin a repo can express.
+
+    It carries no comparison specifier, so the requirement pattern could not see
+    it and it vanished — the repo then reported OK against a drifted Dockerfile.
+    """
+    root = _repo(tmp_path, {
+        "pyproject.toml": '''
+            [project]
+            name = "c"
+            version = "0.1.0"
+            dependencies = ["blastbox @ git+https://example.invalid/blastbox@v0.1.30"]
+        ''',
+    })
+    pins = scan(root)
+    assert len(pins) == 1, pins
+    assert "git+https" in pins[0].specifier
+    assert pins[0].floor is None          # a URL is not a version; never fake one
+
+
+def test_pep735_dependency_groups_are_scanned(tmp_path):
+    root = _repo(tmp_path, {
+        "pyproject.toml": '''
+            [project]
+            name = "c"
+            version = "0.1.0"
+            dependencies = ["blastbox>=0.1.27,<0.2"]
+
+            [dependency-groups]
+            dev = ["blastbox>=0.1.5"]
+        ''',
+    })
+    assert sorted(disagreements(scan(root))) == ["0.1.27", "0.1.5"]
+
+
+def test_a_toml_lock_is_parsed_as_toml_not_as_requirements(tmp_path):
+    """uv.lock/poetry.lock were selected then handed to a requirements regex
+    that can never match TOML: read, zero pins, reported clean."""
+    root = _repo(tmp_path, {
+        "pyproject.toml": PYPROJECT,
+        "uv.lock": '''
+            [[package]]
+            name = "blastbox"
+            version = "0.1.17"
+        ''',
+    })
+    assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.27"]
+
+
+def test_constraints_and_requirements_dir_are_install_paths(tmp_path):
+    root = _repo(tmp_path, {
+        "pyproject.toml": PYPROJECT,
+        "constraints.txt": "blastbox==0.1.9\n",
+        "requirements/base.txt": "blastbox==0.1.11\n",
+    })
+    assert sorted(disagreements(scan(root))) == ["0.1.11", "0.1.27", "0.1.9"]
+
+
+def test_constraint_files_with_range_specifiers_are_parsed(tmp_path):
+    """A hashed lock pins with ==, but constraints/requirements files carry any
+    specifier; matching only == skipped them silently."""
+    root = _repo(tmp_path, {
+        "pyproject.toml": PYPROJECT,
+        "constraints.txt": "blastbox>=0.1.9,<0.2\n",
+    })
+    assert sorted(disagreements(scan(root))) == ["0.1.27", "0.1.9"]
+
+
+def test_a_direct_reference_on_a_dockerfile_install_line_is_a_pin(tmp_path):
+    """A Dockerfile can install a direct reference just as a pyproject can."""
+    root = _repo(tmp_path, {
+        "pyproject.toml": PYPROJECT,
+        "deploy/docker/Dockerfile.w": '''
+            FROM p
+            RUN pip install "blastbox @ git+https://example.invalid/b@v0.1.30"
+        ''',
+    })
+    refs = [p for p in scan(root) if p.specifier.startswith("@")]
+    assert len(refs) == 1, [(p.file if hasattr(p, "file") else p.path, p.specifier) for p in scan(root)]

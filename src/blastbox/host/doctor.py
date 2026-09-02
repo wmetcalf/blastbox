@@ -52,6 +52,25 @@ _SAFE = re.compile(r"[^A-Za-z0-9._+:!~<>= -]")
 # docker itself refused (container restarting, paused, gone) as opposed to the
 # command simply not existing inside a running container.
 _DAEMON_ERR = "error response from daemon"
+# "the command is not in this image" -- the only exec failure that legitimately
+# means "not a blastbox container" rather than "could not look".
+_NO_INTERPRETER = ("not found", "no such file or directory", "executable file not found")
+
+# Flags for running an image whose provenance is exactly what is in question.
+_CONFINE = (
+    "--network", "none",
+    "--read-only",
+    "--pids-limit", "64",
+    "--memory", "256m",
+    "--cap-drop", "ALL",
+    "--security-opt", "no-new-privileges",
+    "--user", "65534:65534",
+)
+
+
+def _looks_like_missing_interpreter(err: str) -> bool:
+    low = err.lower()
+    return any(marker in low for marker in _NO_INTERPRETER)
 
 
 def _run(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -105,15 +124,31 @@ def _ps(runner: Runner) -> list[dict[str, str]]:
     return out
 
 
-def _project_of(runner: Runner, name: str) -> str:
-    proc = runner([
-        "docker", "inspect", name,
-        "--format", '{{index .Config.Labels "com.docker.compose.project"}}',
-    ])
+def _project_of(runner: Runner, name: str, image: str = "") -> str:
+    try:
+        proc = runner([
+            "docker", "inspect", name,
+            "--format", '{{index .Config.Labels "com.docker.compose.project"}}',
+        ])
+    except subprocess.TimeoutExpired:
+        # One hung inspect must not abort the whole survey. But do not pretend
+        # this container has no project: if it IS in a compose stack, filing it
+        # under an image/name key would split it from its siblings and hide
+        # drift. A distinct key says "we could not tell".
+        return f"(unknown-project:{name})"
     value = proc.stdout.strip() if proc.returncode == 0 else ""
-    # An unlabeled container belongs to no compose project; grouping them all
-    # under one key would invent drift between unrelated `docker run` boxes.
-    return value or f"(none:{name})"
+    # Go templates render a missing key as "<no value>" on some docker builds
+    # (this one emits an empty line). Treat both as absent.
+    if value == "<no value>":
+        value = ""
+    if value:
+        return value
+    # No compose label. Group by IMAGE, not by container name: blastbox starts
+    # its own workers with `docker run`, so a name-unique key would make every
+    # worker its own group and drift() -- which compares WITHIN a group -- could
+    # never flag them. Two containers from one image must agree; two unrelated
+    # `docker run` boxes still do not share a group.
+    return f"(image:{image})" if image else f"(none:{name})"
 
 
 def _version_in(runner: Runner, name: str, status: str) -> tuple[str, str]:
@@ -135,8 +170,17 @@ def _version_in(runner: Runner, name: str, status: str) -> tuple[str, str]:
         ["docker", "exec", name, "python3", "-c", _PROBE],
         ["docker", "exec", name, "python", "-c", _PROBE],
         # Consumer images install into a venv that is not on exec's PATH.
+        # Stop at the FIRST venv interpreter that reports a version. Running
+        # them all and reading the last line drops a container whose blastbox
+        # lives in an earlier venv when a later one lacks it.
         ["docker", "exec", name, "sh", "-lc",
-         'for p in /opt/*/bin/python; do "$p" - <<\'EOF\'\n' + _PROBE + "EOF\ndone"],
+         'for p in /opt/*/bin/python; do [ -x "$p" ] || continue; '
+         # The pipe belongs on the COMMAND line, before the heredoc body --
+         # after the EOF terminator it is a syntax error, not a pipeline.
+         # tail -n1 because an interpreter may print a banner before the answer.
+         'v=$("$p" - <<\'EOF\' | tail -n1\n' + _PROBE + "EOF\n" + '); '
+         'case "$v" in ""|NOPKG*|PROBEFAIL*) continue;; *) printf %s "$v"; exit 0;; esac; '
+         'done; printf NOPKG'],
     ]
     last_err = ""
     saw_nopkg = False
@@ -146,8 +190,11 @@ def _version_in(runner: Runner, name: str, status: str) -> tuple[str, str]:
         except subprocess.TimeoutExpired:
             # A hung docker or interpreter is precisely "we do not know".
             return UNKNOWN, "probe timed out"
-        text = _sanitise((proc.stdout or "").strip())
-        line = text.splitlines()[-1] if text else ""
+        # Take the last line FIRST, then sanitise it. Sanitising the whole
+        # stream truncates at 200 chars, so any interpreter that prints a
+        # banner or warning first would have the version cut off entirely.
+        raw_lines = (proc.stdout or "").strip().splitlines()
+        line = _sanitise(raw_lines[-1]) if raw_lines else ""
         if proc.returncode == 0 and line:
             if line == NOPKG:
                 # This interpreter lacks blastbox, but a venv one may have it.
@@ -165,16 +212,80 @@ def _version_in(runner: Runner, name: str, status: str) -> tuple[str, str]:
             return UNKNOWN, last_err[:140]
     if saw_nopkg:
         return NOPKG, ""
-    # Every interpreter attempt failed at the shell level: nothing to inspect,
-    # which for a redis or postgres container is simply the truth.
+    if last_err and not _looks_like_missing_interpreter(last_err):
+        # An exec that failed for a reason OTHER than "no such command" --
+        # OCI runtime errors, permission/seccomp/AppArmor denials, a read-only
+        # rootfs -- means we could not look, not that blastbox is absent.
+        # Returning NOPKG here dropped the container from the report entirely,
+        # so nothing told the operator a box had been skipped.
+        return UNKNOWN, last_err[:140]
+    # Every attempt failed because there is no interpreter: for a redis or
+    # postgres container that is simply the truth.
     return NOPKG, last_err[:140]
+
+
+def version_in_image(image: str, runner: Runner | None = None) -> tuple[str, str]:
+    """The blastbox version installed in an IMAGE (not a running container).
+
+    Runs the same probe used for containers, in a throwaway container, so a
+    stamp's self-reported version can be checked against reality. Returns
+    (version, detail); version is UNKNOWN when it could not be read.
+    """
+    run = runner or _run
+    # Pin to one immutable ID: a concurrent pull or rebuild can repoint a tag
+    # between the stamp read and this probe, so the two would describe different
+    # images while appearing to describe one.
+    pinned = run(["docker", "inspect", "--type", "image", image, "--format", "{{.Id}}"])
+    if pinned.returncode == 0 and pinned.stdout.strip():
+        image = pinned.stdout.strip()
+    for interp in ("python3", "python"):
+        try:
+            proc = run([
+                "docker", "run", "--rm",
+                # This EXECUTES an image whose provenance is the thing in
+                # question -- unlike survey(), which execs into a container the
+                # operator already chose to run. Give it as close to nothing as
+                # docker allows. (Routing this through blastbox's own gVisor/FC
+                # runtime would be stronger still; that is a larger change and
+                # is noted in the module docstring.)
+                *_CONFINE,
+                "--entrypoint", interp, image, "-c", _PROBE,
+            ])
+        except subprocess.TimeoutExpired:
+            return UNKNOWN, "probe timed out"
+        raw = (proc.stdout or "").strip().splitlines()
+        line = _sanitise(raw[-1]) if raw else ""
+        if proc.returncode == 0 and line.startswith(_PROBEFAIL):
+            # "metadata unreadable" must not collapse into "no blastbox here".
+            return UNKNOWN, f"metadata unreadable: {line}"
+        if proc.returncode == 0 and line and line != NOPKG:
+            return line, ""
+    try:
+        proc = run([
+            "docker", "run", "--rm",
+            *_CONFINE,
+            "--entrypoint", "sh", image, "-lc",
+            'for p in /opt/*/bin/python; do [ -x "$p" ] || continue; '
+            'v=$("$p" - <<\'EOF\'\n' + _PROBE + "EOF\n" + '); '
+            'case "$v" in ""|NOPKG*) continue;; *) printf %s "$v"; exit 0;; esac; '
+            'done; printf NOPKG',
+        ])
+    except subprocess.TimeoutExpired:
+        return UNKNOWN, "probe timed out"
+    raw = (proc.stdout or "").strip().splitlines()
+    line = _sanitise(raw[-1]) if raw else ""
+    if proc.returncode == 0 and line and line != NOPKG:
+        return line, ""
+    return UNKNOWN, (_sanitise((proc.stderr or "").strip())[:140] or "no blastbox in image")
 
 
 def survey(runner: Runner | None = None) -> list[Container]:
     """Every running container that has blastbox installed."""
     run = runner or _run
     if runner is None and shutil.which("docker") is None:
-        return []
+        # Returning [] here is the vacuous pass this module exists to prevent:
+        # "docker is not installed" would read as "nothing is running".
+        raise DockerUnavailable("docker is not installed or not on PATH")
     found: list[Container] = []
     for row in _ps(run):
         name = row.get("name", "")
@@ -186,7 +297,7 @@ def survey(runner: Runner | None = None) -> list[Container]:
         found.append(Container(
             name=name,
             image=row.get("image", "?"),
-            project=_project_of(run, name),
+            project=_project_of(run, name, row.get("image", "")),
             status=row.get("status", "?"),
             version=version,
             detail=detail,

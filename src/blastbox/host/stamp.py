@@ -129,11 +129,20 @@ class Stamp:
             if _DIGEST_RE.match(self.base_digest or "")
             else self.base_image_id
         )
-        try:
-            proc = run(["docker", "inspect", ref, "--format", "{{.Id}}"])
-        except StampError:
+        # A failure to ASK is not an answer. Callers state "the base is gone"
+        # on a False, so an unreachable daemon must raise rather than be
+        # reported as absence -- the same rule read() and doctor already follow.
+        proc = run(["docker", "inspect", "--type", "image", ref,
+                    "--format", "{{.Id}}"])
+        if proc.returncode == 0:
+            return True
+        stderr = (proc.stderr or "").lower()
+        if "no such" in stderr or "not found" in stderr:
             return False
-        return proc.returncode == 0
+        raise StampError(
+            f"cannot determine whether {ref} is present: "
+            f"{(proc.stderr or '').strip()[:120]}"
+        )
 
 
 REVISION_FILE = ".blastbox-revision"
@@ -187,6 +196,23 @@ def git_revision(repo: Path | str, runner: Runner | None = None) -> str:
     return sha
 
 
+# Docker reports RepoDigests for Hub images in SHORT form ("minio/minio@sha256:…")
+# even when inspected by a fully-qualified reference. Verified against a real
+# daemon: `docker inspect docker.io/minio/minio:latest` returns `minio/minio@…`.
+# Without normalising, stamping a fully-qualified base raises "1 repo digests and
+# none for 'docker.io/minio/minio'".
+_HUB_PREFIXES = ("docker.io/library/", "index.docker.io/library/",
+                 "docker.io/", "index.docker.io/")
+
+
+def _canonical_repo(repo: str) -> str:
+    """Strip Docker Hub's implicit registry/namespace so references compare equal."""
+    for prefix in _HUB_PREFIXES:
+        if repo.startswith(prefix):
+            return repo[len(prefix):]
+    return repo
+
+
 def repo_of(image: str) -> str:
     """The repository part of an image reference, without tag or digest.
 
@@ -209,7 +235,7 @@ def base_image_id(image: str, runner: Runner | None = None) -> str:
     mistaken for one.
     """
     run = runner or _run
-    proc = run(["docker", "inspect", image, "--format", "{{.Id}}"])
+    proc = run(["docker", "inspect", "--type", "image", image, "--format", "{{.Id}}"])
     if proc.returncode == 0 and proc.stdout.strip():
         return proc.stdout.strip()
     raise StampError(f"{image}: cannot resolve an image ID (absent, or docker unavailable)")
@@ -223,7 +249,8 @@ def base_digest(image: str, runner: Runner | None = None) -> str:
     """
     run = runner or _run
     repo = repo_of(image)
-    proc = run(["docker", "inspect", image, "--format", "{{json .RepoDigests}}"])
+    proc = run(["docker", "inspect", "--type", "image", image,
+                "--format", "{{json .RepoDigests}}"])
     if proc.returncode == 0:
         try:
             # Docker reports a nil RepoDigests field as JSON `null`, which
@@ -233,12 +260,12 @@ def base_digest(image: str, runner: Runner | None = None) -> str:
             raw = []
         digests = [str(d) for d in (raw or [])]
         # One image can carry digests from several repositories; take the one
-        # for the repo actually requested, or the sole entry when unambiguous.
-        matching = [d for d in digests if d.split("@", 1)[0] == repo]
+        # for the repo actually requested. A sole entry that does NOT match is
+        # still the wrong repository, so it is refused rather than assumed.
+        want = _canonical_repo(repo)
+        matching = [d for d in digests if _canonical_repo(d.split("@", 1)[0]) == want]
         if matching:
             return matching[0].split("@", 1)[-1]
-        if len(digests) == 1 and digests[0].split("@", 1)[0] == repo:
-            return digests[0].split("@", 1)[-1]
         if digests:
             raise StampError(
                 f"{image}: {len(digests)} repo digests and none for {repo!r}; "
@@ -275,6 +302,13 @@ def build_args(
     Failing loudly beats emitting something that silently mis-parses.
     """
     revision = git_revision(repo, runner)
+    if revision != UNKNOWN and not _REVISION_RE.match(revision):
+        raise StampError(
+            f"{repo}: recorded revision {revision!r} is not a commit id. "
+            f"`{REVISION_FILE}` must hold the sha the tree came from -- a branch "
+            "or release name looks recorded exactly as much as 'unknown' does, "
+            "and the image would read back as UNSTAMPED."
+        )
     if revision == UNKNOWN:
         raise StampError(
             f"{repo}: no source revision (not a git checkout and no "
@@ -311,6 +345,35 @@ def _require_shell_safe(key: str, value: str) -> None:
         )
 
 
+def verify_contents(image: str, runner: Runner | None = None) -> tuple[bool, str]:
+    """Check the recorded blastbox version against what the image ACTUALLY has.
+
+    The `org.blastbox.version` label is a self-report: `build_args` writes
+    whatever it was told, defaulting to the version of the CLI on the build
+    host, which is not necessarily what the image installs. Nothing verified it,
+    and `doctor` deliberately reads only running containers -- so a stamp
+    claiming 0.1.27 on an image containing 0.1.17 was unrepresentable in either
+    module, and `pins`, `stamp --read` and `doctor` could all exit 0 on a fleet
+    running a version nobody declared.
+
+    This is the join: it runs the same probe `doctor` uses, inside the image.
+
+    Returns (agrees, detail).
+    """
+    from blastbox.host.doctor import UNKNOWN as D_UNKNOWN  # noqa: PLC0415 -- cycle
+    from blastbox.host.doctor import version_in_image  # noqa: PLC0415
+
+    stamped = read(image, runner).blastbox
+    if stamped in (UNKNOWN, ""):
+        return False, "image records no blastbox version"
+    actual, detail = version_in_image(image, runner)
+    if actual == D_UNKNOWN:
+        return False, f"cannot read the image's blastbox: {detail}"
+    if actual != stamped:
+        return False, f"label says {stamped}, image contains {actual}"
+    return True, actual
+
+
 def read(image: str, runner: Runner | None = None) -> Stamp:
     """The stamp an image carries, if any.
 
@@ -318,15 +381,19 @@ def read(image: str, runner: Runner | None = None) -> Stamp:
     name or a stopped daemon must not read as "this image is unstamped".
     """
     run = runner or _run
-    proc = run(["docker", "inspect", image, "--format", "{{json .Config.Labels}}"])
+    proc = run(["docker", "inspect", "--type", "image", image,
+                "--format", "{{json .Config.Labels}}"])
     if proc.returncode != 0:
         raise StampError(
             f"{image}: cannot inspect ({(proc.stderr or '').strip()[:120]})"
         )
     try:
         labels = json.loads(proc.stdout.strip() or "{}") or {}
-    except json.JSONDecodeError:
-        return Stamp()
+    except json.JSONDecodeError as exc:
+        # Unparseable output is "could not read", not "carries no stamp".
+        # Every other error path here raises; this one used to contradict the
+        # docstring by returning an all-unknown Stamp.
+        raise StampError(f"{image}: unparseable inspect output ({exc})") from exc
     return Stamp(
         blastbox=labels.get(LABEL_BLASTBOX, UNKNOWN),
         revision=labels.get(LABEL_REVISION, UNKNOWN),
