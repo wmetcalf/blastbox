@@ -351,8 +351,8 @@ def test_a_local_only_base_is_reproducible_via_its_image_id():
 def test_a_local_only_base_is_stamped_and_pinned_by_image_id():
     """Every image on these hosts is local-only, so this is the common path.
 
-    The ID goes in its own label (not the OCI digest key) and the build is
-    pinned to it.
+    The ID goes in its own label (not the OCI digest key); the build is pinned
+    to the reference, because an image ID is not a resolvable FROM.
     """
     from blastbox.host.stamp import LABEL_BASE_DIGEST, LABEL_BASE_IMAGE_ID
 
@@ -373,7 +373,11 @@ def test_a_local_only_base_is_stamped_and_pinned_by_image_id():
     assert f"{LABEL_BASE_IMAGE_ID}=sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf" in joined
     assert f"{LABEL_BASE_DIGEST}=" in joined            # emitted, but empty
     assert f"{LABEL_BASE_DIGEST}=sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf" not in joined   # never as a digest
-    assert "BASE_IMAGE=sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf" in joined        # build pinned to the ID
+    # The build is pinned to the REFERENCE, not the ID: buildkit reads
+    # `sha256:...` as the repository `docker.io/library/sha256:...` and tries to
+    # pull it, so pinning by ID fails the build under the default builder.
+    assert "BASE_IMAGE=redtusk-worker:bb0127" in joined
+    assert "BASE_IMAGE=sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf" not in joined
 
 
 def test_an_unrunnable_git_status_is_not_reported_clean(tmp_path):
@@ -776,3 +780,42 @@ def test_an_arg_name_differing_only_in_case_is_not_the_same_arg(tmp_path):
     """docker matches build-arg names exactly; `base_image` != `BASE_IMAGE`."""
     body = "ARG base_image\nFROM ${base_image}\n"
     assert "declares no `ARG BASE_IMAGE`" in _refused(_df(tmp_path, body))
+
+
+def test_a_local_only_base_is_pinned_by_a_reference_a_builder_can_resolve(tmp_path):
+    """An image ID is not a usable FROM under the default builder.
+
+    buildkit reads `sha256:...` as the repository `docker.io/library/sha256:...`
+    and tries to pull it, so a local-only base pinned by ID fails the build
+    with "pull access denied". The classic builder DOES resolve it -- which is
+    why this survived a hand-verified build on a box with buildkit off.
+    """
+    from blastbox.host.stamp import LABEL_BASE_IMAGE_ID, build_args
+
+    image_id = "sha256:" + "9" * 64
+
+    def run(argv):
+        argv = list(argv)
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(argv, 0, "b" * 40 + "\n", "")
+        if "status" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if "{{json .RepoDigests}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if "{{.Id}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, image_id + "\n", "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    df = tmp_path / "Dockerfile"
+    df.write_text("ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n")
+    args = build_args(
+        blastbox_version="0.1.28", repo=tmp_path, base="redtusk-worker:bb0128",
+        dockerfile=df, runner=run,
+    )
+    joined = " ".join(args)
+    assert "--build-arg BASE_IMAGE=redtusk-worker:bb0128" in joined, joined
+    assert f"--build-arg BASE_IMAGE={image_id}" not in joined, (
+        "the image ID is not resolvable as a FROM under buildkit"
+    )
+    # The ID is still RECORDED -- that is the provenance; only the pin changes.
+    assert f"{LABEL_BASE_IMAGE_ID}={image_id}" in joined, joined

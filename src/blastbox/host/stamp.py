@@ -406,8 +406,9 @@ def build_args(
     """`docker build` flags that stamp the image.
 
     When ``base`` is given, the returned flags ALSO pin the build to what is
-    being recorded (``--build-arg <base_arg>=repo@sha256:...``, or the image ID
-    for a local-only base). Resolving a reference and then letting the build
+    being recorded (``--build-arg <base_arg>=repo@sha256:...``, or the caller's
+    reference for a local-only base, which buildkit can resolve where an image
+    ID cannot). Resolving a reference and then letting the build
     resolve the mutable tag independently -- especially with ``--pull`` -- can
     stamp one image while building on another. Pinning makes the stamp true by
     construction.
@@ -452,7 +453,22 @@ def build_args(
         _require_shell_safe(key, value)
         args += ["--label", f"{key}={value}"]
     if base:
-        pinned = f"{repo_of(base)}@{digest}" if digest else image_id
+        # A registry digest is a real pin and every builder resolves it. An
+        # image ID is NOT a usable FROM: buildkit reads `sha256:...` as the
+        # repository `docker.io/library/sha256:...` and tries to PULL it, so a
+        # local-only base pinned by ID fails the build outright ("pull access
+        # denied") under the default builder. The classic builder does resolve
+        # it, which is exactly why this survived a hand-verified build -- the
+        # box that proved it had buildkit off.
+        #
+        # For a local-only base we therefore pass the REFERENCE the caller
+        # named and record the image ID in the label. That is a weaker pin: the
+        # reference is mutable, so the guarantee is "the build used whatever
+        # this reference meant at build time, and the label says which image
+        # that was" -- checkable after the fact (the recorded ID either still
+        # matches the reference or it does not), rather than guaranteed by
+        # construction. Push the base to a registry to get the strong form.
+        pinned = f"{repo_of(base)}@{digest}" if digest else base
         _require_shell_safe(base_arg, pinned)
         args += ["--build-arg", f"{base_arg}={pinned}"]
     return args
