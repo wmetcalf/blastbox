@@ -45,7 +45,13 @@ _ARG_USE_RE = re.compile(r'\$\{?BLASTBOX_VERSION\}?')
 
 
 def _version_key(version: str) -> tuple[int, ...]:
-    """Sortable release tuple; non-numeric suffixes sort before the release."""
+    """Sortable RELEASE tuple. Suffixes are ignored, not ordered.
+
+    `0.1.27rc1` and `0.1.27` both key to (0, 1, 27) -- this compares releases
+    only. The previous docstring claimed pre-releases sort BEFORE the release,
+    which the truncation never did, so `max()` fell back to written order for
+    such a tie.
+    """
     m = re.match(r"^(\d+(?:\.\d+)*)", version)
     if not m:
         return (0,)
@@ -77,6 +83,14 @@ class PinScanError(RuntimeError):
     pyproject makes a drifted repo report OK, which is the failure this module
     exists to prevent.
     """
+
+
+# `blastbox @ git+https://host/repo@v0.1.30` -- a direct reference. It has no
+# comparison specifier, so the requirement pattern cannot see it, and dropping it
+# silently is the worst outcome: it is the strongest pin a repo can express.
+_DIRECT_REF_RE = re.compile(
+    r"^(?i:blastbox)(?:\[[a-zA-Z0-9,._\-]+\])?\s*@\s*(?P<url>\S+)"
+)
 
 
 @dataclass(frozen=True)
@@ -151,6 +165,12 @@ def _split_requirement(req: str) -> tuple[str, str] | None:
     head = req.split(";", 1)[0].strip()
     if not head.lower().startswith("blastbox"):
         return None
+    direct = _DIRECT_REF_RE.match(head)
+    if direct:
+        # Record the reference itself as the specifier. floor() yields None for
+        # it (no comparison operator), so it does not fake a version -- but the
+        # pin is now VISIBLE instead of vanishing.
+        return head.split("@", 1)[0].strip(), "@" + direct.group("url")
     m = _REQ_RE.match(head)
     if not m:
         return None
@@ -167,6 +187,9 @@ def _scan_pyproject(path: Path) -> list[Pin]:
     reqs: list[str] = list(project.get("dependencies") or [])
     for extra_reqs in (project.get("optional-dependencies") or {}).values():
         reqs.extend(extra_reqs)
+    # PEP 735 dependency-groups live at the TOP level, not under [project].
+    for group in (data.get("dependency-groups") or {}).values():
+        reqs.extend(r for r in group if isinstance(r, str))
 
     lines = raw_text.splitlines()
     claimed: set[int] = set()
@@ -238,6 +261,34 @@ def _isolate_requirements(line: str) -> list[str]:
     return out
 
 
+_TOML_LOCK_NAMES = {"uv.lock", "poetry.lock", "pdm.lock"}
+
+
+def _scan_toml_lock(path: Path) -> list[Pin]:
+    """blastbox pins inside a TOML lock (uv/poetry/pdm).
+
+    These were previously handed to the requirements-format scanner, whose
+    pattern cannot match TOML -- so the file was read, produced nothing, and the
+    repo reported clean. Silent under-reporting is the failure PinScanError
+    exists to prevent.
+    """
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise PinScanError(f"{path}: {exc}") from exc
+    out: list[Pin] = []
+    for pkg in data.get("package") or []:
+        if not isinstance(pkg, dict):
+            continue
+        if str(pkg.get("name", "")).lower() != "blastbox":
+            continue
+        version = str(pkg.get("version", "")).strip()
+        if version:
+            out.append(Pin(str(path), 0, "lock", f"{pkg.get('name')}=={version}",
+                           "==" + version))
+    return out
+
+
 def _scan_lock(path: Path) -> list[Pin]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -291,7 +342,11 @@ def scan(root: Path) -> list[Pin]:
             pins.extend(_scan_pyproject(path))
         elif name.startswith("Dockerfile") or name.endswith((".Dockerfile", ".dockerfile")):
             pins.extend(_scan_dockerfile(path))
-        elif re.fullmatch(r"requirements[\w.\-]*\.(txt|lock)|[\w.\-]+\.lock", name):
+        elif name in _TOML_LOCK_NAMES:
+            pins.extend(_scan_toml_lock(path))
+        elif re.fullmatch(
+            r"(requirements|constraints)[\w.\-]*\.(txt|lock)|[\w.\-]+\.lock", name
+        ) or (path.parent.name == "requirements" and name.endswith(".txt")):
             pins.extend(_scan_lock(path))
     return sorted(pins, key=lambda p: (p.path, p.line))
 

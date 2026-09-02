@@ -421,3 +421,61 @@ def test_an_unreadable_directory_fails_instead_of_under_reporting(tmp_path):
             scan(root)
     finally:
         os.chmod(blocked, 0o755)
+
+
+def test_a_direct_reference_is_a_pin_not_a_silent_drop(tmp_path):
+    """`blastbox @ git+https://...` is the STRONGEST pin a repo can express.
+
+    It carries no comparison specifier, so the requirement pattern could not see
+    it and it vanished — the repo then reported OK against a drifted Dockerfile.
+    """
+    root = _repo(tmp_path, {
+        "pyproject.toml": '''
+            [project]
+            name = "c"
+            version = "0.1.0"
+            dependencies = ["blastbox @ git+https://example.invalid/blastbox@v0.1.30"]
+        ''',
+    })
+    pins = scan(root)
+    assert len(pins) == 1, pins
+    assert "git+https" in pins[0].specifier
+    assert pins[0].floor is None          # a URL is not a version; never fake one
+
+
+def test_pep735_dependency_groups_are_scanned(tmp_path):
+    root = _repo(tmp_path, {
+        "pyproject.toml": '''
+            [project]
+            name = "c"
+            version = "0.1.0"
+            dependencies = ["blastbox>=0.1.27,<0.2"]
+
+            [dependency-groups]
+            dev = ["blastbox>=0.1.5"]
+        ''',
+    })
+    assert sorted(disagreements(scan(root))) == ["0.1.27", "0.1.5"]
+
+
+def test_a_toml_lock_is_parsed_as_toml_not_as_requirements(tmp_path):
+    """uv.lock/poetry.lock were selected then handed to a requirements regex
+    that can never match TOML: read, zero pins, reported clean."""
+    root = _repo(tmp_path, {
+        "pyproject.toml": PYPROJECT,
+        "uv.lock": '''
+            [[package]]
+            name = "blastbox"
+            version = "0.1.17"
+        ''',
+    })
+    assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.27"]
+
+
+def test_constraints_and_requirements_dir_are_install_paths(tmp_path):
+    root = _repo(tmp_path, {
+        "pyproject.toml": PYPROJECT,
+        "constraints.txt": "blastbox==0.1.9\n",
+        "requirements/base.txt": "blastbox==0.1.11\n",
+    })
+    assert sorted(disagreements(scan(root))) == ["0.1.11", "0.1.27", "0.1.9"]

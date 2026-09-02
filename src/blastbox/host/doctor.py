@@ -52,6 +52,14 @@ _SAFE = re.compile(r"[^A-Za-z0-9._+:!~<>= -]")
 # docker itself refused (container restarting, paused, gone) as opposed to the
 # command simply not existing inside a running container.
 _DAEMON_ERR = "error response from daemon"
+# "the command is not in this image" -- the only exec failure that legitimately
+# means "not a blastbox container" rather than "could not look".
+_NO_INTERPRETER = ("not found", "no such file or directory", "executable file not found")
+
+
+def _looks_like_missing_interpreter(err: str) -> bool:
+    low = err.lower()
+    return any(marker in low for marker in _NO_INTERPRETER)
 
 
 def _run(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -188,8 +196,15 @@ def _version_in(runner: Runner, name: str, status: str) -> tuple[str, str]:
             return UNKNOWN, last_err[:140]
     if saw_nopkg:
         return NOPKG, ""
-    # Every interpreter attempt failed at the shell level: nothing to inspect,
-    # which for a redis or postgres container is simply the truth.
+    if last_err and not _looks_like_missing_interpreter(last_err):
+        # An exec that failed for a reason OTHER than "no such command" --
+        # OCI runtime errors, permission/seccomp/AppArmor denials, a read-only
+        # rootfs -- means we could not look, not that blastbox is absent.
+        # Returning NOPKG here dropped the container from the report entirely,
+        # so nothing told the operator a box had been skipped.
+        return UNKNOWN, last_err[:140]
+    # Every attempt failed because there is no interpreter: for a redis or
+    # postgres container that is simply the truth.
     return NOPKG, last_err[:140]
 
 
@@ -203,16 +218,28 @@ def version_in_image(image: str, runner: Runner | None = None) -> tuple[str, str
     run = runner or _run
     for interp in ("python3", "python"):
         try:
-            proc = run(["docker", "run", "--rm", "--entrypoint", interp, image, "-c", _PROBE])
+            proc = run([
+                "docker", "run", "--rm",
+                # This EXECUTES an image whose provenance is the thing in
+                # question -- unlike survey(), which execs into a container the
+                # operator already chose to run. Give it nothing.
+                "--network", "none", "--read-only", "--pids-limit", "64",
+                "--entrypoint", interp, image, "-c", _PROBE,
+            ])
         except subprocess.TimeoutExpired:
             return UNKNOWN, "probe timed out"
         raw = (proc.stdout or "").strip().splitlines()
         line = _sanitise(raw[-1]) if raw else ""
-        if proc.returncode == 0 and line and line != NOPKG and not line.startswith(_PROBEFAIL):
+        if proc.returncode == 0 and line.startswith(_PROBEFAIL):
+            # "metadata unreadable" must not collapse into "no blastbox here".
+            return UNKNOWN, f"metadata unreadable: {line}"
+        if proc.returncode == 0 and line and line != NOPKG:
             return line, ""
     try:
         proc = run([
-            "docker", "run", "--rm", "--entrypoint", "sh", image, "-lc",
+            "docker", "run", "--rm",
+            "--network", "none", "--read-only", "--pids-limit", "64",
+            "--entrypoint", "sh", image, "-lc",
             'for p in /opt/*/bin/python; do [ -x "$p" ] || continue; '
             'v=$("$p" - <<\'EOF\'\n' + _PROBE + "EOF\n" + '); '
             'case "$v" in ""|NOPKG*) continue;; *) printf %s "$v"; exit 0;; esac; '

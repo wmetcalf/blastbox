@@ -1219,52 +1219,57 @@ def _stamp_cmd(args: argparse.Namespace) -> int:
     """Emit build flags that record provenance, or read what an image recorded."""
     from blastbox.host import stamp as st  # noqa: PLC0415 -- CLI-only
 
-    try:
-        if args.read:
-            got = st.read(args.read)
-        else:
+    if not args.read:
+        try:
             version = args.blastbox_version or _installed_version()
             print(" ".join(st.build_args(
                 blastbox_version=version, repo=Path(args.repo),
                 base=args.base, base_arg=args.base_arg,
             )))
-            return 0
+        except st.StampError as exc:
+            print(f"stamp failed: {exc}")
+            return 2
+        return 0
+
+    try:
+        got = st.read(args.read)
+        agrees, detail = st.verify_contents(args.read)
+        resolvable = got.resolvable() if got.reproducible else False
     except st.StampError as exc:
+        # "could not perform the check" -- distinct from a real finding, and the
+        # same exit code doctor and pins use for it.
         print(f"stamp failed: {exc}")
         return 2
-    if True:
-        print(f"  blastbox    {got.blastbox}")
-        print(f"  revision    {got.revision}")
-        print(f"  base name     {got.base_name}")
-        print(f"  base digest   {got.base_digest}")
-        print(f"  base image id {got.base_image_id}")
-        agrees, detail = st.verify_contents(args.read)
-        if not agrees:
-            print(
-                f"\nSTAMP DISAGREES WITH THE IMAGE: {detail}\n"
-                "  The blastbox label is a self-report written at build time. It\n"
-                "  says one thing; the image contains another, so rebuilding from\n"
-                "  the recorded facts would not reproduce what is here."
-            )
-            return 1
-        if got.reproducible:
-            if got.resolvable():
-                print("\nOK: records what it was built from, and that base is still here")
-                return 0
-            print(
-                "\nSTAMPED BUT UNBUILDABLE: the recorded base is no longer on this\n"
-                "  host. The stamp is intact; the thing it names is gone. Pull or\n"
-                "  rebuild the base before trying to reproduce this image."
-            )
-            return 1
+    print(f"  blastbox    {got.blastbox}")
+    print(f"  revision    {got.revision}")
+    print(f"  base name     {got.base_name}")
+    print(f"  base digest   {got.base_digest}")
+    print(f"  base image id {got.base_image_id}")
+    if not agrees:
         print(
-            "\nUNSTAMPED: this image does not record what it was built from.\n"
-            "  A tag can be re-pointed or deleted; without the base DIGEST the\n"
-            "  image cannot be deliberately rebuilt. Measured cost of this gap:\n"
-            "  the base that built redtusk-cold-worker:rows no longer exists."
+            f"\nSTAMP DISAGREES WITH THE IMAGE: {detail}\n"
+            "  The blastbox label is a self-report written at build time. It\n"
+            "  says one thing; the image contains another, so rebuilding from\n"
+            "  the recorded facts would not reproduce what is here."
         )
         return 1
-    return 0
+    if got.reproducible:
+        if resolvable:
+            print("\nOK: records what it was built from, and that base is still here")
+            return 0
+        print(
+            "\nSTAMPED BUT UNBUILDABLE: the recorded base is no longer on this\n"
+            "  host. The stamp is intact; the thing it names is gone. Pull or\n"
+            "  rebuild the base before trying to reproduce this image."
+        )
+        return 1
+    print(
+        "\nUNSTAMPED: this image does not record what it was built from.\n"
+        "  A tag can be re-pointed or deleted; without the base DIGEST the\n"
+        "  image cannot be deliberately rebuilt. Measured cost of this gap:\n"
+        "  the base that built redtusk-cold-worker:rows no longer exists."
+    )
+    return 1
 
 
 def _installed_version() -> str:

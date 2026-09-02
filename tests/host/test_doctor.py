@@ -278,13 +278,37 @@ def test_a_long_banner_does_not_truncate_the_version():
     assert [c.version for c in found] == ["0.1.27"]
 
 
-def test_the_first_venv_with_blastbox_wins():
+def test_the_venv_probe_stops_at_the_first_interpreter_that_answers():
     """Running every /opt/*/bin/python and reading the LAST line drops a
-    container whose blastbox lives in an earlier venv."""
-    def exec_response(argv):
-        # the shell loop is expected to stop at the first hit and print only it
+    container whose blastbox lives in an earlier venv.
+
+    The first version of this test passed for the wrong reason: its fake
+    answered the `python3` attempt, so the venv command was never built and the
+    test could not see the loop being deleted. It now REFUSES the system
+    interpreters, forcing the venv path, and asserts the emitted shell actually
+    short-circuits.
+    """
+    seen: list[str] = []
+
+    def run(argv):
+        argv = list(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(
+                argv, 0, '{"name":"x","image":"i","status":"Up"}\n', "")
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, "proj\n", "")
+        if argv[3] in ("python3", "python"):
+            return subprocess.CompletedProcess(argv, 127, "", "exec: not found")
+        seen.append(argv[-1])                       # the venv shell command
         return subprocess.CompletedProcess(argv, 0, "0.1.27", "")
-    assert [c.version for c in survey(_base_fake(exec_response))] == ["0.1.27"]
+
+    assert [c.version for c in survey(run)] == ["0.1.27"]
+    assert seen, "the venv fallback was never reached"
+    shell = seen[0]
+    assert "/opt/*/bin/python" in shell
+    # short-circuit: the loop must exit on the first interpreter that answers,
+    # not run them all and let the last one win.
+    assert "exit 0" in shell and "continue" in shell
 
 
 def test_a_missing_docker_binary_raises_rather_than_reporting_an_empty_fleet():
@@ -347,3 +371,41 @@ def test_version_in_image_reads_an_image_not_a_container():
         assert argv[:2] == ["docker", "run"], argv
         return subprocess.CompletedProcess(argv, 0, "0.1.27\n", "")
     assert version_in_image("img", run) == ("0.1.27", "")
+
+
+def test_a_non_daemon_exec_failure_is_UNKNOWN_not_a_silent_drop():
+    """gVisor/OCI/permission failures are "could not look", not "not ours".
+
+    Returning NOPKG dropped the container from the report entirely, so nothing
+    told the operator a box had been skipped — and --expect then passed on the
+    containers that survived the filter.
+    """
+    def run(argv):
+        argv = list(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(
+                argv, 0, '{"name":"worker","image":"rt:1","status":"Up"}\n', "")
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, "rt\n", "")
+        return subprocess.CompletedProcess(
+            argv, 126, "",
+            "OCI runtime exec failed: unable to start container process: permission denied")
+    found = survey(run)
+    assert [c.name for c in found] == ["worker"], "the container must not vanish"
+    assert found[0].version == UNKNOWN
+    assert "OCI runtime" in found[0].detail
+
+
+def test_an_image_probe_is_confined():
+    """version_in_image EXECUTES an image whose provenance is in question."""
+    from blastbox.host.doctor import version_in_image
+
+    seen = []
+
+    def run(argv):
+        seen.append(list(argv))
+        return subprocess.CompletedProcess(list(argv), 0, "0.1.27\n", "")
+    version_in_image("suspect:img", run)
+    argv = seen[0]
+    for flag in ("--network", "none", "--read-only", "--pids-limit"):
+        assert flag in argv, argv

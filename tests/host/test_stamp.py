@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 import subprocess
 
 from blastbox.host.stamp import (
@@ -164,6 +165,14 @@ def test_no_git_and_no_file_is_unknown_not_a_guess(tmp_path):
     assert git_revision(tmp_path, run) == UNKNOWN
 
 
+def _inspect_ref(argv):
+    """The image reference in a `docker inspect [--type image] <ref> ...` argv."""
+    rest = argv[2:]
+    if rest[:2] == ["--type", "image"]:
+        rest = rest[2:]
+    return rest[0]
+
+
 def _git(sha: str, dirty: bool = False):
     """git + docker stand-in. The repo digest it reports MATCHES the image asked
     about, because base_digest() now refuses a digest belonging to another
@@ -176,7 +185,8 @@ def _git(sha: str, dirty: bool = False):
             return subprocess.CompletedProcess(argv, 0, " M x\n" if dirty else "", "")
         if "{{json .RepoDigests}}" in argv:
             from blastbox.host.stamp import repo_of
-            repo = repo_of(argv[2])
+            # `docker inspect --type image <ref>` -- the ref is not argv[2].
+            repo = repo_of(_inspect_ref(argv))
             return subprocess.CompletedProcess(
                 argv, 0,
                 json.dumps([f"{repo}@{_BD}"]), "")
@@ -543,3 +553,64 @@ def test_a_stamp_matching_the_image_agrees():
 
     agrees, detail = verify_contents("img", run)
     assert agrees and detail == "0.1.27"
+
+
+def test_images_are_inspected_with_type_image():
+    """docker resolves CONTAINER names before image names.
+
+    A container sharing a tag's name (routine under compose) would answer
+    instead — returning a container ID and the container's inherited labels as
+    if they were the image's.
+    """
+    from blastbox.host.stamp import base_image_id, read
+
+    seen: list[list[str]] = []
+
+    def run(argv):
+        argv = list(argv)
+        seen.append(argv)
+        if "{{json .Config.Labels}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        return subprocess.CompletedProcess(argv, 0, "sha256:" + "a" * 64 + "\n", "")
+
+    base_image_id("collide", run)
+    read("collide", run)
+    for argv in seen:
+        assert argv[:4] == ["docker", "inspect", "--type", "image"], argv
+
+
+def test_a_non_commit_revision_file_is_refused_at_build_time():
+    """`release-2026-09-02` looks recorded exactly as much as `unknown` does.
+
+    The read path already validated the shape; the write path did not, so the
+    build succeeded and the image read back UNSTAMPED.
+    """
+    import tempfile
+
+    import pytest as _pytest
+
+    from blastbox.host.stamp import REVISION_FILE, StampError
+
+    d = tempfile.mkdtemp()
+    (pathlib.Path(d) / REVISION_FILE).write_text("release-2026-09-02\n", encoding="utf-8")
+
+    def run(argv):
+        return subprocess.CompletedProcess(list(argv), 128, "", "not a git repository")
+
+    with _pytest.raises(StampError):
+        build_args(blastbox_version="0.1.27", repo=d, runner=run)
+
+
+def test_unparseable_inspect_output_raises_rather_than_reading_as_unstamped():
+    """Every other error path here raises; this one contradicted the docstring."""
+    import pytest as _pytest
+
+    from blastbox.host.stamp import StampError
+
+    def run(argv):
+        # docker emitting two objects for an ambiguous name
+        return subprocess.CompletedProcess(
+            list(argv), 0, '{"a":"1"}\n{"a":"1"}\n', "")
+
+    with _pytest.raises(StampError):
+        read("ambiguous", run)
