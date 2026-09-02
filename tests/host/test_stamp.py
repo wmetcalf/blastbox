@@ -225,14 +225,31 @@ def test_base_labels_are_emitted_even_without_a_base():
     assert f"{BD}=" in joined
 
 
-def test_the_build_is_pinned_to_the_digest_being_stamped():
-    """Resolving a digest then building the mutable tag can stamp image A and
-    build image B -- especially with --pull. Pin the build to what is recorded."""
+def test_the_build_is_pinned_to_exactly_the_base_that_was_named():
+    """Deriving a "better" reference produces one the builder cannot resolve.
+
+    A RepoDigest is not proof of a registry: with the containerd image store,
+    buildkit gives a locally built image a manifest digest that was never
+    pushed, so `repo@sha256:...` sends the build to Docker Hub for a digest
+    that exists only on this host. That killed a real build while every unit
+    test passed, because the laptop's image store reported no RepoDigests and
+    the branch was never taken there.
+    """
     args = build_args(
         blastbox_version="0.1.27", repo=".", base="base:tag", runner=_git("5aa1abc"))
     joined = " ".join(args)
-    assert "--build-arg" in joined
-    assert f"BASE_IMAGE=base@{_BD}" in joined
+    assert "--build-arg BASE_IMAGE=base:tag" in joined, joined
+    assert f"BASE_IMAGE=base@{_BD}" not in joined, "a local RepoDigest is not a registry pin"
+    # The digest is still RECORDED; only what gets PINNED changed.
+    assert f"{LABEL_BASE_DIGEST}={_BD}" in joined, joined
+
+
+def test_a_caller_supplied_digest_reference_is_passed_through_verbatim():
+    """Asking for a digest pin explicitly is how you get the strong form."""
+    ref = f"registry.example/base@{_BD}"
+    args = build_args(
+        blastbox_version="0.1.27", repo=".", base=ref, runner=_git("5aa1abc"))
+    assert f"--build-arg BASE_IMAGE={ref}" in " ".join(args)
 
 
 def test_the_pinned_build_arg_name_is_configurable():
@@ -240,7 +257,7 @@ def test_the_pinned_build_arg_name_is_configurable():
     args = build_args(
         blastbox_version="0.1.27", repo=".", base="b:t",
         base_arg="BASE", runner=_git("5aa1abc"))
-    assert f"BASE=b@{_BD}" in " ".join(args)
+    assert "BASE=b:t" in " ".join(args)
 
 
 def test_an_unresolvable_base_raises_instead_of_stamping_unknown():
@@ -851,7 +868,8 @@ def test_a_registry_digest_is_never_reported_as_moved():
     """A digest is immutable; asking whether it moved is a category error."""
     from blastbox.host.stamp import Stamp
 
-    s = Stamp(blastbox="0.1.28", revision="c" * 40, base_name="redtusk-worker:bb0128",
+    s = Stamp(blastbox="0.1.28", revision="c" * 40,
+              base_name="registry.example/base@sha256:" + "d" * 64,
               base_digest="sha256:" + "d" * 64, base_image_id="sha256:" + "a" * 64)
 
     def explode(argv):  # must not even be consulted
@@ -926,3 +944,43 @@ def test_a_bare_image_id_as_the_base_is_refused():
     with _pytest.raises(StampError) as e:
         build_args(blastbox_version="0.1.28", repo=".", base="sha256:" + "a" * 64)
     assert "bare image ID" in str(e.value)
+
+
+def test_an_image_with_no_blastbox_is_not_a_stamp_disagreement(monkeypatch):
+    """RedTusk's worker base is a pure JVM/Tika image, deliberately no python.
+
+    Reading "the probe found nothing" as "the label lies" failed a build that
+    was entirely correct -- the image is not supposed to contain blastbox, so
+    there is nothing for its stamp to disagree with.
+    """
+    from blastbox.host import doctor
+    from blastbox.host.stamp import verify_contents
+
+    def run(argv):
+        argv = list(argv)
+        if "inspect" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, '{"org.blastbox.version":"0.1.29"}', "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(doctor, "version_in_image", lambda i, r=None: (doctor.NOPKG, ""))
+    agrees, _ = verify_contents("redtusk-worker:x", run)
+    assert agrees is None, "no blastbox in the image is 'nothing to join', not a lie"
+
+
+def test_a_failed_probe_is_still_a_disagreement(monkeypatch):
+    """"Could not check" must not quietly become "checked and fine"."""
+    from blastbox.host import doctor
+    from blastbox.host.stamp import verify_contents
+
+    def run(argv):
+        argv = list(argv)
+        if "inspect" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, '{"org.blastbox.version":"0.1.29"}', "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(
+        doctor, "version_in_image", lambda i, r=None: (doctor.UNKNOWN, "probe timed out"))
+    agrees, detail = verify_contents("redtusk-worker:x", run)
+    assert agrees is False and "probe timed out" in detail

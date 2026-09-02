@@ -276,7 +276,16 @@ def version_in_image(image: str, runner: Runner | None = None) -> tuple[str, str
     line = _sanitise(raw[-1]) if raw else ""
     if proc.returncode == 0 and line and line != NOPKG:
         return line, ""
-    return UNKNOWN, (_sanitise((proc.stderr or "").strip())[:140] or "no blastbox in image")
+    if proc.returncode == 0 and line == NOPKG:
+        # The probe RAN and found no blastbox. That is an answer -- "this is not
+        # a blastbox image" -- and it is not the same as "the probe failed",
+        # which is what returning UNKNOWN here used to say. The distinction is
+        # the whole point of the NOPKG sentinel, and collapsing it made
+        # verify_contents call a pure-JVM worker base a stamp DISAGREEMENT: the
+        # image is not supposed to contain blastbox, so there is nothing to
+        # disagree with.
+        return NOPKG, "the image contains no blastbox"
+    return UNKNOWN, (_sanitise((proc.stderr or "").strip())[:140] or "probe produced no output")
 
 
 def survey(runner: Runner | None = None) -> list[Container]:

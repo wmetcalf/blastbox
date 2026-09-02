@@ -478,3 +478,36 @@ def test_the_emitted_venv_shell_actually_runs():
     proc = subprocess.run(["sh", "-lc", shell], capture_output=True, text=True)
     assert proc.returncode == 0, f"rc={proc.returncode} stderr={proc.stderr!r}"
     assert proc.stdout == "0.1.27", f"stdout={proc.stdout!r}"
+
+
+def test_an_image_without_blastbox_reports_NOPKG_not_UNKNOWN():
+    """"Ran fine, blastbox is not here" is an ANSWER, not a failed look.
+
+    Collapsing it into UNKNOWN made `stamp --read` call RedTusk's worker base
+    -- a pure JVM/Tika image with no python at all -- a stamp DISAGREEMENT, and
+    failed a build that was entirely correct.
+    """
+    from blastbox.host.doctor import NOPKG, version_in_image
+
+    def run(argv):
+        argv = list(argv)
+        if "{{.Id}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, "sha256:pinned\n", "")
+        return subprocess.CompletedProcess(argv, 0, "NOPKG\n", "")
+
+    version, detail = version_in_image("redtusk-worker:x", run)
+    assert version == NOPKG, f"got {version!r} ({detail})"
+
+
+def test_a_probe_that_produced_nothing_is_still_UNKNOWN():
+    """No output at all is "could not look", and must stay distinguishable."""
+    from blastbox.host.doctor import UNKNOWN, version_in_image
+
+    def run(argv):
+        argv = list(argv)
+        if "{{.Id}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, "sha256:pinned\n", "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    version, _ = version_in_image("redtusk-worker:x", run)
+    assert version == UNKNOWN
