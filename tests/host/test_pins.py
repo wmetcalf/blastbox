@@ -125,3 +125,129 @@ def test_a_mention_without_an_install_is_not_a_pin(tmp_path):
         ''',
     })
     assert [p.kind for p in scan(root)] == ["pyproject", "pyproject"]
+
+
+def test_extras_do_not_truncate_line_attribution(tmp_path):
+    """`req.split(",")[0]` truncated `blastbox[host,s3]` to `blastbox[host`."""
+    root = _repo(tmp_path, {
+        "pyproject.toml": '''
+            [project]
+            name = "c"
+            version = "0.1.0"
+            dependencies = ["blastbox>=0.1.27,<0.2"]
+            [project.optional-dependencies]
+            a = ["blastbox[host,s3]>=0.1.27,<0.2"]
+            b = ["blastbox[host,s3]>=0.1.27,<0.2"]
+        '''
+    })
+    lines = sorted(p.line for p in scan(root))
+    assert lines == [5, 7, 8], lines          # distinct, real lines
+    assert all(p.line != 0 for p in scan(root))
+
+
+def test_environment_markers_do_not_leak_into_the_version(tmp_path):
+    root = _repo(tmp_path, {
+        "pyproject.toml": '''
+            [project]
+            name = "c"
+            version = "0.1.0"
+            dependencies = ["blastbox>=0.1.27; python_version >= '3.12'"]
+        '''
+    })
+    assert {p.floor for p in scan(root)} == {"0.1.27"}
+    assert not [p for p in scan(root) if p.kind.startswith("dockerfile")]
+
+
+def test_compatible_release_pins_count_as_drift(tmp_path):
+    """`~=` was matched but yielded no floor, so it vanished from drift groups."""
+    root = _repo(tmp_path, {
+        "pyproject.toml": '''
+            [project]
+            name = "c"
+            version = "0.1.0"
+            dependencies = ["blastbox~=0.1.17"]
+        ''',
+        "deploy/docker/Dockerfile.w": '''
+            FROM p
+            RUN pip install "blastbox==0.1.27"
+        ''',
+    })
+    assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.27"]
+
+
+def test_a_wrapped_run_install_is_one_logical_line(tmp_path):
+    root = _repo(tmp_path, {
+        "pyproject.toml": PYPROJECT,
+        "deploy/docker/Dockerfile.w": '''
+            FROM p
+            RUN pip install --no-cache-dir \\
+                  "blastbox[host]>=0.1.17,<0.2" \\
+             && echo done
+        ''',
+    })
+    assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.27"]
+
+
+def test_an_unused_ARG_is_not_a_pin(tmp_path):
+    """Documented contract: the ARG is a pin only if an install consumes it."""
+    root = _repo(tmp_path, {
+        "pyproject.toml": PYPROJECT,
+        "deploy/docker/Dockerfile.w": '''
+            FROM p
+            ARG BLASTBOX_VERSION=0.1.9
+            RUN echo "$BLASTBOX_VERSION" > /etc/note
+        ''',
+    })
+    assert {p.floor for p in scan(root)} == {"0.1.27"}
+    assert not [p for p in scan(root) if p.kind.startswith("dockerfile")]
+
+
+def test_lock_pins_with_extras_are_found(tmp_path):
+    root = _repo(tmp_path, {
+        "pyproject.toml": PYPROJECT,
+        "deploy/requirements.lock": 'blastbox[host]==0.1.17 \\\n    --hash=sha256:abc\n',
+    })
+    assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.27"]
+
+
+def test_a_malformed_pyproject_raises_instead_of_reporting_clean(tmp_path):
+    """Silently returning no pins makes a drifted repo look OK."""
+    import pytest as _pytest
+
+    from blastbox.host.pins import PinScanError
+
+    root = _repo(tmp_path, {"pyproject.toml": "[project\nname = broken"})
+    with _pytest.raises(PinScanError):
+        scan(root)
+
+
+def test_echoing_a_requirement_is_not_an_install(tmp_path):
+    """`pip`/`install` as bare words is not an install command."""
+    root = _repo(tmp_path, {
+        "pyproject.toml": PYPROJECT,
+        "deploy/docker/Dockerfile.w": '''
+            FROM p
+            RUN echo "to install run: blastbox>=0.1.9" > /etc/readme
+        ''',
+    })
+    assert {p.floor for p in scan(root)} == {"0.1.27"}
+    assert not [p for p in scan(root) if p.kind.startswith("dockerfile")]
+
+
+def test_a_bare_name_does_not_attribute_to_the_description(tmp_path):
+    """Real shape: pdf-titan-arum's description contains the word "blastbox".
+
+    A bare-name needle matched the description line and reported pyproject:8
+    instead of the dependency at :12.
+    """
+    root = _repo(tmp_path, {
+        "pyproject.toml": '''
+            [project]
+            name = "titanarum"
+            version = "0.1.0"
+            description = "PDF forensic engine for blastbox"
+            dependencies = ["blastbox>=0.1.27,<0.2"]
+        '''
+    })
+    pins = scan(root)
+    assert [p.line for p in pins] == [6], [(p.line, p.raw) for p in pins]
