@@ -616,38 +616,163 @@ def test_unparseable_inspect_output_raises_rather_than_reading_as_unstamped():
         read("ambiguous", run)
 
 
-def test_a_dockerfile_that_ignores_the_pinned_arg_is_refused(tmp_path):
-    """docker WARNS and ignores an undeclared --build-arg.
+def _df(tmp_path, body):
+    p = tmp_path / "Dockerfile"
+    p.write_text(body)
+    return p
 
-    The build then resolves the mutable tag itself while the label claims a
-    pinned digest: a stamp wrong in the one way that matters, produced silently
-    by a typo in the ARG name.
-    """
+
+def _refused(path, arg="BASE_IMAGE"):
+    """Return the refusal message, or fail if the file was accepted."""
     import pytest as _pytest
 
-    from blastbox.host.stamp import StampError
+    from blastbox.host.stamp import StampError, assert_arg_selects_base
 
-    df = tmp_path / "Dockerfile"
-    df.write_text("FROM alpine\nARG SOMETHING_ELSE=1\n", encoding="utf-8")
-    with _pytest.raises(StampError) as err:
-        build_args(blastbox_version="0.1.27", repo=".", base="b:t",
-                   dockerfile=df, runner=_git("5aa1abc"))
-    assert "SOMETHING_ELSE" in str(err.value)      # names what IS declared
+    with _pytest.raises(StampError) as e:
+        assert_arg_selects_base(path, arg)
+    return str(e.value)
 
 
-def test_a_dockerfile_declaring_the_arg_is_accepted(tmp_path):
-    df = tmp_path / "Dockerfile"
-    df.write_text("FROM alpine\nARG BASE_IMAGE=x\n", encoding="utf-8")
-    args = build_args(blastbox_version="0.1.27", repo=".", base="b:t",
-                      dockerfile=df, runner=_git("5aa1abc"))
-    assert any("BASE_IMAGE=b@" in a for a in args)
+def test_an_undeclared_arg_is_refused_and_the_real_args_are_named(tmp_path):
+    """docker WARNS and ignores an undeclared --build-arg.
+
+    The build resolves the mutable tag itself while the label claims a pinned
+    digest: a stamp wrong in the one way that matters, from a typo in a name.
+    """
+    msg = _refused(_df(tmp_path, "ARG BASE\nFROM ${BASE}\n"))
+    assert "declares no `ARG BASE_IMAGE`" in msg
+    assert "BASE" in msg  # tell the caller what IS declared
 
 
-def test_the_arg_check_is_skipped_when_no_base_is_pinned(tmp_path):
-    """No base means no --build-arg, so there is nothing for the Dockerfile
-    to declare."""
-    df = tmp_path / "Dockerfile"
-    df.write_text("FROM alpine\n", encoding="utf-8")
-    args = build_args(blastbox_version="0.1.27", repo=".",
-                      dockerfile=df, runner=_git("5aa1abc"))
-    assert any("org.blastbox.version=0.1.27" in a for a in args)
+def test_an_arg_the_base_never_interpolates_is_refused(tmp_path):
+    """Declaration is not selection.
+
+    `FROM alpine` + `ARG BASE_IMAGE` accepts the build-arg and ignores it, so
+    the image is alpine-based while the label claims the pinned digest. This is
+    the exact vector codex raised on #101 against the first version of this
+    check, which looked only for the declaration.
+    """
+    msg = _refused(_df(tmp_path, "FROM alpine\nARG BASE_IMAGE=x\n"))
+    assert "does not interpolate it" in msg
+    assert "alpine" in msg
+
+
+def test_an_arg_declared_only_inside_a_stage_is_refused(tmp_path):
+    """Only an ARG before the first FROM can parameterize a FROM.
+
+    Declared in-stage, the base stays a constant while the label says pinned.
+    """
+    msg = _refused(_df(tmp_path, "FROM ${BASE_IMAGE}\nARG BASE_IMAGE\nRUN true\n"))
+    assert "BEFORE the first" in msg
+
+
+def test_a_file_with_no_from_is_refused(tmp_path):
+    assert "no FROM" in _refused(_df(tmp_path, "ARG BASE_IMAGE\nRUN true\n"))
+
+
+def test_a_correctly_parameterized_dockerfile_is_accepted(tmp_path):
+    from blastbox.host.stamp import assert_arg_selects_base
+
+    assert_arg_selects_base(_df(tmp_path, "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\nRUN true\n"), "BASE_IMAGE")
+
+
+def test_the_instruction_keyword_is_case_insensitive(tmp_path):
+    """`arg`/`from` are valid Dockerfile syntax; uppercase is only convention.
+
+    Rejecting them would refuse a file docker builds correctly.
+    """
+    from blastbox.host.stamp import assert_arg_selects_base
+
+    assert_arg_selects_base(_df(tmp_path, "arg BASE_IMAGE=d\nfrom ${BASE_IMAGE}\n"), "BASE_IMAGE")
+
+
+def test_the_arg_name_is_case_sensitive(tmp_path):
+    """Keywords fold; NAMES do not. `ARG base_image` does not satisfy BASE_IMAGE."""
+    assert "declares no" in _refused(_df(tmp_path, "ARG base_image\nfrom ${base_image}\n"))
+
+
+def test_a_dollar_prefix_of_a_longer_name_does_not_count(tmp_path):
+    """`$BASE_IMAGE_TAG` interpolates a DIFFERENT arg than `$BASE_IMAGE`."""
+    body = "ARG BASE_IMAGE\nARG BASE_IMAGE_TAG\nFROM $BASE_IMAGE_TAG\n"
+    assert "does not interpolate" in _refused(_df(tmp_path, body))
+
+
+def test_a_bare_dollar_reference_is_accepted(tmp_path):
+    from blastbox.host.stamp import assert_arg_selects_base
+
+    assert_arg_selects_base(_df(tmp_path, "ARG BASE_IMAGE\nFROM $BASE_IMAGE\n"), "BASE_IMAGE")
+
+
+def test_a_default_expansion_is_accepted(tmp_path):
+    from blastbox.host.stamp import assert_arg_selects_base
+
+    assert_arg_selects_base(
+        _df(tmp_path, "ARG BASE_IMAGE\nFROM ${BASE_IMAGE:-alpine}\n"), "BASE_IMAGE"
+    )
+
+
+def test_a_platform_flag_does_not_hide_the_reference(tmp_path):
+    from blastbox.host.stamp import assert_arg_selects_base
+
+    assert_arg_selects_base(
+        _df(tmp_path, "ARG BASE_IMAGE\nFROM --platform=linux/amd64 ${BASE_IMAGE}\n"),
+        "BASE_IMAGE",
+    )
+
+
+def test_a_continued_from_line_is_read_as_one_instruction(tmp_path):
+    """Split across a backslash, a naive line reader sees a FROM with no ref."""
+    from blastbox.host.stamp import assert_arg_selects_base
+
+    assert_arg_selects_base(
+        _df(tmp_path, "ARG BASE_IMAGE\nFROM \\\n  ${BASE_IMAGE}\n"), "BASE_IMAGE"
+    )
+
+
+def test_a_multistage_final_stage_is_the_one_that_must_be_pinned(tmp_path):
+    """The BUILDER may be parameterized while the shipped image is not.
+
+    Only the last stage becomes the image, so pinning the builder pins nothing.
+    """
+    body = "ARG BASE_IMAGE\nFROM ${BASE_IMAGE} AS builder\nRUN true\nFROM alpine\nCOPY --from=builder /x /x\n"
+    assert "does not interpolate" in _refused(_df(tmp_path, body))
+
+
+def test_a_final_stage_inheriting_a_parameterized_stage_is_accepted(tmp_path):
+    """`FROM builder` IS based on whatever builder was built from."""
+    from blastbox.host.stamp import assert_arg_selects_base
+
+    body = "ARG BASE_IMAGE\nFROM ${BASE_IMAGE} AS builder\nRUN true\nFROM builder\nRUN true\n"
+    assert_arg_selects_base(_df(tmp_path, body), "BASE_IMAGE")
+
+
+def test_stage_names_resolve_case_insensitively(tmp_path):
+    """docker lowercases stage names, so `FROM Builder` is the same stage."""
+    from blastbox.host.stamp import assert_arg_selects_base
+
+    body = "ARG BASE_IMAGE\nFROM ${BASE_IMAGE} AS builder\nFROM Builder\n"
+    assert_arg_selects_base(_df(tmp_path, body), "BASE_IMAGE")
+
+
+def test_a_comment_that_looks_like_an_arg_does_not_count(tmp_path):
+    """Prose is not a declaration -- the same trap the pin scanner exists for."""
+    body = "# ARG BASE_IMAGE is what you would use\nFROM alpine\n"
+    assert "declares no" in _refused(_df(tmp_path, body))
+
+
+def test_a_comment_ending_in_a_backslash_does_not_swallow_the_next_line(tmp_path):
+    """Docker strips comments BEFORE joining continuations.
+
+    Treating the backslash as a continuation joins the comment onto the FROM,
+    and the file then parses as having no base at all.
+    """
+    from blastbox.host.stamp import assert_arg_selects_base
+
+    body = "ARG BASE_IMAGE\n# a trailing backslash in prose \\\nFROM ${BASE_IMAGE}\n"
+    assert_arg_selects_base(_df(tmp_path, body), "BASE_IMAGE")
+
+
+def test_an_arg_name_differing_only_in_case_is_not_the_same_arg(tmp_path):
+    """docker matches build-arg names exactly; `base_image` != `BASE_IMAGE`."""
+    body = "ARG base_image\nFROM ${base_image}\n"
+    assert "declares no `ARG BASE_IMAGE`" in _refused(_df(tmp_path, body))

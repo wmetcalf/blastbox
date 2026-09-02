@@ -279,29 +279,122 @@ def base_digest(image: str, runner: Runner | None = None) -> str:
     )
 
 
-def assert_arg_declared(dockerfile: Path | str, base_arg: str) -> None:
-    """Fail unless ``dockerfile`` declares ``base_arg`` as an ARG.
+def _logical_lines(text: str) -> list[str]:
+    """Dockerfile instructions, comments dropped and continuations joined.
 
-    Docker WARNS and ignores a --build-arg the Dockerfile never declares. The
-    build then resolves the mutable tag itself while the label claims a pinned
-    digest -- a stamp that is wrong in the one way that matters, produced
-    silently. The whole point of pinning is defeated by a typo in the ARG name.
+    A `FROM` split across lines with a trailing backslash is one instruction to
+    docker; treating it as two makes the base look like a bare `FROM` with no
+    reference, so the check would pass a file it never actually read.
+    """
+    lines: list[str] = []
+    pending = ""
+    for raw in text.splitlines():
+        if not pending and re.match(r"^\s*#", raw):
+            continue
+        stripped = raw.rstrip()
+        if stripped.endswith("\\"):
+            pending += stripped[:-1] + " "
+            continue
+        lines.append((pending + stripped).strip())
+        pending = ""
+    if pending:
+        lines.append(pending.strip())
+    return [ln for ln in lines if ln]
+
+
+def _uses(ref: str, name: str) -> bool:
+    """Does ``ref`` interpolate the build arg ``name``?
+
+    Both `$NAME` and `${NAME...}` (including `${NAME:-default}`) count. Arg
+    NAMES are case-sensitive even though instruction keywords are not.
+    """
+    return bool(
+        re.search(rf"\$\{{{re.escape(name)}[}}:]", ref)
+        or re.search(rf"\${re.escape(name)}(?![A-Za-z0-9_])", ref)
+    )
+
+
+def assert_arg_selects_base(dockerfile: Path | str, base_arg: str) -> None:
+    """Fail unless ``base_arg`` actually chooses the image's base.
+
+    Three distinct ways a `--build-arg <base_arg>=<digest>` silently fails to
+    pin anything, all of which leave a label claiming a base the build did not
+    use -- the one kind of wrong stamp that matters:
+
+    * The ARG is not declared. Docker WARNS and IGNORES the build-arg.
+    * The ARG is declared, but only INSIDE a stage. Only an ARG before the
+      first FROM can parameterize a FROM, so an in-stage declaration leaves
+      the base a constant.
+    * The ARG is declared globally and never interpolated into the base at
+      all. `FROM alpine` + `ARG BASE_IMAGE` accepts the flag and ignores it.
+
+    Multi-stage builds resolve through their stage graph: the final stage's
+    base may name an earlier stage, and it is that chain's terminal reference
+    that has to be the parameterized one.
     """
     path = Path(dockerfile)
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise StampError(f"{path}: cannot read ({exc})") from exc
-    declared = re.search(
-        rf"^\s*ARG\s+{re.escape(base_arg)}\b", text, re.MULTILINE
-    )
-    if not declared:
-        args = sorted(set(re.findall(r"^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)", text, re.MULTILINE)))
+
+    lines = _logical_lines(text)
+    # Instruction keywords are case-insensitive ("arg x" is valid); arg and
+    # stage NAMES are not (stage names docker lowercases, arg names it does not).
+    global_args: list[str] = []
+    all_args: list[str] = []
+    stages: list[tuple[str, str | None]] = []  # (base ref, stage name)
+    for ln in lines:
+        if m := re.match(r"(?i)^ARG\s+([A-Za-z_][A-Za-z0-9_]*)", ln):
+            all_args.append(m.group(1))
+            if not stages:
+                global_args.append(m.group(1))
+        elif m := re.match(r"(?i)^FROM\s+(.*)$", ln):
+            rest = re.sub(r"(?i)^(--\S+\s+)*", "", m.group(1)).strip()
+            parts = rest.split()
+            if not parts:
+                continue
+            name = None
+            if len(parts) >= 3 and parts[-2].lower() == "as":
+                name = parts[-1].lower()
+            stages.append((parts[0], name))
+
+    if not stages:
+        raise StampError(f"{path}: no FROM instruction; nothing to pin.")
+
+    if base_arg not in all_args:
         raise StampError(
             f"{path} declares no `ARG {base_arg}`, so docker would ignore the "
             f"--build-arg that pins the base and the stamp would claim a digest "
-            f"the build did not use. Declared ARGs: {', '.join(args) or 'none'}. "
+            f"the build did not use. Declared ARGs: "
+            f"{', '.join(sorted(set(all_args))) or 'none'}. "
             f"Pass --base-arg with the right name, or add the ARG."
+        )
+
+    # Follow the final stage back through any stage-to-stage references: the
+    # base of `FROM builder` is whatever `builder` was built FROM.
+    named = {n: ref for ref, n in stages if n}
+    ref = stages[-1][0]
+    seen: set[str] = set()
+    while (key := ref.lower()) in named and key not in seen:
+        seen.add(key)
+        ref = named[key]
+
+    if not _uses(ref, base_arg):
+        raise StampError(
+            f"{path} declares `ARG {base_arg}` but its base is {ref!r}, which "
+            f"does not interpolate it. docker would accept the --build-arg and "
+            f"build on {ref!r} anyway, while the label claimed the pinned "
+            f"digest. Write the base as `FROM ${{{base_arg}}}`, or stamp "
+            f"without --base."
+        )
+
+    if base_arg not in global_args:
+        raise StampError(
+            f"{path} declares `ARG {base_arg}` only inside a build stage. Docker "
+            f"honours an ARG in a FROM only when it is declared BEFORE the first "
+            f"FROM, so the base would not be pinned while the label said it was. "
+            f"Move `ARG {base_arg}` above the first FROM."
         )
 
 
@@ -329,7 +422,7 @@ def build_args(
     Failing loudly beats emitting something that silently mis-parses.
     """
     if base and dockerfile is not None:
-        assert_arg_declared(dockerfile, base_arg)
+        assert_arg_selects_base(dockerfile, base_arg)
     revision = git_revision(repo, runner)
     if revision != UNKNOWN and not _REVISION_RE.match(revision):
         raise StampError(
