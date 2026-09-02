@@ -348,7 +348,7 @@ def test_a_local_only_base_is_reproducible_via_its_image_id():
     ).reproducible
 
 
-def test_a_local_only_base_is_stamped_and_pinned_by_image_id():
+def test_a_local_only_base_records_the_image_id_and_pins_by_reference():
     """Every image on these hosts is local-only, so this is the common path.
 
     The ID goes in its own label (not the OCI digest key); the build is pinned
@@ -819,3 +819,71 @@ def test_a_local_only_base_is_pinned_by_a_reference_a_builder_can_resolve(tmp_pa
     )
     # The ID is still RECORDED -- that is the provenance; only the pin changes.
     assert f"{LABEL_BASE_IMAGE_ID}={image_id}" in joined, joined
+
+
+def _moved_runner(recorded, current):
+    def run(argv):
+        argv = list(argv)
+        if "{{.Id}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, current + "\n", "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    return run
+
+
+def test_a_moved_local_base_is_reported_rather_than_read_as_verified():
+    """A local tag can move between the inspection and the build.
+
+    Concurrent builds do exactly this, and the result is a child built from B
+    while its label names A. Nothing prevents it without a registry digest --
+    but the reference either still resolves to the recorded ID or it does not.
+    """
+    from blastbox.host.stamp import Stamp
+
+    old, new = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+    s = Stamp(blastbox="0.1.28", revision="c" * 40, base_name="redtusk-worker:bb0128",
+              base_digest="", base_image_id=old)
+    assert s.base_moved(_moved_runner(old, new)) == new
+    assert s.base_moved(_moved_runner(old, old)) == "", "unmoved must report nothing"
+
+
+def test_a_registry_digest_is_never_reported_as_moved():
+    """A digest is immutable; asking whether it moved is a category error."""
+    from blastbox.host.stamp import Stamp
+
+    s = Stamp(blastbox="0.1.28", revision="c" * 40, base_name="redtusk-worker:bb0128",
+              base_digest="sha256:" + "d" * 64, base_image_id="sha256:" + "a" * 64)
+
+    def explode(argv):  # must not even be consulted
+        raise AssertionError("docker was asked about an immutable digest")
+
+    assert s.base_moved(explode) == ""
+
+
+def test_an_unanswerable_move_check_raises_rather_than_reporting_agreement():
+    """Silence would read as "verified" -- the same rule resolvable follows."""
+    import pytest as _pytest
+
+    from blastbox.host.stamp import Stamp, StampError
+
+    s = Stamp(blastbox="0.1.28", revision="c" * 40, base_name="redtusk-worker:bb0128",
+              base_digest="", base_image_id="sha256:" + "a" * 64)
+
+    def broken(argv):
+        return subprocess.CompletedProcess(argv, 1, "", "Cannot connect to the Docker daemon")
+
+    with _pytest.raises(StampError):
+        s.base_moved(broken)
+
+
+def test_an_absent_base_is_left_to_resolvable_not_double_reported():
+    """One problem must not be counted as two."""
+    from blastbox.host.stamp import Stamp
+
+    s = Stamp(blastbox="0.1.28", revision="c" * 40, base_name="redtusk-worker:bb0128",
+              base_digest="", base_image_id="sha256:" + "a" * 64)
+
+    def gone(argv):
+        return subprocess.CompletedProcess(argv, 1, "", "Error: No such image: redtusk-worker:bb0128")
+
+    assert s.base_moved(gone) == ""

@@ -145,6 +145,48 @@ class Stamp:
         )
 
 
+    def base_moved(self, runner: Runner | None = None) -> str:
+        """The base reference's CURRENT image ID, when it differs from the record.
+
+        Empty string means "no disagreement to report": either the base was
+        pinned by a registry digest (immutable, nothing to check), nothing was
+        recorded, or the reference still resolves to the image that was stamped.
+
+        This is the check that makes an ID-only stamp trustworthy after the
+        fact. A local tag can move between the inspection that produced the
+        label and the build that consumed it -- concurrent builds do exactly
+        this -- and the result is a child built from B while claiming A.
+        Nothing can prevent that without a registry digest, but the tag either
+        still resolves to the recorded ID or it does not, and that is
+        answerable.
+
+        Raises rather than reporting agreement when the question cannot be
+        asked, for the same reason `resolvable` does: a failure to ASK is not
+        an answer, and silence here would read as "verified".
+        """
+        if _DIGEST_RE.match(self.base_digest or ""):
+            return ""  # a registry digest cannot move
+        recorded = self.base_image_id or ""
+        name = self.base_name or ""
+        if not _DIGEST_RE.match(recorded) or name in (UNKNOWN, ""):
+            return ""
+        run = runner or _run
+        proc = run(["docker", "inspect", "--type", "image", name, "--format", "{{.Id}}"])
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").lower()
+            if "no such" in stderr or "not found" in stderr:
+                # The reference is gone entirely -- that is `resolvable`'s
+                # finding, not a moved tag, and reporting it here too would
+                # double-count one problem as two.
+                return ""
+            raise StampError(
+                f"cannot determine whether {name} still resolves to the recorded "
+                f"image: {(proc.stderr or '').strip()[:120]}"
+            )
+        current = (proc.stdout or "").strip()
+        return "" if current == recorded else current
+
+
 REVISION_FILE = ".blastbox-revision"
 
 
@@ -408,10 +450,17 @@ def build_args(
     When ``base`` is given, the returned flags ALSO pin the build to what is
     being recorded (``--build-arg <base_arg>=repo@sha256:...``, or the caller's
     reference for a local-only base, which buildkit can resolve where an image
-    ID cannot). Resolving a reference and then letting the build
-    resolve the mutable tag independently -- especially with ``--pull`` -- can
-    stamp one image while building on another. Pinning makes the stamp true by
-    construction.
+    ID cannot). Resolving a reference and then letting the build resolve the
+    mutable tag independently -- especially with ``--pull`` -- can stamp one
+    image while building on another.
+
+    A REGISTRY DIGEST makes the stamp true by construction. A local-only base
+    does not: the reference is mutable, so if the tag moves between the
+    inspection here and the build, the label names the image that was inspected
+    while the build used the one the tag points at now. What that buys is
+    DETECTION rather than prevention -- ``Stamp.base_moved`` compares the
+    recorded ID against what the reference resolves to today, and ``--read``
+    reports the disagreement. Push the base to a registry for prevention.
 
     Base labels are emitted even with no base, as empty values: docker inherits
     LABELs from the parent, so an unset base label would silently carry the

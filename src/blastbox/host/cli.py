@@ -1255,6 +1255,7 @@ def _stamp_cmd(args: argparse.Namespace) -> int:
         got = st.read(args.read)
         agrees, detail = st.verify_contents(args.read)
         resolvable = got.resolvable() if got.reproducible else False
+        moved = got.base_moved() if resolvable else ""
     except st.StampError as exc:
         # "could not perform the check" -- distinct from a real finding, and the
         # same exit code doctor and pins use for it.
@@ -1274,6 +1275,16 @@ def _stamp_cmd(args: argparse.Namespace) -> int:
         )
         return 1
     if got.reproducible:
+        if resolvable and moved:
+            print(
+                f"\nTHE BASE HAS MOVED: {got.base_name} resolved to\n"
+                f"  {got.base_image_id} when this was stamped, and to\n"
+                f"  {moved} now.\n"
+                "  A local reference is not an immutable pin, so this image may\n"
+                "  have been built from a different image than its label names.\n"
+                "  Push the base to a registry to pin by digest instead."
+            )
+            return 1
         if resolvable:
             print("\nOK: records what it was built from, and that base is still here")
             return 0
