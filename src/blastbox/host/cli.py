@@ -1198,8 +1198,9 @@ def _stamp_cmd(args: argparse.Namespace) -> int:
     if True:
         print(f"  blastbox    {got.blastbox}")
         print(f"  revision    {got.revision}")
-        print(f"  base name   {got.base_name}")
-        print(f"  base digest {got.base_digest}")
+        print(f"  base name     {got.base_name}")
+        print(f"  base digest   {got.base_digest}")
+        print(f"  base image id {got.base_image_id}")
         if got.reproducible:
             print("\nOK: records the base digest and source revision it was built from")
             return 0

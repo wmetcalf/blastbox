@@ -60,17 +60,25 @@ def test_base_is_recorded_by_digest_not_tag():
     assert base_digest("reg/img:tag", run) == "sha256:deadbeef"
 
 
-def test_a_local_only_base_falls_back_to_the_image_id():
-    """Never-pushed bases have no repo digest, but the image ID still pins it."""
+def test_a_local_only_base_has_no_repo_digest():
+    """An image ID is NOT a repo digest and must not be written as one."""
     def run(argv):
         argv = list(argv)
         if "{{json .RepoDigests}}" in argv:
             return subprocess.CompletedProcess(argv, 0, "[]", "")
-        # Only answer the actual image-ID inspect, so the test notices if the
-        # fallback stops making that call.
+        return subprocess.CompletedProcess(argv, 1, "", "")
+    assert base_digest("redtusk-worker:bb0127", run) == ""
+
+
+def test_the_image_id_is_recorded_under_its_own_label():
+    from blastbox.host.stamp import LABEL_BASE_IMAGE_ID, base_image_id
+
+    def run(argv):
+        argv = list(argv)
         assert argv[:2] == ["docker", "inspect"] and "{{.Id}}" in argv, argv
         return subprocess.CompletedProcess(argv, 0, "sha256:localid\n", "")
-    assert base_digest("redtusk-worker:bb0127", run) == "sha256:localid"
+    assert base_image_id("img:tag", run) == "sha256:localid"
+    assert LABEL_BASE_IMAGE_ID != "org.opencontainers.image.base.digest"
 
 
 def test_build_args_carry_all_four_facts():
@@ -173,8 +181,10 @@ def test_a_dirty_build_is_not_reproducible():
     """
     from blastbox.host.stamp import Stamp
 
-    assert not Stamp(revision="abc-dirty", base_digest="sha256:bd").reproducible
-    assert Stamp(revision="abc", base_digest="sha256:bd").reproducible
+    assert not Stamp(
+        revision="abc-dirty", base_name="b:t", base_digest="sha256:bd").reproducible
+    assert Stamp(
+        revision="abc", base_name="b:t", base_digest="sha256:bd").reproducible
 
 
 def test_base_labels_are_emitted_even_without_a_base():
@@ -259,12 +269,18 @@ def test_an_uninspectable_image_raises_rather_than_reading_as_unstamped():
         read("typo:tag", run)
 
 
-def test_emitted_args_are_shell_quoted():
-    """The output is meant for command substitution."""
-    args = build_args(
-        blastbox_version="0.1.27 rc1", repo=".", runner=_git("s"))
-    joined = " ".join(args)
-    assert "'org.blastbox.version=0.1.27 rc1'" in joined
+def test_a_value_needing_quotes_is_refused_not_quoted():
+    """Command substitution word-splits WITHOUT removing quotes.
+
+    A quoted value arrives with literal quote characters attached, so emitting
+    one would silently corrupt the build. Refusing is the honest answer.
+    """
+    import pytest as _pytest
+
+    from blastbox.host.stamp import StampError
+
+    with _pytest.raises(StampError):
+        build_args(blastbox_version="0.1.27 rc1", repo=".", runner=_git("s"))
 
 
 def test_a_registry_port_is_not_mistaken_for_a_tag():
@@ -276,3 +292,60 @@ def test_a_registry_port_is_not_mistaken_for_a_tag():
     assert repo_of("img:tag") == "img"
     assert repo_of("img@sha256:abc") == "img"
     assert repo_of("ns/img:tag") == "ns/img"
+
+
+def test_a_missing_git_binary_falls_back_to_the_revision_file(tmp_path):
+    """A deployed rsynced tree often has no git at all -- exactly where the
+    recorded revision matters most. subprocess raises FileNotFoundError there,
+    which is not a non-zero returncode."""
+    from blastbox.host.stamp import REVISION_FILE
+
+    (tmp_path / REVISION_FILE).write_text("recorded-sha\n", encoding="utf-8")
+
+    def run(argv):
+        raise FileNotFoundError("git")
+    assert git_revision(tmp_path, run) == "recorded-sha"
+
+
+def test_a_base_digest_without_a_name_is_not_reproducible():
+    """A bare sha256 does not say which repository to pull it from."""
+    from blastbox.host.stamp import Stamp
+
+    assert not Stamp(revision="abc", base_digest="sha256:bd").reproducible
+    assert Stamp(revision="abc", base_digest="sha256:bd", base_name="b:t").reproducible
+
+
+def test_a_local_only_base_is_reproducible_via_its_image_id():
+    from blastbox.host.stamp import Stamp
+
+    assert Stamp(
+        revision="abc", base_name="b:t", base_image_id="sha256:localid",
+    ).reproducible
+
+
+def test_a_local_only_base_is_stamped_and_pinned_by_image_id():
+    """Every image on these hosts is local-only, so this is the common path.
+
+    The ID goes in its own label (not the OCI digest key) and the build is
+    pinned to it.
+    """
+    from blastbox.host.stamp import LABEL_BASE_DIGEST, LABEL_BASE_IMAGE_ID
+
+    def run(argv):
+        argv = list(argv)
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(argv, 0, "sha1\n", "")
+        if "status" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if "{{json .RepoDigests}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if "{{.Id}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, "sha256:localid\n", "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    joined = " ".join(build_args(
+        blastbox_version="0.1.27", repo=".", base="redtusk-worker:bb0127", runner=run))
+    assert f"{LABEL_BASE_IMAGE_ID}=sha256:localid" in joined
+    assert f"{LABEL_BASE_DIGEST}=" in joined            # emitted, but empty
+    assert f"{LABEL_BASE_DIGEST}=sha256:localid" not in joined   # never as a digest
+    assert "BASE_IMAGE=sha256:localid" in joined        # build pinned to the ID

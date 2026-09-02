@@ -22,7 +22,7 @@ plus ``org.blastbox.version`` for the framework version, which OCI has no key fo
 from __future__ import annotations
 
 import json
-import shlex
+import re
 import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -34,6 +34,16 @@ LABEL_BLASTBOX = "org.blastbox.version"
 LABEL_REVISION = "org.opencontainers.image.revision"
 LABEL_BASE_NAME = "org.opencontainers.image.base.name"
 LABEL_BASE_DIGEST = "org.opencontainers.image.base.digest"
+# A local-only base has no manifest digest. Its content-addressed image ID pins
+# it exactly on this host, but it is NOT a repo digest and must not be written
+# into the OCI key as if it were.
+LABEL_BASE_IMAGE_ID = "org.blastbox.base.image_id"
+
+# Emitted flags are consumed with `$(blastbox stamp ...)`. Command substitution
+# word-splits its output but does NOT remove quotes, so a quoted value arrives
+# with literal quote characters attached. Rather than emit something that breaks,
+# refuse values that would need quoting.
+_SHELL_SAFE = re.compile(r"^[\w@%+=:,./-]*$")
 
 UNKNOWN = "unknown"
 DIRTY_SUFFIX = "-dirty"
@@ -59,6 +69,7 @@ class Stamp:
     revision: str = UNKNOWN
     base_name: str = UNKNOWN
     base_digest: str = UNKNOWN
+    base_image_id: str = UNKNOWN
 
     @property
     def reproducible(self) -> bool:
@@ -69,8 +80,13 @@ class Stamp:
         `<sha>-dirty` build cannot be reproduced from that sha by definition:
         the uncommitted changes are not recorded anywhere.
         """
+        # The NAME is required alongside the digest: a bare `sha256:...` does
+        # not say which repository to pull it from, so it cannot be resolved
+        # back to an image on its own.
+        pinned = self.base_digest not in (UNKNOWN, "") or self.base_image_id not in (UNKNOWN, "")
         return (
-            self.base_digest not in (UNKNOWN, "")
+            pinned
+            and self.base_name not in (UNKNOWN, "")
             and self.revision not in (UNKNOWN, "")
             and not self.revision.endswith(DIRTY_SUFFIX)
         )
@@ -97,12 +113,20 @@ def git_revision(repo: Path | str, runner: Runner | None = None) -> str:
         recorded = marker.read_text(encoding="utf-8").strip()
     except OSError:
         recorded = ""
-    head = run(["git", "-C", str(repo), "rev-parse", "HEAD"])
+    try:
+        head = run(["git", "-C", str(repo), "rev-parse", "HEAD"])
+    except (FileNotFoundError, OSError):
+        # git is not installed. A deployed rsynced tree often has no git at all,
+        # which is exactly where the recorded revision matters most.
+        return recorded or UNKNOWN
     if head.returncode != 0:
         # Not a checkout: use what the deploy recorded, if anything.
         return recorded or UNKNOWN
     sha = head.stdout.strip()
-    dirty = run(["git", "-C", str(repo), "status", "--porcelain"])
+    try:
+        dirty = run(["git", "-C", str(repo), "status", "--porcelain"])
+    except (FileNotFoundError, OSError):
+        return sha
     if dirty.returncode == 0 and dirty.stdout.strip():
         return f"{sha}-dirty"
     return sha
@@ -122,14 +146,25 @@ def repo_of(image: str) -> str:
     return f"{head}{slash}{last}"
 
 
+def base_image_id(image: str, runner: Runner | None = None) -> str:
+    """The content-addressed image ID of ``image``.
+
+    Not a repo digest: this is the config digest, exact on THIS host but not a
+    manifest reference. It is recorded under its own label so it cannot be
+    mistaken for one.
+    """
+    run = runner or _run
+    proc = run(["docker", "inspect", image, "--format", "{{.Id}}"])
+    if proc.returncode == 0 and proc.stdout.strip():
+        return proc.stdout.strip()
+    raise StampError(f"{image}: cannot resolve an image ID (absent, or docker unavailable)")
+
+
 def base_digest(image: str, runner: Runner | None = None) -> str:
-    """The repo digest of ``image``, or its local image ID if never pushed.
+    """The REPO digest of ``image``, or "" when it has none (never pushed).
 
-    A local-only base has no repo digest; its content-addressed image ID is
-    still a precise identifier on this host, which is where rebuilds happen.
-
-    Raises StampError when neither can be read -- stamping `unknown` there
-    produces an image that looks recorded and cannot be rebuilt.
+    Deliberately does not fall back to the image ID: that is a different kind of
+    identifier and belongs in its own label.
     """
     run = runner or _run
     repo = repo_of(image)
@@ -151,9 +186,7 @@ def base_digest(image: str, runner: Runner | None = None) -> str:
                 f"{image}: {len(digests)} repo digests and none for {repo!r}; "
                 "cannot tell which base this is"
             )
-    proc = run(["docker", "inspect", image, "--format", "{{.Id}}"])
-    if proc.returncode == 0 and proc.stdout.strip():
-        return proc.stdout.strip()
+        return ""
     raise StampError(
         f"{image}: cannot resolve a digest (image absent, or docker unavailable). "
         "Pull or build the base first; stamping 'unknown' would look recorded "
@@ -165,32 +198,52 @@ def build_args(
     *, blastbox_version: str, repo: Path | str, base: str | None = None,
     base_arg: str = "BASE_IMAGE", runner: Runner | None = None,
 ) -> list[str]:
-    """`docker build` flags that stamp the image, shell-quoted.
+    """`docker build` flags that stamp the image.
 
-    When ``base`` is given, the returned flags ALSO pin the build to the digest
-    being recorded (``--build-arg <base_arg>=name@sha256:...``). Resolving a
-    digest and then letting the build resolve the mutable tag independently --
-    especially with ``--pull`` -- can stamp one image while building on another.
-    Pinning makes the stamp true by construction.
+    When ``base`` is given, the returned flags ALSO pin the build to what is
+    being recorded (``--build-arg <base_arg>=repo@sha256:...``, or the image ID
+    for a local-only base). Resolving a reference and then letting the build
+    resolve the mutable tag independently -- especially with ``--pull`` -- can
+    stamp one image while building on another. Pinning makes the stamp true by
+    construction.
 
-    The base labels are emitted even with no base, as empty values. Docker
-    inherits LABELs from the parent image, so an unset base label would silently
-    carry the PARENT's base digest and claim a grandparent as this image's base.
+    Base labels are emitted even with no base, as empty values: docker inherits
+    LABELs from the parent, so an unset base label would silently carry the
+    PARENT's base and claim a grandparent as this image's base.
+
+    Values that would need shell quoting are REFUSED. The output is consumed via
+    ``$(blastbox stamp ...)``, and command substitution word-splits without
+    removing quotes, so a quoted value arrives with literal quote characters.
+    Failing loudly beats emitting something that silently mis-parses.
     """
     revision = git_revision(repo, runner)
+    digest = base_digest(base, runner) if base else ""
+    image_id = base_image_id(base, runner) if base and not digest else ""
     labels = {
         LABEL_BLASTBOX: blastbox_version,
         LABEL_REVISION: revision,
         LABEL_BASE_NAME: base or "",
-        LABEL_BASE_DIGEST: base_digest(base, runner) if base else "",
+        LABEL_BASE_DIGEST: digest,
+        LABEL_BASE_IMAGE_ID: image_id,
     }
     args: list[str] = []
     for key, value in labels.items():
-        args += ["--label", shlex.quote(f"{key}={value}")]
+        _require_shell_safe(key, value)
+        args += ["--label", f"{key}={value}"]
     if base:
-        pinned = f"{repo_of(base)}@{labels[LABEL_BASE_DIGEST]}"
-        args += ["--build-arg", shlex.quote(f"{base_arg}={pinned}")]
+        pinned = f"{repo_of(base)}@{digest}" if digest else image_id
+        _require_shell_safe(base_arg, pinned)
+        args += ["--build-arg", f"{base_arg}={pinned}"]
     return args
+
+
+def _require_shell_safe(key: str, value: str) -> None:
+    if not _SHELL_SAFE.match(value):
+        raise StampError(
+            f"{key}={value!r} contains characters that would need shell quoting. "
+            "These flags are consumed with $(...), which word-splits without "
+            "removing quotes, so a quoted value would arrive corrupted."
+        )
 
 
 def read(image: str, runner: Runner | None = None) -> Stamp:
@@ -214,4 +267,5 @@ def read(image: str, runner: Runner | None = None) -> Stamp:
         revision=labels.get(LABEL_REVISION, UNKNOWN),
         base_name=labels.get(LABEL_BASE_NAME, UNKNOWN),
         base_digest=labels.get(LABEL_BASE_DIGEST, UNKNOWN),
+        base_image_id=labels.get(LABEL_BASE_IMAGE_ID, UNKNOWN),
     )
