@@ -175,9 +175,10 @@ def _version_in(runner: Runner, name: str, status: str) -> tuple[str, str]:
         # lives in an earlier venv when a later one lacks it.
         ["docker", "exec", name, "sh", "-lc",
          'for p in /opt/*/bin/python; do [ -x "$p" ] || continue; '
-         # tail -n1: an interpreter may print a banner or warning before the
-         # answer, and the answer is the LAST line, not the whole stream.
-         'v=$("$p" - <<\'EOF\'\n' + _PROBE + "EOF\n" + ' | tail -n1); '
+         # The pipe belongs on the COMMAND line, before the heredoc body --
+         # after the EOF terminator it is a syntax error, not a pipeline.
+         # tail -n1 because an interpreter may print a banner before the answer.
+         'v=$("$p" - <<\'EOF\' | tail -n1\n' + _PROBE + "EOF\n" + '); '
          'case "$v" in ""|NOPKG*|PROBEFAIL*) continue;; *) printf %s "$v"; exit 0;; esac; '
          'done; printf NOPKG'],
     ]

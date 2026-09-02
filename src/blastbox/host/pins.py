@@ -94,7 +94,7 @@ class PinScanError(RuntimeError):
 # comparison specifier, so the requirement pattern cannot see it, and dropping it
 # silently is the worst outcome: it is the strongest pin a repo can express.
 _DIRECT_REF_RE = re.compile(
-    r"^(?i:blastbox)(?:\[[a-zA-Z0-9,._\-]+\])?\s*@\s*(?P<url>\S+)"
+    r"(?<![\w.\-])(?i:blastbox)(?:\[[a-zA-Z0-9,._\-]+\])?\s*@\s*(?P<url>[^\s\"']+)"
 )
 
 
@@ -258,11 +258,18 @@ def _scan_dockerfile(path: Path) -> list[Pin]:
 
 
 def _isolate_requirements(line: str) -> list[str]:
-    """Every blastbox requirement token on an install command line."""
+    """Every blastbox requirement token on an install command line.
+
+    Includes DIRECT REFERENCES (`blastbox @ git+https://…`): a Dockerfile can
+    install one just as a pyproject can, and dropping it here would repeat the
+    silent-omission bug already fixed for pyproject.
+    """
     out: list[str] = []
     for m in _REQ_RE.finditer(line):
         start = line.lower().rfind("blastbox", 0, m.end())
         out.append(line[start : m.end()])
+    for m in _DIRECT_REF_RE.finditer(line):
+        out.append(m.group(0))
     return out
 
 

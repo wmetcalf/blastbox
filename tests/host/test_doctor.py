@@ -440,3 +440,41 @@ def test_a_banner_before_the_venv_answer_is_ignored():
 
     survey(run)
     assert "tail -n1" in seen[0], seen[0]
+
+
+def test_the_emitted_venv_shell_actually_runs():
+    """EXECUTE the probe, do not just assert its text.
+
+    A previous version placed `| tail -n1` after the heredoc terminator, which
+    is a shell syntax error -- and every unit test still passed, because the
+    fakes return canned output and never run the string. This runs it against a
+    real interpreter that prints a banner before the version.
+    """
+    import os
+    import pathlib
+    import tempfile
+
+    from blastbox.host import doctor
+
+    captured: list[str] = []
+
+    def capture(argv):
+        argv = list(argv)
+        if argv[:2] == ["docker", "exec"] and argv[3] == "sh":
+            captured.append(argv[-1])
+        return subprocess.CompletedProcess(argv, 127, "", "exec: not found")
+
+    doctor._version_in(capture, "x", "Up")
+    assert captured, "the venv probe was never built"
+
+    root = tempfile.mkdtemp()
+    binpath = pathlib.Path(root) / "venvA" / "bin"
+    binpath.mkdir(parents=True)
+    fake = binpath / "python"
+    fake.write_text('#!/bin/sh\ncat >/dev/null\necho "WARNING: banner"\necho "0.1.27"\n')
+    os.chmod(fake, 0o755)
+
+    shell = captured[0].replace("/opt/*/bin/python", f"{root}/*/bin/python")
+    proc = subprocess.run(["sh", "-lc", shell], capture_output=True, text=True)
+    assert proc.returncode == 0, f"rc={proc.returncode} stderr={proc.stderr!r}"
+    assert proc.stdout == "0.1.27", f"stdout={proc.stdout!r}"

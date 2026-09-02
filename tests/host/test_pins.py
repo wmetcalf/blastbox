@@ -489,3 +489,16 @@ def test_constraint_files_with_range_specifiers_are_parsed(tmp_path):
         "constraints.txt": "blastbox>=0.1.9,<0.2\n",
     })
     assert sorted(disagreements(scan(root))) == ["0.1.27", "0.1.9"]
+
+
+def test_a_direct_reference_on_a_dockerfile_install_line_is_a_pin(tmp_path):
+    """A Dockerfile can install a direct reference just as a pyproject can."""
+    root = _repo(tmp_path, {
+        "pyproject.toml": PYPROJECT,
+        "deploy/docker/Dockerfile.w": '''
+            FROM p
+            RUN pip install "blastbox @ git+https://example.invalid/b@v0.1.30"
+        ''',
+    })
+    refs = [p for p in scan(root) if p.specifier.startswith("@")]
+    assert len(refs) == 1, [(p.file if hasattr(p, "file") else p.path, p.specifier) for p in scan(root)]
