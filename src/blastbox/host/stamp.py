@@ -279,9 +279,36 @@ def base_digest(image: str, runner: Runner | None = None) -> str:
     )
 
 
+def assert_arg_declared(dockerfile: Path | str, base_arg: str) -> None:
+    """Fail unless ``dockerfile`` declares ``base_arg`` as an ARG.
+
+    Docker WARNS and ignores a --build-arg the Dockerfile never declares. The
+    build then resolves the mutable tag itself while the label claims a pinned
+    digest -- a stamp that is wrong in the one way that matters, produced
+    silently. The whole point of pinning is defeated by a typo in the ARG name.
+    """
+    path = Path(dockerfile)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise StampError(f"{path}: cannot read ({exc})") from exc
+    declared = re.search(
+        rf"^\s*ARG\s+{re.escape(base_arg)}\b", text, re.MULTILINE
+    )
+    if not declared:
+        args = sorted(set(re.findall(r"^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)", text, re.MULTILINE)))
+        raise StampError(
+            f"{path} declares no `ARG {base_arg}`, so docker would ignore the "
+            f"--build-arg that pins the base and the stamp would claim a digest "
+            f"the build did not use. Declared ARGs: {', '.join(args) or 'none'}. "
+            f"Pass --base-arg with the right name, or add the ARG."
+        )
+
+
 def build_args(
     *, blastbox_version: str, repo: Path | str, base: str | None = None,
-    base_arg: str = "BASE_IMAGE", runner: Runner | None = None,
+    base_arg: str = "BASE_IMAGE", dockerfile: Path | str | None = None,
+    runner: Runner | None = None,
 ) -> list[str]:
     """`docker build` flags that stamp the image.
 
@@ -301,6 +328,8 @@ def build_args(
     removing quotes, so a quoted value arrives with literal quote characters.
     Failing loudly beats emitting something that silently mis-parses.
     """
+    if base and dockerfile is not None:
+        assert_arg_declared(dockerfile, base_arg)
     revision = git_revision(repo, runner)
     if revision != UNKNOWN and not _REVISION_RE.match(revision):
         raise StampError(

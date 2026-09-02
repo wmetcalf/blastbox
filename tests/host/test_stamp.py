@@ -614,3 +614,40 @@ def test_unparseable_inspect_output_raises_rather_than_reading_as_unstamped():
 
     with _pytest.raises(StampError):
         read("ambiguous", run)
+
+
+def test_a_dockerfile_that_ignores_the_pinned_arg_is_refused(tmp_path):
+    """docker WARNS and ignores an undeclared --build-arg.
+
+    The build then resolves the mutable tag itself while the label claims a
+    pinned digest: a stamp wrong in the one way that matters, produced silently
+    by a typo in the ARG name.
+    """
+    import pytest as _pytest
+
+    from blastbox.host.stamp import StampError
+
+    df = tmp_path / "Dockerfile"
+    df.write_text("FROM alpine\nARG SOMETHING_ELSE=1\n", encoding="utf-8")
+    with _pytest.raises(StampError) as err:
+        build_args(blastbox_version="0.1.27", repo=".", base="b:t",
+                   dockerfile=df, runner=_git("5aa1abc"))
+    assert "SOMETHING_ELSE" in str(err.value)      # names what IS declared
+
+
+def test_a_dockerfile_declaring_the_arg_is_accepted(tmp_path):
+    df = tmp_path / "Dockerfile"
+    df.write_text("FROM alpine\nARG BASE_IMAGE=x\n", encoding="utf-8")
+    args = build_args(blastbox_version="0.1.27", repo=".", base="b:t",
+                      dockerfile=df, runner=_git("5aa1abc"))
+    assert any("BASE_IMAGE=b@" in a for a in args)
+
+
+def test_the_arg_check_is_skipped_when_no_base_is_pinned(tmp_path):
+    """No base means no --build-arg, so there is nothing for the Dockerfile
+    to declare."""
+    df = tmp_path / "Dockerfile"
+    df.write_text("FROM alpine\n", encoding="utf-8")
+    args = build_args(blastbox_version="0.1.27", repo=".",
+                      dockerfile=df, runner=_git("5aa1abc"))
+    assert any("org.blastbox.version=0.1.27" in a for a in args)

@@ -1074,6 +1074,12 @@ def build_parser() -> argparse.ArgumentParser:
     pst.add_argument("--repo", default=".", help="source repo whose revision to record (default: .)")
     pst.add_argument("--base", help="base image to record by DIGEST, not tag")
     pst.add_argument(
+        "-f", "--dockerfile",
+        help="Dockerfile the flags will be passed to. When given, refuses to emit "
+             "a pinned base the Dockerfile does not declare an ARG for -- docker "
+             "would ignore it and the stamp would claim a digest the build never used",
+    )
+    pst.add_argument(
         "--base-arg", default="BASE_IMAGE",
         help="Dockerfile ARG that receives the digest-pinned base (default: BASE_IMAGE)",
     )
@@ -1238,6 +1244,7 @@ def _stamp_cmd(args: argparse.Namespace) -> int:
             print(" ".join(st.build_args(
                 blastbox_version=version, repo=Path(args.repo),
                 base=args.base, base_arg=args.base_arg,
+                dockerfile=args.dockerfile,
             )))
         except st.StampError as exc:
             print(f"stamp failed: {exc}")
