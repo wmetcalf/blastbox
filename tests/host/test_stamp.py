@@ -348,11 +348,11 @@ def test_a_local_only_base_is_reproducible_via_its_image_id():
     ).reproducible
 
 
-def test_a_local_only_base_is_stamped_and_pinned_by_image_id():
+def test_a_local_only_base_records_the_image_id_and_pins_by_reference():
     """Every image on these hosts is local-only, so this is the common path.
 
-    The ID goes in its own label (not the OCI digest key) and the build is
-    pinned to it.
+    The ID goes in its own label (not the OCI digest key); the build is pinned
+    to the reference, because an image ID is not a resolvable FROM.
     """
     from blastbox.host.stamp import LABEL_BASE_DIGEST, LABEL_BASE_IMAGE_ID
 
@@ -373,7 +373,11 @@ def test_a_local_only_base_is_stamped_and_pinned_by_image_id():
     assert f"{LABEL_BASE_IMAGE_ID}=sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf" in joined
     assert f"{LABEL_BASE_DIGEST}=" in joined            # emitted, but empty
     assert f"{LABEL_BASE_DIGEST}=sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf" not in joined   # never as a digest
-    assert "BASE_IMAGE=sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf" in joined        # build pinned to the ID
+    # The build is pinned to the REFERENCE, not the ID: buildkit reads
+    # `sha256:...` as the repository `docker.io/library/sha256:...` and tries to
+    # pull it, so pinning by ID fails the build under the default builder.
+    assert "BASE_IMAGE=redtusk-worker:bb0127" in joined
+    assert "BASE_IMAGE=sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf" not in joined
 
 
 def test_an_unrunnable_git_status_is_not_reported_clean(tmp_path):
@@ -776,3 +780,149 @@ def test_an_arg_name_differing_only_in_case_is_not_the_same_arg(tmp_path):
     """docker matches build-arg names exactly; `base_image` != `BASE_IMAGE`."""
     body = "ARG base_image\nFROM ${base_image}\n"
     assert "declares no `ARG BASE_IMAGE`" in _refused(_df(tmp_path, body))
+
+
+def test_a_local_only_base_is_pinned_by_a_reference_a_builder_can_resolve(tmp_path):
+    """An image ID is not a usable FROM under the default builder.
+
+    buildkit reads `sha256:...` as the repository `docker.io/library/sha256:...`
+    and tries to pull it, so a local-only base pinned by ID fails the build
+    with "pull access denied". The classic builder DOES resolve it -- which is
+    why this survived a hand-verified build on a box with buildkit off.
+    """
+    from blastbox.host.stamp import LABEL_BASE_IMAGE_ID, build_args
+
+    image_id = "sha256:" + "9" * 64
+
+    def run(argv):
+        argv = list(argv)
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(argv, 0, "b" * 40 + "\n", "")
+        if "status" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if "{{json .RepoDigests}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if "{{.Id}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, image_id + "\n", "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    df = tmp_path / "Dockerfile"
+    df.write_text("ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n")
+    args = build_args(
+        blastbox_version="0.1.28", repo=tmp_path, base="redtusk-worker:bb0128",
+        dockerfile=df, runner=run,
+    )
+    joined = " ".join(args)
+    assert "--build-arg BASE_IMAGE=redtusk-worker:bb0128" in joined, joined
+    assert f"--build-arg BASE_IMAGE={image_id}" not in joined, (
+        "the image ID is not resolvable as a FROM under buildkit"
+    )
+    # The ID is still RECORDED -- that is the provenance; only the pin changes.
+    assert f"{LABEL_BASE_IMAGE_ID}={image_id}" in joined, joined
+
+
+def _moved_runner(recorded, current):
+    def run(argv):
+        argv = list(argv)
+        if "{{.Id}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, current + "\n", "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    return run
+
+
+def test_a_moved_local_base_is_reported_rather_than_read_as_verified():
+    """A local tag can move between the inspection and the build.
+
+    Concurrent builds do exactly this, and the result is a child built from B
+    while its label names A. Nothing prevents it without a registry digest --
+    but the reference either still resolves to the recorded ID or it does not.
+    """
+    from blastbox.host.stamp import Stamp
+
+    old, new = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+    s = Stamp(blastbox="0.1.28", revision="c" * 40, base_name="redtusk-worker:bb0128",
+              base_digest="", base_image_id=old)
+    assert s.base_moved(_moved_runner(old, new)) == new
+    assert s.base_moved(_moved_runner(old, old)) == "", "unmoved must report nothing"
+
+
+def test_a_registry_digest_is_never_reported_as_moved():
+    """A digest is immutable; asking whether it moved is a category error."""
+    from blastbox.host.stamp import Stamp
+
+    s = Stamp(blastbox="0.1.28", revision="c" * 40, base_name="redtusk-worker:bb0128",
+              base_digest="sha256:" + "d" * 64, base_image_id="sha256:" + "a" * 64)
+
+    def explode(argv):  # must not even be consulted
+        raise AssertionError("docker was asked about an immutable digest")
+
+    assert s.base_moved(explode) == ""
+
+
+def test_an_unanswerable_move_check_raises_rather_than_reporting_agreement():
+    """Silence would read as "verified" -- the same rule resolvable follows."""
+    import pytest as _pytest
+
+    from blastbox.host.stamp import Stamp, StampError
+
+    s = Stamp(blastbox="0.1.28", revision="c" * 40, base_name="redtusk-worker:bb0128",
+              base_digest="", base_image_id="sha256:" + "a" * 64)
+
+    def broken(argv):
+        return subprocess.CompletedProcess(argv, 1, "", "Cannot connect to the Docker daemon")
+
+    with _pytest.raises(StampError):
+        s.base_moved(broken)
+
+
+def test_an_absent_base_is_left_to_resolvable_not_double_reported():
+    """One problem must not be counted as two."""
+    from blastbox.host.stamp import Stamp
+
+    s = Stamp(blastbox="0.1.28", revision="c" * 40, base_name="redtusk-worker:bb0128",
+              base_digest="", base_image_id="sha256:" + "a" * 64)
+
+    def gone(argv):
+        return subprocess.CompletedProcess(argv, 1, "", "Error: No such image: redtusk-worker:bb0128")
+
+    assert s.base_moved(gone) == ""
+
+
+def test_a_deleted_base_TAG_is_unresolvable_even_when_the_image_id_survives():
+    """The rebuild uses the NAME, so that is what has to still exist.
+
+    Inspecting the image ID instead reported OK for a base whose tag had been
+    deleted: the ID is still in docker's store, but the builder is handed the
+    tag and the rebuild fails.
+    """
+    from blastbox.host.stamp import Stamp
+
+    s = Stamp(blastbox="0.1.28", revision="c" * 40, base_name="redtusk-worker:bb0128",
+              base_digest="", base_image_id="sha256:" + "a" * 64)
+    asked = []
+
+    def run(argv):
+        argv = list(argv)
+        asked.append(argv)
+        return subprocess.CompletedProcess(argv, 1, "", "Error: No such image: redtusk-worker:bb0128")
+
+    assert s.resolvable(run) is False
+    assert any("redtusk-worker:bb0128" in a for a in asked[0]), (
+        f"resolvable must inspect the NAME, not the id: {asked[0]}"
+    )
+
+
+def test_a_bare_image_id_as_the_base_is_refused():
+    """docker inspect accepts it; buildkit cannot resolve it as a FROM.
+
+    Left through, it falls into the reference fallback and is passed as the
+    build-arg -- recreating the very failure that fallback exists to fix.
+    """
+    import pytest as _pytest
+
+    from blastbox.host.stamp import StampError, build_args
+
+    with _pytest.raises(StampError) as e:
+        build_args(blastbox_version="0.1.28", repo=".", base="sha256:" + "a" * 64)
+    assert "bare image ID" in str(e.value)

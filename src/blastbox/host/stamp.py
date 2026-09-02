@@ -124,10 +124,15 @@ class Stamp:
         if not self.reproducible:
             return False
         run = runner or _run
+        # Check the reference a REBUILD would actually use, which is what
+        # build_args emits: the repo@digest when there is one, otherwise the
+        # base NAME. Inspecting the image ID instead reported OK for a base
+        # whose tag had been deleted -- the ID is still in docker's store, but
+        # the tag is what gets handed to the builder, and the rebuild fails.
         ref = (
             f"{repo_of(self.base_name)}@{self.base_digest}"
             if _DIGEST_RE.match(self.base_digest or "")
-            else self.base_image_id
+            else self.base_name
         )
         # A failure to ASK is not an answer. Callers state "the base is gone"
         # on a False, so an unreachable daemon must raise rather than be
@@ -143,6 +148,48 @@ class Stamp:
             f"cannot determine whether {ref} is present: "
             f"{(proc.stderr or '').strip()[:120]}"
         )
+
+
+    def base_moved(self, runner: Runner | None = None) -> str:
+        """The base reference's CURRENT image ID, when it differs from the record.
+
+        Empty string means "no disagreement to report": either the base was
+        pinned by a registry digest (immutable, nothing to check), nothing was
+        recorded, or the reference still resolves to the image that was stamped.
+
+        This is the check that makes an ID-only stamp trustworthy after the
+        fact. A local tag can move between the inspection that produced the
+        label and the build that consumed it -- concurrent builds do exactly
+        this -- and the result is a child built from B while claiming A.
+        Nothing can prevent that without a registry digest, but the tag either
+        still resolves to the recorded ID or it does not, and that is
+        answerable.
+
+        Raises rather than reporting agreement when the question cannot be
+        asked, for the same reason `resolvable` does: a failure to ASK is not
+        an answer, and silence here would read as "verified".
+        """
+        if _DIGEST_RE.match(self.base_digest or ""):
+            return ""  # a registry digest cannot move
+        recorded = self.base_image_id or ""
+        name = self.base_name or ""
+        if not _DIGEST_RE.match(recorded) or name in (UNKNOWN, ""):
+            return ""
+        run = runner or _run
+        proc = run(["docker", "inspect", "--type", "image", name, "--format", "{{.Id}}"])
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").lower()
+            if "no such" in stderr or "not found" in stderr:
+                # The reference is gone entirely -- that is `resolvable`'s
+                # finding, not a moved tag, and reporting it here too would
+                # double-count one problem as two.
+                return ""
+            raise StampError(
+                f"cannot determine whether {name} still resolves to the recorded "
+                f"image: {(proc.stderr or '').strip()[:120]}"
+            )
+        current = (proc.stdout or "").strip()
+        return "" if current == recorded else current
 
 
 REVISION_FILE = ".blastbox-revision"
@@ -406,11 +453,19 @@ def build_args(
     """`docker build` flags that stamp the image.
 
     When ``base`` is given, the returned flags ALSO pin the build to what is
-    being recorded (``--build-arg <base_arg>=repo@sha256:...``, or the image ID
-    for a local-only base). Resolving a reference and then letting the build
-    resolve the mutable tag independently -- especially with ``--pull`` -- can
-    stamp one image while building on another. Pinning makes the stamp true by
-    construction.
+    being recorded (``--build-arg <base_arg>=repo@sha256:...``, or the caller's
+    reference for a local-only base, which buildkit can resolve where an image
+    ID cannot). Resolving a reference and then letting the build resolve the
+    mutable tag independently -- especially with ``--pull`` -- can stamp one
+    image while building on another.
+
+    A REGISTRY DIGEST makes the stamp true by construction. A local-only base
+    does not: the reference is mutable, so if the tag moves between the
+    inspection here and the build, the label names the image that was inspected
+    while the build used the one the tag points at now. What that buys is
+    DETECTION rather than prevention -- ``Stamp.base_moved`` compares the
+    recorded ID against what the reference resolves to today, and ``--read``
+    reports the disagreement. Push the base to a registry for prevention.
 
     Base labels are emitted even with no base, as empty values: docker inherits
     LABELs from the parent, so an unset base label would silently carry the
@@ -421,6 +476,17 @@ def build_args(
     removing quotes, so a quoted value arrives with literal quote characters.
     Failing loudly beats emitting something that silently mis-parses.
     """
+    if base and _DIGEST_RE.fullmatch(base.strip()):
+        # docker inspect ACCEPTS a bare image ID, and no repo digest is found
+        # for it, so it would fall through to being passed as the build-arg --
+        # recreating exactly the buildkit failure this fallback exists to fix,
+        # since buildkit reads `sha256:...` as a repository and tries to pull.
+        raise StampError(
+            f"--base {base} is a bare image ID, which is not a reference any "
+            "builder can resolve as a FROM. Pass the name the image is tagged "
+            "with (`docker image inspect <id> --format '{{.RepoTags}}'`), or "
+            "push it and pass repo@sha256:... to pin by digest."
+        )
     if base and dockerfile is not None:
         assert_arg_selects_base(dockerfile, base_arg)
     revision = git_revision(repo, runner)
@@ -452,7 +518,22 @@ def build_args(
         _require_shell_safe(key, value)
         args += ["--label", f"{key}={value}"]
     if base:
-        pinned = f"{repo_of(base)}@{digest}" if digest else image_id
+        # A registry digest is a real pin and every builder resolves it. An
+        # image ID is NOT a usable FROM: buildkit reads `sha256:...` as the
+        # repository `docker.io/library/sha256:...` and tries to PULL it, so a
+        # local-only base pinned by ID fails the build outright ("pull access
+        # denied") under the default builder. The classic builder does resolve
+        # it, which is exactly why this survived a hand-verified build -- the
+        # box that proved it had buildkit off.
+        #
+        # For a local-only base we therefore pass the REFERENCE the caller
+        # named and record the image ID in the label. That is a weaker pin: the
+        # reference is mutable, so the guarantee is "the build used whatever
+        # this reference meant at build time, and the label says which image
+        # that was" -- checkable after the fact (the recorded ID either still
+        # matches the reference or it does not), rather than guaranteed by
+        # construction. Push the base to a registry to get the strong form.
+        pinned = f"{repo_of(base)}@{digest}" if digest else base
         _require_shell_safe(base_arg, pinned)
         args += ["--build-arg", f"{base_arg}={pinned}"]
     return args
