@@ -502,3 +502,44 @@ def test_a_genuinely_different_repository_still_raises():
         return subprocess.CompletedProcess(argv, 1, "", "")
     with _pytest.raises(StampError):
         base_digest("docker.io/minio/minio:latest", run)
+
+
+def test_a_stamp_that_disagrees_with_the_image_is_caught():
+    """The join the three modules previously lacked.
+
+    `org.blastbox.version` is a self-report written at build time. Nothing
+    verified it, and doctor reads only running containers — so a label claiming
+    0.1.27 on an image containing 0.1.17 was unrepresentable, and pins, stamp
+    and doctor could all exit 0 on a fleet nobody declared.
+    """
+    from blastbox.host.stamp import LABEL_BLASTBOX, verify_contents
+
+    labels = {LABEL_BLASTBOX: "0.1.27"}
+
+    def run(argv):
+        argv = list(argv)
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(labels), "")
+        if argv[:2] == ["docker", "run"]:
+            return subprocess.CompletedProcess(argv, 0, "0.1.17\n", "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    agrees, detail = verify_contents("img", run)
+    assert not agrees
+    assert "0.1.27" in detail and "0.1.17" in detail
+
+
+def test_a_stamp_matching_the_image_agrees():
+    from blastbox.host.stamp import LABEL_BLASTBOX, verify_contents
+
+    def run(argv):
+        argv = list(argv)
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({LABEL_BLASTBOX: "0.1.27"}), "")
+        if argv[:2] == ["docker", "run"]:
+            return subprocess.CompletedProcess(argv, 0, "0.1.27\n", "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    agrees, detail = verify_contents("img", run)
+    assert agrees and detail == "0.1.27"

@@ -329,6 +329,35 @@ def _require_shell_safe(key: str, value: str) -> None:
         )
 
 
+def verify_contents(image: str, runner: Runner | None = None) -> tuple[bool, str]:
+    """Check the recorded blastbox version against what the image ACTUALLY has.
+
+    The `org.blastbox.version` label is a self-report: `build_args` writes
+    whatever it was told, defaulting to the version of the CLI on the build
+    host, which is not necessarily what the image installs. Nothing verified it,
+    and `doctor` deliberately reads only running containers -- so a stamp
+    claiming 0.1.27 on an image containing 0.1.17 was unrepresentable in either
+    module, and `pins`, `stamp --read` and `doctor` could all exit 0 on a fleet
+    running a version nobody declared.
+
+    This is the join: it runs the same probe `doctor` uses, inside the image.
+
+    Returns (agrees, detail).
+    """
+    from blastbox.host.doctor import UNKNOWN as D_UNKNOWN  # noqa: PLC0415 -- cycle
+    from blastbox.host.doctor import version_in_image  # noqa: PLC0415
+
+    stamped = read(image, runner).blastbox
+    if stamped in (UNKNOWN, ""):
+        return False, "image records no blastbox version"
+    actual, detail = version_in_image(image, runner)
+    if actual == D_UNKNOWN:
+        return False, f"cannot read the image's blastbox: {detail}"
+    if actual != stamped:
+        return False, f"label says {stamped}, image contains {actual}"
+    return True, actual
+
+
 def read(image: str, runner: Runner | None = None) -> Stamp:
     """The stamp an image carries, if any.
 

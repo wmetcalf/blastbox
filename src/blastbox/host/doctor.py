@@ -105,7 +105,7 @@ def _ps(runner: Runner) -> list[dict[str, str]]:
     return out
 
 
-def _project_of(runner: Runner, name: str) -> str:
+def _project_of(runner: Runner, name: str, image: str = "") -> str:
     try:
         proc = runner([
             "docker", "inspect", name,
@@ -117,13 +117,17 @@ def _project_of(runner: Runner, name: str) -> str:
         return f"(none:{name})"
     value = proc.stdout.strip() if proc.returncode == 0 else ""
     # Go templates render a missing key as "<no value>" on some docker builds
-    # (this one emits an empty line). Treat both as absent -- otherwise every
-    # unlabeled container groups under one pseudo-project and invents drift.
+    # (this one emits an empty line). Treat both as absent.
     if value == "<no value>":
         value = ""
-    # An unlabeled container belongs to no compose project; grouping them all
-    # under one key would invent drift between unrelated `docker run` boxes.
-    return value or f"(none:{name})"
+    if value:
+        return value
+    # No compose label. Group by IMAGE, not by container name: blastbox starts
+    # its own workers with `docker run`, so a name-unique key would make every
+    # worker its own group and drift() -- which compares WITHIN a group -- could
+    # never flag them. Two containers from one image must agree; two unrelated
+    # `docker run` boxes still do not share a group.
+    return f"(image:{image})" if image else f"(none:{name})"
 
 
 def _version_in(runner: Runner, name: str, status: str) -> tuple[str, str]:
@@ -189,6 +193,40 @@ def _version_in(runner: Runner, name: str, status: str) -> tuple[str, str]:
     return NOPKG, last_err[:140]
 
 
+def version_in_image(image: str, runner: Runner | None = None) -> tuple[str, str]:
+    """The blastbox version installed in an IMAGE (not a running container).
+
+    Runs the same probe used for containers, in a throwaway container, so a
+    stamp's self-reported version can be checked against reality. Returns
+    (version, detail); version is UNKNOWN when it could not be read.
+    """
+    run = runner or _run
+    for interp in ("python3", "python"):
+        try:
+            proc = run(["docker", "run", "--rm", "--entrypoint", interp, image, "-c", _PROBE])
+        except subprocess.TimeoutExpired:
+            return UNKNOWN, "probe timed out"
+        raw = (proc.stdout or "").strip().splitlines()
+        line = _sanitise(raw[-1]) if raw else ""
+        if proc.returncode == 0 and line and line != NOPKG and not line.startswith(_PROBEFAIL):
+            return line, ""
+    try:
+        proc = run([
+            "docker", "run", "--rm", "--entrypoint", "sh", image, "-lc",
+            'for p in /opt/*/bin/python; do [ -x "$p" ] || continue; '
+            'v=$("$p" - <<\'EOF\'\n' + _PROBE + "EOF\n" + '); '
+            'case "$v" in ""|NOPKG*) continue;; *) printf %s "$v"; exit 0;; esac; '
+            'done; printf NOPKG',
+        ])
+    except subprocess.TimeoutExpired:
+        return UNKNOWN, "probe timed out"
+    raw = (proc.stdout or "").strip().splitlines()
+    line = _sanitise(raw[-1]) if raw else ""
+    if proc.returncode == 0 and line and line != NOPKG:
+        return line, ""
+    return UNKNOWN, (_sanitise((proc.stderr or "").strip())[:140] or "no blastbox in image")
+
+
 def survey(runner: Runner | None = None) -> list[Container]:
     """Every running container that has blastbox installed."""
     run = runner or _run
@@ -207,7 +245,7 @@ def survey(runner: Runner | None = None) -> list[Container]:
         found.append(Container(
             name=name,
             image=row.get("image", "?"),
-            project=_project_of(run, name),
+            project=_project_of(run, name, row.get("image", "")),
             status=row.get("status", "?"),
             version=version,
             detail=detail,

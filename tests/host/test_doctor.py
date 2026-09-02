@@ -199,13 +199,18 @@ def test_container_controlled_output_is_sanitised():
 
 
 def test_unlabeled_containers_are_not_merged_into_one_project():
-    """Two unrelated `docker run` boxes must not look like one drifting project."""
+    """Two unrelated `docker run` boxes must not look like one drifting project.
+
+    "Unrelated" means DIFFERENT IMAGES: containers from one image are expected
+    to agree, so they deliberately do share a group (see the image-grouping
+    test below).
+    """
     def run(argv):
         argv = list(argv)
         if argv[:2] == ["docker", "ps"]:
             return subprocess.CompletedProcess(
                 argv, 0,
-                '{"name":"a","image":"i","status":"Up"}\n{"name":"b","image":"i","status":"Up"}\n', "")
+                '{"name":"a","image":"ia","status":"Up"}\n{"name":"b","image":"ib","status":"Up"}\n', "")
         if argv[:2] == ["docker", "inspect"]:
             return subprocess.CompletedProcess(argv, 0, "\n", "")
         return subprocess.CompletedProcess(argv, 0, ("0.1.17" if argv[2] == "a" else "0.1.27") + "\n", "")
@@ -254,7 +259,7 @@ def test_a_no_value_project_label_is_treated_as_absent():
         if argv[:2] == ["docker", "ps"]:
             return subprocess.CompletedProcess(
                 argv, 0,
-                '{"name":"a","image":"i","status":"Up"}\n{"name":"b","image":"i","status":"Up"}\n', "")
+                '{"name":"a","image":"ia","status":"Up"}\n{"name":"b","image":"ib","status":"Up"}\n', "")
         if argv[:2] == ["docker", "inspect"]:
             return subprocess.CompletedProcess(argv, 0, "<no value>\n", "")
         return subprocess.CompletedProcess(
@@ -294,3 +299,51 @@ def test_a_missing_docker_binary_raises_rather_than_reporting_an_empty_fleet():
     with patch("blastbox.host.doctor.shutil.which", return_value=None):
         with _pytest.raises(DockerUnavailable):
             survey()
+
+
+def test_unlabeled_containers_group_by_image_so_drift_is_visible():
+    """The regression this fixes: making each unlabeled container its own key
+    meant drift() -- which compares WITHIN a group -- could never flag them, so
+    the exact three-way fleet in this module's docstring reported OK."""
+    def run(argv):
+        argv = list(argv)
+        if argv[:2] == ["docker", "ps"]:
+            rows = [
+                '{"name":"bb-host","image":"rt:1","status":"Up"}',
+                '{"name":"bb-cold","image":"rt:1","status":"Up"}',
+            ]
+            return subprocess.CompletedProcess(argv, 0, "\n".join(rows) + "\n", "")
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, "\n", "")   # no compose label
+        return subprocess.CompletedProcess(
+            argv, 0, ("0.1.26" if argv[2] == "bb-host" else "0.1.17") + "\n", "")
+    d = drift(survey(run))
+    assert len(d) == 1, d                       # one image -> one group
+    assert d["(image:rt:1)"] == {"0.1.17", "0.1.26"}
+
+
+def test_unrelated_images_still_do_not_share_a_group():
+    def run(argv):
+        argv = list(argv)
+        if argv[:2] == ["docker", "ps"]:
+            rows = [
+                '{"name":"a","image":"one:1","status":"Up"}',
+                '{"name":"b","image":"two:1","status":"Up"}',
+            ]
+            return subprocess.CompletedProcess(argv, 0, "\n".join(rows) + "\n", "")
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, "\n", "")
+        return subprocess.CompletedProcess(
+            argv, 0, ("0.1.26" if argv[2] == "a" else "0.1.17") + "\n", "")
+    d = drift(survey(run))
+    assert len(d) == 2 and all(len(v) == 1 for v in d.values())
+
+
+def test_version_in_image_reads_an_image_not_a_container():
+    from blastbox.host.doctor import version_in_image
+
+    def run(argv):
+        argv = list(argv)
+        assert argv[:2] == ["docker", "run"], argv
+        return subprocess.CompletedProcess(argv, 0, "0.1.27\n", "")
+    assert version_in_image("img", run) == ("0.1.27", "")
