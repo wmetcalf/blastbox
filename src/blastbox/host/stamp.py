@@ -58,7 +58,21 @@ class StampError(RuntimeError):
 
 
 def _run(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(list(argv), capture_output=True, text=True, timeout=60)
+    """Run a helper, turning "could not run it at all" into StampError.
+
+    A missing binary or a timeout must not surface as a raw OSError from deep
+    inside a build script; and it must never be mistaken for "the value is
+    absent". git is handled separately -- its absence is a legitimate state on
+    a deployed tree.
+    """
+    try:
+        return subprocess.run(list(argv), capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired as exc:
+        raise StampError(f"{argv[0]} timed out: {' '.join(map(str, argv))[:120]}") from exc
+    except FileNotFoundError as exc:
+        if argv and argv[0] == "git":
+            raise
+        raise StampError(f"{argv[0]} is not installed") from exc
 
 
 @dataclass(frozen=True)
@@ -86,6 +100,7 @@ class Stamp:
         pinned = self.base_digest not in (UNKNOWN, "") or self.base_image_id not in (UNKNOWN, "")
         return (
             pinned
+            and self.blastbox not in (UNKNOWN, "")
             and self.base_name not in (UNKNOWN, "")
             and self.revision not in (UNKNOWN, "")
             and not self.revision.endswith(DIRTY_SUFFIX)
@@ -126,9 +141,14 @@ def git_revision(repo: Path | str, runner: Runner | None = None) -> str:
     try:
         dirty = run(["git", "-C", str(repo), "status", "--porcelain"])
     except (FileNotFoundError, OSError):
-        return sha
-    if dirty.returncode == 0 and dirty.stdout.strip():
-        return f"{sha}-dirty"
+        # git vanished between the two calls; we cannot claim the tree is clean.
+        return f"{sha}{DIRTY_SUFFIX}"
+    if dirty.returncode != 0:
+        # Cannot tell whether the tree is clean, so do not claim that it is:
+        # a clean sha for a dirty tree names a commit that never built this.
+        return f"{sha}{DIRTY_SUFFIX}"
+    if dirty.stdout.strip():
+        return f"{sha}{DIRTY_SUFFIX}"
     return sha
 
 
@@ -171,9 +191,12 @@ def base_digest(image: str, runner: Runner | None = None) -> str:
     proc = run(["docker", "inspect", image, "--format", "{{json .RepoDigests}}"])
     if proc.returncode == 0:
         try:
-            digests = [str(d) for d in json.loads(proc.stdout.strip() or "[]")]
+            # Docker reports a nil RepoDigests field as JSON `null`, which
+            # decodes to None and is not iterable.
+            raw = json.loads(proc.stdout.strip() or "[]")
         except json.JSONDecodeError:
-            digests = []
+            raw = []
+        digests = [str(d) for d in (raw or [])]
         # One image can carry digests from several repositories; take the one
         # for the repo actually requested, or the sole entry when unambiguous.
         matching = [d for d in digests if d.split("@", 1)[0] == repo]
@@ -217,6 +240,13 @@ def build_args(
     Failing loudly beats emitting something that silently mis-parses.
     """
     revision = git_revision(repo, runner)
+    if revision == UNKNOWN:
+        raise StampError(
+            f"{repo}: no source revision (not a git checkout and no "
+            f"{REVISION_FILE}). Stamping 'unknown' produces an image that looks "
+            "recorded and cannot be rebuilt; write the revision the tree came "
+            "from into that file as part of the deploy."
+        )
     digest = base_digest(base, runner) if base else ""
     image_id = base_image_id(base, runner) if base and not digest else ""
     labels = {

@@ -181,9 +181,9 @@ def test_a_dirty_build_is_not_reproducible():
     """
     from blastbox.host.stamp import Stamp
 
-    assert not Stamp(
+    assert not Stamp(blastbox="0.1.27",
         revision="abc-dirty", base_name="b:t", base_digest="sha256:bd").reproducible
-    assert Stamp(
+    assert Stamp(blastbox="0.1.27",
         revision="abc", base_name="b:t", base_digest="sha256:bd").reproducible
 
 
@@ -311,14 +311,15 @@ def test_a_base_digest_without_a_name_is_not_reproducible():
     """A bare sha256 does not say which repository to pull it from."""
     from blastbox.host.stamp import Stamp
 
-    assert not Stamp(revision="abc", base_digest="sha256:bd").reproducible
-    assert Stamp(revision="abc", base_digest="sha256:bd", base_name="b:t").reproducible
+    assert not Stamp(blastbox="0.1.27", revision="abc", base_digest="sha256:bd").reproducible
+    assert Stamp(blastbox="0.1.27", revision="abc",
+                 base_digest="sha256:bd", base_name="b:t").reproducible
 
 
 def test_a_local_only_base_is_reproducible_via_its_image_id():
     from blastbox.host.stamp import Stamp
 
-    assert Stamp(
+    assert Stamp(blastbox="0.1.27",
         revision="abc", base_name="b:t", base_image_id="sha256:localid",
     ).reproducible
 
@@ -349,3 +350,42 @@ def test_a_local_only_base_is_stamped_and_pinned_by_image_id():
     assert f"{LABEL_BASE_DIGEST}=" in joined            # emitted, but empty
     assert f"{LABEL_BASE_DIGEST}=sha256:localid" not in joined   # never as a digest
     assert "BASE_IMAGE=sha256:localid" in joined        # build pinned to the ID
+
+
+def test_an_unrunnable_git_status_is_not_reported_clean(tmp_path):
+    """rev-parse succeeded, status failed: we cannot claim the tree is clean."""
+    def run(argv):
+        argv = list(argv)
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(argv, 0, "abc\n", "")
+        return subprocess.CompletedProcess(argv, 128, "", "fatal: unreadable index")
+    assert git_revision(tmp_path, run) == "abc-dirty"
+
+
+def test_null_repodigests_do_not_crash():
+    """Docker reports a nil RepoDigests field as JSON `null`, not `[]`."""
+    def run(argv):
+        argv = list(argv)
+        if "{{json .RepoDigests}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, "null", "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+    assert base_digest("local:only", run) == ""
+
+
+def test_an_unknown_revision_is_refused_before_emitting_flags(tmp_path):
+    """`revision=unknown` looks recorded and cannot be rebuilt."""
+    import pytest as _pytest
+
+    from blastbox.host.stamp import StampError
+
+    def run(argv):
+        return subprocess.CompletedProcess(list(argv), 128, "", "not a git repository")
+    with _pytest.raises(StampError):
+        build_args(blastbox_version="0.1.27", repo=tmp_path, runner=run)
+
+
+def test_a_missing_blastbox_version_is_not_reproducible():
+    from blastbox.host.stamp import Stamp
+
+    assert not Stamp(
+        revision="abc", base_name="b:t", base_digest="sha256:bd").reproducible
