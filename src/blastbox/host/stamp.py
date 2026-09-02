@@ -124,10 +124,15 @@ class Stamp:
         if not self.reproducible:
             return False
         run = runner or _run
+        # Check the reference a REBUILD would actually use, which is what
+        # build_args emits: the repo@digest when there is one, otherwise the
+        # base NAME. Inspecting the image ID instead reported OK for a base
+        # whose tag had been deleted -- the ID is still in docker's store, but
+        # the tag is what gets handed to the builder, and the rebuild fails.
         ref = (
             f"{repo_of(self.base_name)}@{self.base_digest}"
             if _DIGEST_RE.match(self.base_digest or "")
-            else self.base_image_id
+            else self.base_name
         )
         # A failure to ASK is not an answer. Callers state "the base is gone"
         # on a False, so an unreachable daemon must raise rather than be
@@ -471,6 +476,17 @@ def build_args(
     removing quotes, so a quoted value arrives with literal quote characters.
     Failing loudly beats emitting something that silently mis-parses.
     """
+    if base and _DIGEST_RE.fullmatch(base.strip()):
+        # docker inspect ACCEPTS a bare image ID, and no repo digest is found
+        # for it, so it would fall through to being passed as the build-arg --
+        # recreating exactly the buildkit failure this fallback exists to fix,
+        # since buildkit reads `sha256:...` as a repository and tries to pull.
+        raise StampError(
+            f"--base {base} is a bare image ID, which is not a reference any "
+            "builder can resolve as a FROM. Pass the name the image is tagged "
+            "with (`docker image inspect <id> --format '{{.RepoTags}}'`), or "
+            "push it and pass repo@sha256:... to pin by digest."
+        )
     if base and dockerfile is not None:
         assert_arg_selects_base(dockerfile, base_arg)
     revision = git_revision(repo, runner)

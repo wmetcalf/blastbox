@@ -887,3 +887,42 @@ def test_an_absent_base_is_left_to_resolvable_not_double_reported():
         return subprocess.CompletedProcess(argv, 1, "", "Error: No such image: redtusk-worker:bb0128")
 
     assert s.base_moved(gone) == ""
+
+
+def test_a_deleted_base_TAG_is_unresolvable_even_when_the_image_id_survives():
+    """The rebuild uses the NAME, so that is what has to still exist.
+
+    Inspecting the image ID instead reported OK for a base whose tag had been
+    deleted: the ID is still in docker's store, but the builder is handed the
+    tag and the rebuild fails.
+    """
+    from blastbox.host.stamp import Stamp
+
+    s = Stamp(blastbox="0.1.28", revision="c" * 40, base_name="redtusk-worker:bb0128",
+              base_digest="", base_image_id="sha256:" + "a" * 64)
+    asked = []
+
+    def run(argv):
+        argv = list(argv)
+        asked.append(argv)
+        return subprocess.CompletedProcess(argv, 1, "", "Error: No such image: redtusk-worker:bb0128")
+
+    assert s.resolvable(run) is False
+    assert any("redtusk-worker:bb0128" in a for a in asked[0]), (
+        f"resolvable must inspect the NAME, not the id: {asked[0]}"
+    )
+
+
+def test_a_bare_image_id_as_the_base_is_refused():
+    """docker inspect accepts it; buildkit cannot resolve it as a FROM.
+
+    Left through, it falls into the reference fallback and is passed as the
+    build-arg -- recreating the very failure that fallback exists to fix.
+    """
+    import pytest as _pytest
+
+    from blastbox.host.stamp import StampError, build_args
+
+    with _pytest.raises(StampError) as e:
+        build_args(blastbox_version="0.1.28", repo=".", base="sha256:" + "a" * 64)
+    assert "bare image ID" in str(e.value)
